@@ -37,18 +37,24 @@ pub struct Token {
     pub col: u32,
     /// Macros that must not expand this token again (C11 6.10.3.4 hide set).
     pub(crate) hidden: Option<Arc<HashSet<String>>>,
-    /// Set on a macro-argument token that a `\`-newline splice, and nothing
-    /// else, separates from the token before it. Phase 2 deletes the splice
-    /// before tokenizing (C11 5.1.1.2p1), so the two are adjacent in the
-    /// spliced source even though their `line`/`col` say otherwise; `#`
-    /// stringizing has to spell them with no space between.
-    pub(crate) spliced_before: bool,
+    /// Whether this token touched the previous one in the token stream:
+    /// no whitespace, comment or newline between them. `\`-newline is
+    /// deleted in translation phase 2 (C11 5.1.1.2p1), before tokens are
+    /// recognized, so a splice alone never separates two tokens. This is
+    /// the *logical* adjacency `#` stringizing and the function-like
+    /// `#define` test need; `line`/`col` are physical positions and, once
+    /// splices are deleted, no longer answer "did these tokens touch" —
+    /// `a\`-newline-`b` is one token starting at `a`, and `a-\`-newline-`>`
+    /// one `->` whose halves sit on different lines. A synthesized token
+    /// (`Token::new`) is never adjacent; a token substituted for a macro
+    /// parameter takes the parameter's flag, like gcc's `PREV_WHITE`.
+    pub(crate) adjacent_before: bool,
     /// For a token that came out of a macro replacement list: the
     /// `(line, col)` of the outermost invocation that produced it, in the
     /// file being processed. `line`/`col` keep the definition-site
-    /// coordinates (they still decide whitespace adjacency); this is what
-    /// the LineMap and `__LINE__` report, so macro-expanded code attributes
-    /// to its expansion site even through forwarding macros.
+    /// coordinates; this is what the LineMap and `__LINE__` report, so
+    /// macro-expanded code attributes to its expansion site even through
+    /// forwarding macros.
     pub(crate) origin: Option<(u32, u32)>,
 }
 
@@ -60,7 +66,7 @@ impl Token {
             col,
             hidden: None,
             origin: None,
-            spliced_before: false,
+            adjacent_before: false,
         }
     }
 
@@ -94,7 +100,7 @@ impl Token {
             col: self.col,
             hidden: Some(Arc::new(set)),
             origin: Some(origin.expansion_site()),
-            spliced_before: self.spliced_before,
+            adjacent_before: self.adjacent_before,
         }
     }
 
@@ -111,11 +117,32 @@ impl Token {
     }
 }
 
+/// Tokenizer for one file. Translation phase 2 happens here, at the
+/// character level: `advance_char` steps over every `\`-newline it lands
+/// on, so `pos` never rests on a splice and every reader — identifiers,
+/// numbers, punctuator munching, string bodies, comment delimiters — sees
+/// the spliced text without knowing splices exist. The one exception is a
+/// C++11 raw string literal, whose body reverts phase 2 and is copied
+/// physically ([lex.pptoken]p3). Token positions stay physical: a token
+/// starts where its first character sits in the file, which is what the
+/// LineMap wants; whether it touched its predecessor is recorded on the
+/// token (`Token::adjacent_before`) rather than recomputed from positions.
 pub struct Lexer<'a> {
     input: &'a str,
+    /// Byte offset of the next character to read; never inside a splice.
     pos: usize,
     line: u32,
     col: u32,
+    /// Byte offset of every `\`-newline in `input`, ascending, found once
+    /// up front so the per-character hot path compares `pos` against
+    /// `next_splice` instead of loading a byte.
+    splices: Vec<usize>,
+    /// `splices[splice_idx]`, or `usize::MAX` once they are used up.
+    next_splice: usize,
+    splice_idx: usize,
+    /// The previous token was a newline (or there was none): whatever comes
+    /// next does not touch it.
+    after_newline: bool,
     /// Decides the C++-only token shapes: raw string literals and
     /// user-defined-literal suffixes are one token in C++ and identifier +
     /// literal (or literal + identifier) in C, where the identifier can be
@@ -127,13 +154,19 @@ pub struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str, language: Language) -> Self {
-        Self {
+        let mut lexer = Self {
             input,
             pos: 0,
             line: 1,
             col: 1,
+            splices: find_splices(input),
+            next_splice: usize::MAX,
+            splice_idx: 0,
+            after_newline: true,
             language,
-        }
+        };
+        lexer.resync_splices();
+        lexer
     }
 
     fn is_cpp(&self) -> bool {
@@ -154,41 +187,60 @@ impl<'a> Lexer<'a> {
     }
 
     fn next_token(&mut self) -> Token {
-        self.skip_whitespace_and_comments();
-        let line = self.line;
-        let col = self.col;
+        // Where the previous token ended. A token that starts right there,
+        // with nothing skipped in between, touched it; a splice is not
+        // "in between" because `pos` never stops on one.
+        let end_of_prev = self.pos;
+        loop {
+            self.skip_whitespace_and_comments();
+            let adjacent = self.pos == end_of_prev && !self.after_newline;
+            let line = self.line;
+            let col = self.col;
+            let Some(mut tok) = self.lex_token(line, col) else {
+                // Unknown character: skip it and lex what follows.
+                self.advance_char();
+                continue;
+            };
+            tok.adjacent_before = adjacent;
+            self.after_newline = matches!(tok.kind, TokenKind::Newline);
+            return tok;
+        }
+    }
 
+    /// The token starting at the current position, or `None` for a
+    /// character no token starts with.
+    fn lex_token(&mut self, line: u32, col: u32) -> Option<Token> {
         if self.is_at_end() {
-            return Token::new(TokenKind::Eof, line, col);
+            return Some(Token::new(TokenKind::Eof, line, col));
         }
 
         let ch = self.peek_char();
 
         if ch == '\n' {
             self.advance_char();
-            return Token::new(TokenKind::Newline, line, col);
+            return Some(Token::new(TokenKind::Newline, line, col));
         }
 
         if ch == '#' {
             if self.peek_char_at(1) == '#' {
                 self.advance_char();
                 self.advance_char();
-                return Token::new(TokenKind::Punct("##"), line, col);
+                return Some(Token::new(TokenKind::Punct("##"), line, col));
             }
             self.advance_char();
-            return Token::new(TokenKind::Hash, line, col);
+            return Some(Token::new(TokenKind::Hash, line, col));
         }
 
         if ch == '"' {
-            return self.read_string(self.pos, line, col);
+            return Some(self.read_string(self.pos, line, col));
         }
 
         if ch == '\'' {
-            return self.read_char(self.pos, line, col);
+            return Some(self.read_char(self.pos, line, col));
         }
 
         if ch.is_ascii_digit() {
-            return self.read_number(line, col);
+            return Some(self.read_number(line, col));
         }
 
         if is_ident_start(ch) {
@@ -196,10 +248,10 @@ impl<'a> Lexer<'a> {
             // identifier skips the probe (this is the lexer's hottest path).
             if matches!(ch, 'R' | 'u' | 'U' | 'L') {
                 if let Some(tok) = self.read_prefixed_literal(line, col) {
-                    return tok;
+                    return Some(tok);
                 }
             }
-            return self.read_identifier(line, col);
+            return Some(self.read_identifier(line, col));
         }
 
         if let Some(one) = single_char_punct(ch) {
@@ -225,12 +277,10 @@ impl<'a> Lexer<'a> {
             for _ in 1..spelling.len() {
                 self.advance_char();
             }
-            return Token::new(TokenKind::Punct(spelling), line, col);
+            return Some(Token::new(TokenKind::Punct(spelling), line, col));
         }
 
-        // Unknown char - skip
-        self.advance_char();
-        self.next_token()
+        None
     }
 
     /// An ordinary string literal whose opening quote is at the current
@@ -294,12 +344,15 @@ impl<'a> Lexer<'a> {
 
     /// Consume the closing `quote` if it is there and return the literal's
     /// spelling from `start`, with the quote appended when it was missing.
+    /// The spelling is the text as written minus any splice the reader
+    /// stepped over: the reader's view and `strip_splices` agree because
+    /// both delete a `\`-newline wherever one starts.
     fn close_literal(&mut self, start: usize, quote: char) -> String {
         let closed = !self.is_at_end() && self.peek_char() == quote;
         if closed {
             self.advance_char();
         }
-        let mut spelling = self.input[start..self.pos].to_string();
+        let mut spelling = strip_splices(&self.input[start..self.pos]);
         if !closed {
             spelling.push(quote);
         }
@@ -312,30 +365,29 @@ impl<'a> Lexer<'a> {
     /// `None` and consumes nothing when the text is an ordinary identifier,
     /// so `Rect`, `u8x`, `L` or `L "x"` (with a space) all lex as before.
     /// C has no raw strings: there `R"(x)"` is the identifier `R` (possibly
-    /// a macro) followed by an ordinary string.
-    ///
-    /// Known limitation: the lexer does no translation-phase-2 splicing, so
-    /// a prefix broken by `\`-newline (`R\` newline `"(x)"`, legal C++) is
-    /// not recognized here, just as `in\` newline `t` is not one
-    /// identifier. Splices are kept as `\` + newline tokens throughout.
+    /// a macro) followed by an ordinary string. The prefix is read through
+    /// the spliced view like any other token, so `L\`-newline-`"x"` is the
+    /// literal `L"x"`.
     fn read_prefixed_literal(&mut self, line: u32, col: u32) -> Option<Token> {
-        let rest = &self.input[self.pos..];
-        let enc = ["u8", "u", "U", "L"]
-            .iter()
-            .find(|p| rest.starts_with(*p))
-            .map_or(0, |p| p.len());
-        let after = &rest[enc..];
-        if self.is_cpp() && after.starts_with("R\"") {
-            return self.read_raw_string(enc + 1, line, col);
+        let ahead = self.lookahead::<4>();
+        let enc = match ahead {
+            ['u', '8', ..] => 2,
+            ['u', ..] | ['U', ..] | ['L', ..] => 1,
+            _ => 0,
+        };
+        if self.is_cpp() && ahead[enc] == 'R' && ahead[enc + 1] == '"' {
+            if let Some(tok) = self.read_raw_string(enc, line, col) {
+                return Some(tok);
+            }
         }
         if enc == 0 {
             return None;
         }
-        let start = self.pos;
-        let quote = after.chars().next()?;
+        let quote = ahead[enc];
         if quote != '"' && quote != '\'' {
             return None;
         }
+        let start = self.pos;
         for _ in 0..enc {
             self.advance_char();
         }
@@ -346,40 +398,75 @@ impl<'a> Lexer<'a> {
         })
     }
 
-    /// Lex a raw string literal whose `"` sits `quote_at` bytes past the
-    /// current position (after the encoding prefix and `R`): a
-    /// d-char-sequence of at most 16 characters, `(`, an arbitrary body and
-    /// `)` + the same d-char-sequence + `"`. Returns `None` and consumes
-    /// nothing for a delimiter containing space, `\`, `)` or a control
-    /// character, or a literal with no matching closer before end of input,
-    /// leaving the text to the identifier/string paths so a malformed
-    /// literal costs a couple of bad tokens instead of swallowing the file.
-    fn read_raw_string(&mut self, quote_at: usize, line: u32, col: u32) -> Option<Token> {
+    /// Lex a raw string literal: `enc` characters of encoding prefix, `R`,
+    /// `"`, a d-char-sequence of at most 16 characters, `(`, an arbitrary
+    /// body and `)` + the same d-char-sequence + `"`. Returns `None` and
+    /// consumes nothing for a delimiter containing space, `\`, `)` or a
+    /// control character, or a literal with no matching closer before end
+    /// of input, leaving the text to the identifier/string paths so a
+    /// malformed literal costs a couple of bad tokens instead of swallowing
+    /// the file.
+    ///
+    /// From the opening `"` on, the text is taken physically: C++11
+    /// [lex.pptoken]p3 reverts line splicing inside a raw string literal,
+    /// so a `\`-newline in the body is two characters of the string, not a
+    /// splice, and the literal is re-emitted exactly as written.
+    fn read_raw_string(&mut self, enc: usize, line: u32, col: u32) -> Option<Token> {
         const MAX_DELIM: usize = 16;
+        // The prefix and `R` are read through the spliced view; `pos` then
+        // rests on the physical `"`.
+        let prefix_end = self.pos;
+        let mut prefix = self.lookahead_string(enc + 1);
+        for _ in 0..enc + 1 {
+            self.advance_char();
+        }
         let rest = &self.input[self.pos..];
-        let after_quote = &rest[quote_at + 1..];
+        debug_assert!(rest.starts_with('"'));
+        let after_quote = &rest[1..];
         // The delimiter is at most 16 d-chars, so look for `(` only that
         // far: an `R"..."` that is really a prefixed ordinary string must
         // not scan ahead to some unrelated `(` further down the file.
-        let delim_len = after_quote
+        let Some(delim_len) = after_quote
             .bytes()
             .take(MAX_DELIM + 1)
-            .position(|b| b == b'(')?;
-        let delim = &after_quote[..delim_len];
-        if !delim.bytes().all(is_d_char) {
+            .position(|b| b == b'(')
+            .filter(|&n| after_quote.as_bytes()[..n].iter().all(|&b| is_d_char(b)))
+        else {
+            self.rewind(prefix_end, line, col);
             return None;
-        }
-        let body_start = quote_at + 1 + delim_len + 1;
+        };
+        let delim = &after_quote[..delim_len];
+        let body_start = 1 + delim_len + 1;
         let closer = format!("){delim}\"");
-        let body_len = rest[body_start..].find(&closer)?;
+        let Some(body_len) = rest[body_start..].find(&closer) else {
+            self.rewind(prefix_end, line, col);
+            return None;
+        };
         let total = body_start + body_len + closer.len();
-        let mut spelling = rest[..total].to_string();
-        let end = self.pos + total;
-        while self.pos < end {
-            self.advance_char();
-        }
+        prefix.push_str(&rest[..total]);
+        self.advance_physical(total);
+        let mut spelling = prefix;
         self.read_ud_suffix(&mut spelling);
         Some(Token::new(TokenKind::String(spelling), line, col))
+    }
+
+    /// Put the lexer back at `pos`, a position it left from `(line, col)`.
+    fn rewind(&mut self, pos: usize, line: u32, col: u32) {
+        self.pos = pos;
+        self.line = line;
+        self.col = col;
+        self.resync_splices();
+    }
+
+    /// Step over `bytes` of text as written, splices included — a raw
+    /// string body — then back onto the spliced view.
+    fn advance_physical(&mut self, bytes: usize) {
+        let end = self.pos + bytes;
+        while self.pos < end {
+            let ch = self.input[self.pos..].chars().next().unwrap_or('\0');
+            self.step(ch);
+        }
+        self.resync_splices();
     }
 
     fn read_number(&mut self, line: u32, col: u32) -> Token {
@@ -461,15 +548,56 @@ impl<'a> Lexer<'a> {
         self.input[self.pos..].chars().next().unwrap_or('\0')
     }
 
-    fn peek_char_at(&self, offset: usize) -> char {
-        self.input[self.pos..].chars().nth(offset).unwrap_or('\0')
+    /// The characters from the current position on, in the spliced view:
+    /// what `advance_char` would consume, one per step.
+    fn spliced_chars(&self) -> impl Iterator<Item = char> + '_ {
+        let input = self.input;
+        let mut pos = self.pos;
+        std::iter::from_fn(move || {
+            let ch = input[pos..].chars().next()?;
+            pos = splice_end(input, pos + ch.len_utf8());
+            Some(ch)
+        })
     }
 
-    fn advance_char(&mut self) {
-        if self.is_at_end() {
-            return;
+    /// The character `offset` characters ahead in the spliced view, `\0`
+    /// past the end.
+    fn peek_char_at(&self, offset: usize) -> char {
+        self.spliced_chars().nth(offset).unwrap_or('\0')
+    }
+
+    /// The next `N` characters of the spliced view, `\0`-padded.
+    fn lookahead<const N: usize>(&self) -> [char; N] {
+        let mut out = ['\0'; N];
+        for (slot, ch) in out.iter_mut().zip(self.spliced_chars()) {
+            *slot = ch;
         }
-        let ch = self.peek_char();
+        out
+    }
+
+    /// The next `n` characters of the spliced view as text.
+    fn lookahead_string(&self, n: usize) -> String {
+        self.spliced_chars().take(n).collect()
+    }
+
+    /// Consume the current character and land on the next one of the
+    /// spliced view. This runs once per character of input, so the splice
+    /// test is one integer compare here and the deletion itself is out of
+    /// line.
+    #[inline]
+    fn advance_char(&mut self) {
+        let Some(ch) = self.input[self.pos..].chars().next() else {
+            return;
+        };
+        self.step(ch);
+        if self.pos == self.next_splice {
+            self.skip_splices();
+        }
+    }
+
+    /// Consume `ch`, the character at `pos`, tracking line and column.
+    #[inline]
+    fn step(&mut self, ch: char) {
         self.pos += ch.len_utf8();
         if ch == '\n' {
             self.line += 1;
@@ -479,8 +607,107 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Translation phase 2: delete every `\`-newline at the current
+    /// position. Each one deleted moves to the start of the next line.
+    #[inline(never)]
+    fn skip_splices(&mut self) {
+        while self.pos == self.next_splice {
+            self.pos += splice_len(self.input, self.pos);
+            self.line += 1;
+            self.col = 1;
+            self.splice_idx += 1;
+            self.aim_next_splice();
+        }
+    }
+
+    /// Re-aim `next_splice` after `pos` moved somewhere other than through
+    /// `advance_char`, then delete any splice found there.
+    fn resync_splices(&mut self) {
+        self.splice_idx = self.splices.partition_point(|&at| at < self.pos);
+        self.aim_next_splice();
+        self.skip_splices();
+    }
+
+    fn aim_next_splice(&mut self) {
+        self.next_splice = self
+            .splices
+            .get(self.splice_idx)
+            .copied()
+            .unwrap_or(usize::MAX);
+    }
+
     fn is_at_end(&self) -> bool {
         self.pos >= self.input.len()
+    }
+}
+
+/// Length in bytes of the line splice at `pos`, or 0 if there is none: a
+/// `\` followed by a newline (`\n` or `\r\n`). gcc and clang also splice
+/// when horizontal whitespace — space, tab, vertical tab or form feed —
+/// sits between the `\` and the newline (with a warning), and so does
+/// this. A `\r` is only the first half of a `\r\n`: `\`-CR-CR-LF and
+/// `\`-CR-space-LF are not splices in either compiler, and not here.
+fn splice_len(input: &str, pos: usize) -> usize {
+    let bytes = input.as_bytes();
+    if bytes.get(pos) != Some(&b'\\') {
+        return 0;
+    }
+    let mut i = pos + 1;
+    while matches!(bytes.get(i), Some(b' ' | b'\t' | b'\x0b' | b'\x0c')) {
+        i += 1;
+    }
+    if bytes.get(i) == Some(&b'\r') {
+        i += 1;
+    }
+    if bytes.get(i) == Some(&b'\n') {
+        i + 1 - pos
+    } else {
+        0
+    }
+}
+
+/// Byte offsets of every line splice in `input`, ascending. `\` is rare
+/// outside string escapes and directive continuations, so this is one fast
+/// byte search over the file rather than a test on every character lexed.
+fn find_splices(input: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = input[from..].find('\\') {
+        let at = from + i;
+        if splice_len(input, at) > 0 {
+            out.push(at);
+        }
+        from = at + 1;
+    }
+    out
+}
+
+/// `text` with every line splice in it deleted.
+fn strip_splices(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find('\\') {
+        let len = splice_len(rest, i);
+        if len == 0 {
+            out.push_str(&rest[..i + 1]);
+            rest = &rest[i + 1..];
+        } else {
+            out.push_str(&rest[..i]);
+            rest = &rest[i + len..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `pos` moved past every line splice that starts there.
+fn splice_end(input: &str, mut pos: usize) -> usize {
+    loop {
+        let len = splice_len(input, pos);
+        if len == 0 {
+            return pos;
+        }
+        pos += len;
     }
 }
 
@@ -1016,5 +1243,159 @@ mod tests {
             vec![id("x"), punct("."), punct("."), id("y")]
         );
         assert_eq!(kinds_c("....."), vec![punct("..."), punct("."), punct(".")]);
+    }
+
+    /// Translation phase 2 (C11 5.1.1.2p1) deletes every `\`-newline before
+    /// tokens are recognized, so a multi-character punctuator written
+    /// across one is still munched as one token (#38).
+    #[test]
+    fn splice_split_punctuator_is_one_token() {
+        assert_eq!(
+            kinds_c("f(x, .\\\n..);"),
+            vec![
+                id("f"),
+                punct("("),
+                id("x"),
+                punct(","),
+                punct("..."),
+                punct(")"),
+                punct(";"),
+            ]
+        );
+        assert_eq!(kinds_c("a-\\\n>b"), vec![id("a"), punct("->"), id("b")]);
+        assert_eq!(kinds_c("a=\\\n=b"), vec![id("a"), punct("=="), id("b")]);
+        assert_eq!(kinds("c-\\\n>\\\n*m"), vec![id("c"), punct("->*"), id("m")]);
+        assert_eq!(kinds_c("#\\\n#"), vec![punct("##")]);
+    }
+
+    #[test]
+    fn splice_split_identifier_and_number_are_one_token() {
+        assert_eq!(
+            kinds_c("int c\\\nd;"),
+            vec![id("int"), id("cd"), punct(";")]
+        );
+        assert_eq!(
+            kinds_c("x = 0x\\\n1F;"),
+            vec![
+                id("x"),
+                punct("="),
+                TokenKind::Number("0x1F".to_string()),
+                punct(";")
+            ]
+        );
+        // A splice inside a string or character literal is deleted too.
+        assert_eq!(kinds_c("\"ab\\\ncd\""), vec![string("abcd")]);
+        assert_eq!(kinds_c("'\\\\\nn'"), vec![chr(r"'\n'")]);
+        // An encoding prefix split from its literal is still a prefix.
+        assert_eq!(kinds_c("L\\\n\"w\""), vec![raw("L\"w\"")]);
+    }
+
+    #[test]
+    fn splice_accepts_crlf_and_trailing_whitespace() {
+        // A CRLF file splices the same way, and gcc/clang splice a `\`
+        // separated from its newline by horizontal whitespace — space,
+        // tab, vertical tab, form feed — with a warning.
+        assert_eq!(kinds_c("a.\\\r\n..b"), vec![id("a"), punct("..."), id("b")]);
+        assert_eq!(
+            kinds_c("in\\ \t\nt x;"),
+            vec![id("int"), id("x"), punct(";")]
+        );
+        assert_eq!(kinds_c("a\\\x0b\nb"), vec![id("ab")]);
+        assert_eq!(kinds_c("a\\\x0c\r\nb"), vec![id("ab")]);
+        // A `\r` that is not the first half of a `\r\n` ends the run:
+        // clang keeps these as two lines (checked with `clang -E`), and so
+        // the `\` stays a token.
+        assert_eq!(
+            kinds_c("a\\\r\r\nb"),
+            vec![id("a"), punct("\\"), TokenKind::Newline, id("b")]
+        );
+        assert_eq!(
+            kinds_c("a\\\r \nb"),
+            vec![id("a"), punct("\\"), TokenKind::Newline, id("b")]
+        );
+    }
+
+    #[test]
+    fn splice_continues_a_comment() {
+        // Phase 2 runs before comments are recognized (phase 3), so a `//`
+        // comment ending in `\` swallows the next line, and `/\`+newline+`*`
+        // opens a block comment. Both are what gcc and clang do.
+        assert_eq!(
+            kinds_c("a // c \\\n b\nd"),
+            vec![id("a"), TokenKind::Newline, id("d")]
+        );
+        assert_eq!(kinds_c("a /\\\n* x *\\\n/ b"), vec![id("a"), id("b")]);
+    }
+
+    #[test]
+    fn splice_inside_a_raw_string_is_kept() {
+        // C++11 [lex.pptoken]p3: inside a raw string literal phase 2 is
+        // reverted, so the body is emitted exactly as written.
+        assert_eq!(kinds("R\"(a\\\nb)\""), vec![raw("R\"(a\\\nb)\"")]);
+        // The prefix itself may be spliced; the body still is not.
+        assert_eq!(kinds("R\\\n\"(a\\\nb)\""), vec![raw("R\"(a\\\nb)\"")]);
+        // A splice right after the literal is deleted again — so much so
+        // that an identifier there is a ud-suffix — and so is one after a
+        // would-be raw string that fell back to identifier + string.
+        assert_eq!(kinds("R\"(a)\"\\\nx"), vec![raw("R\"(a)\"x")]);
+        assert_eq!(
+            kinds("R\"(a)\"\\\n+x"),
+            vec![raw("R\"(a)\""), punct("+"), id("x")]
+        );
+        assert_eq!(
+            kinds("R\"a b(x)\"\\\n+y"),
+            vec![id("R"), string("a b(x)"), punct("+"), id("y")]
+        );
+        // In C, `R"(...)"` is the identifier `R` and an ordinary string, so
+        // a splice in the body is deleted like in any string — what clang
+        // does under `-std=c11`; its default GNU mode and gcc's lex a raw
+        // string there and keep the splice.
+        assert_eq!(kinds_c("R\"(x\\\ny)\""), vec![id("R"), string("(xy)")]);
+    }
+
+    #[test]
+    fn backslash_not_before_a_newline_is_a_token() {
+        assert_eq!(kinds_c("a \\ b"), vec![id("a"), punct("\\"), id("b")]);
+        assert_eq!(kinds_c("a\\"), vec![id("a"), punct("\\")]);
+    }
+
+    #[test]
+    fn tokens_after_a_splice_keep_physical_positions() {
+        let toks = Lexer::new("ab\\\ncd ef\\\n\ngh", Language::C).tokenize();
+        let at = |i: usize| (toks[i].line, toks[i].col);
+        assert_eq!(toks[0].kind, id("abcd"));
+        assert_eq!(at(0), (1, 1));
+        assert_eq!(toks[1].kind, id("ef"));
+        assert_eq!(at(1), (2, 4));
+        assert_eq!(toks[2].kind, TokenKind::Newline);
+        assert_eq!(at(2), (3, 1));
+        assert_eq!(toks[3].kind, id("gh"));
+        assert_eq!(at(3), (4, 1));
+    }
+
+    /// `adjacent_before` answers "did this token touch the previous one in
+    /// the phase-3 stream?" — what `#` stringizing and the function-like
+    /// `#define` test need, and what physical positions stop answering
+    /// once splices are deleted.
+    #[test]
+    fn adjacency_flag_sees_through_splices_and_not_through_whitespace() {
+        let flags = |src: &str| -> Vec<bool> {
+            Lexer::new(src, Language::C)
+                .tokenize()
+                .into_iter()
+                .take_while(|t| !matches!(t.kind, TokenKind::Eof))
+                .map(|t| t.adjacent_before)
+                .collect()
+        };
+        assert_eq!(flags("a(b) c"), vec![false, true, true, true, false]);
+        assert_eq!(flags("a\\\n(b"), vec![false, true, true]);
+        assert_eq!(flags("a \\\n(b"), vec![false, false, true]);
+        assert_eq!(flags("a\\\n (b"), vec![false, false, true]);
+        assert_eq!(flags("a/**/b"), vec![false, false]);
+        assert_eq!(flags("a\nb"), vec![false, true, false]);
+        // Two tight splices in a row are still nothing: `ab` is one
+        // identifier, and `(` after them touches `a`.
+        assert_eq!(flags("a\\\n\\\nb"), vec![false]);
+        assert_eq!(flags("a\\\n\\\n(b"), vec![false, true, true]);
     }
 }

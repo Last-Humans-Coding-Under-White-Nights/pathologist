@@ -15,6 +15,37 @@
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Re-verified 2026-09-06 (line splicing in the lexer, #38):** all three
+pinned corpora were re-fetched at their pinned revisions and analyzed with
+the branch binary and with one built from `master` (80c2325). `eval_check`
+passes 83/83 with both, and every exact metric — `diagnostics`,
+`edges_indirect`, `dlsym_edges`, every dispatch target set and every probe —
+is identical between the two runs, as are the bulk totals. The parse-failure
+set is unchanged: the same **259** files with the same ERROR sites, so the
+shapes the fix targets (an identifier or multi-character punctuator written
+across a `\`-newline, the spliced `...` of #38) do not occur in these corpora
+outside directives and are covered by unit tests only.
+
+What does move in `docs/PARSE_FAILURES.md` is the **line** of 31 sites in
+eight files (seven HDF, one Hiview), each 1–3 rows earlier. That column is
+tree-sitter's row in the *preprocessed output*, and a `\`-newline in ordinary
+code — a string literal continued across lines, a statement ending in `\` —
+used to be written back as the `\` token plus a newline, one extra output
+line per continuation. The lexer now deletes it in translation phase 2, so
+every site below such a continuation shifts up by the number of continuations
+above it. The sites themselves, their columns and their snippets are the
+same. The committed report was also eight sites stale against `master`'s own
+binary — the `->*` sites in camera's two event-emitter headers and `dps.h`
+had been catalogued as `->* func` fragments and are `->` / `*` fragments
+under the current `master` tokenization — so the regenerated file carries
+that drift too; it is attributed to `master` by regenerating from the
+`master` binary's TSVs, which reproduce it exactly.
+
+The cost is in the lexer alone: lexing every file of the camera corpus
+single-threaded (16.1 MB, best of five) goes from **123 to 112 MiB/s**, the
+per-character splice check, and the token count drops by 836 — the `\` +
+newline pairs that no longer exist as tokens.
+
 **Re-verified 2026-09-05 (review follow-ups on #46):** five further review
 passes over the branch found eleven more shapes, and all three corpora were
 re-analyzed before and after fixing each. Ten of the eleven do not occur in
