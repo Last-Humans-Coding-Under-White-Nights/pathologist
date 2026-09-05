@@ -707,6 +707,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "trace-capi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "tempfile",
+ "trace-analysis",
+ "trace-db",
+ "trace-ir",
+ "trace-parse",
+ "trace-preproc",
+]
+
+[[package]]
 name = "trace-cli"
 version = "0.1.0"
 dependencies = [

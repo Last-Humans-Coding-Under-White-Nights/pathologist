@@ -353,91 +353,41 @@ fn run_analyze(
     Ok(())
 }
 
-/// Exact name or C++ qualified suffix (`Foo::Bar` matches `--from Bar`).
-/// User text is escaped so SQLite `LIKE` wildcards `_` / `%` are literal.
-fn push_fn_name_filter(sql: &mut String, params: &mut Vec<String>, column: &str, name: &str) {
-    params.push(name.to_string());
-    let eq = params.len();
-    params.push(format!("%::{}", like_escape(name)));
-    let like = params.len();
-    sql.push_str(&format!(
-        " AND ({column} = ?{eq} OR {column} LIKE ?{like} ESCAPE '!')"
-    ));
-}
-
-fn like_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '!' | '%' | '_' => {
-                out.push('!');
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
     let conn = open_db(&db)?;
     match command {
         InspectCommands::Calls { from, to, file } => {
-            trace_db::require_call_edge_caller(&conn)?;
-            let mut sql = String::from(
-                "SELECT caller.name, csf.path, cs.line, callee.name, callee_f.path, ce.resolution \
-                 FROM call_edges ce \
-                 LEFT JOIN call_sites cs ON cs.id = ce.call_site_id \
-                 LEFT JOIN files csf ON csf.id = cs.file_id \
-                 JOIN functions caller ON caller.id = ce.caller_fn_id \
-                 JOIN files caller_f ON caller_f.id = caller.file_id \
-                 JOIN functions callee ON callee.id = ce.callee_fn_id \
-                 JOIN files callee_f ON callee_f.id = callee.file_id WHERE 1=1",
-            );
-            let mut params: Vec<String> = Vec::new();
-            if let Some(f) = from.as_deref() {
-                push_fn_name_filter(&mut sql, &mut params, "caller.name", f);
-            }
-            if let Some(t) = to.as_deref() {
-                push_fn_name_filter(&mut sql, &mut params, "callee.name", t);
-            }
-            if let Some(p) = file.as_deref() {
-                params.push(format!("%{}%", like_escape(p)));
-                let n = params.len();
-                sql.push_str(&format!(
-                    " AND (csf.path LIKE ?{n} ESCAPE '!' OR callee_f.path LIKE ?{n} ESCAPE '!' OR (ce.call_site_id IS NULL AND caller_f.path LIKE ?{n} ESCAPE '!'))"
-                ));
-            }
-            // Sort real call sites first; synthetic (IPC bridge) edges have a
-            // NULL path/line so SQLite would otherwise sort them to the top.
-            sql.push_str(
-                " ORDER BY CASE WHEN csf.path IS NULL THEN 1 ELSE 0 END, csf.path, cs.line",
-            );
+            let edges = trace_db::call_edges(
+                &conn,
+                &trace_db::CallEdgeFilter {
+                    from: from.as_deref(),
+                    to: to.as_deref(),
+                    file: file.as_deref(),
+                },
+            )?;
             fn basename(p: &str) -> &str {
                 p.rsplit('/').next().unwrap_or(p)
             }
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                let line: Option<i64> = row.get(2)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    line,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })?;
-            for row in rows {
-                let (caller, cfile, line, callee, efile, res) = row?;
-                match (cfile, line) {
+            for e in edges {
+                match (e.call_site_path, e.call_site_line) {
+                    // Real call sites.
                     (Some(cf), Some(l)) => println!(
-                        "{caller} ({}:{l}) -> {callee} [{}] ({res})",
-                        basename(&cf),
-                        basename(&efile)
+                        "{caller} ({basename_of_call_site}:{l}) -> {callee} [{basename_of_callee}] \
+                         ({res})",
+                        basename_of_call_site = basename(&cf),
+                        callee = e.callee_name,
+                        basename_of_callee = basename(&e.callee_path),
+                        res = e.resolution,
+                        caller = e.caller_name,
                     ),
                     // Synthetic IPC bridge edges have no source call site.
-                    _ => println!("{caller} -> {callee} [{}] ({res})", basename(&efile)),
+                    _ => println!(
+                        "{caller} -> {callee} [{basename_of_callee}] ({res})",
+                        callee = e.callee_name,
+                        basename_of_callee = basename(&e.callee_path),
+                        res = e.resolution,
+                        caller = e.caller_name,
+                    ),
                 }
             }
         }

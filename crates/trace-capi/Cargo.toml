@@ -1,0 +1,24 @@
+[package]
+name = "trace-capi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "C FFI for trace: whole-project index (analyze) and inspect queries"
+publish = false
+
+[lib]
+name = "trace_capi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+trace-ir.workspace = true
+trace-preproc.workspace = true
+trace-parse.workspace = true
+trace-analysis.workspace = true
+trace-db.workspace = true
+anyhow.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

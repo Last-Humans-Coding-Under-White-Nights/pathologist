@@ -113,7 +113,7 @@ fn edge_annotation(e: &GraphEdge) -> String {
     if e.site.is_empty() {
         e.label.clone()
     } else {
-        format!("{} ({})", e.label, e.site)
+        format!("{} ({})", e.label, e.site.display())
     }
 }
 
@@ -155,7 +155,8 @@ fn render_text(
                         writeln!(
                             out,
                             "{indent}-{}-> {buf} (see above; also {})",
-                            e.label, e.site
+                            e.label,
+                            e.site.display()
                         )
                         .unwrap();
                     }
@@ -164,7 +165,7 @@ fn render_text(
                 if e.site.is_empty() {
                     writeln!(out, "{indent}-{}-> {buf}", e.label).unwrap();
                 } else {
-                    writeln!(out, "{indent}-{}-> {buf} ({})", e.label, e.site).unwrap();
+                    writeln!(out, "{indent}-{}-> {buf} ({})", e.label, e.site.display()).unwrap();
                 }
             }
         }
@@ -236,7 +237,7 @@ fn render_json(
             from: e.from,
             to: e.to,
             label: e.label.clone(),
-            site: e.site.clone(),
+            site: e.site.display(),
         })
         .collect();
     let doc = JsonGraph {
@@ -351,7 +352,7 @@ fn render_mermaid(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inspect::{GraphNode, QueryGraph};
+    use crate::inspect::{EdgeSite, GraphNode, QueryGraph};
 
     fn graph() -> QueryGraph {
         let mut g = QueryGraph::default();
@@ -361,6 +362,8 @@ mod tests {
                 id: 1,
                 label: "main".into(),
                 detail: "main.c:1".into(),
+                kind: None,
+                loc_kind: None,
             },
         );
         g.nodes.insert(
@@ -369,6 +372,8 @@ mod tests {
                 id: 2,
                 label: "target".into(),
                 detail: "target.c:5".into(),
+                kind: None,
+                loc_kind: None,
             },
         );
         g.order.push((1, 0));
@@ -377,7 +382,11 @@ mod tests {
             from: 1,
             to: 2,
             label: "indirect".into(),
-            site: "target.c:5".into(),
+            site: EdgeSite {
+                path: "/proj/target.c".into(),
+                line: 5,
+                col: 2,
+            },
         });
         g
     }
@@ -412,7 +421,7 @@ mod tests {
             from: 2,
             to: 1,
             label: "direct".into(),
-            site: String::new(),
+            site: EdgeSite::default(),
         });
         let out = render_graph(&g, RenderFormat::Text, &meta(), &mut label);
         assert!(out.contains("  -direct-> fn1 (see above)"), "{out}");
@@ -480,6 +489,8 @@ mod tests {
                 id: 3,
                 label: "a\"b\\c&d|e".into(),
                 detail: String::new(),
+                kind: Some(crate::inspect::FlowNodeKind::Loc),
+                loc_kind: Some(trace_analysis::LocKind::Heap),
             },
         );
         g.order.push((3, 2));
@@ -487,7 +498,11 @@ mod tests {
             from: 2,
             to: 3,
             label: "copy".into(),
-            site: "x\"y".into(),
+            site: EdgeSite {
+                path: "x\"y".into(),
+                line: 0,
+                col: 0,
+            },
         });
         let mut node_label = |id: i64, out: &mut String| {
             out.push_str(&g.nodes.get(&id).unwrap().label.clone());
@@ -496,7 +511,7 @@ mod tests {
         assert!(dot.contains("n3 [label=\"a\\\"b\\\\c&d|e\"];"), "{dot}");
         let mmd = render_graph(&g, RenderFormat::Mermaid, &meta(), &mut node_label);
         assert!(mmd.contains("n3[\"a&quot;b\\c&amp;d&#124;e\"]"), "{mmd}");
-        assert!(mmd.contains("copy (x&quot;y)"), "{mmd}");
+        assert!(mmd.contains("copy (x&quot;y:0)"), "{mmd}");
     }
 
     #[test]

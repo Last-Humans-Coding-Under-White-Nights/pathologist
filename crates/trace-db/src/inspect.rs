@@ -7,6 +7,8 @@ use anyhow::{bail, Result};
 use rusqlite::Connection;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+pub use trace_analysis::LocKind;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// Forward: callees (call graph) / where a value flows to (dataflow).
@@ -50,6 +52,46 @@ impl std::fmt::Display for FunctionRef {
     }
 }
 
+/// Node kind of a `flow_nodes` row, as categorized for value-flow graphs.
+/// Call graphs have no PAG node kinds (their nodes are functions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowNodeKind {
+    Var,
+    Loc,
+    CallTarget,
+    Terminator,
+}
+
+impl FlowNodeKind {
+    fn from_schema_str(s: &str) -> Option<Self> {
+        match s {
+            "var" => Some(Self::Var),
+            "loc" => Some(Self::Loc),
+            "call_target" => Some(Self::CallTarget),
+            "terminator" => Some(Self::Terminator),
+            _ => None,
+        }
+    }
+}
+
+/// Map the schema's `flow_nodes.detail` string for `loc` nodes back to the
+/// abstract-location kind it was exported from (`LocKind`).
+pub fn loc_kind_from_schema_str(s: &str) -> Option<LocKind> {
+    match s {
+        "global" => Some(LocKind::Global),
+        "file_static" => Some(LocKind::FileStatic),
+        "fn_static" => Some(LocKind::FnStatic),
+        "local" => Some(LocKind::Local),
+        "heap" => Some(LocKind::Heap),
+        "field" => Some(LocKind::Field),
+        "field_summary" => Some(LocKind::FieldSummary),
+        "array_summary" => Some(LocKind::ArraySummary),
+        "function" => Some(LocKind::Function),
+        "string_lit" => Some(LocKind::StringLit),
+        _ => None,
+    }
+}
+
 /// A graph query result: flat node/edge sets plus BFS discovery order so the
 /// CLI can print an indented view without re-traversing.
 #[derive(Debug, Default)]
@@ -70,6 +112,12 @@ pub struct GraphNode {
     pub id: i64,
     pub label: String,
     pub detail: String,
+    /// PAG node kind for value-flow graphs; `None` for call graphs (whose
+    /// nodes are functions, not PAG nodes).
+    pub kind: Option<FlowNodeKind>,
+    /// Abstract-location category for `kind == Some(FlowNodeKind::Loc)`,
+    /// e.g. `Heap` / `Field`; `None` otherwise.
+    pub loc_kind: Option<LocKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +125,36 @@ pub struct GraphEdge {
     pub from: i64,
     pub to: i64,
     pub label: String,
-    pub site: String,
+    /// Call/flow source site attached to the edge (empty when the edge has no
+    /// site, e.g. value-flow edges). Render it with `EdgeSite::display`.
+    pub site: EdgeSite,
+}
+
+/// Call/flow source site attached to a graph edge: full source path plus
+/// 1-based line/col (both 0 when there is no site).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EdgeSite {
+    pub path: String,
+    pub line: i64,
+    pub col: i64,
+}
+
+impl EdgeSite {
+    /// True when the edge has no source site.
+    pub fn is_empty(&self) -> bool {
+        self.path.is_empty()
+    }
+
+    /// The display form used by the renderers: `basename:line` (empty when
+    /// there is no site).
+    pub fn display(&self) -> String {
+        if self.path.is_empty() {
+            String::new()
+        } else {
+            let base = self.path.rsplit('/').next().unwrap_or(&self.path);
+            format!("{base}:{}", self.line)
+        }
+    }
 }
 
 /// Functions whose `[line_start, line_end]` range contains `line` in files
@@ -141,6 +218,8 @@ fn load_function_labels(conn: &Connection) -> Result<FxHashMap<i64, GraphNode>> 
                 } else {
                     format!("{file_name}:{line} [external]")
                 },
+                kind: None,
+                loc_kind: None,
             },
         ))
     })?;
@@ -152,11 +231,11 @@ fn load_function_labels(conn: &Connection) -> Result<FxHashMap<i64, GraphNode>> 
     Ok(map)
 }
 
-type Adjacency = FxHashMap<i64, Vec<(i64, &'static str, String)>>;
+type Adjacency = FxHashMap<i64, Vec<(i64, &'static str, EdgeSite)>>;
 
 fn load_call_adjacency(conn: &Connection, dir: Direction) -> Result<Adjacency> {
     let mut stmt = conn.prepare(
-        "SELECT ce.caller_fn_id, ce.callee_fn_id, ce.resolution, p.path, cs.line \
+        "SELECT ce.caller_fn_id, ce.callee_fn_id, ce.resolution, p.path, cs.line, cs.col \
          FROM call_edges ce \
          LEFT JOIN call_sites cs ON cs.id = ce.call_site_id \
          LEFT JOIN files p ON p.id = cs.file_id",
@@ -167,11 +246,14 @@ fn load_call_adjacency(conn: &Connection, dir: Direction) -> Result<Adjacency> {
         // placeholder location rather than mis-attributing a real call site.
         let path: Option<String> = row.get(3)?;
         let line: Option<i64> = row.get(4)?;
-        let site = match (&path, line) {
-            (Some(p), Some(l)) => {
-                format!("{}:{}", p.rsplit('/').next().unwrap_or(p), l)
-            }
-            _ => "(ipc bridge)".to_string(),
+        let col: Option<i64> = row.get(5)?;
+        let site = match (&path, line, col) {
+            (Some(p), Some(l), Some(c)) => EdgeSite {
+                path: p.clone(),
+                line: l,
+                col: c,
+            },
+            _ => EdgeSite::default(),
         };
         Ok((
             row.get::<_, i64>(0)?,
@@ -236,6 +318,113 @@ pub fn require_call_edge_caller(conn: &Connection) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Filter for `call_edges`, mirroring `trace calls --from/--to/--file`.
+pub struct CallEdgeFilter<'a> {
+    /// Substring/qualified-suffix filter on the caller name.
+    pub from: Option<&'a str>,
+    /// Substring/qualified-suffix filter on the callee name.
+    pub to: Option<&'a str>,
+    /// File-substring filter matching the call-site path, the callee path, or
+    /// (for site-less edges) the caller's own path.
+    pub file: Option<&'a str>,
+}
+
+/// One call edge row, including the caller's own source path (needed for
+/// displaying synthetic IPC-bridge edges, which carry no call site).
+pub struct CallEdgeRef {
+    pub caller_id: i64,
+    pub caller_name: String,
+    pub caller_path: String,
+    /// Call-site source path; `None` for synthetic (IPC bridge) edges.
+    pub call_site_path: Option<String>,
+    /// 1-based call-site line; `None` for synthetic edges.
+    pub call_site_line: Option<i64>,
+    /// 1-based call-site column; `None` for synthetic edges.
+    pub call_site_col: Option<i64>,
+    pub callee_name: String,
+    pub callee_path: String,
+    pub resolution: String,
+}
+
+/// All call edges (including synthetic IPC bridge edges) filtered per
+/// [`CallEdgeFilter`]. Real call sites sort first; synthetic edges have no
+/// source site so they sort after.
+pub fn call_edges(conn: &Connection, filter: &CallEdgeFilter<'_>) -> Result<Vec<CallEdgeRef>> {
+    require_call_edge_caller(conn)?;
+    let mut sql = String::from(
+        "SELECT caller.id, caller.name, caller_f.path, csf.path, cs.line, cs.col, callee.name, \
+                 callee_f.path, ce.resolution \
+                 FROM call_edges ce \
+                 LEFT JOIN call_sites cs ON cs.id = ce.call_site_id \
+                 LEFT JOIN files csf ON csf.id = cs.file_id \
+                 JOIN functions caller ON caller.id = ce.caller_fn_id \
+                 JOIN files caller_f ON caller_f.id = caller.file_id \
+                 JOIN functions callee ON callee.id = ce.callee_fn_id \
+                 JOIN files callee_f ON callee_f.id = callee.file_id WHERE 1=1",
+    );
+    let mut params: Vec<String> = Vec::new();
+    if let Some(f) = filter.from {
+        push_fn_name_filter(&mut sql, &mut params, "caller.name", f);
+    }
+    if let Some(t) = filter.to {
+        push_fn_name_filter(&mut sql, &mut params, "callee.name", t);
+    }
+    if let Some(p) = filter.file {
+        params.push(format!("%{}%", like_escape(p)));
+        let n = params.len();
+        sql.push_str(&format!(
+            " AND (csf.path LIKE ?{n} ESCAPE '!' OR callee_f.path LIKE ?{n} ESCAPE '!' OR \
+             (ce.call_site_id IS NULL AND caller_f.path LIKE ?{n} ESCAPE '!'))"
+        ));
+    }
+    // Sort real call sites first; synthetic (IPC bridge) edges have a NULL
+    // path/line so SQLite would otherwise sort them to the top.
+    sql.push_str(" ORDER BY CASE WHEN csf.path IS NULL THEN 1 ELSE 0 END, csf.path, cs.line");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        let line: Option<i64> = row.get(4)?;
+        let col: Option<i64> = row.get(5)?;
+        Ok(CallEdgeRef {
+            caller_id: row.get(0)?,
+            caller_name: row.get(1)?,
+            caller_path: row.get(2)?,
+            call_site_path: row.get(3)?,
+            call_site_line: line,
+            call_site_col: col,
+            callee_name: row.get(6)?,
+            callee_path: row.get(7)?,
+            resolution: row.get(8)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Exact name or C++ qualified suffix (`Foo::Bar` matches `--from Bar`).
+/// User text is escaped so SQLite `LIKE` wildcards `_` / `%` are literal.
+fn push_fn_name_filter(sql: &mut String, params: &mut Vec<String>, column: &str, name: &str) {
+    params.push(name.to_string());
+    let eq = params.len();
+    params.push(format!("%::{}", like_escape(name)));
+    let like = params.len();
+    sql.push_str(&format!(
+        " AND ({column} = ?{eq} OR {column} LIKE ?{like} ESCAPE '!')"
+    ));
+}
+
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '!' | '%' | '_' => {
+                out.push('!');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn require_flow_tables(conn: &Connection) -> Result<()> {
@@ -308,10 +497,14 @@ pub fn call_graph(
             }
         }
     }
-    // Collapse exact duplicates (same pair, same annotation).
-    graph
-        .edges
-        .dedup_by(|a, b| a.from == b.from && a.to == b.to && a.site == b.site);
+    // Collapse exact duplicates (same pair, same annotation, same exact
+    // source site). The site is compared on the full path/line/col — not the
+    // `basename:line` display form — or two calls on one line (different
+    // columns) or same-basename files in different directories would collapse
+    // into a single distinct edge.
+    graph.edges.dedup_by(|a, b| {
+        a.from == b.from && a.to == b.to && a.label == b.label && a.site == b.site
+    });
     Ok(graph)
 }
 
@@ -515,10 +708,10 @@ pub fn dataflow_graph(
             };
             fwd.entry(src)
                 .or_default()
-                .push((dst, kind_static, String::new()));
+                .push((dst, kind_static, EdgeSite::default()));
             rev.entry(dst)
                 .or_default()
-                .push((src, kind_static, String::new()));
+                .push((src, kind_static, EdgeSite::default()));
         }
     }
 
@@ -531,6 +724,7 @@ pub fn dataflow_graph(
             let kind: String = row.get(1)?;
             let label: String = row.get(2)?;
             let detail: String = row.get(3)?;
+            let kind_enum = FlowNodeKind::from_schema_str(&kind);
             let tag = match kind.as_str() {
                 "loc" => "loc",
                 "call_target" => "target",
@@ -542,12 +736,18 @@ pub fn dataflow_graph(
             } else {
                 format!("{tag}:{label}")
             };
+            let loc_kind = match kind_enum {
+                Some(FlowNodeKind::Loc) => loc_kind_from_schema_str(&detail),
+                _ => None,
+            };
             Ok((
                 id,
                 GraphNode {
                     id,
                     label: shown,
                     detail,
+                    kind: kind_enum,
+                    loc_kind,
                 },
             ))
         })?;
@@ -584,6 +784,8 @@ pub fn dataflow_graph(
                     id,
                     label: format!("node{id}"),
                     detail: String::new(),
+                    kind: None,
+                    loc_kind: None,
                 },
             );
         }
@@ -604,7 +806,7 @@ pub fn dataflow_graph(
                     from: id,
                     to: *to,
                     label: (*kind).to_string(),
-                    site: String::new(),
+                    site: EdgeSite::default(),
                 });
                 if visited.insert(*to) {
                     queue.push_back(Entry {
@@ -808,13 +1010,17 @@ mod tests {
         let g = call_graph(&conn, 10, Direction::Down, 5).unwrap();
         assert_eq!(g.order.len(), 3);
         assert!(!g.truncated);
-        // Edge annotations carry resolution + call site.
+        // Edge annotations carry resolution + the exact source site (display
+        // form, full path, and the 1-based line/col).
         let e = format!("{:?}", g.edges);
         assert!(
             g.edges.iter().any(|e| e.from == 10
                 && e.to == 11
                 && e.label == "direct"
-                && e.site == "main.c:15"),
+                && e.site.display() == "main.c:15"
+                && e.site.path == "/proj/main.c"
+                && e.site.line == 15
+                && e.site.col == 5),
             "edges: {e}"
         );
     }

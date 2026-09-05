@@ -6,6 +6,7 @@ members = [
     "crates/trace-parse",
     "crates/trace-analysis",
     "crates/trace-db",
+    "crates/trace-capi",
     "crates/trace-cli",
 ]
 
