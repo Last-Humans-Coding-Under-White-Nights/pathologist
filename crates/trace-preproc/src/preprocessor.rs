@@ -30,6 +30,27 @@ pub struct PreprocessResult {
     pub diagnostics: Vec<Diagnostic>,
     /// Canonical paths processed by this run (`#include` closure).
     pub included_headers: Vec<PathBuf>,
+    /// The subset of [`Self::included_headers`] this run expanded itself
+    /// instead of replaying from the shared cache — because no entry existed
+    /// yet, or because the entry's [`crate::MacroFingerprint`] did not match
+    /// this run's macro environment (#55).
+    ///
+    /// With `inline_include_bodies` off these are the headers whose body is
+    /// in THIS unit's text, so the indexer must not also merge a PCH unit
+    /// built under a different configuration for them.
+    pub inlined_headers: Vec<PathBuf>,
+    /// The language this run lexed as. Variant indices below are positions
+    /// in the list for THIS language — a header reached from both C and C++
+    /// has one list per language and the two are unrelated.
+    pub language: crate::Language,
+    /// For each header this run replayed from the shared cache, the index of
+    /// the variant it matched (see [`crate::ExpansionVariants`]).
+    ///
+    /// With `inline_include_bodies` off a replayed header contributes no
+    /// text, so its declarations have to come from a separately lowered
+    /// unit — and it must be the unit built from *this* expansion, not from
+    /// whichever configuration the warm pass happened to take.
+    pub replayed_variants: Vec<(PathBuf, usize)>,
 }
 
 #[derive(Debug)]
@@ -47,6 +68,18 @@ struct PreprocessorState {
     fallback_macros: HashSet<String>,
     include_stack: Vec<PathBuf>,
     included_guard: HashSet<PathBuf>,
+    /// Included files this run expanded itself (see
+    /// `PreprocessResult::inlined_headers`).
+    inlined_files: HashSet<PathBuf>,
+    /// The expansion this run resolved each processed path to — the variant
+    /// replayed from the cache, or the one this run composed. With several
+    /// variants per path the cache alone can no longer answer "what did this
+    /// header expand to *here*", and both the guard-skip path and
+    /// `compose_cache_text` need exactly that.
+    entry_used: HashMap<PathBuf, crate::IncludeExpansion>,
+    /// Variant index of each cache hit, for
+    /// `PreprocessResult::replayed_variants`.
+    variant_used: HashMap<PathBuf, usize>,
     conditional_stack: Vec<CondFrame>,
     /// Depth of `conditional_stack` when the current file started. Frames
     /// below it belong to includers: `#elif`/`#else`/`#endif` in this file
@@ -84,6 +117,11 @@ struct PreprocessorState {
     /// and captures its suffix into `IncludeExpansion::ops`; cleared when
     /// the last frame closes.
     macro_ops: Vec<MacroOp>,
+    /// Memoized `binding_hash` per macro name, invalidated by
+    /// `insert_macro` / `remove_macro`. A read hook that hashed a
+    /// replacement list on every identifier occurrence would charge the
+    /// header's whole token stream for each of its macros.
+    macro_hashes: HashMap<String, u64>,
     /// Set once a run-wide limit (output cap, token budget, include depth)
     /// has cut an expansion short. Everything composed from here on is
     /// missing content, so nothing further may be published to the shared
@@ -114,6 +152,20 @@ struct CondFrame {
 struct CacheFrame {
     /// Guard-skipped includes at the live-output offset of the `#include`.
     skips: Vec<(usize, PathBuf)>,
+    /// Cached expansions this header replayed, for
+    /// `IncludeExpansion::nested_variants`. Recorded on the innermost frame
+    /// only: an enclosing entry pins this one, which pins these in turn, so
+    /// the chain is closed by following it.
+    replayed: Vec<(PathBuf, usize)>,
+    /// The macro environment this header's expansion has read so far, which
+    /// becomes `IncludeExpansion::deps`. Every open frame receives each read,
+    /// so a nested header's dependencies reach its includers.
+    deps: crate::MacroFingerprint,
+    /// Names this frame has already decided: recorded in `deps`, or bound by
+    /// the frame's own `#define` / `#undef` (its `ops`, which every consumer
+    /// replays, so the consumer's binding cannot matter). Doubles as the
+    /// short-circuit for the per-identifier read hook.
+    settled: HashSet<Arc<str>>,
     /// Diagnostics in this header's transitive include closure. This must be
     /// independent from `PreprocessorState::diagnostics`: a report can have
     /// been emitted earlier in this run and still be required by a cache
@@ -132,6 +184,9 @@ impl PreprocessorState {
             fallback_macros: HashSet::new(),
             include_stack: vec![file.clone()],
             included_guard: HashSet::new(),
+            inlined_files: HashSet::new(),
+            entry_used: HashMap::new(),
+            variant_used: HashMap::new(),
             conditional_stack: Vec::new(),
             cond_base: 0,
             output: String::new(),
@@ -147,6 +202,7 @@ impl PreprocessorState {
             tokens_processed: 0,
             cache_frames: Vec::new(),
             macro_ops: Vec::new(),
+            macro_hashes: HashMap::new(),
             expansion_incomplete: false,
         };
         if let Some(shared) = &state.opts.shared_macros {
@@ -183,8 +239,146 @@ impl PreprocessorState {
 
     /// A name only a builtin fallback defines does not count as defined for
     /// `#ifdef` / `#ifndef` / `defined()`.
-    fn is_defined_for_conditionals(&self, name: &str) -> bool {
+    fn is_defined_for_conditionals(&mut self, name: &str) -> bool {
+        self.record_read(name);
         self.macros.contains_key(name) && !self.fallback_macros.contains(name)
+    }
+
+    /// Content hash of what `name` is currently bound to, or `None` when it
+    /// is unbound. The builtin-fallback mark is part of the binding: a
+    /// fallback expands in text but reads as undefined in a conditional, so
+    /// two environments that disagree about it can produce different
+    /// expansions of the same header.
+    fn binding_hash(&mut self, name: &str) -> Option<u64> {
+        let def = self.macros.get(name)?;
+        if let Some(h) = self.macro_hashes.get(name) {
+            return Some(*h);
+        }
+        let h = hash_macro_binding(def, self.fallback_macros.contains(name));
+        self.macro_hashes.insert(name.to_string(), h);
+        Some(h)
+    }
+
+    /// Is `name` already settled for every open cache frame?
+    ///
+    /// Testing the innermost frame alone is enough, because an inner frame's
+    /// `settled` set is a subset of every enclosing frame's: each of the
+    /// three writers (`record_read`, `note_local_binding`,
+    /// `merge_recorded_deps`) inserts into *all* open frames, and a frame
+    /// starts empty when it is pushed — so anything the innermost frame
+    /// knows was settled while it existed, and every outer frame took the
+    /// same insert. This is what keeps the per-identifier read hook at one
+    /// hash lookup rather than one per level of `#include` nesting.
+    fn innermost_settled(&self, name: &str) -> bool {
+        self.cache_frames
+            .last()
+            .is_none_or(|frame| frame.settled.contains(name))
+    }
+
+    /// Record that the expansion consulted `name`, for every cached header
+    /// currently being built. Free when no cache frame is open, which is the
+    /// case for translation-unit text.
+    ///
+    /// Called on *every* macro-table consultation, the misses included: an
+    /// identifier that found nothing here expanded to itself, and an entry
+    /// holding that text must not be replayed into a unit where the name is
+    /// a macro (#55).
+    fn record_read(&mut self, name: &str) {
+        if self.innermost_settled(name) {
+            return;
+        }
+        let hash = self.binding_hash(name);
+        let interned: Arc<str> = Arc::from(name);
+        for frame in &mut self.cache_frames {
+            if !frame.settled.insert(Arc::clone(&interned)) {
+                continue;
+            }
+            match hash {
+                Some(h) => frame.deps.defined.push((Arc::clone(&interned), h)),
+                None => {
+                    frame.deps.undefined.insert(Arc::clone(&interned));
+                }
+            }
+        }
+    }
+
+    /// Mark `name` as bound by the cached headers being built, so a later
+    /// read of it is not charged to the consumer's environment. Recorded
+    /// even when the name is already a dependency — `settled` short-circuits
+    /// that case and the earlier read stays in `deps`, which is correct: the
+    /// consumer's binding did reach this expansion, before the header
+    /// overwrote it.
+    fn note_local_binding(&mut self, name: &str) {
+        if self.innermost_settled(name) {
+            return;
+        }
+        let interned: Arc<str> = Arc::from(name);
+        for frame in &mut self.cache_frames {
+            frame.settled.insert(Arc::clone(&interned));
+        }
+    }
+
+    /// Fold a cached entry's dependencies into every open cache frame, so a
+    /// header that embeds or replays a nested expansion inherits what that
+    /// expansion read. Without this an entry matches its consumer's
+    /// environment while a nested expansion frozen inside its text does not.
+    ///
+    /// The bindings are taken as *recorded*, not re-read from the current
+    /// table. At a guard-skip site the nested entry was produced earlier in
+    /// this run, possibly under a state this frame has since moved away
+    /// from; the enclosing entry is only valid where that earlier state
+    /// holds, and re-reading would claim otherwise. Names this frame binds
+    /// itself are already `settled` and stay out.
+    fn merge_recorded_deps(&mut self, deps: &crate::MacroFingerprint) {
+        if self.cache_frames.is_empty() {
+            return;
+        }
+        for (name, hash) in &deps.defined {
+            if self.innermost_settled(name) {
+                continue;
+            }
+            for frame in &mut self.cache_frames {
+                if frame.settled.insert(Arc::clone(name)) {
+                    frame.deps.defined.push((Arc::clone(name), *hash));
+                }
+            }
+        }
+        for name in &deps.undefined {
+            if self.innermost_settled(name) {
+                continue;
+            }
+            for frame in &mut self.cache_frames {
+                if frame.settled.insert(Arc::clone(name)) {
+                    frame.deps.undefined.insert(Arc::clone(name));
+                }
+            }
+        }
+    }
+
+    /// Does `deps` describe the environment this run is in right now?
+    fn fingerprint_matches(&mut self, deps: &crate::MacroFingerprint) -> bool {
+        for (name, hash) in &deps.defined {
+            if self.binding_hash(name) != Some(*hash) {
+                return false;
+            }
+        }
+        if deps.undefined.is_empty() {
+            return true;
+        }
+        // Whichever side is smaller: an entry can depend on thousands of
+        // names being unbound (every plain identifier in the header), while
+        // a unit's own table is usually far smaller than that.
+        if deps.undefined.len() <= self.macros.len() {
+            !deps
+                .undefined
+                .iter()
+                .any(|name| self.macros.contains_key(name.as_ref()))
+        } else {
+            !self
+                .macros
+                .keys()
+                .any(|name| deps.undefined.contains(name.as_str()))
+        }
     }
 
     fn init_cli_defines(&mut self) {
@@ -234,6 +428,8 @@ impl PreprocessorState {
 
     fn insert_macro(&mut self, name: String, def: MacroDef) {
         self.log_macro_op(MacroOp::Define(name.clone(), def.clone()));
+        self.note_local_binding(&name);
+        self.macro_hashes.remove(&name);
         self.fallback_macros.remove(&name);
         self.macros.insert(name.clone(), def.clone());
         if self.opts.accumulate_macros {
@@ -247,6 +443,8 @@ impl PreprocessorState {
 
     fn remove_macro(&mut self, name: &str) {
         self.log_macro_op(MacroOp::Undef(name.to_string()));
+        self.note_local_binding(name);
+        self.macro_hashes.remove(name);
         self.fallback_macros.remove(name);
         self.macros.shift_remove(name);
         if self.opts.accumulate_macros {
@@ -488,13 +686,27 @@ impl PreprocessorState {
     /// Replay a cached expansion into the output. Returns false when no
     /// entry exists for `canonical`.
     fn splice_cached(&mut self, canonical: &Path) -> bool {
-        let Some(cache) = &self.opts.include_expansion_cache else {
+        // No stored expansion is valid here unless its fingerprint matches
+        // this run's macro environment (#55). Returning false falls through
+        // to a full expansion, which — with `inline_include_bodies` off —
+        // puts the header's body in the consuming unit's own text, where it
+        // is lowered under the environment that actually applies.
+        let Some((at, entry)) = self.matching_variant(canonical) else {
             return false;
         };
-        let key = (canonical.to_path_buf(), self.language);
-        let Some(entry) = cache.read().ok().and_then(|guard| guard.get(&key).cloned()) else {
-            return false;
-        };
+        self.entry_used
+            .insert(canonical.to_path_buf(), entry.clone());
+        self.variant_used.insert(canonical.to_path_buf(), at);
+        if let Some(frame) = self.cache_frames.last_mut() {
+            frame.replayed.push((canonical.to_path_buf(), at));
+        }
+        // Replaying an entry adopts its nested choices too: those headers
+        // are never visited here, and without this the consumer has no
+        // record for them and has to merge every stored expansion of each.
+        for (path, at) in entry.nested_variants.iter() {
+            self.variant_used.entry(path.clone()).or_insert(*at);
+        }
+        self.merge_recorded_deps(&entry.deps);
         for diagnostic in entry.diagnostics.iter().cloned() {
             self.push_diagnostic(diagnostic);
         }
@@ -554,10 +766,55 @@ impl PreprocessorState {
         }
     }
 
-    fn cached_expansion(&self, canonical: &Path) -> Option<crate::IncludeExpansion> {
-        let cache = self.opts.include_expansion_cache.as_ref()?;
+    /// Offer `entry` to the shared cache as an expansion of `canonical`
+    /// under the environment its fingerprint records.
+    ///
+    /// Two writers that reached the same fingerprint produce the same
+    /// expansion — that is what a fingerprint means — so a race between
+    /// them is not observable, and the append-only list keeps every index
+    /// already handed out valid. Past the cap nothing is stored and later
+    /// consumers expand the header themselves, which costs time and changes
+    /// no output.
+    fn publish_variant(&self, canonical: PathBuf, entry: crate::IncludeExpansion) {
+        let Some(cache) = self.opts.include_expansion_cache.as_ref() else {
+            return;
+        };
+        let Ok(mut guard) = cache.write() else {
+            return;
+        };
+        let variants = guard.entry((canonical, self.language)).or_default();
+        let signature = entry.deps.signature();
+        if variants.len() >= self.opts.max_expansion_variants
+            || variants.iter().any(|v| v.deps.signature() == signature)
+        {
+            return;
+        }
+        variants.push(entry);
+    }
+
+    /// The stored expansion of `canonical` whose fingerprint this run's
+    /// macro environment satisfies, if any.
+    ///
+    /// Matching needs `&mut self` (it memoizes binding hashes), so the
+    /// fingerprints are lifted out under one read lock and the winner
+    /// re-read under a second. That is sound because [`ExpansionVariants`]
+    /// is append-only: a concurrent writer can lengthen the list, never
+    /// move what an index already refers to.
+    fn matching_variant(&mut self, canonical: &Path) -> Option<(usize, crate::IncludeExpansion)> {
         let key = (canonical.to_path_buf(), self.language);
-        cache.read().ok().and_then(|guard| guard.get(&key).cloned())
+        let deps: Vec<Arc<crate::MacroFingerprint>> = {
+            let cache = self.opts.include_expansion_cache.as_ref()?;
+            let guard = cache.read().ok()?;
+            guard
+                .get(&key)?
+                .iter()
+                .map(|e| Arc::clone(&e.deps))
+                .collect()
+        };
+        let at = deps.iter().position(|d| self.fingerprint_matches(d))?;
+        let cache = self.opts.include_expansion_cache.as_ref()?;
+        let guard = cache.read().ok()?;
+        Some((at, guard.get(&key)?.get(at).cloned()?))
     }
 
     fn is_cacheable_header(path: &Path) -> bool {
@@ -601,7 +858,7 @@ impl PreprocessorState {
             if !embedded.insert(path.clone()) {
                 continue;
             }
-            let Some(entry) = self.cached_expansion(path) else {
+            let Some(entry) = self.entry_used.get(path) else {
                 continue;
             };
             if text.len().saturating_add(entry.text.len()) > self.opts.max_output_bytes {
@@ -671,12 +928,36 @@ impl PreprocessorState {
             // cache frame instead; `compose_cache_text` embeds the nested
             // expansion only into that frame's cache entry.
             if !self.opts.frozen_expansion_cache {
+                let replayed_as = self.variant_used.get(&canonical).copied();
                 if let Some(frame) = self.cache_frames.last_mut() {
                     frame.skips.push((self.output.len(), canonical.clone()));
+                    // The body is skipped here, but this header still needs
+                    // its own lowered unit and only the entry being built
+                    // knows which expansion of it applies.
+                    if let Some(at) = replayed_as {
+                        frame.replayed.push((canonical.clone(), at));
+                    }
                 }
-                if let Some(entry) = self.cached_expansion(&canonical) {
+                if let Some(entry) = self.entry_used.get(&canonical).cloned() {
                     for diagnostic in entry.diagnostics.iter() {
                         self.record_cache_diagnostic(diagnostic);
+                    }
+                    // `compose_cache_text` will embed this expansion's text
+                    // in the frame's entry, so the frame depends on
+                    // everything the expansion read.
+                    self.merge_recorded_deps(&entry.deps);
+                    // ...and on its macro effects. The body is skipped, so
+                    // these are NOT executed — they already are in force in
+                    // this run. Logging them is what makes the enclosing
+                    // entry self-contained: without it, whether A's `ops`
+                    // carry B's `#define`s depends on whether B happened to
+                    // be included before A, which is inclusion history
+                    // rather than a property of A. Two runs would then
+                    // publish different `ops` under the same fingerprint.
+                    // Replaying a duplicated block is harmless: the ops of
+                    // one header are contiguous and idempotent as a group.
+                    for op in entry.ops.iter() {
+                        self.log_macro_op(op.clone());
                     }
                 }
             }
@@ -705,6 +986,12 @@ impl PreprocessorState {
         let is_root = self.include_stack.len() == 1;
         if !is_root && self.splice_cached(&canonical) {
             return Ok(());
+        }
+
+        if !is_root {
+            // Past every cache path: this run is about to expand the body
+            // itself, so the header's content belongs to this unit's text.
+            self.inlined_files.insert(canonical.clone());
         }
 
         let cache_header =
@@ -755,6 +1042,9 @@ impl PreprocessorState {
         if pushing_frame {
             self.cache_frames.push(CacheFrame {
                 skips: Vec::new(),
+                replayed: Vec::new(),
+                deps: crate::MacroFingerprint::default(),
+                settled: HashSet::new(),
                 diagnostics: Vec::new(),
                 diagnostic_keys: HashSet::new(),
             });
@@ -808,8 +1098,7 @@ impl PreprocessorState {
             // An expansion composed after a run-wide limit cut this run
             // short is missing content; publishing it would hand that
             // truncation to every later consumer of the header.
-            let cache = self.opts.include_expansion_cache.as_ref();
-            if let Some(cache) = cache.filter(|_| !self.expansion_incomplete) {
+            if !self.expansion_incomplete && self.opts.include_expansion_cache.is_some() {
                 let output_end = self.output.len();
                 let (composed, composed_map, extra_files) = if self.opts.inline_include_bodies {
                     self.compose_cache_text(output_start, output_end, &frame.skips)
@@ -832,23 +1121,54 @@ impl PreprocessorState {
                     None => Arc::default(),
                 };
                 let diagnostics: Arc<Vec<Diagnostic>> = Arc::new(frame.diagnostics);
+                let deps = frame.deps;
+                let replayed = frame.replayed;
                 // Diagnostics alone are not content. An entry holding nothing
                 // else replays as an empty expansion, and `splice_cached`
                 // reports the hit as a success, so every later consumer that
                 // reaches this header with its guard undefined silently loses
                 // the body. Leave it uncached and let those runs expand it.
                 if !composed.is_empty() || !ops.is_empty() || !new_files.is_empty() {
-                    if let Ok(mut guard) = cache.write() {
-                        guard.entry((canonical, self.language)).or_insert(
-                            crate::IncludeExpansion {
-                                text: composed.into(),
-                                files: Arc::new(new_files),
-                                diagnostics,
-                                line_map: Arc::new(composed_map),
-                                ops,
-                            },
-                        );
+                    // Which expansion of each header this one pulled in, so
+                    // a consumer that replays this entry can lower the same
+                    // ones (it never visits them itself). Taken from the
+                    // frame rather than from `new_files`, which only counts
+                    // files this run expanded — a nested header that was
+                    // itself replayed never records emitted bytes and would
+                    // drop out.
+                    // Closed over nesting, so one lookup answers for the
+                    // whole subtree: entries are built bottom-up, so each
+                    // one this replayed is already closed, and unioning
+                    // their records keeps the property.
+                    let mut nested_variants: Vec<(PathBuf, usize)> = Vec::new();
+                    let mut seen: HashSet<PathBuf> = HashSet::new();
+                    for (nested_path, nested_at) in replayed {
+                        if let Some(deeper) = self
+                            .entry_used
+                            .get(&nested_path)
+                            .map(|e| Arc::clone(&e.nested_variants))
+                        {
+                            for (p, v) in deeper.iter() {
+                                if seen.insert(p.clone()) {
+                                    nested_variants.push((p.clone(), *v));
+                                }
+                            }
+                        }
+                        if seen.insert(nested_path.clone()) {
+                            nested_variants.push((nested_path, nested_at));
+                        }
                     }
+                    let entry = crate::IncludeExpansion {
+                        text: composed.into(),
+                        files: Arc::new(new_files),
+                        diagnostics,
+                        line_map: Arc::new(composed_map),
+                        ops,
+                        deps: Arc::new(deps),
+                        nested_variants: Arc::new(nested_variants),
+                    };
+                    self.entry_used.insert(canonical.clone(), entry.clone());
+                    self.publish_variant(canonical, entry);
                 }
             }
             // The log only feeds open frames; once the outermost cached
@@ -914,6 +1234,7 @@ impl PreprocessorState {
                         continue;
                     }
                     if !tok.is_hidden(name) {
+                        self.record_read(name);
                         if let Some(macro_def) = self.macros.get(name).cloned() {
                             match macro_def {
                                 MacroDef::Function { .. } | MacroDef::GmockMethod => {
@@ -992,6 +1313,7 @@ impl PreprocessorState {
                         continue;
                     }
                     if !tok.is_hidden(name) {
+                        self.record_read(name);
                         match self.macros.get(name).cloned() {
                             Some(MacroDef::Object { replacement }) => {
                                 if !self.push_expansion(tok.line) {
@@ -1260,6 +1582,7 @@ impl PreprocessorState {
                 i += 1;
                 continue;
             }
+            self.record_read(name);
             let Some(def) = self.macros.get(name).cloned() else {
                 out.push(tokens[i].clone());
                 i += 1;
@@ -1614,8 +1937,9 @@ impl PreprocessorState {
             let tok = work[i].clone();
             if let TokenKind::Identifier(name) = &tok.kind {
                 if name == "defined" {
-                    let (val, consumed) =
-                        defined_operand(&work, i, &self.macros, &self.fallback_macros);
+                    let (operand, consumed) = defined_operand(&work, i);
+                    let operand = operand.map(str::to_string);
+                    let val = operand.is_some_and(|n| self.is_defined_for_conditionals(&n));
                     out.push(Token::new(
                         TokenKind::Number(if val { "1" } else { "0" }.into()),
                         tok.line,
@@ -1637,6 +1961,9 @@ impl PreprocessorState {
                 // evaluation: expanding it here (often to nothing) would
                 // mangle the expression (`1 || __init` -> `1 ||`), while an
                 // unexpanded identifier correctly evaluates to 0.
+                if !tok.is_hidden(name) {
+                    self.record_read(name);
+                }
                 if !tok.is_hidden(name) && !self.fallback_macros.contains(name.as_str()) {
                     match self.macros.get(name) {
                         Some(MacroDef::Object { replacement }) => {
@@ -1707,7 +2034,10 @@ impl PreprocessorState {
             output: self.output,
             line_map: self.line_map,
             diagnostics: self.diagnostics,
+            language: self.language,
             included_headers: self.included_guard.into_iter().collect(),
+            inlined_headers: self.inlined_files.into_iter().collect(),
+            replayed_variants: self.variant_used.into_iter().collect(),
         }
     }
 }
@@ -1926,6 +2256,11 @@ impl PreprocessorState {
                 // fresh invocation and eaten. `expand_gmock_method` hides the
                 // macro it expands; the rest of the family is hidden here,
                 // where the table is in reach.
+                for tok in &expanded {
+                    if let TokenKind::Identifier(n) = &tok.kind {
+                        self.record_read(n);
+                    }
+                }
                 expanded
                     .into_iter()
                     .map(|t| {
@@ -2974,17 +3309,16 @@ fn parse_cond_macro_args(toks: &[Token], mut i: usize) -> Option<(MacroArgs, usi
     None
 }
 
-/// Resolve one `defined X` / `defined(X)` operator at `toks[i]`
-/// (which is the `defined` identifier). Returns the truth value and how
-/// many tokens the operator consumed; malformed operands conservatively
-/// evaluate to false.
-fn defined_operand(
-    toks: &[Token],
-    i: usize,
-    macros: &MacroTable,
-    fallbacks: &HashSet<String>,
-) -> (bool, usize) {
-    let is_defined = |n: &str| macros.contains_key(n) && !fallbacks.contains(n);
+/// Parse one `defined X` / `defined(X)` operator at `toks[i]` (which is the
+/// `defined` identifier). Returns the operand name and how many tokens the
+/// operator consumed; a malformed operand has no name and conservatively
+/// evaluates to false.
+///
+/// The truth value is not decided here: `defined(X)` is a read of the macro
+/// environment even though it substitutes nothing, and a cached header's
+/// fingerprint has to see it (#55), so the caller resolves the name through
+/// `is_defined_for_conditionals`.
+fn defined_operand(toks: &[Token], i: usize) -> (Option<&str>, usize) {
     match toks.get(i + 1).map(|t| &t.kind) {
         Some(TokenKind::Punct(p)) if *p == "(" => {
             if let (Some(TokenKind::Identifier(n)), Some(TokenKind::Punct(c))) = (
@@ -2992,14 +3326,56 @@ fn defined_operand(
                 toks.get(i + 3).map(|t| &t.kind),
             ) {
                 if *c == ")" {
-                    return (is_defined(n), 4);
+                    return (Some(n), 4);
                 }
             }
-            (false, 2)
+            (None, 2)
         }
-        Some(TokenKind::Identifier(n)) => (is_defined(n), 2),
-        _ => (false, 1),
+        Some(TokenKind::Identifier(n)) => (Some(n), 2),
+        _ => (None, 1),
     }
+}
+
+/// Content hash of a macro binding, for [`crate::MacroFingerprint`].
+/// Hashes what a consumer could observe: the replacement token stream
+/// (spelling and adjacency, which is all `#` and `##` depend on), the
+/// parameter list, and whether the name is only a builtin fallback.
+fn hash_macro_binding(def: &MacroDef, fallback: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    fallback.hash(&mut h);
+    let hash_tokens = |h: &mut std::collections::hash_map::DefaultHasher, toks: &[Token]| {
+        for t in toks {
+            t.adjacent_before.hash(h);
+            match &t.kind {
+                TokenKind::Identifier(sp) | TokenKind::Number(sp) => (0u8, sp.as_str()).hash(h),
+                TokenKind::String(sp) => (1u8, sp.as_str()).hash(h),
+                TokenKind::Char(sp) => (2u8, sp.as_str()).hash(h),
+                TokenKind::Punct(sp) => (3u8, *sp).hash(h),
+                TokenKind::Hash => 4u8.hash(h),
+                TokenKind::Newline => 5u8.hash(h),
+                TokenKind::Eof => 6u8.hash(h),
+            }
+        }
+    };
+    match def {
+        MacroDef::Object { replacement } => {
+            0u8.hash(&mut h);
+            hash_tokens(&mut h, replacement);
+        }
+        MacroDef::Function {
+            params,
+            replacement,
+            variadic,
+        } => {
+            1u8.hash(&mut h);
+            params.hash(&mut h);
+            variadic.hash(&mut h);
+            hash_tokens(&mut h, replacement);
+        }
+        MacroDef::GmockMethod => 2u8.hash(&mut h),
+    }
+    h.finish()
 }
 
 /// Evaluate a fully expanded `#if` condition with C operator precedence.
@@ -3519,7 +3895,25 @@ pub fn preprocess_string(source: &str, file: &Path, opts: &PreprocessOptions) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::{ExpansionKey, IncludeExpansion};
+    use crate::options::{ExpansionCache, IncludeExpansion};
+
+    /// The one cached expansion of `path`. These tests seed a single macro
+    /// environment, so a second variant would mean the fingerprinting split
+    /// something it should not have (see `ExpansionVariants`).
+    fn sole_variant(
+        cache: &ExpansionCache,
+        path: PathBuf,
+        language: Language,
+    ) -> Option<IncludeExpansion> {
+        let guard = cache.read().unwrap();
+        let variants = guard.get(&(path, language))?;
+        assert!(
+            variants.len() <= 1,
+            "expected one cached expansion, got {}",
+            variants.len()
+        );
+        variants.first().cloned()
+    }
     use std::sync::{Arc, RwLock};
 
     #[test]
@@ -4048,8 +4442,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         // never expand.
         let dir = unique_tmp_dir("cache_language");
         fs::write(dir.join("shared.h"), "#define C + 1\n#define VAL 'a'C\n").unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let run = |name: &str| {
             let path = dir.join(name);
             fs::write(&path, "#include \"shared.h\"\nint n = VAL;\n").unwrap();
@@ -4490,8 +4883,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             "#ifndef container_of\n#define container_of(p, t, m) REAL_CONTAINER(p)\n#endif\n",
         )
         .unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -4535,8 +4927,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         // The declaration makes the header content-bearing so a cache entry
         // is actually stored and the second TU takes the replay path.
         fs::write(dir.join("u.h"), "int u_decl;\n#undef __init\n").unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -4563,8 +4954,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         // X is undefined when the entry is created, so a state diff records
         // nothing — only a log of executed directives catches this #undef.
         fs::write(dir.join("u.h"), "int u_decl;\n#undef X\n").unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -4585,8 +4975,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         let dir = unique_tmp_dir("undef_redef");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("r.h"), "int r_decl;\n#undef X\n#define X 9\n").unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -4613,8 +5002,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         let dir = unique_tmp_dir("replay_overwrite");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("r.h"), "int r_decl;\n#define X 9\n").unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -4638,8 +5026,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         let dir = unique_tmp_dir("replay_accum");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("m.h"), "int m_decl;\n#define FROM_HDR 5\n").unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let src = "#include \"m.h\"\n";
         let shared1 = Arc::new(RwLock::new(MacroTable::new()));
         let opts1 = PreprocessOptions::new()
@@ -5331,8 +5718,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         .unwrap();
 
         let shared = Arc::new(RwLock::new(MacroTable::new()));
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
 
         // Warm-style pass over the first twin: defines LIST_H, caches text.
         let warm_opts = PreprocessOptions::new()
@@ -5366,11 +5752,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             r2.diagnostics
         );
         // (b) outer.h's cached entry must not claim b/list.h as content-bearing
-        let outer_entry = cache
-            .read()
-            .unwrap()
-            .get(&(dir.join("outer.h"), Language::C))
-            .cloned();
+        let outer_entry = sole_variant(&cache, dir.join("outer.h"), Language::C);
         let claimed_b = outer_entry
             .as_ref()
             .map(|e| e.files.iter().any(|f| *f == b.join("list.h")))
@@ -5407,8 +5789,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
                 .collect();
             t.insert("G_H".to_string(), MacroDef::Object { replacement: toks });
         }
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let opts = PreprocessOptions::new()
             .with_shared_macros(Arc::clone(&shared))
             .with_include_expansion_cache(cache)
@@ -5451,8 +5832,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         )
         .unwrap();
 
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.path().to_path_buf());
@@ -5505,8 +5885,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         )
         .unwrap();
 
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(cache)
             .with_include(dir.to_path_buf());
@@ -5550,8 +5929,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         )
         .unwrap();
 
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(cache)
             .with_include(dir.to_path_buf());
@@ -5602,8 +5980,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         )
         .unwrap();
 
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let warm = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.to_path_buf());
@@ -5620,12 +5997,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             top.output.len()
         );
 
-        let right = cache
-            .read()
-            .unwrap()
-            .get(&(dir.join("right.h"), Language::C))
-            .cloned()
-            .expect("right.h cached");
+        let right = sole_variant(&cache, dir.join("right.h"), Language::C).expect("right.h cached");
         assert!(
             right.text.contains("NeedThis"),
             "right.h cache must be self-contained, got {}",
@@ -5659,8 +6031,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             src.push_str(&format!("int v{i};\n#endif\n"));
             fs::write(dir.join(format!("h{i}.h")), src).unwrap();
         }
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.to_path_buf());
@@ -5851,8 +6222,7 @@ int x = A;
             "#ifndef TOP_H\n#define TOP_H\n#include \"common.h\"\nint from_top;\n#endif\n",
         )
         .unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.to_path_buf())
@@ -5868,12 +6238,8 @@ int x = A;
             "nested header body must not be copied into parent live output: {}",
             top.output
         );
-        let common = cache
-            .read()
-            .unwrap()
-            .get(&(dir.join("common.h"), Language::C))
-            .cloned()
-            .expect("common.h cached");
+        let common =
+            sole_variant(&cache, dir.join("common.h"), Language::C).expect("common.h cached");
         assert!(
             common.text.contains("NeedThis"),
             "child cache still holds its own text: {}",
@@ -5909,8 +6275,7 @@ int from_late;
 ",
         )
         .unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.to_path_buf())
@@ -6879,8 +7244,7 @@ int from_late;
         fs::write(dir.join("first.c"), "#define G 1\n#include \"guarded.h\"\n").unwrap();
         fs::write(dir.join("second.c"), "#include \"guarded.h\"\n").unwrap();
 
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let opts = || {
             PreprocessOptions::new()
                 .with_include_expansion_cache(Arc::clone(&cache))
@@ -6932,9 +7296,8 @@ int from_late;
         fs::write(dir.join("big.c"), &big).unwrap();
         fs::write(dir.join("small.c"), "#include \"parent.h\"\n").unwrap();
 
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-        let opts = |cache: Option<&Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>>>| {
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let opts = |cache: Option<&ExpansionCache>| {
             let base = PreprocessOptions::new()
                 .with_max_output_bytes(2000)
                 .with_include(dir.path.clone());
@@ -7005,8 +7368,7 @@ int from_late;
         .unwrap();
         fs::write(dir.join("other.c"), "#include \"parent.h\"\n").unwrap();
 
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let cached_opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.path.clone());

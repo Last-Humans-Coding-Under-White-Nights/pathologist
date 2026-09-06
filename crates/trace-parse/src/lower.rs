@@ -1,6 +1,6 @@
 use crate::deps::IncludeGraph;
 use crate::discover::discover_source_files;
-use crate::index_cache::IndexSourceCache;
+use crate::index_cache::{IndexSourceCache, PreprocessedSource};
 use crate::merge::{merge_unit_index, merge_unit_symbols, merge_unit_types, UnitIndex};
 use crate::parse::node_text;
 use rayon::prelude::*;
@@ -251,28 +251,15 @@ pub fn build_program_with_jobs(
     // from the shared expansion cache instead; per-header tables only prevent
     // cross-header guard leakage.
     //
-    // Translation units still inherit a single table — the union of all
-    // headers' final macro states — because cached expansions are replayed
-    // without executing their #define directives, so TU-local code needs the
-    // macros those headers define.
-    //
-    // One union per language: a `-D` body and a header's replacement lists
-    // are token sequences, and the C and C++ lexers disagree on raw strings
-    // and ud-suffixes, so a TU inherits the table lexed its own way. Both
-    // unions still hold EVERY warmed header's macros (same-language warm
-    // preferred, the other language's re-lexed for the destination as
-    // fallback): a header not reached from a unit of that language is rare
-    // in one but not the other, and the union's job — twin-guard dedup and
-    // a macro superset for orphan and PCH headers — must not depend on
-    // which language reached it.
-    let union_macros: HashMap<Language, Arc<std::sync::RwLock<MacroTable>>> =
-        [Language::C, Language::Cpp]
-            .into_iter()
-            .map(|l| {
-                let table = macro_table_from_defines(&opts.defines, l);
-                (l, Arc::new(std::sync::RwLock::new(table)))
-            })
-            .collect();
+    // Translation units do NOT inherit a union of every header's macros.
+    // That union used to exist because cached expansions were replayed
+    // without executing their `#define`s; `splice_cached` replays an entry's
+    // `ops` now, so a unit gets exactly the macros of the headers it
+    // actually includes. Keeping the union was not merely redundant, it was
+    // wrong twice over: a macro reached units that never included the header
+    // defining it, and — since the union holds every header's include guard
+    // — every header would read its own guard as already defined, so no
+    // cached expansion could ever match its consumer's environment (#55).
     let project_headers: Vec<PathBuf> = include_graph
         .project_files
         .iter()
@@ -426,25 +413,6 @@ pub fn build_program_with_jobs(
             if failed {
                 continue;
             }
-            for (language, union) in &union_macros {
-                let Some((from, done)) = warmed
-                    .iter()
-                    .find(|(l, _)| l == language)
-                    .or_else(|| warmed.first())
-                else {
-                    continue;
-                };
-                if let (Ok(mut union), Ok(done)) = (union.write(), done.read()) {
-                    for (name, def) in done.iter() {
-                        let def = if from == language {
-                            def.clone()
-                        } else {
-                            def.relexed(*language)
-                        };
-                        union.insert(name.clone(), def);
-                    }
-                }
-            }
             index_item_progress(
                 i,
                 warm_n,
@@ -458,12 +426,121 @@ pub fn build_program_with_jobs(
         }
     }
 
+    let reachable_from_c = include_graph.reachable_from(&c_sources);
+    let cpp_parse: Arc<HashSet<PathBuf>> = Arc::new(include_graph.reachable_from(&cpp_tus));
+    // See `index_language`: with no C translation unit in the tree, a `.h`
+    // the include graph cannot tie to a C++ unit is still C++.
+    let no_c_units = c_tus.is_empty();
+
+    // One option set per language; each file takes the one matching the
+    // language it is lexed and parsed as (`index_language`). Each unit starts
+    // from the command-line defines alone and acquires header macros by
+    // executing its own `#include`s.
+    //
+    // `index_opts` freezes the expansion cache; `discover_opts` does not.
+    // Freezing used to be what kept output independent of thread scheduling,
+    // since a worker insert was a first-writer-wins race. Fingerprinting
+    // changes that: an expansion is a function of its file and of the macro
+    // environment its fingerprint records, so two workers that reach the same
+    // fingerprint produce the same entry and the race is not observable. What
+    // IS still scheduling-dependent is which unit pioneers a variant and
+    // therefore expands the header into its own text — so discovery writes
+    // the cache and its texts are thrown away, and every text that reaches
+    // the parser comes from the frozen pass below.
+    let index_opts: HashMap<Language, PreprocessOptions> = [Language::C, Language::Cpp]
+        .into_iter()
+        .map(|l| {
+            let o = eff_opts
+                .clone()
+                .with_frozen_expansion_cache(true)
+                .with_language(l);
+            (l, o)
+        })
+        .collect();
+    let discover_opts: HashMap<Language, PreprocessOptions> = [Language::C, Language::Cpp]
+        .into_iter()
+        .map(|l| (l, eff_opts.clone().with_language(l)))
+        .collect();
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .stack_size(16 * 1024 * 1024)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // Preprocess every translation unit BEFORE choosing the PCH set, in two
+    // passes.
+    //
+    // Discovery runs against a writable cache. The warm pass only ever saw
+    // each header on its own, under the command-line defines, but a unit
+    // reaches a header after its siblings' `#define`s are in force, so that
+    // one expansion matches almost nothing. Units that find no match expand
+    // the header and publish what they built, so the environments this tree
+    // actually presents end up in the cache — and units sharing an
+    // environment, which is most of them, end up sharing one expansion.
+    //
+    // Settle then re-runs the units that expanded something, against the
+    // frozen result. Each now finds the expansion its own environment
+    // produced, so its text is file-local again and the header bodies are
+    // lowered once each instead of once per consumer.
+    let tu_paths: HashSet<PathBuf> = file_order.iter().cloned().collect();
+    let pre_t = Instant::now();
+    index_progress(format!(
+        "preprocess: {} TUs (jobs={jobs})",
+        file_order.len()
+    ));
+    pool.install(|| {
+        file_order.par_iter().for_each(|path| {
+            let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
+            let _ = source_cache.get_or_preprocess(path, &include_graph, &discover_opts[&lang]);
+        });
+    });
+    // A unit that matched every include it reached already has the text the
+    // settle pass would build for it: its includes hit the same expansions
+    // either way, and with nothing expanded it opened no cache frame, so
+    // writability changed nothing it produced. Only the units that expanded
+    // something have to run again — against their own published expansions,
+    // which is what turns an inlined body back into a shared one.
+    let dirty: HashSet<PathBuf> = source_cache.units_that_inlined(&tu_paths);
+    source_cache.evict_all(&dirty);
+    pool.install(|| {
+        dirty.par_iter().for_each(|path| {
+            let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
+            let _ = source_cache.get_or_preprocess(path, &include_graph, &index_opts[&lang]);
+        });
+    });
+    index_progress(format!(
+        "preprocess-done: {:.1}s ({} of {} units re-run)",
+        pre_t.elapsed().as_secs_f64(),
+        dirty.len(),
+        file_order.len()
+    ));
+
+    // A header every unit expanded for itself must not ALSO get a PCH unit:
+    // that unit would carry whichever configuration the warm pass happened to
+    // take, which may be one no translation unit in this tree has. A header
+    // some unit did take from the cache still needs one, and so does every
+    // header reachable from it (nested PCH merges types from those).
+    let provenance = source_cache.header_provenance(&tu_paths);
+    // Nested PCH merges types from the headers a PCH'd header includes, so a
+    // header consumed from the cache keeps the whole closure below it.
+    let consumed_closure = include_graph.reachable_from(&provenance.consumed_paths);
+    let skip_headers: HashSet<PathBuf> = provenance
+        .inlined
+        .iter()
+        .filter(|h| !consumed_closure.contains(*h))
+        .cloned()
+        .collect();
+    let lang_of = |p: &Path| index_language(p, &cpp_parse, no_c_units, forced_language);
+    // Close the consumed set over nesting: replaying an expansion pins the
+    // expansions it in turn replayed, and a consumer never visits those.
+    let wanted_variants =
+        close_over_nested_variants(&provenance.consumed, &include_expansion_cache);
+
     // Macro includes discovered while warming can make a previously "orphan"
     // header reachable from a `.c`. Those must be PCH'd into `header_ir` so
     // TUs can merge their prototypes; they must not stay on the orphan path
     // (merged into the global program only, invisible at TU lower time).
-    let reachable_from_c = include_graph.reachable_from(&c_sources);
-    let cpp_parse: Arc<HashSet<PathBuf>> = Arc::new(include_graph.reachable_from(&cpp_tus));
     let mut pch_headers: Vec<PathBuf> = project_headers
         .iter()
         .filter(|p| reachable_from_c.contains(*p))
@@ -477,33 +554,19 @@ pub fn build_program_with_jobs(
     }
     pch_headers.sort();
     pch_headers.dedup();
+    pch_headers.retain(|p| !skip_headers.contains(p));
     let pch_order = Arc::new(include_graph.index_order(&pch_headers));
     let pch_set: HashSet<PathBuf> = pch_headers.iter().cloned().collect();
+    // Orphans get the same treatment: indexing a header standalone that every
+    // unit already expanded for itself would reintroduce the configuration
+    // the PCH filter just dropped.
     let orphan_headers: Vec<PathBuf> = include_graph.index_order(
         &project_headers
             .iter()
-            .filter(|p| !pch_set.contains(*p))
+            .filter(|p| !pch_set.contains(*p) && !skip_headers.contains(*p))
             .cloned()
             .collect::<Vec<_>>(),
     );
-
-    // Parallel phases must treat the expansion cache as read-only: warm-pass
-    // entries were produced sequentially and deterministically, while worker
-    // inserts are first-writer-wins races that make output scheduling-
-    // dependent. Misses expand inline under each TU's own macro/guard state.
-    // One option set per language; each file takes the one matching the
-    // language it is lexed and parsed as (`index_language`).
-    let index_opts: HashMap<Language, PreprocessOptions> = union_macros
-        .iter()
-        .map(|(l, table)| {
-            let o = eff_opts
-                .clone()
-                .with_shared_macros(Arc::clone(table))
-                .with_frozen_expansion_cache(true)
-                .with_language(*l);
-            (*l, o)
-        })
-        .collect();
 
     index_progress(format!(
         "parse: {} orphan headers, {} TUs (jobs={jobs})",
@@ -511,20 +574,31 @@ pub fn build_program_with_jobs(
         file_order.len()
     ));
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(jobs)
-        .stack_size(16 * 1024 * 1024)
-        .build()
-        .map_err(|e| e.to_string())?;
-
+    // One unit per expansion some translation unit actually replayed. A
+    // header whose only stored expansion nothing consumed contributes
+    // nothing: that is the warm pass's configuration, and if no unit
+    // presents it, it is not a configuration this tree has.
+    let pch_units: Vec<(PathBuf, usize)> = pch_headers
+        .iter()
+        .flat_map(|p| {
+            let mut vs =
+                variants_to_lower(&wanted_variants, &include_expansion_cache, p, lang_of(p));
+            vs.sort_unstable();
+            vs.into_iter().map(move |v| (p.clone(), v))
+        })
+        .collect();
     let pch_t = Instant::now();
-    index_progress(format!("pch: parse {} headers once", pch_headers.len()));
+    index_progress(format!(
+        "pch: parse {} expansions of {} headers",
+        pch_units.len(),
+        pch_headers.len()
+    ));
     // Include-graph order (included files before includers), including
     // preprocess-only edges so a header is never PCH'd in the same wave as a
     // nested type the raw `#include` scanner missed. Nested merge copies
     // types/typedefs only; TUs pull prototypes from every reachable header.
     // Cyclic leftovers are indexed in `index_order`, never as a parallel wave.
-    let mut header_ir_map: HashMap<PathBuf, Arc<UnitIndex>> = HashMap::new();
+    let mut header_ir_map: HeaderIr = HashMap::new();
     let (pch_waves, pch_cycles) = if jobs == 1 {
         (vec![pch_order.as_ref().clone()], Vec::new())
     } else {
@@ -534,32 +608,55 @@ pub fn build_program_with_jobs(
         if wave.is_empty() {
             continue;
         }
-        if jobs == 1 || wave.len() == 1 {
-            for path in &wave {
-                let unit = index_source_file(
+        let wave_units: Vec<(PathBuf, usize)> = wave
+            .iter()
+            .flat_map(|p| {
+                let mut vs =
+                    variants_to_lower(&wanted_variants, &include_expansion_cache, p, lang_of(p));
+                vs.sort_unstable();
+                vs.into_iter().map(move |v| (p.clone(), v))
+            })
+            .collect();
+        if wave_units.is_empty() {
+            continue;
+        }
+        if jobs == 1 || wave_units.len() == 1 {
+            for (path, variant) in &wave_units {
+                let unit = index_header_variant(
                     path,
+                    *variant,
                     root,
                     &include_graph,
-                    &index_opts[&index_language(path, &cpp_parse, forced_language)],
-                    &source_cache,
+                    &include_expansion_cache,
+                    index_language(path, &cpp_parse, no_c_units, forced_language),
                     Some(&header_ir_map),
                     pch_order.as_ref(),
                 );
-                header_ir_map.insert(include_graph.intern_path(path), Arc::new(unit));
+                push_header_ir(
+                    &mut header_ir_map,
+                    &include_graph,
+                    path,
+                    lang_of(path),
+                    *variant,
+                    unit,
+                );
             }
         } else {
             let snapshot = header_ir_map.clone();
-            let units: Vec<(PathBuf, UnitIndex)> = pool.install(|| {
-                wave.par_iter()
-                    .map(|path| {
+            let units: Vec<(PathBuf, usize, UnitIndex)> = pool.install(|| {
+                wave_units
+                    .par_iter()
+                    .map(|(path, variant)| {
                         (
                             path.clone(),
-                            index_source_file(
+                            *variant,
+                            index_header_variant(
                                 path,
+                                *variant,
                                 root,
                                 &include_graph,
-                                &index_opts[&index_language(path, &cpp_parse, forced_language)],
-                                &source_cache,
+                                &include_expansion_cache,
+                                index_language(path, &cpp_parse, no_c_units, forced_language),
                                 Some(&snapshot),
                                 pch_order.as_ref(),
                             ),
@@ -567,22 +664,46 @@ pub fn build_program_with_jobs(
                     })
                     .collect()
             });
-            for (path, unit) in units {
-                header_ir_map.insert(include_graph.intern_path(&path), Arc::new(unit));
+            for (path, variant, unit) in units {
+                push_header_ir(
+                    &mut header_ir_map,
+                    &include_graph,
+                    &path,
+                    lang_of(&path),
+                    variant,
+                    unit,
+                );
             }
         }
     }
     for path in include_graph.index_order(&pch_cycles) {
-        let unit = index_source_file(
+        let mut variants = variants_to_lower(
+            &wanted_variants,
+            &include_expansion_cache,
             &path,
-            root,
-            &include_graph,
-            &index_opts[&index_language(&path, &cpp_parse, forced_language)],
-            &source_cache,
-            Some(&header_ir_map),
-            pch_order.as_ref(),
+            lang_of(&path),
         );
-        header_ir_map.insert(include_graph.intern_path(&path), Arc::new(unit));
+        variants.sort_unstable();
+        for variant in variants {
+            let unit = index_header_variant(
+                &path,
+                variant,
+                root,
+                &include_graph,
+                &include_expansion_cache,
+                index_language(&path, &cpp_parse, no_c_units, forced_language),
+                Some(&header_ir_map),
+                pch_order.as_ref(),
+            );
+            push_header_ir(
+                &mut header_ir_map,
+                &include_graph,
+                &path,
+                lang_of(&path),
+                variant,
+                unit,
+            );
+        }
     }
     let header_ir = Arc::new(header_ir_map);
     index_progress(format!(
@@ -591,8 +712,10 @@ pub fn build_program_with_jobs(
         header_ir.len()
     ));
     for path in include_graph.index_order(&header_ir.keys().cloned().collect::<Vec<_>>()) {
-        if let Some(unit) = header_ir.get(&path) {
-            merge_unit_index(&mut program, unit.as_ref());
+        if let Some(units) = header_ir.get(&path) {
+            for (_, _, unit) in units {
+                merge_unit_index(&mut program, unit.as_ref());
+            }
         }
     }
     program.types.complete_nested_tags();
@@ -617,7 +740,7 @@ pub fn build_program_with_jobs(
                         path,
                         root,
                         &include_graph,
-                        &index_opts[&index_language(path, &cpp_parse, forced_language)],
+                        &index_opts[&index_language(path, &cpp_parse, no_c_units, forced_language)],
                         &source_cache,
                         Some(&header_ir),
                         pch_order.as_ref(),
@@ -644,7 +767,8 @@ pub fn build_program_with_jobs(
                             path,
                             root,
                             &include_graph,
-                            &index_opts[&index_language(path, &cpp_parse, forced_language)],
+                            &index_opts
+                                [&index_language(path, &cpp_parse, no_c_units, forced_language)],
                             &source_cache,
                             Some(&header_ir),
                             pch_order.as_ref(),
@@ -675,7 +799,7 @@ pub fn build_program_with_jobs(
                         path,
                         root,
                         &include_graph,
-                        &index_opts[&index_language(path, &cpp_parse, forced_language)],
+                        &index_opts[&index_language(path, &cpp_parse, no_c_units, forced_language)],
                         &source_cache,
                         Some(&header_ir),
                         pch_order.as_ref(),
@@ -702,7 +826,8 @@ pub fn build_program_with_jobs(
                             path,
                             root,
                             &include_graph,
-                            &index_opts[&index_language(path, &cpp_parse, forced_language)],
+                            &index_opts
+                                [&index_language(path, &cpp_parse, no_c_units, forced_language)],
                             &source_cache,
                             Some(&header_ir),
                             pch_order.as_ref(),
@@ -999,12 +1124,170 @@ fn headers_to_merge<'a>(
 /// this. An explicit `PreprocessOptions::with_language` wins; otherwise a
 /// file reachable from a C++ TU is C++ (a `.h` included from `.cpp`), and
 /// anything else follows its extension.
-fn index_language(path: &Path, cpp_parse: &HashSet<PathBuf>, forced: Option<Language>) -> Language {
+/// The language a file is lexed and parsed as during indexing.
+///
+/// `cpp_parse` holds everything the include graph can reach from a C++
+/// translation unit. A file outside it falls back to its extension, and
+/// `.h` is language-ambiguous, so an orphan header — one no translation
+/// unit includes — used to be read as C even in a tree that contains no C
+/// at all. That is not a harmless default: the C lexer splits `->*`, and
+/// the C grammar does not know namespaces, so such a header lowered a
+/// second, unqualified copy of every declaration it pulled in and interned
+/// a phantom function for the operand of every pointer-to-member call
+/// (#37). `no_c_units` settles the ambiguity where the tree itself does:
+/// with no C translation unit anywhere, an ambiguous header is C++. A
+/// mixed tree keeps the extension fallback, where the ambiguity is real.
+/// Lowered units for one header: one per cached expansion of it that some
+/// translation unit replayed (see `trace_preproc::ExpansionVariants`).
+/// Ordered by variant index.
+type HeaderIr = HashMap<PathBuf, Vec<(Language, usize, Arc<UnitIndex>)>>;
+
+fn push_header_ir(
+    map: &mut HeaderIr,
+    graph: &IncludeGraph,
+    path: &Path,
+    language: Language,
+    variant: usize,
+    unit: UnitIndex,
+) {
+    let slot = map.entry(graph.intern_path(path)).or_default();
+    slot.push((language, variant, Arc::new(unit)));
+    slot.sort_by_key(|(_, v, _)| *v);
+}
+
+/// Every `(header, variant)` a unit depends on, given the ones units
+/// replayed directly.
+///
+/// Replaying an expansion pins the expansions it in turn replayed: indexing
+/// keeps each header's text file-local, so a nested header contributes no
+/// text to its includer's entry and needs its own unit — and the consumer
+/// never visits it, so only the entry itself knows which one applies.
+fn close_over_nested_variants(
+    consumed: &HashSet<(PathBuf, Language, usize)>,
+    cache: &trace_preproc::ExpansionCache,
+) -> HashMap<(PathBuf, Language), HashSet<usize>> {
+    let mut wanted: HashMap<(PathBuf, Language), HashSet<usize>> = HashMap::new();
+    let mut queue: Vec<(PathBuf, Language, usize)> = consumed.iter().cloned().collect();
+    while let Some((path, language, variant)) = queue.pop() {
+        if !wanted
+            .entry((path.clone(), language))
+            .or_default()
+            .insert(variant)
+        {
+            continue;
+        }
+        // A nested record was made by the same run, so it indexes the same
+        // language's list.
+        let nested = {
+            let Ok(guard) = cache.read() else { continue };
+            guard
+                .get(&(path, language))
+                .and_then(|vs| vs.get(variant))
+                .map(|e| Arc::clone(&e.nested_variants))
+        };
+        if let Some(nested) = nested {
+            queue.extend(nested.iter().map(|(p, v)| (p.clone(), language, *v)));
+        }
+    }
+    wanted
+}
+
+/// Which expansions of `path` to lower.
+///
+/// Normally the ones units replayed, directly or through a nesting chain.
+/// A header nothing recorded is one no unit reached — it is only in the PCH
+/// set because the include graph says a `.c` could get there — and it is
+/// still indexed, from every expansion the warm pass built, so that dropping
+/// a configuration is never how a declaration goes missing.
+fn variants_to_lower(
+    wanted: &HashMap<(PathBuf, Language), HashSet<usize>>,
+    cache: &trace_preproc::ExpansionCache,
+    path: &Path,
+    language: Language,
+) -> Vec<usize> {
+    if let Some(vs) = wanted.get(&(path.to_path_buf(), language)) {
+        return vs.iter().copied().collect();
+    }
+    cache
+        .read()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .get(&(path.to_path_buf(), language))
+                .map(|vs| vs.len())
+        })
+        .map(|n| (0..n).collect())
+        .unwrap_or_default()
+}
+
+/// Lower one stored expansion of a header into its own unit.
+///
+/// The text comes from the cache rather than from re-preprocessing the
+/// header: re-preprocessing would rebuild it under the command-line defines
+/// alone, which is the very configuration mismatch this is here to avoid.
+#[allow(clippy::too_many_arguments)]
+fn index_header_variant(
+    path: &Path,
+    variant: usize,
+    root: &Path,
+    graph: &IncludeGraph,
+    cache: &trace_preproc::ExpansionCache,
+    language: Language,
+    header_ir: Option<&HeaderIr>,
+    pch_order: &[PathBuf],
+) -> UnitIndex {
+    let expansion = cache.read().ok().and_then(|guard| {
+        guard
+            .get(&(graph.intern_path(path), language))
+            .and_then(|vs| vs.get(variant))
+            .cloned()
+    });
+    let Some(expansion) = expansion else {
+        return UnitIndex {
+            path: path.to_path_buf(),
+            ..Default::default()
+        };
+    };
+    let pre = Arc::new(PreprocessedSource::from_expansion(&expansion, language));
+    let mut program = Program::new(root.to_path_buf());
+    match lower_prepared_source(
+        &mut program,
+        path,
+        graph,
+        pre,
+        language,
+        header_ir,
+        pch_order,
+    ) {
+        Ok(()) => program_into_unit(path.to_path_buf(), program),
+        Err(e) => UnitIndex {
+            path: path.to_path_buf(),
+            diagnostics: vec![Diagnostic {
+                severity: DiagnosticSeverity::Error,
+                file: None,
+                line: 0,
+                message: e,
+                stage: "parse".into(),
+            }],
+            ..Default::default()
+        },
+    }
+}
+
+fn index_language(
+    path: &Path,
+    cpp_parse: &HashSet<PathBuf>,
+    no_c_units: bool,
+    forced: Option<Language>,
+) -> Language {
     forced.unwrap_or_else(|| {
         if cpp_parse.contains(path) {
-            Language::Cpp
-        } else {
-            Language::from_path(path)
+            return Language::Cpp;
+        }
+        match Language::from_path(path) {
+            Language::Cpp => Language::Cpp,
+            Language::C if no_c_units && is_index_header(path) => Language::Cpp,
+            Language::C => Language::C,
         }
     })
 }
@@ -1023,7 +1306,7 @@ fn index_source_file(
     graph: &IncludeGraph,
     index_opts: &PreprocessOptions,
     source_cache: &IndexSourceCache,
-    header_ir: Option<&HashMap<PathBuf, Arc<UnitIndex>>>,
+    header_ir: Option<&HeaderIr>,
     pch_order: &[PathBuf],
 ) -> UnitIndex {
     let mut program = Program::new(root.to_path_buf());
@@ -1080,10 +1363,31 @@ fn process_indexed_file(
     graph: &IncludeGraph,
     index_opts: &PreprocessOptions,
     source_cache: &IndexSourceCache,
-    header_ir: Option<&HashMap<PathBuf, Arc<UnitIndex>>>,
+    header_ir: Option<&HeaderIr>,
     pch_order: &[PathBuf],
 ) -> Result<(), String> {
     let pre = source_cache.get_or_preprocess(path, graph, index_opts)?;
+    // `index_opts` was chosen by `index_language`, so its language is the
+    // one the text was lexed as; the grammar must not be re-derived from
+    // the path or a forced language would preprocess as one language and
+    // parse as the other.
+    let language = index_opts
+        .language
+        .unwrap_or_else(|| Language::from_path(path));
+    lower_prepared_source(program, path, graph, pre, language, header_ir, pch_order)
+}
+
+/// Lower already-preprocessed text into `program`.
+#[allow(clippy::too_many_arguments)]
+fn lower_prepared_source(
+    program: &mut Program,
+    path: &Path,
+    graph: &IncludeGraph,
+    pre: Arc<PreprocessedSource>,
+    language: Language,
+    header_ir: Option<&HeaderIr>,
+    pch_order: &[PathBuf],
+) -> Result<(), String> {
     let self_canon = graph.intern_path(path);
     let file_id = program.symbols.add_file_interned(&self_canon);
     add_preprocess_diagnostics(program, graph, file_id, &pre.diagnostics);
@@ -1102,11 +1406,31 @@ fn process_indexed_file(
             types_only,
         );
         for h in headers {
-            if let Some(unit) = ir.get(h) {
-                if types_only {
-                    merge_unit_types(program, unit);
-                } else {
-                    merge_unit_symbols(program, unit);
+            if let Some(units) = ir.get(h) {
+                // The expansion this unit replayed, when it has one. A
+                // header it reached only through another header's cached
+                // expansion leaves no record here — `PreprocessedSource`
+                // carries the includer's `nested_variants` for exactly the
+                // headers that entry pulled in, and anything still missing
+                // is merged from every stored expansion, which is additive
+                // for the declarations these two modes copy.
+                for (unit_lang, variant, unit) in units {
+                    // A header reached from both C and C++ is lowered once,
+                    // in the language `index_language` chose. A unit of the
+                    // other language recorded an index into that language's
+                    // own variant list, where it means something else, so it
+                    // is not a record for this unit at all.
+                    let wanted = (*unit_lang == language)
+                        .then(|| pre.replayed_variants.get(h))
+                        .flatten();
+                    if wanted.is_some_and(|w| w != variant) {
+                        continue;
+                    }
+                    if types_only {
+                        merge_unit_types(program, unit);
+                    } else {
+                        merge_unit_symbols(program, unit);
+                    }
                 }
             }
             let hid = program.symbols.add_file_interned(h);
@@ -1123,15 +1447,7 @@ fn process_indexed_file(
         );
         let _ = std::fs::write(std::path::Path::new(&dir).join(fname), pre.text.as_ref());
     }
-    // `index_opts` was chosen by `index_language`, so its language is the
-    // one the text was lexed as; the grammar must not be re-derived from
-    // the path or a forced language would preprocess as one language and
-    // parse as the other.
-    let lang = source_lang(
-        index_opts
-            .language
-            .unwrap_or_else(|| Language::from_path(path)),
-    );
+    let lang = source_lang(language);
     let parsed = crate::parse::parse_source_with_lang(Arc::clone(&pre.text), lang)?;
     if crate::parse::has_parse_errors(&parsed.tree) {
         program.add_diagnostic(Diagnostic {

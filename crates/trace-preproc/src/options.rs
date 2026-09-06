@@ -40,6 +40,75 @@ impl Language {
 /// first unit's tokenization replayed into the other.
 pub type ExpansionKey = (PathBuf, Language);
 
+/// What a cached expansion read from the macro environment that produced it.
+///
+/// [`ExpansionKey`] says *which* file was expanded; this says *when the
+/// result is valid*. A cache entry is a function of the header's text and of
+/// every macro its expansion consulted, so replaying it into a translation
+/// unit whose environment differs in any of those names hands that unit an
+/// expansion of a configuration it does not have (#55).
+///
+/// Three properties this must have, each of which is a way to get it wrong:
+///
+/// - **Undefined is a binding, not an absence.** An identifier read while no
+///   macro defined it belongs in [`Self::undefined`]. It expanded to itself
+///   here, but it may be a macro in another unit, and this entry must not
+///   match there. Recording only names that actually expanded misses exactly
+///   that case.
+/// - **Nested includes contribute upward.** A header's reads include those of
+///   every header it pulls in, or an entry matches while a nested expansion
+///   embedded in its text silently does not.
+/// - **Conditional reads count.** `#if` / `#ifdef` / `defined()` consult the
+///   environment even though they substitute nothing.
+///
+/// A name the expansion defined before reading it is not a dependency: its
+/// binding at that point came from the entry's own `ops`, which every
+/// consumer replays.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MacroFingerprint {
+    /// Names read while bound, each with a content hash of the binding (see
+    /// `binding_hash`). Ordered by first read, for stable diagnostics.
+    pub defined: Vec<(Arc<str>, u64)>,
+    /// Names read while unbound.
+    pub undefined: HashSet<Arc<str>>,
+}
+
+impl MacroFingerprint {
+    /// Order-independent digest, for deciding whether a variant of this
+    /// expansion is already stored. `defined` is ordered by first read, and
+    /// two runs can reach the same bindings by different routes, so the
+    /// digest must not depend on the order either half was built in.
+    pub fn signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        // XOR of per-entry hashes: commutative, so insertion order drops out.
+        let mut acc: u64 = 0;
+        let mut one = |tag: u8, name: &str, hash: u64| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (tag, name, hash).hash(&mut h);
+            acc ^= h.finish();
+        };
+        for (name, hash) in &self.defined {
+            one(0, name, *hash);
+        }
+        for name in &self.undefined {
+            one(1, name, 0);
+        }
+        acc
+    }
+}
+
+/// The expansions stored for one [`ExpansionKey`]: one per macro
+/// environment a consumer has actually presented, in insertion order.
+///
+/// Append-only. `splice_cached` resolves a variant to an index under one
+/// read lock and re-reads it under another, which is sound precisely
+/// because nothing is ever removed or reordered: an index, once handed
+/// out, keeps pointing at the same expansion.
+pub type ExpansionVariants = Vec<IncludeExpansion>;
+
+/// Shared, variant-keyed cache of expanded `#include` bodies.
+pub type ExpansionCache = Arc<RwLock<HashMap<ExpansionKey, ExpansionVariants>>>;
+
 /// Cached preprocessed body for a `#include`d file (shared across translation units).
 #[derive(Debug, Clone)]
 pub struct IncludeExpansion {
@@ -61,6 +130,16 @@ pub struct IncludeExpansion {
     /// cannot represent a no-op `#undef` or an undef-then-redefine of a
     /// name that existed at both capture boundaries.
     pub ops: Arc<Vec<crate::MacroOp>>,
+    /// The macro environment this expansion read (see [`MacroFingerprint`]).
+    /// A consumer may replay this entry only when its own environment binds
+    /// every one of these names the same way.
+    pub deps: Arc<MacroFingerprint>,
+    /// The variants this expansion itself replayed for the headers it
+    /// brought in. Indexing keeps each header's text file-local, so those
+    /// nested headers contribute no text here and need their own lowered
+    /// units — and a consumer of this entry never visits them, so it cannot
+    /// work out which expansion of each applies. This is that record.
+    pub nested_variants: Arc<Vec<(PathBuf, usize)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,7 +150,7 @@ pub struct PreprocessOptions {
     pub source_cache: Option<std::sync::Arc<HashMap<PathBuf, std::sync::Arc<str>>>>,
     /// Shared cache of expanded `#include` bodies keyed by canonical path
     /// and lexing language (see [`ExpansionKey`]).
-    pub include_expansion_cache: Option<Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>>>,
+    pub include_expansion_cache: Option<ExpansionCache>,
     /// Basename → project paths for fast include resolution.
     pub basename_index: Option<Arc<HashMap<String, Vec<PathBuf>>>>,
     /// Shared macro table populated during header warm-up; inherited by translation units.
@@ -101,6 +180,15 @@ pub struct PreprocessOptions {
     /// lexed as. `None` derives it from the TU path via
     /// [`Language::from_path`].
     pub language: Option<Language>,
+    /// How many expansions of one header the cache may hold (see
+    /// [`ExpansionVariants`]).
+    ///
+    /// This bounds storage, not correctness. A header that needs more
+    /// environments than this simply stops publishing new ones; a consumer
+    /// that finds no match expands the header into its own text, which is
+    /// what an unseeded cache does anyway. A cache miss is a performance
+    /// event and must never be reported as unexplored configuration.
+    pub max_expansion_variants: usize,
 }
 
 impl Default for PreprocessOptions {
@@ -120,6 +208,7 @@ impl Default for PreprocessOptions {
             max_expanded_tokens: 8_000_000,
             inline_include_bodies: true,
             language: None,
+            max_expansion_variants: 8,
         }
     }
 }
@@ -139,10 +228,7 @@ impl PreprocessOptions {
         self
     }
 
-    pub fn with_include_expansion_cache(
-        mut self,
-        cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>>,
-    ) -> Self {
+    pub fn with_include_expansion_cache(mut self, cache: ExpansionCache) -> Self {
         self.include_expansion_cache = Some(cache);
         self
     }
@@ -199,6 +285,11 @@ impl PreprocessOptions {
 
     pub fn with_language(mut self, language: Language) -> Self {
         self.language = Some(language);
+        self
+    }
+
+    pub fn with_max_expansion_variants(mut self, n: usize) -> Self {
+        self.max_expansion_variants = n;
         self
     }
 }
