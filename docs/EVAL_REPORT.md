@@ -15,6 +15,14 @@
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Re-verified 2026-09-06 (compiler-attribute elision, #61):** all three pinned
+corpora pass `eval_check` (**86/86**). HDF parse-warning files fall **169 → 25**,
+which removes 144 parse diagnostics and moves the exact diagnostics baseline
+**1,764 → 1,620**. Camera falls **64 → 62** and **4,767 → 4,765** respectively;
+Hiview remains at 32 parse-warning files and 2,959 diagnostics. Every function,
+call-edge, argument-flow, dispatch-target, and correctness-probe result is
+unchanged (or remains within its existing machine-tolerance band).
+
 **Re-verified 2026-09-06 (line splicing in the lexer, #38):** all three
 pinned corpora were re-fetched at their pinned revisions and analyzed with
 the branch binary and with one built from `master` (80c2325). `eval_check`

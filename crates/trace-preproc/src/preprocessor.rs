@@ -346,6 +346,26 @@ impl PreprocessorState {
         }
     }
 
+    /// Drop a complete compiler-attribute group while retaining its newline
+    /// tokens. Returning `None` leaves malformed/unterminated input untouched:
+    /// report hygiene must never consume the rest of a translation unit.
+    fn elide_attribute_group(
+        &mut self,
+        tokens: &[Token],
+        start: usize,
+    ) -> Result<Option<usize>, PreprocessError> {
+        let Some(end) = attribute_group_end(tokens, start) else {
+            return Ok(None);
+        };
+        for tok in &tokens[start + 1..end] {
+            self.check_resource_limits(tok.line)?;
+            if matches!(tok.kind, TokenKind::Newline) {
+                self.emit_token(tok);
+            }
+        }
+        Ok(Some(end))
+    }
+
     fn emit_str(&mut self, s: &str, line: u32, col: u32) {
         let offset = self.output.len();
         self.output.push_str(s);
@@ -909,6 +929,16 @@ impl PreprocessorState {
 
             if self.is_active() {
                 if let TokenKind::Identifier(name) = &tok.kind {
+                    // A real macro definition wins. Otherwise these reserved
+                    // compiler spellings are syntax-only metadata; remove the
+                    // balanced group at the same rescan boundary that sees
+                    // attributes produced by another macro's replacement.
+                    if self.macros.get(name).is_none() || tok.is_hidden(name) {
+                        if let Some(end) = self.elide_attribute_group(tokens, i)? {
+                            i = end;
+                            continue;
+                        }
+                    }
                     if self.emit_predefined(tok, name) {
                         i += 1;
                         continue;
@@ -987,6 +1017,12 @@ impl PreprocessorState {
             }
             if self.is_active() {
                 if let TokenKind::Identifier(name) = &tok.kind {
+                    if self.macros.get(name).is_none() || tok.is_hidden(name) {
+                        if let Some(end) = self.elide_attribute_group(tokens, i)? {
+                            i = end;
+                            continue;
+                        }
+                    }
                     if self.emit_predefined(tok, name) {
                         i += 1;
                         continue;
@@ -1746,6 +1782,62 @@ fn at_beginning_of_line(tokens: &[Token], i: usize) -> bool {
         return true;
     }
     matches!(tokens[i - 1].kind, TokenKind::Newline)
+}
+
+/// Return the index after a balanced `__attribute__((...))` or
+/// `__declspec(...)` group. GNU attributes require their characteristic
+/// double parenthesis so an unrelated identifier call is not discarded.
+fn attribute_group_end(tokens: &[Token], start: usize) -> Option<usize> {
+    let name = match tokens.get(start).map(|tok| &tok.kind) {
+        Some(TokenKind::Identifier(name)) if name == "__attribute__" || name == "__declspec" => {
+            name.as_str()
+        }
+        _ => return None,
+    };
+    let mut open = start + 1;
+    while matches!(
+        tokens.get(open).map(|tok| &tok.kind),
+        Some(TokenKind::Newline)
+    ) {
+        open += 1;
+    }
+    if !matches!(
+        tokens.get(open).map(|tok| &tok.kind),
+        Some(TokenKind::Punct("("))
+    ) {
+        return None;
+    }
+    if name == "__attribute__" {
+        let mut inner = open + 1;
+        while matches!(
+            tokens.get(inner).map(|tok| &tok.kind),
+            Some(TokenKind::Newline)
+        ) {
+            inner += 1;
+        }
+        if !matches!(
+            tokens.get(inner).map(|tok| &tok.kind),
+            Some(TokenKind::Punct("("))
+        ) {
+            return None;
+        }
+    }
+
+    let mut depth = 0usize;
+    for (offset, tok) in tokens.iter().enumerate().skip(open) {
+        match tok.kind {
+            TokenKind::Punct("(") => depth += 1,
+            TokenKind::Punct(")") => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(offset + 1);
+                }
+            }
+            TokenKind::Eof => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Advance to the end of the current directive line, leaving `i` on the
@@ -6891,5 +6983,44 @@ int from_late;
             cached.output
         );
         assert!(cached.output.contains("common_decl"), "{:?}", cached.output);
+    }
+
+    #[test]
+    fn attribute_group_fixture_preserves_declarations_and_source_lines() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/preproc/attribute_groups.c");
+        let mut opts = PreprocessOptions::new();
+        opts.track_line_map = true;
+        let result = preprocess_file(&path, &opts).unwrap();
+
+        assert!(
+            !result.output.contains("__attribute__"),
+            "{}",
+            result.output
+        );
+        assert!(!result.output.contains("__declspec"), "{}", result.output);
+        for declaration in [
+            "const int before_type",
+            "const int after_declarator",
+            "int msvc_aligned",
+            "int trace_log",
+            "void stop_now(void)",
+        ] {
+            assert!(
+                result.output.contains(declaration),
+                "missing {declaration:?} from {}",
+                result.output
+            );
+        }
+        let stop_now = lookup_at(&result, "stop_now");
+        assert_eq!(stop_now.line, 8, "{:?}", result.line_map);
+    }
+
+    #[test]
+    fn unterminated_attribute_group_is_emitted_without_swallowing_later_code() {
+        let source = "int broken __attribute__((used) value;\nint still_here;\n";
+        let result = preprocess_string(source, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(result.output.contains("__attribute__"), "{}", result.output);
+        assert!(result.output.contains("still_here"), "{}", result.output);
     }
 }

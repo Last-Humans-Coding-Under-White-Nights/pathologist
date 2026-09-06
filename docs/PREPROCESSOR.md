@@ -57,6 +57,7 @@ flowchart LR
 | `#line` | Location tracking in `LineMap` |
 | `#undef` | |
 | Predefined | `__FILE__`, `__LINE__` — inside a macro body `__LINE__` is the line of the (outermost) invocation, C11 6.10.8.1, and both work in object-like as well as function-like bodies; builtin fallback macros for headers the indexed tree does not ship (see [Builtin fallback macros](#builtin-fallback-macros)) |
+| Compiler attribute groups | Balanced `__attribute__((...))` and `__declspec(...)` groups are elided after macro expansion, including before a type, after a declarator, and on a function definition. This is parse-report hygiene: attributes do not add call-graph facts, while trailing GNU attributes can make tree-sitter reject an otherwise useful declaration. Newlines inside an elided group are retained so source-line mapping does not drift; an unterminated group is emitted unchanged instead of swallowing the rest of the file. |
 | Token spacing | No space before `)` / `]`; space between `>` and `&` / `*` so `operator()` and `shared_ptr<T> &p` survive re-lexing |
 
 ### P1 (planned)
