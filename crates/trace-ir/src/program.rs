@@ -51,6 +51,18 @@ pub struct Diagnostic {
     pub stage: String,
 }
 
+/// A templated C++ base as written on a derived class.
+///
+/// `declaration_scope` is kept separately because an unqualified template
+/// argument is resolved where the derived class is declared, not relative to
+/// the namespace that qualifies the template itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateBase {
+    pub derived: String,
+    pub spelling: String,
+    pub declaration_scope: String,
+}
+
 /// Cross-unit deduplication state used by the merge stage: entities whose
 /// origin (header file + position) was already merged map to the first copy.
 #[derive(Debug, Clone, Default)]
@@ -110,6 +122,13 @@ pub struct Program {
     /// (`ns::Cls`). Populated at lowering, consumed post-merge by virtual
     /// dispatch expansion.
     pub inheritance: Vec<(String, String)>,
+    /// C++ template-base facts, including their declaration namespace.
+    ///
+    /// The ordinary inheritance graph stores the bare template name for CHA
+    /// (for example, `IRemoteStub`), while consumers that understand a
+    /// particular template can inspect the preserved spelling
+    /// (`IRemoteStub<IFoo>`).
+    pub template_bases: Vec<TemplateBase>,
     /// Classes declared `final` — CHA does not walk into their subclasses.
     pub final_classes: Vec<String>,
 }
@@ -131,6 +150,29 @@ impl Program {
         if !self.inheritance.contains(&edge) {
             self.inheritance.push(edge);
         }
+    }
+
+    /// Preserve a templated base-class spelling once.
+    pub fn add_template_base(&mut self, derived: &str, base: &str, declaration_scope: &str) {
+        if derived.is_empty() || base.is_empty() {
+            return;
+        }
+        let fact = TemplateBase {
+            derived: derived.to_string(),
+            spelling: base.to_string(),
+            declaration_scope: declaration_scope.to_string(),
+        };
+        if !self.template_bases.contains(&fact) {
+            self.template_bases.push(fact);
+        }
+    }
+
+    /// Templated base-class facts declared directly on `cls`.
+    pub fn template_bases_of(&self, cls: &str) -> Vec<&TemplateBase> {
+        self.template_bases
+            .iter()
+            .filter(|fact| fact.derived == cls)
+            .collect()
     }
 
     /// Record that `cls` is a `final` class.

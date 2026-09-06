@@ -33,6 +33,7 @@ Each stage must remain independently testable.
 4. **IDs**: Use newtype IDs from `trace-ir` (`FnId`, `VarId`, etc.). Do not use raw integers in public APIs.
 5. **Internal linkage**: `static` functions are not in `fn_by_name`. Solver and `pag.expand_return_flows` must use `resolve_function_in_scope(name, Some(file))`, not external-only `resolve_function`.
 6. **Storage classes**: file-scope `static` → `FileStatic`; function-local `static` → `FnStatic` (see `storage_for` in `lower.rs`).
+7. **IPC detection (see `docs/IPC_ROADMAP.md`)**: Proxy/stub pairs are detected from class-name suffixes (`*Proxy`/`*Client` and `*Stub`) + `SendRequest` call presence; bridges match by interface + method-name correspondence. Detection is **pure** (reads `&Program`, returns `Vec<IpcBridge>`, no `Program` mutation, no control-flow/opcode analysis) and runs during PAG build; the solver injects a synthetic `CallGraphEdge` per bridge. Opcode-level analysis is deferred to IDL-aware v2.
 
 ## IR flow constraints (`trace-ir/src/flow.rs`)
 

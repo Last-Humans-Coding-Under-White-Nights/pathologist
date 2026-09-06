@@ -422,6 +422,88 @@ fn inspect_calls_matches_cpp_qualified_suffix() {
 }
 
 #[test]
+fn inspect_calls_file_filter_preserves_call_site_semantics() {
+    let bin = env!("CARGO_BIN_EXE_trace");
+    let db = build_and_export("static_direct_call");
+    {
+        let conn = open_db(&db).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, sha256) VALUES (999, '/defs/caller_only.c', 'caller')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE functions SET file_id = 999 WHERE name = 'caller'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let caller_only = Command::new(bin)
+        .args([
+            "inspect",
+            db.to_str().unwrap(),
+            "calls",
+            "--file",
+            "caller_only.c",
+        ])
+        .output()
+        .expect("inspect caller definition filter");
+    assert!(caller_only.status.success());
+    assert!(
+        caller_only.stdout.is_empty(),
+        "ordinary edges must not match only their caller definition file: {}",
+        String::from_utf8_lossy(&caller_only.stdout)
+    );
+
+    let call_site = Command::new(bin)
+        .args(["inspect", db.to_str().unwrap(), "calls", "--file", "main.c"])
+        .output()
+        .expect("inspect call-site filter");
+    assert!(call_site.status.success());
+    assert!(
+        String::from_utf8_lossy(&call_site.stdout).contains("caller"),
+        "ordinary edge should still match its call-site file"
+    );
+}
+
+#[test]
+fn inspect_calls_file_filter_uses_synthetic_caller_file() {
+    let bin = env!("CARGO_BIN_EXE_trace");
+    let db = build_and_export("ipc_basic");
+    {
+        let conn = open_db(&db).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, sha256) VALUES (999, '/defs/proxy_only.cpp', 'proxy')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE functions SET file_id = 999 WHERE name LIKE 'IFooProxy::%'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let output = Command::new(bin)
+        .args([
+            "inspect",
+            db.to_str().unwrap(),
+            "calls",
+            "--file",
+            "proxy_only.cpp",
+        ])
+        .output()
+        .expect("inspect synthetic caller filter");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("IFooProxy::GetInfo") && stdout.contains("(ipc)"),
+        "synthetic edge should match its caller definition file: {stdout}"
+    );
+}
+
+#[test]
 fn inspect_calls_like_wildcards_are_literal() {
     let bin = env!("CARGO_BIN_EXE_trace");
     let tmp = TempDb::new("trace_inspect_like.db");

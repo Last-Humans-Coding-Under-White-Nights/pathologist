@@ -17,6 +17,7 @@
         "edges_direct": {"cmp": "band", "value": 37427, "tol": 240},
         "edges_indirect": {"cmp": "exact", "value": 4643},
         "edges_external": {"cmp": "band", "value": 30100, "tol": 200},
+        "edges_ipc": {"cmp": "exact", "value": 0},
         "arg_flow_edges": {"cmp": "band", "value": 63471, "tol": 150},
         "diagnostics": {"cmp": "exact", "value": 1764},
         "dlsym_edges": {"cmp": "exact", "value": 4}
@@ -58,6 +59,7 @@
         "edges_direct": {"cmp": "band", "value": 7791, "tol": 160},
         "edges_indirect": {"cmp": "exact", "value": 24},
         "edges_external": {"cmp": "band", "value": 20472, "tol": 160},
+        "edges_ipc": {"cmp": "exact", "value": 14},
         "arg_flow_edges": {"cmp": "band", "value": 9243, "tol": 120},
         "diagnostics": {"cmp": "exact", "value": 2959},
         "dlsym_edges": {"cmp": "exact", "value": 1}
@@ -94,6 +96,7 @@
         "edges_direct": {"cmp": "band", "value": 19427, "tol": 420},
         "edges_indirect": {"cmp": "exact", "value": 109},
         "edges_external": {"cmp": "band", "value": 53600, "tol": 420},
+        "edges_ipc": {"cmp": "exact", "value": 2},
         "arg_flow_edges": {"cmp": "band", "value": 17245, "tol": 250},
         "diagnostics": {"cmp": "exact", "value": 4767},
         "dlsym_edges": {"cmp": "exact", "value": 0}

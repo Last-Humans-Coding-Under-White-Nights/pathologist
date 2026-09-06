@@ -7,6 +7,13 @@ use indexmap::{IndexMap, IndexSet};
 use rustc_hash::{FxHashMap, FxHashSet};
 use trace_ir::{CallSiteId, FnId, LocId, PagNodeId, Program, StorageClass, VarId};
 
+/// Sentinel `CallSiteId` used for synthetic IPC bridge call edges. Real call
+/// sites are allocated sequentially from `0`; this value marks an edge that
+/// does not correspond to any single source-level call (the proxy method has
+/// only the opaque `SendRequest` call site), so exporters/consumers can
+/// distinguish it and must not join it to a real `CallSite`.
+pub const SYNTHETIC_CALL_SITE: CallSiteId = CallSiteId(u32::MAX);
+
 #[derive(Debug, Clone)]
 pub struct AnalyzeOptions {
     /// Retain full points-to sets on the result (for `--debug-points-to` export).
@@ -17,6 +24,9 @@ pub struct AnalyzeOptions {
     /// Solver pop budget (None = unlimited). Override via
     /// `TRACE_SOLVE_BUDGET_POPS=<n>` env var; =0 restores unlimited.
     pub solve_budget: Option<u64>,
+    /// Emit synthetic IPC proxy→stub bridge edges (detected from class-name
+    /// patterns). Disable to keep the call graph free of synthetic edges.
+    pub enable_ipc: bool,
 }
 
 impl Default for AnalyzeOptions {
@@ -25,6 +35,7 @@ impl Default for AnalyzeOptions {
             retain_points_to: false,
             models: std::sync::Arc::new(FnModelSet::builtin()),
             solve_budget: Some(800_000),
+            enable_ipc: true,
         }
     }
 }
@@ -45,7 +56,7 @@ pub fn analyze(program: &Program) -> (Pag, AnalysisResult) {
 }
 
 pub fn analyze_with_options(program: &Program, opts: AnalyzeOptions) -> (Pag, AnalysisResult) {
-    let mut pag = Pag::build_with_models(program, &opts.models);
+    let mut pag = Pag::build_with_models_and_ipc(program, &opts.models, opts.enable_ipc);
     let mut result = solve(
         &mut pag,
         program,
@@ -768,6 +779,31 @@ fn solve(
         }
     }
 
+    // Emit synthetic call edges for IPC proxy→stub bridges detected at PAG
+    // build. These connect the proxy method to the stub handler it would
+    // dispatch to across the (opaque) Binder boundary. The resolution is
+    // marked `IpcBridge` (distinct from a source-level direct call). Edges
+    // may target external interface methods when the stub delegates to an
+    // inherited pure-virtual; these are still emitted for call graph
+    // completeness.
+    for bridge in &pag.ipc_bridges {
+        let callee = bridge.stub_handler;
+        call_edges.push(CallGraphEdge {
+            call_site: SYNTHETIC_CALL_SITE,
+            caller: bridge.proxy_method,
+            callee,
+            resolution: ResolutionKind::IpcBridge,
+        });
+    }
+    if std::env::var("TRACE_DEBUG_IPC").is_ok() {
+        for bridge in &pag.ipc_bridges {
+            let caller = program.symbols.function(bridge.proxy_method).name.clone();
+            let callee = program.symbols.function(bridge.stub_handler).name.clone();
+            eprintln!("[ipc] bridge: {caller}  -->  {callee}");
+        }
+        eprintln!("[ipc] total bridges: {}", pag.ipc_bridges.len());
+    }
+
     let points_to = if retain_points_to {
         st.pts.into_iter().collect()
     } else {
@@ -1219,6 +1255,11 @@ fn extract_arg_flow(
     result: &mut AnalysisResult,
 ) {
     for edge in call_edges {
+        // Synthetic edges (IPC bridges) have no source-level call site and no
+        // argument wiring in v1; skip them here.
+        if edge.call_site == SYNTHETIC_CALL_SITE {
+            continue;
+        }
         let cs = program
             .symbols
             .call_sites

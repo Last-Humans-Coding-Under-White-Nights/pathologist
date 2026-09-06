@@ -156,24 +156,32 @@ type Adjacency = FxHashMap<i64, Vec<(i64, &'static str, String)>>;
 
 fn load_call_adjacency(conn: &Connection, dir: Direction) -> Result<Adjacency> {
     let mut stmt = conn.prepare(
-        "SELECT cs.caller_fn_id, ce.callee_fn_id, ce.resolution, p.path, cs.line \
+        "SELECT ce.caller_fn_id, ce.callee_fn_id, ce.resolution, p.path, cs.line \
          FROM call_edges ce \
-         JOIN call_sites cs ON cs.id = ce.call_site_id \
-         JOIN files p ON p.id = cs.file_id",
+         LEFT JOIN call_sites cs ON cs.id = ce.call_site_id \
+         LEFT JOIN files p ON p.id = cs.file_id",
     )?;
     let mut adj: Adjacency = FxHashMap::default();
     let rows = stmt.query_map([], |row| {
+        // Synthetic edges (IPC bridges) have no call site; render them with a
+        // placeholder location rather than mis-attributing a real call site.
+        let path: Option<String> = row.get(3)?;
+        let line: Option<i64> = row.get(4)?;
+        let site = match (&path, line) {
+            (Some(p), Some(l)) => {
+                format!("{}:{}", p.rsplit('/').next().unwrap_or(p), l)
+            }
+            _ => "(ipc bridge)".to_string(),
+        };
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
+            site,
         ))
     })?;
     for r in rows {
-        let (caller, callee, resolution, path, line) = r?;
-        let site = format!("{}:{}", path.rsplit('/').next().unwrap_or(&path), line);
+        let (caller, callee, resolution, site) = r?;
         match dir {
             Direction::Down => {
                 adj.entry(caller)
@@ -196,6 +204,7 @@ fn leak_resolution(resolution: &str) -> &'static str {
         "indirect" => "indirect",
         "ambiguous" => "ambiguous",
         "external" => "external",
+        "ipc" => "ipc",
         _ => "call",
     }
 }
@@ -218,6 +227,17 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(n != 0)
 }
 
+/// Require the schema-v3 caller column used by synthetic call edges.
+pub fn require_call_edge_caller(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "call_edges", "caller_fn_id")? {
+        bail!(
+            "`call_edges.caller_fn_id` missing: database predates synthetic call-edge export; \
+             re-run `trace analyze` with this binary"
+        );
+    }
+    Ok(())
+}
+
 fn require_flow_tables(conn: &Connection) -> Result<()> {
     for t in ["flow_nodes", "flow_edges"] {
         if !table_exists(conn, t)? {
@@ -238,6 +258,7 @@ pub fn call_graph(
     dir: Direction,
     max_depth: u32,
 ) -> Result<QueryGraph> {
+    require_call_edge_caller(conn)?;
     let labels = load_function_labels(conn)?;
     if !labels.contains_key(&root_fn_id) {
         bail!("function id {root_fn_id} not found in database");
@@ -664,12 +685,12 @@ pub fn require_symbols_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::SCHEMA_V2;
+    use crate::schema::SCHEMA_V3;
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
         // files: 1 = /proj/main.c
         conn.execute(
             "INSERT INTO files (id, path, sha256) VALUES (1, '/proj/main.c', '')",
@@ -701,12 +722,12 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO call_edges (id, call_site_id, callee_fn_id, resolution) VALUES (200, 100, 11, 'direct')",
+            "INSERT INTO call_edges (id, call_site_id, caller_fn_id, callee_fn_id, resolution) VALUES (200, 100, 10, 11, 'direct')",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO call_edges (id, call_site_id, callee_fn_id, resolution) VALUES (201, 101, 12, 'external')",
+            "INSERT INTO call_edges (id, call_site_id, caller_fn_id, callee_fn_id, resolution) VALUES (201, 101, 11, 12, 'external')",
             [],
         )
         .unwrap();
@@ -828,7 +849,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO call_edges (id, call_site_id, callee_fn_id, resolution) VALUES (202, 102, 10, 'direct')",
+            "INSERT INTO call_edges (id, call_site_id, caller_fn_id, callee_fn_id, resolution) VALUES (202, 102, 11, 10, 'direct')",
             [],
         )
         .unwrap();
@@ -929,12 +950,12 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO call_edges (id, call_site_id, callee_fn_id, resolution) VALUES (203, 103, 14, 'direct')",
+            "INSERT INTO call_edges (id, call_site_id, caller_fn_id, callee_fn_id, resolution) VALUES (203, 103, 13, 14, 'direct')",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO call_edges (id, call_site_id, callee_fn_id, resolution) VALUES (204, 104, 13, 'direct')",
+            "INSERT INTO call_edges (id, call_site_id, caller_fn_id, callee_fn_id, resolution) VALUES (204, 104, 14, 13, 'direct')",
             [],
         )
         .unwrap();
@@ -1023,6 +1044,16 @@ mod tests {
 
         let err = find_symbols_at(&conn, "main.c", 12, 9).unwrap_err();
         assert!(err.to_string().contains("variables.col"), "{err}");
+        assert!(err.to_string().contains("re-run"), "{err}");
+
+        conn.execute_batch(
+            "CREATE TABLE call_edges ( \
+                id INTEGER PRIMARY KEY, call_site_id INTEGER, \
+                callee_fn_id INTEGER NOT NULL, resolution TEXT NOT NULL );",
+        )
+        .unwrap();
+        let err = require_call_edge_caller(&conn).unwrap_err();
+        assert!(err.to_string().contains("call_edges.caller_fn_id"), "{err}");
         assert!(err.to_string().contains("re-run"), "{err}");
 
         let orphan = SymbolRef {

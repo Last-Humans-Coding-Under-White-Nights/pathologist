@@ -58,6 +58,7 @@ trace analyze [OPTIONS] <TARGET>
 | `--full-export` | Export full IR detail: all types, all variables, PAG `locations`. Slower and produces a larger database. |
 | `--debug-points-to` | Retain points-to sets during analysis and export the `points_to` debug table (requires PAG in memory). Implies keeping location data needed for export. |
 | `--models <FILE>` | Load a TOML function-model file (interprocedural summaries for bodyless callees, e.g. `memcpy_s`). Repeatable; later files override earlier entries and built-ins. See `docs/ANALYSIS.md`. |
+| `--no-ipc` | Disable IPC proxy→stub bridge edge detection (enabled by default). Bridge edges are synthetic (`resolution = 'ipc'`, `call_site_id = NULL`) and connect a `*Proxy*` method to its `*Stub*` handler across the opaque Binder boundary. See `docs/IPC_ROADMAP.md`. |
 
 **Progress output** (stderr):
 
@@ -111,8 +112,9 @@ trace inspect <DB> calls [--from FN] [--to FN] [--file SUBSTR]
 
 Edges print as `caller (file:line) -> callee [deffile] (resolution)` — the
 `[deffile]` bracket distinguishes same-name (e.g. `static`) functions defined
-in different files; `--file` filters edges whose caller or callee file path
-contains the substring.
+in different files; `--file` filters ordinary edges by call-site or callee
+file. A synthetic edge has no call site, so its caller definition file is used
+instead.
 ```
 
 | Option | Description |
@@ -120,6 +122,7 @@ contains the substring.
 | `<DB>` | Path to SQLite file produced by `trace analyze`. |
 | `--from <FN>` | Filter edges where the **caller** name equals `FN` or ends with `::FN` (C++ qualified methods). `_` and `%` in `FN` are literal, not `LIKE` wildcards. |
 | `--to <FN>` | Filter edges where the **callee** name equals `FN` or ends with `::FN`. Same escaping as `--from`. |
+| `--file <SUBSTR>` | Filter ordinary edges by call-site or callee file; synthetic edges by caller or callee definition file. |
 
 Both filters may be combined. Output format:
 
@@ -335,14 +338,14 @@ So unresolved indirect sites (e.g. `sbuf->impl->readBuffer` before a fix) still 
 
 ## SQLite database schema
 
-Schema version: **v2**. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed.
+Schema version: **v3**. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed.
 
 ### Entity relationship (overview)
 
 ```text
 analysis_run
-files ─┬─ functions ─┬─ call_sites ─┬─ call_edges → functions (callee)
-       │             │              └─ arg_flow_edges → variables
+files ─┬─ functions ─┬─ call_sites ─ arg_flow_edges → variables
+       │             └─ call_edges → functions (caller and callee)
        └─ variables ─ flow_nodes ─ flow_edges → flow_nodes
                     (fn_id → functions, type_id → types)
 types
@@ -359,7 +362,7 @@ Metadata for one `trace analyze` invocation.
 |--------|------|-------------|
 | `id` | INTEGER PK | Run id (always `1` per file). |
 | `trace_version` | TEXT | Full binary identity: package version, source revision, dirty state, and build date. |
-| `schema_version` | INTEGER | Database layout version (currently `2`). |
+| `schema_version` | INTEGER | Database layout version (currently `3`). |
 | `target_root` | TEXT | Absolute or normalized `<TARGET>` path. |
 | `created_at` | TEXT | Unix timestamp (seconds). |
 | `options_json` | TEXT | JSON: `include_paths`, `defines`, `include_points_to`, `full_detail`. |
@@ -408,9 +411,10 @@ Resolved caller → callee edges (one row per target; indirect sites may have mu
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INTEGER PK | Edge id. |
-| `call_site_id` | INTEGER FK → `call_sites` | Call site this edge resolves. |
+| `call_site_id` | INTEGER FK → `call_sites` | Call site this edge resolves; `NULL` for synthetic IPC bridge edges. |
+| `caller_fn_id` | INTEGER FK → `functions` | Resolved caller function. |
 | `callee_fn_id` | INTEGER FK → `functions` | Resolved target function. |
-| `resolution` | TEXT | `direct`, `indirect`, `ambiguous`, or `external` (statically resolved but bodyless under the analyzed root). |
+| `resolution` | TEXT | `direct`, `indirect`, `ambiguous`, `external` (statically resolved but bodyless under the analyzed root), or `ipc` (synthetic proxy→stub bridge edge — no source call site, caller is the proxy method). |
 
 **Indexes:** `call_edges(callee_fn_id)`, `call_edges(call_site_id)`.
 
@@ -529,8 +533,8 @@ including translation unit); one row per distinct `(file, line, message)`.
 ```sql
 SELECT callee.name, ce.resolution, cs.line, cs.callee_text
 FROM call_edges ce
-JOIN call_sites cs ON cs.id = ce.call_site_id
-JOIN functions caller ON caller.id = cs.caller_fn_id
+LEFT JOIN call_sites cs ON cs.id = ce.call_site_id
+JOIN functions caller ON caller.id = ce.caller_fn_id
 JOIN functions callee ON callee.id = ce.callee_fn_id
 WHERE caller.name = 'HdfSbufReadBuffer';
 ```
@@ -552,7 +556,7 @@ ORDER BY caller.name, cs.line;
 SELECT caller.name, callee.name, cs.line
 FROM call_edges ce
 JOIN call_sites cs ON cs.id = ce.call_site_id
-JOIN functions caller ON caller.id = cs.caller_fn_id
+JOIN functions caller ON caller.id = ce.caller_fn_id
 JOIN functions callee ON callee.id = ce.callee_fn_id
 WHERE ce.resolution = 'indirect'
   AND cs.callee_text LIKE '%readBuffer%';
@@ -563,8 +567,8 @@ WHERE ce.resolution = 'indirect'
 ```sql
 SELECT caller.name, ce.resolution, cs.line
 FROM call_edges ce
-JOIN call_sites cs ON cs.id = ce.call_site_id
-JOIN functions caller ON caller.id = cs.caller_fn_id
+LEFT JOIN call_sites cs ON cs.id = ce.call_site_id
+JOIN functions caller ON caller.id = ce.caller_fn_id
 JOIN functions callee ON callee.id = ce.callee_fn_id
 WHERE callee.name = 'LiteNetSetIpAddr';
 ```

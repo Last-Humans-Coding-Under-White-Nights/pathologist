@@ -48,6 +48,9 @@ enum Commands {
         /// Include points-to debug table in output (also retains points-to in memory during analysis).
         #[arg(long)]
         debug_points_to: bool,
+        /// Disable IPC proxy/stub bridge edge detection (enabled by default).
+        #[arg(long)]
+        no_ipc: bool,
         /// Export full IR detail (types, all variables, PAG locations). Default: call graph + arg-flow only.
         #[arg(long)]
         full_export: bool,
@@ -76,8 +79,8 @@ enum InspectCommands {
         /// Filter edges whose callee name equals FN or ends with `::FN`.
         #[arg(long)]
         to: Option<String>,
-        /// Only edges whose caller or callee file path contains this substring
-        /// (disambiguates same-name functions defined in different files).
+        /// Only edges whose call-site or callee file path contains this substring.
+        /// For a synthetic edge with no call site, match its caller definition file.
         #[arg(long)]
         file: Option<String>,
     },
@@ -160,6 +163,7 @@ fn main() -> Result<()> {
             debug_points_to,
             full_export,
             models,
+            no_ipc,
         } => run_analyze(
             target,
             output,
@@ -170,6 +174,7 @@ fn main() -> Result<()> {
             debug_points_to,
             full_export,
             models,
+            no_ipc,
         ),
         Commands::Inspect { db, command } => run_inspect(db, command),
     }
@@ -186,6 +191,7 @@ fn run_analyze(
     debug_points_to: bool,
     full_export: bool,
     model_files: Vec<PathBuf>,
+    no_ipc: bool,
 ) -> Result<()> {
     if let Some(secs) = timeout_secs {
         std::thread::spawn(move || {
@@ -276,6 +282,7 @@ fn run_analyze(
             retain_points_to: debug_points_to,
             models,
             solve_budget: Some(800_000),
+            enable_ipc: !no_ipc,
         },
     );
     let indirect = analysis
@@ -312,6 +319,7 @@ fn run_analyze(
     let mut direct_edges = 0usize;
     let mut indirect_edges = 0usize;
     let mut external_edges = 0usize;
+    let mut ipc_edges = 0usize;
     for e in &analysis.call_edges {
         match e.resolution {
             // Ambiguous groups with direct in the summary: both are
@@ -322,10 +330,11 @@ fn run_analyze(
             }
             trace_analysis::ResolutionKind::Indirect => indirect_edges += 1,
             trace_analysis::ResolutionKind::External => external_edges += 1,
+            trace_analysis::ResolutionKind::IpcBridge => ipc_edges += 1,
         }
     }
     eprintln!(
-        "analysis complete: {} functions ({} external), {} call edges ({} direct, {} indirect, {} external), {} arg-flow edges -> {}",
+        "analysis complete: {} functions ({} external), {} call edges ({} direct, {} indirect, {} external, {} ipc), {} arg-flow edges -> {}",
         program.symbols.functions.len(),
         program
             .symbols
@@ -337,6 +346,7 @@ fn run_analyze(
         direct_edges,
         indirect_edges,
         external_edges,
+        ipc_edges,
         analysis.arg_flow_edges.len(),
         output.display()
     );
@@ -373,12 +383,14 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
     let conn = open_db(&db)?;
     match command {
         InspectCommands::Calls { from, to, file } => {
+            trace_db::require_call_edge_caller(&conn)?;
             let mut sql = String::from(
                 "SELECT caller.name, csf.path, cs.line, callee.name, callee_f.path, ce.resolution \
                  FROM call_edges ce \
-                 JOIN call_sites cs ON cs.id = ce.call_site_id \
-                 JOIN functions caller ON caller.id = cs.caller_fn_id \
-                 JOIN files csf ON csf.id = cs.file_id \
+                 LEFT JOIN call_sites cs ON cs.id = ce.call_site_id \
+                 LEFT JOIN files csf ON csf.id = cs.file_id \
+                 JOIN functions caller ON caller.id = ce.caller_fn_id \
+                 JOIN files caller_f ON caller_f.id = caller.file_id \
                  JOIN functions callee ON callee.id = ce.callee_fn_id \
                  JOIN files callee_f ON callee_f.id = callee.file_id WHERE 1=1",
             );
@@ -393,19 +405,24 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
                 params.push(format!("%{}%", like_escape(p)));
                 let n = params.len();
                 sql.push_str(&format!(
-                    " AND (csf.path LIKE ?{n} ESCAPE '!' OR callee_f.path LIKE ?{n} ESCAPE '!')"
+                    " AND (csf.path LIKE ?{n} ESCAPE '!' OR callee_f.path LIKE ?{n} ESCAPE '!' OR (ce.call_site_id IS NULL AND caller_f.path LIKE ?{n} ESCAPE '!'))"
                 ));
             }
-            sql.push_str(" ORDER BY csf.path, cs.line");
+            // Sort real call sites first; synthetic (IPC bridge) edges have a
+            // NULL path/line so SQLite would otherwise sort them to the top.
+            sql.push_str(
+                " ORDER BY CASE WHEN csf.path IS NULL THEN 1 ELSE 0 END, csf.path, cs.line",
+            );
             fn basename(p: &str) -> &str {
                 p.rsplit('/').next().unwrap_or(p)
             }
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                let line: Option<i64> = row.get(2)?;
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(1)?,
+                    line,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
@@ -413,11 +430,15 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             })?;
             for row in rows {
                 let (caller, cfile, line, callee, efile, res) = row?;
-                println!(
-                    "{caller} ({}:{line}) -> {callee} [{}] ({res})",
-                    basename(&cfile),
-                    basename(&efile)
-                );
+                match (cfile, line) {
+                    (Some(cf), Some(l)) => println!(
+                        "{caller} ({}:{l}) -> {callee} [{}] ({res})",
+                        basename(&cf),
+                        basename(&efile)
+                    ),
+                    // Synthetic IPC bridge edges have no source call site.
+                    _ => println!("{caller} -> {callee} [{}] ({res})", basename(&efile)),
+                }
             }
         }
         InspectCommands::Callgraph {

@@ -2,6 +2,7 @@
 
 mod flow;
 mod ids;
+pub mod ipc;
 mod paths;
 mod program;
 mod span;
@@ -10,6 +11,7 @@ mod types;
 
 pub use flow::*;
 pub use ids::*;
+pub use ipc::*;
 pub use paths::*;
 pub use program::*;
 pub use span::*;

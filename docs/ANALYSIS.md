@@ -22,6 +22,8 @@ flowchart TD
   Idx[SolverIndices]
   WL[Worklist fixpoint]
   CG[On-the-fly call edges]
+  IPC[IPC proxy/stub bridges]
+  OUT[AnalysisResult call edges]
   AF[arg_flow extraction]
 
   Flow --> PAG
@@ -29,6 +31,8 @@ flowchart TD
   PAG --> Idx --> WL
   WL --> CG
   CG --> WL
+  CG --> OUT
+  IPC --> OUT
   CG --> AF
 ```
 
@@ -182,10 +186,43 @@ A plain call whose definition lives in another TU is lowered with `is_direct = f
 ```rust
 pub struct AnalyzeOptions {
     pub retain_points_to: bool,  // CLI: --debug-points-to
+    pub enable_ipc: bool,        // CLI: enabled unless --no-ipc
+    // function models and solve budget omitted
 }
 ```
 
 When `retain_points_to` is false (default), points-to sets are discarded after solving to reduce memory.
+
+### OpenHarmony IPC bridges
+
+For an in-tree OpenHarmony proxy/stub pair, analysis adds a synthetic call
+edge from a proxy method that calls `SendRequest` to the corresponding stub
+handler. Classes are paired by their qualified `*Proxy`/`*Client` and `*Stub`
+names; methods match exactly, with `HandleX` and `XStub` handler fallbacks.
+For a stub with interface-only declarations, defined overrides in classes
+deriving from that stub are preferred; otherwise matching methods on the
+stub's transitive interface bases are retained, including default method
+bodies and bodyless declarations. Interface bases are recovered from both
+ordinary inheritance and the interface argument of an exact
+`IRemoteStub<IFoo>` base. An unqualified interface argument is resolved in the
+stub declaration namespace, independently of a qualified wrapper namespace;
+a relative qualified argument such as `api::IFoo` searches the declaration
+namespace and its enclosing namespaces, while only `::api::IFoo` forces global
+lookup. Bodyless methods are intentionally leaf targets when no implementation
+is indexed.
+The edge has resolution `ipc` and no source call site, and can be disabled
+with `--no-ipc`.
+Because v1 has no opcode or parcel-type information, overloaded handlers at
+the selected naming tier are all retained as a may-analysis result. With `m`
+proxy overloads and `n` handler overloads this deliberately emits the full
+`m × n` cross-product, so IPC edge counts can grow for overloaded interfaces.
+
+This is deliberately name-based and does not interpret transaction opcodes or
+control flow in `OnRemoteRequest`. Synthetic IPC edges are appended after the
+points-to fixpoint and do not feed the solver worklist. The analysis also does
+not model parcel argument or return-value flow. See
+[IPC_ROADMAP.md](IPC_ROADMAP.md) for the pattern study, validation targets, and
+limitations.
 
 ## Field sensitivity
 
@@ -700,12 +737,14 @@ Next slices (hiview-grounded): [docs/CPP_ROADMAP.md](CPP_ROADMAP.md).
   "Signature-guarded function-value propagation"): calls through cells whose
   declared fn-pointer arity mismatches the stored function are not reported.
   Sites whose only reachable "targets" arrived via such wrong-type flow now
-  report none (e.g. stub-side `super->X` calls behind the unmodeled IPC
+  report none (e.g. stub-side `super->X` calls behind an opaque IPC
   boundary in HDF — their baseline targets were cross-object pollution, not
   real resolutions).
-- **IPC / process boundaries are unmodeled**: `HdfRemoteServiceObtain`-style
-  registrations that hand a dispatcher to an external broker do not connect
-  client proxies to server-side handler objects.
+- **IPC / process boundaries are only partly modeled**: OpenHarmony
+  `SendRequest` proxy methods connect to same-tree, conventionally named stub
+  handlers through synthetic `ipc` call edges. Opcode dispatch, parcel flow,
+  cross-repository services, and `HdfRemoteServiceObtain`-style registrations
+  remain unmodeled.
 - **`memcpy` / `memmove`**: modeled through function models (see above);
   unmodeled copier names remain invisible.
 - Macro-generated identifiers may be skipped when classified as macro-like callees.

@@ -1,6 +1,6 @@
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
-pub const SCHEMA_V2: &str = r#"
+pub const SCHEMA_V3: &str = r#"
 CREATE TABLE IF NOT EXISTS analysis_run (
     id INTEGER PRIMARY KEY,
     trace_version TEXT NOT NULL,
@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS call_sites (
 
 CREATE TABLE IF NOT EXISTS call_edges (
     id INTEGER PRIMARY KEY,
-    call_site_id INTEGER NOT NULL REFERENCES call_sites(id),
+    call_site_id INTEGER REFERENCES call_sites(id),
+    caller_fn_id INTEGER NOT NULL REFERENCES functions(id),
     callee_fn_id INTEGER NOT NULL REFERENCES functions(id),
     resolution TEXT NOT NULL
 );
@@ -95,6 +96,7 @@ CREATE TABLE IF NOT EXISTS diagnostics (
 );
 
 CREATE INDEX IF NOT EXISTS idx_call_edges_callee ON call_edges(callee_fn_id);
+CREATE INDEX IF NOT EXISTS idx_call_edges_caller ON call_edges(caller_fn_id);
 CREATE INDEX IF NOT EXISTS idx_call_edges_callsite ON call_edges(call_site_id);
 CREATE INDEX IF NOT EXISTS idx_arg_flow_callsite ON arg_flow_edges(call_site_id);
 CREATE INDEX IF NOT EXISTS idx_functions_name ON functions(name);

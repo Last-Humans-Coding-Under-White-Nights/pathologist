@@ -86,8 +86,9 @@ trace inspect <DB> calls [--from FN] [--to FN] [--file SUBSTR]
 - `--from`/`--to` match **exactly** or by C++ qualified suffix
   (`--from OnEventProxy` matches `ns::Plugin::OnEventProxy`). `_` and `%` are
   literal, not LIKE wildcards.
-- `--file` keeps edges whose caller **or** callee file path contains the
-  substring (disambiguates same-name `static` functions in different files).
+- `--file` keeps ordinary edges whose call-site or callee file path contains
+  the substring. Synthetic edges have no call site, so their caller definition
+  file is used instead.
 
 Line format:
 
@@ -291,7 +292,7 @@ the DB directly. Default (minimal) export contains:
 | `analysis_run`, `files` | Runs; `files(id, path, sha256)`. |
 | `functions` | `id, name, file_id, line_start, line_end, linkage, signature, is_defined` (external linkage included). |
 | `call_sites` | `id, caller_fn_id, file_id, line, col, callee_text, is_direct`. Every *resolved* site plus every *indirect* site (resolved or not) — direct-without-argflow and fully resolved direct sites with no arg flow may be filtered out (call site export filter). |
-| `call_edges` | `id, call_site_id, callee_fn_id, resolution` (`direct`/`indirect`/`ambiguous`/`external`). Reaches the callee via `JOIN call_sites ON call_edges.call_site_id = call_sites.id` — there is no `caller_id` column. |
+| `call_edges` | `id, call_site_id, caller_fn_id, callee_fn_id, resolution` (`direct`/`indirect`/`ambiguous`/`external`/`ipc`). `call_site_id` is `NULL` for synthetic IPC bridges; always read the caller from `caller_fn_id`. |
 | `arg_flow_edges` | `id, call_site_id, arg_index, actual_var_id, actual_fn_id, formal_var_id`. `actual_fn_id` is set when the actual is a function pointer (fn-ptr arg flow), else `actual_var_id`. |
 | `flow_nodes`, `flow_edges` | PAG value-flow graph backing `dataflow` (`flow_nodes.kind`: `var`/`loc`/`call_target`/`terminator`; `flow_edges.kind`: `copy`/`addr_of`/`load`/`store`/`gep`/`dlsym`/`points_to`/`call_arg`/`terminates`). |
 | `variables`, `locations`, `types`, `points_to`, `diagnostics` | `variables` full / PAG-referenced in minimal; `locations`/`types` only with `--full-export`; `points_to` only with `--debug-points-to`; `diagnostics` always. |
@@ -308,13 +309,13 @@ ORDER BY caller.name, cs.line;
 -- Transitive callees of fn named 'dispatch_table' (recursive CTE closure)
 WITH RECURSIVE cal(id) AS (
   SELECT DISTINCT ce.callee_fn_id
-  FROM call_edges ce JOIN call_sites cs ON cs.id = ce.call_site_id
-  JOIN functions f ON f.id = cs.caller_fn_id
+  FROM call_edges ce
+  JOIN functions f ON f.id = ce.caller_fn_id
   WHERE f.name = 'dispatch_table'
   UNION
   SELECT DISTINCT ce.callee_fn_id
-  FROM call_edges ce JOIN call_sites cs ON cs.id = ce.call_site_id
-  JOIN cal c ON cs.caller_fn_id = c.id
+  FROM call_edges ce
+  JOIN cal c ON ce.caller_fn_id = c.id
 )
 SELECT cal.id, f.name FROM cal JOIN functions f ON f.id = cal.id ORDER BY cal.id;
 

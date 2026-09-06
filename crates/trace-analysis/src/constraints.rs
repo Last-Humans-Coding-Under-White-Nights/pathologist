@@ -29,6 +29,11 @@ pub enum ResolutionKind {
     /// analyzed root (libc, logging backends, vendor externs). Resolved to
     /// a synthesized bodyless entry — not an unresolved indirect site.
     External,
+    /// Synthetic edge injected for an IPC proxy→stub bridge. No source-level
+    /// call site (the proxy body only has an opaque `SendRequest` call); see
+    /// `SYNTHETIC_CALL_SITE`. Distinct from `Direct` so consumers can recognize
+    /// and optionally filter bridge edges.
+    IpcBridge,
 }
 
 #[derive(Debug, Clone)]

@@ -1,6 +1,6 @@
 # SQLite schema
 
-Schema version: **v2**
+Schema version: **v3**
 
 See also the [README](../README.md) for CLI flags that control what is exported.
 
@@ -40,8 +40,8 @@ Unresolved indirect calls therefore appear in `call_sites` with zero `call_edges
 
 ```text
 analysis_run
-files ─┬─ functions ─┬─ call_sites ─┬─ call_edges → functions (callee)
-       │             │              └─ arg_flow_edges → variables
+files ─┬─ functions ─┬─ call_sites ─ arg_flow_edges → variables
+       │             └─ call_edges → functions (caller and callee)
        ├─ variables ─ flow_nodes ─ flow_edges → flow_nodes
        └─ variables (type_id → types when exported)
 types
@@ -58,7 +58,7 @@ diagnostics
 |--------|------|-------------|
 | `id` | INTEGER PK | Run id |
 | `trace_version` | TEXT | Full binary identity: package version, source revision, dirty state, and build date |
-| `schema_version` | INTEGER | Database layout version (currently `2`) |
+| `schema_version` | INTEGER | Database layout version (currently `3`) |
 | `target_root` | TEXT | Analyzed directory |
 | `created_at` | TEXT | Unix timestamp (seconds) |
 | `options_json` | TEXT | JSON: `include_paths`, `defines`, `include_points_to`, `full_detail` |
@@ -109,13 +109,23 @@ Call sites inside header-defined functions are deduplicated by
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INTEGER PK | Edge id |
-| `call_site_id` | INTEGER FK → `call_sites` | Call site |
+| `call_site_id` | INTEGER FK → `call_sites` | Call site; **`NULL` for synthetic edges** (see below) |
+| `caller_fn_id` | INTEGER FK → `functions` | Resolved caller function |
 | `callee_fn_id` | INTEGER FK → `functions` | Resolved target |
-| `resolution` | TEXT | `direct`, `indirect`, `ambiguous`, `external` (callee statically resolved but bodyless under the analyzed root — see `functions.is_defined`) |
+| `resolution` | TEXT | `direct`, `indirect`, `ambiguous`, `external` (callee statically resolved but bodyless under the analyzed root — see `functions.is_defined`), `ipc` (synthetic proxy→stub bridge edge) |
 
 Multiple rows per call site are allowed (may-analysis indirect targets).
 
-**Indexes:** `call_edges(callee_fn_id)`, `call_edges(call_site_id)`
+**Synthetic edges (IPC bridges):** edges injected for a proxy→stub bridge
+carry `call_site_id = NULL` and `resolution = 'ipc'` (there is no single
+source-level call site — the proxy body only has the opaque `SendRequest`
+call). Their caller is given by `caller_fn_id` (the proxy method); consumers
+must use `ce.caller_fn_id`, not `cs.caller_fn_id`, and treat `NULL` as a
+synthetic/bridge edge with no source location. IPC detection is enabled by
+default and disabled with the `--no-ipc` analyze flag.
+
+**Indexes:** `call_edges(caller_fn_id)`, `call_edges(callee_fn_id)`,
+`call_edges(call_site_id)`
 
 ### arg_flow_edges
 
@@ -249,8 +259,8 @@ in <path>`, `file_id` NULL). See `docs/PREPROCESSOR.md`, "Error recovery".
 ```sql
 SELECT callee.name, ce.resolution, cs.line, cs.callee_text
 FROM call_edges ce
-JOIN call_sites cs ON cs.id = ce.call_site_id
-JOIN functions caller ON caller.id = cs.caller_fn_id
+LEFT JOIN call_sites cs ON cs.id = ce.call_site_id
+JOIN functions caller ON caller.id = ce.caller_fn_id
 JOIN functions callee ON callee.id = ce.callee_fn_id
 WHERE caller.name = 'HdfSbufReadBuffer';
 ```
@@ -272,7 +282,7 @@ ORDER BY caller.name, cs.line;
 SELECT caller.name, callee.name, cs.callee_text, cs.line
 FROM call_edges ce
 JOIN call_sites cs ON cs.id = ce.call_site_id
-JOIN functions caller ON caller.id = cs.caller_fn_id
+JOIN functions caller ON caller.id = ce.caller_fn_id
 JOIN functions callee ON callee.id = ce.callee_fn_id
 WHERE ce.resolution = 'indirect';
 ```
@@ -282,8 +292,8 @@ WHERE ce.resolution = 'indirect';
 ```sql
 SELECT caller.name, ce.resolution, cs.line
 FROM call_edges ce
-JOIN call_sites cs ON cs.id = ce.call_site_id
-JOIN functions caller ON caller.id = cs.caller_fn_id
+LEFT JOIN call_sites cs ON cs.id = ce.call_site_id
+JOIN functions caller ON caller.id = ce.caller_fn_id
 JOIN functions callee ON callee.id = ce.callee_fn_id
 WHERE callee.name = 'LiteNetSetIpAddr';
 ```
@@ -318,9 +328,12 @@ trace inspect graph.db callgraph --file SUBSTR --line N [--depth N] [--direction
 trace inspect graph.db dataflow --file SUBSTR --line N --col C [--depth N] [--direction down|up]
 ```
 
-- `calls` lists rows from `call_edges` joined with `call_sites` / `functions`.
+- `calls` lists rows from `call_edges` joined with `functions` and left-joined
+  with `call_sites` (synthetic IPC edges have no call site).
   `--from` / `--to` match an exact `functions.name` or a C++ suffix (`%::FN`
   with `_`/`%` in `FN` escaped so they are not `LIKE` wildcards).
+  `--file` matches ordinary edges by call-site or callee file. For synthetic
+  edges it matches the caller or callee definition file.
   Unresolved indirect sites require SQL (query above).
 - `callgraph` finds the function whose `[line_start, line_end]` contains the
   given line and prints its transitive callees (`down`) or callers (`up`),

@@ -69,7 +69,7 @@ fn export_sqlite_roundtrip() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(versions, ("0.1.0 (test000 2026-09-02)".to_owned(), 2));
+    assert_eq!(versions, ("0.1.0 (test000 2026-09-02)".to_owned(), 3));
 }
 
 #[test]

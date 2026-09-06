@@ -136,8 +136,9 @@ def globals_from_db(db):
     out["edges_direct"] = edges.get("direct", 0)
     out["edges_indirect"] = edges.get("indirect", 0)
     out["edges_external"] = edges.get("external", 0)
+    out["edges_ipc"] = edges.get("ipc", 0)
     out["edges_unknown"] = {k: v for k, v in edges.items()
-                            if k not in ("direct", "indirect", "external")}
+                            if k not in ("direct", "indirect", "external", "ipc")}
     out["arg_flow_edges"] = cur.execute("SELECT COUNT(*) FROM arg_flow_edges").fetchone()[0]
     out["diagnostics"] = cur.execute("SELECT COUNT(*) FROM diagnostics").fetchone()[0]
     out["dlsym_edges"] = cur.execute(

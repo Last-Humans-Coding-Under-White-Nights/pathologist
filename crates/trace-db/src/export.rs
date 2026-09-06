@@ -1,4 +1,4 @@
-use crate::schema::{SCHEMA_V2, SCHEMA_VERSION};
+use crate::schema::{SCHEMA_V3, SCHEMA_VERSION};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use rustc_hash::FxHashSet;
@@ -53,7 +53,7 @@ pub fn export_to_sqlite(
             "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY;",
         )?;
         conn.execute_batch("BEGIN IMMEDIATE;")?;
-        conn.execute_batch(SCHEMA_V2)?;
+        conn.execute_batch(SCHEMA_V3)?;
 
         let options_json = serde_json::json!({
             "include_paths": program.include_paths,
@@ -501,7 +501,7 @@ fn export_call_sites_filtered(
 
 fn export_call_edges(conn: &Connection, analysis: &AnalysisResult) -> Result<()> {
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO call_edges (id, call_site_id, callee_fn_id, resolution) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO call_edges (id, call_site_id, caller_fn_id, callee_fn_id, resolution) VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
     for (i, edge) in analysis.call_edges.iter().enumerate() {
         let resolution = match edge.resolution {
@@ -509,10 +509,17 @@ fn export_call_edges(conn: &Connection, analysis: &AnalysisResult) -> Result<()>
             trace_analysis::ResolutionKind::Indirect => "indirect",
             trace_analysis::ResolutionKind::Ambiguous => "ambiguous",
             trace_analysis::ResolutionKind::External => "external",
+            trace_analysis::ResolutionKind::IpcBridge => "ipc",
         };
+        // Synthetic edges (e.g. IPC bridge injection) have no corresponding
+        // source-level call site; store NULL so consumers can distinguish them
+        // rather than mis-joining to a real call site.
+        let call_site_id: Option<i64> = (edge.call_site != trace_analysis::SYNTHETIC_CALL_SITE)
+            .then_some(edge.call_site.0 as i64);
         stmt.execute(params![
             i as i64 + 1,
-            edge.call_site.0,
+            call_site_id,
+            edge.caller.0,
             edge.callee.0,
             resolution
         ])?;
