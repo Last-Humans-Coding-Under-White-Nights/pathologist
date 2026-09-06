@@ -489,12 +489,28 @@ pub fn build_program_with_jobs(
         "preprocess: {} TUs (jobs={jobs})",
         file_order.len()
     ));
-    pool.install(|| {
-        file_order.par_iter().for_each(|path| {
-            let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
-            let _ = source_cache.get_or_preprocess(path, &include_graph, &discover_opts[&lang]);
-        });
-    });
+    // Sequential, deliberately, while every other phase runs on the pool.
+    //
+    // Discovery is the one pass that WRITES the shared expansion cache while
+    // reading it, and an expansion is not a pure function of (header, macro
+    // environment): its `files`, `ops` and nested-variant records are taken
+    // relative to what its includer had already included, so whichever unit
+    // reaches a header first decides that entry's content, and every later
+    // consumer inherits it. Run in parallel that choice is a thread race —
+    // camera moved over 20,299 / 20,326 / 20,847 direct edges across three
+    // runs of the same tree, and hiview mis-parsed `base/include/plugin.h`
+    // in some runs and not others, where `master` is bit-stable at every job
+    // count. Ordering the writes is what makes the result reproducible;
+    // content-addressing the entries does not, because the variation is in
+    // the content.
+    //
+    // The settle pass below reads a frozen cache and stays parallel, as does
+    // every phase after it, so the cost is one serial pass over the units
+    // (camera: ~+1s wall, and 208 rather than 285 units re-run).
+    for path in file_order.iter() {
+        let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
+        let _ = source_cache.get_or_preprocess(path, &include_graph, &discover_opts[&lang]);
+    }
     // A unit that matched every include it reached already has the text the
     // settle pass would build for it: its includes hit the same expansions
     // either way, and with nothing expanded it opened no cache frame, so
