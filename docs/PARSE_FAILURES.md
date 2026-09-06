@@ -298,9 +298,9 @@ Each entry is a translation unit or header indexed as its own file; reasons come
 
 | Line | Col | Node kind | Snippet |
 |-----:|----:|-----------|---------|
-| 1150 | 64 | `missing ;` | `` |
-| 1150 | 104 | `ERROR` | `=(` |
-| 1150 | 137 | `ERROR` | `)` |
+| 1147 | 64 | `missing ;` | `` |
+| 1147 | 104 | `ERROR` | `=(` |
+| 1147 | 137 | `ERROR` | `)` |
 
 #### `adapter/khdf/linux/model/usb/host/src/usb_pnp_notify.c`
 
@@ -358,9 +358,9 @@ Each entry is a translation unit or header indexed as its own file; reasons come
 
 | Line | Col | Node kind | Snippet |
 |-----:|----:|-----------|---------|
-| 480 | 69 | `missing ;` | `` |
-| 480 | 109 | `ERROR` | `=(` |
-| 480 | 147 | `ERROR` | `)` |
+| 479 | 69 | `missing ;` | `` |
+| 479 | 109 | `ERROR` | `=(` |
+| 479 | 147 | `ERROR` | `)` |
 
 #### `adapter/khdf/linux/platform/mipi_dsi/mipi_drm_adapter.c`
 
@@ -997,9 +997,9 @@ Each entry is a translation unit or header indexed as its own file; reasons come
 
 | Line | Col | Node kind | Snippet |
 |-----:|----:|-----------|---------|
-| 678 | 57 | `missing ;` | `` |
-| 678 | 97 | `ERROR` | `=(` |
-| 678 | 123 | `ERROR` | `)` |
+| 675 | 57 | `missing ;` | `` |
+| 675 | 97 | `ERROR` | `=(` |
+| 675 | 123 | `ERROR` | `)` |
 
 #### `framework/model/display/driver/panel/ili9881c_boe.c`
 
@@ -1007,9 +1007,9 @@ Each entry is a translation unit or header indexed as its own file; reasons come
 
 | Line | Col | Node kind | Snippet |
 |-----:|----:|-----------|---------|
-| 676 | 65 | `missing ;` | `` |
-| 676 | 105 | `ERROR` | `=(` |
-| 676 | 139 | `ERROR` | `)` |
+| 675 | 65 | `missing ;` | `` |
+| 675 | 105 | `ERROR` | `=(` |
+| 675 | 139 | `ERROR` | `)` |
 
 #### `framework/model/display/driver/panel/mipi_icn9700.c`
 
@@ -1275,9 +1275,9 @@ Each entry is a translation unit or header indexed as its own file; reasons come
 
 | Line | Col | Node kind | Snippet |
 |-----:|----:|-----------|---------|
-| 373 | 68 | `missing ;` | `` |
-| 373 | 108 | `ERROR` | `=(` |
-| 373 | 145 | `ERROR` | `)` |
+| 372 | 68 | `missing ;` | `` |
+| 372 | 108 | `ERROR` | `=(` |
+| 372 | 145 | `ERROR` | `)` |
 
 #### `framework/model/sensor/driver/magnetic/sensor_magnetic_driver.c`
 
@@ -1325,9 +1325,9 @@ Each entry is a translation unit or header indexed as its own file; reasons come
 
 | Line | Col | Node kind | Snippet |
 |-----:|----:|-----------|---------|
-| 375 | 71 | `missing ;` | `` |
-| 375 | 111 | `ERROR` | `=(` |
-| 375 | 151 | `ERROR` | `)` |
+| 372 | 71 | `missing ;` | `` |
+| 372 | 111 | `ERROR` | `=(` |
+| 372 | 151 | `ERROR` | `)` |
 
 #### `framework/sample/platform/uart/src/uart_sample.c`
 
@@ -1525,9 +1525,9 @@ Each entry is a translation unit or header indexed as its own file; reasons come
 
 | Line | Col | Node kind | Snippet |
 |-----:|----:|-----------|---------|
-| 500 | 58 | `missing ;` | `` |
-| 500 | 98 | `ERROR` | `=(` |
-| 500 | 125 | `ERROR` | `)` |
+| 498 | 58 | `missing ;` | `` |
+| 498 | 98 | `ERROR` | `=(` |
+| 498 | 125 | `ERROR` | `)` |
 
 #### `framework/test/unittest/platform/common/i3c_driver_test.c`
 
@@ -2064,16 +2064,16 @@ Each entry is a translation unit or header indexed as its own file; reasons come
 
 | Line | Col | Node kind | Snippet |
 |-----:|----:|-----------|---------|
-| 515 | 8 | `ERROR` | `template void RawDataBuilder` |
-| 516 | 84 | `ERROR` | `&` |
-| 517 | 8 | `ERROR` | `template void RawDataBuilder` |
-| 518 | 85 | `ERROR` | `&` |
-| 519 | 8 | `ERROR` | `template void RawDataBuilder` |
-| 520 | 81 | `ERROR` | `&` |
-| 521 | 8 | `ERROR` | `template RawDataBuilder& RawDataBuilder:: AppendValue< double>(const std:: string& , double) ;` |
-| 522 | 8 | `ERROR` | `template RawDataBuilder& RawDataBuilder:: AppendValue< std:: string>(const std:: string& , std:: string) ;` |
-| 523 | 8 | `ERROR` | `template RawDataBuilder& RawDataBuilder:: AppendValue< int64_t>(const std:: string& , int64_t) ;` |
-| 524 | 8 | `ERROR` | `template RawDataBuilder` |
+| 514 | 8 | `ERROR` | `template void RawDataBuilder` |
+| 515 | 84 | `ERROR` | `&` |
+| 516 | 8 | `ERROR` | `template void RawDataBuilder` |
+| 517 | 85 | `ERROR` | `&` |
+| 518 | 8 | `ERROR` | `template void RawDataBuilder` |
+| 519 | 81 | `ERROR` | `&` |
+| 520 | 8 | `ERROR` | `template RawDataBuilder& RawDataBuilder:: AppendValue< double>(const std:: string& , double) ;` |
+| 521 | 8 | `ERROR` | `template RawDataBuilder& RawDataBuilder:: AppendValue< std:: string>(const std:: string& , std:: string) ;` |
+| 522 | 8 | `ERROR` | `template RawDataBuilder& RawDataBuilder:: AppendValue< int64_t>(const std:: string& , int64_t) ;` |
+| 523 | 8 | `ERROR` | `template RawDataBuilder` |
 
 #### `base/event_store/include/sys_event_query.h`
 
@@ -2359,14 +2359,14 @@ Each entry is a translation unit or header indexed as its own file; reasons come
 | 26 | `frameworks/native/camera/test/unittest/framework_native/session/src/capture_session_unittest.cpp` | generic tree-sitter ERROR node(s) in preprocessed C++ | 1 |
 | 27 | `frameworks/native/ndk/impl/camera_manager_impl.cpp` | generic tree-sitter ERROR node(s) in preprocessed C++ | 8 |
 | 28 | `frameworks/native/ndk/impl/metadata_output_impl.cpp` | generic tree-sitter ERROR node(s) in preprocessed C++ | 1 |
-| 29 | `frameworks/taihe/include/camera_event_emitter_taihe.h` | generic tree-sitter ERROR node(s) in preprocessed C++ | 8 |
+| 29 | `frameworks/taihe/include/camera_event_emitter_taihe.h` | generic tree-sitter ERROR node(s) in preprocessed C++ | 4 |
 | 30 | `frameworks/taihe/src/camera_constructor_taihe.cpp` | generic tree-sitter ERROR node(s) in preprocessed C++ | 1 |
 | 31 | `frameworks/taihe/src/camera_picker_constructor_taihe.cpp` | generic tree-sitter ERROR node(s) in preprocessed C++ | 1 |
 | 32 | `interfaces/inner_api/native/camera/include/ability/camera_ability_builder.h` | generic tree-sitter ERROR node(s) in preprocessed C++ | 1 |
 | 33 | `interfaces/inner_api/native/camera/include/input/camera_manager.h` | tree-sitter-cpp node `missing type_identifier` at 1 site(s) | 1 |
 | 34 | `interfaces/inner_api/native/camera/include/input/i_standard_camera_listener.h` | generic tree-sitter ERROR node(s) in preprocessed C++ | 2 |
 | 35 | `interfaces/inner_api/native/camera/include/output/photo_output.h` | generic tree-sitter ERROR node(s) in preprocessed C++ | 3 |
-| 36 | `interfaces/kits/js/camera_napi/include/camera_napi_event_emitter.h` | generic tree-sitter ERROR node(s) in preprocessed C++ | 8 |
+| 36 | `interfaces/kits/js/camera_napi/include/camera_napi_event_emitter.h` | generic tree-sitter ERROR node(s) in preprocessed C++ | 4 |
 | 37 | `interfaces/kits/js/camera_napi/include/session/camera_napi_adaptor.h` | generic tree-sitter ERROR node(s) in preprocessed C++ | 5 |
 | 38 | `mediastream/test/unittest/filter/src/audio_encoder_filter_unit_test.cpp` | tree-sitter-cpp node `missing ;` at 2 site(s) | 2 |
 | 39 | `moviefile/include/movie_file/plugin/movie_file_video_filter_plugin.h` | tree-sitter-cpp node `missing field_identifier` at 1 site(s) | 1 |
@@ -2721,12 +2721,8 @@ Each entry is a translation unit or header indexed as its own file; reasons come
 |-----:|----:|-----------|---------|
 | 11 | 14 | `ERROR` | `T::` |
 | 12 | 14 | `ERROR` | `T::` |
-| 25 | 2 | `ERROR` | `(T*) this->*((` |
-| 25 | 48 | `ERROR` | `))(callbackName` |
-| 25 | 79 | `ERROR` | `)` |
-| 40 | 2 | `ERROR` | `(T*) this->*((` |
-| 40 | 51 | `ERROR` | `))(callbackName` |
-| 40 | 73 | `ERROR` | `)` |
+| 25 | 11 | `ERROR` | `->` |
+| 40 | 11 | `ERROR` | `->` |
 
 #### `frameworks/taihe/src/camera_constructor_taihe.cpp`
 
@@ -2787,12 +2783,8 @@ Each entry is a translation unit or header indexed as its own file; reasons come
 |-----:|----:|-----------|---------|
 | 11 | 14 | `ERROR` | `T::` |
 | 13 | 14 | `ERROR` | `T::` |
-| 29 | 2 | `ERROR` | `(T*) this->*((` |
-| 29 | 47 | `ERROR` | `))( callbackName` |
-| 30 | 106 | `ERROR` | `)` |
-| 46 | 2 | `ERROR` | `(T*) this->*((` |
-| 46 | 50 | `ERROR` | `))( callbackName` |
-| 47 | 87 | `ERROR` | `)` |
+| 29 | 11 | `ERROR` | `->` |
+| 46 | 11 | `ERROR` | `->` |
 
 #### `interfaces/kits/js/camera_napi/include/session/camera_napi_adaptor.h`
 
@@ -2800,11 +2792,11 @@ Each entry is a translation unit or header indexed as its own file; reasons come
 
 | Line | Col | Node kind | Snippet |
 |-----:|----:|-----------|---------|
-| 77 | 27 | `ERROR` | `->* setFunc` |
-| 100 | 27 | `ERROR` | `->* setFunc` |
-| 131 | 31 | `ERROR` | `->* getFunc` |
-| 152 | 24 | `ERROR` | `->* setCbFunc` |
-| 175 | 24 | `ERROR` | `->* unSetCbFunc` |
+| 77 | 30 | `ERROR` | `*` |
+| 100 | 30 | `ERROR` | `*` |
+| 131 | 34 | `ERROR` | `*` |
+| 152 | 27 | `ERROR` | `*` |
+| 175 | 27 | `ERROR` | `*` |
 
 #### `mediastream/test/unittest/filter/src/audio_encoder_filter_unit_test.cpp`
 
@@ -2957,7 +2949,7 @@ Each entry is a translation unit or header indexed as its own file; reasons come
 
 | Line | Col | Node kind | Snippet |
 |-----:|----:|-----------|---------|
-| 22 | 21 | `ERROR` | `->* func` |
+| 22 | 24 | `ERROR` | `*` |
 
 #### `services/deferred_processing_service/include/deferred_processing_service.h`
 

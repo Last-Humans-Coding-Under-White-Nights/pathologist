@@ -22,6 +22,14 @@ All notable changes to `trace` are documented in this file.
 
 ### Fixed
 
+- The preprocessor lexer now runs translation phase 2 (`\`-newline splicing) before it
+  recognizes tokens, so an identifier, a multi-character punctuator, an encoding prefix or a
+  string body written across a line splice is one token. `#define F(x, .\`-newline-`..)` is
+  the variadic macro gcc and clang accept instead of a rejected definition, and `int c\`-newline-
+  `d;` preprocesses to `int cd;` instead of `int c\ d;`. Whether two tokens touched is now
+  recorded by the lexer rather than recomputed from physical positions, and an argument
+  substituted into a macro body takes the parameter's adjacency for `#` stringizing, as gcc does
+  (an argument that is empty or newline-only leaves the parameter's whitespace behind).
 - Operator names containing `<` are no longer truncated to the bare keyword `operator`.
   `operator<`, `operator<=`, `operator<<` and `operator<=>` had their `<...>` stripped as if it
   were a template-argument list, so a class's comparison operators collapsed into one symbol and
