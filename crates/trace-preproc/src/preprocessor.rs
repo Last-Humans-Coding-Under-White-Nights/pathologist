@@ -1792,6 +1792,30 @@ fn varargs_omitted(args: &[Vec<Token>], idx: usize) -> bool {
     idx == 0 && args.len() == 1 && arg_is_blank(&args[0])
 }
 
+/// Whether the `##` whose right operand sits at `right` is the GNU
+/// `, ## __VA_ARGS__` form: the variadic tail parameter after the operator
+/// and a comma already emitted into `out`. `substitute_macro`'s `##` branch
+/// owns that shape — it deletes the comma when the varargs are omitted and
+/// leaves the operator inert otherwise — so an empty parameter standing
+/// between the comma and the `##` must step aside instead of consuming the
+/// operator as an ordinary placemarker would.
+fn is_gnu_comma_paste(
+    body: &[Token],
+    right: usize,
+    params: &[String],
+    variadic: bool,
+    out: &[Token],
+) -> bool {
+    let Some(TokenKind::Identifier(name)) = body.get(right).map(|t| &t.kind) else {
+        return false;
+    };
+    params
+        .iter()
+        .position(|p| p == name)
+        .is_some_and(|idx| is_variadic_tail(params, variadic, idx))
+        && matches!(out.last().map(|t| &t.kind), Some(TokenKind::Punct(s)) if *s == ",")
+}
+
 /// Index of the `(` that opens a function-like macro's parameter list, if
 /// the token after the macro name at `name_idx` is one. C11 6.10.3p10: the
 /// definition is function-like only when `(` immediately follows the macro
@@ -2442,8 +2466,14 @@ fn substitute_macro(
     // behind, so `S(a x+b)` with `x` empty stringizes to "a +b" as in gcc
     // and clang. (A `##` placemarker leaves none: `a ## y+b` is "a+b".)
     let mut gap = false;
+    // Adjacency owed to the token that survives a placemarker paste: an empty
+    // `##` operand takes its position, so `a x ## +b` with `x` empty spaces
+    // the `+` off `a` exactly as the `x` did. Every path that emits a token
+    // consumes it.
+    let mut paste_adjacency = None;
     let mut i = 0;
     while i < body.len() {
+        let adjacency = paste_adjacency.take().unwrap_or(body[i].adjacent_before);
         let concat_width = concat_width_at(body, i);
         if concat_width > 0 && i + concat_width < body.len() {
             if let TokenKind::Identifier(name) = &body[i + concat_width].kind {
@@ -2508,7 +2538,7 @@ fn substitute_macro(
                     .with_macro_hide(origin, macro_name);
                     // The literal stands where the `#` stood, so it touches
                     // whatever the `#` touched: `S((#x))` is "(\"a\")".
-                    literal.adjacent_before = body[i].adjacent_before;
+                    literal.adjacent_before = adjacency;
                     push_substituted(&mut out, &mut gap, literal);
                     i += 2;
                     continue;
@@ -2536,21 +2566,44 @@ fn substitute_macro(
                 // token, and an argument with none is empty.
                 match out[first..].iter_mut().find(|t| !is_newline(t)) {
                     Some(tok) => {
-                        tok.adjacent_before = body[i].adjacent_before && !gap;
+                        tok.adjacent_before = adjacency && !gap;
                         gap = false;
                     }
-                    None => gap |= !body[i].adjacent_before,
+                    None => {
+                        // C99 placemarker, mirroring the `## param` case
+                        // above: the empty operand must swallow the `##`
+                        // itself, or the operator would reach
+                        // apply_concatenation and paste whatever preceded
+                        // the parameter — `S(a x ## +b)` with `x` empty
+                        // fusing `a` and `+` into the non-token `a+`. The
+                        // exception is GNU `, ## __VA_ARGS__`, whose comma
+                        // the `##` branch above deletes; hiding the operator
+                        // there would leave the unparseable `f(a,)`.
+                        let width = concat_width_after(body, i);
+                        if width > 0
+                            && !is_gnu_comma_paste(body, i + 1 + width, params, variadic, &out)
+                        {
+                            // The surviving right operand takes this
+                            // parameter's position, and with it its
+                            // adjacency; the argument's newlines go with the
+                            // placemarker, as on the `## param` side.
+                            out.truncate(first);
+                            paste_adjacency = Some(adjacency);
+                            i += 1 + width;
+                            continue;
+                        }
+                        gap |= !adjacency;
+                    }
                 }
                 i += 1;
                 continue;
             }
         }
-        // Replacement-list tokens (not from arguments) inherit the hide set.
-        push_substituted(
-            &mut out,
-            &mut gap,
-            body[i].with_macro_hide(origin, macro_name),
-        );
+        // Replacement-list tokens (not from arguments) inherit the hide set,
+        // and their own adjacency unless they survived a placemarker paste.
+        let mut token = body[i].with_macro_hide(origin, macro_name);
+        token.adjacent_before = adjacency;
+        push_substituted(&mut out, &mut gap, token);
         i += 1;
     }
     out
@@ -2600,6 +2653,15 @@ fn apply_concatenation(mut tokens: Vec<Token>) -> Vec<Token> {
             return next;
         }
         tokens = next;
+    }
+}
+
+/// `concat_width_at` for the token that follows `i`, 0 at the end of `tokens`.
+fn concat_width_after(tokens: &[Token], i: usize) -> usize {
+    if i + 1 < tokens.len() {
+        concat_width_at(tokens, i + 1)
+    } else {
+        0
     }
 }
 
@@ -6681,6 +6743,86 @@ int from_late;
         assert!(out.contains("g2= \"a( +b)\" ;"), "{out}");
         assert!(out.contains("g3= \"a(+b)\" ;"), "{out}");
         assert!(out.contains("r= \"a+b\" ;"), "{out}");
+    }
+
+    /// An empty parameter on the left of `##` is a placemarker (C99
+    /// 6.10.3.3p2), so the paste is a no-op and the token *before* the
+    /// parameter is not an operand: `S(a x ## +b)` is "a +b", never the
+    /// pasted non-token `a+`. Values checked against gcc and clang.
+    #[test]
+    fn empty_left_paste_preserves_operand_boundary() {
+        let src = include_str!("../../../tests/fixtures/preproc/empty_left_paste.c");
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        for expected in [
+            r#"b "a +b""#,
+            r#"p "(y)""#,
+            r#"q "a z""#,
+            r#"r "a xz""#,
+            r#"v "a +b""#,
+            r#"n "a +b""#,
+            r#"e "a +b""#,
+        ] {
+            assert!(
+                result.output.contains(expected),
+                "missing {expected}: {}",
+                result.output
+            );
+        }
+    }
+
+    /// The same shapes outside a `#`, where the damage reaches the parser: a
+    /// bad paste destroys the string literal in `a x ## "s"` and swallows the
+    /// `(` in `f(x ## y)`, and tree-sitter loses the enclosing construct.
+    #[test]
+    fn empty_left_paste_preserves_non_stringized_tokens() {
+        let src = include_str!("../../../tests/fixtures/preproc/empty_left_paste.c");
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(result.output.contains(r#"c a "s""#), "{}", result.output);
+        assert!(result.output.contains("d f(y)"), "{}", result.output);
+    }
+
+    /// An empty parameter between a comma and `## __VA_ARGS__` leaves the GNU
+    /// comma rule alone: it is the comma the omitted varargs delete, not a
+    /// token the placemarker may shield. The compilers split here — clang
+    /// collapses the placemarker first and deletes the comma (`g(o)`), while
+    /// gcc applies the rule only to a comma spelled immediately before the
+    /// `##` and so keeps it (`g(o, )`). We follow clang. Swallowing the `##`
+    /// as an ordinary placemarker would land on gcc's output by accident,
+    /// not by rule, and inconsistently — see the newline-blank case below.
+    #[test]
+    fn empty_left_paste_keeps_gnu_comma_deletion() {
+        let src = include_str!("../../../tests/fixtures/preproc/empty_left_paste.c");
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        for expected in ["x g(o)", "y g(o ,)", "z h(t)"] {
+            assert!(
+                result.output.contains(expected),
+                "missing {expected}: {}",
+                result.output
+            );
+        }
+    }
+
+    /// The same GNU-comma shapes with a newline-only blank argument, pinned
+    /// as they behave rather than as a rule they follow. `is_gnu_comma_paste`
+    /// reads the last token already emitted, and an argument that is only
+    /// newlines pushes those first, hiding the comma from the predicate — so
+    /// the placemarker swallows the `##` after all and the comma survives.
+    /// That lands on gcc's output where the token-only spelling above lands
+    /// on clang's; both compilers are self-consistent across the two
+    /// spellings and we are not. Reading the body's comma instead of
+    /// `out.last()` would settle it. Pinned so the split cannot drift
+    /// unnoticed while it stands.
+    #[test]
+    fn empty_left_paste_newline_blank_keeps_gnu_comma() {
+        let src = include_str!("../../../tests/fixtures/preproc/empty_left_paste.c");
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        for expected in ["w g(o ,)", "u h(t ,)"] {
+            assert!(
+                result.output.contains(expected),
+                "missing {expected}: {}",
+                result.output
+            );
+        }
     }
 
     /// An argument that is only newlines is empty too — whitespace, not
