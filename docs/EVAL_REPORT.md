@@ -15,6 +15,38 @@
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Re-verified 2026-09-06 (empty left token-paste operand, #52):**
+compared fresh release builds of the parent (#38, compared pre-merge as
+`e763ff2` and merged unchanged as `240bb97`) and the local #52 fix
+against all three clean OpenHarmony checkouts at the revisions in
+`scripts/eval_expected.json`, using `--jobs 8` and the 800,000-pop budget.
+`eval_check.py` passes **86/86** on both (including three checkout checks).
+All global metrics, dispatch target counts and probe results are identical
+between these runs; no expectation values needed adjustment.
+
+The parse-failure TSVs produced by each build's `parse_failures` example
+from its corresponding evaluation databases are byte-identical in all
+three corpora. Regenerating `docs/PARSE_FAILURES.md` produces no diff: the
+same **259** files, ERROR sites, output rows, columns and snippets. Thus
+#52 has no measured impact on these pinned corpora. Its regression fixture,
+`tests/fixtures/preproc/empty_left_paste.c`, checks stringized adjacency and
+the non-stringized output that feeds parsing: `a x ## "s"` must retain the
+string literal when `x` is empty, and `f(x ## y)` with empty `x` must retain
+the opening parenthesis as a separate token. Both non-stringized cases fail
+on the parent build and pass with the fix; Clang agrees with the fixture's
+expected output.
+
+The corpus runs above predate the review follow-up that keeps an empty
+parameter between a comma and `## __VA_ARGS__` out of GNU comma elision's
+way. That guard cannot move them: it fires only on a macro body whose `##`
+has a parameter on its left, the variadic tail on its right, and a comma
+before that parameter, and no such body exists in the three checkouts --
+`#define`s matching `, <identifier> ##` at all number three, all in
+`drivers_hdf_core/framework/include/utils/hcs_macro.h`, and all with the
+literal token `_` rather than a parameter as the left operand
+(`HCS_CAT(parent, _##node)`). Outside that shape the guard is inert and the
+byte-identical results above stand.
+
 **Re-verified 2026-09-06 (line splicing in the lexer, #38):** all three
 pinned corpora were re-fetched at their pinned revisions and analyzed with
 the branch binary and with one built from `master` (80c2325). `eval_check`
