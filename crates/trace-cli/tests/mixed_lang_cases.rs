@@ -43,14 +43,15 @@ fn shared_header_macros_replay_in_each_units_language() {
 }
 
 #[test]
-fn single_language_header_macros_are_relexed_for_the_other_union() {
-    // c_only.h is reached only from a.c and cpp_only.h only from b.cpp, so
-    // each is warmed in one language. Its macros still enter the other
-    // language's union table (the union is the full superset), re-lexed
-    // for that language: a.c's `c_leak` uses CHAR_LEAK from cpp_only.h,
-    // which must be `'a'` + `C` (a helper call) there, and b.cpp's
-    // `cpp_leak` uses RAW_LEAK from c_only.h, which must be one raw string
-    // (no call) there. Neither unit includes the header it borrows from.
+fn header_macros_do_not_reach_units_that_do_not_include_it() {
+    // c_only.h is reached only from a.c and cpp_only.h only from b.cpp.
+    // Each unit uses the OTHER header's macro without including it:
+    // a.c's `c_leak` names CHAR_LEAK (cpp_only.h) and b.cpp's `cpp_leak`
+    // names RAW_LEAK (c_only.h). The warm pass used to union every header's
+    // macros into one table per language and hand it to every unit, so both
+    // expanded and called `helper`. A unit's macro environment is now what
+    // its own `#include`s give it (#55), so neither name is a macro here and
+    // neither call happens.
     let root = fixture("mixed_lang");
     let program = build_program(&root, &default_opts(&root)).expect("build");
     let (_pag, analysis) = analyze(&program);
@@ -60,21 +61,11 @@ fn single_language_header_macros_are_relexed_for_the_other_union() {
             program.symbols.functions.iter().any(|f| f.name == name),
             "{name} must be indexed"
         );
+        assert!(
+            must_not_have_edge(&program, &analysis, name, "helper"),
+            "{name}: a macro from a header this unit never includes reached it"
+        );
     }
-    assert!(
-        has_edge(
-            &program,
-            &analysis,
-            "c_leak",
-            "helper",
-            ResolutionKind::Direct
-        ),
-        "c_leak: a C++-warmed `'a'C` must be re-lexed as `'a'` + `C` for the C union"
-    );
-    assert!(
-        must_not_have_edge(&program, &analysis, "cpp_leak", "helper"),
-        "cpp_leak: a C-warmed `R` + `\"(x)\"` must be re-lexed as one raw string for the C++ union"
-    );
 }
 
 #[test]
