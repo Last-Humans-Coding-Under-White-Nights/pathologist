@@ -558,3 +558,253 @@ fn inspect_calls_like_wildcards_are_literal() {
         "--from foo_bar should match ns::foo_bar -> ns::foo, got:\n{stdout}"
     );
 }
+
+#[test]
+fn inspect_chains_direct_and_indirect() {
+    let bin = env!("CARGO_BIN_EXE_trace");
+    let db_chain = build_and_export("header_chain");
+
+    // Depth 1 cannot reach ChainTarget
+    let out = Command::new(bin)
+        .args([
+            "inspect",
+            db_chain.to_str().unwrap(),
+            "callchain",
+            "--from",
+            "user",
+            "--to",
+            "ChainTarget",
+            "--depth",
+            "1",
+        ])
+        .output()
+        .expect("inspect callchain depth 1");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no call chain found from user to ChainTarget within depth 1"),
+        "expected no chain at depth 1, got:\n{stdout}"
+    );
+
+    // Depth 2 finds the chain: user -> BCaller -> ChainTarget
+    let out = Command::new(bin)
+        .args([
+            "inspect",
+            db_chain.to_str().unwrap(),
+            "callchain",
+            "--from",
+            "user",
+            "--to",
+            "ChainTarget",
+            "--depth",
+            "2",
+        ])
+        .output()
+        .expect("inspect callchain depth 2");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Chain 1 (depth 2):"),
+        "expected Chain 1 (depth 2), got:\n{stdout}"
+    );
+    assert!(stdout.contains("-direct-> BCaller"));
+    assert!(stdout.contains("-direct-> ChainTarget"));
+    assert!(stdout.contains("1 chain found"));
+
+    // JSON format output
+    let out_json = Command::new(bin)
+        .args([
+            "inspect",
+            db_chain.to_str().unwrap(),
+            "callchain",
+            "--from",
+            "user",
+            "--to",
+            "ChainTarget",
+            "--depth",
+            "2",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("inspect callchain json");
+    assert!(out_json.status.success());
+    let stdout_json = String::from_utf8_lossy(&out_json.stdout);
+    assert!(
+        stdout_json.contains("\"title\": \"call chains from user to ChainTarget (depth <= 2)\"")
+    );
+    assert!(stdout_json.contains("\"direction\": \"down\""));
+    assert!(stdout_json.contains("\"label\": \"BCaller"));
+    assert!(stdout_json.contains("\"label\": \"ChainTarget"));
+
+    // Direction up: from ChainTarget up to user
+    let out_up = Command::new(bin)
+        .args([
+            "inspect",
+            db_chain.to_str().unwrap(),
+            "callchain",
+            "--from",
+            "ChainTarget",
+            "--to",
+            "user",
+            "--direction",
+            "up",
+            "--depth",
+            "2",
+        ])
+        .output()
+        .expect("inspect callchain up");
+    assert!(out_up.status.success());
+    let stdout_up = String::from_utf8_lossy(&out_up.stdout);
+    assert!(stdout_up.contains("Chain 1 (depth 2):"));
+    assert!(stdout_up.contains("<-direct- BCaller"));
+    assert!(stdout_up.contains("<-direct- user"));
+
+    // Indirect call fixture: run -> target
+    let db_indirect = build_and_export("indirect_call");
+    let out_ind = Command::new(bin)
+        .args([
+            "inspect",
+            db_indirect.to_str().unwrap(),
+            "callchain",
+            "--from",
+            "run",
+            "--to",
+            "target",
+            "--depth",
+            "1",
+        ])
+        .output()
+        .expect("inspect indirect callchain");
+    assert!(out_ind.status.success());
+    let stdout_ind = String::from_utf8_lossy(&out_ind.stdout);
+    assert!(stdout_ind.contains("Chain 1 (depth 1):"));
+    assert!(stdout_ind.contains("-indirect-> target"));
+
+    // File:line syntax resolution
+    let out_pos = Command::new(bin)
+        .args([
+            "inspect",
+            db_chain.to_str().unwrap(),
+            "chains",
+            "--from",
+            "main.c:5",
+            "--to",
+            "main.c:3",
+            "--depth",
+            "3",
+        ])
+        .output()
+        .expect("inspect chains by file:line");
+    assert!(out_pos.status.success());
+    let stdout_pos = String::from_utf8_lossy(&out_pos.stdout);
+    assert!(stdout_pos.contains("Chain 1 (depth 2):"));
+    assert!(stdout_pos.contains("-direct-> ChainTarget"));
+}
+
+#[test]
+fn inspect_callchain_edge_cases() {
+    let bin = env!("CARGO_BIN_EXE_trace");
+    let dir = tempfile::tempdir().unwrap();
+    let src = r#"
+void target(void) {}
+void skip(void) { target(); }
+void keep(void) { target(); }
+int main(void) {
+    skip();
+    keep();
+    return 0;
+}
+"#;
+    std::fs::write(dir.path().join("main.c"), src).unwrap();
+    let filter_file = dir.path().join("filter.json");
+    std::fs::write(&filter_file, r#"{"functions": ["keep"]}"#).unwrap();
+
+    let db = TempDb::new("callchain_edge_cases.db");
+    let out = Command::new(bin)
+        .args([
+            "analyze",
+            dir.path().to_str().unwrap(),
+            "-o",
+            db.to_str().unwrap(),
+        ])
+        .output()
+        .expect("analyze runs");
+    assert!(out.status.success());
+
+    // 1. Without filter and limit 1: 2 paths exist (main->skip->target, main->keep->target),
+    // so limit 1 must truncate.
+    let out_lim1 = Command::new(bin)
+        .args([
+            "inspect",
+            db.to_str().unwrap(),
+            "callchain",
+            "--from",
+            "main",
+            "--to",
+            "target",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("inspect callchain limit 1");
+    assert!(out_lim1.status.success());
+    let stdout_lim1 = String::from_utf8_lossy(&out_lim1.stdout);
+    assert!(stdout_lim1.contains("1 chain found"));
+    assert!(stdout_lim1.contains("(truncated at limit; increase --limit or --depth to see more)"));
+
+    // 2. Filter ^keep$ with limit 1: if main->skip->target was discovered first,
+    // filtering leaves 0 results, but truncation warning must be preserved!
+    let out_filt_lim1 = Command::new(bin)
+        .args([
+            "inspect",
+            db.to_str().unwrap(),
+            "callchain",
+            "--from",
+            "main",
+            "--to",
+            "target",
+            "--limit",
+            "1",
+            "--callgraph-filter",
+            filter_file.to_str().unwrap(),
+        ])
+        .output()
+        .expect("inspect callchain filtered limit 1");
+    assert!(out_filt_lim1.status.success());
+    let stdout_filt_lim1 = String::from_utf8_lossy(&out_filt_lim1.stdout);
+    assert!(stdout_filt_lim1.contains("no call chain found from main to target within depth 5"));
+    assert!(
+        stdout_filt_lim1.contains("(truncated at limit; increase --limit or --depth to see more)")
+    );
+
+    // 3. With limit 0, keep path is found
+    let out_filt_lim0 = Command::new(bin)
+        .args([
+            "inspect",
+            db.to_str().unwrap(),
+            "callchain",
+            "--from",
+            "main",
+            "--to",
+            "target",
+            "--limit",
+            "0",
+            "--callgraph-filter",
+            filter_file.to_str().unwrap(),
+        ])
+        .output()
+        .expect("inspect callchain filtered limit 0");
+    assert!(out_filt_lim0.status.success());
+    let stdout_filt_lim0 = String::from_utf8_lossy(&out_filt_lim0.stdout);
+    assert!(stdout_filt_lim0.contains("keep"));
+    assert!(stdout_filt_lim0.contains("1 chain found"));
+}

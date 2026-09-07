@@ -551,7 +551,7 @@ fn build_graph(g: &QueryGraph, is_callgraph: bool) -> TraceGraph {
 ///
 /// # Safety
 ///
-/// `graph` must have come from `trace_db_callgraph` or `trace_db_dataflow`.
+/// `graph` must have come from `trace_db_callgraph`, `trace_db_call_chains`, or `trace_db_dataflow`.
 #[no_mangle]
 pub unsafe extern "C" fn trace_graph_free(graph: *mut TraceGraph) {
     if graph.is_null() {
@@ -623,6 +623,44 @@ pub unsafe extern "C" fn trace_db_callgraph(
     let res = guard(|| {
         let g = trace_db::call_graph(conn, root_fn_id, dir, depth).map_err(ApiError::from)?;
         Ok(build_graph(&g, true))
+    });
+    unsafe { settle(res, out, out_err) }
+}
+
+/// Find all call chains connecting `from_fn_id` and `to_fn_id` bounded by `depth`.
+/// Fills `out`; free with `trace_graph_free`.
+///
+/// # Safety
+///
+/// `db` must be a live handle, `out` a valid destination.
+#[no_mangle]
+pub unsafe extern "C" fn trace_db_call_chains(
+    db: *mut TraceDb,
+    from_fn_id: i64,
+    to_fn_id: i64,
+    direction: i32,
+    depth: u32,
+    limit: usize,
+    out: *mut TraceGraph,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    reset_err(out_err);
+    if db.is_null() || out.is_null() {
+        return arg_err(out_err, "db and out must not be null");
+    }
+    if depth == 0 && from_fn_id != to_fn_id {
+        return arg_err(out_err, "depth must be >= 1");
+    }
+    let Some(dir) = check_dir(direction, out_err) else {
+        return TraceStatus::TraceErrInvalidArg as c_int;
+    };
+    let conn = &(*db).conn;
+    let res = guard(|| {
+        let lim = if limit == 0 { None } else { Some(limit) };
+        let chains_res = trace_db::call_chains(conn, from_fn_id, to_fn_id, dir, depth, lim)
+            .map_err(ApiError::from)?;
+        let qg = chains_res.to_query_graph(conn).map_err(ApiError::from)?;
+        Ok(build_graph(&qg, true))
     });
     unsafe { settle(res, out, out_err) }
 }
@@ -1503,6 +1541,198 @@ mod tests {
         };
         assert_eq!(status, TraceStatus::TraceErrInvalidArg as c_int);
         assert!(cstr_show(err).contains("n_roots"), "{}", cstr_show(err));
+        unsafe { trace_db_close(db) };
+    }
+
+    #[test]
+    fn call_chains_down_and_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = analyze_fixture(dir.path());
+
+        let main_line = line_of(MAIN_C, "int main(void)");
+        let helper_line = line_of(MAIN_C, "int helper(int *p)");
+        let file = CString::new("main.c").unwrap();
+
+        let mut list = TraceFunctionList {
+            items: ptr::null_mut(),
+            count: 0,
+            _impl: ptr::null_mut(),
+        };
+        let mut err: *mut c_char = ptr::null_mut();
+        let status =
+            unsafe { trace_db_find_functions(db, file.as_ptr(), main_line, &mut list, &mut err) };
+        assert_eq!(status, TraceStatus::TraceOk as c_int);
+        assert_eq!(list.count, 1);
+        let main_id = unsafe { (*list.items).id };
+        unsafe { trace_function_list_free(&mut list) };
+
+        let status =
+            unsafe { trace_db_find_functions(db, file.as_ptr(), helper_line, &mut list, &mut err) };
+        assert_eq!(status, TraceStatus::TraceOk as c_int);
+        assert_eq!(list.count, 1);
+        let helper_id = unsafe { (*list.items).id };
+        unsafe { trace_function_list_free(&mut list) };
+
+        // Test DOWN: main -> helper
+        let mut g = TraceGraph {
+            nodes: ptr::null_mut(),
+            n_nodes: 0,
+            edges: ptr::null_mut(),
+            n_edges: 0,
+            truncated: 0,
+            _impl: ptr::null_mut(),
+        };
+        let status = unsafe {
+            trace_db_call_chains(
+                db,
+                main_id,
+                helper_id,
+                TraceDirection::TraceDirectionDown as i32,
+                3,
+                0,
+                &mut g,
+                &mut err,
+            )
+        };
+        assert_eq!(
+            status,
+            TraceStatus::TraceOk as c_int,
+            "err={}",
+            cstr_show(err)
+        );
+        assert_eq!(g.n_nodes, 2);
+        assert_eq!(g.n_edges, 1);
+        let e = unsafe { &*g.edges };
+        assert_eq!(e.from, main_id);
+        assert_eq!(e.to, helper_id);
+        assert_eq!(e.resolution, TraceResolution::TraceResolutionDirect);
+        unsafe { trace_graph_free(&mut g) };
+
+        // Test UP: helper -> main
+        let status = unsafe {
+            trace_db_call_chains(
+                db,
+                helper_id,
+                main_id,
+                TraceDirection::TraceDirectionUp as i32,
+                3,
+                0,
+                &mut g,
+                &mut err,
+            )
+        };
+        assert_eq!(
+            status,
+            TraceStatus::TraceOk as c_int,
+            "err={}",
+            cstr_show(err)
+        );
+        assert_eq!(g.n_nodes, 2);
+        assert_eq!(g.n_edges, 1);
+        let e = unsafe { &*g.edges };
+        assert_eq!(e.from, main_id);
+        assert_eq!(e.to, helper_id);
+        unsafe { trace_graph_free(&mut g) };
+
+        // Test depth 0 with same function
+        let status = unsafe {
+            trace_db_call_chains(
+                db,
+                main_id,
+                main_id,
+                TraceDirection::TraceDirectionDown as i32,
+                0,
+                0,
+                &mut g,
+                &mut err,
+            )
+        };
+        assert_eq!(
+            status,
+            TraceStatus::TraceOk as c_int,
+            "err={}",
+            cstr_show(err)
+        );
+        assert_eq!(g.n_nodes, 1);
+        assert_eq!(g.n_edges, 0);
+        unsafe { trace_graph_free(&mut g) };
+
+        unsafe { trace_db_close(db) };
+    }
+
+    #[test]
+    fn call_chains_error_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = analyze_fixture(dir.path());
+        let mut g = TraceGraph {
+            nodes: ptr::null_mut(),
+            n_nodes: 0,
+            edges: ptr::null_mut(),
+            n_edges: 0,
+            truncated: 0,
+            _impl: ptr::null_mut(),
+        };
+        let mut err: *mut c_char = ptr::null_mut();
+
+        // Unknown function id
+        let status = unsafe {
+            trace_db_call_chains(
+                db,
+                999_999,
+                1,
+                TraceDirection::TraceDirectionDown as i32,
+                3,
+                0,
+                &mut g,
+                &mut err,
+            )
+        };
+        assert_eq!(status, TraceStatus::TraceErrNotFound as c_int);
+        assert!(cstr_show(err).contains("not found"));
+        unsafe { trace_string_free(err) };
+        err = ptr::null_mut();
+
+        // Depth 0 for different functions
+        let status = unsafe {
+            trace_db_call_chains(
+                db,
+                1,
+                2,
+                TraceDirection::TraceDirectionDown as i32,
+                0,
+                0,
+                &mut g,
+                &mut err,
+            )
+        };
+        assert_eq!(status, TraceStatus::TraceErrInvalidArg as c_int);
+        assert!(cstr_show(err).contains("depth"));
+        unsafe { trace_string_free(err) };
+        err = ptr::null_mut();
+
+        // Out-of-band direction
+        let status = unsafe { trace_db_call_chains(db, 1, 2, 42, 3, 0, &mut g, &mut err) };
+        assert_eq!(status, TraceStatus::TraceErrInvalidArg as c_int);
+        assert!(cstr_show(err).contains("direction"));
+        unsafe { trace_string_free(err) };
+        err = ptr::null_mut();
+
+        // Null arguments
+        let status = unsafe {
+            trace_db_call_chains(
+                ptr::null_mut(),
+                1,
+                2,
+                TraceDirection::TraceDirectionDown as i32,
+                3,
+                0,
+                &mut g,
+                &mut err,
+            )
+        };
+        assert_eq!(status, TraceStatus::TraceErrInvalidArg as c_int);
+        unsafe { trace_string_free(err) };
+
         unsafe { trace_db_close(db) };
     }
 }
