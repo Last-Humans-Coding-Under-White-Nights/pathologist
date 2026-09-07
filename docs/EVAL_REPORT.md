@@ -15,6 +15,40 @@
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Re-verified 2026-09-08 (#57 review follow-ups):** conditional records now count a
+final comment/whitespace line without a trailing newline, locate spliced directives
+at their opening `#`, and retain operator-shaped names used as explicit macro
+operands. The report reader requires a final row-count completion record, rejecting
+captures cut off between complete TSV rows. Regression tests cover all four cases.
+
+Rebuilt the release example and regenerated all three clean pinned corpus captures
+and [CONDITIONAL_COVERAGE.md](CONDITIONAL_COVERAGE.md): all **4,742 chains** and
+coverage totals are unchanged. A fresh release CLI passes **86/86 corpus checks**
+without changing expectations. **531 Rust tests**, **4 Python reader tests**, Clippy
+with warnings denied, and formatting checks pass.
+
+**Re-verified 2026-09-07 (conditional-compilation coverage report, #57):** fresh
+release builds of parent `b7e070b` and the reviewed branch were run on all three
+clean pinned corpora under `/private/tmp/corpora`, `--jobs 8`, with the
+800,000-pop solver budget. SQLite dumps excluding `analysis_run` metadata are
+identical for HDF, Hiview and Camera (637,311, 339,424 and 696,239 SQL statements).
+The default index does not enable conditional recording, and no analysis or
+parse-failure counts change relative to the parent.
+
+The initial evaluation found **18 inherited expectation failures**, reproduced
+on the parent: the checked-in baseline predated the counts already documented
+below for #64. Those failing expectations in `scripts/eval_expected.json` were
+refreshed to the verified counts, with all tolerances and dispatch target
+checks retained. The refreshed evaluation passes all 86 checks.
+
+[CONDITIONAL_COVERAGE.md](CONDITIONAL_COVERAGE.md) was regenerated on all three
+corpora after fixing external-header file totals and definition evidence from
+comments or string literals. The report tool now also rejects missing/empty
+source trees and hard input failures, retains `-D` values in metadata, and
+preserves carriage returns inside TSV fields. Workspace tests, the example's
+regression tests, the Python reader regression, Clippy and formatting checks
+pass.
+
 **Re-verified 2026-09-07 (member access through a declared `operator->`, #64):**
 fresh release builds of `master` (52fd920) and the branch were compared on
 the same machine against the three clean pinned checkouts under

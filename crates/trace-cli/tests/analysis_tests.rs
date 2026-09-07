@@ -747,10 +747,15 @@ fn unterminated_if_fixture_exports_preprocess_error() {
         .iter()
         .filter(|r| r.0 == "preprocess" && r.4.contains("unterminated #if"))
         .collect();
-    assert_eq!(hits.len(), 1, "{rows:?}");
-    assert_eq!(hits[0].1, "Error", "{rows:?}");
-    assert!(hits[0].2.ends_with("unterminated_if_header.h"), "{rows:?}");
-    assert_eq!(hits[0].3, 1, "{rows:?}");
+    assert_eq!(hits.len(), 2, "{rows:?}");
+    for file in [
+        "unterminated_if_header.h",
+        "conditional_unterminated_comment.c",
+    ] {
+        let hit = hits.iter().find(|r| r.2.ends_with(file)).expect(file);
+        assert_eq!(hit.1, "Error", "{rows:?}");
+        assert_eq!(hit.3, 1, "{rows:?}");
+    }
 }
 
 #[test]

@@ -193,6 +193,13 @@ pub struct PreprocessOptions {
     /// what an unseeded cache does anyway. A cache miss is a performance
     /// event and must never be reported as unexplored configuration.
     pub max_expansion_variants: usize,
+    /// When true, every conditional chain the run meets is recorded in
+    /// `PreprocessResult::conditionals` (see [`crate::ConditionalChain`]),
+    /// for measuring what the configuration excludes (#57). Off by default:
+    /// indexing does not need it, and a cached header replays its text
+    /// without re-evaluating its conditionals, so the record is complete
+    /// only for a run that expands every include itself.
+    pub record_conditionals: bool,
 }
 
 impl Default for PreprocessOptions {
@@ -213,6 +220,7 @@ impl Default for PreprocessOptions {
             inline_include_bodies: true,
             language: None,
             max_expansion_variants: 8,
+            record_conditionals: false,
         }
     }
 }
@@ -294,6 +302,11 @@ impl PreprocessOptions {
 
     pub fn with_max_expansion_variants(mut self, n: usize) -> Self {
         self.max_expansion_variants = n;
+        self
+    }
+
+    pub fn with_record_conditionals(mut self, record: bool) -> Self {
+        self.record_conditionals = record;
         self
     }
 }

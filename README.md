@@ -616,6 +616,7 @@ tests/fixtures/    Integration test C corpora
 - **No path sensitivity** — all branches and paths are merged.
 - **Preprocessor subset** — not gcc/clang compatible for all extensions; see [docs/PREPROCESSOR.md](docs/PREPROCESSOR.md).
 - **Include paths** — must be supplied manually via `--include` / `-D`; no `compile_commands.json` yet.
+- **Single configuration** — a name no `-D` or reached `#define` binds resolves to `0` in every `#if`; what that excludes on the eval corpora, per condition and region, is measured in [docs/CONDITIONAL_COVERAGE.md](docs/CONDITIONAL_COVERAGE.md).
 - **Line numbers** — refer to preprocessed TUs; map back to original sources manually when needed.
 
 ## Further reading
@@ -623,6 +624,7 @@ tests/fixtures/    Integration test C corpora
 - [Architecture](docs/ARCHITECTURE.md)
 - [Analysis algorithm](docs/ANALYSIS.md)
 - [Preprocessor spec](docs/PREPROCESSOR.md)
+- [Conditional-compilation coverage (eval corpora)](docs/CONDITIONAL_COVERAGE.md)
 - [SQLite schema (detailed)](docs/SQLITE_SCHEMA.md)
 - [Roadmap](docs/ROADMAP.md)
 - [C++ next slices (hiview)](docs/CPP_ROADMAP.md)
