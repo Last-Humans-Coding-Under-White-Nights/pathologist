@@ -1284,4 +1284,28 @@ mod tests {
         assert!(Direction::parse("up").is_ok());
         assert!(Direction::parse("sideways").is_err());
     }
+
+    #[test]
+    fn callgraph_filter_prunes_after_bfs() {
+        // Mirror the CLI flow: BFS then display-only filter.
+        let conn = test_conn();
+        let filter = crate::CallGraphFilter::from_json(r#"{ "functions": ["helper"] }"#).unwrap();
+        let mut g = call_graph(&conn, 10, Direction::Down, 5).unwrap();
+        assert_eq!(g.order.len(), 3, "full BFS reaches main, helper, proto");
+
+        crate::filter_query_graph(&mut g, &filter);
+
+        let names: Vec<&str> = g
+            .order
+            .iter()
+            .map(|&(id, _)| g.nodes[&id].label.as_str())
+            .collect();
+        // main--helper edge survives (helper matches); helper->proto survives
+        // (helper matches); proto is left of *both* its edges' matching side
+        // only via helper, and stays because the helper->proto edge is kept.
+        assert_eq!(names, vec!["main", "helper", "proto"], "names: {names:?}");
+        assert!(g.nodes.contains_key(&10));
+        assert!(g.nodes.contains_key(&11));
+        assert!(g.nodes.contains_key(&12));
+    }
 }

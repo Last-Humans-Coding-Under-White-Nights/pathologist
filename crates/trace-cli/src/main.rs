@@ -83,6 +83,10 @@ enum InspectCommands {
         /// For a synthetic edge with no call site, match its caller definition file.
         #[arg(long)]
         file: Option<String>,
+        /// JSON config file listing regex patterns for function names to keep.
+        /// An edge is shown when its caller or callee matches any pattern.
+        #[arg(long = "callgraph-filter")]
+        callgraph_filter: Option<PathBuf>,
     },
     /// Call graph around the function containing FILE:LINE.
     ///
@@ -103,6 +107,10 @@ enum InspectCommands {
         /// Graph output format: `text`, `json`, `graphviz`, or `mermaid`.
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
+        /// JSON config file listing regex patterns for function names to keep.
+        /// Only edges whose caller or callee matches are shown.
+        #[arg(long = "callgraph-filter")]
+        callgraph_filter: Option<PathBuf>,
     },
     /// Value-flow (dataflow) graph for the variable declared at FILE:LINE:COL.
     ///
@@ -358,7 +366,12 @@ fn run_analyze(
 fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
     let conn = open_db(&db)?;
     match command {
-        InspectCommands::Calls { from, to, file } => {
+        InspectCommands::Calls {
+            from,
+            to,
+            file,
+            callgraph_filter,
+        } => {
             let edges = trace_db::call_edges(
                 &conn,
                 &trace_db::CallEdgeFilter {
@@ -367,10 +380,19 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
                     file: file.as_deref(),
                 },
             )?;
+            let filter = match callgraph_filter {
+                Some(p) => Some(trace_db::CallGraphFilter::from_file(&p)?),
+                None => None,
+            };
             fn basename(p: &str) -> &str {
                 p.rsplit('/').next().unwrap_or(p)
             }
             for e in edges {
+                if let Some(f) = &filter {
+                    if !f.matches(&e.caller_name) && !f.matches(&e.callee_name) {
+                        continue;
+                    }
+                }
                 match (e.call_site_path, e.call_site_line) {
                     // Real call sites.
                     (Some(cf), Some(l)) => println!(
@@ -399,13 +421,18 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             depth,
             direction,
             format,
+            callgraph_filter,
         } => {
             let dir = trace_db::Direction::parse(&direction)?;
             if depth == 0 {
                 anyhow::bail!("depth must be >= 1");
             }
             let start = trace_db::require_function_at(&conn, &file, line)?;
-            let graph = trace_db::call_graph(&conn, start.id, dir, depth)?;
+            let mut graph = trace_db::call_graph(&conn, start.id, dir, depth)?;
+            if let Some(p) = callgraph_filter {
+                let filter = trace_db::CallGraphFilter::from_file(&p)?;
+                trace_db::filter_query_graph(&mut graph, &filter);
+            }
             let dir_word = match dir {
                 trace_db::Direction::Down => "callees",
                 trace_db::Direction::Up => "callers",
