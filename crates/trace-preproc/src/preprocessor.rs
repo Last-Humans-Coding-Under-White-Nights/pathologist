@@ -166,6 +166,9 @@ struct CacheFrame {
     /// replays, so the consumer's binding cannot matter). Doubles as the
     /// short-circuit for the per-identifier read hook.
     settled: HashSet<Arc<str>>,
+    /// Actual writes, distinguished from reads in `settled` when a skipped
+    /// header snapshots a binding after merging its historical dependencies.
+    locally_bound: HashSet<Arc<str>>,
     /// Diagnostics in this header's transitive include closure. This must be
     /// independent from `PreprocessorState::diagnostics`: a report can have
     /// been emitted earlier in this run and still be required by a cache
@@ -263,8 +266,9 @@ impl PreprocessorState {
     ///
     /// Testing the innermost frame alone is enough, because an inner frame's
     /// `settled` set is a subset of every enclosing frame's: each of the
-    /// three writers (`record_read`, `note_local_binding`,
-    /// `merge_recorded_deps`) inserts into *all* open frames, and a frame
+    /// writers (`record_read`, `note_local_binding`,
+    /// `merge_recorded_deps`, `record_snapshot_read`) insert into all open
+    /// frames that have not already settled the name, and a frame
     /// starts empty when it is pushed — so anything the innermost frame
     /// knows was settled while it existed, and every outer frame took the
     /// same insert. This is what keeps the per-identifier read hook at one
@@ -309,12 +313,49 @@ impl PreprocessorState {
     /// consumer's binding did reach this expansion, before the header
     /// overwrote it.
     fn note_local_binding(&mut self, name: &str) {
-        if self.innermost_settled(name) {
+        if self.cache_frames.is_empty() {
             return;
         }
         let interned: Arc<str> = Arc::from(name);
         for frame in &mut self.cache_frames {
             frame.settled.insert(Arc::clone(&interned));
+            frame.locally_bound.insert(Arc::clone(&interned));
+        }
+    }
+
+    /// A snapshot must retain both historical and current dependencies if
+    /// they disagree. Such an entry cannot match any consumer, so that
+    /// consumer expands it live. Ordinary `record_read` would discard the
+    /// current dependency because the historical one already settled it.
+    fn record_snapshot_read(&mut self, name: &str) {
+        let hash = self.binding_hash(name);
+        let interned: Arc<str> = Arc::from(name);
+        for frame in &mut self.cache_frames {
+            if frame.locally_bound.contains(name) {
+                continue;
+            }
+            frame.deps.incompatible |= frame
+                .deps
+                .defined
+                .iter()
+                .any(|(n, h)| n == &interned && Some(*h) != hash)
+                || (hash.is_some() && frame.deps.undefined.contains(name));
+            frame.settled.insert(Arc::clone(&interned));
+            match hash {
+                Some(h) => {
+                    if !frame
+                        .deps
+                        .defined
+                        .iter()
+                        .any(|(n, v)| n == &interned && *v == h)
+                    {
+                        frame.deps.defined.push((Arc::clone(&interned), h));
+                    }
+                }
+                None => {
+                    frame.deps.undefined.insert(Arc::clone(&interned));
+                }
+            }
         }
     }
 
@@ -332,6 +373,11 @@ impl PreprocessorState {
     fn merge_recorded_deps(&mut self, deps: &crate::MacroFingerprint) {
         if self.cache_frames.is_empty() {
             return;
+        }
+        if deps.incompatible {
+            for frame in &mut self.cache_frames {
+                frame.deps.incompatible = true;
+            }
         }
         for (name, hash) in &deps.defined {
             if self.innermost_settled(name) {
@@ -357,6 +403,9 @@ impl PreprocessorState {
 
     /// Does `deps` describe the environment this run is in right now?
     fn fingerprint_matches(&mut self, deps: &crate::MacroFingerprint) -> bool {
+        if deps.incompatible {
+            return false;
+        }
         for (name, hash) in &deps.defined {
             if self.binding_hash(name) != Some(*hash) {
                 return false;
@@ -776,6 +825,11 @@ impl PreprocessorState {
     /// consumers expand the header themselves, which costs time and changes
     /// no output.
     fn publish_variant(&self, canonical: PathBuf, entry: crate::IncludeExpansion) {
+        // Keep incompatible expansions only in entry_used for this run's
+        // text composition; they cannot serve any consumer or use a slot.
+        if entry.deps.incompatible {
+            return;
+        }
         let Some(cache) = self.opts.include_expansion_cache.as_ref() else {
             return;
         };
@@ -946,18 +1000,35 @@ impl PreprocessorState {
                     // in the frame's entry, so the frame depends on
                     // everything the expansion read.
                     self.merge_recorded_deps(&entry.deps);
-                    // ...and on its macro effects. The body is skipped, so
-                    // these are NOT executed — they already are in force in
-                    // this run. Logging them is what makes the enclosing
-                    // entry self-contained: without it, whether A's `ops`
-                    // carry B's `#define`s depends on whether B happened to
-                    // be included before A, which is inclusion history
-                    // rather than a property of A. Two runs would then
-                    // publish different `ops` under the same fingerprint.
-                    // Replaying a duplicated block is harmless: the ops of
-                    // one header are contiguous and idempotent as a group.
-                    for op in entry.ops.iter() {
-                        self.log_macro_op(op.clone());
+                    // Keep the embedded header's macro effects self-contained,
+                    // but preserve intervening changes: in B, D, B the skipped
+                    // B must not undo D's definitions or undefs. Snapshot the
+                    // current binding of each affected name, without executing
+                    // it. External bindings also constrain this frame's cache
+                    // fingerprint; locally written names are already settled.
+                    let mut seen = HashSet::new();
+                    // Only the final operation for each name matters here.
+                    for op in entry.ops.iter().rev() {
+                        let (MacroOp::Define(name, _) | MacroOp::Undef(name)) = op;
+                        if !seen.insert(name) {
+                            continue;
+                        }
+                        let original = match op {
+                            MacroOp::Define(_, def) => Some(hash_macro_binding(def, false)),
+                            MacroOp::Undef(_) => None,
+                        };
+                        // An unchanged binding is already supplied by B's
+                        // own final directive. In particular, do not require
+                        // an ordinary include guard to be both absent (B's
+                        // input) and present (B's effect) in the consumer.
+                        if self.binding_hash(name) != original {
+                            self.record_snapshot_read(name);
+                        }
+                        let current = match self.macros.get(name) {
+                            Some(def) => MacroOp::Define(name.clone(), def.clone()),
+                            None => MacroOp::Undef(name.clone()),
+                        };
+                        self.log_macro_op(current);
                     }
                 }
             }
@@ -1045,6 +1116,7 @@ impl PreprocessorState {
                 replayed: Vec::new(),
                 deps: crate::MacroFingerprint::default(),
                 settled: HashSet::new(),
+                locally_bound: HashSet::new(),
                 diagnostics: Vec::new(),
                 diagnostic_keys: HashSet::new(),
             });
@@ -7225,6 +7297,99 @@ int from_late;
         assert!(out.contains(r#"j= "(\"a\")" ;"#), "{out}");
         assert!(out.contains(r#"k= "( \"a\" )" ;"#), "{out}");
         assert!(out.contains(r#"h= "a\"z\" +b" ;"#), "{out}");
+    }
+
+    #[test]
+    fn cached_guard_skip_preserves_interleaved_macro_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("b.h"),
+            "#define VALUE 1\n#define REMOVED 1\nint b;\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("d.h"),
+            "#undef VALUE\n#define VALUE 2\n#undef REMOVED\nint d;\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("a.h"),
+            "#include \"b.h\"\n#include \"d.h\"\n#include \"b.h\"\nint a;\n",
+        )
+        .unwrap();
+        let source = "#include \"a.h\"\nint value = VALUE;\n#ifdef REMOVED\nint wrong;\n#endif\n";
+        let path = dir.path().join("main.c");
+        fs::write(&path, source).unwrap();
+        let base = PreprocessOptions::new().with_include(dir.path().to_path_buf());
+        let live = preprocess_file(&path, &base).unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let opts = base.with_include_expansion_cache(cache);
+        preprocess_file(&path, &opts).unwrap();
+        let replay = preprocess_file(&path, &opts.with_frozen_expansion_cache(true)).unwrap();
+        let tail = |text: &str| text[text.find("int value").unwrap()..].to_string();
+        assert_eq!(tail(&live.output), "int value= 2 ;\n");
+        assert_eq!(tail(&replay.output), tail(&live.output));
+    }
+
+    #[test]
+    fn cached_guard_skip_does_not_replay_conflicting_macro_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("b.h"),
+            "#ifdef VALUE\nint configured;\n#endif\n#define VALUE 1\nint b;\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("a.h"), "#include \"b.h\"\nint a;\n").unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path().to_path_buf())
+            .with_include_expansion_cache(cache);
+        let path = dir.path().join("main.c");
+        fs::write(
+            &path,
+            "#include \"b.h\"\n#undef VALUE\n#define VALUE 2\n#include \"a.h\"\n#include \"c.h\"\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("c.h"), "#include \"a.h\"\nint c;\n").unwrap();
+        preprocess_file(&path, &opts).unwrap();
+        fs::write(&path, "#include \"a.h\"\nint value = VALUE;\n").unwrap();
+        let opts = opts.with_frozen_expansion_cache(true);
+        let result = preprocess_file(&path, &opts).unwrap();
+        assert!(
+            result.output.contains("int value= 1 ;"),
+            "{}",
+            result.output
+        );
+        fs::write(&path, "#define VALUE 2\n#include \"c.h\"\n").unwrap();
+        let nested = preprocess_file(&path, &opts).unwrap();
+        assert!(
+            nested.output.contains("int configured ;"),
+            "{}",
+            nested.output
+        );
+    }
+
+    #[test]
+    fn cached_guard_skip_tracks_external_macro_override() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("b.h"), "#define VALUE 1\nint b;\n").unwrap();
+        fs::write(dir.path().join("a.h"), "#include \"b.h\"\nint a;\n").unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path().to_path_buf())
+            .with_include_expansion_cache(cache);
+        let path = dir.path().join("main.c");
+        for value in [2, 3] {
+            fs::write(&path, format!("#include \"b.h\"\n#undef VALUE\n#define VALUE {value}\n#include \"a.h\"\nint value = VALUE;\n")).unwrap();
+            preprocess_file(&path, &opts).unwrap();
+            let replay =
+                preprocess_file(&path, &opts.clone().with_frozen_expansion_cache(true)).unwrap();
+            assert!(
+                replay.output.contains(&format!("int value= {value} ;")),
+                "{}",
+                replay.output
+            );
+        }
     }
 
     /// A header whose body was guard-skipped contributes no text, no macro

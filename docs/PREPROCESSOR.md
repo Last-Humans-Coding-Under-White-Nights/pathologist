@@ -221,6 +221,8 @@ A cached expansion replays its text **without** executing the `#define`s it cont
 
 ### Cache self-containment
 
+When an already-included header is embedded in a cache entry, its affected macro names are logged with their **current** bindings (including absence), without changing the live table. Reusing its original operations would undo intervening directives in an `A → B, D, B` diamond. External overrides of the nested header's final bindings become fingerprint dependencies. If an override conflicts with a historical dependency needed by the embedded text, the expansion is marked incompatible and is not published to the shared cache. That mark propagates through enclosing entries, so consumers expand those headers live too. Unchanged bindings, including ordinary include guards, need no extra dependency.
+
 Cached expansions are flat text — nested `#include`s inside an entry were already resolved when the entry was built. An entry built while a nested header was already in this run's include-once set would otherwise freeze *without* that header's content, permanently hiding its definitions from every consumer routed through the entry.
 
 Re-splicing the nested cached blob into **live output** on every such skip exponentiates on diamond include graphs (each copy contains previous copies). Instead, the skip is recorded on the in-progress cache frame and the nested expansion is **embedded only into that frame's cache entry** at the `#include` site. Live output stays unique per file; frozen-phase guard-skips stay silent as before. Duplicate definitions inside a cache entry are still harmless downstream (merge deduplicates same-origin entities; re-declarations remain valid C).

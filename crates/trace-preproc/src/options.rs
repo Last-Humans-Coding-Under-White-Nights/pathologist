@@ -66,6 +66,10 @@ pub type ExpansionKey = (PathBuf, Language);
 /// consumer replays.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MacroFingerprint {
+    /// Embedded text and macro effects require incompatible environments.
+    /// This propagates through enclosing entries even when a local binding
+    /// would otherwise mask the conflicting dependency names.
+    pub incompatible: bool,
     /// Names read while bound, each with a content hash of the binding (see
     /// `binding_hash`). Ordered by first read, for stable diagnostics.
     pub defined: Vec<(Arc<str>, u64)>,
@@ -81,7 +85,7 @@ impl MacroFingerprint {
     pub fn signature(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         // XOR of per-entry hashes: commutative, so insertion order drops out.
-        let mut acc: u64 = 0;
+        let mut acc = u64::from(self.incompatible);
         let mut one = |tag: u8, name: &str, hash: u64| {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             (tag, name, hash).hash(&mut h);
