@@ -123,6 +123,7 @@ instead.
 | `--from <FN>` | Filter edges where the **caller** name equals `FN` or ends with `::FN` (C++ qualified methods). `_` and `%` in `FN` are literal, not `LIKE` wildcards. |
 | `--to <FN>` | Filter edges where the **callee** name equals `FN` or ends with `::FN`. Same escaping as `--from`. |
 | `--file <SUBSTR>` | Filter ordinary edges by call-site or callee file; synthetic edges by caller or callee definition file. |
+| `--callgraph-filter <FILE>` | JSON file listing regex patterns over function names; edges whose caller and callee both fail to match are hidden. |
 
 Both filters may be combined. Output format:
 
@@ -138,6 +139,19 @@ Only **`call_edges`** are listed. Unresolved indirect call sites appear in `call
 trace inspect /tmp/hdf.db calls --from NetIfSetAddr
 trace inspect /tmp/hdf.db calls --from HdfSbufReadBuffer
 trace inspect /tmp/hdf.db calls --to LiteNetSetIpAddr
+```
+
+When the full call graph is too large but you only care about a handful of
+functions (e.g. memory-related ones), pass a filter config and only edges whose
+caller or callee matches are printed. The database and analysis stay untouched;
+the filter is purely a display adapter.
+
+```json
+{ "functions": ["malloc", "free", "calloc", "realloc", "memcpy", "memset"] }
+```
+
+```bash
+trace inspect /tmp/hdf.db calls --callgraph-filter mem.json
 ```
 
 For unresolved indirect calls, query SQL directly (see below).
@@ -157,6 +171,7 @@ trace inspect <DB> callgraph --file SUBSTR --line N [--depth N] [--direction dow
 | `--depth <N>` | Maximum BFS depth (default 3). |
 | `--direction` | `down` = callees (default), `up` = callers. |
 | `--format` | Output format: `text` (default), `json`, `graphviz`, or `mermaid`. |
+| `--callgraph-filter <FILE>` | JSON file listing regex patterns over function names; edges whose caller and callee both fail to match are hidden, nodes left without any surviving edge are pruned. The start function (the root) is always kept even when it does not match, so the query anchor stays visible. |
 
 The start function is chosen among definitions whose `[line_start, line_end]`
 contains `--line`. Edges are labeled with their resolution (`direct`,
@@ -168,6 +183,7 @@ callees print `(see above; also file:line)`.
 ```bash
 trace inspect /tmp/hdf.db callgraph --file devsvc_manager.c --line 120 --depth 2
 trace inspect /tmp/hdf.db callgraph --file hdf_service_record.c --line 20 --direction up
+trace inspect /tmp/hdf.db callgraph --file allocator.c --line 44 --callgraph-filter mem.json
 ```
 
 ### `trace inspect dataflow`
