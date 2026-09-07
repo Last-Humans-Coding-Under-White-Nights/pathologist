@@ -19,10 +19,14 @@
  *    borrowed and copied during the call; they must be valid for the call's
  *    duration only.
  *  - Error messages returned via `char **out_err` are malloc-style heap
- *    strings you own; free them with `trace_string_free`.
+ *    strings you own; free them with `trace_string_free`. Non-fatal
+ *    diagnostics returned via `char **out_warnings` (trace_index) are owned
+ *    the same way.
  *  - `*out_err` is cleared to NULL at the start of every call and set only
  *    on failure. On success it is NULL; if it is non-NULL it holds a heap
  *    message you must free. Never reuse a non-NULL `*out_err` across calls.
+ *    `*out_warnings` is likewise cleared at the start of `trace_index` and
+ *    set on success only.
  *  - Each handle is single-threaded; do not share across threads.
  *
  * Status codes
@@ -248,12 +252,30 @@ void trace_string_free(char *s);
  *
  * `opts->root` must reference a directory containing .c/.cpp sources; the
  * database is written to `opts->output_db` (created/replaced atomically).
- * On success `*out` receives summary counters. Return values: TRACE_OK, or
- * TRACE_ERR_INVALID_ARG (incl. ABI mismatch), TRACE_ERR_ANALYSIS, TRACE_ERR_PANIC.
+ * On success `*out` receives summary counters. Return values: TRACE_OK,
+ * TRACE_ERR_INVALID_ARG (incl. ABI mismatch), TRACE_ERR_IO (unusable output
+ * path / export I/O), TRACE_ERR_ANALYSIS, TRACE_ERR_PANIC.
+ *
+ * This is the 0.1 entry point; its signature is frozen. Use
+ * `trace_index_ext` to also receive the run's non-fatal warnings.
  */
 trace_status trace_index(const trace_index_options *opts,
                          trace_index_result *out,
                          char **out_err);
+
+/*
+ * Index a project directory into a SQLite database, with a warning channel.
+ *
+ * Behaves exactly like `trace_index`, but on success delivers non-fatal
+ * diagnostics (e.g. include paths lying outside the analyzed tree) through
+ * `out_warnings` when non-null: it is set to a heap string (free with
+ * `trace_string_free`) if the run produced any, else NULL; pass NULL to
+ * ignore warnings.
+ */
+trace_status trace_index_ext(const trace_index_options *opts,
+                             trace_index_result *out,
+                             char **out_warnings,
+                             char **out_err);
 
 /*
  * Open an indexed database read-only. Returns an owned handle or NULL plus a

@@ -32,10 +32,15 @@ int main(void) {
 
     trace_index_result r;
     char *err = NULL;
-    if (trace_index(&opts, &r, &err) != TRACE_OK) {
+    char *warnings = NULL;
+    if (trace_index_ext(&opts, &r, &warnings, &err) != TRACE_OK) {
         fprintf(stderr, "index failed: %s\n", err);
         trace_string_free(err);
         return 1;
+    }
+    if (warnings) {       /* non-fatal diagnostics, e.g. out-of-tree includes */
+        fprintf(stderr, "warning: %s\n", warnings);
+        trace_string_free(warnings);
     }
     printf("%llu functions indexed\n", (unsigned long long)r.functions);
 
@@ -67,7 +72,7 @@ The tricky part of any C API is who owns what. The rules here:
 | Item | Owner | Lifetime |
 |------|-------|----------|
 | `trace_db` handle | caller | until `trace_db_close` |
-| `char **out_err` payloads | caller | free with `trace_string_free` |
+| `char **out_err` / `char **out_warnings` payloads | caller | free with `trace_string_free` |
 | Strings inside a result (`name`, `path`, `label`, `detail`, …) | the result object | until the matching `trace_*_free` |
 | `items` arrays in a result | the result object | freed by the same `trace_*_free` |
 | Inputs (`const char *`, `trace_index_options`, `trace_symbol[]`) | caller, borrowed | copied during the call |
@@ -115,6 +120,14 @@ string `Vec` moves the `CString` values but not the buffers they own.
   as `TRACE_ERR_IO` before running the pipeline; the probe exactly mirrors the
   exporter, so it creates a missing parent directory (like the CLI does) and
   never leaves a stale 0-byte file at `output_db` on a later failure.
+- **Warnings are a separate channel.** `trace_index_ext` reports non-fatal
+  diagnostics through the optional `out_warnings` argument instead of failing:
+  on success it holds a heap message (free with `trace_string_free`) when the
+  run produced any, else NULL. The include paths that canonicalize outside the
+  analyzed tree — the "twin headers" hazard the CLI warns about — are surfaced
+  here, so embedders see the same diagnostic `-I` misuse the CLI prints. The
+  0.1 `trace_index` remains the frozen no-warnings entry point; new callers
+  that want the diagnostics use `trace_index_ext`.
 - **Strict argument validation.** Everything that is a program error is
   rejected at the boundary with `TRACE_ERR_INVALID_ARG` instead of being
   coerced or deferred:
@@ -153,8 +166,11 @@ Each code is produced by the specific path that classifies it in `ApiError`
 - `TRACE_ERR_INVALID_ARG` — null/overshort pointers, malformed arrays, invalid
   `trace_direction`, invalid `trace_symbol.kind`, `depth == 0`, `n_roots == 0`,
   out-of-band `trace_index_options.size`.
-- `TRACE_ERR_IO` — output-path problems from the `trace_index` preflight, and
-  database open failures in `trace_db_open`.
+- `TRACE_ERR_IO` — filesystem problems: output-path issues caught by the
+  `trace_index` preflight, export I/O failures from SQLite/`std::io` (the
+  `From<anyhow::Error>` adapter downcasts the chain and maps filesystem and
+  SQLite I/O codes to `TRACE_ERR_IO`), and database open failures in
+  `trace_db_open`.
 - `TRACE_ERR_NOT_FOUND` — absent queried entities, e.g. a call-graph root id
   with no matching function. The `From<anyhow::Error>` adapter classifies a
   `not found` / `no value-flow node` message from the inspect layer as

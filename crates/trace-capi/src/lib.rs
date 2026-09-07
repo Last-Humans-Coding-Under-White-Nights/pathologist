@@ -26,6 +26,6 @@ mod util;
 
 pub use types::*;
 
-pub use index::trace_index;
+pub use index::{trace_index, trace_index_ext};
 pub use inspect::*;
 pub use util::*;

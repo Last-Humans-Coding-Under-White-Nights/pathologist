@@ -4,7 +4,8 @@
 use crate::types::{TraceIndexOptions, TraceIndexResult, TraceStatus};
 use crate::util::{guard, set_error, ApiError};
 use std::ffi::{c_char, c_int};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::ptr;
 use std::sync::Arc;
 use trace_analysis::{analyze_with_options, AnalyzeOptions, FnModelSet};
 use trace_db::{export_to_sqlite, ExportOptions};
@@ -77,9 +78,9 @@ fn arg_err(msg: &str, out_err: *mut *mut c_char) -> i32 {
 /// the parent directory and touches the temporary file the exporter will
 /// write (`<out>.db.tmp`), never the final path. That means a destination the
 /// exporter would accept is accepted here too — including a missing parent
-/// directory (created, like the CLI does), a read-only file the exporter
-/// would unlink-and-replace, or a dangling symlink at `output` — and one it
-/// would reject is rejected before any parsing happens.
+/// directory (created, like the CLI does), a read-only stale temp the
+/// exporter would unlink-and-recreate, or a dangling symlink at `output` —
+/// and one it would reject is rejected before any parsing happens.
 ///
 /// The probe is side-effect-free: the parent directory it creates is left
 /// (the exporter will need it anyway) and the temp file it probes is
@@ -94,26 +95,75 @@ fn preflight_output(path: &std::path::Path) -> Result<(), ApiError> {
             ))
         })?;
     }
-    let created = !temp.exists();
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&temp)
-        .map_err(|e| {
+    // Mirror the exporter: it unlinks a stale `<out>.db.tmp` (removing a file
+    // only needs write permission on the parent directory) and lets SQLite
+    // create a fresh one, so a leftover read-only temp must not fail the
+    // probe either. A temp that is a directory still fails here — exactly as
+    // it does in `export_to_sqlite`, whose `remove_file` on a directory
+    // errors too.
+    if temp.exists() {
+        std::fs::remove_file(&temp).map_err(|e| {
             ApiError::Io(format!(
-                "cannot open output database {}: {e}",
-                path.display()
+                "cannot replace stale temporary output {}: {e}",
+                temp.display()
             ))
         })?;
-    if created {
-        let _ = std::fs::remove_file(&temp);
     }
+    // The exporter opens the temp with SQLite's create semantics;
+    // `create_new` is the closest Rust mirror after the unlink above.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+    {
+        Ok(_) => {}
+        Err(e) => {
+            return Err(ApiError::Io(format!(
+                "cannot open output database {}: {e}",
+                path.display()
+            )));
+        }
+    }
+    let _ = std::fs::remove_file(&temp);
     Ok(())
 }
 
-fn run_index(cfg: &IndexConfig) -> Result<TraceIndexResult, ApiError> {
+/// Collect include paths that canonicalize into a different tree than the
+/// analyzed root. Headers there may resolve to same-named twins and silently
+/// starve translation units, so embedders need the same warning the CLI
+/// prints. Returns the CLI message text, or `None` when nothing is outside.
+///
+/// Mirrors the containment check and wording of `trace-cli/src/main.rs`
+/// (the `outside` filter before `build_program_with_jobs`); keep the two in
+/// step, or fold both into a shared pipeline helper.
+fn outside_root_warning(root: &Path, includes: &[PathBuf]) -> Option<String> {
+    let root_canon = trace_ir::canonicalize(root);
+    let outside: Vec<PathBuf> = includes
+        .iter()
+        .map(|p| trace_ir::canonicalize(p))
+        .filter(|c| !(c.starts_with(&root_canon) || root_canon.starts_with(c)))
+        .collect();
+    if outside.is_empty() {
+        return None;
+    }
+    let mut w = format!(
+        "{} include path(s) lie outside the analysis tree {};\n\
+         headers may resolve to twins in another tree and lose definitions:",
+        outside.len(),
+        root_canon.display()
+    );
+    for p in outside.iter().take(5) {
+        w.push_str(&format!("\n  {}", p.display()));
+    }
+    if outside.len() > 5 {
+        w.push_str(&format!("\n  ... and {} more", outside.len() - 5));
+    }
+    Some(w)
+}
+
+fn run_index(cfg: &IndexConfig) -> Result<(TraceIndexResult, String), ApiError> {
     preflight_output(&cfg.output)?;
+    let warning = outside_root_warning(&cfg.root, &cfg.includes).unwrap_or_default();
     let mut models = FnModelSet::builtin();
     for path in &cfg.models {
         let src = std::fs::read_to_string(path).map_err(|e| {
@@ -161,16 +211,24 @@ fn run_index(cfg: &IndexConfig) -> Result<TraceIndexResult, ApiError> {
     )
     .map_err(ApiError::from)?;
 
-    Ok(TraceIndexResult {
-        files: program.symbols.files.len() as u64,
-        functions: program.symbols.functions.len() as u64,
-        call_edges: analysis.call_edges.len() as u64,
-        arg_flow_edges: analysis.arg_flow_edges.len() as u64,
-    })
+    Ok((
+        TraceIndexResult {
+            files: program.symbols.files.len() as u64,
+            functions: program.symbols.functions.len() as u64,
+            call_edges: analysis.call_edges.len() as u64,
+            arg_flow_edges: analysis.arg_flow_edges.len() as u64,
+        },
+        warning,
+    ))
 }
 
 /// Index a project directory (`opts.root`) into a SQLite database
 /// (`opts.output_db`) and fill `out` with summary counters.
+///
+/// This is the 0.1 entry point and its signature is frozen: it reports only
+/// hard errors (via `out_err`). Callers that also want the non-fatal
+/// diagnostics (include paths lying outside the analyzed tree) use
+/// `trace_index_ext`, which adds an `out_warnings` channel.
 ///
 /// Returns `TRACE_OK` (0) on success. On failure returns a non-zero status
 /// and, when `out_err` is non-null, sets it to a message the caller frees
@@ -179,16 +237,51 @@ fn run_index(cfg: &IndexConfig) -> Result<TraceIndexResult, ApiError> {
 ///
 /// # Safety
 ///
-/// `opts` and `out` must be valid for the duration of the call, and `opts`
-/// must point to a `trace_index_options` at least as large as `size`
-/// reports.
+/// `opts`, `out` and `out_err` must be valid for the duration of the call
+/// (when non-null), and `opts` must point to a `trace_index_options` at least
+/// as large as `size` reports.
 #[no_mangle]
 pub unsafe extern "C" fn trace_index(
     opts: *const TraceIndexOptions,
     out: *mut TraceIndexResult,
     out_err: *mut *mut c_char,
 ) -> c_int {
+    unsafe { trace_index_impl(opts, out, ptr::null_mut(), out_err) }
+}
+
+/// Index a project directory into a SQLite database, with a warning channel.
+///
+/// Behaves exactly like `trace_index`, but on success also delivers non-fatal
+/// diagnostics (e.g. include paths canonicalizing outside the analyzed tree)
+/// through `out_warnings` when non-null: it is set to a heap message — or
+/// cleared to NULL when the run produced none — that the caller frees with
+/// `trace_string_free`. Pass `NULL` to ignore warnings.
+///
+/// # Safety
+///
+/// `opts`, `out`, `out_warnings` and `out_err` must be valid for the duration
+/// of the call (when non-null), and `opts` must point to a
+/// `trace_index_options` at least as large as `size` reports.
+#[no_mangle]
+pub unsafe extern "C" fn trace_index_ext(
+    opts: *const TraceIndexOptions,
+    out: *mut TraceIndexResult,
+    out_warnings: *mut *mut c_char,
+    out_err: *mut *mut c_char,
+) -> c_int {
+    unsafe { trace_index_impl(opts, out, out_warnings, out_err) }
+}
+
+unsafe fn trace_index_impl(
+    opts: *const TraceIndexOptions,
+    out: *mut TraceIndexResult,
+    out_warnings: *mut *mut c_char,
+    out_err: *mut *mut c_char,
+) -> c_int {
     crate::util::reset_err(out_err);
+    if !out_warnings.is_null() {
+        *out_warnings = ptr::null_mut();
+    }
     if opts.is_null() || out.is_null() {
         return arg_err("opts and out must not be null", out_err);
     }
@@ -218,8 +311,11 @@ pub unsafe extern "C" fn trace_index(
     };
 
     match guard(|| run_index(&cfg)) {
-        Ok(result) => {
+        Ok((result, warnings)) => {
             unsafe { *out = result };
+            if !warnings.is_empty() {
+                unsafe { set_error(out_warnings, &warnings) };
+            }
             TraceStatus::TraceOk as c_int
         }
         Err(err) => {

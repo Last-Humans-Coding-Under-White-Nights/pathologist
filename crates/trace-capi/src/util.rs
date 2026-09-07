@@ -44,19 +44,50 @@ impl ApiError {
     }
 }
 
-/// Wrap an error produced by the `trace-db` inspect layer. A `not
-/// found`-family message means the queried entity is absent (`NotFound`);
-/// everything else is an `Analysis` failure (the arg/IO checks that would
-/// produce the other codes are all resolved on the C side, before this
-/// adapter is reached).
+/// Wrap an error produced by the `trace-db` export/inspect layer. The
+/// classification reads the *whole* error chain, not just the display text:
+/// a filesystem failure — e.g. `export_to_sqlite` hitting an unwritable
+/// output or a directory standing where a file must be written — surfaces as
+/// `TRACE_ERR_IO` rather than `TRACE_ERR_ANALYSIS`. A `not found`-family
+/// message means the queried entity is absent (`NotFound`); everything else
+/// is an `Analysis` failure.
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        if e.downcast_ref::<std::io::Error>().is_some() {
+            return ApiError::Io(format!("{e:#}"));
+        }
+        if let Some(sqlite) = e.downcast_ref::<rusqlite::Error>() {
+            if is_sqlite_io_error(sqlite) {
+                return ApiError::Io(format!("{e:#}"));
+            }
+        }
         let msg = format!("{e:#}");
         if msg.contains("not found") || msg.contains("no value-flow node") {
             ApiError::NotFound(msg)
         } else {
             ApiError::Analysis(msg)
         }
+    }
+}
+
+/// True when a `rusqlite::Error` is a filesystem-level failure (unable to
+/// open/create the database file, read-only output, disk I/O error, full
+/// disk) rather than a SQL/schema/constraint error, which stays an
+/// `Analysis` failure.
+fn is_sqlite_io_error(e: &rusqlite::Error) -> bool {
+    use rusqlite::ErrorCode;
+    match e {
+        rusqlite::Error::InvalidPath(_) => true,
+        rusqlite::Error::SqliteFailure(err, _) => matches!(
+            err.code,
+            ErrorCode::CannotOpen
+                | ErrorCode::ReadOnly
+                | ErrorCode::SystemIoFailure
+                | ErrorCode::DiskFull
+                | ErrorCode::PermissionDenied
+                | ErrorCode::NoLargeFileSupport
+        ),
+        _ => false,
     }
 }
 

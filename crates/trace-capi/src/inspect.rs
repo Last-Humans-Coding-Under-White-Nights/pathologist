@@ -708,7 +708,7 @@ pub unsafe extern "C" fn trace_db_dataflow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::trace_index;
+    use crate::index::{trace_index, trace_index_ext};
     use crate::types::TraceIndexOptions;
     use crate::util::trace_string_free;
     use std::ffi::CString;
@@ -748,8 +748,9 @@ mod tests {
             call_edges: 0,
             arg_flow_edges: 0,
         };
+        let mut warnings: *mut c_char = ptr::null_mut();
         let mut err: *mut c_char = ptr::null_mut();
-        let status = unsafe { trace_index(&opts, &mut result, &mut err) };
+        let status = unsafe { trace_index_ext(&opts, &mut result, &mut warnings, &mut err) };
         assert_eq!(
             status,
             TraceStatus::TraceOk as c_int,
@@ -758,6 +759,9 @@ mod tests {
         );
         if !err.is_null() {
             unsafe { trace_string_free(err) };
+        }
+        if !warnings.is_null() {
+            unsafe { trace_string_free(warnings) };
         }
         assert!(result.functions >= 2, "{result:?}");
 
@@ -1073,10 +1077,12 @@ mod tests {
             call_edges: 0,
             arg_flow_edges: 0,
         };
+        let mut warnings: *mut c_char = ptr::null_mut();
         let mut err: *mut c_char = ptr::null_mut();
-        let status = unsafe { trace_index(&opts, &mut result, &mut err) };
+        let status = unsafe { trace_index_ext(&opts, &mut result, &mut warnings, &mut err) };
         assert_eq!(status, TraceStatus::TraceErrIo as c_int);
         assert!(!err.is_null());
+        assert!(warnings.is_null(), "warnings must only be set on success");
         unsafe { trace_string_free(err) };
         // Restore perms so tempdir cleanup can remove the directory.
         let mut perms = std::fs::metadata(&ro_dir).unwrap().permissions();
@@ -1118,9 +1124,11 @@ mod tests {
             call_edges: 0,
             arg_flow_edges: 0,
         };
+        let mut warnings: *mut c_char = ptr::null_mut();
         let mut err: *mut c_char = ptr::null_mut();
-        let status = unsafe { trace_index(&opts, &mut result, &mut err) };
+        let status = unsafe { trace_index_ext(&opts, &mut result, &mut warnings, &mut err) };
         assert_eq!(status, TraceStatus::TraceErrAnalysis as c_int);
+        assert!(warnings.is_null(), "warnings must only be set on success");
         if !err.is_null() {
             unsafe { trace_string_free(err) };
         }
@@ -1129,6 +1137,199 @@ mod tests {
             !out_path.exists(),
             "failed index must not leave a stale output file"
         );
+    }
+
+    #[test]
+    fn stable_trace_index_entry_point_works() {
+        // `trace_index` is the frozen 0.1 signature (no warnings channel);
+        // keep proving old consumers' calling convention keeps working.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.c"), MAIN_C).unwrap();
+        let root = CString::new(dir.path().to_str().unwrap()).unwrap();
+        let out_path = dir.path().join("out.db");
+        let out_c = CString::new(out_path.to_str().unwrap()).unwrap();
+        let opts = TraceIndexOptions {
+            size: std::mem::size_of::<TraceIndexOptions>(),
+            root: root.as_ptr(),
+            output_db: out_c.as_ptr(),
+            includes: ptr::null(),
+            n_includes: 0,
+            defines: ptr::null(),
+            n_defines: 0,
+            jobs: 1,
+            full_export: 0,
+            debug_points_to: 0,
+            models: ptr::null(),
+            n_models: 0,
+        };
+        let mut result = TraceIndexResult {
+            files: 0,
+            functions: 0,
+            call_edges: 0,
+            arg_flow_edges: 0,
+        };
+        let mut err: *mut c_char = ptr::null_mut();
+        let status = unsafe { trace_index(&opts, &mut result, &mut err) };
+        assert_eq!(
+            status,
+            TraceStatus::TraceOk as c_int,
+            "3-arg trace_index must still work, err={}",
+            cstr_show(err)
+        );
+        if !err.is_null() {
+            unsafe { trace_string_free(err) };
+        }
+        assert!(result.functions >= 2, "{result:?}");
+    }
+
+    #[test]
+    fn export_io_error_is_classified_as_io() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.c"), MAIN_C).unwrap();
+        let root = CString::new(dir.path().to_str().unwrap()).unwrap();
+        // A directory standing where the final output file must be written:
+        // the preflight probe passes (it only touches `<out>.db.tmp`, and
+        // parent creation + SQLite writes both succeed), but the exporter
+        // cannot `remove_file` the directory and must surface a filesystem
+        // error — classified as TRACE_ERR_IO, not TRACE_ERR_ANALYSIS.
+        let out_dir = dir.path().join("out.db");
+        std::fs::create_dir(&out_dir).unwrap();
+        let out_c = CString::new(out_dir.to_str().unwrap()).unwrap();
+        let opts = TraceIndexOptions {
+            size: std::mem::size_of::<TraceIndexOptions>(),
+            root: root.as_ptr(),
+            output_db: out_c.as_ptr(),
+            includes: ptr::null(),
+            n_includes: 0,
+            defines: ptr::null(),
+            n_defines: 0,
+            jobs: 1,
+            full_export: 0,
+            debug_points_to: 0,
+            models: ptr::null(),
+            n_models: 0,
+        };
+        let mut result = TraceIndexResult {
+            files: 0,
+            functions: 0,
+            call_edges: 0,
+            arg_flow_edges: 0,
+        };
+        let mut warnings: *mut c_char = ptr::null_mut();
+        let mut err: *mut c_char = ptr::null_mut();
+        let status = unsafe { trace_index_ext(&opts, &mut result, &mut warnings, &mut err) };
+        assert_eq!(
+            status,
+            TraceStatus::TraceErrIo as c_int,
+            "export filesystem failures must map to TRACE_ERR_IO, got err={}",
+            cstr_show(err)
+        );
+        assert!(!err.is_null());
+        assert!(warnings.is_null());
+        unsafe { trace_string_free(err) };
+    }
+
+    #[test]
+    fn read_only_stale_temp_does_not_fail_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.c"), MAIN_C).unwrap();
+        // A leftover read-only `<out>.db.tmp`: the exporter unlinks it
+        // (removal only needs write permission on the parent directory) and
+        // lets SQLite create a fresh file — so the probe must accept it too.
+        let out_path = dir.path().join("out.db");
+        let temp = out_path.with_extension("db.tmp");
+        std::fs::write(&temp, "0").unwrap();
+        let mut perms = std::fs::metadata(&temp).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&temp, perms).unwrap();
+        let root = CString::new(dir.path().to_str().unwrap()).unwrap();
+        let out_c = CString::new(out_path.to_str().unwrap()).unwrap();
+        let opts = TraceIndexOptions {
+            size: std::mem::size_of::<TraceIndexOptions>(),
+            root: root.as_ptr(),
+            output_db: out_c.as_ptr(),
+            includes: ptr::null(),
+            n_includes: 0,
+            defines: ptr::null(),
+            n_defines: 0,
+            jobs: 1,
+            full_export: 0,
+            debug_points_to: 0,
+            models: ptr::null(),
+            n_models: 0,
+        };
+        let mut result = TraceIndexResult {
+            files: 0,
+            functions: 0,
+            call_edges: 0,
+            arg_flow_edges: 0,
+        };
+        let mut warnings: *mut c_char = ptr::null_mut();
+        let mut err: *mut c_char = ptr::null_mut();
+        let status = unsafe { trace_index_ext(&opts, &mut result, &mut warnings, &mut err) };
+        assert_eq!(
+            status,
+            TraceStatus::TraceOk as c_int,
+            "a stale read-only temp must not fail the probe, err={}",
+            cstr_show(err)
+        );
+        if !err.is_null() {
+            unsafe { trace_string_free(err) };
+        }
+        if !warnings.is_null() {
+            unsafe { trace_string_free(warnings) };
+        }
+        assert!(out_path.exists(), "index must have replaced the output");
+    }
+
+    #[test]
+    fn out_of_tree_include_warning_is_surfaced() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.c"), MAIN_C).unwrap();
+        // A sibling include dir that is NOT under the analyzed root: headers
+        // there could shadow same-named twins, so the run warns (it still
+        // succeeds) — the diagnostic the CLI prints must reach embedders.
+        let root = CString::new(dir.path().to_str().unwrap()).unwrap();
+        let inc = CString::new(format!("{}-outside", dir.path().display())).unwrap();
+        let includes = [inc.as_ptr()];
+        let out_c = CString::new(format!("{}/out.db", dir.path().display())).unwrap();
+        let opts = TraceIndexOptions {
+            size: std::mem::size_of::<TraceIndexOptions>(),
+            root: root.as_ptr(),
+            output_db: out_c.as_ptr(),
+            includes: includes.as_ptr(),
+            n_includes: 1,
+            defines: ptr::null(),
+            n_defines: 0,
+            jobs: 1,
+            full_export: 0,
+            debug_points_to: 0,
+            models: ptr::null(),
+            n_models: 0,
+        };
+        let mut result = TraceIndexResult {
+            files: 0,
+            functions: 0,
+            call_edges: 0,
+            arg_flow_edges: 0,
+        };
+        let mut warnings: *mut c_char = ptr::null_mut();
+        let mut err: *mut c_char = ptr::null_mut();
+        let status = unsafe { trace_index_ext(&opts, &mut result, &mut warnings, &mut err) };
+        assert_eq!(
+            status,
+            TraceStatus::TraceOk as c_int,
+            "err={}",
+            cstr_show(err)
+        );
+        if !err.is_null() {
+            unsafe { trace_string_free(err) };
+        }
+        assert!(!warnings.is_null(), "out-of-tree include must be warned");
+        let w = cstr_show(warnings);
+        assert!(w.contains("lie outside the analysis tree"), "{w}");
+        assert!(w.contains("-outside"), "{w}");
+        unsafe { trace_string_free(warnings) };
     }
 
     #[test]
@@ -1195,9 +1396,10 @@ mod tests {
         };
         let mut err: *mut c_char = ptr::null_mut();
         let status = unsafe {
-            trace_index(
+            trace_index_ext(
                 &small as *const SmallOpts as *const TraceIndexOptions,
                 &mut result,
+                ptr::null_mut(),
                 &mut err,
             )
         };

@@ -124,11 +124,16 @@ static int cmd_analyze(int argc, char **argv) {
 
     trace_index_result r;
     char *err = NULL;
-    trace_status st = trace_index(&opts, &r, &err);
+    char *warnings = NULL;
+    trace_status st = trace_index_ext(&opts, &r, &warnings, &err);
     if (st != TRACE_OK) {
         print_err(&err);
         printf("index failed (status %d)\n", (int)st);
         return 1;
+    }
+    if (warnings) {
+        fprintf(stderr, "warning: %s\n", warnings);
+        trace_string_free(warnings);
     }
     printf("indexed: %llu files, %llu functions, %llu call edges, %llu arg-flow edges -> %s\n",
            (unsigned long long)r.files, (unsigned long long)r.functions,

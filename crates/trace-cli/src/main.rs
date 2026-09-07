@@ -243,6 +243,8 @@ fn run_analyze(
     // (same basename, different tree) resolve to the wrong copy, which
     // silently starves translation units. Warn loudly — this misconfiguration
     // previously produced silent false negatives.
+    // The C API repeats this check (`outside_root_warning`, trace-capi);
+    // keep the containment predicate in step with it.
     let root_canon = trace_ir::canonicalize(&target);
     let outside: Vec<PathBuf> = opts
         .include_paths
