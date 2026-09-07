@@ -506,9 +506,28 @@ C++-aware only where it must be — everything else reuses the C machinery.
   (`plugin_->OnEvent()` inside a method) is looked up as a data member of
   the enclosing class (and bases) when it is not a local/param, so
   `shared_ptr<Plugin>` fields unwrap like parameters.
-- **Smart pointers**: `std::shared_ptr<T>` / `unique_ptr` / `weak_ptr`
-  intern as `Ptr(Struct{T})`, so `p->method` types as `T`. Nested pointer
-  layers (`T &`, `T *`) are peeled for the same reason.
+- **Smart pointers / `operator->`**: a wrapper is recognised by the
+  `operator->` it declares, not by its name (#64). Its instantiation interns
+  as `Struct{sptr<T>}` — the wrapper stays the variable's class, so `sp.Get()`
+  is the wrapper's member — and `p->m()` looks `m` up on what the arrow
+  returns: for a class template, the argument at the declared parameter's
+  position (`Handle<Meta, T>` returning `T *` takes the second); for a named
+  class, that class, followed on through a chain of up to eight links with
+  cycles cut; for a raw pointer, its pointee, which ends the chain. `*sp` is
+  the same pointee. A raw pointer receiver, `this` included, is the built-in
+  arrow. What each `operator->` returns is recorded as an `ArrowReturn` fact
+  merged with a header's types, so a wrapper-typed field declared in a
+  different header from the wrapper resolves too. Where the chain names no
+  class — overloads that disagree, a dependent return the index cannot name
+  (`sptr<T>`, or a parameter of a base template), a cycle — the site is left
+  unresolved: a member invented on the wrapper would be indistinguishable
+  from a real call out of tree. `shared_ptr` / `unique_ptr` / `weak_ptr` keep
+  a name-based fallback to their first argument for the common case that
+  their header is outside the tree and there is no declaration to ask; a
+  guess from a name, not a resolution. Only the terminal member call is
+  emitted — the implicit calls to each `operator->` are not represented —
+  and a reference member holding a wrapper lowers as a pointer and is read
+  as one.
 - **Callables**: only `std::function<Sig>` / `::std::function<Sig>` intern
   as `FnPtr` so assignment and field stores of function addresses
   participate in indirect-call resolution. Other types whose last segment

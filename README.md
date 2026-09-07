@@ -611,7 +611,7 @@ tests/fixtures/    Integration test C corpora
 
 ## Limitations
 
-- **C++ first step** — namespaces, overloads (arity), classes/virtual dispatch (including virtual bases), `final` class/method devirtualization, ctors/dtors, implicit `this->method()`, `shared_ptr`/`unique_ptr`/`weak_ptr` unwrap, and callables (`std::function`, lambdas, `operator()`) are modeled; type-based overload ranking and templates beyond name-stripping are not (see [docs/ANALYSIS.md](docs/ANALYSIS.md)). Next slices from hiview: [docs/CPP_ROADMAP.md](docs/CPP_ROADMAP.md).
+- **C++ first step** — namespaces, overloads (arity), classes/virtual dispatch (including virtual bases), `final` class/method devirtualization, ctors/dtors, implicit `this->method()`, smart-pointer unwrap through a declared `operator->` (`shared_ptr`, and OHOS `sptr`/`RefPtr` or HDI `AutoPtr` alike, the wrapper keeping its own members for `.`), and callables (`std::function`, lambdas, `operator()`) are modeled; type-based overload ranking and templates beyond name-stripping are not (see [docs/ANALYSIS.md](docs/ANALYSIS.md)). Next slices from hiview: [docs/CPP_ROADMAP.md](docs/CPP_ROADMAP.md).
 - **May-analysis** — indirect calls can list multiple targets; absence of an edge does not prove unreachability.
 - **No path sensitivity** — all branches and paths are merged.
 - **Preprocessor subset** — not gcc/clang compatible for all extensions; see [docs/PREPROCESSOR.md](docs/PREPROCESSOR.md).

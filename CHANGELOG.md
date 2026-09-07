@@ -22,6 +22,24 @@ All notable changes to `trace` are documented in this file.
 
 ### Fixed
 
+- `x->m()` resolves the receiver through the **declared** `operator->` rather than a hardcoded
+  list of smart-pointer names (#64). A wrapper's instantiation keeps the wrapper as its class,
+  and a `->` on it looks the member up on what its `operator->` returns: for a class template,
+  the argument at the declared parameter's position (OHOS `sptr<T>` / `RefPtr<T>` and HDI
+  `AutoPtr<T>` need no list entry); for a named class, that class, followed on through a chain
+  up to eight links deep with cycles cut; for a raw pointer, its pointee. `*w` on a wrapper is
+  the same pointee. Previously a wrapper outside the three listed names kept its own class as
+  the receiver and had a member **invented** on it — `sptr::AddOutput` is an edge to an
+  undefined external function, indistinguishable downstream from a real call out of tree —
+  while a listed one was unwrapped on the *type*, so `sp.reset()` bound to the pointee's
+  `reset`. A `.` call now stays on the wrapper, and where nothing names a class (overloads that
+  disagree, a return type the index cannot name, a cycle) the site is left unresolved instead.
+  The name list survives only as a fallback for a wrapper whose class is absent from the index
+  (`std::shared_ptr` with its header out of tree), a guess from a name rather than a
+  resolution. What an `operator->` returns is carried as a fact alongside a header's types, so
+  a wrapper-typed field declared in a different header from the wrapper resolves too. A member
+  prototype declared in a class body now also carries its declared return type, which the merge
+  keeps over the definition's; it used to be a `void` placeholder.
 - The preprocessor lexer now runs translation phase 2 (`\`-newline splicing) before it
   recognizes tokens, so an identifier, a multi-character punctuator, an encoding prefix or a
   string body written across a line splice is one token. `#define F(x, .\`-newline-`..)` is
