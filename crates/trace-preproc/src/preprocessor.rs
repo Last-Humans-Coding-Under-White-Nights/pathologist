@@ -357,6 +357,33 @@ impl PreprocessorState {
         let Some(end) = attribute_group_end(tokens, start) else {
             return Ok(None);
         };
+        if attribute_group_must_survive(tokens, start, end) {
+            return Ok(None);
+        }
+        for tok in &tokens[start + 1..end] {
+            self.check_resource_limits(tok.line)?;
+            if matches!(tok.kind, TokenKind::Newline) {
+                self.emit_token(tok);
+            }
+        }
+        Ok(Some(end))
+    }
+
+    fn elide_attribute_macro_group(
+        &mut self,
+        tokens: &[Token],
+        start: usize,
+        replacement: &[Token],
+    ) -> Result<Option<usize>, PreprocessError> {
+        let Some(name) = compiler_attribute_marker(replacement) else {
+            return Ok(None);
+        };
+        let Some(end) = attribute_group_end_after_name(tokens, start + 1, name) else {
+            return Ok(None);
+        };
+        if attribute_group_must_survive(tokens, start + 1, end) {
+            return Ok(None);
+        }
         for tok in &tokens[start + 1..end] {
             self.check_resource_limits(tok.line)?;
             if matches!(tok.kind, TokenKind::Newline) {
@@ -977,6 +1004,13 @@ impl PreprocessorState {
                                         continue;
                                     }
                                     let painted = Self::paint_replacement(&replacement, tok, name);
+                                    if let Some(end) =
+                                        self.elide_attribute_macro_group(tokens, i, &painted)?
+                                    {
+                                        self.pop_expansion();
+                                        i = end;
+                                        continue;
+                                    }
                                     let r = self.expand_tokens_no_directives(&painted);
                                     self.pop_expansion();
                                     r?;
@@ -1036,6 +1070,13 @@ impl PreprocessorState {
                                     continue;
                                 }
                                 let painted = Self::paint_replacement(&replacement, tok, name);
+                                if let Some(end) =
+                                    self.elide_attribute_macro_group(tokens, i, &painted)?
+                                {
+                                    self.pop_expansion();
+                                    i = end;
+                                    continue;
+                                }
                                 let r = self.expand_tokens_no_directives(&painted);
                                 self.pop_expansion();
                                 r?;
@@ -1794,7 +1835,10 @@ fn attribute_group_end(tokens: &[Token], start: usize) -> Option<usize> {
         }
         _ => return None,
     };
-    let mut open = start + 1;
+    attribute_group_end_after_name(tokens, start + 1, name)
+}
+
+fn attribute_group_end_after_name(tokens: &[Token], mut open: usize, name: &str) -> Option<usize> {
     while matches!(
         tokens.get(open).map(|tok| &tok.kind),
         Some(TokenKind::Newline)
@@ -1838,6 +1882,37 @@ fn attribute_group_end(tokens: &[Token], start: usize) -> Option<usize> {
         }
     }
     None
+}
+
+fn compiler_attribute_marker(tokens: &[Token]) -> Option<&str> {
+    let mut significant = tokens.iter().filter_map(|token| match &token.kind {
+        TokenKind::Identifier(name) => Some(name.as_str()),
+        TokenKind::Newline | TokenKind::Eof => None,
+        _ => Some(""),
+    });
+    let name = significant.next()?;
+    if significant.next().is_none() && matches!(name, "__attribute__" | "__declspec") {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn attribute_group_must_survive(tokens: &[Token], start: usize, end: usize) -> bool {
+    const MEANINGFUL: &[&str] = &[
+        "alias",
+        "cleanup",
+        "constructor",
+        "destructor",
+        "visibility",
+        "weak",
+    ];
+
+    tokens[start..end].iter().any(|token| match &token.kind {
+        TokenKind::Hash => true,
+        TokenKind::Identifier(name) => MEANINGFUL.contains(&name.as_str()),
+        _ => false,
+    })
 }
 
 /// Advance to the end of the current directive line, leaving `i` on the
@@ -7022,5 +7097,44 @@ int from_late;
         let result = preprocess_string(source, Path::new("t.c"), &PreprocessOptions::new());
         assert!(result.output.contains("__attribute__"), "{}", result.output);
         assert!(result.output.contains("still_here"), "{}", result.output);
+    }
+
+    #[test]
+    fn meaningful_attribute_groups_survive_preprocessing() {
+        for attribute in [
+            "constructor",
+            "destructor",
+            "weak",
+            "visibility(\"hidden\")",
+            "alias(\"target\")",
+            "cleanup(release_value)",
+        ] {
+            let source = format!("int value __attribute__(({attribute}));\n");
+            let result = preprocess_string(&source, Path::new("t.c"), &PreprocessOptions::new());
+            assert!(
+                result.output.contains(attribute),
+                "attribute {attribute:?} was discarded from {:?}",
+                result.output
+            );
+        }
+    }
+
+    #[test]
+    fn directive_inside_attribute_group_is_processed() {
+        let source = "int x __attribute__((\n#define SIZE 16\naligned(SIZE)));\nint a[SIZE];\n";
+        let result = preprocess_string(source, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(result.output.contains("int a[16]"), "{}", result.output);
+    }
+
+    #[test]
+    fn macro_spelled_attribute_name_elides_following_noise_group() {
+        let source = "#define ATTR __attribute__\nint x ATTR ((used)) = 1;\n";
+        let result = preprocess_string(source, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(
+            !result.output.contains("__attribute__"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("int x= 1"), "{}", result.output);
     }
 }

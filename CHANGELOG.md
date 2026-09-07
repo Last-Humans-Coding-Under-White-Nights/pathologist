@@ -22,11 +22,13 @@ All notable changes to `trace` are documented in this file.
 
 ### Fixed
 
-- Balanced GNU `__attribute__((...))` and MSVC `__declspec(...)` groups are
-  elided during preprocessing, including attributes produced by macro
-  expansion. This removes attribute-only tree-sitter failures without changing
-  functions, call edges, argument flow, or dispatch targets; unterminated
-  groups remain in the output rather than consuming later code.
+- Balanced declarator-noise GNU `__attribute__((...))` and MSVC
+  `__declspec(...)` groups are elided during preprocessing, including
+  attributes produced by macro expansion. Attributes that affect symbol or
+  call semantics remain in the token stream. This removes attribute-only
+  tree-sitter failures without changing functions, call edges, argument flow,
+  or dispatch targets; unterminated groups remain in the output rather than
+  consuming later code.
 - The preprocessor lexer now runs translation phase 2 (`\`-newline splicing) before it
   recognizes tokens, so an identifier, a multi-character punctuator, an encoding prefix or a
   string body written across a line splice is one token. `#define F(x, .\`-newline-`..)` is
