@@ -23,7 +23,7 @@ Do not chase STL noise (`std::string::c_str`, `parcel->WriteString`,
 | Capability | Hiview evidence |
 |------------|-----------------|
 | CHA from static receiver + implicit `this` | `Plugin::OnEventProxy` → 22 plugin `OnEvent` bodies |
-| `shared_ptr<T>` unwrap when `T` is in the signature | `call_sp` fixture; typed `Plugin*` paths |
+| Smart-pointer / `operator->` unwrap, by declaration not by name (C12) | `call_sp` fixture; typed `Plugin*` paths; hdf `AutoPtr<T>` (+4,551 direct edges) |
 | `final` / virtual bases | fixtures only (`cpp_dispatch`); hiview barely uses them |
 | Direct `std::function` field store | `cpp_callable`; **not** the factory path (C3) |
 | `$lambda` as a nested function | 357 interned; almost none have **incoming** edges |
@@ -412,6 +412,84 @@ prebuilt `.so` files that have no source under the target root.
 
 ---
 
+## C12 — Member access through `operator->` (#64)
+
+**Status: implemented.** `x->m()` used to unwrap the receiver through a
+hardcoded list of three names (`shared_ptr` / `unique_ptr` / `weak_ptr`).
+A wrapper called anything else did not unwrap: the receiver kept the
+*wrapper's* class and a phantom member was invented on it. That is worse
+than a miss — `sptr::AddOutput` is an edge to an undefined external
+function, and nothing downstream can tell it from a real call out of tree.
+A listed wrapper had the opposite problem: it was unwrapped on the *type*,
+so `sp.reset()` bound to the pointee's `reset` and `sp.get()` became a
+phantom `Pointee::get`.
+
+Hiview is `std::shared_ptr`-based, so this never surfaced there. Camera is
+`sptr`-based: **14,338** `sptr<...>` occurrences, led by
+`sptr<CaptureOutput>` (1,514), `sptr<CameraInput>` (1,073),
+`sptr<CameraDevice>` (1,022), `sptr<CaptureSession>` (523).
+
+The receiver is now resolved through the **declared** `operator->`:
+
+- A wrapper's instantiation keeps the wrapper as its class, with the
+  arguments in its tag (`sptr<CaptureSession>`). `.` is the wrapper's own
+  member; `->` and `*` are the pointee's.
+- What an `operator->` returns is recorded as a fact when it is declared.
+  For a class template returning a parameter (`T *`) the fact is the
+  parameter's position, and the call site substitutes the instantiation's
+  argument at it — `sptr<T>`, `RefPtr<T>` and HDI `AutoPtr<T>` need no
+  list entry. A named class is followed on through a chain up to eight
+  links deep, cycles cut; a raw pointer ends the chain at its pointee.
+- The facts travel with a header's *types*, which is what a header unit
+  contributes to the units that include it, so a wrapper-typed field
+  declared in a different header from the wrapper resolves too.
+- The name list survives only as a fallback for a wrapper whose class is
+  **not** in the index — `std::shared_ptr` when its header is out of tree.
+  It is a guess from a name rather than a resolution.
+- Where nothing names a class — overloads that disagree, a dependent return
+  the index cannot name (`sptr<T>` inside a template, a parameter of a base
+  template), a cycle, an iterator's `operator*` — the site is left
+  unresolved. No member is invented on the wrapper.
+
+Not modelled: the implicit call to each `operator->` (only the terminal
+member call is emitted), an `operator*` other than a smart pointer's, and a
+reference member holding a wrapper (it lowers as a pointer and is read as
+one).
+
+**Relationship to C1:** complementary, not a duplicate. C1 infers the type
+of a *variable* (`auto`, `lock()`, `make_shared`); this resolves *member
+lookup* through a wrapper whose type is already known. Camera needs this
+one, hiview needs C1.
+
+**Precondition for supplying `refbase.h`.** Camera does not declare `sptr`
+anywhere in the tree today, so its 27,474 unresolved indirect sites are
+honest misses. The moment the missing include is supplied they would all
+have become phantom `sptr::*` edges; with C12 in first, they resolve.
+
+**Eval result (`master` 52fd920 → this change, same machine, `--jobs 8`):**
+HDI's in-tree `OHOS::HDI::AutoPtr<T>` is exactly this shape, so hdf moves —
+direct edges **37,632 → 42,183** (4,551 distinct edges added, none lost
+when compared by file, line, column, caller and callee), external edges
+**29,853 → 28,854**, external functions **2,499 → 2,403**, the **118**
+invented `AutoPtr::*` members among them gone while all **36** direct calls
+to the real `AutoPtr::Get` stay. Defined functions, indirect edges and
+diagnostics do not move. Spot-checked against the sources:
+`method->GetName()` on the `const AutoPtr<ASTMethod> &` parameter of
+`CClientProxyCodeEmitter::EmitProxyMethodImpl`
+(`codegen/c_client_proxy_code_emitter.cpp:271,275`) reaches the in-tree
+`ASTMethod::GetName` where it was an external `AutoPtr::GetName`.
+
+hiview and camera declare no wrapper in the tree, so every `->` takes the
+path it took before: direct edges are unchanged in hiview and gain two in
+camera, indirect edges and diagnostics are unchanged. What moves is the
+`.` side of the name fallback — `sp.get()`, `wp.lock()`, `up.release()`
+are external calls on `std::shared_ptr::get`, `std::weak_ptr::lock`,
+`std::unique_ptr::release` now, not phantoms on the pointee (`Event::get`,
+`Plugin::lock`), and a wrapper's construction is a constructor call on the
+wrapper. See [EVAL_REPORT.md](EVAL_REPORT.md) for the full comparison.
+Fixture `tests/fixtures/cpp_smart_ptr`.
+
+
 ## Later / skip for this corpus
 
 | Item | Why deferred |
@@ -464,4 +542,5 @@ plugins without `dlsym` is C3 (static `REGISTER` ctors).
 | C9 | `obj.GetNumber<uint64_t>()` → `GetNumber`; overlay done — see `tests/fixtures/cpp_templates_overloads` |
 | C10 | `.c` includes `class` header, `.cpp` defines methods; virtual call still CHA |
 | C11 | `dlsym(h, "target")` then call; `extern "C" int target()` in-tree |
+| C12 | `sptr<T>` / `RefPtr<T>` / absent `shared_ptr<T>`, a wrapper chain, a cyclic one, `(*sp).m()`, `sp.reset()` — see `tests/fixtures/cpp_smart_ptr` |
 | ADL | `swap(a, b)` with `kit::Widget*` args → `kit::swap`; `using namespace/util::helper`; `using lib::bump`; `a::b::go()` → `a::b::clamp` — see `tests/fixtures/cpp_name_lookup` |

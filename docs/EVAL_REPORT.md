@@ -15,6 +15,87 @@
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Re-verified 2026-09-07 (member access through a declared `operator->`, #64):**
+fresh release builds of `master` (52fd920) and the branch were compared on
+the same machine against the three clean pinned checkouts under
+`/private/tmp/corpora`, `--jobs 8`, 800,000-pop budget. The branch index is
+bit-reproducible: three `--jobs 8` runs and one `--jobs 1` run print the
+same totals on each corpus.
+
+| Metric | hdf `master` → #64 | hiview `master` → #64 | camera `master` → #64 |
+|---|---:|---:|---:|
+| Functions defined | 10,246 → 10,246 | 7,779 → 7,779 | 19,015 → 19,015 |
+| Functions external | 2,499 → 2,403 | 3,666 → 3,657 | 6,906 → 6,598 |
+| Direct edges | 37,632 → 42,183 | 8,204 → 8,204 | 20,310 → 20,315 |
+| Indirect edges | 4,642 → 4,642 | 24 → 24 | 109 → 109 |
+| External edges | 29,853 → 28,854 | 20,316 → 20,394 | 52,898 → 53,081 |
+| Arg-flow edges | 62,712 → 65,960 | 9,517 → 9,517 | 17,233 → 17,237 |
+| Diagnostics | 1,803 → 1,803 | 2,989 → 2,989 | 4,860 → 4,860 |
+
+Comparing distinct direct edges by (file, line, column, caller, callee)
+loses **none** in any corpus; hdf gains **4,551**, hiview **0**, camera
+**2**. Every dispatch-target, dlsym, IPC and probe check passes on both
+builds; indirect edges and diagnostics are identical.
+
+hdf is where the change lands: HDI's in-tree `OHOS::HDI::AutoPtr<T>`
+declares `T *operator->()` and was on no name list, so every `p->m()` on an
+`AutoPtr` invented `AutoPtr::m`. The **118** external functions under
+`OHOS::HDI::AutoPtr::*` on `master` are gone; the **36** direct calls to the
+real `AutoPtr::Get` (87 to `AutoPtr::*` members overall) stay, because the
+wrapper keeps its own class for `.`. Source-checked:
+`CClientProxyCodeEmitter::EmitProxyMethodImpl`
+(`framework/tools/hdi-gen/codegen/c_client_proxy_code_emitter.cpp:271,275`)
+takes `const AutoPtr<ASTMethod> &method`; `method->GetName()` was an
+external `AutoPtr::GetName` and is now the in-tree `ASTMethod::GetName`.
+An earlier, type-wide draft of this fix moved hdf by +713 direct edges; the
+difference is wrapper-typed fields declared in a header other than the
+wrapper's, which that draft could not follow and this one does through
+`Program::arrow_returns`.
+
+hiview and camera declare no wrapper in the tree (`std::shared_ptr`,
+`sptr`), so every `->` takes the path it took before. The two added camera
+edges are `success->Executing()` / `failed->Executing()` on
+`std::shared_ptr<VideoProcessSuccessFuzz>` locals in
+`test/fuzztest/videoprocesscommand_fuzzer/video_process_command_fuzzer.cpp`
+(lines 79, 86), which now reach the in-tree base-class `Executing` where
+`master` had an external edge on the fuzz subclass. What moves otherwise is
+the `.` side of the name fallback. A `shared_ptr` used to intern as a
+pointer to its pointee, so `sp.get()` / `wp.lock()` / `up.release()` were
+phantoms on the pointee (`Event::get`, `Plugin::lock`) and `sp.reset()`
+bound to a real `reset` on the pointee when it had one; they are external
+calls on `std::shared_ptr::get`, `std::weak_ptr::lock`,
+`std::unique_ptr::release` now, hence fewer external *functions*. External
+*edges* rise because a wrapper is now a class value: a member initializer
+or local declaration of one emits a constructor call
+(`std::shared_ptr::shared_ptr`, `std::unique_ptr::unique_ptr`) — 135 hiview
+sites gain such an edge, 57 lose a pointee phantom. Camera also loses
+`std::vector::iterator::GetCameras` / `::OnCameraStatus`, the members
+`master` invented on an iterator for `(*it)->GetCameras()` in
+`services/camera_service/src/hcamera_host_manager.cpp:1398,1400`: a
+dereference of a class that declares no `operator->` is unknown now and the
+site stays unresolved.
+
+**Expectation status: `master` 72/86, branch 68/86.** The fourteen misses
+on `master` are #66's — it moved every corpus's totals and diagnostics
+without re-capturing `scripts/eval_expected.json` — and the branch adds the
+four bands the change legitimately leaves: hdf direct and total edges,
+camera total and external functions. The values are not re-captured here
+because the baseline is already off; re-capture once on the reference setup
+after this lands. Every exact check that passes on `master` passes on the
+branch.
+
+Validation: **501 workspace tests** pass, **119** of them C++ cases;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --check` are clean.
+
+To reproduce, build `trace-cli --release` from each tree, then run each
+binary with:
+
+```sh
+python3 scripts/eval_check.py --bin /path/to/trace \
+  --corpus-base /private/tmp/corpora --outdir /tmp/arrow-eval
+```
+
 **Re-verified 2026-09-06 (empty left token-paste operand, #52):**
 compared fresh release builds of the parent (#38, compared pre-merge as
 `e763ff2` and merged unchanged as `240bb97`) and the local #52 fix
@@ -3011,8 +3092,8 @@ to run, so a small function/edge difference between two runs of the *same*
 binary is noise, not a finding. The probes are `min`/`band` thresholds, so they
 confirm nothing collapsed; they do not pin a number to diff against.
 
-Exit codes: **0** all checks pass (current: **83 checks, 0 failures** — the three extra
-checks are the revision pins), **1** some expectation was missed, **2** the run is not
+Exit codes: **0** all checks pass (**86 checks**, three of them the revision pins; `master` has
+missed 14 since #66, see the latest comparison above), **1** some expectation was missed, **2** the run is not
 usable at all and its numbers must not be read — a corpus missing, at the wrong revision
 or dirty (unless `--skip-rev-check` / `--allow-dirty` downgrade it), or `trace analyze`
 itself failing. The 1-vs-2 split is what lets the baseline comparison above tolerate a

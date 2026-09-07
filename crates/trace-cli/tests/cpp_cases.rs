@@ -5,7 +5,7 @@ mod common;
 
 use std::sync::OnceLock;
 
-use common::{default_opts, fixture, fn_name};
+use common::{default_opts, fixture, fn_name, must_not_have_edge};
 use trace_analysis::{analyze, AnalysisResult, ResolutionKind};
 use trace_ir::{FnId, Program};
 use trace_parse::build_program;
@@ -368,6 +368,322 @@ fn cpp_smart_ptr_field_receiver_unwraps() {
         has_direct(&program, &analysis, "Holder::go", "Plugin::OnEvent"),
         "plugin_->OnEvent on a shared_ptr field should type as Plugin"
     );
+}
+
+// --- cpp_smart_ptr: member access through a declared `operator->` (#64) ---
+
+/// The `cpp_smart_ptr` fixture, analysed once.
+fn cpp_smart_ptr() -> &'static (Program, AnalysisResult) {
+    static CACHE: OnceLock<(Program, AnalysisResult)> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let root = fixture("cpp_smart_ptr");
+        let program = build_program(&root, &default_opts(&root)).expect("build");
+        let (_pag, analysis) = analyze(&program);
+        (program, analysis)
+    })
+}
+
+#[test]
+fn arrow_unwraps_by_declaration_not_by_wrapper_name() {
+    // The issue's three-way reproduction: the same source, differing only in
+    // the wrapper's name. `sptr` and `RefPtr` used to invent an external
+    // `sptr::AddOutput` / `RefPtr::AddOutput`; only `shared_ptr` unwrapped,
+    // because only `shared_ptr` was on a hardcoded list.
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in ["UseSptr", "UseRefPtr", "UseShared"] {
+        assert!(
+            has_direct(program, analysis, caller, "CaptureSession::AddOutput"),
+            "{caller}: `session->AddOutput` must resolve through the wrapper"
+        );
+    }
+    for (caller, wrapper) in [("UseSptr", "sptr"), ("UseRefPtr", "RefPtr")] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, &format!("{wrapper}::AddOutput")),
+            "no member may be invented on {wrapper} itself"
+        );
+    }
+}
+
+#[test]
+fn arrow_follows_a_chain_of_wrappers() {
+    // `Outer::operator->` yields `Inner`, whose `operator->` yields the
+    // pointee; neither is a template, so both are resolved at the call site.
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(
+        has_direct(program, analysis, "UseChain", "CaptureSession::AddOutput"),
+        "outer->AddOutput must follow Outer -> Inner -> CaptureSession"
+    );
+}
+
+#[test]
+fn arrow_through_a_wrapper_field_unwraps() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(
+        has_direct(program, analysis, "UseField", "CaptureSession::AddOutput"),
+        "holder->session_->AddOutput must unwrap the field's wrapper too"
+    );
+}
+
+#[test]
+fn an_unfollowable_arrow_chain_leaves_the_site_unresolved() {
+    // `Ping::operator->` yields `Pong`, whose `operator->` yields `Ping`:
+    // the chain names no pointee. An unresolved indirect site is honest; an
+    // invented `Ping::AddOutput` would be indistinguishable from a real call
+    // to an out-of-tree function.
+    let (program, analysis) = cpp_smart_ptr();
+    let targets: Vec<String> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == "UseCycle")
+        .map(|e| fn_name(program, e.callee))
+        .collect();
+    assert!(
+        targets.is_empty(),
+        "a cyclic operator-> chain must invent nothing, got {targets:?}"
+    );
+}
+
+#[test]
+fn a_wrapper_parameter_resolves_across_headers() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(
+        has_direct(program, analysis, "DrawThrough", "Widget::Draw"),
+        "a wrapper spelled in a .cpp signature unwraps like any other"
+    );
+}
+
+#[test]
+fn arrow_field_across_headers() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "WidgetBox::DrawHeld",
+        "Widget::Draw"
+    ));
+}
+
+#[test]
+fn arrow_preserves_wrapper_dot() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(program, analysis, "UseDot", "sptr::GetRefPtr"));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "UseDot",
+        "CaptureSession::GetRefPtr"
+    ));
+}
+
+#[test]
+fn arrow_raw_pointer() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "UseRaw",
+        "PointerTarget::Own"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "UseRaw",
+        "CaptureSession::Own"
+    ));
+}
+
+#[test]
+fn arrow_explicit_this() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "PointerTarget::ExplicitThis",
+        "PointerTarget::Own"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "PointerTarget::ExplicitThis",
+        "CaptureSession::Own"
+    ));
+}
+
+#[test]
+fn arrow_pointer_return_terminates() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "UsePointerReturn",
+        "PointerTarget::Own"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "UsePointerReturn",
+        "CaptureSession::Own"
+    ));
+}
+
+#[test]
+fn arrow_reference_receiver() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "UseReference",
+        "CaptureSession::AddOutput"
+    ));
+}
+
+#[test]
+fn arrow_second_template_parameter() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "UseSecond",
+        "CaptureSession::AddOutput"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "UseSecond",
+        "PointerTarget::AddOutput"
+    ));
+}
+
+#[test]
+fn arrow_raw_pointer_field() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "UseRawField",
+        "PointerTarget::Own"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "UseRawField",
+        "CaptureSession::Own"
+    ));
+}
+
+#[test]
+fn arrow_local_reference() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "UseLocalReference",
+        "CaptureSession::AddOutput"
+    ));
+}
+
+#[test]
+fn arrow_disagreeing_overloads_do_not_guess_a_template_argument() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(program
+        .symbols
+        .call_sites
+        .iter()
+        .any(|site| fn_name(program, site.caller) == "UseAmbiguous"));
+    assert!(!analysis
+        .call_edges
+        .iter()
+        .any(|edge| fn_name(program, edge.caller) == "UseAmbiguous"));
+}
+
+#[test]
+fn arrow_unsupported_substitutions_stay_unresolved() {
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in ["UseInheritedTemplate", "UseNestedDependent"] {
+        assert!(program
+            .symbols
+            .call_sites
+            .iter()
+            .any(|site| fn_name(program, site.caller) == caller));
+        assert!(
+            !analysis
+                .call_edges
+                .iter()
+                .any(|edge| fn_name(program, edge.caller) == caller),
+            "{caller} must not invent a target"
+        );
+    }
+}
+
+#[test]
+fn arrow_wrapper_identity_preserves_layout_and_construction() {
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in ["UseTemplateCallback", "UseWrapperCallback"] {
+        assert!(common::has_any_edge(
+            program,
+            analysis,
+            caller,
+            "CallbackTarget"
+        ));
+    }
+    assert!(has_direct(
+        program,
+        analysis,
+        "UseWrapperCallback",
+        "CallbackHandle::CallbackHandle"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "ConstructHolder::ConstructHolder",
+        "CallbackHandle::CallbackHandle"
+    ));
+}
+
+#[test]
+fn a_dereferenced_wrapper_is_its_pointee() {
+    // `(*w).m()` and `(*pw)->m()`: a smart pointer's `operator*` names the
+    // pointee its `operator->` does, and a raw pointer to a wrapper is the
+    // wrapper itself.
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in ["UseDerefDot", "UseDerefDotShared", "UseDerefArrow"] {
+        assert!(
+            has_direct(program, analysis, caller, "CaptureSession::AddOutput"),
+            "{caller}: `*w` must yield the pointee, as `w->` does"
+        );
+    }
+}
+
+#[test]
+fn a_dot_call_on_a_wrapper_is_the_wrappers_member() {
+    // The wrapper keeps its own class for `.`: `p.reset()` on a
+    // `shared_ptr<Resettable>` is the wrapper's `reset`, and must not bind
+    // to the pointee's member of the same name.
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "UseDotShadow",
+        "Resettable::reset"
+    ));
+}
+
+#[test]
+fn dereferencing_a_class_that_is_no_wrapper_invents_nothing() {
+    // `(*it)->m()` on an iterator: its `operator*` yields something the index
+    // does not follow, so the site stays unresolved instead of a member being
+    // invented on the iterator itself.
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "UseIterDeref",
+        "Iter::AddOutput"
+    ));
+    assert!(!analysis
+        .call_edges
+        .iter()
+        .any(|e| fn_name(program, e.caller) == "UseIterDeref"));
 }
 
 #[test]
@@ -1885,10 +2201,12 @@ fn conversion_operator_returns_the_type_it_converts_to() {
             .clone()
     };
     assert_eq!(ret("Handle::operator bool"), trace_ir::TypeDesc::Bool);
-    // Characterizing a limit this does *not* lift: a member declared in the
-    // class and defined out of line keeps the prototype's placeholder return
-    // type. That is general to all member functions, not to conversion
-    // operators, so the target type survives only without a declaration.
+    // The prototype's return type wins the merge, so it is the prototype that
+    // has to carry a real one. A plain method's in-class declaration does
+    // (#64 reads it there, which is what lets `operator->` be followed), but a
+    // conversion operator's does not: it has no `type` node, the converted-to
+    // type sitting inside the `operator_cast` instead. Declared in the class
+    // and defined out of line, it therefore still keeps the placeholder.
     let split = defined_return_types(
         "conv_op_ret_split",
         "struct Payload { int v; };\n\
@@ -1899,13 +2217,14 @@ fn conversion_operator_returns_the_type_it_converts_to() {
     assert_eq!(
         split,
         vec![
-            ("Split::Plain".to_string(), trace_ir::TypeDesc::Void),
+            ("Split::Plain".to_string(), trace_ir::TypeDesc::Int),
             (
                 "Split::operator Payload*".to_string(),
                 trace_ir::TypeDesc::Void
             ),
         ],
-        "the prototype's return type wins the merge, for a plain method too"
+        "a plain member prototype carries its return type; a conversion \
+         operator's does not, and the merge keeps the placeholder"
     );
 
     // A reference lowers as a pointer here, as it does everywhere else.

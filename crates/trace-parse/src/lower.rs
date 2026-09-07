@@ -103,6 +103,7 @@ struct LowerContext {
     /// `binary_expression` nodes).
     ast_depth: u32,
     ast_depth_warned: bool,
+    reference_vars: HashSet<VarId>,
 }
 
 /// C++ class scope during member lowering.
@@ -1492,6 +1493,7 @@ fn lower_prepared_source(
         call_return_dst: RefCell::new(HashMap::new()),
         ast_depth: 0,
         ast_depth_warned: false,
+        reference_vars: HashSet::new(),
     };
     lower_tree(
         program,
@@ -1625,6 +1627,7 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
         anon_type_counter: program.anon_type_counter,
         inheritance: std::mem::take(&mut program.inheritance),
         template_bases: std::mem::take(&mut program.template_bases),
+        arrow_returns: std::mem::take(&mut program.arrow_returns),
         final_classes: std::mem::take(&mut program.final_classes),
     }
 }
@@ -2341,12 +2344,19 @@ fn register_member_prototype(
         return;
     }
     let full_name = canonicalize_conversion_target(&format!("{}::{}", cls_qual, short));
+    if short == "operator->" {
+        register_arrow_return(program, ctx, source, node, cls_qual);
+    }
     let flags = virtual_flags(source, node);
     let provisional_id = program.symbols.alloc_fn_id();
     // Prototypes carry no parameter variables; they merge into their
     // definitions, which supply the real param list for arity filtering.
     let params: Vec<VarId> = Vec::new();
     let span = node_span(program, ctx, node);
+    let ret_type = node
+        .child_by_field_name("type")
+        .map(|t| parse_type_node(program, ctx, source, t))
+        .unwrap_or_else(|| program.types.void());
     program.symbols.add_function(Function {
         id: provisional_id,
         name: full_name,
@@ -2355,7 +2365,7 @@ fn register_member_prototype(
         } else {
             Linkage::External
         },
-        return_type: program.types.void(),
+        return_type: ret_type,
         params,
         locals: Vec::new(),
         span,
@@ -2399,6 +2409,11 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
         Some(c) => Some(c.qual_name.clone()),
         None => derive_owner_class(program, &name),
     };
+    if let Some(cls) = eff_class.as_deref() {
+        if name.ends_with("::operator->") {
+            register_arrow_return(program, ctx, source, node, cls);
+        }
+    }
     let ret_type = match node.child_by_field_name("type") {
         Some(t) => parse_type_node(program, ctx, source, t),
         // A conversion operator has no `type` field: what it returns is the
@@ -2593,6 +2608,9 @@ fn lower_parameter(
     };
     let type_id = program.types.intern(type_desc);
     let var_id = program.symbols.alloc_var_id();
+    if declarator.is_some_and(|d| d.kind() == "reference_declarator") {
+        ctx.reference_vars.insert(var_id);
+    }
     let span = node_span(program, ctx, node);
     program.symbols.add_variable(Variable {
         id: var_id,
@@ -2774,6 +2792,9 @@ fn lower_one_declarator(
         return;
     }
     let var_id = program.symbols.alloc_var_id();
+    if decl.kind() == "reference_declarator" {
+        ctx.reference_vars.insert(var_id);
+    }
     let span = node_span(program, ctx, span_node);
     program.symbols.add_variable(Variable {
         id: var_id,
@@ -3162,71 +3183,92 @@ fn collect_call_at_node(
     // fall through to the generic indirect handling below (vtable-slot
     // style flow resolution), preserving soundness.
     if ctx.is_cpp && func.kind() == "field_expression" {
-        let op_is_member_access = func
-            .children(&mut func.walk())
-            .any(|c| c.kind() == "." || c.kind() == "->");
+        let (op_is_member_access, op_is_arrow) = member_access_op(func);
         if op_is_member_access {
             if let Some(field) = func.child_by_field_name("field") {
                 if matches!(
                     field.kind(),
                     "field_identifier" | "destructor_name" | "template_type" | "template_method"
                 ) {
-                    if let Some(recv) = func.child_by_field_name("argument") {
-                        if let Some(cls) = infer_static_class(program, ctx, source, recv) {
-                            let kind = if field.kind() == "destructor_name" {
-                                trace_ir::MethodKind::Dtor
-                            } else {
-                                trace_ir::MethodKind::Named(strip_template_args(
-                                    &normalize_qualified(node_text(source, &field)),
-                                ))
-                            };
-                            let field_name = strip_template_args(&normalize_qualified(node_text(
-                                source, &field,
-                            )));
-                            let has_method =
-                                !member_targets_upward(program, &cls, &kind).is_empty();
-                            if has_method {
+                    if let Some((recv, recv_cls)) =
+                        func.child_by_field_name("argument").and_then(|recv| {
+                            infer_static_class(program, ctx, source, recv).map(|c| (recv, c))
+                        })
+                    {
+                        // `p->m()` looks `m` up on what `p`'s `operator->`
+                        // yields, not on `p`'s own class (#64).
+                        let Some(cls) =
+                            member_receiver_class(program, ctx, source, recv, op_is_arrow)
+                        else {
+                            // The wrapper's `operator->` names no class, so
+                            // neither does `m`. Record the site unresolved
+                            // instead of inventing a member on the wrapper.
+                            let call_args = collect_call_args(
+                                program,
+                                ctx,
+                                source,
+                                node.child_by_field_name("arguments"),
+                            );
+                            emit_unresolved_site(
+                                program,
+                                caller,
+                                field_callee_text(source, func),
+                                recv_cls,
+                                call_args,
+                                span,
+                            );
+                            return;
+                        };
+                        let kind = if field.kind() == "destructor_name" {
+                            trace_ir::MethodKind::Dtor
+                        } else {
+                            trace_ir::MethodKind::Named(strip_template_args(&normalize_qualified(
+                                node_text(source, &field),
+                            )))
+                        };
+                        let field_name =
+                            strip_template_args(&normalize_qualified(node_text(source, &field)));
+                        let has_method = !member_targets_upward(program, &cls, &kind).is_empty();
+                        if has_method {
+                            let call_args = collect_call_args(
+                                program,
+                                ctx,
+                                source,
+                                node.child_by_field_name("arguments"),
+                            );
+                            emit_member_sites(program, caller, &cls, &kind, call_args, span);
+                            return;
+                        }
+                        // Functor field: `h->cb()` where `cb` is a class
+                        // with `operator()`, not a method named `cb`.
+                        if let Some(field_cls) = infer_static_class(program, ctx, source, func) {
+                            let op = trace_ir::MethodKind::Named("operator()".to_string());
+                            if !member_targets_upward(program, &field_cls, &op).is_empty() {
                                 let call_args = collect_call_args(
                                     program,
                                     ctx,
                                     source,
                                     node.child_by_field_name("arguments"),
                                 );
-                                emit_member_sites(program, caller, &cls, &kind, call_args, span);
-                                return;
-                            }
-                            // Functor field: `h->cb()` where `cb` is a class
-                            // with `operator()`, not a method named `cb`.
-                            if let Some(field_cls) = infer_static_class(program, ctx, source, func)
-                            {
-                                let op = trace_ir::MethodKind::Named("operator()".to_string());
-                                if !member_targets_upward(program, &field_cls, &op).is_empty() {
-                                    let call_args = collect_call_args(
-                                        program,
-                                        ctx,
-                                        source,
-                                        node.child_by_field_name("arguments"),
-                                    );
-                                    emit_member_sites(
-                                        program, caller, &field_cls, &op, call_args, span,
-                                    );
-                                    return;
-                                }
-                            }
-                            // Callable data members (`std::function`, fn-ptr
-                            // fields) are not methods: fall through to the
-                            // generic field-load path so they resolve like
-                            // C function pointers.
-                            if !class_has_data_field(program, &cls, &field_name) {
-                                let call_args = collect_call_args(
-                                    program,
-                                    ctx,
-                                    source,
-                                    node.child_by_field_name("arguments"),
+                                emit_member_sites(
+                                    program, caller, &field_cls, &op, call_args, span,
                                 );
-                                emit_member_sites(program, caller, &cls, &kind, call_args, span);
                                 return;
                             }
+                        }
+                        // Callable data members (`std::function`, fn-ptr
+                        // fields) are not methods: fall through to the
+                        // generic field-load path so they resolve like
+                        // C function pointers.
+                        if !class_has_data_field(program, &cls, &field_name) {
+                            let call_args = collect_call_args(
+                                program,
+                                ctx,
+                                source,
+                                node.child_by_field_name("arguments"),
+                            );
+                            emit_member_sites(program, caller, &cls, &kind, call_args, span);
+                            return;
                         }
                     }
                 }
@@ -3808,6 +3850,43 @@ fn resolve_cpp_name_candidates(
     out
 }
 
+/// A member call nothing could be resolved for, spelled the way the source
+/// spells it. The `->` kept in the name is the point: the solver refuses to
+/// resolve a name holding one (`direct_by_name`), so no callee is invented —
+/// and an invented one is indistinguishable downstream from a real call to a
+/// function outside the tree (#64).
+fn emit_unresolved_site(
+    program: &mut Program,
+    caller: FnId,
+    callee_name: String,
+    receiver_class: String,
+    args: CallArgs,
+    span: Span,
+) {
+    let CallArgs {
+        var_args,
+        fn_args,
+        addr_of_member_args,
+        argc: _,
+        arg_desc: _,
+    } = args;
+    let call_id = program.symbols.alloc_call_id();
+    program.symbols.call_sites.push(CallSite {
+        id: call_id,
+        caller,
+        callee_name,
+        callee_var: None,
+        callee_fn_id: None,
+        var_args,
+        fn_args,
+        addr_of_member_args,
+        span,
+        is_direct: false,
+        receiver_class: Some(receiver_class),
+        return_dst: None,
+    });
+}
+
 /// Emit call sites for `cls::member` — the override set across derived
 /// classes, found by walking up the inheritance chain to the nearest
 /// declaring class and expanding its subclasses.
@@ -3819,6 +3898,8 @@ fn emit_member_sites(
     args: CallArgs,
     span: Span,
 ) {
+    let cls = receiver_lookup_name(program, cls);
+    let cls = cls.as_str();
     let CallArgs {
         var_args,
         fn_args,
@@ -3974,7 +4055,7 @@ fn class_field_desc(program: &Program, cls: &str, field: &str) -> Option<TypeDes
 }
 
 fn class_field_static_class(program: &Program, cls: &str, field: &str) -> Option<String> {
-    class_name_of_desc(&class_field_desc(program, cls, field)?)
+    class_name_of_desc(program, &class_field_desc(program, cls, field)?)
 }
 
 /// Explicit (non-`this`) parameter count. `None` means the prototype listed
@@ -4104,23 +4185,35 @@ fn lower_lambda_expression(
 /// delete-through-base is the dominant pattern — expand downward through
 /// the subclass closure as the dynamic-dispatch target set.
 fn member_targets_upward(program: &Program, cls: &str, kind: &trace_ir::MethodKind) -> Vec<FnId> {
-    let declared_on = |c: &str| -> Vec<FnId> { program.symbols.functions_named(&kind.name_on(c)) };
+    let own = declared_members_upward(program, cls, kind);
+    if own.is_empty() {
+        return program.method_targets(cls, kind);
+    }
+    let virtual_dispatch =
+        kind.is_destructor() || own.iter().any(|t| program.symbols.function(*t).is_virtual);
+    if virtual_dispatch {
+        // Expand from the *static* type so `final` classes/methods cut off
+        // sibling and descendant overrides.
+        program.method_targets(cls, kind)
+    } else {
+        own
+    }
+}
+
+/// The entries the nearest declaring class up the inheritance chain has for
+/// `kind` — the lookup half of [`member_targets_upward`], without the
+/// downward subclass expansion it falls back to on a miss. Callers that ask
+/// about a member of the receiver's own class (`operator->`) want only this:
+/// the closure walk is the expensive half and answers a different question.
+fn declared_members_upward(program: &Program, cls: &str, kind: &trace_ir::MethodKind) -> Vec<FnId> {
     let mut queue = std::collections::VecDeque::new();
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     queue.push_back(cls.to_string());
     seen.insert(cls.to_string());
     while let Some(cur) = queue.pop_front() {
-        let own = declared_on(&cur);
+        let own = program.symbols.functions_named(&kind.name_on(&cur));
         if !own.is_empty() {
-            let virtual_dispatch =
-                kind.is_destructor() || own.iter().any(|t| program.symbols.function(*t).is_virtual);
-            return if virtual_dispatch {
-                // Expand from the *static* type so `final` classes/methods
-                // cut off sibling and descendant overrides.
-                program.method_targets(cls, kind)
-            } else {
-                own
-            };
+            return own;
         }
         for base in program.bases_of(&cur) {
             if seen.insert(base.clone()) {
@@ -4128,11 +4221,395 @@ fn member_targets_upward(program: &Program, cls: &str, kind: &trace_ir::MethodKi
             }
         }
     }
-    let down = program.method_targets(cls, kind);
-    if !down.is_empty() {
-        return down;
-    }
     Vec::new()
+}
+
+/// Longest `operator->` chain followed before giving up. Real wrappers nest
+/// one deep, occasionally two; the cap only bounds a chain that a partial
+/// index has made circular.
+const MAX_ARROW_DEPTH: usize = 8;
+
+/// The standard smart pointers, taken on their name alone when their class is
+/// not in the index to be asked — the common case, their header being outside
+/// the tree. A guess from a name, not a resolution; every other wrapper is
+/// recognised by the `operator->` it declares (#64).
+fn is_std_smart_ptr_name(cls: &str) -> bool {
+    matches!(
+        last_type_segment(cls),
+        "shared_ptr" | "unique_ptr" | "weak_ptr"
+    )
+}
+
+/// Whether `cls` declares `operator->`, in this unit's symbols or in a fact
+/// merged from a header unit (see [`register_arrow_return`]).
+fn declares_arrow(program: &Program, cls: &str) -> bool {
+    program.arrow_returns.iter().any(|f| f.class_name == cls)
+        || !declared_members_upward(
+            program,
+            cls,
+            &trace_ir::MethodKind::Named("operator->".into()),
+        )
+        .is_empty()
+}
+
+/// The class a `Struct` tag is looked up under. A smart-pointer instantiation
+/// keeps its arguments in its name (`sptr<CaptureSession>`) so that a `->` on
+/// it can substitute them; the class itself is spelled without them. Every
+/// other template tag is interned already stripped and is looked up as is.
+fn receiver_lookup_name(program: &Program, name: &str) -> String {
+    let cls = strip_template_args(name);
+    if declares_arrow(program, &cls) || is_std_smart_ptr_name(&cls) {
+        cls
+    } else {
+        name.to_owned()
+    }
+}
+
+/// The class `x->m` looks `m` up on, given `x`'s declared type (#64).
+///
+/// A raw pointer is the built-in arrow: the pointee's class. A class value is
+/// the overloaded one: what its declared `operator->` returns, followed again
+/// while that is itself a class, up to [`MAX_ARROW_DEPTH`] links with cycles
+/// cut. A class declaring no `operator->` is its own receiver.
+///
+/// `None` where the chain names no class — overloads that disagree, a return
+/// type the index cannot name, a cycle. The caller leaves such a site
+/// unresolved: a member invented on the wrapper (`sptr::AddOutput`) would be
+/// an edge to an undefined external function, indistinguishable downstream
+/// from a real call out of tree.
+fn resolve_operator_arrow(program: &Program, desc: TypeDesc) -> Option<String> {
+    let mut current = desc;
+    let mut seen = HashSet::new();
+    for _ in 0..=MAX_ARROW_DEPTH {
+        if let TypeDesc::Ptr(inner) = current {
+            return class_name_of_desc(program, &inner);
+        }
+        let TypeDesc::Struct { ref name, .. } = current else {
+            return None;
+        };
+        if !seen.insert(name.clone()) {
+            return None;
+        }
+        let cls = strip_template_args(name);
+        let args = template_arguments(name);
+        let kind = trace_ir::MethodKind::Named("operator->".into());
+        let ops = declared_members_upward(program, &cls, &kind);
+        // The facts for the class that declares the operator — `cls` itself
+        // or the base the lookup stopped at.
+        let owners: Vec<_> = ops
+            .iter()
+            .filter_map(|id| {
+                program
+                    .symbols
+                    .function(*id)
+                    .name
+                    .strip_suffix("::operator->")
+            })
+            .collect();
+        let facts: Vec<_> = program
+            .arrow_returns
+            .iter()
+            .filter(|f| f.class_name == cls || owners.contains(&f.class_name.as_str()))
+            .collect();
+        if facts.is_empty() {
+            if ops.is_empty() {
+                // No `operator->` to ask. A standard smart pointer is taken
+                // on its name and unwraps to its first argument; anything
+                // else is no wrapper, and `->` on it is a plain dereference.
+                return if is_std_smart_ptr_name(&cls) {
+                    args.first()
+                        .map(|s| receiver_lookup_name(program, &sanitize_type_name(s)))
+                } else {
+                    Some(name.clone())
+                };
+            }
+            // Declared, but with a return type nothing recorded.
+            return None;
+        }
+        // Overloads (`T *operator->()` and its `const` twin) must agree: the
+        // pointee of a wrapper is one class, so disagreement means the lookup
+        // found two different members and choosing one would invent an edge.
+        let mut next = None;
+        for fact in facts {
+            let mut target = if let Some(index) = fact.parameter {
+                // A parameter is a position in the declaring template's own
+                // list. Declared on a base (`Derived<X> : Base<Y>`), it
+                // indexes the base's arguments, which are not `args`.
+                if fact.class_name != cls {
+                    return None;
+                }
+                TypeDesc::Struct {
+                    name: args.get(index)?.clone(),
+                    fields: Vec::new(),
+                }
+            } else {
+                fact.target.clone()
+            };
+            if fact.pointer {
+                target = TypeDesc::Ptr(Box::new(target));
+            }
+            if next.as_ref().is_some_and(|first| first != &target) {
+                return None;
+            }
+            next = Some(target);
+        }
+        current = next?;
+    }
+    None
+}
+
+/// The class a member access on `recv` looks the member up on: `recv`'s own
+/// class for `.`, what its arrow yields for `->` (see
+/// [`resolve_operator_arrow`]).
+fn member_receiver_class(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    recv: Node,
+    arrow: bool,
+) -> Option<String> {
+    if !arrow {
+        return infer_static_class(program, ctx, source, recv);
+    }
+    resolve_operator_arrow(program, receiver_desc(program, ctx, source, recv)?)
+}
+
+/// What `*e` yields. A pointer dereferences to its pointee. A smart pointer
+/// dereferences through its `operator->`: its `operator*` names the same
+/// pointee, so `(*sp).m()` looks `m` up where `sp->m()` does. Any other
+/// class value has an `operator*` this index does not follow — an iterator's
+/// yields whatever the container holds — so the result is unknown, rather
+/// than the class itself with a member invented on it
+/// (`std::vector::iterator::GetCameras`).
+fn deref_desc(program: &Program, desc: TypeDesc) -> Option<TypeDesc> {
+    match desc {
+        TypeDesc::Ptr(inner) => Some(*inner),
+        TypeDesc::Struct { ref name, .. } => {
+            let cls = strip_template_args(name);
+            if !(declares_arrow(program, &cls) || is_std_smart_ptr_name(&cls)) {
+                return None;
+            }
+            resolve_operator_arrow(program, desc).map(|name| TypeDesc::Struct {
+                name,
+                fields: Vec::new(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The receiver's declared type with its pointer layers intact — unlike
+/// [`infer_static_class`], which peels them — so that `->` can tell a raw
+/// pointer (built-in arrow, the pointee's members) from a class value
+/// (overloaded arrow, whatever `operator->` yields). A reference lowers as a
+/// pointer everywhere else; here it is the value it refers to.
+fn receiver_desc(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<TypeDesc> {
+    let node = peel_expression(node);
+    match node.kind() {
+        "this" => Some(TypeDesc::Ptr(Box::new(TypeDesc::Struct {
+            name: ctx.class_ctx.as_ref()?.qual_name.clone(),
+            fields: Vec::new(),
+        }))),
+        "identifier" => {
+            if let Some(v) = lookup_var(ctx, program, node_text(source, &node)) {
+                let mut desc = program
+                    .types
+                    .get(program.symbols.variable(v).type_id)
+                    .desc
+                    .clone();
+                if ctx.reference_vars.contains(&v) {
+                    if let TypeDesc::Ptr(inner) = desc {
+                        desc = *inner;
+                    }
+                }
+                return Some(desc);
+            }
+            class_field_desc(
+                program,
+                &ctx.class_ctx.as_ref()?.qual_name,
+                node_text(source, &node),
+            )
+        }
+        "field_expression" => {
+            let base = node.child_by_field_name("argument")?;
+            let cls = member_receiver_class(program, ctx, source, base, is_arrow_access(node))?;
+            class_field_desc(
+                program,
+                &cls,
+                node_text(source, &node.child_by_field_name("field")?),
+            )
+        }
+        "pointer_expression" => {
+            let desc = receiver_desc(program, ctx, source, node.named_child(0)?)?;
+            match pointer_op(source, node).as_deref() {
+                Some("*") => deref_desc(program, desc),
+                Some("&") => Some(TypeDesc::Ptr(Box::new(desc))),
+                _ => None,
+            }
+        }
+        "new_expression" => Some(TypeDesc::Ptr(Box::new(TypeDesc::Struct {
+            name: new_expression_class(program, ctx, source, node)?,
+            fields: Vec::new(),
+        }))),
+        _ => infer_static_class(program, ctx, source, node).map(|name| TypeDesc::Struct {
+            name,
+            fields: Vec::new(),
+        }),
+    }
+}
+
+/// Record what `cls::operator->` returns, for the call sites that follow it
+/// (#64). It is kept as a fact of its own rather than read back from the
+/// function's return type because a header unit reaches the units that
+/// include it as *types only*: a wrapper-typed field declared in a different
+/// header from the wrapper is lowered while the wrapper's members are not in
+/// that unit's symbol table, and the facts are merged alongside the types.
+///
+/// Inside a class template the declared type may be a parameter: `T *` is
+/// recorded by `T`'s position, for the call site to substitute from the
+/// instantiation's arguments. A type that merely mentions a parameter
+/// (`sptr<T>`) is recorded as unknown — never guessed to be argument zero.
+fn register_arrow_return(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+    cls: &str,
+) {
+    let Some(t) = node.child_by_field_name("type") else {
+        return;
+    };
+    let spelling = node_text(source, &t).trim();
+    let mut ancestor = node.parent();
+    let mut parameter = None;
+    let mut dependent = false;
+    while let Some(parent) = ancestor {
+        if parent.kind() == "template_declaration" {
+            if let Some(params) = parent.child_by_field_name("parameters") {
+                // Positions must line up with the instantiation's argument
+                // list: a comment between parameters is a named child too,
+                // and would shift every parameter after it.
+                let mut cursor = params.walk();
+                let params = params
+                    .named_children(&mut cursor)
+                    .filter(|p| p.kind() != "comment");
+                for (i, param) in params.enumerate() {
+                    let ident = param.child_by_field_name("name").or_else(|| {
+                        param
+                            .named_children(&mut param.walk())
+                            .find(|n| n.kind() == "type_identifier")
+                    });
+                    if let Some(ident) = ident {
+                        let name = node_text(source, &ident);
+                        if name == spelling {
+                            parameter = Some(i);
+                        }
+                        dependent |= spelling
+                            .split(|c: char| !c.is_alphanumeric() && c != '_')
+                            .any(|token| token == name);
+                    }
+                }
+            }
+            break;
+        }
+        ancestor = parent.parent();
+    }
+    let mut target = if dependent && parameter.is_none() {
+        TypeDesc::Unknown
+    } else {
+        type_desc_from_node(program, ctx, source, t)
+    };
+    let pointer = node
+        .child_by_field_name("declarator")
+        .is_some_and(|d| d.kind() == "pointer_declarator");
+    // A named pointer typedef already includes its terminating pointer layer.
+    let pointer = if let TypeDesc::Ptr(inner) = target {
+        target = *inner;
+        true
+    } else {
+        pointer
+    };
+    let fact = trace_ir::ArrowReturn {
+        class_name: cls.to_owned(),
+        target,
+        parameter,
+        pointer,
+    };
+    if !program.arrow_returns.contains(&fact) {
+        program.arrow_returns.push(fact);
+    }
+}
+
+/// The top-level arguments of a template spelling: `W<A, B<C>, D>` yields
+/// `A`, `B<C>` and `D`; a spelling without `<` yields nothing.
+fn template_arguments(raw: &str) -> Vec<String> {
+    let Some(start) = raw.find('<') else {
+        return Vec::new();
+    };
+    let mut depth = 0;
+    let mut from = start + 1;
+    let mut args = Vec::new();
+    for (i, c) in raw.char_indices().skip_while(|(i, _)| *i <= start) {
+        match c {
+            '<' => depth += 1,
+            '>' if depth > 0 => depth -= 1,
+            ',' | '>' if depth == 0 => {
+                args.push(raw[from..i].trim().to_owned());
+                from = i + 1;
+                if c == '>' {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    args
+}
+
+/// A template spelling with every class in it qualified to the current
+/// scope, so that the argument substituted at a `->` names the class the way
+/// the index does: `sptr<Plugin>` inside `namespace ohos` is
+/// `ohos::sptr<ohos::Plugin>`.
+fn qualify_template_spelling(ctx: &LowerContext, raw: &str) -> String {
+    let head = qualify_type_name(ctx, &normalize_qualified(type_name_before_template(raw)));
+    let args: Vec<_> = template_arguments(raw)
+        .into_iter()
+        .map(|arg| {
+            let clean = sanitize_type_name(&arg);
+            if clean.contains('<') {
+                qualify_template_spelling(ctx, &clean)
+            } else if primitive_scalar_desc(&clean).is_some() {
+                clean
+            } else {
+                qualify_type_name(ctx, &normalize_qualified(&clean))
+            }
+        })
+        .collect();
+    format!("{head}<{}>", args.join(","))
+}
+
+/// Whether a `field_expression` spells `->` rather than `.`.
+fn is_arrow_access(node: Node) -> bool {
+    member_access_op(node).1
+}
+
+/// `(is member access, is `->`)` for a `field_expression`, in one walk.
+fn member_access_op(node: Node) -> (bool, bool) {
+    let mut arrow = false;
+    let mut dot = false;
+    for child in node.children(&mut node.walk()) {
+        match child.kind() {
+            "->" => arrow = true,
+            "." => dot = true,
+            _ => {}
+        }
+    }
+    (arrow || dot, arrow)
 }
 
 /// Static class of a receiver expression, when inferable from declared
@@ -4161,6 +4638,11 @@ fn infer_static_class(
             let op = pointer_op(source, node);
             if op.as_deref() == Some("*") {
                 let arg = node.named_child(0)?;
+                if ctx.is_cpp {
+                    // `*sp` on a smart pointer is the pointee, as `sp->` is.
+                    let desc = deref_desc(program, receiver_desc(program, ctx, source, arg)?)?;
+                    return class_name_of_desc(program, &desc);
+                }
                 return infer_static_class(program, ctx, source, arg);
             }
             None
@@ -4169,18 +4651,19 @@ fn infer_static_class(
             let base = node.child_by_field_name("argument")?;
             let field = node.child_by_field_name("field")?;
             let base_cls = infer_static_class(program, ctx, source, base)?;
+            // `w->f` reads `f` off what `w`'s `operator->` yields (#64).
+            let base_cls = if ctx.is_cpp && is_arrow_access(node) {
+                member_receiver_class(program, ctx, source, base, true)?
+            } else {
+                base_cls
+            };
             let fname = normalize_qualified(node_text(source, &field));
             class_field_static_class(program, &base_cls, &fname)
         }
         "cast_expression" => {
             let type_node = node.child_by_field_name("type")?;
             let raw = normalize_qualified(node_text(source, &type_node));
-            let stripped = strip_template_args(&raw);
-            let qualified = if stripped.contains("::") {
-                stripped
-            } else {
-                ctx.qualify(&stripped)
-            };
+            let qualified = qualify_type_name(ctx, &strip_template_args(&raw));
             if program
                 .types
                 .type_id_by_tag(&qualified, trace_ir::TypeKind::Struct)
@@ -4198,16 +4681,17 @@ fn infer_static_class(
 
 fn var_static_class(program: &Program, v: VarId) -> Option<String> {
     let var = program.symbols.variable(v);
-    class_name_of_desc(&program.types.get(var.type_id).desc)
+    class_name_of_desc(program, &program.types.get(var.type_id).desc)
 }
 
 /// Peel `Ptr` layers (including references, which lower as pointers) to a
-/// class/struct tag. `shared_ptr<T>` interned as `Ptr(Struct{T})` and
-/// `T &` / `T *` all yield `T`.
-fn class_name_of_desc(desc: &TypeDesc) -> Option<String> {
+/// class/struct tag: `T &` / `T *` yield `T`. A smart pointer is its own
+/// class here (`sptr<T>` yields `sptr`, for `sp.Get()`); what it points to
+/// is the arrow's business, see [`resolve_operator_arrow`].
+fn class_name_of_desc(program: &Program, desc: &TypeDesc) -> Option<String> {
     match desc {
-        TypeDesc::Struct { name, .. } => Some(name.clone()),
-        TypeDesc::Ptr(inner) => class_name_of_desc(inner),
+        TypeDesc::Struct { name, .. } => Some(receiver_lookup_name(program, name)),
+        TypeDesc::Ptr(inner) => class_name_of_desc(program, inner),
         _ => None,
     }
 }
@@ -5801,18 +6285,26 @@ fn type_desc_from_node(
                 params: Vec::new(),
             };
         }
-        // Use the unstripped spelling: `normalize_qualified` drops `<T>`,
-        // which is the pointee we need for `shared_ptr<Plugin>`.
-        if let Some(pointee) = smart_ptr_pointee(text).or_else(|| smart_ptr_pointee(&raw)) {
-            let qualified = if pointee.contains("::") {
-                pointee
-            } else {
-                ctx.qualify(&pointee)
-            };
-            return TypeDesc::Ptr(Box::new(TypeDesc::Struct {
-                name: qualified,
-                fields: Vec::new(),
-            }));
+        // A smart-pointer instantiation keeps its arguments in its tag
+        // (`sptr<Plugin>`), which is what `p->m()` substitutes `T` from at
+        // the call site; the wrapper stays the variable's own class, so
+        // `p.Get()` is the wrapper's member and not the pointee's (#64).
+        if ctx.is_cpp && text.contains('<') {
+            let cls = qualify_type_name(ctx, &normalize_qualified(type_name_before_template(text)));
+            if declares_arrow(program, &cls) || is_std_smart_ptr_name(&cls) {
+                let fields = program
+                    .types
+                    .type_id_by_tag(&cls, trace_ir::TypeKind::Struct)
+                    .and_then(|id| match &program.types.get(id).desc {
+                        TypeDesc::Struct { fields, .. } => Some(fields.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                return TypeDesc::Struct {
+                    name: qualify_template_spelling(ctx, text),
+                    fields,
+                };
+            }
         }
         let stripped = strip_template_args(&raw);
         let tag_hit = program
@@ -5824,11 +6316,7 @@ fn type_desc_from_node(
         if !looks_class {
             // Plain C typedef aliases keep the legacy path below.
         } else {
-            let qualified = if stripped.contains("::") {
-                stripped
-            } else {
-                ctx.qualify(&stripped)
-            };
+            let qualified = qualify_type_name(ctx, &stripped);
             return TypeDesc::Struct {
                 name: qualified,
                 fields: Vec::new(),
@@ -6549,43 +7037,13 @@ fn is_callable_wrapper(raw: &str) -> bool {
     name == "std::function" || name == "::std::function"
 }
 
-/// `std::shared_ptr<T>` / `unique_ptr` / `weak_ptr` → pointee tag `T`.
-fn smart_ptr_pointee(raw: &str) -> Option<String> {
-    let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
-    let head = last_type_segment(type_name_before_template(&compact));
-    if !matches!(head, "shared_ptr" | "unique_ptr" | "weak_ptr") {
-        return None;
-    }
-    Some(sanitize_type_name(&template_first_arg(&compact)?))
-}
-
-fn template_first_arg(raw: &str) -> Option<String> {
-    let start = raw.find('<')? + 1;
-    let bytes = raw.as_bytes();
-    let mut depth = 1i32;
-    let mut end = None;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
-        match b {
-            b'<' => depth += 1,
-            b'>' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(i);
-                    break;
-                }
-            }
-            b',' if depth == 1 => {
-                end = Some(i);
-                break;
-            }
-            _ => {}
-        }
-    }
-    let arg = raw[start..end?].trim();
-    if arg.is_empty() {
-        None
+/// A class spelling in the current scope, with the enclosing namespace
+/// applied only to an unqualified one.
+fn qualify_type_name(ctx: &LowerContext, name: &str) -> String {
+    if name.contains("::") {
+        name.to_string()
     } else {
-        Some(arg.to_string())
+        ctx.qualify(name)
     }
 }
 

@@ -102,6 +102,28 @@ impl MergeDedup {
     }
 }
 
+/// What a C++ class's declared `operator->` returns, kept apart from the
+/// function's own return type so that it reaches the units that include the
+/// declaring header: those merge a header's *types* only, and a wrapper-typed
+/// field declared in another header is lowered without the wrapper's members
+/// in scope. Call sites follow these facts to the class `x->m` looks `m` up on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrowReturn {
+    /// The declaring class, spelled without template arguments.
+    pub class_name: String,
+    /// The returned type, with the pointer layer recorded in `pointer`.
+    /// `Unknown` for a dependent type that is not a bare parameter
+    /// (`sptr<T>`), which no call site can name.
+    pub target: crate::TypeDesc,
+    /// When the returned type is a bare template parameter (`T *`), its
+    /// position in the class template's parameter list, for the call site to
+    /// substitute from the instantiation's arguments.
+    pub parameter: Option<usize>,
+    /// Whether a pointer is returned. A pointer ends the arrow chain at its
+    /// pointee; a class value continues it through that class's own arrow.
+    pub pointer: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Program {
     pub root: PathBuf,
@@ -129,6 +151,9 @@ pub struct Program {
     /// particular template can inspect the preserved spelling
     /// (`IRemoteStub<IFoo>`).
     pub template_bases: Vec<TemplateBase>,
+    /// Declared C++ `operator->` returns, merged with a unit's types so a
+    /// header's wrappers are followable from every unit that includes it.
+    pub arrow_returns: Vec<ArrowReturn>,
     /// Classes declared `final` — CHA does not walk into their subclasses.
     pub final_classes: Vec<String>,
 }

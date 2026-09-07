@@ -25,6 +25,8 @@ pub struct UnitIndex {
     pub inheritance: Vec<(String, String)>,
     /// Per-unit templated base facts (C++).
     pub template_bases: Vec<TemplateBase>,
+    /// Per-unit declared `operator->` returns (C++), merged in every mode.
+    pub arrow_returns: Vec<trace_ir::ArrowReturn>,
     /// Classes declared `final` in this unit.
     pub final_classes: Vec<String>,
 }
@@ -59,6 +61,11 @@ fn merge_unit(program: &mut Program, unit: &UnitIndex, mode: MergeMode) {
     }
     for fact in &unit.template_bases {
         program.add_template_base(&fact.derived, &fact.spelling, &fact.declaration_scope);
+    }
+    for fact in &unit.arrow_returns {
+        if !program.arrow_returns.contains(fact) {
+            program.arrow_returns.push(fact.clone());
+        }
     }
     for cls in &unit.final_classes {
         program.mark_class_final(cls);
