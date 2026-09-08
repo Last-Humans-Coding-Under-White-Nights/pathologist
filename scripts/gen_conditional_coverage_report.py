@@ -30,8 +30,11 @@ for _c in CORPORA:
 # Record kinds examples/conditional_coverage.rs emits, with their field
 # counts (the record kind included). Anything else means the TSV did not
 # come from that tool, or came from a different version of it.
-TSV_FIELDS = {"META": 3, "FILE": 5, "CHAIN": 7, "ARM": 12, "READ": 8, "NAME": 7}
+TSV_FIELDS = {"META": 3, "FILE": 5, "CHAIN": 7, "ARM": 12, "READ": 8, "NAME": 7,
+              "GN_DEFINE": 8}
 CLASSES = ["configuration", "unknown", "toolchain", "include-guard"]
+# Confidence labels examples/support/gn_defines.rs emits, worst-last.
+RANKS = {"high": 0, "medium": 1, "low": 2}
 TOP_N = 40
 
 
@@ -109,11 +112,22 @@ class NameInfo:
 
 
 @dataclass
+class GnCandidate:
+    name: str
+    value: str | None
+    path: str
+    line: int
+    confidence: str
+    conditions: str
+
+
+@dataclass
 class Corpus:
     files: dict[str, tuple[str, int, int]] = field(default_factory=dict)  # path -> kind, lines, runs
     chains: dict[tuple[str, int], Chain] = field(default_factory=dict)
     names: dict[str, NameInfo] = field(default_factory=dict)
     defines: str = ""
+    gn_candidates: list[GnCandidate] = field(default_factory=list)
 
 
 def die(msg: str) -> None:
@@ -174,6 +188,19 @@ def load_tsv(tsv: Path) -> Corpus:
                 if cls not in CLASSES:
                     die(f"{tsv}:{lineno}: unknown class {cls!r}")
                 corpus.names[name] = NameInfo(cls, cli == "1", int(defines), site, build)
+            elif kind == "GN_DEFINE":
+                _, name, has_value, value, path, entry_line, confidence, conditions = parts
+                if has_value not in ("0", "1"):
+                    die(f"{tsv}:{lineno}: has-value is {has_value!r}, not 0 or 1")
+                if confidence not in RANKS:
+                    die(f"{tsv}:{lineno}: unknown confidence {confidence!r}")
+                if int(entry_line) < 1:
+                    die(f"{tsv}:{lineno}: entry line {entry_line!r} is not 1-based")
+                if has_value == "0" and value:
+                    die(f"{tsv}:{lineno}: value {value!r} on a candidate with no value")
+                corpus.gn_candidates.append(GnCandidate(
+                    name, value if has_value == "1" else None, path, int(entry_line),
+                    confidence, conditions))
         except (KeyError, IndexError, ValueError) as e:
             die(f"{tsv}:{lineno}: {e.__class__.__name__} on row {line!r}")
     return corpus
@@ -188,6 +215,9 @@ class NameStats:
     bound: int = 0
     unbound: int = 0
     unknown: int = 0
+
+
+NO_STATS = NameStats()
 
 
 def name_stats(corpus: Corpus) -> dict[str, NameStats]:
@@ -371,6 +401,30 @@ def name_rows(corpus: Corpus, stats: dict[str, NameStats], names: list[str]) -> 
     return out
 
 
+def gn_candidate_table(corpus: Corpus, stats: dict[str, NameStats]) -> list[str]:
+    out = [
+        "| Name | Value | Source | Confidence | GN conditions | Lines, sole / shared |",
+        "|------|-------|--------|------------|---------------|----------------------:|",
+    ]
+    # Lines are per name, so weigh each name once rather than per entry.
+    weight: dict[str, int] = {}
+    for c in corpus.gn_candidates:
+        s = stats.get(c.name, NO_STATS)
+        weight[c.name] = -(s.sole + s.shared)
+    ordered = sorted(corpus.gn_candidates,
+                     key=lambda c: (RANKS[c.confidence], weight[c.name], c.name, c.path, c.line))
+    for c in ordered[:TOP_N]:
+        s = stats.get(c.name, NO_STATS)
+        value = "(no explicit value)" if c.value is None else (code(c.value) if c.value else "(empty)")
+        # A name no chain reads has no line evidence at all, which is not the
+        # same as a name whose chains happen to exclude no lines.
+        lines = f"{fmt(s.sole)} / {fmt(s.shared)}" if c.name in stats else "—"
+        out.append(f"| {code(c.name)} | {value} | {code(f'{c.path}:{c.line}')} | "
+                   f"{c.confidence} | {code(c.conditions) if c.conditions else '—'} | "
+                   f"{lines} |")
+    return out
+
+
 def render_corpus(corpus_meta: dict, corpus: Corpus) -> list[str]:
     name = corpus_meta["name"]
     s = summarize(corpus)
@@ -433,6 +487,22 @@ def render_corpus(corpus_meta: dict, corpus: Corpus) -> list[str]:
     )
     lines.append("")
     lines.extend(name_rows(corpus, stats, unknown[:TOP_N]))
+    lines.append("")
+    lines.append("### GN define candidates")
+    lines.append("")
+    lines.append(
+        "Candidates only: never applied, not per-TU configuration, and conditions are recorded "
+        "rather than evaluated. Confidence levels, what is skipped and what is not resolved are "
+        "defined in [GN_DEFINES.md](GN_DEFINES.md). Ranked by confidence, then by lines in "
+        "always-excluded chains reading the name (shared lines overlap and are not predicted "
+        "recovery); `—` in that column marks a name no conditional chain reads at all, as "
+        "against `0 / 0` for one that is read but gates no always-excluded lines. "
+        f"Showing {min(TOP_N, len(corpus.gn_candidates))} of "
+        f"{fmt(len(corpus.gn_candidates))} candidate entries from `BUILD.gn`, `*.gni` and `*.gn`; "
+        "the TSV retains every entry."
+    )
+    lines.append("")
+    lines.extend(gn_candidate_table(corpus, stats))
     lines.append("")
     return lines
 
@@ -510,8 +580,11 @@ def main() -> int:
         "predefine (a fixed list — language, compiler, target OS, architecture, type sizes, "
         "`__has_*`). *configuration*: a `-D`, an in-tree `#define` in any region (comments and "
         "string literals ignored), or a name an "
-        "in-tree build file spells (GN, CMake, Make, Kconfig — spelled, not parsed; #58 is the "
-        "ranked version). *unknown*: nothing in the checkout accounts for it. Unknown is a real "
+        "in-tree build file spells (GN, CMake, Make, Kconfig — spelled, not parsed). "
+        "Separately, GN define candidates (#58) record direct string entries in `defines = [...]` "
+        "and `defines += [...]` in `BUILD.gn`, `*.gni` and `*.gn`, with values, entry locations, "
+        "conditions and confidence. Computed entries and interpolated names are skipped. "
+        "*unknown*: nothing in the checkout accounts for it. Unknown is a real "
         "category, not a failure to classify: #59 needs to know which names it cannot reason about."
     )
     out.append(

@@ -25,6 +25,7 @@
 //!   ARM    path  chain-line  index  directive  line  end-line  taken  skipped  unevaluated  evaluated  expression
 //!   READ   path  chain-line  index  name  bound  unbound  unknown
 //!   NAME   name  class  cli  defines  define-site  build-file
+//!   GN_DEFINE name has-value value file line confidence conditions
 //!   END    number-of-preceding-records
 //!
 //! `path` is relative to the root. Counts on ARM / READ rows are over the
@@ -41,6 +42,9 @@ use trace_preproc::{
     preprocess_file, ArmOutcome, ConditionalArm, ConditionalChain, Language, PreprocessOptions,
 };
 use walkdir::WalkDir;
+
+#[path = "support/gn_defines.rs"]
+mod gn_defines;
 
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
@@ -192,6 +196,24 @@ fn main() -> Result<(), String> {
             "NAME\t{name}\t{}\t{}\t{defines}\t{site}\t{build}\n",
             class.as_str(),
             u8::from(evidence.cli.contains(name))
+        ));
+    }
+    for (path, candidate) in &evidence.gn_candidates {
+        let conditions = candidate
+            .conditions
+            .iter()
+            .map(|c| format!("({c})"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        out.push_str(&format!(
+            "GN_DEFINE\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            candidate.name,
+            u8::from(candidate.value.is_some()),
+            field(candidate.value.as_deref().unwrap_or("")),
+            rel(path),
+            candidate.line,
+            candidate.confidence.as_str(),
+            field(&conditions)
         ));
     }
     // A newline alone cannot distinguish a complete capture from one cut
@@ -369,6 +391,8 @@ struct Evidence {
     defines: HashMap<String, (u32, (PathBuf, u32))>,
     /// Name → first in-tree build file that spells it.
     build_files: HashMap<String, PathBuf>,
+    /// All GN candidates, including names no recorded condition reads.
+    gn_candidates: Vec<(PathBuf, gn_defines::Candidate)>,
 }
 
 impl Evidence {
@@ -418,6 +442,13 @@ impl Evidence {
                 if ev.names.contains(ident) && !ev.build_files.contains_key(ident) {
                     ev.build_files.insert(ident.to_string(), path.clone());
                 }
+            }
+            if is_gn_file(&path) {
+                ev.gn_candidates.extend(
+                    gn_defines::scan(&text)
+                        .into_iter()
+                        .map(|candidate| (path.clone(), candidate)),
+                );
             }
         }
         ev
@@ -492,11 +523,22 @@ fn scan_defines(text: &str) -> Vec<(String, u32)> {
 fn is_build_file(path: &Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    matches!(
-        name,
-        "BUILD.gn" | "CMakeLists.txt" | "Makefile" | "makefile" | "GNUmakefile"
-    ) || matches!(ext, "gni" | "gn" | "cmake" | "mk")
+    is_gn_file(path)
+        || matches!(
+            name,
+            "CMakeLists.txt" | "Makefile" | "makefile" | "GNUmakefile"
+        )
+        || matches!(ext, "cmake" | "mk")
         || name.starts_with("Kconfig")
+}
+
+/// The GN subset of `is_build_file`: the files `gn_defines` parses.
+fn is_gn_file(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n == "BUILD.gn")
+        || path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e, "gni" | "gn"))
 }
 
 /// Identifier-shaped words in `text`.
@@ -743,6 +785,40 @@ fn is_toolchain_fact(name: &str) -> bool {
 mod tests {
     use super::*;
     use trace_preproc::ArmDirective;
+
+    #[test]
+    fn gn_evidence_is_gathered_without_applying_defines() {
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/gn_defines");
+        let (tus, headers) = discover_source_files(&root);
+        let graph = IncludeGraph::build(&root, &tus, &headers);
+        // The graph publishes the canonical root every path is compared against.
+        let root = graph.root.clone();
+        let mut records = Records::default();
+        records
+            .run(
+                &root.join("main.c"),
+                &PreprocessOptions::default().with_record_conditionals(true),
+            )
+            .unwrap();
+        let ev = Evidence::gather(&root, &graph, &[], &records);
+        assert_eq!(ev.gn_candidates.len(), 6);
+        let feature = ev
+            .gn_candidates
+            .iter()
+            .find(|(_, c)| c.name == "FEATURE")
+            .unwrap();
+        assert_eq!(feature.0, root.join("BUILD.gn"));
+        assert_eq!(feature.1.line, 2);
+        assert_eq!(feature.1.value.as_deref(), Some("1"));
+        assert!(ev
+            .gn_candidates
+            .iter()
+            .any(|(p, c)| p.ends_with("flags.gni") && c.name == "CONFIG_FLAG"));
+        let chain = records.chains.values().next().unwrap();
+        assert_eq!(chain.arms[0].taken, 0);
+        assert_eq!(chain.arms[1].taken, 1);
+    }
 
     fn arm(
         directive: ArmDirective,

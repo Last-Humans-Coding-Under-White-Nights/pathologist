@@ -1,0 +1,8 @@
+source_set("fixture") {
+  defines = [ "FEATURE=1", "EXPLICIT_EMPTY=" ]
+  if (enable_extra) {
+    defines += [ "EXTRA", "VERSION=$version" ]
+  } else {
+    defines += [ "FALLBACK" ]
+  }
+}
