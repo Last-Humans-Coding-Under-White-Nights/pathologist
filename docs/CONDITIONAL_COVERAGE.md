@@ -28,7 +28,7 @@ python3 scripts/gen_conditional_coverage_report.py
 - **Environment.** Every translation unit is preprocessed from the command-line defines alone with its includes expanded inline — the environment `trace analyze` gives each unit — and headers no unit reaches are preprocessed standalone, as the indexer does with orphans. No expansion cache: a cache hit replays a header's text without re-evaluating its conditionals. A header reached from several units is evaluated once per unit, so an arm can be taken in some runs and not in others (*sometimes excluded*); *always excluded* arms were never taken by any run. File totals include headers resolved outside the root through `--include`. Missing or empty source trees and hard input failures stop the measurement without publishing TSV. Command-line metadata retains `-D` values. A final completion record counts all preceding TSV rows; missing or mismatched completion records are rejected, including captures cut off at a complete line. Older TSV files must be regenerated.
 - **Which arm.** An undefined name does not always select `#else`: `#if !X` with `X` unknown takes the first arm. Each arm's outcome is recorded per run rather than assumed.
 - **Names read** are what the evaluation consulted, macro expansion included (`#if HAS_X` with `#define HAS_X defined(X)` reads both). *Unbound reads* count the evaluations that found no macro bound to the name — the cases that resolved against the default of `0`. An arm that was never evaluated contributes only the identifiers it spells.
-- **Classes.** *include-guard*: tested by a chain that wraps a whole file (`#ifndef X` first, `#define X` next, no `#else`, nothing after its `#endif`) and by no other chain — a default-value idiom alone in a file has the guard shape, and an `#if X > 1` elsewhere that depends on the name says it is configuration. *toolchain*: a macro gcc/clang predefine (a fixed list — language, compiler, target OS, architecture, type sizes, `__has_*`). *configuration*: a `-D`, an in-tree `#define` in any region (comments and string literals ignored), or a name an in-tree build file spells (GN, CMake, Make, Kconfig — spelled, not parsed; #58 is the ranked version). *unknown*: nothing in the checkout accounts for it. Unknown is a real category, not a failure to classify: #59 needs to know which names it cannot reason about.
+- **Classes.** *include-guard*: tested by a chain that wraps a whole file (`#ifndef X` first, `#define X` next, no `#else`, nothing after its `#endif`) and by no other chain — a default-value idiom alone in a file has the guard shape, and an `#if X > 1` elsewhere that depends on the name says it is configuration. *toolchain*: a macro gcc/clang predefine (a fixed list — language, compiler, target OS, architecture, type sizes, `__has_*`). *configuration*: a `-D`, an in-tree `#define` in any region (comments and string literals ignored), or a name an in-tree build file spells (GN, CMake, Make, Kconfig — spelled, not parsed). Separately, GN define candidates (#58) record direct string entries in `defines = [...]` and `defines += [...]` in `BUILD.gn`, `*.gni` and `*.gn`, with values, entry locations, conditions and confidence. Computed entries and interpolated names are skipped. *unknown*: nothing in the checkout accounts for it. Unknown is a real category, not a failure to classify: #59 needs to know which names it cannot reason about.
 - **Lines are source lines** strictly between the arm's directive and the next directive of its chain, not reachable code: a nested chain's directive lines count, blank and comment lines and continuation lines of multiline conditions count, and an always-excluded outer arm hides its inner chains (they are *never evaluated* and add nothing). Sometimes-excluded lines of nested chains can overlap. Excluded lines are not an acceptance metric on their own — what matters for #59 is whether the excluded arms hold new, source-verified driver and callback targets.
 
 ## Overview
@@ -233,6 +233,53 @@ Lines are apportioned as described above: *sole* when the name is the only one t
 | `CONFIG_DRIVERS_HDF_PLATFORM_I2S` | unknown | 3 | 0 | 4 | 0 | 0 / 1 | — | — |
 | `CONFIG_DRIVERS_HDF_PLATFORM_I3C` | unknown | 3 | 0 | 4 | 0 | 0 / 1 | — | — |
 
+### GN define candidates
+
+Candidates only: never applied, not per-TU configuration, and conditions are recorded rather than evaluated. Confidence levels, what is skipped and what is not resolved are defined in [GN_DEFINES.md](GN_DEFINES.md). Ranked by confidence, then by lines in always-excluded chains reading the name (shared lines overlap and are not predicted recovery); `—` in that column marks a name no conditional chain reads at all, as against `0 / 0` for one that is read but gates no always-excluded lines. Showing 40 of 50 candidate entries from `BUILD.gn`, `*.gni` and `*.gn`; the TSV retains every entry.
+
+| Name | Value | Source | Confidence | GN conditions | Lines, sole / shared |
+|------|-------|--------|------------|---------------|----------------------:|
+| `__USER__` | (no explicit value) | `adapter/uhdf/manager/BUILD.gn:64` | high | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf/platform/BUILD.gn:86` | high | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf/posix/old/BUILD.gn:39` | high | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/manager/BUILD.gn:28` | high | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `framework/sample/platform/uart/dev/BUILD.gn:33` | high | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `framework/sample/platform/uart/dispatch/BUILD.gn:36` | high | — | 650 / 9 |
+| `SAMPLE_DRIVER` | (no explicit value) | `adapter/uhdf2/hdi/test/BUILD.gn:39` | medium | `(with_sample)` | 1,769 / 0 |
+| `SAMPLE_DRIVER` | (no explicit value) | `adapter/uhdf2/hdi/test/BUILD.gn:60` | medium | `(with_sample)` | 1,769 / 0 |
+| `SAMPLE_DRIVER` | (no explicit value) | `adapter/uhdf2/hdi/test/smq_test/BUILD.gn:35` | medium | `(with_sample)` | 1,769 / 0 |
+| `SAMPLE_DRIVER` | (no explicit value) | `adapter/uhdf2/host/test/BUILD.gn:46` | medium | `(with_sample)` | 1,769 / 0 |
+| `SAMPLE_DRIVER` | (no explicit value) | `adapter/uhdf2/test/unittest/manager/BUILD.gn:195` | medium | `(with_sample)` | 1,769 / 0 |
+| `__USER__` | (no explicit value) | `adapter/uhdf/posix/BUILD.gn:49` | medium | `(defined(ohos_lite))` | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf/test/unittest/manager/BUILD.gn:36` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf/test/unittest/manager/BUILD.gn:68` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf/test/unittest/manager/BUILD.gn:96` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf/test/unittest/manager/BUILD.gn:130` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf/test/unittest/manager/BUILD.gn:168` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf/test/unittest/osal/BUILD.gn:34` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf/test/unittest/osal/BUILD.gn:63` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf/test/unittest/platform/BUILD.gn:39` | medium | `(hdf_core_platform_test_support)` | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/hdi/BUILD.gn:85` | medium | `(defined(ohos_lite))` | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/host/BUILD.gn:42` | medium | `(!(defined(ohos_lite)))` | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/host/test/BUILD.gn:84` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/platform/BUILD.gn:66` | medium | `(is_standard_system)` | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/test/unittest/manager/BUILD.gn:35` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/test/unittest/manager/BUILD.gn:68` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/test/unittest/manager/BUILD.gn:92` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/test/unittest/manager/BUILD.gn:119` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/test/unittest/manager/BUILD.gn:143` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/test/unittest/manager/BUILD.gn:167` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/test/unittest/manager/BUILD.gn:191` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/test/unittest/osal/BUILD.gn:36` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/test/unittest/osal/BUILD.gn:70` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `adapter/uhdf2/test/unittest/platform/BUILD.gn:32` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `framework/test/fuzztest/devicemanagerstart_fuzzer/BUILD.gn:23` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `framework/test/fuzztest/devmgr_service_fuzzer/BUILD.gn:22` | medium | — | 650 / 9 |
+| `__USER__` | (no explicit value) | `framework/test/unittest/model/audio/BUILD.gn:27` | medium | — | 650 / 9 |
+| `__LITEOS__` | (no explicit value) | `adapter/uhdf/test/unittest/manager/BUILD.gn:97` | medium | — | 203 / 16 |
+| `__LITEOS__` | (no explicit value) | `adapter/uhdf/test/unittest/manager/BUILD.gn:131` | medium | — | 203 / 16 |
+| `__OHOS_USER__` | (no explicit value) | `adapter/uhdf2/utils/BUILD.gn:105` | medium | `(!(defined(ohos_lite)))` | — |
+
 ---
 
 ## hiviewdfx_hiview
@@ -396,6 +443,53 @@ Lines are apportioned as described above: *sole* when the name is the only one t
 | `EPOLL_CLOEXEC` | unknown | 1 | 0 | 0 | 0 | 0 / 0 | — | — |
 | `TEST_LOCAL_SRC` | unknown | 1 | 0 | 0 | 0 | 0 / 1 | — | — |
 
+### GN define candidates
+
+Candidates only: never applied, not per-TU configuration, and conditions are recorded rather than evaluated. Confidence levels, what is skipped and what is not resolved are defined in [GN_DEFINES.md](GN_DEFINES.md). Ranked by confidence, then by lines in always-excluded chains reading the name (shared lines overlap and are not predicted recovery); `—` in that column marks a name no conditional chain reads at all, as against `0 / 0` for one that is read but gates no always-excluded lines. Showing 40 of 138 candidate entries from `BUILD.gn`, `*.gni` and `*.gn`; the TSV retains every entry.
+
+| Name | Value | Source | Confidence | GN conditions | Lines, sole / shared |
+|------|-------|--------|------------|---------------|----------------------:|
+| `UNITTEST` | (no explicit value) | `plugins/faultlogger/service/BUILD.gn:96` | high | — | 12 / 0 |
+| `UNIT_TEST` | (no explicit value) | `plugins/faultlogger/service/BUILD.gn:95` | high | — | 8 / 0 |
+| `BINDER_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/BUILD.gn:86` | medium | `(hiview_eventlogger_binder_catcher_enable)` | 1,283 / 0 |
+| `BINDER_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/test/BUILD.gn:75` | medium | `(hiview_eventlogger_binder_catcher_enable)` | 1,283 / 0 |
+| `DMESG_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/BUILD.gn:91` | medium | `(hiview_eventlogger_dmesg_catcher_enable)` | 671 / 20 |
+| `DMESG_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/test/BUILD.gn:79` | medium | `(hiview_eventlogger_dmesg_catcher_enable)` | 671 / 20 |
+| `USAGE_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/BUILD.gn:108` | medium | `(hiview_eventlogger_usage_catcher_enable)` | 584 / 0 |
+| `USAGE_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/test/BUILD.gn:91` | medium | `(hiview_eventlogger_usage_catcher_enable)` | 584 / 0 |
+| `FOLD_PC_COUNT_DURATION_ENABLE` | (no explicit value) | `plugins/usage_event_report/test/unittest/BUILD.gn:115` | medium | `(hiview_support_fold_pc_count_duration_enable)` | 524 / 0 |
+| `APPEVENT_PUBLISH_ENABLE` | (no explicit value) | `base/event_publish/test/BUILD.gn:30` | medium | `(hiview_appevent_publish_enable)` | 495 / 0 |
+| `UNIFIED_COLLECTOR_CPU_ENABLE` | (no explicit value) | `framework/native/unified_collection/BUILD.gn:197` | medium | `(hiview_unified_collector_cpu_enable)` | 377 / 0 |
+| `UNIFIED_COLLECTOR_CPU_ENABLE` | (no explicit value) | `framework/native/unified_collection/decorator/test/BUILD.gn:55` | medium | `(hiview_unified_collector_cpu_enable)` | 377 / 0 |
+| `UNIFIED_COLLECTOR_CPU_ENABLE` | (no explicit value) | `test/unittest/unified_collection/client/BUILD.gn:37` | medium | `(hiview_unified_collector_cpu_enable)` | 377 / 0 |
+| `UNIFIED_COLLECTOR_CPU_ENABLE` | (no explicit value) | `test/unittest/unified_collection/utility/BUILD.gn:78` | medium | `(hiview_unified_collector_cpu_enable)` | 377 / 0 |
+| `HITRACE_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/BUILD.gn:72` | medium | `(hiview_eventlogger_hitrace_catcher_enable)` | 334 / 0 |
+| `HITRACE_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/BUILD.gn:100` | medium | `(hiview_eventlogger_hitrace_catcher_enable)` | 334 / 0 |
+| `HITRACE_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/test/BUILD.gn:87` | medium | `(hiview_eventlogger_hitrace_catcher_enable)` | 334 / 0 |
+| `HITRACE_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/manager/BUILD.gn:40` | medium | `(hiview_eventlogger_hitrace_catcher_enable)` | 334 / 0 |
+| `HITRACE_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/manager/test/BUILD.gn:59` | medium | `(hiview_eventlogger_hitrace_catcher_enable)` | 334 / 0 |
+| `HITRACE_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/test/BUILD.gn:98` | medium | `(hiview_eventlogger_hitrace_catcher_enable)` | 334 / 0 |
+| `STACKTRACE_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/BUILD.gn:78` | medium | `(hiview_eventlogger_stacktrace_catcher_enable)` | 324 / 0 |
+| `STACKTRACE_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/test/BUILD.gn:71` | medium | `(hiview_eventlogger_stacktrace_catcher_enable)` | 324 / 0 |
+| `SCB_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/BUILD.gn:112` | medium | `(hiview_eventlogger_scb_catcher_enable)` | 301 / 0 |
+| `SCB_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/test/BUILD.gn:95` | medium | `(hiview_eventlogger_scb_catcher_enable)` | 301 / 0 |
+| `UNIFIED_COLLECTOR_TRACE_ENABLE` | (no explicit value) | `framework/native/unified_collection/BUILD.gn:244` | medium | `(hiview_unified_collector_trace_enable)` | 298 / 0 |
+| `UNIFIED_COLLECTOR_TRACE_ENABLE` | (no explicit value) | `framework/native/unified_collection/decorator/test/BUILD.gn:80` | medium | `(hiview_unified_collector_trace_enable)` | 298 / 0 |
+| `UNIFIED_COLLECTOR_TRACE_ENABLE` | (no explicit value) | `plugins/unified_collector/BUILD.gn:87` | medium | `(hiview_unified_collector_trace_enable)` | 298 / 0 |
+| `UNIFIED_COLLECTOR_TRACE_ENABLE` | (no explicit value) | `service/BUILD.gn:71` | medium | `(hiview_unified_collector_trace_enable)` | 298 / 0 |
+| `UNIFIED_COLLECTOR_TRACE_ENABLE` | (no explicit value) | `test/unittest/unified_collection/utility/BUILD.gn:156` | medium | — | 298 / 0 |
+| `WINDOW_MANAGER_ENABLE` | (no explicit value) | `plugins/eventlogger/BUILD.gn:69` | medium | `(window_manager_enable && hiview_eventlogger_window_manager_enable)` | 294 / 0 |
+| `WINDOW_MANAGER_ENABLE` | (no explicit value) | `plugins/eventlogger/test/BUILD.gn:95` | medium | `(window_manager_enable)` | 294 / 0 |
+| `HAS_HIPERF` | (no explicit value) | `framework/native/unified_collection/decorator/test/BUILD.gn:76` | medium | `(has_hiperf && hiview_unified_collector_perf_enable)` | 187 / 0 |
+| `HILOG_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/BUILD.gn:96` | medium | `(hiview_eventlogger_hilog_catcher_enable)` | 181 / 0 |
+| `HILOG_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/test/BUILD.gn:83` | medium | `(hiview_eventlogger_hilog_catcher_enable)` | 181 / 0 |
+| `OTHER_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/BUILD.gn:117` | medium | `(hiview_eventlogger_other_catcher_enable)` | 180 / 0 |
+| `OTHER_CATCHER_ENABLE` | (no explicit value) | `plugins/eventlogger/log_catcher/test/BUILD.gn:99` | medium | `(hiview_eventlogger_other_catcher_enable)` | 180 / 0 |
+| `UNIFIED_COLLECTOR_IO_ENABLE` | (no explicit value) | `framework/native/unified_collection/BUILD.gn:209` | medium | `(hiview_unified_collector_io_enable)` | 121 / 0 |
+| `UNIFIED_COLLECTOR_IO_ENABLE` | (no explicit value) | `framework/native/unified_collection/decorator/test/BUILD.gn:68` | medium | `(hiview_unified_collector_io_enable)` | 121 / 0 |
+| `UNIFIED_COLLECTOR_IO_ENABLE` | (no explicit value) | `test/unittest/unified_collection/utility/BUILD.gn:82` | medium | `(hiview_unified_collector_io_enable)` | 121 / 0 |
+| `UNIFIED_COLLECTOR_MEMORY_ENABLE` | (no explicit value) | `framework/native/unified_collection/BUILD.gn:220` | medium | `(hiview_unified_collector_memory_enable)` | 117 / 0 |
+
 ---
 
 ## multimedia_camera_framework
@@ -529,5 +623,52 @@ Lines are apportioned as described above: *sole* when the name is the only one t
 | `CONFIG_USE_JEMALLOC_DFX_INTF` | unknown | 1 | 3 | 0 | 0 | 0 / 66 | — | — |
 | `CAMERA_DISABLE_ZOOM_RATIO_FOR_AUDIO` | unknown | 1 | 1 | 0 | 0 | 0 / 1 | — | — |
 | `CROSS_PLATFORM` | unknown | 2 | 1 | 0 | 0 | 0 / 2 | — | — |
+
+### GN define candidates
+
+Candidates only: never applied, not per-TU configuration, and conditions are recorded rather than evaluated. Confidence levels, what is skipped and what is not resolved are defined in [GN_DEFINES.md](GN_DEFINES.md). Ranked by confidence, then by lines in always-excluded chains reading the name (shared lines overlap and are not predicted recovery); `—` in that column marks a name no conditional chain reads at all, as against `0 / 0` for one that is read but gates no always-excluded lines. Showing 40 of 103 candidate entries from `BUILD.gn`, `*.gni` and `*.gn`; the TSV retains every entry.
+
+| Name | Value | Source | Confidence | GN conditions | Lines, sole / shared |
+|------|-------|--------|------------|---------------|----------------------:|
+| `CAMERA_CAPTURE_YUV` | (no explicit value) | `common/BUILD.gn:153` | medium | `(camera_framework_feature_capture_yuv)` | 2,205 / 0 |
+| `CAMERA_CAPTURE_YUV` | (no explicit value) | `common/test/unittest/BUILD.gn:71` | medium | `(camera_framework_feature_capture_yuv)` | 2,205 / 0 |
+| `CAMERA_CAPTURE_YUV` | (no explicit value) | `dynamic_libs/BUILD.gn:64` | medium | `(camera_framework_feature_capture_yuv)` | 2,205 / 0 |
+| `CAMERA_CAPTURE_YUV` | (no explicit value) | `dynamic_libs/BUILD.gn:120` | medium | `(camera_framework_feature_capture_yuv)` | 2,205 / 0 |
+| `CAMERA_CAPTURE_YUV` | (no explicit value) | `frameworks/native/camera/base/BUILD.gn:225` | medium | `(camera_framework_feature_capture_yuv)` | 2,205 / 0 |
+| `CAMERA_CAPTURE_YUV` | (no explicit value) | `frameworks/native/camera/test/moduletest/BUILD.gn:213` | medium | `(camera_framework_feature_capture_yuv)` | 2,205 / 0 |
+| `CAMERA_CAPTURE_YUV` | (no explicit value) | `frameworks/native/camera/test/moduletest/BUILD.gn:394` | medium | `(camera_framework_feature_capture_yuv)` | 2,205 / 0 |
+| `CAMERA_CAPTURE_YUV` | (no explicit value) | `frameworks/native/camera/test/unittest/camera_deferred_unittest/BUILD.gn:172` | medium | `(camera_framework_feature_capture_yuv)` | 2,205 / 0 |
+| `CAMERA_CAPTURE_YUV` | (no explicit value) | `frameworks/native/camera/test/unittest/camera_ndk_unittest/BUILD.gn:104` | medium | `(camera_framework_feature_capture_yuv)` | 2,205 / 0 |
+| `CAMERA_CAPTURE_YUV` | (no explicit value) | `frameworks/native/camera/test/unittest/camera_service/BUILD.gn:201` | medium | `(camera_framework_feature_capture_yuv)` | 2,205 / 0 |
+| `CAMERA_CAPTURE_YUV` | (no explicit value) | `frameworks/native/camera/test/unittest/framework_native/BUILD.gn:147` | medium | `(camera_framework_feature_capture_yuv)` | 2,205 / 0 |
+| `CAMERA_CAPTURE_YUV` | (no explicit value) | `services/camera_service/BUILD.gn:297` | medium | `(camera_framework_feature_capture_yuv)` | 2,205 / 0 |
+| `CAMERA_CAPTURE_YUV` | (no explicit value) | `services/deferred_processing_service/BUILD.gn:254` | medium | `(camera_framework_feature_capture_yuv)` | 2,205 / 0 |
+| `CAMERA_MOVING_PHOTO` | (no explicit value) | `frameworks/native/camera/base/BUILD.gn:214` | medium | `(camera_framework_feature_moving_photo)` | 1,009 / 0 |
+| `CAMERA_MOVING_PHOTO` | (no explicit value) | `frameworks/native/camera/extension/BUILD.gn:151` | medium | `(camera_framework_feature_moving_photo)` | 1,009 / 0 |
+| `CAMERA_MOVING_PHOTO` | (no explicit value) | `frameworks/native/camera/test/unittest/camera_service/BUILD.gn:186` | medium | `(camera_framework_feature_moving_photo)` | 1,009 / 0 |
+| `CAMERA_MOVING_PHOTO` | (no explicit value) | `frameworks/native/camera/test/unittest/framework_native/BUILD.gn:139` | medium | `(camera_framework_feature_moving_photo)` | 1,009 / 0 |
+| `CAMERA_MOVING_PHOTO` | (no explicit value) | `services/camera_service/BUILD.gn:268` | medium | `(camera_framework_feature_moving_photo)` | 1,009 / 0 |
+| `CAMERA_MOVING_PHOTO` | (no explicit value) | `test/fuzztest/cameradevice_fuzzer/BUILD.gn:64` | medium | `(camera_framework_feature_moving_photo)` | 1,009 / 0 |
+| `CAMERA_MOVING_PHOTO` | (no explicit value) | `test/fuzztest/capturesessionadd_fuzzer/BUILD.gn:44` | medium | `(camera_framework_feature_moving_photo)` | 1,009 / 0 |
+| `CAMERA_MOVING_PHOTO` | (no explicit value) | `test/fuzztest/hcameradevice_fuzzer/BUILD.gn:66` | medium | `(camera_framework_feature_moving_photo)` | 1,009 / 0 |
+| `CAMERA_MOVING_PHOTO` | (no explicit value) | `test/fuzztest/hcapturesession_fuzzer/BUILD.gn:151` | medium | `(camera_framework_feature_moving_photo)` | 1,009 / 0 |
+| `CAMERA_MOVING_PHOTO` | (no explicit value) | `test/fuzztest/hstreamcapture_fuzzer/BUILD.gn:68` | medium | `(camera_framework_feature_moving_photo)` | 1,009 / 0 |
+| `CAMERA_MOVING_PHOTO` | (no explicit value) | `test/fuzztest/hstreamoperator_fuzzer/BUILD.gn:145` | medium | `(camera_framework_feature_moving_photo)` | 1,009 / 0 |
+| `CAMERA_MOVIE_FILE` | (no explicit value) | `frameworks/native/camera/base/BUILD.gn:218` | medium | `(camera_framework_feature_movie_file)` | 319 / 0 |
+| `CAMERA_MOVIE_FILE` | (no explicit value) | `frameworks/native/camera/test/unittest/framework_native/BUILD.gn:143` | medium | `(camera_framework_feature_movie_file)` | 319 / 0 |
+| `CAMERA_MOVIE_FILE` | (no explicit value) | `services/camera_service/BUILD.gn:280` | medium | `(camera_framework_feature_movie_file)` | 319 / 0 |
+| `CAMERA_FRAMEWORK_FEATURE_MEDIA_STREAM` | (no explicit value) | `frameworks/native/camera/base/BUILD.gn:207` | medium | `(camera_framework_feature_media_stream)` | 225 / 0 |
+| `CAMERA_FRAMEWORK_FEATURE_MEDIA_STREAM` | (no explicit value) | `frameworks/native/camera/extension/BUILD.gn:155` | medium | `(camera_framework_feature_media_stream)` | 225 / 0 |
+| `CAMERA_FRAMEWORK_FEATURE_MEDIA_STREAM` | (no explicit value) | `services/camera_service/BUILD.gn:247` | medium | `(camera_framework_feature_media_stream)` | 225 / 0 |
+| `HOOK_CAMERA_OPERATOR` | (no explicit value) | `services/camera_service/BUILD.gn:291` | medium | `(camera_framework_feature_camera_rotate_plugin)` | 220 / 0 |
+| `CAMERA_LIVE_SCENE_RECOGNITION` | (no explicit value) | `frameworks/native/camera/test/unittest/camera_service/BUILD.gn:182` | medium | `(camera_framework_feature_camera_live_scene_recognition)` | 213 / 0 |
+| `CAMERA_LIVE_SCENE_RECOGNITION` | (no explicit value) | `services/camera_service/BUILD.gn:287` | medium | `(camera_framework_feature_camera_live_scene_recognition)` | 213 / 0 |
+| `COMPATIBILITY_CONFIG_CENTER_ENABLE` | (no explicit value) | `services/camera_service/BUILD.gn:224` | medium | `(defined(global_parts_info) &&       defined(global_parts_info.multidevicecompatibility_compatibility_config_center))` | 184 / 0 |
+| `CAMERA_USE_SENSOR` | (no explicit value) | `frameworks/native/camera/base/BUILD.gn:199` | medium | `(use_sensor)` | 158 / 0 |
+| `CAMERA_USE_SENSOR` | (no explicit value) | `frameworks/native/camera/base/BUILD.gn:292` | medium | `(use_sensor)` | 158 / 0 |
+| `CAMERA_USE_SENSOR` | (no explicit value) | `frameworks/native/camera/extension/BUILD.gn:143` | medium | `(use_sensor)` | 158 / 0 |
+| `CAMERA_USE_SENSOR` | (no explicit value) | `frameworks/native/camera/test/unittest/camera_deferred_unittest/BUILD.gn:168` | medium | `(use_sensor)` | 158 / 0 |
+| `CAMERA_USE_SENSOR` | (no explicit value) | `frameworks/native/camera/test/unittest/camera_service/BUILD.gn:178` | medium | `(use_sensor)` | 158 / 0 |
+| `CAMERA_USE_SENSOR` | (no explicit value) | `frameworks/native/camera/test/unittest/framework_native/BUILD.gn:135` | medium | `(use_sensor)` | 158 / 0 |
 
 ---

@@ -40,6 +40,20 @@ trace analyze /path/to/project -o /tmp/project.db --jobs 8
 
 ## CLI reference
 
+### Conditional coverage and GN define evidence
+
+```bash
+cargo run -p trace-cli --release --example conditional_coverage -- /path/to/project > coverage.tsv
+```
+
+The reporting example records conditional branches and scans `BUILD.gn`,
+`*.gni` and `*.gn` for direct string entries in `defines = [...]` and `defines += [...]`.
+`GN_DEFINE` TSV rows retain the macro name, whether a value was supplied, the
+value, file, entry line, confidence, and enclosing GN conditions. No inferred
+define is applied. See [GN evidence](docs/GN_DEFINES.md) for ranking and limits;
+`scripts/gen_conditional_coverage_report.py` renders these candidates alongside
+the [conditional coverage report](docs/CONDITIONAL_COVERAGE.md).
+
 ### `trace analyze`
 
 Analyze every C/C++ file (`.c`, `.cpp`, `.cc`, `.cxx`) under `TARGET` and write results to SQLite.

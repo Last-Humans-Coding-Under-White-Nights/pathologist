@@ -6,6 +6,9 @@ All notable changes to `trace` are documented in this file.
 
 ### Added
 
+- GN define evidence in conditional coverage reports (#58): candidates from `BUILD.gn`,
+  `*.gni` and `*.gn` retain values, source locations, enclosing conditions, and confidence.
+  Reports rank the evidence without applying inferred defines or claiming per-TU accuracy.
 - Source revision, dirty-state, and build-date metadata in `trace --version` and exported databases.
 - Explicit database schema-version metadata.
 - Validated, version-tagged GitHub releases alongside the rolling `master-latest` prerelease.
