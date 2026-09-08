@@ -45,12 +45,16 @@ pub struct PreprocessResult {
     /// has one list per language and the two are unrelated.
     pub language: crate::Language,
     /// For each header this run replayed from the shared cache, the index of
-    /// the variant it matched (see [`crate::ExpansionVariants`]).
+    /// each variant it matched (see [`crate::ExpansionVariants`]).
     ///
     /// With `inline_include_bodies` off a replayed header contributes no
     /// text, so its declarations have to come from a separately lowered
     /// unit — and it must be the unit built from *this* expansion, not from
     /// whichever configuration the warm pass happened to take.
+    ///
+    /// One path can appear more than once: a header included twice under
+    /// different macros expands twice, and both expansions belong to this
+    /// unit (#56). Sorted, so the record does not depend on hash order.
     pub replayed_variants: Vec<(PathBuf, usize)>,
     /// Every conditional chain this run evaluated or skipped, in the order
     /// their opening directives were met, headers included. Empty unless
@@ -72,7 +76,24 @@ struct PreprocessorState {
     /// `#undef` clears the mark. Only ever shrinks during a run.
     fallback_macros: HashSet<String>,
     include_stack: Vec<PathBuf>,
-    included_guard: HashSet<PathBuf>,
+    /// Canonical paths this run has processed, for
+    /// `PreprocessResult::included_headers` and for the `files` set of each
+    /// cached expansion. Membership alone is NOT a reason to skip a repeated
+    /// `#include` — see `file_guards` (#56).
+    included_files: HashSet<PathBuf>,
+    /// The reason each processed path may be skipped when it is included
+    /// again: its `#pragma once`, or the include guard wrapping it. A path
+    /// absent here has no reason, and re-expands.
+    ///
+    /// A wrapper is read off the token stream before the file runs
+    /// (`detect_include_guard`) and a `#pragma once` at the directive
+    /// itself; either is inherited from `IncludeExpansion::guards` when a
+    /// header is replayed from the cache instead of visited.
+    file_guards: HashMap<PathBuf, crate::FileGuard>,
+    /// How many times this run has brought each path in — expanded or
+    /// replayed from the cache — against
+    /// `PreprocessOptions::max_file_expansions`.
+    file_expansions: HashMap<PathBuf, usize>,
     /// Included files this run expanded itself (see
     /// `PreprocessResult::inlined_headers`).
     inlined_files: HashSet<PathBuf>,
@@ -82,9 +103,25 @@ struct PreprocessorState {
     /// header expand to *here*", and both the guard-skip path and
     /// `compose_cache_text` need exactly that.
     entry_used: HashMap<PathBuf, crate::IncludeExpansion>,
-    /// Variant index of each cache hit, for
-    /// `PreprocessResult::replayed_variants`.
+    /// Variant index of the LATEST cache hit per path — what the guard-skip
+    /// site records on an enclosing frame, and what
+    /// `IncludeExpansion::nested_variants` inherits.
     variant_used: HashMap<PathBuf, usize>,
+    /// Every `(path, variant)` this run replayed at an `#include` of that
+    /// path itself, for `PreprocessResult::replayed_variants`. Distinct from
+    /// `variant_used` because a header included twice under different macros
+    /// replays two expansions and a map keyed by path can only name one.
+    ///
+    /// `IncludeExpansion::nested_variants` is deliberately not recorded
+    /// here. Those records do still reach `replayed_variants`, through
+    /// `variant_used`, which `finish` unions in — but only ever one variant
+    /// per nested path, since `splice_cached` inserts them with
+    /// `Entry::or_insert`. Keeping a second, per-pair set of them was the
+    /// version that regressed: a path then accumulated a variant from every
+    /// entry that mentioned it, the unit merged header units it never
+    /// reached, and hdf lost 514 direct call edges to the resolution that
+    /// shifted under.
+    direct_variants: HashSet<(PathBuf, usize)>,
     conditional_stack: Vec<CondFrame>,
     /// Depth of `conditional_stack` when the current file started. Frames
     /// below it belong to includers: `#elif`/`#else`/`#endif` in this file
@@ -139,14 +176,10 @@ struct PreprocessorState {
     /// the evaluation consulted, in order, repeats included. `None`
     /// otherwise, which is what keeps the per-identifier read hook free.
     cond_reads: Option<Vec<ConditionRead>>,
-    /// An include-guard candidate opened by the previous directive of the
-    /// current file: the chain and the name it tests. The next directive
-    /// consumes it, and only a `#define` of that name keeps it alive as
-    /// `guard_pending`. Per file: saved and cleared around each include.
-    guard_candidate: Option<(usize, String)>,
-    /// A chain whose `#ifndef X` / `#define X` opening matched; it becomes
-    /// an include guard if nothing but whitespace follows its `#endif`.
-    guard_pending: Option<usize>,
+    /// Does the current file have an include guard wrapping the whole of
+    /// it? Decided by `detect_include_guard` when the file's token stream
+    /// starts running. Per file: saved and restored around each include.
+    guarded_file: bool,
 }
 
 /// One level of `#if`/`#elif`/`#else` nesting. A per-level bool is not
@@ -191,6 +224,9 @@ struct CacheFrame {
     /// Actual writes, distinguished from reads in `settled` when a skipped
     /// header snapshots a binding after merging its historical dependencies.
     locally_bound: HashSet<Arc<str>>,
+    /// Include guards learned anywhere in this header's `#include` closure,
+    /// becoming `IncludeExpansion::guards` (#56).
+    guards: HashMap<PathBuf, crate::FileGuard>,
     /// Diagnostics in this header's transitive include closure. This must be
     /// independent from `PreprocessorState::diagnostics`: a report can have
     /// been emitted earlier in this run and still be required by a cache
@@ -208,10 +244,13 @@ impl PreprocessorState {
             macros: MacroTable::new(),
             fallback_macros: HashSet::new(),
             include_stack: vec![file.clone()],
-            included_guard: HashSet::new(),
+            included_files: HashSet::new(),
+            file_guards: HashMap::new(),
+            file_expansions: HashMap::new(),
             inlined_files: HashSet::new(),
             entry_used: HashMap::new(),
             variant_used: HashMap::new(),
+            direct_variants: HashSet::new(),
             conditional_stack: Vec::new(),
             cond_base: 0,
             output: String::new(),
@@ -231,8 +270,7 @@ impl PreprocessorState {
             expansion_incomplete: false,
             conditionals: Vec::new(),
             cond_reads: None,
-            guard_candidate: None,
-            guard_pending: None,
+            guarded_file: false,
         };
         if let Some(shared) = &state.opts.shared_macros {
             if let Ok(guard) = shared.read() {
@@ -657,46 +695,85 @@ impl PreprocessorState {
         }
     }
 
-    /// Note that the chain just opened has the first half of an include
-    /// guard's shape: `#ifndef NAME` (or `#if !defined(NAME)`) before any
-    /// other token of the file, at the file's top level. `start` indexes
-    /// the directive's `#`.
-    fn note_guard_candidate(
-        &mut self,
-        chain: Option<usize>,
-        name: &str,
-        tokens: &[Token],
-        start: usize,
-    ) {
+    /// Mark `chain` as this file's include guard, for the conditional
+    /// record (#57). `start` indexes the opening directive's `#`.
+    ///
+    /// The whole shape is already decided — `guarded_file` is
+    /// `detect_include_guard`'s answer for this file — so all that is left
+    /// is to name the chain it belongs to: a guard's `#ifndef` is the file's
+    /// first token, at its top level, so at most one chain can match.
+    fn mark_include_guard(&mut self, chain: Option<usize>, tokens: &[Token], start: usize) {
         let Some(chain) = chain else { return };
-        if self.conditional_stack.len() - 1 != self.cond_base {
-            return;
-        }
-        if tokens[..start].iter().all(is_newline) {
-            self.guard_candidate = Some((chain, name.to_string()));
+        if self.guarded_file
+            && self.conditional_stack.len() - 1 == self.cond_base
+            && tokens[..start].iter().all(is_newline)
+        {
+            self.conditionals[chain].include_guard = true;
         }
     }
 
-    /// An `#endif` closed `chain`: it is an include guard if its `#define`
-    /// matched and nothing but whitespace follows. `i` is just past the
-    /// `endif` keyword.
-    fn settle_guard(&mut self, chain: Option<usize>, tokens: &[Token], i: usize) {
-        if chain.is_none() || self.guard_pending != chain {
-            return;
+    // ---- include guards (#56) -------------------------------------------
+
+    /// Learn why `path` need not be expanded again, and tell every cached
+    /// header currently being built. A consumer replaying one of those
+    /// entries never visits `path` itself, so the reason has to travel with
+    /// the entry or the consumer re-expands a body the entry already holds.
+    fn record_guard(&mut self, path: PathBuf, guard: crate::FileGuard) {
+        // `#pragma once` outranks a wrapper and is never downgraded: it
+        // holds for the rest of the run whatever the macro table does. It is
+        // the *binding* that sticks, though, not the announcement — every
+        // open frame still has to be told, including frames opened after the
+        // pragma was first read. Returning early here left an entry carrying
+        // such a header's body without the reason to skip it, and the
+        // consumer expanded it a second time.
+        let guard = match self.file_guards.get(&path) {
+            Some(crate::FileGuard::Once) => crate::FileGuard::Once,
+            _ => guard,
+        };
+        for frame in &mut self.cache_frames {
+            frame.guards.insert(path.clone(), guard.clone());
         }
-        self.guard_pending = None;
-        // A guard has nothing to choose between: an `#else` / `#elif` arm
-        // makes the chain a real conditional on the name.
-        if self.conditionals[chain.unwrap()].arms.len() != 1 {
-            return;
+        self.file_guards.insert(path, guard);
+    }
+
+    /// Re-announce a guard this run already knows, for the entries opened
+    /// since it was learned.
+    fn propagate_guard(&mut self, path: &Path) {
+        if let Some(guard) = self.file_guards.get(path).cloned() {
+            self.record_guard(path.to_path_buf(), guard);
         }
-        let mut rest = i;
-        skip_directive_line(tokens, &mut rest);
-        if tokens[rest..]
-            .iter()
-            .all(|t| matches!(t.kind, TokenKind::Newline | TokenKind::Eof))
-        {
-            self.conditionals[chain.unwrap()].include_guard = true;
+    }
+
+    /// Adopt the guards a cached expansion learned, for this run and for
+    /// every entry being built around it.
+    fn merge_guards(&mut self, guards: &[(PathBuf, crate::FileGuard)]) {
+        for (path, guard) in guards {
+            self.record_guard(path.clone(), guard.clone());
+        }
+    }
+
+    /// May a repeated `#include` of `canonical` be skipped? Only on a
+    /// reason the file itself stated.
+    ///
+    /// Note what this does NOT do: charge the guard's name to the enclosing
+    /// cache entry's fingerprint. The skip does depend on the live table, so
+    /// reading it there would be defensible, but a header that skips the ten
+    /// its includer already pulled in would carry ten guard names and only
+    /// match a consumer with the same include history — camera lost 879
+    /// direct call edges to that, since past `max_expansion_variants`
+    /// nothing publishes and the shared per-header units those declarations
+    /// come from stop being built. The skip is kept self-contained the way
+    /// the blanket suppression was instead: the site below snapshots the
+    /// skipped expansion's macro effects into this entry's own `ops` and
+    /// embeds its text, so a consumer reaches the same state either way.
+    fn guard_suppresses(&self, canonical: &Path) -> bool {
+        match self.file_guards.get(canonical) {
+            Some(crate::FileGuard::Once) => true,
+            Some(crate::FileGuard::Ifndef(name)) => {
+                self.macros.contains_key(name.as_ref())
+                    && !self.fallback_macros.contains(name.as_ref())
+            }
+            None => false,
         }
     }
 
@@ -917,6 +994,7 @@ impl PreprocessorState {
         self.entry_used
             .insert(canonical.to_path_buf(), entry.clone());
         self.variant_used.insert(canonical.to_path_buf(), at);
+        self.direct_variants.insert((canonical.to_path_buf(), at));
         if let Some(frame) = self.cache_frames.last_mut() {
             frame.replayed.push((canonical.to_path_buf(), at));
         }
@@ -927,13 +1005,17 @@ impl PreprocessorState {
             self.variant_used.entry(path.clone()).or_insert(*at);
         }
         self.merge_recorded_deps(&entry.deps);
+        // The consumer never visits the headers this entry covers, so the
+        // reasons they may be skipped have to come from the entry (#56).
+        let guards = Arc::clone(&entry.guards);
+        self.merge_guards(&guards);
         for diagnostic in entry.diagnostics.iter().cloned() {
             self.push_diagnostic(diagnostic);
         }
         if !self.opts.inline_include_bodies {
             self.replay_macro_delta(&entry);
-            self.included_guard.insert(canonical.to_path_buf());
-            self.included_guard.extend(entry.files.iter().cloned());
+            self.included_files.insert(canonical.to_path_buf());
+            self.included_files.extend(entry.files.iter().cloned());
             return true;
         }
         if self.output.len().saturating_add(entry.text.len()) > self.opts.max_output_bytes {
@@ -945,7 +1027,7 @@ impl PreprocessorState {
                     self.opts.max_output_bytes
                 ),
             );
-            self.included_guard.insert(canonical.to_path_buf());
+            self.included_files.insert(canonical.to_path_buf());
             return true;
         }
         let offset = self.output.len();
@@ -967,7 +1049,7 @@ impl PreprocessorState {
             let sub = &entry.line_map;
             self.line_map.splice(sub, offset, &remap);
         }
-        self.included_guard.extend(entry.files.iter().cloned());
+        self.included_files.extend(entry.files.iter().cloned());
         true
     }
 
@@ -1145,14 +1227,29 @@ impl PreprocessorState {
 
     fn process_file(&mut self, path: &Path) -> Result<(), PreprocessError> {
         let canonical = trace_ir::canonicalize(path);
-        if self.included_guard.contains(&canonical) {
-            // Already expanded earlier in this run. Re-splicing the cached
-            // subtree into *live* output exponentiates on diamond include
-            // graphs (each skip copies a self-contained blob that already
-            // contains previous copies). Record the skip on the in-progress
-            // cache frame instead; `compose_cache_text` embeds the nested
-            // expansion only into that frame's cache entry.
+        // A repeated `#include` is skipped only on a reason the file itself
+        // stated — its `#pragma once`, or its include guard while that guard
+        // is defined. Membership in `included_files` is not one: suppressing
+        // on it lost every deliberate re-inclusion, X-macro tables above all
+        // (#56).
+        if self.guard_suppresses(&canonical) {
+            // Re-splicing the cached subtree into *live* output exponentiates
+            // on diamond include graphs (each skip copies a self-contained
+            // blob that already contains previous copies). Record the skip on
+            // the in-progress cache frame instead; `compose_cache_text`
+            // embeds the nested expansion only into that frame's cache entry.
             if !self.opts.frozen_expansion_cache {
+                // The reason this include was skipped belongs to every entry
+                // being built around it, along with the reasons for
+                // everything the skipped expansion covered.
+                self.propagate_guard(&canonical);
+                if let Some(guards) = self
+                    .entry_used
+                    .get(&canonical)
+                    .map(|e| Arc::clone(&e.guards))
+                {
+                    self.merge_guards(&guards);
+                }
                 let replayed_as = self.variant_used.get(&canonical).copied();
                 if let Some(frame) = self.cache_frames.last_mut() {
                     frame.skips.push((self.output.len(), canonical.clone()));
@@ -1218,6 +1315,28 @@ impl PreprocessorState {
             return Ok(());
         }
 
+        // Depth does not bound repetition: an unguarded file included by
+        // fifty siblings is expanded fifty times at depth two, and a pair of
+        // unguarded files that include each other recurs until the depth cap
+        // at every one of those sites. Cap the expansions of a single path
+        // and say so, rather than losing the content silently the way the
+        // blanket suppression did (#56).
+        let expansions = self.file_expansions.entry(canonical.clone()).or_insert(0);
+        *expansions += 1;
+        if *expansions > self.opts.max_file_expansions {
+            if *expansions == self.opts.max_file_expansions + 1 {
+                self.limit_warn(
+                    1,
+                    format!(
+                        "include expanded more than {} times ({}); skipping further inclusions",
+                        self.opts.max_file_expansions,
+                        path.display()
+                    ),
+                );
+            }
+            return Ok(());
+        }
+
         // The root of this run is the file whose text IS the output, so it
         // is never replayed from the expansion cache: an entry for it can
         // already exist when another header pulled it in first (a
@@ -1240,7 +1359,7 @@ impl PreprocessorState {
             self.opts.include_expansion_cache.is_some() && Self::is_cacheable_header(&canonical);
 
         let guard_snapshot = if cache_header {
-            self.included_guard.clone()
+            self.included_files.clone()
         } else {
             HashSet::new()
         };
@@ -1253,7 +1372,7 @@ impl PreprocessorState {
         } else {
             None
         };
-        self.included_guard.insert(canonical.clone());
+        self.included_files.insert(canonical.clone());
         let output_start = self.output.len();
         let pushing_frame = cache_header && !self.opts.frozen_expansion_cache;
 
@@ -1288,6 +1407,7 @@ impl PreprocessorState {
                 deps: crate::MacroFingerprint::default(),
                 settled: HashSet::new(),
                 locally_bound: HashSet::new(),
+                guards: HashMap::new(),
                 diagnostics: Vec::new(),
                 diagnostic_keys: HashSet::new(),
             });
@@ -1353,7 +1473,7 @@ impl PreprocessorState {
                     )
                 };
                 let mut new_files: HashSet<PathBuf> = self
-                    .included_guard
+                    .included_files
                     .difference(&guard_snapshot)
                     .filter(|p| self.emitted_bytes.get(*p).copied().unwrap_or(0) > 0)
                     .cloned()
@@ -1366,6 +1486,20 @@ impl PreprocessorState {
                 let diagnostics: Arc<Vec<Diagnostic>> = Arc::new(frame.diagnostics);
                 let deps = frame.deps;
                 let replayed = frame.replayed;
+                // Only for the files this entry actually covers. A frame
+                // also learns the guards of headers it skipped because the
+                // includer had already pulled them in — those contribute no
+                // text here, so handing them to a consumer would suppress an
+                // `#include` whose body the consumer never received. Camera
+                // lost 1,064 direct call edges to exactly that.
+                let mut guards: Vec<(PathBuf, crate::FileGuard)> = frame
+                    .guards
+                    .into_iter()
+                    .filter(|(p, _)| *p == canonical || new_files.contains(p))
+                    .collect();
+                // The map's iteration order is not stable across runs and
+                // the index must be bit-reproducible.
+                guards.sort_by(|a, b| a.0.cmp(&b.0));
                 // Diagnostics alone are not content. An entry holding nothing
                 // else replays as an empty expansion, and `splice_cached`
                 // reports the hit as a success, so every later consumer that
@@ -1408,6 +1542,7 @@ impl PreprocessorState {
                         line_map: Arc::new(composed_map),
                         ops,
                         deps: Arc::new(deps),
+                        guards: Arc::new(guards),
                         nested_variants: Arc::new(nested_variants),
                     };
                     self.entry_used.insert(canonical.clone(), entry.clone());
@@ -1440,10 +1575,19 @@ impl PreprocessorState {
     fn process_file_tokens(&mut self, tokens: &[Token]) -> Result<(), PreprocessError> {
         let depth = self.conditional_stack.len();
         let outer_base = std::mem::replace(&mut self.cond_base, depth);
-        let outer_guard = (self.guard_candidate.take(), self.guard_pending.take());
+        // Before the token loop, not at the closing `#endif`: a guarded
+        // header that reaches itself back through another header re-enters
+        // while its own `#endif` is still ahead, and a guard learned on the
+        // way out cannot answer for that inclusion (#56).
+        let guard = detect_include_guard(tokens);
+        let outer_guarded = std::mem::replace(&mut self.guarded_file, guard.is_some());
+        if let Some(name) = guard {
+            let path = trace_ir::canonicalize(&self.current_file);
+            self.record_guard(path, crate::FileGuard::Ifndef(name));
+        }
         let result = self.process_tokens(tokens);
         self.cond_base = outer_base;
-        (self.guard_candidate, self.guard_pending) = outer_guard;
+        self.guarded_file = outer_guarded;
         if result.is_ok() {
             for idx in depth..self.conditional_stack.len() {
                 let line = self.conditional_stack[idx].line;
@@ -1661,16 +1805,6 @@ impl PreprocessorState {
         let record_line = tokens[start].line;
         i += 1;
 
-        // Whatever this directive is, it decides the guard candidate the
-        // previous one opened: only `#define` of the tested name keeps it.
-        if let Some((chain, name)) = self.guard_candidate.take() {
-            if directive == "define"
-                && matches!(tokens.get(i).map(|t| &t.kind), Some(TokenKind::Identifier(n)) if *n == name)
-            {
-                self.guard_pending = Some(chain);
-            }
-        }
-
         match directive.as_str() {
             "include" if self.is_active() => {
                 i = self.handle_include(tokens, i)?;
@@ -1705,7 +1839,7 @@ impl PreprocessorState {
                     });
                     self.push_cond(cond, line, chain);
                     if negate {
-                        self.note_guard_candidate(chain, &name, tokens, start);
+                        self.mark_include_guard(chain, tokens, start);
                     }
                 } else {
                     let rest = directive_rest(tokens, i);
@@ -1757,10 +1891,8 @@ impl PreprocessorState {
                     reads: if evaluate { reads } else { spelled_reads(expr) },
                 });
                 self.push_cond(cond, line, chain);
-                if evaluate {
-                    if let Some(name) = negated_defined_name(expr) {
-                        self.note_guard_candidate(chain, name, tokens, start);
-                    }
+                if evaluate && negated_defined_name(expr).is_some() {
+                    self.mark_include_guard(chain, tokens, start);
                 }
             }
             "elif" => {
@@ -1824,14 +1956,26 @@ impl PreprocessorState {
                 if let Some(chain) = frame.chain {
                     self.conditionals[chain].terminated = true;
                 }
-                self.settle_guard(frame.chain, tokens, i);
             }
             // Directives whose operands we ignore: the shared skip below
             // consumes the rest of the line. Calling skip_to_newline here as
             // well would eat the newline AND the whole following line
             // (e.g. `#pragma pack(push, 4)` swallowing the struct after it).
             "line" => {}
-            "pragma" => {}
+            "pragma" => {
+                // `#pragma once` is the file's own statement that one
+                // expansion per translation unit is enough; nothing else
+                // about a pragma concerns the preprocessor. Reached inside a
+                // skipped arm it states nothing, so it is read only while
+                // active — and once read it holds for the rest of the run,
+                // whatever later happens to the controlling condition.
+                if self.is_active()
+                    && matches!(tokens.get(i).map(|t| &t.kind), Some(TokenKind::Identifier(n)) if n.as_str() == "once")
+                {
+                    let path = trace_ir::canonicalize(&self.current_file);
+                    self.record_guard(path, crate::FileGuard::Once);
+                }
+            }
             "undef" if self.is_active() => {
                 let name = self.read_directive_ident(tokens, &mut i)?;
                 self.remove_macro(&name);
@@ -1883,7 +2027,7 @@ impl PreprocessorState {
         };
         let live_at = self.output.len();
         if let Err(e) = self.process_file(&include_path) {
-            // The include is already in `included_guard` and contributed
+            // The include is already in `included_files` and contributed
             // nothing, so this expansion — and every frame enclosing it — is
             // missing the header's content. Publishing any of them would keep
             // starving consumers after the underlying failure clears.
@@ -2395,9 +2539,15 @@ impl PreprocessorState {
             line_map: self.line_map,
             diagnostics: self.diagnostics,
             language: self.language,
-            included_headers: self.included_guard.into_iter().collect(),
+            included_headers: self.included_files.into_iter().collect(),
             inlined_headers: self.inlined_files.into_iter().collect(),
-            replayed_variants: self.variant_used.into_iter().collect(),
+            replayed_variants: {
+                let mut vs: HashSet<(PathBuf, usize)> = self.direct_variants;
+                vs.extend(self.variant_used);
+                let mut vs: Vec<(PathBuf, usize)> = vs.into_iter().collect();
+                vs.sort();
+                vs
+            },
             conditionals: self.conditionals,
         }
     }
@@ -2538,6 +2688,96 @@ fn at_beginning_of_line(tokens: &[Token], i: usize) -> bool {
         return true;
     }
     matches!(tokens[i - 1].kind, TokenKind::Newline)
+}
+
+/// The include guard wrapping the whole file, if it has one: `#ifndef NAME`
+/// (or `#if !defined(NAME)`) before any other token, `#define NAME` as the
+/// very next directive, and the matching `#endif` with nothing but
+/// whitespace after it. A second arm disqualifies it — a guard has nothing
+/// to choose between.
+///
+/// Read off the token stream rather than observed while the file runs, so
+/// the answer is available at the file's first inclusion and does not depend
+/// on that run reaching the `#endif` (#56).
+fn detect_include_guard(tokens: &[Token]) -> Option<Arc<str>> {
+    let mut i = 0;
+    let name = guard_opener(tokens, &mut i)?;
+    // The `#define` of that same name has to be the next directive.
+    if next_directive(tokens, &mut i)? != "define" || ident_name(tokens.get(i)?)? != &*name {
+        return None;
+    }
+    // Directives only, tracking nesting, to the `#endif` that closes the
+    // opener.
+    let mut depth = 1usize;
+    while let Some(directive) = next_directive(tokens, &mut i) {
+        match directive {
+            "if" | "ifdef" | "ifndef" => depth += 1,
+            "elif" | "else" if depth == 1 => return None,
+            "endif" => {
+                depth -= 1;
+                if depth == 0 {
+                    skip_directive_line(tokens, &mut i);
+                    return tokens[i..]
+                        .iter()
+                        .all(|t| matches!(t.kind, TokenKind::Newline | TokenKind::Eof))
+                        .then_some(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The name an `#ifndef NAME` / `#if !defined(NAME)` opener tests, when one
+/// is the file's very first token. Leaves `i` past that directive line.
+///
+/// Spelled out rather than routed through `next_directive`, which skips over
+/// lines that are not directives: the opener has to be *first*, or the text
+/// before it would escape the wrapper.
+fn guard_opener(tokens: &[Token], i: &mut usize) -> Option<Arc<str>> {
+    while matches!(tokens.get(*i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+        *i += 1;
+    }
+    if !matches!(tokens.get(*i)?.kind, TokenKind::Hash) {
+        return None;
+    }
+    *i += 1;
+    let keyword = ident_name(tokens.get(*i)?)?;
+    *i += 1;
+    let name = match keyword {
+        "ifndef" => ident_name(tokens.get(*i)?)?,
+        "if" => negated_defined_name(directive_rest(tokens, *i))?,
+        _ => return None,
+    };
+    let name = Arc::from(name);
+    skip_directive_line(tokens, i);
+    Some(name)
+}
+
+/// The next directive's keyword, leaving `i` just past it; `None` at end of
+/// input. Lines that are not directives are skipped, as is a `#` followed by
+/// something other than a directive name (a `# 1 "x.c"` line marker).
+fn next_directive<'a>(tokens: &'a [Token], i: &mut usize) -> Option<&'a str> {
+    loop {
+        while matches!(tokens.get(*i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+            *i += 1;
+        }
+        match tokens.get(*i)?.kind {
+            TokenKind::Eof => return None,
+            TokenKind::Hash => {
+                *i += 1;
+                match tokens.get(*i).and_then(ident_name) {
+                    Some(keyword) => {
+                        *i += 1;
+                        return Some(keyword);
+                    }
+                    None => skip_directive_line(tokens, i),
+                }
+            }
+            _ => skip_directive_line(tokens, i),
+        }
+    }
 }
 
 /// Advance to the end of the current directive line, leaving `i` on the
@@ -7697,7 +7937,7 @@ int from_late;
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("b.h"),
-            "#define VALUE 1\n#define REMOVED 1\nint b;\n",
+            "#ifndef B_H\n#define B_H\n#define VALUE 1\n#define REMOVED 1\nint b;\n#endif\n",
         )
         .unwrap();
         fs::write(
@@ -7729,7 +7969,7 @@ int from_late;
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("b.h"),
-            "#ifdef VALUE\nint configured;\n#endif\n#define VALUE 1\nint b;\n",
+            "#ifndef B_H\n#define B_H\n#ifdef VALUE\nint configured;\n#endif\n#define VALUE 1\nint b;\n#endif\n",
         )
         .unwrap();
         fs::write(dir.path().join("a.h"), "#include \"b.h\"\nint a;\n").unwrap();
@@ -7765,7 +8005,11 @@ int from_late;
     #[test]
     fn cached_guard_skip_tracks_external_macro_override() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("b.h"), "#define VALUE 1\nint b;\n").unwrap();
+        fs::write(
+            dir.path().join("b.h"),
+            "#ifndef B_H\n#define B_H\n#define VALUE 1\nint b;\n#endif\n",
+        )
+        .unwrap();
         fs::write(dir.path().join("a.h"), "#include \"b.h\"\nint a;\n").unwrap();
         let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
         let opts = PreprocessOptions::new()
@@ -7783,6 +8027,288 @@ int from_late;
                 replay.output
             );
         }
+    }
+
+    /// The issue's reproduction, at the level the defect lives on: one table
+    /// included once per `#define` of its entry macro. Nothing about the
+    /// file says "once", so every inclusion expands (#56).
+    #[test]
+    fn unguarded_file_re_expands_on_every_include() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("list.def"), "ENTRY(alpha)\nENTRY(beta)\n").unwrap();
+        let path = dir.path().join("t.c");
+        fs::write(
+            &path,
+            "#define ENTRY(n) void fn_##n(void) {}\n#include \"list.def\"\n#undef ENTRY\n\
+             #define ENTRY(n) void use_##n(void) { fn_##n(); }\n#include \"list.def\"\n",
+        )
+        .unwrap();
+        let out = preprocess_file(&path, &PreprocessOptions::new())
+            .unwrap()
+            .output;
+        for name in ["fn_alpha", "fn_beta", "use_alpha", "use_beta"] {
+            assert!(out.contains(name), "{name} missing from {out}");
+        }
+    }
+
+    /// An include guard suppresses while its name is defined, and stops
+    /// suppressing when the name goes away.
+    #[test]
+    fn include_guard_suppresses_only_while_its_name_is_defined() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("body.h"),
+            "#ifndef BODY_H\n#define BODY_H\nint MARK;\n#endif\n",
+        )
+        .unwrap();
+        let path = dir.path().join("t.c");
+        fs::write(
+            &path,
+            "#define MARK a\n#include \"body.h\"\n#undef MARK\n#define MARK b\n\
+             #include \"body.h\"\n#undef BODY_H\n#undef MARK\n#define MARK c\n\
+             #include \"body.h\"\n",
+        )
+        .unwrap();
+        let out = preprocess_file(&path, &PreprocessOptions::new())
+            .unwrap()
+            .output;
+        assert!(out.contains("int a ;"), "{out}");
+        assert!(!out.contains("int b ;"), "guard did not suppress: {out}");
+        assert!(
+            out.contains("int c ;"),
+            "`#undef` of the guard ignored: {out}"
+        );
+    }
+
+    /// `#pragma once` read with the enclosing conditional active holds for
+    /// the rest of the run, whatever later happens to that condition.
+    #[test]
+    fn active_pragma_once_holds_for_the_rest_of_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("once.h"),
+            "#ifdef ENABLE_ONCE\n#pragma once\n#endif\nint MARK;\n",
+        )
+        .unwrap();
+        let path = dir.path().join("t.c");
+        let source = |enable: &str| {
+            format!(
+                "{enable}#define MARK a\n#include \"once.h\"\n#undef ENABLE_ONCE\n\
+                 #undef MARK\n#define MARK b\n#include \"once.h\"\n"
+            )
+        };
+        fs::write(&path, source("#define ENABLE_ONCE 1\n")).unwrap();
+        let out = preprocess_file(&path, &PreprocessOptions::new())
+            .unwrap()
+            .output;
+        assert!(out.contains("int a ;"), "{out}");
+        assert!(!out.contains("int b ;"), "`#pragma once` was undone: {out}");
+
+        // The same header reached with the conditional inactive: a pragma in
+        // a skipped group states nothing, so the file re-expands. This is a
+        // separate run by construction — once the first run has read an
+        // active `#pragma once`, it holds for that whole unit.
+        fs::write(&path, source("")).unwrap();
+        let out = preprocess_file(&path, &PreprocessOptions::new())
+            .unwrap()
+            .output;
+        assert!(out.contains("int a ;") && out.contains("int b ;"), "{out}");
+    }
+
+    /// `a.h` includes `b.h` includes `a.h`, both guarded. The recursion now
+    /// terminates on the guard rather than on the blanket path set, and
+    /// neither body may be lost to it.
+    #[test]
+    fn guarded_recursive_includes_terminate_with_both_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.h"),
+            "#ifndef A_H\n#define A_H\n#include \"b.h\"\nint a;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("b.h"),
+            "#ifndef B_H\n#define B_H\n#include \"a.h\"\nint b;\n#endif\n",
+        )
+        .unwrap();
+        let path = dir.path().join("t.c");
+        fs::write(&path, "#include \"a.h\"\n").unwrap();
+        let result = preprocess_file(&path, &PreprocessOptions::new()).unwrap();
+        assert_eq!(
+            result.output.matches("int a ;").count(),
+            1,
+            "{}",
+            result.output
+        );
+        assert_eq!(
+            result.output.matches("int b ;").count(),
+            1,
+            "{}",
+            result.output
+        );
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("include depth")),
+            "termination came from the depth cap: {:?}",
+            result.diagnostics
+        );
+    }
+
+    /// Guard-driven skips still feed the cache frames, so a diamond graph
+    /// costs one expansion per header rather than one per path through it.
+    #[test]
+    fn diamond_include_graph_does_not_re_splice_exponentially() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("h0.h"),
+            "#ifndef H0\n#define H0\nint h0;\n#endif\n",
+        )
+        .unwrap();
+        const LEVELS: usize = 12;
+        for level in 1..=LEVELS {
+            fs::write(
+                dir.path().join(format!("h{level}.h")),
+                format!(
+                    "#ifndef H{level}\n#define H{level}\n#include \"h{prev}.h\"\n\
+                     #include \"h{prev}.h\"\nint h{level};\n#endif\n",
+                    prev = level - 1
+                ),
+            )
+            .unwrap();
+        }
+        let path = dir.path().join("t.c");
+        fs::write(&path, format!("#include \"h{LEVELS}.h\"\n")).unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let opts = PreprocessOptions::new().with_include_expansion_cache(cache);
+        let result = preprocess_file(&path, &opts).unwrap();
+        for level in 0..=LEVELS {
+            assert_eq!(
+                result.output.matches(&format!("int h{level} ;")).count(),
+                1,
+                "h{level} re-spliced: {} bytes of output",
+                result.output.len()
+            );
+        }
+    }
+
+    /// The wrapper shapes that are an include guard, and the near-misses
+    /// that are not. Read structurally, so this is decided the same way for
+    /// a file's first inclusion as for its tenth.
+    #[test]
+    fn include_guard_shape_is_read_off_the_token_stream() {
+        let guard_of = |src: &str| {
+            detect_include_guard(&Lexer::new(src, Language::C).tokenize())
+                .map(|n| n.as_ref().to_string())
+        };
+        assert_eq!(
+            guard_of("#ifndef G\n#define G\nint x;\n#endif\n").as_deref(),
+            Some("G")
+        );
+        // Leading comments and blank lines are not tokens.
+        assert_eq!(
+            guard_of("/* c */\n\n#ifndef G\n#define G\nint x;\n#endif // G\n").as_deref(),
+            Some("G")
+        );
+        assert_eq!(
+            guard_of("#if !defined(G)\n#define G\nint x;\n#endif\n").as_deref(),
+            Some("G")
+        );
+        // Nested conditionals do not close the wrapper early.
+        assert_eq!(
+            guard_of("#ifndef G\n#define G\n#ifdef A\nint a;\n#else\nint b;\n#endif\n#endif\n")
+                .as_deref(),
+            Some("G")
+        );
+        // A second arm makes it a conditional on the name, not a guard.
+        assert_eq!(
+            guard_of("#ifndef G\n#define G\nint x;\n#else\nint y;\n#endif\n"),
+            None
+        );
+        // Content before the wrapper, or after it.
+        assert_eq!(
+            guard_of("int before;\n#ifndef G\n#define G\n#endif\n"),
+            None
+        );
+        assert_eq!(guard_of("#ifndef G\n#define G\n#endif\nint after;\n"), None);
+        // The `#define` must be the next DIRECTIVE, of that name — ordinary
+        // text before it changes nothing, since it is inside the wrapper and
+        // therefore skipped on a later inclusion either way.
+        assert_eq!(
+            guard_of("#ifndef G\nint x;\n#define G\n#endif\n").as_deref(),
+            Some("G")
+        );
+        assert_eq!(
+            guard_of("#ifndef G\n#if A\n#define G\n#endif\n#endif\n"),
+            None
+        );
+        assert_eq!(guard_of("#ifndef G\n#define H\n#endif\n"), None);
+        assert_eq!(guard_of("#ifdef G\n#define G\n#endif\n"), None);
+        assert_eq!(guard_of("int x;\n"), None);
+    }
+
+    /// A `#pragma once` header embedded in a cached expansion must hand its
+    /// guard to the consumer along with its text. `record_guard` returned
+    /// early once `Once` was already known, which kept the guard out of
+    /// every frame opened after that point — so the entry carried the body
+    /// and not the reason to skip it, and the consumer expanded it twice.
+    #[test]
+    fn pragma_once_guard_reaches_frames_opened_after_it_was_learned() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("once.h"), "#pragma once\nint once_body;\n").unwrap();
+        fs::write(dir.path().join("a.h"), "#include \"once.h\"\nint a;\n").unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path().to_path_buf())
+            .with_include_expansion_cache(cache);
+        let path = dir.path().join("main.c");
+
+        // Producer: once.h is expanded before a.h opens its cache frame, so
+        // a.h skips it and embeds its text.
+        fs::write(&path, "#include \"once.h\"\n#include \"a.h\"\n").unwrap();
+        let produced = preprocess_file(&path, &opts).unwrap();
+        assert_eq!(produced.output.matches("int once_body ;").count(), 1);
+
+        // Consumer: replays a.h, then reaches once.h itself.
+        fs::write(&path, "#include \"a.h\"\n#include \"once.h\"\n").unwrap();
+        let consumed =
+            preprocess_file(&path, &opts.clone().with_frozen_expansion_cache(true)).unwrap();
+        assert_eq!(
+            consumed.output.matches("int once_body ;").count(),
+            1,
+            "`#pragma once` body expanded twice: {}",
+            consumed.output
+        );
+    }
+
+    /// Repetition is legitimate but not unbounded: past the cap the include
+    /// is skipped and said so, rather than lost the way the blanket
+    /// suppression lost it.
+    #[test]
+    fn repeated_expansion_of_one_path_is_capped_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("x.h"), "int x;\n").unwrap();
+        let path = dir.path().join("t.c");
+        fs::write(&path, "#include \"x.h\"\n".repeat(6)).unwrap();
+        let opts = PreprocessOptions::new().with_max_file_expansions(3);
+        let result = preprocess_file(&path, &opts).unwrap();
+        assert_eq!(
+            result.output.matches("int x ;").count(),
+            3,
+            "{}",
+            result.output
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter(|d| d.message.contains("include expanded more than 3 times"))
+                .count(),
+            1,
+            "expected exactly one report: {:?}",
+            result.diagnostics
+        );
     }
 
     /// A header whose body was guard-skipped contributes no text, no macro

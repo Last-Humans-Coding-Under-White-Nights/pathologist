@@ -15,6 +15,44 @@
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Re-verified 2026-09-08 (conditional `#include` suppression, #56):** fresh
+release builds of `master` (0a35409) and the branch were compared on the same
+machine against the three clean pinned checkouts under `/private/tmp/corpora`,
+`--jobs 8`, 800,000-pop budget. Both pass **86/86** `eval_check` checks with
+every measured value identical, and the SQLite dumps excluding `analysis_run`
+are **byte-identical** on all three corpora (637,396, 339,509 and 696,324
+statements). The `parse_failures` captures (633 / 142 / 385 rows) and the
+`conditional_coverage` TSVs are byte-identical too, so `docs/PARSE_FAILURES.md`
+and `docs/CONDITIONAL_COVERAGE.md` need no regeneration and
+`scripts/eval_expected.json` needs no re-capture.
+
+That the corpora do not move is the expected result, not an absent effect:
+every cacheable header the three trees reach carries a recognised guard or a
+`#pragma once`, so the skip decision is the same one the blanket path set used
+to make. What changes is which *reasons* are accepted, and the reachable
+regression was the reverse direction — suppressing an include for a reason
+that does not hold there. Two shapes of that were found and fixed before this
+result: fingerprinting the guard name at a skip site (camera −879 direct
+edges, since an entry then only matched a consumer with the same include
+history and nothing published past `max_expansion_variants`), and exporting
+`IncludeExpansion` guards for files the entry does not cover (camera −1,064
+direct edges, consumers suppressing an `#include` whose body they never
+received). Both are recorded at their sites in `preprocessor.rs`.
+
+Index time and peak RSS, three runs each on macOS (Darwin), 8 logical CPUs,
+`--jobs 8` — the change deliberately re-expands more than before, so these are
+budgets rather than a formality:
+
+| Corpus | `master` time | branch time | `master` peak RSS | branch peak RSS |
+|--------|---------------|-------------|-------------------|-----------------|
+| drivers_hdf_core | 7.67–7.74 s | 7.68–7.77 s | 602–685 MB | 672–673 MB |
+| hiviewdfx_hiview | 5.04–5.12 s | 5.11–5.23 s | 357–361 MB | 348–360 MB |
+| multimedia_camera_framework | 21.20–23.19 s | 21.19–21.53 s | 1,056–1,121 MB | 1,077–1,160 MB |
+
+Every branch range overlaps `master`'s, so the cost of re-expanding is inside
+run-to-run noise on these trees. The index stays reproducible: three `--jobs 8`
+runs and one `--jobs 1` run of each corpus give the same dump hash.
+
 **Re-verified 2026-09-08 (language predefines `__cplusplus` / `__STDC__` /
 `__STDC_VERSION__`, #70):** fresh release builds of `master` (ef4cf1e) and the
 branch were compared on the same machine against the three clean pinned

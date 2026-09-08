@@ -1440,7 +1440,7 @@ fn lower_prepared_source(
                     let wanted = (*unit_lang == language)
                         .then(|| pre.replayed_variants.get(h))
                         .flatten();
-                    if wanted.is_some_and(|w| w != variant) {
+                    if wanted.is_some_and(|w| !w.contains(variant)) {
                         continue;
                     }
                     if types_only {

@@ -33,6 +33,27 @@ All notable changes to `trace` are documented in this file.
 
 ### Fixed
 
+- A repeated `#include` of a path is suppressed only on a reason the file itself stated (#56).
+  The preprocessor used to skip any path it had already processed in this run, before looking at
+  include guards at all, so every deliberate re-inclusion was lost — an X-macro table included
+  once per `#define` of its entry macro contributed only its first expansion, silently and
+  without a diagnostic. A file is now skipped when an include guard wrapping it is defined
+  (`#undef`ing that guard and including the file again re-expands it, as in cpp), or when a
+  `#pragma once` was reached with the enclosing conditionals active — which then holds for the
+  rest of the translation unit, whatever later happens to the controlling condition. The guard is
+  read off the token stream before the body runs, so a header that reaches itself back through
+  another header answers for that inclusion too; guarded recursion still terminates on the guard
+  rather than on the include-depth cap. Guard-driven skips keep feeding the cache frames, so a
+  diamond include graph costs one expansion per header as before, and the guards a cached
+  expansion learned travel with it for the files it actually covers. Genuine repetition is bounded
+  by `max_file_expansions` (64 inclusions of one path per run), which reports rather than loses.
+  A header a unit includes twice under different macros now contributes both of its expansions to
+  that unit instead of only the last. The index is byte-identical to the previous release on all
+  three eval corpora, at unchanged index time and peak RSS.
+- A `#pragma once` header embedded in a cached expansion carries its guard to the consumer along
+  with its text. Recording the guard returned early once `#pragma once` was already known for that
+  path, which kept it out of every cache frame opened afterwards, so an entry could hold such a
+  header's body without the reason to skip it and the consuming unit expanded it a second time.
 - The preprocessor predefines what the language implies (#70): `__cplusplus` (`201703L`) in a
   unit lexed as C++, `__STDC_VERSION__` (`201710L`) in a C unit, `__STDC__` in both. A
   command-line `-D` of the same name outranks the predefined value and a source `#undef`
