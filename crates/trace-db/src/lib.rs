@@ -7,6 +7,7 @@ mod render;
 mod schema;
 
 pub use export::*;
+pub use filter::filter_call_chains;
 pub use filter::filter_query_graph;
 pub use filter::CallGraphFilter;
 pub use inspect::*;

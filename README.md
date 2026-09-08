@@ -188,6 +188,34 @@ trace inspect /tmp/hdf.db callgraph --file hdf_service_record.c --line 20 --dire
 trace inspect /tmp/hdf.db callgraph --file allocator.c --line 44 --callgraph-filter mem.json
 ```
 
+### `trace inspect callchain`
+
+Find all simple call paths (chains) between two functions no longer than `--depth`.
+
+```text
+trace inspect <DB> callchain [--from FN|FILE:LINE] [--to FN|FILE:LINE] [--depth N] [--limit N]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--from <FN>` | Start function name, C++ qualified suffix, or `FILE:LINE` (e.g. `main` or `main.c:10`). |
+| `--to <FN>` | Target function name, C++ qualified suffix, or `FILE:LINE` (e.g. `target` or `worker.c:25`). |
+| `--from-file <SUBSTR>`, `--from-line <N>` | File and line locating the start function. |
+| `--to-file <SUBSTR>`, `--to-line <N>` | File and line locating the target function. |
+| `--depth <N>` | Maximum path length in call hops (default 5). |
+| `--direction` | `down` = callers -> callees (default), `up` = callees -> callers. |
+| `--limit <N>` | Maximum number of chains to return (default 100, 0 for unlimited). |
+| `--format` | Output format: `text` (default), `json`, `graphviz`, or `mermaid`. |
+| `--callgraph-filter` | Path to JSON filter config file (`{"functions": ["regex", ...]}`). |
+
+**Examples**
+
+```bash
+trace inspect /tmp/trace.db callchain --from main --to target --depth 3
+trace inspect /tmp/trace.db callchain --from main.c:10 --to target.c:20
+trace inspect /tmp/trace.db callchain --from caller --to helper --format mermaid
+```
+
 ### `trace inspect dataflow`
 
 Walk the PAG value-flow graph from a variable declaration.

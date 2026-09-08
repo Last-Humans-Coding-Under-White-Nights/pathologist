@@ -5,7 +5,7 @@
 //! Rendering is pure — it only consumes the `QueryGraph` returned by
 //! `call_graph` / `dataflow_graph`, so every format is testable in isolation.
 
-use crate::inspect::{GraphEdge, QueryGraph};
+use crate::inspect::{CallChainsResult, FunctionRef, GraphEdge, GraphNode, QueryGraph};
 use anyhow::{bail, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
@@ -96,6 +96,142 @@ pub fn render_graph(
         RenderFormat::Json => render_json(graph, meta, label),
         RenderFormat::Graphviz => render_graphviz(graph, meta, label),
         RenderFormat::Mermaid => render_mermaid(graph, meta, label),
+    }
+}
+
+/// Render a call-chains result: as formatted text showing each chain,
+/// or as JSON/Graphviz/Mermaid via the unified query graph.
+pub fn render_call_chains(
+    result: &CallChainsResult,
+    format: RenderFormat,
+    start: &FunctionRef,
+    target: &FunctionRef,
+    direction: crate::inspect::Direction,
+    max_depth: u32,
+    node_labels: &FxHashMap<i64, GraphNode>,
+) -> String {
+    let dir_str = match direction {
+        crate::inspect::Direction::Down => "down",
+        crate::inspect::Direction::Up => "up",
+    };
+    match format {
+        RenderFormat::Text => {
+            let mut out = String::new();
+            writeln!(
+                out,
+                "call chains from {start} to {target} ({dir_str}, depth <= {max_depth}):"
+            )
+            .unwrap();
+
+            if result.chains.is_empty() {
+                writeln!(
+                    out,
+                    "no call chain found from {} to {} within depth {}",
+                    start.name, target.name, max_depth
+                )
+                .unwrap();
+                if result.truncated {
+                    writeln!(
+                        out,
+                        "(truncated at limit; increase --limit or --depth to see more)"
+                    )
+                    .unwrap();
+                }
+                return out;
+            }
+
+            for (idx, chain) in result.chains.iter().enumerate() {
+                let chain_num = idx + 1;
+                let depth = chain.edges.len();
+                writeln!(out, "Chain {chain_num} (depth {depth}):").unwrap();
+                if let Some(&root_id) = chain.nodes.first() {
+                    let root_display = match node_labels.get(&root_id) {
+                        Some(n) => format!(
+                            "{} ({})",
+                            n.label,
+                            if n.detail.is_empty() { "?" } else { &n.detail }
+                        ),
+                        None => format!("fn{root_id}"),
+                    };
+                    writeln!(out, "  {root_display}").unwrap();
+                }
+                for (i, edge) in chain.edges.iter().enumerate() {
+                    let next_node_id = chain.nodes[i + 1];
+                    let node_display = match node_labels.get(&next_node_id) {
+                        Some(n) => format!(
+                            "{} ({})",
+                            n.label,
+                            if n.detail.is_empty() { "?" } else { &n.detail }
+                        ),
+                        None => format!("fn{next_node_id}"),
+                    };
+                    let arrow = match direction {
+                        crate::inspect::Direction::Down => format!("-{}->", edge.resolution),
+                        crate::inspect::Direction::Up => format!("<-{}-", edge.resolution),
+                    };
+                    if edge.site.is_empty() {
+                        writeln!(out, "  {arrow} {node_display}").unwrap();
+                    } else {
+                        writeln!(out, "  {arrow} {node_display} ({})", edge.site.display())
+                            .unwrap();
+                    }
+                }
+            }
+
+            if result.truncated {
+                writeln!(
+                    out,
+                    "(truncated at limit; increase --limit or --depth to see more)"
+                )
+                .unwrap();
+            }
+
+            let chain_word = if result.chains.len() == 1 {
+                "chain"
+            } else {
+                "chains"
+            };
+            writeln!(
+                out,
+                "{} {chain_word} found (depth <= {max_depth}).",
+                result.chains.len()
+            )
+            .unwrap();
+
+            out
+        }
+        other => {
+            let graph = result.to_query_graph_with_labels(node_labels);
+            let summary = format!(
+                "{} chains, {} functions, {} edges",
+                result.chains.len(),
+                graph.nodes.len(),
+                graph.edges.len()
+            );
+            let title = format!(
+                "call chains from {} to {} (depth <= {})",
+                start.name, target.name, max_depth
+            );
+            let meta = GraphMeta {
+                title: &title,
+                direction: dir_str,
+                depth: max_depth,
+                summary: &summary,
+            };
+            render_graph(
+                &graph,
+                other,
+                &meta,
+                &mut |id, out| match graph.nodes.get(&id) {
+                    Some(n) => out.push_str(&format!(
+                        "{} ({})",
+                        n.label,
+                        if n.detail.is_empty() { "?" } else { &n.detail }
+                    )),
+                    None => out.push_str(&format!("fn{id}")),
+                },
+            )
+        }
     }
 }
 
@@ -526,5 +662,164 @@ mod tests {
         }
         assert!(RenderFormat::parse("dot").is_err());
         assert_eq!(RenderFormat::Text.as_str(), "text");
+    }
+
+    #[test]
+    fn render_call_chains_formats() {
+        let mut labels = FxHashMap::default();
+        labels.insert(
+            1,
+            GraphNode {
+                id: 1,
+                label: "main".into(),
+                detail: "main.c:10".into(),
+                kind: None,
+                loc_kind: None,
+            },
+        );
+        labels.insert(
+            2,
+            GraphNode {
+                id: 2,
+                label: "helper".into(),
+                detail: "helper.c:20".into(),
+                kind: None,
+                loc_kind: None,
+            },
+        );
+        let start = FunctionRef {
+            id: 1,
+            name: "main".into(),
+            path: "/proj/main.c".into(),
+            line_start: 10,
+            line_end: 15,
+            is_defined: true,
+        };
+        let target = FunctionRef {
+            id: 2,
+            name: "helper".into(),
+            path: "/proj/helper.c".into(),
+            line_start: 20,
+            line_end: 25,
+            is_defined: true,
+        };
+        let result = CallChainsResult {
+            chains: vec![crate::CallChain {
+                nodes: vec![1, 2],
+                edges: vec![crate::CallChainEdge {
+                    caller_id: 1,
+                    callee_id: 2,
+                    resolution: "direct".into(),
+                    site: EdgeSite {
+                        path: "main.c".into(),
+                        line: 12,
+                        col: 5,
+                    },
+                }],
+            }],
+            truncated: false,
+        };
+
+        let text = render_call_chains(
+            &result,
+            RenderFormat::Text,
+            &start,
+            &target,
+            crate::inspect::Direction::Down,
+            2,
+            &labels,
+        );
+        assert!(text.contains("Chain 1 (depth 1):"));
+        assert!(text.contains("main (main.c:10)"));
+        assert!(text.contains("-direct-> helper (helper.c:20) (main.c:12)"));
+        assert!(text.contains("(down, depth <= 2):"));
+        assert!(text.contains("1 chain found"));
+
+        let text_up = render_call_chains(
+            &result,
+            RenderFormat::Text,
+            &start,
+            &target,
+            crate::inspect::Direction::Up,
+            2,
+            &labels,
+        );
+        assert!(text_up.contains("<-direct- helper"));
+        assert!(text_up.contains("(up, depth <= 2):"));
+
+        let json = render_call_chains(
+            &result,
+            RenderFormat::Json,
+            &start,
+            &target,
+            crate::inspect::Direction::Down,
+            2,
+            &labels,
+        );
+        assert!(json.contains("\"title\": \"call chains from main to helper"));
+        assert!(json.contains("\"direction\": \"down\""));
+        assert!(json.contains("\"label\": \"direct\""));
+        assert!(json.contains("\"site\": \"main.c:12\""));
+
+        let dot = render_call_chains(
+            &result,
+            RenderFormat::Graphviz,
+            &start,
+            &target,
+            crate::inspect::Direction::Down,
+            2,
+            &labels,
+        );
+        assert!(dot.contains("digraph "));
+        assert!(dot.contains("n1 -> n2"));
+
+        let mmd = render_call_chains(
+            &result,
+            RenderFormat::Mermaid,
+            &start,
+            &target,
+            crate::inspect::Direction::Down,
+            2,
+            &labels,
+        );
+        assert!(mmd.contains("flowchart TD"));
+        assert!(mmd.contains("n1[\"main (main.c:10)\"]"));
+    }
+
+    #[test]
+    fn render_call_chains_empty_with_truncated_warning() {
+        let start = FunctionRef {
+            id: 1,
+            name: "main".to_string(),
+            path: "main.c".to_string(),
+            line_start: 10,
+            line_end: 15,
+            is_defined: true,
+        };
+        let target = FunctionRef {
+            id: 2,
+            name: "target".to_string(),
+            path: "target.c".to_string(),
+            line_start: 20,
+            line_end: 25,
+            is_defined: true,
+        };
+        let labels = FxHashMap::default();
+        let result = CallChainsResult {
+            chains: vec![],
+            truncated: true,
+        };
+
+        let text = render_call_chains(
+            &result,
+            RenderFormat::Text,
+            &start,
+            &target,
+            crate::inspect::Direction::Down,
+            2,
+            &labels,
+        );
+        assert!(text.contains("no call chain found from main to target within depth 2"));
+        assert!(text.contains("(truncated at limit; increase --limit or --depth to see more)"));
     }
 }

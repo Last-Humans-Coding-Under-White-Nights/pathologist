@@ -36,7 +36,7 @@ pub enum ResolutionKind {
     IpcBridge,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallGraphEdge {
     pub call_site: trace_ir::CallSiteId,
     pub caller: trace_ir::FnId,

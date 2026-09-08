@@ -12,6 +12,8 @@
  *                               [--direction up|down]
  *   ctrace inspect DB dataflow --file SUBSTR --line N --col C [--depth N]
  *                              [--direction up|down]
+ *   ctrace inspect DB callchain FROM_ID TO_ID [DEPTH] [DIRECTION] [LIMIT]
+ *                            (or --from ID --to ID [--depth N] [--direction up|down] [--limit N])
  *
  * Build:
  *   cc ctrace.c -I ../include -L target/release -ltrace_capi -o ctrace
@@ -314,10 +316,25 @@ static int cmd_dataflow(trace_db *db, const char *file, long long line,
     return 0;
 }
 
+static int cmd_chains(trace_db *db, int64_t from_id, int64_t to_id,
+                      long depth, trace_direction dir, size_t limit) {
+    trace_graph g;
+    memset(&g, 0, sizeof(g));
+    char *err = NULL;
+    trace_status st = trace_db_call_chains(db, from_id, to_id, dir, (uint32_t)depth, limit, &g, &err);
+    if (st != TRACE_OK) {
+        print_err(&err);
+        return 1;
+    }
+    print_graph(&g);
+    trace_graph_free(&g);
+    return 0;
+}
+
 /* argument parser for `inspect` subcommands is inline in cmd_inspect. */
 static int cmd_inspect(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: ctrace inspect DB {functions|symbols|calls|callgraph|dataflow} ...\n");
+        fprintf(stderr, "usage: ctrace inspect DB {functions|symbols|calls|callgraph|dataflow|callchain} ...\n");
         return 2;
     }
     const char *db_path = argv[1];
@@ -357,7 +374,7 @@ static int cmd_inspect(int argc, char **argv) {
 
     const char *file = NULL, *line_s = NULL, *col_s = NULL;
     const char *from = NULL, *to = NULL, *sub = NULL;
-    const char *depth_s = NULL, *dir_s = NULL;
+    const char *depth_s = NULL, *dir_s = NULL, *limit_s = NULL;
     for (int i = 0; i + 1 < nf; i += 2) {
         const char *k = flags[i];
         const char *v = flags[i + 1];
@@ -368,6 +385,7 @@ static int cmd_inspect(int argc, char **argv) {
         else if (!strcmp(k, "--to")) to = v;
         else if (!strcmp(k, "--depth")) depth_s = v;
         else if (!strcmp(k, "--direction")) dir_s = v;
+        else if (!strcmp(k, "--limit")) limit_s = v;
         else if (!strcmp(k, "--file-substr")) sub = v;
     }
     /* Positional forms fall back to file/line/col when flags are absent. */
@@ -422,6 +440,40 @@ static int cmd_inspect(int argc, char **argv) {
                 rc = 2;
             } else {
                 rc = cmd_dataflow(db, file, atoll(line_s), atoll(col_s), depth, dir);
+            }
+        }
+    } else if (!strcmp(cmd, "callchain") || !strcmp(cmd, "chains")) {
+        const char *from_arg = from ? from : (npos > 0 ? positionals[0] : NULL);
+        const char *to_arg = to ? to : (npos > 1 ? positionals[1] : NULL);
+        const char *d_arg = depth_s ? depth_s : (npos > 2 ? positionals[2] : NULL);
+        const char *dir_arg = dir_s ? dir_s : (npos > 3 ? positionals[3] : NULL);
+        const char *lim_arg = limit_s ? limit_s : (npos > 4 ? positionals[4] : NULL);
+
+        if (!from_arg || !to_arg) {
+            fprintf(stderr, "callchain requires --from and --to (or positional FROM_ID TO_ID [DEPTH] [DIRECTION] [LIMIT])\n");
+            rc = 2;
+        } else {
+            int64_t from_id = atoll(from_arg);
+            int64_t to_id = atoll(to_arg);
+            trace_direction dir = parse_dir(dir_arg ? dir_arg : "down");
+            long depth = 5;
+            if (d_arg) {
+                char *end = NULL;
+                long d = strtol(d_arg, &end, 10);
+                if (end == d_arg || *end != '\0' || (from_id == to_id ? d < 0 : d < 1)) {
+                    depth = -1;
+                } else {
+                    depth = d;
+                }
+            }
+            long lim = lim_arg ? atol(lim_arg) : 0;
+            size_t limit = lim > 0 ? (size_t)lim : 0;
+            if (dir == (trace_direction)-1 || depth < 0) {
+                fprintf(stderr, "callchain: bad --direction or --depth "
+                                "(direction: up|down, depth: >= 1)\n");
+                rc = 2;
+            } else {
+                rc = cmd_chains(db, from_id, to_id, depth, dir, limit);
             }
         }
     } else {

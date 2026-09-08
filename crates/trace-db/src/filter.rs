@@ -171,6 +171,23 @@ pub fn filter_query_graph(graph: &mut QueryGraph, filter: &CallGraphFilter) {
     graph.order = order;
 }
 
+/// Filter a call-chains result in place. A chain is kept if any of its nodes
+/// matches the filter.
+pub fn filter_call_chains(
+    result: &mut crate::inspect::CallChainsResult,
+    filter: &CallGraphFilter,
+    labels: &rustc_hash::FxHashMap<i64, crate::inspect::GraphNode>,
+) {
+    result.chains.retain(|chain| {
+        chain.nodes.iter().any(|&id| {
+            labels
+                .get(&id)
+                .map(|n| filter.matches(&n.label))
+                .unwrap_or(false)
+        })
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

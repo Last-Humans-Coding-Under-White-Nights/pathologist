@@ -345,6 +345,22 @@ trace_status trace_db_callgraph(trace_db *db,
                                 char **out_err);
 
 /*
+ * Find all call chains connecting `from_fn_id` and `to_fn_id` bounded by
+ * `depth` steps. Direction DOWN searches callers->callees; UP searches
+ * callees->callers. `limit` caps the number of discovered chains (0 for
+ * unlimited). `depth >= 1` (unless from_fn_id == to_fn_id where depth 0
+ * yields a trivial chain). Fills `out`; free with `trace_graph_free`.
+ */
+trace_status trace_db_call_chains(trace_db *db,
+                                  int64_t from_fn_id,
+                                  int64_t to_fn_id,
+                                  trace_direction direction,
+                                  uint32_t depth,
+                                  size_t limit,
+                                  trace_graph *out,
+                                  char **out_err);
+
+/*
  * Bounded BFS over the value-flow graph starting at the variables described
  * by `roots` (typically output of `trace_db_find_symbols`). `depth >= 1` and
  * `n_roots >= 1`; `direction` must be DOWN or UP (other values are rejected

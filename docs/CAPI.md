@@ -62,7 +62,7 @@ int main(void) {
 ```
 
 Full featured example: `crates/trace-capi/examples/ctrace.c` (a small CLI with
-`analyze` / `functions` / `symbols` / `calls` / `callgraph` / `dataflow`
+`analyze` / `functions` / `symbols` / `calls` / `callgraph` / `dataflow` / `callchain`
 subcommands).
 
 ## Memory-safety model
@@ -213,6 +213,13 @@ out-of-band value is an error instead of silently running in one direction.
   over `call_edges`. Node `id`s are `functions.id`; node `kind` is
   `TRACE_NODE_UNKNOWN` (call-graph nodes are functions, not PAG nodes). Edges
   carry `resolution` plus the full call-site path/line/col.
+- **Call chains.** `trace_db_call_chains(db, from_fn_id, to_fn_id, direction, depth, limit, out, out_err)`
+  finds all paths between two functions bounded by `depth` steps. Direction
+  `TRACE_DIRECTION_DOWN` searches callers->callees; `TRACE_DIRECTION_UP` searches
+  callees->callers. `limit` caps the number of discovered chains (0 for unlimited).
+  Result is delivered as a `trace_graph` representing the union graph of all
+  discovered chains; node `id`s are `functions.id`, edges carry call `resolution`
+  and call-site location.
 - **Dataflow.** `trace_db_dataflow(db, symbols, n, direction, depth)` BFS over
   `flow_edges`. Pass a `trace_symbol` array obtained from
   `trace_db_find_symbols` (its `var_id` identifies the start variables). Pass

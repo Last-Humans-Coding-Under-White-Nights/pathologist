@@ -196,7 +196,7 @@ pub fn find_functions_at(
     Ok(out)
 }
 
-fn load_function_labels(conn: &Connection) -> Result<FxHashMap<i64, GraphNode>> {
+pub fn load_function_labels(conn: &Connection) -> Result<FxHashMap<i64, GraphNode>> {
     let mut stmt = conn.prepare(
         "SELECT f.id, f.name, p.path, f.line_start, f.is_defined \
          FROM functions f JOIN files p ON p.id = f.file_id",
@@ -408,8 +408,10 @@ fn push_fn_name_filter(sql: &mut String, params: &mut Vec<String>, column: &str,
     let eq = params.len();
     params.push(format!("%::{}", like_escape(name)));
     let like = params.len();
+    params.push(format!("::{name}"));
+    let suffix = params.len();
     sql.push_str(&format!(
-        " AND ({column} = ?{eq} OR {column} LIKE ?{like} ESCAPE '!')"
+        " AND ({column} = ?{eq} OR ({column} LIKE ?{like} ESCAPE '!' AND SUBSTR({column}, -LENGTH(?{suffix})) = ?{suffix}))"
     ));
 }
 
@@ -506,6 +508,262 @@ pub fn call_graph(
         a.from == b.from && a.to == b.to && a.label == b.label && a.site == b.site
     });
     Ok(graph)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallChainEdge {
+    pub caller_id: i64,
+    pub callee_id: i64,
+    pub resolution: String,
+    pub site: EdgeSite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallChain {
+    pub nodes: Vec<i64>,
+    pub edges: Vec<CallChainEdge>,
+}
+
+impl CallChain {
+    pub fn depth(&self) -> usize {
+        self.edges.len()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct CallChainsResult {
+    pub chains: Vec<CallChain>,
+    pub truncated: bool,
+}
+
+impl CallChainsResult {
+    pub fn to_query_graph(&self, conn: &Connection) -> Result<QueryGraph> {
+        let labels = load_function_labels(conn)?;
+        Ok(self.to_query_graph_with_labels(&labels))
+    }
+
+    pub fn to_query_graph_with_labels(&self, labels: &FxHashMap<i64, GraphNode>) -> QueryGraph {
+        let mut graph = QueryGraph {
+            truncated: self.truncated,
+            ..Default::default()
+        };
+
+        let mut node_min_depth: FxHashMap<i64, u32> = FxHashMap::default();
+
+        for chain in &self.chains {
+            for (d, &node_id) in chain.nodes.iter().enumerate() {
+                if let Some(lbl) = labels.get(&node_id) {
+                    graph.nodes.insert(node_id, lbl.clone());
+                }
+                let entry = node_min_depth.entry(node_id).or_insert(d as u32);
+                if (d as u32) < *entry {
+                    *entry = d as u32;
+                }
+            }
+            for edge in &chain.edges {
+                graph.edges.push(GraphEdge {
+                    from: edge.caller_id,
+                    to: edge.callee_id,
+                    label: edge.resolution.clone(),
+                    site: edge.site.clone(),
+                });
+            }
+        }
+
+        graph.edges.sort_by(|a, b| {
+            (
+                a.from,
+                a.to,
+                &a.label,
+                &a.site.path,
+                a.site.line,
+                a.site.col,
+            )
+                .cmp(&(
+                    b.from,
+                    b.to,
+                    &b.label,
+                    &b.site.path,
+                    b.site.line,
+                    b.site.col,
+                ))
+        });
+        graph.edges.dedup_by(|a, b| {
+            a.from == b.from && a.to == b.to && a.label == b.label && a.site == b.site
+        });
+
+        let mut ordered_nodes: Vec<(i64, u32)> = node_min_depth.into_iter().collect();
+        ordered_nodes.sort_by_key(|&(id, d)| (d, id));
+        graph.order = ordered_nodes;
+
+        graph
+    }
+}
+
+/// Find all simple call chains (paths) from `from_fn_id` to `to_fn_id` with length <= `max_depth`.
+/// `dir` selects traversal direction: `Down` follows callers -> callees, `Up` follows callees -> callers.
+pub fn call_chains(
+    conn: &Connection,
+    from_fn_id: i64,
+    to_fn_id: i64,
+    dir: Direction,
+    max_depth: u32,
+    limit: Option<usize>,
+) -> Result<CallChainsResult> {
+    require_call_edge_caller(conn)?;
+    let labels = load_function_labels(conn)?;
+    if !labels.contains_key(&from_fn_id) {
+        bail!("start function id {from_fn_id} not found in database");
+    }
+    if !labels.contains_key(&to_fn_id) {
+        bail!("target function id {to_fn_id} not found in database");
+    }
+    if max_depth == 0 {
+        if from_fn_id == to_fn_id {
+            return Ok(CallChainsResult {
+                chains: vec![CallChain {
+                    nodes: vec![from_fn_id],
+                    edges: vec![],
+                }],
+                truncated: false,
+            });
+        }
+        bail!("depth must be >= 1");
+    }
+
+    let mut adj = load_call_adjacency(conn, dir)?;
+    for list in adj.values_mut() {
+        list.sort_by(|a, b| {
+            (a.0, a.1, &a.2.path, a.2.line, a.2.col).cmp(&(b.0, b.1, &b.2.path, b.2.line, b.2.col))
+        });
+        list.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+    }
+
+    let max_chains = match limit {
+        Some(0) | None => usize::MAX,
+        Some(lim) => lim,
+    };
+
+    let mut chains = Vec::new();
+    let mut truncated = false;
+
+    if from_fn_id == to_fn_id {
+        chains.push(CallChain {
+            nodes: vec![from_fn_id],
+            edges: vec![],
+        });
+    }
+
+    let mut current_nodes = vec![from_fn_id];
+    let mut current_edges = Vec::new();
+    let mut active_nodes = FxHashSet::default();
+    active_nodes.insert(from_fn_id);
+
+    #[allow(clippy::too_many_arguments)]
+    fn dfs(
+        u: i64,
+        target: i64,
+        dir: Direction,
+        depth: u32,
+        max_depth: u32,
+        adj: &Adjacency,
+        current_nodes: &mut Vec<i64>,
+        current_edges: &mut Vec<CallChainEdge>,
+        active_nodes: &mut FxHashSet<i64>,
+        chains: &mut Vec<CallChain>,
+        truncated: &mut bool,
+        max_chains: usize,
+    ) {
+        if *truncated {
+            return;
+        }
+        if depth >= max_depth {
+            return;
+        }
+        if let Some(neighbors) = adj.get(&u) {
+            for (v, resolution, site) in neighbors {
+                let (caller_id, callee_id) = match dir {
+                    Direction::Down => (u, *v),
+                    Direction::Up => (*v, u),
+                };
+                let edge = CallChainEdge {
+                    caller_id,
+                    callee_id,
+                    resolution: (*resolution).to_string(),
+                    site: site.clone(),
+                };
+
+                if *v == target {
+                    if chains.len() >= max_chains {
+                        *truncated = true;
+                        return;
+                    }
+                    let mut path_nodes = current_nodes.clone();
+                    path_nodes.push(*v);
+                    let mut path_edges = current_edges.clone();
+                    path_edges.push(edge.clone());
+                    chains.push(CallChain {
+                        nodes: path_nodes,
+                        edges: path_edges,
+                    });
+                    continue;
+                }
+
+                if !active_nodes.contains(v) {
+                    active_nodes.insert(*v);
+                    current_nodes.push(*v);
+                    current_edges.push(edge);
+
+                    dfs(
+                        *v,
+                        target,
+                        dir,
+                        depth + 1,
+                        max_depth,
+                        adj,
+                        current_nodes,
+                        current_edges,
+                        active_nodes,
+                        chains,
+                        truncated,
+                        max_chains,
+                    );
+
+                    current_edges.pop();
+                    current_nodes.pop();
+                    active_nodes.remove(v);
+
+                    if *truncated {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    dfs(
+        from_fn_id,
+        to_fn_id,
+        dir,
+        0,
+        max_depth,
+        &adj,
+        &mut current_nodes,
+        &mut current_edges,
+        &mut active_nodes,
+        &mut chains,
+        &mut truncated,
+        max_chains,
+    );
+
+    chains.sort_by(|a, b| {
+        a.edges
+            .len()
+            .cmp(&b.edges.len())
+            .then_with(|| a.nodes.cmp(&b.nodes))
+    });
+
+    Ok(CallChainsResult { chains, truncated })
 }
 
 #[derive(Debug, Clone)]
@@ -868,6 +1126,111 @@ fn nearest_functions(
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+/// Functions whose name equals `name` or ends with `::name` (C++ qualified method),
+/// optionally filtering by file path substring. Definitions rank before prototypes,
+/// narrower ranges before wider ones.
+pub fn find_functions_by_name(
+    conn: &Connection,
+    name: &str,
+    file_substring: Option<&str>,
+) -> Result<Vec<FunctionRef>> {
+    if name.is_empty() {
+        bail!("function name filter must not be empty");
+    }
+    let mut sql = String::from(
+        "SELECT f.id, f.name, p.path, f.line_start, f.line_end, f.is_defined \
+         FROM functions f JOIN files p ON p.id = f.file_id \
+         WHERE (f.name = ?1 OR (f.name LIKE ?2 ESCAPE '!' AND SUBSTR(f.name, -LENGTH(?3)) = ?3))",
+    );
+    let mut params = vec![
+        name.to_string(),
+        format!("%::{}", like_escape(name)),
+        format!("::{name}"),
+    ];
+    if let Some(fs) = file_substring {
+        params.push(format!("%{}%", like_escape(fs)));
+        let idx = params.len();
+        sql.push_str(&format!(" AND p.path LIKE ?{idx} ESCAPE '!'"));
+    }
+    sql.push_str(" ORDER BY f.is_defined DESC, (f.line_end - f.line_start) ASC, f.name ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok(FunctionRef {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            path: row.get(2)?,
+            line_start: row.get(3)?,
+            line_end: row.get(4)?,
+            is_defined: row.get::<_, i64>(5)? != 0,
+        })
+    })?;
+    let cands: Vec<FunctionRef> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let cands = cands
+        .into_iter()
+        .filter(|f| f.name == name || f.name.ends_with(&format!("::{name}")))
+        .collect();
+    Ok(cands)
+}
+
+/// Look up a function by name (or qualified suffix) and optional file substring.
+/// Returns the single match or the single defined match. Bails with candidate
+/// list if ambiguous.
+pub fn require_function_by_name(
+    conn: &Connection,
+    name: &str,
+    file_substring: Option<&str>,
+) -> Result<FunctionRef> {
+    let cands = find_functions_by_name(conn, name, file_substring)?;
+    if cands.is_empty() {
+        if let Some(fs) = file_substring {
+            bail!("no function matching '{name}' found in files containing '{fs}'");
+        } else {
+            bail!("no function matching '{name}' found in database");
+        }
+    }
+    let defined_count = cands.iter().filter(|c| c.is_defined).count();
+    if cands.len() == 1 || defined_count == 1 {
+        if let Some(def) = cands.iter().find(|c| c.is_defined) {
+            return Ok(def.clone());
+        }
+        return Ok(cands[0].clone());
+    }
+    let descriptions: Vec<String> = cands.iter().map(|f| f.to_string()).collect();
+    bail!(
+        "multiple functions match '{name}':\n  {}\nDisambiguate with file substring or file:line",
+        descriptions.join("\n  ")
+    );
+}
+
+/// Flexible function resolution supporting:
+/// - `line` + `file` -> `require_function_at`
+/// - `name` containing `file:line` (e.g. `main.c:10`) -> `require_function_at`
+/// - `name` -> `require_function_by_name` (with optional `file` filter)
+pub fn resolve_function_target(
+    conn: &Connection,
+    name: Option<&str>,
+    file: Option<&str>,
+    line: Option<i64>,
+) -> Result<FunctionRef> {
+    if let Some(l) = line {
+        let f = file.ok_or_else(|| anyhow::anyhow!("line specified without file"))?;
+        require_function_at(conn, f, l)
+    } else if let Some(n) = name {
+        if let Some((f, l_str)) = n.rsplit_once(':') {
+            if let Ok(l) = l_str.parse::<i64>() {
+                if !f.is_empty() {
+                    return require_function_at(conn, f, l);
+                }
+            }
+        }
+        require_function_by_name(conn, n, file)
+    } else if let Some(f) = file {
+        bail!("file specified without line or function name: '{f}'");
+    } else {
+        bail!("must specify function name or file and line");
+    }
 }
 
 /// Resolve position → best symbol, with a helpful error when nothing matches.
@@ -1307,5 +1670,133 @@ mod tests {
         assert!(g.nodes.contains_key(&10));
         assert!(g.nodes.contains_key(&11));
         assert!(g.nodes.contains_key(&12));
+    }
+
+    #[test]
+    fn call_chains_basic() {
+        let conn = test_conn();
+        // Depth 1 from main to proto (down): no chains
+        let r1 = call_chains(&conn, 10, 12, Direction::Down, 1, None).unwrap();
+        assert!(r1.chains.is_empty());
+
+        // Depth 2 from main to proto (down): main -> helper -> proto
+        let r2 = call_chains(&conn, 10, 12, Direction::Down, 2, None).unwrap();
+        assert_eq!(r2.chains.len(), 1);
+        assert_eq!(r2.chains[0].nodes, vec![10, 11, 12]);
+        assert_eq!(r2.chains[0].edges.len(), 2);
+        assert_eq!(r2.chains[0].edges[0].caller_id, 10);
+        assert_eq!(r2.chains[0].edges[0].callee_id, 11);
+        assert_eq!(r2.chains[0].edges[0].site.line, 15);
+        assert_eq!(r2.chains[0].edges[1].caller_id, 11);
+        assert_eq!(r2.chains[0].edges[1].callee_id, 12);
+        assert_eq!(r2.chains[0].edges[1].site.line, 23);
+
+        // Convert to query graph
+        let qg = r2.to_query_graph(&conn).unwrap();
+        assert_eq!(qg.nodes.len(), 3);
+        assert_eq!(qg.edges.len(), 2);
+
+        // Depth 2 from proto to main (up): proto <- helper <- main
+        let r_up = call_chains(&conn, 12, 10, Direction::Up, 2, None).unwrap();
+        assert_eq!(r_up.chains.len(), 1);
+        assert_eq!(r_up.chains[0].nodes, vec![12, 11, 10]);
+        assert_eq!(r_up.chains[0].edges.len(), 2);
+        // edges still record true caller and callee
+        assert_eq!(r_up.chains[0].edges[0].caller_id, 11);
+        assert_eq!(r_up.chains[0].edges[0].callee_id, 12);
+        assert_eq!(r_up.chains[0].edges[1].caller_id, 10);
+        assert_eq!(r_up.chains[0].edges[1].callee_id, 11);
+    }
+
+    #[test]
+    fn function_by_name_and_target_resolution() {
+        let conn = test_conn();
+        let main_fn = require_function_by_name(&conn, "main", None).unwrap();
+        assert_eq!(main_fn.id, 10);
+        assert_eq!(main_fn.name, "main");
+
+        // resolve by name
+        let target = resolve_function_target(&conn, Some("helper"), None, None).unwrap();
+        assert_eq!(target.id, 11);
+
+        // resolve by file:line string
+        let by_pos = resolve_function_target(&conn, Some("main.c:15"), None, None).unwrap();
+        assert_eq!(by_pos.id, 10);
+
+        // resolve by explicit file and line
+        let by_file_line = resolve_function_target(&conn, None, Some("main.c"), Some(23)).unwrap();
+        assert_eq!(by_file_line.id, 11);
+    }
+
+    #[test]
+    fn call_chains_truncation_only_when_additional_path_exists() {
+        let conn = test_conn();
+        // In test_conn, only 1 path exists: 10 -> 11 -> 12.
+        // With limit 1, it should NOT be marked as truncated.
+        let r_single = call_chains(&conn, 10, 12, Direction::Down, 2, Some(1)).unwrap();
+        assert_eq!(r_single.chains.len(), 1);
+        assert!(
+            !r_single.truncated,
+            "single existing path with limit 1 must not be truncated"
+        );
+
+        // Now add a second path: 10 -> 12 directly
+        conn.execute(
+            "INSERT INTO call_sites (id, caller_fn_id, file_id, line, col, callee_text, is_direct) VALUES (102, 10, 1, 18, 5, 'proto', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO call_edges (id, call_site_id, caller_fn_id, callee_fn_id, resolution) VALUES (202, 102, 10, 12, 'direct')",
+            [],
+        )
+        .unwrap();
+
+        // With 2 paths existing and limit 1, it MUST be marked as truncated
+        let r_multi = call_chains(&conn, 10, 12, Direction::Down, 2, Some(1)).unwrap();
+        assert_eq!(r_multi.chains.len(), 1);
+        assert!(
+            r_multi.truncated,
+            "two existing paths with limit 1 must be marked truncated"
+        );
+
+        // With limit 2 (all paths returned), it should NOT be truncated
+        let r_all = call_chains(&conn, 10, 12, Direction::Down, 2, Some(2)).unwrap();
+        assert_eq!(r_all.chains.len(), 2);
+        assert!(
+            !r_all.truncated,
+            "all existing paths returned must not be truncated"
+        );
+    }
+
+    #[test]
+    fn function_by_name_case_sensitive_cpp_suffix() {
+        let conn = test_conn();
+        // Insert functions with different casing: run vs ns::Run vs ns::run
+        for (id, name) in [(50, "run"), (51, "ns::Run"), (52, "ns::run")] {
+            conn.execute(
+                "INSERT INTO functions (id, name, file_id, line_start, line_end, linkage, signature, is_defined) \
+                 VALUES (?1, ?2, 1, 100, 110, 'external', 'fn', 1)",
+                rusqlite::params![id, name],
+            )
+            .unwrap();
+        }
+
+        // Searching for "run" must match "run" and "ns::run", but NOT "ns::Run"
+        let matches_lower = find_functions_by_name(&conn, "run", None).unwrap();
+        let names_lower: Vec<&str> = matches_lower.iter().map(|f| f.name.as_str()).collect();
+        assert!(names_lower.contains(&"run"));
+        assert!(names_lower.contains(&"ns::run"));
+        assert!(
+            !names_lower.contains(&"ns::Run"),
+            "--from run must not select ns::Run"
+        );
+
+        // Searching for "Run" must match "ns::Run", but NOT "run" or "ns::run"
+        let matches_upper = find_functions_by_name(&conn, "Run", None).unwrap();
+        let names_upper: Vec<&str> = matches_upper.iter().map(|f| f.name.as_str()).collect();
+        assert!(names_upper.contains(&"ns::Run"));
+        assert!(!names_upper.contains(&"run"));
+        assert!(!names_upper.contains(&"ns::run"));
     }
 }

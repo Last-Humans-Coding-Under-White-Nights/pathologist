@@ -137,6 +137,43 @@ enum InspectCommands {
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
     },
+    /// Call chains (paths) between two functions no longer than depth.
+    #[command(alias = "chains")]
+    Callchain {
+        /// Start function name, C++ qualified suffix, or FILE:LINE (e.g. `main` or `main.c:10`).
+        #[arg(long)]
+        from: Option<String>,
+        /// Target function name, C++ qualified suffix, or FILE:LINE (e.g. `target` or `main.c:20`).
+        #[arg(long)]
+        to: Option<String>,
+        /// File path substring locating the start function.
+        #[arg(long = "from-file")]
+        from_file: Option<String>,
+        /// Line inside the start function.
+        #[arg(long = "from-line")]
+        from_line: Option<i64>,
+        /// File path substring locating the target function.
+        #[arg(long = "to-file")]
+        to_file: Option<String>,
+        /// Line inside the target function.
+        #[arg(long = "to-line")]
+        to_line: Option<i64>,
+        /// Maximum traversal depth (path length in call hops).
+        #[arg(long, default_value_t = 5)]
+        depth: u32,
+        /// Traversal direction: `down` (callees) or `up` (callers).
+        #[arg(long, default_value = "down")]
+        direction: String,
+        /// Maximum number of chains to return (0 for unlimited).
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Graph output format: `text`, `json`, `graphviz`, or `mermaid`.
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+        /// JSON config file listing regex patterns for function names to keep.
+        #[arg(long = "callgraph-filter")]
+        callgraph_filter: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -529,6 +566,56 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
                         None => out.push_str(&format!("node{id}")),
                     },
                 );
+            print!("{out}");
+        }
+        InspectCommands::Callchain {
+            from,
+            to,
+            from_file,
+            from_line,
+            to_file,
+            to_line,
+            depth,
+            direction,
+            limit,
+            format,
+            callgraph_filter,
+        } => {
+            let dir = trace_db::Direction::parse(&direction)?;
+            let start = trace_db::resolve_function_target(
+                &conn,
+                from.as_deref(),
+                from_file.as_deref(),
+                from_line,
+            )?;
+            let target = trace_db::resolve_function_target(
+                &conn,
+                to.as_deref(),
+                to_file.as_deref(),
+                to_line,
+            )?;
+            let mut result = trace_db::call_chains(
+                &conn,
+                start.id,
+                target.id,
+                dir,
+                depth,
+                if limit == 0 { None } else { Some(limit) },
+            )?;
+            let labels = trace_db::load_function_labels(&conn)?;
+            if let Some(p) = callgraph_filter {
+                let filter = trace_db::CallGraphFilter::from_file(&p)?;
+                trace_db::filter_call_chains(&mut result, &filter, &labels);
+            }
+            let out = trace_db::render_call_chains(
+                &result,
+                format.to_render(),
+                &start,
+                &target,
+                dir,
+                depth,
+                &labels,
+            );
             print!("{out}");
         }
     }
