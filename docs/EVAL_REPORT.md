@@ -15,6 +15,42 @@
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Re-verified 2026-09-08 (language predefines `__cplusplus` / `__STDC__` /
+`__STDC_VERSION__`, #70):** fresh release builds of `master` (ef4cf1e) and the
+branch were compared on the same machine against the three clean pinned
+checkouts under `/private/tmp/corpora`, `--jobs 8`, 800,000-pop budget. Both
+pass **86/86** `eval_check` checks with every measured value identical, the
+SQLite dumps excluding `analysis_run` are byte-identical on all three corpora
+(637,396, 339,509 and 696,324 statements), and the `parse_failures` captures
+are byte-identical (hdf 740, hiview 3,190, camera 3,412 rows). A `--jobs 1`
+run of the branch on HDF dumps identically to its `--jobs 8` run.
+
+The index does not move because every `__cplusplus` conditional in these
+corpora — 930 of them — guards only an `extern "C" {` / `}` wrapper; not one
+compares the value or guards a declaration. Those wrappers now reach the C++
+parser as `linkage_specification` nodes, which changes no symbol, span, edge
+or diagnostic.
+
+What moves is the measurement that found the defect,
+[CONDITIONAL_COVERAGE.md](CONDITIONAL_COVERAGE.md), regenerated here on all
+three corpora (4,742 chains, unchanged). `__cplusplus` was read by 930 chains
+with **every** evaluation unbound; the reads under C++ units are bound now, and
+what stays unbound is the C units and the headers reached only from C.
+
+| Coverage metric | `master` → #70 |
+|---|---|
+| HDF lines always excluded | 7,302 (2.4%) → 6,980 (2.3%) |
+| HDF lines excluded in some runs only | 80 → 387 |
+| HDF `__cplusplus` evaluations bound | 0 / 18,432 → 1,518 / 17,028 |
+| HDF files with an always-excluded arm | 446 → 341 |
+| Camera lines always excluded | 5,031 → 4,991 |
+| Hiview lines always excluded | 7,397 → 7,387 |
+
+The `__cplusplus` rows drop out of the Hiview and Camera unbound-name tables
+entirely: there every read is now bound. The recovered lines are the wrapper
+bodies themselves, which is why the recovery is visible in coverage and not in
+the index.
+
 **Re-verified 2026-09-08 (#57 review follow-ups):** conditional records now count a
 final comment/whitespace line without a trailing newline, locate spliced directives
 at their opening `#`, and retain operator-shaped names used as explicit macro

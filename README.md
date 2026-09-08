@@ -54,7 +54,7 @@ trace analyze [OPTIONS] <TARGET>
 | `-o`, `--output <PATH>` | Output database path. Default: `trace.db`. |
 | `--include <PATH>` | Add a preprocessor `#include` search path. Repeatable. |
 | `-D <NAME>` | Define preprocessor macro `NAME=1`. Repeatable. |
-| `-D <NAME=VALUE>` | Define macro with explicit value. Repeatable. |
+| `-D <NAME=VALUE>` | Define macro with explicit value. Repeatable. Overrides the language predefines (`__cplusplus`, `__STDC_VERSION__`, `__STDC__`) when the name matches. |
 | `--jobs <N>` | Parallel jobs for indexing (parse + lower). Default: logical CPU count. |
 | `--timeout-secs <N>` | Watchdog: abort the process after N seconds (exit 124). Useful when probing hang-prone trees. |
 | `--full-export` | Export full IR detail: all types, all variables, PAG `locations`. Slower and produces a larger database. |
@@ -89,7 +89,7 @@ trace analyze ./my_app -o /tmp/debug.db --debug-points-to --full-export
 
 **Notes**
 
-- **`.c` and `.cpp`-family files** are indexed as translation units. Headers are pulled in via `#include` during preprocessing, not analyzed as standalone TUs. C++ support is a pragmatic first step — see [docs/ANALYSIS.md](docs/ANALYSIS.md) for scope and imprecision.
+- **`.c` and `.cpp`-family files** are indexed as translation units. Headers are pulled in via `#include` during preprocessing, not analyzed as standalone TUs. A C++ unit is preprocessed with `__cplusplus` (`201703L`) and `__STDC__` predefined, a C unit with `__STDC__` and `__STDC_VERSION__` (`201710L`), so `#ifdef __cplusplus` takes the C++ arm in `.cpp` units and the C arm in `.c` units, headers included. C++ support is a pragmatic first step — see [docs/ANALYSIS.md](docs/ANALYSIS.md) for scope and imprecision.
 - Line numbers in the database refer to **original** files on disk (resolved through the preprocessor's `LineMap`); call sites inside macro expansions attribute to the expansion site.
 - Pass include paths that match your build; there is no `compile_commands.json` integration yet.
 - **`static` functions** (internal linkage) and **file-scope `static` variables** are resolved within the defining translation unit. **`static` locals** inside functions are tracked as `fn_static` storage.
@@ -660,7 +660,7 @@ tests/fixtures/    Integration test C corpora
 - **C++ first step** — namespaces, overloads (arity), classes/virtual dispatch (including virtual bases), `final` class/method devirtualization, ctors/dtors, implicit `this->method()`, smart-pointer unwrap through a declared `operator->` (`shared_ptr`, and OHOS `sptr`/`RefPtr` or HDI `AutoPtr` alike, the wrapper keeping its own members for `.`), and callables (`std::function`, lambdas, `operator()`) are modeled; type-based overload ranking and templates beyond name-stripping are not (see [docs/ANALYSIS.md](docs/ANALYSIS.md)). Next slices from hiview: [docs/CPP_ROADMAP.md](docs/CPP_ROADMAP.md).
 - **May-analysis** — indirect calls can list multiple targets; absence of an edge does not prove unreachability.
 - **No path sensitivity** — all branches and paths are merged.
-- **Preprocessor subset** — not gcc/clang compatible for all extensions; see [docs/PREPROCESSOR.md](docs/PREPROCESSOR.md).
+- **Preprocessor subset** — not gcc/clang compatible for all extensions, and no compiler is impersonated (`__GNUC__` / `__clang__` stay undefined; only the language's own `__cplusplus` / `__STDC__` / `__STDC_VERSION__` are predefined); see [docs/PREPROCESSOR.md](docs/PREPROCESSOR.md).
 - **Include paths** — must be supplied manually via `--include` / `-D`; no `compile_commands.json` yet.
 - **Single configuration** — a name no `-D` or reached `#define` binds resolves to `0` in every `#if`; what that excludes on the eval corpora, per condition and region, is measured in [docs/CONDITIONAL_COVERAGE.md](docs/CONDITIONAL_COVERAGE.md).
 - **Line numbers** — refer to preprocessed TUs; map back to original sources manually when needed.

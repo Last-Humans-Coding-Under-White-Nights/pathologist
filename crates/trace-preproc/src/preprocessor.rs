@@ -238,12 +238,21 @@ impl PreprocessorState {
             if let Ok(guard) = shared.read() {
                 state.macros = guard.clone();
             }
-            // The warm table is normally seeded from the CLI defines, but a
-            // name it never accumulated must still beat the builtin fallback
-            // installed below. First-wins keeps definitions the warm pass
-            // picked up from source.
+            // The warm table is normally seeded from the predefines and the
+            // CLI defines both (`macro_table_from_defines`), which is where
+            // their relative precedence is usually decided; a name it never
+            // accumulated must still beat the builtin fallback installed
+            // below. Both seeds are first-wins, so what the warm pass picked
+            // up from source outranks either. Order still matters for the
+            // one case the warm table settles neither way — a caller whose
+            // table binds neither name — so the CLI defines go first and
+            // `-D __cplusplus=…` wins there too, as on the path below.
             state.init_cli_defines_missing_only();
+            state.init_predefined_macros(true);
         } else {
+            // Predefines first: a `-D __cplusplus=…` overrides the
+            // language's own value.
+            state.init_predefined_macros(false);
             state.init_cli_defines();
         }
         // Builtins are local to each preprocess so they apply even when
@@ -475,6 +484,24 @@ impl PreprocessorState {
                 .macros
                 .keys()
                 .any(|name| deps.undefined.contains(name.as_str()))
+        }
+    }
+
+    /// Seed the language's own predefined macros (see
+    /// [`crate::predefined_macros`]). Real definitions, not fallbacks: a
+    /// C++ unit's `#ifdef __cplusplus` must be true. With `missing_only`
+    /// a name the inherited warm table already binds is kept.
+    fn init_predefined_macros(&mut self, missing_only: bool) {
+        for (name, val) in crate::predefined_macros(self.language) {
+            if missing_only && self.macros.contains_key(*name) {
+                continue;
+            }
+            self.insert_macro(
+                name.to_string(),
+                MacroDef::Object {
+                    replacement: lex_macro_body(val, self.language),
+                },
+            );
         }
     }
 
@@ -4330,6 +4357,7 @@ pub fn preprocess_string(source: &str, file: &Path, opts: &PreprocessOptions) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::macros::macro_table_from_defines;
     use crate::options::{ExpansionCache, IncludeExpansion};
 
     /// The one cached expansion of `path`. These tests seed a single macro
@@ -8386,5 +8414,166 @@ int from_late;
             PreprocessOptions::new().with_define("and", "1"),
         );
         assert_eq!(reads_of(&bound[0].arms[0]), vec![("and", Some(true))]);
+    }
+
+    /// `__cplusplus` is predefined for a unit lexed as C++ and unbound in a
+    /// C unit (#70): `#ifdef`, `defined()`, `#if` arithmetic and text
+    /// position all see it.
+    #[test]
+    fn cplusplus_predefined_for_cpp_units_only() {
+        let src = "#ifdef __cplusplus\nint ifdef_arm;\n#endif\n\
+                   #if defined(__cplusplus)\nint defined_arm;\n#endif\n\
+                   #if __cplusplus >= 201103L\nint cxx11_arm;\n#endif\n\
+                   long v = __cplusplus;\n";
+        let cpp = preprocess_string(src, Path::new("t.cpp"), &PreprocessOptions::new()).output;
+        assert!(cpp.contains("ifdef_arm"), "{cpp}");
+        assert!(cpp.contains("defined_arm"), "{cpp}");
+        assert!(cpp.contains("cxx11_arm"), "{cpp}");
+        assert!(cpp.contains("v= 201703L ;"), "{cpp}");
+
+        let c = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new()).output;
+        assert!(!c.contains("ifdef_arm"), "{c}");
+        assert!(!c.contains("defined_arm"), "{c}");
+        assert!(!c.contains("cxx11_arm"), "{c}");
+        assert!(c.contains("v= __cplusplus ;"), "{c}");
+
+        // The language option decides, not the extension.
+        let forced = preprocess_string(
+            src,
+            Path::new("t.c"),
+            &PreprocessOptions::new().with_language(Language::Cpp),
+        )
+        .output;
+        assert!(forced.contains("cxx11_arm"), "{forced}");
+    }
+
+    /// A command-line `-D __cplusplus=…` beats the predefined value, so a
+    /// tree that pins its own standard level is honoured.
+    #[test]
+    fn cli_define_overrides_predefined_cplusplus() {
+        let src = "#if __cplusplus >= 201103L\nint cxx11_arm;\n#else\nint cxx98_arm;\n#endif\n";
+        let out = preprocess_string(
+            src,
+            Path::new("t.cpp"),
+            &PreprocessOptions::new().with_define("__cplusplus", "199711L"),
+        )
+        .output;
+        assert!(out.contains("cxx98_arm"), "{out}");
+        assert!(!out.contains("cxx11_arm"), "{out}");
+    }
+
+    /// `__STDC__` is predefined for both languages (g++ defines it too);
+    /// `__STDC_VERSION__` only for C.
+    #[test]
+    fn stdc_predefined_per_language() {
+        let src = "#ifdef __STDC__\nint stdc_arm;\n#endif\n\
+                   #if __STDC_VERSION__ >= 201112L\nint c11_arm;\n#endif\n";
+        let c = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new()).output;
+        assert!(c.contains("stdc_arm"), "{c}");
+        assert!(c.contains("c11_arm"), "{c}");
+        let cpp = preprocess_string(src, Path::new("t.cpp"), &PreprocessOptions::new()).output;
+        assert!(cpp.contains("stdc_arm"), "{cpp}");
+        assert!(!cpp.contains("c11_arm"), "{cpp}");
+    }
+
+    /// The warm pass seeds each header's table from
+    /// `macro_table_from_defines`, and a translation unit that inherits a
+    /// shared table takes the predefines from it: both routes must agree
+    /// with the plain one.
+    #[test]
+    fn predefined_macros_seed_the_shared_table() {
+        let none = indexmap::IndexMap::new();
+        let cpp_table = macro_table_from_defines(&none, Language::Cpp);
+        assert!(cpp_table.contains_key("__cplusplus"));
+        assert!(cpp_table.contains_key("__STDC__"));
+        assert!(!cpp_table.contains_key("__STDC_VERSION__"));
+        let c_table = macro_table_from_defines(&none, Language::C);
+        assert!(!c_table.contains_key("__cplusplus"));
+        assert!(c_table.contains_key("__STDC_VERSION__"));
+
+        let pinned = indexmap::IndexMap::from([("__cplusplus".to_string(), "199711L".to_string())]);
+        let pinned_table = macro_table_from_defines(&pinned, Language::Cpp);
+        let src = "#if __cplusplus >= 201103L\nint cxx11_arm;\n#else\nint cxx98_arm;\n#endif\n";
+        let out = preprocess_string(
+            src,
+            Path::new("t.cpp"),
+            &PreprocessOptions::new()
+                .with_shared_macros(Arc::new(RwLock::new(pinned_table)))
+                .with_define("__cplusplus", "199711L"),
+        )
+        .output;
+        assert!(out.contains("cxx98_arm"), "{out}");
+
+        let out = preprocess_string(
+            src,
+            Path::new("t.cpp"),
+            &PreprocessOptions::new().with_shared_macros(Arc::new(RwLock::new(cpp_table))),
+        )
+        .output;
+        assert!(out.contains("cxx11_arm"), "{out}");
+    }
+
+    /// A predefine is an ordinary definition, not a builtin fallback, so
+    /// source may `#undef` it and the conditionals that follow see it gone.
+    #[test]
+    fn undef_of_a_predefined_macro_takes_effect() {
+        let src = "#ifdef __cplusplus\nint before;\n#endif\n\
+                   #undef __cplusplus\n\
+                   #ifdef __cplusplus\nint after;\n#else\nint gone;\n#endif\n";
+        let out = preprocess_string(src, Path::new("t.cpp"), &PreprocessOptions::new()).output;
+        assert!(out.contains("before"), "{out}");
+        assert!(out.contains("gone"), "{out}");
+        assert!(!out.contains("after"), "{out}");
+    }
+
+    /// A `-D` beats the predefined value on the shared-table path too. The
+    /// indexer seeds that table through `macro_table_from_defines`, which
+    /// already applies the CLI defines over the predefines, but a caller
+    /// that hands over a table those never reached must get the same
+    /// precedence rather than the language's own value.
+    #[test]
+    fn cli_define_beats_predefined_cplusplus_with_a_shared_table() {
+        let src = "#if __cplusplus >= 201103L\nint cxx11_arm;\n#else\nint cxx98_arm;\n#endif\n";
+        let out = preprocess_string(
+            src,
+            Path::new("t.cpp"),
+            &PreprocessOptions::new()
+                .with_shared_macros(crate::new_shared_macro_table())
+                .with_define("__cplusplus", "199711L"),
+        )
+        .output;
+        assert!(out.contains("cxx98_arm"), "{out}");
+        assert!(!out.contains("cxx11_arm"), "{out}");
+    }
+
+    /// A header's read of `__cplusplus` is a fingerprint dependency like any
+    /// other macro read: bound in the C++ entry, unbound in the C entry.
+    #[test]
+    fn predefined_cplusplus_is_a_fingerprint_dependency() {
+        let dir = unique_tmp_dir("cplusplus_fingerprint");
+        fs::write(
+            dir.join("lang.h"),
+            "#ifdef __cplusplus\nint cxx_decl;\n#else\nint c_decl;\n#endif\n",
+        )
+        .unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let run = |name: &str| {
+            let path = dir.join(name);
+            fs::write(&path, "#include \"lang.h\"\n").unwrap();
+            let opts = PreprocessOptions::new()
+                .with_include_expansion_cache(Arc::clone(&cache))
+                .with_include(dir.path.clone());
+            preprocess_file(&path, &opts).unwrap().output
+        };
+        assert!(run("t.cpp").contains("cxx_decl"));
+        assert!(run("t.c").contains("c_decl"));
+        let cpp = sole_variant(&cache, dir.join("lang.h"), Language::Cpp).expect("C++ entry");
+        assert!(
+            cpp.deps.defined.iter().any(|(n, _)| &**n == "__cplusplus"),
+            "{:?}",
+            cpp.deps
+        );
+        let c = sole_variant(&cache, dir.join("lang.h"), Language::C).expect("C entry");
+        assert!(c.deps.undefined.contains("__cplusplus"), "{:?}", c.deps);
     }
 }

@@ -35,9 +35,9 @@ python3 scripts/gen_conditional_coverage_report.py
 
 | Corpus | Files | Source lines | Chains | Always excluded | Sometimes excluded | Unknown names | … controlling excluded arms |
 |--------|------:|-------------:|-------:|----------------:|-------------------:|--------------:|----------------------------:|
-| `drivers_hdf_core` | 1,483 | 300,071 | 2,286 | 7,302 (2.4%) | 80 (0.0%) | 98 | 86 |
-| `hiviewdfx_hiview` | 1,428 | 173,562 | 1,199 | 7,397 (4.3%) | 1 (0.0%) | 16 | 13 |
-| `multimedia_camera_framework` | 1,593 | 403,098 | 1,257 | 5,031 (1.2%) | 35 (0.0%) | 4 | 4 |
+| `drivers_hdf_core` | 1,483 | 300,071 | 2,286 | 6,980 (2.3%) | 387 (0.1%) | 98 | 86 |
+| `hiviewdfx_hiview` | 1,428 | 173,562 | 1,199 | 7,387 (4.3%) | 1 (0.0%) | 16 | 13 |
+| `multimedia_camera_framework` | 1,593 | 403,098 | 1,257 | 4,991 (1.2%) | 35 (0.0%) | 4 | 4 |
 
 ## Always-excluded lines by name class, sole dependency
 
@@ -45,7 +45,7 @@ python3 scripts/gen_conditional_coverage_report.py
 |-------|----:|-------:|-------:|
 | configuration | 3,812 | 6,744 | 4,976 |
 | unknown | 1,417 | 379 | 13 |
-| toolchain | 1,159 | 72 | 40 |
+| toolchain | 837 | 62 | 0 |
 | include-guard | 0 | 0 | 0 |
 
 ## drivers_hdf_core
@@ -59,28 +59,28 @@ Generated from `conditional_coverage /private/tmp/corpora/drivers_hdf_core` with
 | Source lines | 300,071 |
 | Conditional chains | 2,286 |
 | … include guards | 681 |
-| … evaluated by at least one run | 1,947 |
-| … never evaluated (inside excluded code in every run) | 339 |
+| … evaluated by at least one run | 1,999 |
+| … never evaluated (inside excluded code in every run) | 287 |
 | … left unterminated | 0 |
-| **Lines always excluded** | **7,302 (2.4%)** |
-| Lines excluded in some runs, included in others | 80 (0.0%) |
-| Files with an always-excluded arm | 446 |
+| **Lines always excluded** | **6,980 (2.3%)** |
+| Lines excluded in some runs, included in others | 387 (0.1%) |
+| Files with an always-excluded arm | 341 |
 
 ### Which arm is taken
 
 | Chains (guards excluded) | Count |
 |--------------------------|------:|
-| Evaluated by at least one run | 1,266 |
-| First arm never taken | 1,128 |
-| … of which an `#else` arm was always taken | 187 |
-| … of which no arm was ever taken (no `#else`, or every arm false) | 941 |
-| First arm always taken | 137 |
-| First arm taken in some runs, not in others | 1 |
+| Evaluated by at least one run | 1,318 |
+| First arm never taken | 910 |
+| … of which an `#else` arm was always taken | 186 |
+| … of which no arm was ever taken (no `#else`, or every arm false) | 724 |
+| First arm always taken | 205 |
+| First arm taken in some runs, not in others | 203 |
 
 | Always-excluded arms by directive | Arms | Lines |
 |-----------------------------------|-----:|------:|
 | `#if` | 195 | 1,731 |
-| `#ifdef` | 933 | 5,476 |
+| `#ifdef` | 715 | 5,154 |
 | `#ifndef` | 0 | 0 |
 | `#elif` | 12 | 54 |
 | `#else` | 22 | 41 |
@@ -91,7 +91,7 @@ Generated from `conditional_coverage /private/tmp/corpora/drivers_hdf_core` with
 |-------|------:|--------------------:|-------------------------------:|-----------------------:|--------------:|
 | configuration | 109 | 657 | 3,812 | 1,059 | 4,757 |
 | unknown | 98 | 270 | 1,417 | 535 | 976 |
-| toolchain | 9 | 924 | 1,159 | 544 | 22,660 |
+| toolchain | 9 | 924 | 837 | 544 | 21,256 |
 | include-guard | 627 | 681 | 0 | 0 | 14,126 |
 
 ### Top expressions by lines always excluded
@@ -99,7 +99,7 @@ Generated from `conditional_coverage /private/tmp/corpora/drivers_hdf_core` with
 | Expression (chain as written) | Regions | Files | Lines always excluded | Lines sometimes excluded | Names (class) |
 |-------------------------------|--------:|------:|----------------------:|-------------------------:|---------------|
 | `#ifdef SAMPLE_DRIVER` | 24 | 5 | 1,769 | 0 | `SAMPLE_DRIVER` (configuration) |
-| `#ifdef __cplusplus` | 607 | 304 | 1,153 | 0 | `__cplusplus` (toolchain) |
+| `#ifdef __cplusplus` | 607 | 304 | 832 | 305 | `__cplusplus` (toolchain) |
 | `#ifdef LOSCFG_DRIVERS_HDF_CONFIG_MACRO / #else` | 52 | 17 | 563 | 0 | `LOSCFG_DRIVERS_HDF_CONFIG_MACRO` (configuration) |
 | `#ifdef __USER__` | 49 | 11 | 531 | 0 | `__USER__` (configuration) |
 | `#ifdef LOSCFG_FS_VFS / #else` | 3 | 2 | 502 | 0 | `LOSCFG_FS_VFS` (unknown) |
@@ -146,7 +146,7 @@ Lines are apportioned as described above: *sole* when the name is the only one t
 | Name | Class | Chains | Lines, sole | Lines, shared | Lines, sometimes | Reads bound / unbound | In-tree `#define` | Build file |
 |------|-------|-------:|------------:|--------------:|-----------------:|----------------------:|-------------------|------------|
 | `SAMPLE_DRIVER` | configuration | 24 | 1,769 | 0 | 0 | 0 / 24 | — | `adapter/uhdf2/hdi/test/BUILD.gn` |
-| `__cplusplus` | toolchain | 880 | 1,154 | 0 | 0 | 0 / 18,432 | — | — |
+| `__cplusplus` | toolchain | 880 | 832 | 0 | 307 | 1,518 / 17,028 | — | — |
 | `__USER__` | configuration | 102 | 650 | 9 | 0 | 0 / 1,006 | — | `adapter/uhdf/manager/BUILD.gn` |
 | `LOSCFG_DRIVERS_HDF_CONFIG_MACRO` | configuration | 54 | 563 | 0 | 0 | 0 / 456 | — | `adapter/khdf/liteos_m/BUILD.gn` |
 | `LOSCFG_FS_VFS` | unknown | 3 | 502 | 0 | 0 | 0 / 3 | — | — |
@@ -249,25 +249,25 @@ Generated from `conditional_coverage /private/tmp/corpora/hiviewdfx_hiview` with
 | … evaluated by at least one run | 1,166 |
 | … never evaluated (inside excluded code in every run) | 33 |
 | … left unterminated | 0 |
-| **Lines always excluded** | **7,397 (4.3%)** |
+| **Lines always excluded** | **7,387 (4.3%)** |
 | Lines excluded in some runs, included in others | 1 (0.0%) |
-| Files with an always-excluded arm | 116 |
+| Files with an always-excluded arm | 111 |
 
 ### Which arm is taken
 
 | Chains (guards excluded) | Count |
 |--------------------------|------:|
 | Evaluated by at least one run | 428 |
-| First arm never taken | 394 |
+| First arm never taken | 384 |
 | … of which an `#else` arm was always taken | 76 |
-| … of which no arm was ever taken (no `#else`, or every arm false) | 318 |
-| First arm always taken | 33 |
+| … of which no arm was ever taken (no `#else`, or every arm false) | 308 |
+| First arm always taken | 43 |
 | First arm taken in some runs, not in others | 1 |
 
 | Always-excluded arms by directive | Arms | Lines |
 |-----------------------------------|-----:|------:|
 | `#if` | 98 | 738 |
-| `#ifdef` | 296 | 6,583 |
+| `#ifdef` | 286 | 6,573 |
 | `#ifndef` | 0 | 0 |
 | `#elif` | 13 | 22 |
 | `#else` | 23 | 54 |
@@ -278,7 +278,7 @@ Generated from `conditional_coverage /private/tmp/corpora/hiviewdfx_hiview` with
 |-------|------:|--------------------:|-------------------------------:|-----------------------:|--------------:|
 | configuration | 41 | 386 | 6,744 | 40 | 898 |
 | unknown | 16 | 49 | 379 | 188 | 899 |
-| toolchain | 7 | 42 | 72 | 180 | 2,319 |
+| toolchain | 7 | 42 | 62 | 180 | 2,273 |
 | include-guard | 736 | 738 | 0 | 0 | 8,782 |
 
 ### Top expressions by lines always excluded
@@ -370,8 +370,8 @@ Lines are apportioned as described above: *sole* when the name is the only one t
 | `__aarch64__` | toolchain | 3 | 12 | 2 | 0 | 0 / 21 | — | — |
 | `UNITTEST` | configuration | 4 | 12 | 0 | 0 | 0 / 4 | — | `plugins/faultlogger/service/BUILD.gn` |
 | `__LP64__` | toolchain | 2 | 12 | 0 | 0 | 0 / 2 | — | — |
-| `__cplusplus` | toolchain | 10 | 10 | 0 | 0 | 0 / 46 | — | — |
 | `UNIT_TEST` | configuration | 2 | 8 | 0 | 0 | 0 / 2 | — | `plugins/faultlogger/service/BUILD.gn` |
+| `TRACE_STRATEGY_UNITTEST` | configuration | 8 | 7 | 0 | 0 | 0 / 8 | — | `framework/native/unified_collection/collector/impl/trace/test/BUILD.gn` |
 
 ### Unknown names
 
@@ -412,25 +412,25 @@ Generated from `conditional_coverage /private/tmp/corpora/multimedia_camera_fram
 | … evaluated by at least one run | 1,257 |
 | … never evaluated (inside excluded code in every run) | 0 |
 | … left unterminated | 0 |
-| **Lines always excluded** | **5,031 (1.2%)** |
+| **Lines always excluded** | **4,991 (1.2%)** |
 | Lines excluded in some runs, included in others | 35 (0.0%) |
-| Files with an always-excluded arm | 114 |
+| Files with an always-excluded arm | 94 |
 
 ### Which arm is taken
 
 | Chains (guards excluded) | Count |
 |--------------------------|------:|
 | Evaluated by at least one run | 408 |
-| First arm never taken | 400 |
+| First arm never taken | 360 |
 | … of which an `#else` arm was always taken | 33 |
-| … of which no arm was ever taken (no `#else`, or every arm false) | 367 |
-| First arm always taken | 8 |
+| … of which no arm was ever taken (no `#else`, or every arm false) | 327 |
+| First arm always taken | 48 |
 | First arm taken in some runs, not in others | 0 |
 
 | Always-excluded arms by directive | Arms | Lines |
 |-----------------------------------|-----:|------:|
 | `#if` | 2 | 2 |
-| `#ifdef` | 398 | 5,020 |
+| `#ifdef` | 358 | 4,980 |
 | `#ifndef` | 0 | 0 |
 | `#elif` | 0 | 0 |
 | `#else` | 3 | 9 |
@@ -441,7 +441,7 @@ Generated from `conditional_coverage /private/tmp/corpora/multimedia_camera_fram
 |-------|------:|--------------------:|-------------------------------:|-----------------------:|--------------:|
 | configuration | 22 | 360 | 4,976 | 0 | 3,553 |
 | unknown | 4 | 6 | 13 | 0 | 760 |
-| toolchain | 3 | 44 | 40 | 4 | 328 |
+| toolchain | 3 | 44 | 0 | 4 | 130 |
 | include-guard | 830 | 849 | 0 | 0 | 21,299 |
 
 ### Top expressions by lines always excluded
@@ -460,7 +460,6 @@ Generated from `conditional_coverage /private/tmp/corpora/multimedia_camera_fram
 | `#ifdef CAMERA_MOVING_PHOTO / #else` | 9 | 4 | 116 | 0 | `CAMERA_MOVING_PHOTO` (configuration) |
 | `#ifdef CAMERA_CAPTURE_YUV / #else` | 8 | 6 | 115 | 0 | `CAMERA_CAPTURE_YUV` (configuration) |
 | `#ifdef MEMMGR_OVERRID` | 18 | 6 | 77 | 0 | `MEMMGR_OVERRID` (configuration) |
-| `#ifdef __cplusplus` | 40 | 20 | 40 | 0 | `__cplusplus` (toolchain) |
 | `#ifdef CAMERA_USE_BATTERY` | 5 | 2 | 36 | 0 | `CAMERA_USE_BATTERY` (configuration) |
 | `#ifdef CAMERA_FRAMEWORK_FEATURE_MEDIA_STREAM / #else` | 4 | 4 | 31 | 0 | `CAMERA_FRAMEWORK_FEATURE_MEDIA_STREAM` (configuration) |
 | `#ifdef DEVICE_MANAGER` | 4 | 2 | 30 | 0 | `DEVICE_MANAGER` (configuration) |
@@ -500,7 +499,6 @@ Lines are apportioned as described above: *sole* when the name is the only one t
 | `COMPATIBILITY_CONFIG_CENTER_ENABLE` | configuration | 10 | 184 | 0 | 0 | 0 / 132 | — | `services/camera_service/BUILD.gn` |
 | `CAMERA_USE_SENSOR` | configuration | 20 | 158 | 0 | 0 | 0 / 609 | — | `frameworks/native/camera/base/BUILD.gn` |
 | `MEMMGR_OVERRID` | configuration | 18 | 77 | 0 | 0 | 0 / 110 | — | `services/camera_service/BUILD.gn` |
-| `__cplusplus` | toolchain | 40 | 40 | 0 | 0 | 0 / 198 | — | — |
 | `CAMERA_USE_BATTERY` | configuration | 5 | 36 | 0 | 0 | 0 / 5 | — | `services/deferred_processing_service/BUILD.gn` |
 | `DEVICE_MANAGER` | configuration | 4 | 30 | 0 | 0 | 0 / 37 | — | `services/camera_service/BUILD.gn` |
 | `CAMERA_USE_IMAGE_EFFECT` | configuration | 7 | 24 | 0 | 0 | 0 / 7 | — | `mediastream/BUILD.gn` |
