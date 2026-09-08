@@ -6153,7 +6153,9 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             .prefix(&format!("trace_preproc_{tag}_"))
             .tempdir()
             .unwrap();
-        let path = dir.path().canonicalize().unwrap();
+        // Production keys go through `trace_ir::canonicalize`, which strips
+        // the `\\?\` prefix `std::fs::canonicalize` returns on Windows.
+        let path = trace_ir::canonicalize(dir.path());
         TmpTree { _dir: dir, path }
     }
 

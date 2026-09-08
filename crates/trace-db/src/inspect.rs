@@ -27,6 +27,15 @@ impl Direction {
     }
 }
 
+/// Final path component of `path`, accepting either separator.
+///
+/// Both separators everywhere: a database is portable, so a Windows-produced
+/// one is often inspected on Linux. A Unix name holding a backslash renders
+/// short, which is display-only.
+pub fn basename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
 #[derive(Debug, Clone)]
 pub struct FunctionRef {
     pub id: i64,
@@ -39,7 +48,7 @@ pub struct FunctionRef {
 
 impl std::fmt::Display for FunctionRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let base = self.path.rsplit('/').next().unwrap_or(&self.path);
+        let base = basename(&self.path);
         write!(
             f,
             "{} ({}:{}-{}){}",
@@ -151,7 +160,7 @@ impl EdgeSite {
         if self.path.is_empty() {
             String::new()
         } else {
-            let base = self.path.rsplit('/').next().unwrap_or(&self.path);
+            let base = basename(&self.path);
             format!("{base}:{}", self.line)
         }
     }
@@ -207,7 +216,7 @@ pub fn load_function_labels(conn: &Connection) -> Result<FxHashMap<i64, GraphNod
         let path: String = row.get(2)?;
         let line: i64 = row.get(3)?;
         let defined: i64 = row.get(4)?;
-        let file_name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        let file_name = basename(&path).to_string();
         Ok((
             id,
             GraphNode {
@@ -783,7 +792,7 @@ impl std::fmt::Display for SymbolRef {
         if let Some(fn_name) = &self.fn_name {
             write!(f, " in {fn_name}")?;
         }
-        let base = self.path.rsplit('/').next().unwrap_or(&self.path);
+        let base = basename(&self.path);
         write!(f, " {base}:{}:{}", self.line, self.col)
     }
 }

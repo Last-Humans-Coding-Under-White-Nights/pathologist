@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Instant;
 use trace_analysis::{analyze_with_options, AnalyzeOptions, ResolutionKind};
-use trace_db::{export_to_sqlite, open_db, ExportOptions};
+use trace_db::{basename, export_to_sqlite, open_db, ExportOptions};
 use trace_parse::build_program_with_jobs;
 use trace_preproc::PreprocessOptions;
 
@@ -421,9 +421,6 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
                 Some(p) => Some(trace_db::CallGraphFilter::from_file(&p)?),
                 None => None,
             };
-            fn basename(p: &str) -> &str {
-                p.rsplit('/').next().unwrap_or(p)
-            }
             for e in edges {
                 if let Some(f) = &filter {
                     if !f.matches(&e.caller_name) && !f.matches(&e.callee_name) {

@@ -1086,15 +1086,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.c"), MAIN_C).unwrap();
         let root = CString::new(dir.path().to_str().unwrap()).unwrap();
-        // Output under a read-only directory: the preflight probe (which now
-        // mirrors the exporter and creates missing parent dirs) must fail
-        // here because it cannot write the temp file.
-        let ro_dir = dir.path().join("ro");
-        std::fs::create_dir(&ro_dir).unwrap();
-        let mut perms = std::fs::metadata(&ro_dir).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&ro_dir, perms).unwrap();
-        let out = CString::new(format!("{}/out.db", ro_dir.display())).unwrap();
+        // Output beneath an existing *file*: `create_dir_all` in
+        // `preflight_output` fails on every platform, unlike a read-only
+        // parent directory, which does not stop file creation on Windows.
+        let out = CString::new(dir.path().join("main.c").join("out.db").to_str().unwrap()).unwrap();
         let opts = TraceIndexOptions {
             size: std::mem::size_of::<TraceIndexOptions>(),
             root: root.as_ptr(),
@@ -1122,11 +1117,6 @@ mod tests {
         assert!(!err.is_null());
         assert!(warnings.is_null(), "warnings must only be set on success");
         unsafe { trace_string_free(err) };
-        // Restore perms so tempdir cleanup can remove the directory.
-        let mut perms = std::fs::metadata(&ro_dir).unwrap().permissions();
-        use std::os::unix::fs::PermissionsExt;
-        perms.set_mode(perms.mode() | 0o200);
-        std::fs::set_permissions(&ro_dir, perms).unwrap();
     }
 
     #[test]
