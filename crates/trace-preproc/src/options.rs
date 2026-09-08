@@ -113,6 +113,26 @@ pub type ExpansionVariants = Vec<IncludeExpansion>;
 /// Shared, variant-keyed cache of expanded `#include` bodies.
 pub type ExpansionCache = Arc<RwLock<HashMap<ExpansionKey, ExpansionVariants>>>;
 
+/// Why a file that a run has already expanded may be skipped when it is
+/// `#include`d again.
+///
+/// There is no third variant, and that is the point: a repeated `#include`
+/// with no reason to skip re-expands, because C says so. Suppressing it
+/// unconditionally silently loses every X-macro table that is included
+/// once per `#define` of its entry macro (#56).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileGuard {
+    /// `#pragma once`, reached with the enclosing conditionals active. It
+    /// holds for the rest of the translation unit no matter what the macro
+    /// table does afterwards — the file said "once", not "once per
+    /// configuration".
+    Once,
+    /// `#ifndef NAME` / `#define NAME` / … / `#endif` around the whole file.
+    /// This suppresses only while `NAME` is defined: `#undef NAME` followed
+    /// by a re-`#include` expands the body again, as it does in cpp.
+    Ifndef(Arc<str>),
+}
+
 /// Cached preprocessed body for a `#include`d file (shared across translation units).
 #[derive(Debug, Clone)]
 pub struct IncludeExpansion {
@@ -138,6 +158,12 @@ pub struct IncludeExpansion {
     /// A consumer may replay this entry only when its own environment binds
     /// every one of these names the same way.
     pub deps: Arc<MacroFingerprint>,
+    /// Include guards learned while producing this expansion: this file's
+    /// own, and every file in its `#include` closure. A consumer replays the
+    /// text without ever visiting those files, so without this record it
+    /// cannot tell a later `#include` that a guard already suppresses from
+    /// one that must re-expand (#56).
+    pub guards: Arc<Vec<(PathBuf, FileGuard)>>,
     /// The variants this expansion itself replayed for the headers it
     /// brought in. Indexing keeps each header's text file-local, so those
     /// nested headers contribute no text here and need their own lowered
@@ -193,6 +219,16 @@ pub struct PreprocessOptions {
     /// what an unseeded cache does anyway. A cache miss is a performance
     /// event and must never be reported as unexplored configuration.
     pub max_expansion_variants: usize,
+    /// How many times one path may be brought into a single run — expanded,
+    /// or replayed from the cache — before and apart from
+    /// [`Self::max_include_depth`].
+    ///
+    /// Repeated inclusion of an unguarded file is legitimate — X-macro
+    /// tables depend on it — so depth alone does not bound it: a header
+    /// included by fifty siblings is brought in fifty times at depth two.
+    /// Past this cap the include is skipped and a `preprocess` diagnostic
+    /// is emitted, so a runaway is loud rather than exponential.
+    pub max_file_expansions: usize,
     /// When true, every conditional chain the run meets is recorded in
     /// `PreprocessResult::conditionals` (see [`crate::ConditionalChain`]),
     /// for measuring what the configuration excludes (#57). Off by default:
@@ -220,6 +256,7 @@ impl Default for PreprocessOptions {
             inline_include_bodies: true,
             language: None,
             max_expansion_variants: 8,
+            max_file_expansions: 64,
             record_conditionals: false,
         }
     }
@@ -302,6 +339,11 @@ impl PreprocessOptions {
 
     pub fn with_max_expansion_variants(mut self, n: usize) -> Self {
         self.max_expansion_variants = n;
+        self
+    }
+
+    pub fn with_max_file_expansions(mut self, n: usize) -> Self {
+        self.max_file_expansions = n;
         self
     }
 

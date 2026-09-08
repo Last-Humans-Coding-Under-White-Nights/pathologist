@@ -25,11 +25,15 @@ pub struct PreprocessedSource {
     /// The language this text was lexed as; `replayed_variants` indexes the
     /// variant list for this language only.
     pub language: Language,
-    /// Header → index of the cached expansion this run replayed for it (see
-    /// `trace_preproc::ExpansionVariants`). A header here contributed no
-    /// text to `text`, so its declarations must be merged from the unit
-    /// built out of *this* expansion.
-    pub replayed_variants: Arc<HashMap<PathBuf, usize>>,
+    /// Header → indices of the cached expansions this run replayed for it
+    /// (see `trace_preproc::ExpansionVariants`). A header here contributed
+    /// no text to `text`, so its declarations must be merged from the units
+    /// built out of *these* expansions.
+    ///
+    /// A list rather than one index: a header included twice under different
+    /// macros — an X-macro table, or one whose guard the unit `#undef`s —
+    /// replays two expansions, and both belong to this unit (#56).
+    pub replayed_variants: Arc<HashMap<PathBuf, Vec<usize>>>,
     /// Everything the preprocessor reported while producing `text`, in
     /// emission order, attributed to the file it happened in (nested
     /// includes included). Empty for raw sources.
@@ -146,9 +150,11 @@ impl IndexSourceCache {
         };
         for (path, src) in guard.iter().filter(|(p, _)| units.contains(*p)) {
             out.inlined.extend(src.inlined_headers.iter().cloned());
-            for (header, variant) in src.replayed_variants.iter() {
-                out.consumed
-                    .insert((header.clone(), src.language, *variant));
+            for (header, variants) in src.replayed_variants.iter() {
+                for variant in variants {
+                    out.consumed
+                        .insert((header.clone(), src.language, *variant));
+                }
                 out.consumed_paths.insert(header.clone());
             }
             // A header reached only through another header's cached
@@ -193,7 +199,7 @@ impl PreprocessedSource {
             line_map: Arc::clone(&expansion.line_map),
             included_headers: Arc::new(expansion.files.iter().cloned().collect()),
             inlined_headers: Arc::new(Vec::new()),
-            replayed_variants: Arc::new(expansion.nested_variants.iter().cloned().collect()),
+            replayed_variants: Arc::new(group_variants(expansion.nested_variants.iter().cloned())),
             language,
             diagnostics: expansion.diagnostics.as_ref().clone(),
         }
@@ -240,10 +246,25 @@ fn read_index_source(
         line_map: Arc::new(preproc_result.line_map),
         included_headers: Arc::new(preproc_result.included_headers),
         inlined_headers: Arc::new(preproc_result.inlined_headers),
-        replayed_variants: Arc::new(preproc_result.replayed_variants.into_iter().collect()),
+        replayed_variants: Arc::new(group_variants(preproc_result.replayed_variants)),
         language: preproc_result.language,
         diagnostics: preproc_result.diagnostics,
     })
+}
+
+/// `(path, variant)` pairs into one list of variants per path, in the order
+/// they arrive (already sorted upstream, so the lists are reproducible).
+fn group_variants(
+    pairs: impl IntoIterator<Item = (PathBuf, usize)>,
+) -> HashMap<PathBuf, Vec<usize>> {
+    let mut out: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    for (path, variant) in pairs {
+        let vs = out.entry(path).or_default();
+        if !vs.contains(&variant) {
+            vs.push(variant);
+        }
+    }
+    out
 }
 
 fn should_preprocess(path: &Path, opts: &PreprocessOptions, graph: &IncludeGraph) -> bool {
