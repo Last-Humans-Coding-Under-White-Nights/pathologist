@@ -33,6 +33,16 @@ All notable changes to `trace` are documented in this file.
 
 ### Fixed
 
+- The preprocessor predefines what the language implies (#70): `__cplusplus` (`201703L`) in a
+  unit lexed as C++, `__STDC_VERSION__` (`201710L`) in a C unit, `__STDC__` in both. A
+  command-line `-D` of the same name outranks the predefined value and a source `#undef`
+  removes it, since these are ordinary definitions rather than builtin fallbacks. Previously nothing
+  was predefined, so every `#ifdef __cplusplus` / `#if __cplusplus >= …` in a C++ unit took the
+  C arm and the declarations it guarded were silently missing from the index. A header shared
+  by a C and a C++ unit reads the name bound in one and unbound in the other, so each unit's
+  expansion stays its own. `docs/CONDITIONAL_COVERAGE.md` records the effect on the eval
+  corpora: `__cplusplus` was read by 930 chains with every evaluation unbound, and HDF's
+  always-excluded line count falls from 7,302 to 6,980.
 - `x->m()` resolves the receiver through the **declared** `operator->` rather than a hardcoded
   list of smart-pointer names (#64). A wrapper's instantiation keeps the wrapper as its class,
   and a `->` on it looks the member up on what its `operator->` returns: for a class template,

@@ -103,3 +103,56 @@ fn warm_macros_do_not_leak_between_tus() {
     // The unit that does include the header is unaffected.
     assert!(has_any_edge(&program, &analysis, "uses", "unrelated"));
 }
+
+/// `__cplusplus` is predefined for a C++ unit and absent from a C unit
+/// (#70). `a.cpp` and `b.c` are the same text: the `#if __cplusplus >=
+/// 201103L` declaration must be indexed from the C++ unit only, and the
+/// header both include must take its `#ifdef __cplusplus` arm in the C++
+/// unit only — each unit's expansion of the shared header is its own (the
+/// #55 fixture shape, with the language rather than a TU `#define` as the
+/// environment that differs).
+#[test]
+fn cplusplus_is_predefined_for_cpp_units_only() {
+    let root = fixture("preproc/cplusplus_predefined");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let cxx11: Vec<String> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "cxx11_only")
+        .map(|f| {
+            program
+                .symbols
+                .files
+                .get(f.file.0 as usize)
+                .map(|fi| fi.path.display().to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(cxx11.len(), 1, "cxx11_only: {cxx11:?}");
+    assert!(
+        cxx11[0].ends_with("a.cpp"),
+        "indexed from the C unit: {cxx11:?}"
+    );
+
+    assert!(
+        has_any_edge(&program, &analysis, "a_main", "cxx_path"),
+        "a.cpp did not take lang.h's `#ifdef __cplusplus` arm: {:?}",
+        callees_of(&program, &analysis, "a_main")
+    );
+    assert!(
+        must_not_have_edge(&program, &analysis, "a_main", "c_path"),
+        "a.cpp took lang.h's `#else` arm"
+    );
+    assert!(
+        has_any_edge(&program, &analysis, "b_main", "c_path"),
+        "b.c did not take lang.h's `#else` arm: {:?}",
+        callees_of(&program, &analysis, "b_main")
+    );
+    assert!(
+        must_not_have_edge(&program, &analysis, "b_main", "cxx_path"),
+        "b.c took lang.h's `#ifdef __cplusplus` arm"
+    );
+}
