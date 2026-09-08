@@ -205,8 +205,8 @@ impl IncludeGraph {
     /// earlier waves, so the wave can be indexed in parallel.
     ///
     /// Cyclic leftovers are **not** a parallel wave: they still depend on
-    /// each other, so they must be indexed in [`index_order`] (the same
-    /// append [`index_order`] uses for cycles).
+    /// each other, so they must be indexed in [`Self::index_order`] (the same
+    /// append [`Self::index_order`] uses for cycles).
     pub fn index_waves(&self, files: &[PathBuf]) -> (Vec<Vec<PathBuf>>, Vec<PathBuf>) {
         let mut ordered_files: Vec<PathBuf> = files.to_vec();
         ordered_files.sort();

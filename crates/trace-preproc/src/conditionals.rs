@@ -23,6 +23,7 @@ pub enum ArmDirective {
 }
 
 impl ArmDirective {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             ArmDirective::If => "if",
@@ -50,6 +51,7 @@ pub enum ArmOutcome {
 }
 
 impl ArmOutcome {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             ArmOutcome::Taken => "taken",
@@ -106,6 +108,7 @@ impl ConditionalArm {
     /// that ends it. Opening directive lines are not counted, but their
     /// continuation lines and nested directives are. This is a physical
     /// line count, not code reachability.
+    #[must_use]
     pub fn body_lines(&self) -> u32 {
         self.end_line.saturating_sub(self.line).saturating_sub(1)
     }
@@ -136,6 +139,7 @@ pub struct ConditionalChain {
 
 impl ConditionalChain {
     /// Line of the opening directive.
+    #[must_use]
     pub fn line(&self) -> u32 {
         self.arms.first().map_or(0, |arm| arm.line)
     }

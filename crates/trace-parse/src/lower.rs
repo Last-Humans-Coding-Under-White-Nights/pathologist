@@ -1,7 +1,10 @@
 use crate::deps::IncludeGraph;
 use crate::discover::discover_source_files;
+use crate::gn_defines::Candidate;
 use crate::index_cache::{IndexSourceCache, PreprocessedSource};
-use crate::merge::{merge_unit_index, merge_unit_symbols, merge_unit_types, UnitIndex};
+use crate::merge::{
+    merge_unit_index, merge_unit_symbols, merge_unit_types, merge_unit_variants, UnitIndex,
+};
 use crate::parse::node_text;
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -218,6 +221,8 @@ pub fn build_program_with_jobs(
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    program.explore = opts.explore;
+    program.explore_budget = opts.explore_budget;
 
     // A dependency root contributes headers only: its sources are never
     // translation units, even when the root sits inside the analyzed tree,
@@ -274,6 +279,19 @@ pub fn build_program_with_jobs(
         .with_include_expansion_cache(Arc::clone(&include_expansion_cache))
         .with_basename_index(basename_index)
         .with_inline_include_bodies(false);
+    let eff_opts = eff_opts.with_record_conditionals(opts.explore || opts.record_conditionals);
+
+    let gn_candidates = if opts.explore {
+        index_progress("explore: scanning GN candidate defines".to_string());
+        Some(crate::explore::scan_project_gn_candidates(root))
+    } else {
+        None
+    };
+    let base_defines: BTreeMap<String, String> = opts
+        .defines
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     // Warm each header under a FRESH macro environment seeded only from the
     // command-line defines. Sharing one accumulating table across headers let
@@ -851,18 +869,20 @@ pub fn build_program_with_jobs(
                     file_order.len(),
                     format!("parse: {}/{} {}", i + 1, file_order.len(), path.display()),
                 );
-                merge_unit_index(
-                    &mut program,
-                    &index_source_file(
-                        path,
-                        root,
-                        &include_graph,
-                        &index_opts[&index_language(path, &cpp_parse, no_c_units, forced_language)],
-                        &source_cache,
-                        Some(&header_ir),
-                        pch_order.as_ref(),
-                    ),
+                let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
+                let (base_unit, var_units) = index_source_file_with_variants(
+                    path,
+                    root,
+                    &include_graph,
+                    &index_opts[&lang],
+                    &source_cache,
+                    Some(&header_ir),
+                    pch_order.as_ref(),
+                    gn_candidates.as_ref(),
+                    &base_defines,
+                    opts.explore_budget,
                 );
+                merge_unit_variants(&mut program, &base_unit, &var_units);
                 index_item_progress(
                     i,
                     file_order.len(),
@@ -875,27 +895,30 @@ pub fn build_program_with_jobs(
                 );
             }
         } else {
-            let mut units: HashMap<PathBuf, UnitIndex> = file_order
+            let results: Vec<(PathBuf, UnitIndex, Vec<UnitIndex>)> = file_order
                 .par_iter()
                 .map(|path| {
-                    (
-                        path.clone(),
-                        index_source_file(
-                            path,
-                            root,
-                            &include_graph,
-                            &index_opts
-                                [&index_language(path, &cpp_parse, no_c_units, forced_language)],
-                            &source_cache,
-                            Some(&header_ir),
-                            pch_order.as_ref(),
-                        ),
-                    )
+                    let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
+                    let (base_unit, var_units) = index_source_file_with_variants(
+                        path,
+                        root,
+                        &include_graph,
+                        &index_opts[&lang],
+                        &source_cache,
+                        Some(&header_ir),
+                        pch_order.as_ref(),
+                        gn_candidates.as_ref(),
+                        &base_defines,
+                        opts.explore_budget,
+                    );
+                    (path.clone(), base_unit, var_units)
                 })
                 .collect();
+            let mut result_map: HashMap<PathBuf, (UnitIndex, Vec<UnitIndex>)> =
+                results.into_iter().map(|(p, b, vs)| (p, (b, vs))).collect();
             for path in &file_order {
-                if let Some(unit) = units.remove(path) {
-                    merge_unit_index(&mut program, &unit);
+                if let Some((base_unit, var_units)) = result_map.remove(path) {
+                    merge_unit_variants(&mut program, &base_unit, &var_units);
                 }
             }
         }
@@ -1415,6 +1438,98 @@ fn index_source_file(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn index_source_file_with_variants(
+    path: &Path,
+    root: &Path,
+    graph: &IncludeGraph,
+    index_opts: &PreprocessOptions,
+    source_cache: &IndexSourceCache,
+    header_ir: Option<&HeaderIr>,
+    pch_order: &[PathBuf],
+    gn_candidates: Option<&HashMap<String, Vec<Candidate>>>,
+    base_defines: &BTreeMap<String, String>,
+    explore_budget: usize,
+) -> (UnitIndex, Vec<UnitIndex>) {
+    let mut base_unit = index_source_file(
+        path,
+        root,
+        graph,
+        index_opts,
+        source_cache,
+        header_ir,
+        pch_order,
+    );
+    let mut variant_units = Vec::new();
+    let Some(candidates) = gn_candidates.filter(|c| explore_budget > 0 && !c.is_empty()) else {
+        return (base_unit, variant_units);
+    };
+    // The base lowering has already populated this cache. A failure is already
+    // recorded on base_unit, so do not emit a duplicate diagnostic.
+    let Ok(pre) = source_cache.get_or_preprocess(path, graph, index_opts) else {
+        return (base_unit, variant_units);
+    };
+    let language = index_opts
+        .language
+        .unwrap_or_else(|| Language::from_path(path));
+
+    let (variants, truncated) = crate::explore::generate_feasible_variants(
+        &pre.conditionals,
+        candidates,
+        base_defines,
+        explore_budget,
+    );
+    let mut warn_explore = |message: String| {
+        base_unit.diagnostics.push(Diagnostic {
+            severity: DiagnosticSeverity::Warning,
+            file: None,
+            line: 0,
+            message,
+            stage: "explore".into(),
+        });
+    };
+
+    if truncated > 0 {
+        warn_explore(format!(
+            "variant exploration budget ({explore_budget}) reached; omitted {truncated} candidate activation goal(s)"
+        ));
+    }
+
+    for variant in variants {
+        let mut var_opts = index_opts.clone();
+        var_opts.defines.extend(variant.defines.iter().cloned());
+        match source_cache.preprocess_uncached(path, graph, &var_opts) {
+            Ok(var_pre) => {
+                let mut var_program = Program::new(root.to_path_buf());
+                match lower_prepared_source(
+                    &mut var_program,
+                    path,
+                    graph,
+                    Arc::new(var_pre),
+                    language,
+                    header_ir,
+                    pch_order,
+                ) {
+                    Ok(()) => {
+                        variant_units.push(program_into_unit(path.to_path_buf(), var_program));
+                    }
+                    Err(e) => {
+                        warn_explore(format!("variant lower failed for {}: {e}", path.display()));
+                    }
+                }
+            }
+            Err(e) => {
+                warn_explore(format!(
+                    "variant preprocess failed for {}: {e}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    (base_unit, variant_units)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn process_indexed_file(
     program: &mut Program,
     path: &Path,
@@ -1578,10 +1693,11 @@ fn add_preprocess_diagnostics(
             message: d.message.clone(),
             stage: PREPROCESS_STAGE.into(),
         };
-        if program.dedup.insert_preprocess_diagnostic(
+        if program.dedup.insert_diagnostic(
             diagnostic.file,
             diagnostic.line,
             &diagnostic.message,
+            &diagnostic.stage,
         ) {
             program.add_diagnostic(diagnostic);
         }

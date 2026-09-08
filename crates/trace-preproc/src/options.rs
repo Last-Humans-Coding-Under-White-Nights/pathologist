@@ -21,6 +21,7 @@ impl Language {
     /// everything else, including the language-ambiguous `.h`, is C. This
     /// is the one place that decides; the indexer's discovery and grammar
     /// choice derive from it.
+    #[must_use]
     pub fn from_path(path: &Path) -> Self {
         match path.extension().and_then(|e| e.to_str()) {
             Some(
@@ -82,6 +83,7 @@ impl MacroFingerprint {
     /// expansion is already stored. `defined` is ordered by first read, and
     /// two runs can reach the same bindings by different routes, so the
     /// digest must not depend on the order either half was built in.
+    #[must_use]
     pub fn signature(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         // XOR of per-entry hashes: commutative, so insertion order drops out.
@@ -239,6 +241,11 @@ pub struct PreprocessOptions {
     /// Dependency roots whose headers contribute declarations but whose
     /// sources are excluded from translation unit discovery (#60).
     pub dep_roots: Vec<PathBuf>,
+    /// When true, explore feasible configuration variants for conditional
+    /// code regions excluded by the default configuration (#59).
+    pub explore: bool,
+    /// Maximum number of configuration variants to explore per translation unit (#59).
+    pub explore_budget: usize,
 }
 
 impl Default for PreprocessOptions {
@@ -262,11 +269,14 @@ impl Default for PreprocessOptions {
             max_file_expansions: 64,
             record_conditionals: false,
             dep_roots: Vec::new(),
+            explore: false,
+            explore_budget: 4,
         }
     }
 }
 
 impl PreprocessOptions {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             track_line_map: true,
@@ -276,36 +286,43 @@ impl PreprocessOptions {
 
     /// Options used for indexing: line-map tracking stays on so lowered
     /// entities can be attributed to their original `#include`d file.
+    #[must_use]
     pub fn for_indexing(mut self) -> Self {
         self.track_line_map = true;
         self
     }
 
+    #[must_use]
     pub fn with_include_expansion_cache(mut self, cache: ExpansionCache) -> Self {
         self.include_expansion_cache = Some(cache);
         self
     }
 
+    #[must_use]
     pub fn with_basename_index(mut self, index: Arc<HashMap<String, Vec<PathBuf>>>) -> Self {
         self.basename_index = Some(index);
         self
     }
 
+    #[must_use]
     pub fn with_shared_macros(mut self, table: crate::SharedMacroTable) -> Self {
         self.shared_macros = Some(table);
         self
     }
 
+    #[must_use]
     pub fn with_accumulate_macros(mut self, accumulate: bool) -> Self {
         self.accumulate_macros = accumulate;
         self
     }
 
+    #[must_use]
     pub fn with_frozen_expansion_cache(mut self, frozen: bool) -> Self {
         self.frozen_expansion_cache = frozen;
         self
     }
 
+    #[must_use]
     pub fn with_include(mut self, path: PathBuf) -> Self {
         self.include_paths.push(path);
         self
@@ -313,53 +330,75 @@ impl PreprocessOptions {
 
     /// Add a dependency root (`--dep`). Pass a canonical path: roots are
     /// matched against canonical file paths by prefix.
+    #[must_use]
     pub fn with_dep(mut self, path: impl Into<PathBuf>) -> Self {
         self.dep_roots.push(path.into());
         self
     }
 
+    #[must_use]
     pub fn with_define(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.defines.insert(name.into(), value.into());
         self
     }
 
+    #[must_use]
     pub fn with_max_output_bytes(mut self, n: usize) -> Self {
         self.max_output_bytes = n;
         self
     }
 
+    #[must_use]
     pub fn with_max_include_depth(mut self, n: usize) -> Self {
         self.max_include_depth = n;
         self
     }
 
+    #[must_use]
     pub fn with_max_expanded_tokens(mut self, n: u64) -> Self {
         self.max_expanded_tokens = n;
         self
     }
 
+    #[must_use]
     pub fn with_inline_include_bodies(mut self, inline_bodies: bool) -> Self {
         self.inline_include_bodies = inline_bodies;
         self
     }
 
+    #[must_use]
     pub fn with_language(mut self, language: Language) -> Self {
         self.language = Some(language);
         self
     }
 
+    #[must_use]
     pub fn with_max_expansion_variants(mut self, n: usize) -> Self {
         self.max_expansion_variants = n;
         self
     }
 
+    #[must_use]
     pub fn with_max_file_expansions(mut self, n: usize) -> Self {
         self.max_file_expansions = n;
         self
     }
 
+    #[must_use]
     pub fn with_record_conditionals(mut self, record: bool) -> Self {
         self.record_conditionals = record;
+        self
+    }
+
+    #[must_use]
+    pub fn with_explore(mut self, explore: bool) -> Self {
+        self.explore = explore;
+        self
+    }
+
+    #[must_use]
+    pub fn with_explore_budget(mut self, budget: usize) -> Self {
+        self.explore_budget = budget;
         self
     }
 }

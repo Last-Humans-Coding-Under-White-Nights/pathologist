@@ -618,8 +618,12 @@ impl SymbolTable {
             .unwrap_or_else(|| panic!("unknown variable id {}", id.0))
     }
 
+    #[must_use]
     pub fn call_site_by_id(&self, id: CallSiteId) -> Option<&CallSite> {
-        self.call_sites.iter().find(|c| c.id == id)
+        self.call_sites
+            .get(id.0 as usize)
+            .filter(|c| c.id == id)
+            .or_else(|| self.call_sites.iter().find(|c| c.id == id))
     }
 
     pub fn function_ids_unique(&self) -> bool {

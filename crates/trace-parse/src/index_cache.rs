@@ -38,6 +38,9 @@ pub struct PreprocessedSource {
     /// emission order, attributed to the file it happened in (nested
     /// includes included). Empty for raw sources.
     pub diagnostics: Vec<Diagnostic>,
+    /// Conditional chains recorded during preprocessing (when `record_conditionals`
+    /// is enabled).
+    pub conditionals: Vec<trace_preproc::ConditionalChain>,
 }
 
 /// Where a set of units' headers came from.
@@ -202,6 +205,7 @@ impl PreprocessedSource {
             replayed_variants: Arc::new(group_variants(expansion.nested_variants.iter().cloned())),
             language,
             diagnostics: expansion.diagnostics.as_ref().clone(),
+            conditionals: Vec::new(),
         }
     }
 
@@ -216,6 +220,7 @@ impl PreprocessedSource {
             replayed_variants: Arc::new(HashMap::new()),
             language: Language::C,
             diagnostics: Vec::new(),
+            conditionals: Vec::new(),
         }
     }
 }
@@ -249,6 +254,7 @@ fn read_index_source(
         replayed_variants: Arc::new(group_variants(preproc_result.replayed_variants)),
         language: preproc_result.language,
         diagnostics: preproc_result.diagnostics,
+        conditionals: preproc_result.conditionals,
     })
 }
 

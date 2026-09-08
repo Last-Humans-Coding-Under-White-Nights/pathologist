@@ -274,7 +274,7 @@ impl PreprocessorState {
         };
         if let Some(shared) = &state.opts.shared_macros {
             if let Ok(guard) = shared.read() {
-                state.macros = guard.clone();
+                state.macros.clone_from(&guard);
             }
             // The warm table is normally seeded from the predefines and the
             // CLI defines both (`macro_table_from_defines`), which is where
@@ -829,8 +829,8 @@ impl PreprocessorState {
             self.output.push(' ');
         }
         let offset = self.output.len();
-        let text = token_to_string(&tok.kind);
-        self.output.push_str(&text);
+        let text = token_as_str(&tok.kind);
+        self.output.push_str(text);
         if self.opts.track_line_map {
             let fid = self.lm_current_file();
             let (line, col) = tok.expansion_site();
@@ -1433,7 +1433,7 @@ impl PreprocessorState {
 
         let emitted = self.output.len() - output_start;
         self.emitted_bytes.insert(canonical.clone(), emitted);
-        let pending_skips = self.cache_frames.last().map(|f| f.skips.len()).unwrap_or(0);
+        let pending_skips = self.cache_frames.last().map_or(0, |f| f.skips.len());
         if cache_header
             && !self.opts.frozen_expansion_cache
             && emitted == 0
@@ -1635,12 +1635,14 @@ impl PreprocessorState {
                         i += 1;
                         continue;
                     }
-                    if !tok.is_hidden(name) {
+                    if tok.is_hidden(name) {
+                        self.emit_token(tok);
+                    } else {
                         self.record_read(name);
                         if let Some(macro_def) = self.macros.get(name).cloned() {
                             match macro_def {
                                 MacroDef::Function { .. } | MacroDef::GmockMethod => {
-                                    if self.next_non_newline_is(tokens, i + 1, "(") {
+                                    if Self::next_non_newline_is(tokens, i + 1, "(") {
                                         if !self.push_expansion(tok.line) {
                                             self.emit_token(tok);
                                             i += 1;
@@ -1680,8 +1682,6 @@ impl PreprocessorState {
                         } else {
                             self.emit_token(tok);
                         }
-                    } else {
-                        self.emit_token(tok);
                     }
                 } else {
                     self.emit_token(tok);
@@ -1738,7 +1738,7 @@ impl PreprocessorState {
                             // verbatim into the output.
                             Some(
                                 macro_def @ (MacroDef::Function { .. } | MacroDef::GmockMethod),
-                            ) if self.next_non_newline_is(tokens, i + 1, "(") => {
+                            ) if Self::next_non_newline_is(tokens, i + 1, "(") => {
                                 if !self.push_expansion(tok.line) {
                                     self.emit_token(tok);
                                     i += 1;
@@ -1812,7 +1812,7 @@ impl PreprocessorState {
             "define" if self.is_active() => {
                 i = self.handle_define(tokens, i)?;
             }
-            "include" | "define" if !self.is_active() => {}
+            "include" | "define" | "undef" if !self.is_active() => {}
             // Inside a skipped group only the nesting matters (C11
             // 6.10.1p6): a malformed operand there must not abort the file.
             "ifdef" | "ifndef" => {
@@ -1980,7 +1980,6 @@ impl PreprocessorState {
                 let name = self.read_directive_ident(tokens, &mut i)?;
                 self.remove_macro(&name);
             }
-            "undef" if !self.is_active() => {}
             _ => {
                 self.warn(
                     tokens[i.saturating_sub(1)].line,
@@ -1988,7 +1987,7 @@ impl PreprocessorState {
                 );
             }
         }
-        i = self.skip_to_newline(tokens, i);
+        i = Self::skip_to_newline(tokens, i);
         Ok(i)
     }
 
@@ -1996,7 +1995,7 @@ impl PreprocessorState {
         while i < tokens.len() && matches!(tokens[i].kind, TokenKind::Newline) {
             i += 1;
         }
-        let line = tokens.get(i).map(|t| t.line).unwrap_or(1);
+        let line = tokens.get(i).map_or(1, |t| t.line);
         // C11 6.10.2: a header-name (`"..."` / `<...>`) is taken as-is;
         // otherwise the rest of the line is macro-expanded and must then
         // form a header-name (`#include FOO` with `#define FOO "n.h"`).
@@ -2018,12 +2017,9 @@ impl PreprocessorState {
             }
         };
 
-        let include_path = match self.resolve_include(&path) {
-            Ok(p) => p,
-            Err(_) => {
-                self.warn(line, format!("include file not found, skipping: {path}"));
-                return Ok(i);
-            }
+        let Ok(include_path) = self.resolve_include(&path) else {
+            self.warn(line, format!("include file not found, skipping: {path}"));
+            return Ok(i);
         };
         let live_at = self.output.len();
         if let Err(e) = self.process_file(&include_path) {
@@ -2087,13 +2083,8 @@ impl PreprocessorState {
                 continue;
             }
             self.record_read(name);
-            let Some(def) = self.macros.get(name).cloned() else {
-                out.push(tokens[i].clone());
-                i += 1;
-                continue;
-            };
-            match def {
-                MacroDef::Object { replacement } => {
+            match self.macros.get(name).cloned() {
+                Some(MacroDef::Object { replacement }) => {
                     if !self.push_expansion(tokens[i].line) {
                         out.push(tokens[i].clone());
                         i += 1;
@@ -2109,8 +2100,8 @@ impl PreprocessorState {
                     out.extend(nested?);
                     i += 1;
                 }
-                MacroDef::Function { .. } | MacroDef::GmockMethod
-                    if self.next_non_newline_is(tokens, i + 1, "(") =>
+                Some(def @ (MacroDef::Function { .. } | MacroDef::GmockMethod))
+                    if Self::next_non_newline_is(tokens, i + 1, "(") =>
                 {
                     if !self.push_expansion(tokens[i].line) {
                         out.push(tokens[i].clone());
@@ -2126,7 +2117,7 @@ impl PreprocessorState {
                     self.pop_expansion();
                     out.extend(nested?);
                 }
-                MacroDef::Function { .. } | MacroDef::GmockMethod => {
+                _ => {
                     out.push(tokens[i].clone());
                     i += 1;
                 }
@@ -2218,7 +2209,7 @@ impl PreprocessorState {
         let mut params = Vec::new();
         let mut variadic = false;
         loop {
-            if self.token_is_ellipsis(tokens, *i) {
+            if Self::token_is_ellipsis(tokens, *i) {
                 // Anonymous `...`: register the variadic under its standard
                 // name so substitution, `##` comma elision, and the
                 // "last param collects the rest" rule all treat it exactly
@@ -2230,12 +2221,15 @@ impl PreprocessorState {
                     .finish_param_list_tail(tokens, i)
                     .then_some((params, variadic));
             }
-            match tokens.get(*i).map(|t| &t.kind) {
-                Some(TokenKind::Punct(s)) if *s == ")" => {
+            match tokens.get(*i) {
+                Some(tok) if tok.is_punct(")") => {
                     *i += 1;
                     break;
                 }
-                Some(TokenKind::Identifier(name)) => {
+                Some(Token {
+                    kind: TokenKind::Identifier(name),
+                    ..
+                }) => {
                     params.push(name.clone());
                     *i += 1;
                 }
@@ -2243,19 +2237,19 @@ impl PreprocessorState {
             }
             // Line splicing makes `args \`-newline-`...` equivalent to
             // `args...`; the lexer has already deleted the splice.
-            if self.token_is_ellipsis(tokens, *i) {
+            if Self::token_is_ellipsis(tokens, *i) {
                 variadic = true;
                 *i += 1;
                 return self
                     .finish_param_list_tail(tokens, i)
                     .then_some((params, variadic));
             }
-            match tokens.get(*i).map(|t| &t.kind) {
-                Some(TokenKind::Punct(s)) if *s == ")" => {
+            match tokens.get(*i) {
+                Some(tok) if tok.is_punct(")") => {
                     *i += 1;
                     break;
                 }
-                Some(TokenKind::Punct(s)) if *s == "," => {
+                Some(tok) if tok.is_punct(",") => {
                     *i += 1;
                 }
                 _ => return self.malformed_param_list(tokens, *i),
@@ -2267,9 +2261,10 @@ impl PreprocessorState {
     /// Warn about a parameter list that ends at a newline / EOF or contains
     /// an unexpected token, then yield `None` so the definition is dropped.
     fn malformed_param_list(&mut self, tokens: &[Token], i: usize) -> Option<(Vec<String>, bool)> {
-        let line = tokens.get(i).map(|t| t.line).unwrap_or(1);
-        let message = match tokens.get(i).map(|t| &t.kind) {
-            None | Some(TokenKind::Eof) | Some(TokenKind::Newline) => {
+        let line = tokens.get(i).map_or(1, |t| t.line);
+        let message = match tokens.get(i) {
+            None => "unterminated macro parameter list; definition ignored",
+            Some(t) if t.is_eof() || t.is_newline() => {
                 "unterminated macro parameter list; definition ignored"
             }
             _ => "expected , or ) in macro parameters; definition ignored",
@@ -2284,12 +2279,13 @@ impl PreprocessorState {
     /// `)` on a later line, which would swallow following code.
     fn finish_param_list_tail(&mut self, tokens: &[Token], i: &mut usize) -> bool {
         loop {
-            match tokens.get(*i).map(|t| &t.kind) {
-                Some(TokenKind::Punct(s)) if *s == ")" => {
+            match tokens.get(*i) {
+                Some(tok) if tok.is_punct(")") => {
                     *i += 1;
                     return true;
                 }
-                None | Some(TokenKind::Eof) | Some(TokenKind::Newline) => {
+                None => return self.malformed_param_list(tokens, *i).is_some(),
+                Some(tok) if tok.is_eof() || tok.is_newline() => {
                     return self.malformed_param_list(tokens, *i).is_some();
                 }
                 Some(_) => *i += 1,
@@ -2303,18 +2299,15 @@ impl PreprocessorState {
     /// malformed-list path, which is right for `. . .` and for dots split
     /// by a comment — `invalid token in macro parameter list` in gcc and
     /// clang.
-    fn token_is_ellipsis(&self, tokens: &[Token], i: usize) -> bool {
-        matches!(&tokens.get(i).map(|t| &t.kind), Some(TokenKind::Punct(s)) if *s == "...")
+    fn token_is_ellipsis(tokens: &[Token], i: usize) -> bool {
+        tokens.get(i).is_some_and(|t| t.is_punct("..."))
     }
 
-    fn next_non_newline_is(&self, tokens: &[Token], mut i: usize, punct: &str) -> bool {
-        while i < tokens.len() && matches!(tokens[i].kind, TokenKind::Newline) {
+    fn next_non_newline_is(tokens: &[Token], mut i: usize, punct: &str) -> bool {
+        while i < tokens.len() && tokens[i].is_newline() {
             i += 1;
         }
-        matches!(
-            tokens.get(i).map(|t| &t.kind),
-            Some(TokenKind::Punct(s)) if *s == punct
-        )
+        tokens.get(i).is_some_and(|t| t.is_punct(punct))
     }
 
     fn parse_macro_args(
@@ -2383,7 +2376,7 @@ impl PreprocessorState {
                 Ok(name)
             }
             _ => Err(self.error(
-                tokens.get(*i).map(|t| t.line).unwrap_or(1),
+                tokens.get(*i).map_or(1, |t| t.line),
                 "expected identifier in directive",
             )),
         }
@@ -2434,7 +2427,7 @@ impl PreprocessorState {
         while i < work.len() {
             steps += 1;
             if steps > MAX_STEPS || work.len() > MAX_TOKENS || out.len() > MAX_TOKENS {
-                let line = work.get(i).map(|t| t.line).unwrap_or(1);
+                let line = work.get(i).map_or(1, |t| t.line);
                 self.warn_condition_budget(line);
                 return None;
             }
@@ -2472,7 +2465,7 @@ impl PreprocessorState {
                     match self.macros.get(name) {
                         Some(MacroDef::Object { replacement }) => {
                             let painted = Self::paint_replacement(replacement, &tok, name);
-                            work.splice(i..i + 1, painted);
+                            work.splice(i..=i, painted);
                             continue; // rescan at i
                         }
                         Some(MacroDef::Function {
@@ -2523,11 +2516,11 @@ impl PreprocessorState {
         Some(out)
     }
 
-    fn skip_to_newline(&self, tokens: &[Token], mut i: usize) -> usize {
-        while i < tokens.len() && !matches!(tokens[i].kind, TokenKind::Newline | TokenKind::Eof) {
+    fn skip_to_newline(tokens: &[Token], mut i: usize) -> usize {
+        while i < tokens.len() && !tokens[i].is_newline() && !tokens[i].is_eof() {
             i += 1;
         }
-        if i < tokens.len() && matches!(tokens[i].kind, TokenKind::Newline) {
+        if i < tokens.len() && tokens[i].is_newline() {
             i += 1;
         }
         i
@@ -2791,13 +2784,13 @@ fn skip_directive_line(tokens: &[Token], i: &mut usize) {
 
 /// Whether `idx` is the variadic collector — by construction always the
 /// last parameter (`parse_macro_param_list` names an anonymous `...`
-/// "__VA_ARGS__"; see the invariant on `MacroDef::Function`).
+/// `"__VA_ARGS__"`; see the invariant on `MacroDef::Function`).
 fn is_variadic_tail(params: &[String], variadic: bool, idx: usize) -> bool {
     variadic && idx + 1 == params.len()
 }
 
 fn is_newline(tok: &Token) -> bool {
-    matches!(tok.kind, TokenKind::Newline)
+    tok.is_newline()
 }
 
 fn arg_is_blank(arg: &[Token]) -> bool {
@@ -3477,7 +3470,7 @@ fn projected_substitution_len(
         let width = match &tok.kind {
             TokenKind::Identifier(name) => match params.iter().position(|p| p == name) {
                 Some(idx) if is_variadic_tail(params, variadic, idx) => args.variadic_len(idx),
-                Some(idx) => args.args.get(idx).map_or(0, |a| a.len()),
+                Some(idx) => args.args.get(idx).map_or(0, Vec::len),
                 None => 1,
             },
             _ => 1,
@@ -3599,36 +3592,33 @@ fn substitute_macro(
                 // tokens are whitespace the argument kept for line
                 // tracking, not tokens: the flag goes on the first real
                 // token, and an argument with none is empty.
-                match out[first..].iter_mut().find(|t| !is_newline(t)) {
-                    Some(tok) => {
-                        tok.adjacent_before = adjacency && !gap;
-                        gap = false;
+                if let Some(tok) = out[first..].iter_mut().find(|t| !t.is_newline()) {
+                    tok.adjacent_before = adjacency && !gap;
+                    gap = false;
+                } else {
+                    // C99 placemarker, mirroring the `## param` case
+                    // above: the empty operand must swallow the `##`
+                    // itself, or the operator would reach
+                    // apply_concatenation and paste whatever preceded
+                    // the parameter — `S(a x ## +b)` with `x` empty
+                    // fusing `a` and `+` into the non-token `a+`. No
+                    // exception for GNU `, ## __VA_ARGS__`: the token
+                    // before that `##` is this parameter, not a comma,
+                    // so `is_gnu_comma_paste` does not hold and the
+                    // comma the placemarker leaves standing is an
+                    // ordinary argument separator (gcc keeps it too).
+                    let width = concat_width_after(body, i);
+                    if width > 0 {
+                        // The surviving right operand takes this
+                        // parameter's position, and with it its
+                        // adjacency; the argument's newlines go with the
+                        // placemarker, as on the `## param` side.
+                        out.truncate(first);
+                        paste_adjacency = Some(adjacency);
+                        i += 1 + width;
+                        continue;
                     }
-                    None => {
-                        // C99 placemarker, mirroring the `## param` case
-                        // above: the empty operand must swallow the `##`
-                        // itself, or the operator would reach
-                        // apply_concatenation and paste whatever preceded
-                        // the parameter — `S(a x ## +b)` with `x` empty
-                        // fusing `a` and `+` into the non-token `a+`. No
-                        // exception for GNU `, ## __VA_ARGS__`: the token
-                        // before that `##` is this parameter, not a comma,
-                        // so `is_gnu_comma_paste` does not hold and the
-                        // comma the placemarker leaves standing is an
-                        // ordinary argument separator (gcc keeps it too).
-                        let width = concat_width_after(body, i);
-                        if width > 0 {
-                            // The surviving right operand takes this
-                            // parameter's position, and with it its
-                            // adjacency; the argument's newlines go with the
-                            // placemarker, as on the `## param` side.
-                            out.truncate(first);
-                            paste_adjacency = Some(adjacency);
-                            i += 1 + width;
-                            continue;
-                        }
-                        gap |= !adjacency;
-                    }
+                    gap |= !adjacency;
                 }
                 i += 1;
                 continue;
@@ -3716,7 +3706,7 @@ fn concat_width_at(tokens: &[Token], i: usize) -> usize {
 /// Fallback definitions for macros whose real definitions live in headers the
 /// indexed tree does not ship (gtest, kernel headers, `<inttypes.h>`). Left
 /// unexpanded they produce tree-sitter ERROR nodes and whole functions get
-/// dropped from the index (docs/PARSE_FAILURES.md catalogs the impact).
+/// dropped from the index (`docs/PARSE_FAILURES.md` catalogs the impact).
 /// Built once; `install_builtin_macros` clones entries per preprocess. The
 /// bodies are plain C, so the C lexer serves both languages.
 static BUILTIN_FALLBACK_MACROS: LazyLock<Vec<(String, MacroDef)>> = LazyLock::new(|| {
@@ -3732,7 +3722,7 @@ static BUILTIN_FALLBACK_MACROS: LazyLock<Vec<(String, MacroDef)>> = LazyLock::ne
         (
             name.to_string(),
             MacroDef::Function {
-                params: params.iter().map(|s| s.to_string()).collect(),
+                params: params.iter().map(ToString::to_string).collect(),
                 replacement: lex_macro_body(replacement, Language::C),
                 variadic: false,
             },
@@ -3824,12 +3814,11 @@ fn paste_two_tokens(left: &Token, right: &Token) -> Token {
     }
 }
 
-fn token_paste_fragment(kind: &TokenKind) -> String {
+fn token_paste_fragment(kind: &TokenKind) -> &str {
     match kind {
-        TokenKind::Identifier(s) => s.clone(),
-        TokenKind::Number(s) => s.clone(),
-        TokenKind::Punct(s) if *s != "##" => (*s).to_string(),
-        _ => String::new(),
+        TokenKind::Identifier(s) | TokenKind::Number(s) => s.as_str(),
+        TokenKind::Punct(s) if *s != "##" => s,
+        _ => "",
     }
 }
 
@@ -3958,16 +3947,16 @@ fn escape_for_stringize(spelling: &str) -> String {
     out
 }
 
-fn token_to_string(kind: &TokenKind) -> String {
+fn token_as_str(kind: &TokenKind) -> &str {
     match kind {
-        TokenKind::Identifier(s) => s.clone(),
-        TokenKind::Number(s) => s.clone(),
-        TokenKind::String(s) => s.clone(),
-        TokenKind::Char(s) => s.clone(),
-        TokenKind::Punct(s) => (*s).to_string(),
-        TokenKind::Hash => "#".to_string(),
-        TokenKind::Newline => "\n".to_string(),
-        TokenKind::Eof => String::new(),
+        TokenKind::Identifier(s)
+        | TokenKind::Number(s)
+        | TokenKind::String(s)
+        | TokenKind::Char(s) => s.as_str(),
+        TokenKind::Punct(s) => s,
+        TokenKind::Hash => "#",
+        TokenKind::Newline => "\n",
+        TokenKind::Eof => "",
     }
 }
 
@@ -4100,11 +4089,11 @@ fn eval_pp_tokens(toks: &[Token]) -> bool {
     v.truthy()
 }
 
-/// A preprocessor arithmetic value: 64-bit two's-complement bits plus the
-/// C signedness of the expression, modeling intmax_t/uintmax_t evaluation
+/// Preprocessor integer value. Evaluated in 64-bit integer arithmetic with the
+/// C signedness of the expression, modeling `intmax_t`/`uintmax_t` evaluation
 /// (C11 6.10.1p4). Binary operators apply the usual arithmetic
 /// conversions: if either operand is unsigned the operation is unsigned
-/// (so `-1 < 1U` is false — the -1 converts to uintmax_t).
+/// (so `-1 < 1U` is false — the -1 converts to `uintmax_t`).
 #[derive(Clone, Copy)]
 struct PpVal {
     bits: u64,
@@ -4114,13 +4103,13 @@ struct PpVal {
 impl PpVal {
     fn signed(v: i64) -> Self {
         Self {
-            bits: v as u64,
+            bits: v.cast_unsigned(),
             unsigned_: false,
         }
     }
 
     fn from_bool(b: bool) -> Self {
-        Self::signed(b as i64)
+        Self::signed(i64::from(b))
     }
 
     fn truthy(self) -> bool {
@@ -4128,7 +4117,7 @@ impl PpVal {
     }
 
     fn as_i64(self) -> i64 {
-        self.bits as i64
+        self.bits.cast_signed()
     }
 
     fn either_unsigned(self, other: Self) -> bool {
@@ -4144,10 +4133,13 @@ struct PpExprParser<'a> {
     err: bool,
 }
 
-impl<'a> PpExprParser<'a> {
+impl PpExprParser<'_> {
     fn peek_punct(&self) -> Option<&str> {
-        match self.toks.get(self.pos).map(|t| &t.kind) {
-            Some(TokenKind::Punct(s)) => Some(s),
+        match self.toks.get(self.pos) {
+            Some(Token {
+                kind: TokenKind::Punct(s),
+                ..
+            }) => Some(s),
             _ => None,
         }
     }
@@ -4289,18 +4281,18 @@ impl<'a> PpExprParser<'a> {
         let mut v = self.additive();
         loop {
             if self.eat("<<") {
-                let sh = self.additive().bits as u32 & 63;
+                let sh = (self.additive().bits & 63) as u32;
                 v = PpVal {
                     bits: v.bits.wrapping_shl(sh),
                     unsigned_: v.unsigned_,
                 };
             } else if self.eat(">>") {
-                let sh = self.additive().bits as u32 & 63;
+                let sh = (self.additive().bits & 63) as u32;
                 v = PpVal {
                     bits: if v.unsigned_ {
                         v.bits.wrapping_shr(sh)
                     } else {
-                        v.as_i64().wrapping_shr(sh) as u64
+                        v.as_i64().wrapping_shr(sh).cast_unsigned()
                     },
                     unsigned_: v.unsigned_,
                 };
@@ -4342,10 +4334,10 @@ impl<'a> PpExprParser<'a> {
                 };
             } else if self.eat("/") {
                 let r = self.unary();
-                v = self.divide(v, r, false);
+                v = Self::divide(v, r, false);
             } else if self.eat("%") {
                 let r = self.unary();
-                v = self.divide(v, r, true);
+                v = Self::divide(v, r, true);
             } else {
                 return v;
             }
@@ -4354,7 +4346,7 @@ impl<'a> PpExprParser<'a> {
 
     /// `/` and `%` under the usual arithmetic conversions; division by
     /// zero conservatively yields 0.
-    fn divide(&mut self, a: PpVal, b: PpVal, rem: bool) -> PpVal {
+    fn divide(a: PpVal, b: PpVal, rem: bool) -> PpVal {
         let unsigned_ = a.either_unsigned(b);
         if b.bits == 0 {
             return PpVal { bits: 0, unsigned_ };
@@ -4366,9 +4358,9 @@ impl<'a> PpExprParser<'a> {
                 a.bits / b.bits
             }
         } else if rem {
-            a.as_i64().wrapping_rem(b.as_i64()) as u64
+            a.as_i64().wrapping_rem(b.as_i64()).cast_unsigned()
         } else {
-            a.as_i64().wrapping_div(b.as_i64()) as u64
+            a.as_i64().wrapping_div(b.as_i64()).cast_unsigned()
         };
         PpVal { bits, unsigned_ }
     }
@@ -4412,22 +4404,20 @@ impl<'a> PpExprParser<'a> {
             // expression malformed keeps the branch closed.
             TokenKind::Number(s) => {
                 self.pos += 1;
-                match parse_pp_int(s) {
-                    Some(v) => v,
-                    None => {
-                        self.err = true;
-                        PpVal::signed(0)
-                    }
+                if let Some(v) = parse_pp_int(s) {
+                    v
+                } else {
+                    self.err = true;
+                    PpVal::signed(0)
                 }
             }
             TokenKind::Char(s) => {
                 self.pos += 1;
-                match char_literal_body(s) {
-                    Some(body) => PpVal::signed(char_value(body)),
-                    None => {
-                        self.err = true;
-                        PpVal::signed(0)
-                    }
+                if let Some(body) = char_literal_body(s) {
+                    PpVal::signed(char_value(body))
+                } else {
+                    self.err = true;
+                    PpVal::signed(0)
                 }
             }
             TokenKind::Punct(p) if *p == "(" => {
@@ -4490,8 +4480,8 @@ impl<'a> PpExprParser<'a> {
 /// Parse a C preprocessor integer literal (decimal, hex, octal, binary,
 /// with optional u/U/l/L suffixes). Anything else — a floating literal, a
 /// user-defined-literal suffix — is `None`. The value is unsigned when it
-/// carries a `u`/`U` suffix or does not fit in a signed 64-bit intmax_t
-/// (hex/octal ladder reaching uintmax_t).
+/// carries a `u`/`U` suffix or does not fit in a signed 64-bit `intmax_t`
+/// (hex/octal ladder reaching `uintmax_t`).
 fn parse_pp_int(s: &str) -> Option<PpVal> {
     let t = s.trim_end_matches(['u', 'U', 'l', 'L']);
     let unsigned_suffix = s[t.len()..].contains(['u', 'U']);
@@ -4547,18 +4537,18 @@ fn char_value(s: &str) -> i64 {
             Some('x') => {
                 let mut v: i64 = 0;
                 while let Some(d) = chars.peek().and_then(|c| c.to_digit(16)) {
-                    v = v.wrapping_mul(16).wrapping_add(d as i64);
+                    v = v.wrapping_mul(16).wrapping_add(i64::from(d));
                     chars.next();
                 }
                 v
             }
             // \ooo octal escape (1-3 digits, first already consumed).
             Some(d @ '0'..='7') => {
-                let mut v: i64 = d as i64 - '0' as i64;
+                let mut v: i64 = i64::from(d as u8 - b'0');
                 for _ in 0..2 {
                     match chars.peek().and_then(|c| c.to_digit(8)) {
                         Some(o) => {
-                            v = v * 8 + o as i64;
+                            v = v * 8 + i64::from(o);
                             chars.next();
                         }
                         None => break,
@@ -4574,6 +4564,11 @@ fn char_value(s: &str) -> i64 {
     }
 }
 
+/// Preprocess a source file on disk using the given options.
+///
+/// # Errors
+///
+/// Returns [`PreprocessError`] if reading the file fails or if preprocessing limits are exceeded.
 pub fn preprocess_file(
     path: &Path,
     opts: &PreprocessOptions,
@@ -4583,6 +4578,7 @@ pub fn preprocess_file(
     Ok(state.finish())
 }
 
+#[must_use]
 pub fn preprocess_string(source: &str, file: &Path, opts: &PreprocessOptions) -> PreprocessResult {
     let mut state = PreprocessorState::new(opts.clone(), file.to_path_buf());
     let tokens = Lexer::new(source, state.language).tokenize();
@@ -5735,7 +5731,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_shared_macros(shared1)
             .with_accumulate_macros(true);
-        preprocess_string(src, &dir.join("a.c"), &opts1);
+        let _ = preprocess_string(src, &dir.join("a.c"), &opts1);
         // The second run hits the cache; the replayed #define must reach the
         // shared table exactly as a live #define would.
         let shared2 = Arc::new(RwLock::new(MacroTable::new()));
@@ -5744,7 +5740,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             .with_include_expansion_cache(cache)
             .with_shared_macros(Arc::clone(&shared2))
             .with_accumulate_macros(true);
-        preprocess_string(src, &dir.join("b.c"), &opts2);
+        let _ = preprocess_string(src, &dir.join("b.c"), &opts2);
         assert!(
             shared2.read().unwrap().contains_key("FROM_HDR"),
             "cache replay must accumulate macros into the shared table"

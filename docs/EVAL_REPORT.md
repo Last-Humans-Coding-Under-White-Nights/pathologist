@@ -15,6 +15,323 @@
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Second review pass fixes, 2026-09-09 (`--explore`, #59):**
+
+A multi-agent review of the branch confirmed three more issues, each fixed with a
+regression test observed failing first.
+
+*A variant repeated the base's non-`preprocess` reports.* The base merge
+short-circuited past `insert_diagnostic` for any stage but `preprocess`, so the
+key was never registered and every variant that re-lowered the same code
+reported it again as new. The registration now always happens and the keep
+decision is made afterwards, which leaves base behavior unchanged — two
+translation units reporting the same `parse` finding still both report it —
+while variants dedupe against what the base already said. On the corpora this
+removes 13 duplicated reports on hdf, 2 on hiview and 40 on camera.
+
+*A candidate whose value named another macro was judged not to open its arm.*
+Evaluating an arm against only the macros its condition can reach (the change
+that made the search linear) walked the closure without the candidate's own
+binding in scope. For a GN entry like `X=FOO` with `#define FOO 5` in the base
+environment, the closure of `X == 5` stopped at `X`, `FOO` was left unbound, and
+the arm read as closed — so the goal could not pack into an existing variant and
+either burned a budget slot or was truncated. The pending binding now takes part
+in the walk. This affected only packing, never a variant's real preprocessing,
+which always inherits the full environment.
+
+*Return-flow deduplication ran on every merge mode.* Only a variant re-lowers a
+body the program already holds, so only a variant can repeat a return flow; the
+linear scan is now gated on that. The default hdf export is byte-identical
+either way, which is the evidence that the scan was rejecting nothing on the
+base path.
+
+Re-validated after these fixes: **622 workspace tests** (three more regressions:
+a variant not repeating the base's report, a different stage still being kept,
+and an aliased candidate packing into an existing variant), strict all-target
+Clippy, `rustfmt --check`, `RUSTDOCFLAGS='-D warnings' cargo doc`, whitespace,
+and **86/86** pinned corpus checks. The default hdf export is unchanged
+(`57e6aaa…`), `--explore --explore-budget 0` still reproduces it byte for byte,
+and hdf `--explore` is identical across three runs plus one at `--jobs 1`.
+Duplicate `call_sites` groups, defined-function counts and call-site counts are
+unchanged from the previous pass.
+
+**Review fixes, 2026-09-09 (`--explore`, #59):**
+
+A review of the branch found two defects that contradicted guarantees this
+change had written down, plus a search that grew quadratically. All are fixed
+and measured here.
+
+*Variant facts were recorded once per variant instead of merging.*
+`Function::locals` had no writer outside the variant path — lowering tracks
+scope in its own map and leaves the field empty — so the merge's local index
+was seeded from an empty list. Every variant re-allocated a `VarId` for a local
+the base already had, and calls binding those locals stopped comparing equal.
+A second cause was independent: lowering names synthesized temporaries after the
+unit-local `VarId` it just allocated (`_gep6` in the base, `_gep772` in a
+variant), so a name could never match across configurations. Locals are now
+recorded on their function in every body-merging mode, and temporaries are
+paired positionally — the k-th temporary of a kind at a source position.
+
+Groups of byte-identical `call_sites` rows, `--explore`, before → after:
+
+| corpus | duplicate groups | `call_sites` rows |
+|---|---|---|
+| hdf | 7,593 → **16** | 81,707 → 73,971 |
+| hiview | 2,436 → **172** | 37,972 → 35,644 |
+| camera | 18,281 → **217** | 120,393 → 102,105 |
+
+The default configuration has **0** on all three. What remains are sites in
+headers where the recorded facts genuinely differ across configurations, which
+`SQLITE_SCHEMA.md` documents as separate records; the systematic repetition is
+gone. A consumer counting `call_edges` no longer reads that repetition as
+recovered coverage.
+
+*A variant could evict a baseline fact.* An `#ifdef X / #else` pair spells one
+function's two implementations on *different lines*, so the line-keyed dedup
+missed and `add_function_with_param_types` treated the variant's body as a
+redeclaration — overwriting the surviving definition's span and parameters. On a
+two-arm fixture the exported span for `install` moved from the arm the default
+configuration compiles (lines 9–11) to the variant's (5–7), and the baseline's
+indirect edge at 10:5 was **replaced** by one at 6:5 rather than joined by it.
+That contradicts the may-analysis invariant and the branch's own comment at
+`pag.rs` that merging a variant only ever adds. A variant definition now extends
+the base entry it belongs to, found by file and name; a name several defined
+functions in one file share (C++ overloads) does not identify a function and
+keeps the line-keyed behavior.
+
+*The search was quadratic in candidate arms.* Each placement rebuilt the whole
+macro environment and re-preprocessed a conjunction of every arm secured so far,
+and the placement loop rescanned the variant's defines and targets. The budget
+capped variants, not work. Arms are now re-checked only when the added define
+can reach them — decided from the identifier closure of their conditions,
+through macro aliases, so a miss is a proof rather than a guess — each condition
+is evaluated against only the macros it can reach, and the loop's membership
+questions are hash lookups.
+
+One translation unit, all arms mutually compatible so they pile into one
+variant:
+
+| candidate arms | before | after |
+|---|---|---|
+| 800 | 1.19 s | 0.07 s |
+| 1,600 | 1.54 s | 0.13 s |
+| 3,200 | 5.89 s | 0.26 s |
+
+Linear in the arm count, and the result is unchanged: both recover all 3,200
+conditional functions.
+
+Also fixed: the diagnostic dedup key ignored `stage`, so a variant's `parse`
+report could stand in for a later unit's `preprocess` report at the same
+position; `union_aggregate_layout` mutated a type in place without letting the
+tag maps reconsider it; and `variants_merged` was written to `options_json`
+undocumented.
+
+Fresh validation on macOS, `--jobs 8`, solver budget 800,000, against the three
+pinned checkouts under `/private/tmp/corpora`:
+
+- `cargo test --workspace`: **619 passed, 0 failed** (613 before, plus six
+  regressions: duplicate-free configuration-independent call sites, a preserved
+  base definition and its call site, alias reachability in the dependency
+  closure, variant bindings in that closure, stage-aware diagnostic dedup, and
+  tag richness after a union). The first two were observed failing before their
+  fixes and passing after.
+- Strict all-target Clippy, `rustfmt --check` on every touched file, and
+  `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps`: clean.
+- `python3 scripts/eval_check.py --corpus-base /private/tmp/corpora`: **86/86**.
+- The default (no `--explore`) hdf export is **byte-identical** to the same
+  export before these fixes, excluding `analysis_run` — the corrections do not
+  touch the configured path.
+- `--explore --explore-budget 0` reproduces that default export byte for byte.
+- hdf `--explore` three times plus once at `--jobs 1`: all four **identical**.
+
+Exploration still adds what it is for, measured against the default run:
+
+| corpus | defined functions | distinct source edges | wall | peak RSS |
+|---|---|---|---|---|
+| hdf | 10,246 → 10,334 | 75,676 → 76,631 | 8.72 s | 730 MB |
+| hiview | 7,779 → 8,108 | 28,613 → 30,659 | 5.35 s | 391 MB |
+| camera | 19,015 → 19,194 | 73,507 → 75,290 | 22.26 s | 1,030 MB |
+
+Peak RSS against the default configuration on the same machine — hdf 649–686 MB,
+hiview 360–374 MB, camera 1,093–1,198 MB — puts every exploring run inside the
+baseline's own run-to-run range, so #59's memory budget is met rather than
+assumed. Distinct source edges group by caller, callee, source file/line/column
+and resolution.
+
+**Cleanup verification, 2026-09-09 (`--explore`, #59):**
+
+Reviewed the cross-crate cleanup and retained the guarded direct call-site lookup,
+borrowed token rendering, removal of the parameter-vector clone, macro-read/goal
+deduplication, and disabled LineMap tracking for synthetic predicates. These
+remove identifiable work; no controlled timing comparison was performed, so this
+pass makes no throughput claim. Iterator rewrites, annotations, and formatting
+are readability/API changes rather than measured performance gains.
+
+Two proposed optimizations needed correction:
+
+- Filtering with `to_str().is_some_and(...)` skipped entire non-UTF-8 directory
+  names. Filename-byte filtering now preserves them while excluding hidden names
+  and `target`. A Unix filename regression failed before the fix and passes now.
+  `to_string_lossy()` already borrows valid UTF-8 names, so replacing it did not
+  eliminate an allocation for every ordinary directory entry.
+- `opts.defines.extend(base_defines.clone())` allocated a temporary tree map.
+  Cloning entries directly into the destination avoids that intermediate map.
+
+New unresolved `LineMap` documentation links were qualified. Workspace Rustdoc
+also exposed older unqualified method links and a public-to-private link; those
+were corrected without changing runtime behavior.
+
+Fresh verification: **613 workspace tests passed**, strict all-target Clippy
+passed, and `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps` passed.
+The rebuilt release binary passed **86/86 pinned corpus checks**.
+Formatting and diff-whitespace checks passed. Earlier timing tables below remain
+historical measurements, not measurements of this cleanup.
+
+**Second review pass, 2026-09-08 (`--explore`, #59):**
+
+Three fixes, each measured as a controlled before/after on this machine — the
+same binary flags, the same solver budget, one run each — rather than against
+the table below, which was captured under different conditions and does not
+reproduce row-for-row here.
+
+- `#else` arms were unreachable. Activation candidates were drawn from the
+  target arm's own `reads`, and the preprocessor records none for an `#else`:
+  it opens by *falsifying* the arms above it. `#ifndef FOO / #else` — one of
+  the most common ways an alternate implementation is spelled — was therefore
+  never explored at all, and `ArmDirective::Else` in `ArmCondition::from_chain`
+  was dead code. Candidates now come from the whole chain prefix; the
+  activation check already negates every preceding arm, so a candidate that
+  would keep an earlier arm true is still rejected.
+- Enabling exploration could *lose* a baseline fact. In
+  `ensure_field_summary_for_var_named`, a GEP whose `expected_name` resolved
+  nowhere in the base variable's layout returned `None`, where the baseline
+  path returns the positional field's summary. Merging a variant must only add
+  facts; it now falls back to the positional entry.
+- A variant re-lowers the whole unit, so every non-`preprocess` diagnostic the
+  base already reported came back once per variant. Variant diagnostics are
+  deduplicated at every stage now; one a variant's own code produces is still
+  new, and still kept.
+
+Also: variant call records no longer overwrite the program-wide site-key entry
+for a source location, so the base configuration's record stays canonical for a
+later unit that reaches the same site; `union_aggregate_layout` answers the
+common "this variant adds nothing" case against the stored layout instead of
+deep-cloning a descriptor per existing field first.
+
+| corpus | functions | call-edge rows | distinct source edges | flow-edge rows | variants |
+|---|---:|---:|---:|---:|---:|
+| hdf | 12,771 → 12,771 | 85,033 → 85,374 | 76,630 → 76,631 | 153,774 → 154,592 | 86 → 87 |
+| hiview | 11,848 → 11,848 | 32,688 → 32,760 | 30,655 → 30,659 | 66,579 → 66,656 | 59 → 61 |
+| camera | 25,892 → 25,892 | 82,965 → 83,017 | 75,291 → 75,291 | 126,384 → 126,460 | 109 → 109 |
+
+Every metric is up or unchanged; nothing is lost on any corpus. Camera's variant
+count is unchanged because its budget is already saturated — its gain is the
+field-summary fallback alone, which is the clearest evidence that the third
+finding was a real loss and not a theoretical one.
+
+- `cargo test --workspace`: **612 passed, 0 failed, 0 ignored**.
+- `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
+  on the touched crates: passed.
+- `python3 scripts/eval_check.py --corpus-base /private/tmp/corpora`: **86/86**.
+- HDF `--explore --explore-budget 0` versus the default run: the two exports are
+  byte-identical once `analysis_run` is excluded.
+- HDF `--explore` three times plus once at `--jobs 1`: all four exports
+  byte-identical. The index stays reproducible.
+
+**Local review validation, 2026-09-08 (`--explore`, #59):**
+
+The review fixed two losses of variant facts: grouping `A && !B` with `B` could
+close a targeted arm, and merging calls by source location alone discarded
+macro-selected callback arguments. Candidate predicates now include earlier-arm
+exclusions and are rechecked under combined definitions. Call merging retains
+separate argument/receiver/return facts. Local-variable matching uses a hash index
+for the functions being extended, replacing repeated linear scans; call lookup
+and flow deduplication remain scoped to one TU's variants. Base indexing reuses
+the existing path instead of duplicating its lowering/error handling.
+
+Fresh validation on macOS, the three clean revision-pinned corpora under
+`/private/tmp/corpora`, `--jobs 8`, solver budget 800,000:
+
+- `cargo test --workspace`: **605 passed, 0 failed, 0 ignored**.
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- Rebuilt release binary: **86/86** default `eval_check` checks passed.
+- HDF `--explore --explore-budget 0`: every analysis table matches the default
+  export row for row; `analysis_run` is excluded because requested options and
+  run metadata differ.
+- Regression tests observed failure before the corresponding fixes and pass now:
+  incompatible define grouping, shadowed `#elif` feasibility, and changed callback
+  arguments at a shared call site. Identical shared calls still deduplicate.
+
+| corpus | functions | call-edge rows | distinct source edges | flow-edge rows | wall seconds |
+|---|---:|---:|---:|---:|---:|
+| hdf | 12,771 | 85,105 | 76,630 | 154,653 | 11.33 |
+| hiview | 11,848 | 32,966 | 30,655 | 72,811 | 6.71 |
+| camera | 25,892 | 83,153 | 75,291 | 137,102 | 30.28 |
+
+These are one fresh run per corpus with `--explore` at budget four; timings include
+`cargo run` startup and are not a controlled before/after speed comparison. The
+larger raw edge counts include separate call records for differing variant facts,
+so they must not be read as equivalent gains in source-level coverage. Distinct
+source edges group by caller, callee, source file/line/column and resolution.
+Conditional signatures and multi-define/nested activation remain the documented
+[analysis limitations](ANALYSIS.md#limits-of---explore).
+
+Reproduce the default check with
+`python3 scripts/eval_check.py --corpus-base /private/tmp/corpora` after rebuilding
+`cargo build --release -p trace-cli`. For exploration, run
+`TRACE_SOLVE_BUDGET_POPS=800000 cargo run -p trace-cli --release -- analyze <corpus> --jobs 8 --explore -o <output.db>`.
+
+**Original implementation measurements, 2026-09-08 (`--explore`, #59):**
+The following numbers describe the implementation before the local review fixes;
+the fresh validation above supersedes them for the current tree.
+release build of the branch against the three pinned checkouts under `/private/tmp/corpora`,
+`--jobs 8`, 800,000-pop budget. The default path passes **86/86** `eval_check` checks: `--explore`
+is off by default. Budget-zero equivalence concerns analysis facts; `analysis_run`
+records different exploration options and must be excluded from a comparison.
+That exactness needed a fix. The solver's name-based GEP fallback was gated on the `--explore`
+flag, so asking for exploration relaxed the cross-struct `FieldId` guard even when no variant was
+ever generated and no layout was ever unioned: at budget 0 it admitted 11 call edges the guard
+exists to reject. It is now gated on `Program::variants_merged`, the count of variant units that
+actually merged.
+
+`--explore` was run three times per corpus, plus once at `--jobs 1` on hdf. Every run is
+**row-identical** — the index stays reproducible, which the shared include-expansion cache makes
+easy to break: variant preprocessing inherits `frozen_expansion_cache`, so an exploratory define
+cannot publish an expansion for another unit to consume. Candidate discovery also walks the tree
+in sorted order and breaks equal-confidence ties on the candidate's source path, so the value a
+variant is built with does not depend on `read_dir` order — that one is invisible on a single
+machine and would have surfaced as an unreproducible index elsewhere.
+
+| corpus | functions | call edges | flow edges | wall (base → explore) |
+|---|---|---|---|---|
+| hdf | 12,649 → 12,771 | 75,679 → 76,634 | 134,838 → 146,833 | 7.6s → 9.3s |
+| hiview | 11,436 → 11,848 | 28,636 → 30,677 | 58,762 → 71,048 | 5.1s → 5.3s |
+| camera | 25,613 → 25,888 | 73,507 → 75,194 | 104,068 → 122,113 | 21.2s → 24.3s |
+
+The cost is the preprocessing and lowering of the variants themselves: +22% on hdf, +15% on
+camera, +5% on hiview at a budget of four.
+
+Counted over **defined** functions, exploration only adds: +90 on hdf, +329 on hiview, +186 on
+camera, with **none** of the baseline's definitions missing on hdf or hiview. Camera shows three,
+and they are not a loss either — `LoggingSurfaceBufferInfo` and the two `TestCaptureCallback`
+members are each defined in two twin files, and the run anchors the row to whichever merges
+first; that dedup predates #59.
+
+A raw whole-table count does suggest 29 hdf functions "dropped", and that reading is wrong. Every
+one of the 29 carries `is_defined = 0`: they are call-target stubs, anchored at the site that
+first references them. Exploration opens earlier code in the same file, so the first reference
+moves and the stub is re-anchored — `HDIServiceManager::GetService` goes from line 730 to line 90
+of `service_manager_hdi_c_test.cpp`, and the same file gains 18 recovered test bodies. Comparing
+by name, all 29 are still in the database. Worth stating because the naive query looks like a
+regression and is not one.
+
+Review fixes measured against the first cut of the branch (hdf): pairing variant parameters with
+the base signature by name rather than by position removed **4,225** variables that positional
+pairing had duplicated or bound to the wrong parameter. The same change stops a variant-only
+parameter from growing the canonical arity, which the solver reads as an indirect-call target's
+parameter count — growing it would have cost baseline call edges.
+
 **Initial validation, 2026-09-08 (dependency roots `--dep <root>`, #60):** fresh release builds of
 `master` (be7d7ca) and the branch were compared against the three clean pinned checkouts under
 `/private/tmp/corpora`, `--jobs 8`, 800,000-pop budget. Both pass **86/86** `eval_check` checks

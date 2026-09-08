@@ -52,13 +52,14 @@ pub struct Token {
     /// For a token that came out of a macro replacement list: the
     /// `(line, col)` of the outermost invocation that produced it, in the
     /// file being processed. `line`/`col` keep the definition-site
-    /// coordinates; this is what the LineMap and `__LINE__` report, so
+    /// coordinates; this is what the [`crate::LineMap`] and `__LINE__` report, so
     /// macro-expanded code attributes to its expansion site even through
     /// forwarding macros.
     pub(crate) origin: Option<(u32, u32)>,
 }
 
 impl Token {
+    #[must_use]
     pub fn new(kind: TokenKind, line: u32, col: u32) -> Self {
         Self {
             kind,
@@ -70,12 +71,34 @@ impl Token {
         }
     }
 
+    #[must_use]
+    pub fn is_newline(&self) -> bool {
+        matches!(self.kind, TokenKind::Newline)
+    }
+
+    #[must_use]
+    pub fn is_eof(&self) -> bool {
+        matches!(self.kind, TokenKind::Eof)
+    }
+
+    #[must_use]
+    pub fn is_punct(&self, punct: &str) -> bool {
+        matches!(&self.kind, TokenKind::Punct(s) if *s == punct)
+    }
+
+    #[must_use]
+    pub fn is_ident(&self, name: &str) -> bool {
+        matches!(&self.kind, TokenKind::Identifier(s) if s == name)
+    }
+
     /// Where this token attributes to: its own position for source text,
     /// the outermost invocation for macro-expanded text.
+    #[must_use]
     pub(crate) fn expansion_site(&self) -> (u32, u32) {
         self.origin.unwrap_or((self.line, self.col))
     }
 
+    #[must_use]
     pub(crate) fn is_hidden(&self, name: &str) -> bool {
         self.hidden.as_ref().is_some_and(|h| h.contains(name))
     }
@@ -85,6 +108,7 @@ impl Token {
     /// the invocation's expansion site. `origin` may itself be a painted
     /// token (a forwarding macro's body), so its own site is inherited
     /// rather than its definition coordinates.
+    #[must_use]
     pub(crate) fn with_macro_hide(&self, origin: &Token, name: &str) -> Token {
         let mut set = HashSet::new();
         if let Some(h) = &origin.hidden {
@@ -104,6 +128,7 @@ impl Token {
         }
     }
 
+    #[must_use]
     pub(crate) fn union_hidden(left: &Token, right: &Token) -> Option<Arc<HashSet<String>>> {
         match (&left.hidden, &right.hidden) {
             (None, None) => None,
@@ -125,7 +150,7 @@ impl Token {
 /// C++11 raw string literal, whose body reverts phase 2 and is copied
 /// physically ([lex.pptoken]p3). Token positions stay physical: a token
 /// starts where its first character sits in the file, which is what the
-/// LineMap wants; whether it touched its predecessor is recorded on the
+/// [`crate::LineMap`] wants; whether it touched its predecessor is recorded on the
 /// token (`Token::adjacent_before`) rather than recomputed from positions.
 pub struct Lexer<'a> {
     input: &'a str,
@@ -153,6 +178,7 @@ pub struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
+    #[must_use]
     pub fn new(input: &'a str, language: Language) -> Self {
         let mut lexer = Self {
             input,
@@ -173,6 +199,7 @@ impl<'a> Lexer<'a> {
         self.language == Language::Cpp
     }
 
+    #[must_use]
     pub fn tokenize(mut self) -> Vec<Token> {
         let mut tokens = Vec::new();
         loop {
@@ -372,7 +399,7 @@ impl<'a> Lexer<'a> {
         let ahead = self.lookahead::<4>();
         let enc = match ahead {
             ['u', '8', ..] => 2,
-            ['u', ..] | ['U', ..] | ['L', ..] => 1,
+            ['u' | 'U' | 'L', ..] => 1,
             _ => 0,
         };
         if self.is_cpp() && ahead[enc] == 'R' && ahead[enc + 1] == '"' {
@@ -417,7 +444,7 @@ impl<'a> Lexer<'a> {
         // rests on the physical `"`.
         let prefix_end = self.pos;
         let mut prefix = self.lookahead_string(enc + 1);
-        for _ in 0..enc + 1 {
+        for _ in 0..=enc {
             self.advance_char();
         }
         let rest = &self.input[self.pos..];
@@ -684,12 +711,15 @@ fn find_splices(input: &str) -> Vec<usize> {
 
 /// `text` with every line splice in it deleted.
 fn strip_splices(text: &str) -> String {
+    if !text.contains('\\') {
+        return text.to_string();
+    }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(i) = rest.find('\\') {
         let len = splice_len(rest, i);
         if len == 0 {
-            out.push_str(&rest[..i + 1]);
+            out.push_str(&rest[..=i]);
             rest = &rest[i + 1..];
         } else {
             out.push_str(&rest[..i]);

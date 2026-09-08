@@ -108,3 +108,4 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 | New SQLite column | `trace-db/src/schema.rs`, `export.rs`, `docs/SQLITE_SCHEMA.md` |
 | Parse new C construct | `trace-parse/src/lower.rs` |
 | Measure what the configuration excludes (`#if` arms not taken) | `PreprocessOptions::record_conditionals` + `PreprocessResult::conditionals` (`trace-preproc/src/conditionals.rs`), `trace-cli/examples/conditional_coverage.rs`, `scripts/gen_conditional_coverage_report.py` → `docs/CONDITIONAL_COVERAGE.md` |
+| Bounded conditional-variant exploration (`--explore`) | `PreprocessOptions::explore` + `explore_budget`, `trace-parse/src/explore.rs`, `gn_defines.rs`, `merge_unit_variants`, `lower.rs` → `docs/ANALYSIS.md` |
