@@ -2824,28 +2824,31 @@ fn varargs_omitted(args: &[Vec<Token>], idx: usize) -> bool {
     idx == 0 && args.len() == 1 && arg_is_blank(&args[0])
 }
 
-/// Whether the `##` whose right operand sits at `right` is the GNU
-/// `, ## __VA_ARGS__` form: the variadic tail parameter after the operator
-/// and a comma already emitted into `out`. `substitute_macro`'s `##` branch
-/// owns that shape — it deletes the comma when the varargs are omitted and
-/// leaves the operator inert otherwise — so an empty parameter standing
-/// between the comma and the `##` must step aside instead of consuming the
-/// operator as an ordinary placemarker would.
-fn is_gnu_comma_paste(
-    body: &[Token],
-    right: usize,
-    params: &[String],
-    variadic: bool,
-    out: &[Token],
-) -> bool {
-    let Some(TokenKind::Identifier(name)) = body.get(right).map(|t| &t.kind) else {
-        return false;
-    };
-    params
-        .iter()
-        .position(|p| p == name)
-        .is_some_and(|idx| is_variadic_tail(params, variadic, idx))
-        && matches!(out.last().map(|t| &t.kind), Some(TokenKind::Punct(s)) if *s == ",")
+/// Whether the `##` operator at `body[op]` is the GNU `, ## __VA_ARGS__`
+/// form: a `,` spelled immediately before the operator in the replacement
+/// list, and the variadic tail parameter immediately after it — that right
+/// half arriving as `right_is_variadic_tail`, since the only caller has
+/// already resolved the parameter it is about to ask after.
+/// `substitute_macro`'s `##` branch owns the form — it deletes the comma
+/// when the varargs are omitted and leaves the operator inert otherwise;
+/// every other `##` over an empty operand is an ordinary C99 placemarker.
+///
+/// The form is a property of the definition, so it must be read from the
+/// definition. Asking instead what token was last emitted answers a
+/// different question — a parameter substituting to something that merely
+/// ends in a comma, or to whitespace hiding the comma behind it, changes the
+/// answer for a macro whose text never changed — and gcc's rule is the
+/// spelled one: `F(v, x, ...) g(v, x ## __VA_ARGS__)` has a parameter
+/// between the comma and the operator, so it is not this form and `F(1,)`
+/// keeps its comma. (clang collapses the placemarker first and applies the
+/// rule to whatever that collapse exposes; we follow gcc, whose reading does
+/// not depend on the arguments.)
+fn is_gnu_comma_paste(body: &[Token], op: usize, right_is_variadic_tail: bool) -> bool {
+    right_is_variadic_tail
+        && op
+            .checked_sub(1)
+            .and_then(|left| body.get(left))
+            .is_some_and(|t| is_punct(t, ","))
 }
 
 /// Index of the `(` that opens a function-like macro's parameter list, if
@@ -3516,12 +3519,7 @@ fn substitute_macro(
             if let TokenKind::Identifier(name) = &body[i + concat_width].kind {
                 if let Some(idx) = params.iter().position(|p| p == name) {
                     let is_va_tail = is_variadic_tail(params, variadic, idx);
-                    if is_va_tail
-                        && matches!(
-                            out.last().map(|t| &t.kind),
-                            Some(TokenKind::Punct(s)) if *s == ","
-                        )
-                    {
+                    if is_gnu_comma_paste(body, i, is_va_tail) {
                         // GNU `, ## args`: with the varargs omitted the
                         // comma is deleted; otherwise the `##` is inert — it
                         // must NOT reach apply_concatenation, which would
@@ -3612,14 +3610,14 @@ fn substitute_macro(
                         // itself, or the operator would reach
                         // apply_concatenation and paste whatever preceded
                         // the parameter — `S(a x ## +b)` with `x` empty
-                        // fusing `a` and `+` into the non-token `a+`. The
-                        // exception is GNU `, ## __VA_ARGS__`, whose comma
-                        // the `##` branch above deletes; hiding the operator
-                        // there would leave the unparseable `f(a,)`.
+                        // fusing `a` and `+` into the non-token `a+`. No
+                        // exception for GNU `, ## __VA_ARGS__`: the token
+                        // before that `##` is this parameter, not a comma,
+                        // so `is_gnu_comma_paste` does not hold and the
+                        // comma the placemarker leaves standing is an
+                        // ordinary argument separator (gcc keeps it too).
                         let width = concat_width_after(body, i);
-                        if width > 0
-                            && !is_gnu_comma_paste(body, i + 1 + width, params, variadic, &out)
-                        {
+                        if width > 0 {
                             // The surviving right operand takes this
                             // parameter's position, and with it its
                             // adjacency; the argument's newlines go with the
@@ -7851,44 +7849,50 @@ int from_late;
         assert!(result.output.contains("d f(y)"), "{}", result.output);
     }
 
-    /// An empty parameter between a comma and `## __VA_ARGS__` leaves the GNU
-    /// comma rule alone: it is the comma the omitted varargs delete, not a
-    /// token the placemarker may shield. The compilers split here — clang
-    /// collapses the placemarker first and deletes the comma (`g(o)`), while
-    /// gcc applies the rule only to a comma spelled immediately before the
-    /// `##` and so keeps it (`g(o, )`). We follow clang. Swallowing the `##`
-    /// as an ordinary placemarker would land on gcc's output by accident,
-    /// not by rule, and inconsistently — see the newline-blank case below.
+    /// The GNU `, ## __VA_ARGS__` form is a property of the definition, so
+    /// it is decided from the body: a `,` spelled immediately before the
+    /// `##`, with the variadic tail parameter right after it. A parameter
+    /// standing between the comma and the operator is not that form — the
+    /// `##` is an ordinary paste whose left operand went empty, a
+    /// placemarker, and the comma is nobody's to delete. That is gcc's rule,
+    /// and being a property of the definition it answers the same for every
+    /// invocation: `w`/`u` are `x`/`z` with the empty argument spelled as a
+    /// newline, and must expand the same. Reading the last token already
+    /// emitted answered both questions by accident — the newline spelling
+    /// pushed a `Newline` where the predicate looked for the comma — so the
+    /// same macro invoked the same way expanded two different ways.
+    ///
+    /// clang instead collapses the placemarker first and applies the comma
+    /// rule to whatever that exposes (`x` -> `g(o)`), which makes the answer
+    /// depend on what the argument expanded to; we follow gcc.
     #[test]
-    fn empty_left_paste_keeps_gnu_comma_deletion() {
+    fn gnu_comma_form_is_decided_from_the_body() {
         let src = include_str!("../../../tests/fixtures/preproc/empty_left_paste.c");
         let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
-        for expected in ["x g(o)", "y g(o ,)", "z h(t)"] {
+        let out = flat(&result.output);
+        // gcc 16 keeps every one of these commas; clang 21 keeps only `y`,
+        // whose varargs are explicitly supplied and empty.
+        for expected in ["xg(o,)", "yg(o,)", "zh(t,)", "wg(o,)", "uh(t,)"] {
             assert!(
-                result.output.contains(expected),
+                out.contains(expected),
                 "missing {expected}: {}",
                 result.output
             );
         }
     }
 
-    /// The same GNU-comma shapes with a newline-only blank argument, pinned
-    /// as they behave rather than as a rule they follow. `is_gnu_comma_paste`
-    /// reads the last token already emitted, and an argument that is only
-    /// newlines pushes those first, hiding the comma from the predicate — so
-    /// the placemarker swallows the `##` after all and the comma survives.
-    /// That lands on gcc's output where the token-only spelling above lands
-    /// on clang's; both compilers are self-consistent across the two
-    /// spellings and we are not. Reading the body's comma instead of
-    /// `out.last()` would settle it. Pinned so the split cannot drift
-    /// unnoticed while it stands.
+    /// The form itself is untouched: a comma really spelled before the `##`
+    /// is deleted when the varargs are omitted (`m`) and kept when one is
+    /// supplied, however it is spelled (`k`, a newline-only argument). gcc
+    /// and clang agree on both.
     #[test]
-    fn empty_left_paste_newline_blank_keeps_gnu_comma() {
+    fn gnu_comma_form_still_deletes_the_comma_it_owns() {
         let src = include_str!("../../../tests/fixtures/preproc/empty_left_paste.c");
         let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
-        for expected in ["w g(o ,)", "u h(t ,)"] {
+        let out = flat(&result.output);
+        for expected in ["mg(o)", "kg(o,)"] {
             assert!(
-                result.output.contains(expected),
+                out.contains(expected),
                 "missing {expected}: {}",
                 result.output
             );

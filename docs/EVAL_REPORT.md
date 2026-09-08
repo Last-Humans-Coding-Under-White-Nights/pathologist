@@ -15,6 +15,25 @@
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Re-verified 2026-09-08 (GNU `, ## __VA_ARGS__` decided from the body, #65):** fresh
+release builds of `master` (c4d0ff0) and the branch were compared on the same machine against
+the three clean pinned checkouts under `/private/tmp/corpora`, `--jobs 8`, 800,000-pop budget.
+Both pass **86/86** `eval_check` checks with every measured value identical, and the SQLite dumps
+excluding `analysis_run` are **byte-identical** on all three corpora (637,396, 339,509 and
+696,324 statements). The `parse_failures` captures (633 / 142 / 385 rows) and the
+`conditional_coverage` TSVs are byte-identical too, so `docs/PARSE_FAILURES.md` and
+`docs/CONDITIONAL_COVERAGE.md` need no regeneration and `scripts/eval_expected.json` needs no
+re-capture.
+
+The change does move output on a shape the corpora do not contain, which is why it was measured
+rather than assumed: `, <param> ## <variadic tail>` — a comma, then a parameter, then the paste —
+now keeps its comma (gcc's reading) where it used to delete it. Scanning the three trees for it
+(logical `#define` lines, `\`-newline continuations joined) finds three `, <ident> ##` macros in
+all, the same three #54's eval notes reported: `HCS_NODE`, `HCS_PROP` and `HCS_NODE_HAS_PROP` in
+HDF, whose left operand is the literal `_` and which are not variadic. The variadic logging
+macros the trees do define paste `## __VA_ARGS__` straight onto a comma, which is the form and is
+unchanged.
+
 **Re-verified 2026-09-08 (conditional `#include` suppression, #56):** fresh
 release builds of `master` (0a35409) and the branch were compared on the same
 machine against the three clean pinned checkouts under `/private/tmp/corpora`,

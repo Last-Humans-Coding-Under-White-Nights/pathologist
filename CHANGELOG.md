@@ -33,6 +33,18 @@ All notable changes to `trace` are documented in this file.
 
 ### Fixed
 
+- The GNU `, ## __VA_ARGS__` comma rule is decided from the macro body (#65), not from the last
+  token already emitted: the form is a `,` spelled immediately before the `##` with the variadic
+  tail parameter right after it. Reading the emitted token asked a different question, and a
+  parameter that substituted to whitespace changed its answer — `CALL(o,)` and the same call with
+  the empty argument spelled as a newline expanded two different ways (`g(o)` against `g(o ,)`),
+  one following clang and the other gcc. Both spellings now expand alike. A parameter standing
+  between the comma and the operator is no longer treated as that form either, so
+  `#define F(v, x, ...) g(v, x ## __VA_ARGS__)` invoked as `F(1,)` keeps the separator it was
+  deleting (`g(1, )`, gcc's reading) instead of emitting `g(1)`. The two sites that used to
+  decide this collapse to one: reading the body, the placemarker branch's exception cannot hold,
+  since the token before that `##` is the parameter being placemarked. The index is
+  byte-identical on all three eval corpora.
 - A repeated `#include` of a path is suppressed only on a reason the file itself stated (#56).
   The preprocessor used to skip any path it had already processed in this run, before looking at
   include guards at all, so every deliberate re-inclusion was lost — an X-macro table included
