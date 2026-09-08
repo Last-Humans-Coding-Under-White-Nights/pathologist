@@ -25,3 +25,7 @@ w CALL(o,
 )
 u LOGV(t,
 )
+#define GNU(o, ...) g(o, ## __VA_ARGS__)
+m GNU(o)
+k GNU(o,
+)
