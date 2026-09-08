@@ -1,3 +1,5 @@
+![](docs/images/Logo-big.png)
+
 # trace
 
 **trace** is a static analysis tool for C codebases. It runs a custom preprocessor, parses translation units with [tree-sitter](https://tree-sitter.github.io/), performs Andersen-style field-sensitive pointer analysis, and exports call graphs and interprocedural argument-flow facts to SQLite.
