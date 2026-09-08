@@ -1,4 +1,4 @@
-use crate::schema::{SCHEMA_V3, SCHEMA_VERSION};
+use crate::schema::{SCHEMA_V4, SCHEMA_VERSION};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use rustc_hash::FxHashSet;
@@ -53,11 +53,12 @@ pub fn export_to_sqlite(
             "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY;",
         )?;
         conn.execute_batch("BEGIN IMMEDIATE;")?;
-        conn.execute_batch(SCHEMA_V3)?;
+        conn.execute_batch(SCHEMA_V4)?;
 
         let options_json = serde_json::json!({
             "include_paths": program.include_paths,
             "defines": program.defines,
+            "dep_roots": program.dep_roots(),
             "include_points_to": opts.include_points_to,
             "full_detail": opts.full_detail,
             "model_files": opts.model_files,
@@ -111,10 +112,15 @@ fn chrono_lite_now() -> String {
 }
 
 fn export_files(conn: &Connection, program: &Program) -> Result<()> {
-    let mut stmt =
-        conn.prepare_cached("INSERT INTO files (id, path, sha256) VALUES (?1, ?2, ?3)")?;
+    let mut stmt = conn
+        .prepare_cached("INSERT INTO files (id, path, sha256, is_dep) VALUES (?1, ?2, ?3, ?4)")?;
     for file in &program.symbols.files {
-        stmt.execute(params![file.id.0, file.path.display().to_string(), ""])?;
+        stmt.execute(params![
+            file.id.0,
+            file.path.display().to_string(),
+            "",
+            file.is_dep as i32
+        ])?;
     }
     Ok(())
 }
@@ -442,7 +448,7 @@ fn export_one_variable(stmt: &mut rusqlite::Statement<'_>, var: &trace_ir::Varia
 
 fn export_functions(conn: &Connection, program: &Program) -> Result<()> {
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO functions (id, name, file_id, line_start, line_end, linkage, signature, is_defined) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO functions (id, name, file_id, line_start, line_end, linkage, signature, is_defined, is_dep) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
     for func in &program.symbols.functions {
         let linkage = match func.linkage {
@@ -458,7 +464,8 @@ fn export_functions(conn: &Connection, program: &Program) -> Result<()> {
             func.end_line.max(func.span.line),
             linkage,
             format!("fn_{}", func.name),
-            func.is_defined as i32
+            func.is_defined as i32,
+            program.is_dep_file(func.file) as i32,
         ])?;
     }
     Ok(())

@@ -50,6 +50,9 @@ pub fn merge_unit_types(program: &mut Program, unit: &UnitIndex) {
 }
 
 /// TU preamble: types plus prototypes; header flow stays on the defining unit.
+///
+/// Also the mode for a dependency-root header's own unit: its bodies are not
+/// the target's code, so they contribute prototypes and stop there (#60).
 pub fn merge_unit_symbols(program: &mut Program, unit: &UnitIndex) {
     merge_unit(program, unit, MergeMode::SymbolsOnly);
 }
@@ -135,6 +138,13 @@ fn merge_unit(program: &mut Program, unit: &UnitIndex, mode: MergeMode) {
         f.span.file = span_file;
         f.file = span_file;
         f.return_type = remap_type(f.return_type, &type_map);
+        // A body written in a dependency header is not the target's code:
+        // keep the signature, drop everything the body would contribute (#60).
+        if program.is_dep_file(span_file) {
+            f.is_defined = false;
+            f.end_line = f.span.line;
+            f.locals.clear();
+        }
         let carries_params = !f.params.is_empty();
         let is_definition = f.is_defined;
         let backfills_params = carries_params
@@ -186,13 +196,17 @@ fn merge_unit(program: &mut Program, unit: &UnitIndex, mode: MergeMode) {
         {
             continue;
         }
+        let span_file = map_file(var.span.file);
+        if var.storage == trace_ir::StorageClass::Local && program.is_dep_file(span_file) {
+            continue;
+        }
         let new_id = program.symbols.alloc_var_id();
         let mut v = var.clone();
         let old = v.id;
         v.id = new_id;
         v.type_id = remap_type(v.type_id, &type_map);
         v.fn_id = v.fn_id.and_then(|id| fn_map.get(&id).copied());
-        v.span.file = map_file(v.span.file);
+        v.span.file = span_file;
         program.symbols.add_variable(v);
         var_map.insert(old, new_id);
     }
@@ -228,6 +242,9 @@ fn merge_unit(program: &mut Program, unit: &UnitIndex, mode: MergeMode) {
             continue;
         }
         let span_file = map_file(cs.span.file);
+        if program.is_dep_file(span_file) {
+            continue;
+        }
         let key: SiteKey = (span_file, cs.span.line, cs.span.col, cs.callee_name.clone());
         if let Some(&existing) = program.dedup.site_keys.get(&key) {
             call_map.insert(cs.id, existing);
@@ -271,6 +288,13 @@ fn merge_unit(program: &mut Program, unit: &UnitIndex, mode: MergeMode) {
         let Some(&new_fn) = fn_map.get(old_fn) else {
             continue;
         };
+        if program
+            .symbols
+            .function_by_id(new_fn)
+            .is_some_and(|f| program.is_dep_file(f.file))
+        {
+            continue;
+        }
         let remapped: Vec<ReturnFlow> = flows
             .iter()
             .filter(|f| return_flow_vars(f).all(|v| var_map.contains_key(&v)))

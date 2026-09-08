@@ -1,6 +1,6 @@
 # SQLite schema
 
-Schema version: **v3**
+Schema version: **v4**
 
 See also the [README](../README.md) for CLI flags that control what is exported.
 
@@ -58,10 +58,10 @@ diagnostics
 |--------|------|-------------|
 | `id` | INTEGER PK | Run id |
 | `trace_version` | TEXT | Full binary identity: package version, source revision, dirty state, and build date |
-| `schema_version` | INTEGER | Database layout version (currently `3`) |
+| `schema_version` | INTEGER | Database layout version (currently `4`) |
 | `target_root` | TEXT | Analyzed directory |
 | `created_at` | TEXT | Unix timestamp (seconds) |
-| `options_json` | TEXT | JSON: `include_paths`, `defines`, `include_points_to`, `full_detail` |
+| `options_json` | TEXT | JSON: `include_paths`, `defines`, `dep_roots`, `include_points_to`, `full_detail` |
 
 ### files
 
@@ -70,6 +70,7 @@ diagnostics
 | `id` | INTEGER PK | File id |
 | `path` | TEXT UNIQUE | Absolute/normalized path |
 | `sha256` | TEXT | Hash placeholder (may be empty) |
+| `is_dep` | INTEGER | 1 if file resides under a dependency root (`--dep`), 0 otherwise |
 
 ### functions
 
@@ -82,7 +83,8 @@ diagnostics
 | `line_end` | INTEGER | End line of the definition body; equals `line_start` for prototypes and synthesized externals |
 | `linkage` | TEXT | `external`, `internal`, `none` |
 | `signature` | TEXT | Placeholder `fn_<name>` |
-| `is_defined` | INTEGER | 1 if a body exists under the analyzed root. 0 rows include prototype-only declarations and synthesized externals (libc/logging backends never declared in-tree) |
+| `is_defined` | INTEGER | 1 if a body exists under the analyzed root. 0 rows include prototype-only declarations, synthesized externals (libc/logging backends never declared in-tree), and dependency declarations |
+| `is_dep` | INTEGER | 1 if function originates from a dependency root (`--dep`), 0 otherwise |
 
 **Index:** `functions(name)`
 
@@ -323,7 +325,7 @@ WHERE af.actual_fn_id IS NOT NULL;
 ## CLI inspection
 
 ```bash
-trace inspect graph.db calls [--from FN] [--to FN]
+trace inspect graph.db calls [--from FN] [--to FN] [--file SUBSTR] [--exclude-deps]
 trace inspect graph.db callgraph --file SUBSTR --line N [--depth N] [--direction down|up]
 trace inspect graph.db dataflow --file SUBSTR --line N --col C [--depth N] [--direction down|up]
 ```
@@ -334,6 +336,9 @@ trace inspect graph.db dataflow --file SUBSTR --line N --col C [--depth N] [--di
   with `_`/`%` in `FN` escaped so they are not `LIKE` wildcards).
   `--file` matches ordinary edges by call-site or callee file. For synthetic
   edges it matches the caller or callee definition file.
+  `--exclude-deps` hides edges whose caller or callee comes from a dependency
+  root (`is_dep = 1`); a database older than v4 has no such column and reports
+  an actionable re-analysis message.
   Unresolved indirect sites require SQL (query above).
 - `callgraph` finds the function whose `[line_start, line_end]` contains the
   given line and prints its transitive callees (`down`) or callers (`up`),

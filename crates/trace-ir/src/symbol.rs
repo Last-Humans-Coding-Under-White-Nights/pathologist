@@ -104,6 +104,10 @@ pub struct CallSite {
 pub struct FileInfo {
     pub id: FileId,
     pub path: PathBuf,
+    /// The file lies under a `--dep` dependency root: it contributes
+    /// declarations only, and its entities export with `is_dep = 1` (#60).
+    /// Decided once, when the path is interned.
+    pub is_dep: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -133,6 +137,8 @@ pub struct SymbolTable {
     /// cross-TU deduplication collapsed the per-TU copies.
     headers_of: FxHashMap<FileId, std::collections::BTreeSet<FileId>>,
     file_by_path: FxHashMap<PathBuf, FileId>,
+    /// Canonical dependency roots (`--dep`); empty for a single-tree run.
+    dep_roots: Vec<PathBuf>,
     /// `FnId -> slot in functions`. Ids are not dense (merged duplicates and
     /// superseded rows leave gaps), so lookups need this index to stay O(1).
     fn_slots: FxHashMap<FnId, u32>,
@@ -142,9 +148,40 @@ pub struct SymbolTable {
 }
 
 impl SymbolTable {
+    /// Declare the dependency roots (canonical) that classify files as they
+    /// are interned. Call before any file is added, so every entry is
+    /// classified under the same roots.
+    pub fn set_dep_roots(&mut self, roots: Vec<PathBuf>) {
+        debug_assert!(
+            self.files.is_empty(),
+            "dependency roots must be set before any file is interned"
+        );
+        self.dep_roots = roots;
+    }
+
+    pub fn dep_roots(&self) -> &[PathBuf] {
+        &self.dep_roots
+    }
+
+    /// Whether `path` lies under a dependency root. This canonicalizes, so
+    /// prefer [`SymbolTable::file_is_dep`] for an already-interned file.
+    pub fn path_is_dep(&self, path: &Path) -> bool {
+        if self.dep_roots.is_empty() {
+            return false;
+        }
+        let canon = crate::canonicalize(path);
+        self.dep_roots.iter().any(|root| canon.starts_with(root))
+    }
+
+    /// Whether an interned file lies under a dependency root. O(1).
+    pub fn file_is_dep(&self, file: FileId) -> bool {
+        self.files.get(file.0 as usize).is_some_and(|f| f.is_dep)
+    }
+
     pub fn add_file(&mut self, path: PathBuf) -> FileId {
         let id = FileId(self.files.len() as u32);
-        self.files.push(FileInfo { id, path });
+        let is_dep = self.path_is_dep(&path);
+        self.files.push(FileInfo { id, path, is_dep });
         id
     }
 

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -57,6 +57,12 @@ enum Commands {
         /// Function-model TOML file (repeatable; overrides built-ins by name).
         #[arg(long = "models")]
         models: Vec<PathBuf>,
+        /// Dependency root: a tree the target builds against but that is not
+        /// under analysis (repeatable). Its headers contribute declarations;
+        /// its sources are never translation units and its bodies contribute
+        /// no call sites or value flow.
+        #[arg(long = "dep")]
+        deps: Vec<PathBuf>,
     },
     /// Inspect an existing analysis database.
     Inspect {
@@ -87,6 +93,9 @@ enum InspectCommands {
         /// An edge is shown when its caller or callee matches any pattern.
         #[arg(long = "callgraph-filter")]
         callgraph_filter: Option<PathBuf>,
+        /// Hide edges whose caller or callee comes from a dependency root.
+        #[arg(long = "exclude-deps")]
+        exclude_deps: bool,
     },
     /// Call graph around the function containing FILE:LINE.
     ///
@@ -208,6 +217,7 @@ fn main() -> Result<()> {
             debug_points_to,
             full_export,
             models,
+            deps,
             no_ipc,
         } => run_analyze(
             target,
@@ -219,6 +229,7 @@ fn main() -> Result<()> {
             debug_points_to,
             full_export,
             models,
+            deps,
             no_ipc,
         ),
         Commands::Inspect { db, command } => run_inspect(db, command),
@@ -236,6 +247,7 @@ fn run_analyze(
     debug_points_to: bool,
     full_export: bool,
     model_files: Vec<PathBuf>,
+    deps: Vec<PathBuf>,
     no_ipc: bool,
 ) -> Result<()> {
     if let Some(secs) = timeout_secs {
@@ -273,6 +285,37 @@ fn run_analyze(
         );
     }
     let mut opts = PreprocessOptions::new();
+    let root_canon = trace_ir::canonicalize(&target);
+    for dep in deps {
+        if !dep.is_dir() {
+            bail!(
+                "dependency root does not exist or is not a directory: {}",
+                dep.display()
+            );
+        }
+        // A dependency root inside the analyzed tree is supported; one that
+        // *contains* it is not. Every discovered source would be classified as
+        // a dependency, leaving no translation units, and the failure would
+        // surface far downstream as "no C/C++ source files found under
+        // <target>" — blaming the tree rather than the flag that emptied it.
+        let dep_canon = trace_ir::canonicalize(&dep);
+        if root_canon.starts_with(&dep_canon) {
+            let relation = if root_canon == dep_canon {
+                "is"
+            } else {
+                "contains"
+            };
+            bail!(
+                "dependency root {} {} the analysis root {}: every source under it would be \
+                 treated as a dependency, leaving nothing to analyze. Pass --dep a subtree \
+                 that excludes the code under analysis, or drop the flag.",
+                dep_canon.display(),
+                relation,
+                root_canon.display()
+            );
+        }
+        opts = opts.with_dep(dep_canon);
+    }
     for inc in includes {
         opts.include_paths.push(inc);
     }
@@ -290,12 +333,14 @@ fn run_analyze(
     // previously produced silent false negatives.
     // The C API repeats this check (`outside_root_warning`, trace-capi);
     // keep the containment predicate in step with it.
-    let root_canon = trace_ir::canonicalize(&target);
+    // A declared dependency root is part of the analysis tree for this
+    // purpose: its headers are meant to be reached from outside `target`.
+    let nests = |a: &PathBuf, b: &PathBuf| a.starts_with(b) || b.starts_with(a);
     let outside: Vec<PathBuf> = opts
         .include_paths
         .iter()
         .map(|p| trace_ir::canonicalize(p))
-        .filter(|c| !(c.starts_with(&root_canon) || root_canon.starts_with(c)))
+        .filter(|c| !nests(c, &root_canon) && !opts.dep_roots.iter().any(|d| nests(c, d)))
         .collect();
     if !outside.is_empty() {
         eprintln!(
@@ -408,6 +453,7 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             to,
             file,
             callgraph_filter,
+            exclude_deps,
         } => {
             let edges = trace_db::call_edges(
                 &conn,
@@ -415,6 +461,7 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
                     from: from.as_deref(),
                     to: to.as_deref(),
                     file: file.as_deref(),
+                    exclude_deps,
                 },
             )?;
             let filter = match callgraph_filter {

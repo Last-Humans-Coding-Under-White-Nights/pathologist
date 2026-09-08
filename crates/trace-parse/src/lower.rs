@@ -205,20 +205,51 @@ pub fn build_program_with_jobs(
     let jobs = jobs.max(1);
     let mut program = Program::new(root.to_path_buf());
     program.include_paths = opts.include_paths.clone();
+    // Set before any path is interned: `SymbolTable` decides `FileInfo::is_dep`
+    // as it interns, so every later dep question is an O(1) file lookup (#60).
+    program.symbols.set_dep_roots(
+        opts.dep_roots
+            .iter()
+            .map(|d| trace_ir::canonicalize(d))
+            .collect(),
+    );
     program.defines = opts
         .defines
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
+    // A dependency root contributes headers only: its sources are never
+    // translation units, even when the root sits inside the analyzed tree,
+    // and its headers are discovered separately (#60).
+    let dep_roots: Vec<PathBuf> = program.dep_roots().to_vec();
+    let under_dep = |p: &PathBuf| dep_roots.iter().any(|dep| p.starts_with(dep));
     let (files, headers) = discover_source_files(root);
-    let files = normalize_discovered_paths(files);
-    let headers = normalize_discovered_paths(headers);
+    let mut files = normalize_discovered_paths(files);
+    let mut headers = normalize_discovered_paths(headers);
+    files.retain(|p| !under_dep(p));
+    headers.retain(|p| !under_dep(p));
+    let dep_headers = normalize_discovered_paths(
+        dep_roots
+            .iter()
+            .flat_map(|dep| discover_source_files(dep).1)
+            .collect(),
+    );
+    let dep_note = if dep_roots.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " + {} headers from {} dependency roots",
+            dep_headers.len(),
+            dep_roots.len()
+        )
+    };
     index_progress(format!(
-        "discover: {} TUs, {} headers under {}",
+        "discover: {} TUs, {} headers under {}{}",
         files.len(),
         headers.len(),
-        root.display()
+        root.display(),
+        dep_note
     ));
     if files.is_empty() && headers.is_empty() {
         return Err(format!(
@@ -227,7 +258,8 @@ pub fn build_program_with_jobs(
         ));
     }
 
-    let mut include_graph = IncludeGraph::build(root, &files, &headers);
+    let mut include_graph =
+        IncludeGraph::build_with_deps(root, &files, &headers, &dep_roots, &dep_headers);
     index_progress(format!(
         "include-graph: {} files, {} include edges",
         include_graph.project_files.len(),
@@ -580,7 +612,9 @@ pub fn build_program_with_jobs(
     let orphan_headers: Vec<PathBuf> = include_graph.index_order(
         &project_headers
             .iter()
-            .filter(|p| !pch_set.contains(*p) && !skip_headers.contains(*p))
+            .filter(|p| {
+                !pch_set.contains(*p) && !skip_headers.contains(*p) && !program.is_dep_path(p)
+            })
             .cloned()
             .collect::<Vec<_>>(),
     );
@@ -730,8 +764,15 @@ pub fn build_program_with_jobs(
     ));
     for path in include_graph.index_order(&header_ir.keys().cloned().collect::<Vec<_>>()) {
         if let Some(units) = header_ir.get(&path) {
+            // A dependency header's own unit is not a translation unit of
+            // the target: merge prototypes, not its bodies' call sites (#60).
+            let is_dep = program.is_dep_path(&path);
             for (_, _, unit) in units {
-                merge_unit_index(&mut program, unit.as_ref());
+                if is_dep {
+                    merge_unit_symbols(&mut program, unit.as_ref());
+                } else {
+                    merge_unit_index(&mut program, unit.as_ref());
+                }
             }
         }
     }
@@ -1394,7 +1435,10 @@ fn process_indexed_file(
     lower_prepared_source(program, path, graph, pre, language, header_ir, pch_order)
 }
 
-/// Lower already-preprocessed text into `program`.
+/// Lower already-preprocessed text into a fresh `program`.
+///
+/// No files may have been interned: dependency roots must be installed before
+/// file classification or preamble merging. Callers create one Program per unit.
 #[allow(clippy::too_many_arguments)]
 fn lower_prepared_source(
     program: &mut Program,
@@ -1405,6 +1449,7 @@ fn lower_prepared_source(
     header_ir: Option<&HeaderIr>,
     pch_order: &[PathBuf],
 ) -> Result<(), String> {
+    program.symbols.set_dep_roots(graph.dep_roots.clone());
     let self_canon = graph.intern_path(path);
     let file_id = program.symbols.add_file_interned(&self_canon);
     add_preprocess_diagnostics(program, graph, file_id, &pre.diagnostics);
@@ -2470,7 +2515,12 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
     let flags = virtual_flags(source, node);
 
     let span = node_span(program, ctx, node);
-    let end_line = node_end_line(program, ctx, node, span);
+    let is_dep = program.is_dep_file(span.file);
+    let end_line = if is_dep {
+        span.line
+    } else {
+        node_end_line(program, ctx, node, span)
+    };
     let fn_id = program.symbols.add_function(Function {
         id: provisional_id,
         name: name.clone(),
@@ -2485,13 +2535,17 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
         span,
         end_line,
         file: ctx.current_file,
-        is_defined: true,
+        is_defined: !is_dep,
         param_type_ids: Vec::new(),
         is_virtual: flags.is_virtual,
         is_final: flags.is_final,
         is_cpp: ctx.is_cpp,
     });
     reassign_fn_id(program, provisional_id, fn_id);
+    // Preserve the signature without allocating body IR or following calls.
+    if is_dep {
+        return;
+    }
     ctx.current_fn = Some(fn_id);
     ctx.locals.clear();
     for &param in &params {
@@ -2771,6 +2825,9 @@ fn lower_one_declarator(
             is_pointer: true,
         });
         register_local(ctx, name, var_id);
+        if program.is_dep_file(span.file) {
+            return;
+        }
         if let Some(init) = init_expr {
             if init.kind() == "initializer_list"
                 && (is_array_type(program, type_id) || declarator_is_array(decl))
@@ -2807,6 +2864,9 @@ fn lower_one_declarator(
         is_pointer: is_ptr,
     });
     register_local(ctx, name, var_id);
+    if program.is_dep_file(span.file) {
+        return;
+    }
     // Constructor invocation spelled as a declaration: `Cls o(1, 2);`.
     // tree-sitter parks the argument list in init_declarator's `value`
     // field, so an argument_list "initializer" IS the ctor call.

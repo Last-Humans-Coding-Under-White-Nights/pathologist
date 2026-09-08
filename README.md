@@ -60,6 +60,7 @@ trace analyze [OPTIONS] <TARGET>
 | `--full-export` | Export full IR detail: all types, all variables, PAG `locations`. Slower and produces a larger database. |
 | `--debug-points-to` | Retain points-to sets during analysis and export the `points_to` debug table (requires PAG in memory). Implies keeping location data needed for export. |
 | `--models <FILE>` | Load a TOML function-model file (interprocedural summaries for bodyless callees, e.g. `memcpy_s`). Repeatable; later files override earlier entries and built-ins. See `docs/ANALYSIS.md`. |
+| `--dep <PATH>` | Treat a directory as a dependency root: a tree the target builds against but that is not under analysis (repeatable). Its headers contribute declarations — types, class definitions, inheritance, prototypes, declared return types — while its sources are never translation units. Function bodies and variable initializers are skipped during lowering, so they contribute no call sites or value flow. See the note below. |
 | `--no-ipc` | Disable IPC proxy→stub bridge edge detection (enabled by default). Bridge edges are synthetic (`resolution = 'ipc'`, `call_site_id = NULL`) and connect a `*Proxy*` method to its `*Stub*` handler across the opaque Binder boundary. See `docs/IPC_ROADMAP.md`. |
 
 **Progress output** (stderr):
@@ -93,6 +94,7 @@ trace analyze ./my_app -o /tmp/debug.db --debug-points-to --full-export
 - Line numbers in the database refer to **original** files on disk (resolved through the preprocessor's `LineMap`); call sites inside macro expansions attribute to the expansion site.
 - Pass include paths that match your build; there is no `compile_commands.json` integration yet.
 - **`static` functions** (internal linkage) and **file-scope `static` variables** are resolved within the defining translation unit. **`static` locals** inside functions are tracked as `fn_static` storage.
+- **Dependency roots (`--dep <PATH>`)** separate what the target *uses* from what it *is*. A dependency's headers are reached and merged for their declarations — smart-pointer wrappers such as `sptr<T>`, base classes, external interfaces — so a wrapper-typed receiver resolves on the wrapped class rather than producing an edge on the wrapper. Its sources are never translation units, its unreached headers are never indexed as standalone units, and a body written in a dependency header merges as a declaration (`is_defined = 0`) with no call sites, locals, value flow or return flow. Files and functions from a dependency root export with `is_dep = 1`; `trace inspect calls --exclude-deps` drops the edges that touch them. A dependency root nested inside the analysis root is fine; one that contains or equals it is rejected at startup, since every source would become a dependency and nothing would be left to analyze.
 
 ## `static` storage support
 
@@ -110,7 +112,7 @@ Same identifier in different `.c` files (each `static`) gets distinct IR ids; re
 Query an existing analysis database.
 
 ```text
-trace inspect <DB> calls [--from FN] [--to FN] [--file SUBSTR]
+trace inspect <DB> calls [--from FN] [--to FN] [--file SUBSTR] [--exclude-deps]
 
 Edges print as `caller (file:line) -> callee [deffile] (resolution)` — the
 `[deffile]` bracket distinguishes same-name (e.g. `static`) functions defined
@@ -126,6 +128,7 @@ instead.
 | `--to <FN>` | Filter edges where the **callee** name equals `FN` or ends with `::FN`. Same escaping as `--from`. |
 | `--file <SUBSTR>` | Filter ordinary edges by call-site or callee file; synthetic edges by caller or callee definition file. |
 | `--callgraph-filter <FILE>` | JSON file listing regex patterns over function names; edges whose caller and callee both fail to match are hidden. |
+| `--exclude-deps` | Hide call edges whose caller or callee comes from a dependency root (`is_dep = 1`). Requires a v4 database. |
 
 Both filters may be combined. Output format:
 
@@ -408,10 +411,10 @@ Metadata for one `trace analyze` invocation.
 |--------|------|-------------|
 | `id` | INTEGER PK | Run id (always `1` per file). |
 | `trace_version` | TEXT | Full binary identity: package version, source revision, dirty state, and build date. |
-| `schema_version` | INTEGER | Database layout version (currently `3`). |
+| `schema_version` | INTEGER | Database layout version (currently `4`). |
 | `target_root` | TEXT | Absolute or normalized `<TARGET>` path. |
 | `created_at` | TEXT | Unix timestamp (seconds). |
-| `options_json` | TEXT | JSON: `include_paths`, `defines`, `include_points_to`, `full_detail`. |
+| `options_json` | TEXT | JSON: `include_paths`, `defines`, `dep_roots`, `include_points_to`, `full_detail`. |
 
 ### `files`
 
@@ -420,6 +423,7 @@ Metadata for one `trace analyze` invocation.
 | `id` | INTEGER PK | Internal file id. |
 | `path` | TEXT UNIQUE | Source file path. |
 | `sha256` | TEXT | Content hash (may be empty in current export). |
+| `is_dep` | INTEGER | 1 if file resides under a dependency root (`--dep`), 0 otherwise. |
 
 ### `functions`
 
@@ -432,7 +436,8 @@ Metadata for one `trace analyze` invocation.
 | `line_end` | INTEGER | End line of the definition body; equals `line_start` for prototypes/synthesized externals. |
 | `linkage` | TEXT | `external`, `internal`, or `none`. |
 | `signature` | TEXT | Placeholder signature string (`fn_<name>`). |
-| `is_defined` | INTEGER | 1 if a body exists under the analyzed root; 0 covers prototypes and synthesized externals (libc, macro-referenced logging backends). |
+| `is_defined` | INTEGER | 1 if a body exists under the analyzed root; 0 covers prototypes and synthesized externals (libc, macro-referenced logging backends, dependency declarations). |
+| `is_dep` | INTEGER | 1 if function originates from a dependency root (`--dep`), 0 otherwise. |
 
 **Index:** `functions(name)`.
 

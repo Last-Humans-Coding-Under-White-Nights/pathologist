@@ -10,6 +10,19 @@ All notable changes to `trace` are documented in this file.
 - Explicit database schema-version metadata.
 - Validated, version-tagged GitHub releases alongside the rolling `master-latest` prerelease.
 - OpenHarmony IPC proxy-to-stub call edges for matching `SendRequest` methods.
+- Dependency roots (#60): a repeatable `--dep <PATH>` names a tree the target builds against but
+  that is not the code under analysis — a vendored SDK, a framework checkout, a sibling repository.
+  Its headers are discovered and merged for what they *declare*: types, class definitions,
+  inheritance, prototypes and declared return types, including a class's `operator->` return, which
+  is what lets a wrapper-typed receiver (`sptr<CaptureSession> s; s->AddOutput(...)`) resolve on the
+  wrapped class instead of falling back to an edge on the wrapper. Nothing a dependency *defines*
+  crosses over: its sources are never translation units, its headers are never indexed as standalone
+  orphan units, and a body written in one contributes no call site, local variable, value-flow
+  constraint or return flow — such functions merge as declarations (`is_defined = 0`). Bodies and
+  variable initializers are skipped during lowering, avoiding discarded IR and preventing flow
+  through parameters, globals, or function-local statics from leaking into the target. Files and
+  functions from a dependency root export with `is_dep = 1`, and `trace inspect calls --exclude-deps`
+  drops the edges that touch them.
 - Conditional-compilation coverage report (#57): with `PreprocessOptions::record_conditionals`
   the preprocessor records every `#if` / `#ifdef` / `#ifndef` chain it meets — the condition as
   written, each arm's line range and whether it was taken, skipped or never evaluated, and the
@@ -30,6 +43,10 @@ All notable changes to `trace` are documented in this file.
 - Database schema is now **v3**: `call_edges.call_site_id` is nullable for synthetic edges and
   `call_edges.caller_fn_id` records their caller independently of a source call site. Inspecting
   call data from an older database reports an actionable re-analysis message.
+- Database schema is now **v4**: `files` and `functions` carry `is_dep INTEGER NOT NULL DEFAULT 0`,
+  separating dependency-root entities from the target's own, and `analysis_run.options_json` records
+  `dep_roots`. `trace inspect calls --exclude-deps` against an older database reports an actionable
+  re-analysis message rather than silently returning unfiltered edges.
 
 ### Fixed
 
