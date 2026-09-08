@@ -1,6 +1,7 @@
 use crate::macros::{lex_macro_body, MacroDef, MacroOp, MacroTable};
 use crate::{
-    Diagnostic, DiagnosticSeverity, Language, Lexer, LineMap, PreprocessOptions, Token, TokenKind,
+    ArmDirective, ArmOutcome, ConditionRead, ConditionalArm, ConditionalChain, Diagnostic,
+    DiagnosticSeverity, Language, Lexer, LineMap, PreprocessOptions, Token, TokenKind,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -51,6 +52,10 @@ pub struct PreprocessResult {
     /// unit — and it must be the unit built from *this* expansion, not from
     /// whichever configuration the warm pass happened to take.
     pub replayed_variants: Vec<(PathBuf, usize)>,
+    /// Every conditional chain this run evaluated or skipped, in the order
+    /// their opening directives were met, headers included. Empty unless
+    /// `PreprocessOptions::record_conditionals` is set (#57).
+    pub conditionals: Vec<ConditionalChain>,
 }
 
 #[derive(Debug)]
@@ -127,6 +132,21 @@ struct PreprocessorState {
     /// missing content, so nothing further may be published to the shared
     /// expansion cache.
     expansion_incomplete: bool,
+    /// Conditional chains recorded so far (`record_conditionals`);
+    /// `CondFrame::chain` indexes into it.
+    conditionals: Vec<ConditionalChain>,
+    /// While a condition is being evaluated with recording on: every name
+    /// the evaluation consulted, in order, repeats included. `None`
+    /// otherwise, which is what keeps the per-identifier read hook free.
+    cond_reads: Option<Vec<ConditionRead>>,
+    /// An include-guard candidate opened by the previous directive of the
+    /// current file: the chain and the name it tests. The next directive
+    /// consumes it, and only a `#define` of that name keeps it alive as
+    /// `guard_pending`. Per file: saved and cleared around each include.
+    guard_candidate: Option<(usize, String)>,
+    /// A chain whose `#ifndef X` / `#define X` opening matched; it becomes
+    /// an include guard if nothing but whitespace follows its `#endif`.
+    guard_pending: Option<usize>,
 }
 
 /// One level of `#if`/`#elif`/`#else` nesting. A per-level bool is not
@@ -145,6 +165,8 @@ struct CondFrame {
     else_seen: bool,
     /// Line of the opening `#if`/`#ifdef`/`#ifndef`, for the EOF diagnostic.
     line: u32,
+    /// The chain this frame is recording into, when recording is on.
+    chain: Option<usize>,
 }
 
 /// One cached header being constructed.
@@ -207,6 +229,10 @@ impl PreprocessorState {
             macro_ops: Vec::new(),
             macro_hashes: HashMap::new(),
             expansion_incomplete: false,
+            conditionals: Vec::new(),
+            cond_reads: None,
+            guard_candidate: None,
+            guard_pending: None,
         };
         if let Some(shared) = &state.opts.shared_macros {
             if let Ok(guard) = shared.read() {
@@ -244,7 +270,18 @@ impl PreprocessorState {
     /// `#ifdef` / `#ifndef` / `defined()`.
     fn is_defined_for_conditionals(&mut self, name: &str) -> bool {
         self.record_read(name);
-        self.macros.contains_key(name) && !self.fallback_macros.contains(name)
+        let bound = self.macros.contains_key(name) && !self.fallback_macros.contains(name);
+        // Here the spelling is explicitly a macro operand, not an operator.
+        // Ordinary expression reads omit unbound alternative operators.
+        if !bound && is_alternative_token(name) {
+            if let Some(reads) = self.cond_reads.as_mut() {
+                reads.push(ConditionRead {
+                    name: name.to_string(),
+                    bound: Some(false),
+                });
+            }
+        }
+        bound
     }
 
     /// Content hash of what `name` is currently bound to, or `None` when it
@@ -288,6 +325,17 @@ impl PreprocessorState {
     /// holding that text must not be replayed into a unit where the name is
     /// a macro (#55).
     fn record_read(&mut self, name: &str) {
+        if let Some(reads) = self.cond_reads.as_mut() {
+            let bound = self.macros.contains_key(name) && !self.fallback_macros.contains(name);
+            // `and` / `or` / `not` … spelled in a condition are operators,
+            // not names the configuration could bind, unless something did.
+            if bound || !is_alternative_token(name) {
+                reads.push(ConditionRead {
+                    name: name.to_string(),
+                    bound: Some(bound),
+                });
+            }
+        }
         if self.innermost_settled(name) {
             return;
         }
@@ -517,7 +565,7 @@ impl PreprocessorState {
         self.conditional_stack.len() > self.cond_base
     }
 
-    fn push_cond(&mut self, cond: bool, line: u32) {
+    fn push_cond(&mut self, cond: bool, line: u32, chain: Option<usize>) {
         let parent_active = self.is_active();
         let active = parent_active && cond;
         self.conditional_stack.push(CondFrame {
@@ -526,7 +574,103 @@ impl PreprocessorState {
             taken: active,
             else_seen: false,
             line,
+            chain,
         });
+    }
+
+    // ---- conditional recording (#57) ------------------------------------
+
+    /// Start collecting the names a condition consults. A no-op unless
+    /// recording is on, so `record_read` stays on its fast path.
+    fn begin_reads(&mut self) {
+        if self.opts.record_conditionals {
+            self.cond_reads = Some(Vec::new());
+        }
+    }
+
+    /// The names collected since `begin_reads`, first read first, once each.
+    fn end_reads(&mut self) -> Vec<ConditionRead> {
+        dedup_reads(self.cond_reads.take().unwrap_or_default())
+    }
+
+    /// Record the opening arm of a new chain; `None` when recording is off.
+    /// The arm is built lazily so an ordinary run spells nothing.
+    fn open_chain(&mut self, arm: impl FnOnce() -> ConditionalArm) -> Option<usize> {
+        if !self.opts.record_conditionals {
+            return None;
+        }
+        let depth = self.conditional_stack.len() - self.cond_base;
+        self.conditionals.push(ConditionalChain {
+            // `current_file` is the path include resolution produced, which
+            // may spell the same header several ways (`src/../common/x.h`
+            // from one includer, `common/x.h` from another). Consumers merge
+            // chains across runs by file, so the record uses the canonical
+            // path, as `included_headers` does. Canonicalization is cached.
+            file: trace_ir::canonicalize(&self.current_file),
+            arms: vec![arm()],
+            depth,
+            terminated: false,
+            include_guard: false,
+        });
+        Some(self.conditionals.len() - 1)
+    }
+
+    /// End the chain's current arm at `line` (the line of the directive
+    /// that follows it).
+    fn close_arm(&mut self, chain: Option<usize>, line: u32) {
+        if let Some(arm) = chain.and_then(|c| self.conditionals[c].arms.last_mut()) {
+            arm.end_line = line;
+        }
+    }
+
+    fn add_arm(&mut self, chain: Option<usize>, line: u32, arm: impl FnOnce() -> ConditionalArm) {
+        self.close_arm(chain, line);
+        if let Some(c) = chain {
+            self.conditionals[c].arms.push(arm());
+        }
+    }
+
+    /// Note that the chain just opened has the first half of an include
+    /// guard's shape: `#ifndef NAME` (or `#if !defined(NAME)`) before any
+    /// other token of the file, at the file's top level. `start` indexes
+    /// the directive's `#`.
+    fn note_guard_candidate(
+        &mut self,
+        chain: Option<usize>,
+        name: &str,
+        tokens: &[Token],
+        start: usize,
+    ) {
+        let Some(chain) = chain else { return };
+        if self.conditional_stack.len() - 1 != self.cond_base {
+            return;
+        }
+        if tokens[..start].iter().all(is_newline) {
+            self.guard_candidate = Some((chain, name.to_string()));
+        }
+    }
+
+    /// An `#endif` closed `chain`: it is an include guard if its `#define`
+    /// matched and nothing but whitespace follows. `i` is just past the
+    /// `endif` keyword.
+    fn settle_guard(&mut self, chain: Option<usize>, tokens: &[Token], i: usize) {
+        if chain.is_none() || self.guard_pending != chain {
+            return;
+        }
+        self.guard_pending = None;
+        // A guard has nothing to choose between: an `#else` / `#elif` arm
+        // makes the chain a real conditional on the name.
+        if self.conditionals[chain.unwrap()].arms.len() != 1 {
+            return;
+        }
+        let mut rest = i;
+        skip_directive_line(tokens, &mut rest);
+        if tokens[rest..]
+            .iter()
+            .all(|t| matches!(t.kind, TokenKind::Newline | TokenKind::Eof))
+        {
+            self.conditionals[chain.unwrap()].include_guard = true;
+        }
     }
 
     fn push_expansion(&mut self, line: u32) -> bool {
@@ -1269,8 +1413,10 @@ impl PreprocessorState {
     fn process_file_tokens(&mut self, tokens: &[Token]) -> Result<(), PreprocessError> {
         let depth = self.conditional_stack.len();
         let outer_base = std::mem::replace(&mut self.cond_base, depth);
+        let outer_guard = (self.guard_candidate.take(), self.guard_pending.take());
         let result = self.process_tokens(tokens);
         self.cond_base = outer_base;
+        (self.guard_candidate, self.guard_pending) = outer_guard;
         if result.is_ok() {
             for idx in depth..self.conditional_stack.len() {
                 let line = self.conditional_stack[idx].line;
@@ -1280,6 +1426,19 @@ impl PreprocessorState {
                     "unterminated #if; conditional closed at end of file".into(),
                 );
             }
+        }
+        // A chain left open (or cut short by an error) ends where the file
+        // does: the line after the last one, so that line is in the arm.
+        // The EOF token sits on the line after a trailing newline, but on
+        // the last line itself when there is none.
+        // Comments and whitespace do not produce tokens, so the token
+        // before EOF cannot tell us whether the physical last line is empty.
+        let last_line = tokens
+            .last()
+            .map_or(1, |eof| eof.line + u32::from(eof.col > 1));
+        for idx in depth..self.conditional_stack.len() {
+            let chain = self.conditional_stack[idx].chain;
+            self.close_arm(chain, last_line);
         }
         self.conditional_stack.truncate(depth);
         result
@@ -1459,12 +1618,31 @@ impl PreprocessorState {
 
         let directive = match &tokens[i].kind {
             TokenKind::Identifier(s) => s.clone(),
+            // Inside a skipped group only the nesting matters (C11
+            // 6.10.1p6): a line marker (`# 1 "x.c"`) or a `#!` line there
+            // must not abort the file, which would also record the arm as
+            // excluding everything to the end of the file.
+            _ if !self.is_active() => {
+                skip_directive_line(tokens, &mut i);
+                return Ok(i);
+            }
             _ => {
                 return Err(self.error(tokens[i].line, "expected directive name after #"));
             }
         };
         let line = tokens[i].line;
+        let record_line = tokens[start].line;
         i += 1;
+
+        // Whatever this directive is, it decides the guard candidate the
+        // previous one opened: only `#define` of the tested name keeps it.
+        if let Some((chain, name)) = self.guard_candidate.take() {
+            if directive == "define"
+                && matches!(tokens.get(i).map(|t| &t.kind), Some(TokenKind::Identifier(n)) if *n == name)
+            {
+                self.guard_pending = Some(chain);
+            }
+        }
 
         match directive.as_str() {
             "include" if self.is_active() => {
@@ -1476,52 +1654,120 @@ impl PreprocessorState {
             "include" | "define" if !self.is_active() => {}
             // Inside a skipped group only the nesting matters (C11
             // 6.10.1p6): a malformed operand there must not abort the file.
-            "ifdef" => {
+            "ifdef" | "ifndef" => {
+                let negate = directive == "ifndef";
+                let directive = if negate {
+                    ArmDirective::Ifndef
+                } else {
+                    ArmDirective::Ifdef
+                };
                 if self.is_active() {
                     let name = self.read_directive_ident(tokens, &mut i)?;
+                    self.begin_reads();
                     let defined = self.is_defined_for_conditionals(&name);
-                    self.push_cond(defined, line);
+                    let reads = self.end_reads();
+                    let cond = defined != negate;
+                    let chain = self.open_chain(|| ConditionalArm {
+                        directive,
+                        expression: name.clone(),
+                        line: record_line,
+                        end_line: record_line,
+                        outcome: arm_outcome(true, cond),
+                        evaluated: true,
+                        reads,
+                    });
+                    self.push_cond(cond, line, chain);
+                    if negate {
+                        self.note_guard_candidate(chain, &name, tokens, start);
+                    }
                 } else {
-                    self.push_cond(false, line);
-                }
-            }
-            "ifndef" => {
-                if self.is_active() {
-                    let name = self.read_directive_ident(tokens, &mut i)?;
-                    let defined = self.is_defined_for_conditionals(&name);
-                    self.push_cond(!defined, line);
-                } else {
-                    self.push_cond(false, line);
+                    let rest = directive_rest(tokens, i);
+                    let operand = &rest[..rest.len().min(1)];
+                    let chain = self.open_chain(|| ConditionalArm {
+                        directive,
+                        expression: operand
+                            .first()
+                            .and_then(ident_name)
+                            .unwrap_or("")
+                            .to_string(),
+                        line: record_line,
+                        end_line: record_line,
+                        outcome: ArmOutcome::Unevaluated,
+                        evaluated: false,
+                        reads: operand
+                            .iter()
+                            .filter_map(ident_name)
+                            .map(|name| ConditionRead {
+                                name: name.to_string(),
+                                bound: None,
+                            })
+                            .collect(),
+                    });
+                    self.push_cond(false, line, chain);
                 }
             }
             "if" => {
                 // Conditions in skipped groups are not evaluated (C11
                 // 6.10.1p6); the frame still pushes to keep nesting balanced.
-                let cond = if self.is_active() {
+                let evaluate = self.is_active();
+                let expr_start = i;
+                let cond = if evaluate {
+                    self.begin_reads();
                     self.expand_and_eval_condition(tokens, &mut i)
                 } else {
                     skip_directive_line(tokens, &mut i);
                     false
                 };
-                self.push_cond(cond, line);
+                let expr = &tokens[expr_start..i];
+                let reads = self.end_reads();
+                let chain = self.open_chain(|| ConditionalArm {
+                    directive: ArmDirective::If,
+                    expression: spell_condition(expr),
+                    line: record_line,
+                    end_line: record_line,
+                    outcome: arm_outcome(evaluate, cond),
+                    evaluated: evaluate,
+                    reads: if evaluate { reads } else { spelled_reads(expr) },
+                });
+                self.push_cond(cond, line, chain);
+                if evaluate {
+                    if let Some(name) = negated_defined_name(expr) {
+                        self.note_guard_candidate(chain, name, tokens, start);
+                    }
+                }
             }
             "elif" => {
                 if !self.has_own_cond() {
                     return Err(self.error(line, "#elif without #if"));
                 }
                 let frame = *self.conditional_stack.last().unwrap();
-                let cond = if frame.parent_active && !frame.taken && !frame.else_seen {
+                let evaluate = frame.parent_active && !frame.taken && !frame.else_seen;
+                let expr_start = i;
+                let cond = if evaluate {
+                    self.begin_reads();
                     self.expand_and_eval_condition(tokens, &mut i)
                 } else {
                     skip_directive_line(tokens, &mut i);
                     false
                 };
+                let expr = &tokens[expr_start..i];
+                let reads = self.end_reads();
                 if frame.else_seen {
                     self.warn(line, "#elif after #else; branch ignored");
                 }
                 let f = self.conditional_stack.last_mut().unwrap();
                 f.active = f.parent_active && !f.taken && cond;
                 f.taken |= f.active;
+                let active = f.active;
+                self.add_arm(frame.chain, record_line, || ConditionalArm {
+                    directive: ArmDirective::Elif,
+                    expression: spell_condition(expr),
+                    line: record_line,
+                    end_line: record_line,
+                    outcome: arm_outcome(frame.parent_active, active),
+                    evaluated: evaluate,
+                    reads: if evaluate { reads } else { spelled_reads(expr) },
+                });
             }
             "else" => {
                 if !self.has_own_cond() {
@@ -1531,12 +1777,27 @@ impl PreprocessorState {
                 f.active = f.parent_active && !f.taken;
                 f.taken = true;
                 f.else_seen = true;
+                let (chain, parent_active, active) = (f.chain, f.parent_active, f.active);
+                self.add_arm(chain, record_line, || ConditionalArm {
+                    directive: ArmDirective::Else,
+                    expression: String::new(),
+                    line: record_line,
+                    end_line: record_line,
+                    outcome: arm_outcome(parent_active, active),
+                    evaluated: false,
+                    reads: Vec::new(),
+                });
             }
             "endif" => {
                 if !self.has_own_cond() {
                     return Err(self.error(line, "#endif without #if"));
                 }
-                self.conditional_stack.pop();
+                let frame = self.conditional_stack.pop().unwrap();
+                self.close_arm(frame.chain, record_line);
+                if let Some(chain) = frame.chain {
+                    self.conditionals[chain].terminated = true;
+                }
+                self.settle_guard(frame.chain, tokens, i);
             }
             // Directives whose operands we ignore: the shared skip below
             // consumes the rest of the line. Calling skip_to_newline here as
@@ -2110,7 +2371,109 @@ impl PreprocessorState {
             included_headers: self.included_guard.into_iter().collect(),
             inlined_headers: self.inlined_files.into_iter().collect(),
             replayed_variants: self.variant_used.into_iter().collect(),
+            conditionals: self.conditionals,
         }
+    }
+}
+
+/// The tokens of the current directive line from `i` to its end.
+fn directive_rest(tokens: &[Token], i: usize) -> &[Token] {
+    let mut end = i;
+    skip_directive_line(tokens, &mut end);
+    &tokens[i.min(end)..end]
+}
+
+fn arm_outcome(evaluated: bool, taken: bool) -> ArmOutcome {
+    match (evaluated, taken) {
+        (false, _) => ArmOutcome::Unevaluated,
+        (true, true) => ArmOutcome::Taken,
+        (true, false) => ArmOutcome::Skipped,
+    }
+}
+
+/// A condition as written: token spellings, with the whitespace the source
+/// had between them collapsed to one space.
+fn spell_condition(tokens: &[Token]) -> String {
+    spell_tokens(tokens, str::to_string)
+}
+
+/// The identifiers a condition spells, for an arm that was never evaluated
+/// (so nothing consulted the environment). `defined`, `__LINE__` and the
+/// alternative operator spellings (`and`, `not`, …) are operators, not names,
+/// except when explicitly used as the operand of `defined`.
+fn spelled_reads(tokens: &[Token]) -> Vec<ConditionRead> {
+    let mut reads = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let mut name = ident_name(&tokens[i]);
+        if name == Some("defined") {
+            let (operand, consumed) = defined_operand(tokens, i);
+            name = operand;
+            i += consumed;
+        } else {
+            name = name.filter(|n| *n != "__LINE__" && !is_alternative_token(n));
+            i += 1;
+        }
+        if let Some(name) = name {
+            reads.push(ConditionRead {
+                name: name.to_string(),
+                bound: None,
+            });
+        }
+    }
+    dedup_reads(reads)
+}
+
+/// The C++ alternative operator spellings (C++ [lex.digraph]; `<iso646.h>`
+/// in C). The evaluator does not interpret them, so `#if A and B` reads as
+/// `A` followed by an unbound identifier; for the conditional record that
+/// identifier is an operator, not a name the configuration failed to bind.
+fn is_alternative_token(name: &str) -> bool {
+    matches!(
+        name,
+        "and"
+            | "and_eq"
+            | "bitand"
+            | "bitor"
+            | "compl"
+            | "not"
+            | "not_eq"
+            | "or"
+            | "or_eq"
+            | "xor"
+            | "xor_eq"
+    )
+}
+
+fn dedup_reads(reads: Vec<ConditionRead>) -> Vec<ConditionRead> {
+    let mut seen: HashSet<String> = HashSet::new();
+    reads
+        .into_iter()
+        .filter(|r| seen.insert(r.name.clone()))
+        .collect()
+}
+
+/// `NAME` from a condition that is exactly `!defined(NAME)` or
+/// `!defined NAME`: the `#if` spelling of an include guard.
+fn negated_defined_name(expr: &[Token]) -> Option<&str> {
+    match expr {
+        [bang, defined, rest @ ..] if is_punct(bang, "!") && is_ident(defined, "defined") => {
+            match rest {
+                [open, name, close] if is_punct(open, "(") && is_punct(close, ")") => {
+                    ident_name(name)
+                }
+                [name] => ident_name(name),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn ident_name(tok: &Token) -> Option<&str> {
+    match &tok.kind {
+        TokenKind::Identifier(n) => Some(n.as_str()),
+        _ => None,
     }
 }
 
@@ -7560,5 +7923,468 @@ int from_late;
             cached.output
         );
         assert!(cached.output.contains("common_decl"), "{:?}", cached.output);
+    }
+
+    fn record(src: &str, opts: PreprocessOptions) -> Vec<ConditionalChain> {
+        preprocess_string(
+            src,
+            Path::new("test.c"),
+            &opts.with_record_conditionals(true),
+        )
+        .conditionals
+    }
+
+    fn reads_of(arm: &ConditionalArm) -> Vec<(&str, Option<bool>)> {
+        arm.reads
+            .iter()
+            .map(|r| (r.name.as_str(), r.bound))
+            .collect()
+    }
+
+    #[test]
+    fn conditionals_are_not_recorded_by_default() {
+        let src = "#ifdef A\nint a;\n#endif\n";
+        let result = preprocess_string(src, Path::new("test.c"), &PreprocessOptions::new());
+        assert!(result.conditionals.is_empty());
+    }
+
+    #[test]
+    fn records_if_elif_else_chain_with_outcomes() {
+        let src = "#if A\nint a;\n#elif B\nint b;\nint b2;\n#else\nint c;\n#endif\nint after;\n";
+        let chains = record(src, PreprocessOptions::new().with_define("B", "1"));
+        assert_eq!(chains.len(), 1);
+        let chain = &chains[0];
+        assert!(chain.terminated);
+        assert!(!chain.include_guard);
+        assert_eq!(chain.depth, 0);
+        assert_eq!(chain.line(), 1);
+        let arms = &chain.arms;
+        assert_eq!(arms.len(), 3);
+
+        assert_eq!(arms[0].directive, ArmDirective::If);
+        assert_eq!(arms[0].expression, "A");
+        assert_eq!((arms[0].line, arms[0].end_line), (1, 3));
+        assert_eq!(arms[0].outcome, ArmOutcome::Skipped);
+        assert!(arms[0].evaluated);
+        assert_eq!(reads_of(&arms[0]), vec![("A", Some(false))]);
+        assert_eq!(arms[0].body_lines(), 1);
+
+        assert_eq!(arms[1].directive, ArmDirective::Elif);
+        assert_eq!(arms[1].expression, "B");
+        assert_eq!((arms[1].line, arms[1].end_line), (3, 6));
+        assert_eq!(arms[1].outcome, ArmOutcome::Taken);
+        assert!(arms[1].evaluated);
+        assert_eq!(reads_of(&arms[1]), vec![("B", Some(true))]);
+        assert_eq!(arms[1].body_lines(), 2);
+
+        assert_eq!(arms[2].directive, ArmDirective::Else);
+        assert_eq!(arms[2].expression, "");
+        assert_eq!((arms[2].line, arms[2].end_line), (6, 8));
+        assert_eq!(arms[2].outcome, ArmOutcome::Skipped);
+        assert!(!arms[2].evaluated);
+        assert!(arms[2].reads.is_empty());
+    }
+
+    /// An undefined name does not always select `#else`: `#if !X` with `X`
+    /// unknown takes the FIRST arm. The record says which arm was taken
+    /// rather than assuming a direction.
+    #[test]
+    fn negated_unknown_name_takes_the_first_arm() {
+        let src = "#if !X\nint first;\n#else\nint second;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        let arms = &chains[0].arms;
+        assert_eq!(arms[0].outcome, ArmOutcome::Taken);
+        assert_eq!(arms[0].expression, "!X");
+        assert_eq!(reads_of(&arms[0]), vec![("X", Some(false))]);
+        assert_eq!(arms[1].outcome, ArmOutcome::Skipped);
+    }
+
+    #[test]
+    fn ifdef_and_ifndef_record_their_operand() {
+        let src = "#ifdef A\nint a;\n#endif\n#ifndef A\nint na;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(chains.len(), 2);
+        assert_eq!(chains[0].arms[0].directive, ArmDirective::Ifdef);
+        assert_eq!(chains[0].arms[0].expression, "A");
+        assert_eq!(chains[0].arms[0].outcome, ArmOutcome::Skipped);
+        assert_eq!(reads_of(&chains[0].arms[0]), vec![("A", Some(false))]);
+        assert_eq!(chains[1].arms[0].directive, ArmDirective::Ifndef);
+        assert_eq!(chains[1].arms[0].expression, "A");
+        assert_eq!(chains[1].arms[0].outcome, ArmOutcome::Taken);
+        assert_eq!(chains[1].line(), 4);
+    }
+
+    #[test]
+    fn if_expression_is_kept_as_written() {
+        let src = "#define ONE 1\n#if defined(A) && (ONE > 0) || defined B\nint a;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        let arm = &chains[0].arms[0];
+        assert_eq!(arm.expression, "defined(A) && (ONE > 0) || defined B");
+        assert_eq!(
+            reads_of(arm),
+            vec![("A", Some(false)), ("ONE", Some(true)), ("B", Some(false))]
+        );
+    }
+
+    /// `#if HAS_X` with `#define HAS_X defined(X)` depends on `X`, which
+    /// only expansion reveals: the reads follow the evaluation, not the
+    /// spelling.
+    #[test]
+    fn condition_reads_follow_macro_expansion() {
+        let src = "#define HAS_X defined(X)\n#if HAS_X\nint a;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(
+            reads_of(&chains[0].arms[0]),
+            vec![("HAS_X", Some(true)), ("X", Some(false))]
+        );
+    }
+
+    /// A read is recorded once per arm, however often the expression
+    /// consults it.
+    #[test]
+    fn repeated_reads_are_recorded_once() {
+        let src = "#if defined(A) || A > 1\nint a;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(reads_of(&chains[0].arms[0]), vec![("A", Some(false))]);
+    }
+
+    /// A chain inside an excluded arm is not evaluated (C11 6.10.1p6). Its
+    /// arms are recorded as such — lines it encloses are excluded by the
+    /// OUTER chain — and its names are known only by their spelling.
+    #[test]
+    fn chain_inside_skipped_arm_is_unevaluated() {
+        let src = "#ifdef X\n#if Y > 1\nint a;\n#else\nint b;\n#endif\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(chains.len(), 2);
+        let outer = &chains[0];
+        assert_eq!(outer.depth, 0);
+        assert_eq!(outer.arms[0].outcome, ArmOutcome::Skipped);
+        assert_eq!((outer.arms[0].line, outer.arms[0].end_line), (1, 7));
+        let inner = &chains[1];
+        assert_eq!(inner.depth, 1);
+        assert_eq!(inner.arms.len(), 2);
+        assert_eq!(inner.arms[0].outcome, ArmOutcome::Unevaluated);
+        assert!(!inner.arms[0].evaluated);
+        assert_eq!(inner.arms[0].expression, "Y > 1");
+        assert_eq!(reads_of(&inner.arms[0]), vec![("Y", None)]);
+        assert_eq!(inner.arms[1].outcome, ArmOutcome::Unevaluated);
+        assert_eq!((inner.arms[0].line, inner.arms[0].end_line), (2, 4));
+        assert_eq!((inner.arms[1].line, inner.arms[1].end_line), (4, 6));
+    }
+
+    /// An `#elif` after a taken arm is skipped without being evaluated; its
+    /// names are still reported, from the spelling.
+    #[test]
+    fn elif_after_taken_arm_is_skipped_without_evaluation() {
+        let src = "#if 1\nint a;\n#elif defined(B) && C\nint b;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        let arm = &chains[0].arms[1];
+        assert_eq!(arm.outcome, ArmOutcome::Skipped);
+        assert!(!arm.evaluated);
+        assert_eq!(reads_of(arm), vec![("B", None), ("C", None)]);
+        assert!(chains[0].arms[0].reads.is_empty());
+    }
+
+    #[test]
+    fn unterminated_chain_is_closed_at_end_of_file() {
+        let src = "int before;\n#ifdef A\nint a;\nint b;\n";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(chains.len(), 1);
+        assert!(!chains[0].terminated);
+        assert_eq!(chains[0].arms[0].line, 2);
+        assert_eq!(chains[0].arms[0].end_line, 5);
+    }
+
+    /// Without a trailing newline the EOF token sits on the last line
+    /// itself; the arm still has to span that line.
+    #[test]
+    fn unterminated_chain_without_trailing_newline_spans_the_last_line() {
+        let src = "int before;\n#ifdef A\nint a;\nint b;";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(chains[0].arms[0].end_line, 5);
+        assert_eq!(chains[0].arms[0].body_lines(), 2);
+    }
+
+    #[test]
+    fn unterminated_chain_counts_trailing_comment_and_whitespace_lines() {
+        let fixture =
+            include_str!("../../../tests/fixtures/preproc/conditional_unterminated_comment.c");
+        for src in [
+            fixture,
+            "#if 0\n   ",
+            "#if 0\n/* comment */",
+            "#if 0\n// final comment\n",
+        ] {
+            let chains = record(src, PreprocessOptions::new());
+            assert_eq!(chains[0].arms[0].end_line, 3, "{src:?}");
+            assert_eq!(chains[0].arms[0].body_lines(), 1, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn conditional_macro_operands_keep_operator_shaped_names() {
+        for directive in [
+            "ifdef and",
+            "ifndef and",
+            "if defined(and)",
+            "if defined and",
+        ] {
+            for outer in ["", "#if 0\n"] {
+                let src = format!(
+                    "{outer}#{directive}\nint x;\n#endif\n{}",
+                    if outer.is_empty() { "" } else { "#endif\n" }
+                );
+                let chains = record(&src, PreprocessOptions::new());
+                let arm = &chains.last().unwrap().arms[0];
+                let bound = if outer.is_empty() { Some(false) } else { None };
+                assert_eq!(reads_of(arm), vec![("and", bound)], "{src:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_directives_start_at_hash_before_splice() {
+        let src = "#\\\nif 0\nint x;\n#\\\nelse\nint y;\n#\\\nendif\n";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(chains[0].line(), 1);
+        assert_eq!(chains[0].arms[0].end_line, 4);
+        assert_eq!(chains[0].arms[0].body_lines(), 2);
+        assert_eq!(chains[0].arms[1].line, 4);
+        assert_eq!(chains[0].arms[1].end_line, 7);
+    }
+
+    #[test]
+    fn include_guard_is_recognized_and_other_ifndefs_are_not() {
+        let dir = unique_tmp_dir("cond_guard");
+        fs::write(
+            dir.join("guarded.h"),
+            "/* license */\n#ifndef GUARDED_H\n#define GUARDED_H\nint g;\n#endif /* GUARDED_H */\n\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("not_defined.h"),
+            "#if !defined(ND_H)\n#define ND_H\nint nd;\n#endif\n",
+        )
+        .unwrap();
+        // The default-value idiom: same opening shape, code after the #endif.
+        fs::write(
+            dir.join("default.h"),
+            "#ifndef LOG_TAG\n#define LOG_TAG 1\n#endif\nint d;\n",
+        )
+        .unwrap();
+        // Something before the #ifndef, and a #define of a different name.
+        fs::write(
+            dir.join("late.h"),
+            "int early;\n#ifndef LATE_H\n#define LATE_H\nint l;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("other_define.h"),
+            "#ifndef OD_H\n#define SOMETHING_ELSE\nint o;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("main.c"),
+            "#include \"guarded.h\"\n#include \"not_defined.h\"\n#include \"default.h\"\n#include \"late.h\"\n#include \"other_define.h\"\n#ifndef MAIN_H\n#define MAIN_H\nint m;\n#endif\n",
+        )
+        .unwrap();
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path.clone())
+            .with_record_conditionals(true);
+        let result = preprocess_file(&dir.join("main.c"), &opts).unwrap();
+        let guard_of = |name: &str| -> Vec<bool> {
+            result
+                .conditionals
+                .iter()
+                .filter(|c| c.file.ends_with(name))
+                .map(|c| c.include_guard)
+                .collect()
+        };
+        assert_eq!(guard_of("guarded.h"), vec![true]);
+        assert_eq!(guard_of("not_defined.h"), vec![true]);
+        assert_eq!(guard_of("default.h"), vec![false]);
+        assert_eq!(guard_of("late.h"), vec![false]);
+        assert_eq!(guard_of("other_define.h"), vec![false]);
+        // The TU's own trailing #ifndef/#define/#endif: preceded by tokens.
+        assert_eq!(guard_of("main.c"), vec![false]);
+        // A guard's chain is recorded in its own file, at the header's depth.
+        let guarded = result
+            .conditionals
+            .iter()
+            .find(|c| c.file.ends_with("guarded.h"))
+            .unwrap();
+        assert_eq!(guarded.depth, 0);
+        assert_eq!(guarded.line(), 2);
+        assert_eq!(guarded.arms[0].outcome, ArmOutcome::Taken);
+        assert_eq!(reads_of(&guarded.arms[0]), vec![("GUARDED_H", Some(false))]);
+    }
+
+    /// A guard candidate is per file: a header included inside the guard
+    /// chain must not consume the includer's pending `#define`, and its own
+    /// guard is judged on its own tokens.
+    #[test]
+    fn include_guard_detection_is_per_file() {
+        let dir = unique_tmp_dir("cond_guard_nested");
+        fs::write(
+            dir.join("inner.h"),
+            "#ifndef INNER_H\n#define INNER_H\nint i;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("outer.h"),
+            "#ifndef OUTER_H\n#include \"inner.h\"\n#define OUTER_H\nint o;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(dir.join("main.c"), "#include \"outer.h\"\n").unwrap();
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path.clone())
+            .with_record_conditionals(true);
+        let result = preprocess_file(&dir.join("main.c"), &opts).unwrap();
+        let outer = result
+            .conditionals
+            .iter()
+            .find(|c| c.file.ends_with("outer.h"))
+            .unwrap();
+        let inner = result
+            .conditionals
+            .iter()
+            .find(|c| c.file.ends_with("inner.h"))
+            .unwrap();
+        // outer.h's next directive after `#ifndef OUTER_H` is an #include,
+        // not the #define, so it is not the canonical guard shape.
+        assert!(!outer.include_guard);
+        assert!(inner.include_guard);
+        assert_eq!(inner.depth, 0, "includer frames do not count as depth");
+    }
+
+    #[test]
+    fn chains_in_included_headers_carry_the_header_path() {
+        let dir = unique_tmp_dir("cond_header_path");
+        fs::write(
+            dir.join("cfg.h"),
+            "#ifdef USE_FAST\nint fast;\n#else\nint slow;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("a.c"),
+            "#define USE_FAST 1\n#include \"cfg.h\"\n#ifdef USE_FAST\nint a;\n#endif\n",
+        )
+        .unwrap();
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path.clone())
+            .with_record_conditionals(true);
+        let result = preprocess_file(&dir.join("a.c"), &opts).unwrap();
+        assert_eq!(result.conditionals.len(), 2);
+        let cfg = &result.conditionals[0];
+        assert!(cfg.file.ends_with("cfg.h"), "{:?}", cfg.file);
+        assert_eq!(cfg.arms[0].outcome, ArmOutcome::Taken);
+        assert_eq!(reads_of(&cfg.arms[0]), vec![("USE_FAST", Some(true))]);
+        assert_eq!(cfg.arms[1].outcome, ArmOutcome::Skipped);
+        assert!(result.conditionals[1].file.ends_with("a.c"));
+    }
+
+    /// The same header reached as `src/../common/cfg.h` from one includer
+    /// and as `common/cfg.h` through an include dir is one file; its chains
+    /// have to merge across runs, so the record carries the canonical path.
+    #[test]
+    fn chain_file_is_canonical_however_the_include_spelled_it() {
+        let dir = unique_tmp_dir("cond_canonical");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("common")).unwrap();
+        fs::write(dir.join("common/cfg.h"), "#ifdef A\nint a;\n#endif\n").unwrap();
+        fs::write(dir.join("src/a.c"), "#include \"../common/cfg.h\"\n").unwrap();
+        fs::write(dir.join("src/b.c"), "#include \"cfg.h\"\n").unwrap();
+        let opts = PreprocessOptions::new()
+            .with_include(dir.join("common"))
+            .with_record_conditionals(true);
+        let via_parent = preprocess_file(&dir.join("src/a.c"), &opts).unwrap();
+        let via_dir = preprocess_file(&dir.join("src/b.c"), &opts).unwrap();
+        let expected = trace_ir::canonicalize(&dir.join("common/cfg.h"));
+        assert_eq!(via_parent.conditionals[0].file, expected);
+        assert_eq!(via_dir.conditionals[0].file, expected);
+        assert!(!via_parent.conditionals[0]
+            .file
+            .components()
+            .any(|c| c == std::path::Component::ParentDir));
+    }
+
+    /// A line marker or `#!` line inside a skipped group is not a directive
+    /// the group needs to understand; it must neither abort the file nor
+    /// stretch the arm to the end of it.
+    #[test]
+    fn non_identifier_directive_in_skipped_group_is_ignored() {
+        let src = "#if 0\n# 1 \"legacy.c\"\n#!/bin/sh\n#endif\nint kept;\nint also;\n";
+        let result = preprocess_string(
+            src,
+            Path::new("test.c"),
+            &PreprocessOptions::new().with_record_conditionals(true),
+        );
+        assert!(result.output.contains("kept"), "{:?}", result.output);
+        assert!(result.output.contains("also"), "{:?}", result.output);
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("preprocess stopped")),
+            "{:?}",
+            result.diagnostics
+        );
+        let chain = &result.conditionals[0];
+        assert!(chain.terminated);
+        assert_eq!(chain.arms[0].end_line, 4);
+        assert_eq!(chain.arms[0].body_lines(), 2);
+        // In an active group the same line is still an error.
+        let active = preprocess_string(
+            "# 1 \"legacy.c\"\nint x;\n",
+            Path::new("test.c"),
+            &PreprocessOptions::new(),
+        );
+        assert!(active
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("expected directive name")));
+    }
+
+    /// `#ifndef X_H / #define X_H / … / #else / … / #endif` has an
+    /// alternative; a guard does not.
+    #[test]
+    fn guard_shaped_chain_with_an_else_arm_is_not_a_guard() {
+        let src = "#ifndef X_H\n#define X_H\nint x;\n#else\nint y;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].arms.len(), 2);
+        assert!(!chains[0].include_guard);
+        let plain = record(
+            "#ifndef X_H\n#define X_H\nint x;\n#endif\n",
+            PreprocessOptions::new(),
+        );
+        assert!(plain[0].include_guard);
+    }
+
+    /// `and` / `not` in a condition are operators, not names the
+    /// configuration failed to bind — unless something did bind them.
+    #[test]
+    fn alternative_operator_spellings_are_not_reads() {
+        let src = "#if defined(A) and not defined(B)\nint x;\n#elif C or D\nint y;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new().with_define("A", "1"));
+        assert_eq!(
+            reads_of(&chains[0].arms[0]),
+            vec![("A", Some(true)), ("B", Some(false))]
+        );
+        assert!(chains[0].arms[1].evaluated);
+        assert_eq!(
+            reads_of(&chains[0].arms[1]),
+            vec![("C", Some(false)), ("D", Some(false))]
+        );
+        // Unevaluated arm: the spelled identifiers, minus the operators.
+        let nested = "#if 0\n#if X and Y\nint n;\n#endif\n#endif\n";
+        let chains = record(nested, PreprocessOptions::new());
+        assert_eq!(reads_of(&chains[1].arms[0]), vec![("X", None), ("Y", None)]);
+        // A macro actually named `and` is a name.
+        let bound = record(
+            "#if and\nint z;\n#endif\n",
+            PreprocessOptions::new().with_define("and", "1"),
+        );
+        assert_eq!(reads_of(&bound[0].arms[0]), vec![("and", Some(true))]);
     }
 }

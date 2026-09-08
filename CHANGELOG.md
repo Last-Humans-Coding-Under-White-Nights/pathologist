@@ -10,6 +10,17 @@ All notable changes to `trace` are documented in this file.
 - Explicit database schema-version metadata.
 - Validated, version-tagged GitHub releases alongside the rolling `master-latest` prerelease.
 - OpenHarmony IPC proxy-to-stub call edges for matching `SendRequest` methods.
+- Conditional-compilation coverage report (#57): with `PreprocessOptions::record_conditionals`
+  the preprocessor records every `#if` / `#ifdef` / `#ifndef` chain it meets — the condition as
+  written, each arm's line range and whether it was taken, skipped or never evaluated, and the
+  names the evaluation consulted with whether each was bound. The `conditional_coverage` example
+  measures a tree under the indexer's per-unit environment and classifies each name (include
+  guard / toolchain / configuration / unknown); `scripts/gen_conditional_coverage_report.py`
+  renders `docs/CONDITIONAL_COVERAGE.md` for the eval corpora. The record is off by default, and the
+  one preprocessing change is that a `#` followed by something other than a directive name (a line
+  marker, a `#!` line) inside a skipped group no longer aborts the file. Recording retains
+  explicit macro operands with operator-shaped names and physical directive/EOF line ranges.
+  A completion record prevents truncated TSV captures from producing partial reports.
 
 ### Changed
 

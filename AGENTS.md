@@ -107,3 +107,4 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 | Field summary / GEP fallback | `trace-analysis/src/pag.rs`, `solver.rs` |
 | New SQLite column | `trace-db/src/schema.rs`, `export.rs`, `docs/SQLITE_SCHEMA.md` |
 | Parse new C construct | `trace-parse/src/lower.rs` |
+| Measure what the configuration excludes (`#if` arms not taken) | `PreprocessOptions::record_conditionals` + `PreprocessResult::conditionals` (`trace-preproc/src/conditionals.rs`), `trace-cli/examples/conditional_coverage.rs`, `scripts/gen_conditional_coverage_report.py` → `docs/CONDITIONAL_COVERAGE.md` |
