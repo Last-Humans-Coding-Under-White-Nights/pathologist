@@ -15,6 +15,51 @@
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Initial validation, 2026-09-08 (dependency roots `--dep <root>`, #60):** fresh release builds of
+`master` (be7d7ca) and the branch were compared against the three clean pinned checkouts under
+`/private/tmp/corpora`, `--jobs 8`, 800,000-pop budget. Both pass **86/86** `eval_check` checks
+with every measured value identical.
+
+The corpora are analyzed without `--dep`; this checks that single-tree analysis
+results remain unchanged. It does not measure dependency-mode performance.
+Dumped sorted from each pair of databases, the `call_edges` rows (caller, call site, callee,
+resolution) and the `functions` rows (name, line range, linkage, `is_defined`) are **byte-identical
+across all three corpora** — 75,679 / 28,636 / 73,507 edge rows and 12,649 / 11,436 / 25,613
+function rows for hdf, hiview and camera. Every file and function in those runs carries
+`is_dep = 0` and `options_json.dep_roots` is `[]`, which is what the code predicts: with no root
+declared, `SymbolTable::dep_roots` is empty, `FileInfo::is_dep` is false for every interned path,
+and dependency guards evaluate to false.
+
+Dependency behavior itself is pinned by fixture rather than by corpus, in
+`tests/fixtures/dep_root/` and `crates/trace-cli/tests/dep_root_tests.rs`: a source under the
+dependency root stays out of the index, an unreached dependency header is never an orphan unit,
+`sptr<TargetService>` unwraps through the declared `operator->` to direct edges on
+`TargetService`, no edge lands on the wrapper, no function declared in a dependency header is
+ever a *caller*, a target call to a dependency declaration does resolve, and `--exclude-deps`
+drops exactly the edges that touch a dependency function and no others.
+
+Review follow-up: the original merge-only filter retained function-local statics
+and could retain body flow through parameters or globals. A regression reproduced
+the leaked static before the fix. Dependency function bodies, constructor-initializer
+lists, and variable initializers now stop during lowering, before body IR is
+allocated. This removes work rather than building facts and filtering them later;
+no wall-time or memory speedup is claimed here.
+
+Fresh validation after the follow-up: **584 workspace tests** pass;
+`cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo fmt --all --check` are clean. The five dependency tests cover the original
+resolution/export/CLI behavior plus body and initializer exclusion with one and two
+workers, and preservation of target-header bodies reached through dependencies.
+A fresh release build also passes **86/86 corpus checks** at the same pinned
+checkouts (`python3 scripts/eval_check.py --corpus-base /private/tmp/corpora
+--outdir /private/tmp/dep-review-eval`). These follow-up runs use no `--dep`;
+the row-by-row comparison was also independently re-run against the reviewed
+implementation (`084a498`, squashed into this commit).
+The sorted `call_edges` and `functions` dumps remain **byte-identical to master
+(be7d7ca) on all three corpora** after the lowering-path change. Unchanged
+no-`--dep` analysis output is therefore measured for the reviewed implementation,
+not inferred from its guards.
+
 **Re-verified 2026-09-08 (GNU `, ## __VA_ARGS__` decided from the body, #65):** fresh
 release builds of `master` (c4d0ff0) and the branch were compared on the same machine against
 the three clean pinned checkouts under `/private/tmp/corpora`, `--jobs 8`, 800,000-pop budget.

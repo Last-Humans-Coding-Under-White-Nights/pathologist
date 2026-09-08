@@ -1,6 +1,6 @@
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
-pub const SCHEMA_V3: &str = r#"
+pub const SCHEMA_V4: &str = r#"
 CREATE TABLE IF NOT EXISTS analysis_run (
     id INTEGER PRIMARY KEY,
     trace_version TEXT NOT NULL,
@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS analysis_run (
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY,
     path TEXT NOT NULL UNIQUE,
-    sha256 TEXT NOT NULL
+    sha256 TEXT NOT NULL,
+    is_dep INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS functions (
@@ -24,7 +25,8 @@ CREATE TABLE IF NOT EXISTS functions (
     line_end INTEGER NOT NULL,
     linkage TEXT NOT NULL,
     signature TEXT NOT NULL,
-    is_defined INTEGER NOT NULL
+    is_defined INTEGER NOT NULL,
+    is_dep INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS types (

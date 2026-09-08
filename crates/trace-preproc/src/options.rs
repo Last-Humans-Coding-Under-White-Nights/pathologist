@@ -236,6 +236,9 @@ pub struct PreprocessOptions {
     /// without re-evaluating its conditionals, so the record is complete
     /// only for a run that expands every include itself.
     pub record_conditionals: bool,
+    /// Dependency roots whose headers contribute declarations but whose
+    /// sources are excluded from translation unit discovery (#60).
+    pub dep_roots: Vec<PathBuf>,
 }
 
 impl Default for PreprocessOptions {
@@ -258,6 +261,7 @@ impl Default for PreprocessOptions {
             max_expansion_variants: 8,
             max_file_expansions: 64,
             record_conditionals: false,
+            dep_roots: Vec::new(),
         }
     }
 }
@@ -304,6 +308,13 @@ impl PreprocessOptions {
 
     pub fn with_include(mut self, path: PathBuf) -> Self {
         self.include_paths.push(path);
+        self
+    }
+
+    /// Add a dependency root (`--dep`). Pass a canonical path: roots are
+    /// matched against canonical file paths by prefix.
+    pub fn with_dep(mut self, path: impl Into<PathBuf>) -> Self {
+        self.dep_roots.push(path.into());
         self
     }
 

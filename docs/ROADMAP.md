@@ -72,6 +72,16 @@
 - Function-local **`static`** variables classified as `FnStatic` (not `Local`)
 - Fixtures: `static_direct_call/`, `static_call_return/`, `fn_arg_flow/`, `fn_static_local/`
 
+### M10 — Dependency roots (`--dep`) ✅
+
+- Repeatable `--dep <root>` for a tree the target builds against but that is not under analysis.
+- Dependency headers discovered and preprocessed; dependency sources never become translation units, and unreached dependency headers are never indexed as orphan units.
+- Declarations only from a dependency body: `is_defined = false`, no locals, call sites, flow constraints or return flows.
+- Receiver typing through dependency declarations — `sptr<T>` unwrapped via its declared `operator->` return.
+- Schema v4: `files.is_dep`, `functions.is_dep`, `dep_roots` in `options_json`.
+- `trace inspect calls --exclude-deps`.
+- Fixture: `tests/fixtures/dep_root/`
+
 ## In progress / next
 
 C++ beyond the first step is planned from the hiview corpus in

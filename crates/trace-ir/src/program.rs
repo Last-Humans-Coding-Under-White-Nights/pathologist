@@ -166,6 +166,23 @@ impl Program {
         }
     }
 
+    /// Dependency roots whose headers contribute declarations but whose
+    /// sources are never indexed as translation units (`--dep`, #60).
+    pub fn dep_roots(&self) -> &[PathBuf] {
+        self.symbols.dep_roots()
+    }
+
+    /// Whether a path lies under a dependency root. Canonicalizes; prefer
+    /// [`Program::is_dep_file`] once the path has been interned.
+    pub fn is_dep_path(&self, path: &std::path::Path) -> bool {
+        self.symbols.path_is_dep(path)
+    }
+
+    /// Whether an interned file lies under a dependency root. O(1).
+    pub fn is_dep_file(&self, file: FileId) -> bool {
+        self.symbols.file_is_dep(file)
+    }
+
     /// Record a `(derived, base)` edge once.
     pub fn add_inheritance(&mut self, derived: &str, base: &str) {
         if derived.is_empty() || base.is_empty() {

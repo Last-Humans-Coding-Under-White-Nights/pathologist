@@ -338,6 +338,8 @@ pub struct CallEdgeFilter<'a> {
     /// File-substring filter matching the call-site path, the callee path, or
     /// (for site-less edges) the caller's own path.
     pub file: Option<&'a str>,
+    /// Exclude edges where caller or callee is in a dependency root.
+    pub exclude_deps: bool,
 }
 
 /// One call edge row, including the caller's own source path (needed for
@@ -374,6 +376,15 @@ pub fn call_edges(conn: &Connection, filter: &CallEdgeFilter<'_>) -> Result<Vec<
                  JOIN files callee_f ON callee_f.id = callee.file_id WHERE 1=1",
     );
     let mut params: Vec<String> = Vec::new();
+    if filter.exclude_deps {
+        if !column_exists(conn, "functions", "is_dep")? {
+            bail!(
+                "`functions.is_dep` missing: database predates dependency-root export; \
+                 re-run `trace analyze` with this binary"
+            );
+        }
+        sql.push_str(" AND caller.is_dep = 0 AND callee.is_dep = 0");
+    }
     if let Some(f) = filter.from {
         push_fn_name_filter(&mut sql, &mut params, "caller.name", f);
     }
@@ -1259,12 +1270,12 @@ pub fn require_symbols_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::SCHEMA_V3;
+    use crate::schema::SCHEMA_V4;
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
         // files: 1 = /proj/main.c
         conn.execute(
             "INSERT INTO files (id, path, sha256) VALUES (1, '/proj/main.c', '')",

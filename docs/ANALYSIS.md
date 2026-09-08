@@ -741,6 +741,70 @@ Known C++ imprecision (in addition to the general list below):
 
 Next slices (hiview-grounded): [docs/CPP_ROADMAP.md](CPP_ROADMAP.md).
 
+## Dependency roots
+
+A repeatable `--dep <root>` names a tree the target builds against but that is
+not the code under analysis: a vendored SDK, a framework checkout, a sibling
+repository. The distinction it draws is between what a tree **declares** and
+what it **defines**. A dependency's declarations are needed — without the
+class definition behind `sptr<T>`, a receiver spelled `sptr<CaptureSession>`
+has no members to look up — while its definitions are noise: indexing them
+inflates the call graph with edges inside code nobody asked about, and costs
+the time to parse it.
+
+### What is discovered
+
+- **Headers** under a dependency root are discovered and preprocessed like
+  project headers. Each header's own directory joins the include path, as does
+  the root itself, so a rooted spelling (`<subdir/foo.h>`) resolves.
+- **Sources** (`.c`, `.cpp`, `.cc`, `.cxx`) under a dependency root are never
+  translation units, even when the root sits inside the analyzed tree.
+- **Unreached headers** under a dependency root are not indexed as standalone
+  orphan units. A dependency contributes what the target actually includes.
+
+A dependency root nested *inside* the analysis root is supported, as the second
+bullet says. One that contains or equals the analysis root is rejected at
+startup: it would classify every discovered source as a dependency and leave no
+translation units, so `--dep` must name a subtree that excludes the code under
+analysis.
+
+### What a dependency contributes
+
+Types, typedefs, struct/class definitions, inheritance edges, `final` markers,
+prototypes, parameter and return types, and declared `operator->` returns —
+everything a call site needs to type its receiver and name its callee.
+
+A body written in a dependency header contributes nothing beyond its signature.
+Whatever the mode a unit merges under, a function whose span lies in a
+dependency file is stored as a declaration: `is_defined = false`, no body line
+range, no locals (including function-local statics), no call sites, no value-flow
+constraints and no return flows. Lowering stops after the signature, before
+walking the body or constructor-initializer list. Dependency variable declarations
+retain their types but their initializers are not lowered. This prevents assignments
+to parameters or globals from leaking through the merge and avoids allocating body
+IR that would only be discarded. A header's own unit merges as a preamble for the
+same reason. Classification uses the original LineMap file, including cached
+expansions; target headers reached through dependencies retain their bodies.
+
+### Receiver typing through a wrapper
+
+This is what the declarations buy. Given `sptr<T>` declared in a dependency
+header with `T *operator->() const`, the recorded arrow return says the class
+returns a pointer to the template parameter in position 0, so a call site can
+substitute from the instantiation's arguments. `infer_static_class` unwraps
+`sptr<CaptureSession>` to `CaptureSession`, and
+`session->AddOutput(...)` resolves to `CaptureSession::AddOutput` instead of
+falling back to an external edge named after the wrapper (`sptr::AddOutput`),
+which corresponds to no function at all.
+
+### Attribution
+
+`FileInfo::is_dep` is decided once, when a path is interned, and every later
+question is an O(1) file lookup. Export carries it through to `files.is_dep`
+and `functions.is_dep` (schema v4), `analysis_run.options_json` records
+`dep_roots`, and `trace inspect calls --exclude-deps` drops the edges whose
+caller or callee is a dependency function.
+
 ## Known imprecision
 
 - All paths merged; no null-check refinement.

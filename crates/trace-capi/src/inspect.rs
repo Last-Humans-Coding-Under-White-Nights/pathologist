@@ -346,6 +346,7 @@ pub unsafe extern "C" fn trace_db_call_edges(
                 from: from.as_deref(),
                 to: to.as_deref(),
                 file: file.as_deref(),
+                exclude_deps: false,
             },
         )
         .map_err(ApiError::from)?;

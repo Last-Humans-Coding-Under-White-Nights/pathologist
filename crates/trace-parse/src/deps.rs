@@ -8,6 +8,8 @@ use walkdir::WalkDir;
 #[derive(Debug, Clone, Default)]
 pub struct IncludeGraph {
     pub root: PathBuf,
+    /// Canonical roots whose entities contribute declarations only.
+    pub dep_roots: Vec<PathBuf>,
     /// All `.c` / `.h` files under the analyzed root (canonical).
     pub project_files: HashSet<PathBuf>,
     /// Direct local include dependencies (dependent → included).
@@ -36,13 +38,30 @@ struct IncludeRef {
 
 impl IncludeGraph {
     pub fn build(root: &Path, c_files: &[PathBuf], h_files: &[PathBuf]) -> Self {
+        Self::build_with_deps(root, c_files, h_files, &[], &[])
+    }
+
+    /// Include graph over the analyzed tree plus dependency-root headers
+    /// (`--dep`, #60). Dependency headers resolve like project headers; the
+    /// roots themselves join the include path so `<subdir/foo.h>` resolves.
+    pub fn build_with_deps(
+        root: &Path,
+        c_files: &[PathBuf],
+        h_files: &[PathBuf],
+        dep_roots: &[PathBuf],
+        dep_headers: &[PathBuf],
+    ) -> Self {
         let root = trace_ir::canonicalize(root);
         let mut project_files: HashSet<PathBuf> = HashSet::new();
-        for p in c_files.iter().chain(h_files.iter()) {
+        for p in c_files
+            .iter()
+            .chain(h_files.iter())
+            .chain(dep_headers.iter())
+        {
             project_files.insert(canonicalize(p));
         }
 
-        let include_dirs = discover_include_dirs(&root, h_files);
+        let include_dirs = discover_include_dirs(&root, h_files, dep_roots, dep_headers);
         let basename_index = build_basename_index(&project_files);
 
         let mut edges: IndexMap<PathBuf, Vec<PathBuf>> = IndexMap::new();
@@ -81,6 +100,7 @@ impl IncludeGraph {
 
         Self {
             root,
+            dep_roots: dep_roots.iter().map(|p| canonicalize(p)).collect(),
             project_files,
             edges,
             include_dirs,
@@ -332,10 +352,15 @@ fn canonicalize(path: &Path) -> PathBuf {
     trace_ir::canonicalize(path)
 }
 
-fn discover_include_dirs(root: &Path, headers: &[PathBuf]) -> Vec<PathBuf> {
+fn discover_include_dirs(
+    root: &Path,
+    headers: &[PathBuf],
+    dep_roots: &[PathBuf],
+    dep_headers: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut dirs: HashSet<PathBuf> = HashSet::new();
     dirs.insert(canonicalize(root));
-    for h in headers {
+    for h in headers.iter().chain(dep_headers.iter()) {
         if let Some(parent) = h.parent() {
             dirs.insert(canonicalize(parent));
         }
@@ -348,6 +373,11 @@ fn discover_include_dirs(root: &Path, headers: &[PathBuf]) -> Vec<PathBuf> {
         if entry.file_name() == "include" {
             dirs.insert(canonicalize(entry.path()));
         }
+    }
+    // Each dependency header's own directory is already in `dirs` above; the
+    // root itself is what a rooted spelling (`<subdir/foo.h>`) resolves from.
+    for dep in dep_roots {
+        dirs.insert(canonicalize(dep));
     }
     let mut v: Vec<PathBuf> = dirs.into_iter().collect();
     v.sort();
