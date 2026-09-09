@@ -505,9 +505,20 @@ fn solve(
                             continue;
                         };
                         if let PagNodeKind::Var(base_var) = pag.nodes[src.0 as usize].kind {
-                            if let Some(summary) =
+                            let summary_opt = if program.variants_merged > 0 {
+                                // Cloned only here: `ensure_*` needs `&mut pag`,
+                                // and the baseline path must not pay for it.
+                                let expected = pag.constraints[idx].field_name.clone();
+                                pag.ensure_field_summary_for_var_named(
+                                    program,
+                                    base_var,
+                                    field,
+                                    expected.as_deref(),
+                                )
+                            } else {
                                 pag.ensure_field_summary_for_var(program, base_var, field)
-                            {
+                            };
+                            if let Some(summary) = summary_opt {
                                 propagate_locs(&mut st, dst, [summary]);
                                 st.merge_memory_into_if_grown(dst, summary);
                             }
@@ -582,17 +593,34 @@ fn solve(
                 // stores from other instances of the same struct type.
                 let mut produced_cell = false;
                 for &loc in delta.iter() {
+                    let mut effective_field = field;
                     // Cross-struct FieldId guard: if the GEP carries a
                     // field name from lowering, reject pointees whose
                     // struct type has a different field at the same
                     // positional index — this prevents functions from
                     // unrelated structs leaking as indirect-call targets.
+                    // Unioning a layout across configurations can move a field
+                    // off its base positional index, so once variants have
+                    // actually been merged the name is resolved instead of the
+                    // pointee being rejected. Requesting `--explore` is not
+                    // enough: with no variant merged nothing was unioned, and
+                    // relaxing the guard would only let unrelated structs
+                    // through.
                     if let Some(ref expected) = expected_name {
                         if let Some(parent_type) =
                             crate::pag::struct_type_for_loc(pag, program, loc)
                         {
                             match program.types.get(parent_type).layout.fields.get(&field) {
                                 Some(fl) if fl.name == *expected => {}
+                                _ if program.variants_merged > 0 => {
+                                    if let Some(fid) =
+                                        program.types.field_id_by_name(parent_type, expected)
+                                    {
+                                        effective_field = fid;
+                                    } else {
+                                        continue;
+                                    }
+                                }
                                 _ => continue,
                             }
                         }
@@ -620,13 +648,15 @@ fn solve(
                         // not surface as an indirect-call target.
                         if !passed {
                             let n = program.symbols.function(fn_id).params.len();
-                            if n > 0 && pag.field_slot_arity(program, loc, field) == Some(n) {
+                            if n > 0
+                                && pag.field_slot_arity(program, loc, effective_field) == Some(n)
+                            {
                                 add_pts(&mut st, dst, loc);
                             }
                         }
                         continue;
                     }
-                    if let Some(field_loc) = pag.ensure_field_loc(program, loc, field) {
+                    if let Some(field_loc) = pag.ensure_field_loc(program, loc, effective_field) {
                         produced_cell = true;
                         // Field loc plus its instance-insensitive summary:
                         // the GEP result points AT these cells.
@@ -665,9 +695,17 @@ fn solve(
                 let base_unpointed = st.pts.get(&node).map(|p| p.is_empty()).unwrap_or(true);
                 if base_unpointed || !produced_cell {
                     if let PagNodeKind::Var(base_var) = pag.nodes[src.0 as usize].kind {
-                        if let Some(summary) =
+                        let summary_opt = if program.variants_merged > 0 {
+                            pag.ensure_field_summary_for_var_named(
+                                program,
+                                base_var,
+                                field,
+                                expected_name.as_deref(),
+                            )
+                        } else {
                             pag.ensure_field_summary_for_var(program, base_var, field)
-                        {
+                        };
+                        if let Some(summary) = summary_opt {
                             propagate_locs(&mut st, dst, [summary]);
                             st.merge_memory_into_if_grown(dst, summary);
                         }

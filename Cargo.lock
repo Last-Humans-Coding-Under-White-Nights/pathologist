@@ -729,6 +729,7 @@ dependencies = [
  "indexmap",
  "rusqlite",
  "rustc-hash",
+ "serde_json",
  "tempfile",
  "trace-analysis",
  "trace-db",

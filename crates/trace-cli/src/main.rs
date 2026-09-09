@@ -63,6 +63,12 @@ enum Commands {
         /// no call sites or value flow.
         #[arg(long = "dep")]
         deps: Vec<PathBuf>,
+        /// Explore feasible configuration variants for conditional code regions (#59).
+        #[arg(long)]
+        explore: bool,
+        /// Maximum number of configuration variants to explore per translation unit (#59).
+        #[arg(long, default_value_t = 4)]
+        explore_budget: usize,
     },
     /// Inspect an existing analysis database.
     Inspect {
@@ -219,6 +225,8 @@ fn main() -> Result<()> {
             models,
             deps,
             no_ipc,
+            explore,
+            explore_budget,
         } => run_analyze(
             target,
             output,
@@ -231,6 +239,8 @@ fn main() -> Result<()> {
             models,
             deps,
             no_ipc,
+            explore,
+            explore_budget,
         ),
         Commands::Inspect { db, command } => run_inspect(db, command),
     }
@@ -249,6 +259,8 @@ fn run_analyze(
     model_files: Vec<PathBuf>,
     deps: Vec<PathBuf>,
     no_ipc: bool,
+    explore: bool,
+    explore_budget: usize,
 ) -> Result<()> {
     if let Some(secs) = timeout_secs {
         std::thread::spawn(move || {
@@ -326,6 +338,9 @@ fn run_analyze(
             opts = opts.with_define(def, "1");
         }
     }
+    opts = opts
+        .with_explore(explore)
+        .with_explore_budget(explore_budget);
 
     // Include paths pointing outside the analyzed tree make twin headers
     // (same basename, different tree) resolve to the wrong copy, which

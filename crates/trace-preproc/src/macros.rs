@@ -11,10 +11,10 @@ pub enum MacroDef {
         params: Vec<String>,
         replacement: Vec<Token>,
         /// Invariant: when true, the LAST entry of `params` is the variadic
-        /// collector — parse_macro_param_list pushes `"__VA_ARGS__"` for the
+        /// collector — `parse_macro_param_list` pushes `"__VA_ARGS__"` for the
         /// anonymous `...` form. A hand-built variadic def (builtins, tests)
         /// must uphold this or the last named parameter will swallow every
-        /// argument; substitute_macro debug_asserts it.
+        /// argument; `substitute_macro` debug_asserts it.
         variadic: bool,
     },
     /// Last-resort parser recovery for a gMock declaration macro
@@ -42,6 +42,7 @@ pub enum MacroOp {
 pub type MacroTable = IndexMap<String, MacroDef>;
 pub type SharedMacroTable = Arc<RwLock<MacroTable>>;
 
+#[must_use]
 pub fn new_shared_macro_table() -> SharedMacroTable {
     Arc::new(RwLock::new(MacroTable::new()))
 }
@@ -60,6 +61,7 @@ pub fn new_shared_macro_table() -> SharedMacroTable {
 /// from a C++ unit. No compiler is claimed: `__GNUC__` / `__clang__` stay
 /// unbound, since either would switch on vendor extensions the parser does
 /// not have.
+#[must_use]
 pub fn predefined_macros(language: Language) -> &'static [(&'static str, &'static str)] {
     match language {
         Language::C => &[("__STDC__", "1"), ("__STDC_VERSION__", "201710L")],
@@ -70,6 +72,7 @@ pub fn predefined_macros(language: Language) -> &'static [(&'static str, &'stati
 /// Object-like macros for the language's [`predefined_macros`] and the
 /// command-line `-D` definitions, in that order, their bodies lexed as
 /// `language` (see [`Language`] for what differs).
+#[must_use]
 pub fn macro_table_from_defines(
     defines: &indexmap::IndexMap<String, String>,
     language: Language,

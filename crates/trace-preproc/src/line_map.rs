@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 ///
 /// File paths are interned in [`LineMap::files`]; entries store the index so
 /// per-token recording stays allocation-free and cache-friendly.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineMap {
     /// Interned origin paths; entry `file` indexes into this vec.
     pub files: Vec<PathBuf>,
@@ -12,7 +12,7 @@ pub struct LineMap {
 }
 
 /// One mapping: byte offset in preprocessed output → original location.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineMapEntry {
     pub output_offset: u32,
     pub file: u32,
@@ -21,6 +21,7 @@ pub struct LineMapEntry {
 }
 
 impl LineMap {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -43,6 +44,7 @@ impl LineMap {
         });
     }
 
+    #[must_use]
     pub fn lookup(&self, output_offset: usize) -> Option<&LineMapEntry> {
         // Entries are pushed with non-decreasing output offsets.
         let idx = self
@@ -55,10 +57,12 @@ impl LineMap {
     }
 
     /// Original path for an entry.
+    #[must_use]
     pub fn path_of(&self, entry: &LineMapEntry) -> &Path {
         &self.files[entry.file as usize]
     }
 
+    #[must_use]
     pub fn lookup_line(&self, _output_line: u32) -> Option<&LineMapEntry> {
         // Approximate: find last entry before this line
         self.entries.last()
@@ -66,15 +70,13 @@ impl LineMap {
 
     /// Entries at or after `start`, re-based so `start` becomes offset 0 and
     /// with the file table reduced to the files actually referenced.
+    #[must_use]
     pub fn slice_from(&self, start: usize) -> LineMap {
         let idx = self
             .entries
             .partition_point(|e| (e.output_offset as usize) < start);
         let mut out = LineMap::new();
-        let mut remap: Vec<u32> = Vec::with_capacity(self.files.len());
-        for _ in 0..self.files.len() {
-            remap.push(u32::MAX);
-        }
+        let mut remap = vec![u32::MAX; self.files.len()];
         for e in &self.entries[idx..] {
             if remap[e.file as usize] == u32::MAX {
                 remap[e.file as usize] = out.intern_file(&self.files[e.file as usize]);

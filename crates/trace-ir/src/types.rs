@@ -351,6 +351,96 @@ impl TypeTable {
         self.intern(TypeDesc::Union { name, fields })
     }
 
+    #[must_use]
+    pub fn union_struct_layout(&mut self, name: String, fields: Vec<(String, TypeDesc)>) -> TypeId {
+        self.union_aggregate_layout(name, fields, TypeKind::Struct)
+    }
+
+    #[must_use]
+    pub fn union_union_layout(&mut self, name: String, fields: Vec<(String, TypeDesc)>) -> TypeId {
+        self.union_aggregate_layout(name, fields, TypeKind::Union)
+    }
+
+    fn aggregate_desc(kind: TypeKind, name: String, fields: Vec<(String, TypeDesc)>) -> TypeDesc {
+        match kind {
+            TypeKind::Struct => TypeDesc::Struct { name, fields },
+            TypeKind::Union => TypeDesc::Union { name, fields },
+            // Only `union_struct_layout` and `union_union_layout` call in.
+            _ => unreachable!("{kind:?} is not an aggregate kind"),
+        }
+    }
+
+    /// Whether the tag layout of `id` already carries this member.
+    ///
+    /// Named members are identified by name. Anonymous members
+    /// (`struct { ... };` with no declarator) all share the empty name, so
+    /// matching on the name alone would let the first one swallow every other
+    /// anonymous member of the variant.
+    fn tag_layout_has_field(&self, id: TypeId, fname: &str, fdesc: &TypeDesc) -> bool {
+        self.get(id).layout.fields.values().any(|fl| {
+            fl.name == fname && (!fname.is_empty() || self.get(fl.type_id).desc == *fdesc)
+        })
+    }
+
+    fn union_aggregate_layout(
+        &mut self,
+        name: String,
+        incoming_fields: Vec<(String, TypeDesc)>,
+        kind: TypeKind,
+    ) -> TypeId {
+        if name.is_empty() {
+            return self.intern(Self::aggregate_desc(kind, name, incoming_fields));
+        }
+        let Some(existing_id) = self.type_id_by_tag(&name, kind) else {
+            return self.intern(Self::aggregate_desc(kind, name, incoming_fields));
+        };
+
+        // Every variant re-merges every aggregate its configuration shares with
+        // the base, so the overwhelmingly common case is an incoming layout that
+        // adds nothing. Answer that against the stored layout, before cloning a
+        // descriptor per existing field — those clones are deep.
+        if incoming_fields
+            .iter()
+            .all(|(n, d)| self.tag_layout_has_field(existing_id, n, d))
+        {
+            return existing_id;
+        }
+
+        let mut merged_fields: Vec<(String, TypeDesc)> = self
+            .get(existing_id)
+            .layout
+            .fields
+            .values()
+            .map(|fl| (fl.name.clone(), self.get(fl.type_id).desc.clone()))
+            .collect();
+        for (in_name, in_desc) in incoming_fields {
+            // Deduplicate against what the variant itself has already added,
+            // not only against the base layout.
+            let already_present = merged_fields
+                .iter()
+                .any(|(n, d)| n == &in_name && (!in_name.is_empty() || d == &in_desc));
+            if !already_present {
+                merged_fields.push((in_name, in_desc));
+            }
+        }
+        let new_desc = Self::aggregate_desc(kind, name, merged_fields);
+        let (size, align, layout) = compute_layout(&new_desc, self);
+        self.types[existing_id.0 as usize].desc = new_desc.clone();
+        self.types[existing_id.0 as usize].size = size;
+        self.types[existing_id.0 as usize].align = align;
+        self.types[existing_id.0 as usize].layout = layout;
+        // The pre-union descriptor stays interned on purpose: it still names
+        // this type, and dropping it would let a later unit spelling the
+        // narrower layout intern a *second* id and lose the union.
+        self.intern.insert(new_desc, existing_id);
+        // The entry just gained fields, so the tag maps have to reconsider it:
+        // they point at the richest layout for a name, and this one changed
+        // under them (#59 review).
+        self.note_named_tag(existing_id);
+        self.needs_tag_completion = true;
+        existing_id
+    }
+
     pub fn field_id_by_name(&self, type_id: TypeId, fname: &str) -> Option<FieldId> {
         let info = self.get(type_id);
         info.layout
@@ -593,5 +683,122 @@ mod tests {
         });
         assert_eq!(still, rich, "empty tag must rewrite to the complete layout");
         assert_eq!(t.type_id_by_tag("Foo", TypeKind::Struct), Some(rich));
+    }
+
+    #[test]
+    fn unioning_a_layout_appends_without_moving_base_fields() {
+        // A variant that inserts a member in the MIDDLE of the base struct.
+        // Appending is what keeps the base configuration's `FieldId`s stable;
+        // the variant's own indices drift, which is what the solver's
+        // `expected_name` fallback exists to repair (#59).
+        let mut t = TypeTable::new();
+        let base = t.compute_struct_layout(
+            "S".into(),
+            vec![("a".into(), TypeDesc::Int), ("b".into(), TypeDesc::Int)],
+        );
+        let a = t.field_id_by_name(base, "a").unwrap();
+        let b = t.field_id_by_name(base, "b").unwrap();
+
+        let merged = t.union_struct_layout(
+            "S".into(),
+            vec![
+                ("a".into(), TypeDesc::Int),
+                ("mid".into(), TypeDesc::Int),
+                ("b".into(), TypeDesc::Int),
+            ],
+        );
+        assert_eq!(merged, base, "the tag keeps its identity across the union");
+        assert_eq!(t.field_id_by_name(merged, "a"), Some(a));
+        assert_eq!(t.field_id_by_name(merged, "b"), Some(b));
+        assert_eq!(t.get(merged).layout.fields.len(), 3);
+        assert_eq!(
+            t.field_id_by_name(merged, "mid"),
+            Some(FieldId(2)),
+            "a variant-only field is appended, not inserted"
+        );
+    }
+
+    #[test]
+    fn unioning_a_layout_keeps_the_tag_on_the_richer_entry() {
+        // The union mutates the stored type in place, so the tag maps — which
+        // point at the richest layout for a name — have to reconsider it
+        // afterwards. They were left holding whatever they had before (#59
+        // review).
+        let mut t = TypeTable::new();
+        let empty = t.compute_struct_layout("S".into(), Vec::new());
+        assert_eq!(t.type_id_by_tag("S", TypeKind::Struct), Some(empty));
+
+        let merged = t.union_struct_layout(
+            "S".into(),
+            vec![("a".into(), TypeDesc::Int), ("b".into(), TypeDesc::Int)],
+        );
+        assert_eq!(
+            t.type_id_by_tag("S", TypeKind::Struct),
+            Some(merged),
+            "the tag resolves to the layout that now carries the fields"
+        );
+        assert_eq!(t.get(merged).layout.fields.len(), 2);
+    }
+
+    #[test]
+    fn re_unioning_the_same_layout_changes_nothing() {
+        // Every variant re-merges every aggregate it shares with the base.
+        let mut t = TypeTable::new();
+        let base = t.compute_struct_layout(
+            "S".into(),
+            vec![("a".into(), TypeDesc::Int), ("b".into(), TypeDesc::Int)],
+        );
+        let size = t.get(base).size;
+        for _ in 0..3 {
+            let again = t.union_struct_layout(
+                "S".into(),
+                vec![("a".into(), TypeDesc::Int), ("b".into(), TypeDesc::Int)],
+            );
+            assert_eq!(again, base);
+            assert_eq!(t.get(base).layout.fields.len(), 2);
+            assert_eq!(t.get(base).size, size);
+        }
+    }
+
+    #[test]
+    fn anonymous_members_are_matched_on_their_type() {
+        // Anonymous members all share the empty name, so name-only matching
+        // would let the first one swallow every other one.
+        let mut t = TypeTable::new();
+        let base = t.compute_struct_layout(
+            "S".into(),
+            vec![(
+                String::new(),
+                TypeDesc::Union {
+                    name: "U1".into(),
+                    fields: vec![("x".into(), TypeDesc::Int)],
+                },
+            )],
+        );
+        let merged = t.union_struct_layout(
+            "S".into(),
+            vec![
+                (
+                    String::new(),
+                    TypeDesc::Union {
+                        name: "U1".into(),
+                        fields: vec![("x".into(), TypeDesc::Int)],
+                    },
+                ),
+                (
+                    String::new(),
+                    TypeDesc::Union {
+                        name: "U2".into(),
+                        fields: vec![("y".into(), TypeDesc::Int)],
+                    },
+                ),
+            ],
+        );
+        assert_eq!(merged, base);
+        assert_eq!(
+            t.get(merged).layout.fields.len(),
+            2,
+            "the identical anonymous member is shared, the differing one is added"
+        );
     }
 }

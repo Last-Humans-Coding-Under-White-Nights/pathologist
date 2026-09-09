@@ -805,6 +805,145 @@ and `functions.is_dep` (schema v4), `analysis_run.options_json` records
 `dep_roots`, and `trace inspect calls --exclude-deps` drops the edges whose
 caller or callee is a dependency function.
 
+## Bounded conditional-variant exploration (`--explore`)
+
+A single build-free configuration necessarily omits implementations hidden behind
+conditional compilation arms (`#if`, `#ifdef`, `#elif`) that are excluded by default
+options (#57, #59). Concatenating alternate arms into a single stream would produce
+syntactically and semantically invalid code (redefined variables, mutually exclusive
+headers, broken scopes).
+
+`--explore` (bounded by `--explore-budget <N>`, default 4) recovers excluded platform
+and feature implementations by exploring feasible configuration variants independently:
+
+1. **Candidate define discovery**: In-tree GN files (`BUILD.gn`, `*.gni`, `*.gn`) are
+   scanned for candidate macro definitions (`defines = [...]`, `defines += [...]`)
+   along with their values and confidence ranking (#58).
+   The scan walks the tree in sorted order and breaks equal-confidence ties on the
+   candidate's source path, so the winning value never depends on `read_dir` order.
+   Hidden entries and `target` are excluded using filename bytes; a non-UTF-8
+   directory name does not suppress candidate discovery.
+2. **Semantic feasibility evaluation**: Rather than naive textual inclusion, each
+   conditional chain arm that was skipped during base preprocessing is checked for
+   activation against candidate defines. Expressions like `#if MODE == 1` vs
+   `#elif MODE == 2` or `#ifdef BINDER_CATCHER_ENABLE` are evaluated semantically using
+   `trace_preproc::preprocess_string`, seeded with the run's base defines so a condition
+   such as `#if FOO && !BAR` is judged against the configuration the variant builds on.
+   Synthetic predicate runs disable LineMap tracking; actual indexing retains it.
+   Repeated macro reads in the chain prefix and already-discovered goals are skipped
+   before activation lookup. Base bindings are cloned directly into the options
+   without constructing a temporary map.
+   `#elif` activation also requires every preceding arm in its chain to be false.
+   A macro the base configuration already fixes is never a candidate: a different value
+   conflicts, and the same value would re-lower the base as a "variant".
+3. **Greedy compatibility grouping**: Compatible activation goals are clustered into
+   variants (subsets of candidate defines that can hold simultaneously) up to the
+   configured explore budget. Chains are identified by `(file, line)` — a translation
+   unit spans every header it expands, so the line alone collides. Different arms of one
+   chain are mutually exclusive and force separate variants; two defines that open the
+   *same* arm (`#if defined(A) || defined(B)`) are not in conflict and share one variant,
+   provided their combined definitions keep every targeted condition true. The combined
+   predicates are checked in one preprocessor run per proposed grouping, including macro
+   aliases in base definitions. This separates `A && !B` from `B` even across unrelated
+   chains. An arm inside a
+   region an enclosing chain excluded (`Unevaluated`, C11 6.10.1p6) cannot be opened by
+   its own macro alone, so it is ranked behind every arm a define really does open and
+   claims only budget nothing else wanted. Goals that cannot fit within the budget
+   are counted in a diagnostic with `stage: "explore"` and `severity: Warning`.
+   The count describes omitted candidate activation goals, not distinct feasible
+   configurations or proven reachable arms.
+4. **Independent preprocessing and lowering**: Each feasible variant is preprocessed and
+   lowered into an isolated `UnitIndex`. Translation unit variants use a frozen header
+   expansion cache, and header variants that depend on newly activated defines miss the
+   cache cleanly and expand locally without polluting the shared cache.
+5. **Variant-aware merge (`merge_unit_variants`)**: a unit and its variants are merged
+   together, so duplicate flow constraints are dropped against a set scoped to that one
+   unit's contribution rather than to the whole program. When merging variant units into
+   the global `Program`:
+   - Function bodies sharing `(file, name, line)` with previously merged variants are
+     **preserved rather than discarded**: parameter and local variable IDs are remapped
+     and extended, call sites are deduplicated and merged, and IR flow constraints and
+     return flows are unioned. Calls at the same source location retain separate records
+     when their remapped arguments, callee, receiver, or return destination differ; only
+     identical call facts are deduplicated. This preserves macro-selected callbacks.
+   - A variant body the base spells on a **different line** — the `#ifdef X / #else`
+     alternative-implementation shape — extends the base entry, found by file and name.
+     Registering it as a second definition would make the symbol table treat it as a
+     redeclaration and overwrite the surviving definition's span and parameters with the
+     variant's, dropping the call sites bound to them. A name that several *defined*
+     functions in one file share (C++ overloads) does not identify a function, so those
+     keep the line-keyed behavior.
+   - Locals are recorded on their function by the merge, since lowering tracks scope in
+     its own map and leaves the field empty. Synthesized temporaries are paired by
+     position — the k-th temporary of a kind at a source position — because lowering
+     names them after the unit-local id it just allocated, so two configurations of the
+     same expression never agree on the name.
+   - Parameters are paired with the base signature **by name, never by position**. A
+     variant routinely inserts a parameter ahead of the ones the base has (`#ifdef
+     DEBUG_LOG` file/line pairs); positional pairing would map the variant's first
+     parameter onto an unrelated one and hand it every value that parameter holds.
+   - A parameter that exists only in a variant is recorded as a **local**. The canonical
+     arity belongs to the base configuration, and the solver reads `params.len()` as the
+     arity of an indirect-call target: growing it would stop base call edges from
+     resolving, making variant data cost baseline precision.
+   - File-scope variables (`FileStatic` and `Global`) sharing origin location and name are
+     paired with the base configuration's variables, unifying initializers, stores, and
+     reads across variants rather than duplicating them into disconnected entities.
+   - Aggregate layouts (`struct` and `union`) are unioned across configurations: fields
+     are matched by name; variant-specific fields not present in the base layout are
+     appended with unique `FieldId`s (`union_struct_layout`, `union_union_layout`).
+     Anonymous members, which share the empty name, are matched on their type as well,
+     so a variant's second unnamed member is not swallowed by its first.
+6. **GEP field resolution by name**: Because unioning aggregate layouts across variants
+   may shift positional field indices across configurations, the pointer-analysis solver
+   guards GEP field resolution: when a positional `field` does not match the GEP's
+   `expected_name`, it resolves the field via
+   `program.types.field_id_by_name(parent_type, expected)` instead of rejecting the
+   pointee. The gate is `Program::variants_merged > 0` — variant units that actually
+   merged — and not the `--explore` flag: a run that asks for exploration and generates
+   no variant unioned no layout, and relaxing the cross-struct `FieldId` guard there
+   would only let unrelated structs through as indirect-call targets. So baseline solver
+   behavior is preserved exactly whenever no variant is merged, `--explore` or not.
+
+### Limits of `--explore`
+
+- **Conditional function signatures are not modeled separately.** The base signature
+  remains canonical. A variant-only parameter is retained as a local, but calls still
+  wire arguments by the canonical positions and arity. Added or reordered parameters
+  can therefore lose variant argument flows or route them to a different parameter.
+  Analyze explicit configurations separately when these signatures matter.
+- **Search is bounded and heuristic.** Goals start from individually activating GN
+  candidates. Conditions needing several new defines together and nested parent/child
+  activation are not exhaustively searched; a lack of budget warnings does not imply
+  complete configuration coverage.
+- **Overloaded definitions in one file keep line-keyed variant merging.** When several
+  defined functions in a file share a name, the file/name pair does not identify one of
+  them, so a variant body on a different line is not recognized as that function's other
+  implementation and is merged as its own definition.
+
+- **A unioned layout may match no single configuration.** Fields a variant adds are
+  appended, so when a configuration inserts a member in the *middle* of a struct, the
+  merged layout holds every field but reproduces neither configuration's offsets. Field
+  identity (and therefore the analysis) is unaffected; the offsets and sizes exported to
+  SQLite are the approximation.
+- **Aggregates that embed a unioned struct by value keep stale offsets.** `TypeDesc`
+  nests member descriptions by value, so growing `struct Inner` does not reach a
+  `struct Outer { struct Inner i; int x; }` interned earlier: `x`'s exported offset and
+  `Outer`'s size still describe the smaller `Inner`. Again `FieldId`s, and the analysis,
+  are unaffected.
+- **Feasibility is an over-approximation.** An arm's condition is evaluated against the
+  command-line defines plus the candidate, not the full macro environment its headers
+  build up. A variant that turns out infeasible costs a budget slot but cannot invent
+  facts: the real preprocessor run still decides what that variant's text is.
+- **Declaration-only rows move.** A function the index only ever sees called is
+  anchored at the call site that first references it. Exploring variants opens earlier
+  code, so that first reference moves and the row is re-anchored: on `drivers_hdf_core`
+  29 such rows sit at a different line, or in a different file, than in the baseline.
+  All of them carry `is_defined = 0` and all are still present. No *defined* function
+  the baseline records is lost on hdf or hiview; on camera three shift between two
+  files that define the same symbol, which is the pre-existing twin-definition dedup
+  rather than anything exploration does.
+
 ## Known imprecision
 
 - All paths merged; no null-check refinement.

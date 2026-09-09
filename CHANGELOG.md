@@ -6,6 +6,46 @@ All notable changes to `trace` are documented in this file.
 
 ### Added
 
+- Bounded conditional-variant exploration with fact unioning (#59): `--explore` and `--explore-budget <N>`
+  (default: 4) recover platform and feature implementations excluded by the single default
+  configuration without requiring a build. Feasible variants are derived from in-tree GN define
+  candidates (`BUILD.gn`, `*.gni`, `*.gn`) and verified via semantic preprocessing against condition
+  expressions (`trace_preproc::preprocess_string`). Feasible variants are preprocessed and lowered
+  independently (never concatenating arms into a single stream). A variant-aware merge
+  (`merge_unit_variants`) preserves calls, parameters, and flows across variants sharing
+  `(file, name, line)` rather than dropping later bodies wholesale, and unions aggregate layouts by
+  field name. Variant parameters are paired with the base signature *by name*, and a parameter a
+  variant adds is recorded as a local: the canonical arity stays that of the base configuration,
+  which the solver reads as the arity of an indirect-call target. Conditional chains are identified
+  by `(file, line)`, since a translation unit spans every header it expands. Two defines that open
+  the *same* arm can share one variant when their combined definitions preserve all target
+  conditions, including earlier-arm precedence for `#elif`. Activation candidates come from the
+  whole chain prefix, not from the target arm alone: an `#else` arm reads no macro of its own, so
+  drawing them from that arm would leave the `#ifndef FOO / #else` shape unexplored. Calls whose
+  arguments change across variants retain separate facts even at the same source location.
+  Arms inside an excluded region
+  (C11 6.10.1p6) are explored last, after every arm a define really does open. Budget exhaustion is
+  reported with stage `"explore"` as a count of omitted candidate activation goals. The
+  solver's name-based GEP fallback is gated on the number of
+  variant units actually merged rather than on the flag, so a run that asks for exploration and
+  generates no variant keeps baseline semantics exactly: `--explore --explore-budget 0` reproduces
+  baseline analysis facts (run metadata records the requested options), and `--explore` is off by default.
+  Locals are recorded on their function by the merge — lowering leaves the field empty — so a
+  variant's body pairs with the base's rather than re-allocating every local, and synthesized
+  temporaries, which lowering names after the unit-local id it just allocated (`_gep6` versus
+  `_gep772`), pair positionally instead of by name. Without both, a configuration-independent
+  call was recorded once per variant and raw edge counts read the repetition as coverage.
+  A variant definition of a function the base spells on a *different* line — the
+  `#ifdef X / #else` shape this feature targets — extends the base entry instead of registering a
+  second definition, which would overwrite the surviving span and parameters and drop the call
+  sites bound to them; a name several defined functions in one file share (C++ overloads) does not
+  identify a function and keeps the line-keyed behavior. Placement re-checks an arm only when the
+  added define can reach it, decided from the identifier closure of its condition through macro
+  aliases, and evaluates each condition against only the macros it can reach, so the search is
+  linear in candidate arms rather than quadratic.
+- Reduce exploration bookkeeping and synthetic predicate mapping work; preserve GN
+  discovery through non-UTF-8 directory names. Borrow preprocessor token text during
+  rendering and use a guarded direct lookup for dense call-site IDs.
 - GN define evidence in conditional coverage reports (#58): candidates from `BUILD.gn`,
   `*.gni` and `*.gn` retain values, source locations, enclosing conditions, and confidence.
   Reports rank the evidence without applying inferred defines or claiming per-TU accuracy.
@@ -53,6 +93,13 @@ All notable changes to `trace` are documented in this file.
 
 ### Fixed
 
+- Diagnostic deduplication keys on the reporting stage as well as the origin, so a
+  report from one stage no longer stands in for a different stage's report of the same
+  text at the same position, and a report's origin is registered even when it is kept
+  unconditionally — otherwise a configuration variant re-lowering the same code
+  reported everything the base configuration had already reported.
+- Unioning an aggregate layout lets the named-tag maps reconsider the type it mutated
+  in place, which they previously kept pointing past.
 - The GNU `, ## __VA_ARGS__` comma rule is decided from the macro body (#65), not from the last
   token already emitted: the form is a `,` spelled immediately before the `##` with the variadic
   tail parameter right after it. Reading the emitted token asked a different question, and a

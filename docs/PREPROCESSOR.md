@@ -357,3 +357,17 @@ A mid-run stop inside ONE nested header must not invalidate the whole TU: indexi
   wrapped-across-lines forms)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for how preprocessing fits the full workflow.
+
+### Conditional exploration consumers
+
+`--explore` consumes recorded conditional chains in `trace-parse`; it does not change
+preprocessor branch semantics. Candidate checks include preceding-arm exclusions for
+`#elif`, and grouped definitions must keep all targeted predicates true. Each selected
+configuration is then preprocessed independently using the frozen expansion cache.
+Budget diagnostics count omitted activation goals; they do not certify reachability
+or exhaustive coverage. See [analysis limits](ANALYSIS.md#limits-of---explore).
+
+Preprocessor cleanup retains the same token spelling and origin semantics while
+borrowing token text during output rendering and token pasting. Synthetic
+exploration predicates omit LineMap construction because they consume only a
+boolean result; file indexing continues to track every original source location.

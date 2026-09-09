@@ -70,10 +70,17 @@ pub struct MergeDedup {
     /// `(file, line) → name → FnId` so a hit does not clone the function name.
     pub fn_keys: FxHashMap<(FileId, u32), FxHashMap<String, FnId>>,
     pub site_keys: FxHashMap<(FileId, u32, u32, String), CallSiteId>,
-    /// Preprocessor reports already merged into the whole program. Unit-local
-    /// copies use different `FileId` spaces, so keys are inserted only after
-    /// their file ids have been remapped.
-    preprocess_diagnostic_keys: FxHashSet<(Option<FileId>, u32, String)>,
+    /// Call records that configuration variants added at a site, beside the
+    /// canonical one in `site_keys` (#59). Program-wide, so a fact recovered
+    /// from a header by two units' variants merges instead of repeating: a
+    /// header's call sites belong to every unit that includes it.
+    pub variant_site_records: FxHashMap<(FileId, u32, u32, String), Vec<CallSiteId>>,
+    /// Reports already merged into the whole program, keyed by stage as well as
+    /// origin: two stages can report the same text at the same position, and
+    /// one is not a duplicate of the other. Unit-local copies use different
+    /// `FileId` spaces, so keys are inserted only after their file ids have
+    /// been remapped.
+    diagnostic_keys: FxHashSet<(Option<FileId>, u32, String, String)>,
 }
 
 impl MergeDedup {
@@ -91,14 +98,17 @@ impl MergeDedup {
             .insert(name, id);
     }
 
-    pub fn insert_preprocess_diagnostic(
+    /// Record a diagnostic's origin, returning whether it is the first of its
+    /// `(file, line, message, stage)`.
+    pub fn insert_diagnostic(
         &mut self,
         file: Option<FileId>,
         line: u32,
         message: &str,
+        stage: &str,
     ) -> bool {
-        self.preprocess_diagnostic_keys
-            .insert((file, line, message.to_owned()))
+        self.diagnostic_keys
+            .insert((file, line, message.to_owned(), stage.to_owned()))
     }
 }
 
@@ -156,6 +166,18 @@ pub struct Program {
     pub arrow_returns: Vec<ArrowReturn>,
     /// Classes declared `final` — CHA does not walk into their subclasses.
     pub final_classes: Vec<String>,
+    /// Whether configuration-variant exploration was enabled (#59).
+    pub explore: bool,
+    /// Maximum configuration-variant exploration budget per translation unit
+    /// (#59), as configured for the run that built this program. The default
+    /// lives with the CLI flag and `PreprocessOptions`, not here.
+    pub explore_budget: usize,
+    /// Variant units actually merged (#59). `--explore` only *offers* to
+    /// explore: a unit with no feasible variant, or a zero budget, merges
+    /// none. Analyses that compensate for cross-variant layout unioning must
+    /// key on this rather than on `explore`, so that requesting exploration
+    /// and getting none is indistinguishable from not requesting it.
+    pub variants_merged: usize,
 }
 
 impl Program {
@@ -317,5 +339,29 @@ impl Program {
 
     pub fn add_diagnostic(&mut self, diag: Diagnostic) {
         self.diagnostics.push(diag);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two stages can report the same text at the same position — a variant's
+    /// `parse` report must not stand in for a later unit's `preprocess` one
+    /// (#59 review).
+    #[test]
+    fn diagnostic_dedup_separates_stages() {
+        let mut dedup = MergeDedup::default();
+        let file = Some(FileId(3));
+
+        assert!(dedup.insert_diagnostic(file, 12, "unknown type name", "parse"));
+        assert!(
+            !dedup.insert_diagnostic(file, 12, "unknown type name", "parse"),
+            "the same report from the same stage is a duplicate"
+        );
+        assert!(
+            dedup.insert_diagnostic(file, 12, "unknown type name", "preprocess"),
+            "a different stage reporting the same text is its own finding"
+        );
     }
 }

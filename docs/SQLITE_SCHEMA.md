@@ -61,7 +61,13 @@ diagnostics
 | `schema_version` | INTEGER | Database layout version (currently `4`) |
 | `target_root` | TEXT | Analyzed directory |
 | `created_at` | TEXT | Unix timestamp (seconds) |
-| `options_json` | TEXT | JSON: `include_paths`, `defines`, `dep_roots`, `include_points_to`, `full_detail` |
+| `options_json` | TEXT | JSON: `include_paths`, `defines`, `dep_roots`, `include_points_to`, `full_detail`, `model_files`, `explore`, `explore_budget`, `variants_merged` |
+
+`explore` and `explore_budget` record what the run *requested*; `variants_merged`
+records how many variant units it actually merged. They come apart: a run can ask
+for exploration and find no feasible variant, or be given a zero budget. A
+consumer asking whether a database contains cross-variant facts must read
+`variants_merged`, not `explore`.
 
 ### files
 
@@ -104,7 +110,12 @@ wins, later copies redirect), so they appear once per origin.
 | `is_direct` | INTEGER | `1` direct by name; `0` indirect |
 
 Call sites inside header-defined functions are deduplicated by
-`(origin file, line, col, callee)` across TUs.
+`(origin file, line, col, callee)` across TUs. Under `--explore`, variant calls
+at that same location retain distinct IDs when their arguments, receiver, callee
+binding, or return destination differ. Identical call facts are deduplicated.
+Consequently, raw `call_edges` counts can increase without adding a distinct
+source-location/target pair; group by caller, callee, source file/line/column and
+resolution when comparing source-level coverage.
 
 ### call_edges
 
@@ -246,7 +257,7 @@ PK: `(var_node_id, loc_id)`
 | `file_id` | INTEGER FK → `files` | Optional |
 | `line` | INTEGER | Line |
 | `message` | TEXT | Text |
-| `stage` | TEXT | `preprocess`, `parse`, `analysis` |
+| `stage` | TEXT | `preprocess`, `parse`, `analysis`, `explore` |
 
 `preprocess` rows are the preprocessor's own diagnostics (missing includes, unknown directives,
 unterminated `#if`, mid-file stops), attributed to the file and line where the condition
