@@ -151,7 +151,7 @@ pub fn scan_project_gn_candidates(root: &Path) -> HashMap<String, Vec<Candidate>
             if e.depth() == 0 {
                 return true;
             }
-            scan_entry_name(e.file_name())
+            (e.file_type().is_file() && e.file_name() == ".gn") || scan_entry_name(e.file_name())
         })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file() && is_gn_file(e.path()))
@@ -164,7 +164,7 @@ pub fn scan_project_gn_candidates(root: &Path) -> HashMap<String, Vec<Candidate>
         };
         for mut cand in gn_defines::scan(&text) {
             // Default empty or bare define to "1".
-            if cand.value.as_deref() == Some("") {
+            if cand.value.as_deref().unwrap_or("").is_empty() {
                 cand.value = Some("1".to_string());
             }
             candidates_by_name
@@ -535,6 +535,37 @@ mod tests {
         assert!(scan_entry_name(OsStr::from_bytes(b"platform_\xff")));
         assert!(!scan_entry_name(OsStr::from_bytes(b".hidden_\xff")));
         assert!(!scan_entry_name(OsStr::new("target")));
+    }
+
+    #[test]
+    fn candidate_scan_normalizes_bare_and_empty_defines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("BUILD.gn"),
+            r#"defines = [ "BARE", "EMPTY=", "VALUE=2" ]"#,
+        )
+        .unwrap();
+        let candidates = scan_project_gn_candidates(dir.path());
+        for (name, value) in [("BARE", "1"), ("EMPTY", "1"), ("VALUE", "2")] {
+            assert_eq!(candidates[name][0].value.as_deref(), Some(value), "{name}");
+        }
+    }
+
+    #[test]
+    fn candidate_scan_includes_dot_gn_but_skips_hidden_and_target_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gn"), r#"defines = [ "ROOT" ]"#).unwrap();
+        for directory in [".hidden", "target", "nested/.gn"] {
+            std::fs::create_dir_all(dir.path().join(directory)).unwrap();
+            std::fs::write(
+                dir.path().join(directory).join("BUILD.gn"),
+                r#"defines = [ "IGNORED" ]"#,
+            )
+            .unwrap();
+        }
+        let candidates = scan_project_gn_candidates(dir.path());
+        assert!(candidates.contains_key("ROOT"));
+        assert!(!candidates.contains_key("IGNORED"));
     }
 
     fn ifdef_chain(file: &str, line: u32, macro_name: &str) -> ConditionalChain {

@@ -138,3 +138,56 @@ int main(void) { return 0; }
         "file-scope variable should not be duplicated by variant merge"
     );
 }
+
+#[test]
+fn variant_only_function_keeps_parameters_out_of_locals() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("BUILD.gn"), "defines = [ \"ALT\" ]\n").unwrap();
+    std::fs::write(
+        dir.path().join("main.c"),
+        "#ifdef ALT\nvoid added(int value) { int local = value; }\n#endif\n",
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &PreprocessOptions::new().with_explore(true)).unwrap();
+    assert!(program.variants_merged > 0);
+    let function = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "added")
+        .unwrap();
+    assert_eq!(function.params.len(), 1);
+    assert!(!function.locals.is_empty());
+    assert!(function
+        .params
+        .iter()
+        .all(|id| !function.locals.contains(id)));
+}
+
+#[test]
+fn unnamed_parameters_remain_distinct_across_variants() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("BUILD.gn"), "defines = [ \"ALT\" ]\n").unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        "void f(int, int) {}\n#ifdef ALT\nvoid added() {}\n#endif\n",
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &PreprocessOptions::new().with_explore(true)).unwrap();
+    assert!(program.variants_merged > 0);
+    let function = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    assert_eq!(function.params.len(), 2);
+    assert_ne!(function.params[0], function.params[1]);
+    let names: Vec<_> = function
+        .params
+        .iter()
+        .map(|id| program.symbols.variable_by_id(*id).unwrap().name.as_str())
+        .collect();
+    assert_eq!(names, ["$arg0", "$arg1"]);
+    assert!(function.locals.is_empty());
+}

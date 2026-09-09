@@ -281,7 +281,7 @@ pub fn build_program_with_jobs(
         .with_inline_include_bodies(false);
     let eff_opts = eff_opts.with_record_conditionals(opts.explore || opts.record_conditionals);
 
-    let gn_candidates = if opts.explore {
+    let gn_candidates = if opts.explore && opts.explore_budget > 0 {
         index_progress("explore: scanning GN candidate defines".to_string());
         Some(crate::explore::scan_project_gn_candidates(root))
     } else {
@@ -1496,6 +1496,7 @@ fn index_source_file_with_variants(
 
     for variant in variants {
         let mut var_opts = index_opts.clone();
+        var_opts.record_conditionals = false;
         var_opts.defines.extend(variant.defines.iter().cloned());
         match source_cache.preprocess_uncached(path, graph, &var_opts) {
             Ok(var_pre) => {

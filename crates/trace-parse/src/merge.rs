@@ -547,8 +547,8 @@ fn merge_unit(
         // `solver` reads `params.len()` as the arity of an indirect-call
         // target, so growing it would stop base call edges from resolving.
         if let Some(canon_fn) = mapped_fn_id {
-            let is_base_param = !matches!(mode, MergeMode::Variant) && var.param_index.is_some();
-            if !is_base_param {
+            let is_param = var.param_index.is_some() && !variant_extended_fns.contains(&canon_fn);
+            if !is_param {
                 if let Some(idx) = program.symbols.function_index(canon_fn) {
                     program.symbols.functions[idx].locals.push(new_id);
                 }

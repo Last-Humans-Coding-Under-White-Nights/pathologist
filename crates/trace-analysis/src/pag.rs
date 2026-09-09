@@ -378,7 +378,7 @@ impl Pag {
         // the field the GEP named: a unioned layout can move a field off the
         // index the configuration that lowered the GEP gave it.
         let by_name = expected_name.and_then(|expected| {
-            if positional.is_some_and(|fl| fl.name == expected) {
+            if expected.is_empty() || positional.is_some_and(|fl| fl.name == expected) {
                 None
             } else {
                 program.types.field_id_by_name(struct_type, expected)
@@ -933,4 +933,45 @@ fn lookup_var_in_fn(
         .get(&caller)
         .and_then(|m| m.get(name).copied())
         .or_else(|| program.symbols.global_by_name.get(name).copied())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trace_ir::{Span, TypeDesc, Variable};
+
+    #[test]
+    fn empty_field_name_does_not_redirect_to_an_anonymous_member() {
+        let mut program = Program::new(".".into());
+        let type_id = program.types.intern(TypeDesc::Struct {
+            name: "Fields".into(),
+            fields: vec![
+                (String::new(), TypeDesc::Int),
+                ("named".into(), TypeDesc::Int),
+            ],
+        });
+        let var = program.symbols.alloc_var_id();
+        program.symbols.add_variable(Variable {
+            id: var,
+            name: "object".into(),
+            type_id,
+            storage: StorageClass::Global,
+            fn_id: None,
+            param_index: None,
+            span: Span::new(trace_ir::FileId(0), 1, 1),
+            is_pointer: false,
+        });
+        let mut pag = Pag::default();
+        let positional = pag
+            .ensure_field_summary_for_var(&program, var, FieldId(1))
+            .unwrap();
+        assert_eq!(
+            pag.ensure_field_summary_for_var_named(&program, var, FieldId(1), Some("")),
+            Some(positional)
+        );
+        assert_eq!(
+            pag.ensure_field_summary_for_var_named(&program, var, FieldId(2), Some("")),
+            None
+        );
+    }
 }
