@@ -94,7 +94,7 @@ C1→C11 there with fixtures.
 | **C++ next slices** | See [CPP_ROADMAP.md](CPP_ROADMAP.md); eval H5 (`auto`/`lock`), H7 (`REGISTER` + map), C11 (`dlsym`) |
 | **`memcpy` / `memmove` summaries** | Registered but no-op; blocks fn-ptr-through-memcpy patterns |
 | **Original-source line remapping** | Done for `#include`d code: header-origin entities carry original file/line via `LineMap` and are deduplicated across TUs |
-| **`compile_commands.json`** | Include paths / defines today via CLI only |
+| **`compile_commands.json` (#62)** | Implemented: optional discovery or explicit path; per-command includes, macro operations, forced includes, language/standard; all configurations merged. Missing build dependencies remain outside its scope. |
 | **Heap allocation modeling** | `malloc` family stubs don't allocate fresh locs yet; C++ `new T` is `NewHeap` |
 | **`__VA_OPT__`** | C23 `__VA_OPT__` (variadics, GNU `, ##args` elision and the `#` stringize operator are done) |
 | **Constant array index refinement** | Avoid merging all fn-ptr table slots |

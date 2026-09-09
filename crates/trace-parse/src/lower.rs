@@ -1,3 +1,7 @@
+// `configured` needs `super::` access to this module's private helpers.
+#[path = "configured.rs"]
+mod configured;
+
 use crate::deps::IncludeGraph;
 use crate::discover::discover_source_files;
 use crate::gn_defines::Candidate;
@@ -231,6 +235,19 @@ pub fn build_program_with_jobs(
     let under_dep = |p: &PathBuf| dep_roots.iter().any(|dep| p.starts_with(dep));
     let (files, headers) = discover_source_files(root);
     let mut files = normalize_discovered_paths(files);
+    let database = crate::compile_commands::CompilationDatabase::load(root, opts)?;
+    files.extend(database.commands.keys().cloned());
+    files.sort();
+    files.dedup();
+    for message in &database.warnings {
+        program.add_diagnostic(Diagnostic {
+            severity: DiagnosticSeverity::Warning,
+            file: None,
+            line: 0,
+            message: message.clone(),
+            stage: "compile_commands".into(),
+        });
+    }
     let mut headers = normalize_discovered_paths(headers);
     files.retain(|p| !under_dep(p));
     headers.retain(|p| !under_dep(p));
@@ -265,6 +282,18 @@ pub fn build_program_with_jobs(
 
     let mut include_graph =
         IncludeGraph::build_with_deps(root, &files, &headers, &dep_roots, &dep_headers);
+    if !database.commands.is_empty() {
+        return configured::build(
+            program,
+            root,
+            opts,
+            jobs,
+            &files,
+            &headers,
+            include_graph,
+            database,
+        );
+    }
     index_progress(format!(
         "include-graph: {} files, {} include edges",
         include_graph.project_files.len(),
@@ -513,11 +542,7 @@ pub fn build_program_with_jobs(
         .map(|l| (l, eff_opts.clone().with_language(l)))
         .collect();
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(jobs)
-        .stack_size(16 * 1024 * 1024)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let pool = index_pool(jobs)?;
 
     // Preprocess every translation unit BEFORE choosing the PCH set, in two
     // passes.
@@ -933,17 +958,28 @@ pub fn build_program_with_jobs(
             .add_file_interned(include_graph.intern_path(&path));
         add_preprocess_diagnostics(&mut program, &include_graph, unit_file, &diagnostics);
     }
-    program.include_deps = include_graph.edge_list();
-    for dir in &include_graph.include_dirs {
-        if !program.include_paths.iter().any(|p| p == dir) {
-            program.include_paths.push(dir.clone());
-        }
-    }
-
-    finalize_extern_callees(&mut program);
-    expand_virtual_overrides(&mut program);
+    let inferred_dirs = include_graph.include_dirs.clone();
+    finalize_program(&mut program, &include_graph, inferred_dirs);
 
     Ok(program)
+}
+
+/// The closing steps every indexing path shares. `extra_dirs` are the search
+/// directories that path observed, recorded in first-seen order.
+fn finalize_program(
+    program: &mut Program,
+    graph: &IncludeGraph,
+    extra_dirs: impl IntoIterator<Item = PathBuf>,
+) {
+    program.include_deps = graph.edge_list();
+    let mut seen: HashSet<PathBuf> = program.include_paths.iter().cloned().collect();
+    for dir in extra_dirs {
+        if seen.insert(dir.clone()) {
+            program.include_paths.push(dir);
+        }
+    }
+    finalize_extern_callees(program);
+    expand_virtual_overrides(program);
 }
 
 /// Classify plain-identifier calls that resolve to no tree-local symbol
@@ -1120,6 +1156,16 @@ fn normalize_discovered_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         .into_iter()
         .map(|p| trace_ir::canonicalize(&p))
         .collect()
+}
+
+/// Indexing workers recurse on deep expressions, so they need more than the
+/// default stack. Both indexing paths build their pool here to keep that true.
+fn index_pool(jobs: usize) -> Result<rayon::ThreadPool, String> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .stack_size(16 * 1024 * 1024)
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 fn project_preprocess_opts(

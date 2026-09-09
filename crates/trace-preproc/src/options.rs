@@ -175,8 +175,29 @@ pub struct IncludeExpansion {
 }
 
 #[derive(Debug, Clone)]
+pub enum CommandMacro {
+    Define(String, String),
+    Undef(String),
+}
+
+#[derive(Debug, Clone)]
 pub struct PreprocessOptions {
+    /// Explicit compilation database path; otherwise indexing checks the
+    /// analysis root, then its `build` directory.
+    pub compilation_database: Option<PathBuf>,
     pub include_paths: Vec<PathBuf>,
+    /// Quoted includes search these before `include_paths`.
+    pub quote_include_paths: Vec<PathBuf>,
+    /// System directories follow `include_paths`, in supplied order.
+    pub system_include_paths: Vec<PathBuf>,
+    /// Use compiler include semantics, without inferred basename fallback.
+    pub strict_include_search: bool,
+    /// Database macro operations, applied after predefines and before `defines`.
+    pub command_macros: Vec<CommandMacro>,
+    /// Headers processed before the source, in this order.
+    pub forced_includes: Vec<PathBuf>,
+    /// Initial search directory for relative forced includes.
+    pub working_directory: Option<PathBuf>,
     pub defines: indexmap::IndexMap<String, String>,
     /// Canonical path → raw file contents (skips disk reads during `#include` expansion).
     pub source_cache: Option<std::sync::Arc<HashMap<PathBuf, std::sync::Arc<str>>>>,
@@ -251,7 +272,14 @@ pub struct PreprocessOptions {
 impl Default for PreprocessOptions {
     fn default() -> Self {
         Self {
+            compilation_database: None,
             include_paths: Vec::new(),
+            quote_include_paths: Vec::new(),
+            system_include_paths: Vec::new(),
+            strict_include_search: false,
+            command_macros: Vec::new(),
+            forced_includes: Vec::new(),
+            working_directory: None,
             defines: indexmap::IndexMap::new(),
             source_cache: None,
             include_expansion_cache: None,
@@ -276,6 +304,19 @@ impl Default for PreprocessOptions {
 }
 
 impl PreprocessOptions {
+    /// Whether these options configure preprocessing away from the tree
+    /// default, so a file must be preprocessed rather than read as-is.
+    /// Lives here so a new configuration field is considered where it is added.
+    pub fn configures_preprocessing(&self) -> bool {
+        !self.defines.is_empty()
+            || !self.include_paths.is_empty()
+            || !self.command_macros.is_empty()
+            || !self.forced_includes.is_empty()
+            || !self.quote_include_paths.is_empty()
+            || !self.system_include_paths.is_empty()
+            || self.strict_include_search
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -325,6 +366,56 @@ impl PreprocessOptions {
     #[must_use]
     pub fn with_include(mut self, path: PathBuf) -> Self {
         self.include_paths.push(path);
+        self
+    }
+
+    /// Select a compilation database explicitly, instead of discovering one.
+    #[must_use]
+    pub fn with_compilation_database(mut self, path: impl Into<PathBuf>) -> Self {
+        self.compilation_database = Some(path.into());
+        self
+    }
+
+    /// Add a `-iquote` directory, searched only by quoted includes.
+    #[must_use]
+    pub fn with_quote_include(mut self, path: impl Into<PathBuf>) -> Self {
+        self.quote_include_paths.push(path.into());
+        self
+    }
+
+    /// Add a `-isystem` directory, searched after `include_paths`.
+    #[must_use]
+    pub fn with_system_include(mut self, path: impl Into<PathBuf>) -> Self {
+        self.system_include_paths.push(path.into());
+        self
+    }
+
+    /// Use compiler include semantics, without the inferred basename fallback.
+    #[must_use]
+    pub fn with_strict_include_search(mut self, strict: bool) -> Self {
+        self.strict_include_search = strict;
+        self
+    }
+
+    /// Append a command macro operation, applied in order after the predefines
+    /// and before `defines`.
+    #[must_use]
+    pub fn with_command_macro(mut self, op: CommandMacro) -> Self {
+        self.command_macros.push(op);
+        self
+    }
+
+    /// Add a `-include` header, processed before the source in this order.
+    #[must_use]
+    pub fn with_forced_include(mut self, path: impl Into<PathBuf>) -> Self {
+        self.forced_includes.push(path.into());
+        self
+    }
+
+    /// Set the directory relative forced includes search first.
+    #[must_use]
+    pub fn with_working_directory(mut self, path: impl Into<PathBuf>) -> Self {
+        self.working_directory = Some(path.into());
         self
     }
 

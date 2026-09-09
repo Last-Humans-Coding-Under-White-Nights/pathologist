@@ -102,13 +102,16 @@ trace analyze ~/drivers_hdf_core -o /tmp/hdf.db \
 
 # Debug pointer analysis
 trace analyze ./my_app -o /tmp/debug.db --debug-points-to --full-export
+
+# Use a compilation database outside the source tree
+trace analyze ./my_app --compile-commands ./out/compile_commands.json -o /tmp/app.db
 ```
 
 **Notes**
 
 - **`.c` and `.cpp`-family files** are indexed as translation units. Headers are pulled in via `#include` during preprocessing, not analyzed as standalone TUs. A C++ unit is preprocessed with `__cplusplus` (`201703L`) and `__STDC__` predefined, a C unit with `__STDC__` and `__STDC_VERSION__` (`201710L`), so `#ifdef __cplusplus` takes the C++ arm in `.cpp` units and the C arm in `.c` units, headers included. C++ support is a pragmatic first step — see [docs/ANALYSIS.md](docs/ANALYSIS.md) for scope and imprecision.
 - Line numbers in the database refer to **original** files on disk (resolved through the preprocessor's `LineMap`); call sites inside macro expansions attribute to the expansion site.
-- Pass include paths that match your build; there is no `compile_commands.json` integration yet.
+- **Compilation database** — automatically reads `compile_commands.json` at the target root, then `build/compile_commands.json`, or an explicit `--compile-commands PATH`. Each entry supplies its working directory, ordered `-I`/`-iquote`/`-isystem` paths, ordered `-D`/`-U`, `-include`, and `-x`/`-std`. All commands for a source contribute facts, even without `--explore`. CLI `--include` paths precede database `-I` paths and CLI `-D` values override database macros. Files without a usable entry retain inferred configuration; a database is never required. See [compilation database support](docs/ANALYSIS.md#compilation-databases-62).
 - **`static` functions** (internal linkage) and **file-scope `static` variables** are resolved within the defining translation unit. **`static` locals** inside functions are tracked as `fn_static` storage.
 - **Dependency roots (`--dep <PATH>`)** separate what the target *uses* from what it *is*. A dependency's headers are reached and merged for their declarations — smart-pointer wrappers such as `sptr<T>`, base classes, external interfaces — so a wrapper-typed receiver resolves on the wrapped class rather than producing an edge on the wrapper. Its sources are never translation units, its unreached headers are never indexed as standalone units, and a body written in a dependency header merges as a declaration (`is_defined = 0`) with no call sites, locals, value flow or return flow. Files and functions from a dependency root export with `is_dep = 1`; `trace inspect calls --exclude-deps` drops the edges that touch them. A dependency root nested inside the analysis root is fine; one that contains or equals it is rejected at startup, since every source would become a dependency and nothing would be left to analyze.
 
@@ -682,8 +685,8 @@ tests/fixtures/    Integration test C corpora
 - **May-analysis** — indirect calls can list multiple targets; absence of an edge does not prove unreachability.
 - **No path sensitivity** — all branches and paths are merged.
 - **Preprocessor subset** — not gcc/clang compatible for all extensions, and no compiler is impersonated (`__GNUC__` / `__clang__` stay undefined; only the language's own `__cplusplus` / `__STDC__` / `__STDC_VERSION__` are predefined); see [docs/PREPROCESSOR.md](docs/PREPROCESSOR.md).
-- **Include paths** — must be supplied manually via `--include` / `-D`; no `compile_commands.json` yet.
-- **Single configuration** — a name no `-D` or reached `#define` binds resolves to `0` in every `#if`; what that excludes on the eval corpora, per condition and region, is measured in [docs/CONDITIONAL_COVERAGE.md](docs/CONDITIONAL_COVERAGE.md).
+- **Build environment** — compilation databases locate existing files; they do not supply missing SDK, standard-library or generated headers. Supply additional roots with `--dep` / `--include` as needed. Compiler-specific target builtins and response files are not modeled.
+- **Configuration coverage** — without database entries or `--explore`, indexing uses one inferred configuration. A name no `-D` or reached `#define` binds resolves to `0` in `#if`; the default exclusions are measured in [docs/CONDITIONAL_COVERAGE.md](docs/CONDITIONAL_COVERAGE.md). Explicit database commands are all merged; exploratory configurations remain bounded by `--explore-budget`.
 - **Line numbers** — refer to preprocessed TUs; map back to original sources manually when needed.
 
 ## Further reading

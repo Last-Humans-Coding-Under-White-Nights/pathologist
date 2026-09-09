@@ -18,6 +18,30 @@ pub struct PreprocessResult {
 CLI equivalents: `--include PATH`, `-D NAME=VALUE`. `PreprocessOptions::with_record_conditionals(true)` turns on the
 [conditional-coverage record](#conditional-coverage-record) (off by default; nothing in indexing needs it).
 
+### Compilation database options (#62)
+
+When `compile_commands.json` exists at the analysis root or its `build/` directory
+(or is selected with `--compile-commands PATH`), indexing reads each
+command's working directory, include directories, macro operations, forced
+includes and language settings. Every command for a source is indexed and its
+facts are merged; explicit commands are independent of the `--explore` budget.
+Files without a usable entry retain inferred configuration. A missing or invalid
+database never prevents indexing; invalid databases/entries produce diagnostics.
+
+`-iquote` directories apply only to quoted includes, followed by `-I`, then
+`-isystem`, then the `-idirafter` chain (`-idirafter`/`-iwithprefix`), preserving
+order within each search class. Configured units use these
+explicit paths without project-wide basename guessing. `-D` and `-U` execute in
+command order after language predefines; explicit CLI defines override the database.
+`-include` files are processed in order before the TU, in the same macro environment
+and with their original locations. Their first search directory is the command's
+working directory. `-x` selects both lexer and parser; `-std` sets the standard
+version macro and strict/GNU dialect marker. This does not emulate a compiler's
+vendor or target-specific builtins, nor supply missing SDK/generated headers.
+
+Each command gets independent preprocessing and source caches, with inline header
+bodies, so include-path changes cannot reuse expansions from a different command.
+
 ## Role in the pipeline
 
 ```mermaid
@@ -42,6 +66,7 @@ flowchart LR
 
 | Feature | Notes |
 |---------|-------|
+| Compilation options (#62) | Ordered command macro operations, quoted/normal/system include search classes, forced headers with original LineMap origins; language and standard-version predefines |
 | Comments | `//`, `/* */` |
 | Line splicing | Translation phase 2 (C11 5.1.1.2p1) runs inside the lexer, at the character level: every `\`-newline (`\n` or `\r\n`, and — as gcc and clang accept with a warning — with horizontal whitespace between the `\` and the newline) is deleted before any token is recognized, so a spliced identifier is one identifier (`int c\`-newline-`d;` is `int cd;`), a spliced multi-character punctuator is munched whole (`.\`-newline-`..` is `...`, so `#define F(x, .\`-newline-`..)` is the variadic macro gcc and clang see — #38), a spliced encoding prefix or string body stays one literal, a `//` comment ending in `\` continues onto the next line and `/\`-newline-`*` opens a block comment. A `\r` counts only as the first half of a `\r\n`: `\`-CR-CR-LF and `\`-CR-space-LF are not splices, as in clang. Inside a C++11 raw string literal the splice is reverted ([lex.pptoken]p3) and the body is kept as written; in C, where `R"(…)"` is the identifier `R` followed by an ordinary string, a splice in that body is deleted like in any string — clang's `-std=c11` behaviour, while gcc and clang in their default GNU modes lex a raw string there and keep the splice as written. Token positions stay physical — a token starts where its first character sits in the file, which is what the LineMap needs — so adjacency can no longer be read off `line`/`col`; instead the lexer records on every token whether it touched the previous one (`Token::adjacent_before`, with a splice counting as nothing and whitespace, comments and newlines as a gap), and that flag is what the function-like `#define` test and `#` stringizing read. Before #38 the lexer kept `\` + newline as two tokens and each consumer that needed phase 2 skipped the pair itself, so the splice was still visible everywhere else: `int c\`-newline-`d;` came out as `int c\ d;` and a spliced ellipsis stayed three `.` tokens |
 | Punctuators | The multi-character forms the lexer knows are one token each, so the re-speller writes them back unbroken: `##`, the two-character operators (`<<` `>>` `<=` `>=` `==` `!=` `&&` `\|\|` `++` `--` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `->`) and the three-character `...` and `->*`. Anything else is one token per character; the ones that still come out glued do so because the output spacing rule happens not to separate them (`::`, `.*`, and the `=` after `>>` / `<<`), not because they are single tokens. `->*` needed its own token because the spacing rule *does* separate it: the space before `*` after `>` that keeps `shared_ptr<T> &p` from gluing into `>&` also split `c->*m` into `c-> * m`, which is not C++, and tree-sitter then recovered the operand as a callee — fabricating a function named after it, in one corpus case named after a template parameter (#37). Recovering the token does not make the construct parse: tree-sitter-cpp knows `->*` only as an overloadable operator name and as a fold operator — `struct S { int operator->*(int); };` and `(a ->* ...)` both parse — and has no rule for it as a binary operator in an ordinary expression, so `c->*m` is an ERROR site even in pristine source, while `c.*m` parses. `->*` is also lexed as one token only in C++: gcc and clang tokenize `a->*b` in C as `->` then `*`. The re-speller gives `...` a leading space when the output already ends in a preprocessing number, because a pp-number absorbs `.` and alphanumerics (C11 6.4.8) and would otherwise swallow it — the GNU case range `case 0x0300 ... 0x0307:` would come back as the single number `0x0300...0x0307`; after an identifier (`Args...`) no space is added. Before #28 there was no `...` case, so every ellipsis lexed as three `.` tokens and, since the spacing rule *does* put a space before `.`, came out as `. . .` — a tree-sitter ERROR site in every variadic declaration, 111 of the 756 catalogued ERROR sites across the pinned corpora |

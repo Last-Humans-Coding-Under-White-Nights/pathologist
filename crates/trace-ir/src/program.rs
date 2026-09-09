@@ -178,6 +178,14 @@ pub struct Program {
     /// key on this rather than on `explore`, so that requesting exploration
     /// and getting none is indistinguishable from not requesting it.
     pub variants_merged: usize,
+    /// Whether any unit was merged with cross-configuration layout unioning
+    /// (`merge_unit_variants`). Distinct from [`Program::variants_merged`],
+    /// which counts *exploration* variants per source and is 0 for an ordinary
+    /// compilation database even though every unit past the first still merges
+    /// as a variant and unions its aggregate layouts. Analyses that compensate
+    /// for a unioned layout — a field moved off the index the configuration
+    /// that lowered the access gave it — must key on this.
+    pub layouts_unioned: bool,
 }
 
 impl Program {

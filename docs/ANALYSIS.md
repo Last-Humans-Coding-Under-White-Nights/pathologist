@@ -805,6 +805,90 @@ and `functions.is_dep` (schema v4), `analysis_run.options_json` records
 `dep_roots`, and `trace inspect calls --exclude-deps` drops the edges whose
 caller or callee is a dependency function.
 
+## Compilation databases (#62)
+
+Indexing opportunistically reads `compile_commands.json` at the analysis root,
+then `build/compile_commands.json`. `--compile-commands PATH` selects another file;
+the library equivalent is `PreprocessOptions::compilation_database`. The first
+discovered database wins. A `--compile-commands PATH` naming no file is a
+mistyped flag and fails the run; everything else degrades. Invalid JSON, invalid
+entries and unreadable databases produce `compile_commands` diagnostics and fall
+back to inferred configuration for sources with no usable entry. A database is
+never required.
+
+The reader accepts `arguments` or a shell-quoted `command`, preferring `arguments`
+when both exist. Leading compiler launchers (`ccache`, `sccache`, `distcc`,
+`distcc-pump`, `gomacc`, `icecc`, `icerun`, `buildcache`), including chains of
+them, are skipped so the real driver decides the default language. Launcher and
+driver names are matched on the executable stem, case-insensitively and with any
+`.exe` suffix removed, so a database produced on Windows resolves the same way. A
+launcher also matches with a version suffix (`ccache-4.10`); a wrapper merely
+named after one (`ccache-clang++`) is the driver itself and is not skipped.
+Command strings use POSIX quoting with one departure: outside quotes a backslash
+escapes only a quote or a space, so the separators in a Windows path survive
+while `\"` in a define still works. Inside double quotes it also pairs with a
+following backslash, so a value ending in `\\` keeps its backslash instead of
+swallowing the closing quote. No shell, compiler or build command is executed.
+Entry paths are resolved against `directory`; a relative `directory` is resolved
+against the database's directory. Existing sources inside
+the analysis root are eligible, including nonstandard extensions selected by `-x`.
+Sources outside that root or below `--dep` roots are excluded.
+
+Each command contributes ordered `-D`/`-U` operations and `-include` headers.
+Quoted includes search the including file's directory, then ordered `-iquote`
+directories, ordered `-I` directories, ordered `-isystem` directories and finally
+the `-idirafter` chain. Angle includes skip the first two classes. A directory
+also marked `-isystem` keeps its system position. Explicit CLI include paths precede database `-I` paths; CLI
+defines override command macros. Configured units do not use inferred include
+directories or basename guessing. Forced includes first search the command's
+working directory and preserve their own source locations; a header they cannot
+find is reported against the source, never against the synthetic search path.
+
+`-x` at the source argument selects both lexer and tree-sitter grammar; otherwise
+the file extension applies (a `++` driver selects C++). `-std` supports C90 through
+C23 and C++98 through C++26, with GNU dialects and common historical aliases.
+It sets `__STDC_VERSION__` or `__cplusplus`, and `__STRICT_ANSI__` for strict
+dialects. A standard outside that set costs only those macros: the entry keeps
+its include paths and macro operations, since the list ages out as compilers
+gain standards and discarding the command would leave the source with no
+configuration at all. A standard that contradicts the source language still
+skips the entry. Syntax recovery remains the existing parser/preprocessor subset; this
+is not full compiler dialect emulation. Vendor/target builtins, sysroot rewriting,
+response files, PCH files and `-imacros` are not modeled. Response files, PCH,
+`-imacros`, unsupported languages and obsolete `-I-` cause an entry to
+be skipped with a diagnostic; unrelated compilation/output flags are ignored.
+`-idirafter` and `-iwithprefix` append to that last chain, which is searched after
+every `-isystem` directory whatever their argument position; `-iwithprefixbefore`
+joins the `-I` chain instead. `-iprefix` supplies the prefix the two `-iwithprefix`
+forms concatenate, textually and without inserting a separator.
+`arguments` is recommended for databases produced on Windows.
+
+All commands for each source are indexed in database order, independently of
+`--explore` and its budget. Sources without entries use inferred options. When a
+database contributes commands, each configuration expands headers inline with a
+separate source cache and macro environment; raw file contents may be shared.
+The shared header warm-up path remains in use when no usable database commands
+exist. This trades some header parsing time for isolation between explicit
+include configurations. Unreached project headers retain standalone indexing;
+dependency headers contribute declarations only.
+
+The complete set of configured units uses the variant-preserving merge, so a
+shared header's differing bodies survive across both commands for one source and
+commands for different sources. Source IDs, locals, call facts, flow constraints
+and returns are remapped and unioned. Variable identity is scoped to the source
+a unit came from: a file-scope `static` in a shared header is a distinct object
+in every translation unit that includes it, and the configurations of one source
+dedup against each other only. `variants_merged` counts configurations
+beyond the first for each source, including exploratory variants when enabled.
+No SQLite schema change is needed. Global `defines` metadata continues to describe
+user overrides; include paths are the union of observed configuration paths,
+not a replacement for per-command search order.
+
+Regression coverage: `crates/trace-cli/tests/compile_commands_tests.rs` and
+`tests/fixtures/compile_commands/`. Format and search semantics follow the
+[Clang database specification](https://clang.llvm.org/docs/JSONCompilationDatabase.html)
+and [GCC directory options](https://gcc.gnu.org/onlinedocs/gcc/Directory-Options.html).
+
 ## Bounded conditional-variant exploration (`--explore`)
 
 A single build-free configuration necessarily omits implementations hidden behind
@@ -872,7 +956,20 @@ and feature implementations by exploring feasible configuration variants indepen
      redeclaration and overwrite the surviving definition's span and parameters with the
      variant's, dropping the call sites bound to them. A name that several *defined*
      functions in one file share (C++ overloads) does not identify a function, so those
-     keep the line-keyed behavior.
+     keep the line-keyed behavior. The base entry must also agree on **signature** --
+     parameter count and types: a configuration that *adds* an overload (`pick(int)`
+     always, `pick(double)` under a define) likewise lands on a line the base never had,
+     and folding it into the base would conflate two functions' parameters and call
+     targets, with the result depending on which source enabled the overload. Parameter
+     types are compared by *shape* rather than by id — two configurations intern their
+     own copy of a type, so an id comparison would split a function from itself — with
+     tags compared by name (the configurations may legitimately carry different field
+     sets, which is what the layout union reconciles) and an unresolved type never
+     splitting anything. The check applies to C++ only: C has no overloading, so arms that
+     differ in arity because the directive wraps the whole declaration are still one
+     function. Alternative arms of one function agree on their signature; a
+     variant that widens a signature in place keeps the function's own line and matches
+     before this fallback is reached.
    - Locals are recorded on their function by the merge, since lowering tracks scope in
      its own map and leaves the field empty. Synthesized temporaries are paired by
      position — the k-th temporary of a kind at a source position — because lowering
@@ -899,11 +996,16 @@ and feature implementations by exploring feasible configuration variants indepen
    guards GEP field resolution: when a positional `field` does not match the GEP's
    `expected_name`, it resolves the field via
    `program.types.field_id_by_name(parent_type, expected)` instead of rejecting the
-   pointee. The gate is `Program::variants_merged > 0` — variant units that actually
-   merged — and not the `--explore` flag: a run that asks for exploration and generates
-   no variant unioned no layout, and relaxing the cross-struct `FieldId` guard there
-   would only let unrelated structs through as indirect-call targets. So baseline solver
-   behavior is preserved exactly whenever no variant is merged, `--explore` or not.
+   pointee. The gate is `Program::layouts_unioned` — set whenever a unit merges as a
+   variant, and so whenever a layout could have been unioned — and not the `--explore`
+   flag: a run that asks for exploration and generates no variant unioned no layout, and
+   relaxing the cross-struct `FieldId` guard there would only let unrelated structs
+   through as indirect-call targets. So baseline solver behavior is preserved exactly
+   whenever no unit merges as a variant, `--explore` or not. It is deliberately *not*
+   `variants_merged > 0`: that field counts exploration variants per source and is 0 for
+   an ordinary compilation database, where every unit past the first still merges as a
+   variant and unions its layouts — so keying on it left the recovery off exactly where
+   commands disagree about a struct.
 
 ### Limits of `--explore`
 

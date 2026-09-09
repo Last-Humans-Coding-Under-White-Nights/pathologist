@@ -274,10 +274,7 @@ fn group_variants(
 }
 
 fn should_preprocess(path: &Path, opts: &PreprocessOptions, graph: &IncludeGraph) -> bool {
-    if !opts.defines.is_empty() || !opts.include_paths.is_empty() {
-        return true;
-    }
-    graph.needs_preprocess.contains(path)
+    opts.configures_preprocessing() || graph.needs_preprocess.contains(path)
 }
 
 #[cfg(test)]

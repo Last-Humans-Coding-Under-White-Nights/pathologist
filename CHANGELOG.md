@@ -6,6 +6,13 @@ All notable changes to `trace` are documented in this file.
 
 ### Added
 
+- Compilation database support (`compile_commands.json`, #62): automatically reads `compile_commands.json`
+  at the analysis root, then `build/compile_commands.json`, or an explicit `--compile-commands PATH`.
+  Each entry supplies its working directory, ordered `-I`/`-iquote`/`-isystem` search paths, ordered
+  `-D`/`-U` macro operations, forced includes (`-include`), and language/standard selection (`-x`, `-std`).
+  Multiple commands for the same translation unit are all indexed and their facts are preserved via
+  variant-aware merging (`merge_unit_variants`). Files without a database entry retain inferred
+  configuration without requiring a compilation database.
 - Bounded conditional-variant exploration with fact unioning (#59): `--explore` and `--explore-budget <N>`
   (default: 4) recover platform and feature implementations excluded by the single default
   configuration without requiring a build. Feasible variants are derived from in-tree GN define

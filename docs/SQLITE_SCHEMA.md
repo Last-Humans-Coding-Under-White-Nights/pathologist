@@ -67,7 +67,10 @@ diagnostics
 records how many variant units it actually merged. They come apart: a run can ask
 for exploration and find no feasible variant, or be given a zero budget. A
 consumer asking whether a database contains cross-variant facts must read
-`variants_merged`, not `explore`.
+`variants_merged`, not `explore`. Compilation databases (#62) can contribute
+additional commands for a source without exploration; those additional units
+also count. `include_paths` is the union of paths observed across configurations,
+while `defines` records user overrides, not every per-command macro environment.
 
 ### files
 
