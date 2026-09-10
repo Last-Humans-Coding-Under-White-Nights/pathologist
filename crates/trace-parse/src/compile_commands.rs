@@ -167,6 +167,10 @@ impl Entry {
         while driver_idx + 1 < args.len() && is_launcher(binary_stem(&args[driver_idx])) {
             driver_idx += 1;
         }
+        let msvc = matches!(
+            binary_stem(&args[driver_idx]).to_ascii_lowercase().as_str(),
+            "cl" | "clang-cl"
+        ) || args.iter().any(|arg| arg == "--driver-mode=cl");
         let driver_cpp = binary_stem(&args[driver_idx]).contains("++");
         let default_language = if driver_cpp {
             Language::Cpp
@@ -180,21 +184,97 @@ impl Entry {
         let mut after_include_paths: Vec<PathBuf> = Vec::new();
         let mut iprefix = String::new();
         let mut source_language = None;
+        let mut source_explicit_x = false;
+        let mut msvc_language = None;
+        let mut updated_cplusplus = !binary_stem(&args[driver_idx]).eq_ignore_ascii_case("cl");
         let mut macros = Vec::new();
         let mut standard = None;
         let mut args = args.iter().skip(driver_idx + 1);
         while let Some(arg) = args.next() {
-            if arg == "--" {
-                break;
-            }
+            // Check the actual input before slash options: an absolute Unix
+            // path can start with /I, /D, or /U too.
             if !arg.starts_with('-') && trace_ir::canonicalize(&directory.join(arg)) == file {
                 source_language = opts.language;
+                source_explicit_x = explicit_x;
                 continue;
+            }
+            // MSVC switches are case-sensitive. Normalize only known driver
+            // options, so Unix absolute source paths remain paths.
+            let normalized;
+            let arg = if msvc {
+                let switch = arg
+                    .strip_prefix('/')
+                    .or_else(|| arg.strip_prefix('-'))
+                    .unwrap_or("");
+                if matches!(switch, "Zc:__cplusplus" | "Zc:__cplusplus-") {
+                    updated_cplusplus = switch == "Zc:__cplusplus";
+                    continue;
+                }
+                if switch == "link" {
+                    break;
+                }
+                if matches!(switch, "TC" | "TP") {
+                    msvc_language = Some(if switch == "TC" {
+                        Language::C
+                    } else {
+                        Language::Cpp
+                    });
+                    continue;
+                }
+                if let Some((flag, tail)) = ["Tc", "Tp"]
+                    .iter()
+                    .find_map(|flag| Some((*flag, switch.strip_prefix(flag)?)))
+                {
+                    let input = if tail.is_empty() {
+                        args.next()
+                            .ok_or_else(|| format!("missing operand for {arg}"))?
+                            .as_str()
+                    } else {
+                        tail
+                    };
+                    if trace_ir::canonicalize(&directory.join(input)) == file {
+                        source_language = Some(if flag == "Tc" {
+                            Language::C
+                        } else {
+                            Language::Cpp
+                        });
+                        source_explicit_x = true;
+                    }
+                    continue;
+                }
+                if let Some((flag, tail)) = [
+                    ("external:I", "-isystem"),
+                    ("FI", "-include"),
+                    ("I", "-I"),
+                    ("D", "-D"),
+                    ("U", "-U"),
+                    ("std:", "-std="),
+                ]
+                .iter()
+                .find_map(|(prefix, flag)| Some((*flag, switch.strip_prefix(prefix)?)))
+                {
+                    normalized = format!("{flag}{tail}");
+                    &normalized
+                } else {
+                    if ["Fo", "Fe", "Fd", "Fi", "Fp"].contains(&switch) {
+                        args.next()
+                            .ok_or_else(|| format!("missing operand for {arg}"))?;
+                        continue;
+                    }
+                    arg
+                }
+            } else {
+                arg
+            };
+            if arg == "--" {
+                break;
             }
             if arg.starts_with('@')
                 || arg == "-I-"
                 || arg.starts_with("-include-pch")
                 || arg.starts_with("-imacros")
+                || arg.starts_with("--include-pch")
+                || arg.starts_with("--imacros")
             {
                 return Err(format!("unsupported preprocessing option {arg}"));
             }
@@ -211,7 +291,7 @@ impl Entry {
                 None => None,
             };
             if let Some(value) = std_value {
-                if !explicit_x {
+                if !explicit_x && !msvc {
                     if let Ok((expected, _)) = standard_macros(&value) {
                         opts.language = Some(expected);
                     }
@@ -235,10 +315,30 @@ impl Entry {
                 "-U",
                 "-x",
             ];
-            if let Some((flag, tail)) = FLAGS
-                .iter()
-                .find_map(|flag| Some((*flag, arg.strip_prefix(flag)?)))
-            {
+            if let Some((flag, tail)) = FLAGS.iter().find_map(|flag| {
+                let tail = arg.strip_prefix(flag)?;
+                // Target options such as -xhost and -x86-asm-syntax
+                // are not attached language selectors.
+                if *flag == "-x"
+                    && !tail.is_empty()
+                    && !matches!(
+                        tail,
+                        "c" | "c++"
+                            | "c-header"
+                            | "c++-header"
+                            | "none"
+                            | "assembler"
+                            | "assembler-with-cpp"
+                            | "objective-c"
+                            | "objective-c++"
+                            | "c-cpp-output"
+                            | "c++-cpp-output"
+                    )
+                {
+                    return None;
+                }
+                Some((*flag, tail))
+            }) {
                 let value = if tail.is_empty() {
                     args.next()
                         .ok_or_else(|| format!("missing operand for {flag}"))?
@@ -305,7 +405,34 @@ impl Entry {
                     .ok_or_else(|| format!("missing operand for {arg}"))?;
             }
         }
-        opts.language = overrides.language.or(source_language).or(opts.language);
+        // A standard is command-wide, but -x applies only to following inputs.
+        // Do not let the default captured at the source hide a later -std.
+        if !source_explicit_x && !msvc {
+            if let Some((language, _)) = standard.as_deref().and_then(|s| standard_macros(s).ok()) {
+                source_language = Some(language);
+            }
+        }
+        opts.language = overrides
+            .language
+            .or(if source_explicit_x {
+                source_language
+            } else {
+                msvc_language.or(source_language)
+            })
+            .or(opts.language);
+        // cl accepts shared project flags for mixed C/C++ sources and ignores
+        // a standard switch that does not apply to this source's language.
+        if msvc
+            && standard
+                .as_deref()
+                .and_then(|s| standard_macros(s).ok())
+                .is_some_and(|(language, _)| opts.language != Some(language))
+        {
+            standard = None;
+        }
+        if msvc && standard.is_none() && opts.language == Some(Language::Cpp) {
+            standard = Some("c++14".into());
+        }
         if let Some(standard) = standard {
             // An unknown `-std` costs the version macros, never the command.
             // The table ages out as compilers gain standards, and discarding
@@ -319,11 +446,45 @@ impl Entry {
                         "standard {standard} does not match source language"
                     ));
                 }
-                opts.command_macros.extend(std_macros);
+                if msvc {
+                    // MSVC dialects do not define GCC's strict-ANSI marker.
+                    for op in std_macros {
+                        match op {
+                            CommandMacro::Define(name, value) if name == "__cplusplus" => {
+                                opts.command_macros
+                                    .push(CommandMacro::Define("_MSVC_LANG".into(), value.clone()));
+                                opts.command_macros.push(CommandMacro::Define(
+                                    name,
+                                    if updated_cplusplus {
+                                        value
+                                    } else {
+                                        "199711L".into()
+                                    },
+                                ));
+                            }
+                            CommandMacro::Define(name, _) | CommandMacro::Undef(name)
+                                if name == "__STRICT_ANSI__" => {}
+                            op => opts.command_macros.push(op),
+                        }
+                    }
+                } else {
+                    opts.command_macros.extend(std_macros);
+                }
             }
         }
         opts.command_macros.extend(macros);
         opts.system_include_paths.extend(after_include_paths);
+        for paths in [
+            &mut opts.include_paths,
+            &mut opts.quote_include_paths,
+            &mut opts.system_include_paths,
+        ] {
+            for path in paths.iter_mut() {
+                *path = trace_ir::canonicalize(path);
+            }
+            let mut seen = std::collections::HashSet::new();
+            paths.retain(|path| seen.insert(path.clone()));
+        }
         // A directory supplied as both -I and -isystem belongs in the system
         // class, as in GCC/Clang. Keep order within each class.
         let systems: std::collections::HashSet<PathBuf> = opts
@@ -456,5 +617,182 @@ fn binary_stem(arg: &str) -> &str {
             &filename[..cut]
         }
         _ => filename,
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    fn options(args: &[&str]) -> Result<PreprocessOptions, String> {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.c");
+        std::fs::write(&file, "").unwrap();
+        Entry {
+            directory: dir.path().into(),
+            file: file.clone(),
+            arguments: Some(args.iter().map(|s| s.to_string()).collect()),
+            command: None,
+        }
+        .options(
+            trace_ir::canonicalize(dir.path()),
+            &trace_ir::canonicalize(&file),
+            &PreprocessOptions::new(),
+        )
+    }
+
+    #[test]
+    fn review_standard_after_source() {
+        let opts = options(&["clang", "main.c", "-std=c++17"]).unwrap();
+        assert_eq!(opts.language, Some(Language::Cpp));
+    }
+
+    #[test]
+    fn review_x_remains_positional() {
+        assert_eq!(
+            options(&["cc", "-xc++", "main.c", "-xc"]).unwrap().language,
+            Some(Language::Cpp)
+        );
+        assert_eq!(
+            options(&["cc", "main.c", "-xc++"]).unwrap().language,
+            Some(Language::C)
+        );
+    }
+
+    #[test]
+    fn review_non_language_x_flags() {
+        assert!(options(&["clang", "-x86-asm-syntax=intel", "-xhost", "main.c"]).is_ok());
+        assert!(options(&["cc", "-x", "assembler", "main.c"]).is_err());
+    }
+
+    #[test]
+    fn review_attached_output_flags_do_not_consume_next_option() {
+        for flags in [["-omain.o", "-MFfile.d"], ["-MTtarget", "-MQquoted"]] {
+            let opts = options(&["cc", flags[0], flags[1], "-DKEEP=1", "main.c"]).unwrap();
+            assert!(opts
+                .command_macros
+                .iter()
+                .any(|m| matches!(m, CommandMacro::Define(n, v) if n == "KEEP" && v == "1")));
+        }
+    }
+
+    #[test]
+    fn review_double_dash_unsupported() {
+        for flag in [
+            "--imacros",
+            "--imacros=defs.h",
+            "--include-pch",
+            "--include-pch=defs.pch",
+        ] {
+            assert!(
+                options(&["cc", flag, "defs.h", "main.c"]).is_err(),
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_msvc_preprocessing_flags() {
+        let opts = options(&[
+            "cl.exe",
+            "/Iinc",
+            "/external:I",
+            "sys",
+            "/DVALUE=2",
+            "/UOLD",
+            "/FIforced.h",
+            "main.c",
+            "/TP",
+            "/std:c++17",
+        ])
+        .unwrap();
+        assert_eq!(opts.language, Some(Language::Cpp));
+        assert_eq!(opts.include_paths.len(), 1);
+        assert_eq!(opts.system_include_paths.len(), 1);
+        assert_eq!(opts.forced_includes, vec![PathBuf::from("forced.h")]);
+        assert!(opts
+            .command_macros
+            .iter()
+            .any(|m| matches!(m, CommandMacro::Define(n, v) if n == "VALUE" && v == "2")));
+        assert!(opts
+            .command_macros
+            .iter()
+            .any(|m| matches!(m, CommandMacro::Undef(n) if n == "OLD")));
+    }
+
+    #[test]
+    fn review_msvc_language_and_output_operands() {
+        for args in [
+            vec!["CL.EXE", "/TP", "main.c"],
+            vec!["clang-cl", "main.c", "-TP"],
+            vec!["cl", "/TC", "/Tpmain.c"],
+            vec!["cl", "/Tp", "main.c", "/TC"],
+            vec!["cl", "/Fo", "main.c", "/TP", "main.c"],
+        ] {
+            assert_eq!(
+                options(&args).unwrap().language,
+                Some(Language::Cpp),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_msvc_inapplicable_standard_preserves_source_language() {
+        for args in [
+            vec!["cl", "/std:c++17", "main.c"],
+            vec!["clang-cl", "/TC", "/std:c++17", "main.c"],
+        ] {
+            assert_eq!(options(&args).unwrap().language, Some(Language::C));
+        }
+    }
+
+    #[test]
+    fn review_msvc_standard_macros() {
+        let opts = options(&["cl", "/TP", "/std:c++20", "main.c"]).unwrap();
+        assert!(opts.command_macros.iter().any(
+            |m| matches!(m, CommandMacro::Define(n,v) if n == "_MSVC_LANG" && v == "202002L")
+        ));
+        assert!(opts.command_macros.iter().any(
+            |m| matches!(m, CommandMacro::Define(n,v) if n == "__cplusplus" && v == "199711L")
+        ));
+        assert!(!opts
+            .command_macros
+            .iter()
+            .any(|m| matches!(m, CommandMacro::Define(n,_) if n == "__STRICT_ANSI__")));
+        let opts = options(&["cl", "/TP", "/std:c++20", "/Zc:__cplusplus", "main.c"]).unwrap();
+        assert!(opts.command_macros.iter().any(
+            |m| matches!(m, CommandMacro::Define(n,v) if n == "__cplusplus" && v == "202002L")
+        ));
+    }
+
+    #[test]
+    fn review_include_paths_are_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("inc")).unwrap();
+        std::fs::create_dir(dir.path().join("build")).unwrap();
+        let file = dir.path().join("main.c");
+        std::fs::write(&file, "").unwrap();
+        let opts = Entry {
+            directory: dir.path().into(),
+            file: file.clone(),
+            command: None,
+            arguments: Some(vec![
+                "cc".into(),
+                "-Ibuild/../inc".into(),
+                "-iquoteinc".into(),
+                "-isystembuild/../inc".into(),
+            ]),
+        }
+        .options(
+            trace_ir::canonicalize(dir.path()),
+            &trace_ir::canonicalize(&file),
+            &PreprocessOptions::new(),
+        )
+        .unwrap();
+        let expected = trace_ir::canonicalize(&dir.path().join("inc"));
+        assert_eq!(opts.quote_include_paths, vec![expected.clone()]);
+        assert_eq!(opts.system_include_paths, vec![expected]);
+        assert!(opts.include_paths.is_empty());
     }
 }

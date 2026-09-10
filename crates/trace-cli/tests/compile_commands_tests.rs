@@ -1058,3 +1058,63 @@ fn field_flow_survives_a_layout_unioned_across_commands() {
         assert_eq!(program.variants_merged, 0);
     }
 }
+
+#[test]
+fn review_overload_alternative_arms_preserve_base_spans_and_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("main.cpp"), "void a() {}\nvoid b() {}\n#ifdef ALT\nvoid pick(int n) { b(); }\nvoid pick(double n) { b(); }\n#else\nvoid pick(int n) { a(); }\nvoid pick(double n) { a(); }\n#endif\n").unwrap();
+    std::fs::write(
+        root.join("compile_commands.json"),
+        json!([
+            {"directory":root,"file":"main.cpp","arguments":["c++","main.cpp"]},
+            {"directory":root,"file":"main.cpp","arguments":["c++","-DALT","main.cpp"]}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let program = build_program_with_jobs(root, &PreprocessOptions::new(), 1).unwrap();
+    let (_, analysis) = trace_analysis::analyze(&program);
+    let defs: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "pick" && f.is_defined)
+        .collect();
+    assert_eq!(
+        defs.iter().map(|f| f.span.line).collect::<Vec<_>>(),
+        vec![7, 8]
+    );
+    for f in defs {
+        for target in ["a", "b"] {
+            let target = program.symbols.resolve_function(target).unwrap();
+            assert!(analysis
+                .call_edges
+                .iter()
+                .any(|e| e.caller == f.id && e.callee == target));
+        }
+    }
+}
+
+#[test]
+fn review_msvc_commands_recover_configured_call_flow() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join("inc")).unwrap();
+    std::fs::write(root.join("inc/config.h"), "#define HEADER_OK 1\n").unwrap();
+    std::fs::write(root.join("forced.h"), "#define FORCED_OK 1\n").unwrap();
+    std::fs::write(
+        root.join("main.c"),
+        include_str!("../../../tests/fixtures/compile_commands/msvc.c"),
+    )
+    .unwrap();
+    for driver in ["cl.exe", "clang-cl"] {
+        std::fs::write(root.join("compile_commands.json"), json!([
+            {"directory":root,"file":"main.c","arguments":[driver,"/I","inc","/DOLD","/UOLD","/DVALUE=2","/FIforced.h","main.c","/TP","/std:c++17"]}
+        ]).to_string()).unwrap();
+        let program = build_program_with_jobs(root, &PreprocessOptions::new(), 1).unwrap();
+        let (_, analysis) = trace_analysis::analyze(&program);
+        assert!(has_any_edge(&program, &analysis, "N::entry", "N::target"));
+        assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+    }
+}

@@ -315,7 +315,9 @@ impl PreprocessorState {
             for op in &ops {
                 match op {
                     crate::CommandMacro::Define(name, value) => {
-                        let text = format!("{name} {value}\n");
+                        // A synthetic newline would splice away a trailing
+                        // backslash. EOF terminates the replacement list too.
+                        let text = format!("{name} {value}");
                         let tokens = Lexer::new(&text, language).tokenize();
                         if let Err(e) = state.handle_define(&tokens, 0) {
                             state.warn(1, format!("invalid command-line macro: {e}"));
@@ -2167,7 +2169,7 @@ impl PreprocessorState {
     }
 
     fn resolve_include(&self, path: &str, quoted: bool) -> Result<PathBuf, PreprocessError> {
-        let candidate = if path.starts_with('/') || path.contains('\\') {
+        let candidate = if Path::new(path).is_absolute() {
             PathBuf::from(path)
         } else {
             self.current_file
@@ -2176,7 +2178,7 @@ impl PreprocessorState {
                 .join(path)
         };
         if (quoted || !self.opts.strict_include_search || Path::new(path).is_absolute())
-            && candidate.is_file()
+            && self.include_exists(&candidate)
         {
             return Ok(candidate);
         }
@@ -2198,6 +2200,16 @@ impl PreprocessorState {
         })
     }
 
+    /// Match the same canonical cache key used by `process_file`.
+    fn include_exists(&self, path: &Path) -> bool {
+        path.is_file()
+            || self
+                .opts
+                .source_cache
+                .as_ref()
+                .is_some_and(|cache| cache.contains_key(&trace_ir::canonicalize(path)))
+    }
+
     /// The include search proper, excluding the including file's own directory.
     fn search_include_dirs(&self, path: &str, quoted: bool) -> Option<PathBuf> {
         let quote_dirs = self.opts.quote_include_paths.iter().filter(|_| quoted);
@@ -2206,7 +2218,7 @@ impl PreprocessorState {
             .chain(&self.opts.system_include_paths)
         {
             let p = inc.join(path);
-            if p.is_file() {
+            if self.include_exists(&p) {
                 return Some(p);
             }
         }
@@ -2979,7 +2991,7 @@ fn parameter_list_open(tokens: &[Token], name_idx: usize) -> Option<usize> {
 /// lexer has already spliced `\`-newline continuations).
 fn read_replacement_list(tokens: &[Token], i: &mut usize) -> Vec<Token> {
     let mut replacement = Vec::new();
-    while *i < tokens.len() && !matches!(tokens[*i].kind, TokenKind::Newline) {
+    while *i < tokens.len() && !matches!(tokens[*i].kind, TokenKind::Newline | TokenKind::Eof) {
         replacement.push(tokens[*i].clone());
         *i += 1;
     }
@@ -4726,6 +4738,72 @@ mod tests {
     }
     use std::sync::{Arc, RwLock};
 
+    #[test]
+    fn review_virtual_headers_in_all_search_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for class in 0..5 {
+            let mut opts = PreprocessOptions::new();
+            opts.strict_include_search = true;
+            let include = root.join("virtual");
+            let mut cache = std::collections::HashMap::new();
+            cache.insert(
+                include.join("header.h"),
+                Arc::<str>::from("int virtual_header;\n"),
+            );
+            opts.source_cache = Some(Arc::new(cache));
+            let source = match class {
+                0 => "#include \"virtual/header.h\"\n",
+                1 => {
+                    opts.quote_include_paths.push(include);
+                    "#include \"header.h\"\n"
+                }
+                2 => {
+                    opts.include_paths.push(include);
+                    "#include <header.h>\n"
+                }
+                3 => {
+                    opts.system_include_paths.push(include);
+                    "#include <header.h>\n"
+                }
+                _ => {
+                    opts.working_directory = Some(root.into());
+                    opts.forced_includes.push("virtual/header.h".into());
+                    ""
+                }
+            };
+            let result = preprocess_string(source, &root.join("main.c"), &opts);
+            assert!(
+                result.output.contains("virtual_header"),
+                "class {class}: {}",
+                result.output
+            );
+        }
+    }
+
+    #[test]
+    fn review_relative_backslash_include() {
+        let dir = tempfile::tempdir().unwrap();
+        // On Unix a backslash is a literal filename character; on Windows it
+        // separates directories. Either spelling must stay source-relative.
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join(r"sub\header.h"), "int from_header;\n").unwrap();
+        let result = preprocess_string(
+            "#include \"sub\\header.h\"\n",
+            &dir.path().join("main.c"),
+            &PreprocessOptions::new(),
+        );
+        assert!(result.output.contains("from_header"), "{}", result.output);
+    }
+
+    #[test]
+    fn review_command_macro_trailing_backslash() {
+        let mut opts = PreprocessOptions::new();
+        opts.command_macros
+            .push(crate::CommandMacro::Define("PATH".into(), "tail\\".into()));
+        let result = preprocess_string("PATH\n", Path::new("main.c"), &opts);
+        assert!(result.output.contains("\\"), "{}", result.output);
+    }
     #[test]
     fn expands_function_like_macro() {
         let src = "#define SQUARE(x) ((x) * (x))\nint y = SQUARE(n);\n";

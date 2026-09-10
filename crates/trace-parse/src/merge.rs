@@ -66,11 +66,9 @@ struct VariantDedup {
     /// include the same header.
     source_scopes: FxHashMap<PathBuf, u32>,
     /// Definitions the base configuration merged for this unit, as
-    /// `file → name → id`, so a variant can find the base's copy of a function
-    /// it spells on a *different line*. `None` marks a name that several
-    /// defined functions in one file share (C++ overloads), where the
-    /// file/name pair does not identify one function.
-    base_defs: FxHashMap<trace_ir::FileId, FxHashMap<String, Option<FnId>>>,
+    /// `file → name → candidates`, so alternative arms can match an existing
+    /// overload by signature even when their source lines differ.
+    base_defs: FxHashMap<trace_ir::FileId, FxHashMap<String, Vec<FnId>>>,
 }
 
 impl VariantDedup {
@@ -159,15 +157,13 @@ pub fn merge_unit_variants(program: &mut Program, base: &UnitIndex, variants: &[
         // first one. Subsequent alternatives must extend that definition too.
         for (file, definitions) in base_definitions(program, unit) {
             let known = seen.base_defs.entry(file).or_default();
-            for (name, id) in definitions {
-                known
-                    .entry(name)
-                    .and_modify(|old| {
-                        if *old != id {
-                            *old = None;
-                        }
-                    })
-                    .or_insert(id);
+            for (name, ids) in definitions {
+                let candidates = known.entry(name).or_default();
+                for id in ids {
+                    if !candidates.contains(&id) {
+                        candidates.push(id);
+                    }
+                }
             }
         }
         program.variants_merged += 1;
@@ -184,15 +180,11 @@ pub fn merge_unit_variants(program: &mut Program, base: &UnitIndex, variants: &[
 /// redeclaration and overwrites the survivor's span and parameters with the
 /// variant's, which evicts facts the baseline had.
 ///
-/// A name shared by several defined functions in one file (C++ overloads) maps
-/// to `None`: the pair does not identify a function, so those keep the
-/// line-keyed behavior.
+/// Keep every overload as a candidate; the caller compares signatures.
 fn base_definitions(
     program: &mut Program,
     base: &UnitIndex,
-) -> FxHashMap<trace_ir::FileId, FxHashMap<String, Option<FnId>>> {
-    use std::collections::hash_map::Entry;
-
+) -> FxHashMap<trace_ir::FileId, FxHashMap<String, Vec<FnId>>> {
     let file_map: Vec<trace_ir::FileId> = base
         .files
         .iter()
@@ -200,7 +192,7 @@ fn base_definitions(
         .collect();
     let primary_file_id = program.symbols.add_file_interned(&base.path);
 
-    let mut by_file: FxHashMap<trace_ir::FileId, FxHashMap<String, Option<FnId>>> =
+    let mut by_file: FxHashMap<trace_ir::FileId, FxHashMap<String, Vec<FnId>>> =
         FxHashMap::default();
     for func in base.functions.iter().filter(|f| f.is_defined) {
         let span_file = file_map
@@ -222,19 +214,13 @@ fn base_definitions(
         {
             continue;
         }
-        match by_file
+        let candidates = by_file
             .entry(span_file)
             .or_default()
             .entry(func.name.clone())
-        {
-            Entry::Occupied(mut slot) => {
-                if *slot.get() != Some(id) {
-                    slot.insert(None);
-                }
-            }
-            Entry::Vacant(slot) => {
-                slot.insert(Some(id));
-            }
+            .or_default();
+        if !candidates.contains(&id) {
+            candidates.push(id);
         }
     }
     by_file
@@ -403,8 +389,9 @@ fn merge_unit(
                 .as_deref()
                 .and_then(|seen| seen.base_defs.get(&span_file))
                 .and_then(|by_name| by_name.get(&func.name))
-                .copied()
-                .flatten();
+                .into_iter()
+                .flatten()
+                .copied();
             // Only an alternative *implementation* extends the base definition.
             // In C++ a configuration that adds an overload — `pick(int)` always,
             // plus `pick(double)` under a define — also lands on a line the base
@@ -420,7 +407,7 @@ fn merge_unit(
             // on the ordinary path: through this unit's `type_map`, and a pair
             // either side cannot resolve counts as matching, so an unknown type
             // never splits a function that a conditional typedef merely respells.
-            canonical = candidate.filter(|&id| {
+            let mut matching = candidate.filter(|&id| {
                 let Some(base) = program.symbols.function_by_id(id) else {
                     return false;
                 };
@@ -452,6 +439,9 @@ fn merge_unit(
                         }
                     })
             });
+            // Unknown types can match several overloads. Keep the ordinary
+            // merge path in that case instead of choosing by insertion order.
+            canonical = matching.next().filter(|_| matching.next().is_none());
         }
         if let Some(canonical) = canonical {
             fn_map.insert(old_id, canonical);

@@ -396,3 +396,8 @@ Preprocessor cleanup retains the same token spelling and origin semantics while
 borrowing token text during output rendering and token pasting. Synthetic
 exploration predicates omit LineMap construction because they consume only a
 boolean result; file indexing continues to track every original source location.
+
+Command-line macro replacement text is lexed without an appended newline, so a
+terminal backslash is preserved. Include lookup uses platform path semantics for
+relative paths and recognizes canonical source-cache entries in every search
+class, including the source directory and forced includes.

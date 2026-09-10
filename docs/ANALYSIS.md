@@ -835,6 +835,21 @@ the analysis root are eligible, including nonstandard extensions selected by `-x
 Sources outside that root or below `--dep` roots are excluded.
 
 Each command contributes ordered `-D`/`-U` operations and `-include` headers.
+For `cl` and `clang-cl` drivers (also `--driver-mode=cl`), the corresponding
+case-sensitive MSVC switches `/I`, `/external:I`, `/D`, `/U`, `/FI`, `/TC`, `/TP`,
+`/Tc`, `/Tp`, and `/std:` are recognized, including attached and separate operands
+where applicable and their `-` spellings. `/TC` and `/TP` apply globally; `/Tc`
+and `/Tp` select the named source. `/link` ends compiler-option parsing. Known
+output-file operands are skipped. C++ standards set `_MSVC_LANG`; `cl` keeps
+`__cplusplus=199711L` unless `/Zc:__cplusplus` enables the standard value.
+MSVC standard options do not introduce `__STRICT_ANSI__`. Compiler-version and
+platform predefines and implicit SDK include paths are not inferred; supply
+needed defines and directories explicitly. This is preprocessing-option support,
+not full compiler emulation. `compile_flags.txt` is not read.
+
+Include directories are canonicalized and deduplicated within each search class
+without changing their order. Source-cache-only headers participate in the same
+search as filesystem headers.
 Quoted includes search the including file's directory, then ordered `-iquote`
 directories, ordered `-I` directories, ordered `-isystem` directories and finally
 the `-idirafter` chain. Angle includes skip the first two classes. A directory
@@ -843,6 +858,13 @@ defines override command macros. Configured units do not use inferred include
 directories or basename guessing. Forced includes first search the command's
 working directory and preserve their own source locations; a header they cannot
 find is reported against the source, never against the synthetic search path.
+
+For GCC-style commands, `-std` applies to the whole command, including when it follows the source. MSVC `/std:` does not change the source language; a standard for the other language is ignored.
+`-x` remains positional: only following input files use that language. Target
+flags such as `-xhost` and `-x86-asm-syntax=intel` are ignored as non-language flags.
+Both single- and double-dash `imacros`/`include-pch` spellings are diagnosed as
+unsupported. Attached output flags (`-oFILE`, `-MFFILE`, `-MTTARGET`, `-MQTARGET`)
+are ignored without consuming the next argument.
 
 `-x` at the source argument selects both lexer and tree-sitter grammar; otherwise
 the file extension applies (a `++` driver selects C++). `-std` supports C90 through
@@ -954,9 +976,9 @@ and feature implementations by exploring feasible configuration variants indepen
      alternative-implementation shape — extends the base entry, found by file and name.
      Registering it as a second definition would make the symbol table treat it as a
      redeclaration and overwrite the surviving definition's span and parameters with the
-     variant's, dropping the call sites bound to them. A name that several *defined*
-     functions in one file share (C++ overloads) does not identify a function, so those
-     keep the line-keyed behavior. The base entry must also agree on **signature** --
+     variant's, dropping the call sites bound to them. Every defined overload remains
+     a candidate; a unique matching signature selects the corresponding base body.
+     Ambiguous matches retain the ordinary merge path. The base entry must agree on **signature** --
      parameter count and types: a configuration that *adds* an overload (`pick(int)`
      always, `pick(double)` under a define) likewise lands on a line the base never had,
      and folding it into the base would conflate two functions' parameters and call
