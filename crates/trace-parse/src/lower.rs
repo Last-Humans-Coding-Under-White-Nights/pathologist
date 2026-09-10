@@ -11,15 +11,17 @@ use crate::merge::{
 };
 use crate::parse::node_text;
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use trace_ir::{
-    CallSite, Diagnostic, DiagnosticSeverity, FieldId, FlowConstraint, FnId, Function, Linkage,
-    Program, ReturnFlow, ScalarKind, Span, StorageClass, TypeDesc, VarId, Variable,
+    is_anonymous_tag, CallSite, Diagnostic, DiagnosticSeverity, FieldId, FlowConstraint, FnId,
+    Function, Linkage, Program, ReturnFlow, ScalarKind, Span, StorageClass, TypeDesc, VarId,
+    Variable,
 };
 use trace_preproc::{macro_table_from_defines, Language, MacroTable, PreprocessOptions};
 use tree_sitter::Node;
@@ -29,6 +31,10 @@ use tree_sitter::Node;
 const MAX_AST_WALK_DEPTH: u32 = 512;
 const INDEX_PROGRESS_EVERY: usize = 50;
 const PREPROCESS_STAGE: &str = "preprocess";
+/// Parse tasks issued per worker in one parallel batch. Batching bounds the
+/// per-unit IR held before merging; four per worker leaves room for uneven
+/// unit sizes.
+const PARSE_BATCHES_PER_WORKER: usize = 4;
 
 fn index_progress(msg: impl std::fmt::Display) {
     let _ = writeln!(std::io::stderr(), "{msg}");
@@ -94,7 +100,7 @@ struct LowerContext {
     /// `new_expression` node IDs already handled by `expr_to_rhs_flow` so
     /// `walk_function_body` skips them (avoids duplicate call sites with
     /// incorrect `this`-parameter wiring).
-    handled_new_exprs: RefCell<std::collections::HashSet<usize>>,
+    handled_new_exprs: RefCell<HashSet<usize>>,
     /// Cache for `resolve_callee_with_loads`: maps the `func` node id of a
     /// field-expression callee to the load variable created for the fn-ptr
     /// load.  Without this, `emit_field_value_store` (via `resolve_callee_var`)
@@ -210,6 +216,10 @@ pub fn build_program_with_jobs(
     jobs: usize,
 ) -> Result<Program, String> {
     let jobs = jobs.max(1);
+    // Include resolution memoizes `is_file` for the run (`is_file_cached`);
+    // start from what the tree looks like now, not from what a previous run in
+    // this process saw.
+    trace_ir::start_file_probe_epoch();
     let mut program = Program::new(root.to_path_buf());
     program.include_paths = opts.include_paths.clone();
     // Set before any path is interned: `SymbolTable` decides `FileInfo::is_dep`
@@ -302,7 +312,8 @@ pub fn build_program_with_jobs(
     let file_order = include_graph.index_order(&files);
 
     let basename_index = Arc::new(include_graph.basename_index.clone());
-    let include_expansion_cache = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let include_expansion_cache =
+        Arc::new(std::sync::RwLock::new(rustc_hash::FxHashMap::default()));
     let eff_opts = project_preprocess_opts(root, opts, &include_graph)
         .for_indexing()
         .with_include_expansion_cache(Arc::clone(&include_expansion_cache))
@@ -386,7 +397,7 @@ pub fn build_program_with_jobs(
     // under a fresh table. Rounds beyond the first touch only reclassified
     // headers, and the graph only grows, so this terminates.
     let source_cache = IndexSourceCache::new();
-    let mut warmed_as: HashMap<PathBuf, Vec<Language>> = HashMap::new();
+    let mut warmed_as: HashMap<PathBuf, Vec<Language>> = HashMap::default();
     // What a header's second-language warm run reported. The cached
     // (first-language) run reaches the export through the header's own
     // unit; this run's text is discarded, so its diagnostics would go with
@@ -583,10 +594,12 @@ pub fn build_program_with_jobs(
     // The settle pass below reads a frozen cache and stays parallel, as does
     // every phase after it, so the cost is one serial pass over the units
     // (camera: ~+1s wall, and 208 rather than 285 units re-run).
+    let discover_t = Instant::now();
     for path in file_order.iter() {
         let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
         let _ = source_cache.get_or_preprocess(path, &include_graph, &discover_opts[&lang]);
     }
+    let discover_secs = discover_t.elapsed().as_secs_f64();
     // A unit that matched every include it reached already has the text the
     // settle pass would build for it: its includes hit the same expansions
     // either way, and with nothing expanded it opened no cache frame, so
@@ -595,15 +608,21 @@ pub fn build_program_with_jobs(
     // which is what turns an inlined body back into a shared one.
     let dirty: HashSet<PathBuf> = source_cache.units_that_inlined(&tu_paths);
     source_cache.evict_all(&dirty);
+    let settle_t = Instant::now();
     pool.install(|| {
         dirty.par_iter().for_each(|path| {
             let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
             let _ = source_cache.get_or_preprocess(path, &include_graph, &index_opts[&lang]);
         });
     });
+    // Split the two passes apart: the serial discovery pass and the parallel
+    // settle pass have different cures, so a single total hides which one to
+    // attack (#83).
     index_progress(format!(
-        "preprocess-done: {:.1}s ({} of {} units re-run)",
+        "preprocess-done: {:.1}s ({:.1}s serial discovery + {:.1}s settle of {} of {} units)",
         pre_t.elapsed().as_secs_f64(),
+        discover_secs,
+        settle_t.elapsed().as_secs_f64(),
         dirty.len(),
         file_order.len()
     ));
@@ -692,7 +711,7 @@ pub fn build_program_with_jobs(
     // nested type the raw `#include` scanner missed. Nested merge copies
     // types/typedefs only; TUs pull prototypes from every reachable header.
     // Cyclic leftovers are indexed in `index_order`, never as a parallel wave.
-    let mut header_ir_map: HeaderIr = HashMap::new();
+    let mut header_ir_map: HeaderIr = HashMap::default();
     let (pch_waves, pch_cycles) = if jobs == 1 {
         (vec![pch_order.as_ref().clone()], Vec::new())
     } else {
@@ -847,6 +866,7 @@ pub fn build_program_with_jobs(
                         pch_order.as_ref(),
                     ),
                 );
+                source_cache.evict(path, &include_graph);
                 index_item_progress(
                     i,
                     orphan_headers.len(),
@@ -859,29 +879,24 @@ pub fn build_program_with_jobs(
                 );
             }
         } else {
-            let mut header_units: HashMap<PathBuf, UnitIndex> = orphan_headers
-                .par_iter()
-                .map(|path| {
-                    (
-                        path.clone(),
-                        index_source_file(
-                            path,
-                            root,
-                            &include_graph,
-                            &index_opts
-                                [&index_language(path, &cpp_parse, no_c_units, forced_language)],
-                            &source_cache,
-                            Some(&header_ir),
-                            pch_order.as_ref(),
-                        ),
-                    )
-                })
-                .collect();
-            for path in &orphan_headers {
-                if let Some(unit) = header_units.remove(path) {
-                    merge_unit_index(&mut program, &unit);
-                }
-            }
+            index_in_batches(
+                &orphan_headers,
+                jobs,
+                |path| {
+                    let unit = index_source_file(
+                        path,
+                        root,
+                        &include_graph,
+                        &index_opts[&index_language(path, &cpp_parse, no_c_units, forced_language)],
+                        &source_cache,
+                        Some(&header_ir),
+                        pch_order.as_ref(),
+                    );
+                    source_cache.evict(path, &include_graph);
+                    unit
+                },
+                |unit| merge_unit_index(&mut program, &unit),
+            );
         }
     });
 
@@ -907,6 +922,7 @@ pub fn build_program_with_jobs(
                     &base_defines,
                     opts.explore_budget,
                 );
+                source_cache.evict(path, &include_graph);
                 merge_unit_variants(&mut program, &base_unit, &var_units);
                 index_item_progress(
                     i,
@@ -920,11 +936,12 @@ pub fn build_program_with_jobs(
                 );
             }
         } else {
-            let results: Vec<(PathBuf, UnitIndex, Vec<UnitIndex>)> = file_order
-                .par_iter()
-                .map(|path| {
+            index_in_batches(
+                &file_order,
+                jobs,
+                |path| {
                     let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
-                    let (base_unit, var_units) = index_source_file_with_variants(
+                    let units = index_source_file_with_variants(
                         path,
                         root,
                         &include_graph,
@@ -936,16 +953,13 @@ pub fn build_program_with_jobs(
                         &base_defines,
                         opts.explore_budget,
                     );
-                    (path.clone(), base_unit, var_units)
-                })
-                .collect();
-            let mut result_map: HashMap<PathBuf, (UnitIndex, Vec<UnitIndex>)> =
-                results.into_iter().map(|(p, b, vs)| (p, (b, vs))).collect();
-            for path in &file_order {
-                if let Some((base_unit, var_units)) = result_map.remove(path) {
-                    merge_unit_variants(&mut program, &base_unit, &var_units);
-                }
-            }
+                    // Header provenance and PCH construction are complete.
+                    // Keep the source through variant generation, then release it.
+                    source_cache.evict(path, &include_graph);
+                    units
+                },
+                |(base_unit, var_units)| merge_unit_variants(&mut program, &base_unit, &var_units),
+            );
         }
     });
 
@@ -1005,13 +1019,26 @@ fn finalize_extern_callees(program: &mut Program) {
         .collect();
     names.sort();
     names.dedup_by(|a, b| a.0 == b.0);
-    for (name, file, line) in names {
+    // The sites each name may claim, in table order, gathered once: a scan
+    // of the whole table per name was quadratic (1.5s of camera's index).
+    let mut sites_by_name: HashMap<&str, Vec<usize>> = names
+        .iter()
+        .map(|(name, _, _)| (name.as_str(), Vec::new()))
+        .collect();
+    for (i, cs) in program.symbols.call_sites.iter().enumerate() {
+        if !cs.is_direct && cs.callee_var.is_none() {
+            if let Some(sites) = sites_by_name.get_mut(cs.callee_name.as_str()) {
+                sites.push(i);
+            }
+        }
+    }
+    for (name, file, line) in &names {
         // A symbol already exists for this name (in-tree prototype or
         // definition): leave the site untouched so the solver's name-based
         // recovery classifies it — defined-elsewhere resolves to a real
         // Direct edge with param wiring; prototype-only becomes External.
         // Synthesizing over it would orphan the real definition.
-        if program.symbols.resolve_function(&name).is_some() {
+        if program.symbols.resolve_function(name).is_some() {
             continue;
         }
         let fid = program.symbols.alloc_fn_id();
@@ -1023,19 +1050,22 @@ fn finalize_extern_callees(program: &mut Program) {
             params: Vec::new(),
             locals: Vec::new(),
             is_cpp: false,
-            span: trace_ir::Span { file, line, col: 0 },
-            end_line: line,
-            file,
+            span: trace_ir::Span {
+                file: *file,
+                line: *line,
+                col: 0,
+            },
+            end_line: *line,
+            file: *file,
             is_defined: false,
             param_type_ids: Vec::new(),
             is_virtual: false,
             is_final: false,
         });
-        for cs in program.symbols.call_sites.iter_mut() {
-            if !cs.is_direct && cs.callee_var.is_none() && cs.callee_name == name {
-                cs.is_direct = true;
-                cs.callee_fn_id = Some(fid);
-            }
+        for &i in &sites_by_name[name.as_str()] {
+            let cs = &mut program.symbols.call_sites[i];
+            cs.is_direct = true;
+            cs.callee_fn_id = Some(fid);
         }
     }
 }
@@ -1160,6 +1190,40 @@ fn normalize_discovered_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 /// Indexing workers recurse on deep expressions, so they need more than the
 /// default stack. Both indexing paths build their pool here to keep that true.
+/// Index `items` in parallel batches of [`PARSE_BATCHES_PER_WORKER`] per
+/// worker, merging each batch in the order given. Indexed parallel
+/// collection preserves the order of a slice, so the merge order is that of
+/// `items` regardless of scheduling, and the IR held before merging is
+/// bounded by one batch rather than by the corpus.
+///
+/// The merge is serial and runs on this thread while the pool indexes the
+/// next batch, so it costs wall time only when it outruns the indexing
+/// (camera: 0.35s of merging against 1.9s of parsing). The channel holds
+/// one finished batch, which bounds what is in flight to two.
+fn index_in_batches<T: Send>(
+    items: &[PathBuf],
+    jobs: usize,
+    index: impl Fn(&PathBuf) -> T + Sync,
+    mut merge: impl FnMut(T) + Send,
+) {
+    let batch_size = jobs.max(1).saturating_mul(PARSE_BATCHES_PER_WORKER);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<T>>(1);
+    let index = &index;
+    rayon::scope(move |scope| {
+        scope.spawn(move |_| {
+            for batch in items.chunks(batch_size) {
+                let results: Vec<T> = batch.par_iter().map(index).collect();
+                if tx.send(results).is_err() {
+                    return;
+                }
+            }
+        });
+        for results in rx {
+            results.into_iter().for_each(&mut merge);
+        }
+    });
+}
+
 fn index_pool(jobs: usize) -> Result<rayon::ThreadPool, String> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(jobs)
@@ -1180,7 +1244,9 @@ fn project_preprocess_opts(
         }
     }
     if eff.source_cache.is_none() && !graph.source_cache.is_empty() {
-        eff.source_cache = Some(Arc::new(graph.source_cache.clone()));
+        eff.source_cache = Some(Arc::new(trace_preproc::SourceCache::new(
+            graph.source_cache.clone(),
+        )));
     }
     let _ = root;
     eff
@@ -1213,7 +1279,7 @@ fn headers_to_merge<'a>(
     included_headers: &'a [PathBuf],
     types_only: bool,
 ) -> Vec<&'a Path> {
-    let mut wanted: HashSet<&Path> = HashSet::new();
+    let mut wanted: HashSet<&Path> = HashSet::default();
     if types_only {
         if let Some(edges) = graph.edges.get(self_canon) {
             for h in edges {
@@ -1293,7 +1359,7 @@ fn close_over_nested_variants(
     consumed: &HashSet<(PathBuf, Language, usize)>,
     cache: &trace_preproc::ExpansionCache,
 ) -> HashMap<(PathBuf, Language), HashSet<usize>> {
-    let mut wanted: HashMap<(PathBuf, Language), HashSet<usize>> = HashMap::new();
+    let mut wanted: HashMap<(PathBuf, Language), HashSet<usize>> = HashMap::default();
     let mut queue: Vec<(PathBuf, Language, usize)> = consumed.iter().cloned().collect();
     while let Some((path, language, variant)) = queue.pop() {
         if !wanted
@@ -1492,7 +1558,7 @@ fn index_source_file_with_variants(
     source_cache: &IndexSourceCache,
     header_ir: Option<&HeaderIr>,
     pch_order: &[PathBuf],
-    gn_candidates: Option<&HashMap<String, Vec<Candidate>>>,
+    gn_candidates: Option<&std::collections::HashMap<String, Vec<Candidate>>>,
     base_defines: &BTreeMap<String, String>,
     explore_budget: usize,
 ) -> (UnitIndex, Vec<UnitIndex>) {
@@ -1686,7 +1752,7 @@ fn lower_prepared_source(
     let mut ctx = LowerContext {
         current_fn: None,
         current_file: file_id,
-        locals: HashMap::new(),
+        locals: HashMap::default(),
         line_map: Some(std::sync::Arc::clone(&pre.line_map)),
         primary_path: self_canon,
         pending: RefCell::new(Vec::new()),
@@ -1695,12 +1761,12 @@ fn lower_prepared_source(
         using_name_imports: Vec::new(),
         class_ctx: None,
         is_cpp: lang == crate::parse::SourceLang::Cpp,
-        handled_new_exprs: RefCell::new(std::collections::HashSet::new()),
-        callee_load_cache: RefCell::new(HashMap::new()),
-        call_return_dst: RefCell::new(HashMap::new()),
+        handled_new_exprs: RefCell::new(HashSet::default()),
+        callee_load_cache: RefCell::new(HashMap::default()),
+        call_return_dst: RefCell::new(HashMap::default()),
         ast_depth: 0,
         ast_depth_warned: false,
-        reference_vars: HashSet::new(),
+        reference_vars: HashSet::default(),
     };
     lower_tree(
         program,
@@ -1846,7 +1912,7 @@ fn lower_typedef(program: &mut Program, ctx: &mut LowerContext, source: &str, no
         if let Some(type_node) = node.child_by_field_name("type") {
             if type_node.kind() == "struct_specifier" || type_node.kind() == "union_specifier" {
                 let tag = lower_struct_specifier(program, ctx, source, type_node);
-                if !alias.is_empty() && !tag.is_empty() && alias != tag {
+                if !alias.is_empty() && !tag.is_empty() {
                     let kind = if type_node.kind() == "union_specifier" {
                         TypeDesc::Union {
                             name: tag.clone(),
@@ -1859,11 +1925,18 @@ fn lower_typedef(program: &mut Program, ctx: &mut LowerContext, source: &str, no
                         }
                     };
                     program.types.intern(kind.clone());
+                    // The declarator's own modifiers belong to the alias:
+                    // `typedef struct Session *SessionPtr` names a POINTER,
+                    // and registering the bare tag made every `SessionPtr s`
+                    // a struct value, so `s->fd` decomposed against a
+                    // non-pointer and the points-to graph lost the edge.
+                    let shaped = walk_declarator_shape(decl, kind);
+                    program.types.intern(shaped.clone());
                     // Register even when alias == tag: later `Tag *x`
                     // declarations resolve through the alias table
                     // (`type_desc_from_node`), and without an entry the
                     // pointer degrades to Int, killing field decomposition.
-                    program.types.register_alias(&alias, kind);
+                    program.types.register_alias(&alias, shaped);
                 }
             } else if let Some(desc) = typedef_underlying_desc(program, ctx, source, node) {
                 program.types.register_alias(&alias, desc);
@@ -2659,7 +2732,7 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
     }
     if let Some(params_node) = find_params(decl) {
         for param in params_node.children(&mut params_node.walk()) {
-            if param.kind() == "parameter_declaration" {
+            if is_parameter_node(param.kind()) {
                 if let Some(var) = lower_parameter(
                     program,
                     ctx,
@@ -2780,6 +2853,19 @@ fn derive_owner_class(program: &Program, qualified_name: &str) -> Option<String>
         }
     }
     None
+}
+
+/// Whether a node in a parameter list declares a parameter.
+///
+/// `optional_parameter_declaration` is tree-sitter's C++ node for a parameter
+/// carrying a default argument (`void f(int a, int b = 0)`). Matching only
+/// `parameter_declaration` dropped those, so a prototype looked lower-arity
+/// than its own definition and the two stopped merging (#83).
+fn is_parameter_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "parameter_declaration" | "optional_parameter_declaration"
+    )
 }
 
 fn lower_parameter(
@@ -3045,9 +3131,7 @@ fn lower_one_declarator(
         && ctx.current_fn.is_some()
     {
         if let Some(cls) = match program.types.get(type_id).desc.clone() {
-            TypeDesc::Struct { name, .. } if !name.is_empty() && !name.starts_with("anon_") => {
-                Some(name)
-            }
+            TypeDesc::Struct { name, .. } if !is_anonymous_tag(&name) => Some(name),
             _ => None,
         } {
             let span = node_span(program, ctx, span_node);
@@ -3203,7 +3287,7 @@ fn lower_function_decl(
     let mut params = Vec::new();
     if let Some(params_node) = find_params(decl) {
         for param in params_node.children(&mut params_node.walk()) {
-            if param.kind() == "parameter_declaration" {
+            if is_parameter_node(param.kind()) {
                 if let Some(var) = lower_parameter(
                     program,
                     ctx,
@@ -4350,7 +4434,7 @@ fn lower_lambda_expression(
         })
     {
         for param in params_node.children(&mut params_node.walk()) {
-            if param.kind() == "parameter_declaration" {
+            if is_parameter_node(param.kind()) {
                 if let Some(var) = lower_parameter(
                     program,
                     ctx,
@@ -4502,7 +4586,7 @@ fn receiver_lookup_name(program: &Program, name: &str) -> String {
 /// from a real call out of tree.
 fn resolve_operator_arrow(program: &Program, desc: TypeDesc) -> Option<String> {
     let mut current = desc;
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     for _ in 0..=MAX_ARROW_DEPTH {
         if let TypeDesc::Ptr(inner) = current {
             return class_name_of_desc(program, &inner);

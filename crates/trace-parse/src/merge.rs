@@ -1,8 +1,8 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
 use trace_ir::{
-    CallSite, CallSiteId, FlowConstraint, FnId, Function, Program, ReturnFlow, TemplateBase,
-    TypeDesc, TypeId, VarId, Variable,
+    same_param_type_or_unresolved, CallSite, CallSiteId, FlowConstraint, FnId, Function, Program,
+    ReturnFlow, TemplateBase, TypeDesc, TypeId, VarId, Variable,
 };
 
 /// Per-file indexing result merged into a single [`Program`].
@@ -226,43 +226,6 @@ fn base_definitions(
     by_file
 }
 
-/// Whether two parameter types are the same *signature* type.
-///
-/// Compared by shape rather than by `TypeId`: two configurations of one source
-/// intern their own copy of a type, so the same C++ parameter can arrive under
-/// different ids and an id comparison would split a function from itself. Tags
-/// compare by name because the configurations may legitimately have contributed
-/// different field sets — reconciling those is what the layout union is for —
-/// and an unresolved type never splits anything.
-fn same_param_type(types: &trace_ir::TypeTable, a: TypeId, b: TypeId) -> bool {
-    a == b || same_type_shape(&types.get(a).desc, &types.get(b).desc)
-}
-
-fn same_type_shape(a: &TypeDesc, b: &TypeDesc) -> bool {
-    match (a, b) {
-        (TypeDesc::Unknown, _) | (_, TypeDesc::Unknown) => true,
-        (TypeDesc::Ptr(x), TypeDesc::Ptr(y)) => same_type_shape(x, y),
-        (TypeDesc::Array { elem: x, .. }, TypeDesc::Array { elem: y, .. }) => same_type_shape(x, y),
-        (TypeDesc::Struct { name: x, .. }, TypeDesc::Struct { name: y, .. })
-        | (TypeDesc::Union { name: x, .. }, TypeDesc::Union { name: y, .. }) => x == y,
-        (
-            TypeDesc::FnPtr {
-                ret: r1,
-                params: p1,
-            },
-            TypeDesc::FnPtr {
-                ret: r2,
-                params: p2,
-            },
-        ) => {
-            p1.len() == p2.len()
-                && same_type_shape(r1, r2)
-                && p1.iter().zip(p2).all(|(x, y)| same_type_shape(x, y))
-        }
-        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
-    }
-}
-
 /// Nested PCH: types, typedefs, and inheritance only.
 pub fn merge_unit_types(program: &mut Program, unit: &UnitIndex) {
     merge_unit(program, unit, MergeMode::TypesOnly, None);
@@ -372,6 +335,19 @@ fn merge_unit(
     } else {
         FxHashMap::default()
     };
+    // Every parameter's type, remapped into the program's id space, indexed by
+    // its unit-local `VarId`. Both places below used to scan `unit.variables`
+    // for each parameter of each function, so one unit cost
+    // O(functions x params x variables) -- and a lowered TU carries tens of
+    // thousands of variables (#83). Only parameters are indexed, which is all
+    // either lookup asks for: locals dominate that list, and `lower_parameter`
+    // is the only thing that builds a variable a function's `params` can name.
+    let unit_param_types: FxHashMap<VarId, TypeId> = unit
+        .variables
+        .iter()
+        .filter(|v| matches!(v.storage, trace_ir::StorageClass::Param))
+        .map(|v| (v.id, remap_type(v.type_id, &type_map)))
+        .collect();
 
     for func in &unit.functions {
         let old_id = func.id;
@@ -407,6 +383,15 @@ fn merge_unit(
             // on the ordinary path: through this unit's `type_map`, and a pair
             // either side cannot resolve counts as matching, so an unknown type
             // never splits a function that a conditional typedef merely respells.
+            // Both sides share the same comparison; the rule AROUND it is
+            // intentionally not shared, because this path demands exact arity
+            // equality while the symbol table treats an empty parameter list as
+            // a wildcard so a params-less prototype still merges. This path
+            // also asks for the `_or_unresolved` spelling, which the symbol
+            // table must not: it is safe here only because an ambiguous answer
+            // falls through to the ordinary merge below rather than picking a
+            // candidate. Keep the two in view of each other -- see
+            // `SymbolTable::register_function`.
             let mut matching = candidate.filter(|&id| {
                 let Some(base) = program.symbols.function_by_id(id) else {
                     return false;
@@ -422,11 +407,7 @@ fn merge_unit(
                 }
                 base.params.len() == func.params.len()
                     && func.params.iter().enumerate().all(|(i, old)| {
-                        let incoming = unit
-                            .variables
-                            .iter()
-                            .find(|v| &v.id == old)
-                            .map(|v| remap_type(v.type_id, &type_map));
+                        let incoming = unit_param_types.get(old).copied();
                         let existing = base.param_type_ids.get(i).copied().or_else(|| {
                             program
                                 .symbols
@@ -434,7 +415,9 @@ fn merge_unit(
                                 .map(|v| v.type_id)
                         });
                         match (existing, incoming) {
-                            (Some(a), Some(b)) => same_param_type(&program.types, a, b),
+                            (Some(a), Some(b)) => {
+                                same_param_type_or_unresolved(&program.types, a, b)
+                            }
                             _ => true,
                         }
                     })
@@ -497,17 +480,6 @@ fn merge_unit(
             f.end_line = f.span.line;
             f.locals.clear();
         }
-        let carries_params = !f.params.is_empty();
-        let is_definition = f.is_defined;
-        let backfills_params = carries_params
-            && (is_definition
-                || program
-                    .symbols
-                    .fn_by_name
-                    .get(&f.name)
-                    .and_then(|&eid| program.symbols.function_index(eid))
-                    .map(|idx| program.symbols.functions[idx].params.is_empty())
-                    .unwrap_or(false));
         // The incoming params are unit-local VarIds: resolving their types
         // against the global table in `add_function` hits unrelated globals
         // whose ids collide, breaking C++ prototype + definition merges. Map
@@ -517,20 +489,32 @@ fn merge_unit(
             .params
             .iter()
             .map(|old| {
-                unit.variables
-                    .iter()
-                    .find(|v| &v.id == old)
-                    .map(|v| remap_type(v.type_id, &type_map))
-                    .unwrap_or(trace_ir::TypeId(0))
+                // `Unknown`, not `TypeId(0)`. Zero is the first descriptor the
+                // prelude interns, `Void`, and no parameter has that type, so
+                // a parameter whose variable did not lower used to guarantee a
+                // signature mismatch and block a merge the rest of the
+                // signature agreed on. `Unknown` is what the comparison
+                // already documents for a type neither side can resolve: it
+                // matches anything, leaving arity to decide.
+                unit_param_types
+                    .get(old)
+                    .copied()
+                    .unwrap_or_else(|| program.types.unknown())
             })
             .collect();
-        let merged = program
-            .symbols
-            .add_function_with_param_types(f, Some(&incoming_param_types));
+        let registered =
+            program
+                .symbols
+                .register_function(f, Some(&incoming_param_types), Some(&program.types));
+        let merged = registered.id;
         // A fresh entry owns its parameter list; an entry this unit merged into
         // has just adopted one. Either way the ids are still unit-local and the
-        // variable pass has to remap them.
-        if merged == new_id || backfills_params {
+        // variable pass has to remap them. Only the symbol table can say which
+        // happened: comparing the survivor's params to the list handed in is
+        // not proof, because unit-local ids can equal an unrelated list of
+        // already-global ids and a later prototype then disconnects a
+        // definition's body from its own parameters (#83).
+        if merged == new_id || registered.adopted_params {
             remap_params.insert(merged);
         }
         fn_map.insert(old_id, merged);
@@ -901,7 +885,7 @@ fn merge_types(
                     dst.compute_union_layout(name.clone(), fields_from_layout(src, info))
                 }
             }
-            other => dst.intern(other.clone()),
+            other => dst.intern_ref(other),
         };
         map.insert(info.id, new_id);
     }
@@ -1043,6 +1027,181 @@ mod tests {
                 program.diagnostics
             );
         }
+    }
+
+    /// One translation unit contributing `name(T *)`, with `T`'s nested tag
+    /// complete or not, as `merge_unit_index` sees it.
+    fn unit_declaring(
+        path: &str,
+        defined: bool,
+        nested_fields: Vec<(String, TypeDesc)>,
+    ) -> UnitIndex {
+        unit_declaring_param(path, defined, nested_fields, "object")
+    }
+
+    /// As [`unit_declaring`], but naming the parameter, so a test can tell
+    /// which unit's variable a merged function's `params` point at.
+    fn unit_declaring_param(
+        path: &str,
+        defined: bool,
+        nested_fields: Vec<(String, TypeDesc)>,
+        param_name: &str,
+    ) -> UnitIndex {
+        let mut types = trace_ir::TypeTable::new();
+        let param_type = types.intern(TypeDesc::Ptr(Box::new(TypeDesc::Struct {
+            name: "Svc".into(),
+            fields: vec![(
+                "object".into(),
+                TypeDesc::Struct {
+                    name: "Obj".into(),
+                    fields: nested_fields,
+                },
+            )],
+        })));
+        let fn_id = FnId(0);
+        let param = VarId(0);
+        UnitIndex {
+            path: PathBuf::from(path),
+            files: vec![PathBuf::from(path)],
+            types,
+            functions: vec![Function {
+                id: fn_id,
+                name: "recycle".into(),
+                linkage: trace_ir::Linkage::External,
+                return_type: TypeId(0),
+                params: vec![param],
+                locals: Vec::new(),
+                span: trace_ir::Span::new(trace_ir::FileId(0), if defined { 40 } else { 8 }, 1),
+                end_line: if defined { 44 } else { 8 },
+                file: trace_ir::FileId(0),
+                is_defined: defined,
+                param_type_ids: Vec::new(),
+                is_virtual: false,
+                is_final: false,
+                is_cpp: true,
+            }],
+            variables: vec![Variable {
+                id: param,
+                name: param_name.into(),
+                type_id: param_type,
+                storage: trace_ir::StorageClass::Param,
+                fn_id: Some(fn_id),
+                param_index: Some(0),
+                span: trace_ir::Span::new(trace_ir::FileId(0), 8, 1),
+                is_pointer: true,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The merge has to hand the symbol table the type table its remapped
+    /// parameter ids live in, or the C++ overload check falls back to
+    /// comparing ids — and the prototype's unit and the defining unit intern
+    /// their own `struct Svc *` whenever they disagree on how complete the
+    /// nested `struct Obj` is, which left every C caller of hdf's IPC
+    /// interface bound to an undefined prototype (#83).
+    #[test]
+    fn a_prototype_and_its_definition_collapse_across_units() {
+        let mut program = Program::new(PathBuf::from("/tmp/root"));
+        // The prototype's unit had seen `struct Obj`'s field; the defining
+        // unit had not.
+        let proto = unit_declaring("if.h", false, vec![("objectId".into(), TypeDesc::Int)]);
+        let def = unit_declaring("impl.cpp", true, Vec::new());
+        merge_unit_index(&mut program, &proto);
+        merge_unit_index(&mut program, &def);
+        let recycle: Vec<_> = program
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == "recycle")
+            .collect();
+        assert_eq!(
+            recycle.len(),
+            1,
+            "prototype and definition must be one record: {recycle:?}"
+        );
+        assert!(recycle[0].is_defined, "the caller must reach the body");
+    }
+
+    /// The other direction of the same signal. When a *definition* merges
+    /// into an existing prototype it hands over its own parameter list, and
+    /// those ids are still unit-local: they must be remapped, or the entry
+    /// points at whichever global variable happens to share the number —
+    /// here the prototype's, so the body's flow facts would reference a
+    /// parameter the function does not list.
+    #[test]
+    fn a_definition_merging_into_a_prototype_remaps_the_params_it_hands_over() {
+        let mut program = Program::new(PathBuf::from("/tmp/root"));
+        let proto = unit_declaring_param("if.h", false, Vec::new(), "declared_object");
+        merge_unit_index(&mut program, &proto);
+        let def = unit_declaring_param("impl.cpp", true, Vec::new(), "defined_object");
+        merge_unit_index(&mut program, &def);
+
+        let id = program.symbols.resolve_function("recycle").unwrap();
+        let f = program.symbols.function(id);
+        assert!(f.is_defined, "the definition must win the entry");
+        let param = f.params[0];
+        let var = program
+            .symbols
+            .variables
+            .iter()
+            .find(|v| v.id == param)
+            .expect("the listed parameter must be a variable this program owns");
+        assert_eq!(
+            var.name, "defined_object",
+            "the entry must point at the defining unit's parameter, not the \
+             prototype's variable that shares its unit-local number"
+        );
+    }
+
+    #[test]
+    fn later_prototype_does_not_split_a_repeated_definition() {
+        let mut program = Program::new(PathBuf::from("/tmp/root"));
+        let def = unit_declaring("impl.cpp", true, Vec::new());
+        let proto = unit_declaring("if.h", false, vec![("objectId".into(), TypeDesc::Int)]);
+        merge_unit_index(&mut program, &def);
+        merge_unit_index(&mut program, &proto);
+        // A different origin bypasses source-location deduplication and
+        // exercises the symbol table's exact-signature comparison.
+        let repeated = unit_declaring("other.cpp", true, Vec::new());
+        merge_unit_index(&mut program, &repeated);
+        assert_eq!(
+            program.symbols.functions.len(),
+            1,
+            "a prototype must not change the signature used to deduplicate a definition"
+        );
+    }
+
+    #[test]
+    fn later_prototype_does_not_collapse_distinct_definitions() {
+        let mut program = Program::new(PathBuf::from("/tmp/root"));
+        let def = unit_declaring("impl.cpp", true, Vec::new());
+        let fields = vec![("objectId".into(), TypeDesc::Int)];
+        let proto = unit_declaring("if.h", false, fields.clone());
+        let other = unit_declaring("mock.cpp", true, fields);
+        merge_unit_index(&mut program, &def);
+        merge_unit_index(&mut program, &proto);
+        merge_unit_index(&mut program, &other);
+        assert_eq!(
+            program.symbols.functions.len(),
+            2,
+            "a shape-compatible prototype must not erase the distinction between bodies"
+        );
+        assert!(program.symbols.functions.iter().all(|f| f.is_defined));
+    }
+
+    #[test]
+    fn later_prototype_preserves_definition_parameter_identity() {
+        let mut program = Program::new(PathBuf::from("/tmp/root"));
+        let def = unit_declaring("impl.cpp", true, Vec::new());
+        merge_unit_index(&mut program, &def);
+        let id = program.symbols.resolve_function("recycle").unwrap();
+        let original_params = program.symbols.function(id).params.clone();
+        // Both units allocate VarId(0), which also happens to be the first
+        // definition's global parameter ID. Equality is not proof of adoption.
+        let proto = unit_declaring("if.h", false, Vec::new());
+        merge_unit_index(&mut program, &proto);
+        assert_eq!(program.symbols.function(id).params, original_params);
     }
 
     /// Deduplication must not silence a *different* stage reporting the same

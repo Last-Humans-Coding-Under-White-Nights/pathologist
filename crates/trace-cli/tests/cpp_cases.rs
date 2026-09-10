@@ -3162,3 +3162,317 @@ fn every_conversion_target_kind_spells_one_member_under_any_macro() {
         }
     }
 }
+
+#[test]
+fn cpp_default_parameters_in_prototype_retained_and_merge() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_default_param_")
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("api.h"),
+        "int compute(int base, int multiplier = 1);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("api.cpp"),
+        "#include \"api.h\"\nint compute(int base, int multiplier) {\n    return base * multiplier;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("main.cpp"),
+        "#include \"api.h\"\nint main() {\n    return compute(5);\n}\n",
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let compute = program
+        .symbols
+        .resolve_function("compute")
+        .expect("compute resolved");
+    let func = program.symbols.function(compute);
+    assert!(
+        func.is_defined,
+        "compute must be defined (prototype and definition merged)"
+    );
+    assert_eq!(
+        func.params.len(),
+        2,
+        "optional parameter must be retained as second param"
+    );
+    let (_pag, analysis) = analyze(&program);
+    assert_eq!(
+        direct_targets(&program, &analysis, "main"),
+        vec!["compute"],
+        "main must call compute"
+    );
+}
+
+#[test]
+fn a_pointer_typedef_to_a_struct_keeps_its_pointer() {
+    // `typedef struct Session *SessionPtr` names a POINTER. The typedef's
+    // struct branch registered the alias as the bare tag and never walked the
+    // declarator, so every `SessionPtr s` was a struct VALUE: `s->fd`
+    // decomposed against a non-pointer and the field edge was lost. Only the
+    // one-statement form is affected -- `typedef struct S S;` followed by
+    // `typedef S *P;` takes the other branch, which walks the declarator.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_ptr_typedef_")
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("a.c"),
+        "struct Session { int fd; };\n\
+         typedef struct Session *SessionPtr;\n\
+         int take(SessionPtr s) { return s->fd; }\n",
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    let take = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "take")
+        .expect("take is indexed");
+    let param = take.params.first().copied().expect("take has a parameter");
+    let ty = program
+        .symbols
+        .variable_by_id(param)
+        .map(|v| v.type_id)
+        .expect("the parameter has a type");
+    assert!(
+        matches!(program.types.get(ty).desc, trace_ir::TypeDesc::Ptr(_)),
+        "SessionPtr is a pointer, got {:?}",
+        program.types.get(ty).desc
+    );
+}
+
+#[test]
+fn c_caller_reaches_a_cpp_extern_c_definition_across_units() {
+    // The shape reported in #83, end to end: a `.c` caller and a `.cpp`
+    // definition meet at one `extern "C"` prototype, and the tag in that
+    // prototype's parameter is complete in the C unit and opaque in the C++
+    // one. Each unit interns its own `TypeId` for it, so comparing the cached
+    // signature by id refused the merge, `dispatch` stayed split into a
+    // prototype and a body, and the caller kept an `external` edge to the
+    // prototype -- exactly `hdf_remote_service.c:68` failing to reach
+    // `hdf_remote_adapter.cpp:469`. Only the corpora and the `merge.rs` unit
+    // tests covered this; `cargo test` alone did not.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_extern_c_e2e_")
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("api.h"),
+        "struct Session;\n\
+         #ifdef __cplusplus\n\
+         extern \"C\" {\n\
+         #endif\n\
+         int dispatch(struct Session *s);\n\
+         #ifdef __cplusplus\n\
+         }\n\
+         #endif\n",
+    )
+    .unwrap();
+    // The C unit sees the tag complete.
+    std::fs::write(
+        root.join("caller.c"),
+        "#include \"api.h\"\n\
+         struct Session { int fd; };\n\
+         int run(struct Session *s) { return dispatch(s); }\n",
+    )
+    .unwrap();
+    // The C++ unit only ever sees it declared.
+    std::fs::write(
+        root.join("impl.cpp"),
+        "#include \"api.h\"\n\
+         extern \"C\" int dispatch(struct Session *s) { return s ? 1 : 0; }\n",
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    let dispatches: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "dispatch")
+        .collect();
+    assert_eq!(
+        dispatches.len(),
+        1,
+        "the prototype and the definition are one function, got {:?}",
+        dispatches
+            .iter()
+            .map(|f| (f.id, f.is_defined))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        dispatches[0].is_defined,
+        "the surviving entry must carry the C++ body"
+    );
+
+    let (_pag, analysis) = analyze(&program);
+    assert_eq!(
+        direct_targets(&program, &analysis, "run"),
+        vec!["dispatch"],
+        "the C caller must reach the C++ definition directly, not as an external"
+    );
+}
+
+#[test]
+fn cpp_array_parameter_prototype_merges_with_pointer_definition() {
+    // `int a[]` and `int *a` declare the same parameter, so this is one
+    // function. Before the top-level decay in `same_param_type` the two read
+    // as C++ overloads: `sum` stayed split and `go` kept an `external` edge to
+    // the undefined prototype -- the #83 symptom from a different cause. Pure
+    // C never showed it, because C prototypes and definitions collapse without
+    // consulting parameter types at all.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_arr_param_")
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("api.h"), "int sum(int a[]);\n").unwrap();
+    std::fs::write(
+        root.join("impl.cpp"),
+        "#include \"api.h\"\nint sum(int *a) { return a[0]; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("main.cpp"),
+        "#include \"api.h\"\nint go(int *p) { return sum(p); }\n",
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    let sums: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "sum")
+        .collect();
+    assert_eq!(
+        sums.len(),
+        1,
+        "the array prototype and the pointer definition are one function"
+    );
+    assert!(
+        sums[0].is_defined,
+        "the surviving entry must carry the body"
+    );
+
+    let (_pag, analysis) = analyze(&program);
+    assert_eq!(
+        direct_targets(&program, &analysis, "go"),
+        vec!["sum"],
+        "go must reach the definition directly"
+    );
+}
+
+#[test]
+fn c_typedef_self_alias_preserves_struct_pointer_type() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_typedef_self_")
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    // Header only has forward typedef struct Session Session;
+    std::fs::write(
+        root.join("session.h"),
+        "typedef struct Session Session;\nint SessionStart(Session **s);\n",
+    )
+    .unwrap();
+    // Caller TU uses the header
+    std::fs::write(
+        root.join("caller.c"),
+        "#include \"session.h\"\nint run(Session **s) {\n    return SessionStart(s);\n}\n",
+    )
+    .unwrap();
+    // Definition TU defines struct Session and the function
+    std::fs::write(
+        root.join("session.c"),
+        "#include \"session.h\"\nstruct Session { int id; };\nint SessionStart(Session **s) {\n    return 0;\n}\n",
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let start = program
+        .symbols
+        .resolve_function("SessionStart")
+        .expect("SessionStart resolved");
+    let func = program.symbols.function(start);
+    assert!(func.is_defined, "SessionStart must be defined");
+
+    // `Session **` must lower as a pointer to the struct, not degrade to
+    // `Ptr(Ptr(Int))`. Check `run`, not `SessionStart`: `run` lives in
+    // caller.c, the TU that sees ONLY `typedef struct Session Session;`, so it
+    // is the side that degraded. `SessionStart` is defined in session.c
+    // alongside `struct Session { int id; }`, so its parameter resolved
+    // through the tag either way and asserting on it proves nothing.
+    let assert_ptr_ptr_session = |fn_name: &str, id| {
+        let f = program.symbols.function(id);
+        let param_var = program.symbols.variable(f.params[0]);
+        let param_ty = program.types.get(param_var.type_id);
+        match &param_ty.desc {
+            trace_ir::TypeDesc::Ptr(inner) => match &**inner {
+                trace_ir::TypeDesc::Ptr(elem) => match &**elem {
+                    trace_ir::TypeDesc::Struct { name, .. } => assert_eq!(name, "Session"),
+                    other => panic!("{fn_name}: expected Struct Session, got {other:?}"),
+                },
+                other => panic!("{fn_name}: expected Ptr, got {other:?}"),
+            },
+            other => panic!("{fn_name}: expected Ptr, got {other:?}"),
+        }
+    };
+    let run = program
+        .symbols
+        .resolve_function("run")
+        .expect("run resolved");
+    assert_ptr_ptr_session("run", run);
+    assert_ptr_ptr_session("SessionStart", start);
+    let (_pag, analysis) = analyze(&program);
+    assert_eq!(
+        direct_targets(&program, &analysis, "run"),
+        vec!["SessionStart"],
+        "run must call SessionStart directly"
+    );
+}
+
+/// The constructor-call check in lowering read the `anon_` prefix without
+/// the digits `is_anonymous_tag` requires, so a tree's own `struct anon_vma`
+/// (a real tag in Linux) lost its constructor calls. A synthesized
+/// `anon_<n>` cannot be spelled as a declared type from source, so the
+/// named side is the only one a test can reach.
+#[test]
+fn named_tag_with_anon_prefix_emits_its_constructor_call() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_anon_ctor_")
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("test.cpp"),
+        r#"
+struct anon_vma {
+    anon_vma(int x);
+};
+anon_vma::anon_vma(int x) {}
+
+void test() {
+    anon_vma v(42);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let targets = direct_targets(&program, &analysis, "test");
+    assert!(
+        targets.iter().any(|t| t == "anon_vma::anon_vma"),
+        "a named tag starting with `anon_` must emit its constructor call: {targets:?}"
+    );
+}

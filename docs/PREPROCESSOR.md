@@ -57,7 +57,8 @@ flowchart LR
 ```
 
 - **`IncludeGraph`** (`trace-parse/src/deps.rs`) scans project files for `#include` directives, builds dependency edges, discovers include directories, and marks which files need preprocessing.
-- Preprocessed output is **cached** per file (parallel cache fill when `--jobs > 1`).
+- Preprocessed output is **cached** per file (parallel cache fill when `--jobs > 1`) and released once
+  the unit is lowered, so the text held at once is bounded by the parse batch in flight.
 - If preprocessing fails hard (the unit's own file cannot be read), the unit is dropped and an error diagnostic is recorded; a stop *inside* a file keeps the output produced so far (see Error recovery).
 
 ## Phases
@@ -207,6 +208,25 @@ For `#include "header.h"` / `#include <header.h>`:
 
 Only **project-local** files under the analysis root are linked; system headers outside the tree are not resolved unless present in the project.
 
+A candidate counts as found when it is a file on disk **or** a `source_cache` key that names none — a
+virtual header, which only a caller that invents one has (tests, and a host embedding the
+preprocessor); `SourceCache` derives that set from its own keys, so a cache built by reading files
+off disk asks the filesystem and nothing else. Both halves are memoized, because step 1 builds a
+fresh candidate for every (including file, spelling) pair and runs on every `#include` a unit
+executes: the filesystem answer is memoized per path for the whole indexing run
+(`trace_ir::is_file_cached`, reset by `start_file_probe_epoch` at the start of each run, so a
+long-lived host sees the tree as it is when the run begins), a first probe is answered from the
+parent directory's listing when that settles it (a name the directory does not hold is a miss
+without a `stat`; a listed, case-folded or non-ASCII name still asks the filesystem, as does one
+under a directory that could not be listed), and step 2's directory walk is memoized per
+(spelling, quoted). When a `SourceCache` is supplied, explicit directory-search
+results (including misses) are shared across preprocessing runs with the same ordered quote,
+include, and system paths. These results expire at the next file-probe epoch. The
+includer-relative candidate is still probed before this cache under the rules of step 1 (quoted
+includes, or any include when strict search is off); basename fallback stays specific to each
+caller, since it depends on that caller's index and strictness. Camera issues 4,343,229
+candidate probes naming 224,945 distinct paths (#83).
+
 ## Include graph and header indexing
 
 | Behavior | Notes |
@@ -222,6 +242,7 @@ Only **project-local** files under the analysis root are linked; system headers 
 Indexing output must be identical across runs of the same tree. Two mechanisms guarantee this:
 
 - **Macro warm pass** runs sequentially over TU-reachable headers in canonical (`index_order`) order, once per language the header is reachable in (C++ when a C++ TU reaches it or the extension is a C++ header spelling, C when a C TU reaches it; `PreprocessOptions::with_language` forces one language for everything). Each warm runs under a **fresh macro table** seeded only from command-line defines lexed in that language; the per-header final states are merged into a **per-language union table** — every warmed header lands in both unions, the same-language warm preferred and the other language's re-lexed for the destination as fallback (`MacroDef::relexed` spells the tokens back with their adjacency intact, which is all the two lexers disagree about), so each union stays the full macro superset (twin-guard dedup, orphan and PCH headers) whichever language reached a header — and each later phase hands a file the union (and option set) of the language it is lexed and parsed as. The first language warmed is the one the header is parsed as and feeds the source cache; a second only fills the expansion cache and its union. Reachability comes from the include graph and warming grows that graph (a `#include MACRO` is discovered only while preprocessing the header spelling it), so the pass runs to a **fixed point**: after each round the discovered edges are added, every header's language list is recomputed, and a header whose list changed — a `.h` first reached from C alone that a C++ unit turns out to reach through a macro include, and is therefore parsed as C++ — is evicted from the source cache and warmed again under a fresh table, so the text the parser sees is always the preprocess in the language it is parsed as. The root file of a preprocess run is never replayed from the expansion cache (a nested include may have cached it first); only nested `#include`s replay. Sharing one accumulating table across headers let include guards defined by earlier-warmed headers starve later headers' expansions (the starved text was then frozen into the expansion cache). Dedup between headers comes from the shared expansion cache, not from shared guard state.
+- **No output reads a hash-map iteration order.** This is not a mechanism so much as an invariant the other two rest on, and it is worth stating because the maps are hashed with `rustc-hash`, which unlike `std`'s `RandomState` is *not* seeded per process: a change that started ordering output by a `HashMap`/`HashSet` traversal would no longer be caught by comparing two runs. Where an order matters it comes from a sort, a `Vec`, an `IndexMap`, or `index_order`. Byte-identical output across the hasher swap is the evidence that nothing did (#83).
 - **Expansion-cache freeze**: the cache is keyed by (canonical path, language), so a C unit never replays a header's C++ tokenization or vice versa. During parallel phases the include-expansion cache is read-only (`PreprocessOptions::frozen_expansion_cache`). Hits replay warm-pass entries (produced deterministically); misses expand inline under each TU's own macro/guard state and are *not* inserted — first-writer-wins inserts would make results scheduling-dependent.
 
 Translation units inherit the **union** of all warm-pass macro states: cached expansions replay without executing their `#define` directives, so TU-local code still needs those macros.

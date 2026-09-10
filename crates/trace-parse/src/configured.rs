@@ -10,7 +10,8 @@ use crate::compile_commands::CompilationDatabase;
 use crate::merge::{merge_unit_index, merge_unit_variants, UnitIndex};
 use crate::{IncludeGraph, IndexSourceCache};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashSet};
+use rustc_hash::FxHashSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use trace_ir::Program;
@@ -104,7 +105,7 @@ pub(super) fn build(
             })
             .collect()
     });
-    let mut consumed = HashSet::new();
+    let mut consumed = FxHashSet::default();
     let variants_merged = results
         .iter()
         .map(|r| r.units.len().saturating_sub(1))
@@ -129,7 +130,7 @@ pub(super) fn build(
     // `merge_unit_variants` counts variants across the whole family; this field
     // means variants per source, so the per-file tally replaces it.
     program.variants_merged = variants_merged;
-    let mut cpp_sources = HashSet::new();
+    let mut cpp_sources = FxHashSet::default();
     let mut no_c_units = true;
     for path in files {
         let configs = configs_for(&database, &fallback, path);

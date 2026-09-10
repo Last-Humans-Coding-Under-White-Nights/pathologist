@@ -96,9 +96,18 @@ impl LineMap {
     }
 
     /// Drop mappings whose output offset is at or after `at`.
+    ///
+    /// Entries are pushed with non-decreasing output offsets (the invariant
+    /// [`LineMap::lookup`] binary-searches on), so the survivors are a prefix
+    /// and the cut point is one binary search. `retain` had to walk all of
+    /// them instead, and the preprocessor cuts here after every cacheable
+    /// nested include, which made dropping a short suffix cost a full pass
+    /// over a map that holds one entry per emitted token (#83).
     pub fn truncate_at(&mut self, at: usize) {
-        let at = at as u32;
-        self.entries.retain(|e| e.output_offset < at);
+        let keep = self
+            .entries
+            .partition_point(|e| (e.output_offset as usize) < at);
+        self.entries.truncate(keep);
     }
 
     /// Append `other`'s entries shifted by `offset`, renumbering its file
@@ -112,5 +121,38 @@ impl LineMap {
                 col: e.col,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_at_keeps_the_offsets_below_the_cut() {
+        let mut map = LineMap::new();
+        let f = map.intern_file(Path::new("/t/a.c"));
+        for (offset, line) in [(0, 1), (4, 1), (9, 2), (9, 3), (20, 4)] {
+            map.push(offset, f, line, 1);
+        }
+        map.truncate_at(9);
+        assert_eq!(
+            map.entries
+                .iter()
+                .map(|e| e.output_offset)
+                .collect::<Vec<_>>(),
+            vec![0, 4],
+            "an entry exactly at the cut goes, and so does everything after it"
+        );
+
+        // A cut past the end keeps everything; a cut at 0 keeps nothing.
+        let mut all = LineMap::new();
+        let f = all.intern_file(Path::new("/t/a.c"));
+        all.push(0, f, 1, 1);
+        all.push(7, f, 2, 1);
+        all.truncate_at(100);
+        assert_eq!(all.entries.len(), 2);
+        all.truncate_at(0);
+        assert!(all.entries.is_empty());
     }
 }
