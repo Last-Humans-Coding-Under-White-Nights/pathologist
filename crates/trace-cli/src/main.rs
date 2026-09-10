@@ -39,6 +39,10 @@ enum Commands {
         /// Define preprocessor macro NAME or NAME=VALUE (repeatable).
         #[arg(short = 'D')]
         defines: Vec<String>,
+        /// Compilation database path (default: TARGET/compile_commands.json,
+        /// then TARGET/build/compile_commands.json).
+        #[arg(long)]
+        compile_commands: Option<PathBuf>,
         /// Number of parallel jobs for indexing (parse/lower).
         #[arg(long)]
         jobs: Option<usize>,
@@ -218,6 +222,7 @@ fn main() -> Result<()> {
             output,
             includes,
             defines,
+            compile_commands,
             jobs,
             timeout_secs,
             debug_points_to,
@@ -232,6 +237,7 @@ fn main() -> Result<()> {
             output,
             includes,
             defines,
+            compile_commands,
             jobs,
             timeout_secs,
             debug_points_to,
@@ -252,6 +258,7 @@ fn run_analyze(
     output: PathBuf,
     includes: Vec<PathBuf>,
     defines: Vec<String>,
+    compile_commands: Option<PathBuf>,
     jobs: Option<usize>,
     timeout_secs: Option<u64>,
     debug_points_to: bool,
@@ -297,6 +304,18 @@ fn run_analyze(
         );
     }
     let mut opts = PreprocessOptions::new();
+    // An explicitly named database that is not there is a mistyped flag. Auto
+    // discovery stays silent, but failing here beats returning a plausible
+    // index built from the inferred configuration the flag meant to replace.
+    if let Some(path) = &compile_commands {
+        if !path.is_file() {
+            bail!(
+                "compilation database does not exist or is not a file: {}",
+                path.display()
+            );
+        }
+    }
+    opts.compilation_database = compile_commands;
     let root_canon = trace_ir::canonicalize(&target);
     for dep in deps {
         if !dep.is_dir() {

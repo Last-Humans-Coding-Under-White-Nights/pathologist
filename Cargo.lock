@@ -775,6 +775,8 @@ dependencies = [
  "indexmap",
  "rayon",
  "rustc-hash",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "trace-ir",

@@ -505,7 +505,7 @@ fn solve(
                             continue;
                         };
                         if let PagNodeKind::Var(base_var) = pag.nodes[src.0 as usize].kind {
-                            let summary_opt = if program.variants_merged > 0 {
+                            let summary_opt = if program.layouts_unioned {
                                 // Cloned only here: `ensure_*` needs `&mut pag`,
                                 // and the baseline path must not pay for it.
                                 let expected = pag.constraints[idx].field_name.clone();
@@ -612,7 +612,7 @@ fn solve(
                         {
                             match program.types.get(parent_type).layout.fields.get(&field) {
                                 Some(fl) if fl.name == *expected => {}
-                                _ if program.variants_merged > 0 => {
+                                _ if program.layouts_unioned => {
                                     if let Some(fid) =
                                         program.types.field_id_by_name(parent_type, expected)
                                     {
@@ -695,7 +695,7 @@ fn solve(
                 let base_unpointed = st.pts.get(&node).map(|p| p.is_empty()).unwrap_or(true);
                 if base_unpointed || !produced_cell {
                     if let PagNodeKind::Var(base_var) = pag.nodes[src.0 as usize].kind {
-                        let summary_opt = if program.variants_merged > 0 {
+                        let summary_opt = if program.layouts_unioned {
                             pag.ensure_field_summary_for_var_named(
                                 program,
                                 base_var,

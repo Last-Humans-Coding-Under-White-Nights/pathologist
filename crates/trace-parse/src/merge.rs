@@ -1,5 +1,5 @@
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use trace_ir::{
     CallSite, CallSiteId, FlowConstraint, FnId, Function, Program, ReturnFlow, TemplateBase,
     TypeDesc, TypeId, VarId, Variable,
@@ -42,7 +42,7 @@ enum MergeMode {
 type SiteKey = (trace_ir::FileId, u32, u32, String);
 type LocalKey = (FnId, trace_ir::FileId, u32, u32, String);
 type TempKey = (FnId, trace_ir::FileId, u32, u32, &'static str);
-type FileVarKey = (trace_ir::FileId, u32, u32, String);
+type FileVarKey = (u32, trace_ir::FileId, u32, u32, String);
 
 /// The kind of a synthesized temporary, or `None` for a declared variable.
 ///
@@ -61,12 +61,25 @@ fn temp_prefix(name: &str) -> Option<&'static str> {
 struct VariantDedup {
     flow: FxHashSet<FlowConstraint>,
     file_vars: FxHashMap<FileVarKey, VarId>,
+    /// One scope per originating translation unit. Variables dedup within a
+    /// source's own configurations, never between two sources that happen to
+    /// include the same header.
+    source_scopes: FxHashMap<PathBuf, u32>,
     /// Definitions the base configuration merged for this unit, as
-    /// `file → name → id`, so a variant can find the base's copy of a function
-    /// it spells on a *different line*. `None` marks a name that several
-    /// defined functions in one file share (C++ overloads), where the
-    /// file/name pair does not identify one function.
-    base_defs: FxHashMap<trace_ir::FileId, FxHashMap<String, Option<FnId>>>,
+    /// `file → name → candidates`, so alternative arms can match an existing
+    /// overload by signature even when their source lines differ.
+    base_defs: FxHashMap<trace_ir::FileId, FxHashMap<String, Vec<FnId>>>,
+}
+
+impl VariantDedup {
+    fn source_scope(&mut self, path: &Path) -> u32 {
+        if let Some(&id) = self.source_scopes.get(path) {
+            return id;
+        }
+        let id = self.source_scopes.len() as u32;
+        self.source_scopes.insert(path.to_path_buf(), id);
+        id
+    }
 }
 
 /// Position of a call site in the merged table.
@@ -114,19 +127,45 @@ pub fn merge_unit_variants(program: &mut Program, base: &UnitIndex, variants: &[
     if variants.is_empty() {
         return;
     }
-    let mut file_vars = FxHashMap::default();
-    for v in &program.symbols.variables[var_start..] {
-        if v.fn_id.is_none() {
-            file_vars.insert((v.span.file, v.span.line, v.span.col, v.name.clone()), v.id);
-        }
-    }
+    // Every unit below merges with `union_aggregates`, whatever the per-source
+    // variant tally ends up saying.
+    program.layouts_unioned = true;
     let mut seen = VariantDedup {
         flow: program.flow[flow_start..].iter().cloned().collect(),
-        file_vars,
+        file_vars: FxHashMap::default(),
+        source_scopes: FxHashMap::default(),
         base_defs: base_definitions(program, base),
     };
+    let base_scope = seen.source_scope(&base.path);
+    for v in &program.symbols.variables[var_start..] {
+        if v.fn_id.is_none() {
+            seen.file_vars.insert(
+                (
+                    base_scope,
+                    v.span.file,
+                    v.span.line,
+                    v.span.col,
+                    v.name.clone(),
+                ),
+                v.id,
+            );
+        }
+    }
     for unit in variants {
         merge_unit(program, unit, MergeMode::Variant, Some(&mut seen));
+        // A later configuration can introduce a definition absent from the
+        // first one. Subsequent alternatives must extend that definition too.
+        for (file, definitions) in base_definitions(program, unit) {
+            let known = seen.base_defs.entry(file).or_default();
+            for (name, ids) in definitions {
+                let candidates = known.entry(name).or_default();
+                for id in ids {
+                    if !candidates.contains(&id) {
+                        candidates.push(id);
+                    }
+                }
+            }
+        }
         program.variants_merged += 1;
     }
 }
@@ -141,15 +180,11 @@ pub fn merge_unit_variants(program: &mut Program, base: &UnitIndex, variants: &[
 /// redeclaration and overwrites the survivor's span and parameters with the
 /// variant's, which evicts facts the baseline had.
 ///
-/// A name shared by several defined functions in one file (C++ overloads) maps
-/// to `None`: the pair does not identify a function, so those keep the
-/// line-keyed behavior.
+/// Keep every overload as a candidate; the caller compares signatures.
 fn base_definitions(
     program: &mut Program,
     base: &UnitIndex,
-) -> FxHashMap<trace_ir::FileId, FxHashMap<String, Option<FnId>>> {
-    use std::collections::hash_map::Entry;
-
+) -> FxHashMap<trace_ir::FileId, FxHashMap<String, Vec<FnId>>> {
     let file_map: Vec<trace_ir::FileId> = base
         .files
         .iter()
@@ -157,7 +192,7 @@ fn base_definitions(
         .collect();
     let primary_file_id = program.symbols.add_file_interned(&base.path);
 
-    let mut by_file: FxHashMap<trace_ir::FileId, FxHashMap<String, Option<FnId>>> =
+    let mut by_file: FxHashMap<trace_ir::FileId, FxHashMap<String, Vec<FnId>>> =
         FxHashMap::default();
     for func in base.functions.iter().filter(|f| f.is_defined) {
         let span_file = file_map
@@ -179,22 +214,53 @@ fn base_definitions(
         {
             continue;
         }
-        match by_file
+        let candidates = by_file
             .entry(span_file)
             .or_default()
             .entry(func.name.clone())
-        {
-            Entry::Occupied(mut slot) => {
-                if *slot.get() != Some(id) {
-                    slot.insert(None);
-                }
-            }
-            Entry::Vacant(slot) => {
-                slot.insert(Some(id));
-            }
+            .or_default();
+        if !candidates.contains(&id) {
+            candidates.push(id);
         }
     }
     by_file
+}
+
+/// Whether two parameter types are the same *signature* type.
+///
+/// Compared by shape rather than by `TypeId`: two configurations of one source
+/// intern their own copy of a type, so the same C++ parameter can arrive under
+/// different ids and an id comparison would split a function from itself. Tags
+/// compare by name because the configurations may legitimately have contributed
+/// different field sets — reconciling those is what the layout union is for —
+/// and an unresolved type never splits anything.
+fn same_param_type(types: &trace_ir::TypeTable, a: TypeId, b: TypeId) -> bool {
+    a == b || same_type_shape(&types.get(a).desc, &types.get(b).desc)
+}
+
+fn same_type_shape(a: &TypeDesc, b: &TypeDesc) -> bool {
+    match (a, b) {
+        (TypeDesc::Unknown, _) | (_, TypeDesc::Unknown) => true,
+        (TypeDesc::Ptr(x), TypeDesc::Ptr(y)) => same_type_shape(x, y),
+        (TypeDesc::Array { elem: x, .. }, TypeDesc::Array { elem: y, .. }) => same_type_shape(x, y),
+        (TypeDesc::Struct { name: x, .. }, TypeDesc::Struct { name: y, .. })
+        | (TypeDesc::Union { name: x, .. }, TypeDesc::Union { name: y, .. }) => x == y,
+        (
+            TypeDesc::FnPtr {
+                ret: r1,
+                params: p1,
+            },
+            TypeDesc::FnPtr {
+                ret: r2,
+                params: p2,
+            },
+        ) => {
+            p1.len() == p2.len()
+                && same_type_shape(r1, r2)
+                && p1.iter().zip(p2).all(|(x, y)| same_type_shape(x, y))
+        }
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+    }
 }
 
 /// Nested PCH: types, typedefs, and inheritance only.
@@ -216,6 +282,10 @@ fn merge_unit(
     mode: MergeMode,
     mut variant_dedup: Option<&mut VariantDedup>,
 ) {
+    let source_scope = variant_dedup
+        .as_deref_mut()
+        .map(|seen| seen.source_scope(&unit.path))
+        .unwrap_or(0);
     program.anon_type_counter = program.anon_type_counter.max(unit.anon_type_counter);
     for (derived, base) in &unit.inheritance {
         program.add_inheritance(derived, base);
@@ -315,12 +385,63 @@ fn merge_unit(
             // and the variant would otherwise register a second definition —
             // which overwrites the base definition's span and parameters and
             // drops the call sites bound to them (#59 review).
-            canonical = variant_dedup
+            let candidate = variant_dedup
                 .as_deref()
                 .and_then(|seen| seen.base_defs.get(&span_file))
                 .and_then(|by_name| by_name.get(&func.name))
-                .copied()
-                .flatten();
+                .into_iter()
+                .flatten()
+                .copied();
+            // Only an alternative *implementation* extends the base definition.
+            // In C++ a configuration that adds an overload — `pick(int)` always,
+            // plus `pick(double)` under a define — also lands on a line the base
+            // never had, and merging it would fold two functions into one and
+            // conflate their parameters and call targets. The signature
+            // separates the two: alternative arms of one function agree on it.
+            // The variant that *widens* a signature in place (`log(msg)`
+            // gaining a `file, line` pair inside the parameter list) keeps the
+            // function's own line, so it matches above and never reaches this
+            // fallback.
+            //
+            // Types are compared the way `add_function_with_param_types` does
+            // on the ordinary path: through this unit's `type_map`, and a pair
+            // either side cannot resolve counts as matching, so an unknown type
+            // never splits a function that a conditional typedef merely respells.
+            let mut matching = candidate.filter(|&id| {
+                let Some(base) = program.symbols.function_by_id(id) else {
+                    return false;
+                };
+                // C has no overloading, so a same-name definition in the same
+                // file is the other arm of one function whatever its signature:
+                // `#ifdef DEBUG` arms routinely differ in arity because the
+                // directive wraps the whole declaration. `symbol.rs` draws this
+                // same line before its own overload check, and merging is what
+                // stops the arm from overwriting the base's span and parameters.
+                if !(func.is_cpp && base.is_cpp) {
+                    return true;
+                }
+                base.params.len() == func.params.len()
+                    && func.params.iter().enumerate().all(|(i, old)| {
+                        let incoming = unit
+                            .variables
+                            .iter()
+                            .find(|v| &v.id == old)
+                            .map(|v| remap_type(v.type_id, &type_map));
+                        let existing = base.param_type_ids.get(i).copied().or_else(|| {
+                            program
+                                .symbols
+                                .variable_by_id(base.params[i])
+                                .map(|v| v.type_id)
+                        });
+                        match (existing, incoming) {
+                            (Some(a), Some(b)) => same_param_type(&program.types, a, b),
+                            _ => true,
+                        }
+                    })
+            });
+            // Unknown types can match several overloads. Keep the ordinary
+            // merge path in that case instead of choosing by insertion order.
+            canonical = matching.next().filter(|_| matching.next().is_none());
         }
         if let Some(canonical) = canonical {
             fn_map.insert(old_id, canonical);
@@ -475,8 +596,13 @@ fn merge_unit(
 
         if var.fn_id.is_none() {
             if let Some(seen) = variant_dedup.as_deref_mut() {
-                let file_key: FileVarKey =
-                    (span_file, var.span.line, var.span.col, var.name.clone());
+                let file_key: FileVarKey = (
+                    source_scope,
+                    span_file,
+                    var.span.line,
+                    var.span.col,
+                    var.name.clone(),
+                );
                 if let Some(&existing) = seen.file_vars.get(&file_key) {
                     var_map.insert(var.id, existing);
                     continue;
@@ -525,7 +651,13 @@ fn merge_unit(
         if var.fn_id.is_none() {
             if let Some(seen) = variant_dedup.as_deref_mut() {
                 seen.file_vars.insert(
-                    (span_file, var.span.line, var.span.col, var.name.clone()),
+                    (
+                        source_scope,
+                        span_file,
+                        var.span.line,
+                        var.span.col,
+                        var.name.clone(),
+                    ),
                     new_id,
                 );
             }
