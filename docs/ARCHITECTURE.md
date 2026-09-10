@@ -117,7 +117,8 @@ Indirect call sites **without** resolved edges are still exported in `call_sites
 
 | Phase | Parallelism |
 |-------|-------------|
-| Preprocess cache | `--jobs N` (rayon), shared across TUs |
+| Preprocess: discovery | **Serial**, deliberately: the one pass that writes the shared expansion cache while reading it, so whichever unit reaches a header first decides that entry's content and ordering the writes is what makes the result reproducible (#83) |
+| Preprocess: settle | `--jobs N` (rayon) against the frozen cache; re-runs only the units that expanded something |
 | Parse + lower | `--jobs N` per-TU indexing, deterministic merge order |
 | Analysis + export | Single-threaded whole-program |
 

@@ -4,7 +4,7 @@ use crate::constraints::{
 use crate::pag::{Pag, PagNodeKind};
 use crate::summaries::{Effect, FnModelSet};
 use indexmap::{IndexMap, IndexSet};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use trace_ir::{CallSiteId, FnId, LocId, PagNodeId, Program, StorageClass, VarId};
 
 /// Sentinel `CallSiteId` used for synthetic IPC bridge call edges. Real call
@@ -82,7 +82,7 @@ struct SolverState {
     /// many nodes hold) append a given (node, loc) pair once per pending
     /// cycle instead of unboundedly inflating delta vectors.
     delta_pending: FxHashSet<(PagNodeId, LocId)>,
-    memory_pts: FxHashMap<LocId, IndexSet<LocId>>,
+    memory_pts: FxHashMap<LocId, IndexSet<LocId, FxBuildHasher>>,
     loc_nodes: FxHashMap<LocId, FxHashSet<PagNodeId>>,
     worklist: Vec<PagNodeId>,
     queued: FxHashSet<PagNodeId>,

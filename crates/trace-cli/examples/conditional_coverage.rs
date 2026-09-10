@@ -89,7 +89,9 @@ fn main() -> Result<(), String> {
         }
     }
     if !include_graph.source_cache.is_empty() {
-        opts.source_cache = Some(std::sync::Arc::new(include_graph.source_cache.clone()));
+        opts.source_cache = Some(std::sync::Arc::new(trace_preproc::SourceCache::new(
+            include_graph.source_cache.clone(),
+        )));
     }
     let root = include_graph.root.clone();
 

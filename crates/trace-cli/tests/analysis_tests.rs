@@ -698,13 +698,15 @@ fn preprocess_diagnostics_are_deduplicated_and_deterministic_across_jobs() {
         "#include \"missing_in_header.h\"\n#common_directive\nvoid helper(void);\n",
     )
     .unwrap();
-    for tu in ["a.c", "b.c", "c.c"] {
+    // Enough units to cross the parallel parse batches (four per worker at
+    // jobs=4) while sharing one header, so the merge order is exercised across
+    // batch boundaries.
+    for i in 0..19 {
+        let tu = format!("tu_{i}.c");
         std::fs::write(
-            root.join(tu),
+            root.join(&tu),
             format!(
-                "#include \"common.h\"\n#{}_directive\nvoid {}_fn(void) {{ helper(); }}\n",
-                &tu[..1],
-                &tu[..1],
+                "#include \"common.h\"\n#tu_{i}_directive\nvoid tu_{i}_fn(void) {{ helper(); }}\n",
             ),
         )
         .unwrap();
@@ -724,16 +726,23 @@ fn preprocess_diagnostics_are_deduplicated_and_deterministic_across_jobs() {
         assert!(hits[0].2.ends_with("common.h"), "jobs={jobs}: {rows:?}");
         assert_eq!(hits[0].3, 1, "jobs={jobs}: {rows:?}");
         assert_eq!(hits[0].1, "Warning", "jobs={jobs}: {rows:?}");
-        assert_eq!(rows.len(), 5, "jobs={jobs}: {rows:?}");
+        assert_eq!(rows.len(), 21, "jobs={jobs}: {rows:?}");
         assert!(
             rows.iter().all(|r| r.0 == "preprocess"),
             "jobs={jobs}: {rows:?}"
         );
 
-        if let Some(expected) = &baseline {
-            assert_eq!(&rows, expected, "diagnostics changed with jobs={jobs}");
+        // The merged program must not depend on scheduling either: ids are
+        // assigned in merge order, which is the file order at every job count.
+        let merged = format!("{:?}\n{:?}", program.symbols, program.types);
+        if let Some((expected_rows, expected_merged)) = &baseline {
+            assert_eq!(&rows, expected_rows, "diagnostics changed with jobs={jobs}");
+            assert_eq!(
+                &merged, expected_merged,
+                "merged program changed with jobs={jobs}"
+            );
         } else {
-            baseline = Some(rows);
+            baseline = Some((rows, merged));
         }
     }
 }

@@ -1,6 +1,7 @@
 use indexmap::IndexMap;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet, VecDeque};
+use rustc_hash::{FxHashMap, FxHashSet as HashSet};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -19,9 +20,9 @@ pub struct IncludeGraph {
     /// Project files that should run through the preprocessor (have or receive `#include`s).
     pub needs_preprocess: HashSet<PathBuf>,
     /// Raw source text loaded while building the include graph (canonical paths).
-    pub source_cache: HashMap<PathBuf, std::sync::Arc<str>>,
+    pub source_cache: FxHashMap<PathBuf, std::sync::Arc<str>>,
     /// Basename → project files (for fast include resolution without tree walks).
-    pub basename_index: HashMap<String, Vec<PathBuf>>,
+    pub basename_index: FxHashMap<String, Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +53,7 @@ impl IncludeGraph {
         dep_headers: &[PathBuf],
     ) -> Self {
         let root = trace_ir::canonicalize(root);
-        let mut project_files: HashSet<PathBuf> = HashSet::new();
+        let mut project_files: HashSet<PathBuf> = HashSet::default();
         for p in c_files
             .iter()
             .chain(h_files.iter())
@@ -65,7 +66,7 @@ impl IncludeGraph {
         let basename_index = build_basename_index(&project_files);
 
         let mut edges: IndexMap<PathBuf, Vec<PathBuf>> = IndexMap::new();
-        let mut source_cache: HashMap<PathBuf, std::sync::Arc<str>> = HashMap::new();
+        let mut source_cache: FxHashMap<PathBuf, std::sync::Arc<str>> = FxHashMap::default();
         let project_list: Vec<PathBuf> = project_files.iter().cloned().collect();
         let scanned: Vec<(PathBuf, String, Vec<PathBuf>)> = project_list
             .par_iter()
@@ -114,7 +115,7 @@ impl IncludeGraph {
         edges: &IndexMap<PathBuf, Vec<PathBuf>>,
         project_files: &HashSet<PathBuf>,
     ) -> HashSet<PathBuf> {
-        let mut set = HashSet::new();
+        let mut set = HashSet::default();
         for dep in edges.keys() {
             set.insert(dep.clone());
         }
@@ -193,11 +194,21 @@ impl IncludeGraph {
             }
         }
 
-        for f in &ordered_files {
-            if !order.contains(f) {
-                order.push(f.clone());
-            }
-        }
+        // Whatever a cycle left unvisited, appended in sorted order. Membership
+        // comes from a set: `order.contains` re-scanned the whole prefix once
+        // per file, so EVERY tree paid O(V^2) here whether or not it had a
+        // cycle -- the scan runs over all V files, and cycles only decide how
+        // many of them are left to append (1,483 files on hdf) (#83).
+        // The set grows as files are appended, the way `order.contains` was
+        // re-evaluated: `files` is deduped by every caller in-tree, but this is
+        // `pub`, and a duplicate cyclic leftover must not index its unit twice.
+        let mut placed: HashSet<PathBuf> = order.iter().cloned().collect();
+        let missing: Vec<PathBuf> = ordered_files
+            .iter()
+            .filter(|f| placed.insert((*f).clone()))
+            .cloned()
+            .collect();
+        order.extend(missing);
         order
     }
 
@@ -299,7 +310,7 @@ impl IncludeGraph {
 
     /// Project files reachable from `start`, including `start`.
     pub fn reachable_paths<'a>(&'a self, start: &'a Path) -> HashSet<&'a Path> {
-        let mut seen: HashSet<&Path> = HashSet::new();
+        let mut seen: HashSet<&Path> = HashSet::default();
         let mut queue: VecDeque<&Path> = VecDeque::new();
         if seen.insert(start) {
             queue.push_back(start);
@@ -317,8 +328,11 @@ impl IncludeGraph {
         seen
     }
 
-    pub fn reachable_from(&self, sources: &HashSet<PathBuf>) -> HashSet<PathBuf> {
-        let mut seen = HashSet::new();
+    pub fn reachable_from<'a>(
+        &self,
+        sources: impl IntoIterator<Item = &'a PathBuf>,
+    ) -> HashSet<PathBuf> {
+        let mut seen = HashSet::default();
         let mut queue: VecDeque<PathBuf> = VecDeque::new();
         for s in sources {
             if seen.insert(s.clone()) {
@@ -358,7 +372,7 @@ fn discover_include_dirs(
     dep_roots: &[PathBuf],
     dep_headers: &[PathBuf],
 ) -> Vec<PathBuf> {
-    let mut dirs: HashSet<PathBuf> = HashSet::new();
+    let mut dirs: HashSet<PathBuf> = HashSet::default();
     dirs.insert(canonicalize(root));
     for h in headers.iter().chain(dep_headers.iter()) {
         if let Some(parent) = h.parent() {
@@ -407,8 +421,8 @@ fn scan_includes(source: &str) -> Vec<IncludeRef> {
     out
 }
 
-fn build_basename_index(project_files: &HashSet<PathBuf>) -> HashMap<String, Vec<PathBuf>> {
-    let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
+fn build_basename_index(project_files: &HashSet<PathBuf>) -> FxHashMap<String, Vec<PathBuf>> {
+    let mut index: FxHashMap<String, Vec<PathBuf>> = FxHashMap::default();
     for path in project_files {
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             index
@@ -427,24 +441,28 @@ fn resolve_include(
     from: &Path,
     inc: &IncludeRef,
     include_dirs: &[PathBuf],
-    basename_index: &HashMap<String, Vec<PathBuf>>,
+    basename_index: &FxHashMap<String, Vec<PathBuf>>,
 ) -> Option<PathBuf> {
-    let candidates = match inc.kind {
-        IncludeKind::Local => {
-            let mut c = Vec::new();
-            if let Some(parent) = from.parent() {
-                c.push(parent.join(&inc.path));
-            }
-            for dir in include_dirs {
-                c.push(dir.join(&inc.path));
-            }
-            c
-        }
-        IncludeKind::System => include_dirs.iter().map(|dir| dir.join(&inc.path)).collect(),
+    // Probed lazily, in the same order as before: the including directory
+    // first for a `"..."` include, then the search list. The candidates used
+    // to be collected into a `Vec` up front, so every include allocated one
+    // `PathBuf` per search directory -- 205 to 291 of them on the corpora --
+    // while the probe below almost always stops at the first or second (#83).
+    // The probe itself goes through the run's memo: an include naming no
+    // project file (`<string>`, `<vector>`) walks the whole list, and every
+    // file that spells it walked it again with a `stat` per candidate --
+    // ten seconds of kernel time on camera, at any job count.
+    let local_first = match inc.kind {
+        IncludeKind::Local => from.parent(),
+        IncludeKind::System => None,
     };
+    let candidates = local_first
+        .map(|parent| parent.join(&inc.path))
+        .into_iter()
+        .chain(include_dirs.iter().map(|dir| dir.join(&inc.path)));
 
     for cand in candidates {
-        if cand.is_file() {
+        if trace_ir::is_file_cached(&cand) {
             return Some(cand);
         }
     }

@@ -3,8 +3,8 @@ use crate::{
     ArmDirective, ArmOutcome, ConditionRead, ConditionalArm, ConditionalChain, Diagnostic,
     DiagnosticSeverity, Language, Lexer, LineMap, PreprocessOptions, Token, TokenKind,
 };
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -75,13 +75,13 @@ struct PreprocessorState {
     /// `#ifdef` / `#ifndef` / `defined()` so an `#ifndef`-guarded real
     /// definition in source still takes effect; any source (re)definition or
     /// `#undef` clears the mark. Only ever shrinks during a run.
-    fallback_macros: HashSet<String>,
+    fallback_macros: FxHashSet<String>,
     include_stack: Vec<PathBuf>,
     /// Canonical paths this run has processed, for
     /// `PreprocessResult::included_headers` and for the `files` set of each
     /// cached expansion. Membership alone is NOT a reason to skip a repeated
     /// `#include` — see `file_guards` (#56).
-    included_files: HashSet<PathBuf>,
+    included_files: FxHashSet<PathBuf>,
     /// The reason each processed path may be skipped when it is included
     /// again: its `#pragma once`, or the include guard wrapping it. A path
     /// absent here has no reason, and re-expands.
@@ -90,24 +90,24 @@ struct PreprocessorState {
     /// (`detect_include_guard`) and a `#pragma once` at the directive
     /// itself; either is inherited from `IncludeExpansion::guards` when a
     /// header is replayed from the cache instead of visited.
-    file_guards: HashMap<PathBuf, crate::FileGuard>,
+    file_guards: FxHashMap<PathBuf, crate::FileGuard>,
     /// How many times this run has brought each path in — expanded or
     /// replayed from the cache — against
     /// `PreprocessOptions::max_file_expansions`.
-    file_expansions: HashMap<PathBuf, usize>,
+    file_expansions: FxHashMap<PathBuf, usize>,
     /// Included files this run expanded itself (see
     /// `PreprocessResult::inlined_headers`).
-    inlined_files: HashSet<PathBuf>,
+    inlined_files: FxHashSet<PathBuf>,
     /// The expansion this run resolved each processed path to — the variant
     /// replayed from the cache, or the one this run composed. With several
     /// variants per path the cache alone can no longer answer "what did this
     /// header expand to *here*", and both the guard-skip path and
     /// `compose_cache_text` need exactly that.
-    entry_used: HashMap<PathBuf, crate::IncludeExpansion>,
+    entry_used: FxHashMap<PathBuf, crate::IncludeExpansion>,
     /// Variant index of the LATEST cache hit per path — what the guard-skip
     /// site records on an enclosing frame, and what
     /// `IncludeExpansion::nested_variants` inherits.
-    variant_used: HashMap<PathBuf, usize>,
+    variant_used: FxHashMap<PathBuf, usize>,
     /// Every `(path, variant)` this run replayed at an `#include` of that
     /// path itself, for `PreprocessResult::replayed_variants`. Distinct from
     /// `variant_used` because a header included twice under different macros
@@ -122,7 +122,7 @@ struct PreprocessorState {
     /// entry that mentioned it, the unit merged header units it never
     /// reached, and hdf lost 514 direct call edges to the resolution that
     /// shifted under.
-    direct_variants: HashSet<(PathBuf, usize)>,
+    direct_variants: FxHashSet<(PathBuf, usize)>,
     conditional_stack: Vec<CondFrame>,
     /// Depth of `conditional_stack` when the current file started. Frames
     /// below it belong to includers: `#elif`/`#else`/`#endif` in this file
@@ -134,14 +134,14 @@ struct PreprocessorState {
     /// Diagnostic identities already emitted in this preprocessing run.
     /// Cached parent expansions can carry the same nested-header report;
     /// retain its first occurrence rather than multiplying it by cache path.
-    diagnostic_keys: HashSet<(Option<PathBuf>, u32, String)>,
+    diagnostic_keys: FxHashSet<(Option<PathBuf>, u32, String)>,
     current_file: PathBuf,
     current_line: u32,
     /// Bytes each processed file contributed to `output`. Files whose
     /// expansion was fully skipped (e.g. by an already-defined include
     /// guard) record 0 and must not be claimed as content-bearing by a
     /// parent's cached `IncludeExpansion::files`.
-    emitted_bytes: HashMap<PathBuf, usize>,
+    emitted_bytes: FxHashMap<PathBuf, usize>,
     /// Interned index of `current_file` in `line_map.files`; `u32::MAX`
     /// means "not interned yet" (re-interned lazily when the file changes).
     lm_cur_file: u32,
@@ -164,7 +164,7 @@ struct PreprocessorState {
     /// `insert_macro` / `remove_macro`. A read hook that hashed a
     /// replacement list on every identifier occurrence would charge the
     /// header's whole token stream for each of its macros.
-    macro_hashes: HashMap<String, u64>,
+    macro_hashes: FxHashMap<String, u64>,
     /// Set once a run-wide limit (output cap, token budget, include depth)
     /// has cut an expansion short. Everything composed from here on is
     /// missing content, so nothing further may be published to the shared
@@ -181,10 +181,16 @@ struct PreprocessorState {
     /// it? Decided by `detect_include_guard` when the file's token stream
     /// starts running. Per file: saved and restored around each include.
     guarded_file: bool,
-    /// `(header, quoted)` → the directory-search result. The search lists are
-    /// fixed for the run, so only the including file's own directory varies,
-    /// and that is checked separately before this cache is consulted.
-    include_search_cache: RefCell<HashMap<(String, bool), Option<PathBuf>>>,
+    /// `(header, quoted)` → the directory-search result, including the
+    /// basename fallback, for this run only. The search lists are fixed for
+    /// the run, so only the including file's own directory varies, and that
+    /// is checked separately before this cache is consulted. A hit here costs
+    /// no lock; a miss falls through to the shared map below.
+    include_search_cache: RefCell<FxHashMap<(String, bool), Option<PathBuf>>>,
+    /// The directory walk's results shared with every other run over the
+    /// same `SourceCache` and search lists (`SourceCache::directory_results`).
+    /// `None` when no source cache was supplied.
+    shared_directory_results: Option<crate::options::DirectoryResults>,
     /// Non-zero while a `-include` header is being spliced in. Those run with
     /// only the root on `include_stack`, but are nested includes all the same.
     forced_include_depth: u32,
@@ -228,58 +234,63 @@ struct CacheFrame {
     /// the frame's own `#define` / `#undef` (its `ops`, which every consumer
     /// replays, so the consumer's binding cannot matter). Doubles as the
     /// short-circuit for the per-identifier read hook.
-    settled: HashSet<Arc<str>>,
+    settled: FxHashSet<Arc<str>>,
     /// Actual writes, distinguished from reads in `settled` when a skipped
     /// header snapshots a binding after merging its historical dependencies.
-    locally_bound: HashSet<Arc<str>>,
+    locally_bound: FxHashSet<Arc<str>>,
     /// Include guards learned anywhere in this header's `#include` closure,
     /// becoming `IncludeExpansion::guards` (#56).
-    guards: HashMap<PathBuf, crate::FileGuard>,
+    guards: FxHashMap<PathBuf, crate::FileGuard>,
     /// Diagnostics in this header's transitive include closure. This must be
     /// independent from `PreprocessorState::diagnostics`: a report can have
     /// been emitted earlier in this run and still be required by a cache
     /// consumer that only includes this header later.
     diagnostics: Vec<Diagnostic>,
-    diagnostic_keys: HashSet<(Option<PathBuf>, u32, String)>,
+    diagnostic_keys: FxHashSet<(Option<PathBuf>, u32, String)>,
 }
 
 impl PreprocessorState {
     fn new(opts: PreprocessOptions, file: PathBuf) -> Self {
         let language = opts.language.unwrap_or_else(|| Language::from_path(&file));
+        let shared_directory_results = opts
+            .source_cache
+            .as_ref()
+            .map(|c| c.directory_results(&opts));
         let mut state = Self {
             opts,
             language,
             macros: MacroTable::new(),
-            fallback_macros: HashSet::new(),
+            fallback_macros: FxHashSet::default(),
             include_stack: vec![file.clone()],
-            included_files: HashSet::new(),
-            file_guards: HashMap::new(),
-            file_expansions: HashMap::new(),
-            inlined_files: HashSet::new(),
-            entry_used: HashMap::new(),
-            variant_used: HashMap::new(),
-            direct_variants: HashSet::new(),
+            included_files: FxHashSet::default(),
+            file_guards: FxHashMap::default(),
+            file_expansions: FxHashMap::default(),
+            inlined_files: FxHashSet::default(),
+            entry_used: FxHashMap::default(),
+            variant_used: FxHashMap::default(),
+            direct_variants: FxHashSet::default(),
             conditional_stack: Vec::new(),
             cond_base: 0,
             output: String::new(),
             line_map: LineMap::new(),
             diagnostics: Vec::new(),
-            diagnostic_keys: HashSet::new(),
+            diagnostic_keys: FxHashSet::default(),
             current_file: file,
             current_line: 1,
-            emitted_bytes: HashMap::new(),
+            emitted_bytes: FxHashMap::default(),
             lm_cur_file: u32::MAX,
             expansion_depth: 0,
             expansion_limit_warned: false,
             tokens_processed: 0,
             cache_frames: Vec::new(),
             macro_ops: Vec::new(),
-            macro_hashes: HashMap::new(),
+            macro_hashes: FxHashMap::default(),
             expansion_incomplete: false,
             conditionals: Vec::new(),
             cond_reads: None,
             guarded_file: false,
-            include_search_cache: RefCell::new(HashMap::new()),
+            include_search_cache: RefCell::new(FxHashMap::default()),
+            shared_directory_results,
             forced_include_depth: 0,
         };
         let warm = state.opts.shared_macros.is_some();
@@ -1179,19 +1190,19 @@ impl PreprocessorState {
         output_start: usize,
         output_end: usize,
         skips: &[(usize, PathBuf)],
-    ) -> (String, LineMap, HashSet<PathBuf>) {
+    ) -> (String, LineMap, FxHashSet<PathBuf>) {
         if skips.is_empty() {
             return (
                 self.output[output_start..output_end].to_string(),
                 self.line_map.slice_from(output_start),
-                HashSet::new(),
+                FxHashSet::default(),
             );
         }
         let mut text = String::new();
         let mut line_map = LineMap::new();
-        let mut extra_files = HashSet::new();
+        let mut extra_files = FxHashSet::default();
         let mut live_pos = output_start;
-        let mut embedded: HashSet<PathBuf> = HashSet::new();
+        let mut embedded: FxHashSet<PathBuf> = FxHashSet::default();
         for (at, path) in skips {
             let at = (*at).min(output_end).max(live_pos);
             Self::append_live_chunk(
@@ -1315,7 +1326,7 @@ impl PreprocessorState {
                     // current binding of each affected name, without executing
                     // it. External bindings also constrain this frame's cache
                     // fingerprint; locally written names are already settled.
-                    let mut seen = HashSet::new();
+                    let mut seen = FxHashSet::default();
                     // Only the final operation for each name matters here.
                     for op in entry.ops.iter().rev() {
                         let (MacroOp::Define(name, _) | MacroOp::Undef(name)) = op;
@@ -1402,7 +1413,7 @@ impl PreprocessorState {
         let guard_snapshot = if cache_header {
             self.included_files.clone()
         } else {
-            HashSet::new()
+            FxHashSet::default()
         };
         // Everything this header's processing executes (`#define`/`#undef`,
         // nested replays included) from here on lands in `macro_ops`; the
@@ -1419,7 +1430,7 @@ impl PreprocessorState {
 
         let content: Arc<str> = if let Some(cache) = &self.opts.source_cache {
             let key = canonical.clone();
-            if let Some(s) = cache.get(&key) {
+            if let Some(s) = cache.text(&key) {
                 Arc::clone(s)
             } else {
                 fs::read_to_string(path)
@@ -1446,11 +1457,11 @@ impl PreprocessorState {
                 skips: Vec::new(),
                 replayed: Vec::new(),
                 deps: crate::MacroFingerprint::default(),
-                settled: HashSet::new(),
-                locally_bound: HashSet::new(),
-                guards: HashMap::new(),
+                settled: FxHashSet::default(),
+                locally_bound: FxHashSet::default(),
+                guards: FxHashMap::default(),
                 diagnostics: Vec::new(),
-                diagnostic_keys: HashSet::new(),
+                diagnostic_keys: FxHashSet::default(),
             });
         }
 
@@ -1510,10 +1521,10 @@ impl PreprocessorState {
                     (
                         self.output[output_start..output_end].to_string(),
                         self.line_map.slice_from(output_start),
-                        HashSet::new(),
+                        FxHashSet::default(),
                     )
                 };
-                let mut new_files: HashSet<PathBuf> = self
+                let mut new_files: FxHashSet<PathBuf> = self
                     .included_files
                     .difference(&guard_snapshot)
                     .filter(|p| self.emitted_bytes.get(*p).copied().unwrap_or(0) > 0)
@@ -1559,7 +1570,7 @@ impl PreprocessorState {
                     // one this replayed is already closed, and unioning
                     // their records keeps the property.
                     let mut nested_variants: Vec<(PathBuf, usize)> = Vec::new();
-                    let mut seen: HashSet<PathBuf> = HashSet::new();
+                    let mut seen: FxHashSet<PathBuf> = FxHashSet::default();
                     for (nested_path, nested_at) in replayed {
                         if let Some(deeper) = self
                             .entry_used
@@ -2191,7 +2202,7 @@ impl PreprocessorState {
                 message: format!("include file not found: {path}"),
             });
         }
-        let found = self.search_include_dirs(path, quoted);
+        let found = self.search_include_dirs(&key);
         self.include_search_cache
             .borrow_mut()
             .insert(key, found.clone());
@@ -2200,27 +2211,64 @@ impl PreprocessorState {
         })
     }
 
-    /// Match the same canonical cache key used by `process_file`.
+    /// Whether `path` names a header this run can read: a file on disk, or an
+    /// entry the caller pre-loaded into `source_cache` (a virtual header).
+    ///
+    /// The cache is probed with `path` as given, NOT with
+    /// `trace_ir::canonicalize(path)`. Reaching the probe means `is_file` said
+    /// no, and `std::fs::canonicalize` requires every component to exist, so
+    /// here it can only fail and fall back to the path as handed in — the one
+    /// path that survives it is an existing *directory*, which is never a
+    /// source-cache key. The two probes therefore give the same answer, and
+    /// the canonical one cost a `realpath` per candidate: `resolve_include`
+    /// builds a fresh includer-relative candidate for every (including file,
+    /// spelling) pair, so the memo in `trace_ir::canonicalize` almost never
+    /// hits and the syscalls were a quarter of preprocessing (#83).
+    ///
+    /// Nor does the probe need `.`/`..` folded out of the key first: a
+    /// candidate spelled that way is settled by `is_file`, since every
+    /// `source_cache` key is a file `IncludeGraph` read off disk and a cached
+    /// header is therefore always also an on-disk one. A caller that seeds
+    /// `source_cache` with keys naming no file (only tests do) must spell them
+    /// the way an `#include` resolves to them.
     fn include_exists(&self, path: &Path) -> bool {
-        path.is_file()
+        trace_ir::is_file_cached(path)
             || self
                 .opts
                 .source_cache
                 .as_ref()
-                .is_some_and(|cache| cache.contains_key(&trace_ir::canonicalize(path)))
+                .is_some_and(|cache| cache.is_virtual(path))
     }
 
-    /// The include search proper, excluding the including file's own directory.
-    fn search_include_dirs(&self, path: &str, quoted: bool) -> Option<PathBuf> {
-        let quote_dirs = self.opts.quote_include_paths.iter().filter(|_| quoted);
-        for inc in quote_dirs
-            .chain(&self.opts.include_paths)
-            .chain(&self.opts.system_include_paths)
-        {
-            let p = inc.join(path);
-            if self.include_exists(&p) {
-                return Some(p);
+    /// The include search proper, excluding the including file's own
+    /// directory, for `key` = (spelling, quoted). The directory walk is
+    /// shared with every run over the same `SourceCache` and search lists
+    /// (hits and misses alike); the basename fallback is not, because it
+    /// depends on the caller's own index and strictness.
+    fn search_include_dirs(&self, key: &(String, bool)) -> Option<PathBuf> {
+        let (path, quoted) = (key.0.as_str(), key.1);
+        let cached = self.shared_directory_results.as_ref().and_then(|cache| {
+            cache
+                .read()
+                .ok()
+                .and_then(|results| results.get(key).cloned())
+        });
+        let found = cached.unwrap_or_else(|| {
+            let quote_dirs = self.opts.quote_include_paths.iter().filter(|_| quoted);
+            let found = quote_dirs
+                .chain(&self.opts.include_paths)
+                .chain(&self.opts.system_include_paths)
+                .map(|inc| inc.join(path))
+                .find(|p| self.include_exists(p));
+            if let Some(cache) = &self.shared_directory_results {
+                if let Ok(mut results) = cache.write() {
+                    results.insert(key.clone(), found.clone());
+                }
             }
+            found
+        });
+        if found.is_some() {
+            return found;
         }
         if let Some(index) = self
             .opts
@@ -2660,7 +2708,7 @@ impl PreprocessorState {
             included_headers: self.included_files.into_iter().collect(),
             inlined_headers: self.inlined_files.into_iter().collect(),
             replayed_variants: {
-                let mut vs: HashSet<(PathBuf, usize)> = self.direct_variants;
+                let mut vs: FxHashSet<(PathBuf, usize)> = self.direct_variants;
                 vs.extend(self.variant_used);
                 let mut vs: Vec<(PathBuf, usize)> = vs.into_iter().collect();
                 vs.sort();
@@ -2741,7 +2789,7 @@ fn is_alternative_token(name: &str) -> bool {
 }
 
 fn dedup_reads(reads: Vec<ConditionRead>) -> Vec<ConditionRead> {
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
     reads
         .into_iter()
         .filter(|r| seen.insert(r.name.clone()))
@@ -4716,6 +4764,11 @@ pub fn preprocess_string(source: &str, file: &Path, opts: &PreprocessOptions) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The file-probe epoch is process-global and empties the shared
+    /// directory-search results, so the test that bumps it and the tests
+    /// that read those results take this first.
+    static PROBE_EPOCH_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use crate::macros::macro_table_from_defines;
     use crate::options::{ExpansionCache, IncludeExpansion};
 
@@ -4746,12 +4799,12 @@ mod tests {
             let mut opts = PreprocessOptions::new();
             opts.strict_include_search = true;
             let include = root.join("virtual");
-            let mut cache = std::collections::HashMap::new();
+            let mut cache = FxHashMap::default();
             cache.insert(
                 include.join("header.h"),
                 Arc::<str>::from("int virtual_header;\n"),
             );
-            opts.source_cache = Some(Arc::new(cache));
+            opts.source_cache = Some(Arc::new(crate::SourceCache::new(cache)));
             let source = match class {
                 0 => "#include \"virtual/header.h\"\n",
                 1 => {
@@ -4779,6 +4832,125 @@ mod tests {
                 result.output
             );
         }
+    }
+
+    #[test]
+    fn shared_directory_search_preserves_context_and_search_order() {
+        let _guard = PROBE_EPOCH_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        let local = dir.path().join("local");
+        let quote = dir.path().join("quote");
+        let mut texts = FxHashMap::default();
+        for (folder, name) in [
+            (&a, "from_a"),
+            (&b, "from_b"),
+            (&local, "from_local"),
+            (&quote, "from_quote"),
+        ] {
+            texts.insert(
+                folder.join("shared.h"),
+                Arc::<str>::from(format!("int {name};\n")),
+            );
+        }
+        let mut opts = PreprocessOptions::new();
+        opts.source_cache = Some(Arc::new(crate::SourceCache::new(texts)));
+        opts.strict_include_search = true;
+        opts.include_paths = vec![a.clone(), b.clone()];
+        let source = dir.path().join("main.c");
+        let check = |file: &Path, text: &str, opts: &PreprocessOptions, expected: &str| {
+            let result = preprocess_string(text, file, opts);
+            assert!(result.output.contains(expected), "{}", result.output);
+        };
+        check(&source, "#include <shared.h>\n", &opts, "from_a");
+        let shared = |opts: &PreprocessOptions, quoted: bool| {
+            let cache = opts.source_cache.as_ref().unwrap().directory_results(opts);
+            let results = cache.read().unwrap();
+            results.get(&("shared.h".to_string(), quoted)).cloned()
+        };
+        assert_eq!(shared(&opts, false), Some(Some(a.join("shared.h"))));
+        // Warm the same quoted key that the local candidate must override.
+        check(&source, "#include \"shared.h\"\n", &opts, "from_a");
+        check(
+            &local.join("main.c"),
+            "#include \"shared.h\"\n",
+            &opts,
+            "from_local",
+        );
+        opts.include_paths.reverse();
+        check(&source, "#include <shared.h>\n", &opts, "from_b");
+        opts.quote_include_paths.push(quote);
+        check(&source, "#include \"shared.h\"\n", &opts, "from_quote");
+        check(&source, "#include <shared.h>\n", &opts, "from_b");
+        opts.include_paths.clear();
+        opts.quote_include_paths.clear();
+        let missing = preprocess_string("#include <shared.h>\n", &source, &opts);
+        assert!(!missing.diagnostics.is_empty());
+        assert_eq!(shared(&opts, false), Some(None));
+        // A cached directory miss must not suppress caller-specific basename fallback.
+        opts.strict_include_search = false;
+        opts.basename_index = Some(Arc::new(FxHashMap::from_iter([(
+            "shared.h".to_string(),
+            vec![a.join("shared.h")],
+        )])));
+        check(&source, "#include <shared.h>\n", &opts, "from_a");
+    }
+
+    #[test]
+    fn shared_directory_search_refreshes_after_a_new_file_probe_epoch() {
+        let _guard = PROBE_EPOCH_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = PreprocessOptions::new();
+        opts.source_cache = Some(Arc::new(crate::SourceCache::default()));
+        opts.include_paths.push(dir.path().to_path_buf());
+        opts.strict_include_search = true;
+        let source = dir.path().join("main.c");
+        let missing = preprocess_string("#include <later.h>\n", &source, &opts);
+        assert!(!missing.diagnostics.is_empty());
+        std::fs::write(dir.path().join("later.h"), "int appeared;\n").unwrap();
+        trace_ir::start_file_probe_epoch();
+        let found = preprocess_string("#include <later.h>\n", &source, &opts);
+        assert!(found.output.contains("appeared"), "{}", found.output);
+    }
+
+    #[test]
+    fn a_source_cache_knows_which_of_its_keys_name_no_file() {
+        // `include_exists` stops at the filesystem unless the cache says a key
+        // is virtual, so a cache that answers `false` for a key naming no file
+        // makes that header unreachable -- and one that answers `true` for an
+        // on-disk key costs a hash per failed candidate for nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let on_disk = root.join("real.h");
+        std::fs::write(&on_disk, "int real_header;\n").unwrap();
+
+        let mut texts = FxHashMap::default();
+        texts.insert(on_disk.clone(), Arc::<str>::from("int real_header;\n"));
+        texts.insert(
+            root.join("virtual.h"),
+            Arc::<str>::from("int virtual_header;\n"),
+        );
+        let cache = crate::SourceCache::new(texts);
+        assert!(cache.is_virtual(&root.join("virtual.h")));
+        assert!(!cache.is_virtual(&on_disk), "real.h is a file on disk");
+        assert!(
+            !cache.is_virtual(&root.join("absent.h")),
+            "a path this cache does not hold is not its virtual header"
+        );
+
+        let mut opts = PreprocessOptions::new();
+        opts.source_cache = Some(Arc::new(cache));
+        let result = preprocess_string(
+            "#include \"real.h\"\n#include \"virtual.h\"\n",
+            &root.join("main.c"),
+            &opts,
+        );
+        assert!(
+            result.output.contains("real_header") && result.output.contains("virtual_header"),
+            "{}",
+            result.output
+        );
     }
 
     #[test]
@@ -5330,7 +5502,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         // never expand.
         let dir = unique_tmp_dir("cache_language");
         fs::write(dir.join("shared.h"), "#define C + 1\n#define VAL 'a'C\n").unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let run = |name: &str| {
             let path = dir.join(name);
             fs::write(&path, "#include \"shared.h\"\nint n = VAL;\n").unwrap();
@@ -5771,7 +5943,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             "#ifndef container_of\n#define container_of(p, t, m) REAL_CONTAINER(p)\n#endif\n",
         )
         .unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -5815,7 +5987,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         // The declaration makes the header content-bearing so a cache entry
         // is actually stored and the second TU takes the replay path.
         fs::write(dir.join("u.h"), "int u_decl;\n#undef __init\n").unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -5842,7 +6014,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         // X is undefined when the entry is created, so a state diff records
         // nothing — only a log of executed directives catches this #undef.
         fs::write(dir.join("u.h"), "int u_decl;\n#undef X\n").unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -5863,7 +6035,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         let dir = unique_tmp_dir("undef_redef");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("r.h"), "int r_decl;\n#undef X\n#define X 9\n").unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -5890,7 +6062,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         let dir = unique_tmp_dir("replay_overwrite");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("r.h"), "int r_decl;\n#define X 9\n").unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -5914,7 +6086,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         let dir = unique_tmp_dir("replay_accum");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("m.h"), "int m_decl;\n#define FROM_HDR 5\n").unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let src = "#include \"m.h\"\n";
         let shared1 = Arc::new(RwLock::new(MacroTable::new()));
         let opts1 = PreprocessOptions::new()
@@ -6608,7 +6780,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         .unwrap();
 
         let shared = Arc::new(RwLock::new(MacroTable::new()));
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
 
         // Warm-style pass over the first twin: defines LIST_H, caches text.
         let warm_opts = PreprocessOptions::new()
@@ -6679,7 +6851,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
                 .collect();
             t.insert("G_H".to_string(), MacroDef::Object { replacement: toks });
         }
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_shared_macros(Arc::clone(&shared))
             .with_include_expansion_cache(cache)
@@ -6722,7 +6894,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         )
         .unwrap();
 
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.path().to_path_buf());
@@ -6775,7 +6947,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         )
         .unwrap();
 
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(cache)
             .with_include(dir.to_path_buf());
@@ -6819,7 +6991,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         )
         .unwrap();
 
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(cache)
             .with_include(dir.to_path_buf());
@@ -6870,7 +7042,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         )
         .unwrap();
 
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let warm = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.to_path_buf());
@@ -6921,7 +7093,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             src.push_str(&format!("int v{i};\n#endif\n"));
             fs::write(dir.join(format!("h{i}.h")), src).unwrap();
         }
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.to_path_buf());
@@ -7112,7 +7284,7 @@ int x = A;
             "#ifndef TOP_H\n#define TOP_H\n#include \"common.h\"\nint from_top;\n#endif\n",
         )
         .unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.to_path_buf())
@@ -7165,7 +7337,7 @@ int from_late;
 ",
         )
         .unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.to_path_buf())
@@ -8146,7 +8318,7 @@ int from_late;
         fs::write(&path, source).unwrap();
         let base = PreprocessOptions::new().with_include(dir.path().to_path_buf());
         let live = preprocess_file(&path, &base).unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = base.with_include_expansion_cache(cache);
         preprocess_file(&path, &opts).unwrap();
         let replay = preprocess_file(&path, &opts.with_frozen_expansion_cache(true)).unwrap();
@@ -8164,7 +8336,7 @@ int from_late;
         )
         .unwrap();
         fs::write(dir.path().join("a.h"), "#include \"b.h\"\nint a;\n").unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include(dir.path().to_path_buf())
             .with_include_expansion_cache(cache);
@@ -8202,7 +8374,7 @@ int from_late;
         )
         .unwrap();
         fs::write(dir.path().join("a.h"), "#include \"b.h\"\nint a;\n").unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include(dir.path().to_path_buf())
             .with_include_expansion_cache(cache);
@@ -8371,7 +8543,7 @@ int from_late;
         }
         let path = dir.path().join("t.c");
         fs::write(&path, format!("#include \"h{LEVELS}.h\"\n")).unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new().with_include_expansion_cache(cache);
         let result = preprocess_file(&path, &opts).unwrap();
         for level in 0..=LEVELS {
@@ -8449,7 +8621,7 @@ int from_late;
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("once.h"), "#pragma once\nint once_body;\n").unwrap();
         fs::write(dir.path().join("a.h"), "#include \"once.h\"\nint a;\n").unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include(dir.path().to_path_buf())
             .with_include_expansion_cache(cache);
@@ -8519,7 +8691,7 @@ int from_late;
         fs::write(dir.join("first.c"), "#define G 1\n#include \"guarded.h\"\n").unwrap();
         fs::write(dir.join("second.c"), "#include \"guarded.h\"\n").unwrap();
 
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = || {
             PreprocessOptions::new()
                 .with_include_expansion_cache(Arc::clone(&cache))
@@ -8571,7 +8743,7 @@ int from_late;
         fs::write(dir.join("big.c"), &big).unwrap();
         fs::write(dir.join("small.c"), "#include \"parent.h\"\n").unwrap();
 
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = |cache: Option<&ExpansionCache>| {
             let base = PreprocessOptions::new()
                 .with_max_output_bytes(2000)
@@ -8643,7 +8815,7 @@ int from_late;
         .unwrap();
         fs::write(dir.join("other.c"), "#include \"parent.h\"\n").unwrap();
 
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let cached_opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.path.clone());
@@ -9275,7 +9447,7 @@ int from_late;
             "#ifdef __cplusplus\nint cxx_decl;\n#else\nint c_decl;\n#endif\n",
         )
         .unwrap();
-        let cache: ExpansionCache = Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let run = |name: &str| {
             let path = dir.join(name);
             fs::write(&path, "#include \"lang.h\"\n").unwrap();

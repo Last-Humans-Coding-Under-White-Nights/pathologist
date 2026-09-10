@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -75,7 +75,7 @@ pub struct MacroFingerprint {
     /// `binding_hash`). Ordered by first read, for stable diagnostics.
     pub defined: Vec<(Arc<str>, u64)>,
     /// Names read while unbound.
-    pub undefined: HashSet<Arc<str>>,
+    pub undefined: FxHashSet<Arc<str>>,
 }
 
 impl MacroFingerprint {
@@ -103,6 +103,108 @@ impl MacroFingerprint {
     }
 }
 
+/// Raw file contents the caller has already read, keyed by canonical path, so
+/// `#include` expansion can skip the disk.
+///
+/// Carries its own answer to "does any key here name no file on disk?", which
+/// is what lets `include_exists` stop at the memoized `stat` for the common
+/// candidate that resolves nowhere. Derived from the map it is derived for, so
+/// the two cannot fall out of step: a caller cannot install a cache and leave
+/// a stale answer beside it.
+#[derive(Debug, Default)]
+pub struct SourceCache {
+    texts: FxHashMap<PathBuf, Arc<str>>,
+    /// Keys naming no file on disk, computed on first need. Usually empty: a
+    /// cache built by reading files off disk holds none, and only a caller
+    /// that invents a header (tests, and a host embedding the preprocessor)
+    /// puts one here.
+    virtual_keys: std::sync::OnceLock<FxHashSet<PathBuf>>,
+    directory_searches: RwLock<DirectorySearches>,
+}
+
+pub(crate) type DirectoryResults = Arc<RwLock<FxHashMap<(String, bool), Option<PathBuf>>>>;
+
+#[derive(Debug, Default)]
+struct DirectorySearches {
+    epoch: u64,
+    configurations: FxHashMap<SearchPaths, DirectoryResults>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct SearchPaths {
+    quote: Vec<PathBuf>,
+    include: Vec<PathBuf>,
+    system: Vec<PathBuf>,
+}
+
+impl SourceCache {
+    #[must_use]
+    pub fn new(texts: FxHashMap<PathBuf, Arc<str>>) -> Self {
+        Self {
+            texts,
+            virtual_keys: std::sync::OnceLock::new(),
+            directory_searches: RwLock::new(DirectorySearches::default()),
+        }
+    }
+
+    /// The shared directory-search results for `opts`' ordered quote, include
+    /// and system paths, created on first use and dropped with the file-probe
+    /// epoch. Every preprocessing run consults this, so the steady state is a
+    /// hit under a read lock.
+    pub(crate) fn directory_results(&self, opts: &PreprocessOptions) -> DirectoryResults {
+        let epoch = trace_ir::file_probe_epoch();
+        let key = SearchPaths {
+            quote: opts.quote_include_paths.clone(),
+            include: opts.include_paths.clone(),
+            system: opts.system_include_paths.clone(),
+        };
+        if let Ok(searches) = self.directory_searches.read() {
+            if searches.epoch == epoch {
+                if let Some(results) = searches.configurations.get(&key) {
+                    return Arc::clone(results);
+                }
+            }
+        }
+        let mut searches = self
+            .directory_searches
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if searches.epoch != epoch {
+            searches.configurations.clear();
+            searches.epoch = epoch;
+        }
+        Arc::clone(searches.configurations.entry(key).or_default())
+    }
+
+    /// The text stored for `path`, if any.
+    #[must_use]
+    pub fn text(&self, path: &Path) -> Option<&Arc<str>> {
+        self.texts.get(path)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.texts.is_empty()
+    }
+
+    /// Whether `path` is a key of this cache that names no file on disk.
+    ///
+    /// The scan behind it is one memoized `stat` per key and runs at most once
+    /// per cache, on the first candidate the filesystem rejected.
+    #[must_use]
+    pub fn is_virtual(&self, path: &Path) -> bool {
+        self.virtual_keys
+            .get_or_init(|| {
+                self.texts
+                    .keys()
+                    .filter(|p| !trace_ir::is_file_cached(p))
+                    .cloned()
+                    .collect()
+            })
+            .contains(path)
+    }
+}
+
 /// The expansions stored for one [`ExpansionKey`]: one per macro
 /// environment a consumer has actually presented, in insertion order.
 ///
@@ -113,7 +215,7 @@ impl MacroFingerprint {
 pub type ExpansionVariants = Vec<IncludeExpansion>;
 
 /// Shared, variant-keyed cache of expanded `#include` bodies.
-pub type ExpansionCache = Arc<RwLock<HashMap<ExpansionKey, ExpansionVariants>>>;
+pub type ExpansionCache = Arc<RwLock<FxHashMap<ExpansionKey, ExpansionVariants>>>;
 
 /// Why a file that a run has already expanded may be skipped when it is
 /// `#include`d again.
@@ -139,7 +241,7 @@ pub enum FileGuard {
 #[derive(Debug, Clone)]
 pub struct IncludeExpansion {
     pub text: Arc<str>,
-    pub files: Arc<HashSet<PathBuf>>,
+    pub files: Arc<FxHashSet<PathBuf>>,
     /// Diagnostics emitted while producing this expansion, including
     /// diagnostics replayed from nested cached headers. Cache hits append
     /// these to the current preprocessing result in their original order.
@@ -199,13 +301,15 @@ pub struct PreprocessOptions {
     /// Initial search directory for relative forced includes.
     pub working_directory: Option<PathBuf>,
     pub defines: indexmap::IndexMap<String, String>,
-    /// Canonical path → raw file contents (skips disk reads during `#include` expansion).
-    pub source_cache: Option<std::sync::Arc<HashMap<PathBuf, std::sync::Arc<str>>>>,
+    /// Raw file contents the caller has already read (skips disk reads during
+    /// `#include` expansion), and the [`SourceCache`] answer that keeps
+    /// `include_exists` off the hash for a candidate that resolves nowhere.
+    pub source_cache: Option<std::sync::Arc<SourceCache>>,
     /// Shared cache of expanded `#include` bodies keyed by canonical path
     /// and lexing language (see [`ExpansionKey`]).
     pub include_expansion_cache: Option<ExpansionCache>,
     /// Basename → project paths for fast include resolution.
-    pub basename_index: Option<Arc<HashMap<String, Vec<PathBuf>>>>,
+    pub basename_index: Option<Arc<FxHashMap<String, Vec<PathBuf>>>>,
     /// Shared macro table populated during header warm-up; inherited by translation units.
     pub shared_macros: Option<crate::SharedMacroTable>,
     /// When true, `#define` / `#undef` update [`Self::shared_macros`].
@@ -340,7 +444,7 @@ impl PreprocessOptions {
     }
 
     #[must_use]
-    pub fn with_basename_index(mut self, index: Arc<HashMap<String, Vec<PathBuf>>>) -> Self {
+    pub fn with_basename_index(mut self, index: Arc<FxHashMap<String, Vec<PathBuf>>>) -> Self {
         self.basename_index = Some(index);
         self
     }

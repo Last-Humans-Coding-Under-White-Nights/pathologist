@@ -15,6 +15,373 @@
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Regression investigation, 2026-09-10 (#83):**
+
+*A C caller no longer reached its `extern "C"` C++ implementation.* Reported against
+`drivers_hdf_core`'s `hdf_remote_service.c:68`, which called
+`HdfRemoteAdapterCheckInterfaceToken` — defined at `hdf_remote_adapter.cpp:469` — and got an
+`external` edge to the *prototype* in `hdf_remote_adapter_if.h:46` instead. Nine of the twelve
+names that header declares were in that state, and the three that were not are exactly the three
+with no `struct` pointer among their parameters.
+
+The prototype and the definition reach the symbol table from two different units. The C++ overload
+check compared their parameter types by `TypeId` and read the mismatch as an overload, so the two
+records stayed apart and every caller kept the undefined one. The ids differed because the same C
+type had been interned twice: `hdf_remote_adapter.cpp`'s unit carried
+`Ptr(Struct HdfRemoteService { object: Struct HdfObject { } , ... })` while every other unit
+carried the same type with `HdfObject`'s `objectId` field present. `TypeDesc` is structural and a
+named aggregate's stored `desc` is a snapshot — `complete_nested_tags` repairs a type's
+`layout.fields` but not its `desc`, and `canonicalize_desc` rewrites only a *bare* empty tag, not
+an empty tag nested inside a non-empty one — so the order in which the PCH preamble merged
+`hdf_object.h` and `hdf_remote_service.h` decided which snapshot a unit got.
+
+Resolved parameter pairs now compare by shape. That comparison already existed for this exact
+reason on the variant merge path (`same_param_type`, "two configurations of one source intern their
+own copy of a type, so the same C++ parameter can arrive under different ids and an id comparison
+would split a function from itself"); it moved to `trace_ir::same_param_type`, and `merge.rs` and
+`symbol.rs` now share the one copy. A pair of *definitions* still compares by id: one qualified
+name legitimately carries two bodies, and merging those lets the second overwrite the survivor's
+span and parameters — the hazard `base_definitions` already guards. Camera
+proved that necessary — the unnarrowed comparison collapsed 23 defined overload groups, folding
+`IStreamOperatorMock::Capture` from two unrelated fuzzer headers together and merging
+`DeferredVideoProcessingSessionCallback::OnError`'s test mock into the production implementation.
+
+Comparing by shape was necessary but not sufficient. Four more faults each faked a mismatch
+between a prototype and its definition, and each was found by asking what the residue the probes
+still reported was made of. The candidate search consulted only `fn_by_name`, a single entry per
+name, so a definition missed its own declaration whenever another overload had been registered
+after it; it now scans the undefined prototypes in `externals_by_name` and only then falls back to
+`fn_by_name` for exact duplicate-definition dedup, and `fn_by_name` itself prefers a defined
+function so a later declaration cannot shadow a body. Lowering discarded tree-sitter's
+`optional_parameter_declaration` nodes, so a parameter carrying a default argument vanished from
+the prototype and the arity check rejected the definition it belonged to. A self-typedef
+(`typedef struct Foo Foo;`) went unregistered, so `Camera_CaptureSession **` lowered as `Int`
+rather than a struct pointer. And a leading `::` made `::Foo` and `Foo` distinct shapes.
+
+These are what move `hiviewdfx_hiview`, which the shape comparison alone did not move at all: 34
+declaration-only entities fold into their definitions and 62 call sites turn direct. Across the
+three corpora the count of names carrying both a definition and a declaration-only entity falls
+from 10 / 40 / 159 to 0 / 17 / 40; the residue is real overload sets where one member is declared
+and another defined, which is not this fault. Retaining default parameters also *raises* camera's
+`functions_defined` by exactly one, which is a recovery and not a duplicate: three unrelated
+headers under `mediastream/test/unittest/filter` each define their own `MockNextFilter`, two taking
+`(std::string name = ..., CFilterType type = ...)` and one taking `()`, and dropping the defaults
+lowered the two-parameter constructors as nullary, so two of the three bodies collapsed into one
+entry.
+
+The duplicate `TypeId` itself is left in place. It is real — HDF interns 239 named tags (anonymous
+ones excluded) under more than one id, `struct HdfDeviceNode` alone under 15 — and it costs
+precision beyond this bug, because `FieldSummary` and points-to key on `TypeId`.
+
+Converging it by canonicalizing an aggregate's field descriptors recursively at intern time (with a
+cycle guard, so `struct Node { struct Node *next; }` keeps its self-reference as a tag reference
+instead of nesting a copy per intern) **was implemented and measured, then rejected**. It works —
+HDF's type table drops from 4,202 to 3,938 entries, its multiply-interned named tags from 239 to
+121, and `HdfDeviceNode` from 15 ids to 2 — but the walk runs on every intern and the rewritten
+descriptors are far larger:
+
+| | index | peak RSS | `edges_indirect` |
+|---|---|---|---|
+| shallow canonicalization (kept) | 6.0-6.2s | ~610 MB | 4642 |
+| recursive canonicalization (rejected) | 17.1s | 1.88 GB | 4666 |
+
+Both rows are HDF on one build, taken before the lookup and lowering fixes above brought the index
+to 5.6-5.8s; the comparison between them is internal to that build.
+
+Tripling index time and peak memory is the wrong trade in a change that exists partly to answer a
+performance regression, and the move in `edges_indirect` — an exact metric — needs attributing on
+its own rather than riding along here. `canonicalize_desc` carries a comment recording that its
+shallowness is deliberate.
+
+A cheaper canonical form is the more promising direction and was not tried: normalize a nested
+named tag *down* to its empty tag-reference form rather than up to its full layout, so a parent's
+descriptor never carries a nested field list at all. That converges both orderings, shrinks
+descriptors instead of growing them, and leaves field resolution to `layout.fields`, which already
+interns through the tag registry — but it has to intern a nested aggregate before stripping it, or
+a tag first seen inside its parent loses its fields, so it needs `canonicalize_desc` to take
+`&mut self` and is a change to the type table's canonical form rather than a fix.
+
+*Indexing had two separate regressions.* All figures below: macOS, 8 logical CPUs, `--jobs 8`,
+warm filesystem cache, release build, idle machine; three runs on HDF, two on camera, reported as
+the range. The ranges are from an idle machine and are the useful figures for comparing rows;
+under load every row inflates together (a loaded run measured master at 12.7s and this change at
+7.1s), so compare rows only within one sitting.
+
+| commit | HDF index | HDF preprocess | camera index | camera preprocess |
+|---|---|---|---|---|
+| `82c1f11`, before #55 | 3.4-3.7s | — (no such phase) | 8.4-9.0s | — |
+| `6615690`, #55 itself | 6.2-6.3s | 2.8s | 19.4s | 7.8s |
+| `ed5b6eb`, before #62 | 6.0-6.1s | 2.7-2.8s | 18.4-19.2s | 7.5-7.8s |
+| `7fee472`, master | 8.8-9.2s | 5.0-5.1s | 24.0-24.9s | 11.2-11.4s |
+| this change, before the probe memo | 5.6-5.9s | 2.6-2.7s | 16.8-17.6s | 6.6-6.9s |
+| this change | 4.2-4.4s | 1.3-1.4s | 10.7-10.8s | 2.4s |
+| this change, second round | 2.7-2.8s | 1.0s | 5.6-5.8s | 1.5s |
+
+The last two rows were re-measured against each other in one later sitting, which put the
+pre-memo row at 5.9-6.1s / 2.7s (HDF) and 17.9-18.0s / 7.0s (camera) — within the ranges above.
+
+`6615690` is measured because it isolates the first regression: #55 alone takes HDF from 3.6s to
+6.2s and camera from 9.0s to 19.4s, and `ed5b6eb` matches it on both corpora, so the PRs merged
+between #55 and #62 contribute nothing measurable. The two regressions are therefore #55's
+(+2.6s HDF, +10.4s camera) and #62's (+3.0s HDF, +5.7s camera), and only the second is fixed here.
+
+**The second regression is fixed here.** Merging the compilation database (#62) cost HDF 2.3s of
+preprocessing and camera 3.7s — on trees with no `compile_commands.json` at all, producing
+byte-identical output. A 4-second sample of the HDF index attributed 338 of 1338 `process_tokens`
+samples to one call chain: `resolve_include` → `include_exists` →
+`trace_ir::canonicalize` → `std::fs::canonicalize` → `realpath` → `__getattrlist`. #62 added a
+source-cache probe under the canonical key so a virtual header can be found, but `resolve_include`
+builds a fresh includer-relative candidate for every (including file, spelling) pair, so the memo
+inside `trace_ir::canonicalize` almost never hits and each miss paid a full `realpath`.
+
+The probe now uses the path as handed in. Reaching it means `is_file` said no, and
+`std::fs::canonicalize` requires every component to exist, so there it can only fail and fall back
+to that same path — the one input that survives it is an existing *directory*, which is never a
+source-cache key. #62's own `review_virtual_headers_in_all_search_classes` still passes in all five
+search classes, and with this one hunk applied on its own all three corpora produce output
+byte-identical to `7fee472`.
+
+**The first regression is mostly paid off, without the redesign it seemed to need.** `82c1f11` has
+no preprocessing phase at all: making a translation unit's macro context reach its headers (#55)
+introduced the two-pass scheme, and `preprocess-done` reports the two passes separately, so the
+serial discovery pass is attributable on its own — 2.2s of HDF's 2.7s and 5.5s of camera's 7.0s.
+That pass stays serial: it is the one pass that writes the shared expansion cache while reading
+it, and running it in parallel moved camera across 20,299 / 20,326 / 20,847 direct edges on three
+runs of one tree. Decoupling expansion-variant discovery from TU text generation, so a cached
+expansion depends only on header content, language and macro fingerprint rather than on incidental
+includer state, would let it run in parallel; **that redesign was still not attempted.** What the
+three changes below do instead is make the serial pass itself cheap — 1.1s on HDF and 1.8s on
+camera — which left HDF about 1.2x its pre-#55 index time and camera about 1.2x; the second round
+below takes both under it (HDF about 0.8x, camera about 0.65x) with the pass still serial.
+
+A 7-second sample of camera's index attributed **3338 of 5603 main-thread samples to `stat`**,
+under `resolve_include` → `include_exists` → `Path::is_file`. The candidate a probe is built from
+is `including_file.parent().join(spelling)`, so it repeats for every include of the same header
+from the same directory and again for every translation unit that re-expands it, while the tree
+under analysis is read-only for the whole run. Counting the probes: camera issues **4,343,229 of
+them naming 224,945 distinct paths**, HDF 1,445,203 naming 135,227, hiview 1,546,148 naming
+136,908 — 91-95% repeats. `trace_ir::is_file_cached` memoizes the answer per thread, keyed on the
+path's encoded bytes, because `Path`'s own `Hash` walks components and normalizes separators as it
+goes and on these paths costs more than hashing them flat. Camera's discovery pass: 5.5s to 2.1s.
+
+Re-sampling then put hashing on top, ~31% of what was left, all of it SipHash over path keys. The
+preprocessor's maps (and `IncludeGraph`'s source cache and basename index, and the shared
+include-expansion cache) now use `rustc-hash`. This is safe for output for a reason worth stating:
+`std`'s `RandomState` is seeded per process, so any output that depended on a hash-map iteration
+order could not have been bit-reproducible run to run in the first place — and it is, at every job
+count, which is what makes the swap a pure cost change. Camera's discovery pass: 2.1s to 1.8s
+including the change below.
+
+The third change is the one probe the memo could not answer. `include_exists` falls through to the
+source cache for a candidate the filesystem rejected, and a cache built by *reading files off
+disk* — which is what `IncludeGraph` hands the indexer — can never rescue one, so the fall-through
+hashed a full path per failed include for nothing: 367 of 2150 samples, 17% of the pass.
+`PreprocessOptions::with_source_cache` now derives whether any key names no file
+(`virtual_headers`, one memoized `stat` per key at install time, and the options are built twice
+per run) and the probe stops at the memoized `stat` when none does. A caller that seeds a header
+the filesystem does not have keeps the conservative answer either way — through the builder,
+because the scan finds its key; through a direct field assignment, because the flag defaults to
+`true`. `with_source_cache_keeps_probing_for_a_header_that_is_only_in_the_cache` is the guard, and
+it fails (`virtual.h` unresolved) if the derivation is forced to `false`.
+
+What is left in the pass, from a final 2-second sample (~1450 main-thread samples): `stat` 182,
+the 225k first probes that have to happen; `MacroFingerprint::signature` 106, which builds a
+`DefaultHasher` per macro entry and XORs the results so insertion order drops out — left alone
+deliberately, since XOR-combining a weaker per-entry hash trades a collision for replaying the
+wrong cached expansion; hide-set `Arc<str>` hashing ~160, which needs macro names interned to
+indices to improve; the lexer 78; and allocator traffic ~250.
+
+Also taken from the performance list, and separate from the `realpath` fix: `LineMap::truncate_at`
+cuts at a `partition_point` rather than walking every entry; the symbol table's redeclaration merge
+reaches an entry through its O(1) `fn_slots` slot; the cross-TU merge indexes a unit's parameter
+types once instead of scanning `unit.variables` per parameter; the include-order cycle tail uses a
+set rather than an O(V^2) `Vec::contains`; and `deps::resolve_include` probes candidates lazily
+instead of allocating one `PathBuf` per search directory (205-291 of them) per include. These
+remove real quadratic and linear paths but are not what moves the numbers above. A lexer
+token-vector `with_capacity(len / 4)` was tried and reverted for showing no benefit; peak RSS on
+camera varies by more than 200 MB run to run, too noisy to attribute a memory effect to any of
+these in either direction.
+
+All three corpora are bit-identical across three runs at `--jobs 8` and at `--jobs 1` with these
+changes, and every exact metric is unchanged against parent `7fee472` measured on the same machine.
+See `scripts/eval_expected.json`'s note for the re-captured bulk totals, including one correction
+that predates this change: hdf's `functions_defined` had been pinned at 10223. That was a real
+measurement as of `6615690`, where it summed with that revision's 2332 external to exactly the
+12555 total pinned beside it — it simply went un-refreshed when later PRs moved hdf's total and
+external pins to 12649 and 2403, leaving 10223 + 2403 = 12626, 23 short of the total it sat next
+to. The parent measures 10246, and this change leaves it there.
+
+**Second performance round, 2026-09-11.** Two costs the samples above had hidden, and four
+smaller ones. The macOS sampler attaches late enough to miss a phase that finishes in the first
+half second at `--jobs 8`, which is how the include-graph build stayed invisible: a `--jobs 1`
+sample put 2.3s of `stat` under `IncludeGraph::build_with_deps`, and `time` showed the same
+figure another way — 10.4s of system time on camera at *every* job count against 17s of user
+time. `deps::resolve_include` probed each candidate with its own `Path::is_file`, so an include
+naming no project file (`<string>`, `<vector>`) walked all 205-291 search directories, once per
+file that spelled it. It now goes through `is_file_cached`, and a first probe is answered from the
+parent directory's listing when that settles it: a name the listing does not hold is a miss without
+a `stat`, while a listed, case-folded or non-ASCII name still asks the filesystem, so a case-folding
+or normalizing filesystem answers exactly as before. Camera's system time: 10.4s to 1.3s. The
+other hidden cost was serial: `finalize_extern_callees` rescanned every call site once per
+synthesized name, quadratic on camera at 1.5s of the index, visible only in the main thread's
+subtree of the profile rather than at the top of any stack; the sites each name may claim are now
+gathered once. The smaller four: `TypeTable::intern` asks the table before cloning or re-boxing a
+descriptor whose canonical form cannot differ, and merging interns by reference, since a header's
+types are re-interned per unit into a table that usually has them; the lowering path's path-keyed
+maps, the PAG's index maps and the solver's `IndexSet<LocId>` (30% of HDF's analysis phase) hash
+with `rustc-hash`; the directory walk behind `#include` is shared across preprocessing runs under
+the same search lists; and the parallel index phases merge one batch while the pool parses the
+next, so the serial merge (0.35s on camera) overlaps parsing. What remains serial on camera: the
+warm pass (0.9s), the discovery pass (1.3s, #55), and export (0.6s). Wall on `--jobs 8`: camera
+9.9-10.3s to 6.1-6.4s, HDF 5.5-6.2s to 4.0-4.7s, hiview 2.9s to 1.7s. Every step was checked the
+same way: DB dumps byte-identical across three `--jobs 8` runs, one `--jobs 1` run and the previous
+binary on all three corpora, eval 90/90.
+
+**Review passes on this change (#83), 2026-09-10:**
+
+Four review rounds ran against the branch. Findings were triaged by reproducing each one rather
+than by reading the patch, and four of them turned out to be defects this change had *introduced*
+in `same_param_type` — a function master does not have at all, since master compared parameter
+types by exact `TypeId`. Loosening that comparison is the core of the fix, and each fault below is
+a way the loosened version was too loose.
+
+The fourth round's finding is the sharpest of them, because the wildcard it names was *inherited*
+rather than written: `same_type_shape` came out of `trace-parse`'s variant merge, where
+`TypeDesc::Unknown` matching anything is correct, and moving it into `trace-ir` for
+`register_function` carried the wildcard across without the guard that made it safe. The variant
+merge takes a candidate only when exactly one matches — `matching.next().filter(|_|
+matching.next().is_none())`, with the comment "Unknown types can match several overloads. Keep the
+ordinary merge path in that case" — while `register_function` takes the first compatible candidate
+out of an overload bucket. So a C++ prototype whose parameter type no header in the include path
+declares absorbed `f(int)`, and `f(double)`'s body then landed on the same entry, leaving callers
+of one overload resolved into another's body. Exact-`TypeId` comparison could not do this, since
+`Unknown` has a single prelude id. `same_param_type` now treats an unresolvable type as a type at
+every depth, and `same_param_type_or_unresolved` is what the variant merge asks for; a comment at
+each site says why only one of them may have the wildcard.
+`an_unresolved_parameter_type_is_not_a_wildcard_across_overloads` fails on the shared-wildcard
+version at its first assertion. All three corpora are byte-identical across the fix, so this was
+latent on the eval trees — which is also why it needed a unit test rather than a probe.
+
+Two smaller findings from the same round, both latent for the same reason — an in-tree caller
+happens to rule them out. Replacing `index_order`'s O(V^2) `order.contains` with a set lost the
+growth the linear scan had (`contains` was re-evaluated as `order` grew), so a duplicate cyclic
+leftover would be appended twice; every caller in-tree dedups `files` first, but the function is
+`pub`, and the set now grows as it filters. And `virtual_headers`, the flag the performance work
+above put on `PreprocessOptions`, was a `bool` sitting beside a separately assignable
+`source_cache` field: correct at every call site today, and silently wrong — `include file not
+found`, with no hint the cache was skipped — for any future one that assigns the field after the
+flag was derived for a different cache. The answer now lives *inside* `trace_preproc::SourceCache`,
+computed from the very map it describes on the first candidate that reaches it, so the two cannot
+fall out of step and the options carry no invariant to maintain.
+
+*An anonymous tag was recognised by an empty name, which no lowered type has.* Tags compare by
+name, so the first cut added a structural comparison for anonymous aggregates, guarded on the name
+being empty. `lower_tag` names an unnamed struct or union `anon_<n>` from a counter each unit seeds
+from the program's, and `extract_tag_name` falls back to a bare `anon`, so the guard never fired
+and the name comparison it replaced stayed in force: two units both numbering their first anonymous
+tag `anon_1` had unrelated types compare *equal*, and one shared tag numbered differently by two
+units compared unequal. Anonymity is decided by the prefix now, as `lower.rs` already reads it. The
+test that was supposed to cover this built its types with `String::new()` — a spelling lowering
+never emits — so it passed against the dead guard; it now also asserts on the real names.
+
+*A nested array's extent was ignored.* `int (*)[10]` and `int (*)[20]` compared equal, collapsing
+distinct overloads. Stated bounds must agree now, an unstated one still matches any, and the
+top-level decay was extended to array-against-array so that a parameter's own discarded bound —
+`int a[10]` against `int a[20]` — still reads as one function rather than newly splitting.
+
+*The reported call path had no `cargo test` coverage.* A `.c` caller reaching a `.cpp` definition
+through one `extern "C"` prototype whose parameter tag is complete in the C unit and opaque in the
+C++ one was covered only by the corpora and by unit-level mocks in `merge.rs`.
+`c_caller_reaches_a_cpp_extern_c_definition_across_units` builds that tree end to end; forced back
+onto exact-`TypeId` comparison it reports `[(FnId(0), false), (FnId(2), true)]` — the split
+prototype and body of the original report.
+
+`LineMap::truncate_at` also stopped narrowing its `usize` argument to `u32` before comparing,
+matching `slice_from`.
+
+Two findings were reproduced and rejected. Passing the *merged* entry's definedness to
+`should_take_primary` on the redeclaration path, rather than the incoming registration's, is
+reachable — with two defined overloads under one name, a declaration matching the one that does
+not hold the primary slot moves the slot onto it — and it is wrong: a declaration asserts no body,
+so letting it reroute every unqualified call site would make resolution depend on declaration
+placement and on unit merge order, which the bit-reproducibility requirement forbids.
+`a_declaration_does_not_move_the_primary_slot_between_two_bodies` pins that, and fails under the
+proposed version. Normalizing `.`/`..` before the source-cache probe in `include_exists` is
+unreachable: the probe runs only after `is_file` says no, and every `source_cache` key is a file
+`IncludeGraph` read off disk, so a cached header is always an on-disk one. Both are recorded as
+comments where a reader would next raise them.
+
+Carried forward unfixed, both pre-existing on `7fee472` and both verified there: the nullary C++
+overload collapse (`void foo();` beside `void foo(int)` folds into one entry, because the
+empty-parameter wildcard cannot tell a prototype *declared* empty from one whose parameters did not
+lower — tightening it to exact arity when both sides are C++ fails 17 tests), and the duplicate
+external definition that overwrites the survivor's span and parameters (guarding it on
+`func.is_defined && !existing.is_defined` costs hdf `edges_indirect` 4642 → 4556, `arg_flow_edges`
+199 rows, and every target at two function-pointer dispatch sites, so last-definition-wins is
+load-bearing for hdf's dispatch resolution and its correct fix is not a guard).
+
+A third round raised the cost of the widened candidate search itself. A pure-C definition and a
+C++-parsed prototype are matched on arity alone — a `.c` body's parameter types are decayed and
+would not compare equal to the header's — and that tolerance was safe only while the search
+consulted the single `fn_by_name` slot. Scanning the whole `externals_by_name` bucket made arity
+ambiguous: two same-arity C++ prototypes under one name, and the definition merged into whichever
+had registered first. Candidates are now tried in two passes, the first demanding the signature
+agree too, so the change decides only which arity-compatible candidate is taken and never whether
+any is. The same round found the internal-linkage merge reporting `adopted_params` without moving
+`param_type_ids` — latent, since nothing matches `static` entries by signature, but the two
+branches encoded different cache semantics — and a doc comment in `merge_unit` whose new paragraph
+had been inserted into the middle of a pre-existing sentence.
+
+A fourth round found three more faults in the loosened comparison, two of them in the anonymity
+repair itself. Requiring only the `anon_` prefix claimed ordinary tags — `anon_vma`, `anon_inode`
+and anything else spelled that way — and since anonymous tags compare structurally, any two of
+them sharing one field became the same type, which is the inverse of the fault the predicate
+exists to fix; the digits are required now. The test is also applied to the leaf, because a C++
+anonymous class is registered qualified (`lower_tag` calls `ctx.qualify`, so an anonymous tag in
+`namespace ns` is `ns::anon_1`) and the whole-name test called that named, leaving two units that
+numbered one tag differently unable ever to match. The test meant to cover this used `anonymizer`,
+which does not carry the prefix at all, so it never exercised the predicate. Separately, an array
+parameter inside a function-pointer type did not decay: a parameter list decays wherever the
+language spells one, so `void (*)(int a[])` and `void (*)(int *a)` are one type, and the `FnPtr`
+arm was comparing its parameters with the plain shape rule.
+
+The same round established that the nested-extent check added in the previous round **cannot fire
+on lowered input**. `walk_declarator_shape` is the only place that constructs a `TypeDesc::Array`
+and it hardcodes `size: None`, so every lowered array is unbounded and `same_array_extent(None,
+None)` is always true; `size: Some(_)` appears nowhere outside this crate's own tests. The check is
+kept because the descriptor admits a bound and comparing it is the correct rule, but it guards a
+contract rather than a reachable fault — worth stating plainly, since the previous round described
+it as fixing collapsed overloads.
+
+Two pre-existing lowering faults were reproduced in this round, and they were handled differently
+because their measured cost differs. `typedef struct Session *SessionPtr` registered the alias as
+the bare tag without walking the declarator, so every `SessionPtr s` lowered as a struct *value*
+and `s->fd` decomposed against a non-pointer; `7fee472` does the same. It is fixed here: the form
+appears nowhere in the three corpora (zero matches for a one-statement `typedef struct T *A;`), all
+three stay byte-identical, and the fix carries its own test.
+
+The other was left out. An unnamed parameter — `void take(S *)`, the ordinary spelling of a
+prototype — reaches `walk_declarator_shape` as an *abstract* declarator, a kind it has no arm for,
+so the modifiers are dropped and the parameter takes the bare type. `S` against the definition's
+`S *` reads as a different signature, so the prototype splits from its body: the #83 symptom
+reachable from plain C++ with no tag divergence at all, and `7fee472` splits it identically.
+Supplying the three abstract arms fixes the repro (`take` becomes one defined entry, both
+parameters `S *`) and passes 90 of 90 with the workspace suites green, but it renumbers the type
+table on two corpora — `.dump` diffs of 669k and 1.36M lines — while moving the #83 residue probes
+not at all (hdf 0, hiview 17, camera 40, all unchanged) and moving entity counts by ones and twos
+in directions this investigation could not account for (hiview `functions_total` and
+`functions_defined` each −2; camera total +1, defined −1, external +2, overload groups −1). A
+change with no measurable effect on the reported fault, an unexplained effect on entity counts and
+a whole-corpus renumbering behind it needs its own attribution and its own expectation re-capture,
+not a ride on a branch whose case rests on being byte-identical. The same applies to
+`is_parameter_node` not matching `variadic_parameter_declaration`, which drops a C++ parameter pack
+from the parameter list and so makes such a function nullary to the arity check.
+
+With every fix above applied, the eval passes 90 of 90 checks, all three corpora are bit-identical
+across three runs at `--jobs 8` and one at `--jobs 1`, and all three produce output byte-identical
+to the pre-review branch — so none of these faults was reachable on the corpora, and they are
+hardening rather than measured recoveries.
+
 **Second review pass fixes, 2026-09-09 (`--explore`, #59):**
 
 A multi-agent review of the branch confirmed three more issues, each fixed with a
@@ -3581,7 +3948,7 @@ to run, so a small function/edge difference between two runs of the *same*
 binary is noise, not a finding. The probes are `min`/`band` thresholds, so they
 confirm nothing collapsed; they do not pin a number to diff against.
 
-Exit codes: **0** all checks pass (**86 checks**, three of them the revision pins; `master` has
+Exit codes: **0** all checks pass (**90 checks**, three of them the revision pins; `master` has
 missed 14 since #66, see the latest comparison above), **1** some expectation was missed, **2** the run is not
 usable at all and its numbers must not be read — a corpus missing, at the wrong revision
 or dirty (unless `--skip-rev-check` / `--allow-dirty` downgrade it), or `trace analyze`

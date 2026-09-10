@@ -1,5 +1,5 @@
 use crate::Language;
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ pub struct Token {
     pub line: u32,
     pub col: u32,
     /// Macros that must not expand this token again (C11 6.10.3.4 hide set).
-    pub(crate) hidden: Option<Arc<HashSet<String>>>,
+    pub(crate) hidden: Option<Arc<FxHashSet<String>>>,
     /// Whether this token touched the previous one in the token stream:
     /// no whitespace, comment or newline between them. `\`-newline is
     /// deleted in translation phase 2 (C11 5.1.1.2p1), before tokens are
@@ -110,7 +110,7 @@ impl Token {
     /// rather than its definition coordinates.
     #[must_use]
     pub(crate) fn with_macro_hide(&self, origin: &Token, name: &str) -> Token {
-        let mut set = HashSet::new();
+        let mut set = FxHashSet::default();
         if let Some(h) = &origin.hidden {
             set.extend(h.iter().cloned());
         }
@@ -129,7 +129,7 @@ impl Token {
     }
 
     #[must_use]
-    pub(crate) fn union_hidden(left: &Token, right: &Token) -> Option<Arc<HashSet<String>>> {
+    pub(crate) fn union_hidden(left: &Token, right: &Token) -> Option<Arc<FxHashSet<String>>> {
         match (&left.hidden, &right.hidden) {
             (None, None) => None,
             (Some(x), None) | (None, Some(x)) => Some(Arc::clone(x)),

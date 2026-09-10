@@ -1,5 +1,5 @@
 use crate::deps::IncludeGraph;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use trace_preproc::{
@@ -66,7 +66,7 @@ pub struct IndexSourceCache {
 impl IndexSourceCache {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(HashMap::new())),
+            inner: Arc::new(RwLock::new(HashMap::default())),
         }
     }
 
@@ -119,7 +119,7 @@ impl IndexSourceCache {
     /// replaying it.
     pub fn units_that_inlined(&self, units: &HashSet<PathBuf>) -> HashSet<PathBuf> {
         let Ok(guard) = self.inner.read() else {
-            return HashSet::new();
+            return HashSet::default();
         };
         guard
             .iter()
@@ -131,7 +131,10 @@ impl IndexSourceCache {
     /// Drop `path` so the next `get_or_preprocess` runs the preprocessor
     /// again. The warm pass uses it for a header whose language changed
     /// after a macro-spelled include made it reachable from the other
-    /// language's units: the text cached so far was lexed the old way.
+    /// language's units: the text cached so far was lexed the old way. The
+    /// index phase uses it for every unit once that unit is lowered, so the
+    /// live preprocessed text is bounded by the batch in flight rather than
+    /// by the corpus.
     pub fn evict(&self, path: &Path, graph: &IncludeGraph) {
         let canonical = graph.intern_path(path);
         if let Ok(mut guard) = self.inner.write() {
@@ -217,7 +220,7 @@ impl PreprocessedSource {
             line_map: Arc::new(LineMap::new()),
             included_headers: Arc::new(Vec::new()),
             inlined_headers: Arc::new(Vec::new()),
-            replayed_variants: Arc::new(HashMap::new()),
+            replayed_variants: Arc::new(HashMap::default()),
             language: Language::C,
             diagnostics: Vec::new(),
             conditionals: Vec::new(),
@@ -263,7 +266,7 @@ fn read_index_source(
 fn group_variants(
     pairs: impl IntoIterator<Item = (PathBuf, usize)>,
 ) -> HashMap<PathBuf, Vec<usize>> {
-    let mut out: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    let mut out: HashMap<PathBuf, Vec<usize>> = HashMap::default();
     for (path, variant) in pairs {
         let vs = out.entry(path).or_default();
         if !vs.contains(&variant) {

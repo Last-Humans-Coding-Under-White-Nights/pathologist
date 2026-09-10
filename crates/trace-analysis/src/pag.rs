@@ -2,7 +2,7 @@ use crate::constraints::{AbstractLocation, Constraint, ConstraintKind, LocKind};
 use crate::ipc::detect_ipc_pairs;
 use crate::summaries::{Effect, FnModelSet};
 use indexmap::IndexMap;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use trace_ir::{
     FieldId, FlowConstraint, FnId, LocId, PagNodeId, Program, ReturnFlow, StorageClass, VarId,
 };
@@ -42,22 +42,22 @@ pub struct Pag {
     pub nodes: Vec<PagNode>,
     pub constraints: Vec<Constraint>,
     pub locations: Vec<AbstractLocation>,
-    pub var_node: IndexMap<VarId, PagNodeId>,
-    pub loc_node: IndexMap<LocId, PagNodeId>,
-    pub call_targets: IndexMap<trace_ir::CallSiteId, PagNodeId>,
-    pub fn_locations: IndexMap<FnId, LocId>,
-    pub var_location: IndexMap<VarId, LocId>,
+    pub var_node: IndexMap<VarId, PagNodeId, FxBuildHasher>,
+    pub loc_node: IndexMap<LocId, PagNodeId, FxBuildHasher>,
+    pub call_targets: IndexMap<trace_ir::CallSiteId, PagNodeId, FxBuildHasher>,
+    pub fn_locations: IndexMap<FnId, LocId, FxBuildHasher>,
+    pub var_location: IndexMap<VarId, LocId, FxBuildHasher>,
     /// Interned `StringConst` locations keyed by literal contents.
     pub string_locs: FxHashMap<String, LocId>,
     /// Field abstract locations keyed by (parent object location, field id).
-    pub field_loc: IndexMap<(LocId, FieldId), LocId>,
+    pub field_loc: IndexMap<(LocId, FieldId), LocId, FxBuildHasher>,
     /// Nesting depth of each synthesized field location (var-rooted = 0
     /// children start at 1). Bounds recursive `obj->next->next->...`
     /// location synthesis once interprocedural flow reaches chained structs.
     pub field_depth: FxHashMap<LocId, u8>,
     /// Per-(struct type, field) summary location for instance-insensitive field flow.
-    pub field_summary: IndexMap<(trace_ir::TypeId, FieldId), LocId>,
-    pub field_loc_to_summary: IndexMap<LocId, LocId>,
+    pub field_summary: IndexMap<(trace_ir::TypeId, FieldId), LocId, FxBuildHasher>,
+    pub field_loc_to_summary: IndexMap<LocId, LocId, FxBuildHasher>,
     /// Fn locations parked into an array var by `ArrayFnMember` inits
     /// (`{ {.., Fn}, .. }`); reachable through any element field load.
     pub array_fn_members: FxHashMap<VarId, Vec<LocId>>,
