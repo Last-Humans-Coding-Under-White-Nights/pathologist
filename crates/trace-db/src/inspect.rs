@@ -7,6 +7,8 @@ use anyhow::{bail, Result};
 use rusqlite::Connection;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+pub use trace_analysis::LocKind;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// Forward: callees (call graph) / where a value flows to (dataflow).
@@ -25,6 +27,15 @@ impl Direction {
     }
 }
 
+/// Final path component of `path`, accepting either separator.
+///
+/// Both separators everywhere: a database is portable, so a Windows-produced
+/// one is often inspected on Linux. A Unix name holding a backslash renders
+/// short, which is display-only.
+pub fn basename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
 #[derive(Debug, Clone)]
 pub struct FunctionRef {
     pub id: i64,
@@ -37,7 +48,7 @@ pub struct FunctionRef {
 
 impl std::fmt::Display for FunctionRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let base = self.path.rsplit('/').next().unwrap_or(&self.path);
+        let base = basename(&self.path);
         write!(
             f,
             "{} ({}:{}-{}){}",
@@ -47,6 +58,46 @@ impl std::fmt::Display for FunctionRef {
             self.line_end,
             if self.is_defined { "" } else { " [external]" }
         )
+    }
+}
+
+/// Node kind of a `flow_nodes` row, as categorized for value-flow graphs.
+/// Call graphs have no PAG node kinds (their nodes are functions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowNodeKind {
+    Var,
+    Loc,
+    CallTarget,
+    Terminator,
+}
+
+impl FlowNodeKind {
+    fn from_schema_str(s: &str) -> Option<Self> {
+        match s {
+            "var" => Some(Self::Var),
+            "loc" => Some(Self::Loc),
+            "call_target" => Some(Self::CallTarget),
+            "terminator" => Some(Self::Terminator),
+            _ => None,
+        }
+    }
+}
+
+/// Map the schema's `flow_nodes.detail` string for `loc` nodes back to the
+/// abstract-location kind it was exported from (`LocKind`).
+pub fn loc_kind_from_schema_str(s: &str) -> Option<LocKind> {
+    match s {
+        "global" => Some(LocKind::Global),
+        "file_static" => Some(LocKind::FileStatic),
+        "fn_static" => Some(LocKind::FnStatic),
+        "local" => Some(LocKind::Local),
+        "heap" => Some(LocKind::Heap),
+        "field" => Some(LocKind::Field),
+        "field_summary" => Some(LocKind::FieldSummary),
+        "array_summary" => Some(LocKind::ArraySummary),
+        "function" => Some(LocKind::Function),
+        "string_lit" => Some(LocKind::StringLit),
+        _ => None,
     }
 }
 
@@ -70,6 +121,12 @@ pub struct GraphNode {
     pub id: i64,
     pub label: String,
     pub detail: String,
+    /// PAG node kind for value-flow graphs; `None` for call graphs (whose
+    /// nodes are functions, not PAG nodes).
+    pub kind: Option<FlowNodeKind>,
+    /// Abstract-location category for `kind == Some(FlowNodeKind::Loc)`,
+    /// e.g. `Heap` / `Field`; `None` otherwise.
+    pub loc_kind: Option<LocKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +134,36 @@ pub struct GraphEdge {
     pub from: i64,
     pub to: i64,
     pub label: String,
-    pub site: String,
+    /// Call/flow source site attached to the edge (empty when the edge has no
+    /// site, e.g. value-flow edges). Render it with `EdgeSite::display`.
+    pub site: EdgeSite,
+}
+
+/// Call/flow source site attached to a graph edge: full source path plus
+/// 1-based line/col (both 0 when there is no site).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EdgeSite {
+    pub path: String,
+    pub line: i64,
+    pub col: i64,
+}
+
+impl EdgeSite {
+    /// True when the edge has no source site.
+    pub fn is_empty(&self) -> bool {
+        self.path.is_empty()
+    }
+
+    /// The display form used by the renderers: `basename:line` (empty when
+    /// there is no site).
+    pub fn display(&self) -> String {
+        if self.path.is_empty() {
+            String::new()
+        } else {
+            let base = basename(&self.path);
+            format!("{base}:{}", self.line)
+        }
+    }
 }
 
 /// Functions whose `[line_start, line_end]` range contains `line` in files
@@ -119,7 +205,7 @@ pub fn find_functions_at(
     Ok(out)
 }
 
-fn load_function_labels(conn: &Connection) -> Result<FxHashMap<i64, GraphNode>> {
+pub fn load_function_labels(conn: &Connection) -> Result<FxHashMap<i64, GraphNode>> {
     let mut stmt = conn.prepare(
         "SELECT f.id, f.name, p.path, f.line_start, f.is_defined \
          FROM functions f JOIN files p ON p.id = f.file_id",
@@ -130,7 +216,7 @@ fn load_function_labels(conn: &Connection) -> Result<FxHashMap<i64, GraphNode>> 
         let path: String = row.get(2)?;
         let line: i64 = row.get(3)?;
         let defined: i64 = row.get(4)?;
-        let file_name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        let file_name = basename(&path).to_string();
         Ok((
             id,
             GraphNode {
@@ -141,6 +227,8 @@ fn load_function_labels(conn: &Connection) -> Result<FxHashMap<i64, GraphNode>> 
                 } else {
                     format!("{file_name}:{line} [external]")
                 },
+                kind: None,
+                loc_kind: None,
             },
         ))
     })?;
@@ -152,11 +240,11 @@ fn load_function_labels(conn: &Connection) -> Result<FxHashMap<i64, GraphNode>> 
     Ok(map)
 }
 
-type Adjacency = FxHashMap<i64, Vec<(i64, &'static str, String)>>;
+type Adjacency = FxHashMap<i64, Vec<(i64, &'static str, EdgeSite)>>;
 
 fn load_call_adjacency(conn: &Connection, dir: Direction) -> Result<Adjacency> {
     let mut stmt = conn.prepare(
-        "SELECT ce.caller_fn_id, ce.callee_fn_id, ce.resolution, p.path, cs.line \
+        "SELECT ce.caller_fn_id, ce.callee_fn_id, ce.resolution, p.path, cs.line, cs.col \
          FROM call_edges ce \
          LEFT JOIN call_sites cs ON cs.id = ce.call_site_id \
          LEFT JOIN files p ON p.id = cs.file_id",
@@ -167,11 +255,14 @@ fn load_call_adjacency(conn: &Connection, dir: Direction) -> Result<Adjacency> {
         // placeholder location rather than mis-attributing a real call site.
         let path: Option<String> = row.get(3)?;
         let line: Option<i64> = row.get(4)?;
-        let site = match (&path, line) {
-            (Some(p), Some(l)) => {
-                format!("{}:{}", p.rsplit('/').next().unwrap_or(p), l)
-            }
-            _ => "(ipc bridge)".to_string(),
+        let col: Option<i64> = row.get(5)?;
+        let site = match (&path, line, col) {
+            (Some(p), Some(l), Some(c)) => EdgeSite {
+                path: p.clone(),
+                line: l,
+                col: c,
+            },
+            _ => EdgeSite::default(),
         };
         Ok((
             row.get::<_, i64>(0)?,
@@ -236,6 +327,126 @@ pub fn require_call_edge_caller(conn: &Connection) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Filter for `call_edges`, mirroring `trace calls --from/--to/--file`.
+pub struct CallEdgeFilter<'a> {
+    /// Substring/qualified-suffix filter on the caller name.
+    pub from: Option<&'a str>,
+    /// Substring/qualified-suffix filter on the callee name.
+    pub to: Option<&'a str>,
+    /// File-substring filter matching the call-site path, the callee path, or
+    /// (for site-less edges) the caller's own path.
+    pub file: Option<&'a str>,
+    /// Exclude edges where caller or callee is in a dependency root.
+    pub exclude_deps: bool,
+}
+
+/// One call edge row, including the caller's own source path (needed for
+/// displaying synthetic IPC-bridge edges, which carry no call site).
+pub struct CallEdgeRef {
+    pub caller_id: i64,
+    pub caller_name: String,
+    pub caller_path: String,
+    /// Call-site source path; `None` for synthetic (IPC bridge) edges.
+    pub call_site_path: Option<String>,
+    /// 1-based call-site line; `None` for synthetic edges.
+    pub call_site_line: Option<i64>,
+    /// 1-based call-site column; `None` for synthetic edges.
+    pub call_site_col: Option<i64>,
+    pub callee_name: String,
+    pub callee_path: String,
+    pub resolution: String,
+}
+
+/// All call edges (including synthetic IPC bridge edges) filtered per
+/// [`CallEdgeFilter`]. Real call sites sort first; synthetic edges have no
+/// source site so they sort after.
+pub fn call_edges(conn: &Connection, filter: &CallEdgeFilter<'_>) -> Result<Vec<CallEdgeRef>> {
+    require_call_edge_caller(conn)?;
+    let mut sql = String::from(
+        "SELECT caller.id, caller.name, caller_f.path, csf.path, cs.line, cs.col, callee.name, \
+                 callee_f.path, ce.resolution \
+                 FROM call_edges ce \
+                 LEFT JOIN call_sites cs ON cs.id = ce.call_site_id \
+                 LEFT JOIN files csf ON csf.id = cs.file_id \
+                 JOIN functions caller ON caller.id = ce.caller_fn_id \
+                 JOIN files caller_f ON caller_f.id = caller.file_id \
+                 JOIN functions callee ON callee.id = ce.callee_fn_id \
+                 JOIN files callee_f ON callee_f.id = callee.file_id WHERE 1=1",
+    );
+    let mut params: Vec<String> = Vec::new();
+    if filter.exclude_deps {
+        if !column_exists(conn, "functions", "is_dep")? {
+            bail!(
+                "`functions.is_dep` missing: database predates dependency-root export; \
+                 re-run `trace analyze` with this binary"
+            );
+        }
+        sql.push_str(" AND caller.is_dep = 0 AND callee.is_dep = 0");
+    }
+    if let Some(f) = filter.from {
+        push_fn_name_filter(&mut sql, &mut params, "caller.name", f);
+    }
+    if let Some(t) = filter.to {
+        push_fn_name_filter(&mut sql, &mut params, "callee.name", t);
+    }
+    if let Some(p) = filter.file {
+        params.push(format!("%{}%", like_escape(p)));
+        let n = params.len();
+        sql.push_str(&format!(
+            " AND (csf.path LIKE ?{n} ESCAPE '!' OR callee_f.path LIKE ?{n} ESCAPE '!' OR \
+             (ce.call_site_id IS NULL AND caller_f.path LIKE ?{n} ESCAPE '!'))"
+        ));
+    }
+    // Sort real call sites first; synthetic (IPC bridge) edges have a NULL
+    // path/line so SQLite would otherwise sort them to the top.
+    sql.push_str(" ORDER BY CASE WHEN csf.path IS NULL THEN 1 ELSE 0 END, csf.path, cs.line");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        let line: Option<i64> = row.get(4)?;
+        let col: Option<i64> = row.get(5)?;
+        Ok(CallEdgeRef {
+            caller_id: row.get(0)?,
+            caller_name: row.get(1)?,
+            caller_path: row.get(2)?,
+            call_site_path: row.get(3)?,
+            call_site_line: line,
+            call_site_col: col,
+            callee_name: row.get(6)?,
+            callee_path: row.get(7)?,
+            resolution: row.get(8)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Exact name or C++ qualified suffix (`Foo::Bar` matches `--from Bar`).
+/// User text is escaped so SQLite `LIKE` wildcards `_` / `%` are literal.
+fn push_fn_name_filter(sql: &mut String, params: &mut Vec<String>, column: &str, name: &str) {
+    params.push(name.to_string());
+    let eq = params.len();
+    params.push(format!("%::{}", like_escape(name)));
+    let like = params.len();
+    params.push(format!("::{name}"));
+    let suffix = params.len();
+    sql.push_str(&format!(
+        " AND ({column} = ?{eq} OR ({column} LIKE ?{like} ESCAPE '!' AND SUBSTR({column}, -LENGTH(?{suffix})) = ?{suffix}))"
+    ));
+}
+
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '!' | '%' | '_' => {
+                out.push('!');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn require_flow_tables(conn: &Connection) -> Result<()> {
@@ -308,11 +519,271 @@ pub fn call_graph(
             }
         }
     }
-    // Collapse exact duplicates (same pair, same annotation).
-    graph
-        .edges
-        .dedup_by(|a, b| a.from == b.from && a.to == b.to && a.site == b.site);
+    // Collapse exact duplicates (same pair, same annotation, same exact
+    // source site). The site is compared on the full path/line/col — not the
+    // `basename:line` display form — or two calls on one line (different
+    // columns) or same-basename files in different directories would collapse
+    // into a single distinct edge.
+    graph.edges.dedup_by(|a, b| {
+        a.from == b.from && a.to == b.to && a.label == b.label && a.site == b.site
+    });
     Ok(graph)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallChainEdge {
+    pub caller_id: i64,
+    pub callee_id: i64,
+    pub resolution: String,
+    pub site: EdgeSite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallChain {
+    pub nodes: Vec<i64>,
+    pub edges: Vec<CallChainEdge>,
+}
+
+impl CallChain {
+    pub fn depth(&self) -> usize {
+        self.edges.len()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct CallChainsResult {
+    pub chains: Vec<CallChain>,
+    pub truncated: bool,
+}
+
+impl CallChainsResult {
+    pub fn to_query_graph(&self, conn: &Connection) -> Result<QueryGraph> {
+        let labels = load_function_labels(conn)?;
+        Ok(self.to_query_graph_with_labels(&labels))
+    }
+
+    pub fn to_query_graph_with_labels(&self, labels: &FxHashMap<i64, GraphNode>) -> QueryGraph {
+        let mut graph = QueryGraph {
+            truncated: self.truncated,
+            ..Default::default()
+        };
+
+        let mut node_min_depth: FxHashMap<i64, u32> = FxHashMap::default();
+
+        for chain in &self.chains {
+            for (d, &node_id) in chain.nodes.iter().enumerate() {
+                if let Some(lbl) = labels.get(&node_id) {
+                    graph.nodes.insert(node_id, lbl.clone());
+                }
+                let entry = node_min_depth.entry(node_id).or_insert(d as u32);
+                if (d as u32) < *entry {
+                    *entry = d as u32;
+                }
+            }
+            for edge in &chain.edges {
+                graph.edges.push(GraphEdge {
+                    from: edge.caller_id,
+                    to: edge.callee_id,
+                    label: edge.resolution.clone(),
+                    site: edge.site.clone(),
+                });
+            }
+        }
+
+        graph.edges.sort_by(|a, b| {
+            (
+                a.from,
+                a.to,
+                &a.label,
+                &a.site.path,
+                a.site.line,
+                a.site.col,
+            )
+                .cmp(&(
+                    b.from,
+                    b.to,
+                    &b.label,
+                    &b.site.path,
+                    b.site.line,
+                    b.site.col,
+                ))
+        });
+        graph.edges.dedup_by(|a, b| {
+            a.from == b.from && a.to == b.to && a.label == b.label && a.site == b.site
+        });
+
+        let mut ordered_nodes: Vec<(i64, u32)> = node_min_depth.into_iter().collect();
+        ordered_nodes.sort_by_key(|&(id, d)| (d, id));
+        graph.order = ordered_nodes;
+
+        graph
+    }
+}
+
+/// Find all simple call chains (paths) from `from_fn_id` to `to_fn_id` with length <= `max_depth`.
+/// `dir` selects traversal direction: `Down` follows callers -> callees, `Up` follows callees -> callers.
+pub fn call_chains(
+    conn: &Connection,
+    from_fn_id: i64,
+    to_fn_id: i64,
+    dir: Direction,
+    max_depth: u32,
+    limit: Option<usize>,
+) -> Result<CallChainsResult> {
+    require_call_edge_caller(conn)?;
+    let labels = load_function_labels(conn)?;
+    if !labels.contains_key(&from_fn_id) {
+        bail!("start function id {from_fn_id} not found in database");
+    }
+    if !labels.contains_key(&to_fn_id) {
+        bail!("target function id {to_fn_id} not found in database");
+    }
+    if max_depth == 0 {
+        if from_fn_id == to_fn_id {
+            return Ok(CallChainsResult {
+                chains: vec![CallChain {
+                    nodes: vec![from_fn_id],
+                    edges: vec![],
+                }],
+                truncated: false,
+            });
+        }
+        bail!("depth must be >= 1");
+    }
+
+    let mut adj = load_call_adjacency(conn, dir)?;
+    for list in adj.values_mut() {
+        list.sort_by(|a, b| {
+            (a.0, a.1, &a.2.path, a.2.line, a.2.col).cmp(&(b.0, b.1, &b.2.path, b.2.line, b.2.col))
+        });
+        list.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+    }
+
+    let max_chains = match limit {
+        Some(0) | None => usize::MAX,
+        Some(lim) => lim,
+    };
+
+    let mut chains = Vec::new();
+    let mut truncated = false;
+
+    if from_fn_id == to_fn_id {
+        chains.push(CallChain {
+            nodes: vec![from_fn_id],
+            edges: vec![],
+        });
+    }
+
+    let mut current_nodes = vec![from_fn_id];
+    let mut current_edges = Vec::new();
+    let mut active_nodes = FxHashSet::default();
+    active_nodes.insert(from_fn_id);
+
+    #[allow(clippy::too_many_arguments)]
+    fn dfs(
+        u: i64,
+        target: i64,
+        dir: Direction,
+        depth: u32,
+        max_depth: u32,
+        adj: &Adjacency,
+        current_nodes: &mut Vec<i64>,
+        current_edges: &mut Vec<CallChainEdge>,
+        active_nodes: &mut FxHashSet<i64>,
+        chains: &mut Vec<CallChain>,
+        truncated: &mut bool,
+        max_chains: usize,
+    ) {
+        if *truncated {
+            return;
+        }
+        if depth >= max_depth {
+            return;
+        }
+        if let Some(neighbors) = adj.get(&u) {
+            for (v, resolution, site) in neighbors {
+                let (caller_id, callee_id) = match dir {
+                    Direction::Down => (u, *v),
+                    Direction::Up => (*v, u),
+                };
+                let edge = CallChainEdge {
+                    caller_id,
+                    callee_id,
+                    resolution: (*resolution).to_string(),
+                    site: site.clone(),
+                };
+
+                if *v == target {
+                    if chains.len() >= max_chains {
+                        *truncated = true;
+                        return;
+                    }
+                    let mut path_nodes = current_nodes.clone();
+                    path_nodes.push(*v);
+                    let mut path_edges = current_edges.clone();
+                    path_edges.push(edge.clone());
+                    chains.push(CallChain {
+                        nodes: path_nodes,
+                        edges: path_edges,
+                    });
+                    continue;
+                }
+
+                if !active_nodes.contains(v) {
+                    active_nodes.insert(*v);
+                    current_nodes.push(*v);
+                    current_edges.push(edge);
+
+                    dfs(
+                        *v,
+                        target,
+                        dir,
+                        depth + 1,
+                        max_depth,
+                        adj,
+                        current_nodes,
+                        current_edges,
+                        active_nodes,
+                        chains,
+                        truncated,
+                        max_chains,
+                    );
+
+                    current_edges.pop();
+                    current_nodes.pop();
+                    active_nodes.remove(v);
+
+                    if *truncated {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    dfs(
+        from_fn_id,
+        to_fn_id,
+        dir,
+        0,
+        max_depth,
+        &adj,
+        &mut current_nodes,
+        &mut current_edges,
+        &mut active_nodes,
+        &mut chains,
+        &mut truncated,
+        max_chains,
+    );
+
+    chains.sort_by(|a, b| {
+        a.edges
+            .len()
+            .cmp(&b.edges.len())
+            .then_with(|| a.nodes.cmp(&b.nodes))
+    });
+
+    Ok(CallChainsResult { chains, truncated })
 }
 
 #[derive(Debug, Clone)]
@@ -332,7 +803,7 @@ impl std::fmt::Display for SymbolRef {
         if let Some(fn_name) = &self.fn_name {
             write!(f, " in {fn_name}")?;
         }
-        let base = self.path.rsplit('/').next().unwrap_or(&self.path);
+        let base = basename(&self.path);
         write!(f, " {base}:{}:{}", self.line, self.col)
     }
 }
@@ -515,10 +986,10 @@ pub fn dataflow_graph(
             };
             fwd.entry(src)
                 .or_default()
-                .push((dst, kind_static, String::new()));
+                .push((dst, kind_static, EdgeSite::default()));
             rev.entry(dst)
                 .or_default()
-                .push((src, kind_static, String::new()));
+                .push((src, kind_static, EdgeSite::default()));
         }
     }
 
@@ -531,6 +1002,7 @@ pub fn dataflow_graph(
             let kind: String = row.get(1)?;
             let label: String = row.get(2)?;
             let detail: String = row.get(3)?;
+            let kind_enum = FlowNodeKind::from_schema_str(&kind);
             let tag = match kind.as_str() {
                 "loc" => "loc",
                 "call_target" => "target",
@@ -542,12 +1014,18 @@ pub fn dataflow_graph(
             } else {
                 format!("{tag}:{label}")
             };
+            let loc_kind = match kind_enum {
+                Some(FlowNodeKind::Loc) => loc_kind_from_schema_str(&detail),
+                _ => None,
+            };
             Ok((
                 id,
                 GraphNode {
                     id,
                     label: shown,
                     detail,
+                    kind: kind_enum,
+                    loc_kind,
                 },
             ))
         })?;
@@ -584,6 +1062,8 @@ pub fn dataflow_graph(
                     id,
                     label: format!("node{id}"),
                     detail: String::new(),
+                    kind: None,
+                    loc_kind: None,
                 },
             );
         }
@@ -604,7 +1084,7 @@ pub fn dataflow_graph(
                     from: id,
                     to: *to,
                     label: (*kind).to_string(),
-                    site: String::new(),
+                    site: EdgeSite::default(),
                 });
                 if visited.insert(*to) {
                     queue.push_back(Entry {
@@ -668,6 +1148,111 @@ fn nearest_functions(
         .map_err(Into::into)
 }
 
+/// Functions whose name equals `name` or ends with `::name` (C++ qualified method),
+/// optionally filtering by file path substring. Definitions rank before prototypes,
+/// narrower ranges before wider ones.
+pub fn find_functions_by_name(
+    conn: &Connection,
+    name: &str,
+    file_substring: Option<&str>,
+) -> Result<Vec<FunctionRef>> {
+    if name.is_empty() {
+        bail!("function name filter must not be empty");
+    }
+    let mut sql = String::from(
+        "SELECT f.id, f.name, p.path, f.line_start, f.line_end, f.is_defined \
+         FROM functions f JOIN files p ON p.id = f.file_id \
+         WHERE (f.name = ?1 OR (f.name LIKE ?2 ESCAPE '!' AND SUBSTR(f.name, -LENGTH(?3)) = ?3))",
+    );
+    let mut params = vec![
+        name.to_string(),
+        format!("%::{}", like_escape(name)),
+        format!("::{name}"),
+    ];
+    if let Some(fs) = file_substring {
+        params.push(format!("%{}%", like_escape(fs)));
+        let idx = params.len();
+        sql.push_str(&format!(" AND p.path LIKE ?{idx} ESCAPE '!'"));
+    }
+    sql.push_str(" ORDER BY f.is_defined DESC, (f.line_end - f.line_start) ASC, f.name ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok(FunctionRef {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            path: row.get(2)?,
+            line_start: row.get(3)?,
+            line_end: row.get(4)?,
+            is_defined: row.get::<_, i64>(5)? != 0,
+        })
+    })?;
+    let cands: Vec<FunctionRef> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let cands = cands
+        .into_iter()
+        .filter(|f| f.name == name || f.name.ends_with(&format!("::{name}")))
+        .collect();
+    Ok(cands)
+}
+
+/// Look up a function by name (or qualified suffix) and optional file substring.
+/// Returns the single match or the single defined match. Bails with candidate
+/// list if ambiguous.
+pub fn require_function_by_name(
+    conn: &Connection,
+    name: &str,
+    file_substring: Option<&str>,
+) -> Result<FunctionRef> {
+    let cands = find_functions_by_name(conn, name, file_substring)?;
+    if cands.is_empty() {
+        if let Some(fs) = file_substring {
+            bail!("no function matching '{name}' found in files containing '{fs}'");
+        } else {
+            bail!("no function matching '{name}' found in database");
+        }
+    }
+    let defined_count = cands.iter().filter(|c| c.is_defined).count();
+    if cands.len() == 1 || defined_count == 1 {
+        if let Some(def) = cands.iter().find(|c| c.is_defined) {
+            return Ok(def.clone());
+        }
+        return Ok(cands[0].clone());
+    }
+    let descriptions: Vec<String> = cands.iter().map(|f| f.to_string()).collect();
+    bail!(
+        "multiple functions match '{name}':\n  {}\nDisambiguate with file substring or file:line",
+        descriptions.join("\n  ")
+    );
+}
+
+/// Flexible function resolution supporting:
+/// - `line` + `file` -> `require_function_at`
+/// - `name` containing `file:line` (e.g. `main.c:10`) -> `require_function_at`
+/// - `name` -> `require_function_by_name` (with optional `file` filter)
+pub fn resolve_function_target(
+    conn: &Connection,
+    name: Option<&str>,
+    file: Option<&str>,
+    line: Option<i64>,
+) -> Result<FunctionRef> {
+    if let Some(l) = line {
+        let f = file.ok_or_else(|| anyhow::anyhow!("line specified without file"))?;
+        require_function_at(conn, f, l)
+    } else if let Some(n) = name {
+        if let Some((f, l_str)) = n.rsplit_once(':') {
+            if let Ok(l) = l_str.parse::<i64>() {
+                if !f.is_empty() {
+                    return require_function_at(conn, f, l);
+                }
+            }
+        }
+        require_function_by_name(conn, n, file)
+    } else if let Some(f) = file {
+        bail!("file specified without line or function name: '{f}'");
+    } else {
+        bail!("must specify function name or file and line");
+    }
+}
+
 /// Resolve position → best symbol, with a helpful error when nothing matches.
 pub fn require_symbols_at(
     conn: &Connection,
@@ -685,12 +1270,12 @@ pub fn require_symbols_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::SCHEMA_V3;
+    use crate::schema::SCHEMA_V4;
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
         // files: 1 = /proj/main.c
         conn.execute(
             "INSERT INTO files (id, path, sha256) VALUES (1, '/proj/main.c', '')",
@@ -808,13 +1393,17 @@ mod tests {
         let g = call_graph(&conn, 10, Direction::Down, 5).unwrap();
         assert_eq!(g.order.len(), 3);
         assert!(!g.truncated);
-        // Edge annotations carry resolution + call site.
+        // Edge annotations carry resolution + the exact source site (display
+        // form, full path, and the 1-based line/col).
         let e = format!("{:?}", g.edges);
         assert!(
             g.edges.iter().any(|e| e.from == 10
                 && e.to == 11
                 && e.label == "direct"
-                && e.site == "main.c:15"),
+                && e.site.display() == "main.c:15"
+                && e.site.path == "/proj/main.c"
+                && e.site.line == 15
+                && e.site.col == 5),
             "edges: {e}"
         );
     }
@@ -1077,5 +1666,157 @@ mod tests {
         assert!(Direction::parse("down").is_ok());
         assert!(Direction::parse("up").is_ok());
         assert!(Direction::parse("sideways").is_err());
+    }
+
+    #[test]
+    fn callgraph_filter_prunes_after_bfs() {
+        // Mirror the CLI flow: BFS then display-only filter.
+        let conn = test_conn();
+        let filter = crate::CallGraphFilter::from_json(r#"{ "functions": ["helper"] }"#).unwrap();
+        let mut g = call_graph(&conn, 10, Direction::Down, 5).unwrap();
+        assert_eq!(g.order.len(), 3, "full BFS reaches main, helper, proto");
+
+        crate::filter_query_graph(&mut g, &filter);
+
+        let names: Vec<&str> = g
+            .order
+            .iter()
+            .map(|&(id, _)| g.nodes[&id].label.as_str())
+            .collect();
+        // main--helper edge survives (helper matches); helper->proto survives
+        // (helper matches); proto is left of *both* its edges' matching side
+        // only via helper, and stays because the helper->proto edge is kept.
+        assert_eq!(names, vec!["main", "helper", "proto"], "names: {names:?}");
+        assert!(g.nodes.contains_key(&10));
+        assert!(g.nodes.contains_key(&11));
+        assert!(g.nodes.contains_key(&12));
+    }
+
+    #[test]
+    fn call_chains_basic() {
+        let conn = test_conn();
+        // Depth 1 from main to proto (down): no chains
+        let r1 = call_chains(&conn, 10, 12, Direction::Down, 1, None).unwrap();
+        assert!(r1.chains.is_empty());
+
+        // Depth 2 from main to proto (down): main -> helper -> proto
+        let r2 = call_chains(&conn, 10, 12, Direction::Down, 2, None).unwrap();
+        assert_eq!(r2.chains.len(), 1);
+        assert_eq!(r2.chains[0].nodes, vec![10, 11, 12]);
+        assert_eq!(r2.chains[0].edges.len(), 2);
+        assert_eq!(r2.chains[0].edges[0].caller_id, 10);
+        assert_eq!(r2.chains[0].edges[0].callee_id, 11);
+        assert_eq!(r2.chains[0].edges[0].site.line, 15);
+        assert_eq!(r2.chains[0].edges[1].caller_id, 11);
+        assert_eq!(r2.chains[0].edges[1].callee_id, 12);
+        assert_eq!(r2.chains[0].edges[1].site.line, 23);
+
+        // Convert to query graph
+        let qg = r2.to_query_graph(&conn).unwrap();
+        assert_eq!(qg.nodes.len(), 3);
+        assert_eq!(qg.edges.len(), 2);
+
+        // Depth 2 from proto to main (up): proto <- helper <- main
+        let r_up = call_chains(&conn, 12, 10, Direction::Up, 2, None).unwrap();
+        assert_eq!(r_up.chains.len(), 1);
+        assert_eq!(r_up.chains[0].nodes, vec![12, 11, 10]);
+        assert_eq!(r_up.chains[0].edges.len(), 2);
+        // edges still record true caller and callee
+        assert_eq!(r_up.chains[0].edges[0].caller_id, 11);
+        assert_eq!(r_up.chains[0].edges[0].callee_id, 12);
+        assert_eq!(r_up.chains[0].edges[1].caller_id, 10);
+        assert_eq!(r_up.chains[0].edges[1].callee_id, 11);
+    }
+
+    #[test]
+    fn function_by_name_and_target_resolution() {
+        let conn = test_conn();
+        let main_fn = require_function_by_name(&conn, "main", None).unwrap();
+        assert_eq!(main_fn.id, 10);
+        assert_eq!(main_fn.name, "main");
+
+        // resolve by name
+        let target = resolve_function_target(&conn, Some("helper"), None, None).unwrap();
+        assert_eq!(target.id, 11);
+
+        // resolve by file:line string
+        let by_pos = resolve_function_target(&conn, Some("main.c:15"), None, None).unwrap();
+        assert_eq!(by_pos.id, 10);
+
+        // resolve by explicit file and line
+        let by_file_line = resolve_function_target(&conn, None, Some("main.c"), Some(23)).unwrap();
+        assert_eq!(by_file_line.id, 11);
+    }
+
+    #[test]
+    fn call_chains_truncation_only_when_additional_path_exists() {
+        let conn = test_conn();
+        // In test_conn, only 1 path exists: 10 -> 11 -> 12.
+        // With limit 1, it should NOT be marked as truncated.
+        let r_single = call_chains(&conn, 10, 12, Direction::Down, 2, Some(1)).unwrap();
+        assert_eq!(r_single.chains.len(), 1);
+        assert!(
+            !r_single.truncated,
+            "single existing path with limit 1 must not be truncated"
+        );
+
+        // Now add a second path: 10 -> 12 directly
+        conn.execute(
+            "INSERT INTO call_sites (id, caller_fn_id, file_id, line, col, callee_text, is_direct) VALUES (102, 10, 1, 18, 5, 'proto', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO call_edges (id, call_site_id, caller_fn_id, callee_fn_id, resolution) VALUES (202, 102, 10, 12, 'direct')",
+            [],
+        )
+        .unwrap();
+
+        // With 2 paths existing and limit 1, it MUST be marked as truncated
+        let r_multi = call_chains(&conn, 10, 12, Direction::Down, 2, Some(1)).unwrap();
+        assert_eq!(r_multi.chains.len(), 1);
+        assert!(
+            r_multi.truncated,
+            "two existing paths with limit 1 must be marked truncated"
+        );
+
+        // With limit 2 (all paths returned), it should NOT be truncated
+        let r_all = call_chains(&conn, 10, 12, Direction::Down, 2, Some(2)).unwrap();
+        assert_eq!(r_all.chains.len(), 2);
+        assert!(
+            !r_all.truncated,
+            "all existing paths returned must not be truncated"
+        );
+    }
+
+    #[test]
+    fn function_by_name_case_sensitive_cpp_suffix() {
+        let conn = test_conn();
+        // Insert functions with different casing: run vs ns::Run vs ns::run
+        for (id, name) in [(50, "run"), (51, "ns::Run"), (52, "ns::run")] {
+            conn.execute(
+                "INSERT INTO functions (id, name, file_id, line_start, line_end, linkage, signature, is_defined) \
+                 VALUES (?1, ?2, 1, 100, 110, 'external', 'fn', 1)",
+                rusqlite::params![id, name],
+            )
+            .unwrap();
+        }
+
+        // Searching for "run" must match "run" and "ns::run", but NOT "ns::Run"
+        let matches_lower = find_functions_by_name(&conn, "run", None).unwrap();
+        let names_lower: Vec<&str> = matches_lower.iter().map(|f| f.name.as_str()).collect();
+        assert!(names_lower.contains(&"run"));
+        assert!(names_lower.contains(&"ns::run"));
+        assert!(
+            !names_lower.contains(&"ns::Run"),
+            "--from run must not select ns::Run"
+        );
+
+        // Searching for "Run" must match "ns::Run", but NOT "run" or "ns::run"
+        let matches_upper = find_functions_by_name(&conn, "Run", None).unwrap();
+        let names_upper: Vec<&str> = matches_upper.iter().map(|f| f.name.as_str()).collect();
+        assert!(names_upper.contains(&"ns::Run"));
+        assert!(!names_upper.contains(&"run"));
+        assert!(!names_upper.contains(&"ns::run"));
     }
 }

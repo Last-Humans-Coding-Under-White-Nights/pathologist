@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -21,6 +21,7 @@ impl Language {
     /// everything else, including the language-ambiguous `.h`, is C. This
     /// is the one place that decides; the indexer's discovery and grammar
     /// choice derive from it.
+    #[must_use]
     pub fn from_path(path: &Path) -> Self {
         match path.extension().and_then(|e| e.to_str()) {
             Some(
@@ -40,11 +41,207 @@ impl Language {
 /// first unit's tokenization replayed into the other.
 pub type ExpansionKey = (PathBuf, Language);
 
+/// What a cached expansion read from the macro environment that produced it.
+///
+/// [`ExpansionKey`] says *which* file was expanded; this says *when the
+/// result is valid*. A cache entry is a function of the header's text and of
+/// every macro its expansion consulted, so replaying it into a translation
+/// unit whose environment differs in any of those names hands that unit an
+/// expansion of a configuration it does not have (#55).
+///
+/// Three properties this must have, each of which is a way to get it wrong:
+///
+/// - **Undefined is a binding, not an absence.** An identifier read while no
+///   macro defined it belongs in [`Self::undefined`]. It expanded to itself
+///   here, but it may be a macro in another unit, and this entry must not
+///   match there. Recording only names that actually expanded misses exactly
+///   that case.
+/// - **Nested includes contribute upward.** A header's reads include those of
+///   every header it pulls in, or an entry matches while a nested expansion
+///   embedded in its text silently does not.
+/// - **Conditional reads count.** `#if` / `#ifdef` / `defined()` consult the
+///   environment even though they substitute nothing.
+///
+/// A name the expansion defined before reading it is not a dependency: its
+/// binding at that point came from the entry's own `ops`, which every
+/// consumer replays.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MacroFingerprint {
+    /// Embedded text and macro effects require incompatible environments.
+    /// This propagates through enclosing entries even when a local binding
+    /// would otherwise mask the conflicting dependency names.
+    pub incompatible: bool,
+    /// Names read while bound, each with a content hash of the binding (see
+    /// `binding_hash`). Ordered by first read, for stable diagnostics.
+    pub defined: Vec<(Arc<str>, u64)>,
+    /// Names read while unbound.
+    pub undefined: FxHashSet<Arc<str>>,
+}
+
+impl MacroFingerprint {
+    /// Order-independent digest, for deciding whether a variant of this
+    /// expansion is already stored. `defined` is ordered by first read, and
+    /// two runs can reach the same bindings by different routes, so the
+    /// digest must not depend on the order either half was built in.
+    #[must_use]
+    pub fn signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        // XOR of per-entry hashes: commutative, so insertion order drops out.
+        let mut acc = u64::from(self.incompatible);
+        let mut one = |tag: u8, name: &str, hash: u64| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (tag, name, hash).hash(&mut h);
+            acc ^= h.finish();
+        };
+        for (name, hash) in &self.defined {
+            one(0, name, *hash);
+        }
+        for name in &self.undefined {
+            one(1, name, 0);
+        }
+        acc
+    }
+}
+
+/// Raw file contents the caller has already read, keyed by canonical path, so
+/// `#include` expansion can skip the disk.
+///
+/// Carries its own answer to "does any key here name no file on disk?", which
+/// is what lets `include_exists` stop at the memoized `stat` for the common
+/// candidate that resolves nowhere. Derived from the map it is derived for, so
+/// the two cannot fall out of step: a caller cannot install a cache and leave
+/// a stale answer beside it.
+#[derive(Debug, Default)]
+pub struct SourceCache {
+    texts: FxHashMap<PathBuf, Arc<str>>,
+    /// Keys naming no file on disk, computed on first need. Usually empty: a
+    /// cache built by reading files off disk holds none, and only a caller
+    /// that invents a header (tests, and a host embedding the preprocessor)
+    /// puts one here.
+    virtual_keys: std::sync::OnceLock<FxHashSet<PathBuf>>,
+    directory_searches: RwLock<DirectorySearches>,
+}
+
+pub(crate) type DirectoryResults = Arc<RwLock<FxHashMap<(String, bool), Option<PathBuf>>>>;
+
+#[derive(Debug, Default)]
+struct DirectorySearches {
+    epoch: u64,
+    configurations: FxHashMap<SearchPaths, DirectoryResults>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct SearchPaths {
+    quote: Vec<PathBuf>,
+    include: Vec<PathBuf>,
+    system: Vec<PathBuf>,
+}
+
+impl SourceCache {
+    #[must_use]
+    pub fn new(texts: FxHashMap<PathBuf, Arc<str>>) -> Self {
+        Self {
+            texts,
+            virtual_keys: std::sync::OnceLock::new(),
+            directory_searches: RwLock::new(DirectorySearches::default()),
+        }
+    }
+
+    /// The shared directory-search results for `opts`' ordered quote, include
+    /// and system paths, created on first use and dropped with the file-probe
+    /// epoch. Every preprocessing run consults this, so the steady state is a
+    /// hit under a read lock.
+    pub(crate) fn directory_results(&self, opts: &PreprocessOptions) -> DirectoryResults {
+        let epoch = trace_ir::file_probe_epoch();
+        let key = SearchPaths {
+            quote: opts.quote_include_paths.clone(),
+            include: opts.include_paths.clone(),
+            system: opts.system_include_paths.clone(),
+        };
+        if let Ok(searches) = self.directory_searches.read() {
+            if searches.epoch == epoch {
+                if let Some(results) = searches.configurations.get(&key) {
+                    return Arc::clone(results);
+                }
+            }
+        }
+        let mut searches = self
+            .directory_searches
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if searches.epoch != epoch {
+            searches.configurations.clear();
+            searches.epoch = epoch;
+        }
+        Arc::clone(searches.configurations.entry(key).or_default())
+    }
+
+    /// The text stored for `path`, if any.
+    #[must_use]
+    pub fn text(&self, path: &Path) -> Option<&Arc<str>> {
+        self.texts.get(path)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.texts.is_empty()
+    }
+
+    /// Whether `path` is a key of this cache that names no file on disk.
+    ///
+    /// The scan behind it is one memoized `stat` per key and runs at most once
+    /// per cache, on the first candidate the filesystem rejected.
+    #[must_use]
+    pub fn is_virtual(&self, path: &Path) -> bool {
+        self.virtual_keys
+            .get_or_init(|| {
+                self.texts
+                    .keys()
+                    .filter(|p| !trace_ir::is_file_cached(p))
+                    .cloned()
+                    .collect()
+            })
+            .contains(path)
+    }
+}
+
+/// The expansions stored for one [`ExpansionKey`]: one per macro
+/// environment a consumer has actually presented, in insertion order.
+///
+/// Append-only. `splice_cached` resolves a variant to an index under one
+/// read lock and re-reads it under another, which is sound precisely
+/// because nothing is ever removed or reordered: an index, once handed
+/// out, keeps pointing at the same expansion.
+pub type ExpansionVariants = Vec<IncludeExpansion>;
+
+/// Shared, variant-keyed cache of expanded `#include` bodies.
+pub type ExpansionCache = Arc<RwLock<FxHashMap<ExpansionKey, ExpansionVariants>>>;
+
+/// Why a file that a run has already expanded may be skipped when it is
+/// `#include`d again.
+///
+/// There is no third variant, and that is the point: a repeated `#include`
+/// with no reason to skip re-expands, because C says so. Suppressing it
+/// unconditionally silently loses every X-macro table that is included
+/// once per `#define` of its entry macro (#56).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileGuard {
+    /// `#pragma once`, reached with the enclosing conditionals active. It
+    /// holds for the rest of the translation unit no matter what the macro
+    /// table does afterwards — the file said "once", not "once per
+    /// configuration".
+    Once,
+    /// `#ifndef NAME` / `#define NAME` / … / `#endif` around the whole file.
+    /// This suppresses only while `NAME` is defined: `#undef NAME` followed
+    /// by a re-`#include` expands the body again, as it does in cpp.
+    Ifndef(Arc<str>),
+}
+
 /// Cached preprocessed body for a `#include`d file (shared across translation units).
 #[derive(Debug, Clone)]
 pub struct IncludeExpansion {
     pub text: Arc<str>,
-    pub files: Arc<HashSet<PathBuf>>,
+    pub files: Arc<FxHashSet<PathBuf>>,
     /// Diagnostics emitted while producing this expansion, including
     /// diagnostics replayed from nested cached headers. Cache hits append
     /// these to the current preprocessing result in their original order.
@@ -61,19 +258,58 @@ pub struct IncludeExpansion {
     /// cannot represent a no-op `#undef` or an undef-then-redefine of a
     /// name that existed at both capture boundaries.
     pub ops: Arc<Vec<crate::MacroOp>>,
+    /// The macro environment this expansion read (see [`MacroFingerprint`]).
+    /// A consumer may replay this entry only when its own environment binds
+    /// every one of these names the same way.
+    pub deps: Arc<MacroFingerprint>,
+    /// Include guards learned while producing this expansion: this file's
+    /// own, and every file in its `#include` closure. A consumer replays the
+    /// text without ever visiting those files, so without this record it
+    /// cannot tell a later `#include` that a guard already suppresses from
+    /// one that must re-expand (#56).
+    pub guards: Arc<Vec<(PathBuf, FileGuard)>>,
+    /// The variants this expansion itself replayed for the headers it
+    /// brought in. Indexing keeps each header's text file-local, so those
+    /// nested headers contribute no text here and need their own lowered
+    /// units — and a consumer of this entry never visits them, so it cannot
+    /// work out which expansion of each applies. This is that record.
+    pub nested_variants: Arc<Vec<(PathBuf, usize)>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CommandMacro {
+    Define(String, String),
+    Undef(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct PreprocessOptions {
+    /// Explicit compilation database path; otherwise indexing checks the
+    /// analysis root, then its `build` directory.
+    pub compilation_database: Option<PathBuf>,
     pub include_paths: Vec<PathBuf>,
+    /// Quoted includes search these before `include_paths`.
+    pub quote_include_paths: Vec<PathBuf>,
+    /// System directories follow `include_paths`, in supplied order.
+    pub system_include_paths: Vec<PathBuf>,
+    /// Use compiler include semantics, without inferred basename fallback.
+    pub strict_include_search: bool,
+    /// Database macro operations, applied after predefines and before `defines`.
+    pub command_macros: Vec<CommandMacro>,
+    /// Headers processed before the source, in this order.
+    pub forced_includes: Vec<PathBuf>,
+    /// Initial search directory for relative forced includes.
+    pub working_directory: Option<PathBuf>,
     pub defines: indexmap::IndexMap<String, String>,
-    /// Canonical path → raw file contents (skips disk reads during `#include` expansion).
-    pub source_cache: Option<std::sync::Arc<HashMap<PathBuf, std::sync::Arc<str>>>>,
+    /// Raw file contents the caller has already read (skips disk reads during
+    /// `#include` expansion), and the [`SourceCache`] answer that keeps
+    /// `include_exists` off the hash for a candidate that resolves nowhere.
+    pub source_cache: Option<std::sync::Arc<SourceCache>>,
     /// Shared cache of expanded `#include` bodies keyed by canonical path
     /// and lexing language (see [`ExpansionKey`]).
-    pub include_expansion_cache: Option<Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>>>,
+    pub include_expansion_cache: Option<ExpansionCache>,
     /// Basename → project paths for fast include resolution.
-    pub basename_index: Option<Arc<HashMap<String, Vec<PathBuf>>>>,
+    pub basename_index: Option<Arc<FxHashMap<String, Vec<PathBuf>>>>,
     /// Shared macro table populated during header warm-up; inherited by translation units.
     pub shared_macros: Option<crate::SharedMacroTable>,
     /// When true, `#define` / `#undef` update [`Self::shared_macros`].
@@ -101,12 +337,53 @@ pub struct PreprocessOptions {
     /// lexed as. `None` derives it from the TU path via
     /// [`Language::from_path`].
     pub language: Option<Language>,
+    /// How many expansions of one header the cache may hold (see
+    /// [`ExpansionVariants`]).
+    ///
+    /// This bounds storage, not correctness. A header that needs more
+    /// environments than this simply stops publishing new ones; a consumer
+    /// that finds no match expands the header into its own text, which is
+    /// what an unseeded cache does anyway. A cache miss is a performance
+    /// event and must never be reported as unexplored configuration.
+    pub max_expansion_variants: usize,
+    /// How many times one path may be brought into a single run — expanded,
+    /// or replayed from the cache — before and apart from
+    /// [`Self::max_include_depth`].
+    ///
+    /// Repeated inclusion of an unguarded file is legitimate — X-macro
+    /// tables depend on it — so depth alone does not bound it: a header
+    /// included by fifty siblings is brought in fifty times at depth two.
+    /// Past this cap the include is skipped and a `preprocess` diagnostic
+    /// is emitted, so a runaway is loud rather than exponential.
+    pub max_file_expansions: usize,
+    /// When true, every conditional chain the run meets is recorded in
+    /// `PreprocessResult::conditionals` (see [`crate::ConditionalChain`]),
+    /// for measuring what the configuration excludes (#57). Off by default:
+    /// indexing does not need it, and a cached header replays its text
+    /// without re-evaluating its conditionals, so the record is complete
+    /// only for a run that expands every include itself.
+    pub record_conditionals: bool,
+    /// Dependency roots whose headers contribute declarations but whose
+    /// sources are excluded from translation unit discovery (#60).
+    pub dep_roots: Vec<PathBuf>,
+    /// When true, explore feasible configuration variants for conditional
+    /// code regions excluded by the default configuration (#59).
+    pub explore: bool,
+    /// Maximum number of configuration variants to explore per translation unit (#59).
+    pub explore_budget: usize,
 }
 
 impl Default for PreprocessOptions {
     fn default() -> Self {
         Self {
+            compilation_database: None,
             include_paths: Vec::new(),
+            quote_include_paths: Vec::new(),
+            system_include_paths: Vec::new(),
+            strict_include_search: false,
+            command_macros: Vec::new(),
+            forced_includes: Vec::new(),
+            working_directory: None,
             defines: indexmap::IndexMap::new(),
             source_cache: None,
             include_expansion_cache: None,
@@ -120,11 +397,31 @@ impl Default for PreprocessOptions {
             max_expanded_tokens: 8_000_000,
             inline_include_bodies: true,
             language: None,
+            max_expansion_variants: 8,
+            max_file_expansions: 64,
+            record_conditionals: false,
+            dep_roots: Vec::new(),
+            explore: false,
+            explore_budget: 4,
         }
     }
 }
 
 impl PreprocessOptions {
+    /// Whether these options configure preprocessing away from the tree
+    /// default, so a file must be preprocessed rather than read as-is.
+    /// Lives here so a new configuration field is considered where it is added.
+    pub fn configures_preprocessing(&self) -> bool {
+        !self.defines.is_empty()
+            || !self.include_paths.is_empty()
+            || !self.command_macros.is_empty()
+            || !self.forced_includes.is_empty()
+            || !self.quote_include_paths.is_empty()
+            || !self.system_include_paths.is_empty()
+            || self.strict_include_search
+    }
+
+    #[must_use]
     pub fn new() -> Self {
         Self {
             track_line_map: true,
@@ -134,71 +431,169 @@ impl PreprocessOptions {
 
     /// Options used for indexing: line-map tracking stays on so lowered
     /// entities can be attributed to their original `#include`d file.
+    #[must_use]
     pub fn for_indexing(mut self) -> Self {
         self.track_line_map = true;
         self
     }
 
-    pub fn with_include_expansion_cache(
-        mut self,
-        cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>>,
-    ) -> Self {
+    #[must_use]
+    pub fn with_include_expansion_cache(mut self, cache: ExpansionCache) -> Self {
         self.include_expansion_cache = Some(cache);
         self
     }
 
-    pub fn with_basename_index(mut self, index: Arc<HashMap<String, Vec<PathBuf>>>) -> Self {
+    #[must_use]
+    pub fn with_basename_index(mut self, index: Arc<FxHashMap<String, Vec<PathBuf>>>) -> Self {
         self.basename_index = Some(index);
         self
     }
 
+    #[must_use]
     pub fn with_shared_macros(mut self, table: crate::SharedMacroTable) -> Self {
         self.shared_macros = Some(table);
         self
     }
 
+    #[must_use]
     pub fn with_accumulate_macros(mut self, accumulate: bool) -> Self {
         self.accumulate_macros = accumulate;
         self
     }
 
+    #[must_use]
     pub fn with_frozen_expansion_cache(mut self, frozen: bool) -> Self {
         self.frozen_expansion_cache = frozen;
         self
     }
 
+    #[must_use]
     pub fn with_include(mut self, path: PathBuf) -> Self {
         self.include_paths.push(path);
         self
     }
 
+    /// Select a compilation database explicitly, instead of discovering one.
+    #[must_use]
+    pub fn with_compilation_database(mut self, path: impl Into<PathBuf>) -> Self {
+        self.compilation_database = Some(path.into());
+        self
+    }
+
+    /// Add a `-iquote` directory, searched only by quoted includes.
+    #[must_use]
+    pub fn with_quote_include(mut self, path: impl Into<PathBuf>) -> Self {
+        self.quote_include_paths.push(path.into());
+        self
+    }
+
+    /// Add a `-isystem` directory, searched after `include_paths`.
+    #[must_use]
+    pub fn with_system_include(mut self, path: impl Into<PathBuf>) -> Self {
+        self.system_include_paths.push(path.into());
+        self
+    }
+
+    /// Use compiler include semantics, without the inferred basename fallback.
+    #[must_use]
+    pub fn with_strict_include_search(mut self, strict: bool) -> Self {
+        self.strict_include_search = strict;
+        self
+    }
+
+    /// Append a command macro operation, applied in order after the predefines
+    /// and before `defines`.
+    #[must_use]
+    pub fn with_command_macro(mut self, op: CommandMacro) -> Self {
+        self.command_macros.push(op);
+        self
+    }
+
+    /// Add a `-include` header, processed before the source in this order.
+    #[must_use]
+    pub fn with_forced_include(mut self, path: impl Into<PathBuf>) -> Self {
+        self.forced_includes.push(path.into());
+        self
+    }
+
+    /// Set the directory relative forced includes search first.
+    #[must_use]
+    pub fn with_working_directory(mut self, path: impl Into<PathBuf>) -> Self {
+        self.working_directory = Some(path.into());
+        self
+    }
+
+    /// Add a dependency root (`--dep`). Pass a canonical path: roots are
+    /// matched against canonical file paths by prefix.
+    #[must_use]
+    pub fn with_dep(mut self, path: impl Into<PathBuf>) -> Self {
+        self.dep_roots.push(path.into());
+        self
+    }
+
+    #[must_use]
     pub fn with_define(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.defines.insert(name.into(), value.into());
         self
     }
 
+    #[must_use]
     pub fn with_max_output_bytes(mut self, n: usize) -> Self {
         self.max_output_bytes = n;
         self
     }
 
+    #[must_use]
     pub fn with_max_include_depth(mut self, n: usize) -> Self {
         self.max_include_depth = n;
         self
     }
 
+    #[must_use]
     pub fn with_max_expanded_tokens(mut self, n: u64) -> Self {
         self.max_expanded_tokens = n;
         self
     }
 
+    #[must_use]
     pub fn with_inline_include_bodies(mut self, inline_bodies: bool) -> Self {
         self.inline_include_bodies = inline_bodies;
         self
     }
 
+    #[must_use]
     pub fn with_language(mut self, language: Language) -> Self {
         self.language = Some(language);
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_expansion_variants(mut self, n: usize) -> Self {
+        self.max_expansion_variants = n;
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_file_expansions(mut self, n: usize) -> Self {
+        self.max_file_expansions = n;
+        self
+    }
+
+    #[must_use]
+    pub fn with_record_conditionals(mut self, record: bool) -> Self {
+        self.record_conditionals = record;
+        self
+    }
+
+    #[must_use]
+    pub fn with_explore(mut self, explore: bool) -> Self {
+        self.explore = explore;
+        self
+    }
+
+    #[must_use]
+    pub fn with_explore_budget(mut self, budget: usize) -> Self {
+        self.explore_budget = budget;
         self
     }
 }

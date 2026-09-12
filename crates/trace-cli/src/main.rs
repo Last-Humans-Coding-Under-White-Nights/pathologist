@@ -1,9 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Instant;
 use trace_analysis::{analyze_with_options, AnalyzeOptions, ResolutionKind};
-use trace_db::{export_to_sqlite, open_db, ExportOptions};
+use trace_db::{basename, export_to_sqlite, open_db, ExportOptions};
 use trace_parse::build_program_with_jobs;
 use trace_preproc::PreprocessOptions;
 
@@ -39,6 +39,10 @@ enum Commands {
         /// Define preprocessor macro NAME or NAME=VALUE (repeatable).
         #[arg(short = 'D')]
         defines: Vec<String>,
+        /// Compilation database path (default: TARGET/compile_commands.json,
+        /// then TARGET/build/compile_commands.json).
+        #[arg(long)]
+        compile_commands: Option<PathBuf>,
         /// Number of parallel jobs for indexing (parse/lower).
         #[arg(long)]
         jobs: Option<usize>,
@@ -57,6 +61,18 @@ enum Commands {
         /// Function-model TOML file (repeatable; overrides built-ins by name).
         #[arg(long = "models")]
         models: Vec<PathBuf>,
+        /// Dependency root: a tree the target builds against but that is not
+        /// under analysis (repeatable). Its headers contribute declarations;
+        /// its sources are never translation units and its bodies contribute
+        /// no call sites or value flow.
+        #[arg(long = "dep")]
+        deps: Vec<PathBuf>,
+        /// Explore feasible configuration variants for conditional code regions (#59).
+        #[arg(long)]
+        explore: bool,
+        /// Maximum number of configuration variants to explore per translation unit (#59).
+        #[arg(long, default_value_t = 4)]
+        explore_budget: usize,
     },
     /// Inspect an existing analysis database.
     Inspect {
@@ -83,6 +99,13 @@ enum InspectCommands {
         /// For a synthetic edge with no call site, match its caller definition file.
         #[arg(long)]
         file: Option<String>,
+        /// JSON config file listing regex patterns for function names to keep.
+        /// An edge is shown when its caller or callee matches any pattern.
+        #[arg(long = "callgraph-filter")]
+        callgraph_filter: Option<PathBuf>,
+        /// Hide edges whose caller or callee comes from a dependency root.
+        #[arg(long = "exclude-deps")]
+        exclude_deps: bool,
     },
     /// Call graph around the function containing FILE:LINE.
     ///
@@ -103,6 +126,10 @@ enum InspectCommands {
         /// Graph output format: `text`, `json`, `graphviz`, or `mermaid`.
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
+        /// JSON config file listing regex patterns for function names to keep.
+        /// Only edges whose caller or callee matches are shown.
+        #[arg(long = "callgraph-filter")]
+        callgraph_filter: Option<PathBuf>,
     },
     /// Value-flow (dataflow) graph for the variable declared at FILE:LINE:COL.
     ///
@@ -128,6 +155,43 @@ enum InspectCommands {
         /// Graph output format: `text`, `json`, `graphviz`, or `mermaid`.
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
+    },
+    /// Call chains (paths) between two functions no longer than depth.
+    #[command(alias = "chains")]
+    Callchain {
+        /// Start function name, C++ qualified suffix, or FILE:LINE (e.g. `main` or `main.c:10`).
+        #[arg(long)]
+        from: Option<String>,
+        /// Target function name, C++ qualified suffix, or FILE:LINE (e.g. `target` or `main.c:20`).
+        #[arg(long)]
+        to: Option<String>,
+        /// File path substring locating the start function.
+        #[arg(long = "from-file")]
+        from_file: Option<String>,
+        /// Line inside the start function.
+        #[arg(long = "from-line")]
+        from_line: Option<i64>,
+        /// File path substring locating the target function.
+        #[arg(long = "to-file")]
+        to_file: Option<String>,
+        /// Line inside the target function.
+        #[arg(long = "to-line")]
+        to_line: Option<i64>,
+        /// Maximum traversal depth (path length in call hops).
+        #[arg(long, default_value_t = 5)]
+        depth: u32,
+        /// Traversal direction: `down` (callees) or `up` (callers).
+        #[arg(long, default_value = "down")]
+        direction: String,
+        /// Maximum number of chains to return (0 for unlimited).
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Graph output format: `text`, `json`, `graphviz`, or `mermaid`.
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+        /// JSON config file listing regex patterns for function names to keep.
+        #[arg(long = "callgraph-filter")]
+        callgraph_filter: Option<PathBuf>,
     },
 }
 
@@ -158,23 +222,31 @@ fn main() -> Result<()> {
             output,
             includes,
             defines,
+            compile_commands,
             jobs,
             timeout_secs,
             debug_points_to,
             full_export,
             models,
+            deps,
             no_ipc,
+            explore,
+            explore_budget,
         } => run_analyze(
             target,
             output,
             includes,
             defines,
+            compile_commands,
             jobs,
             timeout_secs,
             debug_points_to,
             full_export,
             models,
+            deps,
             no_ipc,
+            explore,
+            explore_budget,
         ),
         Commands::Inspect { db, command } => run_inspect(db, command),
     }
@@ -186,12 +258,16 @@ fn run_analyze(
     output: PathBuf,
     includes: Vec<PathBuf>,
     defines: Vec<String>,
+    compile_commands: Option<PathBuf>,
     jobs: Option<usize>,
     timeout_secs: Option<u64>,
     debug_points_to: bool,
     full_export: bool,
     model_files: Vec<PathBuf>,
+    deps: Vec<PathBuf>,
     no_ipc: bool,
+    explore: bool,
+    explore_budget: usize,
 ) -> Result<()> {
     if let Some(secs) = timeout_secs {
         std::thread::spawn(move || {
@@ -228,6 +304,49 @@ fn run_analyze(
         );
     }
     let mut opts = PreprocessOptions::new();
+    // An explicitly named database that is not there is a mistyped flag. Auto
+    // discovery stays silent, but failing here beats returning a plausible
+    // index built from the inferred configuration the flag meant to replace.
+    if let Some(path) = &compile_commands {
+        if !path.is_file() {
+            bail!(
+                "compilation database does not exist or is not a file: {}",
+                path.display()
+            );
+        }
+    }
+    opts.compilation_database = compile_commands;
+    let root_canon = trace_ir::canonicalize(&target);
+    for dep in deps {
+        if !dep.is_dir() {
+            bail!(
+                "dependency root does not exist or is not a directory: {}",
+                dep.display()
+            );
+        }
+        // A dependency root inside the analyzed tree is supported; one that
+        // *contains* it is not. Every discovered source would be classified as
+        // a dependency, leaving no translation units, and the failure would
+        // surface far downstream as "no C/C++ source files found under
+        // <target>" — blaming the tree rather than the flag that emptied it.
+        let dep_canon = trace_ir::canonicalize(&dep);
+        if root_canon.starts_with(&dep_canon) {
+            let relation = if root_canon == dep_canon {
+                "is"
+            } else {
+                "contains"
+            };
+            bail!(
+                "dependency root {} {} the analysis root {}: every source under it would be \
+                 treated as a dependency, leaving nothing to analyze. Pass --dep a subtree \
+                 that excludes the code under analysis, or drop the flag.",
+                dep_canon.display(),
+                relation,
+                root_canon.display()
+            );
+        }
+        opts = opts.with_dep(dep_canon);
+    }
     for inc in includes {
         opts.include_paths.push(inc);
     }
@@ -238,17 +357,24 @@ fn run_analyze(
             opts = opts.with_define(def, "1");
         }
     }
+    opts = opts
+        .with_explore(explore)
+        .with_explore_budget(explore_budget);
 
     // Include paths pointing outside the analyzed tree make twin headers
     // (same basename, different tree) resolve to the wrong copy, which
     // silently starves translation units. Warn loudly — this misconfiguration
     // previously produced silent false negatives.
-    let root_canon = trace_ir::canonicalize(&target);
+    // The C API repeats this check (`outside_root_warning`, trace-capi);
+    // keep the containment predicate in step with it.
+    // A declared dependency root is part of the analysis tree for this
+    // purpose: its headers are meant to be reached from outside `target`.
+    let nests = |a: &PathBuf, b: &PathBuf| a.starts_with(b) || b.starts_with(a);
     let outside: Vec<PathBuf> = opts
         .include_paths
         .iter()
         .map(|p| trace_ir::canonicalize(p))
-        .filter(|c| !(c.starts_with(&root_canon) || root_canon.starts_with(c)))
+        .filter(|c| !nests(c, &root_canon) && !opts.dep_roots.iter().any(|d| nests(c, d)))
         .collect();
     if !outside.is_empty() {
         eprintln!(
@@ -353,91 +479,54 @@ fn run_analyze(
     Ok(())
 }
 
-/// Exact name or C++ qualified suffix (`Foo::Bar` matches `--from Bar`).
-/// User text is escaped so SQLite `LIKE` wildcards `_` / `%` are literal.
-fn push_fn_name_filter(sql: &mut String, params: &mut Vec<String>, column: &str, name: &str) {
-    params.push(name.to_string());
-    let eq = params.len();
-    params.push(format!("%::{}", like_escape(name)));
-    let like = params.len();
-    sql.push_str(&format!(
-        " AND ({column} = ?{eq} OR {column} LIKE ?{like} ESCAPE '!')"
-    ));
-}
-
-fn like_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '!' | '%' | '_' => {
-                out.push('!');
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
     let conn = open_db(&db)?;
     match command {
-        InspectCommands::Calls { from, to, file } => {
-            trace_db::require_call_edge_caller(&conn)?;
-            let mut sql = String::from(
-                "SELECT caller.name, csf.path, cs.line, callee.name, callee_f.path, ce.resolution \
-                 FROM call_edges ce \
-                 LEFT JOIN call_sites cs ON cs.id = ce.call_site_id \
-                 LEFT JOIN files csf ON csf.id = cs.file_id \
-                 JOIN functions caller ON caller.id = ce.caller_fn_id \
-                 JOIN files caller_f ON caller_f.id = caller.file_id \
-                 JOIN functions callee ON callee.id = ce.callee_fn_id \
-                 JOIN files callee_f ON callee_f.id = callee.file_id WHERE 1=1",
-            );
-            let mut params: Vec<String> = Vec::new();
-            if let Some(f) = from.as_deref() {
-                push_fn_name_filter(&mut sql, &mut params, "caller.name", f);
-            }
-            if let Some(t) = to.as_deref() {
-                push_fn_name_filter(&mut sql, &mut params, "callee.name", t);
-            }
-            if let Some(p) = file.as_deref() {
-                params.push(format!("%{}%", like_escape(p)));
-                let n = params.len();
-                sql.push_str(&format!(
-                    " AND (csf.path LIKE ?{n} ESCAPE '!' OR callee_f.path LIKE ?{n} ESCAPE '!' OR (ce.call_site_id IS NULL AND caller_f.path LIKE ?{n} ESCAPE '!'))"
-                ));
-            }
-            // Sort real call sites first; synthetic (IPC bridge) edges have a
-            // NULL path/line so SQLite would otherwise sort them to the top.
-            sql.push_str(
-                " ORDER BY CASE WHEN csf.path IS NULL THEN 1 ELSE 0 END, csf.path, cs.line",
-            );
-            fn basename(p: &str) -> &str {
-                p.rsplit('/').next().unwrap_or(p)
-            }
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                let line: Option<i64> = row.get(2)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    line,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })?;
-            for row in rows {
-                let (caller, cfile, line, callee, efile, res) = row?;
-                match (cfile, line) {
+        InspectCommands::Calls {
+            from,
+            to,
+            file,
+            callgraph_filter,
+            exclude_deps,
+        } => {
+            let edges = trace_db::call_edges(
+                &conn,
+                &trace_db::CallEdgeFilter {
+                    from: from.as_deref(),
+                    to: to.as_deref(),
+                    file: file.as_deref(),
+                    exclude_deps,
+                },
+            )?;
+            let filter = match callgraph_filter {
+                Some(p) => Some(trace_db::CallGraphFilter::from_file(&p)?),
+                None => None,
+            };
+            for e in edges {
+                if let Some(f) = &filter {
+                    if !f.matches(&e.caller_name) && !f.matches(&e.callee_name) {
+                        continue;
+                    }
+                }
+                match (e.call_site_path, e.call_site_line) {
+                    // Real call sites.
                     (Some(cf), Some(l)) => println!(
-                        "{caller} ({}:{l}) -> {callee} [{}] ({res})",
-                        basename(&cf),
-                        basename(&efile)
+                        "{caller} ({basename_of_call_site}:{l}) -> {callee} [{basename_of_callee}] \
+                         ({res})",
+                        basename_of_call_site = basename(&cf),
+                        callee = e.callee_name,
+                        basename_of_callee = basename(&e.callee_path),
+                        res = e.resolution,
+                        caller = e.caller_name,
                     ),
                     // Synthetic IPC bridge edges have no source call site.
-                    _ => println!("{caller} -> {callee} [{}] ({res})", basename(&efile)),
+                    _ => println!(
+                        "{caller} -> {callee} [{basename_of_callee}] ({res})",
+                        callee = e.callee_name,
+                        basename_of_callee = basename(&e.callee_path),
+                        res = e.resolution,
+                        caller = e.caller_name,
+                    ),
                 }
             }
         }
@@ -447,13 +536,18 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             depth,
             direction,
             format,
+            callgraph_filter,
         } => {
             let dir = trace_db::Direction::parse(&direction)?;
             if depth == 0 {
                 anyhow::bail!("depth must be >= 1");
             }
             let start = trace_db::require_function_at(&conn, &file, line)?;
-            let graph = trace_db::call_graph(&conn, start.id, dir, depth)?;
+            let mut graph = trace_db::call_graph(&conn, start.id, dir, depth)?;
+            if let Some(p) = callgraph_filter {
+                let filter = trace_db::CallGraphFilter::from_file(&p)?;
+                trace_db::filter_query_graph(&mut graph, &filter);
+            }
             let dir_word = match dir {
                 trace_db::Direction::Down => "callees",
                 trace_db::Direction::Up => "callers",
@@ -550,6 +644,56 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
                         None => out.push_str(&format!("node{id}")),
                     },
                 );
+            print!("{out}");
+        }
+        InspectCommands::Callchain {
+            from,
+            to,
+            from_file,
+            from_line,
+            to_file,
+            to_line,
+            depth,
+            direction,
+            limit,
+            format,
+            callgraph_filter,
+        } => {
+            let dir = trace_db::Direction::parse(&direction)?;
+            let start = trace_db::resolve_function_target(
+                &conn,
+                from.as_deref(),
+                from_file.as_deref(),
+                from_line,
+            )?;
+            let target = trace_db::resolve_function_target(
+                &conn,
+                to.as_deref(),
+                to_file.as_deref(),
+                to_line,
+            )?;
+            let mut result = trace_db::call_chains(
+                &conn,
+                start.id,
+                target.id,
+                dir,
+                depth,
+                if limit == 0 { None } else { Some(limit) },
+            )?;
+            let labels = trace_db::load_function_labels(&conn)?;
+            if let Some(p) = callgraph_filter {
+                let filter = trace_db::CallGraphFilter::from_file(&p)?;
+                trace_db::filter_call_chains(&mut result, &filter, &labels);
+            }
+            let out = trace_db::render_call_chains(
+                &result,
+                format.to_render(),
+                &start,
+                &target,
+                dir,
+                depth,
+                &labels,
+            );
             print!("{out}");
         }
     }

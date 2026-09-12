@@ -38,6 +38,19 @@ pub fn has_edge(
     })
 }
 
+/// An edge from `caller` to `callee` at any resolution kind.
+pub fn has_any_edge(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    callee: &str,
+) -> bool {
+    analysis
+        .call_edges
+        .iter()
+        .any(|e| fn_name(program, e.caller) == caller && fn_name(program, e.callee) == callee)
+}
+
 pub fn must_not_have_edge(
     program: &Program,
     analysis: &AnalysisResult,

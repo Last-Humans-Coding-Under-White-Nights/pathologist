@@ -506,9 +506,28 @@ C++-aware only where it must be — everything else reuses the C machinery.
   (`plugin_->OnEvent()` inside a method) is looked up as a data member of
   the enclosing class (and bases) when it is not a local/param, so
   `shared_ptr<Plugin>` fields unwrap like parameters.
-- **Smart pointers**: `std::shared_ptr<T>` / `unique_ptr` / `weak_ptr`
-  intern as `Ptr(Struct{T})`, so `p->method` types as `T`. Nested pointer
-  layers (`T &`, `T *`) are peeled for the same reason.
+- **Smart pointers / `operator->`**: a wrapper is recognised by the
+  `operator->` it declares, not by its name (#64). Its instantiation interns
+  as `Struct{sptr<T>}` — the wrapper stays the variable's class, so `sp.Get()`
+  is the wrapper's member — and `p->m()` looks `m` up on what the arrow
+  returns: for a class template, the argument at the declared parameter's
+  position (`Handle<Meta, T>` returning `T *` takes the second); for a named
+  class, that class, followed on through a chain of up to eight links with
+  cycles cut; for a raw pointer, its pointee, which ends the chain. `*sp` is
+  the same pointee. A raw pointer receiver, `this` included, is the built-in
+  arrow. What each `operator->` returns is recorded as an `ArrowReturn` fact
+  merged with a header's types, so a wrapper-typed field declared in a
+  different header from the wrapper resolves too. Where the chain names no
+  class — overloads that disagree, a dependent return the index cannot name
+  (`sptr<T>`, or a parameter of a base template), a cycle — the site is left
+  unresolved: a member invented on the wrapper would be indistinguishable
+  from a real call out of tree. `shared_ptr` / `unique_ptr` / `weak_ptr` keep
+  a name-based fallback to their first argument for the common case that
+  their header is outside the tree and there is no declaration to ask; a
+  guess from a name, not a resolution. Only the terminal member call is
+  emitted — the implicit calls to each `operator->` are not represented —
+  and a reference member holding a wrapper lowers as a pointer and is read
+  as one.
 - **Callables**: only `std::function<Sig>` / `::std::function<Sig>` intern
   as `FnPtr` so assignment and field stores of function addresses
   participate in indirect-call resolution. Other types whose last segment
@@ -721,6 +740,333 @@ Known C++ imprecision (in addition to the general list below):
   missed but never wrongly added).
 
 Next slices (hiview-grounded): [docs/CPP_ROADMAP.md](CPP_ROADMAP.md).
+
+## Dependency roots
+
+A repeatable `--dep <root>` names a tree the target builds against but that is
+not the code under analysis: a vendored SDK, a framework checkout, a sibling
+repository. The distinction it draws is between what a tree **declares** and
+what it **defines**. A dependency's declarations are needed — without the
+class definition behind `sptr<T>`, a receiver spelled `sptr<CaptureSession>`
+has no members to look up — while its definitions are noise: indexing them
+inflates the call graph with edges inside code nobody asked about, and costs
+the time to parse it.
+
+### What is discovered
+
+- **Headers** under a dependency root are discovered and preprocessed like
+  project headers. Each header's own directory joins the include path, as does
+  the root itself, so a rooted spelling (`<subdir/foo.h>`) resolves.
+- **Sources** (`.c`, `.cpp`, `.cc`, `.cxx`) under a dependency root are never
+  translation units, even when the root sits inside the analyzed tree.
+- **Unreached headers** under a dependency root are not indexed as standalone
+  orphan units. A dependency contributes what the target actually includes.
+
+A dependency root nested *inside* the analysis root is supported, as the second
+bullet says. One that contains or equals the analysis root is rejected at
+startup: it would classify every discovered source as a dependency and leave no
+translation units, so `--dep` must name a subtree that excludes the code under
+analysis.
+
+### What a dependency contributes
+
+Types, typedefs, struct/class definitions, inheritance edges, `final` markers,
+prototypes, parameter and return types, and declared `operator->` returns —
+everything a call site needs to type its receiver and name its callee.
+
+A body written in a dependency header contributes nothing beyond its signature.
+Whatever the mode a unit merges under, a function whose span lies in a
+dependency file is stored as a declaration: `is_defined = false`, no body line
+range, no locals (including function-local statics), no call sites, no value-flow
+constraints and no return flows. Lowering stops after the signature, before
+walking the body or constructor-initializer list. Dependency variable declarations
+retain their types but their initializers are not lowered. This prevents assignments
+to parameters or globals from leaking through the merge and avoids allocating body
+IR that would only be discarded. A header's own unit merges as a preamble for the
+same reason. Classification uses the original LineMap file, including cached
+expansions; target headers reached through dependencies retain their bodies.
+
+### Receiver typing through a wrapper
+
+This is what the declarations buy. Given `sptr<T>` declared in a dependency
+header with `T *operator->() const`, the recorded arrow return says the class
+returns a pointer to the template parameter in position 0, so a call site can
+substitute from the instantiation's arguments. `infer_static_class` unwraps
+`sptr<CaptureSession>` to `CaptureSession`, and
+`session->AddOutput(...)` resolves to `CaptureSession::AddOutput` instead of
+falling back to an external edge named after the wrapper (`sptr::AddOutput`),
+which corresponds to no function at all.
+
+### Attribution
+
+`FileInfo::is_dep` is decided once, when a path is interned, and every later
+question is an O(1) file lookup. Export carries it through to `files.is_dep`
+and `functions.is_dep` (schema v4), `analysis_run.options_json` records
+`dep_roots`, and `trace inspect calls --exclude-deps` drops the edges whose
+caller or callee is a dependency function.
+
+## Compilation databases (#62)
+
+Indexing opportunistically reads `compile_commands.json` at the analysis root,
+then `build/compile_commands.json`. `--compile-commands PATH` selects another file;
+the library equivalent is `PreprocessOptions::compilation_database`. The first
+discovered database wins. A `--compile-commands PATH` naming no file is a
+mistyped flag and fails the run; everything else degrades. Invalid JSON, invalid
+entries and unreadable databases produce `compile_commands` diagnostics and fall
+back to inferred configuration for sources with no usable entry. A database is
+never required.
+
+The reader accepts `arguments` or a shell-quoted `command`, preferring `arguments`
+when both exist. Leading compiler launchers (`ccache`, `sccache`, `distcc`,
+`distcc-pump`, `gomacc`, `icecc`, `icerun`, `buildcache`), including chains of
+them, are skipped so the real driver decides the default language. Launcher and
+driver names are matched on the executable stem, case-insensitively and with any
+`.exe` suffix removed, so a database produced on Windows resolves the same way. A
+launcher also matches with a version suffix (`ccache-4.10`); a wrapper merely
+named after one (`ccache-clang++`) is the driver itself and is not skipped.
+Command strings use POSIX quoting with one departure: outside quotes a backslash
+escapes only a quote or a space, so the separators in a Windows path survive
+while `\"` in a define still works. Inside double quotes it also pairs with a
+following backslash, so a value ending in `\\` keeps its backslash instead of
+swallowing the closing quote. No shell, compiler or build command is executed.
+Entry paths are resolved against `directory`; a relative `directory` is resolved
+against the database's directory. Existing sources inside
+the analysis root are eligible, including nonstandard extensions selected by `-x`.
+Sources outside that root or below `--dep` roots are excluded.
+
+Each command contributes ordered `-D`/`-U` operations and `-include` headers.
+For `cl` and `clang-cl` drivers (also `--driver-mode=cl`), the corresponding
+case-sensitive MSVC switches `/I`, `/external:I`, `/D`, `/U`, `/FI`, `/TC`, `/TP`,
+`/Tc`, `/Tp`, and `/std:` are recognized, including attached and separate operands
+where applicable and their `-` spellings. `/TC` and `/TP` apply globally; `/Tc`
+and `/Tp` select the named source. `/link` ends compiler-option parsing. Known
+output-file operands are skipped. C++ standards set `_MSVC_LANG`; `cl` keeps
+`__cplusplus=199711L` unless `/Zc:__cplusplus` enables the standard value.
+MSVC standard options do not introduce `__STRICT_ANSI__`. Compiler-version and
+platform predefines and implicit SDK include paths are not inferred; supply
+needed defines and directories explicitly. This is preprocessing-option support,
+not full compiler emulation. `compile_flags.txt` is not read.
+
+Include directories are canonicalized and deduplicated within each search class
+without changing their order. Source-cache-only headers participate in the same
+search as filesystem headers.
+Quoted includes search the including file's directory, then ordered `-iquote`
+directories, ordered `-I` directories, ordered `-isystem` directories and finally
+the `-idirafter` chain. Angle includes skip the first two classes. A directory
+also marked `-isystem` keeps its system position. Explicit CLI include paths precede database `-I` paths; CLI
+defines override command macros. Configured units do not use inferred include
+directories or basename guessing. Forced includes first search the command's
+working directory and preserve their own source locations; a header they cannot
+find is reported against the source, never against the synthetic search path.
+
+For GCC-style commands, `-std` applies to the whole command, including when it follows the source. MSVC `/std:` does not change the source language; a standard for the other language is ignored.
+`-x` remains positional: only following input files use that language. Target
+flags such as `-xhost` and `-x86-asm-syntax=intel` are ignored as non-language flags.
+Both single- and double-dash `imacros`/`include-pch` spellings are diagnosed as
+unsupported. Attached output flags (`-oFILE`, `-MFFILE`, `-MTTARGET`, `-MQTARGET`)
+are ignored without consuming the next argument.
+
+`-x` at the source argument selects both lexer and tree-sitter grammar; otherwise
+the file extension applies (a `++` driver selects C++). `-std` supports C90 through
+C23 and C++98 through C++26, with GNU dialects and common historical aliases.
+It sets `__STDC_VERSION__` or `__cplusplus`, and `__STRICT_ANSI__` for strict
+dialects. A standard outside that set costs only those macros: the entry keeps
+its include paths and macro operations, since the list ages out as compilers
+gain standards and discarding the command would leave the source with no
+configuration at all. A standard that contradicts the source language still
+skips the entry. Syntax recovery remains the existing parser/preprocessor subset; this
+is not full compiler dialect emulation. Vendor/target builtins, sysroot rewriting,
+response files, PCH files and `-imacros` are not modeled. Response files, PCH,
+`-imacros`, unsupported languages and obsolete `-I-` cause an entry to
+be skipped with a diagnostic; unrelated compilation/output flags are ignored.
+`-idirafter` and `-iwithprefix` append to that last chain, which is searched after
+every `-isystem` directory whatever their argument position; `-iwithprefixbefore`
+joins the `-I` chain instead. `-iprefix` supplies the prefix the two `-iwithprefix`
+forms concatenate, textually and without inserting a separator.
+`arguments` is recommended for databases produced on Windows.
+
+All commands for each source are indexed in database order, independently of
+`--explore` and its budget. Sources without entries use inferred options. When a
+database contributes commands, each configuration expands headers inline with a
+separate source cache and macro environment; raw file contents may be shared.
+The shared header warm-up path remains in use when no usable database commands
+exist. This trades some header parsing time for isolation between explicit
+include configurations. Unreached project headers retain standalone indexing;
+dependency headers contribute declarations only.
+
+The complete set of configured units uses the variant-preserving merge, so a
+shared header's differing bodies survive across both commands for one source and
+commands for different sources. Source IDs, locals, call facts, flow constraints
+and returns are remapped and unioned. Variable identity is scoped to the source
+a unit came from: a file-scope `static` in a shared header is a distinct object
+in every translation unit that includes it, and the configurations of one source
+dedup against each other only. `variants_merged` counts configurations
+beyond the first for each source, including exploratory variants when enabled.
+No SQLite schema change is needed. Global `defines` metadata continues to describe
+user overrides; include paths are the union of observed configuration paths,
+not a replacement for per-command search order.
+
+Regression coverage: `crates/trace-cli/tests/compile_commands_tests.rs` and
+`tests/fixtures/compile_commands/`. Format and search semantics follow the
+[Clang database specification](https://clang.llvm.org/docs/JSONCompilationDatabase.html)
+and [GCC directory options](https://gcc.gnu.org/onlinedocs/gcc/Directory-Options.html).
+
+## Bounded conditional-variant exploration (`--explore`)
+
+A single build-free configuration necessarily omits implementations hidden behind
+conditional compilation arms (`#if`, `#ifdef`, `#elif`) that are excluded by default
+options (#57, #59). Concatenating alternate arms into a single stream would produce
+syntactically and semantically invalid code (redefined variables, mutually exclusive
+headers, broken scopes).
+
+`--explore` (bounded by `--explore-budget <N>`, default 4) recovers excluded platform
+and feature implementations by exploring feasible configuration variants independently:
+
+1. **Candidate define discovery**: In-tree GN files (`BUILD.gn`, `*.gni`, `*.gn`) are
+   scanned for candidate macro definitions (`defines = [...]`, `defines += [...]`)
+   along with their values and confidence ranking (#58).
+   The scan walks the tree in sorted order and breaks equal-confidence ties on the
+   candidate's source path, so the winning value never depends on `read_dir` order.
+   Hidden entries and `target` are excluded using filename bytes; a non-UTF-8
+   directory name does not suppress candidate discovery.
+2. **Semantic feasibility evaluation**: Rather than naive textual inclusion, each
+   conditional chain arm that was skipped during base preprocessing is checked for
+   activation against candidate defines. Expressions like `#if MODE == 1` vs
+   `#elif MODE == 2` or `#ifdef BINDER_CATCHER_ENABLE` are evaluated semantically using
+   `trace_preproc::preprocess_string`, seeded with the run's base defines so a condition
+   such as `#if FOO && !BAR` is judged against the configuration the variant builds on.
+   Synthetic predicate runs disable LineMap tracking; actual indexing retains it.
+   Repeated macro reads in the chain prefix and already-discovered goals are skipped
+   before activation lookup. Base bindings are cloned directly into the options
+   without constructing a temporary map.
+   `#elif` activation also requires every preceding arm in its chain to be false.
+   A macro the base configuration already fixes is never a candidate: a different value
+   conflicts, and the same value would re-lower the base as a "variant".
+3. **Greedy compatibility grouping**: Compatible activation goals are clustered into
+   variants (subsets of candidate defines that can hold simultaneously) up to the
+   configured explore budget. Chains are identified by `(file, line)` — a translation
+   unit spans every header it expands, so the line alone collides. Different arms of one
+   chain are mutually exclusive and force separate variants; two defines that open the
+   *same* arm (`#if defined(A) || defined(B)`) are not in conflict and share one variant,
+   provided their combined definitions keep every targeted condition true. The combined
+   predicates are checked in one preprocessor run per proposed grouping, including macro
+   aliases in base definitions. This separates `A && !B` from `B` even across unrelated
+   chains. An arm inside a
+   region an enclosing chain excluded (`Unevaluated`, C11 6.10.1p6) cannot be opened by
+   its own macro alone, so it is ranked behind every arm a define really does open and
+   claims only budget nothing else wanted. Goals that cannot fit within the budget
+   are counted in a diagnostic with `stage: "explore"` and `severity: Warning`.
+   The count describes omitted candidate activation goals, not distinct feasible
+   configurations or proven reachable arms.
+4. **Independent preprocessing and lowering**: Each feasible variant is preprocessed and
+   lowered into an isolated `UnitIndex`. Translation unit variants use a frozen header
+   expansion cache, and header variants that depend on newly activated defines miss the
+   cache cleanly and expand locally without polluting the shared cache.
+5. **Variant-aware merge (`merge_unit_variants`)**: a unit and its variants are merged
+   together, so duplicate flow constraints are dropped against a set scoped to that one
+   unit's contribution rather than to the whole program. When merging variant units into
+   the global `Program`:
+   - Function bodies sharing `(file, name, line)` with previously merged variants are
+     **preserved rather than discarded**: parameter and local variable IDs are remapped
+     and extended, call sites are deduplicated and merged, and IR flow constraints and
+     return flows are unioned. Calls at the same source location retain separate records
+     when their remapped arguments, callee, receiver, or return destination differ; only
+     identical call facts are deduplicated. This preserves macro-selected callbacks.
+   - A variant body the base spells on a **different line** — the `#ifdef X / #else`
+     alternative-implementation shape — extends the base entry, found by file and name.
+     Registering it as a second definition would make the symbol table treat it as a
+     redeclaration and overwrite the surviving definition's span and parameters with the
+     variant's, dropping the call sites bound to them. Every defined overload remains
+     a candidate; a unique matching signature selects the corresponding base body.
+     Ambiguous matches retain the ordinary merge path. The base entry must agree on **signature** --
+     parameter count and types: a configuration that *adds* an overload (`pick(int)`
+     always, `pick(double)` under a define) likewise lands on a line the base never had,
+     and folding it into the base would conflate two functions' parameters and call
+     targets, with the result depending on which source enabled the overload. Parameter
+     types are compared by *shape* rather than by id — two configurations intern their
+     own copy of a type, so an id comparison would split a function from itself — with
+     tags compared by name (the configurations may legitimately carry different field
+     sets, which is what the layout union reconciles) and an unresolved type never
+     splitting anything. The check applies to C++ only: C has no overloading, so arms that
+     differ in arity because the directive wraps the whole declaration are still one
+     function. Alternative arms of one function agree on their signature; a
+     variant that widens a signature in place keeps the function's own line and matches
+     before this fallback is reached.
+   - Locals are recorded on their function by the merge, since lowering tracks scope in
+     its own map and leaves the field empty. Synthesized temporaries are paired by
+     position — the k-th temporary of a kind at a source position — because lowering
+     names them after the unit-local id it just allocated, so two configurations of the
+     same expression never agree on the name.
+   - Parameters are paired with the base signature **by name, never by position**. A
+     variant routinely inserts a parameter ahead of the ones the base has (`#ifdef
+     DEBUG_LOG` file/line pairs); positional pairing would map the variant's first
+     parameter onto an unrelated one and hand it every value that parameter holds.
+   - A parameter that exists only in a variant is recorded as a **local**. The canonical
+     arity belongs to the base configuration, and the solver reads `params.len()` as the
+     arity of an indirect-call target: growing it would stop base call edges from
+     resolving, making variant data cost baseline precision.
+   - File-scope variables (`FileStatic` and `Global`) sharing origin location and name are
+     paired with the base configuration's variables, unifying initializers, stores, and
+     reads across variants rather than duplicating them into disconnected entities.
+   - Aggregate layouts (`struct` and `union`) are unioned across configurations: fields
+     are matched by name; variant-specific fields not present in the base layout are
+     appended with unique `FieldId`s (`union_struct_layout`, `union_union_layout`).
+     Anonymous members, which share the empty name, are matched on their type as well,
+     so a variant's second unnamed member is not swallowed by its first.
+6. **GEP field resolution by name**: Because unioning aggregate layouts across variants
+   may shift positional field indices across configurations, the pointer-analysis solver
+   guards GEP field resolution: when a positional `field` does not match the GEP's
+   `expected_name`, it resolves the field via
+   `program.types.field_id_by_name(parent_type, expected)` instead of rejecting the
+   pointee. The gate is `Program::layouts_unioned` — set whenever a unit merges as a
+   variant, and so whenever a layout could have been unioned — and not the `--explore`
+   flag: a run that asks for exploration and generates no variant unioned no layout, and
+   relaxing the cross-struct `FieldId` guard there would only let unrelated structs
+   through as indirect-call targets. So baseline solver behavior is preserved exactly
+   whenever no unit merges as a variant, `--explore` or not. It is deliberately *not*
+   `variants_merged > 0`: that field counts exploration variants per source and is 0 for
+   an ordinary compilation database, where every unit past the first still merges as a
+   variant and unions its layouts — so keying on it left the recovery off exactly where
+   commands disagree about a struct.
+
+### Limits of `--explore`
+
+- **Conditional function signatures are not modeled separately.** The base signature
+  remains canonical. A variant-only parameter is retained as a local, but calls still
+  wire arguments by the canonical positions and arity. Added or reordered parameters
+  can therefore lose variant argument flows or route them to a different parameter.
+  Analyze explicit configurations separately when these signatures matter.
+- **Search is bounded and heuristic.** Goals start from individually activating GN
+  candidates. Conditions needing several new defines together and nested parent/child
+  activation are not exhaustively searched; a lack of budget warnings does not imply
+  complete configuration coverage.
+- **Overloaded definitions in one file keep line-keyed variant merging.** When several
+  defined functions in a file share a name, the file/name pair does not identify one of
+  them, so a variant body on a different line is not recognized as that function's other
+  implementation and is merged as its own definition.
+
+- **A unioned layout may match no single configuration.** Fields a variant adds are
+  appended, so when a configuration inserts a member in the *middle* of a struct, the
+  merged layout holds every field but reproduces neither configuration's offsets. Field
+  identity (and therefore the analysis) is unaffected; the offsets and sizes exported to
+  SQLite are the approximation.
+- **Aggregates that embed a unioned struct by value keep stale offsets.** `TypeDesc`
+  nests member descriptions by value, so growing `struct Inner` does not reach a
+  `struct Outer { struct Inner i; int x; }` interned earlier: `x`'s exported offset and
+  `Outer`'s size still describe the smaller `Inner`. Again `FieldId`s, and the analysis,
+  are unaffected.
+- **Feasibility is an over-approximation.** An arm's condition is evaluated against the
+  command-line defines plus the candidate, not the full macro environment its headers
+  build up. A variant that turns out infeasible costs a budget slot but cannot invent
+  facts: the real preprocessor run still decides what that variant's text is.
+- **Declaration-only rows move.** A function the index only ever sees called is
+  anchored at the call site that first references it. Exploring variants opens earlier
+  code, so that first reference moves and the row is re-anchored: on `drivers_hdf_core`
+  29 such rows sit at a different line, or in a different file, than in the baseline.
+  All of them carry `is_defined = 0` and all are still present. No *defined* function
+  the baseline records is lost on hdf or hiview; on camera three shift between two
+  files that define the same symbol, which is the pre-existing twin-definition dedup
+  rather than anything exploration does.
 
 ## Known imprecision
 

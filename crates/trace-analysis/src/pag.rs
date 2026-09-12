@@ -2,7 +2,7 @@ use crate::constraints::{AbstractLocation, Constraint, ConstraintKind, LocKind};
 use crate::ipc::detect_ipc_pairs;
 use crate::summaries::{Effect, FnModelSet};
 use indexmap::IndexMap;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use trace_ir::{
     FieldId, FlowConstraint, FnId, LocId, PagNodeId, Program, ReturnFlow, StorageClass, VarId,
 };
@@ -42,22 +42,22 @@ pub struct Pag {
     pub nodes: Vec<PagNode>,
     pub constraints: Vec<Constraint>,
     pub locations: Vec<AbstractLocation>,
-    pub var_node: IndexMap<VarId, PagNodeId>,
-    pub loc_node: IndexMap<LocId, PagNodeId>,
-    pub call_targets: IndexMap<trace_ir::CallSiteId, PagNodeId>,
-    pub fn_locations: IndexMap<FnId, LocId>,
-    pub var_location: IndexMap<VarId, LocId>,
+    pub var_node: IndexMap<VarId, PagNodeId, FxBuildHasher>,
+    pub loc_node: IndexMap<LocId, PagNodeId, FxBuildHasher>,
+    pub call_targets: IndexMap<trace_ir::CallSiteId, PagNodeId, FxBuildHasher>,
+    pub fn_locations: IndexMap<FnId, LocId, FxBuildHasher>,
+    pub var_location: IndexMap<VarId, LocId, FxBuildHasher>,
     /// Interned `StringConst` locations keyed by literal contents.
     pub string_locs: FxHashMap<String, LocId>,
     /// Field abstract locations keyed by (parent object location, field id).
-    pub field_loc: IndexMap<(LocId, FieldId), LocId>,
+    pub field_loc: IndexMap<(LocId, FieldId), LocId, FxBuildHasher>,
     /// Nesting depth of each synthesized field location (var-rooted = 0
     /// children start at 1). Bounds recursive `obj->next->next->...`
     /// location synthesis once interprocedural flow reaches chained structs.
     pub field_depth: FxHashMap<LocId, u8>,
     /// Per-(struct type, field) summary location for instance-insensitive field flow.
-    pub field_summary: IndexMap<(trace_ir::TypeId, FieldId), LocId>,
-    pub field_loc_to_summary: IndexMap<LocId, LocId>,
+    pub field_summary: IndexMap<(trace_ir::TypeId, FieldId), LocId, FxBuildHasher>,
+    pub field_loc_to_summary: IndexMap<LocId, LocId, FxBuildHasher>,
     /// Fn locations parked into an array var by `ArrayFnMember` inits
     /// (`{ {.., Fn}, .. }`); reachable through any element field load.
     pub array_fn_members: FxHashMap<VarId, Vec<LocId>>,
@@ -278,7 +278,7 @@ impl Pag {
     }
 
     /// Instance-sensitive child location for `parent.field`. Past
-    /// [`FIELD_LOC_DEPTH_CAP`], further nesting is folded into the
+    /// `FIELD_LOC_DEPTH_CAP`, further nesting is folded into the
     /// instance-insensitive summary: unbounded recursive synthesis (linked
     /// structures reached through interprocedural flow) would otherwise
     /// diverge, while summaries stay bounded by (type, field).
@@ -350,19 +350,54 @@ impl Pag {
     }
 
     /// Instance-insensitive summary location for `(struct type of var, field)`.
+    #[must_use]
     pub fn ensure_field_summary_for_var(
         &mut self,
         program: &Program,
         var: trace_ir::VarId,
         field: FieldId,
     ) -> Option<LocId> {
+        self.ensure_field_summary_for_var_named(program, var, field, None)
+    }
+
+    /// Instance-insensitive summary location for `(struct type of var, field)`,
+    /// falling back to resolving `expected_name` if positional `field` does not match.
+    #[must_use]
+    pub fn ensure_field_summary_for_var_named(
+        &mut self,
+        program: &Program,
+        var: trace_ir::VarId,
+        field: FieldId,
+        expected_name: Option<&str>,
+    ) -> Option<LocId> {
         let v = program.symbols.variable_by_id(var)?;
         let struct_type = struct_type_from_type_id(program, v.type_id)?;
-        let field_layout = program.types.get(struct_type).layout.fields.get(&field)?;
+        let mut resolved_field = field;
+        let positional = program.types.get(struct_type).layout.fields.get(&field);
+        // Resolve by name only when the positional index does not already carry
+        // the field the GEP named: a unioned layout can move a field off the
+        // index the configuration that lowered the GEP gave it.
+        let by_name = expected_name.and_then(|expected| {
+            if expected.is_empty() || positional.is_some_and(|fl| fl.name == expected) {
+                None
+            } else {
+                program.types.field_id_by_name(struct_type, expected)
+            }
+        });
+        let field_layout = if let Some(fid) = by_name {
+            resolved_field = fid;
+            program.types.get(struct_type).layout.fields.get(&fid)?
+        } else {
+            // The name resolves nowhere in this layout — a base variable whose
+            // static type simply has no such member. Keep the positional field
+            // the baseline path would have used: merging a variant must only
+            // ever add facts, never drop one the baseline had.
+            positional?
+        };
         Some(self.ensure_field_summary_loc(
             program,
             struct_type,
-            field,
+            resolved_field,
             field_layout.type_id,
             &field_layout.name,
         ))
@@ -898,4 +933,45 @@ fn lookup_var_in_fn(
         .get(&caller)
         .and_then(|m| m.get(name).copied())
         .or_else(|| program.symbols.global_by_name.get(name).copied())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trace_ir::{Span, TypeDesc, Variable};
+
+    #[test]
+    fn empty_field_name_does_not_redirect_to_an_anonymous_member() {
+        let mut program = Program::new(".".into());
+        let type_id = program.types.intern(TypeDesc::Struct {
+            name: "Fields".into(),
+            fields: vec![
+                (String::new(), TypeDesc::Int),
+                ("named".into(), TypeDesc::Int),
+            ],
+        });
+        let var = program.symbols.alloc_var_id();
+        program.symbols.add_variable(Variable {
+            id: var,
+            name: "object".into(),
+            type_id,
+            storage: StorageClass::Global,
+            fn_id: None,
+            param_index: None,
+            span: Span::new(trace_ir::FileId(0), 1, 1),
+            is_pointer: false,
+        });
+        let mut pag = Pag::default();
+        let positional = pag
+            .ensure_field_summary_for_var(&program, var, FieldId(1))
+            .unwrap();
+        assert_eq!(
+            pag.ensure_field_summary_for_var_named(&program, var, FieldId(1), Some("")),
+            Some(positional)
+        );
+        assert_eq!(
+            pag.ensure_field_summary_for_var_named(&program, var, FieldId(2), Some("")),
+            None
+        );
+    }
 }

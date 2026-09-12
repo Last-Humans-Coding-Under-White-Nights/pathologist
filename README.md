@@ -1,3 +1,5 @@
+![](docs/images/Logo-big.png)
+
 # trace
 
 **trace** is a static analysis tool for C codebases. It runs a custom preprocessor, parses translation units with [tree-sitter](https://tree-sitter.github.io/), performs Andersen-style field-sensitive pointer analysis, and exports call graphs and interprocedural argument-flow facts to SQLite.
@@ -38,6 +40,20 @@ trace analyze /path/to/project -o /tmp/project.db --jobs 8
 
 ## CLI reference
 
+### Conditional coverage and GN define evidence
+
+```bash
+cargo run -p trace-cli --release --example conditional_coverage -- /path/to/project > coverage.tsv
+```
+
+The reporting example records conditional branches and scans `BUILD.gn`,
+`*.gni` and `*.gn` for direct string entries in `defines = [...]` and `defines += [...]`.
+`GN_DEFINE` TSV rows retain the macro name, whether a value was supplied, the
+value, file, entry line, confidence, and enclosing GN conditions. No inferred
+define is applied. See [GN evidence](docs/GN_DEFINES.md) for ranking and limits;
+`scripts/gen_conditional_coverage_report.py` renders these candidates alongside
+the [conditional coverage report](docs/CONDITIONAL_COVERAGE.md).
+
 ### `trace analyze`
 
 Analyze every C/C++ file (`.c`, `.cpp`, `.cc`, `.cxx`) under `TARGET` and write results to SQLite.
@@ -52,12 +68,15 @@ trace analyze [OPTIONS] <TARGET>
 | `-o`, `--output <PATH>` | Output database path. Default: `trace.db`. |
 | `--include <PATH>` | Add a preprocessor `#include` search path. Repeatable. |
 | `-D <NAME>` | Define preprocessor macro `NAME=1`. Repeatable. |
-| `-D <NAME=VALUE>` | Define macro with explicit value. Repeatable. |
+| `-D <NAME=VALUE>` | Define macro with explicit value. Repeatable. Overrides the language predefines (`__cplusplus`, `__STDC_VERSION__`, `__STDC__`) when the name matches. |
 | `--jobs <N>` | Parallel jobs for indexing (parse + lower). Default: logical CPU count. |
 | `--timeout-secs <N>` | Watchdog: abort the process after N seconds (exit 124). Useful when probing hang-prone trees. |
 | `--full-export` | Export full IR detail: all types, all variables, PAG `locations`. Slower and produces a larger database. |
 | `--debug-points-to` | Retain points-to sets during analysis and export the `points_to` debug table (requires PAG in memory). Implies keeping location data needed for export. |
 | `--models <FILE>` | Load a TOML function-model file (interprocedural summaries for bodyless callees, e.g. `memcpy_s`). Repeatable; later files override earlier entries and built-ins. See `docs/ANALYSIS.md`. |
+| `--dep <PATH>` | Treat a directory as a dependency root: a tree the target builds against but that is not under analysis (repeatable). Its headers contribute declarations — types, class definitions, inheritance, prototypes, declared return types — while its sources are never translation units. Function bodies and variable initializers are skipped during lowering, so they contribute no call sites or value flow. See the note below. |
+| `--explore` | Enable bounded conditional-variant exploration. Discovers candidate macro definitions from project GN files (`BUILD.gn`, `*.gni`), evaluates semantic feasibility of excluded `#if`/`#ifdef`/`#elif` arms, preprocesses and lowers feasible variants independently, and unions their facts into the merged program (preserving body and call facts plus struct fields across configurations; conditional signatures retain the base arity, see [limits](docs/ANALYSIS.md#limits-of---explore)). Off by default. |
+| `--explore-budget <N>` | Maximum additional configurations per translation unit (default: 4). Budget diagnostics count omitted candidate activation goals, not proven reachable configurations. |
 | `--no-ipc` | Disable IPC proxy→stub bridge edge detection (enabled by default). Bridge edges are synthetic (`resolution = 'ipc'`, `call_site_id = NULL`) and connect a `*Proxy*` method to its `*Stub*` handler across the opaque Binder boundary. See `docs/IPC_ROADMAP.md`. |
 
 **Progress output** (stderr):
@@ -83,14 +102,18 @@ trace analyze ~/drivers_hdf_core -o /tmp/hdf.db \
 
 # Debug pointer analysis
 trace analyze ./my_app -o /tmp/debug.db --debug-points-to --full-export
+
+# Use a compilation database outside the source tree
+trace analyze ./my_app --compile-commands ./out/compile_commands.json -o /tmp/app.db
 ```
 
 **Notes**
 
-- **`.c` and `.cpp`-family files** are indexed as translation units. Headers are pulled in via `#include` during preprocessing, not analyzed as standalone TUs. C++ support is a pragmatic first step — see [docs/ANALYSIS.md](docs/ANALYSIS.md) for scope and imprecision.
+- **`.c` and `.cpp`-family files** are indexed as translation units. Headers are pulled in via `#include` during preprocessing, not analyzed as standalone TUs. A C++ unit is preprocessed with `__cplusplus` (`201703L`) and `__STDC__` predefined, a C unit with `__STDC__` and `__STDC_VERSION__` (`201710L`), so `#ifdef __cplusplus` takes the C++ arm in `.cpp` units and the C arm in `.c` units, headers included. C++ support is a pragmatic first step — see [docs/ANALYSIS.md](docs/ANALYSIS.md) for scope and imprecision.
 - Line numbers in the database refer to **original** files on disk (resolved through the preprocessor's `LineMap`); call sites inside macro expansions attribute to the expansion site.
-- Pass include paths that match your build; there is no `compile_commands.json` integration yet.
+- **Compilation database** — automatically reads `compile_commands.json` at the target root, then `build/compile_commands.json`, or an explicit `--compile-commands PATH`. Each entry supplies its working directory, ordered `-I`/`-iquote`/`-isystem` paths, ordered `-D`/`-U`, `-include`, and `-x`/`-std`. MSVC `cl`/`clang-cl` preprocessing switches (`/I`, `/D`, `/U`, `/FI`, `/TC`, `/TP`, `/Tc`, `/Tp`, `/std:`) are also supported. All commands for a source contribute facts, even without `--explore`. CLI `--include` paths precede database `-I` paths and CLI `-D` values override database macros. Files without a usable entry retain inferred configuration; a database is never required. See [compilation database support](docs/ANALYSIS.md#compilation-databases-62).
 - **`static` functions** (internal linkage) and **file-scope `static` variables** are resolved within the defining translation unit. **`static` locals** inside functions are tracked as `fn_static` storage.
+- **Dependency roots (`--dep <PATH>`)** separate what the target *uses* from what it *is*. A dependency's headers are reached and merged for their declarations — smart-pointer wrappers such as `sptr<T>`, base classes, external interfaces — so a wrapper-typed receiver resolves on the wrapped class rather than producing an edge on the wrapper. Its sources are never translation units, its unreached headers are never indexed as standalone units, and a body written in a dependency header merges as a declaration (`is_defined = 0`) with no call sites, locals, value flow or return flow. Files and functions from a dependency root export with `is_dep = 1`; `trace inspect calls --exclude-deps` drops the edges that touch them. A dependency root nested inside the analysis root is fine; one that contains or equals it is rejected at startup, since every source would become a dependency and nothing would be left to analyze.
 
 ## `static` storage support
 
@@ -108,7 +131,7 @@ Same identifier in different `.c` files (each `static`) gets distinct IR ids; re
 Query an existing analysis database.
 
 ```text
-trace inspect <DB> calls [--from FN] [--to FN] [--file SUBSTR]
+trace inspect <DB> calls [--from FN] [--to FN] [--file SUBSTR] [--exclude-deps]
 
 Edges print as `caller (file:line) -> callee [deffile] (resolution)` — the
 `[deffile]` bracket distinguishes same-name (e.g. `static`) functions defined
@@ -123,6 +146,8 @@ instead.
 | `--from <FN>` | Filter edges where the **caller** name equals `FN` or ends with `::FN` (C++ qualified methods). `_` and `%` in `FN` are literal, not `LIKE` wildcards. |
 | `--to <FN>` | Filter edges where the **callee** name equals `FN` or ends with `::FN`. Same escaping as `--from`. |
 | `--file <SUBSTR>` | Filter ordinary edges by call-site or callee file; synthetic edges by caller or callee definition file. |
+| `--callgraph-filter <FILE>` | JSON file listing regex patterns over function names; edges whose caller and callee both fail to match are hidden. |
+| `--exclude-deps` | Hide call edges whose caller or callee comes from a dependency root (`is_dep = 1`). Requires a v4 database. |
 
 Both filters may be combined. Output format:
 
@@ -138,6 +163,19 @@ Only **`call_edges`** are listed. Unresolved indirect call sites appear in `call
 trace inspect /tmp/hdf.db calls --from NetIfSetAddr
 trace inspect /tmp/hdf.db calls --from HdfSbufReadBuffer
 trace inspect /tmp/hdf.db calls --to LiteNetSetIpAddr
+```
+
+When the full call graph is too large but you only care about a handful of
+functions (e.g. memory-related ones), pass a filter config and only edges whose
+caller or callee matches are printed. The database and analysis stay untouched;
+the filter is purely a display adapter.
+
+```json
+{ "functions": ["malloc", "free", "calloc", "realloc", "memcpy", "memset"] }
+```
+
+```bash
+trace inspect /tmp/hdf.db calls --callgraph-filter mem.json
 ```
 
 For unresolved indirect calls, query SQL directly (see below).
@@ -157,6 +195,7 @@ trace inspect <DB> callgraph --file SUBSTR --line N [--depth N] [--direction dow
 | `--depth <N>` | Maximum BFS depth (default 3). |
 | `--direction` | `down` = callees (default), `up` = callers. |
 | `--format` | Output format: `text` (default), `json`, `graphviz`, or `mermaid`. |
+| `--callgraph-filter <FILE>` | JSON file listing regex patterns over function names; edges whose caller and callee both fail to match are hidden, nodes left without any surviving edge are pruned. The start function (the root) is always kept even when it does not match, so the query anchor stays visible. |
 
 The start function is chosen among definitions whose `[line_start, line_end]`
 contains `--line`. Edges are labeled with their resolution (`direct`,
@@ -168,6 +207,35 @@ callees print `(see above; also file:line)`.
 ```bash
 trace inspect /tmp/hdf.db callgraph --file devsvc_manager.c --line 120 --depth 2
 trace inspect /tmp/hdf.db callgraph --file hdf_service_record.c --line 20 --direction up
+trace inspect /tmp/hdf.db callgraph --file allocator.c --line 44 --callgraph-filter mem.json
+```
+
+### `trace inspect callchain`
+
+Find all simple call paths (chains) between two functions no longer than `--depth`.
+
+```text
+trace inspect <DB> callchain [--from FN|FILE:LINE] [--to FN|FILE:LINE] [--depth N] [--limit N]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--from <FN>` | Start function name, C++ qualified suffix, or `FILE:LINE` (e.g. `main` or `main.c:10`). |
+| `--to <FN>` | Target function name, C++ qualified suffix, or `FILE:LINE` (e.g. `target` or `worker.c:25`). |
+| `--from-file <SUBSTR>`, `--from-line <N>` | File and line locating the start function. |
+| `--to-file <SUBSTR>`, `--to-line <N>` | File and line locating the target function. |
+| `--depth <N>` | Maximum path length in call hops (default 5). |
+| `--direction` | `down` = callers -> callees (default), `up` = callees -> callers. |
+| `--limit <N>` | Maximum number of chains to return (default 100, 0 for unlimited). |
+| `--format` | Output format: `text` (default), `json`, `graphviz`, or `mermaid`. |
+| `--callgraph-filter` | Path to JSON filter config file (`{"functions": ["regex", ...]}`). |
+
+**Examples**
+
+```bash
+trace inspect /tmp/trace.db callchain --from main --to target --depth 3
+trace inspect /tmp/trace.db callchain --from main.c:10 --to target.c:20
+trace inspect /tmp/trace.db callchain --from caller --to helper --format mermaid
 ```
 
 ### `trace inspect dataflow`
@@ -362,10 +430,10 @@ Metadata for one `trace analyze` invocation.
 |--------|------|-------------|
 | `id` | INTEGER PK | Run id (always `1` per file). |
 | `trace_version` | TEXT | Full binary identity: package version, source revision, dirty state, and build date. |
-| `schema_version` | INTEGER | Database layout version (currently `3`). |
+| `schema_version` | INTEGER | Database layout version (currently `4`). |
 | `target_root` | TEXT | Absolute or normalized `<TARGET>` path. |
 | `created_at` | TEXT | Unix timestamp (seconds). |
-| `options_json` | TEXT | JSON: `include_paths`, `defines`, `include_points_to`, `full_detail`. |
+| `options_json` | TEXT | JSON: `include_paths`, `defines`, `dep_roots`, `include_points_to`, `full_detail`. |
 
 ### `files`
 
@@ -374,6 +442,7 @@ Metadata for one `trace analyze` invocation.
 | `id` | INTEGER PK | Internal file id. |
 | `path` | TEXT UNIQUE | Source file path. |
 | `sha256` | TEXT | Content hash (may be empty in current export). |
+| `is_dep` | INTEGER | 1 if file resides under a dependency root (`--dep`), 0 otherwise. |
 
 ### `functions`
 
@@ -386,7 +455,8 @@ Metadata for one `trace analyze` invocation.
 | `line_end` | INTEGER | End line of the definition body; equals `line_start` for prototypes/synthesized externals. |
 | `linkage` | TEXT | `external`, `internal`, or `none`. |
 | `signature` | TEXT | Placeholder signature string (`fn_<name>`). |
-| `is_defined` | INTEGER | 1 if a body exists under the analyzed root; 0 covers prototypes and synthesized externals (libc, macro-referenced logging backends). |
+| `is_defined` | INTEGER | 1 if a body exists under the analyzed root; 0 covers prototypes and synthesized externals (libc, macro-referenced logging backends, dependency declarations). |
+| `is_dep` | INTEGER | 1 if function originates from a dependency root (`--dep`), 0 otherwise. |
 
 **Index:** `functions(name)`.
 
@@ -611,11 +681,12 @@ tests/fixtures/    Integration test C corpora
 
 ## Limitations
 
-- **C++ first step** — namespaces, overloads (arity), classes/virtual dispatch (including virtual bases), `final` class/method devirtualization, ctors/dtors, implicit `this->method()`, `shared_ptr`/`unique_ptr`/`weak_ptr` unwrap, and callables (`std::function`, lambdas, `operator()`) are modeled; type-based overload ranking and templates beyond name-stripping are not (see [docs/ANALYSIS.md](docs/ANALYSIS.md)). Next slices from hiview: [docs/CPP_ROADMAP.md](docs/CPP_ROADMAP.md).
+- **C++ first step** — namespaces, overloads (arity), classes/virtual dispatch (including virtual bases), `final` class/method devirtualization, ctors/dtors, implicit `this->method()`, smart-pointer unwrap through a declared `operator->` (`shared_ptr`, and OHOS `sptr`/`RefPtr` or HDI `AutoPtr` alike, the wrapper keeping its own members for `.`), and callables (`std::function`, lambdas, `operator()`) are modeled; type-based overload ranking and templates beyond name-stripping are not (see [docs/ANALYSIS.md](docs/ANALYSIS.md)). Next slices from hiview: [docs/CPP_ROADMAP.md](docs/CPP_ROADMAP.md).
 - **May-analysis** — indirect calls can list multiple targets; absence of an edge does not prove unreachability.
 - **No path sensitivity** — all branches and paths are merged.
-- **Preprocessor subset** — not gcc/clang compatible for all extensions; see [docs/PREPROCESSOR.md](docs/PREPROCESSOR.md).
-- **Include paths** — must be supplied manually via `--include` / `-D`; no `compile_commands.json` yet.
+- **Preprocessor subset** — not gcc/clang compatible for all extensions, and no compiler is impersonated (`__GNUC__` / `__clang__` stay undefined; only the language's own `__cplusplus` / `__STDC__` / `__STDC_VERSION__` are predefined); see [docs/PREPROCESSOR.md](docs/PREPROCESSOR.md).
+- **Build environment** — compilation databases locate existing files; they do not supply missing SDK, standard-library or generated headers. Supply additional roots with `--dep` / `--include` as needed. Compiler-specific target builtins and response files are not modeled.
+- **Configuration coverage** — without database entries or `--explore`, indexing uses one inferred configuration. A name no `-D` or reached `#define` binds resolves to `0` in `#if`; the default exclusions are measured in [docs/CONDITIONAL_COVERAGE.md](docs/CONDITIONAL_COVERAGE.md). Explicit database commands are all merged; exploratory configurations remain bounded by `--explore-budget`.
 - **Line numbers** — refer to preprocessed TUs; map back to original sources manually when needed.
 
 ## Further reading
@@ -623,6 +694,7 @@ tests/fixtures/    Integration test C corpora
 - [Architecture](docs/ARCHITECTURE.md)
 - [Analysis algorithm](docs/ANALYSIS.md)
 - [Preprocessor spec](docs/PREPROCESSOR.md)
+- [Conditional-compilation coverage (eval corpora)](docs/CONDITIONAL_COVERAGE.md)
 - [SQLite schema (detailed)](docs/SQLITE_SCHEMA.md)
 - [Roadmap](docs/ROADMAP.md)
 - [C++ next slices (hiview)](docs/CPP_ROADMAP.md)

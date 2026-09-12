@@ -1,8 +1,10 @@
 use crate::macros::{lex_macro_body, MacroDef, MacroOp, MacroTable};
 use crate::{
-    Diagnostic, DiagnosticSeverity, Language, Lexer, LineMap, PreprocessOptions, Token, TokenKind,
+    ArmDirective, ArmOutcome, ConditionRead, ConditionalArm, ConditionalChain, Diagnostic,
+    DiagnosticSeverity, Language, Lexer, LineMap, PreprocessOptions, Token, TokenKind,
 };
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -30,6 +32,35 @@ pub struct PreprocessResult {
     pub diagnostics: Vec<Diagnostic>,
     /// Canonical paths processed by this run (`#include` closure).
     pub included_headers: Vec<PathBuf>,
+    /// The subset of [`Self::included_headers`] this run expanded itself
+    /// instead of replaying from the shared cache — because no entry existed
+    /// yet, or because the entry's [`crate::MacroFingerprint`] did not match
+    /// this run's macro environment (#55).
+    ///
+    /// With `inline_include_bodies` off these are the headers whose body is
+    /// in THIS unit's text, so the indexer must not also merge a PCH unit
+    /// built under a different configuration for them.
+    pub inlined_headers: Vec<PathBuf>,
+    /// The language this run lexed as. Variant indices below are positions
+    /// in the list for THIS language — a header reached from both C and C++
+    /// has one list per language and the two are unrelated.
+    pub language: crate::Language,
+    /// For each header this run replayed from the shared cache, the index of
+    /// each variant it matched (see [`crate::ExpansionVariants`]).
+    ///
+    /// With `inline_include_bodies` off a replayed header contributes no
+    /// text, so its declarations have to come from a separately lowered
+    /// unit — and it must be the unit built from *this* expansion, not from
+    /// whichever configuration the warm pass happened to take.
+    ///
+    /// One path can appear more than once: a header included twice under
+    /// different macros expands twice, and both expansions belong to this
+    /// unit (#56). Sorted, so the record does not depend on hash order.
+    pub replayed_variants: Vec<(PathBuf, usize)>,
+    /// Every conditional chain this run evaluated or skipped, in the order
+    /// their opening directives were met, headers included. Empty unless
+    /// `PreprocessOptions::record_conditionals` is set (#57).
+    pub conditionals: Vec<ConditionalChain>,
 }
 
 #[derive(Debug)]
@@ -44,9 +75,54 @@ struct PreprocessorState {
     /// `#ifdef` / `#ifndef` / `defined()` so an `#ifndef`-guarded real
     /// definition in source still takes effect; any source (re)definition or
     /// `#undef` clears the mark. Only ever shrinks during a run.
-    fallback_macros: HashSet<String>,
+    fallback_macros: FxHashSet<String>,
     include_stack: Vec<PathBuf>,
-    included_guard: HashSet<PathBuf>,
+    /// Canonical paths this run has processed, for
+    /// `PreprocessResult::included_headers` and for the `files` set of each
+    /// cached expansion. Membership alone is NOT a reason to skip a repeated
+    /// `#include` — see `file_guards` (#56).
+    included_files: FxHashSet<PathBuf>,
+    /// The reason each processed path may be skipped when it is included
+    /// again: its `#pragma once`, or the include guard wrapping it. A path
+    /// absent here has no reason, and re-expands.
+    ///
+    /// A wrapper is read off the token stream before the file runs
+    /// (`detect_include_guard`) and a `#pragma once` at the directive
+    /// itself; either is inherited from `IncludeExpansion::guards` when a
+    /// header is replayed from the cache instead of visited.
+    file_guards: FxHashMap<PathBuf, crate::FileGuard>,
+    /// How many times this run has brought each path in — expanded or
+    /// replayed from the cache — against
+    /// `PreprocessOptions::max_file_expansions`.
+    file_expansions: FxHashMap<PathBuf, usize>,
+    /// Included files this run expanded itself (see
+    /// `PreprocessResult::inlined_headers`).
+    inlined_files: FxHashSet<PathBuf>,
+    /// The expansion this run resolved each processed path to — the variant
+    /// replayed from the cache, or the one this run composed. With several
+    /// variants per path the cache alone can no longer answer "what did this
+    /// header expand to *here*", and both the guard-skip path and
+    /// `compose_cache_text` need exactly that.
+    entry_used: FxHashMap<PathBuf, crate::IncludeExpansion>,
+    /// Variant index of the LATEST cache hit per path — what the guard-skip
+    /// site records on an enclosing frame, and what
+    /// `IncludeExpansion::nested_variants` inherits.
+    variant_used: FxHashMap<PathBuf, usize>,
+    /// Every `(path, variant)` this run replayed at an `#include` of that
+    /// path itself, for `PreprocessResult::replayed_variants`. Distinct from
+    /// `variant_used` because a header included twice under different macros
+    /// replays two expansions and a map keyed by path can only name one.
+    ///
+    /// `IncludeExpansion::nested_variants` is deliberately not recorded
+    /// here. Those records do still reach `replayed_variants`, through
+    /// `variant_used`, which `finish` unions in — but only ever one variant
+    /// per nested path, since `splice_cached` inserts them with
+    /// `Entry::or_insert`. Keeping a second, per-pair set of them was the
+    /// version that regressed: a path then accumulated a variant from every
+    /// entry that mentioned it, the unit merged header units it never
+    /// reached, and hdf lost 514 direct call edges to the resolution that
+    /// shifted under.
+    direct_variants: FxHashSet<(PathBuf, usize)>,
     conditional_stack: Vec<CondFrame>,
     /// Depth of `conditional_stack` when the current file started. Frames
     /// below it belong to includers: `#elif`/`#else`/`#endif` in this file
@@ -58,14 +134,14 @@ struct PreprocessorState {
     /// Diagnostic identities already emitted in this preprocessing run.
     /// Cached parent expansions can carry the same nested-header report;
     /// retain its first occurrence rather than multiplying it by cache path.
-    diagnostic_keys: HashSet<(Option<PathBuf>, u32, String)>,
+    diagnostic_keys: FxHashSet<(Option<PathBuf>, u32, String)>,
     current_file: PathBuf,
     current_line: u32,
     /// Bytes each processed file contributed to `output`. Files whose
     /// expansion was fully skipped (e.g. by an already-defined include
     /// guard) record 0 and must not be claimed as content-bearing by a
     /// parent's cached `IncludeExpansion::files`.
-    emitted_bytes: HashMap<PathBuf, usize>,
+    emitted_bytes: FxHashMap<PathBuf, usize>,
     /// Interned index of `current_file` in `line_map.files`; `u32::MAX`
     /// means "not interned yet" (re-interned lazily when the file changes).
     lm_cur_file: u32,
@@ -84,11 +160,40 @@ struct PreprocessorState {
     /// and captures its suffix into `IncludeExpansion::ops`; cleared when
     /// the last frame closes.
     macro_ops: Vec<MacroOp>,
+    /// Memoized `binding_hash` per macro name, invalidated by
+    /// `insert_macro` / `remove_macro`. A read hook that hashed a
+    /// replacement list on every identifier occurrence would charge the
+    /// header's whole token stream for each of its macros.
+    macro_hashes: FxHashMap<String, u64>,
     /// Set once a run-wide limit (output cap, token budget, include depth)
     /// has cut an expansion short. Everything composed from here on is
     /// missing content, so nothing further may be published to the shared
     /// expansion cache.
     expansion_incomplete: bool,
+    /// Conditional chains recorded so far (`record_conditionals`);
+    /// `CondFrame::chain` indexes into it.
+    conditionals: Vec<ConditionalChain>,
+    /// While a condition is being evaluated with recording on: every name
+    /// the evaluation consulted, in order, repeats included. `None`
+    /// otherwise, which is what keeps the per-identifier read hook free.
+    cond_reads: Option<Vec<ConditionRead>>,
+    /// Does the current file have an include guard wrapping the whole of
+    /// it? Decided by `detect_include_guard` when the file's token stream
+    /// starts running. Per file: saved and restored around each include.
+    guarded_file: bool,
+    /// `(header, quoted)` → the directory-search result, including the
+    /// basename fallback, for this run only. The search lists are fixed for
+    /// the run, so only the including file's own directory varies, and that
+    /// is checked separately before this cache is consulted. A hit here costs
+    /// no lock; a miss falls through to the shared map below.
+    include_search_cache: RefCell<FxHashMap<(String, bool), Option<PathBuf>>>,
+    /// The directory walk's results shared with every other run over the
+    /// same `SourceCache` and search lists (`SourceCache::directory_results`).
+    /// `None` when no source cache was supplied.
+    shared_directory_results: Option<crate::options::DirectoryResults>,
+    /// Non-zero while a `-include` header is being spliced in. Those run with
+    /// only the root on `include_stack`, but are nested includes all the same.
+    forced_include_depth: u32,
 }
 
 /// One level of `#if`/`#elif`/`#else` nesting. A per-level bool is not
@@ -107,6 +212,8 @@ struct CondFrame {
     else_seen: bool,
     /// Line of the opening `#if`/`#ifdef`/`#ifndef`, for the EOF diagnostic.
     line: u32,
+    /// The chain this frame is recording into, when recording is on.
+    chain: Option<usize>,
 }
 
 /// One cached header being constructed.
@@ -114,57 +221,134 @@ struct CondFrame {
 struct CacheFrame {
     /// Guard-skipped includes at the live-output offset of the `#include`.
     skips: Vec<(usize, PathBuf)>,
+    /// Cached expansions this header replayed, for
+    /// `IncludeExpansion::nested_variants`. Recorded on the innermost frame
+    /// only: an enclosing entry pins this one, which pins these in turn, so
+    /// the chain is closed by following it.
+    replayed: Vec<(PathBuf, usize)>,
+    /// The macro environment this header's expansion has read so far, which
+    /// becomes `IncludeExpansion::deps`. Every open frame receives each read,
+    /// so a nested header's dependencies reach its includers.
+    deps: crate::MacroFingerprint,
+    /// Names this frame has already decided: recorded in `deps`, or bound by
+    /// the frame's own `#define` / `#undef` (its `ops`, which every consumer
+    /// replays, so the consumer's binding cannot matter). Doubles as the
+    /// short-circuit for the per-identifier read hook.
+    settled: FxHashSet<Arc<str>>,
+    /// Actual writes, distinguished from reads in `settled` when a skipped
+    /// header snapshots a binding after merging its historical dependencies.
+    locally_bound: FxHashSet<Arc<str>>,
+    /// Include guards learned anywhere in this header's `#include` closure,
+    /// becoming `IncludeExpansion::guards` (#56).
+    guards: FxHashMap<PathBuf, crate::FileGuard>,
     /// Diagnostics in this header's transitive include closure. This must be
     /// independent from `PreprocessorState::diagnostics`: a report can have
     /// been emitted earlier in this run and still be required by a cache
     /// consumer that only includes this header later.
     diagnostics: Vec<Diagnostic>,
-    diagnostic_keys: HashSet<(Option<PathBuf>, u32, String)>,
+    diagnostic_keys: FxHashSet<(Option<PathBuf>, u32, String)>,
 }
 
 impl PreprocessorState {
     fn new(opts: PreprocessOptions, file: PathBuf) -> Self {
         let language = opts.language.unwrap_or_else(|| Language::from_path(&file));
+        let shared_directory_results = opts
+            .source_cache
+            .as_ref()
+            .map(|c| c.directory_results(&opts));
         let mut state = Self {
             opts,
             language,
             macros: MacroTable::new(),
-            fallback_macros: HashSet::new(),
+            fallback_macros: FxHashSet::default(),
             include_stack: vec![file.clone()],
-            included_guard: HashSet::new(),
+            included_files: FxHashSet::default(),
+            file_guards: FxHashMap::default(),
+            file_expansions: FxHashMap::default(),
+            inlined_files: FxHashSet::default(),
+            entry_used: FxHashMap::default(),
+            variant_used: FxHashMap::default(),
+            direct_variants: FxHashSet::default(),
             conditional_stack: Vec::new(),
             cond_base: 0,
             output: String::new(),
             line_map: LineMap::new(),
             diagnostics: Vec::new(),
-            diagnostic_keys: HashSet::new(),
+            diagnostic_keys: FxHashSet::default(),
             current_file: file,
             current_line: 1,
-            emitted_bytes: HashMap::new(),
+            emitted_bytes: FxHashMap::default(),
             lm_cur_file: u32::MAX,
             expansion_depth: 0,
             expansion_limit_warned: false,
             tokens_processed: 0,
             cache_frames: Vec::new(),
             macro_ops: Vec::new(),
+            macro_hashes: FxHashMap::default(),
             expansion_incomplete: false,
+            conditionals: Vec::new(),
+            cond_reads: None,
+            guarded_file: false,
+            include_search_cache: RefCell::new(FxHashMap::default()),
+            shared_directory_results,
+            forced_include_depth: 0,
         };
+        let warm = state.opts.shared_macros.is_some();
         if let Some(shared) = &state.opts.shared_macros {
             if let Ok(guard) = shared.read() {
-                state.macros = guard.clone();
+                state.macros.clone_from(&guard);
             }
-            // The warm table is normally seeded from the CLI defines, but a
-            // name it never accumulated must still beat the builtin fallback
-            // installed below. First-wins keeps definitions the warm pass
-            // picked up from source.
+            // The warm table is normally seeded from the predefines and the
+            // CLI defines both (`macro_table_from_defines`), which is where
+            // their relative precedence is usually decided; a name it never
+            // accumulated must still beat the builtin fallback installed
+            // below. Both seeds are first-wins, so what the warm pass picked
+            // up from source outranks either. Order still matters for the
+            // one case the warm table settles neither way — a caller whose
+            // table binds neither name — so the CLI defines go first and
+            // `-D __cplusplus=…` wins there too, as on the path below.
             state.init_cli_defines_missing_only();
+            state.init_predefined_macros(true);
         } else {
+            // Predefines first: a `-D __cplusplus=…` overrides the
+            // language's own value.
+            state.init_predefined_macros(false);
             state.init_cli_defines();
         }
         // Builtins are local to each preprocess so they apply even when
         // the shared warm table is cloned (hiview `__UNUSED` lives in .cpp
         // files, not in the header that `#ifndef`s it).
         state.install_builtin_macros();
+        if !state.opts.command_macros.is_empty() {
+            // `handle_define` needs `&mut self`, and the state owns `opts`,
+            // so lend the operations out rather than cloning them.
+            let ops = std::mem::take(&mut state.opts.command_macros);
+            for op in &ops {
+                match op {
+                    crate::CommandMacro::Define(name, value) => {
+                        // A synthetic newline would splice away a trailing
+                        // backslash. EOF terminates the replacement list too.
+                        let text = format!("{name} {value}");
+                        let tokens = Lexer::new(&text, language).tokenize();
+                        if let Err(e) = state.handle_define(&tokens, 0) {
+                            state.warn(1, format!("invalid command-line macro: {e}"));
+                        }
+                    }
+                    crate::CommandMacro::Undef(name) => state.remove_macro(name),
+                }
+            }
+            state.opts.command_macros = ops;
+            // Explicit user overrides have the final say, under whichever
+            // precedence the branch above settled on.
+            if warm {
+                state.init_cli_defines_missing_only();
+            } else {
+                state.init_cli_defines();
+            }
+        }
+        // Seeding the environment is the constructor's job; a caller that
+        // forgot this step would silently drop every `-include`.
+        state.process_forced_includes();
         state
     }
 
@@ -183,8 +367,232 @@ impl PreprocessorState {
 
     /// A name only a builtin fallback defines does not count as defined for
     /// `#ifdef` / `#ifndef` / `defined()`.
-    fn is_defined_for_conditionals(&self, name: &str) -> bool {
-        self.macros.contains_key(name) && !self.fallback_macros.contains(name)
+    fn is_defined_for_conditionals(&mut self, name: &str) -> bool {
+        self.record_read(name);
+        let bound = self.macros.contains_key(name) && !self.fallback_macros.contains(name);
+        // Here the spelling is explicitly a macro operand, not an operator.
+        // Ordinary expression reads omit unbound alternative operators.
+        if !bound && is_alternative_token(name) {
+            if let Some(reads) = self.cond_reads.as_mut() {
+                reads.push(ConditionRead {
+                    name: name.to_string(),
+                    bound: Some(false),
+                });
+            }
+        }
+        bound
+    }
+
+    /// Content hash of what `name` is currently bound to, or `None` when it
+    /// is unbound. The builtin-fallback mark is part of the binding: a
+    /// fallback expands in text but reads as undefined in a conditional, so
+    /// two environments that disagree about it can produce different
+    /// expansions of the same header.
+    fn binding_hash(&mut self, name: &str) -> Option<u64> {
+        let def = self.macros.get(name)?;
+        if let Some(h) = self.macro_hashes.get(name) {
+            return Some(*h);
+        }
+        let h = hash_macro_binding(def, self.fallback_macros.contains(name));
+        self.macro_hashes.insert(name.to_string(), h);
+        Some(h)
+    }
+
+    /// Is `name` already settled for every open cache frame?
+    ///
+    /// Testing the innermost frame alone is enough, because an inner frame's
+    /// `settled` set is a subset of every enclosing frame's: each of the
+    /// writers (`record_read`, `note_local_binding`,
+    /// `merge_recorded_deps`, `record_snapshot_read`) insert into all open
+    /// frames that have not already settled the name, and a frame
+    /// starts empty when it is pushed — so anything the innermost frame
+    /// knows was settled while it existed, and every outer frame took the
+    /// same insert. This is what keeps the per-identifier read hook at one
+    /// hash lookup rather than one per level of `#include` nesting.
+    fn innermost_settled(&self, name: &str) -> bool {
+        self.cache_frames
+            .last()
+            .is_none_or(|frame| frame.settled.contains(name))
+    }
+
+    /// Record that the expansion consulted `name`, for every cached header
+    /// currently being built. Free when no cache frame is open, which is the
+    /// case for translation-unit text.
+    ///
+    /// Called on *every* macro-table consultation, the misses included: an
+    /// identifier that found nothing here expanded to itself, and an entry
+    /// holding that text must not be replayed into a unit where the name is
+    /// a macro (#55).
+    fn record_read(&mut self, name: &str) {
+        if let Some(reads) = self.cond_reads.as_mut() {
+            let bound = self.macros.contains_key(name) && !self.fallback_macros.contains(name);
+            // `and` / `or` / `not` … spelled in a condition are operators,
+            // not names the configuration could bind, unless something did.
+            if bound || !is_alternative_token(name) {
+                reads.push(ConditionRead {
+                    name: name.to_string(),
+                    bound: Some(bound),
+                });
+            }
+        }
+        if self.innermost_settled(name) {
+            return;
+        }
+        let hash = self.binding_hash(name);
+        let interned: Arc<str> = Arc::from(name);
+        for frame in &mut self.cache_frames {
+            if !frame.settled.insert(Arc::clone(&interned)) {
+                continue;
+            }
+            match hash {
+                Some(h) => frame.deps.defined.push((Arc::clone(&interned), h)),
+                None => {
+                    frame.deps.undefined.insert(Arc::clone(&interned));
+                }
+            }
+        }
+    }
+
+    /// Mark `name` as bound by the cached headers being built, so a later
+    /// read of it is not charged to the consumer's environment. Recorded
+    /// even when the name is already a dependency — `settled` short-circuits
+    /// that case and the earlier read stays in `deps`, which is correct: the
+    /// consumer's binding did reach this expansion, before the header
+    /// overwrote it.
+    fn note_local_binding(&mut self, name: &str) {
+        if self.cache_frames.is_empty() {
+            return;
+        }
+        let interned: Arc<str> = Arc::from(name);
+        for frame in &mut self.cache_frames {
+            frame.settled.insert(Arc::clone(&interned));
+            frame.locally_bound.insert(Arc::clone(&interned));
+        }
+    }
+
+    /// A snapshot must retain both historical and current dependencies if
+    /// they disagree. Such an entry cannot match any consumer, so that
+    /// consumer expands it live. Ordinary `record_read` would discard the
+    /// current dependency because the historical one already settled it.
+    fn record_snapshot_read(&mut self, name: &str) {
+        let hash = self.binding_hash(name);
+        let interned: Arc<str> = Arc::from(name);
+        for frame in &mut self.cache_frames {
+            if frame.locally_bound.contains(name) {
+                continue;
+            }
+            frame.deps.incompatible |= frame
+                .deps
+                .defined
+                .iter()
+                .any(|(n, h)| n == &interned && Some(*h) != hash)
+                || (hash.is_some() && frame.deps.undefined.contains(name));
+            frame.settled.insert(Arc::clone(&interned));
+            match hash {
+                Some(h) => {
+                    if !frame
+                        .deps
+                        .defined
+                        .iter()
+                        .any(|(n, v)| n == &interned && *v == h)
+                    {
+                        frame.deps.defined.push((Arc::clone(&interned), h));
+                    }
+                }
+                None => {
+                    frame.deps.undefined.insert(Arc::clone(&interned));
+                }
+            }
+        }
+    }
+
+    /// Fold a cached entry's dependencies into every open cache frame, so a
+    /// header that embeds or replays a nested expansion inherits what that
+    /// expansion read. Without this an entry matches its consumer's
+    /// environment while a nested expansion frozen inside its text does not.
+    ///
+    /// The bindings are taken as *recorded*, not re-read from the current
+    /// table. At a guard-skip site the nested entry was produced earlier in
+    /// this run, possibly under a state this frame has since moved away
+    /// from; the enclosing entry is only valid where that earlier state
+    /// holds, and re-reading would claim otherwise. Names this frame binds
+    /// itself are already `settled` and stay out.
+    fn merge_recorded_deps(&mut self, deps: &crate::MacroFingerprint) {
+        if self.cache_frames.is_empty() {
+            return;
+        }
+        if deps.incompatible {
+            for frame in &mut self.cache_frames {
+                frame.deps.incompatible = true;
+            }
+        }
+        for (name, hash) in &deps.defined {
+            if self.innermost_settled(name) {
+                continue;
+            }
+            for frame in &mut self.cache_frames {
+                if frame.settled.insert(Arc::clone(name)) {
+                    frame.deps.defined.push((Arc::clone(name), *hash));
+                }
+            }
+        }
+        for name in &deps.undefined {
+            if self.innermost_settled(name) {
+                continue;
+            }
+            for frame in &mut self.cache_frames {
+                if frame.settled.insert(Arc::clone(name)) {
+                    frame.deps.undefined.insert(Arc::clone(name));
+                }
+            }
+        }
+    }
+
+    /// Does `deps` describe the environment this run is in right now?
+    fn fingerprint_matches(&mut self, deps: &crate::MacroFingerprint) -> bool {
+        if deps.incompatible {
+            return false;
+        }
+        for (name, hash) in &deps.defined {
+            if self.binding_hash(name) != Some(*hash) {
+                return false;
+            }
+        }
+        if deps.undefined.is_empty() {
+            return true;
+        }
+        // Whichever side is smaller: an entry can depend on thousands of
+        // names being unbound (every plain identifier in the header), while
+        // a unit's own table is usually far smaller than that.
+        if deps.undefined.len() <= self.macros.len() {
+            !deps
+                .undefined
+                .iter()
+                .any(|name| self.macros.contains_key(name.as_ref()))
+        } else {
+            !self
+                .macros
+                .keys()
+                .any(|name| deps.undefined.contains(name.as_str()))
+        }
+    }
+
+    /// Seed the language's own predefined macros (see
+    /// [`crate::predefined_macros`]). Real definitions, not fallbacks: a
+    /// C++ unit's `#ifdef __cplusplus` must be true. With `missing_only`
+    /// a name the inherited warm table already binds is kept.
+    fn init_predefined_macros(&mut self, missing_only: bool) {
+        for (name, val) in crate::predefined_macros(self.language) {
+            if missing_only && self.macros.contains_key(*name) {
+                continue;
+            }
+            self.insert_macro(
+                name.to_string(),
+                MacroDef::Object {
+                    replacement: lex_macro_body(val, self.language),
+                },
+            );
+        }
     }
 
     fn init_cli_defines(&mut self) {
@@ -234,6 +642,8 @@ impl PreprocessorState {
 
     fn insert_macro(&mut self, name: String, def: MacroDef) {
         self.log_macro_op(MacroOp::Define(name.clone(), def.clone()));
+        self.note_local_binding(&name);
+        self.macro_hashes.remove(&name);
         self.fallback_macros.remove(&name);
         self.macros.insert(name.clone(), def.clone());
         if self.opts.accumulate_macros {
@@ -247,6 +657,8 @@ impl PreprocessorState {
 
     fn remove_macro(&mut self, name: &str) {
         self.log_macro_op(MacroOp::Undef(name.to_string()));
+        self.note_local_binding(name);
+        self.macro_hashes.remove(name);
         self.fallback_macros.remove(name);
         self.macros.shift_remove(name);
         if self.opts.accumulate_macros {
@@ -270,7 +682,7 @@ impl PreprocessorState {
         self.conditional_stack.len() > self.cond_base
     }
 
-    fn push_cond(&mut self, cond: bool, line: u32) {
+    fn push_cond(&mut self, cond: bool, line: u32, chain: Option<usize>) {
         let parent_active = self.is_active();
         let active = parent_active && cond;
         self.conditional_stack.push(CondFrame {
@@ -279,7 +691,142 @@ impl PreprocessorState {
             taken: active,
             else_seen: false,
             line,
+            chain,
         });
+    }
+
+    // ---- conditional recording (#57) ------------------------------------
+
+    /// Start collecting the names a condition consults. A no-op unless
+    /// recording is on, so `record_read` stays on its fast path.
+    fn begin_reads(&mut self) {
+        if self.opts.record_conditionals {
+            self.cond_reads = Some(Vec::new());
+        }
+    }
+
+    /// The names collected since `begin_reads`, first read first, once each.
+    fn end_reads(&mut self) -> Vec<ConditionRead> {
+        dedup_reads(self.cond_reads.take().unwrap_or_default())
+    }
+
+    /// Record the opening arm of a new chain; `None` when recording is off.
+    /// The arm is built lazily so an ordinary run spells nothing.
+    fn open_chain(&mut self, arm: impl FnOnce() -> ConditionalArm) -> Option<usize> {
+        if !self.opts.record_conditionals {
+            return None;
+        }
+        let depth = self.conditional_stack.len() - self.cond_base;
+        self.conditionals.push(ConditionalChain {
+            // `current_file` is the path include resolution produced, which
+            // may spell the same header several ways (`src/../common/x.h`
+            // from one includer, `common/x.h` from another). Consumers merge
+            // chains across runs by file, so the record uses the canonical
+            // path, as `included_headers` does. Canonicalization is cached.
+            file: trace_ir::canonicalize(&self.current_file),
+            arms: vec![arm()],
+            depth,
+            terminated: false,
+            include_guard: false,
+        });
+        Some(self.conditionals.len() - 1)
+    }
+
+    /// End the chain's current arm at `line` (the line of the directive
+    /// that follows it).
+    fn close_arm(&mut self, chain: Option<usize>, line: u32) {
+        if let Some(arm) = chain.and_then(|c| self.conditionals[c].arms.last_mut()) {
+            arm.end_line = line;
+        }
+    }
+
+    fn add_arm(&mut self, chain: Option<usize>, line: u32, arm: impl FnOnce() -> ConditionalArm) {
+        self.close_arm(chain, line);
+        if let Some(c) = chain {
+            self.conditionals[c].arms.push(arm());
+        }
+    }
+
+    /// Mark `chain` as this file's include guard, for the conditional
+    /// record (#57). `start` indexes the opening directive's `#`.
+    ///
+    /// The whole shape is already decided — `guarded_file` is
+    /// `detect_include_guard`'s answer for this file — so all that is left
+    /// is to name the chain it belongs to: a guard's `#ifndef` is the file's
+    /// first token, at its top level, so at most one chain can match.
+    fn mark_include_guard(&mut self, chain: Option<usize>, tokens: &[Token], start: usize) {
+        let Some(chain) = chain else { return };
+        if self.guarded_file
+            && self.conditional_stack.len() - 1 == self.cond_base
+            && tokens[..start].iter().all(is_newline)
+        {
+            self.conditionals[chain].include_guard = true;
+        }
+    }
+
+    // ---- include guards (#56) -------------------------------------------
+
+    /// Learn why `path` need not be expanded again, and tell every cached
+    /// header currently being built. A consumer replaying one of those
+    /// entries never visits `path` itself, so the reason has to travel with
+    /// the entry or the consumer re-expands a body the entry already holds.
+    fn record_guard(&mut self, path: PathBuf, guard: crate::FileGuard) {
+        // `#pragma once` outranks a wrapper and is never downgraded: it
+        // holds for the rest of the run whatever the macro table does. It is
+        // the *binding* that sticks, though, not the announcement — every
+        // open frame still has to be told, including frames opened after the
+        // pragma was first read. Returning early here left an entry carrying
+        // such a header's body without the reason to skip it, and the
+        // consumer expanded it a second time.
+        let guard = match self.file_guards.get(&path) {
+            Some(crate::FileGuard::Once) => crate::FileGuard::Once,
+            _ => guard,
+        };
+        for frame in &mut self.cache_frames {
+            frame.guards.insert(path.clone(), guard.clone());
+        }
+        self.file_guards.insert(path, guard);
+    }
+
+    /// Re-announce a guard this run already knows, for the entries opened
+    /// since it was learned.
+    fn propagate_guard(&mut self, path: &Path) {
+        if let Some(guard) = self.file_guards.get(path).cloned() {
+            self.record_guard(path.to_path_buf(), guard);
+        }
+    }
+
+    /// Adopt the guards a cached expansion learned, for this run and for
+    /// every entry being built around it.
+    fn merge_guards(&mut self, guards: &[(PathBuf, crate::FileGuard)]) {
+        for (path, guard) in guards {
+            self.record_guard(path.clone(), guard.clone());
+        }
+    }
+
+    /// May a repeated `#include` of `canonical` be skipped? Only on a
+    /// reason the file itself stated.
+    ///
+    /// Note what this does NOT do: charge the guard's name to the enclosing
+    /// cache entry's fingerprint. The skip does depend on the live table, so
+    /// reading it there would be defensible, but a header that skips the ten
+    /// its includer already pulled in would carry ten guard names and only
+    /// match a consumer with the same include history — camera lost 879
+    /// direct call edges to that, since past `max_expansion_variants`
+    /// nothing publishes and the shared per-header units those declarations
+    /// come from stop being built. The skip is kept self-contained the way
+    /// the blanket suppression was instead: the site below snapshots the
+    /// skipped expansion's macro effects into this entry's own `ops` and
+    /// embeds its text, so a consumer reaches the same state either way.
+    fn guard_suppresses(&self, canonical: &Path) -> bool {
+        match self.file_guards.get(canonical) {
+            Some(crate::FileGuard::Once) => true,
+            Some(crate::FileGuard::Ifndef(name)) => {
+                self.macros.contains_key(name.as_ref())
+                    && !self.fallback_macros.contains(name.as_ref())
+            }
+            None => false,
+        }
     }
 
     fn push_expansion(&mut self, line: u32) -> bool {
@@ -334,8 +881,8 @@ impl PreprocessorState {
             self.output.push(' ');
         }
         let offset = self.output.len();
-        let text = token_to_string(&tok.kind);
-        self.output.push_str(&text);
+        let text = token_as_str(&tok.kind);
+        self.output.push_str(text);
         if self.opts.track_line_map {
             let fid = self.lm_current_file();
             let (line, col) = tok.expansion_site();
@@ -357,7 +904,7 @@ impl PreprocessorState {
         let Some(end) = attribute_group_end(tokens, start) else {
             return Ok(None);
         };
-        if attribute_group_must_survive(tokens, start, end) {
+        if self.attribute_group_must_survive(tokens, start, end)? {
             return Ok(None);
         }
         for tok in &tokens[start + 1..end] {
@@ -375,13 +922,17 @@ impl PreprocessorState {
         start: usize,
         replacement: &[Token],
     ) -> Result<Option<usize>, PreprocessError> {
-        let Some(name) = compiler_attribute_marker(replacement) else {
+        if !Self::next_non_newline_is(tokens, start + 1, "(") {
+            return Ok(None);
+        }
+        let expanded = self.expand_operand_tokens(replacement)?;
+        let Some(name) = compiler_attribute_marker(&expanded) else {
             return Ok(None);
         };
         let Some(end) = attribute_group_end_after_name(tokens, start + 1, name) else {
             return Ok(None);
         };
-        if attribute_group_must_survive(tokens, start + 1, end) {
+        if self.attribute_group_must_survive(tokens, start + 1, end)? {
             return Ok(None);
         }
         for tok in &tokens[start + 1..end] {
@@ -391,6 +942,22 @@ impl PreprocessorState {
             }
         }
         Ok(Some(end))
+    }
+
+    fn attribute_group_must_survive(
+        &mut self,
+        tokens: &[Token],
+        start: usize,
+        end: usize,
+    ) -> Result<bool, PreprocessError> {
+        if tokens[start..end]
+            .iter()
+            .any(|token| matches!(token.kind, TokenKind::Hash))
+        {
+            return Ok(true);
+        }
+        let expanded = self.expand_operand_tokens(&tokens[start..end])?;
+        Ok(attribute_group_must_survive(&expanded, 0, expanded.len()))
     }
 
     fn emit_str(&mut self, s: &str, line: u32, col: u32) {
@@ -535,20 +1102,39 @@ impl PreprocessorState {
     /// Replay a cached expansion into the output. Returns false when no
     /// entry exists for `canonical`.
     fn splice_cached(&mut self, canonical: &Path) -> bool {
-        let Some(cache) = &self.opts.include_expansion_cache else {
+        // No stored expansion is valid here unless its fingerprint matches
+        // this run's macro environment (#55). Returning false falls through
+        // to a full expansion, which — with `inline_include_bodies` off —
+        // puts the header's body in the consuming unit's own text, where it
+        // is lowered under the environment that actually applies.
+        let Some((at, entry)) = self.matching_variant(canonical) else {
             return false;
         };
-        let key = (canonical.to_path_buf(), self.language);
-        let Some(entry) = cache.read().ok().and_then(|guard| guard.get(&key).cloned()) else {
-            return false;
-        };
+        self.entry_used
+            .insert(canonical.to_path_buf(), entry.clone());
+        self.variant_used.insert(canonical.to_path_buf(), at);
+        self.direct_variants.insert((canonical.to_path_buf(), at));
+        if let Some(frame) = self.cache_frames.last_mut() {
+            frame.replayed.push((canonical.to_path_buf(), at));
+        }
+        // Replaying an entry adopts its nested choices too: those headers
+        // are never visited here, and without this the consumer has no
+        // record for them and has to merge every stored expansion of each.
+        for (path, at) in entry.nested_variants.iter() {
+            self.variant_used.entry(path.clone()).or_insert(*at);
+        }
+        self.merge_recorded_deps(&entry.deps);
+        // The consumer never visits the headers this entry covers, so the
+        // reasons they may be skipped have to come from the entry (#56).
+        let guards = Arc::clone(&entry.guards);
+        self.merge_guards(&guards);
         for diagnostic in entry.diagnostics.iter().cloned() {
             self.push_diagnostic(diagnostic);
         }
         if !self.opts.inline_include_bodies {
             self.replay_macro_delta(&entry);
-            self.included_guard.insert(canonical.to_path_buf());
-            self.included_guard.extend(entry.files.iter().cloned());
+            self.included_files.insert(canonical.to_path_buf());
+            self.included_files.extend(entry.files.iter().cloned());
             return true;
         }
         if self.output.len().saturating_add(entry.text.len()) > self.opts.max_output_bytes {
@@ -560,7 +1146,7 @@ impl PreprocessorState {
                     self.opts.max_output_bytes
                 ),
             );
-            self.included_guard.insert(canonical.to_path_buf());
+            self.included_files.insert(canonical.to_path_buf());
             return true;
         }
         let offset = self.output.len();
@@ -582,7 +1168,7 @@ impl PreprocessorState {
             let sub = &entry.line_map;
             self.line_map.splice(sub, offset, &remap);
         }
-        self.included_guard.extend(entry.files.iter().cloned());
+        self.included_files.extend(entry.files.iter().cloned());
         true
     }
 
@@ -601,10 +1187,60 @@ impl PreprocessorState {
         }
     }
 
-    fn cached_expansion(&self, canonical: &Path) -> Option<crate::IncludeExpansion> {
-        let cache = self.opts.include_expansion_cache.as_ref()?;
+    /// Offer `entry` to the shared cache as an expansion of `canonical`
+    /// under the environment its fingerprint records.
+    ///
+    /// Two writers that reached the same fingerprint produce the same
+    /// expansion — that is what a fingerprint means — so a race between
+    /// them is not observable, and the append-only list keeps every index
+    /// already handed out valid. Past the cap nothing is stored and later
+    /// consumers expand the header themselves, which costs time and changes
+    /// no output.
+    fn publish_variant(&self, canonical: PathBuf, entry: crate::IncludeExpansion) {
+        // Keep incompatible expansions only in entry_used for this run's
+        // text composition; they cannot serve any consumer or use a slot.
+        if entry.deps.incompatible {
+            return;
+        }
+        let Some(cache) = self.opts.include_expansion_cache.as_ref() else {
+            return;
+        };
+        let Ok(mut guard) = cache.write() else {
+            return;
+        };
+        let variants = guard.entry((canonical, self.language)).or_default();
+        let signature = entry.deps.signature();
+        if variants.len() >= self.opts.max_expansion_variants
+            || variants.iter().any(|v| v.deps.signature() == signature)
+        {
+            return;
+        }
+        variants.push(entry);
+    }
+
+    /// The stored expansion of `canonical` whose fingerprint this run's
+    /// macro environment satisfies, if any.
+    ///
+    /// Matching needs `&mut self` (it memoizes binding hashes), so the
+    /// fingerprints are lifted out under one read lock and the winner
+    /// re-read under a second. That is sound because [`ExpansionVariants`]
+    /// is append-only: a concurrent writer can lengthen the list, never
+    /// move what an index already refers to.
+    fn matching_variant(&mut self, canonical: &Path) -> Option<(usize, crate::IncludeExpansion)> {
         let key = (canonical.to_path_buf(), self.language);
-        cache.read().ok().and_then(|guard| guard.get(&key).cloned())
+        let deps: Vec<Arc<crate::MacroFingerprint>> = {
+            let cache = self.opts.include_expansion_cache.as_ref()?;
+            let guard = cache.read().ok()?;
+            guard
+                .get(&key)?
+                .iter()
+                .map(|e| Arc::clone(&e.deps))
+                .collect()
+        };
+        let at = deps.iter().position(|d| self.fingerprint_matches(d))?;
+        let cache = self.opts.include_expansion_cache.as_ref()?;
+        let guard = cache.read().ok()?;
+        Some((at, guard.get(&key)?.get(at).cloned()?))
     }
 
     fn is_cacheable_header(path: &Path) -> bool {
@@ -621,19 +1257,19 @@ impl PreprocessorState {
         output_start: usize,
         output_end: usize,
         skips: &[(usize, PathBuf)],
-    ) -> (String, LineMap, HashSet<PathBuf>) {
+    ) -> (String, LineMap, FxHashSet<PathBuf>) {
         if skips.is_empty() {
             return (
                 self.output[output_start..output_end].to_string(),
                 self.line_map.slice_from(output_start),
-                HashSet::new(),
+                FxHashSet::default(),
             );
         }
         let mut text = String::new();
         let mut line_map = LineMap::new();
-        let mut extra_files = HashSet::new();
+        let mut extra_files = FxHashSet::default();
         let mut live_pos = output_start;
-        let mut embedded: HashSet<PathBuf> = HashSet::new();
+        let mut embedded: FxHashSet<PathBuf> = FxHashSet::default();
         for (at, path) in skips {
             let at = (*at).min(output_end).max(live_pos);
             Self::append_live_chunk(
@@ -648,7 +1284,7 @@ impl PreprocessorState {
             if !embedded.insert(path.clone()) {
                 continue;
             }
-            let Some(entry) = self.cached_expansion(path) else {
+            let Some(entry) = self.entry_used.get(path) else {
                 continue;
             };
             if text.len().saturating_add(entry.text.len()) > self.opts.max_output_bytes {
@@ -710,20 +1346,76 @@ impl PreprocessorState {
 
     fn process_file(&mut self, path: &Path) -> Result<(), PreprocessError> {
         let canonical = trace_ir::canonicalize(path);
-        if self.included_guard.contains(&canonical) {
-            // Already expanded earlier in this run. Re-splicing the cached
-            // subtree into *live* output exponentiates on diamond include
-            // graphs (each skip copies a self-contained blob that already
-            // contains previous copies). Record the skip on the in-progress
-            // cache frame instead; `compose_cache_text` embeds the nested
-            // expansion only into that frame's cache entry.
+        // A repeated `#include` is skipped only on a reason the file itself
+        // stated — its `#pragma once`, or its include guard while that guard
+        // is defined. Membership in `included_files` is not one: suppressing
+        // on it lost every deliberate re-inclusion, X-macro tables above all
+        // (#56).
+        if self.guard_suppresses(&canonical) {
+            // Re-splicing the cached subtree into *live* output exponentiates
+            // on diamond include graphs (each skip copies a self-contained
+            // blob that already contains previous copies). Record the skip on
+            // the in-progress cache frame instead; `compose_cache_text`
+            // embeds the nested expansion only into that frame's cache entry.
             if !self.opts.frozen_expansion_cache {
+                // The reason this include was skipped belongs to every entry
+                // being built around it, along with the reasons for
+                // everything the skipped expansion covered.
+                self.propagate_guard(&canonical);
+                if let Some(guards) = self
+                    .entry_used
+                    .get(&canonical)
+                    .map(|e| Arc::clone(&e.guards))
+                {
+                    self.merge_guards(&guards);
+                }
+                let replayed_as = self.variant_used.get(&canonical).copied();
                 if let Some(frame) = self.cache_frames.last_mut() {
                     frame.skips.push((self.output.len(), canonical.clone()));
+                    // The body is skipped here, but this header still needs
+                    // its own lowered unit and only the entry being built
+                    // knows which expansion of it applies.
+                    if let Some(at) = replayed_as {
+                        frame.replayed.push((canonical.clone(), at));
+                    }
                 }
-                if let Some(entry) = self.cached_expansion(&canonical) {
+                if let Some(entry) = self.entry_used.get(&canonical).cloned() {
                     for diagnostic in entry.diagnostics.iter() {
                         self.record_cache_diagnostic(diagnostic);
+                    }
+                    // `compose_cache_text` will embed this expansion's text
+                    // in the frame's entry, so the frame depends on
+                    // everything the expansion read.
+                    self.merge_recorded_deps(&entry.deps);
+                    // Keep the embedded header's macro effects self-contained,
+                    // but preserve intervening changes: in B, D, B the skipped
+                    // B must not undo D's definitions or undefs. Snapshot the
+                    // current binding of each affected name, without executing
+                    // it. External bindings also constrain this frame's cache
+                    // fingerprint; locally written names are already settled.
+                    let mut seen = FxHashSet::default();
+                    // Only the final operation for each name matters here.
+                    for op in entry.ops.iter().rev() {
+                        let (MacroOp::Define(name, _) | MacroOp::Undef(name)) = op;
+                        if !seen.insert(name) {
+                            continue;
+                        }
+                        let original = match op {
+                            MacroOp::Define(_, def) => Some(hash_macro_binding(def, false)),
+                            MacroOp::Undef(_) => None,
+                        };
+                        // An unchanged binding is already supplied by B's
+                        // own final directive. In particular, do not require
+                        // an ordinary include guard to be both absent (B's
+                        // input) and present (B's effect) in the consumer.
+                        if self.binding_hash(name) != original {
+                            self.record_snapshot_read(name);
+                        }
+                        let current = match self.macros.get(name) {
+                            Some(def) => MacroOp::Define(name.clone(), def.clone()),
+                            None => MacroOp::Undef(name.clone()),
+                        };
+                        self.log_macro_op(current);
                     }
                 }
             }
@@ -742,6 +1434,28 @@ impl PreprocessorState {
             return Ok(());
         }
 
+        // Depth does not bound repetition: an unguarded file included by
+        // fifty siblings is expanded fifty times at depth two, and a pair of
+        // unguarded files that include each other recurs until the depth cap
+        // at every one of those sites. Cap the expansions of a single path
+        // and say so, rather than losing the content silently the way the
+        // blanket suppression did (#56).
+        let expansions = self.file_expansions.entry(canonical.clone()).or_insert(0);
+        *expansions += 1;
+        if *expansions > self.opts.max_file_expansions {
+            if *expansions == self.opts.max_file_expansions + 1 {
+                self.limit_warn(
+                    1,
+                    format!(
+                        "include expanded more than {} times ({}); skipping further inclusions",
+                        self.opts.max_file_expansions,
+                        path.display()
+                    ),
+                );
+            }
+            return Ok(());
+        }
+
         // The root of this run is the file whose text IS the output, so it
         // is never replayed from the expansion cache: an entry for it can
         // already exist when another header pulled it in first (a
@@ -749,18 +1463,24 @@ impl PreprocessorState {
         // with `inline_include_bodies` off a replay would yield an empty
         // run. `include_stack` holds only the root at this point (see
         // `Preprocessor::new`); nested includes push on top of it.
-        let is_root = self.include_stack.len() == 1;
+        let is_root = self.include_stack.len() == 1 && self.forced_include_depth == 0;
         if !is_root && self.splice_cached(&canonical) {
             return Ok(());
+        }
+
+        if !is_root {
+            // Past every cache path: this run is about to expand the body
+            // itself, so the header's content belongs to this unit's text.
+            self.inlined_files.insert(canonical.clone());
         }
 
         let cache_header =
             self.opts.include_expansion_cache.is_some() && Self::is_cacheable_header(&canonical);
 
         let guard_snapshot = if cache_header {
-            self.included_guard.clone()
+            self.included_files.clone()
         } else {
-            HashSet::new()
+            FxHashSet::default()
         };
         // Everything this header's processing executes (`#define`/`#undef`,
         // nested replays included) from here on lands in `macro_ops`; the
@@ -771,13 +1491,13 @@ impl PreprocessorState {
         } else {
             None
         };
-        self.included_guard.insert(canonical.clone());
+        self.included_files.insert(canonical.clone());
         let output_start = self.output.len();
         let pushing_frame = cache_header && !self.opts.frozen_expansion_cache;
 
         let content: Arc<str> = if let Some(cache) = &self.opts.source_cache {
             let key = canonical.clone();
-            if let Some(s) = cache.get(&key) {
+            if let Some(s) = cache.text(&key) {
                 Arc::clone(s)
             } else {
                 fs::read_to_string(path)
@@ -802,8 +1522,13 @@ impl PreprocessorState {
         if pushing_frame {
             self.cache_frames.push(CacheFrame {
                 skips: Vec::new(),
+                replayed: Vec::new(),
+                deps: crate::MacroFingerprint::default(),
+                settled: FxHashSet::default(),
+                locally_bound: FxHashSet::default(),
+                guards: FxHashMap::default(),
                 diagnostics: Vec::new(),
-                diagnostic_keys: HashSet::new(),
+                diagnostic_keys: FxHashSet::default(),
             });
         }
 
@@ -827,7 +1552,7 @@ impl PreprocessorState {
 
         let emitted = self.output.len() - output_start;
         self.emitted_bytes.insert(canonical.clone(), emitted);
-        let pending_skips = self.cache_frames.last().map(|f| f.skips.len()).unwrap_or(0);
+        let pending_skips = self.cache_frames.last().map_or(0, |f| f.skips.len());
         if cache_header
             && !self.opts.frozen_expansion_cache
             && emitted == 0
@@ -855,8 +1580,7 @@ impl PreprocessorState {
             // An expansion composed after a run-wide limit cut this run
             // short is missing content; publishing it would hand that
             // truncation to every later consumer of the header.
-            let cache = self.opts.include_expansion_cache.as_ref();
-            if let Some(cache) = cache.filter(|_| !self.expansion_incomplete) {
+            if !self.expansion_incomplete && self.opts.include_expansion_cache.is_some() {
                 let output_end = self.output.len();
                 let (composed, composed_map, extra_files) = if self.opts.inline_include_bodies {
                     self.compose_cache_text(output_start, output_end, &frame.skips)
@@ -864,11 +1588,11 @@ impl PreprocessorState {
                     (
                         self.output[output_start..output_end].to_string(),
                         self.line_map.slice_from(output_start),
-                        HashSet::new(),
+                        FxHashSet::default(),
                     )
                 };
-                let mut new_files: HashSet<PathBuf> = self
-                    .included_guard
+                let mut new_files: FxHashSet<PathBuf> = self
+                    .included_files
                     .difference(&guard_snapshot)
                     .filter(|p| self.emitted_bytes.get(*p).copied().unwrap_or(0) > 0)
                     .cloned()
@@ -879,23 +1603,69 @@ impl PreprocessorState {
                     None => Arc::default(),
                 };
                 let diagnostics: Arc<Vec<Diagnostic>> = Arc::new(frame.diagnostics);
+                let deps = frame.deps;
+                let replayed = frame.replayed;
+                // Only for the files this entry actually covers. A frame
+                // also learns the guards of headers it skipped because the
+                // includer had already pulled them in — those contribute no
+                // text here, so handing them to a consumer would suppress an
+                // `#include` whose body the consumer never received. Camera
+                // lost 1,064 direct call edges to exactly that.
+                let mut guards: Vec<(PathBuf, crate::FileGuard)> = frame
+                    .guards
+                    .into_iter()
+                    .filter(|(p, _)| *p == canonical || new_files.contains(p))
+                    .collect();
+                // The map's iteration order is not stable across runs and
+                // the index must be bit-reproducible.
+                guards.sort_by(|a, b| a.0.cmp(&b.0));
                 // Diagnostics alone are not content. An entry holding nothing
                 // else replays as an empty expansion, and `splice_cached`
                 // reports the hit as a success, so every later consumer that
                 // reaches this header with its guard undefined silently loses
                 // the body. Leave it uncached and let those runs expand it.
                 if !composed.is_empty() || !ops.is_empty() || !new_files.is_empty() {
-                    if let Ok(mut guard) = cache.write() {
-                        guard.entry((canonical, self.language)).or_insert(
-                            crate::IncludeExpansion {
-                                text: composed.into(),
-                                files: Arc::new(new_files),
-                                diagnostics,
-                                line_map: Arc::new(composed_map),
-                                ops,
-                            },
-                        );
+                    // Which expansion of each header this one pulled in, so
+                    // a consumer that replays this entry can lower the same
+                    // ones (it never visits them itself). Taken from the
+                    // frame rather than from `new_files`, which only counts
+                    // files this run expanded — a nested header that was
+                    // itself replayed never records emitted bytes and would
+                    // drop out.
+                    // Closed over nesting, so one lookup answers for the
+                    // whole subtree: entries are built bottom-up, so each
+                    // one this replayed is already closed, and unioning
+                    // their records keeps the property.
+                    let mut nested_variants: Vec<(PathBuf, usize)> = Vec::new();
+                    let mut seen: FxHashSet<PathBuf> = FxHashSet::default();
+                    for (nested_path, nested_at) in replayed {
+                        if let Some(deeper) = self
+                            .entry_used
+                            .get(&nested_path)
+                            .map(|e| Arc::clone(&e.nested_variants))
+                        {
+                            for (p, v) in deeper.iter() {
+                                if seen.insert(p.clone()) {
+                                    nested_variants.push((p.clone(), *v));
+                                }
+                            }
+                        }
+                        if seen.insert(nested_path.clone()) {
+                            nested_variants.push((nested_path, nested_at));
+                        }
                     }
+                    let entry = crate::IncludeExpansion {
+                        text: composed.into(),
+                        files: Arc::new(new_files),
+                        diagnostics,
+                        line_map: Arc::new(composed_map),
+                        ops,
+                        deps: Arc::new(deps),
+                        guards: Arc::new(guards),
+                        nested_variants: Arc::new(nested_variants),
+                    };
+                    self.entry_used.insert(canonical.clone(), entry.clone());
+                    self.publish_variant(canonical, entry);
                 }
             }
             // The log only feeds open frames; once the outermost cached
@@ -924,8 +1694,19 @@ impl PreprocessorState {
     fn process_file_tokens(&mut self, tokens: &[Token]) -> Result<(), PreprocessError> {
         let depth = self.conditional_stack.len();
         let outer_base = std::mem::replace(&mut self.cond_base, depth);
+        // Before the token loop, not at the closing `#endif`: a guarded
+        // header that reaches itself back through another header re-enters
+        // while its own `#endif` is still ahead, and a guard learned on the
+        // way out cannot answer for that inclusion (#56).
+        let guard = detect_include_guard(tokens);
+        let outer_guarded = std::mem::replace(&mut self.guarded_file, guard.is_some());
+        if let Some(name) = guard {
+            let path = trace_ir::canonicalize(&self.current_file);
+            self.record_guard(path, crate::FileGuard::Ifndef(name));
+        }
         let result = self.process_tokens(tokens);
         self.cond_base = outer_base;
+        self.guarded_file = outer_guarded;
         if result.is_ok() {
             for idx in depth..self.conditional_stack.len() {
                 let line = self.conditional_stack[idx].line;
@@ -935,6 +1716,19 @@ impl PreprocessorState {
                     "unterminated #if; conditional closed at end of file".into(),
                 );
             }
+        }
+        // A chain left open (or cut short by an error) ends where the file
+        // does: the line after the last one, so that line is in the arm.
+        // The EOF token sits on the line after a trailing newline, but on
+        // the last line itself when there is none.
+        // Comments and whitespace do not produce tokens, so the token
+        // before EOF cannot tell us whether the physical last line is empty.
+        let last_line = tokens
+            .last()
+            .map_or(1, |eof| eof.line + u32::from(eof.col > 1));
+        for idx in depth..self.conditional_stack.len() {
+            let chain = self.conditional_stack[idx].chain;
+            self.close_arm(chain, last_line);
         }
         self.conditional_stack.truncate(depth);
         result
@@ -970,11 +1764,14 @@ impl PreprocessorState {
                         i += 1;
                         continue;
                     }
-                    if !tok.is_hidden(name) {
+                    if tok.is_hidden(name) {
+                        self.emit_token(tok);
+                    } else {
+                        self.record_read(name);
                         if let Some(macro_def) = self.macros.get(name).cloned() {
                             match macro_def {
                                 MacroDef::Function { .. } | MacroDef::GmockMethod => {
-                                    if self.next_non_newline_is(tokens, i + 1, "(") {
+                                    if Self::next_non_newline_is(tokens, i + 1, "(") {
                                         if !self.push_expansion(tok.line) {
                                             self.emit_token(tok);
                                             i += 1;
@@ -1021,8 +1818,6 @@ impl PreprocessorState {
                         } else {
                             self.emit_token(tok);
                         }
-                    } else {
-                        self.emit_token(tok);
                     }
                 } else {
                     self.emit_token(tok);
@@ -1062,6 +1857,7 @@ impl PreprocessorState {
                         continue;
                     }
                     if !tok.is_hidden(name) {
+                        self.record_read(name);
                         match self.macros.get(name).cloned() {
                             Some(MacroDef::Object { replacement }) => {
                                 if !self.push_expansion(tok.line) {
@@ -1091,7 +1887,7 @@ impl PreprocessorState {
                             // verbatim into the output.
                             Some(
                                 macro_def @ (MacroDef::Function { .. } | MacroDef::GmockMethod),
-                            ) if self.next_non_newline_is(tokens, i + 1, "(") => {
+                            ) if Self::next_non_newline_is(tokens, i + 1, "(") => {
                                 if !self.push_expansion(tok.line) {
                                     self.emit_token(tok);
                                     i += 1;
@@ -1142,11 +1938,20 @@ impl PreprocessorState {
 
         let directive = match &tokens[i].kind {
             TokenKind::Identifier(s) => s.clone(),
+            // Inside a skipped group only the nesting matters (C11
+            // 6.10.1p6): a line marker (`# 1 "x.c"`) or a `#!` line there
+            // must not abort the file, which would also record the arm as
+            // excluding everything to the end of the file.
+            _ if !self.is_active() => {
+                skip_directive_line(tokens, &mut i);
+                return Ok(i);
+            }
             _ => {
                 return Err(self.error(tokens[i].line, "expected directive name after #"));
             }
         };
         let line = tokens[i].line;
+        let record_line = tokens[start].line;
         i += 1;
 
         match directive.as_str() {
@@ -1156,55 +1961,121 @@ impl PreprocessorState {
             "define" if self.is_active() => {
                 i = self.handle_define(tokens, i)?;
             }
-            "include" | "define" if !self.is_active() => {}
+            "include" | "define" | "undef" if !self.is_active() => {}
             // Inside a skipped group only the nesting matters (C11
             // 6.10.1p6): a malformed operand there must not abort the file.
-            "ifdef" => {
+            "ifdef" | "ifndef" => {
+                let negate = directive == "ifndef";
+                let directive = if negate {
+                    ArmDirective::Ifndef
+                } else {
+                    ArmDirective::Ifdef
+                };
                 if self.is_active() {
                     let name = self.read_directive_ident(tokens, &mut i)?;
+                    self.begin_reads();
                     let defined = self.is_defined_for_conditionals(&name);
-                    self.push_cond(defined, line);
+                    let reads = self.end_reads();
+                    let cond = defined != negate;
+                    let chain = self.open_chain(|| ConditionalArm {
+                        directive,
+                        expression: name.clone(),
+                        line: record_line,
+                        end_line: record_line,
+                        outcome: arm_outcome(true, cond),
+                        evaluated: true,
+                        reads,
+                    });
+                    self.push_cond(cond, line, chain);
+                    if negate {
+                        self.mark_include_guard(chain, tokens, start);
+                    }
                 } else {
-                    self.push_cond(false, line);
-                }
-            }
-            "ifndef" => {
-                if self.is_active() {
-                    let name = self.read_directive_ident(tokens, &mut i)?;
-                    let defined = self.is_defined_for_conditionals(&name);
-                    self.push_cond(!defined, line);
-                } else {
-                    self.push_cond(false, line);
+                    let rest = directive_rest(tokens, i);
+                    let operand = &rest[..rest.len().min(1)];
+                    let chain = self.open_chain(|| ConditionalArm {
+                        directive,
+                        expression: operand
+                            .first()
+                            .and_then(ident_name)
+                            .unwrap_or("")
+                            .to_string(),
+                        line: record_line,
+                        end_line: record_line,
+                        outcome: ArmOutcome::Unevaluated,
+                        evaluated: false,
+                        reads: operand
+                            .iter()
+                            .filter_map(ident_name)
+                            .map(|name| ConditionRead {
+                                name: name.to_string(),
+                                bound: None,
+                            })
+                            .collect(),
+                    });
+                    self.push_cond(false, line, chain);
                 }
             }
             "if" => {
                 // Conditions in skipped groups are not evaluated (C11
                 // 6.10.1p6); the frame still pushes to keep nesting balanced.
-                let cond = if self.is_active() {
+                let evaluate = self.is_active();
+                let expr_start = i;
+                let cond = if evaluate {
+                    self.begin_reads();
                     self.expand_and_eval_condition(tokens, &mut i)
                 } else {
                     skip_directive_line(tokens, &mut i);
                     false
                 };
-                self.push_cond(cond, line);
+                let expr = &tokens[expr_start..i];
+                let reads = self.end_reads();
+                let chain = self.open_chain(|| ConditionalArm {
+                    directive: ArmDirective::If,
+                    expression: spell_condition(expr),
+                    line: record_line,
+                    end_line: record_line,
+                    outcome: arm_outcome(evaluate, cond),
+                    evaluated: evaluate,
+                    reads: if evaluate { reads } else { spelled_reads(expr) },
+                });
+                self.push_cond(cond, line, chain);
+                if evaluate && negated_defined_name(expr).is_some() {
+                    self.mark_include_guard(chain, tokens, start);
+                }
             }
             "elif" => {
                 if !self.has_own_cond() {
                     return Err(self.error(line, "#elif without #if"));
                 }
                 let frame = *self.conditional_stack.last().unwrap();
-                let cond = if frame.parent_active && !frame.taken && !frame.else_seen {
+                let evaluate = frame.parent_active && !frame.taken && !frame.else_seen;
+                let expr_start = i;
+                let cond = if evaluate {
+                    self.begin_reads();
                     self.expand_and_eval_condition(tokens, &mut i)
                 } else {
                     skip_directive_line(tokens, &mut i);
                     false
                 };
+                let expr = &tokens[expr_start..i];
+                let reads = self.end_reads();
                 if frame.else_seen {
                     self.warn(line, "#elif after #else; branch ignored");
                 }
                 let f = self.conditional_stack.last_mut().unwrap();
                 f.active = f.parent_active && !f.taken && cond;
                 f.taken |= f.active;
+                let active = f.active;
+                self.add_arm(frame.chain, record_line, || ConditionalArm {
+                    directive: ArmDirective::Elif,
+                    expression: spell_condition(expr),
+                    line: record_line,
+                    end_line: record_line,
+                    outcome: arm_outcome(frame.parent_active, active),
+                    evaluated: evaluate,
+                    reads: if evaluate { reads } else { spelled_reads(expr) },
+                });
             }
             "else" => {
                 if !self.has_own_cond() {
@@ -1214,24 +2085,50 @@ impl PreprocessorState {
                 f.active = f.parent_active && !f.taken;
                 f.taken = true;
                 f.else_seen = true;
+                let (chain, parent_active, active) = (f.chain, f.parent_active, f.active);
+                self.add_arm(chain, record_line, || ConditionalArm {
+                    directive: ArmDirective::Else,
+                    expression: String::new(),
+                    line: record_line,
+                    end_line: record_line,
+                    outcome: arm_outcome(parent_active, active),
+                    evaluated: false,
+                    reads: Vec::new(),
+                });
             }
             "endif" => {
                 if !self.has_own_cond() {
                     return Err(self.error(line, "#endif without #if"));
                 }
-                self.conditional_stack.pop();
+                let frame = self.conditional_stack.pop().unwrap();
+                self.close_arm(frame.chain, record_line);
+                if let Some(chain) = frame.chain {
+                    self.conditionals[chain].terminated = true;
+                }
             }
             // Directives whose operands we ignore: the shared skip below
             // consumes the rest of the line. Calling skip_to_newline here as
             // well would eat the newline AND the whole following line
             // (e.g. `#pragma pack(push, 4)` swallowing the struct after it).
             "line" => {}
-            "pragma" => {}
+            "pragma" => {
+                // `#pragma once` is the file's own statement that one
+                // expansion per translation unit is enough; nothing else
+                // about a pragma concerns the preprocessor. Reached inside a
+                // skipped arm it states nothing, so it is read only while
+                // active — and once read it holds for the rest of the run,
+                // whatever later happens to the controlling condition.
+                if self.is_active()
+                    && matches!(tokens.get(i).map(|t| &t.kind), Some(TokenKind::Identifier(n)) if n.as_str() == "once")
+                {
+                    let path = trace_ir::canonicalize(&self.current_file);
+                    self.record_guard(path, crate::FileGuard::Once);
+                }
+            }
             "undef" if self.is_active() => {
                 let name = self.read_directive_ident(tokens, &mut i)?;
                 self.remove_macro(&name);
             }
-            "undef" if !self.is_active() => {}
             _ => {
                 self.warn(
                     tokens[i.saturating_sub(1)].line,
@@ -1239,7 +2136,7 @@ impl PreprocessorState {
                 );
             }
         }
-        i = self.skip_to_newline(tokens, i);
+        i = Self::skip_to_newline(tokens, i);
         Ok(i)
     }
 
@@ -1247,7 +2144,7 @@ impl PreprocessorState {
         while i < tokens.len() && matches!(tokens[i].kind, TokenKind::Newline) {
             i += 1;
         }
-        let line = tokens.get(i).map(|t| t.line).unwrap_or(1);
+        let line = tokens.get(i).map_or(1, |t| t.line);
         // C11 6.10.2: a header-name (`"..."` / `<...>`) is taken as-is;
         // otherwise the rest of the line is macro-expanded and must then
         // form a header-name (`#include FOO` with `#define FOO "n.h"`).
@@ -1269,16 +2166,14 @@ impl PreprocessorState {
             }
         };
 
-        let include_path = match self.resolve_include(&path) {
-            Ok(p) => p,
-            Err(_) => {
-                self.warn(line, format!("include file not found, skipping: {path}"));
-                return Ok(i);
-            }
+        let (path, quoted) = path;
+        let Ok(include_path) = self.resolve_include(&path, quoted) else {
+            self.warn(line, format!("include file not found, skipping: {path}"));
+            return Ok(i);
         };
         let live_at = self.output.len();
         if let Err(e) = self.process_file(&include_path) {
-            // The include is already in `included_guard` and contributed
+            // The include is already in `included_files` and contributed
             // nothing, so this expansion — and every frame enclosing it — is
             // missing the header's content. Publishing any of them would keep
             // starving consumers after the underlying failure clears.
@@ -1337,13 +2232,9 @@ impl PreprocessorState {
                 i += 1;
                 continue;
             }
-            let Some(def) = self.macros.get(name).cloned() else {
-                out.push(tokens[i].clone());
-                i += 1;
-                continue;
-            };
-            match def {
-                MacroDef::Object { replacement } => {
+            self.record_read(name);
+            match self.macros.get(name).cloned() {
+                Some(MacroDef::Object { replacement }) => {
                     if !self.push_expansion(tokens[i].line) {
                         out.push(tokens[i].clone());
                         i += 1;
@@ -1359,8 +2250,8 @@ impl PreprocessorState {
                     out.extend(nested?);
                     i += 1;
                 }
-                MacroDef::Function { .. } | MacroDef::GmockMethod
-                    if self.next_non_newline_is(tokens, i + 1, "(") =>
+                Some(def @ (MacroDef::Function { .. } | MacroDef::GmockMethod))
+                    if Self::next_non_newline_is(tokens, i + 1, "(") =>
                 {
                     if !self.push_expansion(tokens[i].line) {
                         out.push(tokens[i].clone());
@@ -1376,7 +2267,7 @@ impl PreprocessorState {
                     self.pop_expansion();
                     out.extend(nested?);
                 }
-                MacroDef::Function { .. } | MacroDef::GmockMethod => {
+                _ => {
                     out.push(tokens[i].clone());
                     i += 1;
                 }
@@ -1385,8 +2276,8 @@ impl PreprocessorState {
         Ok(out)
     }
 
-    fn resolve_include(&self, path: &str) -> Result<PathBuf, PreprocessError> {
-        let candidate = if path.starts_with('/') || path.contains('\\') {
+    fn resolve_include(&self, path: &str, quoted: bool) -> Result<PathBuf, PreprocessError> {
+        let candidate = if Path::new(path).is_absolute() {
             PathBuf::from(path)
         } else {
             self.current_file
@@ -1394,27 +2285,147 @@ impl PreprocessorState {
                 .unwrap_or(Path::new("."))
                 .join(path)
         };
-        if candidate.exists() {
+        if (quoted || !self.opts.strict_include_search || Path::new(path).is_absolute())
+            && self.include_exists(&candidate)
+        {
             return Ok(candidate);
         }
-        for inc in &self.opts.include_paths {
-            let p = inc.join(path);
-            if p.is_file() {
-                return Ok(p);
-            }
+        // Everything below depends only on the header spelling and the fixed
+        // search lists, so a guarded header re-included by many files, and
+        // every file that includes it, share one directory walk.
+        let key = (path.to_string(), quoted);
+        if let Some(hit) = self.include_search_cache.borrow().get(&key) {
+            return hit.clone().ok_or_else(|| PreprocessError::Message {
+                message: format!("include file not found: {path}"),
+            });
         }
-        if let Some(index) = &self.opts.basename_index {
+        let found = self.search_include_dirs(&key);
+        self.include_search_cache
+            .borrow_mut()
+            .insert(key, found.clone());
+        found.ok_or_else(|| PreprocessError::Message {
+            message: format!("include file not found: {path}"),
+        })
+    }
+
+    /// Whether `path` names a header this run can read: a file on disk, or an
+    /// entry the caller pre-loaded into `source_cache` (a virtual header).
+    ///
+    /// The cache is probed with `path` as given, NOT with
+    /// `trace_ir::canonicalize(path)`. Reaching the probe means `is_file` said
+    /// no, and `std::fs::canonicalize` requires every component to exist, so
+    /// here it can only fail and fall back to the path as handed in — the one
+    /// path that survives it is an existing *directory*, which is never a
+    /// source-cache key. The two probes therefore give the same answer, and
+    /// the canonical one cost a `realpath` per candidate: `resolve_include`
+    /// builds a fresh includer-relative candidate for every (including file,
+    /// spelling) pair, so the memo in `trace_ir::canonicalize` almost never
+    /// hits and the syscalls were a quarter of preprocessing (#83).
+    ///
+    /// Nor does the probe need `.`/`..` folded out of the key first: a
+    /// candidate spelled that way is settled by `is_file`, since every
+    /// `source_cache` key is a file `IncludeGraph` read off disk and a cached
+    /// header is therefore always also an on-disk one. A caller that seeds
+    /// `source_cache` with keys naming no file (only tests do) must spell them
+    /// the way an `#include` resolves to them.
+    fn include_exists(&self, path: &Path) -> bool {
+        trace_ir::is_file_cached(path)
+            || self
+                .opts
+                .source_cache
+                .as_ref()
+                .is_some_and(|cache| cache.is_virtual(path))
+    }
+
+    /// The include search proper, excluding the including file's own
+    /// directory, for `key` = (spelling, quoted). The directory walk is
+    /// shared with every run over the same `SourceCache` and search lists
+    /// (hits and misses alike); the basename fallback is not, because it
+    /// depends on the caller's own index and strictness.
+    fn search_include_dirs(&self, key: &(String, bool)) -> Option<PathBuf> {
+        let (path, quoted) = (key.0.as_str(), key.1);
+        let cached = self.shared_directory_results.as_ref().and_then(|cache| {
+            cache
+                .read()
+                .ok()
+                .and_then(|results| results.get(key).cloned())
+        });
+        let found = cached.unwrap_or_else(|| {
+            let quote_dirs = self.opts.quote_include_paths.iter().filter(|_| quoted);
+            let found = quote_dirs
+                .chain(&self.opts.include_paths)
+                .chain(&self.opts.system_include_paths)
+                .map(|inc| inc.join(path))
+                .find(|p| self.include_exists(p));
+            if let Some(cache) = &self.shared_directory_results {
+                if let Ok(mut results) = cache.write() {
+                    results.insert(key.clone(), found.clone());
+                }
+            }
+            found
+        });
+        if found.is_some() {
+            return found;
+        }
+        if let Some(index) = self
+            .opts
+            .basename_index
+            .as_ref()
+            .filter(|_| !self.opts.strict_include_search)
+        {
             if let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str()) {
                 if let Some(matches) = index.get(name) {
                     if matches.len() == 1 {
-                        return Ok(matches[0].clone());
+                        return Some(matches[0].clone());
                     }
                 }
             }
         }
-        Err(PreprocessError::Message {
-            message: format!("include file not found: {path}"),
-        })
+        None
+    }
+
+    fn process_forced_includes(&mut self) {
+        if self.opts.forced_includes.is_empty() {
+            return;
+        }
+        let source = self.current_file.clone();
+        // resolve_include searches the current file's parent first. A synthetic
+        // filename supplies the command directory without changing process cwd.
+        let search_from = self
+            .opts
+            .working_directory
+            .as_ref()
+            .map(|directory| directory.join("<command-line>"));
+        // A forced header's text is spliced into this unit exactly like a
+        // nested `#include`, so it must not be taken for the root file: the
+        // root is never recorded in `inlined_files`, and a header both inlined
+        // here and left out of that set would be lowered a second time as its
+        // own unit.
+        self.forced_include_depth += 1;
+        for include in self.opts.forced_includes.clone() {
+            let name = include.to_string_lossy().into_owned();
+            if let Some(directory) = &search_from {
+                self.current_file = directory.clone();
+            }
+            let resolved = self.resolve_include(&name, true);
+            // Warn as the source, never as the synthetic `<command-line>`:
+            // a diagnostic's file is interned into the program, and that
+            // path does not exist.
+            self.current_file = source.clone();
+            match resolved {
+                Ok(path) => {
+                    if let Err(e) = self.process_file(&path) {
+                        self.warn(1, format!("forced include preprocessing failed: {e}"));
+                    }
+                }
+                Err(_) => self.warn(
+                    1,
+                    format!("forced include file not found, skipping: {name}"),
+                ),
+            }
+        }
+        self.forced_include_depth -= 1;
+        self.current_file = source;
     }
 
     fn handle_define(&mut self, tokens: &[Token], mut i: usize) -> Result<usize, PreprocessError> {
@@ -1468,7 +2479,7 @@ impl PreprocessorState {
         let mut params = Vec::new();
         let mut variadic = false;
         loop {
-            if self.token_is_ellipsis(tokens, *i) {
+            if Self::token_is_ellipsis(tokens, *i) {
                 // Anonymous `...`: register the variadic under its standard
                 // name so substitution, `##` comma elision, and the
                 // "last param collects the rest" rule all treat it exactly
@@ -1480,12 +2491,15 @@ impl PreprocessorState {
                     .finish_param_list_tail(tokens, i)
                     .then_some((params, variadic));
             }
-            match tokens.get(*i).map(|t| &t.kind) {
-                Some(TokenKind::Punct(s)) if *s == ")" => {
+            match tokens.get(*i) {
+                Some(tok) if tok.is_punct(")") => {
                     *i += 1;
                     break;
                 }
-                Some(TokenKind::Identifier(name)) => {
+                Some(Token {
+                    kind: TokenKind::Identifier(name),
+                    ..
+                }) => {
                     params.push(name.clone());
                     *i += 1;
                 }
@@ -1493,19 +2507,19 @@ impl PreprocessorState {
             }
             // Line splicing makes `args \`-newline-`...` equivalent to
             // `args...`; the lexer has already deleted the splice.
-            if self.token_is_ellipsis(tokens, *i) {
+            if Self::token_is_ellipsis(tokens, *i) {
                 variadic = true;
                 *i += 1;
                 return self
                     .finish_param_list_tail(tokens, i)
                     .then_some((params, variadic));
             }
-            match tokens.get(*i).map(|t| &t.kind) {
-                Some(TokenKind::Punct(s)) if *s == ")" => {
+            match tokens.get(*i) {
+                Some(tok) if tok.is_punct(")") => {
                     *i += 1;
                     break;
                 }
-                Some(TokenKind::Punct(s)) if *s == "," => {
+                Some(tok) if tok.is_punct(",") => {
                     *i += 1;
                 }
                 _ => return self.malformed_param_list(tokens, *i),
@@ -1517,9 +2531,10 @@ impl PreprocessorState {
     /// Warn about a parameter list that ends at a newline / EOF or contains
     /// an unexpected token, then yield `None` so the definition is dropped.
     fn malformed_param_list(&mut self, tokens: &[Token], i: usize) -> Option<(Vec<String>, bool)> {
-        let line = tokens.get(i).map(|t| t.line).unwrap_or(1);
-        let message = match tokens.get(i).map(|t| &t.kind) {
-            None | Some(TokenKind::Eof) | Some(TokenKind::Newline) => {
+        let line = tokens.get(i).map_or(1, |t| t.line);
+        let message = match tokens.get(i) {
+            None => "unterminated macro parameter list; definition ignored",
+            Some(t) if t.is_eof() || t.is_newline() => {
                 "unterminated macro parameter list; definition ignored"
             }
             _ => "expected , or ) in macro parameters; definition ignored",
@@ -1534,12 +2549,13 @@ impl PreprocessorState {
     /// `)` on a later line, which would swallow following code.
     fn finish_param_list_tail(&mut self, tokens: &[Token], i: &mut usize) -> bool {
         loop {
-            match tokens.get(*i).map(|t| &t.kind) {
-                Some(TokenKind::Punct(s)) if *s == ")" => {
+            match tokens.get(*i) {
+                Some(tok) if tok.is_punct(")") => {
                     *i += 1;
                     return true;
                 }
-                None | Some(TokenKind::Eof) | Some(TokenKind::Newline) => {
+                None => return self.malformed_param_list(tokens, *i).is_some(),
+                Some(tok) if tok.is_eof() || tok.is_newline() => {
                     return self.malformed_param_list(tokens, *i).is_some();
                 }
                 Some(_) => *i += 1,
@@ -1553,18 +2569,15 @@ impl PreprocessorState {
     /// malformed-list path, which is right for `. . .` and for dots split
     /// by a comment — `invalid token in macro parameter list` in gcc and
     /// clang.
-    fn token_is_ellipsis(&self, tokens: &[Token], i: usize) -> bool {
-        matches!(&tokens.get(i).map(|t| &t.kind), Some(TokenKind::Punct(s)) if *s == "...")
+    fn token_is_ellipsis(tokens: &[Token], i: usize) -> bool {
+        tokens.get(i).is_some_and(|t| t.is_punct("..."))
     }
 
-    fn next_non_newline_is(&self, tokens: &[Token], mut i: usize, punct: &str) -> bool {
-        while i < tokens.len() && matches!(tokens[i].kind, TokenKind::Newline) {
+    fn next_non_newline_is(tokens: &[Token], mut i: usize, punct: &str) -> bool {
+        while i < tokens.len() && tokens[i].is_newline() {
             i += 1;
         }
-        matches!(
-            tokens.get(i).map(|t| &t.kind),
-            Some(TokenKind::Punct(s)) if *s == punct
-        )
+        tokens.get(i).is_some_and(|t| t.is_punct(punct))
     }
 
     fn parse_macro_args(
@@ -1633,7 +2646,7 @@ impl PreprocessorState {
                 Ok(name)
             }
             _ => Err(self.error(
-                tokens.get(*i).map(|t| t.line).unwrap_or(1),
+                tokens.get(*i).map_or(1, |t| t.line),
                 "expected identifier in directive",
             )),
         }
@@ -1684,15 +2697,16 @@ impl PreprocessorState {
         while i < work.len() {
             steps += 1;
             if steps > MAX_STEPS || work.len() > MAX_TOKENS || out.len() > MAX_TOKENS {
-                let line = work.get(i).map(|t| t.line).unwrap_or(1);
+                let line = work.get(i).map_or(1, |t| t.line);
                 self.warn_condition_budget(line);
                 return None;
             }
             let tok = work[i].clone();
             if let TokenKind::Identifier(name) = &tok.kind {
                 if name == "defined" {
-                    let (val, consumed) =
-                        defined_operand(&work, i, &self.macros, &self.fallback_macros);
+                    let (operand, consumed) = defined_operand(&work, i);
+                    let operand = operand.map(str::to_string);
+                    let val = operand.is_some_and(|n| self.is_defined_for_conditionals(&n));
                     out.push(Token::new(
                         TokenKind::Number(if val { "1" } else { "0" }.into()),
                         tok.line,
@@ -1714,11 +2728,14 @@ impl PreprocessorState {
                 // evaluation: expanding it here (often to nothing) would
                 // mangle the expression (`1 || __init` -> `1 ||`), while an
                 // unexpanded identifier correctly evaluates to 0.
+                if !tok.is_hidden(name) {
+                    self.record_read(name);
+                }
                 if !tok.is_hidden(name) && !self.fallback_macros.contains(name.as_str()) {
                     match self.macros.get(name) {
                         Some(MacroDef::Object { replacement }) => {
                             let painted = Self::paint_replacement(replacement, &tok, name);
-                            work.splice(i..i + 1, painted);
+                            work.splice(i..=i, painted);
                             continue; // rescan at i
                         }
                         Some(MacroDef::Function {
@@ -1769,11 +2786,11 @@ impl PreprocessorState {
         Some(out)
     }
 
-    fn skip_to_newline(&self, tokens: &[Token], mut i: usize) -> usize {
-        while i < tokens.len() && !matches!(tokens[i].kind, TokenKind::Newline | TokenKind::Eof) {
+    fn skip_to_newline(tokens: &[Token], mut i: usize) -> usize {
+        while i < tokens.len() && !tokens[i].is_newline() && !tokens[i].is_eof() {
             i += 1;
         }
-        if i < tokens.len() && matches!(tokens[i].kind, TokenKind::Newline) {
+        if i < tokens.len() && tokens[i].is_newline() {
             i += 1;
         }
         i
@@ -1784,18 +2801,129 @@ impl PreprocessorState {
             output: self.output,
             line_map: self.line_map,
             diagnostics: self.diagnostics,
-            included_headers: self.included_guard.into_iter().collect(),
+            language: self.language,
+            included_headers: self.included_files.into_iter().collect(),
+            inlined_headers: self.inlined_files.into_iter().collect(),
+            replayed_variants: {
+                let mut vs: FxHashSet<(PathBuf, usize)> = self.direct_variants;
+                vs.extend(self.variant_used);
+                let mut vs: Vec<(PathBuf, usize)> = vs.into_iter().collect();
+                vs.sort();
+                vs
+            },
+            conditionals: self.conditionals,
         }
     }
 }
 
-fn parse_include_header(tokens: &[Token]) -> Option<String> {
+/// The tokens of the current directive line from `i` to its end.
+fn directive_rest(tokens: &[Token], i: usize) -> &[Token] {
+    let mut end = i;
+    skip_directive_line(tokens, &mut end);
+    &tokens[i.min(end)..end]
+}
+
+fn arm_outcome(evaluated: bool, taken: bool) -> ArmOutcome {
+    match (evaluated, taken) {
+        (false, _) => ArmOutcome::Unevaluated,
+        (true, true) => ArmOutcome::Taken,
+        (true, false) => ArmOutcome::Skipped,
+    }
+}
+
+/// A condition as written: token spellings, with the whitespace the source
+/// had between them collapsed to one space.
+fn spell_condition(tokens: &[Token]) -> String {
+    spell_tokens(tokens, str::to_string)
+}
+
+/// The identifiers a condition spells, for an arm that was never evaluated
+/// (so nothing consulted the environment). `defined`, `__LINE__` and the
+/// alternative operator spellings (`and`, `not`, …) are operators, not names,
+/// except when explicitly used as the operand of `defined`.
+fn spelled_reads(tokens: &[Token]) -> Vec<ConditionRead> {
+    let mut reads = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let mut name = ident_name(&tokens[i]);
+        if name == Some("defined") {
+            let (operand, consumed) = defined_operand(tokens, i);
+            name = operand;
+            i += consumed;
+        } else {
+            name = name.filter(|n| *n != "__LINE__" && !is_alternative_token(n));
+            i += 1;
+        }
+        if let Some(name) = name {
+            reads.push(ConditionRead {
+                name: name.to_string(),
+                bound: None,
+            });
+        }
+    }
+    dedup_reads(reads)
+}
+
+/// The C++ alternative operator spellings (C++ [lex.digraph]; `<iso646.h>`
+/// in C). The evaluator does not interpret them, so `#if A and B` reads as
+/// `A` followed by an unbound identifier; for the conditional record that
+/// identifier is an operator, not a name the configuration failed to bind.
+fn is_alternative_token(name: &str) -> bool {
+    matches!(
+        name,
+        "and"
+            | "and_eq"
+            | "bitand"
+            | "bitor"
+            | "compl"
+            | "not"
+            | "not_eq"
+            | "or"
+            | "or_eq"
+            | "xor"
+            | "xor_eq"
+    )
+}
+
+fn dedup_reads(reads: Vec<ConditionRead>) -> Vec<ConditionRead> {
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    reads
+        .into_iter()
+        .filter(|r| seen.insert(r.name.clone()))
+        .collect()
+}
+
+/// `NAME` from a condition that is exactly `!defined(NAME)` or
+/// `!defined NAME`: the `#if` spelling of an include guard.
+fn negated_defined_name(expr: &[Token]) -> Option<&str> {
+    match expr {
+        [bang, defined, rest @ ..] if is_punct(bang, "!") && is_ident(defined, "defined") => {
+            match rest {
+                [open, name, close] if is_punct(open, "(") && is_punct(close, ")") => {
+                    ident_name(name)
+                }
+                [name] => ident_name(name),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn ident_name(tok: &Token) -> Option<&str> {
+    match &tok.kind {
+        TokenKind::Identifier(n) => Some(n.as_str()),
+        _ => None,
+    }
+}
+
+fn parse_include_header(tokens: &[Token]) -> Option<(String, bool)> {
     let mut i = 0;
     while i < tokens.len() && matches!(tokens[i].kind, TokenKind::Newline) {
         i += 1;
     }
     match tokens.get(i).map(|t| &t.kind) {
-        Some(TokenKind::String(s)) => plain_string_body(s).map(str::to_string),
+        Some(TokenKind::String(s)) => plain_string_body(s).map(|s| (s.to_string(), true)),
         Some(TokenKind::Punct(s)) if *s == "<" => {
             let mut header = String::new();
             i += 1;
@@ -1807,7 +2935,7 @@ fn parse_include_header(tokens: &[Token]) -> Option<String> {
                     TokenKind::Punct(s) if *s != ">" => {
                         header.push_str(s);
                     }
-                    TokenKind::Punct(s) if *s == ">" => return Some(header),
+                    TokenKind::Punct(s) if *s == ">" => return Some((header, false)),
                     _ => return None,
                 }
                 i += 1;
@@ -1830,7 +2958,12 @@ fn at_beginning_of_line(tokens: &[Token], i: usize) -> bool {
 /// double parenthesis so an unrelated identifier call is not discarded.
 fn attribute_group_end(tokens: &[Token], start: usize) -> Option<usize> {
     let name = match tokens.get(start).map(|tok| &tok.kind) {
-        Some(TokenKind::Identifier(name)) if name == "__attribute__" || name == "__declspec" => {
+        Some(TokenKind::Identifier(name))
+            if matches!(
+                name.as_str(),
+                "__attribute__" | "__attribute" | "__declspec"
+            ) =>
+        {
             name.as_str()
         }
         _ => return None,
@@ -1851,7 +2984,7 @@ fn attribute_group_end_after_name(tokens: &[Token], mut open: usize, name: &str)
     ) {
         return None;
     }
-    if name == "__attribute__" {
+    if matches!(name, "__attribute__" | "__attribute") {
         let mut inner = open + 1;
         while matches!(
             tokens.get(inner).map(|tok| &tok.kind),
@@ -1867,6 +3000,18 @@ fn attribute_group_end_after_name(tokens: &[Token], mut open: usize, name: &str)
         }
     }
 
+    let declaration_start = tokens[..open]
+        .iter()
+        .rposition(|token| matches!(token.kind, TokenKind::Punct(";" | "{" | "}")))
+        .map_or(0, |index| index + 1);
+    let enclosing_depth = tokens[declaration_start..open]
+        .iter()
+        .fold(0usize, |depth, token| match token.kind {
+            TokenKind::Punct("(") => depth + 1,
+            TokenKind::Punct(")") => depth.saturating_sub(1),
+            TokenKind::Punct(";" | "{" | "}") => 0,
+            _ => depth,
+        });
     let mut depth = 0usize;
     for (offset, tok) in tokens.iter().enumerate().skip(open) {
         match tok.kind {
@@ -1874,10 +3019,18 @@ fn attribute_group_end_after_name(tokens: &[Token], mut open: usize, name: &str)
             TokenKind::Punct(")") => {
                 depth = depth.checked_sub(1)?;
                 if depth == 0 {
+                    let next = tokens[offset + 1..]
+                        .iter()
+                        .find(|t| !matches!(t.kind, TokenKind::Newline));
+                    if enclosing_depth > 0
+                        && next.is_some_and(|t| matches!(t.kind, TokenKind::Punct(";" | "{" | "}")))
+                    {
+                        return None;
+                    }
                     return Some(offset + 1);
                 }
             }
-            TokenKind::Eof => return None,
+            TokenKind::Eof | TokenKind::Punct(";" | "{" | "}") => return None,
             _ => {}
         }
     }
@@ -1891,7 +3044,9 @@ fn compiler_attribute_marker(tokens: &[Token]) -> Option<&str> {
         _ => Some(""),
     });
     let name = significant.next()?;
-    if significant.next().is_none() && matches!(name, "__attribute__" | "__declspec") {
+    if significant.next().is_none()
+        && matches!(name, "__attribute__" | "__attribute" | "__declspec")
+    {
         Some(name)
     } else {
         None
@@ -1906,13 +3061,107 @@ fn attribute_group_must_survive(tokens: &[Token], start: usize, end: usize) -> b
         "destructor",
         "visibility",
         "weak",
+        "noreturn",
+        "selectany",
+        "dllexport",
+        "dllimport",
     ];
 
     tokens[start..end].iter().any(|token| match &token.kind {
         TokenKind::Hash => true,
-        TokenKind::Identifier(name) => MEANINGFUL.contains(&name.as_str()),
+        TokenKind::Identifier(name) => MEANINGFUL.contains(&name.trim_matches('_')),
         _ => false,
     })
+}
+
+/// The include guard wrapping the whole file, if it has one: `#ifndef NAME`
+/// (or `#if !defined(NAME)`) before any other token, `#define NAME` as the
+/// very next directive, and the matching `#endif` with nothing but
+/// whitespace after it. A second arm disqualifies it — a guard has nothing
+/// to choose between.
+///
+/// Read off the token stream rather than observed while the file runs, so
+/// the answer is available at the file's first inclusion and does not depend
+/// on that run reaching the `#endif` (#56).
+fn detect_include_guard(tokens: &[Token]) -> Option<Arc<str>> {
+    let mut i = 0;
+    let name = guard_opener(tokens, &mut i)?;
+    // The `#define` of that same name has to be the next directive.
+    if next_directive(tokens, &mut i)? != "define" || ident_name(tokens.get(i)?)? != &*name {
+        return None;
+    }
+    // Directives only, tracking nesting, to the `#endif` that closes the
+    // opener.
+    let mut depth = 1usize;
+    while let Some(directive) = next_directive(tokens, &mut i) {
+        match directive {
+            "if" | "ifdef" | "ifndef" => depth += 1,
+            "elif" | "else" if depth == 1 => return None,
+            "endif" => {
+                depth -= 1;
+                if depth == 0 {
+                    skip_directive_line(tokens, &mut i);
+                    return tokens[i..]
+                        .iter()
+                        .all(|t| matches!(t.kind, TokenKind::Newline | TokenKind::Eof))
+                        .then_some(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The name an `#ifndef NAME` / `#if !defined(NAME)` opener tests, when one
+/// is the file's very first token. Leaves `i` past that directive line.
+///
+/// Spelled out rather than routed through `next_directive`, which skips over
+/// lines that are not directives: the opener has to be *first*, or the text
+/// before it would escape the wrapper.
+fn guard_opener(tokens: &[Token], i: &mut usize) -> Option<Arc<str>> {
+    while matches!(tokens.get(*i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+        *i += 1;
+    }
+    if !matches!(tokens.get(*i)?.kind, TokenKind::Hash) {
+        return None;
+    }
+    *i += 1;
+    let keyword = ident_name(tokens.get(*i)?)?;
+    *i += 1;
+    let name = match keyword {
+        "ifndef" => ident_name(tokens.get(*i)?)?,
+        "if" => negated_defined_name(directive_rest(tokens, *i))?,
+        _ => return None,
+    };
+    let name = Arc::from(name);
+    skip_directive_line(tokens, i);
+    Some(name)
+}
+
+/// The next directive's keyword, leaving `i` just past it; `None` at end of
+/// input. Lines that are not directives are skipped, as is a `#` followed by
+/// something other than a directive name (a `# 1 "x.c"` line marker).
+fn next_directive<'a>(tokens: &'a [Token], i: &mut usize) -> Option<&'a str> {
+    loop {
+        while matches!(tokens.get(*i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+            *i += 1;
+        }
+        match tokens.get(*i)?.kind {
+            TokenKind::Eof => return None,
+            TokenKind::Hash => {
+                *i += 1;
+                match tokens.get(*i).and_then(ident_name) {
+                    Some(keyword) => {
+                        *i += 1;
+                        return Some(keyword);
+                    }
+                    None => skip_directive_line(tokens, i),
+                }
+            }
+            _ => skip_directive_line(tokens, i),
+        }
+    }
 }
 
 /// Advance to the end of the current directive line, leaving `i` on the
@@ -1926,13 +3175,13 @@ fn skip_directive_line(tokens: &[Token], i: &mut usize) {
 
 /// Whether `idx` is the variadic collector — by construction always the
 /// last parameter (`parse_macro_param_list` names an anonymous `...`
-/// "__VA_ARGS__"; see the invariant on `MacroDef::Function`).
+/// `"__VA_ARGS__"`; see the invariant on `MacroDef::Function`).
 fn is_variadic_tail(params: &[String], variadic: bool, idx: usize) -> bool {
     variadic && idx + 1 == params.len()
 }
 
 fn is_newline(tok: &Token) -> bool {
-    matches!(tok.kind, TokenKind::Newline)
+    tok.is_newline()
 }
 
 fn arg_is_blank(arg: &[Token]) -> bool {
@@ -1959,6 +3208,33 @@ fn varargs_omitted(args: &[Vec<Token>], idx: usize) -> bool {
     idx == 0 && args.len() == 1 && arg_is_blank(&args[0])
 }
 
+/// Whether the `##` operator at `body[op]` is the GNU `, ## __VA_ARGS__`
+/// form: a `,` spelled immediately before the operator in the replacement
+/// list, and the variadic tail parameter immediately after it — that right
+/// half arriving as `right_is_variadic_tail`, since the only caller has
+/// already resolved the parameter it is about to ask after.
+/// `substitute_macro`'s `##` branch owns the form — it deletes the comma
+/// when the varargs are omitted and leaves the operator inert otherwise;
+/// every other `##` over an empty operand is an ordinary C99 placemarker.
+///
+/// The form is a property of the definition, so it must be read from the
+/// definition. Asking instead what token was last emitted answers a
+/// different question — a parameter substituting to something that merely
+/// ends in a comma, or to whitespace hiding the comma behind it, changes the
+/// answer for a macro whose text never changed — and gcc's rule is the
+/// spelled one: `F(v, x, ...) g(v, x ## __VA_ARGS__)` has a parameter
+/// between the comma and the operator, so it is not this form and `F(1,)`
+/// keeps its comma. (clang collapses the placemarker first and applies the
+/// rule to whatever that collapse exposes; we follow gcc, whose reading does
+/// not depend on the arguments.)
+fn is_gnu_comma_paste(body: &[Token], op: usize, right_is_variadic_tail: bool) -> bool {
+    right_is_variadic_tail
+        && op
+            .checked_sub(1)
+            .and_then(|left| body.get(left))
+            .is_some_and(|t| is_punct(t, ","))
+}
+
 /// Index of the `(` that opens a function-like macro's parameter list, if
 /// the token after the macro name at `name_idx` is one. C11 6.10.3p10: the
 /// definition is function-like only when `(` immediately follows the macro
@@ -1981,7 +3257,7 @@ fn parameter_list_open(tokens: &[Token], name_idx: usize) -> Option<usize> {
 /// lexer has already spliced `\`-newline continuations).
 fn read_replacement_list(tokens: &[Token], i: &mut usize) -> Vec<Token> {
     let mut replacement = Vec::new();
-    while *i < tokens.len() && !matches!(tokens[*i].kind, TokenKind::Newline) {
+    while *i < tokens.len() && !matches!(tokens[*i].kind, TokenKind::Newline | TokenKind::Eof) {
         replacement.push(tokens[*i].clone());
         *i += 1;
     }
@@ -2069,6 +3345,11 @@ impl PreprocessorState {
                 // fresh invocation and eaten. `expand_gmock_method` hides the
                 // macro it expands; the rest of the family is hidden here,
                 // where the table is in reach.
+                for tok in &expanded {
+                    if let TokenKind::Identifier(n) = &tok.kind {
+                        self.record_read(n);
+                    }
+                }
                 expanded
                     .into_iter()
                     .map(|t| {
@@ -2580,7 +3861,7 @@ fn projected_substitution_len(
         let width = match &tok.kind {
             TokenKind::Identifier(name) => match params.iter().position(|p| p == name) {
                 Some(idx) if is_variadic_tail(params, variadic, idx) => args.variadic_len(idx),
-                Some(idx) => args.args.get(idx).map_or(0, |a| a.len()),
+                Some(idx) => args.args.get(idx).map_or(0, Vec::len),
                 None => 1,
             },
             _ => 1,
@@ -2609,19 +3890,20 @@ fn substitute_macro(
     // behind, so `S(a x+b)` with `x` empty stringizes to "a +b" as in gcc
     // and clang. (A `##` placemarker leaves none: `a ## y+b` is "a+b".)
     let mut gap = false;
+    // Adjacency owed to the token that survives a placemarker paste: an empty
+    // `##` operand takes its position, so `a x ## +b` with `x` empty spaces
+    // the `+` off `a` exactly as the `x` did. Every path that emits a token
+    // consumes it.
+    let mut paste_adjacency = None;
     let mut i = 0;
     while i < body.len() {
+        let adjacency = paste_adjacency.take().unwrap_or(body[i].adjacent_before);
         let concat_width = concat_width_at(body, i);
         if concat_width > 0 && i + concat_width < body.len() {
             if let TokenKind::Identifier(name) = &body[i + concat_width].kind {
                 if let Some(idx) = params.iter().position(|p| p == name) {
                     let is_va_tail = is_variadic_tail(params, variadic, idx);
-                    if is_va_tail
-                        && matches!(
-                            out.last().map(|t| &t.kind),
-                            Some(TokenKind::Punct(s)) if *s == ","
-                        )
-                    {
+                    if is_gnu_comma_paste(body, i, is_va_tail) {
                         // GNU `, ## args`: with the varargs omitted the
                         // comma is deleted; otherwise the `##` is inert — it
                         // must NOT reach apply_concatenation, which would
@@ -2675,7 +3957,7 @@ fn substitute_macro(
                     .with_macro_hide(origin, macro_name);
                     // The literal stands where the `#` stood, so it touches
                     // whatever the `#` touched: `S((#x))` is "(\"a\")".
-                    literal.adjacent_before = body[i].adjacent_before;
+                    literal.adjacent_before = adjacency;
                     push_substituted(&mut out, &mut gap, literal);
                     i += 2;
                     continue;
@@ -2701,23 +3983,43 @@ fn substitute_macro(
                 // tokens are whitespace the argument kept for line
                 // tracking, not tokens: the flag goes on the first real
                 // token, and an argument with none is empty.
-                match out[first..].iter_mut().find(|t| !is_newline(t)) {
-                    Some(tok) => {
-                        tok.adjacent_before = body[i].adjacent_before && !gap;
-                        gap = false;
+                if let Some(tok) = out[first..].iter_mut().find(|t| !t.is_newline()) {
+                    tok.adjacent_before = adjacency && !gap;
+                    gap = false;
+                } else {
+                    // C99 placemarker, mirroring the `## param` case
+                    // above: the empty operand must swallow the `##`
+                    // itself, or the operator would reach
+                    // apply_concatenation and paste whatever preceded
+                    // the parameter — `S(a x ## +b)` with `x` empty
+                    // fusing `a` and `+` into the non-token `a+`. No
+                    // exception for GNU `, ## __VA_ARGS__`: the token
+                    // before that `##` is this parameter, not a comma,
+                    // so `is_gnu_comma_paste` does not hold and the
+                    // comma the placemarker leaves standing is an
+                    // ordinary argument separator (gcc keeps it too).
+                    let width = concat_width_after(body, i);
+                    if width > 0 {
+                        // The surviving right operand takes this
+                        // parameter's position, and with it its
+                        // adjacency; the argument's newlines go with the
+                        // placemarker, as on the `## param` side.
+                        out.truncate(first);
+                        paste_adjacency = Some(adjacency);
+                        i += 1 + width;
+                        continue;
                     }
-                    None => gap |= !body[i].adjacent_before,
+                    gap |= !adjacency;
                 }
                 i += 1;
                 continue;
             }
         }
-        // Replacement-list tokens (not from arguments) inherit the hide set.
-        push_substituted(
-            &mut out,
-            &mut gap,
-            body[i].with_macro_hide(origin, macro_name),
-        );
+        // Replacement-list tokens (not from arguments) inherit the hide set,
+        // and their own adjacency unless they survived a placemarker paste.
+        let mut token = body[i].with_macro_hide(origin, macro_name);
+        token.adjacent_before = adjacency;
+        push_substituted(&mut out, &mut gap, token);
         i += 1;
     }
     out
@@ -2770,6 +4072,15 @@ fn apply_concatenation(mut tokens: Vec<Token>) -> Vec<Token> {
     }
 }
 
+/// `concat_width_at` for the token that follows `i`, 0 at the end of `tokens`.
+fn concat_width_after(tokens: &[Token], i: usize) -> usize {
+    if i + 1 < tokens.len() {
+        concat_width_at(tokens, i + 1)
+    } else {
+        0
+    }
+}
+
 fn concat_width_at(tokens: &[Token], i: usize) -> usize {
     if matches!(&tokens[i].kind, TokenKind::Punct(s) if *s == "##") {
         return 1;
@@ -2786,7 +4097,7 @@ fn concat_width_at(tokens: &[Token], i: usize) -> usize {
 /// Fallback definitions for macros whose real definitions live in headers the
 /// indexed tree does not ship (gtest, kernel headers, `<inttypes.h>`). Left
 /// unexpanded they produce tree-sitter ERROR nodes and whole functions get
-/// dropped from the index (docs/PARSE_FAILURES.md catalogs the impact).
+/// dropped from the index (`docs/PARSE_FAILURES.md` catalogs the impact).
 /// Built once; `install_builtin_macros` clones entries per preprocess. The
 /// bodies are plain C, so the C lexer serves both languages.
 static BUILTIN_FALLBACK_MACROS: LazyLock<Vec<(String, MacroDef)>> = LazyLock::new(|| {
@@ -2802,7 +4113,7 @@ static BUILTIN_FALLBACK_MACROS: LazyLock<Vec<(String, MacroDef)>> = LazyLock::ne
         (
             name.to_string(),
             MacroDef::Function {
-                params: params.iter().map(|s| s.to_string()).collect(),
+                params: params.iter().map(ToString::to_string).collect(),
                 replacement: lex_macro_body(replacement, Language::C),
                 variadic: false,
             },
@@ -2894,12 +4205,11 @@ fn paste_two_tokens(left: &Token, right: &Token) -> Token {
     }
 }
 
-fn token_paste_fragment(kind: &TokenKind) -> String {
+fn token_paste_fragment(kind: &TokenKind) -> &str {
     match kind {
-        TokenKind::Identifier(s) => s.clone(),
-        TokenKind::Number(s) => s.clone(),
-        TokenKind::Punct(s) if *s != "##" => (*s).to_string(),
-        _ => String::new(),
+        TokenKind::Identifier(s) | TokenKind::Number(s) => s.as_str(),
+        TokenKind::Punct(s) if *s != "##" => s,
+        _ => "",
     }
 }
 
@@ -3028,16 +4338,16 @@ fn escape_for_stringize(spelling: &str) -> String {
     out
 }
 
-fn token_to_string(kind: &TokenKind) -> String {
+fn token_as_str(kind: &TokenKind) -> &str {
     match kind {
-        TokenKind::Identifier(s) => s.clone(),
-        TokenKind::Number(s) => s.clone(),
-        TokenKind::String(s) => s.clone(),
-        TokenKind::Char(s) => s.clone(),
-        TokenKind::Punct(s) => (*s).to_string(),
-        TokenKind::Hash => "#".to_string(),
-        TokenKind::Newline => "\n".to_string(),
-        TokenKind::Eof => String::new(),
+        TokenKind::Identifier(s)
+        | TokenKind::Number(s)
+        | TokenKind::String(s)
+        | TokenKind::Char(s) => s.as_str(),
+        TokenKind::Punct(s) => s,
+        TokenKind::Hash => "#",
+        TokenKind::Newline => "\n",
+        TokenKind::Eof => "",
     }
 }
 
@@ -3079,17 +4389,16 @@ fn parse_cond_macro_args(toks: &[Token], mut i: usize) -> Option<(MacroArgs, usi
     None
 }
 
-/// Resolve one `defined X` / `defined(X)` operator at `toks[i]`
-/// (which is the `defined` identifier). Returns the truth value and how
-/// many tokens the operator consumed; malformed operands conservatively
-/// evaluate to false.
-fn defined_operand(
-    toks: &[Token],
-    i: usize,
-    macros: &MacroTable,
-    fallbacks: &HashSet<String>,
-) -> (bool, usize) {
-    let is_defined = |n: &str| macros.contains_key(n) && !fallbacks.contains(n);
+/// Parse one `defined X` / `defined(X)` operator at `toks[i]` (which is the
+/// `defined` identifier). Returns the operand name and how many tokens the
+/// operator consumed; a malformed operand has no name and conservatively
+/// evaluates to false.
+///
+/// The truth value is not decided here: `defined(X)` is a read of the macro
+/// environment even though it substitutes nothing, and a cached header's
+/// fingerprint has to see it (#55), so the caller resolves the name through
+/// `is_defined_for_conditionals`.
+fn defined_operand(toks: &[Token], i: usize) -> (Option<&str>, usize) {
     match toks.get(i + 1).map(|t| &t.kind) {
         Some(TokenKind::Punct(p)) if *p == "(" => {
             if let (Some(TokenKind::Identifier(n)), Some(TokenKind::Punct(c))) = (
@@ -3097,14 +4406,56 @@ fn defined_operand(
                 toks.get(i + 3).map(|t| &t.kind),
             ) {
                 if *c == ")" {
-                    return (is_defined(n), 4);
+                    return (Some(n), 4);
                 }
             }
-            (false, 2)
+            (None, 2)
         }
-        Some(TokenKind::Identifier(n)) => (is_defined(n), 2),
-        _ => (false, 1),
+        Some(TokenKind::Identifier(n)) => (Some(n), 2),
+        _ => (None, 1),
     }
+}
+
+/// Content hash of a macro binding, for [`crate::MacroFingerprint`].
+/// Hashes what a consumer could observe: the replacement token stream
+/// (spelling and adjacency, which is all `#` and `##` depend on), the
+/// parameter list, and whether the name is only a builtin fallback.
+fn hash_macro_binding(def: &MacroDef, fallback: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    fallback.hash(&mut h);
+    let hash_tokens = |h: &mut std::collections::hash_map::DefaultHasher, toks: &[Token]| {
+        for t in toks {
+            t.adjacent_before.hash(h);
+            match &t.kind {
+                TokenKind::Identifier(sp) | TokenKind::Number(sp) => (0u8, sp.as_str()).hash(h),
+                TokenKind::String(sp) => (1u8, sp.as_str()).hash(h),
+                TokenKind::Char(sp) => (2u8, sp.as_str()).hash(h),
+                TokenKind::Punct(sp) => (3u8, *sp).hash(h),
+                TokenKind::Hash => 4u8.hash(h),
+                TokenKind::Newline => 5u8.hash(h),
+                TokenKind::Eof => 6u8.hash(h),
+            }
+        }
+    };
+    match def {
+        MacroDef::Object { replacement } => {
+            0u8.hash(&mut h);
+            hash_tokens(&mut h, replacement);
+        }
+        MacroDef::Function {
+            params,
+            replacement,
+            variadic,
+        } => {
+            1u8.hash(&mut h);
+            params.hash(&mut h);
+            variadic.hash(&mut h);
+            hash_tokens(&mut h, replacement);
+        }
+        MacroDef::GmockMethod => 2u8.hash(&mut h),
+    }
+    h.finish()
 }
 
 /// Evaluate a fully expanded `#if` condition with C operator precedence.
@@ -3129,11 +4480,11 @@ fn eval_pp_tokens(toks: &[Token]) -> bool {
     v.truthy()
 }
 
-/// A preprocessor arithmetic value: 64-bit two's-complement bits plus the
-/// C signedness of the expression, modeling intmax_t/uintmax_t evaluation
+/// Preprocessor integer value. Evaluated in 64-bit integer arithmetic with the
+/// C signedness of the expression, modeling `intmax_t`/`uintmax_t` evaluation
 /// (C11 6.10.1p4). Binary operators apply the usual arithmetic
 /// conversions: if either operand is unsigned the operation is unsigned
-/// (so `-1 < 1U` is false — the -1 converts to uintmax_t).
+/// (so `-1 < 1U` is false — the -1 converts to `uintmax_t`).
 #[derive(Clone, Copy)]
 struct PpVal {
     bits: u64,
@@ -3143,13 +4494,13 @@ struct PpVal {
 impl PpVal {
     fn signed(v: i64) -> Self {
         Self {
-            bits: v as u64,
+            bits: v.cast_unsigned(),
             unsigned_: false,
         }
     }
 
     fn from_bool(b: bool) -> Self {
-        Self::signed(b as i64)
+        Self::signed(i64::from(b))
     }
 
     fn truthy(self) -> bool {
@@ -3157,7 +4508,7 @@ impl PpVal {
     }
 
     fn as_i64(self) -> i64 {
-        self.bits as i64
+        self.bits.cast_signed()
     }
 
     fn either_unsigned(self, other: Self) -> bool {
@@ -3173,10 +4524,13 @@ struct PpExprParser<'a> {
     err: bool,
 }
 
-impl<'a> PpExprParser<'a> {
+impl PpExprParser<'_> {
     fn peek_punct(&self) -> Option<&str> {
-        match self.toks.get(self.pos).map(|t| &t.kind) {
-            Some(TokenKind::Punct(s)) => Some(s),
+        match self.toks.get(self.pos) {
+            Some(Token {
+                kind: TokenKind::Punct(s),
+                ..
+            }) => Some(s),
             _ => None,
         }
     }
@@ -3318,18 +4672,18 @@ impl<'a> PpExprParser<'a> {
         let mut v = self.additive();
         loop {
             if self.eat("<<") {
-                let sh = self.additive().bits as u32 & 63;
+                let sh = (self.additive().bits & 63) as u32;
                 v = PpVal {
                     bits: v.bits.wrapping_shl(sh),
                     unsigned_: v.unsigned_,
                 };
             } else if self.eat(">>") {
-                let sh = self.additive().bits as u32 & 63;
+                let sh = (self.additive().bits & 63) as u32;
                 v = PpVal {
                     bits: if v.unsigned_ {
                         v.bits.wrapping_shr(sh)
                     } else {
-                        v.as_i64().wrapping_shr(sh) as u64
+                        v.as_i64().wrapping_shr(sh).cast_unsigned()
                     },
                     unsigned_: v.unsigned_,
                 };
@@ -3371,10 +4725,10 @@ impl<'a> PpExprParser<'a> {
                 };
             } else if self.eat("/") {
                 let r = self.unary();
-                v = self.divide(v, r, false);
+                v = Self::divide(v, r, false);
             } else if self.eat("%") {
                 let r = self.unary();
-                v = self.divide(v, r, true);
+                v = Self::divide(v, r, true);
             } else {
                 return v;
             }
@@ -3383,7 +4737,7 @@ impl<'a> PpExprParser<'a> {
 
     /// `/` and `%` under the usual arithmetic conversions; division by
     /// zero conservatively yields 0.
-    fn divide(&mut self, a: PpVal, b: PpVal, rem: bool) -> PpVal {
+    fn divide(a: PpVal, b: PpVal, rem: bool) -> PpVal {
         let unsigned_ = a.either_unsigned(b);
         if b.bits == 0 {
             return PpVal { bits: 0, unsigned_ };
@@ -3395,9 +4749,9 @@ impl<'a> PpExprParser<'a> {
                 a.bits / b.bits
             }
         } else if rem {
-            a.as_i64().wrapping_rem(b.as_i64()) as u64
+            a.as_i64().wrapping_rem(b.as_i64()).cast_unsigned()
         } else {
-            a.as_i64().wrapping_div(b.as_i64()) as u64
+            a.as_i64().wrapping_div(b.as_i64()).cast_unsigned()
         };
         PpVal { bits, unsigned_ }
     }
@@ -3441,22 +4795,20 @@ impl<'a> PpExprParser<'a> {
             // expression malformed keeps the branch closed.
             TokenKind::Number(s) => {
                 self.pos += 1;
-                match parse_pp_int(s) {
-                    Some(v) => v,
-                    None => {
-                        self.err = true;
-                        PpVal::signed(0)
-                    }
+                if let Some(v) = parse_pp_int(s) {
+                    v
+                } else {
+                    self.err = true;
+                    PpVal::signed(0)
                 }
             }
             TokenKind::Char(s) => {
                 self.pos += 1;
-                match char_literal_body(s) {
-                    Some(body) => PpVal::signed(char_value(body)),
-                    None => {
-                        self.err = true;
-                        PpVal::signed(0)
-                    }
+                if let Some(body) = char_literal_body(s) {
+                    PpVal::signed(char_value(body))
+                } else {
+                    self.err = true;
+                    PpVal::signed(0)
                 }
             }
             TokenKind::Punct(p) if *p == "(" => {
@@ -3519,8 +4871,8 @@ impl<'a> PpExprParser<'a> {
 /// Parse a C preprocessor integer literal (decimal, hex, octal, binary,
 /// with optional u/U/l/L suffixes). Anything else — a floating literal, a
 /// user-defined-literal suffix — is `None`. The value is unsigned when it
-/// carries a `u`/`U` suffix or does not fit in a signed 64-bit intmax_t
-/// (hex/octal ladder reaching uintmax_t).
+/// carries a `u`/`U` suffix or does not fit in a signed 64-bit `intmax_t`
+/// (hex/octal ladder reaching `uintmax_t`).
 fn parse_pp_int(s: &str) -> Option<PpVal> {
     let t = s.trim_end_matches(['u', 'U', 'l', 'L']);
     let unsigned_suffix = s[t.len()..].contains(['u', 'U']);
@@ -3576,18 +4928,18 @@ fn char_value(s: &str) -> i64 {
             Some('x') => {
                 let mut v: i64 = 0;
                 while let Some(d) = chars.peek().and_then(|c| c.to_digit(16)) {
-                    v = v.wrapping_mul(16).wrapping_add(d as i64);
+                    v = v.wrapping_mul(16).wrapping_add(i64::from(d));
                     chars.next();
                 }
                 v
             }
             // \ooo octal escape (1-3 digits, first already consumed).
             Some(d @ '0'..='7') => {
-                let mut v: i64 = d as i64 - '0' as i64;
+                let mut v: i64 = i64::from(d as u8 - b'0');
                 for _ in 0..2 {
                     match chars.peek().and_then(|c| c.to_digit(8)) {
                         Some(o) => {
-                            v = v * 8 + o as i64;
+                            v = v * 8 + i64::from(o);
                             chars.next();
                         }
                         None => break,
@@ -3603,6 +4955,11 @@ fn char_value(s: &str) -> i64 {
     }
 }
 
+/// Preprocess a source file on disk using the given options.
+///
+/// # Errors
+///
+/// Returns [`PreprocessError`] if reading the file fails or if preprocessing limits are exceeded.
 pub fn preprocess_file(
     path: &Path,
     opts: &PreprocessOptions,
@@ -3612,6 +4969,7 @@ pub fn preprocess_file(
     Ok(state.finish())
 }
 
+#[must_use]
 pub fn preprocess_string(source: &str, file: &Path, opts: &PreprocessOptions) -> PreprocessResult {
     let mut state = PreprocessorState::new(opts.clone(), file.to_path_buf());
     let tokens = Lexer::new(source, state.language).tokenize();
@@ -3624,9 +4982,218 @@ pub fn preprocess_string(source: &str, file: &Path, opts: &PreprocessOptions) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::{ExpansionKey, IncludeExpansion};
+
+    /// The file-probe epoch is process-global and empties the shared
+    /// directory-search results, so the test that bumps it and the tests
+    /// that read those results take this first.
+    static PROBE_EPOCH_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::macros::macro_table_from_defines;
+    use crate::options::{ExpansionCache, IncludeExpansion};
+
+    /// The one cached expansion of `path`. These tests seed a single macro
+    /// environment, so a second variant would mean the fingerprinting split
+    /// something it should not have (see `ExpansionVariants`).
+    fn sole_variant(
+        cache: &ExpansionCache,
+        path: PathBuf,
+        language: Language,
+    ) -> Option<IncludeExpansion> {
+        let guard = cache.read().unwrap();
+        let variants = guard.get(&(path, language))?;
+        assert!(
+            variants.len() <= 1,
+            "expected one cached expansion, got {}",
+            variants.len()
+        );
+        variants.first().cloned()
+    }
     use std::sync::{Arc, RwLock};
 
+    #[test]
+    fn review_virtual_headers_in_all_search_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for class in 0..5 {
+            let mut opts = PreprocessOptions::new();
+            opts.strict_include_search = true;
+            let include = root.join("virtual");
+            let mut cache = FxHashMap::default();
+            cache.insert(
+                include.join("header.h"),
+                Arc::<str>::from("int virtual_header;\n"),
+            );
+            opts.source_cache = Some(Arc::new(crate::SourceCache::new(cache)));
+            let source = match class {
+                0 => "#include \"virtual/header.h\"\n",
+                1 => {
+                    opts.quote_include_paths.push(include);
+                    "#include \"header.h\"\n"
+                }
+                2 => {
+                    opts.include_paths.push(include);
+                    "#include <header.h>\n"
+                }
+                3 => {
+                    opts.system_include_paths.push(include);
+                    "#include <header.h>\n"
+                }
+                _ => {
+                    opts.working_directory = Some(root.into());
+                    opts.forced_includes.push("virtual/header.h".into());
+                    ""
+                }
+            };
+            let result = preprocess_string(source, &root.join("main.c"), &opts);
+            assert!(
+                result.output.contains("virtual_header"),
+                "class {class}: {}",
+                result.output
+            );
+        }
+    }
+
+    #[test]
+    fn shared_directory_search_preserves_context_and_search_order() {
+        let _guard = PROBE_EPOCH_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        let local = dir.path().join("local");
+        let quote = dir.path().join("quote");
+        let mut texts = FxHashMap::default();
+        for (folder, name) in [
+            (&a, "from_a"),
+            (&b, "from_b"),
+            (&local, "from_local"),
+            (&quote, "from_quote"),
+        ] {
+            texts.insert(
+                folder.join("shared.h"),
+                Arc::<str>::from(format!("int {name};\n")),
+            );
+        }
+        let mut opts = PreprocessOptions::new();
+        opts.source_cache = Some(Arc::new(crate::SourceCache::new(texts)));
+        opts.strict_include_search = true;
+        opts.include_paths = vec![a.clone(), b.clone()];
+        let source = dir.path().join("main.c");
+        let check = |file: &Path, text: &str, opts: &PreprocessOptions, expected: &str| {
+            let result = preprocess_string(text, file, opts);
+            assert!(result.output.contains(expected), "{}", result.output);
+        };
+        check(&source, "#include <shared.h>\n", &opts, "from_a");
+        let shared = |opts: &PreprocessOptions, quoted: bool| {
+            let cache = opts.source_cache.as_ref().unwrap().directory_results(opts);
+            let results = cache.read().unwrap();
+            results.get(&("shared.h".to_string(), quoted)).cloned()
+        };
+        assert_eq!(shared(&opts, false), Some(Some(a.join("shared.h"))));
+        // Warm the same quoted key that the local candidate must override.
+        check(&source, "#include \"shared.h\"\n", &opts, "from_a");
+        check(
+            &local.join("main.c"),
+            "#include \"shared.h\"\n",
+            &opts,
+            "from_local",
+        );
+        opts.include_paths.reverse();
+        check(&source, "#include <shared.h>\n", &opts, "from_b");
+        opts.quote_include_paths.push(quote);
+        check(&source, "#include \"shared.h\"\n", &opts, "from_quote");
+        check(&source, "#include <shared.h>\n", &opts, "from_b");
+        opts.include_paths.clear();
+        opts.quote_include_paths.clear();
+        let missing = preprocess_string("#include <shared.h>\n", &source, &opts);
+        assert!(!missing.diagnostics.is_empty());
+        assert_eq!(shared(&opts, false), Some(None));
+        // A cached directory miss must not suppress caller-specific basename fallback.
+        opts.strict_include_search = false;
+        opts.basename_index = Some(Arc::new(FxHashMap::from_iter([(
+            "shared.h".to_string(),
+            vec![a.join("shared.h")],
+        )])));
+        check(&source, "#include <shared.h>\n", &opts, "from_a");
+    }
+
+    #[test]
+    fn shared_directory_search_refreshes_after_a_new_file_probe_epoch() {
+        let _guard = PROBE_EPOCH_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = PreprocessOptions::new();
+        opts.source_cache = Some(Arc::new(crate::SourceCache::default()));
+        opts.include_paths.push(dir.path().to_path_buf());
+        opts.strict_include_search = true;
+        let source = dir.path().join("main.c");
+        let missing = preprocess_string("#include <later.h>\n", &source, &opts);
+        assert!(!missing.diagnostics.is_empty());
+        std::fs::write(dir.path().join("later.h"), "int appeared;\n").unwrap();
+        trace_ir::start_file_probe_epoch();
+        let found = preprocess_string("#include <later.h>\n", &source, &opts);
+        assert!(found.output.contains("appeared"), "{}", found.output);
+    }
+
+    #[test]
+    fn a_source_cache_knows_which_of_its_keys_name_no_file() {
+        // `include_exists` stops at the filesystem unless the cache says a key
+        // is virtual, so a cache that answers `false` for a key naming no file
+        // makes that header unreachable -- and one that answers `true` for an
+        // on-disk key costs a hash per failed candidate for nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let on_disk = root.join("real.h");
+        std::fs::write(&on_disk, "int real_header;\n").unwrap();
+
+        let mut texts = FxHashMap::default();
+        texts.insert(on_disk.clone(), Arc::<str>::from("int real_header;\n"));
+        texts.insert(
+            root.join("virtual.h"),
+            Arc::<str>::from("int virtual_header;\n"),
+        );
+        let cache = crate::SourceCache::new(texts);
+        assert!(cache.is_virtual(&root.join("virtual.h")));
+        assert!(!cache.is_virtual(&on_disk), "real.h is a file on disk");
+        assert!(
+            !cache.is_virtual(&root.join("absent.h")),
+            "a path this cache does not hold is not its virtual header"
+        );
+
+        let mut opts = PreprocessOptions::new();
+        opts.source_cache = Some(Arc::new(cache));
+        let result = preprocess_string(
+            "#include \"real.h\"\n#include \"virtual.h\"\n",
+            &root.join("main.c"),
+            &opts,
+        );
+        assert!(
+            result.output.contains("real_header") && result.output.contains("virtual_header"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn review_relative_backslash_include() {
+        let dir = tempfile::tempdir().unwrap();
+        // On Unix a backslash is a literal filename character; on Windows it
+        // separates directories. Either spelling must stay source-relative.
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join(r"sub\header.h"), "int from_header;\n").unwrap();
+        let result = preprocess_string(
+            "#include \"sub\\header.h\"\n",
+            &dir.path().join("main.c"),
+            &PreprocessOptions::new(),
+        );
+        assert!(result.output.contains("from_header"), "{}", result.output);
+    }
+
+    #[test]
+    fn review_command_macro_trailing_backslash() {
+        let mut opts = PreprocessOptions::new();
+        opts.command_macros
+            .push(crate::CommandMacro::Define("PATH".into(), "tail\\".into()));
+        let result = preprocess_string("PATH\n", Path::new("main.c"), &opts);
+        assert!(result.output.contains("\\"), "{}", result.output);
+    }
     #[test]
     fn expands_function_like_macro() {
         let src = "#define SQUARE(x) ((x) * (x))\nint y = SQUARE(n);\n";
@@ -4153,8 +5720,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         // never expand.
         let dir = unique_tmp_dir("cache_language");
         fs::write(dir.join("shared.h"), "#define C + 1\n#define VAL 'a'C\n").unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let run = |name: &str| {
             let path = dir.join(name);
             fs::write(&path, "#include \"shared.h\"\nint n = VAL;\n").unwrap();
@@ -4595,8 +6161,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             "#ifndef container_of\n#define container_of(p, t, m) REAL_CONTAINER(p)\n#endif\n",
         )
         .unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -4640,8 +6205,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         // The declaration makes the header content-bearing so a cache entry
         // is actually stored and the second TU takes the replay path.
         fs::write(dir.join("u.h"), "int u_decl;\n#undef __init\n").unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -4668,8 +6232,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         // X is undefined when the entry is created, so a state diff records
         // nothing — only a log of executed directives catches this #undef.
         fs::write(dir.join("u.h"), "int u_decl;\n#undef X\n").unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -4690,8 +6253,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         let dir = unique_tmp_dir("undef_redef");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("r.h"), "int r_decl;\n#undef X\n#define X 9\n").unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -4718,8 +6280,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         let dir = unique_tmp_dir("replay_overwrite");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("r.h"), "int r_decl;\n#define X 9\n").unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include(dir.to_path_buf())
             .with_include_expansion_cache(cache);
@@ -4743,8 +6304,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         let dir = unique_tmp_dir("replay_accum");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("m.h"), "int m_decl;\n#define FROM_HDR 5\n").unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let src = "#include \"m.h\"\n";
         let shared1 = Arc::new(RwLock::new(MacroTable::new()));
         let opts1 = PreprocessOptions::new()
@@ -4752,7 +6312,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_shared_macros(shared1)
             .with_accumulate_macros(true);
-        preprocess_string(src, &dir.join("a.c"), &opts1);
+        let _ = preprocess_string(src, &dir.join("a.c"), &opts1);
         // The second run hits the cache; the replayed #define must reach the
         // shared table exactly as a live #define would.
         let shared2 = Arc::new(RwLock::new(MacroTable::new()));
@@ -4761,7 +6321,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             .with_include_expansion_cache(cache)
             .with_shared_macros(Arc::clone(&shared2))
             .with_accumulate_macros(true);
-        preprocess_string(src, &dir.join("b.c"), &opts2);
+        let _ = preprocess_string(src, &dir.join("b.c"), &opts2);
         assert!(
             shared2.read().unwrap().contains_key("FROM_HDR"),
             "cache replay must accumulate macros into the shared table"
@@ -5408,7 +6968,9 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             .prefix(&format!("trace_preproc_{tag}_"))
             .tempdir()
             .unwrap();
-        let path = dir.path().canonicalize().unwrap();
+        // Production keys go through `trace_ir::canonicalize`, which strips
+        // the `\\?\` prefix `std::fs::canonicalize` returns on Windows.
+        let path = trace_ir::canonicalize(dir.path());
         TmpTree { _dir: dir, path }
     }
 
@@ -5436,8 +6998,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         .unwrap();
 
         let shared = Arc::new(RwLock::new(MacroTable::new()));
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
 
         // Warm-style pass over the first twin: defines LIST_H, caches text.
         let warm_opts = PreprocessOptions::new()
@@ -5471,11 +7032,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             r2.diagnostics
         );
         // (b) outer.h's cached entry must not claim b/list.h as content-bearing
-        let outer_entry = cache
-            .read()
-            .unwrap()
-            .get(&(dir.join("outer.h"), Language::C))
-            .cloned();
+        let outer_entry = sole_variant(&cache, dir.join("outer.h"), Language::C);
         let claimed_b = outer_entry
             .as_ref()
             .map(|e| e.files.iter().any(|f| *f == b.join("list.h")))
@@ -5512,8 +7069,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
                 .collect();
             t.insert("G_H".to_string(), MacroDef::Object { replacement: toks });
         }
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_shared_macros(Arc::clone(&shared))
             .with_include_expansion_cache(cache)
@@ -5556,8 +7112,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         )
         .unwrap();
 
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.path().to_path_buf());
@@ -5610,8 +7165,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         )
         .unwrap();
 
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(cache)
             .with_include(dir.to_path_buf());
@@ -5655,8 +7209,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         )
         .unwrap();
 
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(cache)
             .with_include(dir.to_path_buf());
@@ -5707,8 +7260,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         )
         .unwrap();
 
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let warm = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.to_path_buf());
@@ -5725,12 +7277,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             top.output.len()
         );
 
-        let right = cache
-            .read()
-            .unwrap()
-            .get(&(dir.join("right.h"), Language::C))
-            .cloned()
-            .expect("right.h cached");
+        let right = sole_variant(&cache, dir.join("right.h"), Language::C).expect("right.h cached");
         assert!(
             right.text.contains("NeedThis"),
             "right.h cache must be self-contained, got {}",
@@ -5764,8 +7311,7 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
             src.push_str(&format!("int v{i};\n#endif\n"));
             fs::write(dir.join(format!("h{i}.h")), src).unwrap();
         }
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.to_path_buf());
@@ -5956,8 +7502,7 @@ int x = A;
             "#ifndef TOP_H\n#define TOP_H\n#include \"common.h\"\nint from_top;\n#endif\n",
         )
         .unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.to_path_buf())
@@ -5973,12 +7518,8 @@ int x = A;
             "nested header body must not be copied into parent live output: {}",
             top.output
         );
-        let common = cache
-            .read()
-            .unwrap()
-            .get(&(dir.join("common.h"), Language::C))
-            .cloned()
-            .expect("common.h cached");
+        let common =
+            sole_variant(&cache, dir.join("common.h"), Language::C).expect("common.h cached");
         assert!(
             common.text.contains("NeedThis"),
             "child cache still holds its own text: {}",
@@ -6014,8 +7555,7 @@ int from_late;
 ",
         )
         .unwrap();
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.to_path_buf())
@@ -6850,6 +8390,92 @@ int from_late;
         assert!(out.contains("r= \"a+b\" ;"), "{out}");
     }
 
+    /// An empty parameter on the left of `##` is a placemarker (C99
+    /// 6.10.3.3p2), so the paste is a no-op and the token *before* the
+    /// parameter is not an operand: `S(a x ## +b)` is "a +b", never the
+    /// pasted non-token `a+`. Values checked against gcc and clang.
+    #[test]
+    fn empty_left_paste_preserves_operand_boundary() {
+        let src = include_str!("../../../tests/fixtures/preproc/empty_left_paste.c");
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        for expected in [
+            r#"b "a +b""#,
+            r#"p "(y)""#,
+            r#"q "a z""#,
+            r#"r "a xz""#,
+            r#"v "a +b""#,
+            r#"n "a +b""#,
+            r#"e "a +b""#,
+        ] {
+            assert!(
+                result.output.contains(expected),
+                "missing {expected}: {}",
+                result.output
+            );
+        }
+    }
+
+    /// The same shapes outside a `#`, where the damage reaches the parser: a
+    /// bad paste destroys the string literal in `a x ## "s"` and swallows the
+    /// `(` in `f(x ## y)`, and tree-sitter loses the enclosing construct.
+    #[test]
+    fn empty_left_paste_preserves_non_stringized_tokens() {
+        let src = include_str!("../../../tests/fixtures/preproc/empty_left_paste.c");
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(result.output.contains(r#"c a "s""#), "{}", result.output);
+        assert!(result.output.contains("d f(y)"), "{}", result.output);
+    }
+
+    /// The GNU `, ## __VA_ARGS__` form is a property of the definition, so
+    /// it is decided from the body: a `,` spelled immediately before the
+    /// `##`, with the variadic tail parameter right after it. A parameter
+    /// standing between the comma and the operator is not that form — the
+    /// `##` is an ordinary paste whose left operand went empty, a
+    /// placemarker, and the comma is nobody's to delete. That is gcc's rule,
+    /// and being a property of the definition it answers the same for every
+    /// invocation: `w`/`u` are `x`/`z` with the empty argument spelled as a
+    /// newline, and must expand the same. Reading the last token already
+    /// emitted answered both questions by accident — the newline spelling
+    /// pushed a `Newline` where the predicate looked for the comma — so the
+    /// same macro invoked the same way expanded two different ways.
+    ///
+    /// clang instead collapses the placemarker first and applies the comma
+    /// rule to whatever that exposes (`x` -> `g(o)`), which makes the answer
+    /// depend on what the argument expanded to; we follow gcc.
+    #[test]
+    fn gnu_comma_form_is_decided_from_the_body() {
+        let src = include_str!("../../../tests/fixtures/preproc/empty_left_paste.c");
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        let out = flat(&result.output);
+        // gcc 16 keeps every one of these commas; clang 21 keeps only `y`,
+        // whose varargs are explicitly supplied and empty.
+        for expected in ["xg(o,)", "yg(o,)", "zh(t,)", "wg(o,)", "uh(t,)"] {
+            assert!(
+                out.contains(expected),
+                "missing {expected}: {}",
+                result.output
+            );
+        }
+    }
+
+    /// The form itself is untouched: a comma really spelled before the `##`
+    /// is deleted when the varargs are omitted (`m`) and kept when one is
+    /// supplied, however it is spelled (`k`, a newline-only argument). gcc
+    /// and clang agree on both.
+    #[test]
+    fn gnu_comma_form_still_deletes_the_comma_it_owns() {
+        let src = include_str!("../../../tests/fixtures/preproc/empty_left_paste.c");
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        let out = flat(&result.output);
+        for expected in ["mg(o)", "kg(o,)"] {
+            assert!(
+                out.contains(expected),
+                "missing {expected}: {}",
+                result.output
+            );
+        }
+    }
+
     /// An argument that is only newlines is empty too — whitespace, not
     /// tokens — so it leaves the parameter's whitespace behind exactly as an
     /// omitted one does, and an argument that starts with a newline takes
@@ -6887,6 +8513,385 @@ int from_late;
         assert!(out.contains(r#"h= "a\"z\" +b" ;"#), "{out}");
     }
 
+    #[test]
+    fn cached_guard_skip_preserves_interleaved_macro_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("b.h"),
+            "#ifndef B_H\n#define B_H\n#define VALUE 1\n#define REMOVED 1\nint b;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("d.h"),
+            "#undef VALUE\n#define VALUE 2\n#undef REMOVED\nint d;\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("a.h"),
+            "#include \"b.h\"\n#include \"d.h\"\n#include \"b.h\"\nint a;\n",
+        )
+        .unwrap();
+        let source = "#include \"a.h\"\nint value = VALUE;\n#ifdef REMOVED\nint wrong;\n#endif\n";
+        let path = dir.path().join("main.c");
+        fs::write(&path, source).unwrap();
+        let base = PreprocessOptions::new().with_include(dir.path().to_path_buf());
+        let live = preprocess_file(&path, &base).unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = base.with_include_expansion_cache(cache);
+        preprocess_file(&path, &opts).unwrap();
+        let replay = preprocess_file(&path, &opts.with_frozen_expansion_cache(true)).unwrap();
+        let tail = |text: &str| text[text.find("int value").unwrap()..].to_string();
+        assert_eq!(tail(&live.output), "int value= 2 ;\n");
+        assert_eq!(tail(&replay.output), tail(&live.output));
+    }
+
+    #[test]
+    fn cached_guard_skip_does_not_replay_conflicting_macro_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("b.h"),
+            "#ifndef B_H\n#define B_H\n#ifdef VALUE\nint configured;\n#endif\n#define VALUE 1\nint b;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("a.h"), "#include \"b.h\"\nint a;\n").unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path().to_path_buf())
+            .with_include_expansion_cache(cache);
+        let path = dir.path().join("main.c");
+        fs::write(
+            &path,
+            "#include \"b.h\"\n#undef VALUE\n#define VALUE 2\n#include \"a.h\"\n#include \"c.h\"\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("c.h"), "#include \"a.h\"\nint c;\n").unwrap();
+        preprocess_file(&path, &opts).unwrap();
+        fs::write(&path, "#include \"a.h\"\nint value = VALUE;\n").unwrap();
+        let opts = opts.with_frozen_expansion_cache(true);
+        let result = preprocess_file(&path, &opts).unwrap();
+        assert!(
+            result.output.contains("int value= 1 ;"),
+            "{}",
+            result.output
+        );
+        fs::write(&path, "#define VALUE 2\n#include \"c.h\"\n").unwrap();
+        let nested = preprocess_file(&path, &opts).unwrap();
+        assert!(
+            nested.output.contains("int configured ;"),
+            "{}",
+            nested.output
+        );
+    }
+
+    #[test]
+    fn cached_guard_skip_tracks_external_macro_override() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("b.h"),
+            "#ifndef B_H\n#define B_H\n#define VALUE 1\nint b;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("a.h"), "#include \"b.h\"\nint a;\n").unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path().to_path_buf())
+            .with_include_expansion_cache(cache);
+        let path = dir.path().join("main.c");
+        for value in [2, 3] {
+            fs::write(&path, format!("#include \"b.h\"\n#undef VALUE\n#define VALUE {value}\n#include \"a.h\"\nint value = VALUE;\n")).unwrap();
+            preprocess_file(&path, &opts).unwrap();
+            let replay =
+                preprocess_file(&path, &opts.clone().with_frozen_expansion_cache(true)).unwrap();
+            assert!(
+                replay.output.contains(&format!("int value= {value} ;")),
+                "{}",
+                replay.output
+            );
+        }
+    }
+
+    /// The issue's reproduction, at the level the defect lives on: one table
+    /// included once per `#define` of its entry macro. Nothing about the
+    /// file says "once", so every inclusion expands (#56).
+    #[test]
+    fn unguarded_file_re_expands_on_every_include() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("list.def"), "ENTRY(alpha)\nENTRY(beta)\n").unwrap();
+        let path = dir.path().join("t.c");
+        fs::write(
+            &path,
+            "#define ENTRY(n) void fn_##n(void) {}\n#include \"list.def\"\n#undef ENTRY\n\
+             #define ENTRY(n) void use_##n(void) { fn_##n(); }\n#include \"list.def\"\n",
+        )
+        .unwrap();
+        let out = preprocess_file(&path, &PreprocessOptions::new())
+            .unwrap()
+            .output;
+        for name in ["fn_alpha", "fn_beta", "use_alpha", "use_beta"] {
+            assert!(out.contains(name), "{name} missing from {out}");
+        }
+    }
+
+    /// An include guard suppresses while its name is defined, and stops
+    /// suppressing when the name goes away.
+    #[test]
+    fn include_guard_suppresses_only_while_its_name_is_defined() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("body.h"),
+            "#ifndef BODY_H\n#define BODY_H\nint MARK;\n#endif\n",
+        )
+        .unwrap();
+        let path = dir.path().join("t.c");
+        fs::write(
+            &path,
+            "#define MARK a\n#include \"body.h\"\n#undef MARK\n#define MARK b\n\
+             #include \"body.h\"\n#undef BODY_H\n#undef MARK\n#define MARK c\n\
+             #include \"body.h\"\n",
+        )
+        .unwrap();
+        let out = preprocess_file(&path, &PreprocessOptions::new())
+            .unwrap()
+            .output;
+        assert!(out.contains("int a ;"), "{out}");
+        assert!(!out.contains("int b ;"), "guard did not suppress: {out}");
+        assert!(
+            out.contains("int c ;"),
+            "`#undef` of the guard ignored: {out}"
+        );
+    }
+
+    /// `#pragma once` read with the enclosing conditional active holds for
+    /// the rest of the run, whatever later happens to that condition.
+    #[test]
+    fn active_pragma_once_holds_for_the_rest_of_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("once.h"),
+            "#ifdef ENABLE_ONCE\n#pragma once\n#endif\nint MARK;\n",
+        )
+        .unwrap();
+        let path = dir.path().join("t.c");
+        let source = |enable: &str| {
+            format!(
+                "{enable}#define MARK a\n#include \"once.h\"\n#undef ENABLE_ONCE\n\
+                 #undef MARK\n#define MARK b\n#include \"once.h\"\n"
+            )
+        };
+        fs::write(&path, source("#define ENABLE_ONCE 1\n")).unwrap();
+        let out = preprocess_file(&path, &PreprocessOptions::new())
+            .unwrap()
+            .output;
+        assert!(out.contains("int a ;"), "{out}");
+        assert!(!out.contains("int b ;"), "`#pragma once` was undone: {out}");
+
+        // The same header reached with the conditional inactive: a pragma in
+        // a skipped group states nothing, so the file re-expands. This is a
+        // separate run by construction — once the first run has read an
+        // active `#pragma once`, it holds for that whole unit.
+        fs::write(&path, source("")).unwrap();
+        let out = preprocess_file(&path, &PreprocessOptions::new())
+            .unwrap()
+            .output;
+        assert!(out.contains("int a ;") && out.contains("int b ;"), "{out}");
+    }
+
+    /// `a.h` includes `b.h` includes `a.h`, both guarded. The recursion now
+    /// terminates on the guard rather than on the blanket path set, and
+    /// neither body may be lost to it.
+    #[test]
+    fn guarded_recursive_includes_terminate_with_both_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.h"),
+            "#ifndef A_H\n#define A_H\n#include \"b.h\"\nint a;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("b.h"),
+            "#ifndef B_H\n#define B_H\n#include \"a.h\"\nint b;\n#endif\n",
+        )
+        .unwrap();
+        let path = dir.path().join("t.c");
+        fs::write(&path, "#include \"a.h\"\n").unwrap();
+        let result = preprocess_file(&path, &PreprocessOptions::new()).unwrap();
+        assert_eq!(
+            result.output.matches("int a ;").count(),
+            1,
+            "{}",
+            result.output
+        );
+        assert_eq!(
+            result.output.matches("int b ;").count(),
+            1,
+            "{}",
+            result.output
+        );
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("include depth")),
+            "termination came from the depth cap: {:?}",
+            result.diagnostics
+        );
+    }
+
+    /// Guard-driven skips still feed the cache frames, so a diamond graph
+    /// costs one expansion per header rather than one per path through it.
+    #[test]
+    fn diamond_include_graph_does_not_re_splice_exponentially() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("h0.h"),
+            "#ifndef H0\n#define H0\nint h0;\n#endif\n",
+        )
+        .unwrap();
+        const LEVELS: usize = 12;
+        for level in 1..=LEVELS {
+            fs::write(
+                dir.path().join(format!("h{level}.h")),
+                format!(
+                    "#ifndef H{level}\n#define H{level}\n#include \"h{prev}.h\"\n\
+                     #include \"h{prev}.h\"\nint h{level};\n#endif\n",
+                    prev = level - 1
+                ),
+            )
+            .unwrap();
+        }
+        let path = dir.path().join("t.c");
+        fs::write(&path, format!("#include \"h{LEVELS}.h\"\n")).unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = PreprocessOptions::new().with_include_expansion_cache(cache);
+        let result = preprocess_file(&path, &opts).unwrap();
+        for level in 0..=LEVELS {
+            assert_eq!(
+                result.output.matches(&format!("int h{level} ;")).count(),
+                1,
+                "h{level} re-spliced: {} bytes of output",
+                result.output.len()
+            );
+        }
+    }
+
+    /// The wrapper shapes that are an include guard, and the near-misses
+    /// that are not. Read structurally, so this is decided the same way for
+    /// a file's first inclusion as for its tenth.
+    #[test]
+    fn include_guard_shape_is_read_off_the_token_stream() {
+        let guard_of = |src: &str| {
+            detect_include_guard(&Lexer::new(src, Language::C).tokenize())
+                .map(|n| n.as_ref().to_string())
+        };
+        assert_eq!(
+            guard_of("#ifndef G\n#define G\nint x;\n#endif\n").as_deref(),
+            Some("G")
+        );
+        // Leading comments and blank lines are not tokens.
+        assert_eq!(
+            guard_of("/* c */\n\n#ifndef G\n#define G\nint x;\n#endif // G\n").as_deref(),
+            Some("G")
+        );
+        assert_eq!(
+            guard_of("#if !defined(G)\n#define G\nint x;\n#endif\n").as_deref(),
+            Some("G")
+        );
+        // Nested conditionals do not close the wrapper early.
+        assert_eq!(
+            guard_of("#ifndef G\n#define G\n#ifdef A\nint a;\n#else\nint b;\n#endif\n#endif\n")
+                .as_deref(),
+            Some("G")
+        );
+        // A second arm makes it a conditional on the name, not a guard.
+        assert_eq!(
+            guard_of("#ifndef G\n#define G\nint x;\n#else\nint y;\n#endif\n"),
+            None
+        );
+        // Content before the wrapper, or after it.
+        assert_eq!(
+            guard_of("int before;\n#ifndef G\n#define G\n#endif\n"),
+            None
+        );
+        assert_eq!(guard_of("#ifndef G\n#define G\n#endif\nint after;\n"), None);
+        // The `#define` must be the next DIRECTIVE, of that name — ordinary
+        // text before it changes nothing, since it is inside the wrapper and
+        // therefore skipped on a later inclusion either way.
+        assert_eq!(
+            guard_of("#ifndef G\nint x;\n#define G\n#endif\n").as_deref(),
+            Some("G")
+        );
+        assert_eq!(
+            guard_of("#ifndef G\n#if A\n#define G\n#endif\n#endif\n"),
+            None
+        );
+        assert_eq!(guard_of("#ifndef G\n#define H\n#endif\n"), None);
+        assert_eq!(guard_of("#ifdef G\n#define G\n#endif\n"), None);
+        assert_eq!(guard_of("int x;\n"), None);
+    }
+
+    /// A `#pragma once` header embedded in a cached expansion must hand its
+    /// guard to the consumer along with its text. `record_guard` returned
+    /// early once `Once` was already known, which kept the guard out of
+    /// every frame opened after that point — so the entry carried the body
+    /// and not the reason to skip it, and the consumer expanded it twice.
+    #[test]
+    fn pragma_once_guard_reaches_frames_opened_after_it_was_learned() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("once.h"), "#pragma once\nint once_body;\n").unwrap();
+        fs::write(dir.path().join("a.h"), "#include \"once.h\"\nint a;\n").unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path().to_path_buf())
+            .with_include_expansion_cache(cache);
+        let path = dir.path().join("main.c");
+
+        // Producer: once.h is expanded before a.h opens its cache frame, so
+        // a.h skips it and embeds its text.
+        fs::write(&path, "#include \"once.h\"\n#include \"a.h\"\n").unwrap();
+        let produced = preprocess_file(&path, &opts).unwrap();
+        assert_eq!(produced.output.matches("int once_body ;").count(), 1);
+
+        // Consumer: replays a.h, then reaches once.h itself.
+        fs::write(&path, "#include \"a.h\"\n#include \"once.h\"\n").unwrap();
+        let consumed =
+            preprocess_file(&path, &opts.clone().with_frozen_expansion_cache(true)).unwrap();
+        assert_eq!(
+            consumed.output.matches("int once_body ;").count(),
+            1,
+            "`#pragma once` body expanded twice: {}",
+            consumed.output
+        );
+    }
+
+    /// Repetition is legitimate but not unbounded: past the cap the include
+    /// is skipped and said so, rather than lost the way the blanket
+    /// suppression lost it.
+    #[test]
+    fn repeated_expansion_of_one_path_is_capped_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("x.h"), "int x;\n").unwrap();
+        let path = dir.path().join("t.c");
+        fs::write(&path, "#include \"x.h\"\n".repeat(6)).unwrap();
+        let opts = PreprocessOptions::new().with_max_file_expansions(3);
+        let result = preprocess_file(&path, &opts).unwrap();
+        assert_eq!(
+            result.output.matches("int x ;").count(),
+            3,
+            "{}",
+            result.output
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter(|d| d.message.contains("include expanded more than 3 times"))
+                .count(),
+            1,
+            "expected exactly one report: {:?}",
+            result.diagnostics
+        );
+    }
+
     /// A header whose body was guard-skipped contributes no text, no macro
     /// ops and no files. Caching it anyway — as happened when its own
     /// "expanded to nothing" warning was the only thing in the entry — makes
@@ -6904,8 +8909,7 @@ int from_late;
         fs::write(dir.join("first.c"), "#define G 1\n#include \"guarded.h\"\n").unwrap();
         fs::write(dir.join("second.c"), "#include \"guarded.h\"\n").unwrap();
 
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = || {
             PreprocessOptions::new()
                 .with_include_expansion_cache(Arc::clone(&cache))
@@ -6957,9 +8961,8 @@ int from_late;
         fs::write(dir.join("big.c"), &big).unwrap();
         fs::write(dir.join("small.c"), "#include \"parent.h\"\n").unwrap();
 
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-        let opts = |cache: Option<&Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>>>| {
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = |cache: Option<&ExpansionCache>| {
             let base = PreprocessOptions::new()
                 .with_max_output_bytes(2000)
                 .with_include(dir.path.clone());
@@ -7030,8 +9033,7 @@ int from_late;
         .unwrap();
         fs::write(dir.join("other.c"), "#include \"parent.h\"\n").unwrap();
 
-        let cache: Arc<RwLock<HashMap<ExpansionKey, IncludeExpansion>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let cached_opts = PreprocessOptions::new()
             .with_include_expansion_cache(Arc::clone(&cache))
             .with_include(dir.path.clone());
@@ -7068,12 +9070,8 @@ int from_late;
         opts.track_line_map = true;
         let result = preprocess_file(&path, &opts).unwrap();
 
-        assert!(
-            !result.output.contains("__attribute__"),
-            "{}",
-            result.output
-        );
-        assert!(!result.output.contains("__declspec"), "{}", result.output);
+        assert!(!result.output.contains("section("), "{}", result.output);
+        assert!(!result.output.contains("align("), "{}", result.output);
         for declaration in [
             "const int before_type",
             "const int after_declarator",
@@ -7108,6 +9106,9 @@ int from_late;
             "visibility(\"hidden\")",
             "alias(\"target\")",
             "cleanup(release_value)",
+            "noreturn",
+            "__weak__",
+            "__visibility__(\"default\")",
         ] {
             let source = format!("int value __attribute__(({attribute}));\n");
             let result = preprocess_string(&source, Path::new("t.c"), &PreprocessOptions::new());
@@ -7128,13 +9129,662 @@ int from_late;
 
     #[test]
     fn macro_spelled_attribute_name_elides_following_noise_group() {
-        let source = "#define ATTR __attribute__\nint x ATTR ((used)) = 1;\n";
+        let source =
+            "#define BASE_ATTR __attribute\n#define ATTR BASE_ATTR\nint x ATTR ((used)) = 1;\n";
         let result = preprocess_string(source, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(!result.output.contains("__attribute"), "{}", result.output);
+        assert!(result.output.contains("int x= 1"), "{}", result.output);
+    }
+
+    #[test]
+    fn attribute_arguments_expand_before_semantic_classification() {
+        let source = "#define ATTR_VIS __visibility__(\"default\")\n#define ATTR __attribute__\nint x ATTR((ATTR_VIS));\n";
+        let result = preprocess_string(source, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(result.output.contains("__attribute__"), "{}", result.output);
         assert!(
-            !result.output.contains("__attribute__"),
+            result.output.contains("__visibility__(\"default\")"),
             "{}",
             result.output
         );
-        assert!(result.output.contains("int x= 1"), "{}", result.output);
+        for attribute in ["selectany", "dllexport", "dllimport"] {
+            let source = format!("__declspec({attribute}) int x;\n");
+            let result = preprocess_string(&source, Path::new("t.c"), &PreprocessOptions::new());
+            assert!(result.output.contains(attribute), "{}", result.output);
+        }
+    }
+
+    #[test]
+    fn malformed_attributes_do_not_consume_declaration_boundaries() {
+        for source in [
+            "int x __attribute__((used; int y = (1);\n",
+            "void foo(int x __attribute__((used) ) { int y; }\n",
+        ] {
+            let result = preprocess_string(source, Path::new("t.c"), &PreprocessOptions::new());
+            assert!(result.output.contains("__attribute__"), "{}", result.output);
+            assert!(result.output.contains("int y"), "{}", result.output);
+        }
+    }
+    fn record(src: &str, opts: PreprocessOptions) -> Vec<ConditionalChain> {
+        preprocess_string(
+            src,
+            Path::new("test.c"),
+            &opts.with_record_conditionals(true),
+        )
+        .conditionals
+    }
+
+    fn reads_of(arm: &ConditionalArm) -> Vec<(&str, Option<bool>)> {
+        arm.reads
+            .iter()
+            .map(|r| (r.name.as_str(), r.bound))
+            .collect()
+    }
+
+    #[test]
+    fn conditionals_are_not_recorded_by_default() {
+        let src = "#ifdef A\nint a;\n#endif\n";
+        let result = preprocess_string(src, Path::new("test.c"), &PreprocessOptions::new());
+        assert!(result.conditionals.is_empty());
+    }
+
+    #[test]
+    fn records_if_elif_else_chain_with_outcomes() {
+        let src = "#if A\nint a;\n#elif B\nint b;\nint b2;\n#else\nint c;\n#endif\nint after;\n";
+        let chains = record(src, PreprocessOptions::new().with_define("B", "1"));
+        assert_eq!(chains.len(), 1);
+        let chain = &chains[0];
+        assert!(chain.terminated);
+        assert!(!chain.include_guard);
+        assert_eq!(chain.depth, 0);
+        assert_eq!(chain.line(), 1);
+        let arms = &chain.arms;
+        assert_eq!(arms.len(), 3);
+
+        assert_eq!(arms[0].directive, ArmDirective::If);
+        assert_eq!(arms[0].expression, "A");
+        assert_eq!((arms[0].line, arms[0].end_line), (1, 3));
+        assert_eq!(arms[0].outcome, ArmOutcome::Skipped);
+        assert!(arms[0].evaluated);
+        assert_eq!(reads_of(&arms[0]), vec![("A", Some(false))]);
+        assert_eq!(arms[0].body_lines(), 1);
+
+        assert_eq!(arms[1].directive, ArmDirective::Elif);
+        assert_eq!(arms[1].expression, "B");
+        assert_eq!((arms[1].line, arms[1].end_line), (3, 6));
+        assert_eq!(arms[1].outcome, ArmOutcome::Taken);
+        assert!(arms[1].evaluated);
+        assert_eq!(reads_of(&arms[1]), vec![("B", Some(true))]);
+        assert_eq!(arms[1].body_lines(), 2);
+
+        assert_eq!(arms[2].directive, ArmDirective::Else);
+        assert_eq!(arms[2].expression, "");
+        assert_eq!((arms[2].line, arms[2].end_line), (6, 8));
+        assert_eq!(arms[2].outcome, ArmOutcome::Skipped);
+        assert!(!arms[2].evaluated);
+        assert!(arms[2].reads.is_empty());
+    }
+
+    /// An undefined name does not always select `#else`: `#if !X` with `X`
+    /// unknown takes the FIRST arm. The record says which arm was taken
+    /// rather than assuming a direction.
+    #[test]
+    fn negated_unknown_name_takes_the_first_arm() {
+        let src = "#if !X\nint first;\n#else\nint second;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        let arms = &chains[0].arms;
+        assert_eq!(arms[0].outcome, ArmOutcome::Taken);
+        assert_eq!(arms[0].expression, "!X");
+        assert_eq!(reads_of(&arms[0]), vec![("X", Some(false))]);
+        assert_eq!(arms[1].outcome, ArmOutcome::Skipped);
+    }
+
+    #[test]
+    fn ifdef_and_ifndef_record_their_operand() {
+        let src = "#ifdef A\nint a;\n#endif\n#ifndef A\nint na;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(chains.len(), 2);
+        assert_eq!(chains[0].arms[0].directive, ArmDirective::Ifdef);
+        assert_eq!(chains[0].arms[0].expression, "A");
+        assert_eq!(chains[0].arms[0].outcome, ArmOutcome::Skipped);
+        assert_eq!(reads_of(&chains[0].arms[0]), vec![("A", Some(false))]);
+        assert_eq!(chains[1].arms[0].directive, ArmDirective::Ifndef);
+        assert_eq!(chains[1].arms[0].expression, "A");
+        assert_eq!(chains[1].arms[0].outcome, ArmOutcome::Taken);
+        assert_eq!(chains[1].line(), 4);
+    }
+
+    #[test]
+    fn if_expression_is_kept_as_written() {
+        let src = "#define ONE 1\n#if defined(A) && (ONE > 0) || defined B\nint a;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        let arm = &chains[0].arms[0];
+        assert_eq!(arm.expression, "defined(A) && (ONE > 0) || defined B");
+        assert_eq!(
+            reads_of(arm),
+            vec![("A", Some(false)), ("ONE", Some(true)), ("B", Some(false))]
+        );
+    }
+
+    /// `#if HAS_X` with `#define HAS_X defined(X)` depends on `X`, which
+    /// only expansion reveals: the reads follow the evaluation, not the
+    /// spelling.
+    #[test]
+    fn condition_reads_follow_macro_expansion() {
+        let src = "#define HAS_X defined(X)\n#if HAS_X\nint a;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(
+            reads_of(&chains[0].arms[0]),
+            vec![("HAS_X", Some(true)), ("X", Some(false))]
+        );
+    }
+
+    /// A read is recorded once per arm, however often the expression
+    /// consults it.
+    #[test]
+    fn repeated_reads_are_recorded_once() {
+        let src = "#if defined(A) || A > 1\nint a;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(reads_of(&chains[0].arms[0]), vec![("A", Some(false))]);
+    }
+
+    /// A chain inside an excluded arm is not evaluated (C11 6.10.1p6). Its
+    /// arms are recorded as such — lines it encloses are excluded by the
+    /// OUTER chain — and its names are known only by their spelling.
+    #[test]
+    fn chain_inside_skipped_arm_is_unevaluated() {
+        let src = "#ifdef X\n#if Y > 1\nint a;\n#else\nint b;\n#endif\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(chains.len(), 2);
+        let outer = &chains[0];
+        assert_eq!(outer.depth, 0);
+        assert_eq!(outer.arms[0].outcome, ArmOutcome::Skipped);
+        assert_eq!((outer.arms[0].line, outer.arms[0].end_line), (1, 7));
+        let inner = &chains[1];
+        assert_eq!(inner.depth, 1);
+        assert_eq!(inner.arms.len(), 2);
+        assert_eq!(inner.arms[0].outcome, ArmOutcome::Unevaluated);
+        assert!(!inner.arms[0].evaluated);
+        assert_eq!(inner.arms[0].expression, "Y > 1");
+        assert_eq!(reads_of(&inner.arms[0]), vec![("Y", None)]);
+        assert_eq!(inner.arms[1].outcome, ArmOutcome::Unevaluated);
+        assert_eq!((inner.arms[0].line, inner.arms[0].end_line), (2, 4));
+        assert_eq!((inner.arms[1].line, inner.arms[1].end_line), (4, 6));
+    }
+
+    /// An `#elif` after a taken arm is skipped without being evaluated; its
+    /// names are still reported, from the spelling.
+    #[test]
+    fn elif_after_taken_arm_is_skipped_without_evaluation() {
+        let src = "#if 1\nint a;\n#elif defined(B) && C\nint b;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        let arm = &chains[0].arms[1];
+        assert_eq!(arm.outcome, ArmOutcome::Skipped);
+        assert!(!arm.evaluated);
+        assert_eq!(reads_of(arm), vec![("B", None), ("C", None)]);
+        assert!(chains[0].arms[0].reads.is_empty());
+    }
+
+    #[test]
+    fn unterminated_chain_is_closed_at_end_of_file() {
+        let src = "int before;\n#ifdef A\nint a;\nint b;\n";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(chains.len(), 1);
+        assert!(!chains[0].terminated);
+        assert_eq!(chains[0].arms[0].line, 2);
+        assert_eq!(chains[0].arms[0].end_line, 5);
+    }
+
+    /// Without a trailing newline the EOF token sits on the last line
+    /// itself; the arm still has to span that line.
+    #[test]
+    fn unterminated_chain_without_trailing_newline_spans_the_last_line() {
+        let src = "int before;\n#ifdef A\nint a;\nint b;";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(chains[0].arms[0].end_line, 5);
+        assert_eq!(chains[0].arms[0].body_lines(), 2);
+    }
+
+    #[test]
+    fn unterminated_chain_counts_trailing_comment_and_whitespace_lines() {
+        let fixture =
+            include_str!("../../../tests/fixtures/preproc/conditional_unterminated_comment.c");
+        for src in [
+            fixture,
+            "#if 0\n   ",
+            "#if 0\n/* comment */",
+            "#if 0\n// final comment\n",
+        ] {
+            let chains = record(src, PreprocessOptions::new());
+            assert_eq!(chains[0].arms[0].end_line, 3, "{src:?}");
+            assert_eq!(chains[0].arms[0].body_lines(), 1, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn conditional_macro_operands_keep_operator_shaped_names() {
+        for directive in [
+            "ifdef and",
+            "ifndef and",
+            "if defined(and)",
+            "if defined and",
+        ] {
+            for outer in ["", "#if 0\n"] {
+                let src = format!(
+                    "{outer}#{directive}\nint x;\n#endif\n{}",
+                    if outer.is_empty() { "" } else { "#endif\n" }
+                );
+                let chains = record(&src, PreprocessOptions::new());
+                let arm = &chains.last().unwrap().arms[0];
+                let bound = if outer.is_empty() { Some(false) } else { None };
+                assert_eq!(reads_of(arm), vec![("and", bound)], "{src:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_directives_start_at_hash_before_splice() {
+        let src = "#\\\nif 0\nint x;\n#\\\nelse\nint y;\n#\\\nendif\n";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(chains[0].line(), 1);
+        assert_eq!(chains[0].arms[0].end_line, 4);
+        assert_eq!(chains[0].arms[0].body_lines(), 2);
+        assert_eq!(chains[0].arms[1].line, 4);
+        assert_eq!(chains[0].arms[1].end_line, 7);
+    }
+
+    #[test]
+    fn include_guard_is_recognized_and_other_ifndefs_are_not() {
+        let dir = unique_tmp_dir("cond_guard");
+        fs::write(
+            dir.join("guarded.h"),
+            "/* license */\n#ifndef GUARDED_H\n#define GUARDED_H\nint g;\n#endif /* GUARDED_H */\n\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("not_defined.h"),
+            "#if !defined(ND_H)\n#define ND_H\nint nd;\n#endif\n",
+        )
+        .unwrap();
+        // The default-value idiom: same opening shape, code after the #endif.
+        fs::write(
+            dir.join("default.h"),
+            "#ifndef LOG_TAG\n#define LOG_TAG 1\n#endif\nint d;\n",
+        )
+        .unwrap();
+        // Something before the #ifndef, and a #define of a different name.
+        fs::write(
+            dir.join("late.h"),
+            "int early;\n#ifndef LATE_H\n#define LATE_H\nint l;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("other_define.h"),
+            "#ifndef OD_H\n#define SOMETHING_ELSE\nint o;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("main.c"),
+            "#include \"guarded.h\"\n#include \"not_defined.h\"\n#include \"default.h\"\n#include \"late.h\"\n#include \"other_define.h\"\n#ifndef MAIN_H\n#define MAIN_H\nint m;\n#endif\n",
+        )
+        .unwrap();
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path.clone())
+            .with_record_conditionals(true);
+        let result = preprocess_file(&dir.join("main.c"), &opts).unwrap();
+        let guard_of = |name: &str| -> Vec<bool> {
+            result
+                .conditionals
+                .iter()
+                .filter(|c| c.file.ends_with(name))
+                .map(|c| c.include_guard)
+                .collect()
+        };
+        assert_eq!(guard_of("guarded.h"), vec![true]);
+        assert_eq!(guard_of("not_defined.h"), vec![true]);
+        assert_eq!(guard_of("default.h"), vec![false]);
+        assert_eq!(guard_of("late.h"), vec![false]);
+        assert_eq!(guard_of("other_define.h"), vec![false]);
+        // The TU's own trailing #ifndef/#define/#endif: preceded by tokens.
+        assert_eq!(guard_of("main.c"), vec![false]);
+        // A guard's chain is recorded in its own file, at the header's depth.
+        let guarded = result
+            .conditionals
+            .iter()
+            .find(|c| c.file.ends_with("guarded.h"))
+            .unwrap();
+        assert_eq!(guarded.depth, 0);
+        assert_eq!(guarded.line(), 2);
+        assert_eq!(guarded.arms[0].outcome, ArmOutcome::Taken);
+        assert_eq!(reads_of(&guarded.arms[0]), vec![("GUARDED_H", Some(false))]);
+    }
+
+    /// A guard candidate is per file: a header included inside the guard
+    /// chain must not consume the includer's pending `#define`, and its own
+    /// guard is judged on its own tokens.
+    #[test]
+    fn include_guard_detection_is_per_file() {
+        let dir = unique_tmp_dir("cond_guard_nested");
+        fs::write(
+            dir.join("inner.h"),
+            "#ifndef INNER_H\n#define INNER_H\nint i;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("outer.h"),
+            "#ifndef OUTER_H\n#include \"inner.h\"\n#define OUTER_H\nint o;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(dir.join("main.c"), "#include \"outer.h\"\n").unwrap();
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path.clone())
+            .with_record_conditionals(true);
+        let result = preprocess_file(&dir.join("main.c"), &opts).unwrap();
+        let outer = result
+            .conditionals
+            .iter()
+            .find(|c| c.file.ends_with("outer.h"))
+            .unwrap();
+        let inner = result
+            .conditionals
+            .iter()
+            .find(|c| c.file.ends_with("inner.h"))
+            .unwrap();
+        // outer.h's next directive after `#ifndef OUTER_H` is an #include,
+        // not the #define, so it is not the canonical guard shape.
+        assert!(!outer.include_guard);
+        assert!(inner.include_guard);
+        assert_eq!(inner.depth, 0, "includer frames do not count as depth");
+    }
+
+    #[test]
+    fn chains_in_included_headers_carry_the_header_path() {
+        let dir = unique_tmp_dir("cond_header_path");
+        fs::write(
+            dir.join("cfg.h"),
+            "#ifdef USE_FAST\nint fast;\n#else\nint slow;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("a.c"),
+            "#define USE_FAST 1\n#include \"cfg.h\"\n#ifdef USE_FAST\nint a;\n#endif\n",
+        )
+        .unwrap();
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path.clone())
+            .with_record_conditionals(true);
+        let result = preprocess_file(&dir.join("a.c"), &opts).unwrap();
+        assert_eq!(result.conditionals.len(), 2);
+        let cfg = &result.conditionals[0];
+        assert!(cfg.file.ends_with("cfg.h"), "{:?}", cfg.file);
+        assert_eq!(cfg.arms[0].outcome, ArmOutcome::Taken);
+        assert_eq!(reads_of(&cfg.arms[0]), vec![("USE_FAST", Some(true))]);
+        assert_eq!(cfg.arms[1].outcome, ArmOutcome::Skipped);
+        assert!(result.conditionals[1].file.ends_with("a.c"));
+    }
+
+    /// The same header reached as `src/../common/cfg.h` from one includer
+    /// and as `common/cfg.h` through an include dir is one file; its chains
+    /// have to merge across runs, so the record carries the canonical path.
+    #[test]
+    fn chain_file_is_canonical_however_the_include_spelled_it() {
+        let dir = unique_tmp_dir("cond_canonical");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("common")).unwrap();
+        fs::write(dir.join("common/cfg.h"), "#ifdef A\nint a;\n#endif\n").unwrap();
+        fs::write(dir.join("src/a.c"), "#include \"../common/cfg.h\"\n").unwrap();
+        fs::write(dir.join("src/b.c"), "#include \"cfg.h\"\n").unwrap();
+        let opts = PreprocessOptions::new()
+            .with_include(dir.join("common"))
+            .with_record_conditionals(true);
+        let via_parent = preprocess_file(&dir.join("src/a.c"), &opts).unwrap();
+        let via_dir = preprocess_file(&dir.join("src/b.c"), &opts).unwrap();
+        let expected = trace_ir::canonicalize(&dir.join("common/cfg.h"));
+        assert_eq!(via_parent.conditionals[0].file, expected);
+        assert_eq!(via_dir.conditionals[0].file, expected);
+        assert!(!via_parent.conditionals[0]
+            .file
+            .components()
+            .any(|c| c == std::path::Component::ParentDir));
+    }
+
+    /// A line marker or `#!` line inside a skipped group is not a directive
+    /// the group needs to understand; it must neither abort the file nor
+    /// stretch the arm to the end of it.
+    #[test]
+    fn non_identifier_directive_in_skipped_group_is_ignored() {
+        let src = "#if 0\n# 1 \"legacy.c\"\n#!/bin/sh\n#endif\nint kept;\nint also;\n";
+        let result = preprocess_string(
+            src,
+            Path::new("test.c"),
+            &PreprocessOptions::new().with_record_conditionals(true),
+        );
+        assert!(result.output.contains("kept"), "{:?}", result.output);
+        assert!(result.output.contains("also"), "{:?}", result.output);
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("preprocess stopped")),
+            "{:?}",
+            result.diagnostics
+        );
+        let chain = &result.conditionals[0];
+        assert!(chain.terminated);
+        assert_eq!(chain.arms[0].end_line, 4);
+        assert_eq!(chain.arms[0].body_lines(), 2);
+        // In an active group the same line is still an error.
+        let active = preprocess_string(
+            "# 1 \"legacy.c\"\nint x;\n",
+            Path::new("test.c"),
+            &PreprocessOptions::new(),
+        );
+        assert!(active
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("expected directive name")));
+    }
+
+    /// `#ifndef X_H / #define X_H / … / #else / … / #endif` has an
+    /// alternative; a guard does not.
+    #[test]
+    fn guard_shaped_chain_with_an_else_arm_is_not_a_guard() {
+        let src = "#ifndef X_H\n#define X_H\nint x;\n#else\nint y;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new());
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].arms.len(), 2);
+        assert!(!chains[0].include_guard);
+        let plain = record(
+            "#ifndef X_H\n#define X_H\nint x;\n#endif\n",
+            PreprocessOptions::new(),
+        );
+        assert!(plain[0].include_guard);
+    }
+
+    /// `and` / `not` in a condition are operators, not names the
+    /// configuration failed to bind — unless something did bind them.
+    #[test]
+    fn alternative_operator_spellings_are_not_reads() {
+        let src = "#if defined(A) and not defined(B)\nint x;\n#elif C or D\nint y;\n#endif\n";
+        let chains = record(src, PreprocessOptions::new().with_define("A", "1"));
+        assert_eq!(
+            reads_of(&chains[0].arms[0]),
+            vec![("A", Some(true)), ("B", Some(false))]
+        );
+        assert!(chains[0].arms[1].evaluated);
+        assert_eq!(
+            reads_of(&chains[0].arms[1]),
+            vec![("C", Some(false)), ("D", Some(false))]
+        );
+        // Unevaluated arm: the spelled identifiers, minus the operators.
+        let nested = "#if 0\n#if X and Y\nint n;\n#endif\n#endif\n";
+        let chains = record(nested, PreprocessOptions::new());
+        assert_eq!(reads_of(&chains[1].arms[0]), vec![("X", None), ("Y", None)]);
+        // A macro actually named `and` is a name.
+        let bound = record(
+            "#if and\nint z;\n#endif\n",
+            PreprocessOptions::new().with_define("and", "1"),
+        );
+        assert_eq!(reads_of(&bound[0].arms[0]), vec![("and", Some(true))]);
+    }
+
+    /// `__cplusplus` is predefined for a unit lexed as C++ and unbound in a
+    /// C unit (#70): `#ifdef`, `defined()`, `#if` arithmetic and text
+    /// position all see it.
+    #[test]
+    fn cplusplus_predefined_for_cpp_units_only() {
+        let src = "#ifdef __cplusplus\nint ifdef_arm;\n#endif\n\
+                   #if defined(__cplusplus)\nint defined_arm;\n#endif\n\
+                   #if __cplusplus >= 201103L\nint cxx11_arm;\n#endif\n\
+                   long v = __cplusplus;\n";
+        let cpp = preprocess_string(src, Path::new("t.cpp"), &PreprocessOptions::new()).output;
+        assert!(cpp.contains("ifdef_arm"), "{cpp}");
+        assert!(cpp.contains("defined_arm"), "{cpp}");
+        assert!(cpp.contains("cxx11_arm"), "{cpp}");
+        assert!(cpp.contains("v= 201703L ;"), "{cpp}");
+
+        let c = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new()).output;
+        assert!(!c.contains("ifdef_arm"), "{c}");
+        assert!(!c.contains("defined_arm"), "{c}");
+        assert!(!c.contains("cxx11_arm"), "{c}");
+        assert!(c.contains("v= __cplusplus ;"), "{c}");
+
+        // The language option decides, not the extension.
+        let forced = preprocess_string(
+            src,
+            Path::new("t.c"),
+            &PreprocessOptions::new().with_language(Language::Cpp),
+        )
+        .output;
+        assert!(forced.contains("cxx11_arm"), "{forced}");
+    }
+
+    /// A command-line `-D __cplusplus=…` beats the predefined value, so a
+    /// tree that pins its own standard level is honoured.
+    #[test]
+    fn cli_define_overrides_predefined_cplusplus() {
+        let src = "#if __cplusplus >= 201103L\nint cxx11_arm;\n#else\nint cxx98_arm;\n#endif\n";
+        let out = preprocess_string(
+            src,
+            Path::new("t.cpp"),
+            &PreprocessOptions::new().with_define("__cplusplus", "199711L"),
+        )
+        .output;
+        assert!(out.contains("cxx98_arm"), "{out}");
+        assert!(!out.contains("cxx11_arm"), "{out}");
+    }
+
+    /// `__STDC__` is predefined for both languages (g++ defines it too);
+    /// `__STDC_VERSION__` only for C.
+    #[test]
+    fn stdc_predefined_per_language() {
+        let src = "#ifdef __STDC__\nint stdc_arm;\n#endif\n\
+                   #if __STDC_VERSION__ >= 201112L\nint c11_arm;\n#endif\n";
+        let c = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new()).output;
+        assert!(c.contains("stdc_arm"), "{c}");
+        assert!(c.contains("c11_arm"), "{c}");
+        let cpp = preprocess_string(src, Path::new("t.cpp"), &PreprocessOptions::new()).output;
+        assert!(cpp.contains("stdc_arm"), "{cpp}");
+        assert!(!cpp.contains("c11_arm"), "{cpp}");
+    }
+
+    /// The warm pass seeds each header's table from
+    /// `macro_table_from_defines`, and a translation unit that inherits a
+    /// shared table takes the predefines from it: both routes must agree
+    /// with the plain one.
+    #[test]
+    fn predefined_macros_seed_the_shared_table() {
+        let none = indexmap::IndexMap::new();
+        let cpp_table = macro_table_from_defines(&none, Language::Cpp);
+        assert!(cpp_table.contains_key("__cplusplus"));
+        assert!(cpp_table.contains_key("__STDC__"));
+        assert!(!cpp_table.contains_key("__STDC_VERSION__"));
+        let c_table = macro_table_from_defines(&none, Language::C);
+        assert!(!c_table.contains_key("__cplusplus"));
+        assert!(c_table.contains_key("__STDC_VERSION__"));
+
+        let pinned = indexmap::IndexMap::from([("__cplusplus".to_string(), "199711L".to_string())]);
+        let pinned_table = macro_table_from_defines(&pinned, Language::Cpp);
+        let src = "#if __cplusplus >= 201103L\nint cxx11_arm;\n#else\nint cxx98_arm;\n#endif\n";
+        let out = preprocess_string(
+            src,
+            Path::new("t.cpp"),
+            &PreprocessOptions::new()
+                .with_shared_macros(Arc::new(RwLock::new(pinned_table)))
+                .with_define("__cplusplus", "199711L"),
+        )
+        .output;
+        assert!(out.contains("cxx98_arm"), "{out}");
+
+        let out = preprocess_string(
+            src,
+            Path::new("t.cpp"),
+            &PreprocessOptions::new().with_shared_macros(Arc::new(RwLock::new(cpp_table))),
+        )
+        .output;
+        assert!(out.contains("cxx11_arm"), "{out}");
+    }
+
+    /// A predefine is an ordinary definition, not a builtin fallback, so
+    /// source may `#undef` it and the conditionals that follow see it gone.
+    #[test]
+    fn undef_of_a_predefined_macro_takes_effect() {
+        let src = "#ifdef __cplusplus\nint before;\n#endif\n\
+                   #undef __cplusplus\n\
+                   #ifdef __cplusplus\nint after;\n#else\nint gone;\n#endif\n";
+        let out = preprocess_string(src, Path::new("t.cpp"), &PreprocessOptions::new()).output;
+        assert!(out.contains("before"), "{out}");
+        assert!(out.contains("gone"), "{out}");
+        assert!(!out.contains("after"), "{out}");
+    }
+
+    /// A `-D` beats the predefined value on the shared-table path too. The
+    /// indexer seeds that table through `macro_table_from_defines`, which
+    /// already applies the CLI defines over the predefines, but a caller
+    /// that hands over a table those never reached must get the same
+    /// precedence rather than the language's own value.
+    #[test]
+    fn cli_define_beats_predefined_cplusplus_with_a_shared_table() {
+        let src = "#if __cplusplus >= 201103L\nint cxx11_arm;\n#else\nint cxx98_arm;\n#endif\n";
+        let out = preprocess_string(
+            src,
+            Path::new("t.cpp"),
+            &PreprocessOptions::new()
+                .with_shared_macros(crate::new_shared_macro_table())
+                .with_define("__cplusplus", "199711L"),
+        )
+        .output;
+        assert!(out.contains("cxx98_arm"), "{out}");
+        assert!(!out.contains("cxx11_arm"), "{out}");
+    }
+
+    /// A header's read of `__cplusplus` is a fingerprint dependency like any
+    /// other macro read: bound in the C++ entry, unbound in the C entry.
+    #[test]
+    fn predefined_cplusplus_is_a_fingerprint_dependency() {
+        let dir = unique_tmp_dir("cplusplus_fingerprint");
+        fs::write(
+            dir.join("lang.h"),
+            "#ifdef __cplusplus\nint cxx_decl;\n#else\nint c_decl;\n#endif\n",
+        )
+        .unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let run = |name: &str| {
+            let path = dir.join(name);
+            fs::write(&path, "#include \"lang.h\"\n").unwrap();
+            let opts = PreprocessOptions::new()
+                .with_include_expansion_cache(Arc::clone(&cache))
+                .with_include(dir.path.clone());
+            preprocess_file(&path, &opts).unwrap().output
+        };
+        assert!(run("t.cpp").contains("cxx_decl"));
+        assert!(run("t.c").contains("c_decl"));
+        let cpp = sole_variant(&cache, dir.join("lang.h"), Language::Cpp).expect("C++ entry");
+        assert!(
+            cpp.deps.defined.iter().any(|(n, _)| &**n == "__cplusplus"),
+            "{:?}",
+            cpp.deps
+        );
+        let c = sole_variant(&cache, dir.join("lang.h"), Language::C).expect("C entry");
+        assert!(c.deps.undefined.contains("__cplusplus"), "{:?}", c.deps);
     }
 }

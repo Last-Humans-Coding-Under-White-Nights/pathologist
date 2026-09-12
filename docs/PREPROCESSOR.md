@@ -4,6 +4,15 @@ trace implements its own C preprocessor in `trace-preproc`. It runs before tree-
 
 ## API
 
+Compiler attribute normalization removes balanced noise groups only. GNU
+`__attribute__`/`__attribute` and MSVC `__declspec` preserve semantic attributes:
+`constructor`, `destructor`, `weak`, `visibility`, `alias`, `cleanup`, `noreturn`,
+`selectany`, `dllexport`, and `dllimport`, including double-underscore spellings.
+Attribute arguments and chained object aliases are expanded before deciding
+whether a group is noise. Groups containing directives are processed normally;
+malformed groups stop at declaration boundaries instead of consuming later code.
+Newlines and expansion origins remain available to the LineMap.
+
 ```rust
 pub fn preprocess_file(path: &Path, opts: &PreprocessOptions) -> Result<PreprocessResult>;
 
@@ -11,10 +20,36 @@ pub struct PreprocessResult {
     pub output: String,
     pub line_map: LineMap,
     pub diagnostics: Vec<Diagnostic>,
+    pub conditionals: Vec<ConditionalChain>, // only with `record_conditionals`
 }
 ```
 
-CLI equivalents: `--include PATH`, `-D NAME=VALUE`.
+CLI equivalents: `--include PATH`, `-D NAME=VALUE`. `PreprocessOptions::with_record_conditionals(true)` turns on the
+[conditional-coverage record](#conditional-coverage-record) (off by default; nothing in indexing needs it).
+
+### Compilation database options (#62)
+
+When `compile_commands.json` exists at the analysis root or its `build/` directory
+(or is selected with `--compile-commands PATH`), indexing reads each
+command's working directory, include directories, macro operations, forced
+includes and language settings. Every command for a source is indexed and its
+facts are merged; explicit commands are independent of the `--explore` budget.
+Files without a usable entry retain inferred configuration. A missing or invalid
+database never prevents indexing; invalid databases/entries produce diagnostics.
+
+`-iquote` directories apply only to quoted includes, followed by `-I`, then
+`-isystem`, then the `-idirafter` chain (`-idirafter`/`-iwithprefix`), preserving
+order within each search class. Configured units use these
+explicit paths without project-wide basename guessing. `-D` and `-U` execute in
+command order after language predefines; explicit CLI defines override the database.
+`-include` files are processed in order before the TU, in the same macro environment
+and with their original locations. Their first search directory is the command's
+working directory. `-x` selects both lexer and parser; `-std` sets the standard
+version macro and strict/GNU dialect marker. This does not emulate a compiler's
+vendor or target-specific builtins, nor supply missing SDK/generated headers.
+
+Each command gets independent preprocessing and source caches, with inline header
+bodies, so include-path changes cannot reuse expansions from a different command.
 
 ## Role in the pipeline
 
@@ -31,7 +66,8 @@ flowchart LR
 ```
 
 - **`IncludeGraph`** (`trace-parse/src/deps.rs`) scans project files for `#include` directives, builds dependency edges, discovers include directories, and marks which files need preprocessing.
-- Preprocessed output is **cached** per file (parallel cache fill when `--jobs > 1`).
+- Preprocessed output is **cached** per file (parallel cache fill when `--jobs > 1`) and released once
+  the unit is lowered, so the text held at once is bounded by the parse batch in flight.
 - If preprocessing fails hard (the unit's own file cannot be read), the unit is dropped and an error diagnostic is recorded; a stop *inside* a file keeps the output produced so far (see Error recovery).
 
 ## Phases
@@ -40,34 +76,35 @@ flowchart LR
 
 | Feature | Notes |
 |---------|-------|
+| Compilation options (#62) | Ordered command macro operations, quoted/normal/system include search classes, forced headers with original LineMap origins; language and standard-version predefines |
 | Comments | `//`, `/* */` |
 | Line splicing | Translation phase 2 (C11 5.1.1.2p1) runs inside the lexer, at the character level: every `\`-newline (`\n` or `\r\n`, and — as gcc and clang accept with a warning — with horizontal whitespace between the `\` and the newline) is deleted before any token is recognized, so a spliced identifier is one identifier (`int c\`-newline-`d;` is `int cd;`), a spliced multi-character punctuator is munched whole (`.\`-newline-`..` is `...`, so `#define F(x, .\`-newline-`..)` is the variadic macro gcc and clang see — #38), a spliced encoding prefix or string body stays one literal, a `//` comment ending in `\` continues onto the next line and `/\`-newline-`*` opens a block comment. A `\r` counts only as the first half of a `\r\n`: `\`-CR-CR-LF and `\`-CR-space-LF are not splices, as in clang. Inside a C++11 raw string literal the splice is reverted ([lex.pptoken]p3) and the body is kept as written; in C, where `R"(…)"` is the identifier `R` followed by an ordinary string, a splice in that body is deleted like in any string — clang's `-std=c11` behaviour, while gcc and clang in their default GNU modes lex a raw string there and keep the splice as written. Token positions stay physical — a token starts where its first character sits in the file, which is what the LineMap needs — so adjacency can no longer be read off `line`/`col`; instead the lexer records on every token whether it touched the previous one (`Token::adjacent_before`, with a splice counting as nothing and whitespace, comments and newlines as a gap), and that flag is what the function-like `#define` test and `#` stringizing read. Before #38 the lexer kept `\` + newline as two tokens and each consumer that needed phase 2 skipped the pair itself, so the splice was still visible everywhere else: `int c\`-newline-`d;` came out as `int c\ d;` and a spliced ellipsis stayed three `.` tokens |
 | Punctuators | The multi-character forms the lexer knows are one token each, so the re-speller writes them back unbroken: `##`, the two-character operators (`<<` `>>` `<=` `>=` `==` `!=` `&&` `\|\|` `++` `--` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `->`) and the three-character `...` and `->*`. Anything else is one token per character; the ones that still come out glued do so because the output spacing rule happens not to separate them (`::`, `.*`, and the `=` after `>>` / `<<`), not because they are single tokens. `->*` needed its own token because the spacing rule *does* separate it: the space before `*` after `>` that keeps `shared_ptr<T> &p` from gluing into `>&` also split `c->*m` into `c-> * m`, which is not C++, and tree-sitter then recovered the operand as a callee — fabricating a function named after it, in one corpus case named after a template parameter (#37). Recovering the token does not make the construct parse: tree-sitter-cpp knows `->*` only as an overloadable operator name and as a fold operator — `struct S { int operator->*(int); };` and `(a ->* ...)` both parse — and has no rule for it as a binary operator in an ordinary expression, so `c->*m` is an ERROR site even in pristine source, while `c.*m` parses. `->*` is also lexed as one token only in C++: gcc and clang tokenize `a->*b` in C as `->` then `*`. The re-speller gives `...` a leading space when the output already ends in a preprocessing number, because a pp-number absorbs `.` and alphanumerics (C11 6.4.8) and would otherwise swallow it — the GNU case range `case 0x0300 ... 0x0307:` would come back as the single number `0x0300...0x0307`; after an identifier (`Args...`) no space is added. Before #28 there was no `...` case, so every ellipsis lexed as three `.` tokens and, since the spacing rule *does* put a space before `.`, came out as `. . .` — a tree-sitter ERROR site in every variadic declaration, 111 of the 756 catalogued ERROR sites across the pinned corpora |
 | Literals | String and character literals are one token each, spelled exactly as written — encoding prefix (`u8` / `u` / `U` / `L`), quotes and escapes included — and re-emitted verbatim; only `#include "…"` (an unprefixed `"…"`) and `#if 'c'` (any prefix) look at the body. Before #14 a prefix was a separate identifier, so `L'x'` came out as `L 'x'` (a tree-sitter ERROR site) and `L"w"` as `L "w"`. **Lexing is language-aware**: a translation unit is lexed as C or C++ by its extension (`.cpp` / `.cc` / `.cxx` / `.c++` / `.C` and the C++ header spellings are C++, `.c` and the ambiguous `.h` are C; `PreprocessOptions::with_language` overrides), and every header it includes is lexed as the including unit, since a header has no language of its own. The include-expansion cache is keyed by (canonical path, language), and the index warm pass warms a header once per language it is reachable in, so a header shared by C and C++ units replays into each the tokenization its own lexer would produce; the header's own IR is parsed as C++ when any C++ TU can reach it, matching the grammar choice below. The two shapes that differ are C++-only: in C, `R"(x)"` is the identifier `R` (which may be a macro) followed by an ordinary string, and `'a'C` is the literal followed by the identifier `C`, so `#define R …` / `#define C …` still expand there (valid C that the C++ rules would swallow). In C++, C++11 **raw string literals** (`R"delim(…)delim"`, with the same prefixes and a d-char-sequence of up to 16 characters) are lexed the same way, so the inner `"`, `(`/`)`, `\`, comment markers and newlines are neither escapes nor token or line boundaries; a literal may span lines (the LineMap maps the whole token to its first character, the tokens after it to their real positions). A C++11 **user-defined-literal suffix** — an identifier glued to the closing quote or to a number, as in `R"(json)"_json`, `"text"s`, `'c'_w` or `10_km` — is part of the literal token, so it is re-emitted without the space every other adjacent identifier gets (`R"(json)" _json` is no longer a user-defined literal) and `#` stringizes it as part of the literal. `#`-stringizing any literal escapes its `"` / `\` like gcc/clang, and a newline inside a raw string as `\n` (gcc's `cpp_quote_string`) so the result is still a one-line literal: `STR(R"(a "b")")` is `"R\"(a \"b\")\""`; a CRLF inside the literal is one newline (`\n`, not `\r\n`), as translation phase 1 normalizes it before the raw string is read. Something that starts like a raw string but is not one — no `(` within 16 characters of the quote, a delimiter containing space / `\` / `)` / a control character, or no matching `)delim"` before end of input — falls back to identifier + ordinary string, so a malformed literal costs a couple of bad tokens instead of swallowing the rest of the file. Before #14 `R"(a "q" b)"` lexed as `R "(a " q " b)"`, the dominant parse-failure class in the hiview corpus (JSON templates and regexes in tests) |
 | `#include "..."` / `<...>` | Include path stack + `--include` |
 | `#include` macro operand | C11 6.10.2: if the tokens are not already `"..."` / `<...>`, the rest of the line is macro-expanded and must then form a header-name (`#include FOO` with `#define FOO "n.h"`) |
-| `#define` | Object-like and **function-like**, including variadics: anonymous `...` / `__VA_ARGS__` and GNU named `args...` (internally the anonymous form registers `__VA_ARGS__` as the last parameter, so both styles share the "last parameter collects the remaining arguments" rule). GNU `, ## args` comma elision drops the comma only when the variadic arguments are **omitted** — an explicitly empty argument (`F(1,)`) keeps the comma, matching gcc/clang — and works through nested expansions (`LOG(fmt, ...)` forwarding `##__VA_ARGS__` into another variadic macro). A parameter list ends at the line end like the rest of the directive: an unterminated (`#define P(x, ...` with no `)`) or malformed (`#define P(x y)`) list warns, drops that definition, and preprocessing continues with the next line — the list never runs on to a `)` in later code (gcc behaviour). A definition is function-like only when `(` immediately follows the name (C11 6.10.3p10, decided from the lexer's adjacency flag since tokens carry no whitespace; a `\`-newline is deleted before tokenizing, so `F\` + `(x)` on the next line is function-like): `#define ALIAS (VALUE)` and `#define HALF (.5)` are object macros whose replacement starts with `(`, and `#define F (x) x` makes `F(1)` expand to `(x) x(1)` as in gcc/clang |
+| `#define` | Object-like and **function-like**, including variadics: anonymous `...` / `__VA_ARGS__` and GNU named `args...` (internally the anonymous form registers `__VA_ARGS__` as the last parameter, so both styles share the "last parameter collects the remaining arguments" rule). GNU `, ## args` comma elision drops the comma only when the variadic arguments are **omitted** — an explicitly empty argument (`F(1,)`) keeps the comma, matching gcc/clang — and works through nested expansions (`LOG(fmt, ...)` forwarding `##__VA_ARGS__` into another variadic macro). Which `##` the rule governs is read off the **body** (#65): a `,` spelled immediately before the operator with the variadic tail parameter right after it. A parameter standing between the comma and the `##` is not that form, so `#define F(v, x, ...) g(v, x ## __VA_ARGS__)` invoked as `F(1,)` is an ordinary placemarker paste and keeps its separator (`g(1, )`) — gcc's reading. clang instead collapses the placemarker first and applies the comma rule to whatever that exposes (`g(1)`); reading the body means the answer depends only on how the macro was written, so the same invocation cannot expand two ways because an argument was spelled as a newline rather than as nothing. A parameter list ends at the line end like the rest of the directive: an unterminated (`#define P(x, ...` with no `)`) or malformed (`#define P(x y)`) list warns, drops that definition, and preprocessing continues with the next line — the list never runs on to a `)` in later code (gcc behaviour). A definition is function-like only when `(` immediately follows the name (C11 6.10.3p10, decided from the lexer's adjacency flag since tokens carry no whitespace; a `\`-newline is deleted before tokenizing, so `F\` + `(x)` on the next line is function-like): `#define ALIAS (VALUE)` and `#define HALF (.5)` are object macros whose replacement starts with `(`, and `#define F (x) x` makes `F(1)` expand to `(x) x(1)` as in gcc/clang |
 | Macro rescanning | Function-like macros invoked inside another macro's expansion are expanded too (C11 6.10.3.4); uninvoked function-like names are emitted verbatim |
 | Macro hide set | Replacement-list tokens are painted with the macro name (and the invoking token's hide set) so self-referential macros such as `#define FOO FOO, BAR` terminate; nested `MIN(MIN(a,b),c)` still expands because argument tokens are not painted |
+| Compiler attribute groups | Balanced noise groups are elided at rescan boundaries after expanding arguments and chained marker aliases. GNU semantic attributes (including underscore spellings and `noreturn`) and MSVC linkage attributes survive. Directives and malformed groups are retained; elision preserves newlines and LineMap origins. |
 | Expansion depth cap | 256 nested expansions; further expansion is skipped with a warning (backstop if hide-set does not apply) |
-| Runaway caps | Per-file limits (defaults): 64 nested `#include`s, 32 MiB live output, 8M tokens (macro rescan included). The token budget counts tokens **materialized**, not merely walked: a function-like invocation walks O(1) — the argument list is skipped wholesale — and then copies each argument once per parameter occurrence, so before #30 an 80k-token argument reached 397 MB of peak allocation under a 2,000-token budget. The projected replacement is charged before it is built, and the rescan charges the result again as it walks it, so a function-like expansion costs roughly twice its width against the budget. Exceeding output/token budget stops that file with an error diagnostic; include-depth skips the nested include. CLI `--timeout-secs N` aborts the whole process. |
-| `##` token pasting | In macro bodies after argument substitution; chained pastes (`a ## b ## c`) collapse left to right, a dangling `##` with no operand is dropped |
+| Runaway caps | Per-file limits (defaults): 64 nested `#include`s, 64 inclusions of any one path per run (`max_file_expansions`, see the repeated-`#include` row above — depth alone does not bound repetition), 32 MiB live output, 8M tokens (macro rescan included). The token budget counts tokens **materialized**, not merely walked: a function-like invocation walks O(1) — the argument list is skipped wholesale — and then copies each argument once per parameter occurrence, so before #30 an 80k-token argument reached 397 MB of peak allocation under a 2,000-token budget. The projected replacement is charged before it is built, and the rescan charges the result again as it walks it, so a function-like expansion costs roughly twice its width against the budget. Exceeding output/token budget stops that file with an error diagnostic; include-depth and the per-path expansion cap skip the nested include. CLI `--timeout-secs N` aborts the whole process. |
+| `##` token pasting | In macro bodies after argument substitution; chained pastes (`a ## b ## c`) collapse left to right, empty operands are placemarkers on either side (the surviving operand keeps the left operand's adjacency), so an empty left parameter never pastes a preceding token; a dangling `##` with no operand is dropped |
 | `#` stringize | `#param` in a function-like body becomes one string literal spelling the argument **as written** (C11 6.10.3.2): token spellings with the inter-token whitespace collapsed to a single space (tokens carry no whitespace, so "was there a gap" is the lexer's `Token::adjacent_before`; a newline inside the argument counts as a space, but a `\`-newline splice does not — phase 2 deletes it before tokenizing, so `STR(a\`-newline-`b)` is `"ab"` and `ALL(p,\`-newline-`q)` under `#__VA_ARGS__` is `"p,q"`, while `STR(a \`-newline-`b)` keeps the real space and is `"a b"`; an argument substituted into a body takes the parameter's adjacency, not the call site's, so `S((x))` invoked as `G( a )` is `"(a)"`; a parameter that expands to nothing leaves its whitespace behind, so `S(a x+b)` with `x` empty — omitted, or written as nothing but newlines — is `"a +b"` while `S(a(x+b))` is `"a(+b)"`, and an argument that starts with a newline takes the parameter's adjacency on its first real token; and the literal `#x` produces stands where the `#` stood, so `S((#x))` is `"(\"a\")"` — all as clang spells them), `"` and `\` inside string and character literals escaped, and `#__VA_ARGS__` spelling the variadic arguments with their commas exactly as written (the argument parser keeps the top-level `,` tokens, so `F(p,q)` gives `"p,q"` and `F(p , q)` gives `"p , q"`). The literal maps to the expansion site (the invoking macro name) in the LineMap. The argument is not macro-expanded first, so `STR(VALUE)` is `"VALUE"`; the two-level `XSTR(x) STR(x)` idiom that expands first needs C11 argument prescan (unsupported, see below) and also yields `"VALUE"`. A `#` not followed by a parameter is emitted verbatim. Before #13 the `#` and its argument were deleted, leaving `#(`/stray-`)` parse errors in every stringizing log/assert macro |
-| Conditionals | `#ifdef`, `#ifndef`, `#if` / `#elif` / `#else` / `#endif`. `#if` conditions get full constant-expression evaluation: the `defined X` / `defined(X)` operator is resolved over unexpanded tokens (C11 6.10.1p4), object **and** function-like macros expand (hide-set painted, depth-capped), and the result is parsed with C operator precedence (`?:`, `\|\|`, `&&`, bitwise, `==`/`!=`, relationals, shifts, arithmetic, unary `!`/`~`/`-`/`+`, parens). Integer literals accept `0x`/`0b`/octal prefixes and `u`/`U`/`l`/`L` suffixes; a number or character constant that is not an integer constant — a floating literal, or a C++ user-defined literal such as `10_km` or `'a'_x` — makes the expression malformed (gcc/clang reject it) instead of evaluating as if the suffix were absent; arithmetic models 64-bit intmax_t/uintmax_t with the usual arithmetic conversions (an operand mixed with an unsigned one converts to unsigned, so `-1 < 1U` is false; `>>` is arithmetic for signed, logical for unsigned; a literal is unsigned when suffixed `u`/`U` or too large for intmax_t). Identifiers surviving expansion evaluate to 0; malformed expressions (trailing tokens, unbalanced parens) conservatively skip the branch; per chain at most one branch activates. `\`-newline continuations inside conditions are spliced by the lexer like everywhere else. Conditions in skipped groups are not evaluated (and malformed `#ifdef` operands there are tolerated). Condition macro expansion runs under its own budget (64K tokens / 1M steps); exceeding it warns and conservatively skips the branch. `#elif` after `#else` warns and is ignored. Conditional groups are **file-scoped** in both directions: a group must be closed in the file that opened it, so at the end of every file (root or `#include`d) the frames it left open are reported as unterminated and popped, and the includer resumes in the state it had at the `#include`; and `#elif` / `#else` / `#endif` may only act on a group opened in the same file — in a header they never see the includer's frames, so a stray one is a `… without #if` error there even when the includer is inside an `#if` (before this, a header ending inside `#if 0` silently swallowed the rest of the translation unit, and a header starting with `#endif` consumed the includer's frame so the includer's own `#endif` failed — #8). A header that *stops early* (budget, malformed argument list) is rebalanced the same way but reports only its stop diagnostic, since its unprocessed remainder may still hold the `#endif`. |
+| Conditionals | `#ifdef`, `#ifndef`, `#if` / `#elif` / `#else` / `#endif`. `#if` conditions get full constant-expression evaluation: the `defined X` / `defined(X)` operator is resolved over unexpanded tokens (C11 6.10.1p4), object **and** function-like macros expand (hide-set painted, depth-capped), and the result is parsed with C operator precedence (`?:`, `\|\|`, `&&`, bitwise, `==`/`!=`, relationals, shifts, arithmetic, unary `!`/`~`/`-`/`+`, parens). Integer literals accept `0x`/`0b`/octal prefixes and `u`/`U`/`l`/`L` suffixes; a number or character constant that is not an integer constant — a floating literal, or a C++ user-defined literal such as `10_km` or `'a'_x` — makes the expression malformed (gcc/clang reject it) instead of evaluating as if the suffix were absent; arithmetic models 64-bit intmax_t/uintmax_t with the usual arithmetic conversions (an operand mixed with an unsigned one converts to unsigned, so `-1 < 1U` is false; `>>` is arithmetic for signed, logical for unsigned; a literal is unsigned when suffixed `u`/`U` or too large for intmax_t). Identifiers surviving expansion evaluate to 0; malformed expressions (trailing tokens, unbalanced parens) conservatively skip the branch; per chain at most one branch activates. `\`-newline continuations inside conditions are spliced by the lexer like everywhere else. Conditions in skipped groups are not evaluated (and malformed `#ifdef` operands there are tolerated, as is a `#` followed by something other than a directive name — a line marker `# 1 "x.c"`, a `#!` line — which in an active group is an error). Condition macro expansion runs under its own budget (64K tokens / 1M steps); exceeding it warns and conservatively skips the branch. `#elif` after `#else` warns and is ignored. Conditional groups are **file-scoped** in both directions: a group must be closed in the file that opened it, so at the end of every file (root or `#include`d) the frames it left open are reported as unterminated and popped, and the includer resumes in the state it had at the `#include`; and `#elif` / `#else` / `#endif` may only act on a group opened in the same file — in a header they never see the includer's frames, so a stray one is a `… without #if` error there even when the includer is inside an `#if` (before this, a header ending inside `#if 0` silently swallowed the rest of the translation unit, and a header starting with `#endif` consumed the includer's frame so the includer's own `#endif` failed — #8). A header that *stops early* (budget, malformed argument list) is rebalanced the same way but reports only its stop diagnostic, since its unprocessed remainder may still hold the `#endif`. |
+| Repeated `#include` | A path already processed in this run is skipped only on a reason the file itself stated, and re-expands otherwise (#56). Two reasons exist. An **include guard** — `#ifndef NAME` (or `#if !defined(NAME)`) as the file's first token, `#define NAME` as the very next directive, and the matching `#endif` with nothing but whitespace after it — suppresses while `NAME` is defined, so `#undef`ing it and including the file again expands the body a second time, as in cpp. It is read off the token stream **before** the body runs (`detect_include_guard`), not observed at the `#endif`: a guarded header that reaches itself back through another header re-enters while its own `#endif` is still ahead, and a guard learned on the way out cannot answer for that inclusion. A **`#pragma once`** reached with the enclosing conditionals active holds for the rest of the translation unit whatever later happens to the controlling condition; in a skipped group it states nothing. A file with neither re-expands on every `#include`, which is what X-macro tables (`#define ENTRY …` / `#include "list.def"`, once per definition) depend on — before #56 every inclusion after the first was suppressed unconditionally and the whole table after the first expansion was lost, silently. Repetition is bounded by `max_file_expansions` (default 64 inclusions of one path per run, separate from the include-depth cap); past it the include is skipped with a diagnostic, since an unguarded pair of files that include each other recurs at every site. Guards learned inside a cached header travel with its entry (`IncludeExpansion::guards`), for the files that entry actually covers — a consumer never visits them and would otherwise re-expand what the entry already holds, or, if the list were wider than the entry's coverage, suppress an `#include` whose body it never received |
 | `#line` | Location tracking in `LineMap` |
 | `#undef` | |
-| Predefined | `__FILE__`, `__LINE__` — inside a macro body `__LINE__` is the line of the (outermost) invocation, C11 6.10.8.1, and both work in object-like as well as function-like bodies; builtin fallback macros for headers the indexed tree does not ship (see [Builtin fallback macros](#builtin-fallback-macros)) |
-| Compiler attribute groups | Balanced declarator-noise `__attribute__((...))` and `__declspec(...)` groups are elided after macro expansion, including before a type, after a declarator, and on a function definition. Attributes with symbol or call semantics (`constructor`, `destructor`, `weak`, `visibility`, `alias`, and `cleanup`) remain in the token stream. Newlines inside an elided group are retained so source-line mapping does not drift; an unterminated group or a group containing a preprocessing directive is processed normally instead of swallowing source state. |
+| Predefined | `__FILE__`, `__LINE__` — inside a macro body `__LINE__` is the line of the (outermost) invocation, C11 6.10.8.1, and both work in object-like as well as function-like bodies. **Language predefines** (#70): every run's macro table is seeded with what the language it is lexed as implies — `__STDC__ 1` in both, `__STDC_VERSION__ 201710L` in a C unit, `__cplusplus 201703L` in a C++ unit (what the OpenHarmony clang defaults to; the corpora only compare against `201103L`) — so `#ifdef __cplusplus`, `defined(__cplusplus)` and `#if __cplusplus >= 201103L` take the C++ arm in a C++ unit and the C arm in a C unit. A command-line `-D` of the same name outranks the predefined value, and a source `#undef` removes it: these are ordinary definitions, not builtin fallbacks. The warm pass seeds each header's table the same way, so a header shared by a C and a C++ unit reads `__cplusplus` bound in one run and unbound in the other — an ordinary fingerprint dependency (#55) that keeps each unit's expansion its own. Before #70 nothing was predefined and every `__cplusplus` read resolved to `0`, so `extern "C"` wrappers and C++-only declarations were silently excluded from C++ units (930 reads across the eval corpora, all unbound). No compiler is claimed: `__GNUC__` / `__clang__` stay unbound. Builtin fallback macros for headers the indexed tree does not ship are separate (see [Builtin fallback macros](#builtin-fallback-macros)) |
 | Token spacing | No space before `)` / `]`; space between `>` and `&` / `*` so `operator()` and `shared_ptr<T> &p` survive re-lexing |
 
 ### P1 (planned)
 
-- `#pragma once` / include-guard detection
 - `__VA_OPT__` (C23)
 
 ### P2 (planned)
 
-- `_Pragma`, additional standard predefined macros
+- `_Pragma`, the remaining standard predefined macros (`__STDC_HOSTED__`, `__DATE__` / `__TIME__`, the C++ feature-test macros)
 
 ## Builtin fallback macros
 
@@ -181,6 +218,25 @@ For `#include "header.h"` / `#include <header.h>`:
 
 Only **project-local** files under the analysis root are linked; system headers outside the tree are not resolved unless present in the project.
 
+A candidate counts as found when it is a file on disk **or** a `source_cache` key that names none — a
+virtual header, which only a caller that invents one has (tests, and a host embedding the
+preprocessor); `SourceCache` derives that set from its own keys, so a cache built by reading files
+off disk asks the filesystem and nothing else. Both halves are memoized, because step 1 builds a
+fresh candidate for every (including file, spelling) pair and runs on every `#include` a unit
+executes: the filesystem answer is memoized per path for the whole indexing run
+(`trace_ir::is_file_cached`, reset by `start_file_probe_epoch` at the start of each run, so a
+long-lived host sees the tree as it is when the run begins), a first probe is answered from the
+parent directory's listing when that settles it (a name the directory does not hold is a miss
+without a `stat`; a listed, case-folded or non-ASCII name still asks the filesystem, as does one
+under a directory that could not be listed), and step 2's directory walk is memoized per
+(spelling, quoted). When a `SourceCache` is supplied, explicit directory-search
+results (including misses) are shared across preprocessing runs with the same ordered quote,
+include, and system paths. These results expire at the next file-probe epoch. The
+includer-relative candidate is still probed before this cache under the rules of step 1 (quoted
+includes, or any include when strict search is off); basename fallback stays specific to each
+caller, since it depends on that caller's index and strictness. Camera issues 4,343,229
+candidate probes naming 224,945 distinct paths (#83).
+
 ## Include graph and header indexing
 
 | Behavior | Notes |
@@ -196,6 +252,7 @@ Only **project-local** files under the analysis root are linked; system headers 
 Indexing output must be identical across runs of the same tree. Two mechanisms guarantee this:
 
 - **Macro warm pass** runs sequentially over TU-reachable headers in canonical (`index_order`) order, once per language the header is reachable in (C++ when a C++ TU reaches it or the extension is a C++ header spelling, C when a C TU reaches it; `PreprocessOptions::with_language` forces one language for everything). Each warm runs under a **fresh macro table** seeded only from command-line defines lexed in that language; the per-header final states are merged into a **per-language union table** — every warmed header lands in both unions, the same-language warm preferred and the other language's re-lexed for the destination as fallback (`MacroDef::relexed` spells the tokens back with their adjacency intact, which is all the two lexers disagree about), so each union stays the full macro superset (twin-guard dedup, orphan and PCH headers) whichever language reached a header — and each later phase hands a file the union (and option set) of the language it is lexed and parsed as. The first language warmed is the one the header is parsed as and feeds the source cache; a second only fills the expansion cache and its union. Reachability comes from the include graph and warming grows that graph (a `#include MACRO` is discovered only while preprocessing the header spelling it), so the pass runs to a **fixed point**: after each round the discovered edges are added, every header's language list is recomputed, and a header whose list changed — a `.h` first reached from C alone that a C++ unit turns out to reach through a macro include, and is therefore parsed as C++ — is evicted from the source cache and warmed again under a fresh table, so the text the parser sees is always the preprocess in the language it is parsed as. The root file of a preprocess run is never replayed from the expansion cache (a nested include may have cached it first); only nested `#include`s replay. Sharing one accumulating table across headers let include guards defined by earlier-warmed headers starve later headers' expansions (the starved text was then frozen into the expansion cache). Dedup between headers comes from the shared expansion cache, not from shared guard state.
+- **No output reads a hash-map iteration order.** This is not a mechanism so much as an invariant the other two rest on, and it is worth stating because the maps are hashed with `rustc-hash`, which unlike `std`'s `RandomState` is *not* seeded per process: a change that started ordering output by a `HashMap`/`HashSet` traversal would no longer be caught by comparing two runs. Where an order matters it comes from a sort, a `Vec`, an `IndexMap`, or `index_order`. Byte-identical output across the hasher swap is the evidence that nothing did (#83).
 - **Expansion-cache freeze**: the cache is keyed by (canonical path, language), so a C unit never replays a header's C++ tokenization or vice versa. During parallel phases the include-expansion cache is read-only (`PreprocessOptions::frozen_expansion_cache`). Hits replay warm-pass entries (produced deterministically); misses expand inline under each TU's own macro/guard state and are *not* inserted — first-writer-wins inserts would make results scheduling-dependent.
 
 Translation units inherit the **union** of all warm-pass macro states: cached expansions replay without executing their `#define` directives, so TU-local code still needs those macros.
@@ -222,7 +279,9 @@ A cached expansion replays its text **without** executing the `#define`s it cont
 
 ### Cache self-containment
 
-Cached expansions are flat text — nested `#include`s inside an entry were already resolved when the entry was built. An entry built while a nested header was already in this run's include-once set would otherwise freeze *without* that header's content, permanently hiding its definitions from every consumer routed through the entry.
+When an already-included header is embedded in a cache entry, its affected macro names are logged with their **current** bindings (including absence), without changing the live table. Reusing its original operations would undo intervening directives in an `A → B, D, B` diamond. External overrides of the nested header's final bindings become fingerprint dependencies. If an override conflicts with a historical dependency needed by the embedded text, the expansion is marked incompatible and is not published to the shared cache. That mark propagates through enclosing entries, so consumers expand those headers live too. Unchanged bindings, including ordinary include guards, need no extra dependency.
+
+Cached expansions are flat text — nested `#include`s inside an entry were already resolved when the entry was built. An entry built while a nested header was already suppressed by its guard in this run would otherwise freeze *without* that header's content, permanently hiding its definitions from every consumer routed through the entry.
 
 Re-splicing the nested cached blob into **live output** on every such skip exponentiates on diamond include graphs (each copy contains previous copies). Instead, the skip is recorded on the in-progress cache frame and the nested expansion is **embedded only into that frame's cache entry** at the `#include` site. Live output stays unique per file; frozen-phase guard-skips stay silent as before. Duplicate definitions inside a cache entry are still harmless downstream (merge deduplicates same-origin entities; re-declarations remain valid C).
 
@@ -247,6 +306,56 @@ Manual `-I` remains appropriate only for things the tool cannot discover:
 - paired with `-D` for the matching platform macros (e.g. `-D __LITEOS__`).
 
 **Limitation:** The raw include scanner only sees literal `#include "..."` / `<...>` lines (no macro expansion). After each warm round, preprocess `included_headers` — including headers reached via `#include FOO` — are added as graph edges, so those files join PCH instead of staying orphan, and a header the new edges reclassify (C++ instead of C) is re-warmed in that language. A macro include spelled directly in a TU is not seen before the parse phase, so it cannot reclassify a header on its own. Headers excluded by `#if 0` in the preprocessor but visible in the raw graph are treated as reachable and not indexed separately — if the TU also omits them at preprocess time, calls in those headers can be missed.
+
+## Conditional-coverage record
+
+Most user scenarios pass no `-D` and have no compilation database, so every condition controlled by a name the run never
+sees resolves against a default of `0`. With `PreprocessOptions::record_conditionals` on, the preprocessor records what
+that decided (#57): one `ConditionalChain` per `#if` / `#ifdef` / `#ifndef` it meets, in the file it is in (headers
+included), with one `ConditionalArm` per `#elif` / `#else` arm. Preprocessing behaviour is unchanged; the option only
+adds the record.
+
+| Field | Meaning |
+|-------|---------|
+| `file` | The file the chain is in, **canonical**: include resolution may spell one header several ways (`src/../common/x.h` from one includer, `common/x.h` through an include dir), and consumers merge chains across runs by file |
+| `arms[i].expression` | The controlling condition **as written** — macro names unexpanded, `defined` kept; the bare operand for `#ifdef` / `#ifndef`, empty for `#else` |
+| `arms[i].line`, `end_line` | Physical line of the opening `#` (even when spliced before the keyword), and the line of the chain's next directive (or one past the file's last line for a chain left open); `body_lines()` is the source lines strictly between them, including continuation lines of a multiline condition — lines, not reachable code |
+| `arms[i].outcome` | `Taken` (lines emitted), `Skipped` (condition false, or an earlier arm already taken), or `Unevaluated` (the whole chain sits in excluded code, C11 6.10.1p6, so nothing was evaluated and the lines are excluded by the *enclosing* chain) |
+| `arms[i].evaluated` | Whether the condition was evaluated at all: false for `#else`, for an arm after a taken one, and inside excluded code |
+| `arms[i].reads` | Names the condition depends on, first read first, once each. For an evaluated arm, every name the evaluation **consulted, expansion included** (`#if HAS_X` with `#define HAS_X defined(X)` reads `HAS_X` and `X`), each with whether a macro (builtin fallbacks excepted) was bound to it at that moment. For an arm that was not evaluated, the identifiers spelled in the expression with `bound = None`. `defined`, `__LINE__` and the alternative operator spellings (`and`, `or`, `not`, …) are operators, not names, and are never reads unless a macro is actually bound to the spelling; explicit operands of `#ifdef`, `#ifndef` and `defined` are always names |
+| `depth` | Nesting within the file; includer frames do not count |
+| `terminated` | Whether an `#endif` closed the chain (an open one is closed at the file's end, with the usual error diagnostic) |
+| `include_guard` | `#ifndef X` (or `#if !defined(X)`) before any other token of the file, `#define X` as the very next directive, no `#elif` / `#else` arm, and nothing but whitespace after its `#endif`. Judged per file: a header included inside another header's guard does not consume its includer's pending `#define`. The default-value idiom (`#ifndef TAG` / `#define TAG 1` / `#endif` followed by code) is not a guard |
+
+Unterminated arms include the final physical line even when it contains only a comment or whitespace without a trailing newline.
+
+Two consequences of recording at evaluation time. First, **which arm was taken is a fact, not a direction**: `#if !X`
+with `X` unknown takes the *first* arm, and the record says so per arm rather than assuming the excluded code is under
+`#else`. Second, **a cached header replays its text without re-evaluating its conditionals**, so a run that replays
+expansions records nothing for them; the record is complete only for a run that expands every include itself, which is
+what the measurement tool does.
+
+**Measurement.** `crates/trace-cli/examples/conditional_coverage.rs` preprocesses every translation unit of a tree
+from the command-line defines alone with its includes expanded inline — the environment `trace analyze` gives each
+unit — plus each orphan header standalone, no expansion cache, and prints one TSV record per file, chain, arm and read,
+with the arm outcomes counted across runs (a header reached from several units is evaluated once per unit). It then
+classifies every name a condition read: **include-guard**; **toolchain** (a fixed list of what gcc/clang predefine —
+a reserved spelling the list does not know, `__KERNEL__` say, stays unknown); **configuration** (a `-D`, an in-tree
+`#define` in *any* region, or a name an in-tree GN/CMake/Make/Kconfig file spells — spelled, not parsed; #58 is the
+ranked version); **unknown**, kept as a real category because #59 needs to know which names it cannot reason about.
+`scripts/gen_conditional_coverage_report.py` renders the three eval corpora into
+[docs/CONDITIONAL_COVERAGE.md](CONDITIONAL_COVERAGE.md). The record is the chain, not the name: excluded lines are
+credited to a name alone only when it is the chain's sole dependency, and reported as *shared* otherwise, so `#if A
+&& B` is not counted twice.
+
+File totals include headers resolved outside the root through `--include`. Definition evidence is
+lexed, so comments and string literals do not contribute phantom `#define` sites. A missing or
+empty source tree, a hard preprocessing failure, or an unreadable file needed for totals makes
+the example fail without publishing TSV output. The report reader preserves carriage returns
+inside fields; only newlines separate records. A final `END\tN` record gives the number of
+preceding records; missing or mismatched completion records are rejected, including captures
+cut off at a complete line. Regenerate older TSV files before using the reader. Run its regression tests with
+`python3 -m unittest discover -s scripts -p test_conditional_coverage_report.py`.
 
 ## Error recovery
 
@@ -293,8 +402,10 @@ A mid-run stop inside ONE nested header must not invalidate the whole TU: indexi
 
 ## Testing
 
-- Unit tests: `trace-preproc/src/`
-- Integration fixtures: `tests/fixtures/preproc/` (including `self_ref_macro.c` for C11 hide-set / X-macro lists, `include_macro.c` for `#include FOO`, `unterminated_if_include.c` + `unterminated_if_header.h` for an `#if` left open by a header, `stray_closer_include.c` + `stray_{endif,else,elif}.h` for closers that would otherwise act on the includer's frame, `stringize.c` for `#param` in log/assert-shaped macros, `raw_string.cpp` for C++11 raw string literals in the shapes the corpora use and `raw_string_shapes.c` for the same text as valid C, where `R` and the would-be ud-suffix are macros that must still expand; the `\`-newline splice cases are unit tests, checked against gcc/clang)
+- Unit tests: `trace-preproc/src/` (the conditional-coverage record: chain outcomes for `#if`/`#elif`/`#else`, the
+  `#if !X` first-arm case, unevaluated nested chains, reads through macro expansion, include-guard recognition against
+  the default-value and late-guard shapes, per-file guard candidates across includes, unterminated chains)
+- Integration fixtures: `tests/fixtures/preproc/` (including `empty_left_paste.c` for empty left `##` operands — stringized spacing, non-stringized literal/punctuation preservation, and which `##` the GNU `, ## __VA_ARGS__` rule governs — including the same invocation spelled with and without a newline for the empty argument, `self_ref_macro.c` for C11 hide-set / X-macro lists, `include_macro.c` for `#include FOO`, `unterminated_if_include.c` + `unterminated_if_header.h` for an `#if` left open by a header, `stray_closer_include.c` + `stray_{endif,else,elif}.h` for closers that would otherwise act on the includer's frame, `stringize.c` for `#param` in log/assert-shaped macros, `raw_string.cpp` for C++11 raw string literals in the shapes the corpora use and `raw_string_shapes.c` for the same text as valid C, where `R` and the would-be ud-suffix are macros that must still expand; the `\`-newline splice cases are unit tests, checked against gcc/clang)
 - Builtin fallback fixtures: `tests/fixtures/builtin_macros/` (`kdriver.c` for the
   kernel/driver table, `hwtest.cpp` for the gtest/OpenHarmony test macros and
   `gmock.cpp` for the gMock declaration macros in their modern, legacy,
@@ -302,3 +413,22 @@ A mid-run stop inside ONE nested header must not invalidate the whole TU: indexi
   wrapped-across-lines forms)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for how preprocessing fits the full workflow.
+
+### Conditional exploration consumers
+
+`--explore` consumes recorded conditional chains in `trace-parse`; it does not change
+preprocessor branch semantics. Candidate checks include preceding-arm exclusions for
+`#elif`, and grouped definitions must keep all targeted predicates true. Each selected
+configuration is then preprocessed independently using the frozen expansion cache.
+Budget diagnostics count omitted activation goals; they do not certify reachability
+or exhaustive coverage. See [analysis limits](ANALYSIS.md#limits-of---explore).
+
+Preprocessor cleanup retains the same token spelling and origin semantics while
+borrowing token text during output rendering and token pasting. Synthetic
+exploration predicates omit LineMap construction because they consume only a
+boolean result; file indexing continues to track every original source location.
+
+Command-line macro replacement text is lexed without an appended newline, so a
+terminal backslash is preserved. Include lookup uses platform path semantics for
+relative paths and recognizes canonical source-cache entries in every search
+class, including the source directory and forced includes.

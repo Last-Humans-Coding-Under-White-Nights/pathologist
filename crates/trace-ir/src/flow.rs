@@ -1,7 +1,7 @@
 use crate::{FieldId, FnId, VarId};
 
 /// Abstract value returned from a function body (may-analysis: union all return sites).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ReturnFlow {
     AddrOfVar {
         src: VarId,
@@ -19,7 +19,7 @@ pub enum ReturnFlow {
 }
 
 /// Statement-level flow facts extracted during IR lowering.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FlowConstraint {
     /// `dst = src` (pointer assignment)
     Copy { dst: VarId, src: VarId },

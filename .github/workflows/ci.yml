@@ -35,6 +35,24 @@ jobs:
       - name: Fmt
         run: cargo fmt --all -- --check
 
+      - name: Build C API (cdylib)
+        run: cargo build -p trace-capi
+
+      - name: Build and run C example (ctrace)
+        run: |
+          cc crates/trace-capi/examples/ctrace.c \
+             -I crates/trace-capi/include \
+             -L target/debug -ltrace_capi \
+             -o target/ctrace
+          export LD_LIBRARY_PATH="$PWD/target/debug"
+          ./target/ctrace analyze tests/fixtures/arg_flow \
+             -o /tmp/capi.db --full-export
+          ./target/ctrace inspect /tmp/capi.db functions main.c 8
+          ./target/ctrace inspect /tmp/capi.db symbols main.c 8 9
+          ./target/ctrace inspect /tmp/capi.db calls --from entry
+          ./target/ctrace inspect /tmp/capi.db callgraph --file main.c --line 8
+          ./target/ctrace inspect /tmp/capi.db dataflow --file main.c --line 8 --col 9
+
   build:
     needs: check
     strategy:

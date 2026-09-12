@@ -74,8 +74,9 @@ trace analyze ./my_app -o /tmp/debug.db --debug-points-to --full-export
 ```
 
 stderr progress is informational (`discover -> parse -> index -> analyze ->
-export -> analysis complete: N functions, M call edges, ...`). Pass include
-paths matching the real build; there is no `compile_commands.json` integration.
+export -> analysis complete: N functions, M call edges, ...`). Trace automatically
+reads `compile_commands.json` at target root or `build/` (or via `--compile-commands PATH`).
+When absent, pass include paths matching the real build.
 
 ## 2. `trace inspect <DB> calls` — flat edge list
 
@@ -343,8 +344,8 @@ Extra targets are almost always documented over-approximation, not bugs:
    initializer elements).
 4. **`dlsym`** resolution uses only the literal string argument at known call
    patterns; it cannot model dynamically composed names.
-5. No flow-sensitivity, no path-sensitivity, no taint model. No
-   `compile_commands.json` support — pass build-like `--include`/`-D`.
+5. No flow-sensitivity, no path-sensitivity, no taint model. Compilation database
+   (`compile_commands.json`) is supported opportunistically or via `--compile-commands PATH`.
 6. Macros: code inside expansions attributes to the expansion call site (via
    LineMap); the custom preprocessor is the source of truth (Clang/gcc not used).
 

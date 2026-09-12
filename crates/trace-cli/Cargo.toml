@@ -25,5 +25,11 @@ tree-sitter.workspace = true
 name = "parse_failures"
 path = "examples/parse_failures.rs"
 
+[[example]]
+name = "conditional_coverage"
+path = "examples/conditional_coverage.rs"
+test = true
+
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true

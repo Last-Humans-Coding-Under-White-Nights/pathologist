@@ -39,7 +39,9 @@ fn main() -> Result<(), String> {
         }
     }
     if eff_opts.source_cache.is_none() && !include_graph.source_cache.is_empty() {
-        eff_opts.source_cache = Some(std::sync::Arc::new(include_graph.source_cache.clone()));
+        eff_opts.source_cache = Some(std::sync::Arc::new(trace_preproc::SourceCache::new(
+            include_graph.source_cache.clone(),
+        )));
     }
     let eff_opts = eff_opts.for_indexing().with_inline_include_bodies(false);
     let cpp_tus: HashSet<PathBuf> = files

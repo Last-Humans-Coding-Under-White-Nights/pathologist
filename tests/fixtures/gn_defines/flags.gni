@@ -1,0 +1,3 @@
+config("flags") {
+  defines = [ "CONFIG_FLAG" ]
+}
