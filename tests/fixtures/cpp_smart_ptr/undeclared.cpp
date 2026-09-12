@@ -152,3 +152,11 @@ namespace Deep {
 int DefinedGlobalField(::Outer::Defined<int> d) { int got = d.df; return got; }
 }
 }
+
+// A peeled receiver dispatches through every base, not only the first.
+class MultiBaseA { public: void FromA() {} };
+class MultiBaseB { public: void FromB() {} };
+class MultiDerived : public MultiBaseA, public MultiBaseB { public: void Own() {} };
+void AbsentMultiFirst(missing<MultiDerived> p) { p->FromA(); }
+void AbsentMultiSecond(missing<MultiDerived> p) { p->FromB(); }
+void AbsentMultiOwn(missing<MultiDerived> p) { p->Own(); }

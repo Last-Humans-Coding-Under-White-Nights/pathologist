@@ -449,3 +449,35 @@ fn ipc_disabled_via_options() {
     });
     assert!(!has_bridge, "expected no bridge edges when IPC is disabled");
 }
+
+#[test]
+fn ipc_smart_ptr_reaches_the_stub_through_an_undeclared_wrapper() {
+    // The two mechanisms are independent — `->` on an out-of-tree wrapper
+    // resolves the proxy class, and the proxy then bridges to its handler —
+    // so nothing pins the chain unless a test walks both links.
+    let (program, pag, analysis) = build("ipc_smart_ptr");
+
+    for (caller, callee) in [
+        ("CallThroughWrapper", "IFooProxy::GetInfo"),
+        ("CallThroughWrapperField", "IFooProxy::SetInfo"),
+    ] {
+        assert!(
+            analysis.call_edges.iter().any(|e| {
+                fn_name(&program, e.caller) == caller && fn_name(&program, e.callee) == callee
+            }),
+            "{caller} must reach {callee} through the wrapper"
+        );
+    }
+
+    for (proxy, handler) in [
+        ("IFooProxy::GetInfo", "IFooStub::HandleGetInfo"),
+        ("IFooProxy::SetInfo", "IFooStub::HandleSetInfo"),
+    ] {
+        assert!(
+            has_bridge_edge(&program, &analysis, proxy, handler),
+            "{proxy} must still bridge to {handler}"
+        );
+    }
+
+    assert_eq!(pag.ipc_bridges.len(), 2);
+}

@@ -520,7 +520,7 @@ declared `operator->` takes over from the guess the moment it appears.
 
 **Eval result (#86, `master` 769f2e8 → this change, same machine, `--jobs
 8`):** camera direct edges **21,059 → 37,646**, external functions
-**6,373 → 5,353**, the **254** invented `OHOS::sptr::*` members gone (a
+**6,373 → 5,352**, the **254** invented `OHOS::sptr::*` members gone (a
 probe pins them at 0). Compared by site and callee, 17,739 direct edges
 are gained and 1,152 lost, 777 of the 808 losing sites carrying the same
 call under a proper qualification or the real member: an unqualified

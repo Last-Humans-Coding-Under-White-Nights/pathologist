@@ -1109,6 +1109,23 @@ fn raw_wrapper_pointer_preserves_callback_flow() {
 }
 
 #[test]
+fn a_peeled_receiver_dispatches_through_every_base() {
+    // A member found on the second base is as reachable as one on the first:
+    // the peeled receiver goes through the ordinary hierarchy lookup.
+    let (program, analysis) = cpp_smart_ptr();
+    for (caller, target) in [
+        ("AbsentMultiFirst", "MultiBaseA::FromA"),
+        ("AbsentMultiSecond", "MultiBaseB::FromB"),
+        ("AbsentMultiOwn", "MultiDerived::Own"),
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, target),
+            "{caller} must reach {target}"
+        );
+    }
+}
+
+#[test]
 fn wrapper_fields_share_pointee_callback_summaries() {
     let (program, analysis) = cpp_smart_ptr();
     for (caller, target) in [

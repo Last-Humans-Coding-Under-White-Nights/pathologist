@@ -114,7 +114,8 @@ All notable changes to `trace` are documented in this file.
   class shares that name. `nullptr_t`, `intmax_t`, `uintmax_t` and `auto` are never qualified to a
   namespace, nor is a literal argument (`Buffer<1024>` inside `namespace N` is not `N::Buffer<N::1024>`);
   `T*const` reads as the pointer argument `T*`, and every pointer level survives a qualifier between
-  them (`T * const *` is `T**`). A `::`-prefixed head is handled in one place, so a declared type
+  them (`T * const *` is `T**`). An empty argument list is no arguments rather than one empty one,
+  so `W<>` is not qualified into `W<ns::>` nor looked up as a class named by the empty string. A `::`-prefixed head is handled in one place, so a declared type
   spelled `::N::Defined<int>` is the same class as `Defined<int>` with its layout. A class is never
   recorded as its own base.
   A typedef is registered under its qualified name as well as its bare

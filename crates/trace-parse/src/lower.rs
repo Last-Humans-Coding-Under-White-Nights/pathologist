@@ -4991,7 +4991,13 @@ fn template_arguments(raw: &str) -> Vec<String> {
             '<' => depth += 1,
             '>' if depth > 0 => depth -= 1,
             ',' | '>' if depth == 0 => {
-                args.push(raw[from..i].trim().to_owned());
+                let arg = raw[from..i].trim();
+                // `W<>` has no arguments. Pushing the empty slice would make
+                // it a one-argument spelling, which the wrapper rule then
+                // qualifies to a bare `ns::` and looks up as a class.
+                if !(arg.is_empty() && args.is_empty() && c == '>') {
+                    args.push(arg.to_owned());
+                }
                 from = i + 1;
                 if c == '>' {
                     break;
@@ -7916,6 +7922,11 @@ mod template_spelling_helpers {
             ["int(*)(int, int)", "B"]
         );
         assert!(template_arguments("Plain").is_empty());
+        // `W<>` has no arguments, not one empty one: a `""` argument would be
+        // qualified to a bare `ns::` and looked up as a class name.
+        assert!(template_arguments("W<>").is_empty());
+        assert!(template_arguments("std::tuple<>").is_empty());
+        assert_eq!(template_arguments("W<A, >"), ["A", ""]);
     }
 
     #[test]

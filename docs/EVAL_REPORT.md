@@ -26,12 +26,20 @@ byte-identical across three `--jobs 8` runs and one `--jobs 1` run. Eval
 | Metric | hdf `master` → #86 | hiview `master` → #86 | camera `master` → #86 |
 |---|---:|---:|---:|
 | Functions defined | 10,246 → 10,246 | 7,779 → 7,783 | 19,016 → 19,020 |
-| Functions external | 2,392 → 2,378 | 3,623 → 3,191 | 6,373 → 5,353 |
+| Functions external | 2,392 → 2,378 | 3,623 → 3,191 | 6,373 → 5,352 |
 | Direct edges | 42,212 → 42,240 | 8,266 → 8,988 | 21,059 → 37,646 |
-| Indirect edges | 4,642 → 4,642 | 24 → 24 | 109 → 108 |
+| Indirect edges | 4,642 → 4,644 | 24 → 24 | 109 → 108 |
 | External edges | 28,826 → 28,794 | 20,329 → 20,003 | 52,214 → 53,177 |
-| Arg-flow edges | 65,961 → 65,986 | 9,585 → 9,973 | 17,104 → 24,482 |
+| Arg-flow edges | 65,961 → 65,988 | 9,585 → 9,973 | 17,104 → 24,489 |
 | Diagnostics | 1,803 → 1,803 | 2,989 → 2,989 | 4,860 → 4,860 |
+
+The `→` column is the branch as it ships, after the review rounds below:
+camera's external functions fall one further as a doubled `::OHOS::sptr::sptr`
+stub folds into `OHOS::sptr::sptr`, camera gains 7 arg-flow edges from a field
+read through a wrapper feeding a constructor argument, and hdf gains 2 indirect
+edges and 2 arg-flow edges once a raw pointer to a wrapper keeps its own
+callback fields. Every cell matches `scripts/eval_expected.json`, except hdf's
+arg-flow centre, which is pinned at 65,986 inside a ±150 band.
 
 An undeclared template spelling keeps its arguments in its tag now
 (`OHOS::CameraStandard::sptr<OHOS::CameraStandard::CaptureSession>`), and
