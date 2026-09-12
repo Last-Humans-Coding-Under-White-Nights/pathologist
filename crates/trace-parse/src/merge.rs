@@ -47,14 +47,18 @@ type FileVarKey = (u32, trace_ir::FileId, u32, u32, String);
 /// The kind of a synthesized temporary, or `None` for a declared variable.
 ///
 /// Lowering names these after the unit-local [`VarId`] it just allocated
-/// (`_gep41`, `_load42`, `_ret43`), so the name identifies an allocation order
-/// rather than the expression, and two configurations of the same code never
-/// agree on it.
+/// (`_gep41`, `_load42`, `_ret43`, `_recv44`), so the name identifies an
+/// allocation order rather than the expression, and two configurations of the
+/// same code never agree on it. Each kind keeps its own ordinal space: a temp
+/// one configuration emits and another does not must not shift the pairing of
+/// an unrelated kind at the same position.
 fn temp_prefix(name: &str) -> Option<&'static str> {
-    ["_gep", "_load", "_ret"].into_iter().find(|prefix| {
-        name.strip_prefix(prefix)
-            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
-    })
+    ["_gep", "_load", "_ret", "_recv"]
+        .into_iter()
+        .find(|prefix| {
+            name.strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        })
 }
 
 #[derive(Default)]

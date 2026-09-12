@@ -5825,7 +5825,7 @@ fn decompose_field_path(
         arrows.push(is_arrow_access(cur));
         cur = cur.child_by_field_name("argument")?;
     }
-    let base = resolve_lvalue_var(program, ctx, source, cur)?;
+    let mut base = resolve_lvalue_var(program, ctx, source, cur)?;
     field_names.reverse();
     arrows.reverse();
 
@@ -5850,12 +5850,25 @@ fn decompose_field_path(
         };
     let mut type_id = struct_type_for_var(program, base)?;
     let mut field_ids = Vec::new();
-    for (fname, arrow) in field_names.iter().zip(arrows) {
+    let mut path_start = 0;
+    let mut summary_receiver = None;
+    for (step, (fname, arrow)) in field_names.iter().zip(arrows).enumerate() {
         // `sp->f` is the pointee's `f`; `sp.f` stays the wrapper's own, so
         // only an overloaded arrow steps through a smart pointer. A raw
         // pointer's built-in arrow stops at the wrapper itself.
         if arrow && !raw_pointer {
-            type_id = peel_wrapper_to_pointee(program, type_id);
+            let pointee = peel_wrapper_to_pointee(program, type_id);
+            if pointee != type_id {
+                // An overloaded arrow crosses into a separate object. Give
+                // the GEP a pointee-typed receiver so PAG's existing summary
+                // fallback connects it to raw-pointer accesses to that type.
+                // Keeping the wrapper prefix would model an inline subobject
+                // and resolve fields against the wrong layout in the solver.
+                summary_receiver = Some(pointee);
+                field_ids.clear();
+                path_start = step;
+                type_id = pointee;
+            }
         }
         let fid = program.types.field_id_by_name(type_id, fname)?;
         field_ids.push(fid);
@@ -5864,6 +5877,12 @@ fn decompose_field_path(
         raw_pointer = matches!(program.types.get(type_id).desc, TypeDesc::Ptr(_));
         type_id = peel_ptr_to_struct(program, type_id);
     }
+    // Method names also pass through decomposition. Allocate only after the
+    // whole path resolves to fields, and only for the final overloaded arrow.
+    if let Some(pointee) = summary_receiver {
+        base = alloc_recv_temp(program, ctx, node, pointee);
+    }
+    field_names.drain(..path_start);
     Some((base, field_ids, field_names))
 }
 
@@ -6336,6 +6355,33 @@ fn resolve_direct_call(
     resolve_direct_call_name(source, node)
 }
 
+/// A receiver standing for the object an overloaded `->` yields, typed as
+/// that pointee so its field step resolves against the pointee's layout.
+/// Its own name prefix keeps it out of the `_ret` ordinal space that a
+/// variant merge pairs temporaries in: whether this temp exists depends on
+/// the receiver's type, so sharing that space would let one configuration's
+/// call-return temp land on another's receiver.
+fn alloc_recv_temp(
+    program: &mut Program,
+    ctx: &LowerContext,
+    span_node: Node,
+    pointee: trace_ir::TypeId,
+) -> VarId {
+    let var_id = program.symbols.alloc_var_id();
+    let span = node_span(program, ctx, span_node);
+    program.symbols.add_variable(Variable {
+        id: var_id,
+        name: format!("_recv{}", var_id.0),
+        type_id: pointee,
+        storage: StorageClass::Local,
+        fn_id: ctx.current_fn,
+        param_index: None,
+        span,
+        is_pointer: true,
+    });
+    var_id
+}
+
 fn alloc_ret_temp(program: &mut Program, ctx: &LowerContext, span_node: Node) -> VarId {
     let span = node_span(program, ctx, span_node);
     alloc_ret_temp_spanned(program, ctx, span)
@@ -6591,17 +6637,15 @@ fn resolve_callee_with_loads(
 ) -> (String, bool, Option<VarId>) {
     let node = peel_expression(node);
     if node.kind() == "field_expression" {
+        // Check before decomposition: overloaded arrows allocate a typed
+        // summary receiver, which a cached call must not allocate again.
+        if let Some(cached_var) = ctx.callee_load_cache.borrow().get(&node.id()).copied() {
+            return (field_callee_text(source, node), false, cached_var);
+        }
         if let Some((base, field_ids, field_names)) =
             decompose_field_path(program, ctx, source, node)
         {
             let text = field_callee_text(source, node);
-            // Return a cached load var if we already created one for this
-            // node (avoids duplicate loads that break CallReturnIndirect
-            // mapping).
-            let cached = ctx.callee_load_cache.borrow().get(&node.id()).cloned();
-            if let Some(cached_var) = cached {
-                return (text, false, cached_var);
-            }
             if let Some(load_var) =
                 emit_field_fn_ptr_load(program, ctx, source, node, base, &field_ids, &field_names)
             {

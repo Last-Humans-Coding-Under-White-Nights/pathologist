@@ -463,9 +463,15 @@ The receiver is now resolved through the **declared** `operator->`:
   class header still records what the arrow returns. A field step follows
   its operator: `sp->f` reaches the pointee's field through a wrapper, on
   the wrapper variable itself as well as along a field chain, while `w.f`
-  stays the wrapper's own field. A member type keeps its `::` and its own
-  name when it carries arguments (`Outer<A>::Inner<B>`), and a member type
-  of a defined template keeps the class the lookup found as its prefix. A
+  stays the wrapper's own field, and a raw `Wrapper<T>*` uses the built-in
+  arrow, so `p->f` stays on the wrapper's own layout. At an overloaded
+  arrow the remaining path restarts on a receiver typed as the pointee, so
+  its field step lands on the pointee's instance-insensitive summary --
+  the one a raw `T*` read or write already uses -- rather than on a
+  subobject of the wrapper the solver would never resolve. A member type
+  keeps its `::` and its own name when it carries arguments
+  (`Outer<A>::Inner<B>`), and a member type of a defined template keeps
+  the class the lookup found as its prefix. A
   wrapper spelled `::W<T>` is the global `W`, tagged without the prefix,
   wherever a head is looked up. `nullptr_t`, `intmax_t`, `uintmax_t`,
   `auto` and a literal argument are never qualified; `T*const` is the

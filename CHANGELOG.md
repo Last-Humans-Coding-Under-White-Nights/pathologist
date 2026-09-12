@@ -122,7 +122,12 @@ All notable changes to `trace` are documented in this file.
   namespace's `T`. An out-of-line `operator->` whose class header is not in the tree records its
   return type under the class its name spells, so the arrow follows the declared return rather than
   being dropped. `sp->f` reads and writes the pointee's field through a wrapper -- declared,
-  standard or out of tree -- as `sp->m()` already reached the pointee's member. Camera's direct
+  standard or out of tree -- as `sp->m()` already reached the pointee's member, while a raw
+  `Wrapper<T>*` keeps its built-in arrow and `p->f` stays on the wrapper's own layout. The step
+  restarts the path on a receiver typed as the pointee, so it resolves to the pointee's
+  instance-insensitive field summary -- the same one a raw `T*` read or write uses -- instead of
+  a wrapper subobject the points-to solver dropped: a callback stored through `T *p` is now
+  called through `sp->cb()`, `w->cb()` and `h.item->cb()` alike. Camera's direct
   edges rise 21,059 -> 37,646 and its 254 `OHOS::sptr::*` phantoms are gone.
 
 ### Changed

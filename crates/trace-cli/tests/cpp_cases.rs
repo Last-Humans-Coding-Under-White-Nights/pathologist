@@ -677,6 +677,9 @@ fn arrow_fallback_matches_a_typedef_by_its_whole_spelling() {
 
 #[test]
 fn field_access_through_a_wrapper_reaches_the_pointee_field() {
+    // A lowering-shape check: one field step per site, no duplicates.
+    // That the step reaches the pointee's summary in the solver is
+    // `wrapper_fields_share_pointee_callback_summaries`.
     let (program, _analysis) = cpp_smart_ptr();
     let geps = program
         .flow
@@ -1101,6 +1104,37 @@ fn raw_wrapper_pointer_preserves_callback_flow() {
         assert!(
             has_any_edge(program, analysis, caller, "RawWrapperTarget"),
             "{caller}: raw arrow must preserve the wrapper's callback flow"
+        );
+    }
+}
+
+#[test]
+fn wrapper_fields_share_pointee_callback_summaries() {
+    let (program, analysis) = cpp_smart_ptr();
+    for (caller, target) in [
+        ("FlowReadMissing", "FlowReadTarget"),
+        ("FlowReadDeclared", "FlowReadTarget"),
+        ("FlowReadReference", "FlowReadTarget"),
+        ("FlowReadDereference", "FlowReadTarget"),
+        ("FlowReadStandard", "FlowReadTarget"),
+        ("FlowReadRaw", "FlowWriteTarget"),
+        ("FlowReadNested", "FlowNestedTarget"),
+        ("FlowReadTwoArrows", "FlowNestedTarget"),
+        ("FlowReadNestedRaw", "FlowNestedTarget"),
+        ("FlowReadWrapperOwn", "FlowWrapperOwnTarget"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, target),
+            "{caller} must reach {target}"
+        );
+    }
+    for (caller, target) in [
+        ("FlowReadDeclared", "FlowWrapperOwnTarget"),
+        ("FlowReadWrapperOwn", "FlowReadTarget"),
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, target),
+            "{caller} must not confuse wrapper and pointee fields"
         );
     }
 }

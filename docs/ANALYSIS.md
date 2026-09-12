@@ -565,7 +565,12 @@ C++-aware only where it must be — everything else reuses the C machinery.
   `p->f` stays on the wrapper's own layout, including callback fields and
   raw-pointer fields reached along a chain; it does not invoke `operator->`.
   References to wrapper values and explicitly dereferenced wrapper pointers
-  still use the overloaded arrow. A member type keeps its `::` and its own name
+  still use the overloaded arrow. At an overloaded arrow, field lowering
+  starts the remaining path on a synthetic receiver typed as the pointee.
+  Its GEP resolves to the pointee's instance-insensitive `FieldSummary`, shared
+  with raw-pointer reads and writes. Wrapper storage is not treated as an
+  inline pointee subobject; wrapper identity is intentionally not tracked by
+  this summary model. A member type keeps its `::` and its own name
   when it carries arguments (`Outer<A>::Inner<B>`); a member type of a
   defined template keeps the class the lookup found as its prefix; `::W<T>`
   is the global `W`, tagged without the prefix, wherever a template head
