@@ -1,5 +1,31 @@
 # Evaluation Report
 
+## Compiler attribute review validation — 2026-09-12 (#61)
+
+Compared a fresh release build of upstream `769f2e8` with the reviewed attribute
+normalization branch on the three pinned corpora from `scripts/eval_expected.json`.
+Both builds used the same clean revisions, 800,000-pop budget, and eight jobs on
+macOS. The upstream build passed 90/90 checks against its existing expectations;
+the reviewed build passed 90/90 after changing only the following exact totals:
+
+| Corpus | Upstream diagnostics | Reviewed diagnostics |
+|---|---:|---:|
+| HDF | 1803 | 1658 |
+| Camera | 4860 | 4859 |
+
+Hiview and every other measured global were identical between the two builds.
+All dispatch-site and correctness probes passed. These reductions replace the
+old branch's pre-rebase capture; no older counts were carried over by assumption.
+The workspace's 714 tests, including semantic-attribute survival, malformed-group
+boundaries, chained macros, LineMap origins, and lowered declaration types/linkage,
+also passed. Preprocessor Clippy passes; workspace Clippy currently reports four
+unchanged `nonminimal_bool` warnings in upstream `gn_defines.rs`.
+
+Reproduce with a release build and
+`python3 scripts/eval_check.py --corpus-base <pinned-corpus-directory> --outdir <fresh-output-directory>`.
+
+## Historical evaluation captures
+
 - **Date:** 2026-09-04
 - **Binary:** current tree (`trace-cli` release)
 - **Solver budget:** 800,000 pops (`TRACE_SOLVE_BUDGET_POPS`)

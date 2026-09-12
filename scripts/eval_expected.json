@@ -19,7 +19,7 @@
         "edges_external": {"cmp": "band", "value": 28826, "tol": 200},
         "edges_ipc": {"cmp": "exact", "value": 0},
         "arg_flow_edges": {"cmp": "band", "value": 65961, "tol": 150},
-        "diagnostics": {"cmp": "exact", "value": 1803},
+        "diagnostics": {"cmp": "exact", "value": 1658},
         "dlsym_edges": {"cmp": "exact", "value": 4}
       },
       "sites": [
@@ -101,7 +101,7 @@
         "edges_external": {"cmp": "band", "value": 52214, "tol": 420},
         "edges_ipc": {"cmp": "exact", "value": 2},
         "arg_flow_edges": {"cmp": "band", "value": 17104, "tol": 250},
-        "diagnostics": {"cmp": "exact", "value": 4860},
+        "diagnostics": {"cmp": "exact", "value": 4859},
         "dlsym_edges": {"cmp": "exact", "value": 0}
       },
       "sites": [

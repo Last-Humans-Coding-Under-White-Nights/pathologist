@@ -4,6 +4,15 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Compiler attribute preprocessing (#61)
+
+Noise attributes are elided without dropping semantic GNU/MSVC attributes,
+including underscore spellings and `noreturn`. Attribute arguments and chained
+aliases expand before classification; malformed groups do not cross declaration
+boundaries. Fixtures cover survival, source locations, and lowered declarations.
+The pinned production corpora retain all call, argument-flow, and symbol checks;
+only HDF and Camera diagnostic totals decrease after normalization.
+
 ### Added
 
 - Compilation database support (`compile_commands.json`, #62): automatically reads `compile_commands.json`
