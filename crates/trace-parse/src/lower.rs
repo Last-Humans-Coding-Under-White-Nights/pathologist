@@ -4973,6 +4973,10 @@ fn register_arrow_return(
 
 /// The top-level arguments of a template spelling: `W<A, B<C>, D>` yields
 /// `A`, `B<C>` and `D`; a spelling without `<` yields nothing.
+/// Arguments split at the top level of `raw`'s first list, nesting and a
+/// function type's own parameter list respected. Quoting is not tracked: a
+/// C++20 structural argument spelled as a string literal with a comma in it
+/// (`Tag<"a, b">`) would split there. No such spelling occurs in the corpora.
 fn template_arguments(raw: &str) -> Vec<String> {
     let Some(start) = raw.find('<') else {
         return Vec::new();
@@ -5844,7 +5848,10 @@ fn decompose_field_path(
     while cur.kind() == "field_expression" {
         field_names.push(field_name_from_node(source, cur)?);
         arrows.push(is_arrow_access(cur));
-        cur = cur.child_by_field_name("argument")?;
+        // Peel inside the walk, not only at the root: `(a->b)->c` is one
+        // chain, and stopping at the parentheses would resolve `c` against
+        // `a`'s layout — the base `resolve_lvalue_var` peels down to anyway.
+        cur = peel_expression(cur.child_by_field_name("argument")?);
     }
     let mut base = resolve_lvalue_var(program, ctx, source, cur)?;
     field_names.reverse();

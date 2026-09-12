@@ -216,6 +216,12 @@ impl Program {
     }
 
     /// Record a `(derived, base)` edge once.
+    ///
+    /// Only a direct self-loop is rejected. A cycle through two or more
+    /// classes (`D: B` merged with `B: D` from another configuration of the
+    /// same header) is representable, so this is not guaranteed to be a DAG:
+    /// every walk over it — [`Self::subclass_closure`], [`Self::method_targets`],
+    /// [`Self::bases_of`] chains — must carry its own visited set.
     pub fn add_inheritance(&mut self, derived: &str, base: &str) {
         // A class is not its own base; a malformed `class A : public A`
         // would otherwise list `A` among `bases_of("A")`.
@@ -364,9 +370,12 @@ impl Program {
                 }
                 continue;
             }
+            // `c`'s own lookup just missed, so start the walk at its bases
+            // rather than letting the queue repeat that same query.
             let mut queue = std::collections::VecDeque::new();
             let mut seen = std::collections::BTreeSet::new();
-            queue.push_back(c);
+            queue.extend(self.bases_of(&c));
+            seen.insert(c);
             while let Some(cur) = queue.pop_front() {
                 if !seen.insert(cur.clone()) {
                     continue;

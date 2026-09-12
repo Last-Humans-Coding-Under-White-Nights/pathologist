@@ -35,3 +35,10 @@ public:
 };
 class FlowArrowDerived : public FlowArrowBase {};
 void FlowReadInherited(FlowArrowDerived d) { d->read_cb(); }
+
+// Parentheses inside a member chain do not end the path (macro expansions
+// and defensive code write them).
+class FlowParenMid { public: FlowPayload *child; };
+void FlowSetParen(FlowParenMid *m) { m->child->read_cb = FlowReadTarget; }
+void FlowReadParen(FlowParenMid *m) { (m->child)->read_cb(); }
+void FlowReadParenWrapper(missing<FlowParenMid> m) { (m->child)->read_cb(); }
