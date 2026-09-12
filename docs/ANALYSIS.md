@@ -430,7 +430,11 @@ effects = []
 C++-aware only where it must be — everything else reuses the C machinery.
 
 - **Namespaces**: `ns_stack` qualifies declarations (`ns::f`). Anonymous
-  namespaces get internal linkage. Unqualified C++ calls resolve through
+  namespaces get internal linkage. A C++17 `namespace A::B {` opens one
+  scope per segment (tree-sitter spells it as a single
+  `nested_namespace_specifier`; it used to read as an anonymous namespace),
+  and a C++20 `namespace A::inline B {` names the inner scope `B`.
+  Unqualified C++ calls resolve through
   **namespace-aware ordinary lookup**: the global namespace, enclosing
   namespaces (innermost to outermost), plus every namespace brought in by
   `using namespace X;`. **ADL** (argument-dependent / Koenig lookup):
@@ -524,7 +528,70 @@ C++-aware only where it must be — everything else reuses the C machinery.
   from a real call out of tree. `shared_ptr` / `unique_ptr` / `weak_ptr` keep
   a name-based fallback to their first argument for the common case that
   their header is outside the tree and there is no declaration to ask; a
-  guess from a name, not a resolution. Only the terminal member call is
+  guess from a name, not a resolution. A wrapper whose class **body** is not
+  in the tree — absent, or only forward-declared — is guessed the same way
+  from its arguments (#86): with exactly one argument that names a declared
+  class, `->` looks the member up on that class; `sptr<T>` / `wptr<T>` and
+  namespace-qualified spellings resolve without their header, on locals,
+  parameters and fields. Two or more arguments, a scalar, pointer or
+  reference argument or an unknown class leave the site unresolved. The
+  argument is looked up through the enclosing namespaces innermost first
+  and then the global scope, on bare and partially qualified spellings,
+  through a typedef and past a trailing `const`, and a leading `::` names
+  the global class with no enclosing namespace searched; `using namespace`
+  directives are not searched, since an out-of-line member defined under
+  one is indexed under the bare class name and only the bare spelling
+  reaches that body. `(*sp).m()` on such a wrapper is the same guess as
+  `sp->m()`, so the two spellings agree. A nested type of an out-of-tree
+  template (`Outer<A>::Inner`, `std::vector<T>::iterator`) keeps its tail
+  on the tag: it is a type of its own, not a wrapper around `A`, and an
+  arrow on it stays unresolved rather than guessing `A` or inventing a
+  member on the nested type. In a template spelling a keyword scalar, a
+  fixed-width integer name or a function type (`void(int, char)`, split on
+  its own commas correctly) is kept as written; only class names are
+  qualified. The wrapper's own name goes through the same enclosing-scope
+  lookup as its arguments, so a wrapper declared in an outer namespace and
+  spelled bare in a nested one keeps its declared `operator->` and its `.`
+  members, and a defined class template spelled with its arguments takes
+  the class that lookup found as its tag. A typedef is registered under its qualified name as well as its
+  bare one and matched whole, never by its last segment alone. An
+  out-of-line `operator->` seen without its class header records its
+  return under the class its name spells and defines that wrapper. A field
+  step follows its operator: `sp->f` on any of these wrappers steps to the
+  pointee's layout, on the wrapper variable itself as well as along a field
+  chain, so field reads and writes through a smart pointer carry the same
+  load and store constraints as through a raw pointer, while `w.f` stays
+  the wrapper's own field. Parentheses inside the chain do not end it:
+  `(a->b)->c` is decomposed as `a->b->c`, not as `c` on `a`'s layout.
+  One rule decides what a wrapper is whether or not
+  the spelling carries arguments, so a concrete class that inherits
+  `operator->` from a base steps through it as an instantiation does.
+  A raw `Wrapper<T>*` uses the built-in arrow:
+  `p->f` stays on the wrapper's own layout, including callback fields and
+  raw-pointer fields reached along a chain; it does not invoke `operator->`.
+  References to wrapper values and explicitly dereferenced wrapper pointers
+  still use the overloaded arrow. `(*sp).f` uses the same pointee field
+  summary under the existing assumption that a wrapper's `operator*`
+  yields the pointee of its `operator->`; dereferencing a raw pointer to
+  a wrapper keeps the wrapper's own fields. At an overloaded arrow, field
+  lowering starts the remaining path on a synthetic receiver typed as the
+  pointee.
+  Its GEP resolves to the pointee's instance-insensitive `FieldSummary`, shared
+  with raw-pointer reads and writes. Wrapper storage is not treated as an
+  inline pointee subobject; wrapper identity is intentionally not tracked by
+  this summary model. A member type keeps its `::` and its own name
+  when it carries arguments (`Outer<A>::Inner<B>`); a member type of a
+  defined template keeps the class the lookup found as its prefix; `::W<T>`
+  is the global `W`, tagged without the prefix, wherever a template head
+  is looked up; `nullptr_t`, `intmax_t`, `uintmax_t`, `auto` and a literal
+  (`4`, `true`) are never qualified; `T*const` is the pointer argument
+  `T*`, and a pointer level survives a qualifier between levels
+  (`T * const *` is `T**`). A C++11 `using Alias = T;` is not
+  lowered as a typedef yet, so an argument spelled through one stays
+  unresolved. Class declarations and definitions are tracked in the
+  type table (`declare_struct` / `define_struct`), travel with a header's
+  types, and are what tells a forward-declared wrapper from a defined one.
+  Only the terminal member call is
   emitted — the implicit calls to each `operator->` are not represented —
   and a reference member holding a wrapper lowers as a pointer and is read
   as one.

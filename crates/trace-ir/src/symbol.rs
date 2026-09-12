@@ -789,6 +789,16 @@ impl SymbolTable {
             .unwrap_or_default()
     }
 
+    /// Whether any external entry carries `name`, without cloning the
+    /// overload set. Internal-linkage functions live in the per-file scope
+    /// table and are not consulted, as in
+    /// [`functions_named`](Self::functions_named).
+    pub fn has_function_named(&self, name: &str) -> bool {
+        self.externals_by_name
+            .get(name)
+            .is_some_and(|ids| !ids.is_empty())
+    }
+
     /// Functions whose fully-qualified name is exactly `namespace::name`.
     /// A declaration may spell the qualification with or without a leading
     /// `::` (`::ns::swap` and `ns::swap` both match namespace `ns`); the

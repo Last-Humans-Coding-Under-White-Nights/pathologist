@@ -85,7 +85,65 @@ All notable changes to `trace` are documented in this file.
   explicit macro operands with operator-shaped names and physical directive/EOF line ranges.
   A completion record prevents truncated TSV captures from producing partial reports.
 
+- `->` through an undeclared smart-pointer wrapper resolves to its argument class (#86). A template
+  spelling whose class body is not in the tree keeps its arguments in its tag, and an arrow on it
+  with exactly one argument naming a declared class looks the member up on that class with the usual
+  hierarchy fan-out, on locals, parameters and fields alike: OpenHarmony's `sptr<T>` / `wptr<T>` and
+  namespace-qualified spellings resolve without their header. A wrapper whose body is in the tree
+  still goes through its own `operator->` (a forward declaration alone does not count as one), `.`
+  stays on the wrapper, and two or more arguments, a scalar, pointer or reference argument or an
+  unknown class leave the site unresolved instead of inventing a member on the wrapper. The argument
+  is looked up through the enclosing namespaces innermost first and then the global scope, on bare
+  and partially qualified spellings, a typedef standing for the class it names and a trailing
+  `const` ignored, and a leading `::` naming the global class and nothing else; `using namespace`
+  directives are not searched, because an out-of-line member defined under one is indexed under the
+  bare class name and only the bare spelling reaches that body. `(*p).m()` on such a wrapper is the
+  same guess as `p->m()`. A nested type of such a template (`Outer<A>::Inner`, an iterator) keeps
+  its tail on the tag and is neither guessed through nor given an invented member; a scalar,
+  fixed-width integer or function-type argument is spelled as written rather than qualified to the
+  enclosing namespace (`missing<int>` inside `namespace N` no longer interned `N::missing<N::int>`).
+  The wrapper's own name is looked up through the enclosing namespaces the same way, so `sptr<T>`
+  spelled inside `namespace OHOS::CameraStandard` is `OHOS::sptr` and keeps its declared
+  `operator->` and its `.` members instead of reading as an undeclared
+  `OHOS::CameraStandard::sptr`, and `::sptr<T>` is the global `sptr` tagged without the prefix; a
+  defined class template spelled with its arguments takes the class that lookup found as its tag
+  (camera's `BlockingQueue<std::any>` inside `DeferredProcessing` is the `CameraStandard::BlockingQueue`
+  its header includes, not a same-named class the header never saw), and a member type of one
+  (`BlockingQueue<std::any>::Iterator`) keeps that class as its prefix. A member type spelled with
+  its own arguments (`Outer<A>::Inner<B>`) keeps its `::` and its own name even when an unrelated
+  class shares that name. `nullptr_t`, `intmax_t`, `uintmax_t` and `auto` are never qualified to a
+  namespace, nor is a literal argument (`Buffer<1024>` inside `namespace N` is not `N::Buffer<N::1024>`);
+  `T*const` reads as the pointer argument `T*`, and every pointer level survives a qualifier between
+  them (`T * const *` is `T**`). An empty argument list is no arguments rather than one empty one,
+  so `W<>` is not qualified into `W<ns::>` nor looked up as a class named by the empty string.
+  A field path is decomposed through parentheses written inside it, so `(a->b)->c` reaches `c` on
+  `b`'s layout instead of dropping the access; macro expansions write chains that way. `(*sp).f`
+  reads and writes the same pointee field summary as `sp->f`, while `(*p).f` on a raw
+  `Wrapper<T>*` keeps the wrapper's own storage. A `::`-prefixed head is handled in one place, so a declared type
+  spelled `::N::Defined<int>` is the same class as `Defined<int>` with its layout. A class is never
+  recorded as its own base.
+  A typedef is registered under its qualified name as well as its bare
+  one, and a template argument is matched against it whole: `A::B::T` never lands on an unrelated
+  namespace's `T`. An out-of-line `operator->` whose class header is not in the tree records its
+  return type under the class its name spells, so the arrow follows the declared return rather than
+  being dropped. `sp->f` reads and writes the pointee's field through a wrapper -- declared,
+  standard or out of tree -- as `sp->m()` already reached the pointee's member, while a raw
+  `Wrapper<T>*` keeps its built-in arrow and `p->f` stays on the wrapper's own layout. The step
+  restarts the path on a receiver typed as the pointee, so it resolves to the pointee's
+  instance-insensitive field summary -- the same one a raw `T*` read or write uses -- instead of
+  a wrapper subobject the points-to solver dropped: a callback stored through `T *p` is now
+  called through `sp->cb()`, `w->cb()` and `h.item->cb()` alike. One rule decides what a wrapper
+  is whether or not the spelling carries arguments, so a concrete class inheriting `operator->`
+  from a base steps through it as a template instantiation does. Camera's direct
+  edges rise 21,059 -> 37,646 and its 254 `OHOS::sptr::*` phantoms are gone.
+
 ### Changed
+- `TypeTable::intern` and `intern_ref` answer an empty named tag from the tag map (#86). Canonicalizing
+  such a tag cloned the richest layout under that name into it and then looked the clone up, when
+  the tag map already holds the id that lookup lands on; merging re-interns every header tag per
+  unit, so the clone was paid once per included header per unit. Output is byte-identical.
+- A unit merge remaps type ids through a dense `Vec` instead of an `FxHashMap` (#86): a source
+  table's ids are a dense index into it.
 
 - Database schema is now **v2**: `analysis_run` carries a `schema_version` column. Databases
   written by earlier versions have no such column and report themselves through the existing
@@ -192,6 +250,12 @@ All notable changes to `trace` are documented in this file.
   the timings above.
 
 ### Fixed
+- A C++17 `namespace A::B {` definition opens two scopes (#86 review). tree-sitter spells the name
+  as one `nested_namespace_specifier`, which the lowering did not look for, so the block read as an
+  anonymous namespace and everything inside registered under the bare name with internal linkage.
+  83 hiview files and 62 camera files open a namespace that way; hiview's external functions fall
+  3,623 -> 3,191 as bare-named prototypes fold into their qualified definitions. A C++20
+  `namespace A::inline B {` names its inner scope `B`, not `inline B`.
 
 - An unresolvable parameter type no longer matches every type in the symbol table's overload check
   (#83 review). `same_type_shape` treats `TypeDesc::Unknown` as a wildcard, which is right for the

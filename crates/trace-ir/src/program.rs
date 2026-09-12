@@ -153,7 +153,9 @@ pub struct Program {
     /// Names are the fully qualified spellings used for functions/types
     /// (`ns::Cls`). Populated at lowering, consumed post-merge by virtual
     /// dispatch expansion.
-    pub inheritance: Vec<(String, String)>,
+    inheritance: Vec<(String, String)>,
+    bases_by_class: FxHashMap<String, Vec<usize>>,
+    derived_by_class: FxHashMap<String, Vec<usize>>,
     /// C++ template-base facts, including their declaration namespace.
     ///
     /// The ordinary inheritance graph stores the bare template name for CHA
@@ -214,14 +216,49 @@ impl Program {
     }
 
     /// Record a `(derived, base)` edge once.
+    ///
+    /// Only a direct self-loop is rejected. A cycle through two or more
+    /// classes (`D: B` merged with `B: D` from another configuration of the
+    /// same header) is representable, so this is not guaranteed to be a DAG:
+    /// every walk over it — [`Self::subclass_closure`], [`Self::method_targets`],
+    /// [`Self::bases_of`] chains — must carry its own visited set.
     pub fn add_inheritance(&mut self, derived: &str, base: &str) {
-        if derived.is_empty() || base.is_empty() {
+        // A class is not its own base; a malformed `class A : public A`
+        // would otherwise list `A` among `bases_of("A")`.
+        if derived.is_empty() || base.is_empty() || derived == base {
             return;
         }
-        let edge = (derived.to_string(), base.to_string());
-        if !self.inheritance.contains(&edge) {
-            self.inheritance.push(edge);
+        if self
+            .bases_by_class
+            .get(derived)
+            .is_some_and(|edges| edges.iter().any(|&i| self.inheritance[i].1 == base))
+        {
+            return;
         }
+        let index = self.inheritance.len();
+        self.inheritance.push((derived.to_owned(), base.to_owned()));
+        push_edge_index(&mut self.bases_by_class, derived, index);
+        push_edge_index(&mut self.derived_by_class, base, index);
+    }
+
+    /// Whether `cls` has a recorded base class.
+    pub fn has_bases(&self, cls: &str) -> bool {
+        self.bases_by_class.contains_key(cls)
+    }
+
+    /// Whether `cls` is a base or a derived class of any recorded edge.
+    pub fn has_inheritance_edges(&self, cls: &str) -> bool {
+        self.bases_by_class.contains_key(cls) || self.derived_by_class.contains_key(cls)
+    }
+
+    pub fn inheritance(&self) -> &[(String, String)] {
+        &self.inheritance
+    }
+
+    pub fn take_inheritance(&mut self) -> Vec<(String, String)> {
+        self.bases_by_class.clear();
+        self.derived_by_class.clear();
+        std::mem::take(&mut self.inheritance)
     }
 
     /// Preserve a templated base-class spelling once.
@@ -270,10 +307,11 @@ impl Program {
 
     /// Direct base classes of `cls`.
     pub fn bases_of(&self, cls: &str) -> Vec<String> {
-        self.inheritance
-            .iter()
-            .filter(|(d, _)| d == cls)
-            .map(|(_, b)| b.clone())
+        self.bases_by_class
+            .get(cls)
+            .into_iter()
+            .flatten()
+            .map(|&i| self.inheritance[i].1.clone())
             .collect()
     }
 
@@ -283,8 +321,9 @@ impl Program {
         let mut i = 0;
         while i < out.len() {
             let cur = out[i].clone();
-            for (derived, base) in &self.inheritance {
-                if base == &cur && !out.iter().any(|c| c == derived) {
+            for &index in self.derived_by_class.get(&cur).into_iter().flatten() {
+                let derived = &self.inheritance[index].0;
+                if !out.iter().any(|c| c == derived) {
                     out.push(derived.clone());
                 }
             }
@@ -304,8 +343,9 @@ impl Program {
             if self.class_is_final(&cur) || self.class_method_is_final(&cur, kind) {
                 continue;
             }
-            for (derived, base) in &self.inheritance {
-                if base == &cur && !out.iter().any(|c| c == derived) {
+            for &index in self.derived_by_class.get(&cur).into_iter().flatten() {
+                let derived = &self.inheritance[index].0;
+                if !out.iter().any(|c| c == derived) {
                     out.push(derived.clone());
                 }
             }
@@ -321,9 +361,21 @@ impl Program {
     pub fn method_targets(&self, cls: &str, kind: &MethodKind) -> Vec<FnId> {
         let mut out = Vec::new();
         for c in self.dispatch_subclass_closure(cls, kind) {
+            let own = self.symbols.functions_named(&kind.name_on(&c));
+            if !own.is_empty() {
+                for id in own {
+                    if !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+                continue;
+            }
+            // `c`'s own lookup just missed, so start the walk at its bases
+            // rather than letting the queue repeat that same query.
             let mut queue = std::collections::VecDeque::new();
             let mut seen = std::collections::BTreeSet::new();
-            queue.push_back(c);
+            queue.extend(self.bases_of(&c));
+            seen.insert(c);
             while let Some(cur) = queue.pop_front() {
                 if !seen.insert(cur.clone()) {
                     continue;
@@ -350,9 +402,39 @@ impl Program {
     }
 }
 
+/// Append `index` under `key`, allocating the key only when it is new: the
+/// ubiquitous bases (`RefBase`) collect thousands of edges across a merge.
+fn push_edge_index(map: &mut FxHashMap<String, Vec<usize>>, key: &str, index: usize) {
+    if let Some(edges) = map.get_mut(key) {
+        edges.push(index);
+    } else {
+        map.insert(key.to_owned(), vec![index]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inheritance_queries_preserve_order_deduplication_and_reset() {
+        let mut program = Program::default();
+        program.add_inheritance("D", "B");
+        program.add_inheritance("D", "A");
+        program.add_inheritance("E", "B");
+        program.add_inheritance("D", "B");
+        program.add_inheritance("B", "D");
+        assert_eq!(program.bases_of("D"), ["B", "A"]);
+        assert_eq!(program.subclass_closure("B"), ["B", "D", "E"]);
+        assert!(program.has_bases("D") && !program.has_bases("A"));
+        assert!(program.has_inheritance_edges("A") && !program.has_inheritance_edges("Z"));
+        assert_eq!(program.take_inheritance().len(), 4);
+        assert!(program.bases_of("D").is_empty());
+        assert!(!program.has_inheritance_edges("A"));
+        assert_eq!(program.subclass_closure("B"), ["B"]);
+        program.add_inheritance("New", "B");
+        assert_eq!(program.subclass_closure("B"), ["B", "New"]);
+    }
 
     /// Two stages can report the same text at the same position — a variant's
     /// `parse` report must not stand in for a later unit's `preprocess` one
