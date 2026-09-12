@@ -117,7 +117,9 @@ All notable changes to `trace` are documented in this file.
   them (`T * const *` is `T**`). An empty argument list is no arguments rather than one empty one,
   so `W<>` is not qualified into `W<ns::>` nor looked up as a class named by the empty string.
   A field path is decomposed through parentheses written inside it, so `(a->b)->c` reaches `c` on
-  `b`'s layout instead of dropping the access; macro expansions write chains that way. A `::`-prefixed head is handled in one place, so a declared type
+  `b`'s layout instead of dropping the access; macro expansions write chains that way. `(*sp).f`
+  reads and writes the same pointee field summary as `sp->f`, while `(*p).f` on a raw
+  `Wrapper<T>*` keeps the wrapper's own storage. A `::`-prefixed head is handled in one place, so a declared type
   spelled `::N::Defined<int>` is the same class as `Defined<int>` with its layout. A class is never
   recorded as its own base.
   A typedef is registered under its qualified name as well as its bare

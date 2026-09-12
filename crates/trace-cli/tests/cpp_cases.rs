@@ -1131,10 +1131,15 @@ fn wrapper_fields_share_pointee_callback_summaries() {
     for (caller, target) in [
         ("FlowReadMissing", "FlowReadTarget"),
         ("FlowReadDeclared", "FlowReadTarget"),
+        ("FlowReadDerefDot", "FlowReadTarget"),
+        ("FlowReadDerefDotDeclared", "FlowReadTarget"),
+        ("FlowReadDerefDotRaw", "FlowReadTarget"),
+        ("FlowReadDerefDotWrapperRaw", "FlowWrapperOwnTarget"),
         ("FlowReadReference", "FlowReadTarget"),
         ("FlowReadDereference", "FlowReadTarget"),
         ("FlowReadStandard", "FlowReadTarget"),
         ("FlowReadRaw", "FlowWriteTarget"),
+        ("FlowReadRaw", "FlowDerefWriteTarget"),
         ("FlowReadNested", "FlowNestedTarget"),
         ("FlowReadTwoArrows", "FlowNestedTarget"),
         ("FlowReadNestedRaw", "FlowNestedTarget"),
@@ -1150,6 +1155,8 @@ fn wrapper_fields_share_pointee_callback_summaries() {
     }
     for (caller, target) in [
         ("FlowReadDeclared", "FlowWrapperOwnTarget"),
+        ("FlowReadDerefDotDeclared", "FlowWrapperOwnTarget"),
+        ("FlowReadDerefDotWrapperRaw", "FlowReadTarget"),
         ("FlowReadWrapperOwn", "FlowReadTarget"),
     ] {
         assert!(

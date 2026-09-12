@@ -5880,6 +5880,27 @@ fn decompose_field_path(
     let mut field_ids = Vec::new();
     let mut path_start = 0;
     let mut summary_receiver = None;
+    // `(*sp).field` crosses into the same separate object as `sp->field`.
+    // Resolving the lvalue base alone retains `sp`'s layout. Only an
+    // overloaded dereference needs a summary receiver; `(*raw).field`
+    // keeps the raw pointer's existing points-to flow.
+    if ctx.is_cpp
+        && cur.kind() == "pointer_expression"
+        && pointer_op(source, cur).as_deref() == Some("*")
+    {
+        if let Some(operand @ TypeDesc::Struct { .. }) = cur
+            .named_child(0)
+            .and_then(|operand| receiver_desc(program, ctx, source, operand))
+        {
+            let TypeDesc::Struct { name, .. } = deref_desc(program, operand)? else {
+                return None;
+            };
+            type_id = program
+                .types
+                .type_id_by_tag(&name, trace_ir::TypeKind::Struct)?;
+            summary_receiver = Some(type_id);
+        }
+    }
     for (step, (fname, arrow)) in field_names.iter().zip(arrows).enumerate() {
         // `sp->f` is the pointee's `f`; `sp.f` stays the wrapper's own, so
         // only an overloaded arrow steps through a smart pointer. A raw

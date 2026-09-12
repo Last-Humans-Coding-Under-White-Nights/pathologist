@@ -570,8 +570,12 @@ C++-aware only where it must be — everything else reuses the C machinery.
   `p->f` stays on the wrapper's own layout, including callback fields and
   raw-pointer fields reached along a chain; it does not invoke `operator->`.
   References to wrapper values and explicitly dereferenced wrapper pointers
-  still use the overloaded arrow. At an overloaded arrow, field lowering
-  starts the remaining path on a synthetic receiver typed as the pointee.
+  still use the overloaded arrow. `(*sp).f` uses the same pointee field
+  summary under the existing assumption that a wrapper's `operator*`
+  yields the pointee of its `operator->`; dereferencing a raw pointer to
+  a wrapper keeps the wrapper's own fields. At an overloaded arrow, field
+  lowering starts the remaining path on a synthetic receiver typed as the
+  pointee.
   Its GEP resolves to the pointee's instance-insensitive `FieldSummary`, shared
   with raw-pointer reads and writes. Wrapper storage is not treated as an
   inline pointee subobject; wrapper identity is intentionally not tracked by
