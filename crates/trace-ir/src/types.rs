@@ -1,6 +1,6 @@
 use crate::{FieldId, TypeId};
 use indexmap::IndexMap;
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -134,6 +134,13 @@ pub struct FieldLayout {
 
 #[derive(Debug, Clone)]
 pub struct TypeTable {
+    /// Every C++ class name a specifier declared, forward declarations
+    /// included, distinct from tags merely referenced by a type.
+    declared_structs: FxHashSet<std::sync::Arc<str>>,
+    /// The subset of [`declared_structs`](Self::declared_structs) whose
+    /// specifier carried a body: a forward declaration says a name is a
+    /// class, a definition says what its members are.
+    defined_structs: FxHashSet<std::sync::Arc<str>>,
     types: Vec<TypeInfo>,
     // Header merging repeatedly hashes nested descriptors and alias names.
     // Preserve insertion order while using the same fast hasher as the tag
@@ -161,6 +168,8 @@ impl Default for TypeTable {
 impl TypeTable {
     pub fn new() -> Self {
         let mut table = Self {
+            declared_structs: FxHashSet::default(),
+            defined_structs: FxHashSet::default(),
             types: Vec::new(),
             intern: IndexMap::default(),
             aliases: IndexMap::default(),
@@ -186,12 +195,12 @@ impl TypeTable {
         if let Some(id) = self.interned_as_is(&desc) {
             return id;
         }
+        if let Some(id) = self.interned_as_tag(&desc) {
+            return id;
+        }
         self.canonicalize_in_place(&mut desc);
         if desc_has_named_tag(&desc) {
             self.needs_tag_completion = true;
-        }
-        if let Some(id) = self.lookup_tag_ref(&desc) {
-            return id;
         }
         if let Some(id) = self.intern.get(&desc) {
             return *id;
@@ -262,11 +271,28 @@ impl TypeTable {
         Some(id)
     }
 
+    /// The id an empty named tag interns under when the tag is already known:
+    /// canonicalization rewrites the tag to the richest layout interned under
+    /// that name, and that layout's descriptor is interned under the same id
+    /// (every entry is, including one widened in place by
+    /// [`union_aggregate_layout`](Self::union_aggregate_layout)). Answers
+    /// exactly as [`intern`](Self::intern) would, side effects included,
+    /// without cloning the layout into the tag first; `None` means the full
+    /// path has to run.
+    fn interned_as_tag(&mut self, desc: &TypeDesc) -> Option<TypeId> {
+        let id = self.lookup_tag_ref(desc)?;
+        self.needs_tag_completion = true;
+        Some(id)
+    }
+
     /// [`intern`](Self::intern) by reference: clones `desc` only when the
     /// table does not hold it yet. Merging a unit interns every one of its
     /// types into a table that usually has them already.
     pub fn intern_ref(&mut self, desc: &TypeDesc) -> TypeId {
         if let Some(id) = self.interned_as_is(desc) {
+            return id;
+        }
+        if let Some(id) = self.interned_as_tag(desc) {
             return id;
         }
         self.intern(desc.clone())
@@ -511,6 +537,46 @@ impl TypeTable {
             TypeKind::Union => self.union_tags.get(name).copied(),
             _ => None,
         }
+    }
+
+    /// Record that `name` is a class: any `class` / `struct` specifier,
+    /// with or without a body.
+    pub fn declare_struct(&mut self, name: &str) {
+        if !self.declared_structs.contains(name) {
+            self.declared_structs.insert(name.into());
+        }
+    }
+
+    /// Record that `name`'s class body was seen; implies
+    /// [`declare_struct`](Self::declare_struct).
+    pub fn define_struct(&mut self, name: &str) {
+        if self.defined_structs.contains(name) {
+            return;
+        }
+        let tag = match self.declared_structs.get(name) {
+            Some(tag) => tag.clone(),
+            None => {
+                let tag: std::sync::Arc<str> = name.into();
+                self.declared_structs.insert(tag.clone());
+                tag
+            }
+        };
+        self.defined_structs.insert(tag);
+    }
+
+    pub fn is_struct_declared(&self, name: &str) -> bool {
+        self.declared_structs.contains(name)
+    }
+
+    pub fn is_struct_defined(&self, name: &str) -> bool {
+        self.defined_structs.contains(name)
+    }
+
+    pub fn merge_struct_declarations(&mut self, other: &Self) {
+        self.declared_structs
+            .extend(other.declared_structs.iter().cloned());
+        self.defined_structs
+            .extend(other.defined_structs.iter().cloned());
     }
 
     fn note_named_tag(&mut self, id: TypeId) {
@@ -881,6 +947,56 @@ mod tests {
             fields: Vec::new(),
         };
         assert_eq!(t.get(t.resolve_type_id(&missing)).desc, TypeDesc::Unknown);
+    }
+
+    #[test]
+    fn struct_declarations_distinguish_forward_from_defined_and_merge() {
+        let mut header = TypeTable::new();
+        header.declare_struct("ns::Fwd");
+        header.define_struct("ns::Full");
+        assert!(header.is_struct_declared("ns::Fwd"));
+        assert!(!header.is_struct_defined("ns::Fwd"));
+        assert!(header.is_struct_declared("ns::Full"));
+        assert!(header.is_struct_defined("ns::Full"));
+        assert!(!header.is_struct_declared("ns::Absent"));
+
+        let mut unit = TypeTable::new();
+        unit.declare_struct("ns::Full");
+        unit.merge_struct_declarations(&header);
+        assert!(unit.is_struct_declared("ns::Fwd"));
+        assert!(!unit.is_struct_defined("ns::Fwd"));
+        assert!(unit.is_struct_defined("ns::Full"));
+        // A definition seen after a forward declaration promotes the name.
+        unit.define_struct("ns::Fwd");
+        assert!(unit.is_struct_defined("ns::Fwd"));
+    }
+
+    #[test]
+    fn empty_tag_interns_to_the_richest_layout_without_a_rewrite() {
+        // Merging re-interns every header tag per unit, so an empty tag whose
+        // name the table already knows must answer from the tag map -- and it
+        // must answer what the rewrite path answers: the richest layout's id,
+        // whether that layout was built by `intern`, widened in place by a
+        // union, or is itself still empty.
+        let mut t = TypeTable::new();
+        let empty = TypeDesc::Struct {
+            name: "Tag".into(),
+            fields: Vec::new(),
+        };
+        let first = t.intern(empty.clone());
+        assert_eq!(t.intern_ref(&empty), first);
+        let full = t.compute_struct_layout("Tag".into(), vec![("a".into(), TypeDesc::Int)]);
+        assert_ne!(full, first);
+        assert_eq!(t.intern_ref(&empty), full);
+        assert_eq!(t.intern(empty.clone()), full);
+        let widened = t.union_struct_layout("Tag".into(), vec![("b".into(), TypeDesc::Char)]);
+        assert_eq!(widened, full);
+        assert_eq!(t.intern_ref(&empty), full);
+        assert_eq!(t.get(full).layout.fields.len(), 2);
+        let ptr = TypeDesc::Ptr(Box::new(empty));
+        let by_ref = t.intern_ref(&ptr);
+        let by_value = t.intern(ptr);
+        assert_eq!(by_ref, by_value);
     }
 
     #[test]

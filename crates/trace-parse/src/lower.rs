@@ -1883,6 +1883,7 @@ fn resolve_pending_fn_refs(program: &mut Program, ctx: &LowerContext) {
 }
 
 fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
+    let inheritance = program.take_inheritance();
     UnitIndex {
         files: program
             .symbols
@@ -1899,11 +1900,23 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
         fn_returns: program.fn_returns.into_iter().collect(),
         diagnostics: program.diagnostics,
         anon_type_counter: program.anon_type_counter,
-        inheritance: std::mem::take(&mut program.inheritance),
+        inheritance,
         template_bases: std::mem::take(&mut program.template_bases),
         arrow_returns: std::mem::take(&mut program.arrow_returns),
         final_classes: std::mem::take(&mut program.final_classes),
     }
+}
+
+/// A typedef is reachable by its bare name and, inside a namespace, by its
+/// qualified one (`Outer::ScopedAlias`), so a qualified spelling of it is
+/// matched whole rather than by its last segment.
+fn register_typedef_alias(program: &mut Program, ctx: &LowerContext, alias: &str, desc: TypeDesc) {
+    if ctx.is_cpp && ctx.ns_stack.iter().any(Option::is_some) {
+        program
+            .types
+            .register_alias(&ctx.qualify(alias), desc.clone());
+    }
+    program.types.register_alias(alias, desc);
 }
 
 fn lower_typedef(program: &mut Program, ctx: &mut LowerContext, source: &str, node: Node) {
@@ -1936,10 +1949,10 @@ fn lower_typedef(program: &mut Program, ctx: &mut LowerContext, source: &str, no
                     // declarations resolve through the alias table
                     // (`type_desc_from_node`), and without an entry the
                     // pointer degrades to Int, killing field decomposition.
-                    program.types.register_alias(&alias, shaped);
+                    register_typedef_alias(program, ctx, &alias, shaped);
                 }
             } else if let Some(desc) = typedef_underlying_desc(program, ctx, source, node) {
-                program.types.register_alias(&alias, desc);
+                register_typedef_alias(program, ctx, &alias, desc);
             }
         }
     }
@@ -2001,14 +2014,33 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
 }
 
 fn lower_namespace(program: &mut Program, ctx: &mut LowerContext, source: &str, node: Node) {
-    let name = node.children(&mut node.walk()).find_map(|c| {
-        if c.kind() == "namespace_identifier" {
-            Some(normalize_qualified(node_text(source, &c)))
-        } else {
-            None
+    // `namespace A::B {` (C++17) opens two scopes at once; tree-sitter
+    // spells it as one `nested_namespace_specifier`. It used to read as an
+    // anonymous namespace, which registered everything inside under the
+    // bare name and with internal linkage.
+    let levels: Vec<Option<String>> = match node.children(&mut node.walk()).find(|c| {
+        matches!(
+            c.kind(),
+            "namespace_identifier" | "nested_namespace_specifier"
+        )
+    }) {
+        Some(c) if c.kind() == "nested_namespace_specifier" => {
+            // `namespace A::inline B {` (C++20) keeps the keyword inside
+            // the segment; the scope is named `B`.
+            normalize_qualified(node_text(source, &c))
+                .split("::")
+                .map(|seg| seg.trim())
+                .map(|seg| seg.strip_prefix("inline ").map_or(seg, str::trim_start))
+                .filter(|seg| !seg.is_empty())
+                .map(|seg| Some(seg.to_string()))
+                .collect()
         }
-    });
-    ctx.ns_stack.push(name.clone());
+        Some(c) => vec![Some(normalize_qualified(node_text(source, &c)))],
+        None => vec![None],
+    };
+    for level in &levels {
+        ctx.ns_stack.push(level.clone());
+    }
     // `using namespace X;` / `using X::f;` inside a namespace block are
     // scoped to the block in real C++ (a directive written here must not
     // keep affecting resolution after the block closes — a leak could let
@@ -2027,7 +2059,9 @@ fn lower_namespace(program: &mut Program, ctx: &mut LowerContext, source: &str, 
     }
     ctx.using_nss.truncate(using_nss_len);
     ctx.using_name_imports.truncate(using_imports_len);
-    ctx.ns_stack.pop();
+    for _ in &levels {
+        ctx.ns_stack.pop();
+    }
 }
 
 /// Enclosing namespaces of the current scope, innermost first, as joined
@@ -2239,6 +2273,11 @@ fn lower_struct_specifier(
     // namespace scope (usings ignored here; documented imprecision).
     // `struct D : B` is the same relationship (only default access differs).
     if is_cpp_class {
+        if node.child_by_field_name("body").is_some() {
+            program.types.define_struct(&reg_name);
+        } else {
+            program.types.declare_struct(&reg_name);
+        }
         let derived = reg_name.clone();
         if class_specifier_is_final(source, node) {
             program.mark_class_final(&derived);
@@ -2690,10 +2729,12 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
         Some(c) => Some(c.qual_name.clone()),
         None => derive_owner_class(program, &name),
     };
-    if let Some(cls) = eff_class.as_deref() {
-        if name.ends_with("::operator->") {
-            register_arrow_return(program, ctx, source, node, cls);
-        }
+    if let Some(prefix) = name.strip_suffix("::operator->") {
+        // Without the class header in the tree there is no tag to derive
+        // the owner from; the operator's own name says which wrapper it
+        // is, and its return type is still what the arrow yields.
+        let cls = eff_class.clone().unwrap_or_else(|| prefix.to_owned());
+        register_arrow_return(program, ctx, source, node, &cls);
     }
     let ret_type = match node.child_by_field_name("type") {
         Some(t) => parse_type_node(program, ctx, source, t),
@@ -4205,7 +4246,7 @@ fn emit_member_sites(
     args: CallArgs,
     span: Span,
 ) {
-    let cls = receiver_lookup_name(program, cls);
+    let cls = receiver_lookup_name(cls);
     let cls = cls.as_str();
     let CallArgs {
         var_args,
@@ -4362,7 +4403,7 @@ fn class_field_desc(program: &Program, cls: &str, field: &str) -> Option<TypeDes
 }
 
 fn class_field_static_class(program: &Program, cls: &str, field: &str) -> Option<String> {
-    class_name_of_desc(program, &class_field_desc(program, cls, field)?)
+    class_name_of_desc(&class_field_desc(program, cls, field)?)
 }
 
 /// Explicit (non-`this`) parameter count. `None` means the prototype listed
@@ -4513,6 +4554,12 @@ fn member_targets_upward(program: &Program, cls: &str, kind: &trace_ir::MethodKi
 /// about a member of the receiver's own class (`operator->`) want only this:
 /// the closure walk is the expensive half and answers a different question.
 fn declared_members_upward(program: &Program, cls: &str, kind: &trace_ir::MethodKind) -> Vec<FnId> {
+    // Most receivers either declare the member or have no indexed bases.
+    // Avoid allocating a traversal queue and visited names for those cases.
+    let own = program.symbols.functions_named(&kind.name_on(cls));
+    if !own.is_empty() || !program.has_bases(cls) {
+        return own;
+    }
     let mut queue = std::collections::VecDeque::new();
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     queue.push_back(cls.to_string());
@@ -4547,6 +4594,16 @@ fn is_std_smart_ptr_name(cls: &str) -> bool {
     )
 }
 
+/// A template instantiation whose class body is not in the tree -- absent,
+/// or only forward-declared -- and so a candidate for the argument guess
+/// (#86). A nested type of one (`Outer<A>::Inner`, an iterator) is a type
+/// of its own, not a wrapper around `A`.
+fn is_undefined_wrapper(program: &Program, name: &str, cls: &str) -> bool {
+    name.contains('<')
+        && !program.types.is_struct_defined(cls)
+        && template_tail(name).trim().is_empty()
+}
+
 /// Whether `cls` declares `operator->`, in this unit's symbols or in a fact
 /// merged from a header unit (see [`register_arrow_return`]).
 fn declares_arrow(program: &Program, cls: &str) -> bool {
@@ -4559,16 +4616,31 @@ fn declares_arrow(program: &Program, cls: &str) -> bool {
         .is_empty()
 }
 
-/// The class a `Struct` tag is looked up under. A smart-pointer instantiation
+/// The class a `Struct` tag is looked up under. A wrapper instantiation
 /// keeps its arguments in its name (`sptr<CaptureSession>`) so that a `->` on
-/// it can substitute them; the class itself is spelled without them. Every
-/// other template tag is interned already stripped and is looked up as is.
-fn receiver_lookup_name(program: &Program, name: &str) -> String {
-    let cls = strip_template_args(name);
-    if declares_arrow(program, &cls) || is_std_smart_ptr_name(&cls) {
-        cls
-    } else {
-        name.to_owned()
+/// it can substitute them; the class itself is spelled without them, whether
+/// the wrapper is declared or not (#86).
+fn receiver_lookup_name(name: &str) -> String {
+    strip_template_args(name)
+}
+
+/// `name` when the index declares a class by it, else the class a `typedef`
+/// spelled `name` stands for (typedefs register under their bare spelling).
+fn declared_class_name(program: &Program, name: &str) -> Option<String> {
+    // Tags are registered without the global-scope prefix.
+    let name = name.strip_prefix("::").unwrap_or(name);
+    if program.types.is_struct_declared(name) {
+        return Some(name.to_owned());
+    }
+    // A typedef is registered under its qualified name as well as its bare
+    // one, so the spelling is matched whole: `A::B::T` never lands on an
+    // unrelated namespace's `T`.
+    let alias = program.types.resolve_alias(name)?;
+    match alias {
+        TypeDesc::Struct { name, .. } if program.types.is_struct_declared(name) => {
+            Some(name.clone())
+        }
+        _ => None,
     }
 }
 
@@ -4589,15 +4661,34 @@ fn resolve_operator_arrow(program: &Program, desc: TypeDesc) -> Option<String> {
     let mut seen = HashSet::default();
     for _ in 0..=MAX_ARROW_DEPTH {
         if let TypeDesc::Ptr(inner) = current {
-            return class_name_of_desc(program, &inner);
+            return class_name_of_desc(&inner);
         }
         let TypeDesc::Struct { ref name, .. } = current else {
             return None;
         };
+        let cls = strip_template_args(name);
+        if is_undefined_wrapper(program, name, &cls) && !is_std_smart_ptr_name(&cls) {
+            // An undefined wrapper -- absent from the tree, or only
+            // forward-declared in it -- unwraps to its sole argument when
+            // that names a class the index knows (#86). An out-of-line
+            // `operator->` defines the wrapper as it registers its return;
+            // one indexed without a readable return type still forbids the
+            // guess.
+            if program
+                .symbols
+                .has_function_named(&format!("{cls}::operator->"))
+            {
+                return None;
+            }
+            let args = template_arguments(name);
+            let [arg] = args.as_slice() else {
+                return None;
+            };
+            return declared_class_name(program, &receiver_lookup_name(arg));
+        }
         if !seen.insert(name.clone()) {
             return None;
         }
-        let cls = strip_template_args(name);
         let args = template_arguments(name);
         let kind = trace_ir::MethodKind::Named("operator->".into());
         let ops = declared_members_upward(program, &cls, &kind);
@@ -4620,15 +4711,20 @@ fn resolve_operator_arrow(program: &Program, desc: TypeDesc) -> Option<String> {
             .collect();
         if facts.is_empty() {
             if ops.is_empty() {
-                // No `operator->` to ask. A standard smart pointer is taken
-                // on its name and unwraps to its first argument; anything
-                // else is no wrapper, and `->` on it is a plain dereference.
-                return if is_std_smart_ptr_name(&cls) {
-                    args.first()
-                        .map(|s| receiver_lookup_name(program, &sanitize_type_name(s)))
-                } else {
-                    Some(name.clone())
-                };
+                // Preserve the existing standard-library fallback, whose
+                // pointee declaration may also live outside the tree.
+                if is_std_smart_ptr_name(&cls) {
+                    return args
+                        .first()
+                        .map(|s| receiver_lookup_name(&sanitize_type_name(s)));
+                }
+                // A nested type of a template whose body is not in the tree
+                // (`Outer<A>::Inner`, an iterator) has nothing to look the
+                // member up on: neither a guess nor a member invented on it.
+                if name.contains('<') && !program.types.is_struct_defined(&cls) {
+                    return None;
+                }
+                return Some(name.clone());
             }
             // Declared, but with a return type nothing recorded.
             return None;
@@ -4693,7 +4789,13 @@ fn deref_desc(program: &Program, desc: TypeDesc) -> Option<TypeDesc> {
         TypeDesc::Ptr(inner) => Some(*inner),
         TypeDesc::Struct { ref name, .. } => {
             let cls = strip_template_args(name);
-            if !(declares_arrow(program, &cls) || is_std_smart_ptr_name(&cls)) {
+            // A wrapper whose body is not in the tree unwraps on `*` as it
+            // does on `->` (#86): `resolve_operator_arrow` holds the one
+            // guess, so `(*sp).m()` and `sp->m()` agree.
+            if !(is_undefined_wrapper(program, name, &cls)
+                || declares_arrow(program, &cls)
+                || is_std_smart_ptr_name(&cls))
+            {
                 return None;
             }
             resolve_operator_arrow(program, desc).map(|name| TypeDesc::Struct {
@@ -4788,6 +4890,8 @@ fn register_arrow_return(
     node: Node,
     cls: &str,
 ) {
+    // An out-of-line operator also proves that this is a defined wrapper.
+    program.types.define_struct(cls);
     let Some(t) = node.child_by_field_name("type") else {
         return;
     };
@@ -4859,10 +4963,16 @@ fn template_arguments(raw: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut depth = 0;
+    let mut paren = 0;
     let mut from = start + 1;
     let mut args = Vec::new();
     for (i, c) in raw.char_indices().skip_while(|(i, _)| *i <= start) {
         match c {
+            // A function type's parameter list (`Callback<void(int, char)>`)
+            // has commas of its own.
+            '(' => paren += 1,
+            ')' if paren > 0 => paren -= 1,
+            _ if paren > 0 => {}
             '<' => depth += 1,
             '>' if depth > 0 => depth -= 1,
             ',' | '>' if depth == 0 => {
@@ -4878,26 +4988,212 @@ fn template_arguments(raw: &str) -> Vec<String> {
     args
 }
 
+/// What follows a spelling's first template argument list: `::Inner` for
+/// `Outer<A>::Inner`, empty for `Outer<A>`, for a spelling without
+/// arguments and for an unbalanced one.
+fn template_tail(raw: &str) -> &str {
+    let Some(start) = raw.find('<') else {
+        return "";
+    };
+    let mut depth = 0i32;
+    let mut paren = 0i32;
+    for (i, c) in raw[start..].char_indices() {
+        match c {
+            '(' => paren += 1,
+            ')' if paren > 0 => paren -= 1,
+            _ if paren > 0 => {}
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &raw[start + i + 1..];
+                }
+            }
+            _ => {}
+        }
+    }
+    ""
+}
+
+/// A keyword scalar, `auto`, or a standard integer / `nullptr_t` name: never
+/// a class, so never qualified to the namespace it is spelled in.
+fn is_fundamental_type_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split_whitespace().all(|word| {
+            matches!(
+                word,
+                "int"
+                    | "char"
+                    | "void"
+                    | "bool"
+                    | "float"
+                    | "double"
+                    | "short"
+                    | "long"
+                    | "signed"
+                    | "unsigned"
+                    | "wchar_t"
+                    | "char8_t"
+                    | "char16_t"
+                    | "char32_t"
+                    | "size_t"
+                    | "ssize_t"
+                    | "ptrdiff_t"
+                    | "intptr_t"
+                    | "uintptr_t"
+                    | "int8_t"
+                    | "int16_t"
+                    | "int32_t"
+                    | "int64_t"
+                    | "uint8_t"
+                    | "uint16_t"
+                    | "uint32_t"
+                    | "uint64_t"
+                    | "intmax_t"
+                    | "uintmax_t"
+                    | "nullptr_t"
+                    | "auto"
+            )
+        })
+}
+
 /// A template spelling with every class in it qualified to the current
 /// scope, so that the argument substituted at a `->` names the class the way
 /// the index does: `sptr<Plugin>` inside `namespace ohos` is
 /// `ohos::sptr<ohos::Plugin>`.
-fn qualify_template_spelling(ctx: &LowerContext, raw: &str) -> String {
-    let head = qualify_type_name(ctx, &normalize_qualified(type_name_before_template(raw)));
+fn qualify_template_spelling(program: &Program, ctx: &LowerContext, raw: &str) -> String {
+    // The wrapper itself is looked up like its arguments: `sptr<T>` inside
+    // `namespace OHOS::CameraStandard` is `OHOS::sptr`, whose `operator->`
+    // and members it must keep.
+    let head = qualify_class_argument(
+        program,
+        ctx,
+        &normalize_qualified(type_name_before_template(raw)),
+    );
+    qualify_template_spelling_under(program, ctx, raw, &head)
+}
+
+/// [`qualify_template_spelling`] with its head already settled: the
+/// arguments are qualified, and a tail (`::Inner<B>` of `Outer<A>::Inner<B>`)
+/// keeps its separator and its own head as written, since a member type of
+/// `Outer` is not looked up through the enclosing namespaces.
+fn qualify_template_spelling_under(
+    program: &Program,
+    ctx: &LowerContext,
+    raw: &str,
+    head: &str,
+) -> String {
     let args: Vec<_> = template_arguments(raw)
         .into_iter()
         .map(|arg| {
-            let clean = sanitize_type_name(&arg);
-            if clean.contains('<') {
-                qualify_template_spelling(ctx, &clean)
-            } else if primitive_scalar_desc(&clean).is_some() {
+            let (base, suffix) = split_pointer_suffix(&arg);
+            let clean = sanitize_type_name(base);
+            let qualified = if clean.contains('(') {
+                // A function type (`void(int, char)`) names no class.
+                normalize_spacing(&clean)
+            } else if clean.contains('<') {
+                qualify_template_spelling(program, ctx, &clean)
+            } else if is_template_literal(&clean)
+                || is_fundamental_type_name(&clean)
+                || primitive_scalar_desc(&clean).is_some()
+            {
                 clean
             } else {
-                qualify_type_name(ctx, &normalize_qualified(&clean))
-            }
+                qualify_class_argument(program, ctx, &normalize_qualified(&clean))
+            };
+            format!("{qualified}{suffix}")
         })
         .collect();
-    format!("{head}<{}>", args.join(","))
+    // `Outer<A>::Inner` is a type of its own: the tail stays on the tag,
+    // which is what keeps it from reading as a wrapper around `A`.
+    let tail = template_tail(raw).trim();
+    let tail = if tail.is_empty() {
+        String::new()
+    } else if tail.contains('<') {
+        let tail_head = normalize_spacing(type_name_before_template(tail));
+        qualify_template_spelling_under(program, ctx, tail, &tail_head)
+    } else {
+        normalize_spacing(tail)
+    };
+    format!("{head}<{}>{tail}", args.join(","))
+}
+
+/// The declared class a template spelling names -- its head or one of its
+/// arguments -- looked up through the enclosing namespaces innermost first
+/// and then the global scope, for a bare spelling and a partially qualified
+/// one alike, and at the global scope only for a `::`-prefixed one
+/// (`CameraStandard::CameraInput` inside `namespace OHOS`), with a typedef
+/// standing for the class it names. Where nothing is declared, the spelling
+/// qualifies to the innermost namespace as any other type does.
+///
+/// Namespaces a `using namespace` brought in are deliberately not searched:
+/// an out-of-line member definition written under one is indexed under the
+/// bare class name (hdf's hc-gen defines `AstObject::IsNode` that way while
+/// the class is `OHOS::Hardware::AstObject`), and only the bare spelling
+/// reaches those bodies rather than the header's prototypes.
+fn qualify_class_argument(program: &Program, ctx: &LowerContext, name: &str) -> String {
+    // `::T` names the global `T` and nothing else: no enclosing namespace
+    // is searched, and none is prepended. Tags are registered without the
+    // prefix, so the answer drops it too.
+    if let Some(global) = name.strip_prefix("::") {
+        return declared_class_name(program, global).unwrap_or_else(|| global.to_owned());
+    }
+    let scopes: Vec<&str> = ctx.ns_stack.iter().flatten().map(String::as_str).collect();
+    (0..=scopes.len())
+        .rev()
+        .map(|depth| {
+            if depth == 0 {
+                name.to_owned()
+            } else {
+                format!("{}::{name}", scopes[..depth].join("::"))
+            }
+        })
+        .find_map(|candidate| declared_class_name(program, &candidate))
+        .unwrap_or_else(|| qualify_type_name(ctx, name))
+}
+
+/// A template argument split into what names the type and the pointer /
+/// reference punctuation after it, every level kept and cv-qualifiers at any
+/// level dropped: `T * const *` is (`T`, `**`), `T &` is (`T`, `&`).
+fn split_pointer_suffix(arg: &str) -> (&str, String) {
+    let mut rest = arg.trim();
+    let mut suffix = String::new();
+    loop {
+        let bare = strip_trailing_cv(rest).trim_end();
+        match bare.strip_suffix(['*', '&']) {
+            Some(shorter) => {
+                suffix.insert(0, bare.chars().next_back().unwrap_or('*'));
+                rest = shorter;
+            }
+            None => return (bare, suffix),
+        }
+    }
+}
+
+/// A non-type template argument spelled as a literal (`4`, `-1`, `true`,
+/// `'a'`): never a class, so never qualified to a namespace.
+fn is_template_literal(arg: &str) -> bool {
+    arg.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() || matches!(c, '\'' | '"' | '-'))
+        || matches!(arg, "true" | "false" | "nullptr")
+}
+
+/// `T const` / `T volatile` spelled after the type, also directly after
+/// pointer or reference punctuation (`T*const`).
+fn strip_trailing_cv(mut s: &str) -> &str {
+    loop {
+        let t = s.trim_end();
+        match t
+            .strip_suffix("const")
+            .or_else(|| t.strip_suffix("volatile"))
+        {
+            Some(rest) if rest.ends_with(|c: char| c.is_whitespace() || matches!(c, '*' | '&')) => {
+                s = rest;
+            }
+            _ => return t,
+        }
+    }
 }
 
 /// Whether a `field_expression` spells `->` rather than `.`.
@@ -4948,7 +5244,7 @@ fn infer_static_class(
                 if ctx.is_cpp {
                     // `*sp` on a smart pointer is the pointee, as `sp->` is.
                     let desc = deref_desc(program, receiver_desc(program, ctx, source, arg)?)?;
-                    return class_name_of_desc(program, &desc);
+                    return class_name_of_desc(&desc);
                 }
                 return infer_static_class(program, ctx, source, arg);
             }
@@ -4988,17 +5284,17 @@ fn infer_static_class(
 
 fn var_static_class(program: &Program, v: VarId) -> Option<String> {
     let var = program.symbols.variable(v);
-    class_name_of_desc(program, &program.types.get(var.type_id).desc)
+    class_name_of_desc(&program.types.get(var.type_id).desc)
 }
 
 /// Peel `Ptr` layers (including references, which lower as pointers) to a
 /// class/struct tag: `T &` / `T *` yield `T`. A smart pointer is its own
 /// class here (`sptr<T>` yields `sptr`, for `sp.Get()`); what it points to
 /// is the arrow's business, see [`resolve_operator_arrow`].
-fn class_name_of_desc(program: &Program, desc: &TypeDesc) -> Option<String> {
+fn class_name_of_desc(desc: &TypeDesc) -> Option<String> {
     match desc {
-        TypeDesc::Struct { name, .. } => Some(receiver_lookup_name(program, name)),
-        TypeDesc::Ptr(inner) => class_name_of_desc(program, inner),
+        TypeDesc::Struct { name, .. } => Some(receiver_lookup_name(name)),
+        TypeDesc::Ptr(inner) => class_name_of_desc(inner),
         _ => None,
     }
 }
@@ -5522,17 +5818,26 @@ fn decompose_field_path(
     node: Node,
 ) -> Option<(VarId, Vec<FieldId>, Vec<String>)> {
     let mut field_names = Vec::new();
+    let mut arrows = Vec::new();
     let mut cur = peel_expression(node);
     while cur.kind() == "field_expression" {
         field_names.push(field_name_from_node(source, cur)?);
+        arrows.push(is_arrow_access(cur));
         cur = cur.child_by_field_name("argument")?;
     }
     let base = resolve_lvalue_var(program, ctx, source, cur)?;
     field_names.reverse();
+    arrows.reverse();
 
     let mut type_id = struct_type_for_var(program, base)?;
     let mut field_ids = Vec::new();
-    for fname in &field_names {
+    for (fname, arrow) in field_names.iter().zip(arrows) {
+        // `sp->f` is the pointee's `f`; `sp.f` stays the wrapper's own, so
+        // only an arrow steps through a smart pointer. A raw pointer was
+        // already stepped through when its type was looked up.
+        if arrow {
+            type_id = peel_wrapper_to_pointee(program, type_id);
+        }
         let fid = program.types.field_id_by_name(type_id, fname)?;
         field_ids.push(fid);
         let layout = program.types.get(type_id);
@@ -5540,6 +5845,41 @@ fn decompose_field_path(
         type_id = peel_ptr_to_struct(program, type_id);
     }
     Some((base, field_ids, field_names))
+}
+
+/// `sp->f` on a smart pointer is `f` of the pointee, as `sp->m()` is the
+/// pointee's member: a wrapper with a declared `operator->`, a standard
+/// one, or one whose body is not in the tree (#86) steps to the class the
+/// arrow yields when that class has a layout to look `f` up in.
+fn peel_wrapper_to_pointee(program: &Program, type_id: trace_ir::TypeId) -> trace_ir::TypeId {
+    let TypeDesc::Struct { name, .. } = &program.types.get(type_id).desc else {
+        return type_id;
+    };
+    if name.is_empty() {
+        return type_id;
+    }
+    let wrapper = if name.contains('<') {
+        let cls = strip_template_args(name);
+        is_undefined_wrapper(program, name, &cls)
+            || is_std_smart_ptr_name(&cls)
+            || declares_arrow(program, &cls)
+    } else {
+        program.arrow_returns.iter().any(|f| f.class_name == *name)
+    };
+    if !wrapper {
+        return type_id;
+    }
+    let desc = TypeDesc::Struct {
+        name: name.clone(),
+        fields: Vec::new(),
+    };
+    resolve_operator_arrow(program, desc)
+        .and_then(|pointee| {
+            program
+                .types
+                .type_id_by_tag(&pointee, trace_ir::TypeKind::Struct)
+        })
+        .unwrap_or(type_id)
 }
 
 fn peel_ptr_to_struct(program: &mut Program, type_id: trace_ir::TypeId) -> trace_ir::TypeId {
@@ -6597,8 +6937,15 @@ fn type_desc_from_node(
         // the call site; the wrapper stays the variable's own class, so
         // `p.Get()` is the wrapper's member and not the pointee's (#64).
         if ctx.is_cpp && text.contains('<') {
-            let cls = qualify_type_name(ctx, &normalize_qualified(type_name_before_template(text)));
-            if declares_arrow(program, &cls) || is_std_smart_ptr_name(&cls) {
+            let cls = qualify_class_argument(
+                program,
+                ctx,
+                &normalize_qualified(type_name_before_template(text)),
+            );
+            if !program.types.is_struct_defined(&cls)
+                || declares_arrow(program, &cls)
+                || is_std_smart_ptr_name(&cls)
+            {
                 let fields = program
                     .types
                     .type_id_by_tag(&cls, trace_ir::TypeKind::Struct)
@@ -6608,8 +6955,21 @@ fn type_desc_from_node(
                     })
                     .unwrap_or_default();
                 return TypeDesc::Struct {
-                    name: qualify_template_spelling(ctx, text),
+                    name: qualify_template_spelling(program, ctx, text),
                     fields,
+                };
+            }
+            // A defined class template spelled with its arguments
+            // (`BlockingQueue<std::any>`): the class the lookup found,
+            // arguments dropped. Re-deriving the tag from the innermost
+            // namespace named a class this unit never saw, or nothing. A
+            // member type of it (`BlockingQueue<std::any>::Iterator`) keeps
+            // that class as its prefix.
+            let tail = template_tail(text).trim();
+            if tail.is_empty() || tail.starts_with("::") {
+                return TypeDesc::Struct {
+                    name: format!("{cls}{}", strip_template_args(&normalize_spacing(tail))),
+                    fields: Vec::new(),
                 };
             }
         }
@@ -7370,7 +7730,8 @@ fn sanitize_type_name(arg: &str) -> String {
         }
         break;
     }
-    s.trim().trim_end_matches(['*', '&']).trim().to_string()
+    let s = strip_trailing_cv(s.trim().trim_end_matches(['*', '&']).trim());
+    s.trim_end_matches(['*', '&']).trim().to_string()
 }
 
 fn find_params(decl: Node) -> Option<Node> {
@@ -7450,6 +7811,98 @@ fn node_end_line(program: &Program, ctx: &LowerContext, node: Node, span: Span) 
 /// enclosing scopes, template arguments, and repeated segments. Rather than
 /// add a case per bug, this enumerates every legal C++ spelling of every type
 /// in a small world and asserts the two properties the naming exists to have.
+#[cfg(test)]
+mod template_spelling_helpers {
+    use super::{
+        is_fundamental_type_name, is_template_literal, split_pointer_suffix, strip_trailing_cv,
+        template_arguments, template_tail,
+    };
+
+    #[test]
+    fn arguments_split_outside_parentheses_and_nested_lists() {
+        assert_eq!(template_arguments("W<A>"), ["A"]);
+        assert_eq!(template_arguments("W<A, B>"), ["A", "B"]);
+        assert_eq!(template_arguments("W<Pair<A, B>, C>"), ["Pair<A, B>", "C"]);
+        assert_eq!(
+            template_arguments("W<void(int, char)>"),
+            ["void(int, char)"]
+        );
+        assert_eq!(
+            template_arguments("W<int(*)(int, int), B>"),
+            ["int(*)(int, int)", "B"]
+        );
+        assert!(template_arguments("Plain").is_empty());
+    }
+
+    #[test]
+    fn tail_is_what_follows_the_first_argument_list() {
+        assert_eq!(template_tail("W<A>"), "");
+        assert_eq!(template_tail("W<A>::Inner"), "::Inner");
+        assert_eq!(template_tail("W<Pair<A, B>>::iterator"), "::iterator");
+        assert_eq!(template_tail("W<void(int, char)>::R"), "::R");
+        assert_eq!(template_tail("Plain"), "");
+        assert_eq!(template_tail("W<A"), "");
+    }
+
+    #[test]
+    fn trailing_cv_is_stripped_past_any_whitespace() {
+        assert_eq!(strip_trailing_cv("A const"), "A");
+        assert_eq!(strip_trailing_cv("A\tconst"), "A");
+        assert_eq!(strip_trailing_cv("A  const volatile "), "A");
+        assert_eq!(strip_trailing_cv("A*const"), "A*");
+        assert_eq!(strip_trailing_cv("A&volatile"), "A&");
+        assert_eq!(strip_trailing_cv("A *const"), "A *");
+        assert_eq!(strip_trailing_cv("myconst"), "myconst");
+        assert_eq!(strip_trailing_cv("A"), "A");
+    }
+
+    #[test]
+    fn pointer_levels_survive_qualifiers_at_any_level() {
+        assert_eq!(split_pointer_suffix("T"), ("T", String::new()));
+        assert_eq!(split_pointer_suffix("T *"), ("T", "*".to_owned()));
+        assert_eq!(split_pointer_suffix("T*const"), ("T", "*".to_owned()));
+        assert_eq!(split_pointer_suffix("T * const *"), ("T", "**".to_owned()));
+        assert_eq!(
+            split_pointer_suffix("const T&"),
+            ("const T", "&".to_owned())
+        );
+        assert_eq!(split_pointer_suffix("T const"), ("T", String::new()));
+    }
+
+    #[test]
+    fn literals_are_never_classes() {
+        for arg in [
+            "4", "-1", "0x10", "true", "false", "nullptr", "'a'", "\"s\"",
+        ] {
+            assert!(is_template_literal(arg), "{arg}");
+        }
+        for arg in ["", "T", "N", "truth", "nullptr_t"] {
+            assert!(!is_template_literal(arg), "{arg}");
+        }
+    }
+
+    #[test]
+    fn fundamental_names_are_keywords_and_fixed_width_integers() {
+        for name in [
+            "int",
+            "char",
+            "void",
+            "unsigned long long",
+            "signed char",
+            "int32_t",
+            "size_t",
+        ] {
+            assert!(is_fundamental_type_name(name), "{name}");
+        }
+        for name in ["nullptr_t", "intmax_t", "uintmax_t", "auto"] {
+            assert!(is_fundamental_type_name(name), "{name}");
+        }
+        for name in ["", "Widget", "int_holder", "ns::int", "intptr"] {
+            assert!(!is_fundamental_type_name(name), "{name}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod conversion_target_properties {
     use super::canonicalize_conversion_target;

@@ -337,10 +337,7 @@ fn interface_class_exists(program: &Program, class: &str) -> bool {
                 .rsplit_once("::")
                 .is_some_and(|(owner, _)| owner == class)
         })
-        || program
-            .inheritance
-            .iter()
-            .any(|(derived, base)| derived == class || base == class)
+        || program.has_inheritance_edges(class)
 }
 
 fn is_stub_class(class: &str) -> bool {

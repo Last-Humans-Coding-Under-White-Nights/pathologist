@@ -15,6 +15,195 @@
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Re-verified 2026-09-12 (`->` through an undeclared template wrapper, #86):**
+fresh release builds of `master` (769f2e8) and the branch were compared on
+the same machine against the three clean pinned checkouts under
+`/private/tmp/corpora`, `--jobs 8`, 800,000-pop budget. The branch index is
+bit-reproducible: on each corpus the SQLite dump (minus `analysis_run`) is
+byte-identical across three `--jobs 8` runs and one `--jobs 1` run. Eval
+91/91 with the re-captured expectations.
+
+| Metric | hdf `master` → #86 | hiview `master` → #86 | camera `master` → #86 |
+|---|---:|---:|---:|
+| Functions defined | 10,246 → 10,246 | 7,779 → 7,783 | 19,016 → 19,020 |
+| Functions external | 2,392 → 2,378 | 3,623 → 3,191 | 6,373 → 5,353 |
+| Direct edges | 42,212 → 42,240 | 8,266 → 8,988 | 21,059 → 37,646 |
+| Indirect edges | 4,642 → 4,642 | 24 → 24 | 109 → 108 |
+| External edges | 28,826 → 28,794 | 20,329 → 20,003 | 52,214 → 53,177 |
+| Arg-flow edges | 65,961 → 65,986 | 9,585 → 9,973 | 17,104 → 24,482 |
+| Diagnostics | 1,803 → 1,803 | 2,989 → 2,989 | 4,860 → 4,860 |
+
+An undeclared template spelling keeps its arguments in its tag now
+(`OHOS::CameraStandard::sptr<OHOS::CameraStandard::CaptureSession>`), and
+`->` on such a value with exactly one argument that names a declared class
+looks the member up on that class, with the usual hierarchy fan-out. A
+wrapper whose body is in the tree still resolves through its own
+`operator->` — a forward declaration alone says nothing about one and does
+not count — `.` still belongs to the wrapper, and every other shape (two
+arguments, a scalar, pointer or reference argument, an unknown class)
+stays unresolved rather than inventing a member on the wrapper. The
+argument is looked up the way C++ looks a name up: through the enclosing
+namespaces innermost first, then the global scope, for a bare and a
+partially qualified spelling alike (`sptr<CameraStandard::CameraInput>`
+inside `namespace OHOS`), a typedef standing for the class it names,
+`T const` read as `T`. Not through `using namespace` directives: hdf's
+hc-gen defines `AstObject::IsNode` under `using namespace OHOS::Hardware`
+and the indexer names that body with the bare class, so searching the
+directive found the real `OHOS::Hardware::AstObject`, whose members are
+prototypes there, and 189 hdf direct edges turned external. Only the bare
+spelling reaches those bodies; the directive stays out of the search.
+
+Camera is where it lands. Comparing distinct edges by (file, line, column,
+caller, callee): **17,739** direct edges gained (13,528 in test and fuzzer
+files, 4,211 in production code; the largest targets are
+`CameraInput::Open` 842, `CameraInput::GetCameraDevice` 769,
+`CaptureSession::AddOutput` 531, `CaptureSession::BeginConfig` 317) and
+**1,152** lost at 808 sites, 777 of which carry a replacement edge. Most
+lost edges were wrong: an unqualified `sptr<T>` used to lower to an
+*unknown* type, so `cameraInput_->Open()` bound by bare name to whatever
+free `Open` / `Release` / `SetCallback` / `Stop` a fuzzer happened to
+define (`test/fuzztest/hcapture_session_fuzzer/hcapture_session_fuzzer.cpp:272-282`);
+`frameworks/cj/camera/src/metadata_output_impl.cpp:121`
+(`metadataOutput_->SetCallback(...)`) reaches `MetadataOutput::SetCallback`
+now. The 31 sites left without an edge call through a wrapper whose
+argument class is not in the tree — `recorder_->Start()` on a
+media-library recorder in
+`frameworks/native/camera/base/src/output/movie_file_output.cpp:123` —
+where `master` had one of those fuzzer functions. The one indirect edge
+lost is the same fault: `avcodec_task_manager.cpp:124` called
+`->GetTimeStamp()` on a `sptr<FrameRecord>` and reached a fuzzer lambda
+through a free function; it is a direct `FrameRecord::GetTimeStamp` now.
+The **254** `OHOS::sptr::*` arrow phantoms are gone and a probe pins them
+at 0; the constructor and `.GetRefPtr()` are the wrapper's own operations
+and stay, under whichever namespace the spelling qualifies to. Defined
+functions rise by 4 because a tag keeps its arguments, so overloads that
+differ only inside them no longer fold: hiview's
+`ParamValue(const std::vector<uint32_t>&)` beside
+`ParamValue(const std::vector<std::string>&)`
+(`base/event_report/event/param_value.cpp:47,52`).
+
+*A second fault, found while addressing review.* The reviewer asked for
+the enclosing-namespace lookup above, and with it camera lost 85 correct
+direct edges — `photoAssetIntf_->AddPhotoProxy(...)` in
+`common/utils/photo_asset_proxy.cpp:101` stopped fanning out to
+`PhotoAssetProxy` / `PhotoAssetAdapter` and went to a bare
+`PhotoAssetIntf::AddPhotoProxy` prototype. `PhotoAssetIntf` is declared in
+`common/utils/photo_asset_interface.h` inside a C++17
+`namespace OHOS::CameraStandard {`, which `lower_namespace` read as an
+*anonymous* namespace: tree-sitter spells the name as one
+`nested_namespace_specifier`, the lowering looked only for a
+`namespace_identifier`, and everything inside registered under the bare
+name with internal linkage. The old innermost-only qualification happened
+to match the properly qualified declaration from other units; the correct
+lookup found the mis-registered bare class first. 83 hiview files and 62
+camera files open a namespace that way (hdf none). Fixed: the specifier's
+segments push one scope each. Every direct edge that changes from this
+(hiview 146, camera 427) has the same call under the proper qualification,
+diagnostics do not move, and hdf is byte-identical; hiview's external
+functions fall **3,620 → 3,191** as bare-named prototypes fold into their
+qualified definitions. hiview's three pinned dispatch sites
+(`Plugin::OnEventProxy:68`, `PluginProxy::OnEvent:28`,
+`EventHandler::OnEventProxy:232`) each gain one target,
+`TraceTestPlugin::OnEvent` — a test plugin declared in such a file, which
+now joins the `Plugin` hierarchy under its proper name — and the pins move
+23 → 24, 23 → 24, 27 → 28. Camera's unresolved-template-text probe moves
+1,246 → 1,157 because 105 sites lost their template text when a wrapper
+member's spelling was stripped of its arguments (`sptr<X>::MakeSptr` is
+`sptr::MakeSptr`); the resolved template-text sites fall 56 → 40 the same
+way and none gains an edge.
+
+hdf and hiview were expected not to move for #86 itself — their wrappers
+are declared in-tree or on the standard name list — and they do, inside
+every band and with every exact metric unchanged. hdf's remaining
+`OHOS::sptr::*` phantoms (`sptr<IRemoteObject>` under `using OHOS::sptr`)
+and its `SharedMemQueueMeta<T>::*` ones become direct edges to
+`ServStatListenerStub::OnRemoteRequest` and
+`OHOS::HDI::Base::SharedMemQueueMeta::Get*`; no other hdf row moves.
+hiview loses its nine `OHOS::sptr::*` phantoms; `.` calls on unqualified
+`vector<T>` / `stack<T>` / `list<T>` locals under `using namespace std`
+(`utility/common_utils/log_parse.cpp:92`), which used to lower to an
+unknown type and carry no edge, are external members on the container now
+— exactly what their `std::`-qualified spellings have always produced.
+
+*Performance.* A tag per instantiation raises the type-table work of every
+header merge: camera's merged table grows from 5,408 to 7,281 entries, and
+the first build of the branch cost ~7% more user CPU on camera. Two
+output-neutral changes pay for it. `TypeTable::intern` answered an empty
+named tag by cloning the richest layout under that name into it and then
+looking the clone up, when the tag map already holds the id it lands on;
+it answers from the tag map now, on the by-value and by-reference paths
+(`empty_tag_interns_to_the_richest_layout_without_a_rewrite` pins the
+equivalence, including a layout widened in place by a union). And a unit
+merge remapped type ids through an `FxHashMap` keyed by an id that is a
+dense index into the source table; it is a `Vec` now. Both leave all three
+dumps byte-identical. Five interleaved runs of each binary, `--jobs 8`,
+`bash time`:
+
+| Corpus | `master` wall / user | #86 wall / user |
+|---|---:|---:|
+| hdf | 4.11s / 9.45s | 4.01s / 9.23s |
+| hiview | 1.67s / 4.38s | 1.65s / 4.33s |
+| camera | 6.53s / 18.08s | 6.66s / 18.33s |
+
+hdf and hiview are faster; camera is within 2% of `master` on both axes,
+which is the run-to-run spread of `master` itself on this machine (its
+user time ranged 17.4s to 18.1s across the day's sessions), with 16,587
+more direct edges and 7,378 more arg-flow edges to solve and export.
+
+**Review round.** Four review findings were confirmed on probes and fixed
+without moving any pinned metric outside its band: the wrapper's own name
+now goes through the enclosing-scope lookup its arguments use (camera's
+`BlockingQueue<std::any>` inside `DeferredProcessing` binds to the
+`CameraStandard::BlockingQueue` its header includes rather than a same-named
+class the header never saw, 12 direct edges → 11 as a doubled `Push`
+overload edge becomes one); a typedef is matched by its whole spelling; an
+out-of-line `operator->` records its return without the class header; and
+`sp->f` steps through a wrapper to the pointee's field (hiview +83 field
+temporaries and +121 flow edges, camera +8 and +12, call edges unchanged by
+name). Output is bit-identical across three `--jobs 8` runs and one
+`--jobs 1`; wall time is level with the previous push (+0.6 %, user +0.9 %,
+inside the run-to-run spread).
+
+**Second review round.** Seven further findings were confirmed on probes
+and fixed. The only one that moves a corpus number is field access through
+a wrapper: a field step now follows its own operator, so `sp->f` on the
+wrapper variable itself reaches the pointee (it previously only did so
+one step down a field chain, `b.item->f`) and `w.f` stays on the wrapper
+(it previously stepped through a wrapper with a declared `operator->`
+and lost the wrapper's own field). Against the previous push that adds
+field steps on direct reads through standard smart pointers — hdf +34
+sites (hc-gen's `forwardWalkObj->child_`), hiview +124
+(`event->eventName_`), camera +985 (`userInfo->scalingFactor`) — with no
+site lost anywhere; call edges are unchanged by name except one external
+constructor stub that camera spelled `::OHOS::sptr::sptr` and now
+`OHOS::sptr::sptr` (the `::W<T>` head fix; functions_total 24,373 →
+24,372), and camera gains 7 arg-flow edges where a field read through a
+wrapper now feeds a constructor argument (24,482 → 24,489). The other
+fixes — a member type of a template keeping its `::` and its own name
+(`Outer<A>::Inner<B>`), a member type of a defined template keeping the
+class the lookup found (`CS::Defined::Iterator`), `T*const` in the cv
+helper, and `nullptr_t` / `intmax_t` / `uintmax_t` / `auto` never
+qualified — change no corpus number. Output is bit-identical across
+three `--jobs 8` runs and one `--jobs 1`; paired against the previous
+push on camera (8 alternating runs) wall is −1.2 % and user −1.5 %,
+inside the spread.
+
+**Third review round.** Three more findings were confirmed on the fixture
+and fixed, none of which moves a corpus number: a literal template
+argument inside a namespace was qualified like a class (`missing<true>`
+in `namespace N` interned `N::missing<N::true>`; literals are now spelled
+as written), a `::`-prefixed head at a type declaration was not stripped
+the way the spelling helper strips it (`::Outer::Defined<int>` missed the
+defined class and its layout, so a field read through it produced
+nothing; the leading `::` is now handled in one place), and a pointer
+level between qualifiers was dropped (`T * const *` read as `T*`). Two
+small hardenings went in with them: a class is never recorded as its own
+base, and merging declared-class sets is one probe per name instead of
+two. Output is identical to the previous push on all three corpora and
+bit-identical across three `--jobs 8` runs and one `--jobs 1`; paired
+against the previous push on camera (8 alternating runs) wall is +0.6 %
+and user +1.0 %, inside the spread (the two runs' ranges overlap).
+
 **Regression investigation, 2026-09-10 (#83):**
 
 *A C caller no longer reached its `extern "C"` C++ implementation.* Reported against

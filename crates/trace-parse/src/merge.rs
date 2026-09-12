@@ -859,16 +859,21 @@ fn return_flow_vars(flow: &ReturnFlow) -> impl Iterator<Item = VarId> + '_ {
     .into_iter()
 }
 
-fn remap_type(id: TypeId, map: &FxHashMap<TypeId, TypeId>) -> TypeId {
-    map.get(&id).copied().unwrap_or(id)
+/// `map` is indexed by the source table's id: those are dense and
+/// [`TypeTable::all`](trace_ir::TypeTable::all) yields them in order, so the
+/// per-type remap a merge does for every variable and return type is an
+/// index rather than a hash of the id.
+fn remap_type(id: TypeId, map: &[TypeId]) -> TypeId {
+    map.get(id.0 as usize).copied().unwrap_or(id)
 }
 
 fn merge_types(
     dst: &mut trace_ir::TypeTable,
     src: &trace_ir::TypeTable,
     union_aggregates: bool,
-) -> FxHashMap<TypeId, TypeId> {
-    let mut map = FxHashMap::default();
+) -> Vec<TypeId> {
+    dst.merge_struct_declarations(src);
+    let mut map = Vec::with_capacity(src.all().len());
     for info in src.all() {
         let new_id = match &info.desc {
             TypeDesc::Struct { name, fields } if !fields.is_empty() => {
@@ -887,7 +892,8 @@ fn merge_types(
             }
             other => dst.intern_ref(other),
         };
-        map.insert(info.id, new_id);
+        debug_assert_eq!(info.id.0 as usize, map.len());
+        map.push(new_id);
     }
     for (alias, desc) in src.all_aliases() {
         if dst.resolve_alias(alias).is_none() {
@@ -1009,6 +1015,53 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// The remap is indexed by the source id (#86), so it must line up with
+    /// `TypeTable::all` for every id the source hands out: one the
+    /// destination already holds under another number, one it has to add,
+    /// and one it canonicalizes to a richer layout on the way in.
+    #[test]
+    fn merge_types_remaps_every_source_id_by_index() {
+        let full_b = TypeDesc::Struct {
+            name: "B".into(),
+            fields: vec![("y".into(), TypeDesc::Int)],
+        };
+        let mut src = trace_ir::TypeTable::new();
+        let a = src.intern(TypeDesc::Struct {
+            name: "A".into(),
+            fields: vec![("x".into(), TypeDesc::Int)],
+        });
+        let p = src.intern(TypeDesc::Ptr(Box::new(TypeDesc::Struct {
+            name: "B".into(),
+            fields: Vec::new(),
+        })));
+        let mut dst = trace_ir::TypeTable::new();
+        let b = dst.intern(full_b.clone());
+
+        let map = merge_types(&mut dst, &src, false);
+
+        assert_eq!(map.len(), src.all().len(), "one slot per source id");
+        assert_eq!(
+            remap_type(TypeId(0), &map),
+            TypeId(0),
+            "the prelude is shared"
+        );
+        let a_dst = remap_type(a, &map);
+        assert_ne!(a_dst, a, "`A` lands after `B`, so its number moves");
+        assert_eq!(dst.get(a_dst).desc, src.get(a).desc);
+        assert_eq!(
+            dst.get(remap_type(p, &map)).desc,
+            TypeDesc::Ptr(Box::new(full_b)),
+            "the empty tag canonicalizes to the layout the destination holds"
+        );
+        assert_eq!(dst.type_id_by_tag("B", trace_ir::TypeKind::Struct), Some(b));
+        let beyond = TypeId(map.len() as u32 + 7);
+        assert_eq!(
+            remap_type(beyond, &map),
+            beyond,
+            "an id outside the map is its own"
+        );
     }
 
     /// A variant re-lowers the whole unit, so it re-reports everything the base
