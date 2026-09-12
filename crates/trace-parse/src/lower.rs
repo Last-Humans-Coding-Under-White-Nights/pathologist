@@ -5829,19 +5829,39 @@ fn decompose_field_path(
     field_names.reverse();
     arrows.reverse();
 
+    // Keep the receiver's pointer provenance before layout lookup strips it.
+    // References and explicit dereferences denote the referred-to value.
+    let mut raw_pointer = ctx.is_cpp
+        && arrows.first() == Some(&true)
+        && if cur.kind() == "identifier" {
+            // The common case only needs a type tag, not a cloned layout.
+            match &program.types.get(variable_type_id(program, base)?).desc {
+                TypeDesc::Ptr(inner) if ctx.reference_vars.contains(&base) => {
+                    matches!(**inner, TypeDesc::Ptr(_))
+                }
+                TypeDesc::Ptr(_) => true,
+                _ => false,
+            }
+        } else {
+            matches!(
+                receiver_desc(program, ctx, source, cur),
+                Some(TypeDesc::Ptr(_))
+            )
+        };
     let mut type_id = struct_type_for_var(program, base)?;
     let mut field_ids = Vec::new();
     for (fname, arrow) in field_names.iter().zip(arrows) {
         // `sp->f` is the pointee's `f`; `sp.f` stays the wrapper's own, so
-        // only an arrow steps through a smart pointer. A raw pointer was
-        // already stepped through when its type was looked up.
-        if arrow {
+        // only an overloaded arrow steps through a smart pointer. A raw
+        // pointer's built-in arrow stops at the wrapper itself.
+        if arrow && !raw_pointer {
             type_id = peel_wrapper_to_pointee(program, type_id);
         }
         let fid = program.types.field_id_by_name(type_id, fname)?;
         field_ids.push(fid);
         let layout = program.types.get(type_id);
         type_id = layout.layout.fields.get(&fid)?.type_id;
+        raw_pointer = matches!(program.types.get(type_id).desc, TypeDesc::Ptr(_));
         type_id = peel_ptr_to_struct(program, type_id);
     }
     Some((base, field_ids, field_names))
@@ -5895,7 +5915,12 @@ fn struct_type_for_var(program: &mut Program, var: VarId) -> Option<trace_ir::Ty
     for _ in 0..4 {
         match &program.types.get(type_id).desc.clone() {
             TypeDesc::Ptr(inner) => {
+                // A template instantiation can exist only inside this pointer
+                // descriptor so far; intern its layout before looking it up.
                 type_id = program.types.resolve_type_id(inner);
+                if type_id == program.types.unknown() {
+                    type_id = program.types.intern((**inner).clone());
+                }
             }
             // Arrays of structs: field access via `arr[i].f` resolves
             // against the element type (index-insensitive over-approx).

@@ -1095,6 +1095,38 @@ fn arrow_unsupported_substitutions_stay_unresolved() {
 }
 
 #[test]
+fn raw_wrapper_pointer_preserves_callback_flow() {
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in ["RawWrapperDirect", "RawWrapperNested"] {
+        assert!(
+            has_any_edge(program, analysis, caller, "RawWrapperTarget"),
+            "{caller}: raw arrow must preserve the wrapper's callback flow"
+        );
+    }
+}
+
+#[test]
+fn wrapper_reference_and_dereference_still_unwrap_fields() {
+    let (program, _) = cpp_smart_ptr();
+    for caller in ["RawWrapperReference", "RawWrapperDereference"] {
+        assert!(
+            program.flow.iter().any(|flow| {
+                let trace_ir::FlowConstraint::GepField {
+                    dst, field_name, ..
+                } = flow
+                else {
+                    return false;
+                };
+                field_name == "payload_value"
+                    && program.symbols.variable(*dst).fn_id
+                        == program.symbols.resolve_function(caller)
+            }),
+            "{caller}: a wrapper value must still use overloaded arrow"
+        );
+    }
+}
+
+#[test]
 fn arrow_wrapper_identity_preserves_layout_and_construction() {
     let (program, analysis) = cpp_smart_ptr();
     for caller in ["UseTemplateCallback", "UseWrapperCallback"] {

@@ -561,7 +561,11 @@ C++-aware only where it must be — everything else reuses the C machinery.
   pointee's layout, on the wrapper variable itself as well as along a field
   chain, so field reads and writes through a smart pointer carry the same
   load and store constraints as through a raw pointer, while `w.f` stays
-  the wrapper's own field. A member type keeps its `::` and its own name
+  the wrapper's own field. A raw `Wrapper<T>*` uses the built-in arrow:
+  `p->f` stays on the wrapper's own layout, including callback fields and
+  raw-pointer fields reached along a chain; it does not invoke `operator->`.
+  References to wrapper values and explicitly dereferenced wrapper pointers
+  still use the overloaded arrow. A member type keeps its `::` and its own name
   when it carries arguments (`Outer<A>::Inner<B>`); a member type of a
   defined template keeps the class the lookup found as its prefix; `::W<T>`
   is the global `W`, tagged without the prefix, wherever a template head
