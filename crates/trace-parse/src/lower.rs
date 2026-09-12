@@ -102,12 +102,17 @@ struct LowerContext {
     /// incorrect `this`-parameter wiring).
     handled_new_exprs: RefCell<HashSet<usize>>,
     /// Cache for `resolve_callee_with_loads`: maps the `func` node id of a
-    /// field-expression callee to the load variable created for the fn-ptr
-    /// load.  Without this, `emit_field_value_store` (via `resolve_callee_var`)
-    /// and the later `collect_call_at_node` (via `resolve_callee_with_loads`)
-    /// would create *two different* load variables for the same expression,
-    /// breaking the `CallReturnIndirect` → `indirect_return_dst` mapping.
-    callee_load_cache: RefCell<HashMap<usize, Option<VarId>>>,
+    /// field-expression callee to the whole answer it gave.
+    /// `emit_field_value_store` (via `resolve_callee_var`) and the later
+    /// `collect_call_at_node` (via `resolve_callee_with_loads`) reach the same
+    /// node, and recomputing would create *two different* load variables for
+    /// one expression — breaking the `CallReturnIndirect` →
+    /// `indirect_return_dst` mapping — and a second summary receiver for an
+    /// overloaded arrow. Memoizing the tuple rather than the load variable
+    /// also keeps the second answer equal to the first: a node that resolves
+    /// through `resolve_callee` names its receiver variable, which a cached
+    /// bare `None` would have dropped.
+    callee_load_cache: RefCell<HashMap<usize, CalleeRef>>,
     /// `call_expression` node id → `CallReturn` destination, so the matching
     /// `CallSite` can carry `return_dst` for `dlsym` models.
     call_return_dst: RefCell<HashMap<usize, VarId>>,
@@ -1907,6 +1912,10 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
     }
 }
 
+/// What a callee expression resolves to: its name, whether the name is a
+/// direct target, and the variable holding the value called through it.
+type CalleeRef = (String, bool, Option<VarId>);
+
 /// A typedef is reachable by its bare name and, inside a namespace, by its
 /// qualified one (`Outer::ScopedAlias`), so a qualified spelling of it is
 /// matched whole rather than by its last segment.
@@ -2030,7 +2039,13 @@ fn lower_namespace(program: &mut Program, ctx: &mut LowerContext, source: &str, 
             normalize_qualified(node_text(source, &c))
                 .split("::")
                 .map(|seg| seg.trim())
-                .map(|seg| seg.strip_prefix("inline ").map_or(seg, str::trim_start))
+                // Only a keyword, never a namespace whose name starts
+                // with one: `inline B` is `B`, `inlineB` is itself.
+                .map(|seg| {
+                    seg.strip_prefix("inline")
+                        .filter(|rest| rest.starts_with(char::is_whitespace))
+                        .map_or(seg, str::trim_start)
+                })
                 .filter(|seg| !seg.is_empty())
                 .map(|seg| Some(seg.to_string()))
                 .collect()
@@ -5897,14 +5912,13 @@ fn peel_wrapper_to_pointee(program: &Program, type_id: trace_ir::TypeId) -> trac
     if name.is_empty() {
         return type_id;
     }
-    let wrapper = if name.contains('<') {
-        let cls = strip_template_args(name);
-        is_undefined_wrapper(program, name, &cls)
-            || is_std_smart_ptr_name(&cls)
-            || declares_arrow(program, &cls)
-    } else {
-        program.arrow_returns.iter().any(|f| f.class_name == *name)
-    };
+    // One rule for both spellings: `is_undefined_wrapper` already requires
+    // arguments, and `declares_arrow` searches the hierarchy, so a concrete
+    // class inheriting `operator->` from a base is a wrapper here too.
+    let cls = strip_template_args(name);
+    let wrapper = is_undefined_wrapper(program, name, &cls)
+        || is_std_smart_ptr_name(&cls)
+        || declares_arrow(program, &cls);
     if !wrapper {
         return type_id;
     }
@@ -6634,30 +6648,31 @@ fn resolve_callee_with_loads(
     ctx: &mut LowerContext,
     source: &str,
     node: Node,
-) -> (String, bool, Option<VarId>) {
+) -> CalleeRef {
     let node = peel_expression(node);
-    if node.kind() == "field_expression" {
-        // Check before decomposition: overloaded arrows allocate a typed
-        // summary receiver, which a cached call must not allocate again.
-        if let Some(cached_var) = ctx.callee_load_cache.borrow().get(&node.id()).copied() {
-            return (field_callee_text(source, node), false, cached_var);
-        }
-        if let Some((base, field_ids, field_names)) =
-            decompose_field_path(program, ctx, source, node)
+    if node.kind() != "field_expression" {
+        return resolve_callee(program, ctx, source, node);
+    }
+    // Answer before decomposition: it emits loads and allocates a summary
+    // receiver for an overloaded arrow, neither of which a second visit to
+    // the same node may repeat.
+    if let Some(cached) = ctx.callee_load_cache.borrow().get(&node.id()) {
+        return cached.clone();
+    }
+    let mut result = None;
+    if let Some((base, field_ids, field_names)) = decompose_field_path(program, ctx, source, node) {
+        let text = field_callee_text(source, node);
+        if let Some(load_var) =
+            emit_field_fn_ptr_load(program, ctx, source, node, base, &field_ids, &field_names)
         {
-            let text = field_callee_text(source, node);
-            if let Some(load_var) =
-                emit_field_fn_ptr_load(program, ctx, source, node, base, &field_ids, &field_names)
-            {
-                ctx.callee_load_cache
-                    .borrow_mut()
-                    .insert(node.id(), Some(load_var));
-                return (text, false, Some(load_var));
-            }
-            ctx.callee_load_cache.borrow_mut().insert(node.id(), None);
+            result = Some((text, false, Some(load_var)));
         }
     }
-    resolve_callee(program, ctx, source, node)
+    let result = result.unwrap_or_else(|| resolve_callee(program, ctx, source, node));
+    ctx.callee_load_cache
+        .borrow_mut()
+        .insert(node.id(), result.clone());
+    result
 }
 
 fn field_callee_text(source: &str, node: Node) -> String {

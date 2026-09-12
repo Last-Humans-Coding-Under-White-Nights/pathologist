@@ -127,7 +127,9 @@ All notable changes to `trace` are documented in this file.
   restarts the path on a receiver typed as the pointee, so it resolves to the pointee's
   instance-insensitive field summary -- the same one a raw `T*` read or write uses -- instead of
   a wrapper subobject the points-to solver dropped: a callback stored through `T *p` is now
-  called through `sp->cb()`, `w->cb()` and `h.item->cb()` alike. Camera's direct
+  called through `sp->cb()`, `w->cb()` and `h.item->cb()` alike. One rule decides what a wrapper
+  is whether or not the spelling carries arguments, so a concrete class inheriting `operator->`
+  from a base steps through it as a template instantiation does. Camera's direct
   edges rise 21,059 -> 37,646 and its 254 `OHOS::sptr::*` phantoms are gone.
 
 ### Changed

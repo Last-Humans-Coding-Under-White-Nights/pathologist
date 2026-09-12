@@ -29,3 +29,9 @@ void FlowReadTwoArrows(missing<FlowHolder> h) { h->item->nested_cb(); }
 void FlowReadNestedRaw(FlowPayload *p) { p->nested_cb(); }
 void FlowSetWrapperOwn(FlowWrapper<FlowPayload> *p) { p->read_cb = FlowWrapperOwnTarget; }
 void FlowReadWrapperOwn(FlowWrapper<FlowPayload> *p) { p->read_cb(); }
+class FlowArrowBase {
+public:
+    FlowPayload *operator->();
+};
+class FlowArrowDerived : public FlowArrowBase {};
+void FlowReadInherited(FlowArrowDerived d) { d->read_cb(); }

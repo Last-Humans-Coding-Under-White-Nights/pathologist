@@ -464,7 +464,9 @@ The receiver is now resolved through the **declared** `operator->`:
   its operator: `sp->f` reaches the pointee's field through a wrapper, on
   the wrapper variable itself as well as along a field chain, while `w.f`
   stays the wrapper's own field, and a raw `Wrapper<T>*` uses the built-in
-  arrow, so `p->f` stays on the wrapper's own layout. At an overloaded
+  arrow, so `p->f` stays on the wrapper's own layout. The same rule decides
+  what a wrapper is whether or not the spelling carries arguments, so a
+  concrete class inheriting `operator->` from a base is one too. At an overloaded
   arrow the remaining path restarts on a receiver typed as the pointee, so
   its field step lands on the pointee's instance-insensitive summary --
   the one a raw `T*` read or write already uses -- rather than on a

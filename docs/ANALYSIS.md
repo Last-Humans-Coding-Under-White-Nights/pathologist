@@ -561,7 +561,10 @@ C++-aware only where it must be — everything else reuses the C machinery.
   pointee's layout, on the wrapper variable itself as well as along a field
   chain, so field reads and writes through a smart pointer carry the same
   load and store constraints as through a raw pointer, while `w.f` stays
-  the wrapper's own field. A raw `Wrapper<T>*` uses the built-in arrow:
+  the wrapper's own field. One rule decides what a wrapper is whether or not
+  the spelling carries arguments, so a concrete class that inherits
+  `operator->` from a base steps through it as an instantiation does.
+  A raw `Wrapper<T>*` uses the built-in arrow:
   `p->f` stays on the wrapper's own layout, including callback fields and
   raw-pointer fields reached along a chain; it does not invoke `operator->`.
   References to wrapper values and explicitly dereferenced wrapper pointers

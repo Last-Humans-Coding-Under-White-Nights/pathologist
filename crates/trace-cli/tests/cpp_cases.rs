@@ -1122,6 +1122,7 @@ fn wrapper_fields_share_pointee_callback_summaries() {
         ("FlowReadTwoArrows", "FlowNestedTarget"),
         ("FlowReadNestedRaw", "FlowNestedTarget"),
         ("FlowReadWrapperOwn", "FlowWrapperOwnTarget"),
+        ("FlowReadInherited", "FlowReadTarget"),
     ] {
         assert!(
             has_any_edge(program, analysis, caller, target),
