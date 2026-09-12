@@ -149,6 +149,9 @@ hdf and hiview are faster; camera is within 2% of `master` on both axes,
 which is the run-to-run spread of `master` itself on this machine (its
 user time ranged 17.4s to 18.1s across the day's sessions), with 16,587
 more direct edges and 7,378 more arg-flow edges to solve and export.
+Re-measured at the end of the review rounds the camera gap reads a little
+wider — see *Fourth review round* below for the final numbers, which are
+what the branch ships.
 
 **Review round.** Four review findings were confirmed on probes and fixed
 without moving any pinned metric outside its band: the wrapper's own name
@@ -203,6 +206,60 @@ two. Output is identical to the previous push on all three corpora and
 bit-identical across three `--jobs 8` runs and one `--jobs 1`; paired
 against the previous push on camera (8 alternating runs) wall is +0.6 %
 and user +1.0 %, inside the spread (the two runs' ranges overlap).
+
+**Fourth review round.** Three findings on the field-step work were
+confirmed and fixed. A raw pointer to a wrapper (`W<T>* p`) took the
+built-in arrow as if it were overloaded, so `p->own_field` resolved on the
+pointee. The lowering for `sp->f` kept the wrapper's static type on the
+`GepField` base, so `struct_type_from_type_id` handed the solver a layout
+without `f` and the constraint was dropped without a trace: a callback
+stored through a raw `T *p` was never called through `sp->cb()`. And the
+chained form modelled the pointee as an inline subobject of the wrapper.
+A field step now restarts the remaining path at an overloaded arrow on a
+receiver typed as the pointee, so it lands on the pointee's
+instance-insensitive `(T, f)` summary — the one a raw `T*` read or write
+already uses. The receiver is a `_recv` temporary rather than a `_ret` one
+because a variant merge pairs temporaries positionally per kind at a
+source position, and whether this one exists depends on the receiver's
+type. Two further findings went in with them: a wrapper is recognized by
+one rule whether or not the spelling carries arguments (a concrete class
+inheriting `operator->` from a base is one), and `resolve_callee_with_loads`
+memoizes its whole answer rather than the load variable alone, so a second
+visit to a node cannot contradict the first.
+
+Measured on a fixture rather than a corpus: against the branch as it stood,
+nine of ten expected indirect edges through a wrapper field were missing and
+one spurious edge crossed the wrapper's own field into the pointee's; all
+twelve assertions hold now. On the corpora the change is edge-neutral —
+call edges compared by caller, callee and resolution are identical on all
+three — and only the receivers appear:
+
+| corpus | variables | flow nodes | flow edges |
+|---|---:|---:|---:|
+| hdf | 115,720 → 115,754 | 156,480 → 156,488 | unchanged |
+| hiview | 71,191 → 71,320 | 123,070 → 123,222 | 59,345 → 59,347 |
+| camera | 136,903 → 137,931 | 224,944 → 226,134 | 97,825 → 97,822 |
+
+Output is bit-identical across three `--jobs 8` runs and one `--jobs 1` run
+per corpus, and `eval_check` passes 91 checks with no expectation
+re-capture. Eight interleaved runs of each binary, `--jobs 8`, `bash time`,
+medians (ranges in brackets):
+
+| Corpus | `master` wall / user | this branch wall / user | vs `master` |
+|---|---:|---:|---:|
+| hdf | 3.96s / 9.37s | 3.96s / 9.20s | wall +0.2%, user −1.8% |
+| hiview | 1.63s / 4.33s | 1.62s / 4.33s | wall −0.4%, user ±0% |
+| camera | 6.40s / 17.83s | 6.59s / 18.26s | wall +3.0%, user +2.4% |
+
+The review-round commits themselves are free: measured against the branch
+as pushed before them, hdf is wall −1.0% / user −0.4%, hiview +0.1% /
+−1.6%, camera −0.4% / ±0%. The camera gap is the type-table cost of a
+tag per instantiation reported above, and it reads slightly wider here than
+the 2% first measured — master's own camera wall spread in this session was
+6.29s to 6.94s, so the wall figure is partly noise, but the user-time
+medians separate with only marginal overlap (master 17.51s–18.24s, branch
+17.90s–18.77s) and ~2.4% is the honest number. hdf and hiview end level
+with or faster than `master`.
 
 **Regression investigation, 2026-09-10 (#83):**
 

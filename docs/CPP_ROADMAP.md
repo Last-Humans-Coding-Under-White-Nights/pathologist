@@ -537,7 +537,9 @@ registered under bare names; fixed, and hiview's external functions fall
 **3,623 → 3,191** as bare prototypes fold into their definitions.
 Type-table growth from a tag per instantiation is paid for by a
 clone-free tag lookup in `TypeTable::intern` and a dense id remap in the
-unit merge; all three corpora are level with or faster than `master`.
+unit merge; hdf and hiview end level with or faster than `master`, camera
+runs about 2-3% above it for 16,587 more direct edges to solve and
+export.
 Residue: 31 camera sites call through a wrapper whose argument class is
 not in the tree and stay unresolved. See
 [EVAL_REPORT.md](EVAL_REPORT.md).
