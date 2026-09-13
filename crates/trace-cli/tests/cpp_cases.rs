@@ -4048,3 +4048,450 @@ void test() {
         "a named tag starting with `anon_` must emit its constructor call: {targets:?}"
     );
 }
+
+fn cpp_type_lookup() -> &'static (Program, AnalysisResult) {
+    static CACHE: OnceLock<(Program, AnalysisResult)> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let root = fixture("cpp_type_lookup");
+        let program = build_program(&root, &default_opts(&root)).expect("build");
+        let (_pag, analysis) = analyze(&program);
+        (program, analysis)
+    })
+}
+
+#[test]
+fn bare_type_name_resolves_through_enclosing_namespaces() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in [
+        "a::b::c::TriLocal",
+        "a::b::c::TriParam",
+        "a::b::c::TriField",
+        "a::x::Partial",
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, "a::b::Deep::Go"),
+            "{caller}"
+        );
+    }
+    assert!(has_direct(
+        program,
+        analysis,
+        "a::b::c::TriGlobal",
+        "GlobalTarget::Run"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "Outer::ArrowReturn",
+        "RealTarget::Run"
+    ));
+    let make = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "a::b::c::MakeDeep")
+        .expect("MakeDeep");
+    assert!(
+        matches!(&program.types.get(make.return_type).desc,
+            trace_ir::TypeDesc::Ptr(inner)
+                if matches!(&**inner, trace_ir::TypeDesc::Struct { name, .. } if name == "a::b::Deep")),
+        "a return type is looked up like any other type"
+    );
+}
+
+#[test]
+fn innermost_type_declaration_shadows_outer_ones() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "n::m::Shadowed",
+        "n::Shadow::Hit"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "n::m::Shadowed",
+        "Shadow::Hit"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "n::m::GlobalShadow",
+        "Shadow::Hit"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "n::m::GlobalShadow",
+        "n::Shadow::Hit"
+    ));
+}
+
+#[test]
+fn same_named_typedefs_in_two_namespaces_stay_apart() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "p::inner::ScopedTypedef",
+        "p::PT::Run"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "p::inner::ScopedTypedef",
+        "q::QT::Run"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "q::OtherTypedef",
+        "q::QT::Run"
+    ));
+}
+
+#[test]
+fn using_alias_declaration_is_a_typedef() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in ["UsingLocal", "UsingPointer", "UsingWrapper"] {
+        assert!(
+            has_direct(program, analysis, caller, "AliasTarget::Run"),
+            "{caller}"
+        );
+    }
+    for caller in ["ua::deeper::UsingEnclosing", "UsingQualified"] {
+        assert!(
+            has_direct(program, analysis, caller, "ua::Scoped::Run"),
+            "{caller}"
+        );
+    }
+    assert!(has_any_edge(program, analysis, "UsingFnPtr", "CbTarget"));
+}
+
+#[test]
+fn class_member_alias_is_scoped_to_its_class() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in [
+        "WithMemberAlias::ViaMember",
+        "WithMemberAlias::ViaParam",
+        "MemberAliasOutside",
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, "AliasTarget::Run"),
+            "{caller}"
+        );
+    }
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "MemberAliasNoLeak",
+        "AliasTarget::Run"
+    ));
+}
+
+#[test]
+fn nested_class_is_registered_under_its_outer_class() {
+    let (program, analysis) = cpp_type_lookup();
+    let tags = struct_tag_names(program);
+    for tag in [
+        "CS::Defined::Iterator",
+        "CS::Plain::It",
+        "GMethods::GIn2",
+        "GIn",
+    ] {
+        assert!(tags.iter().any(|t| t == tag), "{tag}: {tags:?}");
+    }
+    for tag in ["CS::Iterator", "CS::It", "GIn2"] {
+        assert!(!tags.iter().any(|t| t == tag), "no {tag}: {tags:?}");
+    }
+    for phantom in ["CS::Defined::it", "CS::Plain::pit", "CS::Plain::cb"] {
+        assert!(
+            !program.symbols.functions.iter().any(|f| f.name == phantom),
+            "{phantom} is a field of the nested class"
+        );
+    }
+    let field_of = |cls: &str, field: &str| {
+        program
+            .types
+            .type_id_by_tag(cls, trace_ir::TypeKind::Struct)
+            .map(|id| match &program.types.get(id).desc {
+                trace_ir::TypeDesc::Struct { fields, .. } => {
+                    fields.iter().any(|(name, _)| name == field)
+                }
+                _ => false,
+            })
+            .unwrap_or(false)
+    };
+    assert!(field_of("CS::Defined::Iterator", "it"));
+    assert!(field_of("CS::Plain::It", "pit"));
+    assert!(field_of("CS::Defined", "df"));
+    assert!(!field_of("CS::Defined", "it"));
+    for (caller, callee) in [
+        ("CS::Sub::P7", "CS::Defined::Iterator::Next"),
+        ("CS::Plain::Use", "CS::Plain::It::Step"),
+        ("CS::OpenBox", "CS::Plain::Box::Open"),
+        ("Built::Builder::Build", "Built::Built"),
+        ("MakeBuilt", "Built::Built"),
+    ] {
+        assert!(has_direct(program, analysis, caller, callee), "{caller}");
+    }
+    for caller in ["CallHook", "CallHook2", "CallNestedCb"] {
+        assert!(
+            has_any_edge(program, analysis, caller, "HookTarget"),
+            "{caller} calls through the nested class's field"
+        );
+    }
+    let it_reads = program
+        .flow
+        .iter()
+        .filter(|f| {
+            matches!(f, trace_ir::FlowConstraint::GepField { field_name, .. }
+                if field_name == "it")
+        })
+        .count();
+    assert_eq!(it_reads, 1, "`i.it` reaches the nested class's layout");
+}
+
+#[test]
+fn constructor_call_arguments_bind_past_this() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "ConstructTakes",
+        "Takes::Takes"
+    ));
+    assert!(
+        has_any_edge(program, analysis, "Takes::Takes", "CtorCbTarget"),
+        "the callback reaches the constructor's own parameter"
+    );
+}
+
+#[test]
+fn member_class_sees_later_members_of_its_enclosing_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "Later::Builder::Build",
+        "Later::Later"
+    ));
+}
+
+#[test]
+fn function_local_aliases_are_block_scoped() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in ["LocalUsing", "LocalTypedef"] {
+        assert!(
+            has_direct(program, analysis, caller, "LocalTarget::Run"),
+            "{caller}"
+        );
+    }
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "LocalOutOfBlock",
+        "LocalTarget::Run"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "LocalAliasCtor",
+        "Built2::Built2"
+    ));
+}
+
+#[test]
+fn array_alias_keeps_its_shape() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "CallTable",
+        "TableCbTarget"
+    ));
+    let table = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "cb_table")
+        .expect("cb_table");
+    assert!(matches!(
+        program.types.get(table.type_id).desc,
+        trace_ir::TypeDesc::Array { .. }
+    ));
+}
+
+#[test]
+fn qualified_spellings_reach_aliases_and_constructors() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in [
+        "TemplateMemberAlias",
+        "ArrowTemplateMemberAlias",
+        "rv::GlobalAliasUse",
+        "CastReceiver",
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, "LocalTarget::Run"),
+            "{caller}"
+        );
+    }
+    for callee in ["rv::Made::Made", "rv::Made::In::In"] {
+        assert!(
+            has_direct(program, analysis, "QualifiedCtor", callee),
+            "{callee}"
+        );
+    }
+}
+
+#[test]
+fn cpp_class_nested_in_c_structs_keeps_its_whole_path() {
+    let (program, _analysis) = cpp_type_lookup();
+    let tags = struct_tag_names(program);
+    assert!(tags.iter().any(|t| t == "CPlain::CMid::CDeep"), "{tags:?}");
+    assert!(program
+        .symbols
+        .resolve_function("CPlain::CMid::CDeep::Go")
+        .is_some());
+}
+
+#[test]
+fn bodyless_class_specifier_inside_a_class_names_the_member_class() {
+    let (program, _analysis) = cpp_type_lookup();
+    let tags = struct_tag_names(program);
+    for tag in ["ListNode", "PimplImpl"] {
+        assert!(!tags.iter().any(|t| t == tag), "no bare {tag}: {tags:?}");
+    }
+    let field_points_to = |cls: &str, field: &str, target: &str| {
+        let id = program
+            .types
+            .type_id_by_tag(cls, trace_ir::TypeKind::Struct)
+            .unwrap_or_else(|| panic!("{cls}: {tags:?}"));
+        matches!(&program.types.get(id).desc, trace_ir::TypeDesc::Struct { fields, .. }
+            if fields.iter().any(|(name, desc)| name == field
+                && matches!(desc, trace_ir::TypeDesc::Ptr(inner)
+                    if matches!(&**inner, trace_ir::TypeDesc::Struct { name, .. } if name == target))))
+    };
+    assert!(field_points_to("List::ListNode", "next", "List::ListNode"));
+    assert!(field_points_to("Pimpl", "p", "Pimpl::PimplImpl"));
+}
+
+#[test]
+fn out_of_line_member_class_is_the_declared_class() {
+    let (program, analysis) = cpp_type_lookup();
+    for callee in ["hm::Manager::Info::Info", "hm::Manager::Info::Get"] {
+        assert!(
+            has_direct(program, analysis, "hm::Manager::Add", callee),
+            "{callee}"
+        );
+    }
+}
+
+#[test]
+fn nearer_function_hides_a_class_of_the_same_name() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "hide::CallHidden",
+        "hide::HiddenCtor"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "hide::CallHidden",
+        "HiddenCtor::HiddenCtor"
+    ));
+}
+
+#[test]
+fn alias_in_a_function_local_class_stays_in_the_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "LocalClassAlias",
+        "OuterAliasTarget::Run"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "LocalClassAlias",
+        "InnerAliasTarget::Run"
+    ));
+}
+
+#[test]
+fn constructor_call_reaches_an_internal_linkage_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(program, e.caller) == "UseLocalHelper"
+                && fn_name(program, e.callee).ends_with("LocalHelper::LocalHelper")
+        }),
+        "{:?}",
+        common::callees_of(program, analysis, "UseLocalHelper")
+    );
+}
+
+#[test]
+fn function_passed_to_new_reaches_the_constructor_parameter() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "Consumer::Consumer",
+        "OnEvent"
+    ));
+}
+
+#[test]
+fn alias_of_an_alias_names_the_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "AliasChain",
+        "ChainTarget::Run"
+    ));
+}
+
+#[test]
+fn local_class_in_a_member_function_sees_the_enclosing_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "Enclosing::Method",
+        "Enclosing::Nested::Run"
+    ));
+}
+
+#[test]
+fn local_class_prefers_the_function_class_over_the_namespace() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "lcns::Enclosing2::Method",
+        "lcns::Enclosing2::Nested::Run"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "lcns::Enclosing2::Method",
+        "lcns::Nested::Run"
+    ));
+}
+
+#[test]
+fn out_of_line_member_of_a_data_only_struct_keeps_its_methods() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "CConfig::CParser::Parse",
+        "HitTarget::Hit"
+    ));
+}

@@ -32,6 +32,7 @@ Do not chase STL noise (`std::string::c_str`, `parcel->WriteString`,
 | `using X::f;` member import | `using lib::bump;` introduces `bump(c)` into the candidate set of the bare name `bump` |
 | Header prototypes namespace-qualified | `lower_function_decl` now applies `qualify_decl` so header prototypes register under `ns::f`, not a bare name |
 | Namespace-relative bare call | bare `clamp()` inside `namespace a::b` finds `a::b::clamp` via enclosing-namespace walk |
+| Type names through enclosing scopes, `using` aliases, member classes (#90, #91, #92) | a local `Deep d;` inside `namespace a::b::c` is `a::b::Deep`; `using Alias = T;` is a typedef; hiview's 14 `AppEventHandler::PostEvent` overloads on member structs stay apart; camera direct edges 37,646 → 38,531 |
 | Conversion operators (`operator T()`) | indexed as `Cls::operator T` — declaration, in-class definition and out-of-class definition all merge, and the definition returns the type it converts to (#46) |
 | Members behind unknown attribute macros | a macro with no `#define` in the include path no longer supplies the name, whether it leads (`FFI_EXPORT T f()`, `MACRO operator ns::S()`), trails (`void C::M() OVERRIDE {}`) or flanks (`EXPORT_API int Get(long) GUARDED_BY(mu_)`) the declarator (#46) |
 | Members behind standard attributes | `[[deprecated]]`, `[[gnu::pure]]`, `__attribute__((pure))` no longer supply the name — camera's `CameraInput` had collapsed all 26 annotated members into one `CameraInput::deprecated` (#46) |
@@ -478,9 +479,8 @@ The receiver is now resolved through the **declared** `operator->`:
   wherever a head is looked up. `nullptr_t`, `intmax_t`, `uintmax_t`,
   `auto` and a literal argument are never qualified; `T*const` is the
   pointer argument `T*`, and every pointer level survives a qualifier
-  between levels. A C++11 `using Alias = T;` is not
-  lowered as a typedef yet; an argument spelled through one stays
-  unresolved.
+  between levels. An argument spelled through a C++11
+  `using Alias = T;` resolves as a typedef does (#91).
 - Class declarations and definitions are tracked separately from inferred
   type tags and travel through header merges. Merely mentioning an
   external type cannot enable the guess; a forward declaration of the

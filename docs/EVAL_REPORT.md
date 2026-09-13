@@ -15,6 +15,88 @@
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Re-verified 2026-09-13 (type-name lookup, #90 / #91 / #92):** fresh
+release builds of `master` (8175eea) and the branch were compared on the same
+machine against the three clean pinned checkouts under `/private/tmp/corpora`,
+`--jobs 8`, 800,000-pop budget. The branch index is bit-reproducible: on each
+corpus the SQLite dump (minus `analysis_run`) is byte-identical across three
+`--jobs 8` runs and one `--jobs 1` run. Eval 91/91 with the re-captured
+expectations; `master` passes 91/91 against the previous ones.
+
+| Metric | hdf `master` → branch | hiview `master` → branch | camera `master` → branch |
+|---|---:|---:|---:|
+| Functions defined | 10,246 → 10,251 | 7,783 → 7,821 | 19,020 → 19,120 |
+| Functions external | 2,378 → 2,349 | 3,191 → 3,126 | 5,352 → 5,185 |
+| Direct edges | 42,240 → 42,256 | 8,988 → 9,293 | 37,646 → 38,531 |
+| Indirect edges | 4,644 → 4,826 | 24 → 24 | 108 → 108 |
+| External edges | 28,794 → 28,735 | 20,003 → 19,968 | 53,177 → 53,000 |
+| Arg-flow edges | 65,988 → 66,267 | 9,973 → 10,125 | 24,489 → 24,933 |
+| Diagnostics | 1,803 → 1,803 | 2,989 → 2,989 | 4,860 → 4,860 |
+
+Every exact metric (files, diagnostics, IPC and dlsym edges, the hiview
+dispatch sets) is unchanged except hdf's indirect edges. Compared by caller,
+callee and resolution, hdf and hiview lose no direct or indirect edge.
+
+hdf gains 182 indirect edges because a body-less `struct Name *p` is looked up
+like any other type name: its C++ tests spell `struct IDevmgrService *svc`
+inside `namespace OHOS`, which used to declare a separate, empty
+`OHOS::IDevmgrService` and leave calls through its function-pointer table as
+external stubs (`OHOS::IDevSvcManager::AddService`). They reach the C struct
+now, and through it `DevmgrServiceAttachDevice`, `HdfKIoServiceDispatch`,
+`DeviceNodeExtPublishService` and the rest of the tables. hdf also gains 16
+direct edges, all in tests (`HdfSBufTest::SbufData` constructions, calls on an
+`HdfRemoteServiceHolder`), and hc-gen's `HeaderFile::HeaderFileSet::emplace`
+externals become `std::set::emplace` once the class-scope `using` resolves
+(two more become `std::unordered_set::emplace` through a function-local one).
+
+hiview gains 305 direct edges, 79 of them qualified constructor calls
+(`WatchPoint::Builder()`) that were externals named after the class. Of its 38
+new definitions, 13 are `AppEventHandler::PostEvent` overloads whose parameter
+types are member structs (`AppLaunchInfo`, `ScrollJankInfo`) that used to
+lower as unknown, folding the 14 source definitions into one. A nested
+builder's `return FreezeJsonException(*this);` used to reach the constructor
+only because the outer class was taken as the implicit `this`; it is a
+constructor call now.
+
+Camera gains 935 direct edges and loses 50, and the 50 are corrections.
+`encoder_->Start()` inside the member class
+`MovieFileVideoEncodedBufferProducer::EncoderWarp` bound by bare name to
+unrelated free `Start` / `Stop` / `SetCallback` / `Release` functions because
+the field's class was unknown, and is an external
+`MediaAVCodec::AVCodecVideoEncoder::Start` now. `DisplayRotationListener` and
+the fuzzer's `VideoProcess*Fuzz` classes are members of `HStreamOperator` and
+`VideoProcessCommandFuzzer`, so calls reach the nested classes' own overrides;
+those three overrides also join `Command::Do`'s dispatch sets
+(`GetCommandName` 31 → 34, `Executing` 30 → 33), the only site checks that
+move. Twenty more belong to member classes forward-declared in a header and
+defined out of line (`class HCameraHostManager::CameraHostInfo { ... }` in the
+`.cpp`): the definition is the declared class now, so its members carry the
+whole `OHOS::CameraStandard::` path and reach the class's own members instead
+of the outer class's or free `SetCallback` / `GetCameraAbility` functions.
+Camera's arg-flow rows reflect a constructor call's arguments binding past the
+implicit `this`: 85 rows that wired an argument into `this` are gone, 66 reach
+the constructor's own parameters, and every constructor path now shifts
+function arguments too, so lambdas passed to `new SimpleTimer(...)` reach its
+`fun` parameter.
+
+Timing, six interleaved runs of each binary, `--jobs 8`, medians:
+
+| Corpus | Wall `master` → branch | User CPU `master` → branch |
+|---|---:|---:|
+| hdf | 4.52 s → 4.59 s (+1.4%) | 9.75 s → 9.62 s (−1.3%) |
+| hiview | 1.67 s → 1.66 s (−0.6%) | 4.41 s → 4.46 s (+1.2%) |
+| camera | 6.74 s → 6.84 s (+1.5%) | 18.43 s → 18.73 s (+1.6%) |
+
+Wall time is within this machine's run-to-run noise; user CPU moves by −1% to
++2%. The lookup itself is not what costs: a build that runs the two most
+frequent new lookups (type names and bare calls) and discards their answers
+times the same as one that skips them, and the index phase is level (hdf
+5.55 s on both, `--jobs 1`). The cost is the solver working on what the
+lookups now resolve: on hdf, 171 more constraints, 257,571 pops against
+249,740, and 673k points-to facts against 653k at the first measurement of
+this branch. Switching member-class registration off alone removes about half
+of hdf's extra solver time.
+
 **Re-verified 2026-09-12 (`->` through an undeclared template wrapper, #86):**
 fresh release builds of `master` (769f2e8) and the branch were compared on
 the same machine against the three clean pinned checkouts under

@@ -458,6 +458,67 @@ C++-aware only where it must be — everything else reuses the C machinery.
   around each `compound_statement` in `walk_function_body`). Leaking them
   block-wide could let the overload ranking collapse away the correct
   in-scope edge, and is avoided.
+- **Type names** are looked up the way C++ looks them up, by one shared
+  walk (`find_in_scope`, #90): the class whose body or member is being
+  lowered and each class around it (a class local to a member function
+  also sees that function's class), then each enclosing namespace
+  innermost first, then the global scope. Locals, parameters, fields,
+  return types, template heads and arguments, bases, `new` and casts all
+  go through it (a C-style cast by the type it names, without its `*`), a
+  bare and a partially qualified spelling alike; a leading `::` asks the
+  global scope only, typedefs included; the innermost declaration shadows
+  an outer one. A typedef is found under its qualified name at
+  each level before the flat table of bare names is read, so two
+  namespaces declaring the same typedef name keep their own. Where nothing
+  is declared, the spelling qualifies to the innermost namespace as
+  before. The walk sees what the unit has declared so far; member function
+  bodies are lowered after the whole class body, so they see member types,
+  aliases and prototypes declared later in it, as C++'s complete-class
+  context does. A member function *defined* further down the class, with no
+  separate declaration, is not registered yet when an earlier body calls
+  it; registering a prototype for every in-class definition would fold
+  overloads together, since prototypes carry no parameter types. `using
+  namespace` directives are not searched (see the arrow section below).
+- **Type aliases**: `using Alias = T;` (#91) registers like
+  `typedef T Alias;`, pointer, array and function shapes included. An alias
+  template (`template<class T> using V = ...`) is not lowered. A typedef
+  or alias declared in a class body is a member of the class: it is
+  registered only as `Cls::Alias`, since classes routinely reuse alias
+  names (`Ptr`, `iterator`), and a class template's member alias is
+  reached through an instantiation (`Holder<int>::Ptr`), a template that
+  declares `operator->` included. A typedef or alias
+  declared in a function body is scoped to its block and never reaches the
+  unit's alias table; one declared in a class local to a function stays in
+  that class.
+- **Member classes** (#92): a class defined in another class's body is
+  `Outer::Inner`, with a layout of its own, and its members are lowered
+  under that tag rather than leaking into the outer class (a member walk
+  used to read `class It { int x; int Next(); };` as a function member of
+  the outer class named after its first field). Member class templates
+  are included. A struct C would also accept, nested only in such
+  structs (no `class` keyword, template, base, or member other than data
+  fields), keeps its namespace tag instead, because C gives a nested
+  struct file scope and a header shared by C and C++ units must name it
+  alike in both; its `Outer::Inner` spelling is registered as an alias of
+  that tag; a class nested in it still spells the whole path
+  (`Outer::Inner::Deep`). A body-less specifier follows the same rules: a
+  forward declaration in a class body (`struct Impl;`) declares the member
+  class, a reference inside another declaration (`struct Node *next;`,
+  `void f(struct Fwd *p)`) finds the class through the scope lookup and only
+  declares a new one in the innermost namespace when nothing is found, and an
+  out-of-line definition (`class Outer::Inner { ... }`) defines the class
+  its outer class declared (for a member a C-compatible struct declared,
+  the qualified spelling of its own, as before, so its methods stay with
+  their definitions). `T(args)` or `ns::T(args)` where `T` names a
+  class with a declared constructor, directly or through a function-local
+  alias, is a constructor call, its arguments
+  bound past the implicit `this`; inside a member class the outer class is
+  not the implicit `this`, and the name of a class whose body is still
+  being lowered constructs it even when its constructor is defined below
+  the call (the site resolves by name). A function of that name declared at
+  the same or a nearer scope hides the class, as in C++, and the call stays
+  a function call. Every constructor path binds all its arguments past
+  `this`, functions passed by name included.
 - **Overloads**: same-name entries are kept apart when **both** sides are C++
   and arity (or same-arity param types) differ (`add_function`;
   `externals_by_name` bucket). Signature comparison uses real types: at TU
@@ -586,9 +647,8 @@ C++-aware only where it must be — everything else reuses the C machinery.
   is looked up; `nullptr_t`, `intmax_t`, `uintmax_t`, `auto` and a literal
   (`4`, `true`) are never qualified; `T*const` is the pointer argument
   `T*`, and a pointer level survives a qualifier between levels
-  (`T * const *` is `T**`). A C++11 `using Alias = T;` is not
-  lowered as a typedef yet, so an argument spelled through one stays
-  unresolved. Class declarations and definitions are tracked in the
+  (`T * const *` is `T**`). An argument spelled through a C++11
+  `using Alias = T;` resolves as a typedef does. Class declarations and definitions are tracked in the
   type table (`declare_struct` / `define_struct`), travel with a header's
   types, and are what tells a forward-declared wrapper from a defined one.
   Only the terminal member call is
