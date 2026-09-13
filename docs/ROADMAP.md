@@ -86,7 +86,7 @@
 
 - `compile_commands.json` discovery (`build/` or target root) and explicit `--compile-commands PATH` flag (#62).
 - Bounded conditional exploration (`--explore` and `--explore-budget`) with GN define candidate harvesting (#59).
-- Programmatic C API library (`crates/trace-capi`, `libtrace_capi.{so,a}`) and header (`include/trace.h`) for indexing and querying analysis results (#40).
+- Programmatic C API library (`crates/trace-capi`, `libtrace_capi.{so,a}`) and header (`crates/trace-capi/include/trace.h`) for indexing and querying analysis results (#40).
 - Schema v4 export and diagnostics deduplication.
 
 ## In progress / next

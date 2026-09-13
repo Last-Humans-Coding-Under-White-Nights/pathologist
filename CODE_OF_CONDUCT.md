@@ -59,9 +59,9 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement by opening an
-issue on the repository issue tracker or contacting the project maintainers.
-All complaints will be reviewed and investigated promptly and fairly.
+reported privately to the project maintainers via email at
+`serzhdruzhok@gmail.com`. All complaints will be reviewed and investigated
+promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the
 reporter of any incident.

@@ -10,8 +10,8 @@ This file is for AI agents and human contributors working on the trace codebase.
 | `trace-preproc` | Custom C/C++ preprocessor (lexer, directives, LineMap, conditionals) |
 | `trace-parse` | File discovery, include graph, tree-sitter parse, AST → IR lowering, merge, compile commands |
 | `trace-analysis` | PAG construction, Andersen solver, call graph, arg flow, IPC bridges, function summaries |
-| `trace-db` | SQLite schema, migrations, and export (minimal/full/debug) |
-| `trace-capi` | C ABI wrapper library (`libtrace_capi`), C header (`trace.h`), FFI indexing and inspect API |
+| `trace-db` | SQLite schema and export (minimal/full/debug) |
+| `trace-capi` | C ABI wrapper library (`libtrace_capi`), C header (`crates/trace-capi/include/trace.h`), FFI indexing and inspect API |
 | `trace-cli` | CLI entry point (`analyze`, `inspect`, reporting examples) |
 
 ## Pipeline (do not reorder casually)
@@ -38,7 +38,7 @@ Each stage must remain independently testable.
 7. **IPC detection (see `docs/IPC_ROADMAP.md`)**: Proxy/stub pairs are detected from class-name suffixes (`*Proxy`/`*Client` and `*Stub`) + `SendRequest` call presence; bridges match by interface + method-name correspondence. Detection is **pure** (reads `&Program`, returns `Vec<IpcBridge>`, no `Program` mutation, no control-flow/opcode analysis) and runs during PAG build; the solver injects a synthetic `CallGraphEdge` per bridge (`call_site_id = SYNTHETIC_CALL_SITE`). Synthetic sites must never be indexed into `Program.symbols.call_sites`.
 8. **Dependency roots (`--dep <PATH>`)**: Dependency roots isolate external build dependencies from code under analysis. Sources under dependency roots never become translation units. Headers in dependency roots contribute declarations only: function bodies merge as declarations (`is_defined = false`) without local variables, call sites, flow constraints, or return flows. All symbols from dependency roots are marked `is_dep = true`.
 9. **Compilation databases (`--compile-commands`)**: Automatic discovery (`compile_commands.json` at target root or `build/`, or explicit flag). Commands provide per-TU include paths, macros, forced includes (`-include`), and language standards. CLI `--include` precedes compilation database `-I`, and CLI `-D` overrides database macros.
-10. **Determinism and bit-reproducibility**: The pipeline must produce identical SQLite exports across runs with identical inputs. Preprocessing cache discovery is serial to ensure deterministic header content. Deduplication at merge time selects the first-encountered definition. Solver iterations and PAG traversal order must remain deterministic.
+10. **Determinism and bit-reproducibility**: The pipeline must produce identical SQLite analysis data across runs with identical inputs (excluding run metadata such as `analysis_run.created_at`). Preprocessing cache discovery is serial to ensure deterministic header content. Deduplication at merge time selects the first-encountered definition. Solver iterations and PAG traversal order must remain deterministic.
 11. **PAG and Solver monotonic convergence**: The Andersen solver uses worklist-based propagation over PAG constraints. Parameter copy wiring and points-to sets must grow monotonically toward a fixpoint. No flow-sensitive or path-sensitive branching is permitted.
 
 ## IR flow constraints (`trace-ir/src/flow.rs`)
@@ -89,7 +89,7 @@ Return-value flow (`ReturnFlow` in `program.fn_returns`):
 
 ## Libc and external summaries
 
-Register external function summaries in `trace-analysis/src/summaries.rs` or function models in `trace-analysis/src/models.rs` (loaded via `--models <FILE>`). Document each summary's imprecision in `docs/ANALYSIS.md`.
+Register external function summaries and function models (`FnModelSet`, loaded via `--models <FILE>`) in `trace-analysis/src/summaries.rs`. Document each summary's imprecision in `docs/ANALYSIS.md`.
 
 ## Tests
 
@@ -132,12 +132,12 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 | Field summary / GEP fallback | `trace-analysis/src/pag.rs`, `solver.rs` |
 | New SQLite column | `trace-db/src/schema.rs`, `export.rs`, `docs/SQLITE_SCHEMA.md` |
 | Parse new C/C++ construct | `trace-parse/src/lower.rs` |
-| C++ virtual dispatch & hierarchy | `trace-ir/src/program.rs` (`inheritance`), `trace-analysis/src/pag.rs` (`resolve_virtual_call`) |
+| C++ virtual dispatch & hierarchy | `trace-ir/src/program.rs` (`inheritance`), `trace-parse/src/lower.rs` (`expand_virtual_overrides`) |
 | C++ smart pointer unwrapping | `trace-parse/src/lower.rs` (`ArrowReturn`), `symbol.rs` |
-| C API functions / FFI bindings | `crates/trace-capi/src/`, `include/trace.h`, `docs/CAPI.md` |
-| Dependency roots (`--dep`) | `trace-parse/src/configured.rs`, `merge.rs`, `trace-cli/src/inspect.rs` |
+| C API functions / FFI bindings | `crates/trace-capi/src/`, `crates/trace-capi/include/trace.h`, `docs/CAPI.md` |
+| Dependency roots (`--dep`) | `trace-parse/src/configured.rs`, `merge.rs`, `trace-db/src/inspect.rs`, `trace-cli/src/main.rs` |
 | Measure what the configuration excludes (`#if` arms not taken) | `PreprocessOptions::record_conditionals` + `PreprocessResult::conditionals` (`trace-preproc/src/conditionals.rs`), `trace-cli/examples/conditional_coverage.rs`, `scripts/gen_conditional_coverage_report.py` → `docs/CONDITIONAL_COVERAGE.md` |
 | Bounded conditional-variant exploration (`--explore`) | `PreprocessOptions::explore` + `explore_budget`, `trace-parse/src/explore.rs`, `gn_defines.rs`, `merge_unit_variants`, `lower.rs` → `docs/ANALYSIS.md` |
 | Compilation database (`--compile-commands`) | `trace-parse/src/compile_commands.rs`, `configured.rs`, `merge_unit_variants` → `docs/ANALYSIS.md` |
-| Function models / summaries | `trace-analysis/src/summaries.rs`, `models.rs` (`--models`) → `docs/ANALYSIS.md` |
+| Function models / summaries | `trace-analysis/src/summaries.rs` (`FnModelSet`, `--models`) → `docs/ANALYSIS.md` |
 | Builtin fallback macros | `trace-preproc/src/preprocessor.rs`, `tests/fixtures/builtin_macros/` → `docs/PREPROCESSOR.md` |

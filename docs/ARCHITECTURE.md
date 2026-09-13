@@ -37,7 +37,7 @@ flowchart LR
 | Analyze | `trace-analysis` | `Program` | `Pag` + `AnalysisResult` |
 | Export | `trace-db` | Program + analysis | SQLite v4 |
 
-The pipeline is also exposed programmatically via `trace-capi` (`libtrace_capi`), providing a C ABI (`include/trace.h`) for indexing and database inspection.
+The pipeline is also exposed programmatically via `trace-capi` (`libtrace_capi`), providing a C ABI (`crates/trace-capi/include/trace.h`) for indexing and database inspection.
 
 ## Translation units and headers
 
@@ -152,10 +152,10 @@ Spans are resolved through the preprocessor `LineMap`: **all** entities use orig
 | New C/C++ construct / flow fact | `trace-parse/src/lower.rs`, `trace-ir/src/flow.rs` |
 | New PAG constraint | `ConstraintKind` in `trace-analysis`, handler in `pag.rs` + `solver.rs` |
 | Return / call semantics | `ReturnFlow`, `CallReturn`, `pag.expand_return_flows` |
-| Libc summary / function model | `trace-analysis/src/summaries.rs`, `models.rs` |
+| Libc summary / function model | `trace-analysis/src/summaries.rs` |
 | SQLite column/table | `trace-db/src/schema.rs`, `export.rs`, `docs/SQLITE_SCHEMA.md` |
-| C API functions / FFI exports | `crates/trace-capi/src/`, `include/trace.h`, `docs/CAPI.md` |
+| C API functions / FFI exports | `crates/trace-capi/src/`, `crates/trace-capi/include/trace.h`, `docs/CAPI.md` |
 | Compilation database support | `trace-parse/src/compile_commands.rs`, `configured.rs` |
-| Dependency root handling | `trace-parse/src/lib.rs`, `configured.rs`, `merge.rs` |
+| Dependency root handling | `trace-parse/src/lib.rs`, `configured.rs`, `merge.rs`, `trace-db/src/inspect.rs` |
 
 See [ANALYSIS.md](ANALYSIS.md) for algorithm details and [AGENTS.md](../AGENTS.md) for contributor invariants.
