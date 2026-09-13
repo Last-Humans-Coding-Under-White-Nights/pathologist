@@ -2,19 +2,24 @@
 
 # trace
 
-**trace** is a static analysis tool for C codebases. It runs a custom preprocessor, parses translation units with [tree-sitter](https://tree-sitter.github.io/), performs Andersen-style field-sensitive pointer analysis, and exports call graphs and interprocedural argument-flow facts to SQLite.
+**trace** is a static analysis tool for C and C++ codebases. It runs a custom preprocessor, parses translation units with [tree-sitter](https://tree-sitter.github.io/), performs Andersen-style field-sensitive pointer analysis, and exports call graphs and interprocedural argument-flow facts to SQLite.
 
 Typical uses:
 
 - Find **direct and indirect** call targets (function pointers, vtables, struct op tables).
 - Trace **argument flow** from call-site actuals to callee formals.
-- Query results with **`trace inspect`** or ad-hoc SQL.
+- Query results with **`trace inspect`**, ad-hoc SQL, or programmatic C API (**`trace-capi`**).
 
 ## Build
 
 ```bash
+# Build CLI binary
 cargo build --release
 # binary: target/release/trace
+
+# Or build C API library (staticlib and cdylib)
+cargo build -p trace-capi --release
+# library: target/release/libtrace_capi.{so,dylib,dll,a}
 ```
 
 Run the workspace test suite:
@@ -687,24 +692,26 @@ tests/fixtures/    Integration test C corpora
 - **Preprocessor subset** — not gcc/clang compatible for all extensions, and no compiler is impersonated (`__GNUC__` / `__clang__` stay undefined; only the language's own `__cplusplus` / `__STDC__` / `__STDC_VERSION__` are predefined); see [docs/PREPROCESSOR.md](docs/PREPROCESSOR.md).
 - **Build environment** — compilation databases locate existing files; they do not supply missing SDK, standard-library or generated headers. Supply additional roots with `--dep` / `--include` as needed. Compiler-specific target builtins and response files are not modeled.
 - **Configuration coverage** — without database entries or `--explore`, indexing uses one inferred configuration. A name no `-D` or reached `#define` binds resolves to `0` in `#if`; the default exclusions are measured in [docs/CONDITIONAL_COVERAGE.md](docs/CONDITIONAL_COVERAGE.md). Explicit database commands are all merged; exploratory configurations remain bounded by `--explore-budget`.
-- **Line numbers** — refer to preprocessed TUs; map back to original sources manually when needed.
+- **Original line attribution** — entities attribute to original source files on disk via the preprocessor's `LineMap` (call sites inside macro expansions attribute to the expansion site's origin; headers are deduplicated across translation units).
 
 ## Further reading
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Analysis algorithm](docs/ANALYSIS.md)
 - [Preprocessor spec](docs/PREPROCESSOR.md)
+- [C API (`trace-capi`)](docs/CAPI.md)
 - [Conditional-compilation coverage (eval corpora)](docs/CONDITIONAL_COVERAGE.md)
 - [SQLite schema (detailed)](docs/SQLITE_SCHEMA.md)
 - [Roadmap](docs/ROADMAP.md)
 - [C++ next slices (hiview)](docs/CPP_ROADMAP.md)
 - [Contributing](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
 - [Agent guide](AGENTS.md)
 - [License](LICENSE)
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, and pull-request guidelines.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, and pull-request guidelines, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for our community standards.
 
 ## License
 
