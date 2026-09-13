@@ -56,6 +56,37 @@ pub struct Function {
     /// when a later overload is compared against it. This field carries the
     /// remapped types so the gate still separates `f(int)` from `f(double)`.
     pub param_type_ids: Vec<TypeId>,
+    /// Parameters the declaration lists, not counting a member's implicit
+    /// `this`; `None` where no declaration was read (synthesized entries).
+    /// An in-class prototype carries no parameter variables, so this is the
+    /// only record of which overload it declares: without it `Get()` and
+    /// `Get(Mode&)` folded into one entry, and merged into whichever same-named
+    /// definition came first. It is compared only where a parameterless entry
+    /// would otherwise match any arity, and only between two C++ entries.
+    pub explicit_arity: Option<u32>,
+    /// A definition written under a qualifier its unit does not know as a
+    /// class (`void Remote::Shared(Callback cb) {}` with the class header
+    /// unresolved), and so lowered without `this`. Only such a body can be
+    /// the member an in-class prototype declares; a function defined inside a
+    /// `namespace` block is spelled unqualified and never is one.
+    pub owner_unresolved: bool,
+    /// The parameter list ends in `...` or a parameter pack: a call may pass
+    /// more arguments than `explicit_arity`.
+    pub variadic: bool,
+    /// A constructor declared `= default` or `= delete` in its class body. It
+    /// is not user-provided, so the class is still an aggregate (C++17) and
+    /// braces initialize its fields rather than call it.
+    pub defaulted_in_class: bool,
+    /// Declared in its class body: a member, whatever its parameter list
+    /// shows. An in-class prototype lowers no parameter variables, so this is
+    /// the only record that a parameterless entry is a member rather than a
+    /// namespace function of the same qualified name.
+    pub declared_in_class: bool,
+    /// How many of those parameters declare a default argument, so a call
+    /// may pass `explicit_arity - default_args` up to `explicit_arity`
+    /// arguments. C++ puts the defaults on the first declaration, so a merge
+    /// keeps the larger count.
+    pub default_args: u32,
     /// Declared `virtual` (C++ methods). Virtual dispatch expansion treats a
     /// method as virtual if *any* entry with its qualified name carries this
     /// flag, so out-of-class definitions without the token still participate.
@@ -89,6 +120,11 @@ pub struct CallSite {
     /// alias effects must not treat them as whole-object copies (copying
     /// the containing object would pollute unrelated fields).
     pub addr_of_member_args: Vec<u32>,
+    /// The argument positions count the callee's implicit `this`: explicit
+    /// arguments start at 1. Lowering sets it wherever it knows the callee is
+    /// a member; after the merge, a site whose callee takes `this` without
+    /// it is bound there (a callee whose class its unit never saw).
+    pub args_bound_past_this: bool,
     pub span: Span,
     pub is_direct: bool,
     /// Static class of a C++ member-call receiver (`this`, typed pointer).
@@ -98,6 +134,34 @@ pub struct CallSite {
     /// LHS of `dst = callee(...)` when the call's value is used (`CallReturn`
     /// destination). `dlsym` models write function addresses here.
     pub return_dst: Option<VarId>,
+}
+
+impl CallSite {
+    /// Whether the site denotes a direct call recoverable by name: lowering
+    /// recorded no callee variable and the callee text is no field or arrow
+    /// expression. Cross-TU calls satisfy this: lowering marks them indirect
+    /// only because the definition was not visible in the translation unit.
+    pub fn resolves_by_name(&self) -> bool {
+        self.callee_var.is_none()
+            && !self.callee_name.contains("->")
+            && !self.callee_name.contains('.')
+    }
+}
+
+/// Whether merging `a` and `b` joins a member's in-class prototype with a
+/// definition lowered without its `this`: a body defined under a qualifier its
+/// unit did not know (`owner_unresolved`). The prototype says it is a member
+/// (`declared_in_class`), with any number of parameters; a namespace function
+/// defined out of line, `void util::Init() {}`, joins a prototype declared in
+/// the namespace and never is.
+fn joins_member_missing_this(a: &Function, b: &Function) -> bool {
+    let (prototype, body) = if a.is_defined { (b, a) } else { (a, b) };
+    prototype.is_cpp
+        && body.is_cpp
+        && !prototype.is_defined
+        && prototype.declared_in_class
+        && body.is_defined
+        && body.owner_unresolved
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +218,11 @@ pub struct SymbolTable {
     /// `FnId -> slot in functions`. Ids are not dense (merged duplicates and
     /// superseded rows leave gaps), so lookups need this index to stay O(1).
     fn_slots: FxHashMap<FnId, u32>,
+    /// Member definitions whose parameter list lacks the implicit `this`: a
+    /// body lowered in a unit that never saw its class (the header include
+    /// unresolved) merged with the class's in-class prototype. Recorded at
+    /// that merge, the only point where both halves are in view.
+    members_missing_this: std::collections::BTreeSet<FnId>,
     next_fn: u32,
     next_var: u32,
     next_call: u32,
@@ -346,9 +415,26 @@ impl SymbolTable {
                             // Pure C: prototype + definition always collapse.
                             return true;
                         }
-                        let arity_ok = existing.params.is_empty()
-                            || func.params.is_empty()
-                            || existing.params.len() == func.params.len();
+                        // `f(T*&)` and `f(T*&, Args&...)` declare the same
+                        // explicit arity and are still two overloads.
+                        let variadic_ok = !both_cpp || existing.variadic == func.variadic;
+                        let arity_ok = variadic_ok
+                            && if existing.params.is_empty() || func.params.is_empty() {
+                                // A parameterless side matches any list, except
+                                // that two C++ declarations of different arity
+                                // are overloads: an in-class prototype lowers no
+                                // parameter variables, and `Get()` swallowed
+                                // `Get(Mode&)` and its definition's callers. The
+                                // counts exclude `this`, so a body lowered
+                                // without its class in view still merges.
+                                !both_cpp
+                                    || existing
+                                        .explicit_arity
+                                        .zip(func.explicit_arity)
+                                        .is_none_or(|(a, b)| a == b)
+                            } else {
+                                existing.params.len() == func.params.len()
+                            };
                         if !both_cpp && !require_types {
                             // Header parsed as C++ vs `.c` body: merge by
                             // arity and ignore param-type mismatch (typedef
@@ -442,9 +528,12 @@ impl SymbolTable {
                         .find(|&id| mixed_language(id) && compatible(id, false))
                 });
             if let Some(existing_id) = matched_id {
+                let mut missing_this = false;
                 if let Some(existing) = self.function_mut_by_id(existing_id) {
+                    missing_this = joins_member_missing_this(existing, &func);
                     if func.is_defined {
                         existing.is_defined = true;
+                        existing.owner_unresolved = func.owner_unresolved;
                         existing.file = func.file;
                         existing.span = func.span;
                         existing.end_line = func.end_line;
@@ -465,6 +554,14 @@ impl SymbolTable {
                             .map(<[TypeId]>::to_vec)
                             .unwrap_or_else(|| func.param_type_ids.clone());
                     }
+                    if existing.explicit_arity.is_none() {
+                        existing.explicit_arity = func.explicit_arity;
+                    }
+                    existing.variadic |= func.variadic;
+                    existing.declared_in_class |= func.declared_in_class;
+                    // User-provided once any declaration of it is.
+                    existing.defaulted_in_class &= func.defaulted_in_class;
+                    existing.default_args = existing.default_args.max(func.default_args);
                     if func.is_virtual {
                         existing.is_virtual = true;
                     }
@@ -481,6 +578,9 @@ impl SymbolTable {
                     if func.is_defined {
                         existing.is_cpp = existing.is_cpp && func.is_cpp;
                     }
+                }
+                if missing_this {
+                    self.members_missing_this.insert(existing_id);
                 }
                 let bucket = self.externals_by_name.entry(func.name.clone()).or_default();
                 if !bucket.contains(&existing_id) {
@@ -730,6 +830,31 @@ impl SymbolTable {
         None
     }
 
+    /// Take the member definitions whose parameters lack the implicit `this`
+    /// (see `members_missing_this`), leaving none recorded.
+    pub fn take_members_missing_this(&mut self) -> std::collections::BTreeSet<FnId> {
+        std::mem::take(&mut self.members_missing_this)
+    }
+
+    /// The functions a call site reaches without points-to, in the merged
+    /// program: the callee lowering bound, else its name resolved scope-first
+    /// for a direct site, or over every candidate for a site recovered by
+    /// name. The solver wires exactly these, so anything that has to agree
+    /// with its wiring asks here.
+    pub fn callees_of(&self, cs: &CallSite) -> Vec<FnId> {
+        if let Some(fid) = cs.callee_fn_id {
+            vec![fid]
+        } else if cs.is_direct {
+            self.resolve_function_in_scope(&cs.callee_name, Some(cs.span.file))
+                .into_iter()
+                .collect()
+        } else if cs.resolves_by_name() {
+            self.resolve_function_candidates(&cs.callee_name, Some(cs.span.file))
+        } else {
+            Vec::new()
+        }
+    }
+
     /// All functions a post-merge name lookup may refer to.
     ///
     /// Name-based facts (`CallReturn`, `ReturnFlow::Call`, recovered direct
@@ -878,6 +1003,30 @@ mod tests {
     use super::*;
     use crate::{Program, TypeDesc};
 
+    #[test]
+    fn resolves_by_name_classifies_plain_identifiers() {
+        let mk = |callee_name: &str, callee_var: Option<u32>, is_direct: bool| CallSite {
+            id: crate::CallSiteId(0),
+            caller: FnId(0),
+            callee_name: callee_name.into(),
+            callee_var: callee_var.map(VarId),
+            callee_fn_id: None,
+            var_args: Vec::new(),
+            fn_args: Vec::new(),
+            addr_of_member_args: Vec::new(),
+            args_bound_past_this: false,
+            span: Span::new(FileId(0), 1, 1),
+            is_direct,
+            receiver_class: None,
+            return_dst: None,
+        };
+        assert!(mk("OsalMemCalloc", None, false).resolves_by_name());
+        assert!(mk("f", None, true).resolves_by_name());
+        assert!(!mk("ops->Dispatch", None, false).resolves_by_name());
+        assert!(!mk("obj.fn", None, false).resolves_by_name());
+        assert!(!mk("fp", Some(3), false).resolves_by_name());
+    }
+
     fn fake_function(
         id: FnId,
         name: &str,
@@ -899,6 +1048,12 @@ mod tests {
             file,
             is_defined,
             param_type_ids: Vec::new(),
+            explicit_arity: None,
+            default_args: 0,
+            owner_unresolved: false,
+            variadic: false,
+            defaulted_in_class: false,
+            declared_in_class: false,
             is_virtual: false,
             is_final: false,
             is_cpp,

@@ -259,6 +259,55 @@ only HDF and Camera diagnostic totals decrease after normalization.
   the timings above.
 
 ### Fixed
+- `T w(member_);` inside a method defines an object, so every `std::lock_guard<std::mutex>
+  lock(mutex_)` / `std::unique_lock` of a data member constructs instead of declaring a phantom
+  function `lock` (camera: 194 phantom `lock` functions gone, 1,181 `std::lock_guard` constructor
+  calls recorded), and `T *p(buf);` initializes a pointer. A parameterless member defined in a unit
+  that never saw its class also gets its `this`, recognised by an in-class declaration flag, which
+  keeps out-of-line namespace functions (`void util::Init() {}`) out. Variadic candidates are
+  pruned only when every argument's type is known and a fixed candidate can take them (a
+  floating-point value binds no pointer), and default arguments are shared only between overloads
+  of loosely the same signature. Expectations re-captured; see `docs/EVAL_REPORT.md`.
+- Overload filtering keeps a variadic candidate (`f(void*, ...)`, a parameter pack) for more arguments
+  than it declares, ranked below any fixed candidate that can take the call, and a variadic declaration
+  no longer merges with a fixed one of the same explicit arity; a class whose constructors are all
+  `= default` / `= delete` in its body is an aggregate, so `A a{f};` initializes its fields; and
+  `T w(Name);` stays a function declaration when `Name` is a type nearer than a variable of that name.
+  camera: `CameraNapiParamParser::Next(T&, Args&...)` is its own overload, and two `Stitching*Info{...}`
+  aggregate initializations stop calling the defaulted constructor (direct edges 39,265 → 39,263).
+- C++ overloads a caller sees only as in-class prototypes resolve to the overload the arguments fit.
+  A prototype lowered no parameters, so `Get()` and `Get(Mode&)` folded into one entry, the call
+  bound to it, and the entry merged into whichever same-named definition came first: camera's
+  `captureSession_->GetExposureMode(mode)` reached `GetExposureMode()`, and
+  `ListenerBase::ExecuteCallback(name, para)` an unrelated variadic template body of the same
+  qualified name. Every declaration records its explicit arity and default-argument count
+  (`Function::explicit_arity`, `default_args`); a parameterless C++ entry merges only with a
+  same-arity one, and calls filter candidates by the arity range, taking the defaults a same-arity
+  candidate declares. A `static` member defined in its class body has external linkage: read as
+  internal, a static member template's body was dropped as its prototype's duplicate
+  (functions_defined camera 19,120 → 19,172). `T w(a, b);` whose parenthesized names are variables
+  or functions defines an object and calls its constructor instead of declaring a phantom function
+  `w` (`FuzzedDataProvider fdp(data, size)`, `CameraNapiParamParser jsParamParser(env, info, ...)`),
+  and `T w{a};` calls the constructor a class declares. No call site loses every edge; camera direct
+  edges 38,531 → 39,265 and arg-flow 24,357 → 29,050, while its indirect edges 182 → 135 are 47 calls
+  to the phantom `fdp`. Expectations re-captured; see `docs/EVAL_REPORT.md`.
+- Arguments of a call to a member function bind to its own parameters, past the implicit `this`
+  (#93, #94). A call site's argument positions are the callee's parameter positions, and a member
+  function's parameter 0 is `this`, but method calls (`recv.m(a)`, `p->m(a)`, implicit `m(a)` and
+  `this->m(a)`, functors `obj(a)` / `h.field(a)`) and constructor member-initializer lists
+  (`Base(a)`, `m_(a)`) recorded their first argument at position 0: it was wired into `this`, the
+  method's own parameters received nothing, and calls made through them were missing from the call
+  graph. They bind from position 1 now, as `new T(...)` and `T(...)` already did after #97, and so
+  do qualified calls reaching a member (`Base::m(a)`, `Cls::Static(a)`), which also count and rank
+  overloads without `this`. A qualified member call in a unit whose class header include is unresolved
+  is bound after the merge, once its name resolves to the member. A member defined out of line in a unit
+  whose class header include is unresolved gets its `this` after merging with the class's prototype, and
+  the calls bound to it before the merge are bound past it; a function defined inside a namespace block
+  is never taken for a member of a same-named class. A braced member initializer (`Base{a}`, `m_{a}`) passes its arguments
+  as well; it used to construct with none. hiview indirect edges 24 → 88 and camera 108 → 182, all
+  lambdas handed to a method that calls its parameter; no call edge is lost in any corpus, and the
+  arg-flow rows that bound an explicit argument to `this` are gone (hdf 66,267 → 66,239, hiview
+  10,125 → 10,119, camera 24,933 → 24,357). Expectations re-captured; see `docs/EVAL_REPORT.md`.
 - Type names are looked up through the enclosing scopes (#90, #91, #92). A local, parameter, field,
   return type, base, `new` or cast spelled with the bare or partially qualified name of a class from
   an enclosing namespace lowered as an unknown type, because only the innermost namespace was tried;

@@ -179,7 +179,7 @@ Because header-defined functions are deduplicated to their header origin at merg
 
 **Cross-TU direct-call recovery**
 
-A plain call whose definition lives in another TU is lowered with `is_direct = false` (the callee symbol is not visible in the calling TU). At solve time, sites that are *not* direct, have no `callee_var`, and whose callee text is a bare identifier are recovered as direct-by-name calls via `direct_by_name`, expanding **all** `resolve_function_candidates` (may-approximation — see `CallReturn` above). Without this, every cross-TU call to a function declared through a pointer-returning prototype (e.g. `T *f(void);`) would be dropped, because such prototypes previously also produced phantom variables — lowering now registers functions for pointer-wrapped declarators instead.
+A plain call whose definition lives in another TU is lowered with `is_direct = false` (the callee symbol is not visible in the calling TU). At solve time, sites that are *not* direct, have no `callee_var`, and whose callee text is a bare identifier are recovered as direct-by-name calls via `CallSite::resolves_by_name`, expanding **all** `resolve_function_candidates` (may-approximation — see `CallReturn` above). Without this, every cross-TU call to a function declared through a pointer-returning prototype (e.g. `T *f(void);`) would be dropped, because such prototypes previously also produced phantom variables — lowering now registers functions for pointer-wrapped declarators instead.
 
 ### Analyze options
 
@@ -302,7 +302,7 @@ After fixpoint, `extract_arg_flow` records:
 (call_site, arg_index, actual_var?, actual_fn?, formal_var)
 ```
 
-Exactly one of `actual_var` or `actual_fn` is set per row. Only arguments that resolve to IR variables or function refs at the call site participate.
+Exactly one of `actual_var` or `actual_fn` is set per row. Only arguments that resolve to IR variables or function refs at the call site participate. `arg_index` is the callee's parameter position: for a C++ member function position 0 is the implicit `this`, and the first explicit argument is at 1.
 
 Return-value flow affects **points-to** (what a call expression assigns), not arg-flow formals.
 
@@ -518,7 +518,8 @@ C++-aware only where it must be — everything else reuses the C machinery.
   the call (the site resolves by name). A function of that name declared at
   the same or a nearer scope hides the class, as in C++, and the call stays
   a function call. Every constructor path binds all its arguments past
-  `this`, functions passed by name included.
+  `this`, functions passed by name included — member initializer lists
+  too (see **Methods** below).
 - **Overloads**: same-name entries are kept apart when **both** sides are C++
   and arity (or same-arity param types) differ (`add_function`;
   `externals_by_name` bucket). Signature comparison uses real types: at TU
@@ -534,6 +535,37 @@ C++-aware only where it must be — everything else reuses the C machinery.
   otherwise callers bind to the undefined prototype (HDF `GpioSetIrq` /
   `gpio->func`). Calls resolve over the candidate set filtered by argument
   count; an empty arity-filtered set falls back to all candidates (varargs).
+  The count a call must fit is a range: every declaration records its
+  **explicit arity** (`Function::explicit_arity`, parameters without `this`)
+  and how many parameters carry a default (`default_args`), and a call
+  passing `n` arguments fits `arity - defaults <= n <= arity`, or any
+  `n >= arity - defaults` when the list ends in `...` or a parameter pack
+  (`Function::variadic`). As in C++, a variadic candidate ranks below any fixed
+  candidate that can take the arguments, so it is dropped only when a fixed one
+  confidently can: every argument's type is known, no pointer binds an
+  arithmetic parameter and no floating-point value binds a pointer.
+  `Log(p, p)` reaches `Log(void*, ...)` beside `Log(int, int)`, `Show(2.5)`
+  reaches `Show(double, ...)` beside `Show(const char*)`, and
+  `Notify("ready", 1)` keeps `Notify(const char*, int)` over
+  `Notify(const char*, ...)`; an argument of unknown type keeps both. A variadic and a fixed declaration of
+  one explicit arity are two overloads and never merge (`Next(T&)` beside
+  `Next(T&, Args&...)`). C++ writes
+  defaults on the declaration, so a candidate also takes the defaults of a
+  same-arity candidate of loosely the same signature (parameter types equal up
+  to class qualification, an unresolved type name lowering as `int` matching
+  a class): a definition the index could not reunite with its prototype
+  (`string` beside `std::string`) still accepts `TrimStr(s)`, while
+  `Format(cb, cb)` does not borrow `Format(int, int = 0)`'s default.
+  An in-class prototype lowers no parameter variables, and a parameterless
+  entry used to merge with a definition of any arity; between two C++
+  entries the explicit arities must now agree, so `Get()` and `Get(Mode&)`
+  stay two entries wherever only their class header is seen, and neither
+  merges into an unrelated same-named body of another arity. Explicit arity
+  excludes `this`, so a body lowered without its class in view (its header
+  not found) still merges with its prototype.
+  A member function reached by its qualified name (`Base::m(a)`,
+  `Cls::Static(a)`) is counted and ranked without its implicit `this`, so
+  `Base::m(cb, 1)` picks `m(Callback, int)` rather than `m(int)`.
   Ties emit one direct site per candidate. Same-arity C++ overloads
   additionally rank by **static argument type**: `CallArgs.arg_desc`
   carries each argument's `TypeDesc` (casts unwrapped, numeric literal
@@ -554,8 +586,10 @@ C++-aware only where it must be — everything else reuses the C machinery.
   Expansion runs again **after TU merge** so overrides declared later in the
   same file or in other TUs are included. Downward expansion is rooted at the
   **static receiver type**. Targets are filtered by **explicit arity**
-  (`params` minus implicit `this`; empty parameter lists stay, and an empty
-  filtered set falls back to all candidates so varargs still resolve). A
+  (`params` minus implicit `this`, or the arity a parameterless prototype
+  declared, within its default arguments; an entry recording neither stays,
+  and an empty filtered set falls back to all candidates so varargs still
+  resolve). A
   `final` class, or a method declared `final`,
   cuts off further subclasses (devirtualization). C++ `struct` inheritance
   and **virtual bases** (`class D : virtual B`) are recorded the same way as
@@ -666,7 +700,46 @@ C++-aware only where it must be — everything else reuses the C machinery.
   field-load path.
 - **Methods**: out-of-class definitions (`Ret Cls::m()`) merge with their
   in-class prototypes. An implicit `this` parameter (`Ptr(Struct{Cls})`,
-  param index 0) is prepended. `virtual` flags survive merges.
+  param index 0) is prepended to every member definition, static members
+  included; in-class prototypes carry no parameters, only their declared
+  arity, and take their definition's list at merge. `static` on a member
+  defined in its class body makes a static member with external linkage,
+  not an internal function: read as internal, a static member template's
+  body never merged with its prototype on the same line and was dropped. `virtual` flags survive merges. A call site's
+  argument positions are the callee's parameter positions, so every call to
+  a member function binds its explicit arguments from position 1, past
+  `this` (#93, #94): `recv.m(a)`, `p->m(a)`, implicit `m(a)` and
+  `this->m(a)`, `Base::m(a)` and `Cls::Static(a)`, functors (`obj(a)`,
+  `h.field(a)`), constructions (`new T(a)`, `T x(a, b)`, `T(a)`) and
+  member initializer lists (`Base(a)`, `m_(a)`, `Base{a}`, `m_{a}`). Only a
+  construction binds anything to `this` — the object it constructs (a
+  declared local or the `new` allocation); a method call's receiver is not
+  bound. Every site records whether its positions count `this`
+  (`CallSite::args_bound_past_this`). A unit that never saw a class cannot
+  tell its members from free functions, so two cases are finished after the
+  merge, in order:
+  - A member *defined* in such a unit (its header include unresolved) lowers
+    without `this` yet merges with the in-class prototype, whose explicit
+    arity agrees; a parameterless one (`void Remote::Reset() {}`) too. The
+    prototype is known to be a member by where it was declared
+    (`Function::declared_in_class`), which is also what makes a parameterless
+    entry a member for `is_member_function`, so a namespace function defined
+    out of line (`void util::Init() {}`) never takes `this`. A body qualifies only when it was written under a qualifier
+    its unit did not know (`Function::owner_unresolved`: out-of-line
+    `void Remote::Shared(Callback cb) {}`); a function defined inside a
+    `namespace` block never does, so an unrelated program's namespace of the
+    same name as a class (hiview's `TimeUtil`), even one declaring the same
+    member, is left alone. The merge records the pairing
+    (`SymbolTable::members_missing_this`) and `add_missing_this_params`
+    prepends `this`, taking the class from the prototype's name.
+  - `bind_calls_past_this` then binds every site whose callee takes `this`
+    but whose arguments were not bound: a qualified call whose unit never
+    saw the class, resolved by name (`SymbolTable::callees_of`, the solver's
+    own rule), and a call beside a definition that has just gained its
+    `this`.
+
+  Before this, the first argument of a method call landed on `this`,
+  so a callback or pointer handed to a method never reached its parameter.
 - **Conversion operators**: `operator T()` is a member named
   `Cls::operator T`, spelled from its `operator_cast` declarator: the name
   runs to the declarator's own parameter list, so the target type keeps its
@@ -751,7 +824,26 @@ C++-aware only where it must be — everything else reuses the C machinery.
   `A` three levels down).
 - **Ctors / dtors**: emitted for `new Cls(...)`, destructor calls on
   `delete p`, explicit qualified dtor calls, constructor-declarations with
-  an argument list, ctor-initializer lists (base + member targets).
+  an argument list, ctor-initializer lists (base + member targets, with
+  parentheses or braces). `Cls o{a};` is a constructor call when the class
+  declares a user-provided constructor; without one the braces initialize an
+  aggregate's fields. A constructor declared `= default` or `= delete` in its
+  class body is not user-provided (`Function::defaulted_in_class`), so
+  `struct A { A() = default; Callback cb; }; A a{f};` still initializes `cb`
+  (C++17). `Cls o(a, b);` whose parenthesized names are all variables or
+  functions in scope defines an object even though tree-sitter parses it as
+  a function declaration, as C++ does when the names are not types (a data
+  member of the enclosing class is a value too: `std::lock_guard<std::mutex>
+  lock(mutex_);` constructs, its member argument recorded without an actual,
+  as a literal's is; so does a pointer, `T *p(buf);`); it
+  used to register a phantom function `o`, so `o.m()` became an indirect
+  call to it. Inside a function body such a declaration lowers as the local
+  and its constructor call, or for a non-class type as `o` initialized
+  from its one argument. `Cls o();` and `Cls f(Type);` stay declarations, and
+  so does `Cls f(Name);` when `Name` is a type nearer than a variable of that
+  name: a function-local alias, or a class or typedef of an enclosing class or
+  namespace (`using Value = int;` hides a global `int Value`). A local
+  variable is nearest.
 - **References** lower as pointers (aliasing stores land on caller memory).
 - **Templates**: lowered once per primary name; `<...>` arguments stripped.
 

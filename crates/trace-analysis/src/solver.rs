@@ -240,14 +240,6 @@ impl SolverState {
     }
 }
 
-/// A call site denotes a recoverable direct call when lowering recorded no
-/// callee variable (`callee_var`) and the callee text is a plain identifier.
-/// Cross-TU calls satisfy this: lowering marks them indirect only because the
-/// definition was not visible in the translation unit.
-fn direct_by_name(cs: &trace_ir::CallSite) -> bool {
-    cs.callee_var.is_none() && !cs.callee_name.contains("->") && !cs.callee_name.contains('.')
-}
-
 fn st_pts_stats_max(pts: &IndexMap<PagNodeId, FxHashSet<LocId>>) -> usize {
     pts.values().map(|s| s.len()).max().unwrap_or(0)
 }
@@ -377,22 +369,7 @@ fn solve(
         // sites resolve by name as before. Any callee without a definition
         // under the analyzed root (prototype-only or synthesized) yields an
         // External edge and no param wiring — there is no body to wire into.
-        let callees: Vec<FnId> = if let Some(fid) = cs.callee_fn_id {
-            vec![fid]
-        } else if cs.is_direct {
-            program
-                .symbols
-                .resolve_function_in_scope(&cs.callee_name, Some(cs.span.file))
-                .into_iter()
-                .collect()
-        } else if direct_by_name(cs) {
-            program
-                .symbols
-                .resolve_function_candidates(&cs.callee_name, Some(cs.span.file))
-        } else {
-            Vec::new()
-        };
-        for callee in callees {
+        for callee in program.symbols.callees_of(cs) {
             let f = program.symbols.function(callee);
             let external = !f.is_defined;
             let has_formals = !f.params.is_empty();
@@ -1329,37 +1306,5 @@ fn extract_arg_flow(
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn direct_by_name_classifies_plain_identifiers() {
-        let mk = |callee_name: &str, callee_var: Option<u32>, is_direct: bool| trace_ir::CallSite {
-            id: trace_ir::CallSiteId(0),
-            caller: trace_ir::FnId(0),
-            callee_name: callee_name.into(),
-            callee_var: callee_var.map(trace_ir::VarId),
-            callee_fn_id: None,
-            var_args: Vec::new(),
-            fn_args: Vec::new(),
-            addr_of_member_args: Vec::new(),
-            span: trace_ir::Span {
-                file: trace_ir::FileId(0),
-                line: 1,
-                col: 1,
-            },
-            is_direct,
-            receiver_class: None,
-            return_dst: None,
-        };
-        assert!(direct_by_name(&mk("OsalMemCalloc", None, false)));
-        assert!(direct_by_name(&mk("f", None, true)));
-        assert!(!direct_by_name(&mk("ops->Dispatch", None, false)));
-        assert!(!direct_by_name(&mk("obj.fn", None, false)));
-        assert!(!direct_by_name(&mk("fp", Some(3), false)));
     }
 }

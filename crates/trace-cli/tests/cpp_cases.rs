@@ -10,6 +10,23 @@ use trace_analysis::{analyze, AnalysisResult, ResolutionKind};
 use trace_ir::{FnId, Linkage, Program};
 use trace_parse::build_program;
 
+/// `fn $name() -> &'static (Program, AnalysisResult)`: the fixture of that
+/// name, built and analysed once per test binary.
+macro_rules! analyzed_fixture {
+    ($(#[$attr:meta])* $name:ident) => {
+        $(#[$attr])*
+        fn $name() -> &'static (Program, AnalysisResult) {
+            static CACHE: OnceLock<(Program, AnalysisResult)> = OnceLock::new();
+            CACHE.get_or_init(|| {
+                let root = fixture(stringify!($name));
+                let program = build_program(&root, &default_opts(&root)).expect("build");
+                let (_pag, analysis) = analyze(&program);
+                (program, analysis)
+            })
+        }
+    };
+}
+
 fn direct_targets(program: &Program, analysis: &AnalysisResult, caller: &str) -> Vec<String> {
     analysis
         .call_edges
@@ -372,16 +389,10 @@ fn cpp_smart_ptr_field_receiver_unwraps() {
 
 // --- cpp_smart_ptr: member access through a declared `operator->` (#64) ---
 
-/// The `cpp_smart_ptr` fixture, analysed once.
-fn cpp_smart_ptr() -> &'static (Program, AnalysisResult) {
-    static CACHE: OnceLock<(Program, AnalysisResult)> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        let root = fixture("cpp_smart_ptr");
-        let program = build_program(&root, &default_opts(&root)).expect("build");
-        let (_pag, analysis) = analyze(&program);
-        (program, analysis)
-    })
-}
+analyzed_fixture!(
+    /// The `cpp_smart_ptr` fixture, analysed once.
+    cpp_smart_ptr
+);
 
 #[test]
 fn arrow_unwraps_undeclared_single_class_argument() {
@@ -4049,15 +4060,7 @@ void test() {
     );
 }
 
-fn cpp_type_lookup() -> &'static (Program, AnalysisResult) {
-    static CACHE: OnceLock<(Program, AnalysisResult)> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        let root = fixture("cpp_type_lookup");
-        let program = build_program(&root, &default_opts(&root)).expect("build");
-        let (_pag, analysis) = analyze(&program);
-        (program, analysis)
-    })
-}
+analyzed_fixture!(cpp_type_lookup);
 
 #[test]
 fn bare_type_name_resolves_through_enclosing_namespaces() {
@@ -4494,4 +4497,505 @@ fn out_of_line_member_of_a_data_only_struct_keeps_its_methods() {
         "CConfig::CParser::Parse",
         "HitTarget::Hit"
     ));
+}
+
+analyzed_fixture!(cpp_member_args);
+
+/// `(arg_index, actual, formal)` for every argument `caller` hands `callee`.
+fn arg_bindings(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    callee: &str,
+) -> Vec<(u32, String, String)> {
+    let sites: std::collections::HashSet<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == caller && fn_name(program, e.callee) == callee)
+        .map(|e| e.call_site)
+        .collect();
+    analysis
+        .arg_flow_edges
+        .iter()
+        .filter(|e| sites.contains(&e.call_site))
+        .map(|e| {
+            let actual = match (e.actual_var, e.actual_fn) {
+                (Some(v), _) => program.symbols.variable(v).name.clone(),
+                (None, Some(f)) => fn_name(program, f),
+                (None, None) => String::new(),
+            };
+            let formal = program.symbols.variable(e.formal).name.clone();
+            (e.arg_index, actual, formal)
+        })
+        .collect()
+}
+
+#[test]
+fn method_call_arguments_bind_past_this() {
+    let (program, analysis) = cpp_member_args();
+    for (callee, actual) in [
+        ("Button::SetHandler", "OnDot"),
+        ("Button::SetHandler", "OnArrow"),
+        ("Button::operator()", "OnFunctor"),
+        ("Slot::operator()", "OnFieldFunctor"),
+        ("Remote::Later", "OnRemote"),
+        ("Remote::Shared", "OnStaticDot"),
+        ("Remote::Shared", "OnStaticQualified"),
+    ] {
+        let bindings = arg_bindings(program, analysis, "Wire", callee);
+        assert!(
+            bindings.contains(&(1, actual.to_owned(), "cb".to_owned())),
+            "Wire -> {callee}: {actual} must reach `cb`, got {bindings:?}"
+        );
+        assert!(
+            has_any_edge(program, analysis, callee, actual),
+            "{callee} calls what it was handed: {actual}"
+        );
+    }
+    let bindings = arg_bindings(program, analysis, "Wire", "Button::SetHandler");
+    assert!(
+        bindings.contains(&(1, "f".to_owned(), "cb".to_owned())),
+        "a variable argument reaches `cb` too: {bindings:?}"
+    );
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "Button::SetHandler",
+        "OnVar"
+    ));
+}
+
+#[test]
+fn member_defined_without_its_class_in_view_takes_this() {
+    let (program, analysis) = cpp_member_args();
+    for (callee, actual) in [
+        ("Detached::Later", "OnDetachedLater"),
+        ("Detached::Shared", "OnDetachedShared"),
+    ] {
+        assert_eq!(
+            arg_bindings(program, analysis, "UseDetached", callee),
+            [(1, actual.to_owned(), "cb".to_owned())],
+            "{callee}: the definition's unit never saw `Detached`"
+        );
+        assert!(has_any_edge(program, analysis, callee, actual));
+        let definition = program
+            .symbols
+            .functions
+            .iter()
+            .find(|f| f.name == callee && f.is_defined)
+            .expect("defined");
+        assert_eq!(
+            program.symbols.variable(definition.params[0]).name,
+            "this",
+            "{callee} has its implicit `this`"
+        );
+    }
+    let this_of = |name: &str| {
+        program
+            .symbols
+            .functions
+            .iter()
+            .find(|f| f.name == name && f.is_defined)
+            .and_then(|f| f.params.first())
+            .map(|&p| program.symbols.variable(p).name.clone())
+    };
+    assert_eq!(
+        this_of("Detached::Reset").as_deref(),
+        Some("this"),
+        "a parameterless member defined without its class takes `this` too"
+    );
+    assert_eq!(
+        this_of("util::Init"),
+        None,
+        "a parameterless namespace function defined out of line takes no `this`"
+    );
+    assert_eq!(
+        arg_bindings(program, analysis, "CallInImplUnit", "Detached::Shared"),
+        [(1, "OnSameUnit".to_owned(), "cb".to_owned())],
+        "a call beside the definition is bound past the `this` it gains"
+    );
+}
+
+#[test]
+fn namespace_function_named_like_a_class_takes_no_this() {
+    let (program, analysis) = cpp_member_args();
+    assert_eq!(
+        arg_bindings(program, analysis, "UseClockNamespace", "ns::Clock::Format"),
+        [(0, "OnFormat".to_owned(), "cb".to_owned())],
+        "`ns::Clock` is a namespace here, whatever `clock_class.hpp` declares"
+    );
+}
+
+#[test]
+fn call_to_a_member_declared_only_binds_past_this() {
+    let (program, _) = cpp_member_args();
+    let site = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|cs| {
+            fn_name(program, cs.caller) == "CallWithoutHeader"
+                && cs.callee_name == "Remote::Declared"
+        })
+        .expect("site");
+    assert_eq!(site.fn_args.first().map(|&(index, _)| index), Some(1));
+}
+
+#[test]
+fn qualified_member_call_resolved_after_the_merge_binds_past_this() {
+    let (program, analysis) = cpp_member_args();
+    assert_eq!(
+        arg_bindings(program, analysis, "CallWithoutHeader", "Remote::Shared"),
+        [(1, "OnUnseen".to_owned(), "cb".to_owned())],
+        "the unit never saw `Remote`, yet `Remote::Shared` is a member"
+    );
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "Remote::Shared",
+        "OnUnseen"
+    ));
+    assert_eq!(
+        arg_bindings(program, analysis, "CallWithoutHeader", "util::Free"),
+        [(0, "OnUnseenFree".to_owned(), "cb".to_owned())],
+        "a namespace function has no `this`"
+    );
+}
+
+#[test]
+fn implicit_this_and_qualified_method_calls_bind_past_this() {
+    let (program, analysis) = cpp_member_args();
+    for (caller, actual) in [
+        ("Button::Relay", "OnImplicit"),
+        ("Button::RelayArrow", "OnThisArrow"),
+        ("Fancy::Qualified", "OnQualified"),
+    ] {
+        let bindings = arg_bindings(program, analysis, caller, "Button::SetHandler");
+        assert!(
+            bindings.contains(&(1, "cb".to_owned(), "cb".to_owned())),
+            "{caller} -> Button::SetHandler: `cb` must reach `cb`, got {bindings:?}"
+        );
+        assert!(
+            has_any_edge(program, analysis, "Button::SetHandler", actual),
+            "{actual} flows through {caller} into Button::SetHandler"
+        );
+    }
+}
+
+#[test]
+fn qualified_method_call_picks_overload_by_explicit_arity() {
+    let (program, analysis) = cpp_member_args();
+    let targets: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == "PickerUser::Use")
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(targets.len(), 1, "one overload takes two arguments");
+    let params = &program.symbols.function(targets[0]).params;
+    assert_eq!(params.len(), 3, "`this`, `cb` and `n`");
+    assert!(has_any_edge(
+        program,
+        analysis,
+        &fn_name(program, targets[0]),
+        "OnOverload"
+    ));
+}
+
+#[test]
+fn no_explicit_argument_binds_to_this() {
+    let (program, analysis) = cpp_member_args();
+    for e in &analysis.arg_flow_edges {
+        if program.symbols.variable(e.formal).name != "this" {
+            continue;
+        }
+        assert!(e.actual_fn.is_none(), "a function reached `this`: {e:?}");
+        let actual = program
+            .symbols
+            .variable(e.actual_var.expect("actual"))
+            .name
+            .clone();
+        assert!(
+            actual.starts_with("_ret"),
+            "only a `new` allocation is bound to `this`, got `{actual}`"
+        );
+    }
+}
+
+#[test]
+fn new_expression_arguments_bind_past_this() {
+    let (program, analysis) = cpp_member_args();
+    for (caller, actual) in [
+        ("MakeWithVar", "f"),
+        ("MakeByName", "OnNewName"),
+        ("MakeStatement", "OnNewStmt"),
+    ] {
+        let bindings = arg_bindings(program, analysis, caller, "Worker::Worker");
+        assert!(
+            bindings.contains(&(1, actual.to_owned(), "cb".to_owned())),
+            "{caller}: {actual} must reach `cb`, got {bindings:?}"
+        );
+    }
+    for actual in ["OnNewVar", "OnNewName", "OnNewStmt"] {
+        assert!(has_any_edge(program, analysis, "Worker::Worker", actual));
+    }
+}
+
+#[test]
+fn member_initializer_arguments_bind_past_this() {
+    let (program, analysis) = cpp_member_args();
+    for (caller, callee, actual) in [
+        ("ByName::ByName", "Base::Base", "OnBaseName"),
+        ("ByVar::ByVar", "Base::Base", "f"),
+        ("BraceBase::BraceBase", "Base::Base", "OnBraceBase"),
+        ("Holder::Holder", "Member::Member", "f"),
+        (
+            "BraceHolder::BraceHolder",
+            "Member::Member",
+            "OnBraceMember",
+        ),
+    ] {
+        let bindings = arg_bindings(program, analysis, caller, callee);
+        assert!(
+            bindings.contains(&(1, actual.to_owned(), "cb".to_owned())),
+            "{caller} -> {callee}: {actual} must reach `cb`, got {bindings:?}"
+        );
+    }
+    for (callee, actual) in [
+        ("Base::Base", "OnBaseName"),
+        ("Base::Base", "OnBaseVar"),
+        ("Base::Base", "OnBraceBase"),
+        ("Member::Member", "OnMember"),
+        ("Member::Member", "OnBraceMember"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, callee, actual),
+            "{callee} calls {actual}"
+        );
+    }
+}
+
+analyzed_fixture!(cpp_overload_prototypes);
+
+/// `callee@file:line` for every edge out of `caller`, sorted; a callee with
+/// no body in the tree is marked `(declared)`.
+fn callee_definitions(program: &Program, analysis: &AnalysisResult, caller: &str) -> Vec<String> {
+    let mut out: Vec<String> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == caller)
+        .map(|e| {
+            let f = program.symbols.function(e.callee);
+            let file = program.symbols.files[f.span.file.0 as usize]
+                .path
+                .file_name();
+            format!(
+                "{}@{}:{}{}",
+                f.name,
+                file.map(|n| n.to_string_lossy()).unwrap_or_default(),
+                f.span.line,
+                if f.is_defined { "" } else { " (declared)" }
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn prototype_overloads_bind_calls_by_declared_arity() {
+    let (program, analysis) = cpp_overload_prototypes();
+    assert_eq!(
+        callee_definitions(program, analysis, "GetWithOut"),
+        ["Session::Get@session.cpp:4"],
+        "`s->Get(mode)` is `Get(Mode&)`, not `Get()`"
+    );
+    assert_eq!(
+        callee_definitions(program, analysis, "GetPlain"),
+        ["Session::Get@session.cpp:3"]
+    );
+    assert_eq!(
+        callee_definitions(program, analysis, "RunTwice"),
+        ["Session::Run@session.cpp:6"]
+    );
+    assert!(has_any_edge(program, analysis, "Session::Run", "OnRun"));
+}
+
+#[test]
+fn prototype_default_arguments_accept_shorter_calls() {
+    let (program, analysis) = cpp_overload_prototypes();
+    let targets = callee_definitions(program, analysis, "LogWithDefault");
+    assert!(
+        targets.iter().any(|t| t == "Session::Log@session.cpp:7"),
+        "`s->Log(OnLog)` fits `Log(Callback, int = 0)`: {targets:?}"
+    );
+    assert!(has_any_edge(program, analysis, "Session::Log", "OnLog"));
+}
+
+#[test]
+fn variadic_overload_stays_a_candidate_for_more_arguments() {
+    let (program, analysis) = cpp_overload_prototypes();
+    assert_eq!(
+        callee_definitions(program, analysis, "LogPointers"),
+        ["Log@variadic.cpp:2"],
+        "`Log(p, p)` fits `Log(void*, ...)`, not `Log(int, int)`"
+    );
+    assert_eq!(
+        callee_definitions(program, analysis, "NotifyOnce"),
+        ["Notify@variadic.cpp:9"],
+        "`Notify(\"ready\", 1)` takes the fixed overload before the variadic one"
+    );
+    assert_eq!(
+        callee_definitions(program, analysis, "TraceUnknown")
+            .into_iter()
+            .filter(|t| t.starts_with("Trace@"))
+            .collect::<Vec<_>>(),
+        ["Trace@variadic.cpp:15", "Trace@variadic.cpp:16"],
+        "an argument of unknown type keeps both overloads"
+    );
+    assert_eq!(
+        callee_definitions(program, analysis, "ShowNumber"),
+        ["Show@variadic.cpp:22"],
+        "`Show(2.5)` cannot take `Show(const char*)`"
+    );
+    assert_eq!(
+        callee_definitions(program, analysis, "EmitMore"),
+        ["Session::Emit@session.cpp:9"],
+        "in-class `Emit(Callback)` and `Emit(Callback, ...)` stay two overloads"
+    );
+    assert!(has_any_edge(program, analysis, "Session::Emit", "OnEmit"));
+}
+
+#[test]
+fn default_arguments_pool_only_within_one_signature() {
+    let (program, analysis) = cpp_overload_prototypes();
+    assert_eq!(
+        callee_definitions(program, analysis, "text::TrimOne"),
+        ["text::Trim@defaults.cpp:6"],
+        "the prototype's default reaches a definition spelled `string`"
+    );
+    assert_eq!(
+        callee_definitions(program, analysis, "FormatUnknown")
+            .into_iter()
+            .filter(|t| t.starts_with("Format@"))
+            .collect::<Vec<_>>(),
+        ["Format@format.cpp:3"],
+        "`Format(cb, cb)` does not borrow `Format(int, int = 0)`'s default"
+    );
+}
+
+#[test]
+fn prototype_does_not_merge_into_a_same_named_body_of_another_arity() {
+    let (program, analysis) = cpp_overload_prototypes();
+    assert_eq!(
+        callee_definitions(program, analysis, "FireNamed"),
+        ["Listener::Fire@listener.cpp:3"],
+        "the unrelated variadic template body must not take the call"
+    );
+    assert!(has_any_edge(program, analysis, "Listener::Fire", "OnFire"));
+}
+
+#[test]
+fn static_member_template_keeps_its_in_class_body() {
+    let (program, analysis) = cpp_overload_prototypes();
+    let walks: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Walker::Walk")
+        .map(|f| (f.span.line, f.is_defined, f.linkage))
+        .collect();
+    assert!(
+        walks.contains(&(7, true, Linkage::External)),
+        "a static member is not internal linkage, and its body survives: {walks:?}"
+    );
+    assert!(
+        callee_definitions(program, analysis, "Walker::Walk")
+            .iter()
+            .any(|t| t == "Walker::Walk@walker.hpp:7"),
+        "`Walk(root_, callback)` reaches the two-parameter static overload"
+    );
+}
+
+analyzed_fixture!(cpp_direct_init);
+
+#[test]
+fn direct_initialization_spelled_like_a_function_declaration_constructs() {
+    let (program, analysis) = cpp_direct_init();
+    for (caller, callee, actual) in [
+        ("ByName", "Worker::Worker", "OnName"),
+        ("ByVariable", "Worker::Worker", "f"),
+        ("ByTwo", "Pair::Pair", "OnFirst"),
+        ("ByBraces", "Worker::Worker", "OnBrace"),
+    ] {
+        let bindings = arg_bindings(program, analysis, caller, callee);
+        assert!(
+            bindings.iter().any(|(i, a, _)| *i == 1 && a == actual),
+            "{caller} -> {callee}: {actual} is argument 1, got {bindings:?}"
+        );
+        assert!(
+            bindings.iter().any(|(i, _, f)| *i == 0 && f == "this"),
+            "{caller}: the object is `this`, got {bindings:?}"
+        );
+    }
+    assert!(
+        arg_bindings(program, analysis, "ByTwo", "Pair::Pair").contains(&(
+            2,
+            "OnSecond".to_owned(),
+            "second".to_owned()
+        ))
+    );
+    for (callee, actual) in [
+        ("Worker::Worker", "OnName"),
+        ("Worker::Worker", "OnVar"),
+        ("Pair::Pair", "OnSecond"),
+        ("Worker::Worker", "OnBrace"),
+        ("PointerDirectInit", "OnPointer"),
+        ("AggregateBraces", "OnAggregate"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, callee, actual),
+            "{callee} -> {actual}"
+        );
+    }
+    let names: Vec<&str> = program
+        .symbols
+        .functions
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    for object in ["w", "p", "c"] {
+        assert!(
+            !names.contains(&object),
+            "`{object}` is an object: {names:?}"
+        );
+    }
+    assert!(
+        has_any_edge(program, analysis, "Counter::Tick", "Lock::Lock"),
+        "a data member in the parentheses is a constructor argument"
+    );
+    assert!(
+        has_any_edge(program, analysis, "PointerFromLocal", "OnTable"),
+        "`Callback *slot(table);` initializes a pointer from the local"
+    );
+    for object in ["guard", "slot"] {
+        assert!(
+            !names.contains(&object),
+            "`{object}` is an object, not a function: {names:?}"
+        );
+    }
+    assert!(
+        has_any_edge(program, analysis, "DefaultedAggregate", "OnDefaulted"),
+        "a class whose only constructor is defaulted is an aggregate"
+    );
+    assert!(
+        has_any_edge(program, analysis, "LocalAliasHidesVariable", "build"),
+        "`Worker build(Value);` declares a function when `Value` names a type"
+    );
+    for declaration in ["make", "nothing"] {
+        assert!(
+            names.contains(&declaration),
+            "`{declaration}` stays a declaration"
+        );
+    }
 }
