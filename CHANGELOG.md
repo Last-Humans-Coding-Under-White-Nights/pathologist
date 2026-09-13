@@ -250,6 +250,35 @@ All notable changes to `trace` are documented in this file.
   the timings above.
 
 ### Fixed
+- Type names are looked up through the enclosing scopes (#90, #91, #92). A local, parameter, field,
+  return type, base, `new` or cast spelled with the bare or partially qualified name of a class from
+  an enclosing namespace lowered as an unknown type, because only the innermost namespace was tried;
+  one lookup (`find_in_scope`) now serves every place a type name is qualified, template spellings
+  included: the enclosing classes, then the enclosing namespaces innermost first, then the global
+  scope, the innermost declaration winning. A typedef is found under its qualified name before the
+  flat table of bare names, so two namespaces declaring the same typedef name keep their own.
+  `using Alias = T;` registers as a typedef does, pointer and function shapes included; a typedef or
+  alias declared in a class body is registered only as `Cls::Alias`. A class defined inside another
+  class registers as `Outer::Inner` with its own layout, and its members are lowered under it: the
+  member walk used to read `class It { int x; int Next(); };` as a function member of the outer class
+  named after its first field, and its body landed on the namespace's `It`. A struct C would also
+  accept keeps its C tag, which C gives file scope, so a header shared by C and C++ units names it
+  alike; its `Outer::Inner` spelling is an alias of that tag. `T(args)` or `ns::T(args)` naming a
+  class with a declared constructor is a constructor call with its arguments bound past the implicit
+  `this`, which a nested builder's `return Outer(*this);` had only reached by matching the outer
+  class as an implicit `this`. Review follow-ups: a typedef or alias in a function body is scoped to
+  its block, an array alias keeps its shape, a class template's member alias (`Holder<int>::Ptr`)
+  and a `::Alias` spelling resolve, a C-style cast looks up the class it names, and a class nested in
+  a C-compatible struct keeps its whole path. A body-less `struct Name` is looked up too: a
+  reference (`struct Node *next;`) finds the class in scope, a forward declaration in a class body
+  (`struct Impl;`) declares the member class, and an out-of-line `class Outer::Inner { ... }` defines
+  the class `Outer` declared. A function declared at the same or a nearer scope hides a class of
+  the same name, a constructor of a class with internal linkage is recognized, every constructor
+  path shifts function arguments past `this` too, an alias in a function-local class stays in the
+  class, and a class local to a member function sees that function's class. hdf's C++ tests that spell `struct IDevmgrService *svc` inside
+  `namespace OHOS` reach the C struct, so its indirect edges rise 4,644 -> 4,826; every other exact
+  eval metric is unchanged. hiview's direct edges rise 8,988 -> 9,293 and camera's 37,646 -> 38,531,
+  with 38 and 100 more defined functions. See docs/EVAL_REPORT.md.
 - A C++17 `namespace A::B {` definition opens two scopes (#86 review). tree-sitter spells the name
   as one `nested_namespace_specifier`, which the lowering did not look for, so the block read as an
   anonymous namespace and everything inside registered under the bare name with internal linkage.
