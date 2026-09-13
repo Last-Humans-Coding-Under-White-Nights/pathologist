@@ -11,9 +11,10 @@ database that you query with `trace inspect` or raw SQL. Use it whenever the
 question is about **who could be called** or **where a value flows** — it does
 not do taint tracking, path-sensitivity, or runtime behavior.
 
-Build the tool before use: `cargo build --release` (binary at
-`target/release/trace`). Always use the release binary, not the debug one, for
-measured runs.
+Build the tool before use: `cargo build --release` (CLI binary at
+`target/release/trace`) or `cargo build -p trace-capi --release` (C ABI library
+at `target/release/libtrace_capi.{so,dylib,dll,a}`). Always use the release binary,
+not the debug one, for measured runs.
 
 ## Pipeline (fixed order)
 
@@ -60,6 +61,11 @@ trace analyze [OPTIONS] <TARGET>
 | `--full-export` | Export full IR: all types, all variables, PAG locations. |
 | `--debug-points-to` | Retain + export the `points_to` table. |
 | `--models <FILE>` | TOML function-model file (interprocedural summaries for bodyless callees, e.g. `memcpy_s`). Later files override earlier ones and built-ins. |
+| `--dep <PATH>` | Treat directory as a dependency root: headers contribute declarations only; sources are never translation units; bodies contribute no call sites or value flow. Repeatable. |
+| `--compile-commands <PATH>` | Explicit path to `compile_commands.json`. When omitted, `TARGET/compile_commands.json` then `TARGET/build/compile_commands.json` are automatically discovered. |
+| `--explore` | Enable bounded conditional-variant exploration with GN define evidence (#59). Off by default. |
+| `--explore-budget <N>` | Maximum additional configuration variants to explore per translation unit (default: 4). |
+| `--no-ipc` | Disable IPC proxy/stub bridge edge detection (enabled by default). |
 
 ```bash
 # Single fixture
@@ -68,6 +74,9 @@ cargo run -p trace-cli --release -- analyze tests/fixtures/fn_ptr_vtable -o /tmp
 # Big real-world tree with extra include roots
 trace analyze ~/project -o /tmp/proj.db --jobs 8 \
   --include ~/project/framework/include -D __LITEOS__ -D CONFIG_XXX=1
+
+# Use dependency roots and compilation database
+trace analyze ~/project --dep ~/sdk --compile-commands ~/project/build/compile_commands.json -o /tmp/proj.db
 
 # Debug dump
 trace analyze ./my_app -o /tmp/debug.db --debug-points-to --full-export
@@ -81,7 +90,7 @@ When absent, pass include paths matching the real build.
 ## 2. `trace inspect <DB> calls` — flat edge list
 
 ```text
-trace inspect <DB> calls [--from FN] [--to FN] [--file SUBSTR]
+trace inspect <DB> calls [--from FN] [--to FN] [--file SUBSTR] [--exclude-deps] [--callgraph-filter FILE]
 ```
 
 - `--from`/`--to` match **exactly** or by C++ qualified suffix
@@ -90,6 +99,10 @@ trace inspect <DB> calls [--from FN] [--to FN] [--file SUBSTR]
 - `--file` keeps ordinary edges whose call-site or callee file path contains
   the substring. Synthetic edges have no call site, so their caller definition
   file is used instead.
+- `--exclude-deps` hides call edges whose caller or callee comes from a
+  dependency root (`is_dep = 1`).
+- `--callgraph-filter <FILE>` filters edges by matching function names against
+  regex patterns in a JSON configuration file.
 
 Line format:
 
@@ -111,13 +124,14 @@ trace inspect /tmp/fix.db  calls --file main.c --from dispatch
 ## 3. `trace inspect <DB> callgraph` — tree around one function
 
 ```text
-trace inspect <DB> callgraph --file SUBSTR --line N [--depth N] [--direction up|down] [--format FORMAT]
+trace inspect <DB> callgraph --file SUBSTR --line N [--depth N] [--direction up|down] [--format FORMAT] [--callgraph-filter FILE]
 ```
 
 - `--file` is a **path substring** (basename or full path).
 - `--line N` must lie inside a function body (`start <= line <= end`); the
   start node prints `name (file.c:S-E)`.
 - `--direction` `down` = callees (default), `up` = callers. BFS, depth default 3.
+- `--callgraph-filter FILE` filters edges using regex patterns from a JSON file.
 - Repeated reaches dedup as `(see above; also file:line)` when re-visited at a
   different call site.
 - Live frontier at the depth limit prints
@@ -290,8 +304,8 @@ the DB directly. Default (minimal) export contains:
 
 | Table | Contents |
 |-------|----------|
-| `analysis_run`, `files` | Runs; `files(id, path, sha256)`. |
-| `functions` | `id, name, file_id, line_start, line_end, linkage, signature, is_defined` (external linkage included). |
+| `analysis_run`, `files` | `analysis_run(id, trace_version, options_json, ...)` (schema v4); `files(id, path, sha256, is_dep)`. |
+| `functions` | `id, name, file_id, line_start, line_end, linkage, signature, is_defined, is_dep` (external linkage and dependency roots included). |
 | `call_sites` | `id, caller_fn_id, file_id, line, col, callee_text, is_direct`. Every *resolved* site plus every *indirect* site (resolved or not) — direct-without-argflow and fully resolved direct sites with no arg flow may be filtered out (call site export filter). |
 | `call_edges` | `id, call_site_id, caller_fn_id, callee_fn_id, resolution` (`direct`/`indirect`/`ambiguous`/`external`/`ipc`). `call_site_id` is `NULL` for synthetic IPC bridges; always read the caller from `caller_fn_id`. |
 | `arg_flow_edges` | `id, call_site_id, arg_index, actual_var_id, actual_fn_id, formal_var_id`. `actual_fn_id` is set when the actual is a function pointer (fn-ptr arg flow), else `actual_var_id`. |
@@ -344,9 +358,16 @@ Extra targets are almost always documented over-approximation, not bugs:
    initializer elements).
 4. **`dlsym`** resolution uses only the literal string argument at known call
    patterns; it cannot model dynamically composed names.
-5. No flow-sensitivity, no path-sensitivity, no taint model. Compilation database
+5. **Dependency roots (`--dep`)**: sources under dependency roots never become
+   translation units; headers contribute declarations only (`is_dep = 1`,
+   `is_defined = 0`, no call sites, locals, or value flow). Filter them in
+   inspect with `trace inspect calls --exclude-deps`.
+6. **Configuration coverage**: without database entries or `--explore`, a single
+   inferred configuration is used; `--explore` explores bounded configuration
+   variants (capped by `--explore-budget`).
+7. No flow-sensitivity, no path-sensitivity, no taint model. Compilation database
    (`compile_commands.json`) is supported opportunistically or via `--compile-commands PATH`.
-6. Macros: code inside expansions attributes to the expansion call site (via
+8. Macros: code inside expansions attributes to the expansion call site (via
    LineMap); the custom preprocessor is the source of truth (Clang/gcc not used).
 
 ## Quick checklist for a typical task

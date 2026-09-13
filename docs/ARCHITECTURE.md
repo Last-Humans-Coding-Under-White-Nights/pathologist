@@ -35,7 +35,9 @@ flowchart LR
 | Parse + lower | `trace-parse` | Preprocessed TU | `UnitIndex` (symbols, types, flow, call sites) |
 | Merge | `trace-parse` | Per-TU indices | Single `Program` |
 | Analyze | `trace-analysis` | `Program` | `Pag` + `AnalysisResult` |
-| Export | `trace-db` | Program + analysis | SQLite v1 |
+| Export | `trace-db` | Program + analysis | SQLite v4 |
+
+The pipeline is also exposed programmatically via `trace-capi` (`libtrace_capi`), providing a C ABI (`crates/trace-capi/include/trace.h`) for indexing and database inspection.
 
 ## Translation units and headers
 
@@ -49,6 +51,7 @@ flowchart LR
 ```mermaid
 flowchart BT
   CLI[trace-cli]
+  CAPI[trace-capi]
   DB[trace-db]
   Analysis[trace-analysis]
   Parse[trace-parse]
@@ -59,6 +62,10 @@ flowchart BT
   CLI --> Analysis
   CLI --> Parse
   CLI --> Preproc
+  CAPI --> DB
+  CAPI --> Analysis
+  CAPI --> Parse
+  CAPI --> Preproc
   DB --> Analysis
   DB --> IR
   Analysis --> IR
@@ -71,10 +78,11 @@ flowchart BT
 |-------|----------------|
 | `trace-ir` | IDs, types, symbol table, `FlowConstraint`, `ReturnFlow`, `Program` |
 | `trace-preproc` | Lexer, directives, macro expansion, `LineMap` |
-| `trace-parse` | Discovery, include graph, tree-sitter parse, IR lowering, TU merge |
-| `trace-analysis` | PAG build, Andersen solver, on-the-fly call graph, arg-flow extraction |
+| `trace-parse` | Discovery, include graph, tree-sitter parse, IR lowering, TU merge, compilation commands |
+| `trace-analysis` | PAG build, Andersen solver, on-the-fly call graph, arg-flow extraction, IPC bridges |
 | `trace-db` | SQLite schema, minimal/full export |
-| `trace-cli` | `analyze`, `inspect` |
+| `trace-capi` | C ABI library (`libtrace_capi`), C header (`trace.h`), indexing and inspect FFI |
+| `trace-cli` | `analyze`, `inspect`, reporting examples |
 
 ## Program IR (`trace-ir`)
 
@@ -90,6 +98,8 @@ After merge, `Program` contains:
 | `include_deps` | `#include` edges for debugging |
 | `inheritance` | Qualified C++ `(derived, base)` facts used by CHA |
 | `template_bases` | Templated base spellings plus the derived class declaration scope, preserved for consumers that interpret template arguments |
+| `arrow_returns` | Declared C++ `operator->` return types for smart-pointer wrappers, preserved across translation units |
+| `final_classes` | Classes marked `final` to prune CHA hierarchy traversal |
 
 Lowering (`trace-parse/src/lower.rs`) walks tree-sitter ASTs and emits **flow constraints** — not a full statement-level CFG.
 
@@ -139,10 +149,13 @@ Spans are resolved through the preprocessor `LineMap`: **all** entities use orig
 | Change | Where |
 |--------|-------|
 | Preprocessor directive/macro | `trace-preproc` |
-| New C construct / flow fact | `trace-parse/src/lower.rs`, `trace-ir/src/flow.rs` |
+| New C/C++ construct / flow fact | `trace-parse/src/lower.rs`, `trace-ir/src/flow.rs` |
 | New PAG constraint | `ConstraintKind` in `trace-analysis`, handler in `pag.rs` + `solver.rs` |
 | Return / call semantics | `ReturnFlow`, `CallReturn`, `pag.expand_return_flows` |
-| Libc summary | `trace-analysis/src/summaries.rs` |
+| Libc summary / function model | `trace-analysis/src/summaries.rs` |
 | SQLite column/table | `trace-db/src/schema.rs`, `export.rs`, `docs/SQLITE_SCHEMA.md` |
+| C API functions / FFI exports | `crates/trace-capi/src/`, `crates/trace-capi/include/trace.h`, `docs/CAPI.md` |
+| Compilation database support | `trace-parse/src/compile_commands.rs`, `configured.rs` |
+| Dependency root handling | `trace-parse/src/lib.rs`, `configured.rs`, `merge.rs`, `trace-db/src/inspect.rs` |
 
 See [ANALYSIS.md](ANALYSIS.md) for algorithm details and [AGENTS.md](../AGENTS.md) for contributor invariants.

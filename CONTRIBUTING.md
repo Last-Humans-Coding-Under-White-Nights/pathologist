@@ -112,4 +112,4 @@ Open an issue at the repository's issue tracker with:
 
 ## Code of conduct
 
-Be respectful. We are here to build useful tools together.
+We are committed to providing a welcoming, inclusive, and harassment-free experience for everyone. This project and everyone participating in it is governed by our [Code of Conduct](CODE_OF_CONDUCT.md). By participating, you are expected to uphold this code. Please report unacceptable behavior according to the instructions in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
