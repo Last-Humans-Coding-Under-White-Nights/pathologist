@@ -23,7 +23,7 @@ Do not chase STL noise (`std::string::c_str`, `parcel->WriteString`,
 | Capability | Hiview evidence |
 |------------|-----------------|
 | CHA from static receiver + implicit `this` | `Plugin::OnEventProxy` → 22 plugin `OnEvent` bodies |
-| Smart-pointer / `operator->` unwrap, by declaration not by name (C12) | `call_sp` fixture; typed `Plugin*` paths; hdf `AutoPtr<T>` (+4,551 direct edges) |
+| Smart-pointer / `operator->` unwrap, by declaration not by name (C12); an undeclared wrapper guessed from its one class argument (#86) | `call_sp` fixture; typed `Plugin*` paths; hdf `AutoPtr<T>` (+4,551 direct edges); camera `sptr<T>` (+16,587 direct edges) |
 | `final` / virtual bases | fixtures only (`cpp_dispatch`); hiview barely uses them |
 | Direct `std::function` field store | `cpp_callable`; **not** the factory path (C3) |
 | `$lambda` as a nested function | 357 interned; almost none have **incoming** edges |
@@ -443,9 +443,59 @@ The receiver is now resolved through the **declared** `operator->`:
 - The facts travel with a header's *types*, which is what a header unit
   contributes to the units that include it, so a wrapper-typed field
   declared in a different header from the wrapper resolves too.
-- The name list survives only as a fallback for a wrapper whose class is
-  **not** in the index — `std::shared_ptr` when its header is out of tree.
-  It is a guess from a name rather than a resolution.
+- For a template wrapper whose **body is not in the tree**, `->` may also
+  use its sole argument when that argument is a declared class (#86).
+  This covers `sptr<T>`, `wptr<T>` and namespace-qualified spellings on
+  locals, parameters and fields, with the ordinary class-hierarchy
+  dispatch rules. Multiple arguments, scalar/pointer/reference arguments
+  and unknown classes do not qualify; rejected arrows stay unresolved
+  instead of inventing a member on the wrapper. The argument is looked up
+  through the enclosing namespaces innermost first and then the global
+  scope, on bare and partially qualified spellings, a typedef standing for
+  the class it names and a trailing `const` ignored, and a leading `::`
+  naming the global class only. `(*sp).m()` on such a wrapper is the same
+  guess as `sp->m()`. A nested type of an out-of-tree template
+  (`Outer<A>::Inner`, an iterator) is not a wrapper around `A`: its arrow
+  stays unresolved. Scalar and function-type arguments are spelled as
+  written, never qualified to a namespace; the wrapper's own name is looked
+  up through the enclosing namespaces like an argument. A typedef is
+  matched by its whole spelling. An out-of-line `operator->` without its
+  class header still records what the arrow returns. A field step follows
+  its operator: `sp->f` reaches the pointee's field through a wrapper, on
+  the wrapper variable itself as well as along a field chain, while `w.f`
+  stays the wrapper's own field, and a raw `Wrapper<T>*` uses the built-in
+  arrow, so `p->f` stays on the wrapper's own layout. The same rule decides
+  what a wrapper is whether or not the spelling carries arguments, so a
+  concrete class inheriting `operator->` from a base is one too. At an overloaded
+  arrow the remaining path restarts on a receiver typed as the pointee, so
+  its field step lands on the pointee's instance-insensitive summary --
+  the one a raw `T*` read or write already uses -- rather than on a
+  subobject of the wrapper the solver would never resolve. A member type
+  keeps its `::` and its own name when it carries arguments
+  (`Outer<A>::Inner<B>`), and a member type of a defined template keeps
+  the class the lookup found as its prefix. A
+  wrapper spelled `::W<T>` is the global `W`, tagged without the prefix,
+  wherever a head is looked up. `nullptr_t`, `intmax_t`, `uintmax_t`,
+  `auto` and a literal argument are never qualified; `T*const` is the
+  pointer argument `T*`, and every pointer level survives a qualifier
+  between levels. A C++11 `using Alias = T;` is not
+  lowered as a typedef yet; an argument spelled through one stays
+  unresolved.
+- Class declarations and definitions are tracked separately from inferred
+  type tags and travel through header merges. Merely mentioning an
+  external type cannot enable the guess; a forward declaration of the
+  wrapper says nothing about its `operator->` and does not disable it. A
+  wrapper with a body continues through its `operator->`; the fallback
+  never overrides one. Dot calls retain the wrapper's identity. The
+  standard-pointer name fallback remains, including for minimal
+  standard-library stubs and out-of-tree pointees.
+- This is a may-analysis approximation for partial source trees, not proof
+  that an absent wrapper implements `operator->`. Requiring exactly one
+  declared class argument bounds the guess; declaration lookup uses hash
+  sets rather than scanning symbols at each call. Explicit dereferencing
+  (`*p`) follows the same rule as `->`: a declared operator, the
+  standard-name fallback, or the one-argument guess on an out-of-tree
+  wrapper.
 - Where nothing names a class — overloads that disagree, a dependent return
   the index cannot name (`sptr<T>` inside a template, a parameter of a base
   template), a cycle, an iterator's `operator*` — the site is left
@@ -462,9 +512,37 @@ lookup* through a wrapper whose type is already known. Camera needs this
 one, hiview needs C1.
 
 **Precondition for supplying `refbase.h`.** Camera does not declare `sptr`
-anywhere in the tree today, so its 27,474 unresolved indirect sites are
-honest misses. The moment the missing include is supplied they would all
-have become phantom `sptr::*` edges; with C12 in first, they resolve.
+anywhere in the tree today, so its 27,474 unresolved indirect sites were
+honest misses until #86 started guessing through the undeclared wrapper.
+The moment the missing include is supplied they would all have become
+phantom `sptr::*` edges; with C12 in first, they resolve — and the
+declared `operator->` takes over from the guess the moment it appears.
+
+**Eval result (#86, `master` 769f2e8 → this change, same machine, `--jobs
+8`):** camera direct edges **21,059 → 37,646**, external functions
+**6,373 → 5,352**, the **254** invented `OHOS::sptr::*` members gone (a
+probe pins them at 0). Compared by site and callee, 17,739 direct edges
+are gained and 1,152 lost, 777 of the 808 losing sites carrying the same
+call under a proper qualification or the real member: an unqualified
+`sptr<T>` lowered to an unknown type before, so `cameraInput_->Open()`
+bound by bare name to a free `Open` some fuzzer defined. The argument is
+looked up through the enclosing namespaces and the global scope, on bare
+and partially qualified spellings, through typedefs and past a trailing
+`const`; `using namespace` directives are not searched (see the report
+for why). hdf moves inside its bands with every exact metric unchanged —
+its last `OHOS::sptr::*` phantoms become real edges. hiview moves for
+that and for a second fault the review exposed: a C++17
+`namespace A::B {` was lowered as an anonymous namespace, so its classes
+registered under bare names; fixed, and hiview's external functions fall
+**3,623 → 3,191** as bare prototypes fold into their definitions.
+Type-table growth from a tag per instantiation is paid for by a
+clone-free tag lookup in `TypeTable::intern` and a dense id remap in the
+unit merge; hdf and hiview end level with or faster than `master`, camera
+runs about 2-3% above it for 16,587 more direct edges to solve and
+export.
+Residue: 31 camera sites call through a wrapper whose argument class is
+not in the tree and stay unresolved. See
+[EVAL_REPORT.md](EVAL_REPORT.md).
 
 **Eval result (`master` 52fd920 → this change, same machine, `--jobs 8`):**
 HDI's in-tree `OHOS::HDI::AutoPtr<T>` is exactly this shape, so hdf moves —
