@@ -1011,6 +1011,55 @@ fn finalize_program(
     add_missing_this_params(program);
     bind_calls_past_this(program);
     expand_virtual_overrides(program);
+    expand_internal_overload_refs(program);
+}
+
+/// Widen each reference to a function by name to every overload the name may
+/// mean. A name resolves to the first internal-linkage entry of its file
+/// (`static void cb(int)`), while `void (*p)(double) = cb;` takes its overload
+/// `cb(double)`. A function pointer's type does not carry the parameter types
+/// that would pick one, so the reference keeps every overload, as when one
+/// entry held all their bodies.
+fn expand_internal_overload_refs(program: &mut Program) {
+    if !program.symbols.has_internal_overloads() {
+        return;
+    }
+    let symbols = &program.symbols;
+    let var_file = |var: VarId| symbols.variable_by_id(var).map(|v| v.span.file);
+    let overloads = |callee: FnId, file: Option<trace_ir::FileId>| {
+        file.into_iter()
+            .flat_map(move |file| symbols.internal_overloads_seen_from(callee, file))
+    };
+    let mut added = Vec::new();
+    for constraint in &program.flow {
+        match *constraint {
+            FlowConstraint::AddrOfFn { dst, callee } => added.extend(
+                overloads(callee, var_file(dst))
+                    .map(|callee| FlowConstraint::AddrOfFn { dst, callee }),
+            ),
+            FlowConstraint::ArrayFnMember { array, callee } => added.extend(
+                overloads(callee, var_file(array))
+                    .map(|callee| FlowConstraint::ArrayFnMember { array, callee }),
+            ),
+            _ => {}
+        }
+    }
+    let mut returns: Vec<(FnId, ReturnFlow)> = Vec::new();
+    for (&owner, flows) in &program.fn_returns {
+        let file = symbols.function_by_id(owner).map(|f| f.span.file);
+        for flow in flows {
+            if let ReturnFlow::AddrOfFn { callee } = *flow {
+                returns.extend(
+                    overloads(callee, file).map(|callee| (owner, ReturnFlow::AddrOfFn { callee })),
+                );
+            }
+        }
+    }
+    program.flow.extend(added);
+    for (owner, flow) in returns {
+        program.fn_returns.entry(owner).or_default().push(flow);
+    }
+    program.symbols.pass_internal_overloads_as_args();
 }
 
 /// Give a member defined in a unit that never saw its class the implicit
@@ -1223,19 +1272,79 @@ fn expand_virtual_overrides(program: &mut Program) {
         if matches!(kind, trace_ir::MethodKind::Ctor) {
             continue;
         }
-        let own = program.symbols.functions_named(&kind.name_on(&cls));
+        // Every file's anonymous namespace spells a class the same, so a
+        // member the call cannot see (in neither its file nor a header that
+        // file includes) is another class's: it does not make the callee
+        // virtual, never stops dispatch as `final`, and is no target when its
+        // class is the receiver's. When the receiver is itself such a class
+        // seen here, so is its whole hierarchy, since a subclass names it: a
+        // member of a class in that hierarchy is a target only where the call
+        // sees it, not a same-named external class's or its subclasses'. A
+        // base declared outside an anonymous namespace still dispatches to the
+        // overrides in every file.
+        //
+        // A callee bound to such a member was looked up where its class is
+        // seen, which a header can make another file than the call's.
+        let bound_in = (f.linkage == trace_ir::Linkage::Internal).then_some(f.file);
+        let sees = |file: trace_ir::FileId| {
+            program.symbols.file_sees(cs.span.file, file)
+                || bound_in.is_some_and(|b| program.symbols.file_sees(b, file))
+        };
+        let visible = |t: FnId| {
+            let t = program.symbols.function(t);
+            t.linkage != trace_ir::Linkage::Internal || sees(t.file)
+        };
         let virtual_dispatch = kind.is_destructor()
             || f.is_virtual
-            || own.iter().any(|t| program.symbols.function(*t).is_virtual);
+            || program
+                .symbols
+                .functions_named(&kind.name_on(&cls))
+                .into_iter()
+                .any(|t| program.symbols.function(t).is_virtual && visible(t));
         if !virtual_dispatch {
             continue;
         }
         let root = cs.receiver_class.as_deref().unwrap_or(&cls);
         let expected_arity = method_explicit_arity(program, fid);
-        for t in program.method_targets(root, &kind) {
-            if !arity_compatible(expected_arity, method_explicit_arity(program, t)) {
-                continue;
-            }
+        let mut targets = if bound_in.is_some() || program.class_is_anonymous_in(root, sees) {
+            let hierarchy: Vec<String> = program
+                .subclass_closure(root)
+                .iter()
+                .map(|c| kind.name_on(c))
+                .collect();
+            let seen_here = |t: FnId| {
+                let target = program.symbols.function(t);
+                visible(t) && (sees(target.file) || !hierarchy.contains(&target.name))
+            };
+            program.method_targets_among(root, &kind, &sees, &seen_here)
+        } else {
+            let own_name = kind.name_on(root);
+            let mut targets = program.method_targets_among(root, &kind, &sees, &|_| true);
+            // A member the call cannot see is a member of another file's
+            // anonymous class: a target only when, as its own file sees it,
+            // that class derives from the receiver's class or an external
+            // class under it, not merely shares a name with one of them.
+            let hierarchy = std::cell::OnceCell::new();
+            targets.retain(|&t| {
+                let target = program.symbols.function(t);
+                if visible(t) {
+                    return true;
+                }
+                target.name != own_name
+                    && method_kind_of_function(&target.name).is_some_and(|(owner, _)| {
+                        let hierarchy: &Vec<String> =
+                            hierarchy.get_or_init(|| program.subclass_closure(root));
+                        program.anonymous_class_derives_from(
+                            &owner,
+                            &|file| program.symbols.file_sees(target.file, file),
+                            &|base| hierarchy.iter().any(|c| c == base),
+                        )
+                    })
+            });
+            targets
+        };
+        targets.retain(|&t| arity_compatible(expected_arity, method_explicit_arity(program, t)));
+        for t in targets {
             let key = (cs.caller, cs.span.line, cs.span.col, t);
             if !seen.insert(key) {
                 continue;
@@ -2004,6 +2113,9 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
         template_bases: std::mem::take(&mut program.template_bases),
         arrow_returns: std::mem::take(&mut program.arrow_returns),
         final_classes: std::mem::take(&mut program.final_classes),
+        anonymous_classes: std::mem::take(&mut program.anonymous_classes),
+        anonymous_final_classes: std::mem::take(&mut program.anonymous_final_classes),
+        anonymous_bases: std::mem::take(&mut program.anonymous_bases),
     }
 }
 
@@ -2499,14 +2611,23 @@ fn lower_struct_specifier(
     // namespace scope (usings ignored here; documented imprecision).
     // `struct D : B` is the same relationship (only default access differs).
     if is_cpp_class {
-        if node.child_by_field_name("body").is_some() {
+        let has_body = node.child_by_field_name("body").is_some();
+        if has_body {
             program.types.define_struct(&reg_name);
         } else {
             program.types.declare_struct(&reg_name);
         }
         let derived = reg_name.clone();
+        let anonymous_in =
+            (has_body && ctx.in_anonymous_namespace()).then(|| node_span(program, ctx, node).file);
+        if let Some(file) = anonymous_in {
+            program.mark_class_anonymous(&derived, file);
+        }
         if class_specifier_is_final(source, node) {
-            program.mark_class_final(&derived);
+            match anonymous_in {
+                Some(file) => program.mark_anonymous_class_final(&derived, file),
+                None => program.mark_class_final(&derived),
+            }
         }
         for child in node.children(&mut node.walk()) {
             if child.kind() != "base_class_clause" {
@@ -2539,6 +2660,9 @@ fn lower_struct_specifier(
                     }
                     let raw = normalize_qualified(base_text);
                     let base = qualify_class_name(program, ctx, &strip_template_args(&raw));
+                    if let Some(file) = anonymous_in {
+                        program.add_anonymous_base(&derived, file, &base);
+                    }
                     program.add_inheritance(&derived, &base);
                 }
             }
@@ -2708,23 +2832,32 @@ fn lower_class_definitions(
             }
         }
     }
-    let saved = ctx.class_ctx.clone();
-    for &m in &members {
-        let member = if m.kind() == "template_declaration" {
-            template_member_decl(m).unwrap_or(m)
-        } else {
-            m
-        };
-        let in_class_def = member.kind() == "function_definition"
-            || (member.kind() == "field_declaration"
-                && member_decl_is_function(member)
-                && node_has_compound_body(member));
-        if in_class_def {
-            ctx.class_ctx = Some(ClassCtx {
-                qual_name: cls_qual.to_string(),
-            });
-            lower_function(program, ctx, source, member);
-        }
+    // Every definition's entry exists before any body is lowered, so a body
+    // finds a member the class defines further down, overloads included (#96).
+    let saved = ctx.class_ctx.replace(ClassCtx {
+        qual_name: cls_qual.to_string(),
+    });
+    let signatures: Vec<_> = members
+        .iter()
+        .map(|&m| {
+            if m.kind() == "template_declaration" {
+                template_member_decl(m).unwrap_or(m)
+            } else {
+                m
+            }
+        })
+        .filter(|&member| {
+            member.kind() == "function_definition"
+                || (member.kind() == "field_declaration"
+                    && member_decl_is_function(member)
+                    && node_has_compound_body(member))
+        })
+        .filter_map(|member| {
+            lower_function_signature(program, ctx, source, member).map(|sig| (member, sig))
+        })
+        .collect();
+    for (member, signature) in signatures {
+        lower_function_body(program, ctx, source, member, signature);
     }
     ctx.class_ctx = saved;
     ctx.type_scope.borrow_mut().pop();
@@ -3135,26 +3268,41 @@ fn register_member_prototype(
 }
 
 fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, node: Node) {
-    let Some(decl) = error_parked_declarator(node)
+    if let Some(signature) = lower_function_signature(program, ctx, source, node) {
+        lower_function_body(program, ctx, source, node, signature);
+    }
+}
+
+/// A function definition's registered entry, whose body is still to be
+/// lowered.
+struct FunctionSignature {
+    fn_id: FnId,
+    params: Vec<VarId>,
+    eff_class: Option<String>,
+}
+
+/// Register a function definition's entry and parameters, without its body.
+/// `None` when there is no body to lower: no name, or a dependency body.
+fn lower_function_signature(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<FunctionSignature> {
+    let decl = error_parked_declarator(node)
         .or_else(|| node.child_by_field_name("declarator"))
-        .or_else(|| find_function_declarator(node))
-    else {
-        return;
-    };
+        .or_else(|| find_function_declarator(node))?;
     // An in-class conversion operator behind a leading macro keeps a
     // declarator, but that declarator names the type it converts *to*; only
     // the member walk knows to read the keyword stranded beside it. Without
     // this the definition landed on `C::S` — defined, colliding with the
     // class `S` itself — while its declaration stayed undefined.
     let raw_name = match conversion_keyword_error(node) {
-        Some(_) => match member_short_name(source, node) {
-            Some(n) => n,
-            None => return,
-        },
+        Some(_) => member_short_name(source, node)?,
         None => parse_declarator_name(source, decl).0,
     };
     if raw_name.is_empty() {
-        return;
+        return None;
     }
     let name = ctx.qualify_decl(&raw_name);
     // Out-of-class member definitions (`void Cls::f() {}`, ctors, dtors):
@@ -3184,17 +3332,7 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
     };
     let provisional_id = program.symbols.alloc_fn_id();
     let mut params = Vec::new();
-    // A member's parameters and body look type names up in its class; the
-    // return type of an out-of-class definition does not (`It C::Make()`
-    // spells `C::It`), and an in-class definition has its class in scope
-    // already.
-    let scoped = ctx.is_cpp
-        && eff_class
-            .as_ref()
-            .is_some_and(|cls| ctx.type_scope.borrow().last() != Some(cls));
-    if let Some(cls) = eff_class.as_ref().filter(|_| scoped) {
-        ctx.type_scope.borrow_mut().push(cls.clone());
-    }
+    let scoped = enter_member_scope(ctx, eff_class.as_ref());
     // Implicit `this` for member functions, ctors and dtors.
     if let Some(cls) = &eff_class {
         let span = node_span(program, ctx, node);
@@ -3206,8 +3344,15 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
     // internal linkage. Registered internal, a static member template's body
     // never merged with its external prototype on the same line, and the unit
     // merge dropped it as that prototype's duplicate.
+    // A member of a class in an anonymous namespace has internal linkage
+    // wherever its definition is written: after the namespace closes, or in
+    // the `.cpp` including the class's header.
+    let definition_file = node_span(program, ctx, node).file;
     let is_static = (eff_class.is_none() && declaration_is_static(source, node))
-        || ctx.in_anonymous_namespace();
+        || ctx.in_anonymous_namespace()
+        || eff_class.as_ref().is_some_and(|cls| {
+            program.class_is_anonymous_in(cls, |f| program.symbols.file_sees(definition_file, f))
+        });
     let flags = virtual_flags(source, node);
 
     let span = node_span(program, ctx, node);
@@ -3248,13 +3393,44 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
         is_cpp: ctx.is_cpp,
     });
     reassign_fn_id(program, provisional_id, fn_id);
-    // Preserve the signature without allocating body IR or following calls.
-    if is_dep {
-        if scoped {
-            ctx.type_scope.borrow_mut().pop();
-        }
-        return;
+    if scoped {
+        ctx.type_scope.borrow_mut().pop();
     }
+    // Preserve the signature without allocating body IR or following calls.
+    (!is_dep).then_some(FunctionSignature {
+        fn_id,
+        params,
+        eff_class,
+    })
+}
+
+/// Push a member's class as the scope type names are looked up in, unless it
+/// is the innermost already; whether it was pushed. A member's parameters and
+/// body look type names up in its class; the return type of an out-of-class
+/// definition does not (`It C::Make()` spells `C::It`), and an in-class
+/// definition has its class in scope already.
+fn enter_member_scope(ctx: &LowerContext, eff_class: Option<&String>) -> bool {
+    let scoped =
+        ctx.is_cpp && eff_class.is_some_and(|cls| ctx.type_scope.borrow().last() != Some(cls));
+    if let Some(cls) = eff_class.filter(|_| scoped) {
+        ctx.type_scope.borrow_mut().push(cls.clone());
+    }
+    scoped
+}
+
+fn lower_function_body(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+    signature: FunctionSignature,
+) {
+    let FunctionSignature {
+        fn_id,
+        params,
+        eff_class,
+    } = signature;
+    let scoped = enter_member_scope(ctx, eff_class.as_ref());
     ctx.current_fn = Some(fn_id);
     ctx.locals.clear();
     for &param in &params {
@@ -3623,16 +3799,17 @@ fn lower_declaration(
 /// than declaring a function. C++ reads it as a function declaration only
 /// when the parenthesized names are types; tree-sitter cannot tell and always
 /// does, so `Worker w(OnReady);` registered a function `w` and constructed
-/// nothing. Inside a function body, a list of bare names that each resolve to
-/// a variable or a function in scope is an argument list. `T w();` stays a
-/// declaration, as it is in C++.
+/// nothing. A list of bare names that each resolve to a variable or a function
+/// in scope is an argument list. `T w();` stays a declaration, as it is in C++.
+/// At file scope a name counts as a global or file `static` variable (the
+/// file's own or an included header's) or a function.
 fn direct_init_arguments(
     program: &Program,
     ctx: &LowerContext,
     source: &str,
     decl: Node,
 ) -> Option<CallArgs> {
-    if !ctx.is_cpp || ctx.current_fn.is_none() || decl.kind() != "function_declarator" {
+    if !ctx.is_cpp || decl.kind() != "function_declarator" {
         return None;
     }
     if decl.child_by_field_name("declarator")?.kind() != "identifier" {
@@ -3669,8 +3846,8 @@ fn direct_init_arguments(
             // A data member is a value, so this defines an object:
             // `std::lock_guard<std::mutex> g(mu_);`. Its value is not a
             // variable here, and the position stays without an actual, as a
-            // literal's does. Checked before `lookup_var`, which would scan
-            // every variable to miss it.
+            // literal's does. Checked before `lookup_var`: in class scope the
+            // member hides a variable of its name outside the class.
         } else if let Some(var) = lookup_var(ctx, program, &name) {
             args.var_args.push((index, var));
         } else {
@@ -5412,7 +5589,10 @@ fn lower_lambda_expression(
 /// the subclass closure as the dynamic-dispatch target set.
 fn member_targets_upward(program: &Program, cls: &str, kind: &trace_ir::MethodKind) -> Vec<FnId> {
     let own = declared_members_upward(program, cls, kind);
-    if own.is_empty() {
+    // Only a virtual call expands to subclasses. A constructor not in view
+    // stays unresolved; the closure made `: Base(a)` reach the derived
+    // constructor it is written in.
+    if own.is_empty() && !matches!(kind, trace_ir::MethodKind::Ctor) {
         return program.method_targets(cls, kind);
     }
     let virtual_dispatch =
@@ -6575,7 +6755,10 @@ fn lower_designated_initializer(
 
 fn peel_expression(mut node: Node) -> Node {
     while node.kind() == "parenthesized_expression" {
-        node = node.named_child(0).unwrap_or(node);
+        match node.named_child(0) {
+            Some(inner) => node = inner,
+            None => break,
+        }
     }
     node
 }
@@ -7638,6 +7821,10 @@ fn resolve_call_fn_arg(
     source: &str,
     node: Node,
 ) -> Option<FnId> {
+    // `Worker w((OnReady));` passes the function in parentheses, the usual
+    // spelling that keeps a direct initialization from reading as a
+    // declaration.
+    let node = peel_expression(node);
     if ctx.is_cpp && node.kind() == "lambda_expression" {
         return lower_lambda_expression(program, ctx, source, node);
     }
@@ -7920,19 +8107,9 @@ fn lookup_var(ctx: &LowerContext, program: &Program, name: &str) -> Option<VarId
     if let Some(&id) = program.symbols.global_by_name.get(name) {
         return Some(id);
     }
-    program
-        .symbols
-        .variables
-        .iter()
-        .find(|v| {
-            v.name == name
-                && match v.storage {
-                    StorageClass::FileStatic => v.span.file == ctx.current_file,
-                    StorageClass::FnStatic => v.fn_id == ctx.current_fn,
-                    _ => false,
-                }
-        })
-        .map(|v| v.id)
+    // A function-local `static` is among `locals`, as every variable declared
+    // in a body is.
+    program.symbols.file_static_named(ctx.current_file, name)
 }
 
 fn declaration_is_static(_source: &str, node: Node) -> bool {

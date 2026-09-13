@@ -148,6 +148,35 @@ impl CallSite {
     }
 }
 
+/// What a surviving entry takes from any redeclaration merged into it,
+/// whatever its linkage. The cached signature moves with the parameter list
+/// it describes, and a merge that hands over no list touches neither: a
+/// shape-compatible prototype can carry different TypeIds, so replacing a
+/// definition's cache would let a later, distinct body pass the exact-id
+/// check, and `merge_unit` remaps an adopted list, which a stale cache would
+/// describe with the old list's ids.
+fn absorb_redeclaration(
+    existing: &mut Function,
+    func: &Function,
+    param_types: Option<&[TypeId]>,
+    adopted_params: bool,
+) {
+    if adopted_params {
+        existing.param_type_ids = param_types
+            .map(<[TypeId]>::to_vec)
+            .unwrap_or_else(|| func.param_type_ids.clone());
+    }
+    if existing.explicit_arity.is_none() {
+        existing.explicit_arity = func.explicit_arity;
+    }
+    existing.variadic |= func.variadic;
+    // User-provided once any declaration of it is.
+    existing.defaulted_in_class &= func.defaulted_in_class;
+    existing.default_args = existing.default_args.max(func.default_args);
+    existing.is_virtual |= func.is_virtual;
+    existing.is_final |= func.is_final;
+}
+
 /// Whether merging `a` and `b` joins a member's in-class prototype with a
 /// definition lowered without its `this`: a body defined under a qualifier its
 /// unit did not know (`owner_unresolved`). The prototype says it is a member
@@ -203,10 +232,23 @@ pub struct SymbolTable {
     /// exact-name `fn_by_name`/`externals_by_name` tables cannot express.
     base_by_name: FxHashMap<String, Vec<FnId>>,
     pub global_by_name: IndexMap<String, VarId>,
+    /// File-`static` variables per file, the first registered of a name
+    /// winning.
+    file_statics_by_name: FxHashMap<FileId, FxHashMap<String, VarId>>,
     /// Internal-linkage definitions per file: `(file, name) -> FnId`.
     /// In C, a file-`static` definition shadows any external definition of
     /// the same name for references inside that file.
     fn_by_scope: FxHashMap<FileId, FxHashMap<String, FnId>>,
+    /// The further C++ overloads of an entry in `fn_by_scope`, keyed by that
+    /// entry: the table holds one function per file and name.
+    scope_overloads: FxHashMap<FnId, Vec<FnId>>,
+    /// The `fn_by_scope` entry each further overload belongs to.
+    overload_primary: FxHashMap<FnId, FnId>,
+    /// Internal-linkage members declared in their class, by qualified name: a
+    /// class in an anonymous namespace. Member lookup spells a member by its
+    /// class (`Cls::m`) without a file, and `fn_by_scope` answers only per
+    /// file, so without this such members were never found.
+    internal_members_by_name: FxHashMap<String, Vec<FnId>>,
     /// Headers whose entities were attributed to this TU during lowering
     /// (`#include`d code). Scope resolution consults them so a `static`
     /// inline defined in a header stays visible to its includers after
@@ -349,7 +391,6 @@ impl SymbolTable {
         param_types: Option<&[TypeId]>,
         types: Option<&crate::TypeTable>,
     ) -> FnRegistration {
-        let mut pending_param_type_ids: Option<Vec<TypeId>> = None;
         let mut adopted_params = false;
         if func.linkage == Linkage::External {
             // Find existing candidates under func.name: all entries in
@@ -394,121 +435,8 @@ impl SymbolTable {
             // incoming pure-C definition scans the whole overload bucket now,
             // so with two same-arity C++ prototypes under one name it used to
             // take whichever was inserted first regardless of signature.
-            let compatible = |existing_id: FnId, require_types: bool| -> bool {
-                // Merge only compatible redeclarations (prototype + definition).
-                // Distinct arities mean C++ overloads — and only then: keep
-                // both entries so call-site resolution can pick between them.
-                //
-                // Overload splitting requires *both* sides to be C++. A `.h`
-                // reached from a C++ TU is parsed as C++ (`is_cpp`), but the
-                // `.c` definition is not. Treating that as an overload (the
-                // old `||`) left callers bound to the undefined prototype —
-                // HDF `GpioSetIrq` never reached `GpioRegListener`, so
-                // `gpio->func` stayed empty. Mixed-language same-name entries
-                // still require matching arity when both sides have params,
-                // so a coincidental C++ overload is not swallowed.
-                let existing_fn = self.function_by_id(existing_id);
-                let both_cpp = func.is_cpp && existing_fn.map(|e| e.is_cpp).unwrap_or(false);
-                existing_fn
-                    .map(|existing| {
-                        if !func.is_cpp && !existing.is_cpp {
-                            // Pure C: prototype + definition always collapse.
-                            return true;
-                        }
-                        // `f(T*&)` and `f(T*&, Args&...)` declare the same
-                        // explicit arity and are still two overloads.
-                        let variadic_ok = !both_cpp || existing.variadic == func.variadic;
-                        let arity_ok = variadic_ok
-                            && if existing.params.is_empty() || func.params.is_empty() {
-                                // A parameterless side matches any list, except
-                                // that two C++ declarations of different arity
-                                // are overloads: an in-class prototype lowers no
-                                // parameter variables, and `Get()` swallowed
-                                // `Get(Mode&)` and its definition's callers. The
-                                // counts exclude `this`, so a body lowered
-                                // without its class in view still merges.
-                                !both_cpp
-                                    || existing
-                                        .explicit_arity
-                                        .zip(func.explicit_arity)
-                                        .is_none_or(|(a, b)| a == b)
-                            } else {
-                                existing.params.len() == func.params.len()
-                            };
-                        if !both_cpp && !require_types {
-                            // Header parsed as C++ vs `.c` body: merge by
-                            // arity and ignore param-type mismatch (typedef
-                            // `GpioIrqFunc` vs decayed `Int`). That tolerance
-                            // is why this pair needs the first pass above --
-                            // it is the reason arity alone can be ambiguous.
-                            return arity_ok;
-                        }
-                        // C++: prototypes and definitions of the *same*
-                        // function merge; distinct same-arity overloads
-                        // must stay apart. Parameter types disambiguate.
-                        // When `param_types` is supplied (cross-TU merge) it
-                        // holds the remapped global types of `func.params`;
-                        // otherwise (per-TU) they resolve via `param_type`.
-                        // The existing side resolves through `param_type_ids`
-                        // first: during a merge pass all functions register
-                        // before their param variables are remapped, so the
-                        // VarId probe comes back `None` for a same-unit
-                        // predecessor with a *different* signature. A side
-                        // whose type is unresolvable falls back to arity-only,
-                        // like the C-vs-C++ path.
-                        //
-                        // Resolved pairs compare by SHAPE, not by id: a `.h`
-                        // prototype and the `.cpp` definition of one function
-                        // reach this table from two different units, and one C
-                        // type is interned twice whenever those units
-                        // disagreed on how complete a nested tag was --
-                        // `struct HdfRemoteService *` split in HDF because the
-                        // defining unit had not seen `struct HdfObject`'s
-                        // fields. An id comparison read that as an overload,
-                        // left the prototype undefined, and every C caller of
-                        // the interface stopped at it (#83).
-                        //
-                        // Shape comparison reunites a declaration with its
-                        // definition across units. It must NOT join two
-                        // DEFINITIONS: camera declares the same class in
-                        // unrelated fuzzer targets (two headers each define
-                        // `IStreamOperatorMock::Capture`) and puts a test mock
-                        // beside the production implementation
-                        // (`DeferredVideoProcessingSessionCallback::OnError`).
-                        // Those are distinct bodies that merely share a
-                        // qualified name, and folding them together lets the
-                        // second overwrite the survivor's span and parameters
-                        // and evict the first body's facts -- the same hazard
-                        // `base_definitions` guards in trace-parse's merge. A
-                        // pair of definitions therefore keeps the exact id
-                        // comparison.
-                        let by_shape = types.filter(|_| !(existing.is_defined && func.is_defined));
-                        arity_ok
-                            && (existing.params.is_empty() || func.params.is_empty() || {
-                                let existing_t = |i: usize| {
-                                    existing
-                                        .param_type_ids
-                                        .get(i)
-                                        .copied()
-                                        .or_else(|| self.param_type(existing.params[i]))
-                                };
-                                let ok = existing.params.iter().enumerate().all(|(i, _)| {
-                                    let incoming_t = param_types
-                                        .and_then(|ts| ts.get(i))
-                                        .copied()
-                                        .or_else(|| self.param_type(*func.params.get(i).unwrap()));
-                                    match (existing_t(i), incoming_t) {
-                                        (Some(ta), Some(tb)) => match by_shape {
-                                            Some(types) => crate::same_param_type(types, ta, tb),
-                                            None => ta == tb,
-                                        },
-                                        _ => true,
-                                    }
-                                });
-                                ok
-                            })
-                    })
-                    .unwrap_or(false)
+            let compatible = |existing_id: FnId, require_types: bool| {
+                self.redeclaration_compatible(&func, param_types, types, existing_id, require_types)
             };
             // Only a mixed-language pair can answer the two passes
             // differently -- it is the sole case that returns before
@@ -545,29 +473,8 @@ impl SymbolTable {
                         existing.params = func.params.clone();
                         adopted_params = true;
                     }
-                    // Keep the cached signature attached to the parameter
-                    // list it describes. A shape-compatible prototype can
-                    // carry different TypeIds; replacing a definition's cache
-                    // would let a later, distinct body pass the exact-id check.
-                    if adopted_params {
-                        existing.param_type_ids = param_types
-                            .map(<[TypeId]>::to_vec)
-                            .unwrap_or_else(|| func.param_type_ids.clone());
-                    }
-                    if existing.explicit_arity.is_none() {
-                        existing.explicit_arity = func.explicit_arity;
-                    }
-                    existing.variadic |= func.variadic;
+                    absorb_redeclaration(existing, &func, param_types, adopted_params);
                     existing.declared_in_class |= func.declared_in_class;
-                    // User-provided once any declaration of it is.
-                    existing.defaulted_in_class &= func.defaulted_in_class;
-                    existing.default_args = existing.default_args.max(func.default_args);
-                    if func.is_virtual {
-                        existing.is_virtual = true;
-                    }
-                    if func.is_final {
-                        existing.is_final = true;
-                    }
                     // A C definition merging into a C++-parsed header
                     // prototype must drop `is_cpp`. Otherwise a later
                     // TU merge sees both_cpp and refuses the body
@@ -619,9 +526,6 @@ impl SymbolTable {
                 .entry(func.name.clone())
                 .or_default()
                 .push(func.id);
-            // The entry is not indexed yet (push_indexed runs below), so
-            // carry the remapped signature types to the push.
-            pending_param_type_ids = param_types.map(|ts| ts.to_vec());
         }
         if func.linkage == Linkage::Internal {
             // Merge forward declarations with definitions for internal
@@ -629,73 +533,146 @@ impl SymbolTable {
             // lower bounds before its definition creates a separate entry;
             // call-sites resolved between the two point at the declaration
             // (is_defined=false) and the solver never expands its body.
-            if let Some(scope_map) = self.fn_by_scope.get(&func.file) {
-                if let Some(&existing_id) = scope_map.get(&func.name) {
-                    if let Some(existing) = self.function_mut_by_id(existing_id) {
-                        if func.is_defined && !existing.is_defined {
-                            existing.is_defined = true;
-                            existing.file = func.file;
-                            existing.span = func.span;
-                            existing.end_line = func.end_line;
-                            if !func.params.is_empty() {
-                                existing.params = func.params.clone();
-                                adopted_params = true;
-                            }
-                        } else if !func.is_defined
-                            && existing.params.is_empty()
-                            && !func.params.is_empty()
-                        {
+            //
+            // A C++ function with internal linkage can be overloaded
+            // (`static void f(int)` beside `f(double)`, or a member of a class
+            // in an anonymous namespace), and merging on file and name alone
+            // gave the overloads one entry holding every body. A C++ entry
+            // merges only into a redeclaration of it, found as an external
+            // one is; C keeps one function per file and name.
+            //
+            // A C++ declaration, its definition and its overloads share the
+            // translation unit, headers included: a header's
+            // `static void f(int);` beside the `.cpp`'s `f(double)`, or a
+            // header's anonymous-namespace class member defined in the `.cpp`.
+            let own_file = self
+                .fn_by_scope
+                .get(&func.file)
+                .and_then(|scope| scope.get(&func.name))
+                .copied();
+            let scoped = own_file.or_else(|| {
+                let headers = self.scope_files(func.file).skip(1);
+                headers.filter(|_| func.is_cpp).find_map(|file| {
+                    let id = *self.fn_by_scope.get(&file)?.get(&func.name)?;
+                    self.function_by_id(id)
+                        .is_some_and(|e| e.is_cpp)
+                        .then_some(id)
+                })
+            });
+            let overloads = func.is_cpp
+                && scoped.is_some_and(|id| self.function_by_id(id).is_some_and(|e| e.is_cpp));
+            let compatible = match scoped {
+                Some(primary) if overloads => std::iter::once(primary)
+                    .chain(
+                        self.scope_overloads
+                            .get(&primary)
+                            .into_iter()
+                            .flatten()
+                            .copied(),
+                    )
+                    .find(|&id| self.redeclaration_compatible(&func, param_types, types, id, true)),
+                _ => scoped,
+            };
+            // A header's entry is every including unit's, and so is each
+            // overload a unit's `.cpp` adds to it: a free function found
+            // through a header is not folded into one, whether it is the
+            // header's declaration or another unit's `static void f(double)`.
+            // It stays this unit's function, and the unit merge joins the
+            // unit's calls to it (`respelled_declarations`). A class member's
+            // prototype does take its definition, as an external member's
+            // does, and keeps its `virtual`.
+            let shared_declaration = own_file.is_none()
+                && compatible.is_some_and(|id| {
+                    self.function_by_id(id).is_some_and(|e| {
+                        // The same header text lowered once more for the unit
+                        // is that entry, not another function.
+                        let same_text =
+                            e.span.file == func.span.file && e.span.line == func.span.line;
+                        !e.declared_in_class && !same_text
+                    })
+                });
+            let redeclared = compatible.filter(|_| !shared_declaration);
+            if let Some(existing_id) = redeclared {
+                if let Some(existing) = self.function_mut_by_id(existing_id) {
+                    if func.is_defined && !existing.is_defined {
+                        existing.is_defined = true;
+                        existing.file = func.file;
+                        existing.span = func.span;
+                        existing.end_line = func.end_line;
+                        if !func.params.is_empty() {
                             existing.params = func.params.clone();
                             adopted_params = true;
                         }
-                        // Same invariant the external branch keeps: the
-                        // surviving entry's parameter list and the
-                        // `param_type_ids` describing it move together, and a
-                        // merge that hands over no list touches neither.
-                        // Nothing matches internal-linkage entries by
-                        // signature -- `fn_by_scope` keys on name and file --
-                        // so a stale cache here is latent rather than a
-                        // mismatch, but `adopted_params` is what tells
-                        // `merge_unit` to remap this entry's parameters, and
-                        // leaving the cache behind would describe the new list
-                        // with the old list's ids.
-                        if adopted_params {
-                            existing.param_type_ids = param_types
-                                .map(<[TypeId]>::to_vec)
-                                .unwrap_or_else(|| func.param_type_ids.clone());
-                        }
-                        if func.is_virtual {
-                            existing.is_virtual = true;
-                        }
-                        if func.is_final {
-                            existing.is_final = true;
-                        }
-                        return FnRegistration {
-                            id: existing_id,
-                            adopted_params,
-                        };
+                    } else if !func.is_defined
+                        && existing.params.is_empty()
+                        && !func.params.is_empty()
+                    {
+                        existing.params = func.params.clone();
+                        adopted_params = true;
                     }
+                    absorb_redeclaration(existing, &func, param_types, adopted_params);
+                    let becomes_member = func.declared_in_class && !existing.declared_in_class;
+                    existing.declared_in_class |= func.declared_in_class;
+                    if becomes_member {
+                        self.internal_members_by_name
+                            .entry(func.name.clone())
+                            .or_default()
+                            .push(existing_id);
+                    }
+                    return FnRegistration {
+                        id: existing_id,
+                        adopted_params,
+                    };
                 }
             }
             // Index every internal-linkage entry, declarations included:
             // lowering resolves identifiers against this table *while the
             // file streams in*, so a designated initializer like
             // `.Read = StaticFn` must bind before the definition is lowered.
-            self.fn_by_scope
-                .entry(func.file)
-                .or_default()
-                .insert(func.name.clone(), func.id);
+            // A further overload leaves the name on the first one and joins
+            // its overloads.
+            // An overload of a member is a member, though its definition,
+            // written outside the class, does not say so.
+            let joins = scoped.filter(|_| overloads && !shared_declaration);
+            let member_overload = joins
+                .and_then(|primary| self.function_by_id(primary))
+                .is_some_and(|primary| primary.declared_in_class);
+            match joins {
+                Some(primary) => {
+                    self.scope_overloads
+                        .entry(primary)
+                        .or_default()
+                        .push(func.id);
+                    self.overload_primary.insert(func.id, primary);
+                }
+                None => {
+                    self.fn_by_scope
+                        .entry(func.file)
+                        .or_default()
+                        .insert(func.name.clone(), func.id);
+                }
+            }
+            if func.declared_in_class || member_overload {
+                self.internal_members_by_name
+                    .entry(func.name.clone())
+                    .or_default()
+                    .push(func.id);
+            }
         }
         // A fresh entry owns the list it arrived with rather than adopting
         // another entry's, so `adopted_params` stays false; the caller
         // recognises this case by the returned id being the one it allocated.
-        let id = if let Some(ts) = pending_param_type_ids.take() {
-            let mut func = func;
-            func.param_type_ids = ts;
-            self.push_indexed(func)
-        } else {
-            self.push_indexed(func)
-        };
+        //
+        // A named entry carries the remapped signature types: a unit merge
+        // registers functions before remapping their parameter variables, so a
+        // later redeclaration or overload compares against this cache.
+        let mut func = func;
+        if func.linkage != Linkage::None {
+            if let Some(ts) = param_types {
+                func.param_type_ids = ts.to_vec();
+            }
+        }
+        let id = self.push_indexed(func);
         debug_assert!(
             !adopted_params,
             "a fresh entry owns its parameter list; nothing adopted one"
@@ -755,21 +732,166 @@ impl SymbolTable {
         self.functions.get_mut(slot).filter(|f| f.id == id)
     }
 
+    /// Whether `func` redeclares the entry `existing_id` rather than
+    /// overloading it: see the two passes in
+    /// [`register_function`](Self::register_function).
+    fn redeclaration_compatible(
+        &self,
+        func: &Function,
+        param_types: Option<&[TypeId]>,
+        types: Option<&crate::TypeTable>,
+        existing_id: FnId,
+        require_types: bool,
+    ) -> bool {
+        // Merge only compatible redeclarations (prototype + definition).
+        // Distinct arities mean C++ overloads — and only then: keep
+        // both entries so call-site resolution can pick between them.
+        //
+        // Overload splitting requires *both* sides to be C++. A `.h`
+        // reached from a C++ TU is parsed as C++ (`is_cpp`), but the
+        // `.c` definition is not. Treating that as an overload (the
+        // old `||`) left callers bound to the undefined prototype —
+        // HDF `GpioSetIrq` never reached `GpioRegListener`, so
+        // `gpio->func` stayed empty. Mixed-language same-name entries
+        // still require matching arity when both sides have params,
+        // so a coincidental C++ overload is not swallowed.
+        let existing_fn = self.function_by_id(existing_id);
+        let both_cpp = func.is_cpp && existing_fn.map(|e| e.is_cpp).unwrap_or(false);
+        existing_fn
+            .map(|existing| {
+                if !func.is_cpp && !existing.is_cpp {
+                    // Pure C: prototype + definition always collapse.
+                    return true;
+                }
+                // `f(T*&)` and `f(T*&, Args&...)` declare the same
+                // explicit arity and are still two overloads.
+                let variadic_ok = !both_cpp || existing.variadic == func.variadic;
+                let arity_ok = variadic_ok
+                    && if existing.params.is_empty() || func.params.is_empty() {
+                        // A parameterless side matches any list, except
+                        // that two C++ declarations of different arity
+                        // are overloads: an in-class prototype lowers no
+                        // parameter variables, and `Get()` swallowed
+                        // `Get(Mode&)` and its definition's callers. The
+                        // counts exclude `this`, so a body lowered
+                        // without its class in view still merges.
+                        !both_cpp
+                            || existing
+                                .explicit_arity
+                                .zip(func.explicit_arity)
+                                .is_none_or(|(a, b)| a == b)
+                    } else {
+                        existing.params.len() == func.params.len()
+                    };
+                if !both_cpp && !require_types {
+                    // Header parsed as C++ vs `.c` body: merge by
+                    // arity and ignore param-type mismatch (typedef
+                    // `GpioIrqFunc` vs decayed `Int`). That tolerance
+                    // is why this pair needs the first pass in `register_function` --
+                    // it is the reason arity alone can be ambiguous.
+                    return arity_ok;
+                }
+                // C++: prototypes and definitions of the *same*
+                // function merge; distinct same-arity overloads
+                // must stay apart. Parameter types disambiguate.
+                // When `param_types` is supplied (cross-TU merge) it
+                // holds the remapped global types of `func.params`;
+                // otherwise (per-TU) they resolve via `param_type`.
+                // The existing side resolves through `param_type_ids`
+                // first: during a merge pass all functions register
+                // before their param variables are remapped, so the
+                // VarId probe comes back `None` for a same-unit
+                // predecessor with a *different* signature. A side
+                // whose type is unresolvable falls back to arity-only,
+                // like the C-vs-C++ path.
+                //
+                // Resolved pairs compare by SHAPE, not by id: a `.h`
+                // prototype and the `.cpp` definition of one function
+                // reach this table from two different units, and one C
+                // type is interned twice whenever those units
+                // disagreed on how complete a nested tag was --
+                // `struct HdfRemoteService *` split in HDF because the
+                // defining unit had not seen `struct HdfObject`'s
+                // fields. An id comparison read that as an overload,
+                // left the prototype undefined, and every C caller of
+                // the interface stopped at it (#83).
+                //
+                // Shape comparison reunites a declaration with its
+                // definition across units. It must NOT join two
+                // DEFINITIONS: camera declares the same class in
+                // unrelated fuzzer targets (two headers each define
+                // `IStreamOperatorMock::Capture`) and puts a test mock
+                // beside the production implementation
+                // (`DeferredVideoProcessingSessionCallback::OnError`).
+                // Those are distinct bodies that merely share a
+                // qualified name, and folding them together lets the
+                // second overwrite the survivor's span and parameters
+                // and evict the first body's facts -- the same hazard
+                // `base_definitions` guards in trace-parse's merge. A
+                // pair of definitions therefore keeps the exact id
+                // comparison.
+                let by_shape = types.filter(|_| !(existing.is_defined && func.is_defined));
+                arity_ok
+                    && (existing.params.is_empty() || func.params.is_empty() || {
+                        let existing_t = |i: usize| {
+                            existing
+                                .param_type_ids
+                                .get(i)
+                                .copied()
+                                .or_else(|| self.param_type(existing.params[i]))
+                        };
+                        let ok = existing.params.iter().enumerate().all(|(i, _)| {
+                            let incoming_t = param_types
+                                .and_then(|ts| ts.get(i))
+                                .copied()
+                                .or_else(|| func.params.get(i).and_then(|&p| self.param_type(p)));
+                            match (existing_t(i), incoming_t) {
+                                (Some(ta), Some(tb)) => match by_shape {
+                                    Some(types) => crate::same_param_type(types, ta, tb),
+                                    None => ta == tb,
+                                },
+                                _ => true,
+                            }
+                        });
+                        ok
+                    })
+            })
+            .unwrap_or(false)
+    }
+
     /// Type of a parameter variable, for overload signature comparison.
     fn param_type(&self, var: VarId) -> Option<TypeId> {
-        self.variables
-            .iter()
-            .find(|v| v.id == var)
+        // Variables usually sit at their id's slot; a unit can push them in
+        // another order than it allocated their ids.
+        self.variable_by_id(var)
+            .or_else(|| self.variables.iter().find(|v| v.id == var))
             .map(|v| v.type_id)
     }
 
     pub fn add_variable(&mut self, var: Variable) -> VarId {
         let id = var.id;
-        if var.storage == StorageClass::Global {
-            self.global_by_name.insert(var.name.clone(), id);
+        match var.storage {
+            StorageClass::Global => {
+                self.global_by_name.insert(var.name.clone(), id);
+            }
+            StorageClass::FileStatic => {
+                self.file_statics_by_name
+                    .entry(var.span.file)
+                    .or_default()
+                    .entry(var.name.clone())
+                    .or_insert(id);
+            }
+            _ => {}
         }
         self.variables.push(var);
         id
+    }
+
+    /// The file-`static` variable `name` code in `file` sees: defined in
+    /// `file`, else in a header it includes.
+    pub fn file_static_named(&self, file: FileId, name: &str) -> Option<VarId> {
+        self.scope_files(file)
+            .find_map(|f| self.file_statics_by_name.get(&f)?.get(name).copied())
     }
 
     pub fn alloc_fn_id(&mut self) -> FnId {
@@ -813,21 +935,93 @@ impl SymbolTable {
     }
 
     fn lookup_in_scopes(&self, name: &str, file: crate::FileId) -> Option<FnId> {
-        if let Some(scope) = self.fn_by_scope.get(&file) {
-            if let Some(id) = scope.get(name) {
-                return Some(*id);
-            }
-        }
-        if let Some(headers) = self.headers_of.get(&file) {
-            for h in headers {
-                if let Some(scope) = self.fn_by_scope.get(h) {
-                    if let Some(id) = scope.get(name) {
-                        return Some(*id);
+        self.scope_files(file)
+            .find_map(|f| self.fn_by_scope.get(&f)?.get(name).copied())
+    }
+
+    /// The further overloads of the internal-linkage entry `id` that code in
+    /// `file` sees, which a name resolving to `id` there may also mean. A
+    /// header's entry is every including unit's, and an overload one unit's
+    /// `.cpp` adds to it is not another unit's.
+    pub fn internal_overloads_seen_from(
+        &self,
+        id: FnId,
+        file: FileId,
+    ) -> impl Iterator<Item = FnId> + '_ {
+        // `id` may be any member of its overload set.
+        let primary = self.overload_primary.get(&id).copied().unwrap_or(id);
+        let further = self
+            .scope_overloads
+            .get(&primary)
+            .into_iter()
+            .flatten()
+            .copied();
+        std::iter::once(primary)
+            .filter(move |&primary| primary != id)
+            .chain(further.filter(move |&overload| {
+                overload != id && self.function_visible_from(overload, file)
+            }))
+    }
+
+    /// Pass each function argument's further internal-linkage overloads, as
+    /// the call's file sees them, at its position too: the name may mean any
+    /// of them.
+    pub fn pass_internal_overloads_as_args(&mut self) {
+        let added: Vec<(usize, Vec<(u32, FnId)>)> = self
+            .call_sites
+            .iter()
+            .enumerate()
+            .filter(|(_, site)| {
+                site.fn_args.iter().any(|(_, callee)| {
+                    self.scope_overloads.contains_key(callee)
+                        || self.overload_primary.contains_key(callee)
+                })
+            })
+            .map(|(i, site)| {
+                let mut more: Vec<(u32, FnId)> = Vec::new();
+                for &(index, callee) in &site.fn_args {
+                    for overload in self.internal_overloads_seen_from(callee, site.span.file) {
+                        let arg = (index, overload);
+                        if !site.fn_args.contains(&arg) && !more.contains(&arg) {
+                            more.push(arg);
+                        }
                     }
                 }
-            }
+                (i, more)
+            })
+            .collect();
+        for (i, more) in added {
+            self.call_sites[i].fn_args.extend(more);
         }
-        None
+    }
+
+    /// Whether any internal-linkage entry has further overloads.
+    pub fn has_internal_overloads(&self) -> bool {
+        !self.scope_overloads.is_empty()
+    }
+
+    /// `file`, then the headers it includes: where a name written in `file`
+    /// is looked for, nearest first.
+    fn scope_files(&self, file: FileId) -> impl Iterator<Item = FileId> + '_ {
+        std::iter::once(file).chain(self.headers_of.get(&file).into_iter().flatten().copied())
+    }
+
+    /// Whether a reference written in `file` can name `id`: an external
+    /// entry is named everywhere, an internal one only in its own file and in
+    /// the files that include the header it is in.
+    pub fn function_visible_from(&self, id: FnId, file: FileId) -> bool {
+        self.function_by_id(id)
+            .is_some_and(|f| f.linkage != Linkage::Internal || self.file_sees(file, f.file))
+    }
+
+    /// Whether code in `file` sees what `other` defines: `other` is `file`, or
+    /// a header `file` includes.
+    pub fn file_sees(&self, file: FileId, other: FileId) -> bool {
+        file == other
+            || self
+                .headers_of
+                .get(&file)
+                .is_some_and(|headers| headers.contains(&other))
     }
 
     /// Take the member definitions whose parameters lack the implicit `this`
@@ -870,20 +1064,12 @@ impl SymbolTable {
         file: Option<crate::FileId>,
     ) -> Vec<FnId> {
         let mut out = Vec::with_capacity(2);
-        if let Some(file) = file {
-            if let Some(scope) = self.fn_by_scope.get(&file) {
-                if let Some(&id) = scope.get(name) {
-                    out.push(id);
-                }
-            }
-            if let Some(headers) = self.headers_of.get(&file) {
-                for h in headers {
-                    if let Some(scope) = self.fn_by_scope.get(h) {
-                        if let Some(&id) = scope.get(name) {
-                            if !out.contains(&id) {
-                                out.push(id);
-                            }
-                        }
+        for f in file.into_iter().flat_map(|file| self.scope_files(file)) {
+            if let Some(&id) = self.fn_by_scope.get(&f).and_then(|scope| scope.get(name)) {
+                let overloads = self.internal_overloads_seen_from(id, file.unwrap_or(f));
+                for id in std::iter::once(id).chain(overloads) {
+                    if !out.contains(&id) {
+                        out.push(id);
                     }
                 }
             }
@@ -906,22 +1092,34 @@ impl SymbolTable {
     }
 
     /// Every external entry declared or defined under `name` (overloads
-    /// included), in declaration order.
+    /// included), in declaration order, then every internal member of a class
+    /// under it. Other internal-linkage functions live in the per-file scope
+    /// table and are not consulted.
     pub fn functions_named(&self, name: &str) -> Vec<FnId> {
+        let internal = self
+            .internal_members_by_name
+            .get(name)
+            .into_iter()
+            .flatten();
         self.externals_by_name
             .get(name)
-            .cloned()
-            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .chain(internal)
+            .copied()
+            .collect()
     }
 
-    /// Whether any external entry carries `name`, without cloning the
-    /// overload set. Internal-linkage functions live in the per-file scope
-    /// table and are not consulted, as in
-    /// [`functions_named`](Self::functions_named).
+    /// Whether [`functions_named`](Self::functions_named) finds any entry,
+    /// without cloning the overload set.
     pub fn has_function_named(&self, name: &str) -> bool {
         self.externals_by_name
             .get(name)
             .is_some_and(|ids| !ids.is_empty())
+            || self
+                .internal_members_by_name
+                .get(name)
+                .is_some_and(|ids| !ids.is_empty())
     }
 
     /// Functions whose fully-qualified name is exactly `namespace::name`.

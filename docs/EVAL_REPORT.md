@@ -68,6 +68,161 @@ Reproduce with a release build and
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Re-verified 2026-09-14 (#95 / #96 PR review: internal-linkage declarations
+and overloads found through included headers):** release build against
+origin/master (1111b0b), same machine and pinned checkouts. hiview and camera
+are unchanged; hdf's `sample_hdi_service_stub.cpp` calls three `static inline`
+helpers of `sample_hdi.h` (`DataBlockBlockUnmarshalling`,
+`DataBlockBlockMarshalling`, `DataBlockFree`), which its unit registered
+twice, from the header and from the translation unit, and resolved as an
+overload tie of one function: each call had two sites to the same callee, and
+now has one (edges_direct 42,255 → 42,252, edges_total 75,817 → 75,814,
+arg-flow 66,257 → 66,253). Each corpus is bit-identical across two `--jobs 8`
+runs and one `--jobs 1` run; eval 91/91 with the expectations re-captured.
+Timing is level over interleaved runs against origin/master: hdf `--jobs 8`
+3.96–4.58 s wall, the first run cold (3.96–3.98 s), hiview 1.65–1.67 s (1.65–1.68 s), camera
+6.50–6.66 s (6.57–6.68 s), camera `--jobs 1` 13.04–13.11 s (12.96–13.31 s).
+A second review round (one unit's `static` functions kept apart from another
+unit's under a shared header, anonymous classes' inherited methods from their
+own file's bases, a stricter qualified-name match) moves no call edge or
+arg-flow row on any corpus; camera `--jobs 8` 6.35–6.43 s against master's
+6.38–6.46 s.
+
+**Re-verified 2026-09-14 (#95 / #96 review: overloads of anonymous-namespace
+members, overloads defined below the calling body, virtual calls on
+same-named anonymous classes, file `static` variables from included headers,
+overloads of internal free functions):**
+release builds of the branch before this review round and after it, same
+machine and pinned checkouts,
+`--jobs 8`. Each corpus is bit-identical across two `--jobs 8` runs and one
+`--jobs 1` run; eval 91/91 with the expectations re-captured. Timing is level
+over interleaved runs against the previous build: hdf `--jobs 8` 3.91–4.00 s
+wall (3.94–4.17 s), hiview 1.65–1.71 s (1.63–1.91 s), camera 6.62–6.85 s
+(6.68–7.12 s), camera `--jobs 1` 13.30–13.38 s (13.26–13.33 s).
+
+| Metric | hdf | hiview | camera |
+|---|---:|---:|---:|
+| Functions total | 12,606 | 10,650 → 10,651 | 23,923 |
+| Functions external | 2,353 | 2,819 | 4,750 → 4,748 |
+| Direct edges | 42,255 | 9,598 | 39,005 → 39,014 |
+| External edges | 28,737 | 20,095 | 54,172 → 54,164 |
+| Arg-flow edges | 66,257 | 10,668 → 10,674 | 28,783 → 28,940 |
+
+Compared by caller, call-site position and callee, the changes are of five
+kinds.
+
+- **Overloads of an anonymous-namespace member.** camera's
+  `hcamera_preconfig.cpp` `PreconfigProfile` defines `toString()` and
+  `toString(cameraInfos, mode)`, which shared one entry per file and name. The
+  second is its own function again, and `DumpPreconfigInfo`'s two calls with
+  two arguments (lines 424, 431) reach it.
+- **An overload defined below the calling body.** hiview's
+  `JankAnimatorMonitorConverter::ConverterReportData(metricData)` calls the
+  three-argument overload written below it, which was not registered yet, so
+  the call bound to itself. With every definition in the class body
+  registered first, it reaches the three-argument overload, and its two extra
+  arguments bind (arg-flow +2).
+- **A construction with the constructors below it.** camera's
+  `Watchdog::GetGlobalWatchdog` constructs `static Watchdog
+  instance("GlobalWatchdog")` above `explicit Watchdog(std::string)` and the
+  deleted copy constructor. The site resolved by name after the merge to both;
+  with the constructors registered first, it binds the one its argument fits
+  (direct −1, arg-flow −2).
+- **A file `static` variable from an included header.** It was found only in
+  the file defining it, so outside its header it was no variable at all.
+  camera's `depth_data_output_napi.h` defines `static EnumHelper<...>
+  DepthDataOutputEventTypeHelper(...)` and its siblings: eight `GetKeyString`
+  calls in `*_napi.cpp` callbacks went to a bare external and now reach
+  `EnumHelper::GetKeyString` directly (direct +8, external −8, the bare
+  `GetKeyString` gone). `metadata_output.h`'s `static const std::map
+  mapLengthOfType` types `find` / `end` as `std::map` members, and
+  `camera_napi.h`'s `static const std::unordered_map mapConnectionType` and
+  its siblings bind as the map argument of `CameraNapi::CreateObjectWithMap`
+  in `CameraNapi::Init` (76 rows), `ResourceManagerNapi::Init` (9) and 71
+  more rows at callback sites (arg-flow +156). `Uri
+  uri(SETTINGS_DATA_BASE_URI);` defines an object instead of the phantom
+  function `CameraDataShareHelper::uri` (functions −2 with `GetKeyString`).
+- **Overloads of an internal free function.** A `static` or
+  anonymous-namespace function's overloads shared one entry per file and
+  name. hiview's `event_field_validator_test.cpp` defines
+  `BuildEvent(domain, name, pid, uid, extra)` and `BuildEvent(name, pid, uid,
+  extra)` in an anonymous namespace: its 38 four-argument calls now reach the
+  four-parameter overload, and that overload's call to the five-parameter one
+  binds its arguments (functions +1, arg-flow +4). camera's
+  `metadata_common_utils.cpp` splits `FillSizeListFromStreamInfo(sizeList,
+  StreamInfo&, format)` from its `StreamRelatedInfo&` twin; the two calls,
+  whose argument type the ranking cannot tell, reach both as an overload tie
+  (functions +1, direct +2, arg-flow +3).
+
+The cross-file virtual-call and `final` fixes, function pointers taken from
+an overloaded internal name, members defined after their anonymous namespace
+closes, declarations and definitions spelling a parameter type two ways, and
+anonymous classes that only share a name with a receiver's subclass move no
+metric: no call edge or arg-flow row changes. Timed with interleaved runs
+against origin/master (1111b0b), the branch is level: hdf `--jobs 8`
+3.95–4.19 s wall (3.96–4.04 s), hiview 1.64–1.73 s (1.67–1.74 s), camera
+6.46–6.60 s (6.57–6.68 s), camera `--jobs 1` 12.94–12.97 s (12.96–12.98 s).
+
+**Re-verified 2026-09-13 (methods defined later in the class body, #96;
+file-scope direct initialization, #95; members of a class in an anonymous
+namespace; constructors never dispatched):** release builds of 2801e87 (#93 /
+#94) and the branch, same machine and pinned checkouts, `--jobs 8`. Each corpus
+is bit-identical across two `--jobs 8` runs and one `--jobs 1` run; eval 91/91
+with the expectations re-captured. Timing is level over interleaved pairs:
+camera `--jobs 8` 6.61 s wall on both (user 18.25 s → 18.30 s, within noise),
+camera `--jobs 1` 13.19 s → 13.15 s user, hiview `--jobs 1` 3.39 s → 3.37 s
+user, hdf `--jobs 8` 3.99 s → 3.98 s wall.
+
+| Metric | hdf | hiview | camera |
+|---|---:|---:|---:|
+| Functions total | 12,601 → 12,606 | 10,653 → 10,650 | 23,960 → 23,923 |
+| Functions external | 2,348 → 2,353 | 2,822 → 2,819 | 4,787 → 4,750 |
+| Direct edges | 42,270 → 42,255 | 9,516 → 9,598 | 39,263 → 39,005 |
+| External edges | 28,724 → 28,737 | 20,105 → 20,095 | 54,245 → 54,172 |
+| Arg-flow edges | 66,258 → 66,257 | 10,598 → 10,668 | 29,024 → 28,783 |
+
+Compared by caller, call-site position and callee, every change is one of
+three kinds.
+
+- **A method defined below the calling body (#96).** The call's bare external
+  (`ShowLevel`, `Modify`, `Validate`) becomes the enclosing class's own method:
+  hdf's `Logger::Debug` … `Logger::Fatal` → `Logger::ShowLevel` (5), hiview's
+  `EvtParser` (3), `LruCache` (2) and `EventRawDataInfo` (1), camera's
+  `CameraNapiObject` (16), `CameraSurfaceBufferUtil` (11),
+  `CameraListenerManager` (7), both `BlockingQueue`s (10), the `*InfoParse`
+  readers (14) and 17 more across 11 classes. The synthesized externals only
+  these calls named are gone (camera 38: `GetDataWidth`, `AddListenerNoLock`,
+  eight `GetVariant*FromNapiValue`, ...).
+- **Members of a class in an anonymous namespace.** They have internal linkage
+  and member lookup never found them, above or below the call. camera's
+  `hcamera_preconfig.cpp` `PreconfigProfile` reaches its own `GetRatioValue`,
+  `toString` and `FindMaxDetailInfoFrom*` (11 external edges become direct,
+  86 camera edges in all with the first kind). hiview's anonymous test fixtures
+  construct through their own constructors (`AshMemTestStruct`,
+  `EventExportDbMgrTestContext`, `TestSysEventServiceStub`: 12 externals), and
+  38 virtual calls reach overrides defined in anonymous namespaces:
+  `HiviewContext::GetHiViewDirectory` from `HiviewGlobal`,
+  `PeriodInfoFileOperator` and a plugin test now reach the seven test
+  contexts that override it, and `ContentReader` and one test reach
+  `ContentReaderVersionTest`'s overrides (7).
+- **A constructor is never dispatched.** `member_targets_upward` fell back to
+  the subclass closure when a class's own constructor was not in view, so
+  `: Base(a)` in a derived constructor, and `new Base(...)`, reached every
+  constructor below `Base`. hdf loses 42 self edges (`Derived::Derived` →
+  itself) and 2 sibling edges, hiview 23 self edges, camera 149 self edges and
+  359 edges to sibling constructors (`ApertureEffectChangeCallbackListener` →
+  `CompositionPositionMatchCallbackListener`: 324 of them land on 41
+  `*CallbackListener` constructors) plus 4 from `new CaptureSession(session)`
+  to `VideoSession`, `PhotoSession`, `ScanSession` and
+  `SecureCameraSession`. The same sites resolve to the base constructor by
+  name after the merge (hdf 42, hiview 25,
+  camera 153 edges; `ListenerBase::ListenerBase`,
+  `CaptureSession::CaptureSession`). The lost arg-flow rows are the arguments
+  those wrong edges wired into sibling constructors' parameters.
+
+The #95 file-scope and doubled-parentheses forms do not occur in the pinned
+corpora, so they move no metric.
+
 **Re-verified 2026-09-13 (second review round: member arguments in direct
 initialization, parameterless members, confident variadic pruning, per-signature
 defaults):** measured against cfbf825 on the same machine and checkouts. Each

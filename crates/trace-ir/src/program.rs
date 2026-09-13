@@ -1,9 +1,10 @@
 use crate::flow::ReturnFlow;
-use crate::symbol::SymbolTable;
+use crate::symbol::{Linkage, SymbolTable};
 use crate::types::TypeTable;
 use crate::{CallSiteId, FileId, FnId};
 use indexmap::IndexMap;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +169,18 @@ pub struct Program {
     pub arrow_returns: Vec<ArrowReturn>,
     /// Classes declared `final` — CHA does not walk into their subclasses.
     pub final_classes: Vec<String>,
+    /// Classes defined in an anonymous namespace, with the files their
+    /// definitions are in. Every file's anonymous namespace spells a class the
+    /// same, so the name alone does not say which of them a receiver is.
+    pub anonymous_classes: BTreeMap<String, BTreeSet<FileId>>,
+    /// The classes of `anonymous_classes` declared `final`, with the files
+    /// defining them so. `final_classes` holds only the other classes: a
+    /// name alone would cut dispatch for every class of it.
+    pub anonymous_final_classes: BTreeMap<String, BTreeSet<FileId>>,
+    /// The direct bases of each class of `anonymous_classes`, with the file
+    /// that derives it so: `inheritance` joins every class of a name, and
+    /// another file's class of the name derives from other bases.
+    pub anonymous_bases: BTreeMap<String, BTreeSet<(FileId, String)>>,
     /// Whether configuration-variant exploration was enabled (#59).
     pub explore: bool,
     /// Maximum configuration-variant exploration budget per translation unit
@@ -298,11 +311,115 @@ impl Program {
         self.final_classes.iter().any(|c| c == cls)
     }
 
-    fn class_method_is_final(&self, cls: &str, kind: &MethodKind) -> bool {
-        self.symbols
-            .functions_named(&kind.name_on(cls))
-            .iter()
-            .any(|&id| self.symbols.function(id).is_final)
+    /// Record that `file` defines the class `cls` in an anonymous namespace.
+    pub fn mark_class_anonymous(&mut self, cls: &str, file: FileId) {
+        self.anonymous_classes
+            .entry(cls.to_string())
+            .or_default()
+            .insert(file);
+    }
+
+    /// Record that `file` defines the class `cls` `final` in an anonymous
+    /// namespace.
+    pub fn mark_anonymous_class_final(&mut self, cls: &str, file: FileId) {
+        self.anonymous_final_classes
+            .entry(cls.to_string())
+            .or_default()
+            .insert(file);
+    }
+
+    /// Record that `file` derives the class `cls`, defined there in an
+    /// anonymous namespace, from `base`.
+    pub fn add_anonymous_base(&mut self, cls: &str, file: FileId, base: &str) {
+        self.anonymous_bases
+            .entry(cls.to_string())
+            .or_default()
+            .insert((file, base.to_string()));
+    }
+
+    /// Whether the class `cls` an anonymous namespace defines in a file
+    /// `sees` admits derives, through bases those files see, from a class
+    /// `outside` admits that is not one of them.
+    pub fn anonymous_class_derives_from(
+        &self,
+        cls: &str,
+        sees: &dyn Fn(FileId) -> bool,
+        outside: &dyn Fn(&str) -> bool,
+    ) -> bool {
+        let mut pending = vec![cls];
+        let mut visited = BTreeSet::new();
+        while let Some(cur) = pending.pop() {
+            if !visited.insert(cur) {
+                continue;
+            }
+            let bases = self.anonymous_bases.get(cur).into_iter().flatten();
+            for (_, base) in bases.filter(|(file, _)| sees(*file)) {
+                if self.class_is_anonymous_in(base, sees) {
+                    pending.push(base);
+                } else if outside(base) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether `cls` names a class an anonymous namespace defines in a file
+    /// `sees` admits.
+    pub fn class_is_anonymous_in(&self, cls: &str, sees: impl Fn(FileId) -> bool) -> bool {
+        Self::defined_in(&self.anonymous_classes, cls, sees)
+    }
+
+    fn defined_in(
+        classes: &BTreeMap<String, BTreeSet<FileId>>,
+        cls: &str,
+        sees: impl Fn(FileId) -> bool,
+    ) -> bool {
+        classes
+            .get(cls)
+            .is_some_and(|files| files.iter().any(|&f| sees(f)))
+    }
+
+    /// The entries under `name` that `keep` admits.
+    fn members_among(&self, name: &str, keep: &dyn Fn(FnId) -> bool) -> Vec<FnId> {
+        let mut ids = self.symbols.functions_named(name);
+        ids.retain(|&id| keep(id));
+        ids
+    }
+
+    /// Whether dispatch stops at `cls`, seen from the files `sees` admits: it
+    /// is `final`, or declares the method `final`. Another file's class in an
+    /// anonymous namespace is another class, and does not stop it.
+    fn dispatch_stops_at(
+        &self,
+        cls: &str,
+        kind: &MethodKind,
+        sees: &dyn Fn(FileId) -> bool,
+    ) -> bool {
+        self.class_is_final(cls)
+            || Self::defined_in(&self.anonymous_final_classes, cls, sees)
+            || self
+                .symbols
+                .functions_named(&kind.name_on(cls))
+                .iter()
+                .any(|&id| {
+                    let f = self.symbols.function(id);
+                    f.is_final && (f.linkage != Linkage::Internal || sees(f.file))
+                })
+    }
+
+    /// Direct base classes of `cls` as the files `sees` admits see it: an
+    /// anonymous-namespace class there derives from its own bases, not from
+    /// those every file's class of its name declares.
+    fn bases_seen(&self, cls: &str, sees: &dyn Fn(FileId) -> bool) -> Vec<String> {
+        if !self.class_is_anonymous_in(cls, sees) {
+            return self.bases_of(cls);
+        }
+        let bases = self.anonymous_bases.get(cls).into_iter().flatten();
+        bases
+            .filter(|(file, _)| sees(*file))
+            .map(|(_, base)| base.clone())
+            .collect()
     }
 
     /// Direct base classes of `cls`.
@@ -334,13 +451,18 @@ impl Program {
 
     /// Subclass closure used for virtual dispatch: stop at `final` classes
     /// and at classes that declare this method `final`.
-    pub fn dispatch_subclass_closure(&self, root: &str, kind: &MethodKind) -> Vec<String> {
+    fn dispatch_subclass_closure(
+        &self,
+        root: &str,
+        kind: &MethodKind,
+        sees: &dyn Fn(FileId) -> bool,
+    ) -> Vec<String> {
         let mut out = vec![root.to_string()];
         let mut i = 0;
         while i < out.len() {
             let cur = out[i].clone();
             i += 1;
-            if self.class_is_final(&cur) || self.class_method_is_final(&cur, kind) {
+            if self.dispatch_stops_at(&cur, kind, sees) {
                 continue;
             }
             for &index in self.derived_by_class.get(&cur).into_iter().flatten() {
@@ -359,9 +481,23 @@ impl Program {
     /// so a `final` class that does not override still resolves to the
     /// inherited implementation, not to sibling overrides.
     pub fn method_targets(&self, cls: &str, kind: &MethodKind) -> Vec<FnId> {
+        self.method_targets_among(cls, kind, &|_| true, &|_| true)
+    }
+
+    /// [`method_targets`](Self::method_targets) for a receiver whose class
+    /// shares its name with others, seen from the files `sees` admits: only
+    /// classes and members seen there stop dispatch as `final`, and a member
+    /// `targets` rejects is no target.
+    pub fn method_targets_among(
+        &self,
+        cls: &str,
+        kind: &MethodKind,
+        sees: &dyn Fn(FileId) -> bool,
+        targets: &dyn Fn(FnId) -> bool,
+    ) -> Vec<FnId> {
         let mut out = Vec::new();
-        for c in self.dispatch_subclass_closure(cls, kind) {
-            let own = self.symbols.functions_named(&kind.name_on(&c));
+        for c in self.dispatch_subclass_closure(cls, kind, sees) {
+            let own = self.members_among(&kind.name_on(&c), targets);
             if !own.is_empty() {
                 for id in own {
                     if !out.contains(&id) {
@@ -374,13 +510,13 @@ impl Program {
             // rather than letting the queue repeat that same query.
             let mut queue = std::collections::VecDeque::new();
             let mut seen = std::collections::BTreeSet::new();
-            queue.extend(self.bases_of(&c));
+            queue.extend(self.bases_seen(&c, sees));
             seen.insert(c);
             while let Some(cur) = queue.pop_front() {
                 if !seen.insert(cur.clone()) {
                     continue;
                 }
-                let ids = self.symbols.functions_named(&kind.name_on(&cur));
+                let ids = self.members_among(&kind.name_on(&cur), targets);
                 if !ids.is_empty() {
                     for id in ids {
                         if !out.contains(&id) {
@@ -389,7 +525,7 @@ impl Program {
                     }
                     break;
                 }
-                for base in self.bases_of(&cur) {
+                for base in self.bases_seen(&cur, sees) {
                     queue.push_back(base);
                 }
             }

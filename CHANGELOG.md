@@ -259,6 +259,67 @@ only HDF and Camera diagnostic totals decrease after normalization.
   the timings above.
 
 ### Fixed
+- A method body calling a method its class defines further down resolves to that method (#96). Class
+  bodies are lowered in source order, so `int Parse() { return ReadHeader(); }` above
+  `int ReadHeader() {}` found no member, and the call went to a bare external `ReadHeader`, or to a
+  base member or global function of that name. A class body now registers every in-class definition
+  before lowering any body, so the call resolves with the arity filter and arguments past `this`
+  (hdf 5, hiview 6, camera 75 externals become direct; 38 camera bare-name externals such as
+  `GetDataWidth` are gone). This holds for any call to a member of the class defined below the
+  body, also when another overload of the name is above it or is the calling body: hiview's
+  `ConverterReportData(metrics)` reaches its three-argument overload instead of itself, and a
+  construction of the class reaches only the constructor its arguments fit (camera
+  `Watchdog::GetGlobalWatchdog` no longer calls the deleted copy constructor). `T w(a);` at file
+  scope defines a global when every name is a global or file `static` variable or a function (#95),
+  and a function name in extra parentheses (`Worker w((OnReady));`) is passed as an argument;
+  neither occurs in the pinned corpora.
+- Members of a class in an anonymous namespace are found by member lookup. They have internal
+  linkage and were indexed only per file, so every call, construction and virtual dispatch to them
+  missed: camera's `PreconfigProfile::toString()` was an external `toString`, hiview's anonymous test
+  fixtures constructed through externals, and `HiviewContext::GetHiViewDirectory` never reached the
+  seven test contexts overriding it. Internal members declared in their class are also indexed by
+  qualified name; a same-named class in another file stays separate, and
+  a virtual call on one reaches only the overrides its own file can see, also when that class only
+  inherits the method. Another file's class of the name never makes the method virtual or stops
+  dispatch as `final` (a `final` class included), and neither a same-named external class nor its
+  subclasses are targets of an anonymous receiver. Overloads of a C++ function with internal
+  linkage, a member or a free `static` / anonymous-namespace function, stay separate functions
+  instead of one entry holding every body, same-arity ones included: camera's
+  `PreconfigProfile::toString(cameraInfos, mode)` is its own function again (functions +1), and
+  hiview's 38 four-argument `BuildEvent` calls in `event_field_validator_test.cpp` reach the
+  four-parameter overload (arg-flow +4). A function pointer taken from an overloaded name
+  (`void (*p)(double) = cb;`, `take(cb)`) holds every overload, as the one entry did, and a
+  declaration and definition spelling a parameter type two ways (`ns::Obj *` and `Obj *`,
+  `std::size_t` and `size_t`) stay one function, while a declaration defined later under its exact
+  signature keeps that definition. A member of such a class defined after the namespace closes is
+  internal and merges with its prototype instead of becoming an external duplicate, and one defined in
+  the `.cpp` including the class's header merges with the header's prototype, keeping its `virtual`.
+  A header's `static` overload and the `.cpp`'s form one overload set, so a function pointer taken in
+  the `.cpp` holds both; hdf's `sample_hdi_service_stub.cpp` no longer resolves each call to a
+  header `static inline` helper twice (direct edges −3, arg-flow −4). A `static` function one unit
+  defines under a shared header stays that unit's, beside another unit's function of the same
+  signature or the header's declaration. Another file's anonymous class sharing a name with a class
+  of the receiver's hierarchy is a target only when it derives from that hierarchy, and an anonymous
+  class's inherited methods come from its own file's bases.
+- A file `static` variable defined in an included header is found by name, as one in the file itself
+  is. It was not a variable at all outside its header: `Worker w(header_static);` declared a phantom
+  function `w`, and a call on it went to a bare external. camera's header statics
+  `DepthDataOutputEventTypeHelper`, `mapLengthOfType` and `mapConnectionType` now type their
+  receivers (8 `GetKeyString` calls reach `EnumHelper::GetKeyString`, `find` / `end` name their map
+  member) and bind as arguments (arg-flow +156), and `Uri uri(SETTINGS_DATA_BASE_URI);` defines an
+  object instead of a phantom function `uri` (functions −2 with the bare `GetKeyString`). A header's
+  file-scope initializer still does not reach the analysis, so a call through a function pointer
+  initialized there has no target yet.
+- A constructor is never dispatched to a subclass. With no constructor of `Base` in view,
+  `: Base(a)` and `new Base(a)` fell back to the virtual-call subclass closure and reached the
+  derived constructor itself and every sibling's: camera's `*CallbackListener` constructors called
+  each other (359 sibling and 149 self edges), `new CaptureSession(session)` reached `VideoSession`
+  and three more, and hdf had 42 self edges. The site now resolves to the base constructor by name
+  after the merge. Across these entries: camera functions 23,960 → 23,923, direct edges 39,263 →
+  39,014, external edges 54,245 → 54,164, arg-flow 29,024 → 28,940; hiview functions 10,653 →
+  10,651, direct edges 9,516 → 9,598, arg-flow 10,598 → 10,674; hdf direct edges 42,270 → 42,252,
+  arg-flow 66,258 → 66,253. Timing unchanged; each corpus bit-identical across `--jobs`.
+  Expectations re-captured; see `docs/EVAL_REPORT.md`.
 - `T w(member_);` inside a method defines an object, so every `std::lock_guard<std::mutex>
   lock(mutex_)` / `std::unique_lock` of a data member constructs instead of declaring a phantom
   function `lock` (camera: 194 phantom `lock` functions gone, 1,181 `std::lock_guard` constructor

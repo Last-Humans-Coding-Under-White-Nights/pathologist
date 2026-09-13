@@ -44,7 +44,7 @@ The pipeline is also exposed programmatically via `trace-capi` (`libtrace_capi`)
 - **Indexed TUs**: `*.c` and `*.cpp`-family files under `<TARGET>`. Each TU selects the tree-sitter C or C++ grammar by extension.
 - **Headers**: discovered for the include graph but **not** lowered as standalone TUs. Their declarations appear in preprocessed `.c` output.
 - **Orphan headers** (never `#include`d by any project `.c`) are skipped — they contribute no reachable code.
-- **Cross-TU linking**: external symbols merged by name in `merge_unit_index` (`fn_by_name`). **`static` / internal-linkage** functions and file-scope `static` variables remain **per-file** and are resolved with `resolve_function_in_scope(name, file)` at analysis time.
+- **Cross-TU linking**: external symbols merged by name in `merge_unit_index` (`fn_by_name`). **`static` / internal-linkage** functions remain **per-file** and are resolved with `resolve_function_in_scope(name, file)` at analysis time; file-scope `static` variables are looked up with `SymbolTable::file_static_named`, in the file and the headers it includes.
 
 ## Crate dependencies
 

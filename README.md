@@ -125,7 +125,7 @@ trace analyze ./my_app --compile-commands ./out/compile_commands.json -o /tmp/ap
 | Context | IR / export | Call / flow resolution |
 |---------|-------------|------------------------|
 | File-scope `static` function | `linkage = internal` | Direct calls and `CallReturn` via scope-aware name lookup (`file` + name) |
-| File-scope `static` variable | `kind = file_static` | Persistent PAG location; name lookup scoped to file |
+| File-scope `static` variable | `kind = file_static` | Persistent PAG location; name lookup scoped to its file and the files including it |
 | Function-local `static` variable | `kind = fn_static` | Persistent PAG location within enclosing function |
 | External (non-`static`) symbols | `linkage = external` | Global `fn_by_name` / `global_by_name` tables |
 
@@ -505,6 +505,8 @@ Maps actual arguments at a call site to callee formal parameters (when wired by 
 | `actual_var_id` | INTEGER FK → `variables` | Variable passed at call site (`NULL` when actual is a function). |
 | `actual_fn_id` | INTEGER FK → `functions` | Function passed as fn-ptr actual (`NULL` when actual is a variable). |
 | `formal_var_id` | INTEGER FK → `variables` | Callee parameter variable. |
+
+A function name with several internal-linkage C++ overloads (`static` or in an anonymous namespace) is passed as each of them: one row per overload at the same `call_site_id`, `arg_index` and `formal_var_id`.
 
 **Index:** `arg_flow_edges(call_site_id)`.
 

@@ -776,6 +776,55 @@ fn same_param_type_inner(
     same_decayed_param(da, db, unresolved_matches)
 }
 
+/// Whether two parameter types may be one type spelled two ways: a qualified
+/// name beside the unqualified one a `using namespace` lets a redeclaration
+/// write (`ns::Obj` and `Obj`, `std::string` and `string`, though not
+/// `ns1::Config` and `ns2::Config`), or a type lowering could not resolve,
+/// which reads as `int` (`Obj` where only `ns::Obj` is declared, `size_t`
+/// without its header). Two different fundamental types, a pointer and a
+/// non-pointer, or function pointers of different parameter lists are told
+/// apart.
+pub fn may_name_same_type(a: &TypeDesc, b: &TypeDesc) -> bool {
+    let named = |t: &TypeDesc| matches!(t, TypeDesc::Struct { .. } | TypeDesc::Union { .. });
+    match (a, b) {
+        (TypeDesc::Unknown, _) | (_, TypeDesc::Unknown) => true,
+        (TypeDesc::Int, other) | (other, TypeDesc::Int)
+            if named(other) || matches!(other, TypeDesc::SizeT) =>
+        {
+            true
+        }
+        (TypeDesc::Ptr(x), TypeDesc::Ptr(y))
+        | (TypeDesc::Ptr(x), TypeDesc::Array { elem: y, .. })
+        | (TypeDesc::Array { elem: x, .. }, TypeDesc::Ptr(y))
+        | (TypeDesc::Array { elem: x, .. }, TypeDesc::Array { elem: y, .. }) => {
+            may_name_same_type(x, y)
+        }
+        (TypeDesc::Struct { name: x, .. }, TypeDesc::Struct { name: y, .. })
+        | (TypeDesc::Union { name: x, .. }, TypeDesc::Union { name: y, .. }) => {
+            same_or_requalified(x, y)
+        }
+        // A declarator's parameter list is not always lowered into the type;
+        // two lists that are both there must agree.
+        (TypeDesc::FnPtr { params: x, .. }, TypeDesc::FnPtr { params: y, .. }) => {
+            x.is_empty()
+                || y.is_empty()
+                || (x.len() == y.len() && x.iter().zip(y).all(|(x, y)| may_name_same_type(x, y)))
+        }
+        _ => same_type_shape(a, b, true),
+    }
+}
+
+/// Whether one spelling is the other, or the other with namespace or class
+/// qualifiers in front of it: `ns::Obj` beside `Obj`.
+fn same_or_requalified(x: &str, y: &str) -> bool {
+    let (x, y) = (x.trim_start_matches("::"), y.trim_start_matches("::"));
+    let (long, short) = if x.len() >= y.len() { (x, y) } else { (y, x) };
+    long == short
+        || long
+            .strip_suffix(short)
+            .is_some_and(|qualifiers| qualifiers.ends_with("::"))
+}
+
 /// [`same_param_type`] on two descriptors: the parameter rule, so it can also
 /// be applied to the parameter list inside a [`TypeDesc::FnPtr`].
 ///

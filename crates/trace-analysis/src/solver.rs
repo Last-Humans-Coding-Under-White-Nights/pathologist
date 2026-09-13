@@ -1206,10 +1206,13 @@ fn wire_params(
                 propagate_pts(st, formal_node, &actual_pts);
             }
             wired.insert((cs.id, idx, callee));
-        } else if let Some(fn_id) = cs.fn_args.iter().find(|(j, _)| *j == idx).map(|(_, f)| *f) {
+        } else if cs.fn_args.iter().any(|(j, _)| *j == idx) {
+            // A name with overloads passes each one it may mean.
             let formal_node = pag.var_node.get(formal).copied().expect("formal var node");
-            if let Some(&fn_loc) = pag.fn_locations.get(&fn_id) {
-                add_pts(st, formal_node, fn_loc);
+            for &(_, fn_id) in cs.fn_args.iter().filter(|(j, _)| *j == idx) {
+                if let Some(&fn_loc) = pag.fn_locations.get(&fn_id) {
+                    add_pts(st, formal_node, fn_loc);
+                }
             }
             wired.insert((cs.id, idx, callee));
         }
@@ -1293,16 +1296,16 @@ fn extract_arg_flow(
                         actual_fn: None,
                         formal: *formal,
                     });
-                } else if let Some(fn_id) =
-                    cs.fn_args.iter().find(|(j, _)| *j == idx).map(|(_, f)| *f)
-                {
-                    result.arg_flow_edges.push(ArgFlowEdge {
-                        call_site: edge.call_site,
-                        arg_index: idx,
-                        actual_var: None,
-                        actual_fn: Some(fn_id),
-                        formal: *formal,
-                    });
+                } else {
+                    for &(_, fn_id) in cs.fn_args.iter().filter(|(j, _)| *j == idx) {
+                        result.arg_flow_edges.push(ArgFlowEdge {
+                            call_site: edge.call_site,
+                            arg_index: idx,
+                            actual_var: None,
+                            actual_fn: Some(fn_id),
+                            formal: *formal,
+                        });
+                    }
                 }
             }
         }
