@@ -53,6 +53,23 @@ jobs:
           ./target/ctrace inspect /tmp/capi.db callgraph --file main.c --line 8
           ./target/ctrace inspect /tmp/capi.db dataflow --file main.c --line 8 --col 9
 
+      - name: Install Doxygen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y doxygen
+
+      - name: Generate C API documentation (Doxygen)
+        run: doxygen Doxyfile
+
+      - name: Package C API documentation
+        run: tar czf trace-capi-docs.tar.gz -C target/doxygen/html .
+
+      - name: Upload C API documentation
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace-capi-docs
+          path: trace-capi-docs.tar.gz
+
   build:
     needs: check
     strategy:
