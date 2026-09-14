@@ -904,7 +904,10 @@ impl PreprocessorState {
         let Some(end) = attribute_group_end(tokens, start) else {
             return Ok(None);
         };
-        if self.attribute_group_must_survive(tokens, start, end)? {
+        let TokenKind::Identifier(name) = &tokens[start].kind else {
+            return Ok(None);
+        };
+        if self.attribute_group_must_survive(tokens, start + 1, end, name)? {
             return Ok(None);
         }
         for tok in &tokens[start + 1..end] {
@@ -932,7 +935,7 @@ impl PreprocessorState {
         let Some(end) = attribute_group_end_after_name(tokens, start + 1, name) else {
             return Ok(None);
         };
-        if self.attribute_group_must_survive(tokens, start + 1, end)? {
+        if self.attribute_group_must_survive(tokens, start + 1, end, name)? {
             return Ok(None);
         }
         for tok in &tokens[start + 1..end] {
@@ -949,6 +952,7 @@ impl PreprocessorState {
         tokens: &[Token],
         start: usize,
         end: usize,
+        name: &str,
     ) -> Result<bool, PreprocessError> {
         if tokens[start..end]
             .iter()
@@ -957,6 +961,17 @@ impl PreprocessorState {
             return Ok(true);
         }
         let expanded = self.expand_operand_tokens(&tokens[start..end])?;
+        let Some(group_end) = attribute_group_end_after_name(&expanded, 0, name) else {
+            return Ok(true);
+        };
+        // Macros can close the raw group's parentheses early and insert code.
+        // Only discard it if expansion still describes exactly one group.
+        if expanded[group_end..]
+            .iter()
+            .any(|token| !matches!(token.kind, TokenKind::Newline | TokenKind::Eof))
+        {
+            return Ok(true);
+        }
         Ok(attribute_group_must_survive(&expanded, 0, expanded.len()))
     }
 

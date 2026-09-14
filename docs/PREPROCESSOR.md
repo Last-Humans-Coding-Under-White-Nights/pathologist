@@ -9,8 +9,14 @@ Compiler attribute normalization removes balanced noise groups only. GNU
 `constructor`, `destructor`, `weak`, `visibility`, `alias`, `cleanup`, `noreturn`,
 `selectany`, `dllexport`, and `dllimport`, including double-underscore spellings.
 Attribute arguments and chained object aliases are expanded before deciding
-whether a group is noise. Groups containing directives are processed normally;
-malformed groups stop at declaration boundaries instead of consuming later code.
+whether a group is noise. Groups containing directives are processed normally.
+The expanded tokens must still form exactly one complete attribute group before
+the raw group may be discarded. An argument macro can close the group early and
+introduce a declaration, so escaped or unbalanced expansions are retained for
+normal processing even when they contain no semantic attribute names.
+Retained GNU spellings can still produce tree-sitter diagnostics; preserving
+their declarations takes precedence over suppressing those diagnostics.
+Malformed groups stop at declaration boundaries instead of consuming later code.
 Balancing is local to the attribute group: a surrounding `for` initializer or
 C++ lambda argument can legitimately leave an enclosing parenthesis open before
 the next semicolon or brace. Elision never consumes that following delimiter;

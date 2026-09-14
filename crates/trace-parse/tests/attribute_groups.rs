@@ -6,6 +6,39 @@ use trace_parse::{
 use trace_preproc::{preprocess_file, PreprocessOptions};
 
 #[test]
+fn attribute_argument_expansion_cannot_discard_a_declaration() {
+    let source = include_str!("../../../tests/fixtures/preproc/attribute_escape.c");
+    let mut missing = Vec::new();
+    for spelling in ["direct", "alias", "replacement"] {
+        let source = match spelling {
+            "alias" => format!(
+                "#define BASE __attribute__\n#define ATTR BASE\n{}",
+                source.replace("__attribute__", "ATTR")
+            ),
+            "replacement" => source.replace(
+                "int x __attribute__((PAYLOAD));",
+                "#define DECL int x __attribute__((PAYLOAD));\nDECL",
+            ),
+            _ => source.to_owned(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escape.c");
+        fs::write(&path, source).unwrap();
+        let preprocessed = preprocess_file(&path, &PreprocessOptions::new()).unwrap();
+        let parsed = parse_c_source(preprocessed.output).unwrap();
+        // Escaped groups are retained conservatively. Tree-sitter can diagnose
+        // their GNU spelling, but both declarations must reach the IR.
+        let program = build_program(dir.path(), &PreprocessOptions::new()).unwrap();
+        for name in ["x", "preserved"] {
+            if !program.symbols.variables.iter().any(|v| v.name == name) {
+                missing.push(format!("{spelling}: lost {name} from {}", parsed.source));
+            }
+        }
+    }
+    assert!(missing.is_empty(), "{}", missing.join("\n"));
+}
+
+#[test]
 fn noise_attributes_in_enclosing_expressions_are_elided() {
     for (extension, lang, source) in [
         (

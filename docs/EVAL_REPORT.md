@@ -18,6 +18,15 @@ Camera 4859); no tolerance was widened. Formatting and preprocessor Clippy with
 `-D warnings` pass. Workspace Clippy succeeds with five warnings in unchanged
 `trace-parse` code (`explore.rs`, `gn_defines.rs`, and `lower.rs`).
 
+The adversarial follow-up found that an argument macro could close the attribute
+and insert a declaration before reopening it. A Clang-valid fixture demonstrated
+silent loss of `preserved` in direct, chained-alias, and replacement-rescan paths.
+Expanded tokens must now describe exactly one complete group before the raw
+group can be discarded. All three paths retain both declarations in the IR;
+retained GNU spelling may still produce tree-sitter diagnostics. The final build
+passes 771 workspace tests, strict preprocessor Clippy, formatting, and all 91
+pinned-corpus checks without further expectation changes.
+
 ## Compiler attribute review validation — 2026-09-12 (#61)
 
 Compared a fresh release build of upstream `769f2e8` with the reviewed attribute
