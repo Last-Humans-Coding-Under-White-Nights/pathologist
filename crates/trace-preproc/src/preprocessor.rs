@@ -893,6 +893,88 @@ impl PreprocessorState {
         }
     }
 
+    /// Drop a complete compiler-attribute group while retaining its newline
+    /// tokens. Returning `None` leaves malformed/unterminated input untouched:
+    /// report hygiene must never consume the rest of a translation unit.
+    fn elide_attribute_group(
+        &mut self,
+        tokens: &[Token],
+        start: usize,
+    ) -> Result<Option<usize>, PreprocessError> {
+        let Some(end) = attribute_group_end(tokens, start) else {
+            return Ok(None);
+        };
+        let TokenKind::Identifier(name) = &tokens[start].kind else {
+            return Ok(None);
+        };
+        if self.attribute_group_must_survive(tokens, start + 1, end, name)? {
+            return Ok(None);
+        }
+        for tok in &tokens[start + 1..end] {
+            self.check_resource_limits(tok.line)?;
+            if matches!(tok.kind, TokenKind::Newline) {
+                self.emit_token(tok);
+            }
+        }
+        Ok(Some(end))
+    }
+
+    fn elide_attribute_macro_group(
+        &mut self,
+        tokens: &[Token],
+        start: usize,
+        replacement: &[Token],
+    ) -> Result<Option<usize>, PreprocessError> {
+        if !Self::next_non_newline_is(tokens, start + 1, "(") {
+            return Ok(None);
+        }
+        let expanded = self.expand_operand_tokens(replacement)?;
+        let Some(name) = compiler_attribute_marker(&expanded) else {
+            return Ok(None);
+        };
+        let Some(end) = attribute_group_end_after_name(tokens, start + 1, name) else {
+            return Ok(None);
+        };
+        if self.attribute_group_must_survive(tokens, start + 1, end, name)? {
+            return Ok(None);
+        }
+        for tok in &tokens[start + 1..end] {
+            self.check_resource_limits(tok.line)?;
+            if matches!(tok.kind, TokenKind::Newline) {
+                self.emit_token(tok);
+            }
+        }
+        Ok(Some(end))
+    }
+
+    fn attribute_group_must_survive(
+        &mut self,
+        tokens: &[Token],
+        start: usize,
+        end: usize,
+        name: &str,
+    ) -> Result<bool, PreprocessError> {
+        if tokens[start..end]
+            .iter()
+            .any(|token| matches!(token.kind, TokenKind::Hash))
+        {
+            return Ok(true);
+        }
+        let expanded = self.expand_operand_tokens(&tokens[start..end])?;
+        let Some(group_end) = attribute_group_end_after_name(&expanded, 0, name) else {
+            return Ok(true);
+        };
+        // Macros can close the raw group's parentheses early and insert code.
+        // Only discard it if expansion still describes exactly one group.
+        if expanded[group_end..]
+            .iter()
+            .any(|token| !matches!(token.kind, TokenKind::Newline | TokenKind::Eof))
+        {
+            return Ok(true);
+        }
+        Ok(attribute_group_must_survive(&expanded, 0, expanded.len()))
+    }
+
     fn emit_str(&mut self, s: &str, line: u32, col: u32) {
         let offset = self.output.len();
         self.output.push_str(s);
@@ -1683,6 +1765,18 @@ impl PreprocessorState {
 
             if self.is_active() {
                 if let TokenKind::Identifier(name) = &tok.kind {
+                    // A real macro definition wins. Otherwise these reserved
+                    // compiler spellings are syntax-only metadata; remove the
+                    // balanced group at the same rescan boundary that sees
+                    // attributes produced by another macro's replacement.
+                    if is_compiler_attribute(name)
+                        && (tok.is_hidden(name) || self.macros.get(name).is_none())
+                    {
+                        if let Some(end) = self.elide_attribute_group(tokens, i)? {
+                            i = end;
+                            continue;
+                        }
+                    }
                     if self.emit_predefined(tok, name) {
                         i += 1;
                         continue;
@@ -1724,6 +1818,13 @@ impl PreprocessorState {
                                         continue;
                                     }
                                     let painted = Self::paint_replacement(&replacement, tok, name);
+                                    if let Some(end) =
+                                        self.elide_attribute_macro_group(tokens, i, &painted)?
+                                    {
+                                        self.pop_expansion();
+                                        i = end;
+                                        continue;
+                                    }
                                     let r = self.expand_tokens_no_directives(&painted);
                                     self.pop_expansion();
                                     r?;
@@ -1762,6 +1863,14 @@ impl PreprocessorState {
             }
             if self.is_active() {
                 if let TokenKind::Identifier(name) = &tok.kind {
+                    if is_compiler_attribute(name)
+                        && (tok.is_hidden(name) || self.macros.get(name).is_none())
+                    {
+                        if let Some(end) = self.elide_attribute_group(tokens, i)? {
+                            i = end;
+                            continue;
+                        }
+                    }
                     if self.emit_predefined(tok, name) {
                         i += 1;
                         continue;
@@ -1776,6 +1885,13 @@ impl PreprocessorState {
                                     continue;
                                 }
                                 let painted = Self::paint_replacement(&replacement, tok, name);
+                                if let Some(end) =
+                                    self.elide_attribute_macro_group(tokens, i, &painted)?
+                                {
+                                    self.pop_expansion();
+                                    i = end;
+                                    continue;
+                                }
                                 let r = self.expand_tokens_no_directives(&painted);
                                 self.pop_expansion();
                                 r?;
@@ -2854,6 +2970,103 @@ fn at_beginning_of_line(tokens: &[Token], i: usize) -> bool {
         return true;
     }
     matches!(tokens[i - 1].kind, TokenKind::Newline)
+}
+
+/// Identify reserved attribute spellings before querying the macro table.
+fn is_compiler_attribute(name: &str) -> bool {
+    matches!(name, "__attribute__" | "__attribute" | "__declspec")
+}
+
+/// Return the index after a balanced `__attribute__((...))` or
+/// `__declspec(...)` group. GNU attributes require their characteristic
+/// double parenthesis so an unrelated identifier call is not discarded.
+fn attribute_group_end(tokens: &[Token], start: usize) -> Option<usize> {
+    let name = match tokens.get(start).map(|tok| &tok.kind) {
+        Some(TokenKind::Identifier(name)) if is_compiler_attribute(name) => name.as_str(),
+        _ => return None,
+    };
+    attribute_group_end_after_name(tokens, start + 1, name)
+}
+
+fn attribute_group_end_after_name(tokens: &[Token], mut open: usize, name: &str) -> Option<usize> {
+    while matches!(
+        tokens.get(open).map(|tok| &tok.kind),
+        Some(TokenKind::Newline)
+    ) {
+        open += 1;
+    }
+    if !matches!(
+        tokens.get(open).map(|tok| &tok.kind),
+        Some(TokenKind::Punct("("))
+    ) {
+        return None;
+    }
+    if matches!(name, "__attribute__" | "__attribute") {
+        let mut inner = open + 1;
+        while matches!(
+            tokens.get(inner).map(|tok| &tok.kind),
+            Some(TokenKind::Newline)
+        ) {
+            inner += 1;
+        }
+        if !matches!(
+            tokens.get(inner).map(|tok| &tok.kind),
+            Some(TokenKind::Punct("("))
+        ) {
+            return None;
+        }
+    }
+
+    let mut depth = 0usize;
+    for (offset, tok) in tokens.iter().enumerate().skip(open) {
+        match tok.kind {
+            TokenKind::Punct("(") => depth += 1,
+            TokenKind::Punct(")") => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(offset + 1);
+                }
+            }
+            TokenKind::Eof | TokenKind::Punct(";" | "{" | "}") => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn compiler_attribute_marker(tokens: &[Token]) -> Option<&str> {
+    let mut significant = tokens.iter().filter_map(|token| match &token.kind {
+        TokenKind::Identifier(name) => Some(name.as_str()),
+        TokenKind::Newline | TokenKind::Eof => None,
+        _ => Some(""),
+    });
+    let name = significant.next()?;
+    if significant.next().is_none() && is_compiler_attribute(name) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn attribute_group_must_survive(tokens: &[Token], start: usize, end: usize) -> bool {
+    const MEANINGFUL: &[&str] = &[
+        "alias",
+        "cleanup",
+        "constructor",
+        "destructor",
+        "visibility",
+        "weak",
+        "noreturn",
+        "selectany",
+        "dllexport",
+        "dllimport",
+    ];
+
+    tokens[start..end].iter().any(|token| match &token.kind {
+        TokenKind::Hash => true,
+        TokenKind::Identifier(name) => MEANINGFUL.contains(&name.trim_matches('_')),
+        _ => false,
+    })
 }
 
 /// The include guard wrapping the whole file, if it has one: `#ifndef NAME`
@@ -8844,6 +9057,113 @@ int from_late;
         assert!(cached.output.contains("common_decl"), "{:?}", cached.output);
     }
 
+    #[test]
+    fn attribute_group_fixture_preserves_declarations_and_source_lines() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/preproc/attribute_groups.c");
+        let mut opts = PreprocessOptions::new();
+        opts.track_line_map = true;
+        let result = preprocess_file(&path, &opts).unwrap();
+
+        assert!(!result.output.contains("section("), "{}", result.output);
+        assert!(!result.output.contains("align("), "{}", result.output);
+        for declaration in [
+            "const int before_type",
+            "const int after_declarator",
+            "int msvc_aligned",
+            "int trace_log",
+            "void stop_now(void)",
+        ] {
+            assert!(
+                result.output.contains(declaration),
+                "missing {declaration:?} from {}",
+                result.output
+            );
+        }
+        let stop_now = lookup_at(&result, "stop_now");
+        assert_eq!(stop_now.line, 8, "{:?}", result.line_map);
+    }
+
+    #[test]
+    fn unterminated_attribute_group_is_emitted_without_swallowing_later_code() {
+        let source = "int broken __attribute__((used) value;\nint still_here;\n";
+        let result = preprocess_string(source, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(result.output.contains("__attribute__"), "{}", result.output);
+        assert!(result.output.contains("still_here"), "{}", result.output);
+    }
+
+    #[test]
+    fn meaningful_attribute_groups_survive_preprocessing() {
+        for attribute in [
+            "constructor",
+            "destructor",
+            "weak",
+            "visibility(\"hidden\")",
+            "alias(\"target\")",
+            "cleanup(release_value)",
+            "noreturn",
+            "__weak__",
+            "__visibility__(\"default\")",
+        ] {
+            let source = format!("int value __attribute__(({attribute}));\n");
+            let result = preprocess_string(&source, Path::new("t.c"), &PreprocessOptions::new());
+            assert!(
+                result.output.contains(attribute),
+                "attribute {attribute:?} was discarded from {:?}",
+                result.output
+            );
+        }
+    }
+
+    #[test]
+    fn directive_inside_attribute_group_is_processed() {
+        let source = "int x __attribute__((\n#define SIZE 16\naligned(SIZE)));\nint a[SIZE];\n";
+        let result = preprocess_string(source, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(result.output.contains("int a[16]"), "{}", result.output);
+    }
+
+    #[test]
+    fn macro_spelled_attribute_name_elides_following_noise_group() {
+        let source =
+            "#define BASE_ATTR __attribute\n#define ATTR BASE_ATTR\nint x ATTR ((used)) = 1;\n";
+        let result = preprocess_string(source, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(!result.output.contains("__attribute"), "{}", result.output);
+        assert!(result.output.contains("int x= 1"), "{}", result.output);
+    }
+
+    #[test]
+    fn attribute_arguments_expand_before_semantic_classification() {
+        let source = "#define ATTR_VIS __visibility__(\"default\")\n#define ATTR __attribute__\nint x ATTR((ATTR_VIS));\n";
+        let result = preprocess_string(source, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(result.output.contains("__attribute__"), "{}", result.output);
+        assert!(
+            result.output.contains("__visibility__(\"default\")"),
+            "{}",
+            result.output
+        );
+        for attribute in ["selectany", "dllexport", "dllimport"] {
+            let source = format!("__declspec({attribute}) int x;\n");
+            let result = preprocess_string(&source, Path::new("t.c"), &PreprocessOptions::new());
+            assert!(result.output.contains(attribute), "{}", result.output);
+        }
+    }
+
+    #[test]
+    fn malformed_attributes_do_not_consume_declaration_boundaries() {
+        for source in [
+            "int x __attribute__((used; int y = (1);\n",
+            "void foo(int x __attribute__((used) { int y; }\n",
+            "int x __declspec(align(16); int y;\n",
+        ] {
+            let result = preprocess_string(source, Path::new("t.c"), &PreprocessOptions::new());
+            assert!(
+                result.output.contains("__attribute__") || result.output.contains("__declspec"),
+                "{}",
+                result.output
+            );
+            assert!(result.output.contains("int y"), "{}", result.output);
+        }
+    }
     fn record(src: &str, opts: PreprocessOptions) -> Vec<ConditionalChain> {
         preprocess_string(
             src,

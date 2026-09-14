@@ -1,5 +1,58 @@
 # Evaluation Report
 
+## Compiler attribute enclosing-expression follow-up — 2026-09-14 (#61)
+
+Attribute balancing now stops at the group's own closing parenthesis, without
+inferring whether enclosing parentheses should be closed before a semicolon or
+brace. The regression failed before the fix for a valid C `for` initializer.
+The C initializer and C++ lambda fixtures now pass preprocessing and parsing in
+all six direct, chained-alias, and replacement-rescan cases. Both original
+fixtures also pass Clang syntax checks. Unclosed attribute groups retain their
+declaration boundaries; eliding a balanced group does not hide an unclosed
+surrounding parameter list from the parser.
+
+After merging upstream `a85b320`, all 770 workspace tests and 91 pinned-corpus
+checks pass with a fresh release build. The merge retains upstream analysis
+expectations and the attribute branch's measured diagnostic totals (HDF 1658,
+Camera 4859); no tolerance was widened. Formatting and preprocessor Clippy with
+`-D warnings` pass. Workspace Clippy succeeds with five warnings in unchanged
+`trace-parse` code (`explore.rs`, `gn_defines.rs`, and `lower.rs`).
+
+The adversarial follow-up found that an argument macro could close the attribute
+and insert a declaration before reopening it. A Clang-valid fixture demonstrated
+silent loss of `preserved` in direct, chained-alias, and replacement-rescan paths.
+Expanded tokens must now describe exactly one complete group before the raw
+group can be discarded. All three paths retain both declarations in the IR;
+retained GNU spelling may still produce tree-sitter diagnostics. The final build
+passes 771 workspace tests, strict preprocessor Clippy, formatting, and all 91
+pinned-corpus checks without further expectation changes.
+
+## Compiler attribute review validation — 2026-09-12 (#61)
+
+Compared a fresh release build of upstream `769f2e8` with the reviewed attribute
+normalization branch on the three pinned corpora from `scripts/eval_expected.json`.
+Both builds used the same clean revisions, 800,000-pop budget, and eight jobs on
+macOS. The upstream build passed 90/90 checks against its existing expectations;
+the reviewed build passed 90/90 after changing only the following exact totals:
+
+| Corpus | Upstream diagnostics | Reviewed diagnostics |
+|---|---:|---:|
+| HDF | 1803 | 1658 |
+| Camera | 4860 | 4859 |
+
+Hiview and every other measured global were identical between the two builds.
+All dispatch-site and correctness probes passed. These reductions replace the
+old branch's pre-rebase capture; no older counts were carried over by assumption.
+The workspace's 714 tests, including semantic-attribute survival, malformed-group
+boundaries, chained macros, LineMap origins, and lowered declaration types/linkage,
+also passed. Preprocessor Clippy passes; workspace Clippy currently reports four
+unchanged `nonminimal_bool` warnings in upstream `gn_defines.rs`.
+
+Reproduce with a release build and
+`python3 scripts/eval_check.py --corpus-base <pinned-corpus-directory> --outdir <fresh-output-directory>`.
+
+## Historical evaluation captures
+
 - **Date:** 2026-09-04
 - **Binary:** current tree (`trace-cli` release)
 - **Solver budget:** 800,000 pops (`TRACE_SOLVE_BUDGET_POPS`)
