@@ -1,5 +1,23 @@
 # Evaluation Report
 
+## Compiler attribute enclosing-expression follow-up — 2026-09-14 (#61)
+
+Attribute balancing now stops at the group's own closing parenthesis, without
+inferring whether enclosing parentheses should be closed before a semicolon or
+brace. The regression failed before the fix for a valid C `for` initializer.
+The C initializer and C++ lambda fixtures now pass preprocessing and parsing in
+all six direct, chained-alias, and replacement-rescan cases. Both original
+fixtures also pass Clang syntax checks. Unclosed attribute groups retain their
+declaration boundaries; eliding a balanced group does not hide an unclosed
+surrounding parameter list from the parser.
+
+After merging upstream `a85b320`, all 770 workspace tests and 91 pinned-corpus
+checks pass with a fresh release build. The merge retains upstream analysis
+expectations and the attribute branch's measured diagnostic totals (HDF 1658,
+Camera 4859); no tolerance was widened. Formatting and preprocessor Clippy with
+`-D warnings` pass. Workspace Clippy succeeds with five warnings in unchanged
+`trace-parse` code (`explore.rs`, `gn_defines.rs`, and `lower.rs`).
+
 ## Compiler attribute review validation — 2026-09-12 (#61)
 
 Compared a fresh release build of upstream `769f2e8` with the reviewed attribute
@@ -40,6 +58,342 @@ Reproduce with a release build and
   and those are the numbers to compare when attributing a change. The
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
+
+**Re-verified 2026-09-13 (type-name lookup, #90 / #91 / #92):** fresh
+release builds of `master` (8175eea) and the branch were compared on the same
+machine against the three clean pinned checkouts under `/private/tmp/corpora`,
+`--jobs 8`, 800,000-pop budget. The branch index is bit-reproducible: on each
+corpus the SQLite dump (minus `analysis_run`) is byte-identical across three
+`--jobs 8` runs and one `--jobs 1` run. Eval 91/91 with the re-captured
+expectations; `master` passes 91/91 against the previous ones.
+
+| Metric | hdf `master` → branch | hiview `master` → branch | camera `master` → branch |
+|---|---:|---:|---:|
+| Functions defined | 10,246 → 10,251 | 7,783 → 7,821 | 19,020 → 19,120 |
+| Functions external | 2,378 → 2,349 | 3,191 → 3,126 | 5,352 → 5,185 |
+| Direct edges | 42,240 → 42,256 | 8,988 → 9,293 | 37,646 → 38,531 |
+| Indirect edges | 4,644 → 4,826 | 24 → 24 | 108 → 108 |
+| External edges | 28,794 → 28,735 | 20,003 → 19,968 | 53,177 → 53,000 |
+| Arg-flow edges | 65,988 → 66,267 | 9,973 → 10,125 | 24,489 → 24,933 |
+| Diagnostics | 1,803 → 1,803 | 2,989 → 2,989 | 4,860 → 4,860 |
+
+Every exact metric (files, diagnostics, IPC and dlsym edges, the hiview
+dispatch sets) is unchanged except hdf's indirect edges. Compared by caller,
+callee and resolution, hdf and hiview lose no direct or indirect edge.
+
+hdf gains 182 indirect edges because a body-less `struct Name *p` is looked up
+like any other type name: its C++ tests spell `struct IDevmgrService *svc`
+inside `namespace OHOS`, which used to declare a separate, empty
+`OHOS::IDevmgrService` and leave calls through its function-pointer table as
+external stubs (`OHOS::IDevSvcManager::AddService`). They reach the C struct
+now, and through it `DevmgrServiceAttachDevice`, `HdfKIoServiceDispatch`,
+`DeviceNodeExtPublishService` and the rest of the tables. hdf also gains 16
+direct edges, all in tests (`HdfSBufTest::SbufData` constructions, calls on an
+`HdfRemoteServiceHolder`), and hc-gen's `HeaderFile::HeaderFileSet::emplace`
+externals become `std::set::emplace` once the class-scope `using` resolves
+(two more become `std::unordered_set::emplace` through a function-local one).
+
+hiview gains 305 direct edges, 79 of them qualified constructor calls
+(`WatchPoint::Builder()`) that were externals named after the class. Of its 38
+new definitions, 13 are `AppEventHandler::PostEvent` overloads whose parameter
+types are member structs (`AppLaunchInfo`, `ScrollJankInfo`) that used to
+lower as unknown, folding the 14 source definitions into one. A nested
+builder's `return FreezeJsonException(*this);` used to reach the constructor
+only because the outer class was taken as the implicit `this`; it is a
+constructor call now.
+
+Camera gains 935 direct edges and loses 50, and the 50 are corrections.
+`encoder_->Start()` inside the member class
+`MovieFileVideoEncodedBufferProducer::EncoderWarp` bound by bare name to
+unrelated free `Start` / `Stop` / `SetCallback` / `Release` functions because
+the field's class was unknown, and is an external
+`MediaAVCodec::AVCodecVideoEncoder::Start` now. `DisplayRotationListener` and
+the fuzzer's `VideoProcess*Fuzz` classes are members of `HStreamOperator` and
+`VideoProcessCommandFuzzer`, so calls reach the nested classes' own overrides;
+those three overrides also join `Command::Do`'s dispatch sets
+(`GetCommandName` 31 → 34, `Executing` 30 → 33), the only site checks that
+move. Twenty more belong to member classes forward-declared in a header and
+defined out of line (`class HCameraHostManager::CameraHostInfo { ... }` in the
+`.cpp`): the definition is the declared class now, so its members carry the
+whole `OHOS::CameraStandard::` path and reach the class's own members instead
+of the outer class's or free `SetCallback` / `GetCameraAbility` functions.
+Camera's arg-flow rows reflect a constructor call's arguments binding past the
+implicit `this`: 85 rows that wired an argument into `this` are gone, 66 reach
+the constructor's own parameters, and every constructor path now shifts
+function arguments too, so lambdas passed to `new SimpleTimer(...)` reach its
+`fun` parameter.
+
+Timing, six interleaved runs of each binary, `--jobs 8`, medians:
+
+| Corpus | Wall `master` → branch | User CPU `master` → branch |
+|---|---:|---:|
+| hdf | 4.52 s → 4.59 s (+1.4%) | 9.75 s → 9.62 s (−1.3%) |
+| hiview | 1.67 s → 1.66 s (−0.6%) | 4.41 s → 4.46 s (+1.2%) |
+| camera | 6.74 s → 6.84 s (+1.5%) | 18.43 s → 18.73 s (+1.6%) |
+
+Wall time is within this machine's run-to-run noise; user CPU moves by −1% to
++2%. The lookup itself is not what costs: a build that runs the two most
+frequent new lookups (type names and bare calls) and discards their answers
+times the same as one that skips them, and the index phase is level (hdf
+5.55 s on both, `--jobs 1`). The cost is the solver working on what the
+lookups now resolve: on hdf, 171 more constraints, 257,571 pops against
+249,740, and 673k points-to facts against 653k at the first measurement of
+this branch. Switching member-class registration off alone removes about half
+of hdf's extra solver time.
+
+**Re-verified 2026-09-12 (`->` through an undeclared template wrapper, #86):**
+fresh release builds of `master` (769f2e8) and the branch were compared on
+the same machine against the three clean pinned checkouts under
+`/private/tmp/corpora`, `--jobs 8`, 800,000-pop budget. The branch index is
+bit-reproducible: on each corpus the SQLite dump (minus `analysis_run`) is
+byte-identical across three `--jobs 8` runs and one `--jobs 1` run. Eval
+91/91 with the re-captured expectations.
+
+| Metric | hdf `master` → #86 | hiview `master` → #86 | camera `master` → #86 |
+|---|---:|---:|---:|
+| Functions defined | 10,246 → 10,246 | 7,779 → 7,783 | 19,016 → 19,020 |
+| Functions external | 2,392 → 2,378 | 3,623 → 3,191 | 6,373 → 5,352 |
+| Direct edges | 42,212 → 42,240 | 8,266 → 8,988 | 21,059 → 37,646 |
+| Indirect edges | 4,642 → 4,644 | 24 → 24 | 109 → 108 |
+| External edges | 28,826 → 28,794 | 20,329 → 20,003 | 52,214 → 53,177 |
+| Arg-flow edges | 65,961 → 65,988 | 9,585 → 9,973 | 17,104 → 24,489 |
+| Diagnostics | 1,803 → 1,803 | 2,989 → 2,989 | 4,860 → 4,860 |
+
+The `→` column is the branch as it ships, after the review rounds below:
+camera's external functions fall one further as a doubled `::OHOS::sptr::sptr`
+stub folds into `OHOS::sptr::sptr`, camera gains 7 arg-flow edges from a field
+read through a wrapper feeding a constructor argument, and hdf gains 2 indirect
+edges and 2 arg-flow edges once a raw pointer to a wrapper keeps its own
+callback fields. Every cell matches `scripts/eval_expected.json`, except hdf's
+arg-flow centre, which is pinned at 65,986 inside a ±150 band.
+
+An undeclared template spelling keeps its arguments in its tag now
+(`OHOS::CameraStandard::sptr<OHOS::CameraStandard::CaptureSession>`), and
+`->` on such a value with exactly one argument that names a declared class
+looks the member up on that class, with the usual hierarchy fan-out. A
+wrapper whose body is in the tree still resolves through its own
+`operator->` — a forward declaration alone says nothing about one and does
+not count — `.` still belongs to the wrapper, and every other shape (two
+arguments, a scalar, pointer or reference argument, an unknown class)
+stays unresolved rather than inventing a member on the wrapper. The
+argument is looked up the way C++ looks a name up: through the enclosing
+namespaces innermost first, then the global scope, for a bare and a
+partially qualified spelling alike (`sptr<CameraStandard::CameraInput>`
+inside `namespace OHOS`), a typedef standing for the class it names,
+`T const` read as `T`. Not through `using namespace` directives: hdf's
+hc-gen defines `AstObject::IsNode` under `using namespace OHOS::Hardware`
+and the indexer names that body with the bare class, so searching the
+directive found the real `OHOS::Hardware::AstObject`, whose members are
+prototypes there, and 189 hdf direct edges turned external. Only the bare
+spelling reaches those bodies; the directive stays out of the search.
+
+Camera is where it lands. Comparing distinct edges by (file, line, column,
+caller, callee): **17,739** direct edges gained (13,528 in test and fuzzer
+files, 4,211 in production code; the largest targets are
+`CameraInput::Open` 842, `CameraInput::GetCameraDevice` 769,
+`CaptureSession::AddOutput` 531, `CaptureSession::BeginConfig` 317) and
+**1,152** lost at 808 sites, 777 of which carry a replacement edge. Most
+lost edges were wrong: an unqualified `sptr<T>` used to lower to an
+*unknown* type, so `cameraInput_->Open()` bound by bare name to whatever
+free `Open` / `Release` / `SetCallback` / `Stop` a fuzzer happened to
+define (`test/fuzztest/hcapture_session_fuzzer/hcapture_session_fuzzer.cpp:272-282`);
+`frameworks/cj/camera/src/metadata_output_impl.cpp:121`
+(`metadataOutput_->SetCallback(...)`) reaches `MetadataOutput::SetCallback`
+now. The 31 sites left without an edge call through a wrapper whose
+argument class is not in the tree — `recorder_->Start()` on a
+media-library recorder in
+`frameworks/native/camera/base/src/output/movie_file_output.cpp:123` —
+where `master` had one of those fuzzer functions. The one indirect edge
+lost is the same fault: `avcodec_task_manager.cpp:124` called
+`->GetTimeStamp()` on a `sptr<FrameRecord>` and reached a fuzzer lambda
+through a free function; it is a direct `FrameRecord::GetTimeStamp` now.
+The **254** `OHOS::sptr::*` arrow phantoms are gone and a probe pins them
+at 0; the constructor and `.GetRefPtr()` are the wrapper's own operations
+and stay, under whichever namespace the spelling qualifies to. Defined
+functions rise by 4 because a tag keeps its arguments, so overloads that
+differ only inside them no longer fold: hiview's
+`ParamValue(const std::vector<uint32_t>&)` beside
+`ParamValue(const std::vector<std::string>&)`
+(`base/event_report/event/param_value.cpp:47,52`).
+
+*A second fault, found while addressing review.* The reviewer asked for
+the enclosing-namespace lookup above, and with it camera lost 85 correct
+direct edges — `photoAssetIntf_->AddPhotoProxy(...)` in
+`common/utils/photo_asset_proxy.cpp:101` stopped fanning out to
+`PhotoAssetProxy` / `PhotoAssetAdapter` and went to a bare
+`PhotoAssetIntf::AddPhotoProxy` prototype. `PhotoAssetIntf` is declared in
+`common/utils/photo_asset_interface.h` inside a C++17
+`namespace OHOS::CameraStandard {`, which `lower_namespace` read as an
+*anonymous* namespace: tree-sitter spells the name as one
+`nested_namespace_specifier`, the lowering looked only for a
+`namespace_identifier`, and everything inside registered under the bare
+name with internal linkage. The old innermost-only qualification happened
+to match the properly qualified declaration from other units; the correct
+lookup found the mis-registered bare class first. 83 hiview files and 62
+camera files open a namespace that way (hdf none). Fixed: the specifier's
+segments push one scope each. Every direct edge that changes from this
+(hiview 146, camera 427) has the same call under the proper qualification,
+diagnostics do not move, and hdf is byte-identical; hiview's external
+functions fall **3,620 → 3,191** as bare-named prototypes fold into their
+qualified definitions. hiview's three pinned dispatch sites
+(`Plugin::OnEventProxy:68`, `PluginProxy::OnEvent:28`,
+`EventHandler::OnEventProxy:232`) each gain one target,
+`TraceTestPlugin::OnEvent` — a test plugin declared in such a file, which
+now joins the `Plugin` hierarchy under its proper name — and the pins move
+23 → 24, 23 → 24, 27 → 28. Camera's unresolved-template-text probe moves
+1,246 → 1,157 because 105 sites lost their template text when a wrapper
+member's spelling was stripped of its arguments (`sptr<X>::MakeSptr` is
+`sptr::MakeSptr`); the resolved template-text sites fall 56 → 40 the same
+way and none gains an edge.
+
+hdf and hiview were expected not to move for #86 itself — their wrappers
+are declared in-tree or on the standard name list — and they do, inside
+every band and with every exact metric unchanged. hdf's remaining
+`OHOS::sptr::*` phantoms (`sptr<IRemoteObject>` under `using OHOS::sptr`)
+and its `SharedMemQueueMeta<T>::*` ones become direct edges to
+`ServStatListenerStub::OnRemoteRequest` and
+`OHOS::HDI::Base::SharedMemQueueMeta::Get*`; no other hdf row moves.
+hiview loses its nine `OHOS::sptr::*` phantoms; `.` calls on unqualified
+`vector<T>` / `stack<T>` / `list<T>` locals under `using namespace std`
+(`utility/common_utils/log_parse.cpp:92`), which used to lower to an
+unknown type and carry no edge, are external members on the container now
+— exactly what their `std::`-qualified spellings have always produced.
+
+*Performance.* A tag per instantiation raises the type-table work of every
+header merge: camera's merged table grows from 5,408 to 7,281 entries, and
+the first build of the branch cost ~7% more user CPU on camera. Two
+output-neutral changes pay for it. `TypeTable::intern` answered an empty
+named tag by cloning the richest layout under that name into it and then
+looking the clone up, when the tag map already holds the id it lands on;
+it answers from the tag map now, on the by-value and by-reference paths
+(`empty_tag_interns_to_the_richest_layout_without_a_rewrite` pins the
+equivalence, including a layout widened in place by a union). And a unit
+merge remapped type ids through an `FxHashMap` keyed by an id that is a
+dense index into the source table; it is a `Vec` now. Both leave all three
+dumps byte-identical. Five interleaved runs of each binary, `--jobs 8`,
+`bash time`:
+
+| Corpus | `master` wall / user | #86 wall / user |
+|---|---:|---:|
+| hdf | 4.11s / 9.45s | 4.01s / 9.23s |
+| hiview | 1.67s / 4.38s | 1.65s / 4.33s |
+| camera | 6.53s / 18.08s | 6.66s / 18.33s |
+
+hdf and hiview are faster; camera is within 2% of `master` on both axes,
+which is the run-to-run spread of `master` itself on this machine (its
+user time ranged 17.4s to 18.1s across the day's sessions), with 16,587
+more direct edges and 7,378 more arg-flow edges to solve and export.
+Re-measured at the end of the review rounds the camera gap reads a little
+wider — see *Fourth review round* below for the final numbers, which are
+what the branch ships.
+
+**Review round.** Four review findings were confirmed on probes and fixed
+without moving any pinned metric outside its band: the wrapper's own name
+now goes through the enclosing-scope lookup its arguments use (camera's
+`BlockingQueue<std::any>` inside `DeferredProcessing` binds to the
+`CameraStandard::BlockingQueue` its header includes rather than a same-named
+class the header never saw, 12 direct edges → 11 as a doubled `Push`
+overload edge becomes one); a typedef is matched by its whole spelling; an
+out-of-line `operator->` records its return without the class header; and
+`sp->f` steps through a wrapper to the pointee's field (hiview +83 field
+temporaries and +121 flow edges, camera +8 and +12, call edges unchanged by
+name). Output is bit-identical across three `--jobs 8` runs and one
+`--jobs 1`; wall time is level with the previous push (+0.6 %, user +0.9 %,
+inside the run-to-run spread).
+
+**Second review round.** Seven further findings were confirmed on probes
+and fixed. The only one that moves a corpus number is field access through
+a wrapper: a field step now follows its own operator, so `sp->f` on the
+wrapper variable itself reaches the pointee (it previously only did so
+one step down a field chain, `b.item->f`) and `w.f` stays on the wrapper
+(it previously stepped through a wrapper with a declared `operator->`
+and lost the wrapper's own field). Against the previous push that adds
+field steps on direct reads through standard smart pointers — hdf +34
+sites (hc-gen's `forwardWalkObj->child_`), hiview +124
+(`event->eventName_`), camera +985 (`userInfo->scalingFactor`) — with no
+site lost anywhere; call edges are unchanged by name except one external
+constructor stub that camera spelled `::OHOS::sptr::sptr` and now
+`OHOS::sptr::sptr` (the `::W<T>` head fix; functions_total 24,373 →
+24,372), and camera gains 7 arg-flow edges where a field read through a
+wrapper now feeds a constructor argument (24,482 → 24,489). The other
+fixes — a member type of a template keeping its `::` and its own name
+(`Outer<A>::Inner<B>`), a member type of a defined template keeping the
+class the lookup found (`CS::Defined::Iterator`), `T*const` in the cv
+helper, and `nullptr_t` / `intmax_t` / `uintmax_t` / `auto` never
+qualified — change no corpus number. Output is bit-identical across
+three `--jobs 8` runs and one `--jobs 1`; paired against the previous
+push on camera (8 alternating runs) wall is −1.2 % and user −1.5 %,
+inside the spread.
+
+**Third review round.** Three more findings were confirmed on the fixture
+and fixed, none of which moves a corpus number: a literal template
+argument inside a namespace was qualified like a class (`missing<true>`
+in `namespace N` interned `N::missing<N::true>`; literals are now spelled
+as written), a `::`-prefixed head at a type declaration was not stripped
+the way the spelling helper strips it (`::Outer::Defined<int>` missed the
+defined class and its layout, so a field read through it produced
+nothing; the leading `::` is now handled in one place), and a pointer
+level between qualifiers was dropped (`T * const *` read as `T*`). Two
+small hardenings went in with them: a class is never recorded as its own
+base, and merging declared-class sets is one probe per name instead of
+two. Output is identical to the previous push on all three corpora and
+bit-identical across three `--jobs 8` runs and one `--jobs 1`; paired
+against the previous push on camera (8 alternating runs) wall is +0.6 %
+and user +1.0 %, inside the spread (the two runs' ranges overlap).
+
+**Fourth review round.** Three findings on the field-step work were
+confirmed and fixed. A raw pointer to a wrapper (`W<T>* p`) took the
+built-in arrow as if it were overloaded, so `p->own_field` resolved on the
+pointee. The lowering for `sp->f` kept the wrapper's static type on the
+`GepField` base, so `struct_type_from_type_id` handed the solver a layout
+without `f` and the constraint was dropped without a trace: a callback
+stored through a raw `T *p` was never called through `sp->cb()`. And the
+chained form modelled the pointee as an inline subobject of the wrapper.
+A field step now restarts the remaining path at an overloaded arrow on a
+receiver typed as the pointee, so it lands on the pointee's
+instance-insensitive `(T, f)` summary — the one a raw `T*` read or write
+already uses. The receiver is a `_recv` temporary rather than a `_ret` one
+because a variant merge pairs temporaries positionally per kind at a
+source position, and whether this one exists depends on the receiver's
+type. Two further findings went in with them: a wrapper is recognized by
+one rule whether or not the spelling carries arguments (a concrete class
+inheriting `operator->` from a base is one), and `resolve_callee_with_loads`
+memoizes its whole answer rather than the load variable alone, so a second
+visit to a node cannot contradict the first.
+
+Measured on a fixture rather than a corpus: against the branch as it stood,
+nine of ten expected indirect edges through a wrapper field were missing and
+one spurious edge crossed the wrapper's own field into the pointee's; all
+twelve assertions hold now. On the corpora the change is edge-neutral —
+call edges compared by caller, callee and resolution are identical on all
+three — and only the receivers appear:
+
+| corpus | variables | flow nodes | flow edges |
+|---|---:|---:|---:|
+| hdf | 115,720 → 115,754 | 156,480 → 156,488 | unchanged |
+| hiview | 71,191 → 71,320 | 123,070 → 123,222 | 59,345 → 59,347 |
+| camera | 136,903 → 137,931 | 224,944 → 226,134 | 97,825 → 97,822 |
+
+Output is bit-identical across three `--jobs 8` runs and one `--jobs 1` run
+per corpus, and `eval_check` passes 91 checks with no expectation
+re-capture. Eight interleaved runs of each binary, `--jobs 8`, `bash time`,
+medians (ranges in brackets):
+
+| Corpus | `master` wall / user | this branch wall / user | vs `master` |
+|---|---:|---:|---:|
+| hdf | 3.96s / 9.37s | 3.96s / 9.20s | wall +0.2%, user −1.8% |
+| hiview | 1.63s / 4.33s | 1.62s / 4.33s | wall −0.4%, user ±0% |
+| camera | 6.40s / 17.83s | 6.59s / 18.26s | wall +3.0%, user +2.4% |
+
+The review-round commits themselves are free: measured against the branch
+as pushed before them, hdf is wall −1.0% / user −0.4%, hiview +0.1% /
+−1.6%, camera −0.4% / ±0%. The camera gap is the type-table cost of a
+tag per instantiation reported above, and it reads slightly wider here than
+the 2% first measured — master's own camera wall spread in this session was
+6.29s to 6.94s, so the wall figure is partly noise, but the user-time
+medians separate with only marginal overlap (master 17.51s–18.24s, branch
+17.90s–18.77s) and ~2.4% is the honest number. hdf and hiview end level
+with or faster than `master`.
 
 **Regression investigation, 2026-09-10 (#83):**
 

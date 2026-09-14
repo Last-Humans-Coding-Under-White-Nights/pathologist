@@ -5,9 +5,9 @@ mod common;
 
 use std::sync::OnceLock;
 
-use common::{default_opts, fixture, fn_name, must_not_have_edge};
+use common::{default_opts, fixture, fn_name, has_any_edge, must_not_have_edge};
 use trace_analysis::{analyze, AnalysisResult, ResolutionKind};
-use trace_ir::{FnId, Program};
+use trace_ir::{FnId, Linkage, Program};
 use trace_parse::build_program;
 
 fn direct_targets(program: &Program, analysis: &AnalysisResult, caller: &str) -> Vec<String> {
@@ -384,6 +384,488 @@ fn cpp_smart_ptr() -> &'static (Program, AnalysisResult) {
 }
 
 #[test]
+fn arrow_unwraps_undeclared_single_class_argument() {
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in [
+        "AbsentLocal",
+        "AbsentParameter",
+        "AbsentField",
+        "AbsentQualified",
+        "AbsentForward",
+    ] {
+        for target in ["AbsentTarget::Run", "AbsentDerived::Run"] {
+            assert!(
+                has_direct(program, analysis, caller, target),
+                "{caller} -> {target}"
+            );
+        }
+    }
+    assert!(!program
+        .symbols
+        .functions
+        .iter()
+        .any(|f| f.name.ends_with("ForwardOnly::Run")));
+}
+
+#[test]
+fn arrow_fallback_honours_global_scope_and_star() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "Outer::Inner::AbsentShadowed",
+        "Outer::Inner::Shadow::Run"
+    ));
+    assert!(
+        has_direct(
+            program,
+            analysis,
+            "Outer::Inner::AbsentGlobal",
+            "Shadow::Run"
+        ),
+        "`::Shadow` names the global class, not the enclosing namespace's"
+    );
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "Outer::Inner::AbsentGlobal",
+        "Outer::Inner::Shadow::Run"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "Outer::Inner::AbsentGlobalQualified",
+        "Outer::Scoped::Run"
+    ));
+    assert!(
+        has_direct(program, analysis, "AbsentStar", "AbsentTarget::Run"),
+        "`(*p).Run()` unwraps the same way `p->Run()` does"
+    );
+}
+
+#[test]
+fn arrow_fallback_skips_nested_types_and_spells_scalar_arguments_as_written() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(
+        must_not_have_edge(
+            program,
+            analysis,
+            "Outer::Inner::AbsentNestedType",
+            "AbsentTarget::Run"
+        ),
+        "`missing<AbsentTarget>::Inner` is not a wrapper around `AbsentTarget`"
+    );
+    assert!(!program
+        .symbols
+        .functions
+        .iter()
+        .any(|f| f.name.contains("missing")));
+    let type_of = |var: &str| -> String {
+        let v = program
+            .symbols
+            .variables
+            .iter()
+            .find(|v| v.name == var)
+            .unwrap_or_else(|| panic!("{var} must be indexed"));
+        match &program.types.get(v.type_id).desc {
+            trace_ir::TypeDesc::Struct { name, .. } => name.clone(),
+            other => panic!("{var}: {other:?}"),
+        }
+    };
+    assert_eq!(type_of("scalar_box"), "Outer::Inner::missing<int>");
+    assert_eq!(
+        type_of("callback_box"),
+        "Outer::Inner::missing<void(int,char)>"
+    );
+    assert_eq!(
+        type_of("fnptr_box"),
+        "Outer::Inner::missing<int(*)(int,int)>"
+    );
+}
+
+#[test]
+fn cpp17_nested_namespace_definition_opens_each_scope() {
+    let root = fixture("cpp_nested_namespace");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    for name in [
+        "a::b::Deep::Go",
+        "a::b::use_deep",
+        "a::b::c::tri",
+        "a::b::c::again",
+        "a::b::inside",
+        "x::y::in_y",
+        "tabbed::ty::tabbed_leaf",
+        "global_after",
+    ] {
+        let id = program
+            .symbols
+            .resolve_function(name)
+            .unwrap_or_else(|| panic!("{name} must be indexed under its qualified name"));
+        assert_eq!(
+            program.symbols.function(id).linkage,
+            Linkage::External,
+            "{name} is not in an anonymous namespace"
+        );
+    }
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name.contains("inline")),
+        "the `inline` keyword is not part of a namespace name"
+    );
+    assert!(has_direct(
+        &program,
+        &analysis,
+        "a::b::use_deep",
+        "a::b::Deep::Go"
+    ));
+    assert!(has_direct(
+        &program,
+        &analysis,
+        "a::b::c::tri",
+        "a::b::Deep::Go"
+    ));
+    assert!(has_direct(
+        &program,
+        &analysis,
+        "a::b::c::again",
+        "a::b::c::tri"
+    ));
+    assert!(has_direct(&program, &analysis, "a::b::inside", "util::tag"));
+    assert!(
+        must_not_have_edge(&program, &analysis, "a::after", "util::tag"),
+        "a `using namespace` inside the block must not outlive it"
+    );
+    assert!(has_direct(
+        &program,
+        &analysis,
+        "global_after",
+        "a::b::use_deep"
+    ));
+}
+
+#[test]
+fn arrow_fallback_looks_the_argument_up_like_cpp() {
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in [
+        "Outer::Inner::AbsentEnclosing",
+        "Outer::Inner::AbsentAlias",
+        "Outer::Inner::AbsentEastConst",
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, "Outer::Scoped::Run"),
+            "{caller}"
+        );
+    }
+    assert!(has_direct(
+        program,
+        analysis,
+        "Outer::Other::AbsentPartial",
+        "Outer::Inner::Deep::Run"
+    ));
+}
+
+#[test]
+fn arrow_undeclared_fallback_rejects_unsupported_arguments() {
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in [
+        "AbsentTwo",
+        "AbsentScalar",
+        "AbsentUnknown",
+        "AbsentPointer",
+        "AbsentReference",
+        "AbsentMentioned",
+    ] {
+        let id = program.symbols.resolve_function(caller).expect("caller");
+        assert!(
+            !analysis.call_edges.iter().any(|e| e.caller == id),
+            "{caller} must stay unresolved"
+        );
+    }
+    assert!(!program
+        .symbols
+        .functions
+        .iter()
+        .any(|f| f.name == "OHOS::sptr::Run"));
+}
+
+#[test]
+fn arrow_fallback_preserves_dot_and_declared_wrappers() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "DrawMissingField",
+        "Widget::Draw"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "DrawNoArrow",
+        "Widget::Draw"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "AbsentDot",
+        "AbsentTarget::promote"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "DeclaredWins",
+        "RealTarget::Run"
+    ));
+    for caller in ["DeclaredWins", "DeclaredNoArrow", "DeclaredOutOfLine"] {
+        assert!(must_not_have_edge(
+            program,
+            analysis,
+            caller,
+            "AbsentTarget::Run"
+        ));
+    }
+    assert!(
+        has_direct(program, analysis, "DeclaredOutOfLine", "RealTarget::Run"),
+        "an out-of-line `operator->` without its class header still says what the arrow yields"
+    );
+}
+
+#[test]
+fn arrow_wrapper_head_is_looked_up_through_enclosing_namespaces() {
+    let (program, analysis) = cpp_smart_ptr();
+    let caller = "Outer::Inner::DeclaredFromEnclosing";
+    assert!(has_direct(program, analysis, caller, "Outer::Scoped::Run"));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        caller,
+        "AbsentTarget::Run"
+    ));
+    assert!(
+        has_any_edge(program, analysis, caller, "Outer::OuterBox::Get"),
+        "`.` stays on the wrapper, under the wrapper's own namespace"
+    );
+    assert!(!program
+        .symbols
+        .functions
+        .iter()
+        .any(|f| f.name == "Outer::Inner::OuterBox::Get"));
+}
+
+#[test]
+fn arrow_fallback_matches_a_typedef_by_its_whole_spelling() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "AbsentQualifiedAlias",
+        "Outer::Scoped::Run"
+    ));
+    assert!(
+        must_not_have_edge(
+            program,
+            analysis,
+            "Outer::Inner::AbsentNoHijack",
+            "AbsentTarget::Run"
+        ),
+        "`NoSuch::GlobalHijack` is not the global `GlobalHijack`"
+    );
+}
+
+#[test]
+fn field_access_through_a_wrapper_reaches_the_pointee_field() {
+    // A lowering-shape check: one field step per site, no duplicates.
+    // That the step reaches the pointee's summary in the solver is
+    // `wrapper_fields_share_pointee_callback_summaries`.
+    let (program, _analysis) = cpp_smart_ptr();
+    let geps = program
+        .flow
+        .iter()
+        .filter(|f| {
+            matches!(f, trace_ir::FlowConstraint::GepField { field_name, .. }
+                if field_name == "absent_payload_value")
+        })
+        .count();
+    assert_eq!(
+        geps, 3,
+        "one field step for the read, the write, and the read on the wrapper variable itself"
+    );
+}
+
+#[test]
+fn field_step_follows_its_operator_on_a_wrapper() {
+    // `b.w.own_raw` is the wrapper's own field: a dot never steps through
+    // a wrapper, even one with a declared `operator->`.
+    let (program, _analysis) = cpp_smart_ptr();
+    let own = program
+        .flow
+        .iter()
+        .filter(|f| {
+            matches!(f, trace_ir::FlowConstraint::GepField { field_name, .. }
+                if field_name == "own_raw")
+        })
+        .count();
+    assert_eq!(own, 1, "`b.w.own_raw` must reach the wrapper's own field");
+}
+
+fn struct_tag_names(program: &Program) -> Vec<String> {
+    program
+        .types
+        .all()
+        .iter()
+        .filter_map(|t| match &t.desc {
+            trace_ir::TypeDesc::Struct { name, .. } if !name.is_empty() => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn arrow_wrapper_head_spelled_global_is_tagged_without_the_prefix() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(
+        has_direct(
+            program,
+            analysis,
+            "Elsewhere::AbsentGlobalHead",
+            "AbsentTarget::Run"
+        ),
+        "`::missing<AbsentTarget>` inside a namespace still unwraps"
+    );
+    let tags = struct_tag_names(program);
+    assert!(
+        tags.iter().any(|t| t == "missing<AbsentTarget>"),
+        "the global wrapper is tagged as it is registered: {tags:?}"
+    );
+    assert!(
+        !tags
+            .iter()
+            .any(|t| t.starts_with("::") || t.contains("::::")),
+        "no tag keeps a leading `::` or gains an empty segment: {tags:?}"
+    );
+}
+
+#[test]
+fn templated_member_type_of_a_wrapper_keeps_its_separator() {
+    let (program, analysis) = cpp_smart_ptr();
+    let tags = struct_tag_names(program);
+    assert!(
+        tags.iter()
+            .any(|t| t == "Outer2<AbsentTarget>::Cursor<AbsentTarget>"),
+        "the member type keeps its `::` although a global `Cursor` exists: {tags:?}"
+    );
+    assert!(
+        !tags.iter().any(|t| t.contains(">Cursor")),
+        "no tag glues the member type onto its owner: {tags:?}"
+    );
+    for callee in ["AbsentTarget::Run", "Cursor::Run"] {
+        assert!(
+            must_not_have_edge(program, analysis, "AbsentTemplatedTail", callee),
+            "a member type of a template is not a wrapper around its argument"
+        );
+    }
+}
+
+#[test]
+fn arrow_fallback_never_spells_a_standard_name_or_pointer_as_a_class() {
+    let (program, analysis) = cpp_smart_ptr();
+    let tags = struct_tag_names(program);
+    assert!(
+        tags.iter().any(|t| t == "Elsewhere::missing<nullptr_t>"),
+        "`nullptr_t` stays unqualified: {tags:?}"
+    );
+    assert!(
+        tags.iter()
+            .any(|t| t == "Elsewhere::missing<AbsentTarget*>"),
+        "`AbsentTarget*const` is the pointer argument `AbsentTarget*`: {tags:?}"
+    );
+    assert!(
+        !tags
+            .iter()
+            .any(|t| t.contains("Elsewhere::nullptr_t") || t.contains("const")),
+        "no tag qualifies a standard name or keeps a trailing qualifier: {tags:?}"
+    );
+    for caller in [
+        "Elsewhere::AbsentNullptrArg",
+        "Elsewhere::AbsentPtrConstArg",
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, "AbsentTarget::Run"),
+            "{caller}: neither argument is a declared class, so no guess"
+        );
+    }
+}
+
+#[test]
+fn template_arguments_that_name_no_class_are_spelled_as_written() {
+    let (program, _analysis) = cpp_smart_ptr();
+    let tags = struct_tag_names(program);
+    for expected in [
+        "Elsewhere::missing<AbsentTarget,4>",
+        "Elsewhere::missing<true>",
+        "Elsewhere::missing<AbsentTarget**>",
+    ] {
+        assert!(
+            tags.iter().any(|t| t == expected),
+            "{expected} missing from {tags:?}"
+        );
+    }
+    assert!(
+        !tags
+            .iter()
+            .any(|t| t.contains("::4") || t.contains("::true")),
+        "a literal is never qualified: {tags:?}"
+    );
+}
+
+#[test]
+fn defined_template_head_spelled_global_finds_the_declared_class() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(
+        has_any_edge(
+            program,
+            analysis,
+            "Outer::Deep::DefinedGlobalHead",
+            "Outer::Defined::Cursor::Next"
+        ),
+        "`::Outer::Defined<int>::Cursor` is the same class as `Defined<int>::Cursor`"
+    );
+    let df = program
+        .flow
+        .iter()
+        .filter(|f| {
+            matches!(f, trace_ir::FlowConstraint::GepField { field_name, .. } if field_name == "df")
+        })
+        .count();
+    assert_eq!(
+        df, 1,
+        "`::Outer::Defined<int>` is the defined class, with its layout"
+    );
+}
+
+#[test]
+fn member_type_of_a_defined_template_keeps_the_class_the_lookup_found() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(
+        has_any_edge(
+            program,
+            analysis,
+            "Outer::Deep::DefinedTail",
+            "Outer::Defined::Cursor::Next"
+        ),
+        "`Defined<int>::Cursor` inside `Outer::Deep` is `Outer::Defined::Cursor`"
+    );
+    let tags = struct_tag_names(program);
+    assert!(
+        !tags.iter().any(|t| t == "Defined::Cursor"),
+        "the enclosing namespace is not dropped from the member type: {tags:?}"
+    );
+}
+
+#[test]
 fn arrow_unwraps_by_declaration_not_by_wrapper_name() {
     // The issue's three-way reproduction: the same source, differing only in
     // the wrapper's name. `sptr` and `RefPtr` used to invent an external
@@ -611,6 +1093,96 @@ fn arrow_unsupported_substitutions_stay_unresolved() {
                 .iter()
                 .any(|edge| fn_name(program, edge.caller) == caller),
             "{caller} must not invent a target"
+        );
+    }
+}
+
+#[test]
+fn raw_wrapper_pointer_preserves_callback_flow() {
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in ["RawWrapperDirect", "RawWrapperNested"] {
+        assert!(
+            has_any_edge(program, analysis, caller, "RawWrapperTarget"),
+            "{caller}: raw arrow must preserve the wrapper's callback flow"
+        );
+    }
+}
+
+#[test]
+fn a_peeled_receiver_dispatches_through_every_base() {
+    // A member found on the second base is as reachable as one on the first:
+    // the peeled receiver goes through the ordinary hierarchy lookup.
+    let (program, analysis) = cpp_smart_ptr();
+    for (caller, target) in [
+        ("AbsentMultiFirst", "MultiBaseA::FromA"),
+        ("AbsentMultiSecond", "MultiBaseB::FromB"),
+        ("AbsentMultiOwn", "MultiDerived::Own"),
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, target),
+            "{caller} must reach {target}"
+        );
+    }
+}
+
+#[test]
+fn wrapper_fields_share_pointee_callback_summaries() {
+    let (program, analysis) = cpp_smart_ptr();
+    for (caller, target) in [
+        ("FlowReadMissing", "FlowReadTarget"),
+        ("FlowReadDeclared", "FlowReadTarget"),
+        ("FlowReadDerefDot", "FlowReadTarget"),
+        ("FlowReadDerefDotDeclared", "FlowReadTarget"),
+        ("FlowReadDerefDotRaw", "FlowReadTarget"),
+        ("FlowReadDerefDotWrapperRaw", "FlowWrapperOwnTarget"),
+        ("FlowReadReference", "FlowReadTarget"),
+        ("FlowReadDereference", "FlowReadTarget"),
+        ("FlowReadStandard", "FlowReadTarget"),
+        ("FlowReadRaw", "FlowWriteTarget"),
+        ("FlowReadRaw", "FlowDerefWriteTarget"),
+        ("FlowReadNested", "FlowNestedTarget"),
+        ("FlowReadTwoArrows", "FlowNestedTarget"),
+        ("FlowReadNestedRaw", "FlowNestedTarget"),
+        ("FlowReadWrapperOwn", "FlowWrapperOwnTarget"),
+        ("FlowReadInherited", "FlowReadTarget"),
+        ("FlowReadParen", "FlowReadTarget"),
+        ("FlowReadParenWrapper", "FlowReadTarget"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, target),
+            "{caller} must reach {target}"
+        );
+    }
+    for (caller, target) in [
+        ("FlowReadDeclared", "FlowWrapperOwnTarget"),
+        ("FlowReadDerefDotDeclared", "FlowWrapperOwnTarget"),
+        ("FlowReadDerefDotWrapperRaw", "FlowReadTarget"),
+        ("FlowReadWrapperOwn", "FlowReadTarget"),
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, target),
+            "{caller} must not confuse wrapper and pointee fields"
+        );
+    }
+}
+
+#[test]
+fn wrapper_reference_and_dereference_still_unwrap_fields() {
+    let (program, _) = cpp_smart_ptr();
+    for caller in ["RawWrapperReference", "RawWrapperDereference"] {
+        assert!(
+            program.flow.iter().any(|flow| {
+                let trace_ir::FlowConstraint::GepField {
+                    dst, field_name, ..
+                } = flow
+                else {
+                    return false;
+                };
+                field_name == "payload_value"
+                    && program.symbols.variable(*dst).fn_id
+                        == program.symbols.resolve_function(caller)
+            }),
+            "{caller}: a wrapper value must still use overloaded arrow"
         );
     }
 }
@@ -3475,4 +4047,451 @@ void test() {
         targets.iter().any(|t| t == "anon_vma::anon_vma"),
         "a named tag starting with `anon_` must emit its constructor call: {targets:?}"
     );
+}
+
+fn cpp_type_lookup() -> &'static (Program, AnalysisResult) {
+    static CACHE: OnceLock<(Program, AnalysisResult)> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let root = fixture("cpp_type_lookup");
+        let program = build_program(&root, &default_opts(&root)).expect("build");
+        let (_pag, analysis) = analyze(&program);
+        (program, analysis)
+    })
+}
+
+#[test]
+fn bare_type_name_resolves_through_enclosing_namespaces() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in [
+        "a::b::c::TriLocal",
+        "a::b::c::TriParam",
+        "a::b::c::TriField",
+        "a::x::Partial",
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, "a::b::Deep::Go"),
+            "{caller}"
+        );
+    }
+    assert!(has_direct(
+        program,
+        analysis,
+        "a::b::c::TriGlobal",
+        "GlobalTarget::Run"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "Outer::ArrowReturn",
+        "RealTarget::Run"
+    ));
+    let make = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "a::b::c::MakeDeep")
+        .expect("MakeDeep");
+    assert!(
+        matches!(&program.types.get(make.return_type).desc,
+            trace_ir::TypeDesc::Ptr(inner)
+                if matches!(&**inner, trace_ir::TypeDesc::Struct { name, .. } if name == "a::b::Deep")),
+        "a return type is looked up like any other type"
+    );
+}
+
+#[test]
+fn innermost_type_declaration_shadows_outer_ones() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "n::m::Shadowed",
+        "n::Shadow::Hit"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "n::m::Shadowed",
+        "Shadow::Hit"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "n::m::GlobalShadow",
+        "Shadow::Hit"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "n::m::GlobalShadow",
+        "n::Shadow::Hit"
+    ));
+}
+
+#[test]
+fn same_named_typedefs_in_two_namespaces_stay_apart() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "p::inner::ScopedTypedef",
+        "p::PT::Run"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "p::inner::ScopedTypedef",
+        "q::QT::Run"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "q::OtherTypedef",
+        "q::QT::Run"
+    ));
+}
+
+#[test]
+fn using_alias_declaration_is_a_typedef() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in ["UsingLocal", "UsingPointer", "UsingWrapper"] {
+        assert!(
+            has_direct(program, analysis, caller, "AliasTarget::Run"),
+            "{caller}"
+        );
+    }
+    for caller in ["ua::deeper::UsingEnclosing", "UsingQualified"] {
+        assert!(
+            has_direct(program, analysis, caller, "ua::Scoped::Run"),
+            "{caller}"
+        );
+    }
+    assert!(has_any_edge(program, analysis, "UsingFnPtr", "CbTarget"));
+}
+
+#[test]
+fn class_member_alias_is_scoped_to_its_class() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in [
+        "WithMemberAlias::ViaMember",
+        "WithMemberAlias::ViaParam",
+        "MemberAliasOutside",
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, "AliasTarget::Run"),
+            "{caller}"
+        );
+    }
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "MemberAliasNoLeak",
+        "AliasTarget::Run"
+    ));
+}
+
+#[test]
+fn nested_class_is_registered_under_its_outer_class() {
+    let (program, analysis) = cpp_type_lookup();
+    let tags = struct_tag_names(program);
+    for tag in [
+        "CS::Defined::Iterator",
+        "CS::Plain::It",
+        "GMethods::GIn2",
+        "GIn",
+    ] {
+        assert!(tags.iter().any(|t| t == tag), "{tag}: {tags:?}");
+    }
+    for tag in ["CS::Iterator", "CS::It", "GIn2"] {
+        assert!(!tags.iter().any(|t| t == tag), "no {tag}: {tags:?}");
+    }
+    for phantom in ["CS::Defined::it", "CS::Plain::pit", "CS::Plain::cb"] {
+        assert!(
+            !program.symbols.functions.iter().any(|f| f.name == phantom),
+            "{phantom} is a field of the nested class"
+        );
+    }
+    let field_of = |cls: &str, field: &str| {
+        program
+            .types
+            .type_id_by_tag(cls, trace_ir::TypeKind::Struct)
+            .map(|id| match &program.types.get(id).desc {
+                trace_ir::TypeDesc::Struct { fields, .. } => {
+                    fields.iter().any(|(name, _)| name == field)
+                }
+                _ => false,
+            })
+            .unwrap_or(false)
+    };
+    assert!(field_of("CS::Defined::Iterator", "it"));
+    assert!(field_of("CS::Plain::It", "pit"));
+    assert!(field_of("CS::Defined", "df"));
+    assert!(!field_of("CS::Defined", "it"));
+    for (caller, callee) in [
+        ("CS::Sub::P7", "CS::Defined::Iterator::Next"),
+        ("CS::Plain::Use", "CS::Plain::It::Step"),
+        ("CS::OpenBox", "CS::Plain::Box::Open"),
+        ("Built::Builder::Build", "Built::Built"),
+        ("MakeBuilt", "Built::Built"),
+    ] {
+        assert!(has_direct(program, analysis, caller, callee), "{caller}");
+    }
+    for caller in ["CallHook", "CallHook2", "CallNestedCb"] {
+        assert!(
+            has_any_edge(program, analysis, caller, "HookTarget"),
+            "{caller} calls through the nested class's field"
+        );
+    }
+    let it_reads = program
+        .flow
+        .iter()
+        .filter(|f| {
+            matches!(f, trace_ir::FlowConstraint::GepField { field_name, .. }
+                if field_name == "it")
+        })
+        .count();
+    assert_eq!(it_reads, 1, "`i.it` reaches the nested class's layout");
+}
+
+#[test]
+fn constructor_call_arguments_bind_past_this() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "ConstructTakes",
+        "Takes::Takes"
+    ));
+    assert!(
+        has_any_edge(program, analysis, "Takes::Takes", "CtorCbTarget"),
+        "the callback reaches the constructor's own parameter"
+    );
+}
+
+#[test]
+fn member_class_sees_later_members_of_its_enclosing_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "Later::Builder::Build",
+        "Later::Later"
+    ));
+}
+
+#[test]
+fn function_local_aliases_are_block_scoped() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in ["LocalUsing", "LocalTypedef"] {
+        assert!(
+            has_direct(program, analysis, caller, "LocalTarget::Run"),
+            "{caller}"
+        );
+    }
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "LocalOutOfBlock",
+        "LocalTarget::Run"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "LocalAliasCtor",
+        "Built2::Built2"
+    ));
+}
+
+#[test]
+fn array_alias_keeps_its_shape() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "CallTable",
+        "TableCbTarget"
+    ));
+    let table = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "cb_table")
+        .expect("cb_table");
+    assert!(matches!(
+        program.types.get(table.type_id).desc,
+        trace_ir::TypeDesc::Array { .. }
+    ));
+}
+
+#[test]
+fn qualified_spellings_reach_aliases_and_constructors() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in [
+        "TemplateMemberAlias",
+        "ArrowTemplateMemberAlias",
+        "rv::GlobalAliasUse",
+        "CastReceiver",
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, "LocalTarget::Run"),
+            "{caller}"
+        );
+    }
+    for callee in ["rv::Made::Made", "rv::Made::In::In"] {
+        assert!(
+            has_direct(program, analysis, "QualifiedCtor", callee),
+            "{callee}"
+        );
+    }
+}
+
+#[test]
+fn cpp_class_nested_in_c_structs_keeps_its_whole_path() {
+    let (program, _analysis) = cpp_type_lookup();
+    let tags = struct_tag_names(program);
+    assert!(tags.iter().any(|t| t == "CPlain::CMid::CDeep"), "{tags:?}");
+    assert!(program
+        .symbols
+        .resolve_function("CPlain::CMid::CDeep::Go")
+        .is_some());
+}
+
+#[test]
+fn bodyless_class_specifier_inside_a_class_names_the_member_class() {
+    let (program, _analysis) = cpp_type_lookup();
+    let tags = struct_tag_names(program);
+    for tag in ["ListNode", "PimplImpl"] {
+        assert!(!tags.iter().any(|t| t == tag), "no bare {tag}: {tags:?}");
+    }
+    let field_points_to = |cls: &str, field: &str, target: &str| {
+        let id = program
+            .types
+            .type_id_by_tag(cls, trace_ir::TypeKind::Struct)
+            .unwrap_or_else(|| panic!("{cls}: {tags:?}"));
+        matches!(&program.types.get(id).desc, trace_ir::TypeDesc::Struct { fields, .. }
+            if fields.iter().any(|(name, desc)| name == field
+                && matches!(desc, trace_ir::TypeDesc::Ptr(inner)
+                    if matches!(&**inner, trace_ir::TypeDesc::Struct { name, .. } if name == target))))
+    };
+    assert!(field_points_to("List::ListNode", "next", "List::ListNode"));
+    assert!(field_points_to("Pimpl", "p", "Pimpl::PimplImpl"));
+}
+
+#[test]
+fn out_of_line_member_class_is_the_declared_class() {
+    let (program, analysis) = cpp_type_lookup();
+    for callee in ["hm::Manager::Info::Info", "hm::Manager::Info::Get"] {
+        assert!(
+            has_direct(program, analysis, "hm::Manager::Add", callee),
+            "{callee}"
+        );
+    }
+}
+
+#[test]
+fn nearer_function_hides_a_class_of_the_same_name() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "hide::CallHidden",
+        "hide::HiddenCtor"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "hide::CallHidden",
+        "HiddenCtor::HiddenCtor"
+    ));
+}
+
+#[test]
+fn alias_in_a_function_local_class_stays_in_the_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "LocalClassAlias",
+        "OuterAliasTarget::Run"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "LocalClassAlias",
+        "InnerAliasTarget::Run"
+    ));
+}
+
+#[test]
+fn constructor_call_reaches_an_internal_linkage_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(program, e.caller) == "UseLocalHelper"
+                && fn_name(program, e.callee).ends_with("LocalHelper::LocalHelper")
+        }),
+        "{:?}",
+        common::callees_of(program, analysis, "UseLocalHelper")
+    );
+}
+
+#[test]
+fn function_passed_to_new_reaches_the_constructor_parameter() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "Consumer::Consumer",
+        "OnEvent"
+    ));
+}
+
+#[test]
+fn alias_of_an_alias_names_the_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "AliasChain",
+        "ChainTarget::Run"
+    ));
+}
+
+#[test]
+fn local_class_in_a_member_function_sees_the_enclosing_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "Enclosing::Method",
+        "Enclosing::Nested::Run"
+    ));
+}
+
+#[test]
+fn local_class_prefers_the_function_class_over_the_namespace() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "lcns::Enclosing2::Method",
+        "lcns::Enclosing2::Nested::Run"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "lcns::Enclosing2::Method",
+        "lcns::Nested::Run"
+    ));
+}
+
+#[test]
+fn out_of_line_member_of_a_data_only_struct_keeps_its_methods() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "CConfig::CParser::Parse",
+        "HitTarget::Hit"
+    ));
 }

@@ -17,4 +17,11 @@ private:
     Handle<Widget> held_;
 };
 
+class MissingWidgetBox {
+public:
+    missing<Widget> held;
+};
+
+template<class T> class HeaderNoArrow {};
+
 #endif

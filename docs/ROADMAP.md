@@ -4,7 +4,7 @@
 
 ### M0 — Skeleton & docs ✅
 
-- Cargo workspace (6 crates)
+- Cargo workspace (initially 6 crates, now 7 with `trace-capi`)
 - README, AGENTS.md, docs/
 - Fixture: `tests/fixtures/direct_call/`
 
@@ -81,6 +81,13 @@
 - Schema v4: `files.is_dep`, `functions.is_dep`, `dep_roots` in `options_json`.
 - `trace inspect calls --exclude-deps`.
 - Fixture: `tests/fixtures/dep_root/`
+
+### M11 — Compilation database, exploration & C API ✅
+
+- `compile_commands.json` discovery (`build/` or target root) and explicit `--compile-commands PATH` flag (#62).
+- Bounded conditional exploration (`--explore` and `--explore-budget`) with GN define candidate harvesting (#59).
+- Programmatic C API library (`crates/trace-capi`, `libtrace_capi.{so,a}`) and header (`crates/trace-capi/include/trace.h`) for indexing and querying analysis results (#40).
+- Schema v4 export and diagnostics deduplication.
 
 ## In progress / next
 
