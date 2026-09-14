@@ -145,6 +145,11 @@ only HDF and Camera diagnostic totals decrease after normalization.
   is whether or not the spelling carries arguments, so a concrete class inheriting `operator->`
   from a base steps through it as a template instantiation does. Camera's direct
   edges rise 21,059 -> 37,646 and its 254 `OHOS::sptr::*` phantoms are gone.
+- C++ `auto` locals take the declared return type of the function their initializer resolves to,
+  including `weak_ptr::lock`, `wptr::promote`, `make_shared` and `make_unique` (#87, C1). The same
+  change resolves `::f()` calls, looks names in an `N::f` body up in `N`, indexes `T &f();`
+  prototypes, scopes C++ locals to their block, and finds a nested type in a class's bases. Rules
+  and limits: `docs/ANALYSIS.md`; corpus results: `docs/EVAL_REPORT.md`.
 
 ### Changed
 - `TypeTable::intern` and `intern_ref` answer an empty named tag from the tag map (#86). Canonicalizing

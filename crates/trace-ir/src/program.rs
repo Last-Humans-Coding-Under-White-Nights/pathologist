@@ -424,12 +424,16 @@ impl Program {
 
     /// Direct base classes of `cls`.
     pub fn bases_of(&self, cls: &str) -> Vec<String> {
+        self.base_names(cls).map(str::to_owned).collect()
+    }
+
+    /// [`Self::bases_of`], borrowed.
+    pub fn base_names(&self, cls: &str) -> impl Iterator<Item = &str> {
         self.bases_by_class
             .get(cls)
             .into_iter()
             .flatten()
-            .map(|&i| self.inheritance[i].1.clone())
-            .collect()
+            .map(|&i| self.inheritance[i].1.as_str())
     }
 
     /// `root` plus every class transitively deriving from it (BFS).

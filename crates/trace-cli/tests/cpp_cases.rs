@@ -37,6 +37,205 @@ fn direct_targets(program: &Program, analysis: &AnalysisResult, caller: &str) ->
 }
 
 #[test]
+fn cpp_auto_return_types_match_explicit_receivers() {
+    let root = fixture("cpp_auto_return");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_, analysis) = analyze(&program);
+    let members = |caller| {
+        let mut targets: Vec<_> = direct_targets(&program, &analysis, caller)
+            .into_iter()
+            .filter(|name| name.starts_with("Worker::") || name.starts_with("Sub::"))
+            .collect();
+        targets.sort();
+        targets
+    };
+    // The type of each local `p` in `caller`.
+    let p_types = |caller: &str| {
+        let id = program.symbols.resolve_function(caller).expect("caller");
+        program
+            .symbols
+            .variables
+            .iter()
+            .filter(move |v| v.fn_id == Some(id) && v.name == "p")
+            .map(|v| &program.types.get(v.type_id).desc)
+    };
+    assert_eq!(
+        program
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == "factories::select")
+            .count(),
+        2,
+        "qualified reference-return definitions must merge with their own prototypes"
+    );
+    let expected = vec!["Sub::go", "Worker::go", "Worker::run"];
+    for caller in [
+        "typed",
+        "inferred",
+        "chained",
+        "references",
+        "defined",
+        "qualified",
+        "member",
+        "conditional",
+        "init_statement",
+        "returned_reference",
+        "copied_reference",
+        "Owner::implicit_member",
+        "qualified_definition",
+        "global_qualified",
+        "global_free",
+        "global_shared",
+        "factories::body_scope",
+        "value_parameter",
+        "qualified_parameter_spelling",
+        "agreeing_overloads",
+        "agreeing_unknown",
+        "uses_std::bare_shared",
+        "cam::promote_in_namespace",
+        "cam::shared_const",
+        "cast_auto",
+        "bodyns::body",
+        "lock_typed",
+        "lock_auto",
+        "promote_typed",
+        "promote_auto",
+        "shared_typed",
+        "shared_auto",
+        "unique_typed",
+        "unique_auto",
+    ] {
+        assert_eq!(members(caller), expected, "{caller}");
+    }
+    for caller in [
+        "unresolved",
+        "dependent_use",
+        "partial_unknown",
+        "dependent_shared",
+        "dependent_copy",
+        "dependent_lock",
+        "dependent_value_use",
+        "box::Box::dependent_member",
+        "bare_without_using",
+        "dependent_receiver",
+        "dependent_static",
+        "Holder::use",
+        "pointer_to_value",
+        "pointer_depth_mismatch",
+        "dependent_alias",
+        "placeholder_scalar",
+        "Mixin::through_this",
+        "Mixin::implicit",
+        "strat_user::via_using",
+    ] {
+        assert!(members(caller).is_empty(), "{caller} must stay unresolved");
+        for guess in [
+            "Other::run",
+            "T::run",
+            "N::run",
+            "Event::run",
+            "SelfBase::self",
+        ] {
+            assert!(
+                !has_direct(&program, &analysis, caller, guess),
+                "{caller} -> {guess}"
+            );
+        }
+        for mut desc in p_types(caller) {
+            // A pointer declarator keeps its own layers over the unknown type.
+            while let trace_ir::TypeDesc::Ptr(inner) = desc {
+                desc = inner;
+            }
+            assert_eq!(
+                *desc,
+                trace_ir::TypeDesc::Unknown,
+                "{caller}::p must stay untyped"
+            );
+        }
+    }
+    assert!(
+        must_not_have_edge(
+            &program,
+            &analysis,
+            "reference_direct_init",
+            "Widget::Widget"
+        ),
+        "binding a reference constructs nothing"
+    );
+    let wrapper = |caller: &str| match p_types(caller).next().expect("p") {
+        trace_ir::TypeDesc::Struct { name, .. } => name.clone(),
+        other => panic!("{caller}::p is {other:?}"),
+    };
+    assert_eq!(wrapper("lock_auto"), "std::shared_ptr<Worker>");
+    assert_eq!(wrapper("promote_auto"), "OHOS::sptr<Worker>");
+    assert_eq!(wrapper("unique_auto"), "std::unique_ptr<Worker>");
+    assert_eq!(wrapper("cam::promote_in_namespace"), "cam::sptr<Worker>");
+    assert!(
+        matches!(
+            p_types("cast_auto").next(),
+            Some(trace_ir::TypeDesc::Ptr(inner)) if matches!(**inner, trace_ir::TypeDesc::Struct { .. })
+        ),
+        "`auto p = (Worker *)v` keeps the pointer layer"
+    );
+    for (caller, callee) in [
+        ("shared_template", "Box::run"),
+        ("ui::construct_local", "ui::Gadget::run"),
+        ("inherited_nested", "NodeBase::Node::run"),
+        ("new_qualified", "qual::Maker::run"),
+        ("shadowed_scope", "Worker::run"),
+        ("shadowed_scope", "Other::run"),
+    ] {
+        assert!(
+            has_direct(&program, &analysis, caller, callee),
+            "{caller} -> {callee}"
+        );
+    }
+    for (caller, callee) in [
+        ("strat_user::via_using", "Strategy::run"),
+        ("ui::construct_local", "Other::run"),
+        ("inherited_nested", "Node::run"),
+    ] {
+        assert!(
+            must_not_have_edge(&program, &analysis, caller, callee),
+            "{caller} -> {callee}"
+        );
+    }
+    assert!(
+        program.symbols.functions.iter().all(|f| f.name != "cb"),
+        "`cb && cb();` declares no function"
+    );
+}
+
+/// A variable declared in a condition (`if (Worker *p = f())`) is placed where
+/// its declarator starts, as one in a plain declaration is, not at its type.
+#[test]
+fn cpp_condition_variable_span_is_its_declarator() {
+    let root = fixture("cpp_auto_return");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let source = std::fs::read_to_string(root.join("main.cpp")).expect("fixture");
+    let (row, text) = source
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.starts_with("void condition_spans()"))
+        .expect("condition_spans");
+    for (name, declarator) in [("typed", "*typed"), ("inferred", "inferred")] {
+        let var = program
+            .symbols
+            .variables
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap_or_else(|| panic!("local `{name}`"));
+        let col = text.find(declarator).expect("declarator") as u32 + 1;
+        assert_eq!(
+            (var.span.line, var.span.col),
+            (row as u32 + 1, col),
+            "`{name}` must start at `{declarator}`"
+        );
+    }
+}
+
+#[test]
 fn cpp_virtual_dispatch_expands_to_overrides() {
     let root = fixture("cpp_basic");
     let program = build_program(&root, &default_opts(&root)).expect("build");

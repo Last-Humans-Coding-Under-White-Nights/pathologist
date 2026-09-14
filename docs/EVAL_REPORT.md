@@ -1,5 +1,88 @@
 # Evaluation Report
 
+## `auto` locals from declared return types — 2026-09-14 (#87, C1)
+
+The single record of what #87 changed on the pinned corpora. The inference
+rules and their limits are in `docs/ANALYSIS.md` ("`auto` local types").
+
+**Setup.** Release builds of origin/master (`22d36cd`, the tree of
+`e24a7f3`), of the first C1 build (`e20e4aa`), and of the final build; macOS,
+8 logical CPUs, pinned checkouts, 800,000-pop budget, `--jobs 8` unless noted.
+`scripts/eval_expected.json` is re-captured from these runs; eval passes 93/93.
+
+| Corpus | Direct edges | All edges | Indirect edges | Arg-flow rows |
+|--------|--------------|-----------|----------------|---------------|
+| HDF | 42,252 → 42,252 | 75,814 → 75,836 | 4,825 | 66,253 |
+| Hiview | 9,598 → 11,241 | 29,797 → 31,726 | 90 → 91 | 10,674 → 12,129 |
+| Camera | 39,014 → 42,584 | 93,315 → 97,590 | 135 → 162 | 28,940 → 30,983 |
+
+**Exact metrics.** Every dispatch-site count and exact metric is unchanged
+except indirect edges. A set comparison of `(caller, callee, line)` against
+master loses none. The new ones are callbacks reachable through newly typed
+receivers:
+- hiview: `EventLoggerConfig::ParseConfigData`, given a lambda by a
+  `make_unique` test.
+- camera: `CameraListenerManager::TriggerListener` +11 (two of them
+  `SketchWrapper::OnSketchStatusChanged` lambdas), the `WorkerThread` worker
+  callback +8, `UnifiedPipelineThreadpool::Submit` +7, and
+  `CameraRoateParamSignTool::ForEachFileSegment` +1.
+
+HDF keeps three `operator<<` definitions apart whose namespace parameter types
+had collapsed to `int` (`functions_defined` 10,253 → 10,256). Bands are
+re-centred, not widened.
+
+**H5.** `PipelineEvent::OnContinue` (`base/pipeline.cpp`) reaches
+`EventLoop::AddEvent` at line 62 and `Plugin::OnEventProxy` at line 64. Both
+have the one-target fan-out of the explicitly typed `EventLoop::ProcessEvent`
+site at line 498, and exact probes cover them. The dispatch inside
+`Plugin::OnEventProxy` stays at 24 targets.
+
+**Determinism.** Each corpus's database is byte-identical across three
+`--jobs 8` runs and one `--jobs 1` run, apart from `analysis_run`.
+
+**Review rounds.** Against the first build, the review rounds drop edges that
+rested on a guess and add edges the stricter rules reach:
+- dropped: hiview's external `TraceStrategy::DoDump` (22) and
+  `SysEvent::GetEventValue` (9), made-up spellings of classes a `using`
+  directive names; hdf's 9 direct `AstObject` edges typed through
+  `std::shared_ptr<AstObject>` spelled the same way;
+- added: overloads that agree on a return type (camera's
+  `CameraInput::GetCameraDeviceInfo` sites), bare `make_shared` /
+  `make_unique` under `using namespace std` (hiview's BBoxDetector tests,
+  camera's `TestBufferInfo`), and `T(args)` constructions (camera's 19
+  external `ExecuteCallbackData` calls now reach the constructor).
+
+**Performance.** The first build checked a return type for template
+parameters by walking the signature's ancestors with `Node::parent`, which
+re-descends from the root on every call. That cost camera 149 ms of index time,
+26 ms of it in the PCH phase. The final build descends once per check, and
+skips it in C units and in units without the `template` keyword. After the
+review rounds, `--jobs 8` wall medians over 9 interleaved runs against master
+and the build before them: hdf 3.966 s (3.925 s, 3.979 s), hiview 1.656 s
+(1.632 s, 1.648 s), camera 6.715 s (6.632 s, 6.628 s; minima 6.522 s,
+6.497 s, 6.506 s). Scoping locals by block applies to C++ only: applied to C
+it reordered hdf's solver worklist (+3.7% pops, +130 ms of solve time).
+
+| Phase (median, 11 interleaved runs) | master | first build | final |
+|---|---:|---:|---:|
+| camera index | 6.057 s | 6.206 s | 6.110 s |
+| camera PCH | 0.505 s | 0.531 s | 0.507 s |
+| hiview index | 1.354 s | 1.364 s | 1.346 s |
+| hdf analyze | 0.751 s | 0.810 s | 0.799 s |
+
+| Wall (median, `--jobs 1`, 5 interleaved runs) | master | first build | final |
+|---|---:|---:|---:|
+| hdf | 6.866 s | 6.967 s | 6.917 s |
+| hiview | 3.029 s | 3.083 s | 3.033 s |
+| camera | 13.081 s | 13.478 s | 13.399 s |
+
+What remains is output, not inference. Serial camera runs that infer the types
+but discard them index as fast as master. The runs that use them spend the rest
+emitting the extra call sites and edges (+4% call edges, +6% arg-flow rows).
+hdf's solve time follows its pop count (251,964 → 257,707). With every new
+behaviour switched off, the constraint count equals master's, yet twelve more
+variable ids reorder the worklist, and that run pops 260,669.
+
 ## Compiler attribute enclosing-expression follow-up — 2026-09-14 (#61)
 
 Attribute balancing now stops at the group's own closing parenthesis, without
