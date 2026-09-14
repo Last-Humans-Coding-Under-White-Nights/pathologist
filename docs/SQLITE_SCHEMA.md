@@ -61,16 +61,17 @@ diagnostics
 | `schema_version` | INTEGER | Database layout version (currently `4`) |
 | `target_root` | TEXT | Analyzed directory |
 | `created_at` | TEXT | Unix timestamp (seconds) |
-| `options_json` | TEXT | JSON: `include_paths`, `defines`, `dep_roots`, `include_points_to`, `full_detail`, `model_files`, `explore`, `explore_budget`, `variants_merged` |
+| `options_json` | TEXT | JSON: `include_paths`, `defines`, `dep_roots`, `include_points_to`, `full_detail`, `model_files`, `explore`, `explore_budget`, `explore_smt`, `variants_merged` |
 
-`explore` and `explore_budget` record what the run *requested*; `variants_merged`
-records how many variant units it actually merged. They come apart: a run can ask
-for exploration and find no feasible variant, or be given a zero budget. A
+`explore`, `explore_budget`, and `explore_smt` record what the run *requested*;
+`variants_merged` records how many variant units it actually merged. They come apart:
+a run can ask for exploration and find no feasible variant, or be given a zero budget. A
 consumer asking whether a database contains cross-variant facts must read
 `variants_merged`, not `explore`. Compilation databases (#62) can contribute
 additional commands for a source without exploration; those additional units
 also count. `include_paths` is the union of paths observed across configurations,
 while `defines` records user overrides, not every per-command macro environment.
+
 
 ### files
 

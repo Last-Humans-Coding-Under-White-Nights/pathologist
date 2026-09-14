@@ -228,6 +228,9 @@ out-of-band value is an error instead of silently running in one direction.
   `kind`/`loc_kind` describe the PAG nodes; edges carry `flow_kind`;
   `path`/`line`/`col` are empty because value-flow edges have no call site.
 - **`truncated`** is set when real neighbors remained beyond `depth`.
+- **Path verification (SMT).**
+  - `trace_inspect_verify_call_chain(db, caller_ids, callee_ids, paths, lines, n_edges)` evaluates whether an interprocedural sequence of call edges has satisfiable branch conditions and argument/parameter bindings using Z3. Returns `1` if feasible (SAT), `0` if contradictory (UNSAT), or `-1` on error/timeout.
+  - `trace_inspect_verify_flow_path(db, flow_node_ids, count)` evaluates the satisfiability of intraprocedural branch guards along a PAG dataflow path. Returns `1` if feasible, `0` if infeasible, or `-1` on error/timeout.
 
 ## Extending the API
 

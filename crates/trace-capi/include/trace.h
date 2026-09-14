@@ -381,6 +381,25 @@ trace_status trace_db_dataflow(trace_db *db,
  */
 void trace_graph_free(trace_graph *graph);
 
+/*
+ * Verify feasibility of a call chain using SMT path-condition solving.
+ * Returns 1 if feasible (SAT), 0 if infeasible (UNSAT), -1 on timeout or error.
+ */
+int trace_inspect_verify_call_chain(trace_db *db,
+                                    const int64_t *caller_ids,
+                                    const int64_t *callee_ids,
+                                    const char *const *paths,
+                                    const int64_t *lines,
+                                    size_t n_edges);
+
+/*
+ * Verify feasibility of a value-flow path using SMT path-condition solving.
+ * Returns 1 if feasible (SAT), 0 if infeasible (UNSAT), -1 on timeout or error.
+ */
+int trace_inspect_verify_flow_path(trace_db *db,
+                                   const int64_t *flow_node_ids,
+                                   size_t count);
+
 #ifdef __cplusplus
 }
 #endif

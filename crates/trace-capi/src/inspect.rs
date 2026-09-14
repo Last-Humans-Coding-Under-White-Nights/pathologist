@@ -666,6 +666,100 @@ pub unsafe extern "C" fn trace_db_call_chains(
     unsafe { settle(res, out, out_err) }
 }
 
+/// Verify feasibility of a call chain using SMT path-condition solving.
+/// Returns 1 if feasible (SAT), 0 if infeasible (UNSAT), -1 on timeout or error.
+///
+/// # Safety
+///
+/// `db` must be a valid pointer to an open `TraceDb`. `caller_ids`, `callee_ids`,
+/// `paths`, and `lines` must each point to arrays of at least `n_edges` elements.
+/// All string pointers within `paths` must be valid, null-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn trace_inspect_verify_call_chain(
+    db: *mut TraceDb,
+    caller_ids: *const i64,
+    callee_ids: *const i64,
+    paths: *const *const c_char,
+    lines: *const i64,
+    n_edges: usize,
+) -> c_int {
+    if db.is_null() {
+        return -1;
+    }
+    if n_edges == 0 {
+        return 1;
+    }
+    if caller_ids.is_null() || callee_ids.is_null() || paths.is_null() || lines.is_null() {
+        return -1;
+    }
+    let callers = std::slice::from_raw_parts(caller_ids, n_edges);
+    let callees = std::slice::from_raw_parts(callee_ids, n_edges);
+    let path_ptrs = std::slice::from_raw_parts(paths, n_edges);
+    let line_slice = std::slice::from_raw_parts(lines, n_edges);
+
+    let mut edges = Vec::with_capacity(n_edges);
+    let mut nodes = Vec::new();
+    if let Some(&first) = callers.first() {
+        nodes.push(first);
+    }
+    for i in 0..n_edges {
+        let p_str = if path_ptrs[i].is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(path_ptrs[i]).to_string_lossy().into_owned()
+        };
+        edges.push(trace_db::CallChainEdge {
+            caller_id: callers[i],
+            callee_id: callees[i],
+            resolution: "direct".to_string(),
+            site: trace_db::EdgeSite {
+                path: p_str,
+                line: line_slice[i],
+                col: 0,
+            },
+        });
+        nodes.push(callees[i]);
+    }
+    let chain = trace_db::CallChain { nodes, edges };
+    let conn = &(*db).conn;
+    match trace_db::verify_call_chain(conn, &chain) {
+        trace_db::PathFeasibility::Feasible => 1,
+        trace_db::PathFeasibility::Infeasible => 0,
+        trace_db::PathFeasibility::Unknown => -1,
+    }
+}
+
+/// Verify feasibility of a flow path using SMT path-condition solving.
+/// Returns 1 if feasible (SAT), 0 if infeasible (UNSAT), -1 on timeout or error.
+///
+/// # Safety
+///
+/// `db` must be a valid pointer to an open `TraceDb`. `flow_node_ids` must point to
+/// an array of at least `count` valid `i64` elements.
+#[no_mangle]
+pub unsafe extern "C" fn trace_inspect_verify_flow_path(
+    db: *mut TraceDb,
+    flow_node_ids: *const i64,
+    count: usize,
+) -> c_int {
+    if db.is_null() {
+        return -1;
+    }
+    if count == 0 {
+        return 1;
+    }
+    if flow_node_ids.is_null() {
+        return -1;
+    }
+    let node_slice = std::slice::from_raw_parts(flow_node_ids, count);
+    let conn = &(*db).conn;
+    match trace_db::verify_flow_path(conn, node_slice) {
+        trace_db::PathFeasibility::Feasible => 1,
+        trace_db::PathFeasibility::Infeasible => 0,
+        trace_db::PathFeasibility::Unknown => -1,
+    }
+}
+
 /// Read a C array of `TraceSymbol` back into inspect-layer `SymbolRef`s
 /// (round-trip of `trace_db_find_symbols` output into dataflow roots).
 unsafe fn read_symbols(
@@ -1723,6 +1817,32 @@ mod tests {
         };
         assert_eq!(status, TraceStatus::TraceErrInvalidArg as c_int);
         unsafe { trace_string_free(err) };
+
+        unsafe { trace_db_close(db) };
+    }
+
+    #[test]
+    fn verify_call_chain_capi() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = analyze_fixture(dir.path());
+
+        let callers = [2i64];
+        let callees = [1i64];
+        let path = CString::new(dir.path().join("main.c").to_str().unwrap()).unwrap();
+        let paths = [path.as_ptr()];
+        let lines = [10i64];
+
+        let res = unsafe {
+            trace_inspect_verify_call_chain(
+                db,
+                callers.as_ptr(),
+                callees.as_ptr(),
+                paths.as_ptr(),
+                lines.as_ptr(),
+                1,
+            )
+        };
+        assert_eq!(res, 1);
 
         unsafe { trace_db_close(db) };
     }

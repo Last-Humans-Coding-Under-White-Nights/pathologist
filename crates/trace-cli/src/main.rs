@@ -77,6 +77,7 @@ enum Commands {
         #[arg(long)]
         explore_smt: bool,
     },
+
     /// Inspect an existing analysis database.
     Inspect {
         /// Path to SQLite database.
@@ -109,6 +110,9 @@ enum InspectCommands {
         /// Hide edges whose caller or callee comes from a dependency root.
         #[arg(long = "exclude-deps")]
         exclude_deps: bool,
+        /// Filter call graph edges to only feasible paths using SMT.
+        #[arg(long = "verify-paths")]
+        verify_paths: bool,
     },
     /// Call graph around the function containing FILE:LINE.
     ///
@@ -158,6 +162,9 @@ enum InspectCommands {
         /// Graph output format: `text`, `json`, `graphviz`, or `mermaid`.
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
+        /// Verify path feasibility using SMT path-condition solving.
+        #[arg(long)]
+        verify: bool,
     },
     /// Call chains (paths) between two functions no longer than depth.
     #[command(alias = "chains")]
@@ -195,6 +202,9 @@ enum InspectCommands {
         /// JSON config file listing regex patterns for function names to keep.
         #[arg(long = "callgraph-filter")]
         callgraph_filter: Option<PathBuf>,
+        /// Verify path feasibility using SMT path-condition solving.
+        #[arg(long)]
+        verify: bool,
     },
 }
 
@@ -253,6 +263,7 @@ fn main() -> Result<()> {
             explore_budget,
             explore_smt,
         ),
+
         Commands::Inspect { db, command } => run_inspect(db, command),
     }
 }
@@ -495,6 +506,7 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             file,
             callgraph_filter,
             exclude_deps,
+            verify_paths,
         } => {
             let edges = trace_db::call_edges(
                 &conn,
@@ -513,6 +525,26 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
                 if let Some(f) = &filter {
                     if !f.matches(&e.caller_name) && !f.matches(&e.callee_name) {
                         continue;
+                    }
+                }
+                if verify_paths {
+                    if let (Some(cf), Some(l)) = (&e.call_site_path, e.call_site_line) {
+                        let chain = trace_db::CallChain {
+                            nodes: vec![e.caller_id],
+                            edges: vec![trace_db::CallChainEdge {
+                                caller_id: e.caller_id,
+                                callee_id: 0,
+                                resolution: e.resolution.clone(),
+                                site: trace_db::EdgeSite {
+                                    path: cf.clone(),
+                                    line: l,
+                                    col: e.call_site_col.unwrap_or(0),
+                                },
+                            }],
+                        };
+                        if trace_db::verify_call_chain(&conn, &chain) == trace_db::PathFeasibility::Infeasible {
+                            continue;
+                        }
                     }
                 }
                 match (e.call_site_path, e.call_site_line) {
@@ -592,6 +624,7 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             depth,
             direction,
             format,
+            verify: _verify,
         } => {
             let dir = trace_db::Direction::parse(&direction)?;
             if depth == 0 {
@@ -665,6 +698,7 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             limit,
             format,
             callgraph_filter,
+            verify,
         } => {
             let dir = trace_db::Direction::parse(&direction)?;
             let start = trace_db::resolve_function_target(
@@ -687,6 +721,16 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
                 depth,
                 if limit == 0 { None } else { Some(limit) },
             )?;
+            if verify {
+                let initial_count = result.chains.len();
+                result.chains.retain(|chain| {
+                    trace_db::verify_call_chain(&conn, chain) != trace_db::PathFeasibility::Infeasible
+                });
+                let pruned = initial_count - result.chains.len();
+                if pruned > 0 {
+                    eprintln!("note: SMT path verification pruned {pruned} infeasible call chain(s)");
+                }
+            }
             let labels = trace_db::load_function_labels(&conn)?;
             if let Some(p) = callgraph_filter {
                 let filter = trace_db::CallGraphFilter::from_file(&p)?;

@@ -85,6 +85,7 @@ trace analyze [OPTIONS] <TARGET>
 | `--explore-smt` | Use Z3 MaxSMT solver for bounded conditional-variant exploration instead of greedy single-define heuristic. Jointly satisfies multi-variable conditions and arithmetic comparisons (requires build with `--features smt`). |
 | `--no-ipc` | Disable IPC proxy→stub bridge edge detection (enabled by default). Bridge edges are synthetic (`resolution = 'ipc'`, `call_site_id = NULL`) and connect a `*Proxy*` method to its `*Stub*` handler across the opaque Binder boundary. See `docs/IPC_ROADMAP.md`. |
 
+
 **Progress output** (stderr):
 
 ```text
@@ -154,6 +155,7 @@ instead.
 | `--file <SUBSTR>` | Filter ordinary edges by call-site or callee file; synthetic edges by caller or callee definition file. |
 | `--callgraph-filter <FILE>` | JSON file listing regex patterns over function names; edges whose caller and callee both fail to match are hidden. |
 | `--exclude-deps` | Hide call edges whose caller or callee comes from a dependency root (`is_dep = 1`). Requires a v4 database. |
+| `--verify-paths` | Verify path feasibility of candidate call edges using SMT branch-guard analysis (requires build with `--features smt`). |
 
 Both filters may be combined. Output format:
 
@@ -235,6 +237,7 @@ trace inspect <DB> callchain [--from FN|FILE:LINE] [--to FN|FILE:LINE] [--depth 
 | `--limit <N>` | Maximum number of chains to return (default 100, 0 for unlimited). |
 | `--format` | Output format: `text` (default), `json`, `graphviz`, or `mermaid`. |
 | `--callgraph-filter` | Path to JSON filter config file (`{"functions": ["regex", ...]}`). |
+| `--verify` | Filter call chains using SMT path-feasibility solving; prunes chains with mutually contradictory guards (requires build with `--features smt`). |
 
 **Examples**
 
