@@ -168,7 +168,14 @@ pub struct Program {
     pub arrow_returns: Vec<ArrowReturn>,
     /// Classes declared `final` — CHA does not walk into their subclasses.
     pub final_classes: Vec<String>,
+    /// IPC calls initiated by proxy methods via `SendRequest`.
+    pub ipc_sends: Vec<crate::ipc::IpcSend>,
+    /// IPC dispatch arms inside stub dispatchers (e.g. `OnRemoteRequest`).
+    pub ipc_dispatches: Vec<crate::ipc::IpcDispatch>,
+    /// Evaluated or known enum constants across the program (`name -> value`).
+    pub enum_constants: FxHashMap<String, u64>,
     /// Whether configuration-variant exploration was enabled (#59).
+
     pub explore: bool,
     /// Maximum configuration-variant exploration budget per translation unit
     /// (#59), as configured for the run that built this program. The default
@@ -176,6 +183,7 @@ pub struct Program {
     pub explore_budget: usize,
     /// Whether SMT configuration-variant exploration was enabled (#Phase S1).
     pub explore_smt: bool,
+
     /// Variant units actually merged (#59). `--explore` only *offers* to
     /// explore: a unit with no feasible variant, or a zero budget, merges
     /// none. Analyses that compensate for cross-variant layout unioning must

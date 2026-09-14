@@ -19,3 +19,4 @@ void caller(void) { int *p; init(&p); }
     }
     walk(parsed.tree.root_node(), 0);
 }
+

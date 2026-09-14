@@ -481,3 +481,447 @@ fn ipc_smart_ptr_reaches_the_stub_through_an_undeclared_wrapper() {
 
     assert_eq!(pag.ipc_bridges.len(), 2);
 }
+
+#[test]
+fn ipc_opcode_disparate_handler_name_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("ipc_test.cpp"),
+        r#"
+enum class FaultCode : unsigned int {
+    REPORT = 0,
+    QUERY = 1,
+};
+
+struct IRemoteObject {
+    int SendRequest(unsigned int code, int data);
+};
+
+class FaultServiceStub {
+public:
+    int ProcessCrashLog(int data) { return 42; }
+    int RetrieveRecord(int data) { return 99; }
+
+    int OnRemoteRequest(unsigned int code, int data) {
+        switch (code) {
+            case static_cast<unsigned int>(FaultCode::REPORT):
+                return ProcessCrashLog(data);
+            case static_cast<unsigned int>(FaultCode::QUERY):
+                return RetrieveRecord(data);
+            default:
+                return -1;
+        }
+    }
+};
+
+class FaultServiceProxy {
+public:
+    IRemoteObject *remote;
+
+    int SubmitFaultReport(int data) {
+        return remote->SendRequest(static_cast<unsigned int>(FaultCode::REPORT), data);
+    }
+
+    int FetchHistoricalLog(int data) {
+        return remote->SendRequest(static_cast<unsigned int>(FaultCode::QUERY), data);
+    }
+};
+
+int main() {
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+
+    let opts = PreprocessOptions::new().with_include(root.to_path_buf());
+    let program = build_program(root, &opts).expect("build program");
+    let (pag, analysis) = analyze(&program);
+
+    assert_eq!(program.ipc_sends.len(), 2, "must discover 2 IpcSend facts");
+    assert_eq!(
+        program.ipc_dispatches.len(),
+        2,
+        "must discover 2 IpcDispatch facts"
+    );
+
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "FaultServiceProxy::SubmitFaultReport",
+            "FaultServiceStub::ProcessCrashLog"
+        ),
+        "SubmitFaultReport must bridge to ProcessCrashLog via opcode REPORT"
+    );
+
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "FaultServiceProxy::FetchHistoricalLog",
+            "FaultServiceStub::RetrieveRecord"
+        ),
+        "FetchHistoricalLog must bridge to RetrieveRecord via opcode QUERY"
+    );
+
+    assert!(
+        !has_bridge_edge(
+            &program,
+            &analysis,
+            "FaultServiceProxy::SubmitFaultReport",
+            "FaultServiceStub::RetrieveRecord"
+        ),
+        "SubmitFaultReport must not bridge to RetrieveRecord"
+    );
+
+    assert_eq!(pag.ipc_bridges.len(), 2);
+}
+
+#[test]
+fn ipc_opcode_arithmetic_base_offset_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("arith_ipc.cpp"),
+        r#"
+#define TRANS_BASE 100
+
+struct IRemoteObject {
+    int SendRequest(int code, int data);
+};
+
+class DeviceStub {
+public:
+    int ResetDevice(int data) { return 1; }
+    int ProbeDevice(int data) { return 2; }
+
+    int OnRemoteRequest(int code, int data) {
+        switch (code) {
+            case TRANS_BASE + 1:
+                return ResetDevice(data);
+            case TRANS_BASE + 2:
+                return ProbeDevice(data);
+            default:
+                return 0;
+        }
+    }
+};
+
+class DeviceProxy {
+public:
+    IRemoteObject *remote;
+
+    int TriggerReset(int x) {
+        return remote->SendRequest(TRANS_BASE + 1, x);
+    }
+
+    int TriggerProbe(int x) {
+        return remote->SendRequest(TRANS_BASE + 2, x);
+    }
+};
+"#,
+    )
+    .unwrap();
+
+    let opts = PreprocessOptions::new().with_include(root.to_path_buf());
+    let program = build_program(root, &opts).expect("build program");
+    let (pag, analysis) = analyze(&program);
+
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "DeviceProxy::TriggerReset",
+            "DeviceStub::ResetDevice"
+        ),
+        "TriggerReset must bridge to ResetDevice via TRANS_BASE + 1"
+    );
+
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "DeviceProxy::TriggerProbe",
+            "DeviceStub::ProbeDevice"
+        ),
+        "TriggerProbe must bridge to ProbeDevice via TRANS_BASE + 2"
+    );
+
+    assert!(
+        !has_bridge_edge(
+            &program,
+            &analysis,
+            "DeviceProxy::TriggerReset",
+            "DeviceStub::ProbeDevice"
+        ),
+        "TriggerReset must not bridge to ProbeDevice"
+    );
+
+    assert_eq!(pag.ipc_bridges.len(), 2);
+}
+
+#[test]
+fn ipc_opcode_if_else_chain_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("if_chain_ipc.cpp"),
+        r#"
+enum class ThermalCode : unsigned int {
+    CHANGED = 10,
+    ASYNC_CHANGED = 20,
+};
+
+struct IRemoteObject {
+    int SendRequest(unsigned int code, int data);
+};
+
+class ThermalStub {
+public:
+    int OnLevelChanged(int data) { return 0; }
+    int OnAsyncLevelChanged(int data) { return 0; }
+
+    int OnRemoteRequest(unsigned int code, int data) {
+        if (code == static_cast<unsigned int>(ThermalCode::CHANGED)) {
+            return OnLevelChanged(data);
+        } else if (code == static_cast<unsigned int>(ThermalCode::ASYNC_CHANGED)) {
+            return OnAsyncLevelChanged(data);
+        }
+        return -1;
+    }
+};
+
+class ThermalProxy {
+public:
+    IRemoteObject *remote;
+
+    int NotifyLevel(int x) {
+        return remote->SendRequest(static_cast<unsigned int>(ThermalCode::CHANGED), x);
+    }
+
+    int NotifyAsyncLevel(int x) {
+        return remote->SendRequest(static_cast<unsigned int>(ThermalCode::ASYNC_CHANGED), x);
+    }
+};
+"#,
+    )
+    .unwrap();
+
+    let opts = PreprocessOptions::new().with_include(root.to_path_buf());
+    let program = build_program(root, &opts).expect("build program");
+    let (pag, analysis) = analyze(&program);
+
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "ThermalProxy::NotifyLevel",
+            "ThermalStub::OnLevelChanged"
+        ),
+        "NotifyLevel must bridge to OnLevelChanged"
+    );
+
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "ThermalProxy::NotifyAsyncLevel",
+            "ThermalStub::OnAsyncLevelChanged"
+        ),
+        "NotifyAsyncLevel must bridge to OnAsyncLevelChanged"
+    );
+
+    assert_eq!(pag.ipc_bridges.len(), 2);
+}
+
+#[cfg(feature = "smt")]
+#[test]
+fn ipc_opcode_symbolic_ternary_smt_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("smt_ipc_test.cpp"),
+        r#"
+#define OP_SYNC 100
+#define OP_ASYNC 200
+#define OP_OTHER 300
+
+struct IRemoteObject {
+    int SendRequest(int code, int data);
+};
+
+class DispatchStub {
+public:
+    int HandleSync(int data) { return 1; }
+    int HandleAsync(int data) { return 2; }
+    int HandleOther(int data) { return 3; }
+
+    int OnRemoteRequest(int code, int data) {
+        switch (code) {
+            case OP_SYNC:
+                return HandleSync(data);
+            case OP_ASYNC:
+                return HandleAsync(data);
+            case OP_OTHER:
+                return HandleOther(data);
+            default:
+                return 0;
+        }
+    }
+};
+
+class DispatchProxy {
+public:
+    IRemoteObject *remote;
+
+    int SendDynamic(int data, int is_async) {
+        return remote->SendRequest(is_async ? OP_ASYNC : OP_SYNC, data);
+    }
+};
+"#,
+    )
+    .unwrap();
+
+    let opts = PreprocessOptions::new().with_include(root.to_path_buf());
+    let program = build_program(root, &opts).expect("build program");
+    let (pag, analysis) = analyze(&program);
+
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "DispatchProxy::SendDynamic",
+            "DispatchStub::HandleAsync"
+        ),
+        "SendDynamic must bridge to HandleAsync"
+    );
+
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "DispatchProxy::SendDynamic",
+            "DispatchStub::HandleSync"
+        ),
+        "SendDynamic must bridge to HandleSync"
+    );
+
+    assert!(
+        !has_bridge_edge(
+            &program,
+            &analysis,
+            "DispatchProxy::SendDynamic",
+            "DispatchStub::HandleOther"
+        ),
+        "SendDynamic must NOT bridge to HandleOther (infeasible opcode)"
+    );
+
+    assert_eq!(pag.ipc_bridges.len(), 2);
+}
+
+#[cfg(feature = "smt")]
+#[test]
+fn test_ipc_symbolic_opcode_enum_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+        class IRemoteBroker {
+        public:
+            virtual ~IRemoteBroker() {}
+        };
+
+        class IRemoteObject {
+        public:
+            virtual int SendRequest(unsigned int code, void* data, void* reply, void* option) = 0;
+        };
+
+        class MyInterface : public IRemoteBroker {
+        public:
+            enum {
+                BASE_CODE = 50,
+                CODE_OP1 = BASE_CODE + 1,
+                CODE_OP2 = BASE_CODE + 2,
+            };
+            virtual void Execute1() = 0;
+            virtual void Execute2() = 0;
+        };
+
+        class MyProxy : public MyInterface {
+        public:
+            IRemoteObject* remote;
+            void Execute1() override {
+                remote->SendRequest(CODE_OP1, nullptr, nullptr, nullptr);
+            }
+            void Execute2() override {
+                // Symbolic expression: BASE_CODE + 2
+                remote->SendRequest(CODE_OP2, nullptr, nullptr, nullptr);
+            }
+        };
+
+        class MyStub : public MyInterface {
+        public:
+            void TargetHandler1() {}
+            void TargetHandler2() {}
+
+            int OnRemoteRequest(unsigned int code, void* data, void* reply, void* option) {
+                switch (code) {
+                    case CODE_OP1:
+                        TargetHandler1();
+                        return 0;
+                    case CODE_OP2:
+                        TargetHandler2();
+                        return 0;
+                    default:
+                        return -1;
+                }
+            }
+        };
+        "#,
+    )
+    .unwrap();
+
+    let opts = PreprocessOptions::new().with_include(root.to_path_buf());
+    let program = build_program(root, &opts).expect("build program");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "MyProxy::Execute1",
+            "MyStub::TargetHandler1"
+        ),
+        "Execute1 should bridge to TargetHandler1 via CODE_OP1"
+    );
+
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "MyProxy::Execute2",
+            "MyStub::TargetHandler2"
+        ),
+        "Execute2 should bridge to TargetHandler2 via CODE_OP2"
+    );
+
+    assert!(
+        !has_bridge_edge(
+            &program,
+            &analysis,
+            "MyProxy::Execute1",
+            "MyStub::TargetHandler2"
+        ),
+        "Execute1 should not bridge to TargetHandler2"
+    );
+}
+
+

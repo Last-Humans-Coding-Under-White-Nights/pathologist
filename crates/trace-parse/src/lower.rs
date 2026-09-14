@@ -333,7 +333,8 @@ pub fn build_program_with_jobs(
         .with_include_expansion_cache(Arc::clone(&include_expansion_cache))
         .with_basename_index(basename_index)
         .with_inline_include_bodies(false);
-    let eff_opts = eff_opts.with_record_conditionals(opts.explore || opts.explore_smt || opts.record_conditionals);
+    let eff_opts = eff_opts
+        .with_record_conditionals(opts.explore || opts.explore_smt || opts.record_conditionals);
 
     let gn_candidates = if (opts.explore || opts.explore_smt) && opts.explore_budget > 0 {
         index_progress("explore: scanning GN candidate defines".to_string());
@@ -1625,6 +1626,7 @@ fn index_source_file_with_variants(
             explore_budget,
         )
     };
+
     let mut warn_explore = |message: String| {
         base_unit.diagnostics.push(Diagnostic {
             severity: DiagnosticSeverity::Warning,
@@ -1941,8 +1943,12 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
         template_bases: std::mem::take(&mut program.template_bases),
         arrow_returns: std::mem::take(&mut program.arrow_returns),
         final_classes: std::mem::take(&mut program.final_classes),
+        ipc_sends: std::mem::take(&mut program.ipc_sends),
+        ipc_dispatches: std::mem::take(&mut program.ipc_dispatches),
+        enum_constants: std::mem::take(&mut program.enum_constants),
     }
 }
+
 
 /// What a callee expression resolves to: its name, whether the name is a
 /// direct target, and the variable holding the value called through it.
@@ -2110,8 +2116,17 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
     ctx.ast_depth += 1;
     match node.kind() {
         "function_definition" => lower_function(program, ctx, source, node),
-        "declaration" => lower_declaration(program, ctx, source, node, None),
+        "declaration" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                if type_node.kind() == "enum_specifier" {
+                    lower_enum_specifier(program, ctx, source, type_node);
+                }
+            }
+            lower_declaration(program, ctx, source, node, None);
+        }
+        "enum_specifier" => lower_enum_specifier(program, ctx, source, node),
         "struct_specifier" | "union_specifier" | "class_specifier" => {
+
             let tag = lower_struct_specifier(program, ctx, source, node);
             // In C++, `struct` is identical to `class` except for default
             // visibility — structs may have constructors, destructors, and
@@ -2646,6 +2661,20 @@ fn lower_class_definitions(
         }
     }
     let saved = ctx.class_ctx.clone();
+    for &m in &members {
+        if matches!(m.kind(), "declaration" | "field_declaration") {
+            if let Some(type_node) = m.child_by_field_name("type") {
+                if type_node.kind() == "enum_specifier" {
+                    ctx.class_ctx = Some(ClassCtx {
+                        qual_name: cls_qual.to_string(),
+                    });
+                    lower_enum_specifier(program, ctx, source, type_node);
+                    ctx.class_ctx = saved.clone();
+                }
+            }
+        }
+    }
+
     for &m in &members {
         let member = if m.kind() == "template_declaration" {
             template_member_decl(m).unwrap_or(m)
@@ -3233,7 +3262,11 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
 
     if let Some(body_node) = node.child_by_field_name("body") {
         walk_function_body(program, ctx, source, body_node, fn_id);
+        if ctx.is_cpp && (name.ends_with("::OnRemoteRequest") || name == "OnRemoteRequest") {
+            scan_ipc_stub_dispatches(program, ctx, source, body_node, fn_id);
+        }
     }
+
     // Constructor-initializer lists are siblings of the body on
     // function_definition; they carry base/member ctor calls.
     if ctx.is_cpp {
@@ -3916,7 +3949,36 @@ fn collect_call_at_node(
     let span = node_span(program, ctx, node);
     let return_dst = ctx.call_return_dst.borrow().get(&node.id()).copied();
 
+    if ctx.is_cpp {
+        let callee_text = node_text(source, &func);
+        let last_segment = callee_text.rsplit([':', '>', '.']).next().map(|s| s.trim());
+        if last_segment == Some("SendRequest") {
+            if let Some(args_node) = node.child_by_field_name("arguments") {
+                if let Some(arg0) = args_node.named_child(0) {
+                    let opcode_raw = node_text(source, &arg0).trim();
+                    let opcode_normalized = normalize_opcode_expr(opcode_raw);
+
+                    let opcode_val = eval_opcode_expr(
+                        &opcode_normalized,
+                        &program.defines,
+                        &program.enum_constants,
+                    );
+                    let send = trace_ir::IpcSend {
+                        proxy_method: caller,
+                        opcode_expr: opcode_raw.to_string(),
+                        opcode_normalized,
+                        opcode_val,
+                    };
+                    if !program.ipc_sends.contains(&send) {
+                        program.ipc_sends.push(send);
+                    }
+                }
+            }
+        }
+    }
+
     // ---- C++ member calls with statically-typed receivers ----
+
     // `recv.method(args)` / `p->method(args)` / explicit `x.~T()` /
     // virtual dispatch through base pointers. Receivers we cannot type
     // fall through to the generic indirect handling below (vtable-slot
@@ -8516,6 +8578,367 @@ fn node_end_line(program: &Program, ctx: &LowerContext, node: Node, span: Span) 
         }
     }
 }
+
+/// Strip `static_cast<...>(...)`, `(type)(...)`, outer parentheses, and collapse whitespace.
+pub(crate) fn normalize_opcode_expr(mut s: &str) -> String {
+    s = s.trim();
+    loop {
+        if let Some(rest) = s
+            .strip_prefix("static_cast")
+            .or_else(|| s.strip_prefix("reinterpret_cast"))
+            .or_else(|| s.strip_prefix("const_cast"))
+        {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('<') {
+                if let Some(pos) = rest.find('>') {
+                    let after = rest[pos + 1..].trim_start();
+                    if after.starts_with('(') && after.ends_with(')') {
+                        s = after[1..after.len() - 1].trim();
+                        continue;
+                    }
+                }
+            }
+        }
+        if let Some(rest) = s
+            .strip_prefix("(uint32_t)")
+            .or_else(|| s.strip_prefix("(uint32)"))
+            .or_else(|| s.strip_prefix("(int32_t)"))
+            .or_else(|| s.strip_prefix("(int)"))
+            .or_else(|| s.strip_prefix("(uint64_t)"))
+            .or_else(|| s.strip_prefix("(unsigned int)"))
+        {
+            s = rest.trim();
+            continue;
+        }
+        if s.starts_with('(') && s.ends_with(')') {
+            let mut depth = 0;
+            let mut balanced_at_end = false;
+            for (i, c) in s.char_indices() {
+                if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                    if depth == 0 && i == s.len() - 1 {
+                        balanced_at_end = true;
+                    } else if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            if balanced_at_end {
+                s = s[1..s.len() - 1].trim();
+                continue;
+            }
+        }
+        break;
+    }
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.replace(" :: ", "::").replace(":: ", "::").replace(" ::", "::")
+}
+
+/// Evaluate an opcode expression to a constant integer if possible.
+pub(crate) fn eval_opcode_expr(
+    expr: &str,
+    defines: &indexmap::IndexMap<String, String>,
+    enums: &rustc_hash::FxHashMap<String, u64>,
+) -> Option<u64> {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return None;
+    }
+    if let Some(v) = trace_preproc::parse_int_literal(expr) {
+        return Some(v as u64);
+    }
+    if let Some(&v) = enums.get(expr) {
+        return Some(v);
+    }
+    let short = expr.rsplit("::").next().unwrap_or(expr);
+    if let Some(&v) = enums.get(short) {
+        return Some(v);
+    }
+    if let Some(def_val) = defines.get(expr).or_else(|| defines.get(short)) {
+        let def_clean = normalize_opcode_expr(def_val);
+        if let Some(v) = trace_preproc::parse_int_literal(&def_clean) {
+            return Some(v as u64);
+        }
+
+        if let Some(&v) = enums
+            .get(&def_clean)
+            .or_else(|| enums.get(def_clean.rsplit("::").next().unwrap_or(&def_clean)))
+        {
+            return Some(v);
+        }
+    }
+    if let Some((left, right)) = expr.rsplit_once('+') {
+        let left_v = eval_opcode_expr(left.trim(), defines, enums)?;
+        let right_v = eval_opcode_expr(right.trim(), defines, enums)?;
+        return Some(left_v.wrapping_add(right_v));
+    }
+    if let Some((left, right)) = expr.rsplit_once('-') {
+        let left_v = eval_opcode_expr(left.trim(), defines, enums)?;
+        let right_v = eval_opcode_expr(right.trim(), defines, enums)?;
+        return Some(left_v.wrapping_sub(right_v));
+    }
+    None
+}
+
+/// Lower an `enum_specifier` and register its member values in `program.enum_constants`.
+fn lower_enum_specifier(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+) {
+    let name = node
+        .child_by_field_name("name")
+        .map(|n| node_text(source, &n).to_string());
+    let qual_prefix = name.as_ref().map(|enum_name| ctx.qualify_decl(enum_name));
+
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+
+    let mut current_val: u64 = 0;
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child.kind() == "enumerator" {
+            let Some(id_node) = child.child_by_field_name("name") else {
+                continue;
+            };
+            let enumerator_name = node_text(source, &id_node).to_string();
+            if let Some(val_node) = child.child_by_field_name("value") {
+                let val_text = node_text(source, &val_node).trim();
+                let norm = normalize_opcode_expr(val_text);
+                if let Some(val) = eval_opcode_expr(&norm, &program.defines, &program.enum_constants) {
+                    current_val = val;
+                }
+            }
+            if let Some(ref prefix) = qual_prefix {
+                let full = format!("{prefix}::{enumerator_name}");
+                program.enum_constants.insert(full, current_val);
+                if let Some(ref ename) = name {
+                    let short_enum = format!("{ename}::{enumerator_name}");
+                    program.enum_constants.insert(short_enum, current_val);
+                }
+            }
+            program.enum_constants.entry(enumerator_name).or_insert(current_val);
+            current_val = current_val.wrapping_add(1);
+        }
+    }
+}
+
+/// Scan a stub dispatcher function body (`OnRemoteRequest`) for IPC dispatch points.
+fn scan_ipc_stub_dispatches(
+    program: &mut Program,
+    _ctx: &LowerContext,
+    source: &str,
+    body: Node,
+    stub_fn: FnId,
+) {
+    fn walk_for_dispatches(node: Node, source: &str, program: &mut Program, stub_fn: FnId) {
+        match node.kind() {
+            "switch_statement" => {
+                let Some(body_node) = node.child_by_field_name("body") else {
+                    return;
+                };
+                let mut cursor = body_node.walk();
+                let children: Vec<Node> = body_node.children(&mut cursor).collect();
+                for (i, child) in children.iter().enumerate() {
+                    if child.kind() == "case_statement" {
+                        if let Some(val_node) = child.child_by_field_name("value") {
+                            let val_text = node_text(source, &val_node).trim();
+                            let norm = normalize_opcode_expr(val_text);
+                            let val = eval_opcode_expr(
+                                &norm,
+                                &program.defines,
+                                &program.enum_constants,
+                            );
+                            let mut callees = Vec::new();
+                            collect_callees_in_case(*child, source, &mut callees);
+                            if callees.is_empty() && i + 1 < children.len() {
+                                collect_callees_in_case(children[i + 1], source, &mut callees);
+                            }
+                            let disp = trace_ir::IpcDispatch {
+                                stub_fn,
+                                opcode_expr: val_text.to_string(),
+                                opcode_normalized: norm,
+                                opcode_val: val,
+                                callee_names: callees,
+                            };
+                            if !program.ipc_dispatches.contains(&disp) {
+                                program.ipc_dispatches.push(disp);
+                            }
+                        }
+                    }
+                }
+            }
+            "if_statement" => {
+                if let Some(cond) = node.child_by_field_name("condition") {
+                    if let Some((val_text, norm, val)) =
+                        extract_if_code_comparison(cond, source, program)
+                    {
+                        let mut callees = Vec::new();
+                        if let Some(consequence) = node.child_by_field_name("consequence") {
+                            collect_callees_in_node(consequence, source, &mut callees);
+                        }
+                        let disp = trace_ir::IpcDispatch {
+                            stub_fn,
+                            opcode_expr: val_text,
+                            opcode_normalized: norm,
+                            opcode_val: val,
+                            callee_names: callees,
+                        };
+                        if !program.ipc_dispatches.contains(&disp) {
+                            program.ipc_dispatches.push(disp);
+                        }
+                    }
+                }
+                if let Some(alt) = node.child_by_field_name("alternative") {
+                    let mut c = alt.walk();
+                    for ch in alt.children(&mut c) {
+                        walk_for_dispatches(ch, source, program, stub_fn);
+                    }
+                }
+            }
+            _ => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    walk_for_dispatches(child, source, program, stub_fn);
+                }
+            }
+        }
+    }
+
+    walk_for_dispatches(body, source, program, stub_fn);
+}
+
+fn extract_if_code_comparison(
+    cond_node: Node,
+    source: &str,
+    program: &Program,
+) -> Option<(String, String, Option<u64>)> {
+    fn find_comparison<'a>(node: Node<'a>) -> Option<Node<'a>> {
+        if node.kind() == "binary_expression" {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "==" {
+                    return Some(node);
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = find_comparison(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    let cmp = find_comparison(cond_node)?;
+    let left = cmp.child_by_field_name("left")?;
+    let right = cmp.child_by_field_name("right")?;
+
+    let left_text = node_text(source, &left).trim();
+    let right_text = node_text(source, &right).trim();
+
+    let val_node = if left_text == "code"
+        || left_text.ends_with("::code")
+        || left_text == "cmd"
+        || left_text.ends_with("::cmd")
+    {
+        right
+    } else if right_text == "code"
+        || right_text.ends_with("::code")
+        || right_text == "cmd"
+        || right_text.ends_with("::cmd")
+    {
+        left
+    } else {
+        return None;
+    };
+
+    let raw = node_text(source, &val_node).trim();
+    let norm = normalize_opcode_expr(raw);
+    let val = eval_opcode_expr(&norm, &program.defines, &program.enum_constants);
+    Some((raw.to_string(), norm, val))
+}
+
+fn collect_callees_in_case(case_node: Node, source: &str, callees: &mut Vec<String>) {
+    let mut cursor = case_node.walk();
+    let mut past_colon = false;
+    for child in case_node.children(&mut cursor) {
+        if child.kind() == ":" {
+            past_colon = true;
+            continue;
+        }
+        if past_colon {
+            collect_callees_in_node(child, source, callees);
+        }
+    }
+}
+
+fn collect_callees_in_node(node: Node, source: &str, callees: &mut Vec<String>) {
+    fn is_ipc_boilerplate(name: &str) -> bool {
+        matches!(
+            name,
+            "ReadInt32"
+                | "ReadInt64"
+                | "ReadUint32"
+                | "ReadUint64"
+                | "ReadString"
+                | "ReadString16"
+                | "ReadParcelable"
+                | "ReadInterfaceToken"
+                | "ReadRemoteObject"
+                | "ReadBool"
+                | "WriteInt32"
+                | "WriteInt64"
+                | "WriteUint32"
+                | "WriteUint64"
+                | "WriteString"
+                | "WriteString16"
+                | "WriteParcelable"
+                | "WriteRemoteObject"
+                | "WriteBool"
+                | "GetFlags"
+                | "GetDescriptor"
+                | "SetTimer"
+                | "CancelTimer"
+                | "GetInstance"
+                | "Unmarshalling"
+        ) || name.starts_with("HIVIEW_LOG")
+            || name.starts_with("HILOG")
+            || name.starts_with("THERMAL_HILOG")
+            || name.starts_with("LOG")
+    }
+
+    if node.kind() == "call_expression" {
+        if let Some(func) = node.child_by_field_name("function") {
+            let name_opt = match func.kind() {
+                "identifier" => Some(node_text(source, &func).trim().to_string()),
+                "field_expression" => func
+                    .child_by_field_name("field")
+                    .map(|f| node_text(source, &f).trim().to_string()),
+                "qualified_identifier" => func
+                    .child_by_field_name("name")
+                    .map(|n| node_text(source, &n).trim().to_string()),
+                _ => None,
+            };
+            if let Some(name) = name_opt {
+                if !is_ipc_boilerplate(&name) && !callees.contains(&name) {
+                    callees.push(name);
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_callees_in_node(child, source, callees);
+    }
+}
+
+
 
 /// Exhaustive check of `canonicalize_conversion_target` over a generated
 /// world of scopes and spellings.

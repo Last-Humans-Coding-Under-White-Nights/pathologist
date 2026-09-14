@@ -29,6 +29,9 @@ pub struct UnitIndex {
     pub arrow_returns: Vec<trace_ir::ArrowReturn>,
     /// Classes declared `final` in this unit.
     pub final_classes: Vec<String>,
+    pub ipc_sends: Vec<trace_ir::IpcSend>,
+    pub ipc_dispatches: Vec<trace_ir::IpcDispatch>,
+    pub enum_constants: FxHashMap<String, u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -835,7 +838,39 @@ fn merge_unit(
             target.extend(remapped);
         }
     }
+
+    for (k, v) in &unit.enum_constants {
+        program.enum_constants.entry(k.clone()).or_insert(*v);
+    }
+
+    for send in &unit.ipc_sends {
+        let proxy_method = fn_map.get(&send.proxy_method).copied().unwrap_or(send.proxy_method);
+        let remapped = trace_ir::IpcSend {
+            proxy_method,
+            opcode_expr: send.opcode_expr.clone(),
+            opcode_normalized: send.opcode_normalized.clone(),
+            opcode_val: send.opcode_val,
+        };
+        if !program.ipc_sends.contains(&remapped) {
+            program.ipc_sends.push(remapped);
+        }
+    }
+
+    for disp in &unit.ipc_dispatches {
+        let stub_fn = fn_map.get(&disp.stub_fn).copied().unwrap_or(disp.stub_fn);
+        let remapped = trace_ir::IpcDispatch {
+            stub_fn,
+            opcode_expr: disp.opcode_expr.clone(),
+            opcode_normalized: disp.opcode_normalized.clone(),
+            opcode_val: disp.opcode_val,
+            callee_names: disp.callee_names.clone(),
+        };
+        if !program.ipc_dispatches.contains(&remapped) {
+            program.ipc_dispatches.push(remapped);
+        }
+    }
 }
+
 
 fn flow_vars(flow: &FlowConstraint) -> impl Iterator<Item = VarId> + '_ {
     match flow {

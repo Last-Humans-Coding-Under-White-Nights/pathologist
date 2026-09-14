@@ -41,6 +41,31 @@ pub fn detect_ipc_pairs(program: &Program) -> Vec<IpcBridge> {
         let Some(handlers) = stub_index.get(&stub_class) else {
             continue;
         };
+
+        // 1. Try Opcode-based symbolic/eval dispatch resolution first
+        let opcode_matches = match_proxy_to_stub_by_opcode(
+            program,
+            *proxy_method,
+            &stub_class,
+            handlers,
+        );
+        if !opcode_matches.is_empty() {
+            if std::env::var_os("TRACE_DEBUG_IPC").is_some() {
+                let p_name = &program.symbols.function(*proxy_method).name;
+                for h in &opcode_matches {
+                    let h_name = &program.symbols.function(*h).name;
+                    eprintln!("trace: ipc opcode bridge: {p_name} -> {h_name}");
+                }
+            }
+            bridges.extend(opcode_matches.into_iter().map(|stub_handler| IpcBridge {
+                proxy_method: *proxy_method,
+                stub_handler,
+                descriptor: String::new(),
+            }));
+            continue;
+        }
+
+        // 2. Name-based match fallback
         let matched_handlers = find_handlers(program, handlers, method);
         if !matched_handlers.is_empty() {
             bridges.extend(matched_handlers.into_iter().map(|stub_handler| IpcBridge {
@@ -50,6 +75,7 @@ pub fn detect_ipc_pairs(program: &Program) -> Vec<IpcBridge> {
             }));
             continue;
         }
+
         // Fallback: stub has no handler methods (only dispatcher + boilerplate).
         // The stub's OnRemoteRequest switch calls interface methods directly on
         // `this` (inherited from the parent interface). Match proxy methods
@@ -378,6 +404,461 @@ fn split_qualified(name: &str) -> Option<(String, String)> {
     let class = parts.join("::");
     Some((class, method))
 }
+
+/// Match a proxy method to stub handler(s) using symbolic opcode equality.
+fn match_proxy_to_stub_by_opcode(
+    program: &Program,
+    proxy_method: FnId,
+    stub_class: &str,
+    handlers: &[FnId],
+) -> Vec<FnId> {
+    let sends: Vec<&trace_ir::IpcSend> = program
+        .ipc_sends
+        .iter()
+        .filter(|s| s.proxy_method == proxy_method)
+        .collect();
+    if sends.is_empty() {
+        return Vec::new();
+    }
+
+    let mut stub_classes = vec![stub_class.to_string()];
+    for base in program.bases_of(stub_class) {
+        if is_stub_class(&base) {
+            stub_classes.push(base);
+        }
+    }
+
+    let dispatches: Vec<&trace_ir::IpcDispatch> = program
+        .ipc_dispatches
+        .iter()
+        .filter(|d| {
+            let name = &program.symbols.function(d.stub_fn).name;
+            stub_classes.iter().any(|cls| {
+                name.starts_with(cls)
+                    && name.get(cls.len()..).is_some_and(|rest| rest.starts_with("::"))
+            })
+        })
+        .collect();
+    if dispatches.is_empty() {
+        return Vec::new();
+    }
+
+    let mut matched = Vec::new();
+    let mut seen = FxHashSet::default();
+
+    for send in &sends {
+        for disp in &dispatches {
+            if opcodes_match(send, disp, program) {
+                for callee in &disp.callee_names {
+                    let candidates = find_handlers(program, handlers, callee);
+                    if !candidates.is_empty() {
+                        for h in candidates {
+                            if seen.insert(h) {
+                                matched.push(h);
+                            }
+                        }
+                    } else {
+                        let iface_candidates = find_interface_methods(program, stub_class, callee);
+                        for h in iface_candidates {
+                            if seen.insert(h) {
+                                matched.push(h);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    matched
+}
+
+fn opcodes_match(
+    send: &trace_ir::IpcSend,
+    disp: &trace_ir::IpcDispatch,
+    program: &Program,
+) -> bool {
+    // 1. Literal integer evaluation match
+    let v1 = send
+        .opcode_val
+        .or_else(|| eval_opcode_expr(&send.opcode_normalized, &program.defines, &program.enum_constants));
+    let v2 = disp
+        .opcode_val
+        .or_else(|| eval_opcode_expr(&disp.opcode_normalized, &program.defines, &program.enum_constants));
+    if let (Some(v1), Some(v2)) = (v1, v2) {
+        return v1 == v2;
+    }
+    if v1.is_some() && v2.is_some() {
+        return false;
+    }
+
+
+    // 2. Normalized expression textual match
+    if !send.opcode_normalized.is_empty() && send.opcode_normalized == disp.opcode_normalized {
+        return true;
+    }
+
+    // 3. Qualified vs unqualified terminal identifier match
+    let p_short = send
+        .opcode_normalized
+        .rsplit("::")
+        .next()
+        .unwrap_or(&send.opcode_normalized);
+    let s_short = disp
+        .opcode_normalized
+        .rsplit("::")
+        .next()
+        .unwrap_or(&disp.opcode_normalized);
+    if !p_short.is_empty()
+        && p_short == s_short
+        && p_short.chars().all(|c| c.is_alphanumeric() || c == '_')
+    {
+        return true;
+    }
+
+    // 4. SMT BitVector symbolic solving
+    #[cfg(feature = "smt")]
+    {
+        if smt_ipc::solve_opcode_equality_smt(
+            &send.opcode_normalized,
+            &disp.opcode_normalized,
+            program,
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn eval_opcode_expr(
+    expr: &str,
+    defines: &indexmap::IndexMap<String, String>,
+    enums: &rustc_hash::FxHashMap<String, u64>,
+) -> Option<u64> {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return None;
+    }
+    if let Some(v) = parse_int_literal(expr) {
+        return Some(v as u64);
+    }
+    if let Some(&v) = enums.get(expr) {
+        return Some(v);
+    }
+    let short = expr.rsplit("::").next().unwrap_or(expr);
+    if let Some(&v) = enums.get(short) {
+        return Some(v);
+    }
+    if let Some(def_val) = defines.get(expr).or_else(|| defines.get(short)) {
+        let def_clean = normalize_opcode_expr(def_val);
+        if let Some(v) = parse_int_literal(&def_clean) {
+            return Some(v as u64);
+        }
+        if let Some(&v) = enums
+            .get(&def_clean)
+            .or_else(|| enums.get(def_clean.rsplit("::").next().unwrap_or(&def_clean)))
+        {
+            return Some(v);
+        }
+    }
+    if let Some((left, right)) = expr.rsplit_once('+') {
+        let left_v = eval_opcode_expr(left.trim(), defines, enums)?;
+        let right_v = eval_opcode_expr(right.trim(), defines, enums)?;
+        return Some(left_v.wrapping_add(right_v));
+    }
+    if let Some((left, right)) = expr.rsplit_once('-') {
+        let left_v = eval_opcode_expr(left.trim(), defines, enums)?;
+        let right_v = eval_opcode_expr(right.trim(), defines, enums)?;
+        return Some(left_v.wrapping_sub(right_v));
+    }
+    None
+}
+
+/// Strip `static_cast<...>(...)`, `(type)(...)`, outer parentheses, and collapse whitespace.
+fn normalize_opcode_expr(mut s: &str) -> String {
+
+    s = s.trim();
+    loop {
+        if let Some(rest) = s
+            .strip_prefix("static_cast")
+            .or_else(|| s.strip_prefix("reinterpret_cast"))
+            .or_else(|| s.strip_prefix("const_cast"))
+        {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('<') {
+                if let Some(pos) = rest.find('>') {
+                    let after = rest[pos + 1..].trim_start();
+                    if after.starts_with('(') && after.ends_with(')') {
+                        s = after[1..after.len() - 1].trim();
+                        continue;
+                    }
+                }
+            }
+        }
+        if let Some(rest) = s
+            .strip_prefix("(uint32_t)")
+            .or_else(|| s.strip_prefix("(uint32)"))
+            .or_else(|| s.strip_prefix("(int32_t)"))
+            .or_else(|| s.strip_prefix("(int)"))
+            .or_else(|| s.strip_prefix("(uint64_t)"))
+            .or_else(|| s.strip_prefix("(unsigned int)"))
+        {
+            s = rest.trim();
+            continue;
+        }
+        if s.starts_with('(') && s.ends_with(')') {
+            let mut depth = 0;
+            let mut balanced_at_end = false;
+            for (i, c) in s.char_indices() {
+                if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                    if depth == 0 && i == s.len() - 1 {
+                        balanced_at_end = true;
+                    } else if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            if balanced_at_end {
+                s = s[1..s.len() - 1].trim();
+                continue;
+            }
+        }
+        break;
+    }
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.replace(" :: ", "::").replace(":: ", "::").replace(" ::", "::")
+}
+
+fn parse_int_literal(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (neg, s) = if let Some(rest) = s.strip_prefix('-') {
+        (true, rest.trim())
+    } else if let Some(rest) = s.strip_prefix('+') {
+        (false, rest.trim())
+    } else {
+        (false, s)
+    };
+    let val = if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        i64::from_str_radix(rest, 16).ok()?
+    } else if let Some(rest) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+        i64::from_str_radix(rest, 2).ok()?
+    } else if s.len() > 1 && s.starts_with('0') && s.chars().all(|c| ('0'..='7').contains(&c)) {
+        i64::from_str_radix(&s[1..], 8).ok()?
+    } else {
+        s.parse::<i64>().ok()?
+    };
+    Some(if neg { -val } else { val })
+}
+
+#[cfg(feature = "smt")]
+mod smt_ipc {
+    use rustc_hash::FxHashMap;
+    use trace_ir::Program;
+    use z3::ast::{Ast, Bool, BV};
+    use z3::{Config, Context, SatResult, Solver};
+
+    use super::{normalize_opcode_expr, parse_int_literal};
+
+    fn find_top_level_ternary(s: &str) -> Option<(usize, usize)> {
+        let mut depth: u32 = 0;
+        let mut q_pos = None;
+        for (i, c) in s.char_indices() {
+            match c {
+                '(' | '<' => depth += 1,
+                ')' | '>' => depth = depth.saturating_sub(1),
+                '?' if depth == 0 && q_pos.is_none() => {
+                    q_pos = Some(i);
+                }
+                ':' if depth == 0 && q_pos.is_some() => {
+                    return Some((q_pos.unwrap(), i));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn find_last_top_level_op<'a>(s: &str, ops: &[&'a str]) -> Option<(usize, &'a str)> {
+        let mut depth: u32 = 0;
+        let mut last = None;
+        let bytes = s.as_bytes();
+
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' | b'<' => depth += 1,
+                b')' | b'>' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => {
+                    for &op in ops {
+                        if s[i..].starts_with(op) {
+                            if op == "+" && s[i..].starts_with("++") {
+                                continue;
+                            }
+                            if op == "-" && (s[i..].starts_with("--") || s[i..].starts_with("->")) {
+                                continue;
+                            }
+                            if op == "&" && s[i..].starts_with("&&") {
+                                continue;
+                            }
+                            if op == "|" && s[i..].starts_with("||") {
+                                continue;
+                            }
+                            last = Some((i, op));
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        last
+    }
+
+    fn lower_to_bv<'ctx>(
+        ctx: &'ctx Context,
+        mut expr: &str,
+        program: &Program,
+        symbols: &mut FxHashMap<String, BV<'ctx>>,
+    ) -> Option<BV<'ctx>> {
+        expr = expr.trim();
+        while expr.starts_with('(') && expr.ends_with(')') {
+            let mut depth = 0;
+            let mut balanced_at_end = false;
+            for (i, c) in expr.char_indices() {
+                if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                    if depth == 0 && i == expr.len() - 1 {
+                        balanced_at_end = true;
+                    } else if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            if balanced_at_end {
+                expr = expr[1..expr.len() - 1].trim();
+            } else {
+                break;
+            }
+        }
+
+        if let Some((q, col)) = find_top_level_ternary(expr) {
+            let cond_str = expr[..q].trim();
+            let then_str = expr[q + 1..col].trim();
+            let else_str = expr[col + 1..].trim();
+            let then_bv = lower_to_bv(ctx, then_str, program, symbols)?;
+            let else_bv = lower_to_bv(ctx, else_str, program, symbols)?;
+            let cond_bool = Bool::new_const(ctx, cond_str);
+            return Some(cond_bool.ite(&then_bv, &else_bv));
+        }
+
+        for ops in &[
+            &["|"][..],
+            &["^"],
+            &["&"],
+            &["<<", ">>"],
+            &["+", "-"],
+            &["*"],
+        ] {
+            if let Some((pos, op)) = find_last_top_level_op(expr, ops) {
+                if (op == "+" || op == "-") && pos == 0 {
+                    continue;
+                }
+                let left_str = expr[..pos].trim();
+                let right_str = expr[pos + op.len()..].trim();
+                if left_str.is_empty() || right_str.is_empty() {
+                    continue;
+                }
+                let left_bv = lower_to_bv(ctx, left_str, program, symbols)?;
+                let right_bv = lower_to_bv(ctx, right_str, program, symbols)?;
+                return match op {
+                    "|" => Some(left_bv.bvor(&right_bv)),
+                    "^" => Some(left_bv.bvxor(&right_bv)),
+                    "&" => Some(left_bv.bvand(&right_bv)),
+                    "<<" => Some(left_bv.bvshl(&right_bv)),
+                    ">>" => Some(left_bv.bvlshr(&right_bv)),
+                    "+" => Some(left_bv.bvadd(&right_bv)),
+                    "-" => Some(left_bv.bvsub(&right_bv)),
+                    "*" => Some(left_bv.bvmul(&right_bv)),
+                    _ => None,
+                };
+            }
+        }
+
+        if let Some(v) = parse_int_literal(expr) {
+            return Some(BV::from_u64(ctx, v as u64, 32));
+        }
+
+        if let Some(&v) = program.enum_constants.get(expr) {
+            return Some(BV::from_u64(ctx, v, 32));
+        }
+        let short = expr.rsplit("::").next().unwrap_or(expr);
+        if let Some(&v) = program.enum_constants.get(short) {
+            return Some(BV::from_u64(ctx, v, 32));
+        }
+
+        if let Some(def_val) = program.defines.get(expr).or_else(|| program.defines.get(short)) {
+            let def_clean = normalize_opcode_expr(def_val);
+            if let Some(v) = parse_int_literal(&def_clean) {
+                return Some(BV::from_u64(ctx, v as u64, 32));
+            }
+            if let Some(&v) = program.enum_constants.get(&def_clean).or_else(|| {
+                program
+                    .enum_constants
+                    .get(def_clean.rsplit("::").next().unwrap_or(&def_clean))
+            }) {
+                return Some(BV::from_u64(ctx, v, 32));
+            }
+        }
+
+        if !short.is_empty() && short.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            let bv = symbols
+                .entry(short.to_string())
+                .or_insert_with(|| BV::new_const(ctx, short, 32))
+                .clone();
+            return Some(bv);
+        }
+
+
+        None
+    }
+
+    pub fn solve_opcode_equality_smt(expr1: &str, expr2: &str, program: &Program) -> bool {
+        let mut cfg = Config::new();
+        cfg.set_param_value("timeout", "50");
+        let ctx = Context::new(&cfg);
+        let solver = Solver::new(&ctx);
+
+        let mut symbols: FxHashMap<String, BV> = FxHashMap::default();
+        let bv1 = match lower_to_bv(&ctx, expr1, program, &mut symbols) {
+            Some(b) => b,
+            None => return false,
+        };
+        let bv2 = match lower_to_bv(&ctx, expr2, program, &mut symbols) {
+            Some(b) => b,
+            None => return false,
+        };
+
+        let symbol_vec: Vec<_> = symbols.values().collect();
+        for i in 0..symbol_vec.len() {
+            for j in (i + 1)..symbol_vec.len() {
+                solver.assert(&symbol_vec[i]._eq(symbol_vec[j]).not());
+            }
+        }
+
+        solver.assert(&bv1._eq(&bv2));
+
+        matches!(solver.check(), SatResult::Sat)
+    }
+}
+
+
 
 #[cfg(test)]
 mod tests {
