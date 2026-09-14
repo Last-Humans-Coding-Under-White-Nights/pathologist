@@ -154,7 +154,7 @@ default and disabled with the `--no-ipc` analyze flag.
 | `actual_fn_id` | INTEGER FK → `functions` | Actual function for fn-ptr args (`NULL` if actual is a variable) |
 | `formal_var_id` | INTEGER FK → `variables` | Callee parameter var |
 
-Exactly one of `actual_var_id` or `actual_fn_id` is set per row.
+Exactly one of `actual_var_id` or `actual_fn_id` is set per row. A function name with several internal-linkage C++ overloads (`static` or in an anonymous namespace) is passed as each of them: one row per overload at the same `call_site_id`, `arg_index` and `formal_var_id`.
 
 **Index:** `arg_flow_edges(call_site_id)`
 

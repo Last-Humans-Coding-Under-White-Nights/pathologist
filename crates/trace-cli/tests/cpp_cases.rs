@@ -4802,6 +4802,46 @@ fn callee_definitions(program: &Program, analysis: &AnalysisResult, caller: &str
     out
 }
 
+/// The file name `f` is defined (or declared) in.
+fn file_name_of(program: &Program, f: &trace_ir::Function) -> String {
+    let path = &program.symbols.files[f.span.file.0 as usize].path;
+    path.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+/// The callee of every edge out of `caller`, or only out of its overload
+/// taking `arity` explicit parameters.
+fn overload_callees(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    arity: Option<u32>,
+) -> Vec<FnId> {
+    analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            let from = program.symbols.function(e.caller);
+            from.name == caller && arity.is_none_or(|a| from.explicit_arity == Some(a))
+        })
+        .map(|e| e.callee)
+        .collect()
+}
+
+/// The explicit arities of [`overload_callees`], sorted, one per edge.
+fn overload_callee_arities(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    arity: Option<u32>,
+) -> Vec<Option<u32>> {
+    let mut arities: Vec<_> = overload_callees(program, analysis, caller, arity)
+        .into_iter()
+        .map(|id| program.symbols.function(id).explicit_arity)
+        .collect();
+    arities.sort();
+    arities
+}
+
 #[test]
 fn prototype_overloads_bind_calls_by_declared_arity() {
     let (program, analysis) = cpp_overload_prototypes();
@@ -4992,10 +5032,466 @@ fn direct_initialization_spelled_like_a_function_declaration_constructs() {
         has_any_edge(program, analysis, "LocalAliasHidesVariable", "build"),
         "`Worker build(Value);` declares a function when `Value` names a type"
     );
-    for declaration in ["make", "nothing"] {
+    for declaration in ["make", "nothing", "make_global"] {
         assert!(
             names.contains(&declaration),
             "`{declaration}` stays a declaration"
         );
     }
+    assert!(
+        arg_bindings(program, analysis, "Parenthesized", "Worker::Worker").contains(&(
+            1,
+            "OnParenthesized".to_owned(),
+            "cb".to_owned()
+        )),
+        "a parenthesized function name is the argument"
+    );
+    for object in [
+        "global_worker",
+        "global_callback",
+        "static_worker",
+        "header_worker",
+    ] {
+        assert!(
+            !names.contains(&object),
+            "`{object}` is a file-scope object: {names:?}"
+        );
+    }
+    assert!(
+        has_direct(program, analysis, "HeaderLocal", "Worker::Worker"),
+        "`Worker w(header_callback);` constructs with a header's file `static`"
+    );
+    assert!(
+        has_any_edge(program, analysis, "CallGlobalCallback", "OnGlobalPointer"),
+        "`Callback global_callback(OnGlobalPointer);` initializes the pointer"
+    );
+}
+
+analyzed_fixture!(cpp_later_members);
+
+#[test]
+fn a_method_calls_a_method_its_class_defines_later() {
+    let (program, analysis) = cpp_later_members();
+    for (caller, callee) in [
+        ("Parser::Parse", "Parser::ReadHeader"),
+        ("Parser2::Parse", "Parser2::ReadHeader"),
+        ("Runner::Run", "Runner::Invoke"),
+        ("Shadow::Go", "Shadow::Helper"),
+        ("Derived::Call", "Derived::Name"),
+        ("Box::Open", "Box::Unpack"),
+        ("Outer::Inner::Start", "Outer::Inner::Step"),
+    ] {
+        assert_eq!(
+            direct_targets(program, analysis, caller),
+            [callee],
+            "{caller} calls {callee}"
+        );
+    }
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(program, e.caller).starts_with("Outer::Spawn::$lambda")
+                && fn_name(program, e.callee) == "Outer::Work"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "a lambda in a method body calls the later method"
+    );
+    assert!(
+        arg_bindings(program, analysis, "Runner::Run", "Runner::Invoke").contains(&(
+            1,
+            "OnLater".to_owned(),
+            "cb".to_owned()
+        )),
+        "the argument binds past `this`"
+    );
+    assert!(has_any_edge(program, analysis, "Runner::Invoke", "OnLater"));
+    assert_eq!(
+        overload_callee_arities(program, analysis, "Overloads::Use", None),
+        [Some(1), Some(2)],
+        "one call per overload, by arity"
+    );
+    for (caller, wrong) in [
+        ("Shadow::Go", "Helper"),
+        ("Derived::Call", "Base::Name"),
+        ("Local::Apply", "Local::Later"),
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, wrong),
+            "{caller} does not call {wrong}"
+        );
+    }
+    // An overload above the calling body does not stand in for the one below.
+    for (caller, caller_arity, callee_arities) in [
+        ("Forward::Process", 1, [Some(0)]),
+        ("Forward::Use", 0, [Some(2)]),
+        ("Built::Make", 0, [Some(0)]),
+        ("Built::Copy", 0, [Some(1)]),
+    ] {
+        let mut arities = overload_callee_arities(program, analysis, caller, Some(caller_arity));
+        arities.dedup();
+        assert_eq!(
+            arities, callee_arities,
+            "{caller} calls the overload its arguments fit"
+        );
+    }
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "Forward::Process",
+        "OnNoArgs"
+    ));
+    assert!(has_any_edge(program, analysis, "Forward::Get", "OnTwoArgs"));
+}
+
+analyzed_fixture!(cpp_anonymous_members);
+
+#[test]
+fn members_of_a_class_in_an_anonymous_namespace_resolve() {
+    let (program, analysis) = cpp_anonymous_members();
+    for (caller, callee) in [
+        ("Profile::Use", "Profile::Ratio"),
+        ("Profile::Use", "Profile::Later"),
+        ("Drive", "Profile::Use"),
+        ("Drive", "Profile::Take"),
+        ("Drive", "Holder::Holder"),
+        ("Drive", "Out::Run"),
+        ("Dispatch", "Impl::Fire"),
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, callee),
+            "{caller} -> {callee}: {:?}",
+            direct_targets(program, analysis, caller)
+        );
+    }
+    for (caller, callee) in [
+        ("Profile::Take", "OnTake"),
+        ("Holder::Holder", "OnHolder"),
+        ("Out::Run", "OnOut"),
+        ("Impl::Fire", "OnFired"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, callee),
+            "{caller} -> {callee}"
+        );
+    }
+    let undefined: Vec<&str> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| !f.is_defined && f.name.starts_with("Profile::"))
+        .map(|f| f.name.as_str())
+        .collect();
+    assert!(
+        undefined.is_empty(),
+        "no external stands in for a defined member: {undefined:?}"
+    );
+    for ctor in ["FromPlain::FromPlain", "AnonFromPlain::AnonFromPlain"] {
+        assert!(
+            must_not_have_edge(program, analysis, ctor, ctor),
+            "`: Plain()` does not construct through {ctor}"
+        );
+    }
+    let callee_files = |caller: &str, callee: &str| -> Vec<String> {
+        let prefix = format!("{callee}@");
+        let mut files: Vec<String> = callee_definitions(program, analysis, caller)
+            .iter()
+            .filter_map(|d| Some(d.strip_prefix(&prefix)?.split(':').next()?.to_owned()))
+            .collect();
+        files.dedup();
+        files
+    };
+    // Each file's class of a name is its own, virtual members included.
+    for (caller, callee, file) in [
+        ("Profile::Use", "Profile::Ratio", "anonymous.cpp"),
+        ("DriveOther", "Profile::Ratio", "other.cpp"),
+        ("FireHere", "Impl::Fire", "anonymous.cpp"),
+        ("FireOther", "Impl::Fire", "other.cpp"),
+    ] {
+        assert_eq!(
+            callee_files(caller, callee),
+            [file],
+            "{caller} calls its own file's {callee}"
+        );
+    }
+    for (caller, other_files) in [
+        ("FireQuiet", "Quiet::Fire"),
+        ("FireInherited", "InheritsSub::Fire"),
+        ("RunPlainly", "Hides::Run"),
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, other_files),
+            "{caller} does not reach {other_files}: other.cpp's class of the name is another class"
+        );
+    }
+    assert_eq!(
+        callee_files("FireOwnFinished", "Finished::Fire"),
+        ["anonymous.cpp"],
+        "an anonymous receiver does not reach an external class of its name"
+    );
+    assert!(
+        must_not_have_edge(program, analysis, "FireOwnFinished", "FinishedSub::Fire"),
+        "nor that class's subclasses"
+    );
+    assert!(
+        has_any_edge(program, analysis, "FireFinished", "FinishedSub::Fire"),
+        "another file's anonymous `final` does not stop dispatch on an external class of its name"
+    );
+    assert!(
+        has_any_edge(program, analysis, "Dispatch", "InheritsSub::Fire"),
+        "a call through the base reaches the override in another file's anonymous namespace"
+    );
+    // Each overload's callees, in declaration order.
+    let bodies = |name: &str| -> Vec<Vec<String>> {
+        program
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == name)
+            .map(|f| {
+                analysis
+                    .call_edges
+                    .iter()
+                    .filter(|e| e.caller == f.id)
+                    .map(|e| fn_name(program, e.callee))
+                    .collect()
+            })
+            .collect()
+    };
+    assert_eq!(
+        bodies("Typed::Work"),
+        [["OnInt"], ["OnDouble"]],
+        "Typed::Work(int) and Typed::Work(double) keep their own bodies"
+    );
+    for name in ["StaticWork", "FreeWork"] {
+        assert_eq!(
+            bodies(name),
+            [["OnFreeInt"], ["OnFreeDouble"]],
+            "{name}(int) and {name}(double) keep their own bodies"
+        );
+    }
+    let mut free_calls = overload_callees(program, analysis, "DriveFreeOverloads", None);
+    free_calls.sort();
+    free_calls.dedup();
+    assert_eq!(
+        free_calls.len(),
+        4,
+        "each call reaches the overload its argument fits: {:?}",
+        callee_definitions(program, analysis, "DriveFreeOverloads")
+    );
+    for (caller, callee) in [("CallFreeWorkPtr", "FreeWork"), ("TakeWork", "StaticWork")] {
+        let reached: Vec<u32> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(program, e.caller) == caller && fn_name(program, e.callee) == callee
+            })
+            .map(|e| program.symbols.function(e.callee).span.line)
+            .collect();
+        assert_eq!(
+            reached.len(),
+            2,
+            "a pointer taken from `{callee}` may hold either overload: {reached:?}"
+        );
+    }
+    let outside: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Outside::Run")
+        .collect();
+    assert!(
+        outside.len() == 2
+            && outside
+                .iter()
+                .all(|f| f.is_defined && f.linkage == Linkage::Internal),
+        "members defined after the namespace closes are its class's internal members: {:?}",
+        outside
+            .iter()
+            .map(|f| (f.span.line, f.is_defined, f.linkage))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        program.symbols.functions_named("Outside::Run").len(),
+        2,
+        "member lookup finds both overloads"
+    );
+    for (caller, callee) in [
+        ("CallExternalRoot", "Shared::Run"),
+        ("CallNamed", "NamedSub::Run"),
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, callee),
+            "{caller} does not reach {callee}: other.cpp's class of the name derives from another class"
+        );
+    }
+    assert!(
+        has_any_edge(program, analysis, "CallOtherRoot", "Shared::Run"),
+        "a call through the base the anonymous class derives from still reaches it"
+    );
+    let respelled: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Respelled")
+        .map(|f| f.is_defined)
+        .collect();
+    assert_eq!(
+        respelled,
+        [true],
+        "a declaration and a definition spelling a type two ways are one function"
+    );
+    assert!(has_direct(program, analysis, "CallRespelled", "Respelled"));
+    let early: Vec<Vec<String>> = overload_callees(program, analysis, "EarlyPick", None)
+        .into_iter()
+        .map(|id| {
+            analysis
+                .call_edges
+                .iter()
+                .filter(|e| e.caller == id)
+                .map(|e| fn_name(program, e.callee))
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        early,
+        [["OnPickArg"]],
+        "a declaration of Pick(Arg) reaches Pick(Arg)'s body, not Pick(int)'s"
+    );
+    assert!(
+        has_any_edge(
+            program,
+            analysis,
+            "FireThroughHeaderImpl",
+            "HeaderLeaf::Fire"
+        ),
+        "a header class's member defined in the .cpp keeps its prototype's `virtual`"
+    );
+    let mut logs: Vec<String> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == "UseHeaderLog")
+        .map(|e| file_name_of(program, program.symbols.function(e.callee)))
+        .collect();
+    logs.sort();
+    assert_eq!(
+        logs,
+        ["anon_header.h", "other.cpp"],
+        "a pointer to `HeaderLog` may hold the header's overload and the .cpp's"
+    );
+    // Each unit's `static` functions under a shared header stay its own.
+    for (caller, own, file) in [
+        ("UseSharedHere", "OnSharedHere", "anonymous.cpp"),
+        ("UseSharedThere", "OnSharedThere", "other.cpp"),
+    ] {
+        for callee in ["SharedTag", "SharedDeclared"] {
+            let reached: Vec<(String, Vec<String>)> = analysis
+                .call_edges
+                .iter()
+                .filter(|e| {
+                    fn_name(program, e.caller) == caller && fn_name(program, e.callee) == callee
+                })
+                .map(|e| {
+                    let body = analysis
+                        .call_edges
+                        .iter()
+                        .filter(|b| b.caller == e.callee)
+                        .map(|b| fn_name(program, b.callee))
+                        .collect();
+                    (
+                        file_name_of(program, program.symbols.function(e.callee)),
+                        body,
+                    )
+                })
+                .collect();
+            assert!(
+                reached
+                    .iter()
+                    .any(|(f, body)| f == file && body.iter().any(|c| c == own))
+                    && reached.iter().all(|(_, body)| !body
+                        .iter()
+                        .any(|c| c.starts_with("OnShared") && c != own)),
+                "{caller} reaches its own file's {callee}, not the other unit's: {reached:?}"
+            );
+        }
+    }
+    for (caller, other_base) in [
+        ("CallMixed", "OtherRoot::Run"),
+        ("CallMixedThere", "ExternalRoot::Run"),
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, other_base),
+            "{caller} does not reach {other_base}: each file's anonymous Mixed has its own base"
+        );
+    }
+    let loads: Vec<bool> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Load")
+        .map(|f| f.is_defined)
+        .collect();
+    assert_eq!(
+        loads,
+        [false, true],
+        "Load(cfg1::Config *) and Load(cfg2::Config *) are two functions"
+    );
+    for caller in ["FireHeaderImpl", "Dispatch"] {
+        let targets: Vec<(bool, String)> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(program, e.caller) == caller
+                    && fn_name(program, e.callee) == "HeaderImpl::Fire"
+            })
+            .map(|e| {
+                let f = program.symbols.function(e.callee);
+                (f.is_defined, file_name_of(program, f))
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            [(true, "other.cpp".to_owned())],
+            "{caller} reaches the body other.cpp defines for a header's anonymous class"
+        );
+    }
+    assert!(has_any_edge(program, analysis, "Respelled", "OnRespelled"));
+    assert_eq!(
+        callee_files("FireOwnOpen", "Open::Fire"),
+        ["anonymous.cpp"],
+        "an anonymous receiver reaches its own class"
+    );
+    assert!(
+        must_not_have_edge(program, analysis, "FireOwnOpen", "OpenSub::Fire"),
+        "not a subclass of an external class of its name"
+    );
+    for (caller, callee) in [
+        ("FireOpen", "OpenSub::Fire"),
+        ("FireSealed", "SealedSub::Fire"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, callee),
+            "{caller} -> {callee}: another file's anonymous class of the name does not stop dispatch"
+        );
+    }
+    assert_eq!(
+        callee_files("Dispatch", "Impl::Fire"),
+        ["anonymous.cpp", "other.cpp"],
+        "a call through the base reaches every file's override"
+    );
+    // Overloads stay two functions, each with its own body.
+    for (arity, callee, other) in [(1, "OnOne", "OnTwo"), (2, "OnTwo", "OnOne")] {
+        let callees: Vec<String> =
+            overload_callees(program, analysis, "Overloaded::Work", Some(arity))
+                .into_iter()
+                .map(|id| fn_name(program, id))
+                .collect();
+        assert!(
+            callees.iter().any(|c| c == callee) && !callees.iter().any(|c| c == other),
+            "Overloaded::Work of arity {arity} calls {callee} only: {callees:?}"
+        );
+    }
+    assert_eq!(
+        overload_callee_arities(program, analysis, "DriveOverloads", None),
+        [Some(1), Some(2)],
+        "one call per overload"
+    );
 }

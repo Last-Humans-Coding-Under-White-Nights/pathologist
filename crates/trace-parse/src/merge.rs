@@ -1,4 +1,5 @@
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use trace_ir::{
     same_param_type_or_unresolved, CallSite, CallSiteId, FlowConstraint, FnId, Function, Program,
@@ -29,6 +30,12 @@ pub struct UnitIndex {
     pub arrow_returns: Vec<trace_ir::ArrowReturn>,
     /// Classes declared `final` in this unit.
     pub final_classes: Vec<String>,
+    /// Classes this unit defines in an anonymous namespace, by unit-local file.
+    pub anonymous_classes: BTreeMap<String, BTreeSet<trace_ir::FileId>>,
+    /// Those of them declared `final`, likewise.
+    pub anonymous_final_classes: BTreeMap<String, BTreeSet<trace_ir::FileId>>,
+    /// Their direct bases, likewise.
+    pub anonymous_bases: BTreeMap<String, BTreeSet<(trace_ir::FileId, String)>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -294,6 +301,21 @@ fn merge_unit(
             .copied()
             .unwrap_or(primary_file_id)
     };
+    for (cls, files) in &unit.anonymous_classes {
+        for &file in files {
+            program.mark_class_anonymous(cls, map_file(file));
+        }
+    }
+    for (cls, files) in &unit.anonymous_final_classes {
+        for &file in files {
+            program.mark_anonymous_class_final(cls, map_file(file));
+        }
+    }
+    for (cls, bases) in &unit.anonymous_bases {
+        for (file, base) in bases {
+            program.add_anonymous_base(cls, map_file(*file), base);
+        }
+    }
 
     if matches!(mode, MergeMode::Full | MergeMode::Variant) {
         for diagnostic in &unit.diagnostics {
@@ -354,8 +376,13 @@ fn merge_unit(
         .map(|v| (v.id, remap_type(v.type_id, &type_map)))
         .collect();
 
+    let respelled = respelled_declarations(unit, &unit_param_types, &program.types);
     for func in &unit.functions {
         let old_id = func.id;
+        if respelled.contains_key(&old_id) {
+            dropped_fns.insert(old_id);
+            continue;
+        }
         let span_file = map_file(func.span.file);
         let mut canonical = program
             .dedup
@@ -526,6 +553,31 @@ fn merge_unit(
         program
             .dedup
             .insert_fn(span_file, func.name.clone(), func.span.line, merged);
+    }
+
+    for (&declaration, &definition) in &respelled {
+        let Some(&merged) = fn_map.get(&definition) else {
+            continue;
+        };
+        fn_map.insert(declaration, merged);
+        // A declaration shared with the units including its header joins a
+        // definition of that header only; one in this unit's own file is this
+        // unit's, and another unit decides for its own copy.
+        let file_of = |id: FnId| {
+            unit.functions
+                .iter()
+                .find(|f| f.id == id)
+                .map(|f| f.span.file)
+        };
+        if let (Some(func), true) = (
+            unit.functions.iter().find(|f| f.id == declaration),
+            file_of(declaration) == file_of(definition),
+        ) {
+            let span_file = map_file(func.span.file);
+            program
+                .dedup
+                .insert_fn(span_file, func.name.clone(), func.span.line, merged);
+        }
     }
 
     let mut var_map: FxHashMap<VarId, VarId> = FxHashMap::default();
@@ -920,6 +972,89 @@ fn fields_from_layout(
         .iter()
         .map(|(_, fl)| (fl.name.clone(), src.get(fl.type_id).desc.clone()))
         .collect()
+}
+
+/// The unit's C++ internal-linkage declarations that another definition of
+/// the unit defines, each with that definition. A `static` function or a
+/// member of a class in an anonymous namespace that is called but never
+/// defined does not link, so a declaration no definition joined when it was
+/// registered is defined under another spelling of a parameter type
+/// (`static void f(ns::Obj *);` and `static void f(Obj *) {}` under
+/// `using namespace ns`, since a type name lowering could not resolve reads as
+/// `int`). The definition is the one of the same name and arity whose
+/// parameter types are the declaration's, else the one whose parameter types
+/// may name them; several candidates leave the declaration alone.
+fn respelled_declarations(
+    unit: &UnitIndex,
+    param_types: &FxHashMap<VarId, TypeId>,
+    types: &trace_ir::TypeTable,
+) -> BTreeMap<FnId, FnId> {
+    let undefined: FxHashSet<&str> = unit
+        .functions
+        .iter()
+        .filter(|f| f.is_cpp && !f.is_defined && f.linkage == trace_ir::Linkage::Internal)
+        .map(|f| f.name.as_str())
+        .collect();
+    if undefined.is_empty() {
+        return BTreeMap::new();
+    }
+    let mut by_name: BTreeMap<&str, Vec<&Function>> = BTreeMap::new();
+    for func in unit
+        .functions
+        .iter()
+        .filter(|f| f.is_cpp && undefined.contains(f.name.as_str()))
+    {
+        by_name.entry(func.name.as_str()).or_default().push(func);
+    }
+    let arity = |f: &Function| f.explicit_arity.map_or(f.params.len(), |n| n as usize);
+    // Whether every parameter pair satisfies `same`; a side without parameter
+    // variables (an in-class prototype) says nothing against it.
+    let params_agree = |a: &Function, b: &Function, same: &dyn Fn(TypeId, TypeId) -> bool| {
+        a.params.is_empty()
+            || b.params.is_empty()
+            || (a.params.len() == b.params.len()
+                && a.params.iter().zip(&b.params).all(|(x, y)| {
+                    match (param_types.get(x), param_types.get(y)) {
+                        (Some(&x), Some(&y)) => same(x, y),
+                        _ => true,
+                    }
+                }))
+    };
+    let mut out = BTreeMap::new();
+    for group in by_name.values().filter(|group| group.len() > 1) {
+        let declarations = group
+            .iter()
+            .filter(|f| !f.is_defined && f.linkage == trace_ir::Linkage::Internal);
+        for declaration in declarations {
+            let definitions: Vec<&Function> = group
+                .iter()
+                .copied()
+                .filter(|f| {
+                    f.is_defined
+                        && f.linkage == trace_ir::Linkage::Internal
+                        && f.variadic == declaration.variadic
+                        && arity(f) == arity(declaration)
+                })
+                .collect();
+            let only = |same: &dyn Fn(TypeId, TypeId) -> bool| {
+                let mut fitting = definitions
+                    .iter()
+                    .filter(|f| params_agree(declaration, f, same));
+                match (fitting.next(), fitting.next()) {
+                    (Some(f), None) => Some(f.id),
+                    _ => None,
+                }
+            };
+            let exact = |x: TypeId, y: TypeId| x == y;
+            let loose = |x: TypeId, y: TypeId| {
+                trace_ir::may_name_same_type(&types.get(x).desc, &types.get(y).desc)
+            };
+            if let Some(definition) = only(&exact).or_else(|| only(&loose)) {
+                out.insert(declaration.id, definition);
+            }
+        }
+    }
+    out
 }
 
 fn remap_flow(

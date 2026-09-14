@@ -96,3 +96,32 @@ void Declarations() {
     Worker make(Callback);
     Worker nothing();
 }
+
+// Doubled parentheses, the usual way to force an object, pass the function.
+void OnParenthesized() {}
+
+void Parenthesized() { Worker w((OnParenthesized)); }
+
+// At file scope too: an object, and a pointer initialized from a function.
+void OnGlobalObject() {}
+void OnGlobalPointer() {}
+
+Worker global_worker(OnGlobalObject);
+
+static Callback static_callback = OnGlobalObject;
+Worker static_worker(static_callback);
+
+// A file `static` from an included header is a variable too.
+void OnHeaderStatic() {}
+
+#include "statics.h"
+
+Worker header_worker(header_callback);
+
+void HeaderLocal() { Worker w(header_callback); }
+Callback global_callback(OnGlobalPointer);
+
+void CallGlobalCallback() { global_callback(); }
+
+// A file-scope declaration whose parameter is a type stays a declaration.
+Worker make_global(Callback);

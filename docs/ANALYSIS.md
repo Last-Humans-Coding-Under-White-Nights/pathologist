@@ -71,7 +71,7 @@ Functions record abstract return values in `program.fn_returns`:
 
 `return &local` is recorded as `AddrOfVar` but is **unsound** for stack locals (may-analysis may report escaped addresses). Prefer treating this as a known imprecision.
 
-At PAG build time, `CallReturn` resolves `callee_name` with **`resolve_function_candidates(name, file)`** — every function the merged name may refer to: the query file's internal-linkage entries (`fn_by_scope`, declarations included) plus the canonical external definition. Name-based facts lose the calling TU's visibility context at merge time, so a name matching both a file-`static` def and an external def is genuinely ambiguous; per may-analysis semantics all candidates are expanded. Callee ids that survived lowering + merge (e.g. `AddrOfFn`) are used directly instead — they are exact.
+At PAG build time, `CallReturn` resolves `callee_name` with **`resolve_function_candidates(name, file)`** — every function the merged name may refer to: the query file's internal-linkage entries (`fn_by_scope`, declarations included, with their further C++ overloads in `scope_overloads`) plus the canonical external definition. Name-based facts lose the calling TU's visibility context at merge time, so a name matching both a file-`static` def and an external def is genuinely ambiguous; per may-analysis semantics all candidates are expanded. Callee ids that survived lowering + merge (e.g. `AddrOfFn`) are used directly instead — they are exact.
 
 This models patterns like:
 
@@ -474,11 +474,10 @@ C++-aware only where it must be — everything else reuses the C machinery.
   before. The walk sees what the unit has declared so far; member function
   bodies are lowered after the whole class body, so they see member types,
   aliases and prototypes declared later in it, as C++'s complete-class
-  context does. A member function *defined* further down the class, with no
-  separate declaration, is not registered yet when an earlier body calls
-  it; registering a prototype for every in-class definition would fold
-  overloads together, since prototypes carry no parameter types. `using
-  namespace` directives are not searched (see the arrow section below).
+  context does. Every in-class definition's signature is registered, with
+  its parameters, before any body is lowered, so a body also sees a member
+  function *defined* further down the class (#96). `using namespace`
+  directives are not searched (see the arrow section below).
 - **Type aliases**: `using Alias = T;` (#91) registers like
   `typedef T Alias;`, pointer, array and function shapes included. An alias
   template (`template<class T> using V = ...`) is not lowered. A typedef
@@ -600,7 +599,86 @@ C++-aware only where it must be — everything else reuses the C machinery.
   (`OnEvent()` from `OnEventProxy`) is rewritten as a member call on the
   enclosing class when that class (or a base) declares the method. This
   runs before free-function name lookup so it does not synthesize an
-  unqualified external stub.
+  unqualified external stub. A body can call a member its class defines
+  further down (#96), so a class body registers every in-class definition's
+  entry, parameters included, before it lowers any body. A call to a member of
+  the class (implicit `this`, `this->m`, another object of the class, or a
+  construction of it) then sees every overload, wherever it is defined, and
+  resolves like any member call (arity filter, arguments past `this`). It wins
+  over a base member or a global function of the same name, as C++
+  class-scope lookup does.
+- **Classes in an anonymous namespace**: their members have internal linkage,
+  indexed per file like a `static` function so a same-named class in another
+  file stays a different class. Member lookup names a member by its class
+  (`Cls::m`) without a file, so internal members declared in their class are
+  also indexed by qualified name (`SymbolTable::functions_named`): calls,
+  constructions and virtual dispatch reach them like any member. Overloads of
+  a C++ function with internal linkage, a member or a free `static` /
+  anonymous-namespace function, stay separate entries, told apart by
+  signature (parameter types, not only arity) as external overloads are:
+  `fn_by_scope` keeps the first per file and name, and
+  `SymbolTable::scope_overloads` the rest, which `resolve_function_candidates`
+  returns with it (`resolve_function_in_scope` still answers the first). A
+  declaration no definition joined when it was registered is defined where
+  registration could not see it: under another spelling of a parameter type
+  (`static void f(ns::Obj *);` and `static void f(Obj *) {}` under `using
+  namespace ns`, since a type name lowering could not resolve reads as
+  `int`), or in another file of the unit. A called but undefined `static`
+  function does not link, so the unit merge (`respelled_declarations`) joins
+  such a declaration to the one definition of its name and arity with exactly
+  its parameter types, else the one whose parameter types may name them
+  (`may_name_same_type`: a qualified name beside its unqualified suffix,
+  `ns::Obj` and `Obj` though not `ns1::Config` and `ns2::Config`, a type read
+  as `int` beside a named one, function pointers whose parameter lists agree
+  where both are known); a later exact definition therefore keeps its
+  declaration, and `f(int)` beside `f(double)` stays two. A
+  function's address taken by name (`void (*p)(double) = cb;`, `f(cb)`, a
+  function table, `return cb;`) resolves to the first entry; after the merge
+  it is widened to every overload, since a function pointer's type does not
+  carry the parameter types that would pick one. A C++ internal-linkage
+  function finds its declaration and overloads in its own file, else in a
+  header that file includes, since both are one translation unit: a header's
+  `static void Log(int)` and the `.cpp`'s `Log(double)` are one overload set,
+  and a header's anonymous-namespace class member defined in the `.cpp`
+  merges with its in-class prototype, `virtual` included. A header's entry is
+  every including unit's, so an overload one unit's `.cpp` adds is used only
+  where that file is seen (`internal_overloads_seen_from`), and a free
+  function found through a header is never folded into the entry it matches
+  there, whether the header's declaration or another unit's
+  `static void f(double)`: it stays its own unit's function, and the unit
+  merge joins that unit's calls to it. Only the same header text lowered once
+  more for the unit (same file and line) is that entry. A member of a
+  class in an anonymous namespace is internal wherever its definition is
+  written, after the namespace closes or in the `.cpp`, and an overload of a
+  member defined outside the class is still found by member lookup. C keeps
+  one entry per file and name.
+  The qualified index does not say which file's class a member belongs to, so
+  `Program::anonymous_classes` records the files that define each class in an
+  anonymous namespace, and `Program::anonymous_final_classes` those declaring
+  it `final` (an external `final` class stays in `final_classes`, by name).
+  After the merge, virtual-call expansion ignores a class or member that
+  neither the call's file nor, for a callee bound to an internal member, that
+  member's file can see (the file itself or a header it includes): it does not
+  make the callee virtual, never stops dispatch as `final`, and is no target
+  when its class is the receiver's. `Program::anonymous_bases` records each
+  anonymous class's bases with the file deriving it, since `inheritance`
+  joins every class of a name: a member the call cannot see, reached through
+  a same-named class of the receiver's hierarchy, is a target only when its
+  own file derives its class from a class of that hierarchy. A walk toward the
+  bases of such a class seen from the call's files follows those bases too,
+  not every file's class of its name. When the receiver is a class in an
+  anonymous namespace that
+  file sees, its whole hierarchy is there too, since a subclass has to name
+  it, so a member of a class in that hierarchy is a target only where the
+  call sees it: a same-named external class and its subclasses are not. A
+  call through a base declared outside an anonymous namespace still reaches
+  the overrides in every file.
+- **Constructors are never dispatched**: when no constructor of a class is in
+  view, a construction (`: Base(a)`, `new Base(a)`, `Base b(a)`) keeps an
+  unresolved site that resolves by name after the merge. Member lookup's
+  fallback to the subclass closure is for virtual calls only; applied to a
+  constructor it reached the derived constructor the initializer is written in
+  and every sibling's.
 - **Field receivers**: a bare identifier used as a member-call receiver
   (`plugin_->OnEvent()` inside a method) is looked up as a data member of
   the enclosing class (and bases) when it is not a local/param, so
@@ -843,7 +921,12 @@ C++-aware only where it must be — everything else reuses the C machinery.
   so does `Cls f(Name);` when `Name` is a type nearer than a variable of that
   name: a function-local alias, or a class or typedef of an enclosing class or
   namespace (`using Value = int;` hides a global `int Value`). A local
-  variable is nearest.
+  variable is nearest. At file scope the same declaration defines a global
+  when every name is a global or file `static` variable, or a function
+  (#95): `Callback g(OnReady);` initializes the pointer, and `Worker w(OnReady);` defines the
+  object without a constructor call, as `Worker w{OnReady};` does, since no
+  function runs it. A function name in extra parentheses, `Worker
+  w((OnReady));`, is an argument like the bare name.
 - **References** lower as pointers (aliasing stores land on caller memory).
 - **Templates**: lowered once per primary name; `<...>` arguments stripped.
 
@@ -910,7 +993,9 @@ Known C++ imprecision (in addition to the general list below):
   `GUARDED_BY`. Either macro alone is handled; only the pair defeats it,
   because the repair the two need lives in different nodes.
 - Objects at namespace scope emit no ctor/dtor sites (no enclosing function).
-- Anonymous-namespace overload ties degrade to first-wins.
+- A file-scope initializer written in a header (`static Cb cb = OnReady;`)
+  does not reach the analysis, so a call through that pointer from a file
+  including the header has no target.
 - **ADL namespace derivation is spelling-based**: only arguments whose
   `Struct`/`Union` tag carries an explicit `::` in the source contribute
   their namespace; enum-typed arguments and types referenced by a *bare*
