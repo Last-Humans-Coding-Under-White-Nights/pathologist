@@ -371,6 +371,8 @@ pub struct PreprocessOptions {
     pub explore: bool,
     /// Maximum number of configuration variants to explore per translation unit (#59).
     pub explore_budget: usize,
+    /// Whether to use MaxSMT/Z3 solver for variant exploration (#Phase S1).
+    pub explore_smt: bool,
 }
 
 impl Default for PreprocessOptions {
@@ -403,6 +405,7 @@ impl Default for PreprocessOptions {
             dep_roots: Vec::new(),
             explore: false,
             explore_budget: 4,
+            explore_smt: false,
         }
     }
 }
@@ -594,6 +597,12 @@ impl PreprocessOptions {
     #[must_use]
     pub fn with_explore_budget(mut self, budget: usize) -> Self {
         self.explore_budget = budget;
+        self
+    }
+
+    #[must_use]
+    pub fn with_explore_smt(mut self, explore_smt: bool) -> Self {
+        self.explore_smt = explore_smt;
         self
     }
 }

@@ -11,3 +11,9 @@ rustc-hash.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 toml.workspace = true
+z3 = { workspace = true, optional = true }
+
+[features]
+default = []
+smt = ["dep:z3"]
+

@@ -4481,9 +4481,9 @@ fn eval_pp_tokens(toks: &[Token]) -> bool {
 /// conversions: if either operand is unsigned the operation is unsigned
 /// (so `-1 < 1U` is false — the -1 converts to `uintmax_t`).
 #[derive(Clone, Copy)]
-struct PpVal {
-    bits: u64,
-    unsigned_: bool,
+pub(crate) struct PpVal {
+    pub(crate) bits: u64,
+    pub(crate) unsigned_: bool,
 }
 
 impl PpVal {
@@ -4502,7 +4502,7 @@ impl PpVal {
         self.bits != 0
     }
 
-    fn as_i64(self) -> i64 {
+    pub(crate) fn as_i64(self) -> i64 {
         self.bits.cast_signed()
     }
 
@@ -4868,7 +4868,7 @@ impl PpExprParser<'_> {
 /// user-defined-literal suffix — is `None`. The value is unsigned when it
 /// carries a `u`/`U` suffix or does not fit in a signed 64-bit `intmax_t`
 /// (hex/octal ladder reaching `uintmax_t`).
-fn parse_pp_int(s: &str) -> Option<PpVal> {
+pub(crate) fn parse_pp_int(s: &str) -> Option<PpVal> {
     let t = s.trim_end_matches(['u', 'U', 'l', 'L']);
     let unsigned_suffix = s[t.len()..].contains(['u', 'U']);
     let (digits, radix) = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
@@ -4897,14 +4897,14 @@ fn plain_string_body(spelling: &str) -> Option<&str> {
 /// (`L'\n'` → `\n`). `None` when the spelling does not end at its closing
 /// quote — a user-defined literal such as `'a'_x`, which is not a
 /// character constant.
-fn char_literal_body(spelling: &str) -> Option<&str> {
+pub(crate) fn char_literal_body(spelling: &str) -> Option<&str> {
     let open = spelling.find('\'').map_or(0, |i| i + 1);
     spelling[open..].strip_suffix('\'')
 }
 
 /// Value of a character constant's body (see `char_literal_body`; escapes
 /// kept verbatim).
-fn char_value(s: &str) -> i64 {
+pub(crate) fn char_value(s: &str) -> i64 {
     let mut chars = s.chars().peekable();
     match chars.next() {
         Some('\\') => match chars.next() {

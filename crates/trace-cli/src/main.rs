@@ -73,6 +73,9 @@ enum Commands {
         /// Maximum number of configuration variants to explore per translation unit (#59).
         #[arg(long, default_value_t = 4)]
         explore_budget: usize,
+        /// Use MaxSMT/Z3 solver to find configuration variants (#Phase S1).
+        #[arg(long)]
+        explore_smt: bool,
     },
     /// Inspect an existing analysis database.
     Inspect {
@@ -232,6 +235,7 @@ fn main() -> Result<()> {
             no_ipc,
             explore,
             explore_budget,
+            explore_smt,
         } => run_analyze(
             target,
             output,
@@ -247,6 +251,7 @@ fn main() -> Result<()> {
             no_ipc,
             explore,
             explore_budget,
+            explore_smt,
         ),
         Commands::Inspect { db, command } => run_inspect(db, command),
     }
@@ -268,6 +273,7 @@ fn run_analyze(
     no_ipc: bool,
     explore: bool,
     explore_budget: usize,
+    explore_smt: bool,
 ) -> Result<()> {
     if let Some(secs) = timeout_secs {
         std::thread::spawn(move || {
@@ -358,8 +364,9 @@ fn run_analyze(
         }
     }
     opts = opts
-        .with_explore(explore)
-        .with_explore_budget(explore_budget);
+        .with_explore(explore || explore_smt)
+        .with_explore_budget(explore_budget)
+        .with_explore_smt(explore_smt);
 
     // Include paths pointing outside the analyzed tree make twin headers
     // (same basename, different tree) resolve to the wrong copy, which

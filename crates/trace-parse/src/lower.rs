@@ -250,6 +250,7 @@ pub fn build_program_with_jobs(
         .collect();
     program.explore = opts.explore;
     program.explore_budget = opts.explore_budget;
+    program.explore_smt = opts.explore_smt;
 
     // A dependency root contributes headers only: its sources are never
     // translation units, even when the root sits inside the analyzed tree,
@@ -332,9 +333,9 @@ pub fn build_program_with_jobs(
         .with_include_expansion_cache(Arc::clone(&include_expansion_cache))
         .with_basename_index(basename_index)
         .with_inline_include_bodies(false);
-    let eff_opts = eff_opts.with_record_conditionals(opts.explore || opts.record_conditionals);
+    let eff_opts = eff_opts.with_record_conditionals(opts.explore || opts.explore_smt || opts.record_conditionals);
 
-    let gn_candidates = if opts.explore && opts.explore_budget > 0 {
+    let gn_candidates = if (opts.explore || opts.explore_smt) && opts.explore_budget > 0 {
         index_progress("explore: scanning GN candidate defines".to_string());
         Some(crate::explore::scan_project_gn_candidates(root))
     } else {
@@ -1597,12 +1598,33 @@ fn index_source_file_with_variants(
         .language
         .unwrap_or_else(|| Language::from_path(path));
 
-    let (variants, truncated) = crate::explore::generate_feasible_variants(
-        &pre.conditionals,
-        candidates,
-        base_defines,
-        explore_budget,
-    );
+    let (variants, truncated) = if index_opts.explore_smt {
+        #[cfg(feature = "smt")]
+        {
+            crate::explore_smt::generate_feasible_variants_smt(
+                &pre.conditionals,
+                candidates,
+                base_defines,
+                explore_budget,
+            )
+        }
+        #[cfg(not(feature = "smt"))]
+        {
+            crate::explore::generate_feasible_variants(
+                &pre.conditionals,
+                candidates,
+                base_defines,
+                explore_budget,
+            )
+        }
+    } else {
+        crate::explore::generate_feasible_variants(
+            &pre.conditionals,
+            candidates,
+            base_defines,
+            explore_budget,
+        )
+    };
     let mut warn_explore = |message: String| {
         base_unit.diagnostics.push(Diagnostic {
             severity: DiagnosticSeverity::Warning,

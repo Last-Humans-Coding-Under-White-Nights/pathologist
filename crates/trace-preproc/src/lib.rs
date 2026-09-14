@@ -1,5 +1,6 @@
 //! Custom C preprocessor for trace.
 
+mod condition_expr;
 mod conditionals;
 mod diagnostic;
 mod lexer;
@@ -8,6 +9,7 @@ mod macros;
 mod options;
 mod preprocessor;
 
+pub use condition_expr::*;
 pub use conditionals::*;
 pub use diagnostic::*;
 pub use lexer::*;

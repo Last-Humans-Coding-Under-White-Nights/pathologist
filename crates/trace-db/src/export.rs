@@ -64,6 +64,7 @@ pub fn export_to_sqlite(
             "model_files": opts.model_files,
             "explore": program.explore,
             "explore_budget": program.explore_budget,
+            "explore_smt": program.explore_smt,
             "variants_merged": program.variants_merged,
         })
         .to_string();

@@ -174,6 +174,8 @@ pub struct Program {
     /// (#59), as configured for the run that built this program. The default
     /// lives with the CLI flag and `PreprocessOptions`, not here.
     pub explore_budget: usize,
+    /// Whether SMT configuration-variant exploration was enabled (#Phase S1).
+    pub explore_smt: bool,
     /// Variant units actually merged (#59). `--explore` only *offers* to
     /// explore: a unit with no feasible variant, or a zero budget, merges
     /// none. Analyses that compensate for cross-variant layout unioning must

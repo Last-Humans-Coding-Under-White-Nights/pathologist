@@ -4,6 +4,8 @@ mod compile_commands;
 mod deps;
 mod discover;
 pub mod explore;
+#[cfg(feature = "smt")]
+pub mod explore_smt;
 pub mod gn_defines;
 mod index_cache;
 mod lower;

@@ -3,6 +3,10 @@ name = "trace-preproc"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+smt = ["dep:z3"]
+
 [dependencies]
 trace-ir = { workspace = true }
 anyhow.workspace = true
@@ -10,6 +14,8 @@ indexmap.workspace = true
 regex.workspace = true
 rustc-hash.workspace = true
 thiserror.workspace = true
+z3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+

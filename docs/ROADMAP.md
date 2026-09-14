@@ -106,6 +106,7 @@ C1→C11 there with fixtures.
 | **`__VA_OPT__`** | C23 `__VA_OPT__` (variadics, GNU `, ##args` elision and the `#` stringize operator are done) |
 | **Constant array index refinement** | Avoid merging all fn-ptr table slots |
 | **Points-to visualization** | Beyond `--debug-points-to` SQL dump |
+| **SMT / Z3 integration** | See [SMT_ROADMAP.md](SMT_ROADMAP.md); MaxSMT explore (S1), query path verification (S2), IPC opcode disambiguation (S3) |
 
 ## Non-goals (v1)
 

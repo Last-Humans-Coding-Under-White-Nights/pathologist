@@ -33,8 +33,9 @@ pub(super) fn build(
     mut graph: IncludeGraph,
     database: CompilationDatabase,
 ) -> Result<Program, String> {
-    let candidates = (opts.explore && opts.explore_budget > 0)
+    let candidates = ((opts.explore || opts.explore_smt) && opts.explore_budget > 0)
         .then(|| crate::explore::scan_project_gn_candidates(root));
+
     // Normalized exactly as `lower.rs` normalizes its shared configuration:
     // the per-source loop below re-derives what it needs, but the orphan-header
     // passes use `fallback` as-is and must not inline include bodies or lose
@@ -70,9 +71,11 @@ pub(super) fn build(
                     // Neither path-keyed source entries nor header expansions are valid
                     // across commands with different search paths, even if macros match.
                     config.include_expansion_cache = None;
-                    config.shared_macros = None;
-                    config.accumulate_macros = false;
-                    config.record_conditionals = opts.explore || opts.record_conditionals;
+                    config.record_conditionals =
+                        opts.explore || opts.explore_smt || opts.record_conditionals;
+                    config.explore = opts.explore || opts.explore_smt;
+                    config.explore_smt = opts.explore_smt;
+
                     if config.source_cache.is_none() {
                         config.source_cache.clone_from(&raw_sources);
                     }

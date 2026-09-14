@@ -112,6 +112,31 @@ impl ConditionalArm {
     pub fn body_lines(&self) -> u32 {
         self.end_line.saturating_sub(self.line).saturating_sub(1)
     }
+
+    /// Parse this arm's directive and expression into a [`ConditionExpr`] AST.
+    #[must_use]
+    pub fn condition_expr(&self) -> crate::ConditionExpr {
+        match self.directive {
+            ArmDirective::Ifdef => {
+                crate::ConditionExpr::Defined(self.expression.trim().to_string())
+            }
+            ArmDirective::Ifndef => crate::ConditionExpr::Not(Box::new(
+                crate::ConditionExpr::Defined(self.expression.trim().to_string()),
+            )),
+            ArmDirective::Else => crate::ConditionExpr::Int(1),
+            ArmDirective::If | ArmDirective::Elif => crate::ConditionExpr::parse(&self.expression),
+        }
+    }
+
+    /// Lower this arm's condition to a Z3 boolean formula (#Phase S1).
+    #[cfg(feature = "smt")]
+    pub fn to_smt_expr<'ctx>(
+        &self,
+        ctx: &'ctx z3::Context,
+        env: &dyn crate::MacroSmtEnv<'ctx>,
+    ) -> z3::ast::Bool<'ctx> {
+        self.condition_expr().to_smt_bool(ctx, env)
+    }
 }
 
 /// One `#if` … `#endif` chain in one file, in the run that met it.

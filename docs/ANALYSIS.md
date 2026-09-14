@@ -1156,6 +1156,24 @@ and feature implementations by exploring feasible configuration variants indepen
    variant and unions its layouts — so keying on it left the recovery off exactly where
    commands disagree about a struct.
 
+### MaxSMT configuration exploration (`--explore-smt`)
+
+When `--explore-smt` is specified (requires building with `--features smt` and `libz3-dev`),
+`trace-parse` replaces greedy single-candidate activation with MaxSMT optimization over Z3:
+
+1. **Exact condition AST lowering**: skipped `#if` and `#elif` conditions are parsed into a
+   preprocessor condition AST (`trace_preproc::ConditionExpr`) and lowered to 64-bit bitvector
+   and boolean constraints in Z3.
+2. **Joint multi-variable satisfaction**: instead of testing candidate defines individually,
+   the SMT solver finds joint assignments that satisfy multi-variable conjunctions (e.g.
+   `defined(CONFIG_A) && LEVEL >= 2`).
+3. **Mutual exclusion & parsimony**: chain arms are encoded with exact mutual exclusion semantics
+   ($\text{Active}(c, i) \iff \psi(c, i) \wedge \bigwedge_{j < i} \neg \psi(c, j)$), and candidate
+   defines are penalized with soft parsimony constraints to prefer minimal define sets.
+4. **Soft line recovery maximization**: the objective function weights candidate models by newly
+   activated code lines, maximizing recovered implementation coverage within `--explore-budget`.
+   If SMT solving fails or produces no variants, exploration falls back gracefully to greedy search.
+
 ### Limits of `--explore`
 
 - **Conditional function signatures are not modeled separately.** The base signature

@@ -7,6 +7,12 @@ edition.workspace = true
 name = "trace"
 path = "src/main.rs"
 
+[features]
+default = []
+smt = ["trace-parse/smt", "trace-preproc/smt", "trace-analysis/smt", "trace-db/smt"]
+
+
+
 [dependencies]
 trace-analysis = { workspace = true }
 trace-db = { workspace = true }
