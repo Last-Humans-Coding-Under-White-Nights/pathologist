@@ -52,7 +52,7 @@ Current kinds:
 - `Load { dst, src }`: Load through pointer (`y = *p`).
 - `Store { dst, src }`: Store through pointer (`*p = y`, `field = val`).
 - `GepField { dst, base, field, field_name }`: Field address or access (`&obj.field`, `p->field`). `field_name` disambiguates structurally distinct types sharing positional field offsets.
-- `ArrayFnMember { array, callee }`: Function-pointer array initializer member (`{ fn0, fn1 }`).
+- `ArrayFnMember { array, callee, index }`: Function-pointer array initializer member (`{ fn0, fn1 }` or `[i] = fn`). Optional index enables slot refinement.
 - `CallReturn { dst, callee_name }`: Direct call assignment (`dst = callee()`), expanded during PAG construction using `fn_returns`.
 - `CallReturnIndirect { dst, callee_var }`: Indirect/virtual call assignment (`dst = callee_var()`), callee resolved at analysis time from points-to sets.
 - `NewHeap { dst }`: Heap allocation (`new T(...)`), allocates fresh heap location so constructor's implicit `this` has concrete pointees.
@@ -137,7 +137,8 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 | C API functions / FFI bindings | `crates/trace-capi/src/`, `crates/trace-capi/include/trace.h`, `docs/CAPI.md` |
 | Dependency roots (`--dep`) | `trace-parse/src/configured.rs`, `merge.rs`, `trace-db/src/inspect.rs`, `trace-cli/src/main.rs` |
 | Measure what the configuration excludes (`#if` arms not taken) | `PreprocessOptions::record_conditionals` + `PreprocessResult::conditionals` (`trace-preproc/src/conditionals.rs`), `trace-cli/examples/conditional_coverage.rs`, `scripts/gen_conditional_coverage_report.py` → `docs/CONDITIONAL_COVERAGE.md` |
-| Bounded conditional-variant exploration (`--explore`) | `PreprocessOptions::explore` + `explore_budget`, `trace-parse/src/explore.rs`, `gn_defines.rs`, `merge_unit_variants`, `lower.rs` → `docs/ANALYSIS.md` |
+| Bounded conditional-variant exploration (`--explore`, `--explore-smt`) | `PreprocessOptions::explore` + `explore_budget` + `explore_smt`, `trace-parse/src/explore.rs`, `explore_smt.rs`, `gn_defines.rs`, `merge_unit_variants`, `lower.rs` → `docs/ANALYSIS.md` |
+
 | Compilation database (`--compile-commands`) | `trace-parse/src/compile_commands.rs`, `configured.rs`, `merge_unit_variants` → `docs/ANALYSIS.md` |
 | Function models / summaries | `trace-analysis/src/summaries.rs` (`FnModelSet`, `--models`) → `docs/ANALYSIS.md` |
 | Builtin fallback macros | `trace-preproc/src/preprocessor.rs`, `tests/fixtures/builtin_macros/` → `docs/PREPROCESSOR.md` |

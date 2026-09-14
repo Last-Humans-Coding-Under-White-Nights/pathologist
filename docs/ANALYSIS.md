@@ -52,7 +52,7 @@ Lowered from C during parse. Mapped to PAG in `Pag::build_flow_constraints`.
 | `Load { dst, src }` | load through pointer | `y = *p` |
 | `Store { dst, src }` | store through pointer | `*p = y`, `field = val` |
 | `GepField { dst, base, field }` | field address | `&obj.field`, `p->field` |
-| `ArrayFnMember { array, callee }` | fn-ptr array init member | `{ fn0, fn1 }` |
+| `ArrayFnMember { array, callee, index }` | fn-ptr array init member | `{ fn0, fn1 }` / `[i] = fn` |
 | `CallReturn { dst, callee_name }` | `dst = callee()` | `p = GetOps()` |
 | `CallReturnIndirect { dst, callee_var }` | `dst = *callee_var()` | `sbuf->impl->readBuffer(...)` (indirect return) |
 | `NewHeap { dst }` | heap allocation | `new T(...)` (C++ ctor result) |
@@ -234,9 +234,13 @@ limitations.
 
 ## Arrays and function-pointer tables
 
-- **Constant index**: treated conservatively (element refinement is future work).
-- **Unknown subscript**: `ArraySummary` — all elements merged.
-- **`ArrayFnMember`**: each initializer function is merged into the array var's points-to; any subscript call may target **any** listed function.
+- **Index refinement (Phase S4)**: Initializer elements record slot indices in `FlowConstraint::ArrayFnMember { array, callee, index }`. When call sites invoke a function through an array subscript (`table[idx]()` or `table[idx].field()`), the index expression is evaluated during lowering:
+  - Concrete integer literals (decimal, hex, octal), enum constants, and `#define` macros.
+  - Bitwise masks (`expr & MASK`) and modulo operations (`expr % N`) via fast pure-Rust bounds deduction.
+  - Compound expressions, bitwise arithmetic, and ternary operators (`(x & 1) + 2`, `flag ? 1 : 3`) via Z3 32-bit BitVector model enumeration (bounded up to 16 solutions) under `--features smt`.
+  - When resolved call sites provide `callee_indices`, the Andersen solver prunes candidate callees whose table slot indices do not intersect the allowed indices.
+- **Unbounded / unknown subscript**: falls back soundly to `ArraySummary` — all elements merged without pruning.
+- **`ArrayFnMember`**: each initializer function is tracked in the array var's points-to and indexed in `pag.array_member_indices`; when no index constraints exist, any subscript call may target any listed function.
 - **Nested initializer lists** (`{ {TYPE, Fn}, ... }`): element expressions are visited recursively, so arrays of structs with fn-ptr members feed `ArrayFnMember` facts into the table var. Element fn values flow through field loads on the array itself *and* through pointers to elements (`m = &arr[i]; m->fn()`), regardless of worklist order.
 - **Field-designated members** (`[i] = { .fn = Fn }`): lowered as precise
   `GepField`+`Store` chains against the array var (index-insensitive, like

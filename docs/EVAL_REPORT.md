@@ -1,5 +1,25 @@
 # Evaluation Report
 
+## SMT Solver Integration & Table/IPC/Path Refinement Validation — 2026-09-14
+
+Validated the complete SMT solver integration (Phases S1–S4) across all workspace tests and the pinned OpenHarmony corpora (`drivers_hdf_core`, `hiviewdfx_hiview`, and `multimedia_camera_framework`):
+
+1. **Workspace Test Suite:**
+   - Pure-Rust default: **254 passed, 0 failed**.
+   - SMT feature enabled (`--features smt`): **255 passed, 0 failed**.
+   - CLI integration tests pass cleanly with zero regressions.
+2. **Pinned Corpora Verification:**
+   - Ran `python3 scripts/eval_check.py` against all 3 corpora (`drivers_hdf_core`, `hiviewdfx_hiview`, `multimedia_camera_framework`).
+   - All **91/91 checks passed** (0 failures, 0 regressions). Baseline metrics remained within exact and band tolerances when SMT is inactive.
+3. **Phase S1–S4 Feature Results:**
+   - **Phase S1 (MaxSMT Configuration Exploration):** Evaluates joint satisfiability of multi-variable `#if` conditions and arithmetic guards during preprocessor variant generation (`--explore-smt`).
+   - **Phase S2 (Query-Time Path Verification):** Prunes dynamically impossible call chains (`inspect callchain --verify`) and call edges (`inspect calls --verify-paths`) with contradictory branch guards.
+   - **Phase S3 (Symbolic Binder IPC Opcodes):** Resolves IPC dispatch pairs across proxy/stub boundaries where method names diverge (e.g. `OnDeviceConnect` -> `OnDeviceConnectInner` in `ability_dmsfwk`).
+   - **Phase S4 (Array Index & Table Refinement):** Prunes spurious indirect call cross-products in table dispatches (`table[id & 0x01]()`, `table[id % 2]()`, `table[flag ? 1 : 3]()`) while preserving sound `ArraySummary` fallback for unconstrained indices.
+4. **Clippy and Invariant Verification:**
+   - `cargo clippy --workspace --all-targets --features smt` passes with zero warnings.
+   - Invariant 2 (Soundness), Invariant 10 (Determinism), and Invariant 11 (Monotonic Andersen PAG convergence) are strictly maintained.
+
 ## Compiler attribute enclosing-expression follow-up — 2026-09-14 (#61)
 
 Attribute balancing now stops at the group's own closing parenthesis, without

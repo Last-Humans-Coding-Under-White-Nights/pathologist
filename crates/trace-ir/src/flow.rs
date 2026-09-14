@@ -42,7 +42,12 @@ pub enum FlowConstraint {
         field_name: String,
     },
     /// Function-pointer array initializer: any subscript may target any listed callee.
-    ArrayFnMember { array: VarId, callee: FnId },
+    /// An optional `index` specifies the concrete slot index in the array table.
+    ArrayFnMember {
+        array: VarId,
+        index: Option<u32>,
+        callee: FnId,
+    },
     /// `dst = callee()` — callee resolved by name after all TUs are merged.
     CallReturn { dst: VarId, callee_name: String },
     /// `dst = callee_var()` — callee resolved at analysis time from the

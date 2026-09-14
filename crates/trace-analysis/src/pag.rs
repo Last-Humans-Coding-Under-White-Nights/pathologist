@@ -61,6 +61,8 @@ pub struct Pag {
     /// Fn locations parked into an array var by `ArrayFnMember` inits
     /// (`{ {.., Fn}, .. }`); reachable through any element field load.
     pub array_fn_members: FxHashMap<VarId, Vec<LocId>>,
+    /// Concrete slot indices for functions registered in an array table (Phase S4).
+    pub array_member_indices: FxHashMap<(VarId, FnId), Vec<u32>>,
     /// Maps callee_var load-var to the PAG node that should receive the
     /// return value of indirect calls whose function pointer is that var.
     pub indirect_return_dst: FxHashMap<VarId, PagNodeId>,
@@ -489,7 +491,7 @@ impl Pag {
                     let base_n = self.var_node_id(*base);
                     self.add_gep(dst_n, base_n, *field, field_name.clone());
                 }
-                FlowConstraint::ArrayFnMember { array, callee } => {
+                FlowConstraint::ArrayFnMember { array, index, callee } => {
                     let array_n = self.var_node_id(*array);
                     // Trust the merge-remapped FnId (see AddrOfFn above).
                     if let Some(&fn_loc) = self.fn_locations.get(callee) {
@@ -501,6 +503,12 @@ impl Pag {
                             .entry(*array)
                             .or_default()
                             .push(fn_loc);
+                        if let Some(idx) = index {
+                            self.array_member_indices
+                                .entry((*array, *callee))
+                                .or_default()
+                                .push(*idx);
+                        }
                     }
                 }
                 FlowConstraint::CallReturn { dst, callee_name } => {
@@ -831,6 +839,11 @@ impl Pag {
             field: None,
             field_name: None,
         });
+    }
+
+    /// Slot indices for a callee function parked in an array table (Phase S4).
+    pub fn array_member_indices(&self, array: VarId, callee: FnId) -> Option<&[u32]> {
+        self.array_member_indices.get(&(array, callee)).map(|v| v.as_slice())
     }
 }
 

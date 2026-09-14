@@ -1173,6 +1173,8 @@ fn expand_virtual_overrides(program: &mut Program) {
                 is_direct: true,
                 receiver_class: cs.receiver_class.clone(),
                 return_dst: cs.return_dst,
+                callee_indices: cs.callee_indices.clone(),
+                callee_array_var: cs.callee_array_var,
             });
         }
     }
@@ -3651,36 +3653,89 @@ fn lower_fn_ptr_array_init(
     array: VarId,
     init: Node,
 ) {
+    lower_fn_ptr_array_init_with_index(program, ctx, source, array, init, None);
+}
+
+fn lower_fn_ptr_array_init_with_index(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    array: VarId,
+    init: Node,
+    parent_index: Option<u32>,
+) {
     let mut cursor = init.walk();
+    let mut current_idx: u32 = 0;
     for child in init.children(&mut cursor) {
-        if matches!(child.kind(), "(" | ")" | ",") {
-            continue;
-        }
-        // Arrays of structs: `{ {TYPE, Fn}, ... }` or `{ {.init = Fn}, ... }`.
-        // Recurse so element expressions nested in inner lists are visited.
-        if child.kind() == "initializer_list" {
-            lower_fn_ptr_array_init(program, ctx, source, array, child);
+        if !child.is_named() || matches!(child.kind(), "(" | ")" | "{" | "}" | "," | ";") {
             continue;
         }
         if child.kind() == "initializer_pair" || child.kind() == "designated_initializer" {
+            let designated_idx = extract_subscript_designator_index(
+                source,
+                child,
+                &program.defines,
+                &program.enum_constants,
+            );
+            if let Some(idx) = designated_idx {
+                current_idx = idx;
+            }
+            let idx_to_use = designated_idx.or(parent_index).unwrap_or(current_idx);
             if let Some(value) = init_pair_value_node(child) {
-                // `[i] = { ... }` with a nested *positional* element list has
-                // no field info — park members via ArrayFnMember (sound blob).
-                // Lists carrying field designators are handled precisely by
-                // `lower_designated_initializer` (via `extract_flow_from_expr`)
-                // so members stay bound to their own field.
                 if value.kind() == "initializer_list" {
-                    if !list_has_field_designators(value) {
-                        lower_fn_ptr_array_init(program, ctx, source, array, value);
-                    }
+                    lower_fn_ptr_array_init_with_index(
+                        program,
+                        ctx,
+                        source,
+                        array,
+                        value,
+                        Some(idx_to_use),
+                    );
                 } else {
-                    push_array_fn_member(program, ctx, source, array, value);
+                    push_array_fn_member(program, ctx, source, array, Some(idx_to_use), value);
                 }
             }
+            current_idx += 1;
             continue;
         }
-        push_array_fn_member(program, ctx, source, array, child);
+        if child.kind() == "initializer_list" {
+            let idx_to_use = parent_index.unwrap_or(current_idx);
+            lower_fn_ptr_array_init_with_index(
+                program,
+                ctx,
+                source,
+                array,
+                child,
+                Some(idx_to_use),
+            );
+            current_idx += 1;
+            continue;
+        }
+        let idx_to_use = parent_index.unwrap_or(current_idx);
+        push_array_fn_member(program, ctx, source, array, Some(idx_to_use), child);
+        current_idx += 1;
     }
+}
+
+fn extract_subscript_designator_index(
+    source: &str,
+    node: Node,
+    defines: &indexmap::IndexMap<String, String>,
+    enums: &rustc_hash::FxHashMap<String, u64>,
+) -> Option<u32> {
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        if c.kind() == "subscript_designator" {
+            let mut inner = c.walk();
+            for g in c.children(&mut inner) {
+                if g.is_named() {
+                    let text = node_text(source, &g).trim();
+                    return crate::array_index::eval_single_index(text, defines, enums);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn init_pair_value_node(node: Node) -> Option<Node> {
@@ -3693,6 +3748,7 @@ fn init_pair_value_node(node: Node) -> Option<Node> {
 /// True when any direct `initializer_pair`/`designated_initializer` child of
 /// this list carries a `.field =` designator (as opposed to purely positional
 /// contents).
+#[allow(dead_code)]
 fn list_has_field_designators(list: Node) -> bool {
     let mut cursor = list.walk();
     for c in list.children(&mut cursor) {
@@ -3714,12 +3770,13 @@ fn push_array_fn_member(
     ctx: &mut LowerContext,
     source: &str,
     array: VarId,
+    index: Option<u32>,
     elem: Node,
 ) {
     if let Some(callee) = resolve_call_fn_arg(program, ctx, source, elem) {
         program
             .flow
-            .push(FlowConstraint::ArrayFnMember { array, callee });
+            .push(FlowConstraint::ArrayFnMember { array, index, callee });
     }
 }
 
@@ -4199,6 +4256,15 @@ fn collect_call_at_node(
         Vec::new()
     };
 
+    let (callee_array_var, callee_indices) = if let Some((arr_node, idx_node)) = extract_callee_subscript(func) {
+        let arr_var = resolve_lvalue_var(program, ctx, source, arr_node);
+        let idx_text = node_text(source, &idx_node);
+        let indices = crate::array_index::eval_index_expr(idx_text, &program.defines, &program.enum_constants);
+        (arr_var, indices)
+    } else {
+        (None, None)
+    };
+
     match chosen.len() {
         0 => {
             let call_id = program.symbols.alloc_call_id();
@@ -4215,6 +4281,8 @@ fn collect_call_at_node(
                 is_direct,
                 receiver_class: None,
                 return_dst,
+                callee_indices: callee_indices.clone(),
+                callee_array_var,
             });
         }
         1 => {
@@ -4232,6 +4300,8 @@ fn collect_call_at_node(
                 is_direct: true,
                 receiver_class: None,
                 return_dst,
+                callee_indices: callee_indices.clone(),
+                callee_array_var,
             });
         }
         n => {
@@ -4256,8 +4326,38 @@ fn collect_call_at_node(
                     is_direct: true,
                     receiver_class: None,
                     return_dst,
+                    callee_indices: callee_indices.clone(),
+                    callee_array_var,
                 });
             }
+        }
+    }
+}
+
+fn extract_callee_subscript<'a>(mut node: Node<'a>) -> Option<(Node<'a>, Node<'a>)> {
+    loop {
+        node = peel_expression(node);
+        match node.kind() {
+            "subscript_expression" => {
+                let arr = node.child_by_field_name("argument")?;
+                let idx = node.child_by_field_name("index")?;
+                return Some((arr, idx));
+            }
+            "field_expression" => {
+                if let Some(arg) = node.child_by_field_name("argument") {
+                    node = arg;
+                } else {
+                    return None;
+                }
+            }
+            "pointer_expression" => {
+                if let Some(arg) = pointer_arg(node) {
+                    node = arg;
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
         }
     }
 }
@@ -4715,6 +4815,8 @@ fn emit_unresolved_site(
         is_direct: false,
         receiver_class: Some(receiver_class),
         return_dst: None,
+        callee_indices: None,
+        callee_array_var: None,
     });
 }
 
@@ -4761,6 +4863,8 @@ fn emit_member_sites(
             is_direct: false,
             receiver_class: Some(cls.to_string()),
             return_dst: None,
+            callee_indices: None,
+            callee_array_var: None,
         });
         return;
     }
@@ -4783,6 +4887,8 @@ fn emit_member_sites(
             is_direct: true,
             receiver_class: Some(cls.to_string()),
             return_dst: None,
+            callee_indices: None,
+            callee_array_var: None,
         });
     }
 }

@@ -29,10 +29,14 @@ pub struct UnitIndex {
     pub arrow_returns: Vec<trace_ir::ArrowReturn>,
     /// Classes declared `final` in this unit.
     pub final_classes: Vec<String>,
+    /// IPC calls initiated by proxy methods via `SendRequest`.
     pub ipc_sends: Vec<trace_ir::IpcSend>,
+    /// IPC dispatch arms inside stub dispatchers (e.g. `OnRemoteRequest`).
     pub ipc_dispatches: Vec<trace_ir::IpcDispatch>,
+    /// Evaluated or known enum constants across this unit.
     pub enum_constants: FxHashMap<String, u64>,
 }
+
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MergeMode {
@@ -114,6 +118,8 @@ fn same_call_facts(a: &CallSite, b: &CallSite) -> bool {
         && a.is_direct == b.is_direct
         && a.receiver_class == b.receiver_class
         && a.return_dst == b.return_dst
+        && a.callee_indices == b.callee_indices
+        && a.callee_array_var == b.callee_array_var
 }
 
 pub fn merge_unit_index(program: &mut Program, unit: &UnitIndex) {
@@ -725,6 +731,7 @@ fn merge_unit(
             .filter_map(|(i, f)| fn_map.get(f).map(|nf| (*i, *nf)))
             .collect();
         site.return_dst = site.return_dst.and_then(|v| var_map.get(&v).copied());
+        site.callee_array_var = site.callee_array_var.and_then(|v| var_map.get(&v).copied());
         site.span.file = span_file;
         if matches!(mode, MergeMode::Variant) {
             // Several configurations can call the same spelled callee at the
@@ -995,8 +1002,13 @@ fn remap_flow(
             field: *field,
             field_name: field_name.clone(),
         },
-        FlowConstraint::ArrayFnMember { array, callee } => FlowConstraint::ArrayFnMember {
+        FlowConstraint::ArrayFnMember {
+            array,
+            index,
+            callee,
+        } => FlowConstraint::ArrayFnMember {
             array: rv(*array),
+            index: *index,
             callee: rf(*callee),
         },
         FlowConstraint::CallReturn { dst, callee_name } => FlowConstraint::CallReturn {

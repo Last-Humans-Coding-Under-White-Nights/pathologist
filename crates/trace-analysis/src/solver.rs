@@ -746,6 +746,18 @@ fn solve(
                 let mut new_callees = Vec::new();
                 for &loc in delta.iter() {
                     if let Some(fn_id) = fn_for_loc(pag, loc) {
+                        // Phase S4: Array table index refinement.
+                        // If this call site accessed an array table with bounded index slots,
+                        // filter out functions whose registered slot indices do not overlap.
+                        let array_var = cs.callee_array_var.or(cs.callee_var);
+                        if let (Some(arr), Some(allowed_indices)) = (array_var, &cs.callee_indices) {
+                            if let Some(member_indices) = pag.array_member_indices(arr, fn_id) {
+                                if !member_indices.iter().any(|idx| allowed_indices.contains(idx)) {
+                                    continue;
+                                }
+                            }
+                        }
+
                         // If the resolved callee is undefined (e.g. a weak
                         // forward declaration), also pull in defined
                         // candidates with the same name so return flows
@@ -1355,6 +1367,8 @@ mod tests {
             is_direct,
             receiver_class: None,
             return_dst: None,
+            callee_indices: None,
+            callee_array_var: None,
         };
         assert!(direct_by_name(&mk("OsalMemCalloc", None, false)));
         assert!(direct_by_name(&mk("f", None, true)));

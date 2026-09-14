@@ -98,6 +98,12 @@ pub struct CallSite {
     /// LHS of `dst = callee(...)` when the call's value is used (`CallReturn`
     /// destination). `dlsym` models write function addresses here.
     pub return_dst: Option<VarId>,
+    /// Refined array slot indices for indirect calls through an array table (Phase S4).
+    /// If `Some`, only functions registered at these slot indices in `callee_array_var`
+    /// are reachable.
+    pub callee_indices: Option<Vec<u32>>,
+    /// Base array variable when an indirect call resolves through an indexed array expression.
+    pub callee_array_var: Option<VarId>,
 }
 
 #[derive(Debug, Clone)]

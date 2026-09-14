@@ -267,11 +267,16 @@ fn fn_ptr_table_over_approximates_all_entries() {
     let (_pag, analysis) = analyze(&program);
     assert!(
         has_any_edge(&program, &analysis, "dispatch_table", "row0"),
-        "table[0]() may reach row0"
+        "table[0]() reaches row0"
     );
     assert!(
-        has_any_edge(&program, &analysis, "dispatch_table", "row1"),
-        "unknown index: may also reach row1 (over-approx)"
+        !has_any_edge(&program, &analysis, "dispatch_table", "row1"),
+        "table[0]() prunes row1 via Phase S4 index refinement"
+    );
+    assert!(
+        has_any_edge(&program, &analysis, "dispatch_unknown", "row0")
+            && has_any_edge(&program, &analysis, "dispatch_unknown", "row1"),
+        "unknown index: reaches both row0 and row1 (over-approx)"
     );
 }
 
