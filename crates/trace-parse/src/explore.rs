@@ -83,10 +83,9 @@ impl VariantIndex {
             return false;
         }
         // Inconsistent values for the same macro cannot agree.
-        !self
-            .defines
+        self.defines
             .get(&goal.name)
-            .is_some_and(|value| value != &goal.value)
+            .is_none_or(|value| value == &goal.value)
     }
 
     fn record(&mut self, goal: &ExplorationGoal) {
