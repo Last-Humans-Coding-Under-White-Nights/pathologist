@@ -149,7 +149,7 @@ default and disabled with the `--no-ipc` analyze flag.
 |--------|------|-------------|
 | `id` | INTEGER PK | Edge id |
 | `call_site_id` | INTEGER FK → `call_sites` | Call site |
-| `arg_index` | INTEGER | 0-based argument index |
+| `arg_index` | INTEGER | 0-based parameter position the argument binds to; for a C++ member function or constructor 0 is the implicit `this`, so explicit arguments start at 1 |
 | `actual_var_id` | INTEGER FK → `variables` | Actual variable (`NULL` if actual is a function) |
 | `actual_fn_id` | INTEGER FK → `functions` | Actual function for fn-ptr args (`NULL` if actual is a variable) |
 | `formal_var_id` | INTEGER FK → `variables` | Callee parameter var |

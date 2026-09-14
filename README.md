@@ -501,7 +501,7 @@ Maps actual arguments at a call site to callee formal parameters (when wired by 
 |--------|------|-------------|
 | `id` | INTEGER PK | Edge id. |
 | `call_site_id` | INTEGER FK → `call_sites` | Call site. |
-| `arg_index` | INTEGER | Zero-based argument index. |
+| `arg_index` | INTEGER | Zero-based parameter position the argument binds to. For a C++ member function or constructor, position 0 is the implicit `this` and the first explicit argument is at 1. |
 | `actual_var_id` | INTEGER FK → `variables` | Variable passed at call site (`NULL` when actual is a function). |
 | `actual_fn_id` | INTEGER FK → `functions` | Function passed as fn-ptr actual (`NULL` when actual is a variable). |
 | `formal_var_id` | INTEGER FK → `variables` | Callee parameter variable. |

@@ -1006,7 +1006,85 @@ fn finalize_program(
         }
     }
     finalize_extern_callees(program);
+    // Members first: a call is bound when its callee takes `this`, which a
+    // member defined without its class in view only has afterwards.
+    add_missing_this_params(program);
+    bind_calls_past_this(program);
     expand_virtual_overrides(program);
+}
+
+/// Give a member defined in a unit that never saw its class the implicit
+/// `this` it has everywhere else. Lowering prepends `this` only when the
+/// definition's unit knows the class: one whose header include is unresolved
+/// lowered `void Remote::Shared(Callback cb)` with `cb` at position 0, yet
+/// merged with the in-class prototype, whose explicit arity agrees, and every
+/// call bound past `this` found no parameter at position 1. The merge records
+/// those definitions (`SymbolTable::members_missing_this`); the prototype was
+/// registered under its class, so the name's qualifier is the class. A class
+/// is not looked up by name here: unrelated programs in one tree can declare
+/// a class and a namespace of the same name.
+fn add_missing_this_params(program: &mut Program) {
+    for fn_id in program.symbols.take_members_missing_this() {
+        let Some(i) = program.symbols.function_index(fn_id) else {
+            continue;
+        };
+        let f = &program.symbols.functions[i];
+        // A conversion operator's target type is no qualifier:
+        // `H::operator ns::S` is a member of `H` (`scope_part`).
+        let scope = scope_part(&f.name);
+        let cls = if scope.len() < f.name.len() {
+            scope.strip_suffix("::")
+        } else {
+            f.name.rsplit_once("::").map(|(cls, _)| cls)
+        };
+        let Some(cls) = cls else {
+            continue;
+        };
+        let (cls, span) = (cls.to_owned(), f.span);
+        let this_id = add_this_param(program, &cls, fn_id, span);
+        let params = &mut program.symbols.functions[i].params;
+        params.insert(0, this_id);
+        for &param in &params[1..] {
+            let var = &mut program.symbols.variables[param.0 as usize];
+            var.param_index = var.param_index.map(|index| index + 1);
+        }
+    }
+}
+
+/// Bind every call whose callee takes `this` past it, when lowering did not.
+/// Lowering binds a call's arguments where its unit can tell the callee is a
+/// member (`CallSite::args_bound_past_this`). A unit that never saw the class
+/// cannot: a qualified call whose header include is unresolved recorded
+/// `Remote::Shared(cb)` from position 0, and so did a call beside a
+/// definition that gains its `this` only after the merge. The callees are
+/// the ones the solver wires (`SymbolTable::callees_of`); a member's name is
+/// always qualified, so an unqualified name is not looked up.
+fn bind_calls_past_this(program: &mut Program) {
+    for i in 0..program.symbols.call_sites.len() {
+        let cs = &program.symbols.call_sites[i];
+        if cs.args_bound_past_this || (cs.var_args.is_empty() && cs.fn_args.is_empty()) {
+            continue;
+        }
+        let takes_this = match cs.callee_fn_id {
+            Some(callee) => is_member_function(program, callee),
+            None => {
+                cs.callee_name.contains("::") && {
+                    let callees = program.symbols.callees_of(cs);
+                    !callees.is_empty() && callees.iter().all(|&f| is_member_function(program, f))
+                }
+            }
+        };
+        if !takes_this {
+            continue;
+        }
+        let site = &mut program.symbols.call_sites[i];
+        shift_past_this(
+            &mut site.var_args,
+            &mut site.fn_args,
+            &mut site.addr_of_member_args,
+        );
+        site.args_bound_past_this = true;
+    }
 }
 
 /// Classify plain-identifier calls that resolve to no tree-local symbol
@@ -1072,6 +1150,12 @@ fn finalize_extern_callees(program: &mut Program) {
             file: *file,
             is_defined: false,
             param_type_ids: Vec::new(),
+            explicit_arity: None,
+            default_args: 0,
+            owner_unresolved: false,
+            variadic: false,
+            defaulted_in_class: false,
+            declared_in_class: false,
             is_virtual: false,
             is_final: false,
         });
@@ -1167,6 +1251,7 @@ fn expand_virtual_overrides(program: &mut Program) {
                 var_args: cs.var_args.clone(),
                 fn_args: cs.fn_args.clone(),
                 addr_of_member_args: cs.addr_of_member_args.clone(),
+                args_bound_past_this: cs.args_bound_past_this,
                 span: cs.span,
                 is_direct: true,
                 receiver_class: cs.receiver_class.clone(),
@@ -3010,8 +3095,12 @@ fn register_member_prototype(
     let flags = virtual_flags(source, node);
     let provisional_id = program.symbols.alloc_fn_id();
     // Prototypes carry no parameter variables; they merge into their
-    // definitions, which supply the real param list for arity filtering.
+    // definitions, which supply the real param list. The count they declare
+    // keeps overloads apart until then (`Get()` beside `Get(Mode&)`).
     let params: Vec<VarId> = Vec::new();
+    let (explicit_arity, shape) = find_params(node).map_or((0, ParamListShape::default()), |p| {
+        declared_param_counts(source, p)
+    });
     let span = node_span(program, ctx, node);
     let ret_type = node
         .child_by_field_name("type")
@@ -3033,6 +3122,12 @@ fn register_member_prototype(
         file: ctx.current_file,
         is_defined: false,
         param_type_ids: Vec::new(),
+        explicit_arity: Some(explicit_arity),
+        default_args: shape.defaults,
+        owner_unresolved: false,
+        variadic: shape.variadic,
+        defaulted_in_class: false,
+        declared_in_class: true,
         is_virtual: flags.is_virtual,
         is_final: flags.is_final,
         is_cpp: ctx.is_cpp,
@@ -3102,44 +3197,17 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
     }
     // Implicit `this` for member functions, ctors and dtors.
     if let Some(cls) = &eff_class {
-        let this_type = program
-            .types
-            .intern(TypeDesc::Ptr(Box::new(TypeDesc::Struct {
-                name: cls.clone(),
-                fields: Vec::new(),
-            })));
-        let this_id = program.symbols.alloc_var_id();
         let span = node_span(program, ctx, node);
-        program.symbols.add_variable(Variable {
-            id: this_id,
-            name: "this".to_string(),
-            type_id: this_type,
-            storage: StorageClass::Param,
-            fn_id: Some(provisional_id),
-            param_index: Some(0),
-            span,
-            is_pointer: true,
-        });
-        params.push(this_id);
+        params.push(add_this_param(program, cls, provisional_id, span));
     }
-    if let Some(params_node) = find_params(decl) {
-        for param in params_node.children(&mut params_node.walk()) {
-            if is_parameter_node(param.kind()) {
-                if let Some(var) = lower_parameter(
-                    program,
-                    ctx,
-                    source,
-                    param,
-                    provisional_id,
-                    params.len() as u32,
-                ) {
-                    params.push(var);
-                }
-            }
-        }
-    }
+    let shape = lower_parameters(program, ctx, source, decl, provisional_id, &mut params);
 
-    let is_static = declaration_is_static(source, node) || ctx.in_anonymous_namespace();
+    // `static` on a member makes it a static member, not a function with
+    // internal linkage. Registered internal, a static member template's body
+    // never merged with its external prototype on the same line, and the unit
+    // merge dropped it as that prototype's duplicate.
+    let is_static = (eff_class.is_none() && declaration_is_static(source, node))
+        || ctx.in_anonymous_namespace();
     let flags = virtual_flags(source, node);
 
     let span = node_span(program, ctx, node);
@@ -3165,6 +3233,16 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
         file: ctx.current_file,
         is_defined: !is_dep,
         param_type_ids: Vec::new(),
+        explicit_arity: Some((params.len() - usize::from(eff_class.is_some())) as u32),
+        default_args: shape.defaults,
+        owner_unresolved: eff_class.is_none() && scope_part(&raw_name).contains("::"),
+        variadic: shape.variadic,
+        // `A() = default;` in its class: not user-provided (C++17 aggregates).
+        defaulted_in_class: ctx.class_ctx.is_some()
+            && node
+                .children(&mut node.walk())
+                .any(|c| matches!(c.kind(), "default_method_clause" | "delete_method_clause")),
+        declared_in_class: ctx.class_ctx.is_some(),
         is_virtual: flags.is_virtual,
         is_final: flags.is_final,
         is_cpp: ctx.is_cpp,
@@ -3238,21 +3316,39 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
 /// Longest `a::b::Cls` prefix of a qualified function name that resolves to
 /// an interned class/struct tag.
 fn derive_owner_class(program: &Program, qualified_name: &str) -> Option<String> {
-    let segs: Vec<&str> = qualified_name.split("::").collect();
-    if segs.len() < 2 {
-        return None;
-    }
-    for split in (1..segs.len()).rev() {
-        let candidate = segs[..split].join("::");
-        if program
-            .types
-            .type_id_by_tag(&candidate, trace_ir::TypeKind::Struct)
-            .is_some()
-        {
-            return Some(candidate);
-        }
-    }
-    None
+    qualified_name
+        .rmatch_indices("::")
+        .map(|(at, _)| &qualified_name[..at])
+        .find(|prefix| {
+            program
+                .types
+                .type_id_by_tag(prefix, trace_ir::TypeKind::Struct)
+                .is_some()
+        })
+        .map(str::to_owned)
+}
+
+/// The implicit `this` of a member of `cls`: a `Ptr(Struct{cls})` parameter
+/// at position 0 of `fn_id`.
+fn add_this_param(program: &mut Program, cls: &str, fn_id: FnId, span: Span) -> VarId {
+    let this_type = program
+        .types
+        .intern(TypeDesc::Ptr(Box::new(TypeDesc::Struct {
+            name: cls.to_owned(),
+            fields: Vec::new(),
+        })));
+    let this_id = program.symbols.alloc_var_id();
+    program.symbols.add_variable(Variable {
+        id: this_id,
+        name: "this".to_string(),
+        type_id: this_type,
+        storage: StorageClass::Param,
+        fn_id: Some(fn_id),
+        param_index: Some(0),
+        span,
+        is_pointer: true,
+    });
+    this_id
 }
 
 /// Whether a node in a parameter list declares a parameter.
@@ -3266,6 +3362,72 @@ fn is_parameter_node(kind: &str) -> bool {
         kind,
         "parameter_declaration" | "optional_parameter_declaration"
     )
+}
+
+/// What a parameter list declares beyond the parameters themselves: how many
+/// carry a default argument, and whether it ends in `...` or a parameter pack,
+/// either of which takes any number of further arguments.
+#[derive(Default)]
+struct ParamListShape {
+    defaults: u32,
+    variadic: bool,
+}
+
+impl ParamListShape {
+    fn record(&mut self, param: Node) {
+        match param.kind() {
+            "optional_parameter_declaration" => self.defaults += 1,
+            "..." | "variadic_parameter_declaration" => self.variadic = true,
+            _ => {}
+        }
+    }
+}
+
+/// The parameters a list declares, counted the way `lower_parameter` lowers
+/// them (`(void)` declares none), and its [`ParamListShape`].
+fn declared_param_counts(source: &str, params_node: Node) -> (u32, ParamListShape) {
+    let is_void = |param: Node| {
+        param.child_by_field_name("declarator").is_none()
+            && param
+                .child_by_field_name("type")
+                .is_some_and(|t| node_text(source, &t) == "void")
+    };
+    let mut declared = 0;
+    let mut shape = ParamListShape::default();
+    for param in params_node.children(&mut params_node.walk()) {
+        if is_parameter_node(param.kind()) && !is_void(param) {
+            declared += 1;
+        }
+        shape.record(param);
+    }
+    (declared, shape)
+}
+
+/// Lower the parameters `decl` lists onto `params`, after any `this` already
+/// there, and return the list's [`ParamListShape`].
+fn lower_parameters(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    decl: Node,
+    fn_id: FnId,
+    params: &mut Vec<VarId>,
+) -> ParamListShape {
+    let mut shape = ParamListShape::default();
+    let Some(params_node) = find_params(decl) else {
+        return shape;
+    };
+    for param in params_node.children(&mut params_node.walk()) {
+        shape.record(param);
+        if !is_parameter_node(param.kind()) {
+            continue;
+        }
+        let index = params.len() as u32;
+        if let Some(var) = lower_parameter(program, ctx, source, param, fn_id, index) {
+            params.push(var);
+        }
+    }
+    shape
 }
 
 fn lower_parameter(
@@ -3393,15 +3555,28 @@ fn lower_declaration(
             "declarator" | "pointer_declarator" | "function_declarator" | "array_declarator" => {
                 // A pointer-returning function declaration (`T *f(void);`) is a
                 // `pointer_declarator` wrapping a `function_declarator`; it must
-                // register a function, not a variable that shadows the name.
+                // register a function, not a variable that shadows the name --
+                // unless it defines an object, `T w(a);` or `T *p(buf);`.
                 if let Some((fdecl, ptr_depth)) = fn_decl_under_pointer(child) {
-                    let mut ret = type_id;
+                    let mut ty = type_id;
                     for _ in 0..ptr_depth {
-                        ret = program.types.intern(trace_ir::TypeDesc::Ptr(Box::new(
-                            program.types.get(ret).desc.clone(),
+                        ty = program.types.intern(trace_ir::TypeDesc::Ptr(Box::new(
+                            program.types.get(ty).desc.clone(),
                         )));
                     }
-                    lower_function_decl(program, ctx, source, fdecl, ret, is_static);
+                    match direct_init_arguments(program, ctx, source, fdecl) {
+                        Some(args) => lower_direct_init(
+                            program,
+                            ctx,
+                            source,
+                            fdecl,
+                            ty,
+                            is_static,
+                            storage_override,
+                            args,
+                        ),
+                        None => lower_function_decl(program, ctx, source, fdecl, ty, is_static),
+                    }
                     continue;
                 }
                 let shaped_type_id = {
@@ -3444,6 +3619,160 @@ fn lower_declaration(
     }
 }
 
+/// The explicit arguments of `T w(a, b);` when it defines an object rather
+/// than declaring a function. C++ reads it as a function declaration only
+/// when the parenthesized names are types; tree-sitter cannot tell and always
+/// does, so `Worker w(OnReady);` registered a function `w` and constructed
+/// nothing. Inside a function body, a list of bare names that each resolve to
+/// a variable or a function in scope is an argument list. `T w();` stays a
+/// declaration, as it is in C++.
+fn direct_init_arguments(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    decl: Node,
+) -> Option<CallArgs> {
+    if !ctx.is_cpp || ctx.current_fn.is_none() || decl.kind() != "function_declarator" {
+        return None;
+    }
+    if decl.child_by_field_name("declarator")?.kind() != "identifier" {
+        return None;
+    }
+    let params = decl.child_by_field_name("parameters")?;
+    let mut args = CallArgs::empty();
+    for param in params.named_children(&mut params.walk()) {
+        if param.kind() == "comment" {
+            continue;
+        }
+        if param.kind() != "parameter_declaration"
+            || param.child_by_field_name("declarator").is_some()
+        {
+            return None;
+        }
+        let name_node = param.child_by_field_name("type")?;
+        if !matches!(name_node.kind(), "type_identifier" | "qualified_identifier") {
+            return None;
+        }
+        let name = normalize_qualified(node_text(source, &name_node));
+        let index = args.argc;
+        if let Some(&var) = ctx.locals.get(&name) {
+            args.var_args.push((index, var));
+        } else if names_type_in_scope(program, ctx, &name) {
+            // A type declared nearer than any global of that name hides it:
+            // `using Value = int;` makes `Worker make(Value);` a declaration.
+            return None;
+        } else if ctx
+            .class_ctx
+            .as_ref()
+            .is_some_and(|c| class_has_data_field(program, &c.qual_name, &name))
+        {
+            // A data member is a value, so this defines an object:
+            // `std::lock_guard<std::mutex> g(mu_);`. Its value is not a
+            // variable here, and the position stays without an actual, as a
+            // literal's does. Checked before `lookup_var`, which would scan
+            // every variable to miss it.
+        } else if let Some(var) = lookup_var(ctx, program, &name) {
+            args.var_args.push((index, var));
+        } else {
+            args.fn_args
+                .push((index, resolve_function_named(program, ctx, &name)?));
+        }
+        args.argc += 1;
+        args.arg_desc.push(TypeDesc::Unknown);
+    }
+    (args.argc > 0).then_some(args)
+}
+
+/// Lower `T w(args);` as the object definition [`direct_init_arguments`]
+/// recognized: the local, then its constructor call with the object as
+/// `this`, or for a type without one, `w` initialized from its one argument.
+#[allow(clippy::too_many_arguments)]
+fn lower_direct_init(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    decl: Node,
+    type_id: trace_ir::TypeId,
+    is_static: bool,
+    storage_override: Option<StorageClass>,
+    args: CallArgs,
+) {
+    let Some(name_node) = decl.child_by_field_name("declarator") else {
+        return;
+    };
+    let Some(object) = lower_one_declarator(
+        program,
+        ctx,
+        source,
+        decl,
+        name_node,
+        type_id,
+        is_static,
+        storage_override,
+        None,
+    ) else {
+        return;
+    };
+    let span = node_span(program, ctx, decl);
+    if program.is_dep_file(span.file) {
+        return;
+    }
+    let Some(cls) = named_class(program, type_id) else {
+        match (args.var_args.as_slice(), args.fn_args.as_slice()) {
+            ([(_, src)], []) => program.flow.push(FlowConstraint::Copy {
+                dst: object,
+                src: *src,
+            }),
+            ([], [(_, callee)]) => program.flow.push(FlowConstraint::AddrOfFn {
+                dst: object,
+                callee: *callee,
+            }),
+            _ => {}
+        }
+        return;
+    };
+    let Some(caller) = ctx.current_fn else {
+        return;
+    };
+    emit_member_sites(
+        program,
+        caller,
+        &cls,
+        &trace_ir::MethodKind::Ctor,
+        Some(object),
+        args,
+        span,
+    );
+}
+
+/// Whether `name` spelled in the current scope denotes a type: a
+/// function-local alias, or a class or typedef declared in an enclosing class
+/// or namespace. At the global scope only a typedef counts, since a global
+/// variable or function of the same name hides a class there (`struct stat`
+/// beside `stat`).
+fn names_type_in_scope(program: &Program, ctx: &LowerContext, name: &str) -> bool {
+    local_alias(ctx, name).is_some()
+        || find_in_scope(ctx, name, |candidate, global| {
+            let class = !global
+                && (program.types.is_struct_declared(candidate)
+                    || program
+                        .types
+                        .type_id_by_tag(candidate, trace_ir::TypeKind::Struct)
+                        .is_some());
+            (class || program.types.resolve_alias(candidate).is_some()).then_some(())
+        })
+        .is_some()
+}
+
+/// The class a declared type names, if any: a named struct, not an anonymous
+/// one.
+fn named_class(program: &Program, type_id: trace_ir::TypeId) -> Option<String> {
+    match &program.types.get(type_id).desc {
+        TypeDesc::Struct { name, .. } if !is_anonymous_tag(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_one_declarator(
     program: &mut Program,
@@ -3455,11 +3784,11 @@ fn lower_one_declarator(
     is_static: bool,
     storage_override: Option<StorageClass>,
     init_expr: Option<Node>,
-) {
+) -> Option<VarId> {
     if is_function_pointer_declarator(decl) {
         let (name, _is_ptr) = parse_declarator_name(source, decl);
         if name.is_empty() {
-            return;
+            return None;
         }
         let var_id = program.symbols.alloc_var_id();
         let span = node_span(program, ctx, span_node);
@@ -3475,7 +3804,7 @@ fn lower_one_declarator(
         });
         register_local(ctx, name, var_id);
         if program.is_dep_file(span.file) {
-            return;
+            return Some(var_id);
         }
         if let Some(init) = init_expr {
             if init.kind() == "initializer_list"
@@ -3485,17 +3814,17 @@ fn lower_one_declarator(
             }
             extract_flow_from_expr(program, ctx, source, init, Some(var_id));
         }
-        return;
+        return Some(var_id);
     }
 
     if decl.kind() == "function_declarator" && !is_function_pointer_declarator(decl) {
         lower_function_decl(program, ctx, source, decl, type_id, is_static);
-        return;
+        return None;
     }
 
     let (name, is_ptr) = parse_declarator_name(source, decl);
     if name.is_empty() {
-        return;
+        return None;
     }
     let var_id = program.symbols.alloc_var_id();
     if decl.kind() == "reference_declarator" {
@@ -3514,44 +3843,46 @@ fn lower_one_declarator(
     });
     register_local(ctx, name, var_id);
     if program.is_dep_file(span.file) {
-        return;
+        return Some(var_id);
     }
     // Constructor invocation spelled as a declaration: `Cls o(1, 2);`.
     // tree-sitter parks the argument list in init_declarator's `value`
-    // field, so an argument_list "initializer" IS the ctor call.
-    let ctor_args: Option<Node> = match init_expr {
-        Some(n) if n.kind() == "argument_list" => Some(n),
-        _ => span_node
-            .children(&mut span_node.walk())
-            .find(|c| c.kind() == "argument_list"),
-    };
-    if ctx.is_cpp
-        && ctor_args.is_some()
-        && span_node.kind() == "init_declarator"
-        && ctx.current_fn.is_some()
-    {
-        if let Some(cls) = match program.types.get(type_id).desc.clone() {
-            TypeDesc::Struct { name, .. } if !is_anonymous_tag(&name) => Some(name),
-            _ => None,
-        } {
-            let span = node_span(program, ctx, span_node);
-            let mut call_args = collect_call_args(program, ctx, source, ctor_args);
-            // The implicit `this` (param 0) points to the object being
-            // constructed; shift explicit args to start at index 1.
-            call_args.shift_past_this();
-            call_args.var_args.insert(0, (0, var_id));
-            emit_member_sites(
-                program,
-                ctx.current_fn.unwrap(),
-                &cls,
-                &trace_ir::MethodKind::Ctor,
-                call_args,
-                span,
-            );
+    // field, so an argument_list "initializer" IS the ctor call. `Cls o{1, 2};`
+    // calls a constructor too when the class declares a user-provided one; a
+    // class without one is an aggregate, whose braces initialize its fields.
+    let mut braced_ctor = false;
+    if ctx.is_cpp && span_node.kind() == "init_declarator" && ctx.current_fn.is_some() {
+        if let Some(cls) = named_class(program, type_id) {
+            // A constructor defaulted or deleted in its class is not
+            // user-provided and leaves the class an aggregate (C++17).
+            braced_ctor = init_expr.is_some_and(|n| n.kind() == "initializer_list")
+                && declared_members_upward(program, &cls, &trace_ir::MethodKind::Ctor)
+                    .iter()
+                    .any(|&ctor| !program.symbols.function(ctor).defaulted_in_class);
+            let ctor_args: Option<Node> = match init_expr {
+                Some(n) if n.kind() == "argument_list" || braced_ctor => Some(n),
+                _ => span_node
+                    .children(&mut span_node.walk())
+                    .find(|c| c.kind() == "argument_list"),
+            };
+            if ctor_args.is_some() {
+                let span = node_span(program, ctx, span_node);
+                let call_args = collect_call_args(program, ctx, source, ctor_args);
+                // The implicit `this` points to the object being constructed.
+                emit_member_sites(
+                    program,
+                    ctx.current_fn.unwrap(),
+                    &cls,
+                    &trace_ir::MethodKind::Ctor,
+                    Some(var_id),
+                    call_args,
+                    span,
+                );
+            }
         }
     }
     if let Some(init) = init_expr {
-        if init.kind() != "argument_list" {
+        if init.kind() != "argument_list" && !braced_ctor {
             // A ctor argument list is not a value flowing into the object.
             if init.kind() == "initializer_list"
                 && (is_array_type(program, type_id) || declarator_is_array(decl))
@@ -3561,6 +3892,7 @@ fn lower_one_declarator(
             extract_flow_from_expr(program, ctx, source, init, Some(var_id));
         }
     }
+    Some(var_id)
 }
 
 /// `ArrayFnMember` facts are only sound for array-typed tables (unknown-index
@@ -3683,23 +4015,9 @@ fn lower_function_decl(
     let name = ctx.qualify_decl(&name);
     let provisional_id = program.symbols.alloc_fn_id();
     let mut params = Vec::new();
-    if let Some(params_node) = find_params(decl) {
-        for param in params_node.children(&mut params_node.walk()) {
-            if is_parameter_node(param.kind()) {
-                if let Some(var) = lower_parameter(
-                    program,
-                    ctx,
-                    source,
-                    param,
-                    provisional_id,
-                    params.len() as u32,
-                ) {
-                    params.push(var);
-                }
-            }
-        }
-    }
+    let shape = lower_parameters(program, ctx, source, decl, provisional_id, &mut params);
     let span = node_span(program, ctx, decl);
+    let explicit_arity = Some(params.len() as u32);
     let fn_id = program.symbols.add_function(Function {
         id: provisional_id,
         name,
@@ -3717,6 +4035,12 @@ fn lower_function_decl(
         file: ctx.current_file,
         is_defined: false,
         param_type_ids: Vec::new(),
+        explicit_arity,
+        default_args: shape.defaults,
+        owner_unresolved: false,
+        variadic: shape.variadic,
+        defaulted_in_class: false,
+        declared_in_class: false,
         is_virtual: false,
         is_final: false,
         is_cpp: ctx.is_cpp,
@@ -3814,17 +4138,15 @@ fn walk_function_body(
                         .children(&mut node.walk())
                         .find(|c| c.kind() == "argument_list");
                     let span = node_span(program, ctx, node);
-                    let mut call_args = collect_call_args(program, ctx, source, args);
-                    // Shift explicit args by 1 so param 0 (`this`) does not
-                    // collide with the first explicit argument.  We leave
-                    // `this` unwired; the solver creates an imprecise summary
-                    // node for it (sound over-approximation).
-                    call_args.shift_past_this();
+                    let call_args = collect_call_args(program, ctx, source, args);
+                    // `this` stays unwired; the solver creates an imprecise
+                    // summary node for it (sound over-approximation).
                     emit_member_sites(
                         program,
                         caller,
                         &cls,
                         &trace_ir::MethodKind::Ctor,
+                        None,
                         call_args,
                         span,
                     );
@@ -3844,6 +4166,7 @@ fn walk_function_body(
                         caller,
                         &cls,
                         &trace_ir::MethodKind::Dtor,
+                        None,
                         CallArgs::empty(),
                         span,
                     );
@@ -3953,7 +4276,7 @@ fn collect_call_at_node(
                                 source,
                                 node.child_by_field_name("arguments"),
                             );
-                            emit_member_sites(program, caller, &cls, &kind, call_args, span);
+                            emit_member_sites(program, caller, &cls, &kind, None, call_args, span);
                             return;
                         }
                         // Functor field: `h->cb()` where `cb` is a class
@@ -3968,7 +4291,7 @@ fn collect_call_at_node(
                                     node.child_by_field_name("arguments"),
                                 );
                                 emit_member_sites(
-                                    program, caller, &field_cls, &op, call_args, span,
+                                    program, caller, &field_cls, &op, None, call_args, span,
                                 );
                                 return;
                             }
@@ -3984,7 +4307,7 @@ fn collect_call_at_node(
                                 source,
                                 node.child_by_field_name("arguments"),
                             );
-                            emit_member_sites(program, caller, &cls, &kind, call_args, span);
+                            emit_member_sites(program, caller, &cls, &kind, None, call_args, span);
                             return;
                         }
                     }
@@ -4008,7 +4331,7 @@ fn collect_call_at_node(
                         source,
                         node.child_by_field_name("arguments"),
                     );
-                    emit_member_sites(program, caller, &cls, &kind, call_args, span);
+                    emit_member_sites(program, caller, &cls, &kind, None, call_args, span);
                     return;
                 }
             }
@@ -4037,17 +4360,14 @@ fn collect_call_at_node(
             Some(_) => None,
         };
         if let Some((cls, kind)) = target {
-            let mut call_args =
+            let call_args =
                 collect_call_args(program, ctx, source, node.child_by_field_name("arguments"));
-            if kind == trace_ir::MethodKind::Ctor {
-                call_args.shift_past_this();
-            }
-            emit_member_sites(program, caller, &cls, &kind, call_args, span);
+            emit_member_sites(program, caller, &cls, &kind, None, call_args, span);
             return;
         }
     }
 
-    let (callee_name, mut is_direct, callee_var) =
+    let (mut callee_name, mut is_direct, callee_var) =
         resolve_callee_with_loads(program, ctx, source, func);
     // Macro-expansion artifacts (stringified log fragments and similar
     // token soup) surface as call sites whose "callee" text embeds string
@@ -4063,15 +4383,10 @@ fn collect_call_at_node(
     if !is_direct && is_likely_macro_callee(&callee_name) {
         return;
     }
-    let collected = collect_call_args(program, ctx, source, node.child_by_field_name("arguments"));
-    let argc = collected.argc as usize;
-    let CallArgs {
-        var_args,
-        fn_args,
-        addr_of_member_args,
-        argc: _,
-        arg_desc,
-    } = collected;
+    let mut args = collect_call_args(program, ctx, source, node.child_by_field_name("arguments"));
+    let argc = args.argc as usize;
+    // Only ranking reads the types; the sites below need the positions.
+    let arg_desc = std::mem::take(&mut args.arg_desc);
 
     // ---- Resolution ----
     // C preserves the exact legacy semantics: one scoped lookup, zero or
@@ -4099,14 +4414,10 @@ fn collect_call_at_node(
                 .symbols
                 .resolve_function_candidates(&callee_name, Some(ctx.current_file))
         };
-        let by_arity: Vec<FnId> = candidates
-            .iter()
-            .copied()
-            .filter(|&f| program.symbols.function(f).params.len() == argc)
-            .collect();
-        if by_arity.is_empty() {
-            candidates
-        } else if by_arity.len() > 1 {
+        // A qualified method call (`Base::m(a)`, `Cls::Static(a)`) lands here
+        // too: its `this` is not one of the arguments.
+        let by_arity = filter_targets_by_argc(program, candidates, argc, &arg_desc, argc == 0);
+        if by_arity.len() > 1 {
             rank_overloads(program, &by_arity, &arg_desc)
         } else {
             by_arity
@@ -4115,66 +4426,64 @@ fn collect_call_at_node(
         Vec::new()
     };
 
-    match chosen.len() {
-        0 => {
-            let call_id = program.symbols.alloc_call_id();
-            program.symbols.call_sites.push(CallSite {
-                id: call_id,
-                caller,
-                callee_name,
-                callee_var,
-                callee_fn_id: None,
-                var_args,
-                fn_args,
-                addr_of_member_args,
-                span,
-                is_direct,
-                receiver_class: None,
-                return_dst,
-            });
-        }
-        1 => {
-            let call_id = program.symbols.alloc_call_id();
-            program.symbols.call_sites.push(CallSite {
-                id: call_id,
-                caller,
-                callee_name,
-                callee_var,
-                callee_fn_id: Some(chosen[0]),
-                var_args,
-                fn_args,
-                addr_of_member_args,
-                span,
-                is_direct: true,
-                receiver_class: None,
-                return_dst,
-            });
-        }
-        n => {
-            // Overload tie (same arity, types undecidable here): emit one
-            // site per candidate — a bounded, explicit may-approximation.
-            for t in chosen.iter().copied() {
-                let call_id = program.symbols.alloc_call_id();
-                program.symbols.call_sites.push(CallSite {
-                    id: call_id,
-                    caller,
-                    callee_name: if n > 1 && t != chosen[0] {
-                        format!("{}::{}", callee_name, program.symbols.function(t).id.0)
-                    } else {
-                        callee_name.clone()
-                    },
-                    callee_var,
-                    callee_fn_id: Some(t),
-                    var_args: var_args.clone(),
-                    fn_args: fn_args.clone(),
-                    addr_of_member_args: addr_of_member_args.clone(),
-                    span,
-                    is_direct: true,
-                    receiver_class: None,
-                    return_dst,
-                });
-            }
-        }
+    if chosen.is_empty() {
+        let call_id = program.symbols.alloc_call_id();
+        program.symbols.call_sites.push(CallSite {
+            id: call_id,
+            caller,
+            callee_name,
+            callee_var,
+            callee_fn_id: None,
+            var_args: args.var_args,
+            fn_args: args.fn_args,
+            addr_of_member_args: args.addr_of_member_args,
+            args_bound_past_this: false,
+            span,
+            is_direct,
+            receiver_class: None,
+            return_dst,
+        });
+        return;
+    }
+    // An overload tie (same arity, types undecidable here) emits one site per
+    // candidate — a bounded, explicit may-approximation. Argument positions
+    // are the callee's parameter positions, and parameter 0 of a member
+    // function reached by its qualified name is `this`.
+    for (i, &t) in chosen.iter().enumerate() {
+        let is_last = i + 1 == chosen.len();
+        let site_args = if is_last {
+            std::mem::replace(&mut args, CallArgs::empty())
+        } else {
+            args.clone()
+        };
+        let bound = argc > 0 && ctx.is_cpp && is_member_function(program, t);
+        let site_args = if bound {
+            site_args.bind_past_this(None)
+        } else {
+            site_args
+        };
+        let call_id = program.symbols.alloc_call_id();
+        program.symbols.call_sites.push(CallSite {
+            id: call_id,
+            caller,
+            callee_name: if t != chosen[0] {
+                format!("{}::{}", callee_name, program.symbols.function(t).id.0)
+            } else if is_last {
+                std::mem::take(&mut callee_name)
+            } else {
+                callee_name.clone()
+            },
+            callee_var,
+            callee_fn_id: Some(t),
+            var_args: site_args.var_args,
+            fn_args: site_args.fn_args,
+            addr_of_member_args: site_args.addr_of_member_args,
+            args_bound_past_this: bound,
+            span,
+            is_direct: true,
+            receiver_class: None,
+            return_dst,
+        });
     }
 }
 
@@ -4182,6 +4491,7 @@ fn collect_call_at_node(
 /// arguments (address-of-function) as `(index, fn)`, positions recorded
 /// as `&base.member` addresses, and the syntactic argument count
 /// (literals included — needed for arity filtering).
+#[derive(Clone)]
 struct CallArgs {
     var_args: Vec<(u32, VarId)>,
     fn_args: Vec<(u32, FnId)>,
@@ -4194,18 +4504,19 @@ struct CallArgs {
 }
 
 impl CallArgs {
-    /// Move the explicit arguments one position on, past the implicit `this`
-    /// a constructor takes as parameter 0.
-    fn shift_past_this(&mut self) {
-        for (index, _) in &mut self.var_args {
-            *index += 1;
+    /// Bind the explicit arguments to a member function's parameters: one
+    /// position on, past the implicit `this` it takes as parameter 0, which
+    /// is `receiver` when the caller has the object (a construction does).
+    fn bind_past_this(mut self, receiver: Option<VarId>) -> Self {
+        shift_past_this(
+            &mut self.var_args,
+            &mut self.fn_args,
+            &mut self.addr_of_member_args,
+        );
+        if let Some(receiver) = receiver {
+            self.var_args.insert(0, (0, receiver));
         }
-        for (index, _) in &mut self.fn_args {
-            *index += 1;
-        }
-        for index in &mut self.addr_of_member_args {
-            *index += 1;
-        }
+        self
     }
 
     fn empty() -> Self {
@@ -4216,6 +4527,46 @@ impl CallArgs {
             argc: 0,
             arg_desc: Vec::new(),
         }
+    }
+}
+
+/// Move argument positions one on, past the implicit `this` a member function
+/// takes as parameter 0.
+fn shift_past_this(
+    var_args: &mut [(u32, VarId)],
+    fn_args: &mut [(u32, FnId)],
+    addr_of_member_args: &mut [u32],
+) {
+    for (index, _) in var_args {
+        *index += 1;
+    }
+    for (index, _) in fn_args {
+        *index += 1;
+    }
+    for index in addr_of_member_args {
+        *index += 1;
+    }
+}
+
+/// Whether parameter 0 of `fid` is the implicit `this` lowering prepends to
+/// a member function's definition (static members included).
+fn has_this_param(program: &Program, fid: FnId) -> bool {
+    let f = program.symbols.function(fid);
+    f.is_cpp
+        && f.params
+            .first()
+            .is_some_and(|&p| program.symbols.variable(p).name == "this")
+}
+
+/// Whether `fid` is a member function. An in-class prototype carries no
+/// parameters, yet merges into a definition whose parameter 0 is `this`, so
+/// a parameterless entry is a member when it was declared in its class.
+fn is_member_function(program: &Program, fid: FnId) -> bool {
+    let f = program.symbols.function(fid);
+    if f.params.is_empty() {
+        f.is_cpp && f.declared_in_class
+    } else {
+        has_this_param(program, fid)
     }
 }
 
@@ -4234,7 +4585,7 @@ fn collect_call_args(
     let mut arg_index = 0u32;
     if let Some(args_node) = args_node {
         for arg in args_node.children(&mut args_node.walk()) {
-            if arg.kind() != "(" && arg.kind() != ")" && arg.kind() != "," {
+            if !matches!(arg.kind(), "(" | ")" | "{" | "}" | ",") {
                 let adesc = arg_expr_type(program, ctx, source, arg);
                 // Parameter positions are syntactic: every argument slot
                 // advances the index even when the expression yields no IR
@@ -4396,6 +4747,7 @@ fn rank_overloads(program: &Program, candidates: &[FnId], arg_desc: &[TypeDesc])
         let params = &program.symbols.function(f).params;
         params
             .iter()
+            .skip(usize::from(has_this_param(program, f)))
             .enumerate()
             .map(|(i, pv)| {
                 let pdesc = program
@@ -4599,9 +4951,10 @@ fn resolve_cpp_name_candidates(
 
 /// A member call nothing could be resolved for, spelled the way the source
 /// spells it. The `->` kept in the name is the point: the solver refuses to
-/// resolve a name holding one (`direct_by_name`), so no callee is invented —
+/// resolve a name holding one (`CallSite::resolves_by_name`), so no callee is invented —
 /// and an invented one is indistinguishable downstream from a real call to a
-/// function outside the tree (#64).
+/// function outside the tree (#64). `args` are the explicit arguments, bound
+/// past the member's `this`.
 fn emit_unresolved_site(
     program: &mut Program,
     caller: FnId,
@@ -4616,7 +4969,7 @@ fn emit_unresolved_site(
         addr_of_member_args,
         argc: _,
         arg_desc: _,
-    } = args;
+    } = args.bind_past_this(None);
     let call_id = program.symbols.alloc_call_id();
     program.symbols.call_sites.push(CallSite {
         id: call_id,
@@ -4627,6 +4980,7 @@ fn emit_unresolved_site(
         var_args,
         fn_args,
         addr_of_member_args,
+        args_bound_past_this: true,
         span,
         is_direct: false,
         receiver_class: Some(receiver_class),
@@ -4636,12 +4990,15 @@ fn emit_unresolved_site(
 
 /// Emit call sites for `cls::member` — the override set across derived
 /// classes, found by walking up the inheritance chain to the nearest
-/// declaring class and expanding its subclasses.
+/// declaring class and expanding its subclasses. `args` are the explicit
+/// arguments, bound here past the member's `this`, which is `receiver` when
+/// the caller has the object (#93, #94).
 fn emit_member_sites(
     program: &mut Program,
     caller: FnId,
     cls: &str,
     kind: &trace_ir::MethodKind,
+    receiver: Option<VarId>,
     args: CallArgs,
     span: Span,
 ) {
@@ -4652,12 +5009,14 @@ fn emit_member_sites(
         fn_args,
         addr_of_member_args,
         argc,
-        arg_desc: _,
-    } = args;
+        arg_desc,
+    } = args.bind_past_this(receiver);
     let targets = filter_targets_by_argc(
         program,
         member_targets_upward(program, cls, kind),
         argc as usize,
+        &arg_desc,
+        true,
     );
     let display = kind.name_on(cls);
     if targets.is_empty() {
@@ -4673,6 +5032,7 @@ fn emit_member_sites(
             var_args,
             fn_args,
             addr_of_member_args,
+            args_bound_past_this: true,
             span,
             is_direct: false,
             receiver_class: Some(cls.to_string()),
@@ -4695,6 +5055,7 @@ fn emit_member_sites(
             var_args: var_args.clone(),
             fn_args: fn_args.clone(),
             addr_of_member_args: addr_of_member_args.clone(),
+            args_bound_past_this: true,
             span,
             is_direct: true,
             receiver_class: Some(cls.to_string()),
@@ -4746,9 +5107,11 @@ fn lower_field_initializer_list(
                 }
             });
         if let Some(target) = target_cls {
+            // `Base(a)` and `m_(a)` hold an argument list, `Base{a}` and
+            // `m_{a}` an initializer list; either way `this` is not in it.
             let args = fi
                 .children(&mut fi.walk())
-                .find(|c| c.kind() == "argument_list");
+                .find(|c| matches!(c.kind(), "argument_list" | "initializer_list"));
             let span = node_span(program, ctx, fi);
             let call_args = collect_call_args(program, ctx, source, args);
             emit_member_sites(
@@ -4756,6 +5119,7 @@ fn lower_field_initializer_list(
                 caller,
                 &target,
                 &trace_ir::MethodKind::Ctor,
+                None,
                 call_args,
                 span,
             );
@@ -4805,16 +5169,76 @@ fn class_field_static_class(program: &Program, cls: &str, field: &str) -> Option
     class_name_of_desc(&class_field_desc(program, cls, field)?)
 }
 
-/// Explicit (non-`this`) parameter count. `None` means the prototype listed
-/// no parameters, so arity is unknown and the candidate must be kept.
+/// Explicit (non-`this`) parameter count: the parameter list when the entry
+/// has one, else the count its declaration recorded (an in-class prototype
+/// lowers no parameter variables). `None` means nothing records it, so the
+/// candidate must be kept.
 fn method_explicit_arity(program: &Program, fid: FnId) -> Option<usize> {
     let f = program.symbols.function(fid);
     if f.params.is_empty() {
-        return None;
+        return f.explicit_arity.map(|n| n as usize);
     }
-    let first = program.symbols.variable(f.params[0]);
-    let n = f.params.len();
-    Some(if first.name == "this" { n - 1 } else { n })
+    Some(f.params.len() - usize::from(has_this_param(program, fid)))
+}
+
+/// Whether `fid` can take arguments of these static types, and the types say
+/// so with confidence: every argument's type is known, no pointer binds an
+/// arithmetic parameter, and no floating-point value binds a pointer. A class
+/// parameter may convert, and a prototype without parameter variables names
+/// no types to contradict the arguments.
+fn confidently_takes(program: &Program, fid: FnId, arg_desc: &[TypeDesc]) -> bool {
+    if arg_desc.iter().any(|arg| matches!(arg, TypeDesc::Unknown)) {
+        return false;
+    }
+    let f = program.symbols.function(fid);
+    f.params
+        .iter()
+        .skip(usize::from(has_this_param(program, fid)))
+        .zip(arg_desc)
+        .all(|(&param, arg)| {
+            let param = &program
+                .types
+                .get(program.symbols.variable(param).type_id)
+                .desc;
+            let floating = matches!(arg.scalar_kind(), ScalarKind::Float | ScalarKind::Double);
+            !(arg.is_pointer_like() && param.scalar_kind() != ScalarKind::Aggregate)
+                && !(floating && param.is_pointer_like())
+        })
+}
+
+/// Whether two declarations of one explicit arity plausibly declare the same
+/// function: their parameter types agree up to the qualification of a class
+/// name, a type unknown on either side matching anything. A type name the
+/// unit could not resolve lowers as `int`, so `int` matches a class too:
+/// `string` under an unresolved `using namespace std` beside `std::string`.
+/// An entry without parameter variables names no types.
+fn same_signature_loosely(program: &Program, a: FnId, b: FnId) -> bool {
+    fn same_type(a: &TypeDesc, b: &TypeDesc) -> bool {
+        match (a, b) {
+            (TypeDesc::Unknown, _) | (_, TypeDesc::Unknown) => true,
+            (TypeDesc::Struct { .. }, TypeDesc::Int) | (TypeDesc::Int, TypeDesc::Struct { .. }) => {
+                true
+            }
+            (TypeDesc::Ptr(a), TypeDesc::Ptr(b)) => same_type(a, b),
+            (TypeDesc::Struct { name: a, .. }, TypeDesc::Struct { name: b, .. }) => {
+                last_type_segment(a) == last_type_segment(b)
+            }
+            _ => a == b,
+        }
+    }
+    let explicit = |f: FnId| {
+        let params = &program.symbols.function(f).params;
+        &params[usize::from(has_this_param(program, f))..]
+    };
+    let (pa, pb) = (explicit(a), explicit(b));
+    pa.is_empty()
+        || pb.is_empty()
+        || pa.iter().zip(pb).all(|(&x, &y)| {
+            same_type(
+                &program.types.get(program.symbols.variable(x).type_id).desc,
+                &program.types.get(program.symbols.variable(y).type_id).desc,
+            )
+        })
 }
 
 fn arity_compatible(expected: Option<usize>, got: Option<usize>) -> bool {
@@ -4824,12 +5248,61 @@ fn arity_compatible(expected: Option<usize>, got: Option<usize>) -> bool {
     }
 }
 
-fn filter_targets_by_argc(program: &Program, targets: Vec<FnId>, argc: usize) -> Vec<FnId> {
-    let by_arity: Vec<FnId> = targets
+/// The targets a call passing `argc` arguments fits: no more arguments than a
+/// target declares, and no fewer than its parameters without a default. A
+/// target whose arity nothing records stays when `keep_unknown` says so. A
+/// variadic target (`f(void*, ...)`) takes more arguments than it declares,
+/// but C++ ranks it below any fixed one that can take the call, so it is
+/// dropped when a fixed target confidently can ([`confidently_takes`]):
+/// `Log(p, p)` reaches `Log(void*, ...)` beside `Log(int, int)`, a same-named
+/// pack template does not displace a fitting fixed member, and an argument of
+/// unknown type keeps both. When none fits, all stay.
+///
+/// C++ writes default arguments on the declaration, so a target also takes the
+/// defaults of a same-arity target of the same signature
+/// ([`same_signature_loosely`]): a definition the index could not reunite with
+/// its prototype (`string` beside `std::string`) still accepts `TrimStr(s)`
+/// for `TrimStr(const std::string&, char = ' ')`, while `Format(cb, cb)` does
+/// not borrow `Format(int, int = 0)`'s.
+fn filter_targets_by_argc(
+    program: &Program,
+    targets: Vec<FnId>,
+    argc: usize,
+    arg_desc: &[TypeDesc],
+    keep_unknown: bool,
+) -> Vec<FnId> {
+    let arities: Vec<Option<usize>> = targets
         .iter()
-        .copied()
-        .filter(|&t| arity_compatible(Some(argc), method_explicit_arity(program, t)))
+        .map(|&f| method_explicit_arity(program, f))
         .collect();
+    let defaults = |f: FnId| program.symbols.function(f).default_args as usize;
+    let fits = |f: FnId, arity: Option<usize>| match arity {
+        Some(declared) if declared == argc => true,
+        Some(declared) if declared < argc => program.symbols.function(f).variadic,
+        Some(declared) => {
+            argc + defaults(f) >= declared
+                || targets.iter().zip(&arities).any(|(&other, &other_arity)| {
+                    other_arity == Some(declared)
+                        && argc + defaults(other) >= declared
+                        && same_signature_loosely(program, f, other)
+                })
+        }
+        None => keep_unknown,
+    };
+    let mut by_arity: Vec<FnId> = targets
+        .iter()
+        .zip(&arities)
+        .filter(|&(&f, &arity)| fits(f, arity))
+        .map(|(&f, _)| f)
+        .collect();
+    let variadic = |f: FnId| program.symbols.function(f).variadic;
+    if by_arity.iter().any(|&f| variadic(f))
+        && by_arity
+            .iter()
+            .any(|&f| !variadic(f) && confidently_takes(program, f, arg_desc))
+    {
+        by_arity.retain(|&f| !variadic(f));
+    }
     if by_arity.is_empty() {
         targets
     } else {
@@ -4901,6 +5374,12 @@ fn lower_lambda_expression(
         file: ctx.current_file,
         is_defined: true,
         param_type_ids: Vec::new(),
+        explicit_arity: Some(params.len() as u32),
+        default_args: 0,
+        owner_unresolved: false,
+        variadic: false,
+        defaulted_in_class: false,
+        declared_in_class: false,
         is_virtual: false,
         is_final: false,
         is_cpp: true,
@@ -6771,15 +7250,14 @@ fn expr_to_rhs_flow(
                     .children(&mut node.walk())
                     .find(|c| c.kind() == "argument_list");
                 let span = node_span(program, ctx, node);
-                let mut call_args = collect_call_args(program, ctx, source, args);
-                call_args.shift_past_this();
-                call_args.var_args.insert(0, (0, alloc_tmp));
+                let call_args = collect_call_args(program, ctx, source, args);
                 if let Some(caller) = ctx.current_fn {
                     emit_member_sites(
                         program,
                         caller,
                         &cls,
                         &trace_ir::MethodKind::Ctor,
+                        Some(alloc_tmp),
                         call_args,
                         span,
                     );

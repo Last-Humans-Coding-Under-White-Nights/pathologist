@@ -108,6 +108,7 @@ fn same_call_facts(a: &CallSite, b: &CallSite) -> bool {
         && a.var_args == b.var_args
         && a.fn_args == b.fn_args
         && a.addr_of_member_args == b.addr_of_member_args
+        && a.args_bound_past_this == b.args_bound_past_this
         && a.is_direct == b.is_direct
         && a.receiver_class == b.receiver_class
         && a.return_dst == b.return_dst
@@ -1133,6 +1134,12 @@ mod tests {
                 file: trace_ir::FileId(0),
                 is_defined: defined,
                 param_type_ids: Vec::new(),
+                explicit_arity: Some(1),
+                default_args: 0,
+                owner_unresolved: false,
+                variadic: false,
+                defaulted_in_class: false,
+                declared_in_class: false,
                 is_virtual: false,
                 is_final: false,
                 is_cpp: true,

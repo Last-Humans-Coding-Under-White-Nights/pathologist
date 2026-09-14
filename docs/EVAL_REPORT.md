@@ -68,6 +68,227 @@ Reproduce with a release build and
   C++-slice probes are *not* in that set: they are `min` and `band` thresholds,
   sized to catch a collapse rather than to pin a value.
 
+**Re-verified 2026-09-13 (second review round: member arguments in direct
+initialization, parameterless members, confident variadic pruning, per-signature
+defaults):** measured against cfbf825 on the same machine and checkouts. Each
+corpus is bit-identical across two `--jobs 8` runs and one `--jobs 1` run; eval
+91/91 with the expectations re-captured; camera timing unchanged (6.52 s median
+wall on both).
+
+| Metric | hdf | hiview | camera |
+|---|---:|---:|---:|
+| Functions total | 12,601 → 12,601 | 10,742 → 10,653 | 24,189 → 23,960 |
+| Functions external | 2,348 → 2,348 | 2,911 → 2,822 | 5,016 → 4,787 |
+| Direct edges | 42,270 → 42,270 | 9,497 → 9,516 | 39,263 → 39,263 |
+| External edges | 28,722 → 28,724 | 19,799 → 20,105 | 52,829 → 54,245 |
+| Arg-flow edges | 66,258 → 66,258 | 10,581 → 10,598 | 29,048 → 29,024 |
+
+Almost all of it is one pattern: `std::lock_guard<std::mutex> lock(mutex_);`
+with a data member in the parentheses parsed as a declaration of a function
+`lock`. It now defines the object and calls its constructor. camera loses 194
+phantom `lock` functions (and `lock2`, `taskLock`, ...) and records 1,181
+`std::lock_guard::lock_guard`, 143 `std::unique_lock::unique_lock` and 9
+`std::shared_lock::shared_lock` calls, all external; `lock.unlock()` on such a
+guard is `std::unique_lock::unlock` now instead of a bare external `unlock`.
+hiview loses 58 `lock` phantoms and gains 239 `lock_guard` and 61 `unique_lock`
+calls; its `UsageEventCacher cacher(dbPath_)` constructs too, so the cacher's
+method calls resolve directly (+19 direct edges, +17 arg-flow rows). hdf gains
+one `unique_lock` and one `shared_lock` construction.
+
+Camera's arg-flow change is the variadic rule: the twelve
+`CameraNapiParamParser jsParamParser(env, info, obj, ...)` sites pass arguments
+of unknown type, so the variadic `(env, info, T*&, Args&...)` constructor is no
+longer pruned, and each site binds the object to `nativeObjPointer` instead of
+feeding the private `(env, info, size_t, T*&, asyncFunction)` it cannot call
+(three rows out, one in, per site). The parameterless-member and
+per-signature-defaults fixes move no corpus row.
+
+**Re-verified 2026-09-13 (variadic overloads, defaulted aggregates, local
+aliases):** measured against 92a643a on the same machine and checkouts. hdf and
+hiview are unchanged; eval 91/91 with camera's expectations re-captured.
+
+| camera metric | before → after |
+|---|---:|
+| Functions defined | 19,172 → 19,173 |
+| Direct edges | 39,265 → 39,263 |
+| Arg-flow edges | 29,050 → 29,048 |
+
+The new defined function is `CameraNapiParamParser::Next(T&, Args&...)`, which
+used to merge with `Next(T&)`: a variadic and a fixed declaration of one explicit
+arity are two overloads. No call edge or arg-flow row moves for it. The two lost
+direct edges, and their two `this` rows, are `StitchingTargetInfo{...}` and
+`StitchingCaptureInfo{...}`: both classes declare only `X() = default;`, so they
+are aggregates and the braces initialize their fields. No corpus site declares a
+function whose parameter names a local alias.
+
+A first cut of the variadic rule kept every variadic candidate that fits by
+arity, and camera showed why C++ ranks them last: NAPI listener units see two
+same-named `listener_base.h` headers (the cj one too, through name-based include
+resolution), so `ExecuteCallback(name, para)` had the fixed NAPI member and the
+cj pack template `ExecuteCallback(T const...)` as candidates, and 11 sites moved
+to the template. A variadic candidate now stays only when no fixed candidate of
+fitting arity can take the arguments (no pointer bound to an arithmetic
+parameter), which keeps `Log(p, p)` on `Log(void*, ...)` and those sites on the
+NAPI member.
+
+**Re-verified 2026-09-13 (prototype overloads, static members, direct
+initialization — follow-ups to #93 / #94):** release builds of the #93 / #94
+commit (fb4b122) and this change were compared on the same machine and
+checkouts, `--jobs 8`, 800,000-pop budget. Bit-reproducible on each corpus
+(three `--jobs 8` runs and one `--jobs 1` run); eval 91/91 with the
+re-captured expectations.
+
+| Metric | hdf before → after | hiview before → after | camera before → after |
+|---|---:|---:|---:|
+| Functions defined | 10,251 → 10,253 | 7,821 → 7,831 | 19,120 → 19,172 |
+| Functions external | 2,349 → 2,348 | 3,126 → 2,911 | 5,185 → 5,016 |
+| Direct edges | 42,256 → 42,270 | 9,293 → 9,497 | 38,531 → 39,265 |
+| Indirect edges | 4,826 → 4,825 | 88 → 90 | 182 → 135 |
+| External edges | 28,735 → 28,722 | 19,968 → 19,799 | 53,000 → 52,829 |
+| Arg-flow edges | 66,239 → 66,258 | 10,119 → 10,581 | 24,357 → 29,050 |
+| Diagnostics | 1,803 → 1,803 | 2,989 → 2,989 | 4,860 → 4,860 |
+
+Three faults, measured in two steps (the overload and static-member fixes, then direct initialization) so each delta has one cause.
+
+*Prototype overloads.* An in-class prototype lowered no parameters, so where
+only a class header was seen its overloads were one entry, and that entry
+merged into whichever same-named definition came first. Declarations now
+record their explicit arity and default-argument count. With the static-member
+fix, this step removes 522 camera direct edges and adds 50 (hiview −19 / +15,
+hdf +14). Every removed edge is an overload set's
+fan-out collapsing onto the overload the call fits: `input->Open()` reached
+all four `CameraInput::Open` overloads at one site, `Release(type)` reached
+`HSharedCaptureSession::Release()`, `GetSessionState()` reached
+`GetSessionState(State&)`, and a one-argument `OnLinkedResult(surface)`
+reached 15 two-parameter `*FilterLinkCallback::OnLinkedResult` overrides.
+Compared by caller, callee, resolution and call-site position, no call site in
+any corpus is left without an edge. The first version of the range filter
+turned `StringUtil::TrimStr(str)` into an external call, because the default
+`cTrim = ' '` lives on a prototype the definition never merged with
+(`string` beside `std::string`). Candidates now share the defaults of a
+same-arity candidate, and that site keeps its direct edge. hiview's
+`SysEventDocReader::Read(saveFunc)` reaches the one-argument
+`Read(ReadCallback)`, which calls the lambda: two indirect edges. The
+declaration-only probe moves hiview 17 → 22 and camera 40 → 52: overload sets
+where one overload is declared and another defined
+(`CameraManager::CreatePreviewOutput` has four declarations) no longer fold
+the declared one into another's body.
+
+*Static members.* `static` on a member defined in its class body was read as
+internal linkage, so a static member template's body never merged with its
+external prototype on the same line and the unit merge dropped it as a
+duplicate. That was hidden while prototypes merged with any arity (hdf's
+`Ast::WalkForward(callback)` bound to itself instead of the static
+`WalkForward(root, callback)`). Keeping those bodies raises functions_defined
+(hdf +2, hiview +10, camera +52). Bare calls to in-class static members stop
+being external stubs (`SharedMemQueue::GetNanoTime`, `HdfSBufTest::DataCompare`).
+The bodies' own calls appear too, among them camera's first `dlsym` edge
+(`LibManager::GetSymbol`).
+
+*Direct initialization.* `T w(a, b);` with variables or functions in the
+parentheses parsed as a function declaration: it registered a phantom function
+`w`, constructed nothing, and `w.m()` became an indirect call to the phantom.
+All lost indirect edges are such phantoms: camera's 47 calls on
+`FuzzedDataProvider fdp(data, size)`, hdf's `buffer1`, and hiview's two
+`controller` calls, offset by two lambdas `LogStoreEx::GetLogFiles` now
+receives. The phantoms are also most of the fall in external functions
+(hiview −215, camera −169), and all seven sites of the template-syntax probe
+(`fdp->ConsumeIntegral<T>`), which now join the unresolved-template probe
+(1157 → 1200). This step adds 1,206 camera direct edges (hiview 208) and removes
+none, and adds 4,569 camera arg-flow rows. 3,558 of the rows are on `CameraNapiParamParser jsParamParser(env, info, ...)`, the
+NAPI entry idiom, which now constructs. The 527 rows that disappear are mostly
+the same rows under renamed temporaries (`_gep938` → `_gep944`), since fewer
+phantoms allocate fewer variables.
+
+Timing, `--jobs 8`, medians of interleaved runs (14 pairs for hdf, 6 for the
+others):
+
+| Corpus | Wall before → after | User CPU before → after |
+|---|---:|---:|
+| hdf | 4.51 s → 4.16 s | 9.79 s → 9.44 s |
+| hiview | 1.68 s → 1.67 s | 4.46 s → 4.46 s |
+| camera | 6.51 s → 6.50 s | 18.20 s → 18.26 s |
+
+hdf's analyze phase is bimodal on this machine for both binaries, and the
+medians caught more fast-mode runs after the change. Within each mode it is
+still faster (0.8 s → 0.7 s and 1.3 s → 1.1 s), consistent with the overload
+fan-out it no longer solves. Carrying real parameter variables on every
+prototype was tried first and rejected: camera variables +31% and index time
+5.8 s → 6.4 s, and strict type comparison left 222 prototypes unmerged, because
+one type is spelled with different qualification in different units.
+
+**Re-verified 2026-09-13 (arguments bound past the implicit `this`, #93 /
+#94):** fresh release builds of `master` (d15d089) and the branch were
+compared on the same machine against the three clean pinned checkouts under
+`/private/tmp/corpora`, `--jobs 8`, 800,000-pop budget. The branch index is
+bit-reproducible: on each corpus the SQLite dump (minus `analysis_run`) is
+byte-identical across three `--jobs 8` runs and one `--jobs 1` run. Eval 91/91
+with the re-captured expectations; `master` passes 91/91 against the previous
+ones.
+
+| Metric | hdf `master` → branch | hiview `master` → branch | camera `master` → branch |
+|---|---:|---:|---:|
+| Functions defined | 10,251 → 10,251 | 7,821 → 7,821 | 19,120 → 19,120 |
+| Functions external | 2,349 → 2,349 | 3,126 → 3,126 | 5,185 → 5,185 |
+| Direct edges | 42,256 → 42,256 | 9,293 → 9,293 | 38,531 → 38,531 |
+| Indirect edges | 4,826 → 4,826 | 24 → 88 | 108 → 182 |
+| External edges | 28,735 → 28,735 | 19,968 → 19,968 | 53,000 → 53,000 |
+| Arg-flow edges | 66,267 → 66,239 | 10,125 → 10,119 | 24,933 → 24,357 |
+| Diagnostics | 1,803 → 1,803 | 2,989 → 2,989 | 4,860 → 4,860 |
+
+A call site's argument positions are the callee's parameter positions, and a
+member function's parameter 0 is `this`. Method calls (`recv.m(a)`, `p->m(a)`,
+implicit `m(a)`, `Base::m(a)`, `Cls::Static(a)`, functors) and member
+initializers (`Base(a)`, `m_(a)`) recorded their first argument at position 0,
+so it was wired into `this` and nothing handed to a method reached the
+method's parameter. Compared by caller, callee, resolution and call-site
+position, no corpus loses a call edge, and the only edges gained are indirect.
+
+hiview gains 64 indirect edges and camera 74, all lambdas handed to a method
+that calls its parameter: hiview's `UCDecorator::Invoke` (30 collector
+lambdas), `RestorableDbStore::AdaptRdbOpt` (9) and `TraceDecorator::Invoke`
+(3), plus 22 across `SysEventQueryWrapper`, `PeriodInfoFileOperator`,
+`SysEventDocReader`, `EventReadHandler`, `EventLoggerConfig`, `EventLoop` and
+`EventJsonParser`; camera's `CameraFunctionsNapi::HandleQuery` (26),
+`ListenerBase::ExecuteCallbackScopeSafe` (18), `StateMachine::StateGuard` (11),
+`Pipeline::SubmitJobOnce` (10) and `MovieFileControllerBase::StatusTransfer`
+(4), plus 5 in `FixedSizeList::find_if`,
+`CameraListenerManager::TriggerListener` and
+`CameraRoateParamSignTool::ForEachFileSegment`. hdf is almost all C and gains
+nothing.
+
+The arg-flow rows that wired an explicit argument into `this` are gone — hdf
+4,096, hiview 3,412, camera 11,134 — and rows on the parameters those
+arguments belong to replace them: hdf 6,803 rows out and 6,775 in, hiview
+5,439 and 5,433, camera 16,337 and 15,761. A call whose first argument
+resolves to a variable and whose last does not (`f(p, 0)`) loses a row this
+way, and the reverse gains one. Camera falls further because 227 of its sites
+are bound to a callee with fewer parameters than the call passes, 221 of them
+by a pre-existing overload fault this change does not touch:
+`ListenerBase::ExecuteCallback(name, para)` reaches a one-parameter entry and
+`captureSession_->GetExposureMode(exposureMode)` reaches
+`GetExposureMode()`. The parent wired the first argument into that callee's
+`this`; there is no parameter for it now, and the call edge is the same.
+
+Qualified calls also count and rank overloads without `this`
+(`Base::m(cb, 1)` picks `m(Callback, int)` rather than `m(int)`); that moves
+no pinned corpus metric.
+
+Timing, `--jobs 8`, medians of interleaved runs (14 pairs for hdf, whose wall
+time is bimodal on this machine for both binaries — about 4.0 s or 4.5 s — and
+6 pairs for the others):
+
+| Corpus | Wall `master` → branch | User CPU `master` → branch |
+|---|---:|---:|
+| hdf | 4.53 s → 4.51 s (−0.4%) | 9.72 s → 9.78 s (+0.6%) |
+| hiview | 1.65 s → 1.66 s (+0.6%) | 4.41 s → 4.44 s (+0.7%) |
+| camera | 6.58 s → 6.62 s (+0.6%) | 18.06 s → 18.20 s (+0.8%) |
+
+hdf's index (2.60 s) and analyze (1.30 s) phase medians are identical on both
+binaries. The lowering change is an index shift on arguments already
+collected; the only new lookup, the owner class of a parameterless callee, runs
+only for a C++ call with arguments resolved to such an entry.
+
 **Re-verified 2026-09-13 (type-name lookup, #90 / #91 / #92):** fresh
 release builds of `master` (8175eea) and the branch were compared on the same
 machine against the three clean pinned checkouts under `/private/tmp/corpora`,
