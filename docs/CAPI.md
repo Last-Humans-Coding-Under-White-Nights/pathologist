@@ -251,3 +251,19 @@ cc crates/trace-capi/examples/ctrace.c \
 LD_LIBRARY_PATH=target/debug ./target/ctrace analyze tests/fixtures/direct_call -o /tmp/t.db
 LD_LIBRARY_PATH=target/debug ./target/ctrace inspect /tmp/t.db callgraph --file main.c --line 1
 ```
+
+## Documentation
+
+Generate the Doxygen API reference:
+
+```bash
+doxygen Doxyfile
+# -> target/doxygen/html/index.html
+```
+
+Or from within the crate directory:
+
+```bash
+cd crates/trace-capi && doxygen
+# -> target/doxygen/html/index.html
+```
