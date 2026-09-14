@@ -994,8 +994,8 @@ C++-aware only where it must be — everything else reuses the C machinery.
 
 Known C++ imprecision (in addition to the general list below):
 
-- Lambda **captures** are unmodeled (including `[this]`); the lambda body
-  still participates in the call graph as a nested function.
+- Lambda **captures** (`[this]`, `[&]`, `[=]`, `[var]`, `[init = expr]`)
+  bind the enclosing scope's variables and `this` into the lambda body.
 - `auto` inference needs a declaration visible in the translation unit;
   it does not infer returns from bodies, substitute general templates, or
   infer function-pointer call results. Trailing `auto` return declarations

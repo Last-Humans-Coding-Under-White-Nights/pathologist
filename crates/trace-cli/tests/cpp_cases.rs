@@ -1655,6 +1655,262 @@ fn cpp_lambda_is_addr_of_fn_and_indirect_call() {
 }
 
 #[test]
+fn cpp_lambda_captures_resolve() {
+    let root = fixture("cpp_lambda_captures");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    // 1. Explicit by-value capture [f1] calling target1
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_explicit_val::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "explicitly captured [f1] should call target1"
+    );
+
+    // 2. Explicit by-reference capture [&f2] calling target2
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_explicit_ref::$lambda")
+                && fn_name(&program, e.callee) == "target2"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "explicitly captured [&f2] should call target2"
+    );
+
+    // 3. Default by-reference capture [&] calling target3
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_default_ref::$lambda")
+                && fn_name(&program, e.callee) == "target3"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "default-captured [&] should call target3"
+    );
+
+    // 4. Default by-value capture [=] calling target4
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_default_val::$lambda")
+                && fn_name(&program, e.callee) == "target4"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "default-captured [=] should call target4"
+    );
+
+    // 5. Mixed: default ref, except f1 by value [&, f1]
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_mixed_ref_val::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }) && analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_mixed_ref_val::$lambda")
+                && fn_name(&program, e.callee) == "target2"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "mixed capture [&, f1] should call target1 and target2"
+    );
+
+    // 6. Mixed: default val, except f2 by ref [=, &f2]
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_mixed_val_ref::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }) && analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_mixed_val_ref::$lambda")
+                && fn_name(&program, e.callee) == "target2"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "mixed capture [=, &f2] should call target1 and target2"
+    );
+
+    // 7. Init-capture [cb = f5] calling target5
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_init_capture::$lambda")
+                && fn_name(&program, e.callee) == "target5"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "init-captured [cb = f5] should call target5"
+    );
+
+    // 8. [this] in Derived calling Derived::derivedAction and inherited Base::baseAction
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Derived::testThisCapture::$lambda")
+                && fn_name(&program, e.callee) == "Derived::derivedAction"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "[this] capture should call Derived::derivedAction"
+    );
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Derived::testThisCapture::$lambda")
+                && fn_name(&program, e.callee) == "Base::baseAction"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "[this] capture should call Base::baseAction"
+    );
+
+    // 9. [*this] in Derived calling Derived::derivedAction
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Derived::testStarThisCapture::$lambda")
+                && fn_name(&program, e.callee) == "Derived::derivedAction"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "[*this] capture should call Derived::derivedAction"
+    );
+
+    // 10. [&] in Derived method capturing this
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Derived::testDefaultCapturesThis::$lambda")
+                && fn_name(&program, e.callee) == "Derived::derivedAction"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "[&] default capture in member method should capture this and call Derived::derivedAction"
+    );
+
+    // 11. [] non-capturing lambda inside member method calling global target8
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Derived::testNoCapture::$lambda")
+                && fn_name(&program, e.callee) == "target8"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "non-capturing lambda should call global target8"
+    );
+    assert!(
+        !analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Derived::testNoCapture::$lambda")
+                && fn_name(&program, e.callee).contains("Derived::")
+        }),
+        "non-capturing lambda must not call any Derived member"
+    );
+
+    // 12. Nested lambdas
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_nested_lambdas::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "nested lambda should access outer captured f1"
+    );
+
+    // 13. Init-capture by reference [&cb = f9] calling target9
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_init_capture_ref::$lambda")
+                && fn_name(&program, e.callee) == "target9"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "reference init-capture [&cb = f9] should call target9"
+    );
+
+    // 14. Captured object calling method Worker::doWork
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_captured_object::$lambda")
+                && fn_name(&program, e.callee) == "Worker::doWork"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "captured object by ref should call Worker::doWork"
+    );
+
+    // 15. Captured pointer calling method Worker::doWork
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_captured_pointer::$lambda")
+                && fn_name(&program, e.callee) == "Worker::doWork"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "captured pointer should call Worker::doWork"
+    );
+
+    // 16. Captured variable passed as argument to helper_call
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_captured_arg_pass::$lambda")
+                && fn_name(&program, e.callee) == "helper_call"
+        }),
+        "captured variable passed to helper_call should record call edge"
+    );
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller) == "helper_call"
+                && fn_name(&program, e.callee) == "target11"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "helper_call receiving captured function pointer should call target11"
+    );
+
+    // 17. Service class member access and calls inside lambda
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Service::testMemberAccess::$lambda")
+                && fn_name(&program, e.callee) == "Service::process"
+        }),
+        "lambda capturing this should call Service::process"
+    );
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Service::testMemberAccess::$lambda")
+                && fn_name(&program, e.callee) == "Worker::doWork"
+        }),
+        "lambda capturing this should call member worker.doWork"
+    );
+
+    // 18. Lambda returning a function pointer
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller) == "test_lambda_returns_fn"
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "caller of lambda returning function pointer should resolve call to target1"
+    );
+
+    // 19. Multiple captures list [f1, &f2, f3, &f4]
+    for target in &["target1", "target2", "target3", "target4"] {
+        assert!(
+            analysis.call_edges.iter().any(|e| {
+                fn_name(&program, e.caller).contains("test_multi_captures::$lambda")
+                    && fn_name(&program, e.callee) == *target
+                    && e.resolution == ResolutionKind::Indirect
+            }),
+            "multi-capture list should resolve call to {}",
+            target
+        );
+    }
+
+    // 20. Mutable lambda calling target1
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_mutable_lambda::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "mutable lambda should call target1"
+    );
+
+    // 21. Multi-level nested lambdas (outer -> mid -> inner)
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_multi_nested_lambdas")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "deeply nested lambda should resolve call to target1"
+    );
+}
+
+#[test]
 fn cpp_functor_operator_call_resolves() {
     let root = fixture("cpp_callable");
     let program = build_program(&root, &default_opts(&root)).expect("build");
