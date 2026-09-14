@@ -1754,7 +1754,9 @@ impl PreprocessorState {
                     // compiler spellings are syntax-only metadata; remove the
                     // balanced group at the same rescan boundary that sees
                     // attributes produced by another macro's replacement.
-                    if self.macros.get(name).is_none() || tok.is_hidden(name) {
+                    if is_compiler_attribute(name)
+                        && (tok.is_hidden(name) || self.macros.get(name).is_none())
+                    {
                         if let Some(end) = self.elide_attribute_group(tokens, i)? {
                             i = end;
                             continue;
@@ -1846,7 +1848,9 @@ impl PreprocessorState {
             }
             if self.is_active() {
                 if let TokenKind::Identifier(name) = &tok.kind {
-                    if self.macros.get(name).is_none() || tok.is_hidden(name) {
+                    if is_compiler_attribute(name)
+                        && (tok.is_hidden(name) || self.macros.get(name).is_none())
+                    {
                         if let Some(end) = self.elide_attribute_group(tokens, i)? {
                             i = end;
                             continue;
@@ -2953,19 +2957,17 @@ fn at_beginning_of_line(tokens: &[Token], i: usize) -> bool {
     matches!(tokens[i - 1].kind, TokenKind::Newline)
 }
 
+/// Identify reserved attribute spellings before querying the macro table.
+fn is_compiler_attribute(name: &str) -> bool {
+    matches!(name, "__attribute__" | "__attribute" | "__declspec")
+}
+
 /// Return the index after a balanced `__attribute__((...))` or
 /// `__declspec(...)` group. GNU attributes require their characteristic
 /// double parenthesis so an unrelated identifier call is not discarded.
 fn attribute_group_end(tokens: &[Token], start: usize) -> Option<usize> {
     let name = match tokens.get(start).map(|tok| &tok.kind) {
-        Some(TokenKind::Identifier(name))
-            if matches!(
-                name.as_str(),
-                "__attribute__" | "__attribute" | "__declspec"
-            ) =>
-        {
-            name.as_str()
-        }
+        Some(TokenKind::Identifier(name)) if is_compiler_attribute(name) => name.as_str(),
         _ => return None,
     };
     attribute_group_end_after_name(tokens, start + 1, name)
@@ -3000,18 +3002,6 @@ fn attribute_group_end_after_name(tokens: &[Token], mut open: usize, name: &str)
         }
     }
 
-    let declaration_start = tokens[..open]
-        .iter()
-        .rposition(|token| matches!(token.kind, TokenKind::Punct(";" | "{" | "}")))
-        .map_or(0, |index| index + 1);
-    let enclosing_depth = tokens[declaration_start..open]
-        .iter()
-        .fold(0usize, |depth, token| match token.kind {
-            TokenKind::Punct("(") => depth + 1,
-            TokenKind::Punct(")") => depth.saturating_sub(1),
-            TokenKind::Punct(";" | "{" | "}") => 0,
-            _ => depth,
-        });
     let mut depth = 0usize;
     for (offset, tok) in tokens.iter().enumerate().skip(open) {
         match tok.kind {
@@ -3019,14 +3009,6 @@ fn attribute_group_end_after_name(tokens: &[Token], mut open: usize, name: &str)
             TokenKind::Punct(")") => {
                 depth = depth.checked_sub(1)?;
                 if depth == 0 {
-                    let next = tokens[offset + 1..]
-                        .iter()
-                        .find(|t| !matches!(t.kind, TokenKind::Newline));
-                    if enclosing_depth > 0
-                        && next.is_some_and(|t| matches!(t.kind, TokenKind::Punct(";" | "{" | "}")))
-                    {
-                        return None;
-                    }
                     return Some(offset + 1);
                 }
             }
@@ -3044,9 +3026,7 @@ fn compiler_attribute_marker(tokens: &[Token]) -> Option<&str> {
         _ => Some(""),
     });
     let name = significant.next()?;
-    if significant.next().is_none()
-        && matches!(name, "__attribute__" | "__attribute" | "__declspec")
-    {
+    if significant.next().is_none() && is_compiler_attribute(name) {
         Some(name)
     } else {
         None
@@ -9157,10 +9137,15 @@ int from_late;
     fn malformed_attributes_do_not_consume_declaration_boundaries() {
         for source in [
             "int x __attribute__((used; int y = (1);\n",
-            "void foo(int x __attribute__((used) ) { int y; }\n",
+            "void foo(int x __attribute__((used) { int y; }\n",
+            "int x __declspec(align(16); int y;\n",
         ] {
             let result = preprocess_string(source, Path::new("t.c"), &PreprocessOptions::new());
-            assert!(result.output.contains("__attribute__"), "{}", result.output);
+            assert!(
+                result.output.contains("__attribute__") || result.output.contains("__declspec"),
+                "{}",
+                result.output
+            );
             assert!(result.output.contains("int y"), "{}", result.output);
         }
     }

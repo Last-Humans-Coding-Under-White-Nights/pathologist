@@ -11,6 +11,10 @@ Compiler attribute normalization removes balanced noise groups only. GNU
 Attribute arguments and chained object aliases are expanded before deciding
 whether a group is noise. Groups containing directives are processed normally;
 malformed groups stop at declaration boundaries instead of consuming later code.
+Balancing is local to the attribute group: a surrounding `for` initializer or
+C++ lambda argument can legitimately leave an enclosing parenthesis open before
+the next semicolon or brace. Elision never consumes that following delimiter;
+an unclosed surrounding declaration remains a parser error after normalization.
 Newlines and expansion origins remain available to the LineMap.
 
 ```rust
