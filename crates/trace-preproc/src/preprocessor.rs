@@ -56,11 +56,17 @@ pub struct PreprocessResult {
     /// One path can appear more than once: a header included twice under
     /// different macros expands twice, and both expansions belong to this
     /// unit (#56). Sorted, so the record does not depend on hash order.
+    ///
+    /// With an [`Self::expansion_journal`], a variant not yet stored is
+    /// recorded by a handle that `ExpansionJournal::commit` makes an index.
     pub replayed_variants: Vec<(PathBuf, usize)>,
     /// Every conditional chain this run evaluated or skipped, in the order
     /// their opening directives were met, headers included. Empty unless
     /// `PreprocessOptions::record_conditionals` is set (#57).
     pub conditionals: Vec<ConditionalChain>,
+    /// Present when the run deferred publishing
+    /// (`PreprocessOptions::defer_expansion_publish`).
+    pub expansion_journal: Option<crate::ExpansionJournal>,
 }
 
 #[derive(Debug)]
@@ -194,6 +200,9 @@ struct PreprocessorState {
     /// Non-zero while a `-include` header is being spliced in. Those run with
     /// only the root on `include_stack`, but are nested includes all the same.
     forced_include_depth: u32,
+    /// Under `defer_expansion_publish`, where this run's cache reads and
+    /// writes go.
+    journal: Option<crate::ExpansionJournal>,
 }
 
 /// One level of `#if`/`#elif`/`#else` nesting. A per-level bool is not
@@ -292,7 +301,17 @@ impl PreprocessorState {
             include_search_cache: RefCell::new(FxHashMap::default()),
             shared_directory_results,
             forced_include_depth: 0,
+            journal: None,
         };
+        if state.opts.defer_expansion_publish
+            && !state.opts.frozen_expansion_cache
+            && state.opts.include_expansion_cache.is_some()
+        {
+            state.journal = Some(crate::ExpansionJournal::new(
+                state.opts.max_expansion_variants,
+                language,
+            ));
+        }
         let warm = state.opts.shared_macros.is_some();
         if let Some(shared) = &state.opts.shared_macros {
             if let Ok(guard) = shared.read() {
@@ -389,13 +408,15 @@ impl PreprocessorState {
     /// two environments that disagree about it can produce different
     /// expansions of the same header.
     fn binding_hash(&mut self, name: &str) -> Option<u64> {
-        let def = self.macros.get(name)?;
-        if let Some(h) = self.macro_hashes.get(name) {
-            return Some(*h);
+        self.env().binding_hash(name)
+    }
+
+    fn env(&mut self) -> MacroEnv<'_> {
+        MacroEnv {
+            macros: &self.macros,
+            fallbacks: &self.fallback_macros,
+            hashes: &mut self.macro_hashes,
         }
-        let h = hash_macro_binding(def, self.fallback_macros.contains(name));
-        self.macro_hashes.insert(name.to_string(), h);
-        Some(h)
     }
 
     /// Is `name` already settled for every open cache frame?
@@ -548,35 +569,6 @@ impl PreprocessorState {
         }
     }
 
-    /// Does `deps` describe the environment this run is in right now?
-    fn fingerprint_matches(&mut self, deps: &crate::MacroFingerprint) -> bool {
-        if deps.incompatible {
-            return false;
-        }
-        for (name, hash) in &deps.defined {
-            if self.binding_hash(name) != Some(*hash) {
-                return false;
-            }
-        }
-        if deps.undefined.is_empty() {
-            return true;
-        }
-        // Whichever side is smaller: an entry can depend on thousands of
-        // names being unbound (every plain identifier in the header), while
-        // a unit's own table is usually far smaller than that.
-        if deps.undefined.len() <= self.macros.len() {
-            !deps
-                .undefined
-                .iter()
-                .any(|name| self.macros.contains_key(name.as_ref()))
-        } else {
-            !self
-                .macros
-                .keys()
-                .any(|name| deps.undefined.contains(name.as_str()))
-        }
-    }
-
     /// Seed the language's own predefined macros (see
     /// [`crate::predefined_macros`]). Real definitions, not fallbacks: a
     /// C++ unit's `#ifdef __cplusplus` must be true. With `missing_only`
@@ -644,8 +636,11 @@ impl PreprocessorState {
         self.log_macro_op(MacroOp::Define(name.clone(), def.clone()));
         self.note_local_binding(&name);
         self.macro_hashes.remove(&name);
-        self.fallback_macros.remove(&name);
-        self.macros.insert(name.clone(), def.clone());
+        let was_fallback = self.fallback_macros.remove(&name);
+        let before = self.macros.insert(name.clone(), def.clone());
+        if let Some(journal) = self.journal.as_mut() {
+            journal.record_macro_change(&name, before.map(|def| (def, was_fallback)));
+        }
         if self.opts.accumulate_macros {
             if let Some(shared) = &self.opts.shared_macros {
                 if let Ok(mut guard) = shared.write() {
@@ -659,8 +654,11 @@ impl PreprocessorState {
         self.log_macro_op(MacroOp::Undef(name.to_string()));
         self.note_local_binding(name);
         self.macro_hashes.remove(name);
-        self.fallback_macros.remove(name);
-        self.macros.shift_remove(name);
+        let was_fallback = self.fallback_macros.remove(name);
+        let before = self.macros.shift_remove(name);
+        if let Some(journal) = self.journal.as_mut() {
+            journal.record_macro_change(name, before.map(|def| (def, was_fallback)));
+        }
         if self.opts.accumulate_macros {
             if let Some(shared) = &self.opts.shared_macros {
                 if let Ok(mut guard) = shared.write() {
@@ -1210,8 +1208,8 @@ impl PreprocessorState {
     /// them is not observable, and the append-only list keeps every index
     /// already handed out valid. Past the cap nothing is stored and later
     /// consumers expand the header themselves, which costs time and changes
-    /// no output.
-    fn publish_variant(&self, canonical: PathBuf, entry: crate::IncludeExpansion) {
+    /// no output. Under `defer_expansion_publish` the journal keeps it back.
+    fn publish_variant(&mut self, canonical: PathBuf, entry: crate::IncludeExpansion) {
         // Keep incompatible expansions only in entry_used for this run's
         // text composition; they cannot serve any consumer or use a slot.
         if entry.deps.incompatible {
@@ -1220,42 +1218,45 @@ impl PreprocessorState {
         let Some(cache) = self.opts.include_expansion_cache.as_ref() else {
             return;
         };
+        let key = (canonical, self.language);
+        if let Some(journal) = self.journal.as_mut() {
+            journal.publish(key, cache, &self.opts.expansion_journals_ahead, entry);
+            return;
+        }
         let Ok(mut guard) = cache.write() else {
             return;
         };
-        let variants = guard.entry((canonical, self.language)).or_default();
-        let signature = entry.deps.signature();
-        if variants.len() >= self.opts.max_expansion_variants
-            || variants.iter().any(|v| v.deps.signature() == signature)
-        {
-            return;
+        let variants = guard.entry(key).or_default();
+        let signatures = variants.iter().map(|v| v.signature);
+        if crate::options::admits_variant(
+            signatures,
+            self.opts.max_expansion_variants,
+            entry.signature,
+        ) {
+            variants.push(entry);
         }
-        variants.push(entry);
     }
 
     /// The stored expansion of `canonical` whose fingerprint this run's
-    /// macro environment satisfies, if any.
-    ///
-    /// Matching needs `&mut self` (it memoizes binding hashes), so the
-    /// fingerprints are lifted out under one read lock and the winner
-    /// re-read under a second. That is sound because [`ExpansionVariants`]
-    /// is append-only: a concurrent writer can lengthen the list, never
-    /// move what an index already refers to.
+    /// macro environment satisfies, if any, and the variant handle to record
+    /// for it: its index, or under `defer_expansion_publish` whatever the
+    /// journal hands out.
     fn matching_variant(&mut self, canonical: &Path) -> Option<(usize, crate::IncludeExpansion)> {
         let key = (canonical.to_path_buf(), self.language);
-        let deps: Vec<Arc<crate::MacroFingerprint>> = {
-            let cache = self.opts.include_expansion_cache.as_ref()?;
-            let guard = cache.read().ok()?;
-            guard
-                .get(&key)?
-                .iter()
-                .map(|e| Arc::clone(&e.deps))
-                .collect()
-        };
-        let at = deps.iter().position(|d| self.fingerprint_matches(d))?;
         let cache = self.opts.include_expansion_cache.as_ref()?;
+        let mut env = MacroEnv {
+            macros: &self.macros,
+            fallbacks: &self.fallback_macros,
+            hashes: &mut self.macro_hashes,
+        };
+        if let Some(journal) = self.journal.as_mut() {
+            let ahead = &self.opts.expansion_journals_ahead;
+            return journal.lookup(&key, cache, ahead, |deps| env.satisfies(deps));
+        }
         let guard = cache.read().ok()?;
-        Some((at, guard.get(&key)?.get(at).cloned()?))
+        let variants = guard.get(&key)?;
+        let at = variants.iter().position(|e| env.satisfies(&e.deps))?;
+        Some((at, variants[at].clone()))
     }
 
     fn is_cacheable_header(path: &Path) -> bool {
@@ -1669,6 +1670,7 @@ impl PreprocessorState {
                             nested_variants.push((nested_path, nested_at));
                         }
                     }
+                    let signature = deps.signature();
                     let entry = crate::IncludeExpansion {
                         text: composed.into(),
                         files: Arc::new(new_files),
@@ -1678,6 +1680,8 @@ impl PreprocessorState {
                         deps: Arc::new(deps),
                         guards: Arc::new(guards),
                         nested_variants: Arc::new(nested_variants),
+                        signature,
+                        id: crate::journal::next_expansion_id(),
                     };
                     self.entry_used.insert(canonical.clone(), entry.clone());
                     self.publish_variant(canonical, entry);
@@ -2816,6 +2820,10 @@ impl PreprocessorState {
     }
 
     fn finish(self) -> PreprocessResult {
+        let mut journal = self.journal;
+        if let Some(journal) = journal.as_mut() {
+            journal.finish(self.macros, self.fallback_macros);
+        }
         PreprocessResult {
             output: self.output,
             line_map: self.line_map,
@@ -2831,6 +2839,7 @@ impl PreprocessorState {
                 vs
             },
             conditionals: self.conditionals,
+            expansion_journal: journal,
         }
     }
 }
@@ -4411,11 +4420,55 @@ fn defined_operand(toks: &[Token], i: usize) -> (Option<&str>, usize) {
     }
 }
 
+/// A run's macro table, for reading bindings and testing fingerprints
+/// against it, with the run's memo of binding hashes.
+struct MacroEnv<'a> {
+    macros: &'a MacroTable,
+    fallbacks: &'a FxHashSet<String>,
+    /// Memoized `hash_macro_binding` per name, invalidated by `insert_macro`
+    /// / `remove_macro`.
+    hashes: &'a mut FxHashMap<String, u64>,
+}
+
+impl MacroEnv<'_> {
+    /// Content hash of what `name` is currently bound to, or `None` when it
+    /// is unbound.
+    fn binding_hash(&mut self, name: &str) -> Option<u64> {
+        let def = self.macros.get(name)?;
+        if let Some(h) = self.hashes.get(name) {
+            return Some(*h);
+        }
+        let h = hash_macro_binding(def, self.fallbacks.contains(name));
+        self.hashes.insert(name.to_string(), h);
+        Some(h)
+    }
+
+    /// Does `deps` describe this environment?
+    fn satisfies(&mut self, deps: &crate::MacroFingerprint) -> bool {
+        let macros = self.macros;
+        deps.satisfied_by(
+            |name| self.binding_hash(name),
+            // Whichever side is smaller: an entry can depend on thousands of
+            // names being unbound (every plain identifier in the header),
+            // while a unit's own table is usually far smaller than that.
+            |undefined| {
+                if undefined.len() <= macros.len() {
+                    undefined
+                        .iter()
+                        .any(|name| macros.contains_key(name.as_ref()))
+                } else {
+                    macros.keys().any(|name| undefined.contains(name.as_str()))
+                }
+            },
+        )
+    }
+}
+
 /// Content hash of a macro binding, for [`crate::MacroFingerprint`].
 /// Hashes what a consumer could observe: the replacement token stream
 /// (spelling and adjacency, which is all `#` and `##` depend on), the
 /// parameter list, and whether the name is only a builtin fallback.
-fn hash_macro_binding(def: &MacroDef, fallback: bool) -> u64 {
+pub(crate) fn hash_macro_binding(def: &MacroDef, fallback: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     fallback.hash(&mut h);

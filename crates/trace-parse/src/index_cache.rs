@@ -3,7 +3,8 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use trace_preproc::{
-    preprocess_file, Diagnostic, IncludeExpansion, Language, LineMap, PreprocessOptions,
+    preprocess_file, Diagnostic, ExpansionCache, ExpansionJournal, IncludeExpansion, Language,
+    LineMap, PreprocessOptions,
 };
 
 /// Preprocessed text plus its origin map for one canonical file path.
@@ -83,11 +84,20 @@ impl IndexSourceCache {
             }
         }
 
-        let src = Arc::new(read_index_source(path, graph, eff_opts)?);
-        if let Ok(mut guard) = self.inner.write() {
-            guard.entry(canonical).or_insert_with(|| Arc::clone(&src));
-        }
+        let src = Arc::new(read_index_source(path, graph, eff_opts)?.0);
+        self.store(canonical, Arc::clone(&src));
         Ok(src)
+    }
+
+    /// Store `src` as the text of `path`, unless an entry is already there.
+    pub fn insert(&self, path: &Path, graph: &IncludeGraph, src: PreprocessedSource) {
+        self.store(graph.intern_path(path), Arc::new(src));
+    }
+
+    fn store(&self, canonical: PathBuf, src: Arc<PreprocessedSource>) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.entry(canonical).or_insert(src);
+        }
     }
 
     /// Preprocess `path` without storing the result here, for the side
@@ -98,12 +108,16 @@ impl IndexSourceCache {
     /// that language's lexer may not see what this one reports (a `#` line
     /// inside a C++ raw string is a directive in C), so the caller forwards
     /// the returned `diagnostics`.
+    ///
+    /// The journal is `Some` when `eff_opts` defers publishing and the source
+    /// was preprocessed; the discovery pass commits it, then stores the
+    /// source with [`Self::insert`].
     pub fn preprocess_uncached(
         &self,
         path: &Path,
         graph: &IncludeGraph,
         eff_opts: &PreprocessOptions,
-    ) -> Result<PreprocessedSource, String> {
+    ) -> Result<(PreprocessedSource, Option<ExpansionJournal>), String> {
         read_index_source(path, graph, eff_opts)
     }
 
@@ -212,6 +226,24 @@ impl PreprocessedSource {
         }
     }
 
+    /// Commit the deferred run that produced this source (see
+    /// [`ExpansionJournal::commit`]), turning the variants it recorded into
+    /// indices. False, changing nothing, when the run does not stand.
+    pub(crate) fn commit(&mut self, journal: &ExpansionJournal, cache: &ExpansionCache) -> bool {
+        let mut replayed: Vec<(PathBuf, usize)> = self
+            .replayed_variants
+            .iter()
+            .flat_map(|(path, variants)| variants.iter().map(|v| (path.clone(), *v)))
+            .collect();
+        if !journal.commit(cache, &mut replayed) {
+            return false;
+        }
+        // Sorted, as a publishing run's record is (`group_variants`).
+        replayed.sort();
+        self.replayed_variants = Arc::new(group_variants(replayed));
+        true
+    }
+
     /// A source indexed as-is: tree-sitter positions already refer to
     /// original locations, and nothing was preprocessed that could report.
     fn raw(text: Arc<str>) -> Self {
@@ -232,24 +264,25 @@ fn read_index_source(
     path: &Path,
     graph: &IncludeGraph,
     eff_opts: &PreprocessOptions,
-) -> Result<PreprocessedSource, String> {
+) -> Result<(PreprocessedSource, Option<ExpansionJournal>), String> {
     let canonical = graph.intern_path(path);
     if !should_preprocess(path, eff_opts, graph) {
         if let Some(s) = graph.source_cache.get(&canonical) {
-            return Ok(PreprocessedSource::raw(Arc::clone(s)));
+            return Ok((PreprocessedSource::raw(Arc::clone(s)), None));
         }
         return std::fs::read_to_string(path)
-            .map(|s| PreprocessedSource::raw(Arc::from(s)))
+            .map(|s| (PreprocessedSource::raw(Arc::from(s)), None))
             .map_err(|e| e.to_string());
     }
-    let preproc_result = preprocess_file(&canonical, eff_opts).map_err(|e| e.to_string())?;
+    let mut preproc_result = preprocess_file(&canonical, eff_opts).map_err(|e| e.to_string())?;
+    let journal = preproc_result.expansion_journal.take();
     // Keep partial output even when preprocessing stopped mid-file. A stop
     // usually happens inside ONE nested header; discarding everything and
     // parsing raw source instead silently drops every `#include`d declaration
     // from the unit (328/440 TUs on a real HDF tree) and feeds the parser
     // unexpanded function-like macros, which is strictly less sound than a
     // truncated-but-consistent prefix (spans stay LineMap-mappable).
-    Ok(PreprocessedSource {
+    let src = PreprocessedSource {
         text: Arc::from(preproc_result.output),
         line_map: Arc::new(preproc_result.line_map),
         included_headers: Arc::new(preproc_result.included_headers),
@@ -258,7 +291,8 @@ fn read_index_source(
         language: preproc_result.language,
         diagnostics: preproc_result.diagnostics,
         conditionals: preproc_result.conditionals,
-    })
+    };
+    Ok((src, journal))
 }
 
 /// `(path, variant)` pairs into one list of variants per path, in the order

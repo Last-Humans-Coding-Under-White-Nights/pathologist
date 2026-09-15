@@ -263,9 +263,83 @@ Indexing output must be identical across runs of the same tree. Two mechanisms g
 
 - **Macro warm pass** runs sequentially over TU-reachable headers in canonical (`index_order`) order, once per language the header is reachable in (C++ when a C++ TU reaches it or the extension is a C++ header spelling, C when a C TU reaches it; `PreprocessOptions::with_language` forces one language for everything). Each warm runs under a **fresh macro table** seeded only from command-line defines lexed in that language; the per-header final states are merged into a **per-language union table** — every warmed header lands in both unions, the same-language warm preferred and the other language's re-lexed for the destination as fallback (`MacroDef::relexed` spells the tokens back with their adjacency intact, which is all the two lexers disagree about), so each union stays the full macro superset (twin-guard dedup, orphan and PCH headers) whichever language reached a header — and each later phase hands a file the union (and option set) of the language it is lexed and parsed as. The first language warmed is the one the header is parsed as and feeds the source cache; a second only fills the expansion cache and its union. Reachability comes from the include graph and warming grows that graph (a `#include MACRO` is discovered only while preprocessing the header spelling it), so the pass runs to a **fixed point**: after each round the discovered edges are added, every header's language list is recomputed, and a header whose list changed — a `.h` first reached from C alone that a C++ unit turns out to reach through a macro include, and is therefore parsed as C++ — is evicted from the source cache and warmed again under a fresh table, so the text the parser sees is always the preprocess in the language it is parsed as. The root file of a preprocess run is never replayed from the expansion cache (a nested include may have cached it first); only nested `#include`s replay. Sharing one accumulating table across headers let include guards defined by earlier-warmed headers starve later headers' expansions (the starved text was then frozen into the expansion cache). Dedup between headers comes from the shared expansion cache, not from shared guard state.
 - **No output reads a hash-map iteration order.** This is not a mechanism so much as an invariant the other two rest on, and it is worth stating because the maps are hashed with `rustc-hash`, which unlike `std`'s `RandomState` is *not* seeded per process: a change that started ordering output by a `HashMap`/`HashSet` traversal would no longer be caught by comparing two runs. Where an order matters it comes from a sort, a `Vec`, an `IndexMap`, or `index_order`. Byte-identical output across the hasher swap is the evidence that nothing did (#83).
-- **Expansion-cache freeze**: the cache is keyed by (canonical path, language), so a C unit never replays a header's C++ tokenization or vice versa. During parallel phases the include-expansion cache is read-only (`PreprocessOptions::frozen_expansion_cache`). Hits replay warm-pass entries (produced deterministically); misses expand inline under each TU's own macro/guard state and are *not* inserted — first-writer-wins inserts would make results scheduling-dependent.
+- **Expansion-cache freeze**: the cache is keyed by (canonical path, language), so a C unit never replays a header's C++ tokenization or vice versa. Every parallel phase after discovery reads the include-expansion cache read-only (`PreprocessOptions::frozen_expansion_cache`): hits replay stored entries, misses expand inline under each TU's own macro/guard state and are *not* inserted — first-writer-wins inserts would make results scheduling-dependent. The one pass that writes it, discovery, runs its units on the pool too, but publishes in unit order (see [Parallel discovery](#parallel-discovery-88)).
 
 Translation units inherit the **union** of all warm-pass macro states: cached expansions replay without executing their `#define` directives, so TU-local code still needs those macros.
+
+### Parallel discovery (#88)
+
+Before any text reaches the parser, every translation unit is preprocessed once against a
+**writable** expansion cache (the discovery pass), so that the macro environments the tree
+actually presents at each `#include` end up stored and shared; units that expanded a header
+themselves are then re-run against the frozen result (the settle pass). Discovery used to run one
+unit at a time on the main thread. It now runs on the worker pool and leaves the cache, and every
+unit's text, byte-for-byte as the one-at-a-time pass in `index_order` does.
+
+**The cache key.** The cache maps `(canonical path, language)` to that header's **variants**: the
+expansions stored so far, in publication order, at most `max_expansion_variants` of them. A variant
+is found by its `trace_preproc::MacroFingerprint` (#55) — the bindings the expansion read,
+unbound names included — not by key alone: at an `#include`, a run takes the *first* stored
+variant whose fingerprint its current environment satisfies, and otherwise expands the header and
+publishes the result, unless a stored variant already has that fingerprint's signature or the list
+is full. A variant is named everywhere downstream by its **index** in that list:
+`PreprocessResult::replayed_variants` and `IncludeExpansion::nested_variants` record indices, and
+header units are lowered and merged per `(header, language, index)`.
+
+**Why the order of publication matters.** Two things about a variant are decided by who publishes
+it first, not by the header and the fingerprint alone. Its index is its position, and a consumer
+takes the first match, so the order decides which of two overlapping variants a unit replays. And
+its content is taken relative to what its publisher had already included (`files`, `ops`,
+`guards`, `nested_variants`), so two units that reach a header under the same fingerprint can build
+entries that differ in exactly the parts later consumers inherit. Content-addressing the entries
+does not remove this, because the variation is in the content. Running the writes in scheduling
+order made the output a thread race — camera moved over 20,299 / 20,326 / 20,847 direct edges
+across three runs of one tree. So the publication order is fixed as **unit order**, and parallelism
+must not be able to change it: what varies between runs is only which thread does the work.
+
+**Why scheduling cannot affect what a unit sees.** A worker runs a unit ahead of the commit point
+with `PreprocessOptions::defer_expansion_publish`. The run keeps what it would publish in a
+`trace_preproc::ExpansionJournal` instead, sees its own kept-back entries exactly as a publishing run
+sees what it published, and records, per header it looked up:
+
+- the variants it was shown, by `IncludeExpansion::id` (an identity unique to the process);
+- for each lookup, what it took — a shown variant, or its own entry / nothing — and the **point
+  in its macro history** it happened at. The run keeps an undo log of every `#define` / `#undef`
+  (the binding each one replaced) and its final table, so the environment of any past lookup can be
+  asked any fingerprint later.
+
+Its result never records an index for a variant that is not stored yet: it records a provisional
+handle (a tag bit plus the id), and the commit turns handles into indices.
+
+The committing thread takes units strictly in order. When unit *n*'s turn comes, units 0..*n*−1 have
+been published, exactly as in the serial pass, and `ExpansionJournal::commit` decides whether the
+parallel run is the run a publishing preprocess of *n* against that cache would be. It is if,
+for every header the run looked up, the variants it was shown are all stored, in the order it saw
+them, and no stored variant it was *not* shown would have been taken instead: none stored ahead of
+what a lookup took (or anywhere, for a lookup that took its own entry or nothing) satisfies that
+lookup's environment. Its own entries must also not duplicate a stored signature or overflow the
+cap. Then every lookup would have taken what it took, the run would have built the same text and
+published the same entries, and they land at the end of each list, where the handles now resolve.
+Otherwise nothing is written and the unit runs again. Whether a run commits depends only on the
+cache as units 0..*n*−1 left it and on the run itself, never on when it ran or what it was shown, so
+thread timing can make a run fail and repeat but cannot change what is committed.
+
+**Scheduling**, which affects only speed (`trace-parse/src/expansion_discovery.rs`). Workers take
+units up to four per worker past the commit point. Each run is shown the stored variants plus the
+kept-back entries of the finished, uncommitted runs ahead of it
+(`PreprocessOptions::expansion_journals_ahead`), so a unit that only replays an earlier unit's new
+variant need not wait for that unit to commit. A run is discarded, and its unit queued again, as soon
+as the cache or a finished run ahead of it rules it out (`ExpansionJournal::is_contradicted` /
+`rules_out`), or a run it was shown is discarded and had fed it (`feeds`). A queued unit waits for
+the unfinished units ahead of it whose own discarded run likely rules it out (`likely_rules_out`). A
+unit that reaches the commit point with no run that stands — or whose worker run failed — is run by
+the committing thread itself, the same way with nothing shown ahead, which always commits since
+nothing else writes the cache. `--jobs 1` runs the serial pass itself.
+
+The `preprocess-done` progress line reports the pass separately:
+`preprocess-done: Xs (Ys discovery, R runs discarded, K in order + Zs settle of N of M units)`,
+where `K` counts the units the committing thread ran itself. Measurements are in
+`docs/EVAL_REPORT.md` ("Parallel include-expansion discovery").
 
 ### Header IR (PCH-style)
 

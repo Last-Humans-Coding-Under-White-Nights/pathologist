@@ -936,6 +936,15 @@ fn merge_types(
     let mut map = Vec::with_capacity(src.all().len());
     for info in src.all() {
         let new_id = match &info.desc {
+            // The layout usually still spells the descriptor's own fields, and
+            // then interning the descriptor by reference is the same as
+            // interning the rebuilt one, without cloning every field deep. A
+            // unit re-merges each header's aggregates, so this is most of them.
+            TypeDesc::Struct { fields, .. } | TypeDesc::Union { fields, .. }
+                if !fields.is_empty() && !union_aggregates && layout_spells_desc(src, info) =>
+            {
+                dst.intern_ref(&info.desc)
+            }
             TypeDesc::Struct { name, fields } if !fields.is_empty() => {
                 if union_aggregates {
                     dst.union_struct_layout(name.clone(), fields_from_layout(src, info))
@@ -961,6 +970,18 @@ fn merge_types(
         }
     }
     map
+}
+
+/// Whether [`fields_from_layout`] would rebuild `info`'s descriptor as it is.
+fn layout_spells_desc(src: &trace_ir::TypeTable, info: &trace_ir::TypeInfo) -> bool {
+    let (TypeDesc::Struct { fields, .. } | TypeDesc::Union { fields, .. }) = &info.desc else {
+        return false;
+    };
+    fields.len() == info.layout.fields.len()
+        && fields
+            .iter()
+            .zip(info.layout.fields.values())
+            .all(|((name, desc), fl)| *name == fl.name && src.get(fl.type_id).desc == *desc)
 }
 
 /// Prefer layout field types over the interned `TypeDesc` field list: PCH
@@ -1204,6 +1225,105 @@ mod tests {
             remap_type(beyond, &map),
             beyond,
             "an id outside the map is its own"
+        );
+    }
+
+    fn int_field(name: &str) -> (String, TypeDesc) {
+        (name.into(), TypeDesc::Int)
+    }
+
+    fn tag(name: &str, fields: Vec<(String, TypeDesc)>) -> TypeDesc {
+        TypeDesc::Struct {
+            name: name.into(),
+            fields,
+        }
+    }
+
+    /// Interning an aggregate by reference when its layout still spells its
+    /// descriptor is a shortcut: it must leave the destination exactly as
+    /// rebuilding the field list from the layout does.
+    #[test]
+    fn merging_an_unchanged_aggregate_matches_rebuilding_it() {
+        let mut src = trace_ir::TypeTable::new();
+        let inner = tag("Inner", vec![int_field("x")]);
+        src.intern(tag(
+            "Outer",
+            vec![
+                ("inner".into(), inner.clone()),
+                ("next".into(), TypeDesc::Ptr(Box::new(inner))),
+            ],
+        ));
+        src.intern(TypeDesc::Union {
+            name: "U".into(),
+            fields: vec![int_field("i"), ("l".into(), TypeDesc::Long)],
+        });
+        for info in src.all() {
+            if matches!(info.desc, TypeDesc::Struct { ref fields, .. } | TypeDesc::Union { ref fields, .. } if !fields.is_empty())
+            {
+                assert!(layout_spells_desc(&src, info), "{:?}", info.desc);
+            }
+        }
+
+        let mut fast = trace_ir::TypeTable::new();
+        let fast_map = merge_types(&mut fast, &src, false);
+        let mut rebuilt = trace_ir::TypeTable::new();
+        let rebuilt_map: Vec<TypeId> = src
+            .all()
+            .iter()
+            .map(|info| match &info.desc {
+                TypeDesc::Struct { name, fields } if !fields.is_empty() => {
+                    rebuilt.compute_struct_layout(name.clone(), fields_from_layout(&src, info))
+                }
+                TypeDesc::Union { name, fields } if !fields.is_empty() => {
+                    rebuilt.compute_union_layout(name.clone(), fields_from_layout(&src, info))
+                }
+                other => rebuilt.intern_ref(other),
+            })
+            .collect();
+        assert_eq!(fast_map, rebuilt_map);
+        assert_eq!(format!("{:?}", fast.all()), format!("{:?}", rebuilt.all()));
+    }
+
+    /// Completing a nested tag rewrites the layout but not the descriptor, so
+    /// the merge has to take the layout's completed field, not the shortcut.
+    #[test]
+    fn a_completed_nested_tag_is_merged_from_the_layout() {
+        let mut src = trace_ir::TypeTable::new();
+        let outer = src.intern(tag(
+            "Outer",
+            vec![("inner".into(), tag("Inner", Vec::new()))],
+        ));
+        src.intern(tag("Inner", vec![int_field("x")]));
+        src.complete_nested_tags();
+        assert!(!layout_spells_desc(&src, src.get(outer)));
+
+        let mut dst = trace_ir::TypeTable::new();
+        let map = merge_types(&mut dst, &src, false);
+        assert_eq!(
+            dst.get(remap_type(outer, &map)).desc,
+            tag(
+                "Outer",
+                vec![("inner".into(), tag("Inner", vec![int_field("x")]))]
+            )
+        );
+    }
+
+    /// A struct spelled with other fields under the same name is a different
+    /// type, shortcut or not.
+    #[test]
+    fn a_same_named_struct_with_other_fields_stays_apart() {
+        let mut src = trace_ir::TypeTable::new();
+        let narrow = src.intern(tag("S", vec![int_field("a")]));
+        let mut dst = trace_ir::TypeTable::new();
+        let wide = dst.intern(tag("S", vec![("a".into(), TypeDesc::Long)]));
+
+        let map = merge_types(&mut dst, &src, false);
+        let merged = remap_type(narrow, &map);
+        assert_ne!(merged, wide);
+        assert_eq!(dst.get(merged).desc, src.get(narrow).desc);
+        assert_eq!(
+            dst.get(wide).desc,
+            tag("S", vec![("a".into(), TypeDesc::Long)])
         );
     }
 

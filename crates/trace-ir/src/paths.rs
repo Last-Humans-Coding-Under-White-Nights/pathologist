@@ -128,8 +128,8 @@ struct DirListing {
 
 /// Epoch and encoded directory path → its listing, or `None` when the
 /// directory could not be read in full (then every probe under it asks the
-/// filesystem, as before). Shared by every thread: the serial discovery
-/// pass and the parallel phases walk the same search lists.
+/// filesystem, as before). Shared by every thread: the discovery workers and
+/// the other parallel phases walk the same search lists.
 static DIR_LISTINGS: LazyLock<RwLock<DirListings>> =
     LazyLock::new(|| RwLock::new((0, FxHashMap::default())));
 

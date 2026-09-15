@@ -512,7 +512,7 @@ pub fn build_program_with_jobs(
                 } else {
                     source_cache
                         .preprocess_uncached(path, &include_graph, &header_prep_opts)
-                        .map(|src| {
+                        .map(|(src, _)| {
                             second_language_diagnostics.insert(path.clone(), src.diagnostics);
                         })
                 };
@@ -607,29 +607,16 @@ pub fn build_program_with_jobs(
         "preprocess: {} TUs (jobs={jobs})",
         file_order.len()
     ));
-    // Sequential, deliberately, while every other phase runs on the pool.
-    //
-    // Discovery is the one pass that WRITES the shared expansion cache while
-    // reading it, and an expansion is not a pure function of (header, macro
-    // environment): its `files`, `ops` and nested-variant records are taken
-    // relative to what its includer had already included, so whichever unit
-    // reaches a header first decides that entry's content, and every later
-    // consumer inherits it. Run in parallel that choice is a thread race —
-    // camera moved over 20,299 / 20,326 / 20,847 direct edges across three
-    // runs of the same tree, and hiview mis-parsed `base/include/plugin.h`
-    // in some runs and not others, where `master` is bit-stable at every job
-    // count. Ordering the writes is what makes the result reproducible;
-    // content-addressing the entries does not, because the variation is in
-    // the content.
-    //
-    // The settle pass below reads a frozen cache and stays parallel, as does
-    // every phase after it, so the cost is one serial pass over the units
-    // (camera: ~+1s wall, and 208 rather than 285 units re-run).
     let discover_t = Instant::now();
-    for path in file_order.iter() {
-        let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
-        let _ = source_cache.get_or_preprocess(path, &include_graph, &discover_opts[&lang]);
+    let discovery = crate::expansion_discovery::Discovery {
+        units: &file_order,
+        graph: &include_graph,
+        sources: &source_cache,
+        expansions: &include_expansion_cache,
+        opts: &discover_opts,
+        language: &|p| index_language(p, &cpp_parse, no_c_units, forced_language),
     }
+    .run(&pool, jobs);
     let discover_secs = discover_t.elapsed().as_secs_f64();
     // A unit that matched every include it reached already has the text the
     // settle pass would build for it: its includes hit the same expansions
@@ -646,13 +633,14 @@ pub fn build_program_with_jobs(
             let _ = source_cache.get_or_preprocess(path, &include_graph, &index_opts[&lang]);
         });
     });
-    // Split the two passes apart: the serial discovery pass and the parallel
-    // settle pass have different cures, so a single total hides which one to
-    // attack (#83).
+    // Split the two passes apart: discovery and the settle pass have
+    // different cures, so a single total hides which one to attack (#83).
     index_progress(format!(
-        "preprocess-done: {:.1}s ({:.1}s serial discovery + {:.1}s settle of {} of {} units)",
+        "preprocess-done: {:.1}s ({:.1}s discovery, {} runs discarded, {} in order + {:.1}s settle of {} of {} units)",
         pre_t.elapsed().as_secs_f64(),
         discover_secs,
+        discovery.discarded,
+        discovery.in_order,
         settle_t.elapsed().as_secs_f64(),
         dirty.len(),
         file_order.len()
@@ -1836,7 +1824,7 @@ fn index_source_file_with_variants(
         var_opts.record_conditionals = false;
         var_opts.defines.extend(variant.defines.iter().cloned());
         match source_cache.preprocess_uncached(path, graph, &var_opts) {
-            Ok(var_pre) => {
+            Ok((var_pre, _)) => {
                 let mut var_program = Program::new(root.to_path_buf());
                 match lower_prepared_source(
                     &mut var_program,
