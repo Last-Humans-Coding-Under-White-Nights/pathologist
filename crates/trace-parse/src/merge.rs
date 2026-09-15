@@ -36,6 +36,8 @@ pub struct UnitIndex {
     pub anonymous_final_classes: BTreeMap<String, BTreeSet<trace_ir::FileId>>,
     /// Their direct bases, likewise.
     pub anonymous_bases: BTreeMap<String, BTreeSet<(trace_ir::FileId, String)>>,
+    /// Namespaces this unit opens, merged in every mode.
+    pub namespaces: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -276,6 +278,7 @@ fn merge_unit(
     for cls in &unit.final_classes {
         program.mark_class_final(cls);
     }
+    program.namespaces.extend(unit.namespaces.iter().cloned());
 
     let type_map = merge_types(
         &mut program.types,

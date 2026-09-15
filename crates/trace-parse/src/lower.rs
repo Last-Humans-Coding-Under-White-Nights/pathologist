@@ -130,6 +130,15 @@ struct LowerContext {
     ast_depth: u32,
     ast_depth_warned: bool,
     reference_vars: HashSet<VarId>,
+    /// Every local registered in the C++ function being lowered, with the
+    /// variable of that name it hid; a block unwinds its own on exit.
+    local_scope_log: Vec<(String, Option<VarId>)>,
+    /// The unit's syntax tree, for descending to a node's ancestors.
+    tree: tree_sitter::Tree,
+    /// Whether the unit can hold a `template_declaration` at all: a C++ unit
+    /// whose text has the keyword. Most units have none, and then no
+    /// signature needs its ancestors.
+    has_templates: bool,
 }
 
 /// C++ class scope during member lowering.
@@ -141,12 +150,14 @@ struct ClassCtx {
 
 impl LowerContext {
     fn namespace_scope(&self) -> String {
-        self.ns_stack
-            .iter()
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("::")
+        let mut scope = String::new();
+        for segment in self.ns_stack.iter().flatten() {
+            if !scope.is_empty() {
+                scope.push_str("::");
+            }
+            scope.push_str(segment);
+        }
+        scope
     }
 
     fn qualify(&self, name: &str) -> String {
@@ -210,7 +221,14 @@ impl LowerContext {
 }
 
 fn register_local(ctx: &mut LowerContext, name: String, id: VarId) {
-    if ctx.current_fn.is_some() {
+    if ctx.current_fn.is_none() {
+        return;
+    }
+    // Only C++ blocks unwind the names they declare (walk_function_body).
+    if ctx.is_cpp {
+        let shadowed = ctx.locals.insert(name.clone(), id);
+        ctx.local_scope_log.push((name, shadowed));
+    } else {
         ctx.locals.insert(name, id);
     }
 }
@@ -1956,6 +1974,7 @@ fn lower_prepared_source(
         });
     }
 
+    let is_cpp = lang == crate::parse::SourceLang::Cpp;
     let mut ctx = LowerContext {
         current_fn: None,
         current_file: file_id,
@@ -1969,13 +1988,16 @@ fn lower_prepared_source(
         class_ctx: None,
         type_scope: RefCell::new(Vec::new()),
         local_aliases: Vec::new(),
-        is_cpp: lang == crate::parse::SourceLang::Cpp,
+        is_cpp,
         handled_new_exprs: RefCell::new(HashSet::default()),
         callee_load_cache: RefCell::new(HashMap::default()),
         call_return_dst: RefCell::new(HashMap::default()),
         ast_depth: 0,
         ast_depth_warned: false,
         reference_vars: HashSet::default(),
+        local_scope_log: Vec::new(),
+        tree: parsed.tree.clone(),
+        has_templates: is_cpp && parsed.source.contains("template"),
     };
     lower_tree(
         program,
@@ -2116,6 +2138,7 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
         anonymous_classes: std::mem::take(&mut program.anonymous_classes),
         anonymous_final_classes: std::mem::take(&mut program.anonymous_final_classes),
         anonymous_bases: std::mem::take(&mut program.anonymous_bases),
+        namespaces: std::mem::take(&mut program.namespaces),
     }
 }
 
@@ -2354,6 +2377,7 @@ fn lower_namespace(program: &mut Program, ctx: &mut LowerContext, source: &str, 
     };
     for level in &levels {
         ctx.ns_stack.push(level.clone());
+        program.namespaces.insert(ctx.namespace_scope());
     }
     // `using namespace X;` / `using X::f;` inside a namespace block are
     // scoped to the block in real C++ (a directive written here must not
@@ -3239,6 +3263,7 @@ fn register_member_prototype(
         .child_by_field_name("type")
         .map(|t| parse_type_node(program, ctx, source, t))
         .unwrap_or_else(|| program.types.void());
+    let ret_type = declared_return_type(program, ctx, source, node, ret_type);
     program.symbols.add_function(Function {
         id: provisional_id,
         name: full_name,
@@ -3279,6 +3304,8 @@ struct FunctionSignature {
     fn_id: FnId,
     params: Vec<VarId>,
     eff_class: Option<String>,
+    /// The class or namespace the definition's names are looked up in.
+    lookup_scope: Option<String>,
 }
 
 /// Register a function definition's entry and parameters, without its body.
@@ -3330,9 +3357,22 @@ fn lower_function_signature(
             None => program.types.int(),
         },
     };
+    let ret_type = declared_return_type(program, ctx, source, node, ret_type);
     let provisional_id = program.symbols.alloc_fn_id();
     let mut params = Vec::new();
-    let scoped = enter_member_scope(ctx, eff_class.as_ref());
+    // Names in the parameters and body of a definition spelled `N::f` are
+    // looked up in `N`, whether `N` is a class or a namespace (`N::f(A)`
+    // means `N::A`). Lowering such a definition as `f(int)` collapsed
+    // distinct overloads and stranded their declarations.
+    let owner_unresolved = eff_class.is_none() && scope_part(&raw_name).contains("::");
+    let lookup_scope = if owner_unresolved {
+        scope_part(&name)
+            .rsplit_once("::")
+            .map(|(scope, _)| scope.to_owned())
+    } else {
+        eff_class.clone()
+    };
+    let scoped = enter_lookup_scope(ctx, lookup_scope.as_ref());
     // Implicit `this` for member functions, ctors and dtors.
     if let Some(cls) = &eff_class {
         let span = node_span(program, ctx, node);
@@ -3380,7 +3420,7 @@ fn lower_function_signature(
         param_type_ids: Vec::new(),
         explicit_arity: Some((params.len() - usize::from(eff_class.is_some())) as u32),
         default_args: shape.defaults,
-        owner_unresolved: eff_class.is_none() && scope_part(&raw_name).contains("::"),
+        owner_unresolved,
         variadic: shape.variadic,
         // `A() = default;` in its class: not user-provided (C++17 aggregates).
         defaulted_in_class: ctx.class_ctx.is_some()
@@ -3401,19 +3441,19 @@ fn lower_function_signature(
         fn_id,
         params,
         eff_class,
+        lookup_scope,
     })
 }
 
-/// Push a member's class as the scope type names are looked up in, unless it
-/// is the innermost already; whether it was pushed. A member's parameters and
-/// body look type names up in its class; the return type of an out-of-class
-/// definition does not (`It C::Make()` spells `C::It`), and an in-class
-/// definition has its class in scope already.
-fn enter_member_scope(ctx: &LowerContext, eff_class: Option<&String>) -> bool {
-    let scoped =
-        ctx.is_cpp && eff_class.is_some_and(|cls| ctx.type_scope.borrow().last() != Some(cls));
-    if let Some(cls) = eff_class.filter(|_| scoped) {
-        ctx.type_scope.borrow_mut().push(cls.clone());
+/// Push the class or namespace a definition's names are looked up in, unless
+/// it is the innermost scope already; whether it was pushed. The parameters
+/// and body of `C::f` look type names up in `C`; the return type of an
+/// out-of-class definition does not (`It C::Make()` spells `C::It`), and an
+/// in-class definition has its class in scope already.
+fn enter_lookup_scope(ctx: &LowerContext, scope: Option<&String>) -> bool {
+    let scoped = ctx.is_cpp && scope.is_some_and(|s| ctx.type_scope.borrow().last() != Some(s));
+    if let Some(s) = scope.filter(|_| scoped) {
+        ctx.type_scope.borrow_mut().push(s.clone());
     }
     scoped
 }
@@ -3429,10 +3469,34 @@ fn lower_function_body(
         fn_id,
         params,
         eff_class,
+        lookup_scope,
     } = signature;
-    let scoped = enter_member_scope(ctx, eff_class.as_ref());
+    let scoped = enter_lookup_scope(ctx, lookup_scope.as_ref());
+    // The body of a free function spelled `N::f` looks function names up in
+    // `N` as well: open the namespaces the definition names but does not sit
+    // in. A scope that neither this unit nor a header it includes opens as a
+    // namespace is a class it cannot see (`Ast::Lookup` under
+    // `using namespace OHOS::Hardware`), not a namespace.
+    let ns_depth = ctx.ns_stack.len();
+    if let Some(scope) = lookup_scope
+        .as_ref()
+        .filter(|scope| eff_class.is_none() && program.namespaces.contains(*scope))
+    {
+        let open = ctx.namespace_scope();
+        let unopened = if open.is_empty() {
+            Some(scope.as_str())
+        } else {
+            scope
+                .strip_prefix(&open)
+                .and_then(|rest| rest.strip_prefix("::"))
+        };
+        for segment in unopened.into_iter().flat_map(|rest| rest.split("::")) {
+            ctx.ns_stack.push(Some(segment.to_owned()));
+        }
+    }
     ctx.current_fn = Some(fn_id);
     ctx.locals.clear();
+    ctx.local_scope_log.clear();
     for &param in &params {
         if let Some(v) = program.symbols.variable_by_id(param) {
             ctx.locals.insert(v.name.clone(), param);
@@ -3483,6 +3547,8 @@ fn lower_function_body(
 
     ctx.current_fn = None;
     ctx.locals.clear();
+    ctx.local_scope_log.clear();
+    ctx.ns_stack.truncate(ns_depth);
     ctx.class_ctx = saved_class;
     if scoped {
         ctx.type_scope.borrow_mut().pop();
@@ -3669,6 +3735,574 @@ fn lower_parameter(
     Some(var_id)
 }
 
+/// Infer only from known value types and declared callees. This does not
+/// emit calls/flows, resolve function pointers, or expand virtual overrides:
+/// an expression has its statically selected declaration's return type.
+fn auto_initializer_type(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    value: Node,
+) -> Option<TypeDesc> {
+    let value = peel_expression(value);
+    let desc = if value.kind() == "call_expression" {
+        call_result_type(program, ctx, source, value)?
+    } else {
+        // A cast or `new` spells its type in the source; any other expression
+        // has the type lowering gave its variable or field.
+        let spelled_dependent = |ctx: &LowerContext| {
+            value.child_by_field_name("type").is_some_and(|ty| {
+                let spelling = node_text(source, &ty);
+                spelling_is_dependent(ctx, source, value, spelling, Spelling::Source)
+            })
+        };
+        let (desc, dependent) = match value.kind() {
+            "cast_expression" => (
+                arg_expr_type(program, ctx, source, value),
+                spelled_dependent(ctx),
+            ),
+            "new_expression" => (
+                receiver_desc(program, ctx, source, value)?,
+                spelled_dependent(ctx),
+            ),
+            _ => {
+                let desc = receiver_desc(program, ctx, source, value)?;
+                let dependent = type_is_dependent(ctx, source, value, &desc);
+                (desc, dependent)
+            }
+        };
+        if dependent {
+            return None;
+        }
+        desc
+    };
+    receiver_type(program, ctx, desc)
+}
+
+/// The type a call expression yields, when one declaration decides it.
+fn call_result_type(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    value: Node,
+) -> Option<TypeDesc> {
+    // Kinds are read off the callee as written, as collect_call_at_node reads
+    // them: a parenthesized name is not a bare name.
+    let func = value.child_by_field_name("function")?;
+    let raw = normalize_spacing(node_text(source, &func));
+    let name = strip_template_args(&raw);
+    if let Some(wrapper) = smart_ptr_factory(ctx, &name) {
+        return smart_ptr_type(program, ctx, source, value, wrapper, &raw, Spelling::Source);
+    }
+    if matches!(func.kind(), "identifier" | "qualified_identifier") {
+        let spelled = normalize_qualified(node_text(source, &func));
+        if lookup_var(ctx, program, &spelled).is_none() {
+            // `T(args)` constructs a `T`, as the call site reads it.
+            if let Some(cls) = constructed_class(program, ctx, &spelled) {
+                return (!spelling_is_dependent(ctx, source, value, &spelled, Spelling::Source))
+                    .then_some(TypeDesc::Struct {
+                        name: cls,
+                        fields: Vec::new(),
+                    });
+            }
+        }
+    }
+    let args: Vec<TypeDesc> = match value.child_by_field_name("arguments") {
+        Some(list) => list
+            .named_children(&mut list.walk())
+            .filter(|n| n.kind() != "comment")
+            .map(|arg| arg_expr_type(program, ctx, source, arg))
+            .collect(),
+        None => Vec::new(),
+    };
+    let candidates = if func.kind() == "field_expression" {
+        let recv = func.child_by_field_name("argument")?;
+        let field = normalize_qualified(node_text(source, &func.child_by_field_name("field")?));
+        let arrow = is_arrow_access(func);
+        if args.is_empty() && !arrow {
+            if let Some(TypeDesc::Struct { name, .. }) = receiver_desc(program, ctx, source, recv) {
+                if let Some(strong) = weak_ptr_upgrade(program, &name, &field) {
+                    return smart_ptr_type(
+                        program,
+                        ctx,
+                        source,
+                        value,
+                        &strong,
+                        &name,
+                        Spelling::Lowered,
+                    );
+                }
+            }
+        }
+        let cls = member_receiver_class(program, ctx, source, recv, arrow)?;
+        declared_members_upward(
+            program,
+            &cls,
+            &trace_ir::MethodKind::Named(strip_template_args(&field)),
+        )
+    } else {
+        let (name, _, var) = resolve_callee(program, ctx, source, func);
+        if var.is_some() {
+            return None;
+        }
+        // An implicit member hides an outer free function of the same name,
+        // just as it does for collect_call_at_node.
+        let members = match &ctx.class_ctx {
+            Some(cc) if is_bare_callee_node(func) => declared_members_upward(
+                program,
+                &cc.qual_name,
+                &trace_ir::MethodKind::Named(name.clone()),
+            ),
+            _ => Vec::new(),
+        };
+        if members.is_empty() {
+            cpp_callee_candidates(program, ctx, func, &name, &args)
+        } else {
+            members
+        }
+    };
+    // A member of a template parameter -- the receiver's class (`T *t`), the
+    // scope (`T::make()`) or a base (`struct M : Base`) -- has no declaration
+    // yet, even when a real class shares the parameter's spelling.
+    if ctx.has_templates {
+        let mut enclosing: Option<Vec<Node>> = None;
+        if candidates.iter().any(|&f| {
+            let Some((owner, _)) = program.symbols.function(f).name.rsplit_once("::") else {
+                return false;
+            };
+            let enclosing = enclosing.get_or_insert_with(|| ancestors(ctx, value).collect());
+            mentions_template_parameter(source, enclosing.iter().copied(), owner, Spelling::Lowered)
+        }) {
+            return None;
+        }
+    }
+    let candidates =
+        filter_targets_by_argc(program, candidates, args.len(), &args, args.is_empty());
+    // Unknown arguments score as ties in call-edge ranking, so they rank
+    // nothing out. The candidates left must all take the arguments and agree
+    // on one return type; a partial match is no evidence for one of several.
+    let candidates = if args.contains(&TypeDesc::Unknown) {
+        candidates
+    } else {
+        rank_overloads(program, &candidates, &args)
+    };
+    let mut returns = candidates.iter().map(|&f| {
+        let function = program.symbols.function(f);
+        method_explicit_arity(program, f)
+            .filter(|&arity| arity_takes(function, arity, args.len()))
+            .map(|_| &program.types.get(function.return_type).desc)
+    });
+    let first = returns.next()??;
+    (!matches!(first, TypeDesc::Unknown) && returns.all(|desc| desc == Some(first)))
+        .then(|| first.clone())
+}
+
+/// `desc` when it can type a receiver: a class, union or function pointer
+/// under its pointer layers. A scalar can be the stand-in lowering gives a
+/// type name it could not resolve, which would rank overloads by a guess. A
+/// standard smart pointer whose argument names no class as written, while the
+/// scopes here name one by it (`std::shared_ptr<TraceStrategy>` declared under
+/// `using namespace OHOS::HiviewDFX`), would reach members under a spelling
+/// the index may not hold; it is left untyped rather than guessed.
+fn receiver_type(program: &Program, ctx: &LowerContext, desc: TypeDesc) -> Option<TypeDesc> {
+    match desc {
+        TypeDesc::Ptr(inner) => Some(TypeDesc::Ptr(Box::new(receiver_type(
+            program, ctx, *inner,
+        )?))),
+        TypeDesc::Struct { ref name, .. } if is_std_smart_ptr_name(&receiver_lookup_name(name)) => {
+            let held = template_arguments(name)
+                .first()
+                .map(|arg| receiver_lookup_name(arg.trim()));
+            let ambiguous = held.is_some_and(|held| {
+                declared_class_name(program, &held).is_none()
+                    && class_seen_from(program, ctx, &held).is_some_and(|seen| seen != held)
+            });
+            (!ambiguous).then_some(desc)
+        }
+        TypeDesc::Struct { .. } | TypeDesc::Union { .. } | TypeDesc::FnPtr { .. } => Some(desc),
+        _ => None,
+    }
+}
+
+/// The class a smart pointer's template argument names from this scope,
+/// cv-qualifiers dropped and template arguments kept (`const Box<int>` holds
+/// `ns::Box<int>`).
+fn held_class(program: &Program, ctx: &LowerContext, arg: &str) -> Option<String> {
+    let arg = arg.trim();
+    let arg = arg.strip_prefix("const ").unwrap_or(arg);
+    let arg = arg.strip_suffix(" const").unwrap_or(arg).trim();
+    let class = class_seen_from(program, ctx, &receiver_lookup_name(arg))?;
+    Some(match arg.find('<') {
+        Some(at) => format!("{class}{}", &arg[at..]),
+        None => class,
+    })
+}
+
+/// The class `name` denotes from the current scope: through the enclosing
+/// classes and namespaces, else through a `using namespace N;` in scope. A
+/// type declared under such a directive spells N's classes bare, and lowering
+/// files a bare name it cannot find under the namespace it sits in
+/// (`strat_user::Strategy` for `hdfx::Strategy`).
+fn class_seen_from(program: &Program, ctx: &LowerContext, name: &str) -> Option<String> {
+    declared_class_in_scope(program, ctx, name).or_else(|| {
+        let mut bare = name;
+        for segment in ctx.ns_stack.iter().flatten() {
+            match bare
+                .strip_prefix(segment.as_str())
+                .and_then(|rest| rest.strip_prefix("::"))
+            {
+                Some(rest) => bare = rest,
+                None => break,
+            }
+        }
+        ctx.using_nss
+            .iter()
+            .find_map(|ns| declared_class_name(program, &format!("{ns}::{bare}")))
+    })
+}
+
+/// Standard factories whose one template argument names the class the
+/// returned smart pointer holds.
+const SMART_PTR_FACTORIES: &[(&str, &str)] = &[
+    ("std::make_shared", "std::shared_ptr"),
+    ("std::make_unique", "std::unique_ptr"),
+];
+
+/// The smart pointer the factory a call spells `name` returns: `std::make_shared`,
+/// `::std::make_shared`, or a bare `make_shared` that `using namespace std;` or
+/// `using std::make_shared;` brings into scope.
+fn smart_ptr_factory(ctx: &LowerContext, name: &str) -> Option<&'static str> {
+    let name = global_lookup_name(name);
+    SMART_PTR_FACTORIES
+        .iter()
+        .find(|(factory, _)| {
+            *factory == name
+                || factory.strip_prefix("std::") == Some(name)
+                    && (ctx.using_nss.iter().any(|ns| ns == "std")
+                        || ctx
+                            .using_name_imports
+                            .iter()
+                            .any(|(base, qualified)| base == name && qualified == factory))
+        })
+        .map(|&(_, wrapper)| wrapper)
+}
+
+/// Weak pointers, by their last name segment, and the method that yields the
+/// matching strong pointer.
+const WEAK_PTR_UPGRADES: &[(&str, &str, &str)] = &[
+    ("weak_ptr", "lock", "shared_ptr"),
+    ("wptr", "promote", "sptr"),
+];
+
+/// The strong pointer `method` on a weak pointer typed `name` yields, spelled
+/// in the weak pointer's own scope (`OHOS::CameraStandard::wptr` promotes to
+/// `OHOS::CameraStandard::sptr`). Only for a wrapper whose body is not in the
+/// tree: a declared one has members of its own to look up.
+fn weak_ptr_upgrade(program: &Program, name: &str, method: &str) -> Option<String> {
+    let cls = receiver_lookup_name(name);
+    if !is_undefined_wrapper(program, name, &cls) {
+        return None;
+    }
+    let last = last_type_segment(&cls);
+    let &(_, _, strong) = WEAK_PTR_UPGRADES
+        .iter()
+        .find(|(weak, upgrade, _)| *weak == last && *upgrade == method)?;
+    Some(format!("{}{strong}", &cls[..cls.len() - last.len()]))
+}
+
+/// `wrapper<class>` for a smart-pointer model whose one template argument is
+/// the one `spelled` carries (`make_shared<T>`, `weak_ptr<T>`), unless that
+/// argument names an enclosing template parameter.
+fn smart_ptr_type(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    value: Node,
+    wrapper: &str,
+    spelled: &str,
+    from: Spelling,
+) -> Option<TypeDesc> {
+    let [arg]: [String; 1] = template_arguments(spelled).try_into().ok()?;
+    let class = held_class(program, ctx, &arg)?;
+    (!spelling_is_dependent(ctx, source, value, &arg, from)).then(|| TypeDesc::Struct {
+        name: format!("{wrapper}<{class}>"),
+        fields: Vec::new(),
+    })
+}
+
+/// The ancestors of `node`, root first, excluding `node` itself.
+///
+/// Every `Node::parent` call re-descends from the root and scans each level's
+/// children, so walking a deep node's ancestors one `parent` at a time costs a
+/// descent per level. Every signature in a unit with templates asks for its
+/// enclosing ones, and a preprocessed unit has thousands of top-level
+/// declarations: descend once per question.
+fn ancestors<'t>(ctx: &'t LowerContext, node: Node<'t>) -> impl Iterator<Item = Node<'t>> {
+    std::iter::successors(Some(ctx.tree.root_node()), move |cur| {
+        cur.child_with_descendant(node)
+    })
+    .take_while(move |cur| cur.id() != node.id())
+}
+
+/// Whether `spelling` mentions a parameter of any `template_declaration` in
+/// `path`.
+fn mentions_template_parameter<'t>(
+    source: &str,
+    path: impl IntoIterator<Item = Node<'t>>,
+    spelling: &str,
+    from: Spelling,
+) -> bool {
+    path.into_iter()
+        .filter(|n| n.kind() == "template_declaration")
+        .filter_map(|n| n.child_by_field_name("parameters"))
+        .any(|params| {
+            template_parameter_names(source, params)
+                .into_iter()
+                .flatten()
+                .any(|name| spelling_mentions(spelling, from, name))
+        })
+}
+
+/// The name of each parameter of a `template_parameter_list`, by position;
+/// `None` for an unnamed one. Comments between parameters are not positions.
+/// A type parameter's name is its identifier (`class T`, `class... Ts`,
+/// `class T = int`, `template<class> class TT`); a value parameter's is in its
+/// declarator (`size_t N`, `Kind K = {}`, `int... Ns`), never its type.
+fn template_parameter_names<'s>(source: &'s str, params: Node) -> Vec<Option<&'s str>> {
+    fn type_identifier(node: Node) -> Option<Node> {
+        node.named_children(&mut node.walk())
+            .find(|n| n.kind() == "type_identifier")
+    }
+    params
+        .named_children(&mut params.walk())
+        .filter(|p| p.kind() != "comment")
+        .map(|param| {
+            match param.kind() {
+                "type_parameter_declaration" | "variadic_type_parameter_declaration" => {
+                    type_identifier(param)
+                }
+                "optional_type_parameter_declaration" => param.child_by_field_name("name"),
+                "template_template_parameter_declaration" => param
+                    .named_children(&mut param.walk())
+                    .find(|n| n.kind() != "template_parameter_list")
+                    .and_then(type_identifier),
+                "parameter_declaration"
+                | "optional_parameter_declaration"
+                | "variadic_parameter_declaration" => param
+                    .child_by_field_name("declarator")
+                    .and_then(declarator_identifier),
+                _ => None,
+            }
+            .map(|ident| node_text(source, &ident))
+            // Error recovery can leave a zero-width name, which every spelling
+            // would contain.
+            .filter(|name| !name.is_empty())
+        })
+        .collect()
+}
+
+/// The identifier a declarator declares, through pointer, reference and
+/// pack layers; `None` for an abstract declarator.
+fn declarator_identifier(node: Node) -> Option<Node> {
+    if node.kind() == "identifier" {
+        return Some(node);
+    }
+    node.child_by_field_name("declarator")
+        .or_else(|| {
+            node.named_children(&mut node.walk())
+                .find(|n| n.kind() == "identifier" || n.kind().ends_with("_declarator"))
+        })
+        .and_then(declarator_identifier)
+}
+
+/// Where a type spelling tested for template parameters comes from.
+#[derive(Clone, Copy)]
+enum Spelling {
+    /// As written: `OHOS::Event` names a member of `OHOS`, never a parameter.
+    Source,
+    /// As lowering qualified it: a parameter `T` of a member template of `C`
+    /// reads `C::T`, so a qualified identifier can still be the parameter.
+    Lowered,
+}
+
+/// Whether the type spelling names `name` as a whole identifier, outside any
+/// qualification when it is a `Spelling::Source`.
+fn spelling_mentions(spelling: &str, from: Spelling, name: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    spelling.match_indices(name).any(|(at, _)| {
+        let before = &spelling[..at];
+        !before.ends_with(is_ident)
+            && !spelling[at + name.len()..].starts_with(is_ident)
+            && (matches!(from, Spelling::Lowered) || !before.trim_end().ends_with("::"))
+    })
+}
+
+/// Template return types require substitution, which C1 deliberately does
+/// not attempt. Check names in all enclosing template parameter lists.
+fn return_is_dependent(ctx: &LowerContext, source: &str, node: Node) -> bool {
+    if !ctx.has_templates {
+        return false;
+    }
+    // The declaration whose `type` is the return type: `node` itself, or the
+    // nearest ancestor with one (a prototype's declarator sits under it).
+    let mut path: Vec<Node> = ancestors(ctx, node).collect();
+    path.push(node);
+    let Some((at, ty)) = path
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, n)| Some((i, n.child_by_field_name("type")?)))
+    else {
+        return false;
+    };
+    let enclosing = &path[..at];
+    enclosing.iter().any(|n| n.kind() == "template_declaration")
+        && spelling_names_dependent_type(source, enclosing, node_text(source, &ty), 0)
+}
+
+/// Whether a type spelled in a template names one of its parameters, directly
+/// or through a member alias of an enclosing class
+/// (`using Ptr = std::shared_ptr<T>; Ptr Get();`), a few aliases deep.
+fn spelling_names_dependent_type(
+    source: &str,
+    enclosing: &[Node],
+    spelling: &str,
+    depth: u8,
+) -> bool {
+    const MAX_ALIAS_DEPTH: u8 = 4;
+    mentions_template_parameter(
+        source,
+        enclosing.iter().copied(),
+        spelling,
+        Spelling::Source,
+    ) || depth < MAX_ALIAS_DEPTH
+        && enclosing
+            .iter()
+            .filter(|n| n.kind() == "field_declaration_list")
+            .flat_map(|body| body.named_children(&mut body.walk()).collect::<Vec<_>>())
+            .filter_map(|member| member_alias(source, member))
+            .any(|(name, aliased)| {
+                spelling_mentions(spelling, Spelling::Source, name)
+                    && spelling_names_dependent_type(source, enclosing, aliased, depth + 1)
+            })
+}
+
+/// The name a member `using` alias or `typedef` declares, and the text of the
+/// type it stands for.
+fn member_alias<'s>(source: &'s str, member: Node) -> Option<(&'s str, &'s str)> {
+    match member.kind() {
+        "alias_declaration" => Some((
+            node_text(source, &member.child_by_field_name("name")?),
+            node_text(source, &member.child_by_field_name("type")?),
+        )),
+        "type_definition" => {
+            let name = std::iter::successors(member.child_by_field_name("declarator"), |d| {
+                d.child_by_field_name("declarator")
+            })
+            .find(|d| d.kind() == "type_identifier")?;
+            Some((node_text(source, &name), node_text(source, &member)))
+        }
+        _ => None,
+    }
+}
+
+fn spelling_is_dependent(
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+    spelling: &str,
+    from: Spelling,
+) -> bool {
+    ctx.has_templates && mentions_template_parameter(source, ancestors(ctx, node), spelling, from)
+}
+
+fn type_is_dependent(ctx: &LowerContext, source: &str, node: Node, desc: &TypeDesc) -> bool {
+    match desc {
+        TypeDesc::Ptr(inner) | TypeDesc::Array { elem: inner, .. } => {
+            type_is_dependent(ctx, source, node, inner)
+        }
+        TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => {
+            spelling_is_dependent(ctx, source, node, name, Spelling::Lowered)
+        }
+        _ => false,
+    }
+}
+
+fn declared_return_type(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+    base: trace_ir::TypeId,
+) -> trace_ir::TypeId {
+    if return_is_dependent(ctx, source, node) {
+        return program.types.unknown();
+    }
+    let depth = node
+        .child_by_field_name("declarator")
+        .and_then(fn_decl_under_pointer)
+        .map_or(0, |(_, depth, _)| depth);
+    pointer_layers(program, base, depth)
+}
+
+/// `ty` under `depth` pointer layers.
+fn pointer_layers(program: &mut Program, ty: trace_ir::TypeId, depth: usize) -> trace_ir::TypeId {
+    (0..depth).fold(ty, |ty, _| {
+        let inner = program.types.get(ty).desc.clone();
+        program.types.ptr_to(inner)
+    })
+}
+
+/// The type of a local declared `decl` with base type `type_id`. An `auto`
+/// local takes its initializer's type, which already includes pointer layers
+/// (`auto *p` deduces the pointee); `auto&` takes it too, as the value the
+/// reference names. An initializer with fewer pointer layers than the
+/// declarator asks for (`auto *p = value()`) deduces nothing.
+fn local_type(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    type_node: Node,
+    type_id: trace_ir::TypeId,
+    decl: Node,
+    value: Option<Node>,
+) -> trace_ir::TypeId {
+    let inferred = value
+        .filter(|_| is_placeholder_type(ctx, type_node))
+        .and_then(|value| auto_initializer_type(program, ctx, source, value))
+        .filter(|desc| pointer_depth(desc) >= declarator_pointer_depth(decl));
+    let desc = inferred
+        .unwrap_or_else(|| walk_declarator_shape(decl, program.types.get(type_id).desc.clone()));
+    program.types.intern(desc)
+}
+
+/// A C++ `auto` type specifier.
+fn is_placeholder_type(ctx: &LowerContext, type_node: Node) -> bool {
+    ctx.is_cpp && type_node.kind() == "placeholder_type_specifier"
+}
+
+/// How many pointer layers `desc` has.
+fn pointer_depth(desc: &TypeDesc) -> usize {
+    std::iter::successors(Some(desc), |desc| desc.pointee()).count() - 1
+}
+
+/// How many `*` a declarator puts in front of its name, through references
+/// and parentheses (`**p`, `*&p`).
+fn declarator_pointer_depth(decl: Node) -> usize {
+    std::iter::successors(Some(decl), |d| {
+        d.child_by_field_name("declarator").or_else(|| {
+            matches!(
+                d.kind(),
+                "reference_declarator" | "parenthesized_declarator"
+            )
+            .then(|| d.named_child(0))
+            .flatten()
+        })
+    })
+    .filter(|d| d.kind() == "pointer_declarator")
+    .count()
+}
+
 fn lower_declaration(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -3683,64 +4317,73 @@ fn lower_declaration(
     let type_id = parse_type_node(program, ctx, source, type_node);
     let is_static = declaration_is_static(source, node);
 
+    let lower_initialized = |program: &mut Program,
+                             ctx: &mut LowerContext,
+                             owner: Node,
+                             decl: Node,
+                             value: Option<Node>| {
+        let ty = local_type(program, ctx, source, type_node, type_id, decl, value);
+        let var = lower_one_declarator(
+            program,
+            ctx,
+            source,
+            owner,
+            decl,
+            ty,
+            is_static,
+            storage_override,
+            value,
+        );
+        // An explicit reference's type carries an alias layer that readers
+        // peel; an `auto&` local's is already the value's own type.
+        if let Some(var) = var.filter(|_| is_placeholder_type(ctx, type_node)) {
+            ctx.reference_vars.remove(&var);
+        }
+    };
+
+    // A condition declaration (`if (auto p = f())`) stores its initializer
+    // directly on the declaration, without an init_declarator child. Its
+    // variable starts at the declarator, as an init_declarator's does.
+    if let (Some(decl), Some(value)) = (
+        node.child_by_field_name("declarator"),
+        node.child_by_field_name("value"),
+    ) {
+        lower_initialized(program, ctx, decl, decl, Some(value));
+        return;
+    }
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
             "init_declarator" => {
                 let decl = child.child_by_field_name("declarator").unwrap_or(child);
-                // `auto p = new T(...)`: recover the pointee class so member
-                // calls through p resolve by static type.
-                let mut eff_type_id = type_id;
-                let mut auto_new = false;
-                if type_node.kind() == "placeholder_type_specifier" {
-                    if let Some(value) = child.child_by_field_name("value") {
-                        if value.kind() == "new_expression" {
-                            auto_new = true;
-                            if let Some(cls) = new_expression_class(program, ctx, source, value) {
-                                let inner = program.types.intern(TypeDesc::Struct {
-                                    name: cls,
-                                    fields: Vec::new(),
-                                });
-                                eff_type_id = program.types.intern(TypeDesc::Ptr(Box::new(
-                                    program.types.get(inner).desc.clone(),
-                                )));
-                            }
-                        }
-                    }
-                }
-                // A pointer/array declarator (`int *p`) must wrap the base
-                // type like params already do; otherwise the local reads as
-                // its base scalar and pointer args mis-rank `f(int)` over
-                // the real `f(int*)`.
-                if !auto_new {
-                    let base = program.types.get(type_id).desc.clone();
-                    eff_type_id = program.types.intern(walk_declarator_shape(decl, base));
-                }
-                lower_one_declarator(
+                lower_initialized(
                     program,
                     ctx,
-                    source,
                     child,
                     decl,
-                    eff_type_id,
-                    is_static,
-                    storage_override,
                     child.child_by_field_name("value"),
                 );
             }
-            "declarator" | "pointer_declarator" | "function_declarator" | "array_declarator" => {
+            // Inside a body, `cb && cb();` parses as a reference-returning
+            // prototype; a real one is declared at namespace scope.
+            "declarator"
+            | "pointer_declarator"
+            | "reference_declarator"
+            | "function_declarator"
+            | "array_declarator"
+                if child.kind() != "reference_declarator" || ctx.current_fn.is_none() =>
+            {
                 // A pointer-returning function declaration (`T *f(void);`) is a
                 // `pointer_declarator` wrapping a `function_declarator`; it must
                 // register a function, not a variable that shadows the name --
                 // unless it defines an object, `T w(a);` or `T *p(buf);`.
-                if let Some((fdecl, ptr_depth)) = fn_decl_under_pointer(child) {
-                    let mut ty = type_id;
-                    for _ in 0..ptr_depth {
-                        ty = program.types.intern(trace_ir::TypeDesc::Ptr(Box::new(
-                            program.types.get(ty).desc.clone(),
-                        )));
-                    }
+                if let Some((fdecl, ptr_depth, binds_reference)) = fn_decl_under_pointer(child) {
+                    let ty = pointer_layers(program, type_id, ptr_depth);
+                    // `T &r(a);` binds a reference, which constructs nothing;
+                    // a reference variable here is not modeled.
                     match direct_init_arguments(program, ctx, source, fdecl) {
+                        Some(_) if binds_reference => {}
                         Some(args) => lower_direct_init(
                             program,
                             ctx,
@@ -3929,7 +4572,7 @@ fn lower_direct_init(
 /// beside `stat`).
 fn names_type_in_scope(program: &Program, ctx: &LowerContext, name: &str) -> bool {
     local_alias(ctx, name).is_some()
-        || find_in_scope(ctx, name, |candidate, global| {
+        || find_in_scope(program, ctx, name, |candidate, global| {
             let class = !global
                 && (program.types.is_struct_declared(candidate)
                     || program
@@ -4190,6 +4833,11 @@ fn lower_function_decl(
         return;
     }
     let name = ctx.qualify_decl(&name);
+    let ret_type = if return_is_dependent(ctx, source, decl) {
+        program.types.unknown()
+    } else {
+        ret_type
+    };
     let provisional_id = program.symbols.alloc_fn_id();
     let mut params = Vec::new();
     let shape = lower_parameters(program, ctx, source, decl, provisional_id, &mut params);
@@ -4368,6 +5016,22 @@ fn walk_function_body(
     let using_nss_len = ctx.using_nss.len();
     let using_imports_len = ctx.using_name_imports.len();
     let local_aliases_len = ctx.local_aliases.len();
+    // In C++ a local lives until the end of its block, or of the statement
+    // whose condition or init-statement declares it (`if (auto p = f())`,
+    // `for (int i = 0; ...)`); an outer variable it hid is back afterwards.
+    // C lowering keeps one name per function.
+    let is_local_scope = ctx.is_cpp
+        && (is_block
+            || matches!(
+                node.kind(),
+                "if_statement"
+                    | "for_statement"
+                    | "for_range_loop"
+                    | "while_statement"
+                    | "switch_statement"
+                    | "catch_clause"
+            ));
+    let local_scope_len = ctx.local_scope_log.len();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk_function_body(program, ctx, source, child, caller);
@@ -4376,6 +5040,14 @@ fn walk_function_body(
         ctx.using_nss.truncate(using_nss_len);
         ctx.using_name_imports.truncate(using_imports_len);
         ctx.local_aliases.truncate(local_aliases_len);
+    }
+    if is_local_scope {
+        for (name, shadowed) in ctx.local_scope_log.drain(local_scope_len..).rev() {
+            match shadowed {
+                Some(outer) => ctx.locals.insert(name, outer),
+                None => ctx.locals.remove(&name),
+            };
+        }
     }
     ctx.ast_depth = ctx.ast_depth.saturating_sub(1);
 }
@@ -4521,15 +5193,8 @@ fn collect_call_at_node(
             // constructs one. Inside a member class the outer class is no
             // longer the implicit `this`, which is what used to catch
             // `Outer(*this)` in a nested builder (#92).
-            None => constructed_class_in_scope(program, ctx, &spelled)
-                .map(|cls| (cls, trace_ir::MethodKind::Ctor))
-                .filter(|(cls, kind)| {
-                    names_function(program, ctx, &kind.name_on(cls))
-                    // Inside a class whose body is still being lowered, its
-                    // name can only construct it, and its constructor may be
-                    // defined below the call; the site resolves by name.
-                    || ctx.type_scope.borrow().iter().any(|scope| scope == cls)
-                }),
+            None => constructed_class(program, ctx, &spelled)
+                .map(|cls| (cls, trace_ir::MethodKind::Ctor)),
             // Functor / callable object: `f()` where `f` has `operator()`.
             Some(v) if func.kind() == "identifier" => var_static_class(program, v)
                 .map(|cls| (cls, trace_ir::MethodKind::Named("operator()".to_string())))
@@ -4555,7 +5220,8 @@ fn collect_call_at_node(
         return;
     }
     if !is_direct && callee_var.is_none() {
-        is_direct = resolve_function_named(program, ctx, &callee_name).is_some();
+        is_direct =
+            resolve_function_named(program, ctx, global_lookup_name(&callee_name)).is_some();
     }
     if !is_direct && is_likely_macro_callee(&callee_name) {
         return;
@@ -4584,13 +5250,7 @@ fn collect_call_at_node(
             .into_iter()
             .collect()
     } else if callee_var.is_none() {
-        let candidates = if is_bare_callee_node(func) {
-            resolve_cpp_name_candidates(program, ctx, &callee_name, &arg_desc)
-        } else {
-            program
-                .symbols
-                .resolve_function_candidates(&callee_name, Some(ctx.current_file))
-        };
+        let candidates = cpp_callee_candidates(program, ctx, func, &callee_name, &arg_desc);
         // A qualified method call (`Base::m(a)`, `Cls::Static(a)`) lands here
         // too: its `this` is not one of the arguments.
         let by_arity = filter_targets_by_argc(program, candidates, argc, &arg_desc, argc == 0);
@@ -4990,6 +5650,24 @@ fn param_match_rank(arg: &TypeDesc, param: &TypeDesc) -> usize {
 /// bucket.
 fn is_bare_callee_node(func: tree_sitter::Node) -> bool {
     matches!(func.kind(), "identifier" | "template_function")
+}
+
+/// The functions a C++ callee `func`, spelled `name`, may call: ordinary and
+/// argument-dependent lookup for a bare name, exact lookup for a qualified one.
+fn cpp_callee_candidates(
+    program: &Program,
+    ctx: &LowerContext,
+    func: Node,
+    name: &str,
+    arg_desc: &[TypeDesc],
+) -> Vec<FnId> {
+    if is_bare_callee_node(func) {
+        resolve_cpp_name_candidates(program, ctx, name, arg_desc)
+    } else {
+        program
+            .symbols
+            .resolve_function_candidates(global_lookup_name(name), Some(ctx.current_file))
+    }
 }
 
 /// ADL (argument-dependent / Koenig) namespaces: the enclosing namespaces
@@ -5425,6 +6103,16 @@ fn arity_compatible(expected: Option<usize>, got: Option<usize>) -> bool {
     }
 }
 
+/// Whether `f`, declaring `declared` explicit parameters, takes `argc`
+/// arguments on its own defaults and variadic tail.
+fn arity_takes(f: &Function, declared: usize, argc: usize) -> bool {
+    match declared.cmp(&argc) {
+        std::cmp::Ordering::Equal => true,
+        std::cmp::Ordering::Less => f.variadic,
+        std::cmp::Ordering::Greater => argc + f.default_args as usize >= declared,
+    }
+}
+
 /// The targets a call passing `argc` arguments fits: no more arguments than a
 /// target declares, and no fewer than its parameters without a default. A
 /// target whose arity nothing records stays when `keep_unknown` says so. A
@@ -5454,11 +6142,10 @@ fn filter_targets_by_argc(
         .collect();
     let defaults = |f: FnId| program.symbols.function(f).default_args as usize;
     let fits = |f: FnId, arity: Option<usize>| match arity {
-        Some(declared) if declared == argc => true,
-        Some(declared) if declared < argc => program.symbols.function(f).variadic,
+        Some(declared) if arity_takes(program.symbols.function(f), declared, argc) => true,
         Some(declared) => {
-            argc + defaults(f) >= declared
-                || targets.iter().zip(&arities).any(|(&other, &other_arity)| {
+            declared > argc
+                && targets.iter().zip(&arities).any(|(&other, &other_arity)| {
                     other_arity == Some(declared)
                         && argc + defaults(other) >= declared
                         && same_signature_loosely(program, f, other)
@@ -5961,27 +6648,16 @@ fn register_arrow_return(
         if parent.kind() == "template_declaration" {
             if let Some(params) = parent.child_by_field_name("parameters") {
                 // Positions must line up with the instantiation's argument
-                // list: a comment between parameters is a named child too,
-                // and would shift every parameter after it.
-                let mut cursor = params.walk();
-                let params = params
-                    .named_children(&mut cursor)
-                    .filter(|p| p.kind() != "comment");
-                for (i, param) in params.enumerate() {
-                    let ident = param.child_by_field_name("name").or_else(|| {
-                        param
-                            .named_children(&mut param.walk())
-                            .find(|n| n.kind() == "type_identifier")
-                    });
-                    if let Some(ident) = ident {
-                        let name = node_text(source, &ident);
-                        if name == spelling {
-                            parameter = Some(i);
-                        }
-                        dependent |= spelling
-                            .split(|c: char| !c.is_alphanumeric() && c != '_')
-                            .any(|token| token == name);
+                // list, which template_parameter_names keeps comments out of.
+                for (i, name) in template_parameter_names(source, params)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if name == Some(spelling) {
+                        parameter = Some(i);
                     }
+                    dependent |= name
+                        .is_some_and(|name| spelling_mentions(spelling, Spelling::Source, name));
                 }
             }
             break;
@@ -6215,7 +6891,7 @@ fn declared_class_in_scope(program: &Program, ctx: &LowerContext, name: &str) ->
     if let Some(TypeDesc::Struct { name, .. }) = local_alias(ctx, name) {
         return program.types.is_struct_declared(name).then(|| name.clone());
     }
-    find_in_scope(ctx, name, |candidate, _| {
+    find_in_scope(program, ctx, name, |candidate, _| {
         declared_class_name(program, candidate)
     })
 }
@@ -6227,7 +6903,7 @@ fn declared_class_in_scope(program: &Program, ctx: &LowerContext, name: &str) ->
 /// `struct Config::Parser { ... }` onto the C tag, apart from the definitions
 /// of its methods.
 fn declared_tag_in_scope(program: &Program, ctx: &LowerContext, name: &str) -> Option<String> {
-    find_in_scope(ctx, name, |candidate, _| {
+    find_in_scope(program, ctx, name, |candidate, _| {
         program
             .types
             .is_struct_declared(candidate)
@@ -6245,7 +6921,7 @@ fn constructed_class_in_scope(program: &Program, ctx: &LowerContext, name: &str)
         return program.types.is_struct_declared(name).then(|| name.clone());
     }
     let last = last_type_segment(name);
-    find_in_scope(ctx, name, |candidate, _| {
+    find_in_scope(program, ctx, name, |candidate, _| {
         let is_constructor = candidate
             .strip_suffix(last)
             .and_then(|scope| scope.strip_suffix("::"))
@@ -6258,6 +6934,17 @@ fn constructed_class_in_scope(program: &Program, ctx: &LowerContext, name: &str)
     .flatten()
 }
 
+/// The class a call spelled `T(args)` constructs: `T` names a class with a
+/// declared constructor. Inside a class whose body is still being lowered, its
+/// name can only construct it, and its constructor may be defined below the
+/// call; the site resolves by name.
+fn constructed_class(program: &Program, ctx: &LowerContext, spelled: &str) -> Option<String> {
+    constructed_class_in_scope(program, ctx, spelled).filter(|cls| {
+        names_function(program, ctx, &trace_ir::MethodKind::Ctor.name_on(cls))
+            || ctx.type_scope.borrow().iter().any(|scope| scope == cls)
+    })
+}
+
 /// Whether a function is declared under `name` where this unit can see it,
 /// internal linkage (`static`, an anonymous namespace) included.
 fn names_function(program: &Program, ctx: &LowerContext, name: &str) -> bool {
@@ -6268,13 +6955,18 @@ fn names_function(program: &Program, ctx: &LowerContext, name: &str) -> bool {
             .is_some()
 }
 
+/// How many base classes a type-name lookup asks about per scope; a
+/// hierarchy is rarely deeper, and a cyclic one must not loop.
+const MAX_BASE_LOOKUP: usize = 32;
+
 /// Look a type name up the way C++ does from the current scope (#90): in the
-/// class being lowered and each class around it, then in each enclosing
-/// namespace, innermost first, and last at the global scope. `probe` is asked
-/// about each candidate spelling in turn and the first answer wins; its flag
-/// is set for the last, global, candidate. A `::`-prefixed name is asked
-/// about at the global scope only.
+/// class being lowered, its bases, and each class around it, then in each
+/// enclosing namespace, innermost first, and last at the global scope. `probe`
+/// is asked about each candidate spelling in turn and the first answer wins;
+/// its flag is set for the last, global, candidate. A `::`-prefixed name is
+/// asked about at the global scope only.
 fn find_in_scope<T>(
+    program: &Program,
     ctx: &LowerContext,
     name: &str,
     mut probe: impl FnMut(&str, bool) -> Option<T>,
@@ -6301,6 +6993,13 @@ fn find_in_scope<T>(
         false
     };
     let mut candidate = String::new();
+    let mut ask = |scope: &str| {
+        candidate.clear();
+        candidate.push_str(scope);
+        candidate.push_str("::");
+        candidate.push_str(name);
+        probe(&candidate, false)
+    };
     // Innermost first. A member class's entry spells its outer classes, so
     // a scope an entry further in already covers is not asked about again.
     for (depth, class) in classes.iter().enumerate().rev() {
@@ -6313,12 +7012,20 @@ fn find_in_scope<T>(
                     .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
             })
         {
-            candidate.clear();
-            candidate.push_str(prefix);
-            candidate.push_str("::");
-            candidate.push_str(name);
-            if let Some(hit) = probe(&candidate, false) {
+            if let Some(hit) = ask(prefix) {
                 return Some(hit);
+            }
+            // A class's members include those of its bases, before the scopes
+            // around it: `Node` in `struct D : Base` is `Base::Node`.
+            let mut bases: Vec<&str> = program.base_names(prefix).collect();
+            let mut seen = 0;
+            while seen < bases.len() && seen < MAX_BASE_LOOKUP {
+                let base = bases[seen];
+                if let Some(hit) = ask(base) {
+                    return Some(hit);
+                }
+                bases.extend(program.base_names(base));
+                seen += 1;
             }
             prefix = prefix.rfind("::").map_or("", |at| &prefix[..at]);
         }
@@ -6346,7 +7053,7 @@ fn find_in_scope<T>(
 /// answered here.
 fn scoped_type_desc(program: &Program, ctx: &LowerContext, name: &str) -> Option<TypeDesc> {
     let spelled_global = name.starts_with("::");
-    find_in_scope(ctx, name, |candidate, global| {
+    find_in_scope(program, ctx, name, |candidate, global| {
         if program.types.is_struct_declared(candidate)
             || program
                 .types
@@ -7999,6 +8706,13 @@ fn is_likely_macro_callee(name: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// The name the index holds a callee spelled `name` under. A leading `::` only
+/// says the lookup starts at the global scope; the spelling keeps it, so an
+/// unresolved `::operator new` stays that external.
+fn global_lookup_name(name: &str) -> &str {
+    name.strip_prefix("::").unwrap_or(name)
+}
+
 fn resolve_callee(
     program: &Program,
     ctx: &LowerContext,
@@ -8140,11 +8854,13 @@ fn is_function_pointer_declarator(decl: Node) -> bool {
 
 /// If `decl` denotes a function whose declarator chain starts with one or more
 /// pointer levels (`T *f(...)` / `T **f(...)`), return the innermost
-/// non-fn-ptr `function_declarator` and the number of pointer levels.
+/// non-fn-ptr `function_declarator`, the number of pointer levels, and whether
+/// a reference layer sits above it (`T &f(...)`).
 /// Variables (plain pointers, arrays, fn-ptr vars) yield `None`.
-fn fn_decl_under_pointer(decl: Node) -> Option<(Node, usize)> {
+fn fn_decl_under_pointer(decl: Node) -> Option<(Node, usize, bool)> {
     let mut cur = decl;
     let mut depth = 0usize;
+    let mut reference = false;
     loop {
         match cur.kind() {
             "pointer_declarator" => {
@@ -8153,14 +8869,15 @@ fn fn_decl_under_pointer(decl: Node) -> Option<(Node, usize)> {
                     .child_by_field_name("declarator")
                     .or_else(|| cur.named_child(0))?;
             }
-            "parenthesized_declarator" => {
+            "parenthesized_declarator" | "reference_declarator" => {
+                reference |= cur.kind() == "reference_declarator";
                 cur = cur.named_child(0)?;
             }
             "function_declarator" => {
                 if is_function_pointer_declarator(cur) {
                     return None;
                 }
-                return Some((cur, depth));
+                return Some((cur, depth, reference));
             }
             _ => return None,
         }
@@ -8216,7 +8933,7 @@ fn type_desc_from_node(
         let raw = normalize_qualified(text);
         if node.kind() == "placeholder_type_specifier" {
             // `auto`: unknown until the initializer is examined; callers
-            // refine new-expression initializers separately.
+            // refine supported initializers separately.
             return TypeDesc::Unknown;
         }
         if let Some(desc) = local_alias(ctx, &raw) {

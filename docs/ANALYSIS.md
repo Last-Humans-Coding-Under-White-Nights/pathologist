@@ -460,7 +460,8 @@ C++-aware only where it must be — everything else reuses the C machinery.
   in-scope edge, and is avoided.
 - **Type names** are looked up the way C++ looks them up, by one shared
   walk (`find_in_scope`, #90): the class whose body or member is being
-  lowered and each class around it (a class local to a member function
+  lowered, its bases (a nested `Node` of `struct D : Base` is `Base::Node`),
+  and each class around it (a class local to a member function
   also sees that function's class), then each enclosing namespace
   innermost first, then the global scope. Locals, parameters, fields,
   return types, template heads and arguments, bases, `new` and casts all
@@ -927,15 +928,94 @@ C++-aware only where it must be — everything else reuses the C machinery.
   object without a constructor call, as `Worker w{OnReady};` does, since no
   function runs it. A function name in extra parentheses, `Worker
   w((OnReady));`, is an argument like the bare name.
+  A reference spelled the same way, `T &r(a);`, binds `r` to `a` and
+  constructs nothing; lowering records neither a constructor call nor `r`.
 - **References** lower as pointers (aliasing stores land on caller memory).
+- **C++ locals** live until the end of their block, or of the `if`, `for`,
+  `while`, `switch` or `catch` whose condition or init-statement declares
+  them (`if (auto p = f())`); a variable of the same name they hid is
+  visible again afterwards. C lowering keeps one name per function.
+- **`auto` local types (#87, C1)**: a call initializer copies the declared
+  return type of the function it resolves to. Free, qualified, explicit and
+  implicit member calls use the call-site lookup and arity filter; ranking
+  narrows overloads when the argument types are known. The candidates left
+  must all take the arguments and agree on one return type (`T *get()` and
+  `T *get() const` do); otherwise the local stays unknown. `T(args)` is a
+  construction when the call site reads it as one, and gives `T`. Pointer
+  layers on definitions and member prototypes, and declaration-only
+  reference-return factories, are preserved for this lookup. A non-call
+  initializer takes the receiver type the member-call path already reads:
+  copies from typed variables and fields (`auto p = q.a`), `*pp` and `&w`; a
+  C-style cast and `new T` give the type they spell, pointer layers
+  included. Only a class, union or function-pointer type, under any pointer
+  layers, is copied: a scalar may be the stand-in for a type name lowering
+  could not resolve. `auto&` and `const auto&` take the type of the value
+  they name, as an explicit `T&` local does, so an argument ranks overloads
+  the same either way. `auto *p` and `auto **p` need an
+  initializer with at least as many pointer layers, and deduce nothing from
+  one with fewer. Both `if (auto p = f())` and `if (auto p = f(); p)` are
+  covered.
+  `lock()` on a `weak_ptr<T>` and `promote()` on a `wptr<T>` whose body is
+  not in the tree produce `shared_ptr<T>` / `sptr<T>` in the weak pointer's
+  own scope (`OHOS::CameraStandard::wptr` promotes to
+  `OHOS::CameraStandard::sptr`); a declared wrapper's own members are looked
+  up instead. `std::make_shared<T>` / `std::make_unique<T>` produce the
+  corresponding wrapper type, spelled bare too where `using namespace std;`
+  or `using std::make_shared;` is in scope, with cv-qualifiers dropped and
+  template arguments kept (`make_shared<const Box<int>>`). These models
+  require a class the call site can name, through its scopes or a `using`
+  directive. They infer types only: they do not synthesize allocation or
+  additional value flows. A standard smart pointer copied from a declared
+  return type whose argument names no class as written, while the scopes
+  name one by it (`std::shared_ptr<TraceStrategy>` declared under
+  `using namespace OHOS::HiviewDFX`), is left untyped rather than guessed.
+  Unresolved callees and template-dependent types remain unknown. A type is
+  dependent when it names a parameter of an enclosing template, directly or
+  through a member alias of an enclosing class
+  (`using Ptr = std::shared_ptr<T>; Ptr Get();`): a type parameter by its
+  identifier, a value parameter (`template<int N>`) by its declarator, never
+  by its type. A source spelling qualified by `::` (`OHOS::Event`) is never
+  the parameter; a name lowering qualified (`ns::T` for a parameter `T` it
+  could not find) still can be. A call whose callee belongs to a parameter
+  (`t->make()` for `T *t`, `T::create()`, a member of a base `Base` in
+  `struct M : Base`) is dependent too. Existing pointer-flow and
+  virtual-dispatch handling then uses the inferred receiver exactly as an
+  explicitly typed receiver.
+- **Qualified names**: a leading `::` (`::f()`, `::ns::f()`,
+  `::std::make_shared<T>()`) is looked up from the global scope; an
+  unresolved call keeps its `::` spelling as the external callee, so
+  `::operator new` stays that external. The parameters and body of a
+  definition spelled `N::f` look type names up in `N`, class or namespace;
+  when `N` is a namespace the unit or a header it includes opens, the body
+  looks function names up in it too. A scope neither opens as a namespace is
+  a class the unit cannot see (`Ast::Lookup` under
+  `using namespace OHOS::Hardware`).
 - **Templates**: lowered once per primary name; `<...>` arguments stripped.
 
 Known C++ imprecision (in addition to the general list below):
 
 - Lambda **captures** are unmodeled (including `[this]`); the lambda body
   still participates in the call graph as a nested function.
-- `auto` from a call (`auto p = wp.lock()`) stays `Unknown`; there is no
-  return-type inference, so member calls on such pointers do not unwrap.
+- `auto` inference needs a declaration visible in the translation unit;
+  it does not infer returns from bodies, substitute general templates, or
+  infer function-pointer call results. Trailing `auto` return declarations
+  remain unknown. Named casts (`auto p = static_cast<T *>(v)`) parse as calls
+  to the cast and stay unknown until C2, as do conditional expressions
+  (`auto p = c ? a : b`). A
+  call whose receiver is itself a call result (`S::GetInstance().Open()`,
+  `auto p = w->self()->self()`) has no static receiver type, whether or not
+  the result is stored in an `auto` local. `shared_ptr::get` and
+  `unique_ptr::release` are not unwrapped to the held class.
+- In-class prototypes carry no parameter types, so same-arity overloads of a
+  member (`Worker *find(int)`, `Other *find(const char *)`) share one entry,
+  which keeps the first declaration's return type; an `auto` local takes it
+  whichever overload the call means.
+- A reference parameter is typed one pointer layer deeper than an explicit
+  `T&` local, so overload ranking can prefer `take(T*)` over `take(T)` for
+  it.
+- An out-of-line member definition under `using namespace N;` at global
+  scope registers under the bare class name, apart from `N::`'s in-class
+  prototypes; a call reaching the prototype stays external.
 - `std::bind` / generic functors without a visible `operator()` stay
   unresolved-indirect unless a function address flows into them.
 - Default construction without parens (`Cls o;`) emits no ctor site.

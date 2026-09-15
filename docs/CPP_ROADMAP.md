@@ -24,6 +24,7 @@ Do not chase STL noise (`std::string::c_str`, `parcel->WriteString`,
 |------------|-----------------|
 | CHA from static receiver + implicit `this` | `Plugin::OnEventProxy` → 22 plugin `OnEvent` bodies |
 | Smart-pointer / `operator->` unwrap, by declaration not by name (C12); an undeclared wrapper guessed from its one class argument (#86) | `call_sp` fixture; typed `Plugin*` paths; hdf `AutoPtr<T>` (+4,551 direct edges); camera `sptr<T>` (+16,587 direct edges) |
+| `auto` from declared returns and smart-pointer factories (C1, #87) | eval H5; see `docs/EVAL_REPORT.md` |
 | `final` / virtual bases | fixtures only (`cpp_dispatch`); hiview barely uses them |
 | Direct `std::function` field store | `cpp_callable`; **not** the factory path (C3) |
 | `$lambda` as a nested function | 357 interned; almost none have **incoming** edges |
@@ -43,46 +44,12 @@ Do not chase STL noise (`std::string::c_str`, `parcel->WriteString`,
 
 ---
 
-## C1 — Return-type inference (`auto`, `lock()`, `make_shared`)
+## C1 — Return-type inference (`auto`, `lock()`, `make_shared`) — implemented (#87)
 
-**Why first:** Unblocks the pipeline pump and most remaining `ptr->…`
-sites. CHA already works once the receiver is `Plugin` / `EventLoop`.
-
-**Hiview:** `base/pipeline.cpp:47-64`
-
-```cpp
-std::weak_ptr<Plugin> plugin = processors_.front();
-if (auto pluginPtr = plugin.lock()) {
-    if (auto workLoop = pluginPtr->GetWorkLoop()) {
-        workLoop->AddEvent(pluginPtr, shared_from_this());
-    } else {
-        pluginPtr->OnEventProxy(shared_from_this());
-    }
-}
-```
-
-`GetWorkLoop()` is declared `std::shared_ptr<EventLoop>` in `plugin.h`;
-`lock()` is `shared_ptr<Plugin>`. Both are hidden behind `auto`, so the
-receiver stays `Unknown` and `OnEventProxy` / `AddEvent` get **0**
-targets (eval H5).
-
-Same shape:
-
-- `SysEventDispatcher::DispatchEvent` — `auto ptr = dispatcher.lock(); ptr->OnEventListeningCallback(...)` (`plugins/sys_dispatcher/sys_dispatcher.cpp:45-48`)
-- `if (auto workLoop = pluginPtr->GetWorkLoop())` — if-init from a typed method, still `auto`
-
-**Design sketch:** On `Var x = call`, copy the callee’s interned return
-type onto `x` (`CallReturn` already exists for pointer flow; this is
-the **type** analogue). Special-case `shared_ptr`/`weak_ptr`/`unique_ptr`
-methods `lock` / `get` / `release` as identity unwraps to `T`.
-`std::make_shared<T>(…)` / `make_unique<T>` intern as `Ptr(Struct{T})`.
-
-**Eval when done:** `pluginPtr->OnEventProxy` in `OnContinue` has the
-same CHA fan-out as typed `Plugin::OnEventProxy`. `workLoop->AddEvent`
-resolves to `EventLoop::AddEvent`.
-
-**Fixture:** `auto p = wp.lock(); p->OnEventProxy();` next to today’s
-explicit `shared_ptr<Plugin> p`.
+Done; this slice closes eval H5. The rules are in `docs/ANALYSIS.md`
+("`auto` local types"); what it leaves unresolved is under "Known C++
+imprecision" there, and named casts and calls on a call result continue as C2
+and C8. Corpus results, H5 and performance are in `docs/EVAL_REPORT.md`.
 
 ---
 
@@ -262,10 +229,11 @@ Same PAG pattern as C fn-ptr arrays + C3 map summary. Prefer one
 `XperfRegisterManager::GetInstance().PostEvent(...)`.
 
 Often the chain is typed (`HiviewPlatform::GetInstance()` returns
-`HiviewPlatform&`). Failures are `auto &platform = …GetInstance()`
-(C1) or SDK singletons outside the tree. In-tree: intern
-`GetInstance` return as `Ptr(Struct{Cls})` from the method’s return
-type (C1 covers this if returns are tracked).
+`HiviewPlatform&`). The `auto` forms are C1's. What is left is a call whose
+receiver is itself a call result (`Cls::GetInstance().OpenTrace(...)`), listed
+under "Known C++ imprecision" in `docs/ANALYSIS.md`. Plan: give the member-call
+path the declared-return lookup C1 applies to `auto` initializers. SDK
+singletons outside the tree stay unresolved.
 
 **Eval when done:** `hiview_service.cpp` `GetInstance().OpenTrace` is a
 direct edge to `TraceStateMachine::OpenTrace` when that class is in-tree.
@@ -597,7 +565,7 @@ C1 type-of-call / lock / make_shared
         → C5 pluginMap_ named lookup
           → C6 PluginProxy
             → C7 other maps (share C3 summary)
-C8 GetInstance          (mostly falls out of C1)
+C8 GetInstance          (partly done by C1; see C8)
 C9 template-method names (cheap, independent)
 C10 header grammar      (foundational; do when HDF mixed headers bit)
 C11 dlopen/dlsym        (POSIX summary; also HDF SbufObtainIpc / driver_loader)
@@ -614,7 +582,7 @@ plugins without `dlsym` is C3 (static `REGISTER` ctors).
 
 | Slice | Fixture sketch |
 |-------|----------------|
-| C1 | `auto p = wp.lock(); p->OnEventProxy();` + `auto l = p->GetWorkLoop(); l->AddEvent(...)` |
+| C1 | `auto p = wp.lock(); p->OnEventProxy();` + `auto l = p->GetWorkLoop(); l->AddEvent(...)` — done, see `tests/fixtures/cpp_auto_return` |
 | C2 | `Event::DownCastTo<SysEvent>(e); sys->SetEventValue(...)` |
 | C3 | `REGISTER`-like static `PluginRegistInfo(MakeFoo)` + `info->getPluginObject()` |
 | C4 | `std::bind(&Plugin::OnEventProxy, this, e)` stored and invoked; `ffrt::submit` stub summary |

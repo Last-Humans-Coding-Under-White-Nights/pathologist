@@ -181,6 +181,9 @@ pub struct Program {
     /// that derives it so: `inheritance` joins every class of a name, and
     /// another file's class of the name derives from other bases.
     pub anonymous_bases: BTreeMap<String, BTreeSet<(FileId, String)>>,
+    /// Qualified names of the C++ namespaces opened (`ns::inner`), merged with
+    /// a header's types so a unit knows the namespaces its headers open.
+    pub namespaces: BTreeSet<String>,
     /// Whether configuration-variant exploration was enabled (#59).
     pub explore: bool,
     /// Maximum configuration-variant exploration budget per translation unit
@@ -424,12 +427,16 @@ impl Program {
 
     /// Direct base classes of `cls`.
     pub fn bases_of(&self, cls: &str) -> Vec<String> {
+        self.base_names(cls).map(str::to_owned).collect()
+    }
+
+    /// [`Self::bases_of`], borrowed.
+    pub fn base_names(&self, cls: &str) -> impl Iterator<Item = &str> {
         self.bases_by_class
             .get(cls)
             .into_iter()
             .flatten()
-            .map(|&i| self.inheritance[i].1.clone())
-            .collect()
+            .map(|&i| self.inheritance[i].1.as_str())
     }
 
     /// `root` plus every class transitively deriving from it (BFS).

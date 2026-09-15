@@ -100,6 +100,7 @@ After merge, `Program` contains:
 | `template_bases` | Templated base spellings plus the derived class declaration scope, preserved for consumers that interpret template arguments |
 | `arrow_returns` | Declared C++ `operator->` return types for smart-pointer wrappers, preserved across translation units |
 | `final_classes` | Classes marked `final` to prune CHA hierarchy traversal |
+| `namespaces` | Qualified names of the C++ namespaces opened, merged from headers so a unit knows the namespaces they open |
 
 Lowering (`trace-parse/src/lower.rs`) walks tree-sitter ASTs and emits **flow constraints** — not a full statement-level CFG.
 

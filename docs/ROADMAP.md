@@ -98,7 +98,7 @@ C1→C11 there with fixtures.
 
 | Item | Notes |
 |------|-------|
-| **C++ next slices** | See [CPP_ROADMAP.md](CPP_ROADMAP.md); eval H5 (`auto`/`lock`), H7 (`REGISTER` + map), C11 (`dlsym`) |
+| **C++ next slices** | See [CPP_ROADMAP.md](CPP_ROADMAP.md) for slice order and status; eval H7 (`REGISTER` + map), C11 (`dlsym`) |
 | **`memcpy` / `memmove` summaries** | Registered but no-op; blocks fn-ptr-through-memcpy patterns |
 | **Original-source line remapping** | Done for `#include`d code: header-origin entities carry original file/line via `LineMap` and are deduplicated across TUs |
 | **`compile_commands.json` (#62)** | Implemented: optional discovery or explicit path; per-command includes, macro operations, forced includes, language/standard; all configurations merged. Missing build dependencies remain outside its scope. |
@@ -139,7 +139,8 @@ Further index-time wins: smarter header/preprocess skipping, incremental TU cach
 | Function-local static | `fn_static_local/` |
 | Preprocessor | `tests/fixtures/preproc/` |
 | C++ first-step | `cpp_basic/`, `cpp_more/`, `cpp_flow/`, `cpp_implicit_this/`, `cpp_callable/`, `cpp_dispatch/`, `cpp_extern_c_driver/` |
-| C++ next (planned) | [CPP_ROADMAP.md](CPP_ROADMAP.md) — `auto`/`lock`, `DownCastTo`, `REGISTER`+map, `std::bind`/`ffrt::submit` |
+| C++ `auto` from declared returns (C1) | `cpp_auto_return/` |
+| C++ next (planned) | [CPP_ROADMAP.md](CPP_ROADMAP.md) — `DownCastTo`, `REGISTER`+map, `std::bind`/`ffrt::submit` |
 | Adversarial / limitations | `tests/fixtures/adversarial_*`, `macro_*` |
 
 Run: `cargo test --workspace`
