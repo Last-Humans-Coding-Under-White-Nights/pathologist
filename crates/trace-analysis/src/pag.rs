@@ -326,7 +326,7 @@ impl Pag {
         if let Some(&loc) = self.field_summary.get(&(struct_type, field)) {
             return loc;
         }
-        let struct_name = match &program.types.get(struct_type).desc {
+        let struct_name = match program.types.get(struct_type).desc.as_ref() {
             trace_ir::TypeDesc::Struct { name, .. } => name.clone(),
             trace_ir::TypeDesc::Union { name, .. } => name.clone(),
             _ => format!("type{}", struct_type.0),
@@ -419,7 +419,7 @@ impl Pag {
     ) -> Option<usize> {
         let parent_type = struct_type_for_loc(self, program, base_loc)?;
         let layout = program.types.get(parent_type).layout.fields.get(&field)?;
-        match &program.types.get(layout.type_id).desc {
+        match program.types.get(layout.type_id).desc.as_ref() {
             trace_ir::TypeDesc::FnPtr { params, .. } => Some(params.len()),
             _ => None,
         }
@@ -573,7 +573,7 @@ impl Pag {
             .types
             .all()
             .iter()
-            .find(|t| matches!(t.desc, trace_ir::TypeDesc::Char))
+            .find(|t| matches!(t.desc.as_ref(), trace_ir::TypeDesc::Char))
             .map(|t| t.id)
             .unwrap_or_else(|| program.types.void());
         let loc_id = LocId(self.locations.len() as u32);
@@ -843,7 +843,7 @@ pub(crate) fn struct_type_for_loc(
     if let Some(var) = pag.locations[loc.0 as usize].var {
         let mut type_id = program.symbols.variable_by_id(var)?.type_id;
         for _ in 0..4 {
-            match &program.types.get(type_id).desc {
+            match program.types.get(type_id).desc.as_ref() {
                 trace_ir::TypeDesc::Ptr(inner) => {
                     type_id = match inner.as_ref() {
                         trace_ir::TypeDesc::Struct { name, .. } => program
@@ -882,7 +882,7 @@ fn inner_or_elem(desc: &trace_ir::TypeDesc) -> &trace_ir::TypeDesc {
 fn type_id_of_loc(pag: &Pag, program: &Program, loc: LocId) -> Option<trace_ir::TypeId> {
     let mut type_id = pag.locations[loc.0 as usize].type_id;
     for _ in 0..4 {
-        match &program.types.get(type_id).desc {
+        match program.types.get(type_id).desc.as_ref() {
             trace_ir::TypeDesc::Ptr(inner) => {
                 type_id = program.types.resolve_type_id(inner);
             }
@@ -897,7 +897,7 @@ fn struct_type_from_type_id(
     mut type_id: trace_ir::TypeId,
 ) -> Option<trace_ir::TypeId> {
     for _ in 0..6 {
-        match &program.types.get(type_id).desc {
+        match program.types.get(type_id).desc.as_ref() {
             trace_ir::TypeDesc::Ptr(inner) => {
                 type_id = match inner.as_ref() {
                     trace_ir::TypeDesc::Struct { name, .. } => program

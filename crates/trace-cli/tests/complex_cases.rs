@@ -88,7 +88,7 @@ fn union_type_registered_in_ir() {
         .types
         .all()
         .iter()
-        .any(|t| matches!(t.desc, trace_ir::TypeDesc::Union { .. }));
+        .any(|t| matches!(t.desc.as_ref(), trace_ir::TypeDesc::Union { .. }));
     assert!(has_union, "union type should be registered in type table");
 }
 

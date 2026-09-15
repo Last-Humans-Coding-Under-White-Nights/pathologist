@@ -40,6 +40,29 @@ flowchart TD
 2. **`solve`** — worklist propagation until fixpoint; discover indirect callees when call-target points-to gains function locations.
 3. **`extract_arg_flow`** — emit `arg_flow_edges` for wired parameter copies at resolved calls.
 
+## Type storage
+
+Type tables share immutable `Arc<TypeDesc>` descriptors and typedef alias
+payloads across simultaneously live headers and translation units. Interning
+order, IDs, layouts, and tag-completion state remain local to each table;
+aggregate union replaces a shared descriptor rather than modifying it.
+Sharing requires full structural equality, including collision checks, and
+weak pool entries do not retain unused descriptor payloads. The public Rust
+`TypeInfo.desc` field is an `Arc`; match through `.as_ref()`. Serialized type
+values and exported data are unchanged. See [memory measurements](MEMORY_PROFILE.md).
+
+Sharing also makes re-interning cheap: a table answers `intern_arc` for an
+allocation it already holds by address, without hashing the descriptor tree,
+and a header unit carries the descriptor each of its types merges as
+(`UnitIndex::merge_descs`), computed once rather than by every consumer. A
+descriptor that tag completion may rewrite (`Ptr(Struct { name, fields: [] })`)
+is answered from a small cache keyed by that spelling and validated against
+the tag's current id, its descriptor allocation and the aggregate-union count,
+so the answer changes exactly when the layout it names does. Internal-linkage
+function and file-static lookups are indexed by name and filtered by the
+asking file's scope, rather than walking every header of the scope per name.
+See the [Clang benchmark](PERFORMANCE_REVIEW.md#clang-source-benchmark-header-import-and-lowering).
+
 ## IR flow constraints (`trace-ir`)
 
 Lowered from C during parse. Mapped to PAG in `Pag::build_flow_constraints`.

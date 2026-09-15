@@ -42,7 +42,7 @@ fn xmacro_generates_structs_handlers_and_table() {
             .types
             .all()
             .iter()
-            .any(|t| matches!(&t.desc, trace_ir::TypeDesc::Struct { name, .. } if name.contains("alpha") || name.contains("beta"))),
+            .any(|t| matches!(t.desc.as_ref(), trace_ir::TypeDesc::Struct { name, .. } if name.contains("alpha") || name.contains("beta"))),
         "X-macro should emit alpha_ctx / beta_ctx structs"
     );
     assert!(

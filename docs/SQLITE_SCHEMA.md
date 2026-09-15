@@ -2,6 +2,10 @@
 
 Schema version: **v4**
 
+Export creates secondary indexes after bulk insertion, within the same
+transaction and before publishing the database. Primary keys and uniqueness
+constraints remain active during insertion. The completed v4 schema is unchanged.
+
 See also the [README](../README.md) for CLI flags that control what is exported.
 
 ## Export modes vs tables

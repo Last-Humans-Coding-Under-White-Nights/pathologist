@@ -186,8 +186,9 @@ fn run_index(cfg: &IndexConfig) -> Result<(TraceIndexResult, String), ApiError> 
         popts = popts.with_define(name, value);
     }
 
-    let program =
+    let mut program =
         build_program_with_jobs(&cfg.root, &popts, cfg.jobs).map_err(ApiError::Analysis)?;
+    program.release_merge_state();
     let (pag, analysis) = analyze_with_options(
         &program,
         AnalyzeOptions {

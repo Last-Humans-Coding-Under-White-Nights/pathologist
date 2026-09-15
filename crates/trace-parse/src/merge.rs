@@ -1,6 +1,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use trace_ir::{
     same_param_type_or_unresolved, CallSite, CallSiteId, FlowConstraint, FnId, Function, Program,
     ReturnFlow, TemplateBase, TypeDesc, TypeId, VarId, Variable,
@@ -38,6 +39,40 @@ pub struct UnitIndex {
     pub anonymous_bases: BTreeMap<String, BTreeSet<(trace_ir::FileId, String)>>,
     /// Namespaces this unit opens, merged in every mode.
     pub namespaces: BTreeSet<String>,
+    /// Per type of `types`, the descriptor `merge_types` interns into the
+    /// receiving table on the ordinary path: the type's own for a type whose
+    /// layout spells it, otherwise the aggregate rebuilt from its layout.
+    /// Computed once per unit rather than once per consumer, and shared, so
+    /// a consumer that already holds it answers by address. Empty when the
+    /// unit was built without it; the merge then rebuilds as it goes.
+    pub merge_descs: Vec<Arc<TypeDesc>>,
+}
+
+/// See [`UnitIndex::merge_descs`].
+pub(crate) fn merge_descs_of(types: &trace_ir::TypeTable) -> Vec<Arc<TypeDesc>> {
+    types
+        .all()
+        .iter()
+        .map(|info| match info.desc.as_ref() {
+            TypeDesc::Struct { name, fields } | TypeDesc::Union { name, fields }
+                if !fields.is_empty() && !layout_spells_desc(types, info) =>
+            {
+                let fields = fields_from_layout(types, info);
+                let rebuilt = match info.desc.as_ref() {
+                    TypeDesc::Struct { .. } => TypeDesc::Struct {
+                        name: name.clone(),
+                        fields,
+                    },
+                    _ => TypeDesc::Union {
+                        name: name.clone(),
+                        fields,
+                    },
+                };
+                types.share_desc(&rebuilt)
+            }
+            _ => Arc::clone(&info.desc),
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -268,7 +303,7 @@ fn merge_unit(
         program.add_inheritance(derived, base);
     }
     for fact in &unit.template_bases {
-        program.add_template_base(&fact.derived, &fact.spelling, &fact.declaration_scope);
+        program.add_template_base_fact(fact);
     }
     for fact in &unit.arrow_returns {
         if !program.arrow_returns.contains(fact) {
@@ -284,6 +319,7 @@ fn merge_unit(
         &mut program.types,
         &unit.types,
         matches!(mode, MergeMode::Variant),
+        Some(unit.merge_descs.as_slice()).filter(|d| d.len() == unit.types.all().len()),
     );
 
     let mut file_map: Vec<trace_ir::FileId> = Vec::with_capacity(unit.files.len());
@@ -931,11 +967,20 @@ fn merge_types(
     dst: &mut trace_ir::TypeTable,
     src: &trace_ir::TypeTable,
     union_aggregates: bool,
+    merge_descs: Option<&[Arc<TypeDesc>]>,
 ) -> Vec<TypeId> {
     dst.merge_struct_declarations(src);
     let mut map = Vec::with_capacity(src.all().len());
-    for info in src.all() {
-        let new_id = match &info.desc {
+    for (i, info) in src.all().iter().enumerate() {
+        // The precomputed descriptor is what the arms below would build;
+        // interning it by address skips both the rebuild and the hashing.
+        if let Some(desc) = merge_descs.filter(|_| !union_aggregates).map(|d| &d[i]) {
+            let new_id = dst.intern_arc(desc);
+            debug_assert_eq!(info.id.0 as usize, map.len());
+            map.push(new_id);
+            continue;
+        }
+        let new_id = match info.desc.as_ref() {
             // The layout usually still spells the descriptor's own fields, and
             // then interning the descriptor by reference is the same as
             // interning the rebuilt one, without cloning every field deep. A
@@ -966,7 +1011,7 @@ fn merge_types(
     }
     for (alias, desc) in src.all_aliases() {
         if dst.resolve_alias(alias).is_none() {
-            dst.register_alias(alias, desc.clone());
+            dst.register_alias_ref(alias, desc);
         }
     }
     map
@@ -974,14 +1019,15 @@ fn merge_types(
 
 /// Whether [`fields_from_layout`] would rebuild `info`'s descriptor as it is.
 fn layout_spells_desc(src: &trace_ir::TypeTable, info: &trace_ir::TypeInfo) -> bool {
-    let (TypeDesc::Struct { fields, .. } | TypeDesc::Union { fields, .. }) = &info.desc else {
+    let (TypeDesc::Struct { fields, .. } | TypeDesc::Union { fields, .. }) = info.desc.as_ref()
+    else {
         return false;
     };
     fields.len() == info.layout.fields.len()
         && fields
             .iter()
             .zip(info.layout.fields.values())
-            .all(|((name, desc), fl)| *name == fl.name && src.get(fl.type_id).desc == *desc)
+            .all(|((name, desc), fl)| *name == fl.name && src.get(fl.type_id).desc.as_ref() == desc)
 }
 
 /// Prefer layout field types over the interned `TypeDesc` field list: PCH
@@ -994,7 +1040,7 @@ fn fields_from_layout(
     info.layout
         .fields
         .iter()
-        .map(|(_, fl)| (fl.name.clone(), src.get(fl.type_id).desc.clone()))
+        .map(|(_, fl)| (fl.name.clone(), src.get(fl.type_id).desc.as_ref().clone()))
         .collect()
 }
 
@@ -1071,7 +1117,7 @@ fn respelled_declarations(
             };
             let exact = |x: TypeId, y: TypeId| x == y;
             let loose = |x: TypeId, y: TypeId| {
-                trace_ir::may_name_same_type(&types.get(x).desc, &types.get(y).desc)
+                trace_ir::may_name_same_type(types.get(x).desc.as_ref(), types.get(y).desc.as_ref())
             };
             if let Some(definition) = only(&exact).or_else(|| only(&loose)) {
                 out.insert(declaration.id, definition);
@@ -1203,7 +1249,7 @@ mod tests {
         let mut dst = trace_ir::TypeTable::new();
         let b = dst.intern(full_b.clone());
 
-        let map = merge_types(&mut dst, &src, false);
+        let map = merge_types(&mut dst, &src, false, None);
 
         assert_eq!(map.len(), src.all().len(), "one slot per source id");
         assert_eq!(
@@ -1216,7 +1262,7 @@ mod tests {
         assert_eq!(dst.get(a_dst).desc, src.get(a).desc);
         assert_eq!(
             dst.get(remap_type(p, &map)).desc,
-            TypeDesc::Ptr(Box::new(full_b)),
+            TypeDesc::Ptr(Box::new(full_b)).into(),
             "the empty tag canonicalizes to the layout the destination holds"
         );
         assert_eq!(dst.type_id_by_tag("B", trace_ir::TypeKind::Struct), Some(b));
@@ -1258,19 +1304,19 @@ mod tests {
             fields: vec![int_field("i"), ("l".into(), TypeDesc::Long)],
         });
         for info in src.all() {
-            if matches!(info.desc, TypeDesc::Struct { ref fields, .. } | TypeDesc::Union { ref fields, .. } if !fields.is_empty())
+            if matches!(info.desc.as_ref(), TypeDesc::Struct { fields, .. } | TypeDesc::Union { fields, .. } if !fields.is_empty())
             {
                 assert!(layout_spells_desc(&src, info), "{:?}", info.desc);
             }
         }
 
         let mut fast = trace_ir::TypeTable::new();
-        let fast_map = merge_types(&mut fast, &src, false);
+        let fast_map = merge_types(&mut fast, &src, false, None);
         let mut rebuilt = trace_ir::TypeTable::new();
         let rebuilt_map: Vec<TypeId> = src
             .all()
             .iter()
-            .map(|info| match &info.desc {
+            .map(|info| match info.desc.as_ref() {
                 TypeDesc::Struct { name, fields } if !fields.is_empty() => {
                     rebuilt.compute_struct_layout(name.clone(), fields_from_layout(&src, info))
                 }
@@ -1298,10 +1344,10 @@ mod tests {
         assert!(!layout_spells_desc(&src, src.get(outer)));
 
         let mut dst = trace_ir::TypeTable::new();
-        let map = merge_types(&mut dst, &src, false);
+        let map = merge_types(&mut dst, &src, false, None);
         assert_eq!(
-            dst.get(remap_type(outer, &map)).desc,
-            tag(
+            dst.get(remap_type(outer, &map)).desc.as_ref(),
+            &tag(
                 "Outer",
                 vec![("inner".into(), tag("Inner", vec![int_field("x")]))]
             )
@@ -1317,13 +1363,13 @@ mod tests {
         let mut dst = trace_ir::TypeTable::new();
         let wide = dst.intern(tag("S", vec![("a".into(), TypeDesc::Long)]));
 
-        let map = merge_types(&mut dst, &src, false);
+        let map = merge_types(&mut dst, &src, false, None);
         let merged = remap_type(narrow, &map);
         assert_ne!(merged, wide);
         assert_eq!(dst.get(merged).desc, src.get(narrow).desc);
         assert_eq!(
-            dst.get(wide).desc,
-            tag("S", vec![("a".into(), TypeDesc::Long)])
+            dst.get(wide).desc.as_ref(),
+            &tag("S", vec![("a".into(), TypeDesc::Long)])
         );
     }
 

@@ -97,6 +97,18 @@ export: 0.1s
 analysis complete: 11442 functions, 25478 call edges, 25803 arg-flow edges -> trace.db
 ```
 
+SQLite export builds secondary indexes after loading rows, before committing
+and publishing the database, to reduce bulk insertion work.
+
+Normal indexing spills large preprocessed source text and LineMaps to temporary
+files and loads them as parsing needs them. Parsing workers run at most two
+units per worker (between 4 and 32 in total) ahead of the ordered merge, which
+limits queued IR without making a batch wait for its slowest unit. Temporary files are cleaned
+automatically; cached header expansions and the final merged program remain in
+memory. Type tables share immutable descriptors across cached headers and TUs
+while retaining local IDs and layouts. On Linux/glibc, indexing returns freed
+heap pages at phase boundaries. See [memory measurements](docs/MEMORY_PROFILE.md).
+
 **Examples**
 
 ```bash

@@ -78,6 +78,9 @@ flowchart LR
 - **`IncludeGraph`** (`trace-parse/src/deps.rs`) scans project files for `#include` directives, builds dependency edges, discovers include directories, and marks which files need preprocessing.
 - Preprocessed output is **cached** per file (parallel cache fill when `--jobs > 1`) and released once
   the unit is lowered, so the text held at once is bounded by the parse batch in flight.
+- Macro definitions share immutable `Arc` token and parameter slices between live
+  tables and cached directive logs. Expansion still creates invocation-specific
+  tokens, preserving token origins, hide sets, and ordered define/undef replay.
 - If preprocessing fails hard (the unit's own file cannot be read), the unit is dropped and an error diagnostic is recorded; a stop *inside* a file keeps the output produced so far (see Error recovery).
 
 ## Phases
@@ -211,6 +214,26 @@ Semantics — a fallback is a definition of last resort, never an answer to
   entries](#macro-operations-in-cached-entries)).
 
 ## LineMap
+
+The normal indexing path stores preprocessed source payloads larger than 512 KiB
+(text plus allocated LineMap entry storage) in automatically cleaned temporary
+files once discovery and settling are done, and only for sources that are read
+back: a unit the settle pass rebuilds is spilled by the settle pass alone, and
+a warmed header that is not indexed on its own drops its text without a file.
+Include provenance, variants, conditionals,
+diagnostics, and original paths remain in memory. Parsing loads the original
+payload without rerunning preprocessing; cached header expansions are unchanged.
+Temporary storage uses the OS temporary directory and may reside on a tmpfs.
+Spill/load errors fail indexing with a diagnostic rather than changing source
+contents. This limits retained source payloads, not the final IR or expansion
+cache, and trades temporary-file I/O for lower process RSS.
+
+Cache composition appends origin mappings only within each live output chunk's
+half-open byte interval. Both interval endpoints are found by binary search;
+entries at the start are retained (including equal-offset entries), entries at
+the end are excluded, and no preceding mapping is added. Only referenced files
+are interned into the destination map. This avoids copying overlapping mapping
+suffixes while preserving original file/line/column attribution.
 
 The preprocessor records mappings from **output byte offsets** to original `(file, line, col)` in `LineMap`.
 
