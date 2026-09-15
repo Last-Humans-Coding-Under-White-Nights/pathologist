@@ -2,6 +2,8 @@ use crate::{FieldId, TypeId};
 use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TypeDesc {
@@ -113,7 +115,8 @@ pub enum TypeKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypeInfo {
     pub id: TypeId,
-    pub desc: TypeDesc,
+    /// Shared immutable descriptor; IDs and completed layouts remain table-local.
+    pub desc: Arc<TypeDesc>,
     pub size: u64,
     pub align: u64,
     pub layout: TypeLayout,
@@ -132,6 +135,92 @@ pub struct FieldLayout {
     pub type_id: TypeId,
 }
 
+/// Content sharing has no effect on interning order or table-local IDs.
+/// Weak entries do not retain descriptor payloads when their tables disappear.
+///
+/// The pool is sharded by descriptor hash so that workers interning into
+/// their own tables at the same time rarely meet on a lock, and so that
+/// pruning dead entries in one shard never stops the others.
+struct DescriptorPool {
+    shards: Vec<Mutex<DescriptorPoolState>>,
+}
+
+const DESCRIPTOR_POOL_SHARDS: usize = 64;
+/// Dead weak entries a shard accumulates before it prunes them.
+const DESCRIPTOR_POOL_PRUNE_EVERY: usize = 1024;
+
+impl Default for DescriptorPool {
+    fn default() -> Self {
+        Self {
+            shards: (0..DESCRIPTOR_POOL_SHARDS)
+                .map(|_| Mutex::new(DescriptorPoolState::default()))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct DescriptorPoolState {
+    buckets: FxHashMap<u64, Vec<Weak<TypeDesc>>>,
+    inserted: usize,
+}
+
+impl std::fmt::Debug for DescriptorPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Pool contents are allocation bookkeeping shared with other live
+        // tables, not part of this table's deterministic debug representation.
+        f.write_str("DescriptorPool")
+    }
+}
+
+impl DescriptorPool {
+    fn share(&self, desc: &TypeDesc) -> Arc<TypeDesc> {
+        let mut hasher = rustc_hash::FxHasher::default();
+        desc.hash(&mut hasher);
+        let hash = hasher.finish();
+        let shard = &self.shards[(hash % DESCRIPTOR_POOL_SHARDS as u64) as usize];
+        let mut state = shard.lock().unwrap_or_else(|e| e.into_inner());
+        // A host can keep old Programs alive while indexing different trees.
+        // Bound dead weak-entry bookkeeping even when the pool never drops.
+        if state.inserted >= DESCRIPTOR_POOL_PRUNE_EVERY {
+            state.buckets.retain(|_, bucket| {
+                bucket.retain(|weak| weak.strong_count() != 0);
+                !bucket.is_empty()
+            });
+            state.inserted = 0;
+        }
+        let bucket = state.buckets.entry(hash).or_default();
+        // Stop at the first match; dead entries met on the way are dropped.
+        let mut i = 0;
+        while i < bucket.len() {
+            match bucket[i].upgrade() {
+                Some(existing) if existing.as_ref() == desc => return existing,
+                Some(_) => i += 1,
+                None => {
+                    bucket.swap_remove(i);
+                }
+            }
+        }
+        let shared = Arc::new(desc.clone());
+        bucket.push(Arc::downgrade(&shared));
+        state.inserted += 1;
+        shared
+    }
+}
+
+fn descriptor_pool() -> Arc<DescriptorPool> {
+    // Share between simultaneously live tables; the pool disappears with the
+    // last table, including its weak-entry bookkeeping in long-lived hosts.
+    static POOL: Mutex<Weak<DescriptorPool>> = Mutex::new(Weak::new());
+    let mut weak = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pool) = weak.upgrade() {
+        return pool;
+    }
+    let pool = Arc::new(DescriptorPool::default());
+    *weak = Arc::downgrade(&pool);
+    pool
+}
+
 #[derive(Debug, Clone)]
 pub struct TypeTable {
     /// Every C++ class name a specifier declared, forward declarations
@@ -141,15 +230,16 @@ pub struct TypeTable {
     /// specifier carried a body: a forward declaration says a name is a
     /// class, a definition says what its members are.
     defined_structs: FxHashSet<std::sync::Arc<str>>,
+    descriptors: Arc<DescriptorPool>,
     types: Vec<TypeInfo>,
     // Header merging repeatedly hashes nested descriptors and alias names.
     // Preserve insertion order while using the same fast hasher as the tag
     // indexes.
-    intern: IndexMap<TypeDesc, TypeId, FxBuildHasher>,
+    intern: IndexMap<Arc<TypeDesc>, TypeId, FxBuildHasher>,
     /// Typedef alias name → resolved descriptor. Alias resolution is needed
     /// because lowering sees bare identifiers (`fn_t`, `SHandle`) whose
     /// pointer-ness is otherwise lost (they degrade to `Int`).
-    aliases: IndexMap<String, TypeDesc, FxBuildHasher>,
+    aliases: IndexMap<String, Arc<TypeDesc>, FxBuildHasher>,
     /// Named `struct` tag → richest interned [`TypeId`] (most fields).
     struct_tags: FxHashMap<String, TypeId>,
     /// Named `union` tag → richest interned [`TypeId`] (most fields).
@@ -170,6 +260,7 @@ impl TypeTable {
         let mut table = Self {
             declared_structs: FxHashSet::default(),
             defined_structs: FxHashSet::default(),
+            descriptors: descriptor_pool(),
             types: Vec::new(),
             intern: IndexMap::default(),
             aliases: IndexMap::default(),
@@ -205,6 +296,11 @@ impl TypeTable {
         if let Some(id) = self.intern.get(&desc) {
             return *id;
         }
+        let desc = self.descriptors.share(&desc);
+        self.intern_shared(desc)
+    }
+
+    fn intern_shared(&mut self, desc: Arc<TypeDesc>) -> TypeId {
         let (size, align, layout) = compute_layout(&desc, self);
         let id = TypeId(self.types.len() as u32);
         self.types.push(TypeInfo {
@@ -246,7 +342,7 @@ impl TypeTable {
             _ => None,
         };
         if let Some(id) = complete {
-            *desc = self.get(id).desc.clone();
+            *desc = self.get(id).desc.as_ref().clone();
             return;
         }
         match desc {
@@ -295,6 +391,13 @@ impl TypeTable {
         if let Some(id) = self.interned_as_tag(desc) {
             return id;
         }
+        if !canonicalize_may_rewrite(desc) {
+            if desc_has_named_tag(desc) {
+                self.needs_tag_completion = true;
+            }
+            let shared = self.descriptors.share(desc);
+            return self.intern_shared(shared);
+        }
         self.intern(desc.clone())
     }
 
@@ -326,7 +429,7 @@ impl TypeTable {
     }
 
     fn complete_type_id(&mut self, id: TypeId) -> TypeId {
-        match self.get(id).desc.clone() {
+        match self.get(id).desc.as_ref().clone() {
             TypeDesc::Struct { name, fields } if fields.is_empty() && !name.is_empty() => {
                 self.type_id_by_tag(&name, TypeKind::Struct).unwrap_or(id)
             }
@@ -387,16 +490,21 @@ impl TypeTable {
     /// Record a typedef alias (`typedef void (*fn_t)(int);` → `fn_t`) so that
     /// later declarations using the bare alias keep their pointer-ness.
     pub fn register_alias(&mut self, alias: &str, desc: TypeDesc) {
+        self.register_alias_ref(alias, &desc);
+    }
+
+    pub fn register_alias_ref(&mut self, alias: &str, desc: &TypeDesc) {
         if !alias.is_empty() {
-            self.aliases.insert(alias.to_string(), desc);
+            let shared = self.descriptors.share(desc);
+            self.aliases.insert(alias.to_string(), shared);
         }
     }
 
     pub fn resolve_alias(&self, alias: &str) -> Option<&TypeDesc> {
-        self.aliases.get(alias)
+        self.aliases.get(alias).map(Arc::as_ref)
     }
 
-    pub fn all_aliases(&self) -> &IndexMap<String, TypeDesc, FxBuildHasher> {
+    pub fn all_aliases(&self) -> &IndexMap<String, Arc<TypeDesc>, FxBuildHasher> {
         &self.aliases
     }
 
@@ -447,7 +555,7 @@ impl TypeTable {
     /// anonymous member of the variant.
     fn tag_layout_has_field(&self, id: TypeId, fname: &str, fdesc: &TypeDesc) -> bool {
         self.get(id).layout.fields.values().any(|fl| {
-            fl.name == fname && (!fname.is_empty() || self.get(fl.type_id).desc == *fdesc)
+            fl.name == fname && (!fname.is_empty() || self.get(fl.type_id).desc.as_ref() == fdesc)
         })
     }
 
@@ -480,7 +588,7 @@ impl TypeTable {
             .layout
             .fields
             .values()
-            .map(|fl| (fl.name.clone(), self.get(fl.type_id).desc.clone()))
+            .map(|fl| (fl.name.clone(), self.get(fl.type_id).desc.as_ref().clone()))
             .collect();
         for (in_name, in_desc) in incoming_fields {
             // Deduplicate against what the variant itself has already added,
@@ -494,6 +602,7 @@ impl TypeTable {
         }
         let new_desc = Self::aggregate_desc(kind, name, merged_fields);
         let (size, align, layout) = compute_layout(&new_desc, self);
+        let new_desc = self.descriptors.share(&new_desc);
         self.types[existing_id.0 as usize].desc = new_desc.clone();
         self.types[existing_id.0 as usize].size = size;
         self.types[existing_id.0 as usize].align = align;
@@ -582,12 +691,12 @@ impl TypeTable {
     fn note_named_tag(&mut self, id: TypeId) {
         let (kind, name, richness) = {
             let info = &self.types[id.0 as usize];
-            let kind = match &info.desc {
+            let kind = match info.desc.as_ref() {
                 TypeDesc::Struct { name, .. } if !name.is_empty() => TypeKind::Struct,
                 TypeDesc::Union { name, .. } if !name.is_empty() => TypeKind::Union,
                 _ => return,
             };
-            let name = match &info.desc {
+            let name = match info.desc.as_ref() {
                 TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => name.clone(),
                 _ => return,
             };
@@ -629,7 +738,7 @@ impl TypeTable {
                     .unwrap_or(self.unknown())
             });
             if pointee != self.unknown() {
-                let pointee_desc = self.get(pointee).desc.clone();
+                let pointee_desc = self.get(pointee).desc.as_ref().clone();
                 let ptr_desc = TypeDesc::Ptr(Box::new(pointee_desc));
                 if let Some(id) = self.intern.get(&ptr_desc) {
                     return *id;
@@ -642,7 +751,7 @@ impl TypeTable {
 
 fn tag_richness(info: &TypeInfo) -> usize {
     let layout_n = info.layout.fields.len();
-    let desc_n = match &info.desc {
+    let desc_n = match info.desc.as_ref() {
         TypeDesc::Struct { fields, .. } | TypeDesc::Union { fields, .. } => fields.len(),
         _ => 0,
     };
@@ -767,7 +876,7 @@ fn same_param_type_inner(
     if a == b {
         return true;
     }
-    let (da, db) = (&types.get(a).desc, &types.get(b).desc);
+    let (da, db) = (types.get(a).desc.as_ref(), types.get(b).desc.as_ref());
     // A parameter written as an array IS a pointer: `int a[]` and `int *a`
     // declare the same function, so a prototype spelling one and a definition
     // spelling the other are one function, not two overloads. The decay is
@@ -972,6 +1081,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn descriptors_share_storage_but_layout_completion_is_local() {
+        let mut a = TypeTable::new();
+        let mut b = TypeTable::new();
+        let desc = TypeDesc::Struct {
+            name: "Shared".into(),
+            fields: vec![("value".into(), TypeDesc::Int)],
+        };
+        let aid = a.intern(desc.clone());
+        let bid = b.intern(desc.clone());
+        assert!(Arc::ptr_eq(&a.get(aid).desc, &b.get(bid).desc));
+        assert!(Arc::ptr_eq(
+            a.intern.get_key_value(&desc).unwrap().0,
+            &a.get(aid).desc
+        ));
+        let before = b.get(bid).clone();
+        let _ = a.union_struct_layout("Shared".into(), vec![("extra".into(), TypeDesc::Long)]);
+        assert_eq!(b.get(bid).desc, before.desc);
+        assert_eq!(b.get(bid).layout.fields.len(), 1);
+        assert_eq!(a.get(aid).layout.fields.len(), 2);
+        assert!(!Arc::ptr_eq(&a.get(aid).desc, &b.get(bid).desc));
+    }
+
+    #[test]
+    fn descriptor_pool_does_not_keep_payloads_alive() {
+        let pool = DescriptorPool::default();
+        let shared = pool.share(&TypeDesc::Ptr(Box::new(TypeDesc::Double)));
+        let weak = Arc::downgrade(&shared);
+        drop(shared);
+        assert!(weak.upgrade().is_none());
+        let rebuilt = pool.share(&TypeDesc::Ptr(Box::new(TypeDesc::Double)));
+        assert_eq!(rebuilt.as_ref(), &TypeDesc::Ptr(Box::new(TypeDesc::Double)));
+    }
+
+    #[test]
     fn primitive_accessors_name_their_own_type() {
         // These named raw indices into the primitives `new` interns, so a
         // reordered or extended prelude silently repointed them: `int()` named
@@ -979,9 +1122,9 @@ mod tests {
         // ask the intern table for their descriptor's id now; this still pins
         // the answers, so a lookup keyed on the wrong descriptor cannot pass.
         let t = TypeTable::new();
-        assert_eq!(t.get(t.void()).desc, TypeDesc::Void);
-        assert_eq!(t.get(t.int()).desc, TypeDesc::Int);
-        assert_eq!(t.get(t.unknown()).desc, TypeDesc::Unknown);
+        assert_eq!(t.get(t.void()).desc.as_ref(), &TypeDesc::Void);
+        assert_eq!(t.get(t.int()).desc.as_ref(), &TypeDesc::Int);
+        assert_eq!(t.get(t.unknown()).desc.as_ref(), &TypeDesc::Unknown);
     }
 
     #[test]
@@ -995,7 +1138,10 @@ mod tests {
             name: "NeverInterned".to_string(),
             fields: Vec::new(),
         };
-        assert_eq!(t.get(t.resolve_type_id(&missing)).desc, TypeDesc::Unknown);
+        assert_eq!(
+            t.get(t.resolve_type_id(&missing)).desc.as_ref(),
+            &TypeDesc::Unknown
+        );
     }
 
     #[test]
@@ -1321,7 +1467,7 @@ mod tests {
         let first = t.intern(node.clone());
         let again = t.intern(node);
         assert_eq!(first, again, "interning the same tag twice is idempotent");
-        let TypeDesc::Struct { fields, .. } = &t.get(first).desc else {
+        let TypeDesc::Struct { fields, .. } = t.get(first).desc.as_ref() else {
             panic!("expected a struct");
         };
         assert_eq!(

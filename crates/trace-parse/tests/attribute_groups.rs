@@ -145,7 +145,7 @@ fn compiler_attributes_no_longer_turn_valid_declarations_into_parse_errors() {
             .expect(name);
         assert_eq!(variable.storage, StorageClass::Global);
         assert!(matches!(
-            program.types.get(variable.type_id).desc,
+            program.types.get(variable.type_id).desc.as_ref(),
             TypeDesc::Int
         ));
         assert!((1..=3).contains(&variable.span.line));
@@ -162,12 +162,12 @@ fn compiler_attributes_no_longer_turn_valid_declarations_into_parse_errors() {
         assert_eq!(function.is_defined, defined);
         if name == "stop_now" {
             assert!(matches!(
-                program.types.get(function.return_type).desc,
+                program.types.get(function.return_type).desc.as_ref(),
                 TypeDesc::Void
             ));
         } else {
             assert!(matches!(
-                program.types.get(function.return_type).desc,
+                program.types.get(function.return_type).desc.as_ref(),
                 TypeDesc::Int
             ));
         }

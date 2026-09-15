@@ -392,7 +392,9 @@ fn run_analyze(
     }
 
     let t0 = Instant::now();
-    let program = build_program_with_jobs(&target, &opts, jobs).map_err(|e| anyhow::anyhow!(e))?;
+    let mut program =
+        build_program_with_jobs(&target, &opts, jobs).map_err(|e| anyhow::anyhow!(e))?;
+    program.release_merge_state();
     eprintln!(
         "index: {:.1}s ({} files, {} functions, {} flow)",
         t0.elapsed().as_secs_f64(),

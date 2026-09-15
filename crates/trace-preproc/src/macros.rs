@@ -2,14 +2,15 @@ use crate::{Language, Token, TokenKind};
 use indexmap::IndexMap;
 use std::sync::{Arc, RwLock};
 
+/// Immutable definition storage is shared by macro tables and cached directive logs.
 #[derive(Debug, Clone)]
 pub enum MacroDef {
     Object {
-        replacement: Vec<Token>,
+        replacement: Arc<[Token]>,
     },
     Function {
-        params: Vec<String>,
-        replacement: Vec<Token>,
+        params: Arc<[String]>,
+        replacement: Arc<[Token]>,
         /// Invariant: when true, the LAST entry of `params` is the variadic
         /// collector — `parse_macro_param_list` pushes `"__VA_ARGS__"` for the
         /// anonymous `...` form. A hand-built variadic def (builtins, tests)
@@ -88,7 +89,7 @@ pub fn macro_table_from_defines(
         table.insert(
             name,
             MacroDef::Object {
-                replacement: lex_macro_body(&val, language),
+                replacement: lex_macro_body(&val, language).into(),
             },
         );
     }
@@ -102,4 +103,36 @@ pub(crate) fn lex_macro_body(src: &str, language: Language) -> Vec<Token> {
         .into_iter()
         .filter(|t| !matches!(t.kind, TokenKind::Eof))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_definition_clones_share_token_storage() {
+        let def = MacroDef::Function {
+            params: vec!["x".to_string()].into(),
+            replacement: lex_macro_body("x + x", Language::C).into(),
+            variadic: false,
+        };
+        let MacroDef::Function {
+            params,
+            replacement,
+            ..
+        } = &def
+        else {
+            unreachable!()
+        };
+        let MacroDef::Function {
+            params: cloned_params,
+            replacement: cloned_tokens,
+            ..
+        } = def.clone()
+        else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(params, &cloned_params));
+        assert!(Arc::ptr_eq(replacement, &cloned_tokens));
+    }
 }

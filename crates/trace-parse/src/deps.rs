@@ -90,6 +90,9 @@ impl IncludeGraph {
                 Some((path.clone(), content, deps))
             })
             .collect();
+        // Discovery uses the global pool; indexing uses a separate pool.
+        // Drop discovery memos before their idle workers retain them for the run.
+        rayon::broadcast(|_| trace_ir::release_thread_path_caches());
         for (path, content, deps) in scanned {
             source_cache.insert(path.clone(), std::sync::Arc::<str>::from(content));
             if !deps.is_empty() {
