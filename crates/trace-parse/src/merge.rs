@@ -935,7 +935,7 @@ fn merge_types(
     dst.merge_struct_declarations(src);
     let mut map = Vec::with_capacity(src.all().len());
     for info in src.all() {
-        let new_id = match &info.desc {
+        let new_id = match info.desc.as_ref() {
             // The layout usually still spells the descriptor's own fields, and
             // then interning the descriptor by reference is the same as
             // interning the rebuilt one, without cloning every field deep. A
@@ -966,7 +966,7 @@ fn merge_types(
     }
     for (alias, desc) in src.all_aliases() {
         if dst.resolve_alias(alias).is_none() {
-            dst.register_alias(alias, desc.clone());
+            dst.register_alias_ref(alias, desc);
         }
     }
     map
@@ -974,14 +974,15 @@ fn merge_types(
 
 /// Whether [`fields_from_layout`] would rebuild `info`'s descriptor as it is.
 fn layout_spells_desc(src: &trace_ir::TypeTable, info: &trace_ir::TypeInfo) -> bool {
-    let (TypeDesc::Struct { fields, .. } | TypeDesc::Union { fields, .. }) = &info.desc else {
+    let (TypeDesc::Struct { fields, .. } | TypeDesc::Union { fields, .. }) = info.desc.as_ref()
+    else {
         return false;
     };
     fields.len() == info.layout.fields.len()
         && fields
             .iter()
             .zip(info.layout.fields.values())
-            .all(|((name, desc), fl)| *name == fl.name && src.get(fl.type_id).desc == *desc)
+            .all(|((name, desc), fl)| *name == fl.name && src.get(fl.type_id).desc.as_ref() == desc)
 }
 
 /// Prefer layout field types over the interned `TypeDesc` field list: PCH
@@ -994,7 +995,7 @@ fn fields_from_layout(
     info.layout
         .fields
         .iter()
-        .map(|(_, fl)| (fl.name.clone(), src.get(fl.type_id).desc.clone()))
+        .map(|(_, fl)| (fl.name.clone(), src.get(fl.type_id).desc.as_ref().clone()))
         .collect()
 }
 
@@ -1071,7 +1072,7 @@ fn respelled_declarations(
             };
             let exact = |x: TypeId, y: TypeId| x == y;
             let loose = |x: TypeId, y: TypeId| {
-                trace_ir::may_name_same_type(&types.get(x).desc, &types.get(y).desc)
+                trace_ir::may_name_same_type(types.get(x).desc.as_ref(), types.get(y).desc.as_ref())
             };
             if let Some(definition) = only(&exact).or_else(|| only(&loose)) {
                 out.insert(declaration.id, definition);
@@ -1216,7 +1217,7 @@ mod tests {
         assert_eq!(dst.get(a_dst).desc, src.get(a).desc);
         assert_eq!(
             dst.get(remap_type(p, &map)).desc,
-            TypeDesc::Ptr(Box::new(full_b)),
+            TypeDesc::Ptr(Box::new(full_b)).into(),
             "the empty tag canonicalizes to the layout the destination holds"
         );
         assert_eq!(dst.type_id_by_tag("B", trace_ir::TypeKind::Struct), Some(b));
@@ -1258,7 +1259,7 @@ mod tests {
             fields: vec![int_field("i"), ("l".into(), TypeDesc::Long)],
         });
         for info in src.all() {
-            if matches!(info.desc, TypeDesc::Struct { ref fields, .. } | TypeDesc::Union { ref fields, .. } if !fields.is_empty())
+            if matches!(info.desc.as_ref(), TypeDesc::Struct { fields, .. } | TypeDesc::Union { fields, .. } if !fields.is_empty())
             {
                 assert!(layout_spells_desc(&src, info), "{:?}", info.desc);
             }
@@ -1270,7 +1271,7 @@ mod tests {
         let rebuilt_map: Vec<TypeId> = src
             .all()
             .iter()
-            .map(|info| match &info.desc {
+            .map(|info| match info.desc.as_ref() {
                 TypeDesc::Struct { name, fields } if !fields.is_empty() => {
                     rebuilt.compute_struct_layout(name.clone(), fields_from_layout(&src, info))
                 }
@@ -1300,8 +1301,8 @@ mod tests {
         let mut dst = trace_ir::TypeTable::new();
         let map = merge_types(&mut dst, &src, false);
         assert_eq!(
-            dst.get(remap_type(outer, &map)).desc,
-            tag(
+            dst.get(remap_type(outer, &map)).desc.as_ref(),
+            &tag(
                 "Outer",
                 vec![("inner".into(), tag("Inner", vec![int_field("x")]))]
             )
@@ -1322,8 +1323,8 @@ mod tests {
         assert_ne!(merged, wide);
         assert_eq!(dst.get(merged).desc, src.get(narrow).desc);
         assert_eq!(
-            dst.get(wide).desc,
-            tag("S", vec![("a".into(), TypeDesc::Long)])
+            dst.get(wide).desc.as_ref(),
+            &tag("S", vec![("a".into(), TypeDesc::Long)])
         );
     }
 

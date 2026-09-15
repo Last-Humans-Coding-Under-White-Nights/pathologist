@@ -581,7 +581,7 @@ impl PreprocessorState {
             self.insert_macro(
                 name.to_string(),
                 MacroDef::Object {
-                    replacement: lex_macro_body(val, self.language),
+                    replacement: lex_macro_body(val, self.language).into(),
                 },
             );
         }
@@ -598,7 +598,7 @@ impl PreprocessorState {
             self.insert_macro(
                 name,
                 MacroDef::Object {
-                    replacement: lex_macro_body(&val, self.language),
+                    replacement: lex_macro_body(&val, self.language).into(),
                 },
             );
         }
@@ -616,7 +616,7 @@ impl PreprocessorState {
             self.insert_macro(
                 name,
                 MacroDef::Object {
-                    replacement: lex_macro_body(&val, self.language),
+                    replacement: lex_macro_body(&val, self.language).into(),
                 },
             );
         }
@@ -1341,23 +1341,7 @@ impl PreprocessorState {
         }
         let dest_off = dest_text.len();
         dest_text.push_str(&src_text[from..to]);
-        let chunk_len = to - from;
-        let sliced = src_map.slice_from(from);
-        let mut remap = Vec::with_capacity(sliced.files.len());
-        for p in &sliced.files {
-            remap.push(dest_map.intern_file(p));
-        }
-        for e in &sliced.entries {
-            if (e.output_offset as usize) >= chunk_len {
-                break;
-            }
-            dest_map.entries.push(crate::LineMapEntry {
-                output_offset: e.output_offset + dest_off as u32,
-                file: remap[e.file as usize],
-                line: e.line,
-                col: e.col,
-            });
-        }
+        dest_map.splice_range(src_map, from..to, dest_off);
     }
 
     fn process_file(&mut self, path: &Path) -> Result<(), PreprocessError> {
@@ -2479,15 +2463,20 @@ impl PreprocessorState {
             self.insert_macro(
                 name,
                 MacroDef::Function {
-                    params,
-                    replacement,
+                    params: params.into(),
+                    replacement: replacement.into(),
                     variadic,
                 },
             );
             return Ok(i);
         }
         let replacement = read_replacement_list(tokens, &mut i);
-        self.insert_macro(name, MacroDef::Object { replacement });
+        self.insert_macro(
+            name,
+            MacroDef::Object {
+                replacement: replacement.into(),
+            },
+        );
         Ok(i)
     }
 
@@ -4109,7 +4098,7 @@ static BUILTIN_FALLBACK_MACROS: LazyLock<Vec<(String, MacroDef)>> = LazyLock::ne
         (
             name.to_string(),
             MacroDef::Object {
-                replacement: lex_macro_body(replacement, Language::C),
+                replacement: lex_macro_body(replacement, Language::C).into(),
             },
         )
     };
@@ -4118,7 +4107,7 @@ static BUILTIN_FALLBACK_MACROS: LazyLock<Vec<(String, MacroDef)>> = LazyLock::ne
             name.to_string(),
             MacroDef::Function {
                 params: params.iter().map(ToString::to_string).collect(),
-                replacement: lex_macro_body(replacement, Language::C),
+                replacement: lex_macro_body(replacement, Language::C).into(),
                 variadic: false,
             },
         )
@@ -7115,7 +7104,12 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
                 .into_iter()
                 .filter(|t| !matches!(t.kind, TokenKind::Eof))
                 .collect();
-            t.insert("G_H".to_string(), MacroDef::Object { replacement: toks });
+            t.insert(
+                "G_H".to_string(),
+                MacroDef::Object {
+                    replacement: toks.into(),
+                },
+            );
         }
         let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
         let opts = PreprocessOptions::new()

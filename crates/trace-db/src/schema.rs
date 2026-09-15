@@ -1,6 +1,17 @@
 pub const SCHEMA_VERSION: i64 = 4;
 
-pub const SCHEMA_V4: &str = r#"
+// Keep the complete public schema and the bulk-export phases in sync without
+// duplicating SQL. The exporter defers only non-unique secondary indexes.
+macro_rules! define_schema {
+    ($tables:literal, $indexes:literal) => {
+        pub const SCHEMA_V4: &str = concat!($tables, $indexes);
+        pub(crate) const TABLES_V4: &str = $tables;
+        pub(crate) const INDEXES_V4: &str = $indexes;
+    };
+}
+
+define_schema!(
+    r#"
 CREATE TABLE IF NOT EXISTS analysis_run (
     id INTEGER PRIMARY KEY,
     trace_version TEXT NOT NULL,
@@ -97,12 +108,6 @@ CREATE TABLE IF NOT EXISTS diagnostics (
     stage TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_call_edges_callee ON call_edges(callee_fn_id);
-CREATE INDEX IF NOT EXISTS idx_call_edges_caller ON call_edges(caller_fn_id);
-CREATE INDEX IF NOT EXISTS idx_call_edges_callsite ON call_edges(call_site_id);
-CREATE INDEX IF NOT EXISTS idx_arg_flow_callsite ON arg_flow_edges(call_site_id);
-CREATE INDEX IF NOT EXISTS idx_functions_name ON functions(name);
-
 -- Value-flow graph (PAG) for `inspect dataflow`. Nodes mirror PAG nodes;
 -- edges are the post-solve constraint set, including parameter copies wired
 -- dynamically during solving (so the table is the interprocedural
@@ -123,7 +128,74 @@ CREATE TABLE IF NOT EXISTS flow_edges (
     kind TEXT NOT NULL
 );
 
+"#,
+    r#"
+CREATE INDEX IF NOT EXISTS idx_call_edges_callee ON call_edges(callee_fn_id);
+CREATE INDEX IF NOT EXISTS idx_call_edges_caller ON call_edges(caller_fn_id);
+CREATE INDEX IF NOT EXISTS idx_call_edges_callsite ON call_edges(call_site_id);
+CREATE INDEX IF NOT EXISTS idx_arg_flow_callsite ON arg_flow_edges(call_site_id);
+CREATE INDEX IF NOT EXISTS idx_functions_name ON functions(name);
 CREATE INDEX IF NOT EXISTS idx_flow_edges_src ON flow_edges(src_node);
 CREATE INDEX IF NOT EXISTS idx_flow_edges_dst ON flow_edges(dst_node);
 CREATE INDEX IF NOT EXISTS idx_flow_nodes_var ON flow_nodes(var_id);
-"#;
+"#
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn deferred_indexes_preserve_schema_and_insertion_constraints() {
+        let staged = Connection::open_in_memory().unwrap();
+        staged.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        staged.execute_batch(TABLES_V4).unwrap();
+        staged
+            .execute(
+                "INSERT INTO files (id, path, sha256) VALUES (1, 'a.c', '')",
+                [],
+            )
+            .unwrap();
+        assert!(staged
+            .execute(
+                "INSERT INTO files (id, path, sha256) VALUES (1, 'b.c', '')",
+                []
+            )
+            .is_err());
+        assert!(staged
+            .execute(
+                "INSERT INTO files (id, path, sha256) VALUES (2, 'a.c', '')",
+                []
+            )
+            .is_err());
+        staged.execute_batch(INDEXES_V4).unwrap();
+        staged.execute_batch("COMMIT;").unwrap();
+
+        let complete = Connection::open_in_memory().unwrap();
+        complete.execute_batch(SCHEMA_V4).unwrap();
+        let schema = |conn: &Connection| {
+            conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(schema(&staged), schema(&complete));
+        assert_eq!(
+            staged
+                .query_row("SELECT path FROM files WHERE id=1", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "a.c"
+        );
+    }
+}

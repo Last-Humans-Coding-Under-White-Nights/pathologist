@@ -214,6 +214,12 @@ impl Program {
         }
     }
 
+    /// Release merge-only lookup tables after the last merge and finalization.
+    /// Callers that intend to merge more units must retain this state.
+    pub fn release_merge_state(&mut self) {
+        self.dedup = MergeDedup::default();
+    }
+
     /// Dependency roots whose headers contribute declarations but whose
     /// sources are never indexed as translation units (`--dep`, #60).
     pub fn dep_roots(&self) -> &[PathBuf] {

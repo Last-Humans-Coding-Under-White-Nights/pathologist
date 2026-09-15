@@ -8,6 +8,7 @@ pub mod explore;
 pub mod gn_defines;
 mod index_cache;
 mod lower;
+mod memory;
 mod merge;
 mod parse;
 
