@@ -101,6 +101,40 @@ impl MacroFingerprint {
         }
         acc
     }
+
+    /// Whether an environment satisfies this fingerprint. `binding` gives a
+    /// name's binding hash, `None` when it is unbound; `any_bound` says
+    /// whether any of the names read unbound is bound, left to the
+    /// environment so it can test from whichever side is smaller.
+    pub(crate) fn satisfied_by(
+        &self,
+        mut binding: impl FnMut(&str) -> Option<u64>,
+        any_bound: impl FnOnce(&FxHashSet<Arc<str>>) -> bool,
+    ) -> bool {
+        !self.incompatible
+            && self
+                .defined
+                .iter()
+                .all(|(name, hash)| binding(name) == Some(*hash))
+            && (self.undefined.is_empty() || !any_bound(&self.undefined))
+    }
+}
+
+/// Whether a variant list holding variants with `signatures` takes one more
+/// with `signature`: it is not full and holds none with that signature.
+pub(crate) fn admits_variant(
+    signatures: impl IntoIterator<Item = u64>,
+    cap: usize,
+    signature: u64,
+) -> bool {
+    let mut len = 0;
+    for stored in signatures {
+        if stored == signature {
+            return false;
+        }
+        len += 1;
+    }
+    len < cap
 }
 
 /// Raw file contents the caller has already read, keyed by canonical path, so
@@ -274,6 +308,12 @@ pub struct IncludeExpansion {
     /// units — and a consumer of this entry never visits them, so it cannot
     /// work out which expansion of each applies. This is that record.
     pub nested_variants: Arc<Vec<(PathBuf, usize)>>,
+    /// `deps.signature()`, computed once.
+    pub signature: u64,
+    /// Unique for the process, so a deferred run can name this entry before
+    /// it has an index (see [`crate::ExpansionJournal`]). Never reaches the
+    /// output.
+    pub id: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -319,6 +359,14 @@ pub struct PreprocessOptions {
     /// set this so first-writer-wins races cannot make output scheduling-
     /// dependent.
     pub frozen_expansion_cache: bool,
+    /// When true (and the cache is not frozen), expansions this run would
+    /// publish are kept back in `PreprocessResult::expansion_journal`, for
+    /// the caller to commit (see [`crate::ExpansionJournal`]).
+    pub defer_expansion_publish: bool,
+    /// Under `defer_expansion_publish`: journals of runs that commit before
+    /// this one, in commit order. The run sees their kept-back entries as if
+    /// they were stored.
+    pub expansion_journals_ahead: Vec<Arc<crate::ExpansionJournal>>,
     /// When false, skip `LineMap` updates (faster indexing; spans are not remapped yet).
     pub track_line_map: bool,
     /// Stop expanding a file once live output exceeds this many bytes.
@@ -391,6 +439,8 @@ impl Default for PreprocessOptions {
             shared_macros: None,
             accumulate_macros: false,
             frozen_expansion_cache: false,
+            defer_expansion_publish: false,
+            expansion_journals_ahead: Vec::new(),
             track_line_map: false,
             max_output_bytes: 32 * 1024 * 1024,
             max_include_depth: 64,
@@ -464,6 +514,21 @@ impl PreprocessOptions {
     #[must_use]
     pub fn with_frozen_expansion_cache(mut self, frozen: bool) -> Self {
         self.frozen_expansion_cache = frozen;
+        self
+    }
+
+    #[must_use]
+    pub fn with_deferred_expansion_publish(mut self, defer: bool) -> Self {
+        self.defer_expansion_publish = defer;
+        self
+    }
+
+    #[must_use]
+    pub fn with_expansion_journals_ahead(
+        mut self,
+        ahead: Vec<Arc<crate::ExpansionJournal>>,
+    ) -> Self {
+        self.expansion_journals_ahead = ahead;
         self
     }
 

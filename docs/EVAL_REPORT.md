@@ -1,5 +1,61 @@
 # Evaluation Report
 
+## Parallel include-expansion discovery — 2026-09-15 (#88)
+
+Measurements for the parallel discovery pass; the design is in `docs/PREPROCESSOR.md` ("Parallel
+discovery"). The same change skips rebuilding a header struct's field list when a unit re-merges it
+unchanged (`merge_types`), which is most of the parse phase's gain below.
+
+**Setup.** Release builds of origin/master (`c1c76b6`) and of this change, on the same machine in
+the same sitting: Apple M1 (4 performance + 4 efficiency cores), macOS, pinned checkouts,
+800,000-pop budget.
+
+**Determinism.** The SQLite dump, minus `analysis_run`, is byte-identical for each corpus across
+master, three `--jobs 8` runs and one `--jobs 1` run. HDF is also identical at `--jobs 2` and 16,
+and hiview with `--explore` is identical to master. `python3 scripts/eval_check.py` passes 93/93
+with no expectation changed.
+
+| `--jobs 8`, median of 7 interleaved runs | master | #88 |
+|---|---:|---:|
+| camera wall | 6.82 s | 5.80 s |
+| camera `preprocess-done` (discovery) | 1.4 s (1.3 s) | 0.7 s (0.5 s) |
+| camera index | 6.0 s | 5.0 s |
+| HDF wall | 4.34 s | 3.74 s |
+| HDF `preprocess-done` (discovery) | 1.0 s (0.9 s) | 0.5 s (0.4 s) |
+| HDF index | 2.8 s | 2.1 s |
+| hiview wall | 1.73 s | 1.51 s |
+| hiview `preprocess-done` (discovery) | 0.3 s (0.3 s) | 0.1 s (0.1 s) |
+| hiview index | 1.4 s | 1.2 s |
+
+| Wall, `--jobs 1`, median of 3 interleaved runs | master | #88 |
+|---|---:|---:|
+| camera | 13.20 s | 12.22 s |
+| HDF | 7.04 s | 6.88 s |
+| hiview | 3.03 s | 2.95 s |
+
+At `--jobs 8`, taken on its own against the discovery change alone (9 interleaved runs, on the
+previous base `23da757`), the struct fast path moves camera's parse phase 2.89 s → 2.73 s and its PCH
+phase 0.48 s → 0.42 s. A camera run discards 130-140 discovery runs and runs 3-6 units in order.
+
+Measured and dropped in the same sitting, each within run-to-run noise: reusing each type's
+descriptor hash when merging (the lookup still compares the descriptor), FxHash for the symbol
+table's `IndexMap`s, and skipping already-present names when merging struct declarations.
+
+**Short of the issue's target.** Camera's discovery pass drops from 1.3 s to 0.5 s, not to nothing.
+Where the rest goes:
+
+- *The fast cores run out.* Camera's discovery takes the same 0.5 s at `--jobs 4` as at `--jobs 8`.
+  Re-running every unit against the finished cache, with nothing to wait for, takes 1.1 s on one
+  thread and 0.24-0.27 s on eight; a journaled run costs the same as a plain one (1.033 s against
+  1.028 s on one thread).
+- *Discarded runs.* The longest chain of units that each take a variant the one before published is
+  0.048 s on camera (HDF 0.022 s, hiview 0.019 s), timed on one thread, so units seldom wait long for
+  each other; but a unit often starts before the variant it needs is published, and is run again.
+
+Counting every publish into a list a unit looked up as a dependency instead, the longest chain is
+0.234 s on camera, and a first version that discarded runs on that rule stayed at 0.7-0.9 s: those
+clashes only moved indices, which provisional handles absorb.
+
 ## `auto` locals from declared return types — 2026-09-14 (#87, C1)
 
 The single record of what #87 changed on the pinned corpora. The inference

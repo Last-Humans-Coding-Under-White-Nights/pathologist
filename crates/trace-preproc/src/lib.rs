@@ -2,6 +2,7 @@
 
 mod conditionals;
 mod diagnostic;
+mod journal;
 mod lexer;
 mod line_map;
 mod macros;
@@ -10,6 +11,7 @@ mod preprocessor;
 
 pub use conditionals::*;
 pub use diagnostic::*;
+pub use journal::*;
 pub use lexer::*;
 pub use line_map::*;
 pub use macros::*;

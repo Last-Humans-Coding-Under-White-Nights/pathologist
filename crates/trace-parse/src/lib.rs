@@ -3,6 +3,7 @@
 mod compile_commands;
 mod deps;
 mod discover;
+mod expansion_discovery;
 pub mod explore;
 pub mod gn_defines;
 mod index_cache;

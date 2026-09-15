@@ -747,6 +747,94 @@ fn preprocess_diagnostics_are_deduplicated_and_deterministic_across_jobs() {
     }
 }
 
+/// The discovery pass runs its units on the pool and commits them in unit
+/// order (#88): whatever the scheduling, the program must be the one the
+/// serial pass builds.
+#[test]
+fn parallel_discovery_builds_the_serial_program() {
+    let dir = temp_root("parallel_discovery");
+    write_discovery_tree(dir.path(), |_| "c");
+    assert_discovery_is_serial(dir.path(), &["op_fast", "op_slow"]);
+}
+
+/// The same tree with every third unit C++: headers shared by C and C++ units
+/// have one variant list per language, and `#ifdef __cplusplus` makes the two
+/// lists differ.
+#[test]
+fn parallel_discovery_builds_the_serial_program_across_languages() {
+    let dir = temp_root("parallel_discovery_languages");
+    write_discovery_tree(dir.path(), |i| if i % 3 == 0 { "cpp" } else { "c" });
+    assert_discovery_is_serial(dir.path(), &["op_c", "op_cpp"]);
+}
+
+/// Forty units that reach shared headers under different macros, so runs
+/// ahead of the commit point publish variants that runs behind them would
+/// replay, clash over, or only be shifted by. `extension` names unit `i`'s
+/// language.
+fn write_discovery_tree(root: &std::path::Path, extension: impl Fn(usize) -> &'static str) {
+    std::fs::write(
+        root.join("config.h"),
+        "#ifndef CONFIG_H\n#define CONFIG_H\n\
+         #ifdef WIDE\ntypedef long word;\n#else\ntypedef int word;\n#endif\n\
+         #include \"ops.h\"\n#endif\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("ops.h"),
+        "#ifndef OPS_H\n#define OPS_H\n\
+         #ifdef __cplusplus\nextern \"C\" {\nint op_cpp(int);\n}\n#else\nint op_c(int);\n#endif\n\
+         #ifdef FAST\nword op_fast(word);\n#define OP op_fast\n\
+         #else\nword op_slow(word);\n#define OP op_slow\n#endif\n#endif\n",
+    )
+    .unwrap();
+    // Unguarded, so each inclusion re-expands under the unit's own `ENTRY`.
+    std::fs::write(root.join("table.h"), "ENTRY(first)\nENTRY(second)\n").unwrap();
+    for i in 0..40 {
+        let mut text = String::new();
+        if i % 3 == 0 {
+            text.push_str("#define WIDE\n");
+        }
+        if i % 5 < 2 {
+            text.push_str("#define FAST\n");
+        }
+        if i % 2 == 0 {
+            text.push_str("#include \"ops.h\"\n");
+        }
+        text.push_str(&format!(
+            "#include \"config.h\"\n\
+             #define ENTRY(n) word n##_{i}(word x) {{ return OP(x); }}\n\
+             #include \"table.h\"\n#undef ENTRY\n\
+             int (*table_{i}[])(word) = {{ first_{i}, second_{i} }};\n"
+        ));
+        std::fs::write(root.join(format!("unit_{i:02}.{}", extension(i))), text).unwrap();
+    }
+}
+
+/// Build `root` at several job counts and require the program the serial pass
+/// builds every time, naming `expected` somewhere in it.
+fn assert_discovery_is_serial(root: &std::path::Path, expected: &[&str]) {
+    let mut baseline = None;
+    for jobs in [1, 2, 4, 8] {
+        let program = trace_parse::build_program_with_jobs(root, &PreprocessOptions::new(), jobs)
+            .expect("build");
+        let built = format!(
+            "{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
+            program.symbols,
+            program.types,
+            program.flow,
+            program.fn_returns,
+            diagnostic_rows(&program)
+        );
+        match &baseline {
+            Some(serial) => assert!(built == *serial, "the program changed with jobs={jobs}"),
+            None => {
+                assert!(expected.iter().all(|name| built.contains(name)));
+                baseline = Some(built);
+            }
+        }
+    }
+}
+
 #[test]
 fn unterminated_if_fixture_exports_preprocess_error() {
     let root = fixture("preproc");

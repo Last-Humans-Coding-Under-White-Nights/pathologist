@@ -4,6 +4,14 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Parallel include-expansion discovery (#88)
+
+The preprocessing discovery pass, the last indexing pass on one thread, runs on the worker pool,
+with output byte-identical to the serial pass. Its `preprocess-done` progress line now also counts
+discarded runs and units run in order. Merging a header's types into a unit no longer rebuilds an
+unchanged struct's field list. Design: `docs/PREPROCESSOR.md` ("Parallel discovery");
+timings: `docs/EVAL_REPORT.md`.
+
 ### Compiler attribute preprocessing (#61)
 
 Noise attributes are elided without dropping semantic GNU/MSVC attributes,
