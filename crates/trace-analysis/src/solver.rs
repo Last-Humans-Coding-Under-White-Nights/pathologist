@@ -759,23 +759,26 @@ fn solve(
                         // value reaches the assignment LHS (e.g.
                         // `sbuf->impl = constructor->obtain(capacity)`).
                         if let Some(callee_var) = cs.callee_var {
-                            if let Some(&dst_n) = pag.indirect_return_dst.get(&callee_var) {
-                                let constraint_before = pag.constraints.len();
-                                let mut visited = FxHashSet::default();
-                                pag.expand_return_flows(
-                                    program,
-                                    dst_n,
-                                    callee,
-                                    models,
-                                    &mut visited,
-                                );
-                                // Index any new constraints added by expand_return_flows
-                                // and push their sources onto the worklist so the solver
-                                // processes them.
-                                if pag.constraints.len() > constraint_before {
-                                    let new_srcs = pag.index_new_constraints(constraint_before);
-                                    for src in new_srcs {
-                                        st.push(src);
+                            let dst_nodes = pag.indirect_return_dst.get(&callee_var).cloned();
+                            if let Some(dst_nodes) = dst_nodes {
+                                for dst_n in dst_nodes {
+                                    let constraint_before = pag.constraints.len();
+                                    let mut visited = FxHashSet::default();
+                                    pag.expand_return_flows(
+                                        program,
+                                        dst_n,
+                                        callee,
+                                        models,
+                                        &mut visited,
+                                    );
+                                    // Index any new constraints added by expand_return_flows
+                                    // and push their sources onto the worklist so the solver
+                                    // processes them.
+                                    if pag.constraints.len() > constraint_before {
+                                        let new_srcs = pag.index_new_constraints(constraint_before);
+                                        for src in new_srcs {
+                                            st.push(src);
+                                        }
                                     }
                                 }
                             }

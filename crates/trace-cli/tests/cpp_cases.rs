@@ -1943,6 +1943,46 @@ fn cpp_lambda_captures_resolve() {
         }),
         "deeply nested lambda should resolve call to target1"
     );
+
+    // 22. Lexical class lookup for captureless lambda calling static member
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("LexicalClass::run::$lambda")
+                && fn_name(&program, e.callee) == "LexicalClass::hit"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "captureless lambda inside member method should resolve static member LexicalClass::hit"
+    );
+
+    // 23. Write through reference init-capture
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller) == "test_ref_init_capture_write"
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }) && analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller) == "test_ref_init_capture_write"
+                && fn_name(&program, e.callee) == "target2"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "write through reference init-capture should update outer variable points-to set to target1 and target2"
+    );
+
+    // 24. Repeated callable invocations preserving distinct return destinations
+    let repeated_edges: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "test_repeated_call_returns"
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        })
+        .collect();
+    assert_eq!(
+        repeated_edges.len(),
+        2,
+        "both distinct invocations a() and b() should resolve to target1"
+    );
 }
 
 #[test]

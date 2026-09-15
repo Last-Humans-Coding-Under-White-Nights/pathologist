@@ -61,9 +61,9 @@ pub struct Pag {
     /// Fn locations parked into an array var by `ArrayFnMember` inits
     /// (`{ {.., Fn}, .. }`); reachable through any element field load.
     pub array_fn_members: FxHashMap<VarId, Vec<LocId>>,
-    /// Maps callee_var load-var to the PAG node that should receive the
+    /// Maps callee_var to the PAG nodes that should receive the
     /// return value of indirect calls whose function pointer is that var.
-    pub indirect_return_dst: FxHashMap<VarId, PagNodeId>,
+    pub indirect_return_dst: FxHashMap<VarId, Vec<PagNodeId>>,
     /// Detected IPC proxy→stub bridges (proxy method → stub handler).
     /// The solver emits a synthetic call edge for each bridge.
     pub ipc_bridges: Vec<trace_ir::IpcBridge>,
@@ -540,10 +540,11 @@ impl Pag {
                 FlowConstraint::CallReturnIndirect { dst, callee_var } => {
                     // Record the return destination so the solver can expand
                     // return flows when it resolves indirect call targets.
-                    // INVARIANT: each callee_var maps to exactly one dst —
-                    // lowering must not reuse callee load vars across sites.
                     let dst_n = self.var_node_id(*dst);
-                    self.indirect_return_dst.insert(*callee_var, dst_n);
+                    let dsts = self.indirect_return_dst.entry(*callee_var).or_default();
+                    if !dsts.contains(&dst_n) {
+                        dsts.push(dst_n);
+                    }
                 }
                 FlowConstraint::NewHeap { dst } => {
                     let dst_n = self.var_node_id(*dst);

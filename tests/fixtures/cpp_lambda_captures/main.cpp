@@ -303,3 +303,43 @@ static void test_multi_nested_lambdas() {
     outer();
 }
 
+// 21. Lexical class lookup for captureless lambda calling static member
+struct LexicalClass {
+    static int hit() {
+        return target1();
+    }
+    void run() {
+        auto l = []() {
+            hit();
+        };
+        l();
+    }
+};
+
+static void test_captureless_lexical_lookup() {
+    LexicalClass c;
+    c.run();
+}
+
+// 22. Write through reference init-capture
+static void test_ref_init_capture_write() {
+    fn_t f = target1;
+    auto l = [&cb = f]() {
+        cb = target2;
+    };
+    l();
+    f();
+}
+
+// 23. Repeated callable invocations preserving distinct return destinations
+static void test_repeated_call_returns() {
+    fn_t f = target1;
+    auto l = [f]() {
+        return f;
+    };
+    auto a = l();
+    auto b = l();
+    a();
+    b();
+}
+

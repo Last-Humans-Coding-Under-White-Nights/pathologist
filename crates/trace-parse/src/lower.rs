@@ -6256,7 +6256,7 @@ fn lower_lambda_expression(
     let mut captures_this = false;
     let mut default_capture_all = false;
     let mut captured_vars: Vec<String> = Vec::new();
-    let mut init_captures: Vec<(String, Node, Node)> = Vec::new();
+    let mut init_captures: Vec<(String, bool, Node, Node)> = Vec::new();
 
     if let Some(cap_node) = node
         .children(&mut node.walk())
@@ -6280,9 +6280,9 @@ fn lower_lambda_expression(
                         child.child_by_field_name("left"),
                         child.child_by_field_name("right"),
                     ) {
-                        let raw = node_text(source, &left);
-                        let name = raw.trim_start_matches('&').trim().to_string();
-                        init_captures.push((name, left, right));
+                        let is_ref = node_text(source, &child).trim_start().starts_with('&');
+                        let name = node_text(source, &left).trim().to_string();
+                        init_captures.push((name, is_ref, left, right));
                     }
                 }
                 _ => {}
@@ -6306,7 +6306,22 @@ fn lower_lambda_expression(
         }
     }
 
-    for (name, left, right) in init_captures {
+    for (name, is_ref, left, right) in init_captures {
+        if let Some(caller) = saved_fn {
+            walk_function_body(program, ctx, source, right, caller);
+        }
+        let right_text = node_text(source, &right).trim();
+        if is_ref {
+            let orig_var = saved_locals
+                .get(right_text)
+                .copied()
+                .or_else(|| resolve_lvalue_var(program, ctx, source, right))
+                .or_else(|| lookup_var(ctx, program, right_text));
+            if let Some(orig_var) = orig_var {
+                lambda_locals.insert(name, orig_var);
+                continue;
+            }
+        }
         let var_id = program.symbols.alloc_var_id();
         let span = node_span(program, ctx, left);
         let type_id = infer_static_class(program, ctx, source, right)
@@ -6331,19 +6346,14 @@ fn lower_lambda_expression(
             is_pointer: is_ptr,
         });
         extract_flow_from_expr(program, ctx, source, right, Some(var_id));
-        if let Some(caller) = saved_fn {
-            walk_function_body(program, ctx, source, right, caller);
-        }
         lambda_locals.insert(name, var_id);
     }
 
+    ctx.class_ctx = saved_class.clone();
     if captures_this {
-        ctx.class_ctx = saved_class.clone();
         if let Some(&this_var) = saved_locals.get("this") {
             lambda_locals.insert("this".to_string(), this_var);
         }
-    } else {
-        ctx.class_ctx = None;
     }
 
     for &param in &params {
