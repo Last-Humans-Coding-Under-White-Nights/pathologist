@@ -6251,13 +6251,118 @@ fn lower_lambda_expression(
     reassign_fn_id(program, provisional_id, fn_id);
     let saved_fn = ctx.current_fn;
     let saved_locals = ctx.locals.clone();
-    ctx.current_fn = Some(fn_id);
-    ctx.locals.clear();
-    for &param in &params {
-        if let Some(v) = program.symbols.variable_by_id(param) {
-            ctx.locals.insert(v.name.clone(), param);
+    let saved_class = ctx.class_ctx.clone();
+
+    let mut captures_this = false;
+    let mut default_capture_all = false;
+    let mut captured_vars: Vec<String> = Vec::new();
+    let mut init_captures: Vec<(String, bool, Node, Node)> = Vec::new();
+
+    if let Some(cap_node) = node
+        .children(&mut node.walk())
+        .find(|c| c.kind() == "lambda_capture_specifier")
+    {
+        for child in cap_node.children(&mut cap_node.walk()) {
+            match child.kind() {
+                "this" => captures_this = true,
+                "lambda_default_capture" => {
+                    default_capture_all = true;
+                    if saved_class.is_some() || saved_locals.contains_key("this") {
+                        captures_this = true;
+                    }
+                }
+                "identifier" => {
+                    let name = node_text(source, &child).to_string();
+                    captured_vars.push(name);
+                }
+                "lambda_capture_initializer" => {
+                    if let (Some(left), Some(right)) = (
+                        child.child_by_field_name("left"),
+                        child.child_by_field_name("right"),
+                    ) {
+                        let is_ref = node_text(source, &child).trim_start().starts_with('&');
+                        let name = node_text(source, &left).trim().to_string();
+                        init_captures.push((name, is_ref, left, right));
+                    }
+                }
+                _ => {}
+            }
         }
     }
+
+    let mut lambda_locals: HashMap<String, VarId> = HashMap::default();
+
+    if default_capture_all {
+        for (name, &var_id) in &saved_locals {
+            if name != "this" {
+                lambda_locals.insert(name.clone(), var_id);
+            }
+        }
+    } else {
+        for name in captured_vars {
+            if let Some(&var_id) = saved_locals.get(&name) {
+                lambda_locals.insert(name, var_id);
+            }
+        }
+    }
+
+    for (name, is_ref, left, right) in init_captures {
+        if let Some(caller) = saved_fn {
+            walk_function_body(program, ctx, source, right, caller);
+        }
+        let right_text = node_text(source, &right).trim();
+        if is_ref && right.kind() == "identifier" {
+            let orig_var = saved_locals
+                .get(right_text)
+                .copied()
+                .or_else(|| lookup_var(ctx, program, right_text));
+            if let Some(orig_var) = orig_var {
+                lambda_locals.insert(name, orig_var);
+                continue;
+            }
+        }
+        let var_id = program.symbols.alloc_var_id();
+        let span = node_span(program, ctx, left);
+        let type_id = infer_static_class(program, ctx, source, right)
+            .map(|cls| {
+                program
+                    .types
+                    .intern(TypeDesc::Ptr(Box::new(TypeDesc::Struct {
+                        name: cls,
+                        fields: Vec::new(),
+                    })))
+            })
+            .unwrap_or_else(|| program.types.int());
+        let is_ptr = matches!(program.types.get(type_id).desc, TypeDesc::Ptr(_));
+        program.symbols.add_variable(Variable {
+            id: var_id,
+            name: name.clone(),
+            type_id,
+            storage: StorageClass::Local,
+            fn_id: Some(fn_id),
+            param_index: None,
+            span,
+            is_pointer: is_ptr,
+        });
+        extract_flow_from_expr(program, ctx, source, right, Some(var_id));
+        lambda_locals.insert(name, var_id);
+    }
+
+    ctx.class_ctx = saved_class.clone();
+    if captures_this {
+        if let Some(&this_var) = saved_locals.get("this") {
+            lambda_locals.insert("this".to_string(), this_var);
+        }
+    }
+
+    for &param in &params {
+        if let Some(v) = program.symbols.variable_by_id(param) {
+            lambda_locals.insert(v.name.clone(), param);
+        }
+    }
+
+    ctx.current_fn = Some(fn_id);
+    ctx.locals = lambda_locals;
     if let Some(body) = node
         .children(&mut node.walk())
         .find(|c| c.kind() == "compound_statement")
@@ -6266,6 +6371,7 @@ fn lower_lambda_expression(
     }
     ctx.current_fn = saved_fn;
     ctx.locals = saved_locals;
+    ctx.class_ctx = saved_class;
     Some(fn_id)
 }
 
@@ -8106,6 +8212,11 @@ fn expr_to_rhs_flow(
         "call_expression" => {
             if let Some(callee_name) = resolve_direct_call(program, ctx, source, node) {
                 emit_call_return(program, ctx, node, dst, callee_name);
+            } else if let Some(callee_var) = resolve_callee_var(program, ctx, source, node) {
+                program
+                    .flow
+                    .push(FlowConstraint::CallReturnIndirect { dst, callee_var });
+                ctx.call_return_dst.borrow_mut().insert(node.id(), dst);
             }
             None
         }
@@ -8285,12 +8396,16 @@ fn resolve_direct_call_name(source: &str, node: Node) -> Option<String> {
 }
 
 fn resolve_direct_call(
-    _program: &Program,
-    _ctx: &LowerContext,
+    program: &Program,
+    ctx: &LowerContext,
     source: &str,
     node: Node,
 ) -> Option<String> {
-    resolve_direct_call_name(source, node)
+    let name = resolve_direct_call_name(source, node)?;
+    if lookup_var(ctx, program, &name).is_some() {
+        return None;
+    }
+    Some(name)
 }
 
 /// A receiver standing for the object an overloaded `->` yields, typed as
