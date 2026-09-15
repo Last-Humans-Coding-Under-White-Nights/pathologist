@@ -1793,7 +1793,24 @@ fn cpp_lambda_captures_resolve() {
         "non-capturing lambda must not call any Derived member"
     );
 
-    // 12. Nested lambdas
+    // Parameter shadowing: lambda param f1 shadows captured f1
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_param_shadow::$lambda")
+                && fn_name(&program, e.callee) == "target2"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "parameter shadowing captured variable should call target2"
+    );
+    assert!(
+        !analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_param_shadow::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+        }),
+        "parameter shadowing captured variable must not call shadowed target1"
+    );
+
+    // Nested lambdas
     assert!(
         analysis.call_edges.iter().any(|e| {
             fn_name(&program, e.caller).contains("test_nested_lambdas::$lambda")
@@ -1801,6 +1818,24 @@ fn cpp_lambda_captures_resolve() {
                 && e.resolution == ResolutionKind::Indirect
         }),
         "nested lambda should access outer captured f1"
+    );
+
+    // Lambda stored in struct field
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller) == "test_lambda_in_struct"
+                && fn_name(&program, e.callee).contains("test_lambda_in_struct::$lambda")
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "call via struct field should invoke lambda"
+    );
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_lambda_in_struct::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "lambda stored in struct field should call target1"
     );
 
     // 13. Init-capture by reference [&cb = f9] calling target9

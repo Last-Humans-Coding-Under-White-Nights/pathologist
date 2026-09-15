@@ -162,11 +162,10 @@ struct Holder {
 static void test_lambda_in_struct() {
     Holder h;
     fn_t f1 = target1;
-    auto l = [f1]() {
-        f1();
+    h.cb = [f1]() -> int {
+        return f1();
     };
-    // non-capturing lambda can convert to fn_t, capturing via auto
-    l();
+    h.cb();
 }
 
 // 12. Init-capture by reference

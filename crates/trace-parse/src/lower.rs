@@ -6256,7 +6256,7 @@ fn lower_lambda_expression(
     let mut captures_this = false;
     let mut default_capture_all = false;
     let mut captured_vars: Vec<String> = Vec::new();
-    let mut init_captures: Vec<(String, Node)> = Vec::new();
+    let mut init_captures: Vec<(String, Node, Node)> = Vec::new();
 
     if let Some(cap_node) = node
         .children(&mut node.walk())
@@ -6282,20 +6282,10 @@ fn lower_lambda_expression(
                     ) {
                         let raw = node_text(source, &left);
                         let name = raw.trim_start_matches('&').trim().to_string();
-                        init_captures.push((name, right));
+                        init_captures.push((name, left, right));
                     }
                 }
-                _ => {
-                    let text = node_text(source, &child);
-                    if text == "this" || text == "*this" || text == "&this" {
-                        captures_this = true;
-                    } else if text.starts_with('&') && text.len() > 1 {
-                        let name = text.trim_start_matches('&').trim().to_string();
-                        if !name.is_empty() && name != "this" {
-                            captured_vars.push(name);
-                        }
-                    }
-                }
+                _ => {}
             }
         }
     }
@@ -6316,9 +6306,9 @@ fn lower_lambda_expression(
         }
     }
 
-    for (name, right) in init_captures {
+    for (name, left, right) in init_captures {
         let var_id = program.symbols.alloc_var_id();
-        let span = node_span(program, ctx, right);
+        let span = node_span(program, ctx, left);
         let type_id = infer_static_class(program, ctx, source, right)
             .map(|cls| {
                 program

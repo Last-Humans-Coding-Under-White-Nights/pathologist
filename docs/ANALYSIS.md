@@ -991,11 +991,11 @@ C++-aware only where it must be — everything else reuses the C machinery.
   a class the unit cannot see (`Ast::Lookup` under
   `using namespace OHOS::Hardware`).
 - **Templates**: lowered once per primary name; `<...>` arguments stripped.
+- **Lambda captures**: explicit (`[var]`, `[&var]`, `[this]`, `[*this]`), default (`[&]`, `[=]`), and init-captures (`[x = expr]`, `[&x = expr]`) bind the enclosing scope's variables, members, and `this` into the lowered lambda body.
 
 Known C++ imprecision (in addition to the general list below):
 
-- Lambda **captures** (`[this]`, `[&]`, `[=]`, `[var]`, `[init = expr]`)
-  bind the enclosing scope's variables and `this` into the lambda body.
+- Lambda captures are instance- and flow-insensitive (by-value object captures do not invoke copy constructors; captured mutations share variable points-to sets across call sites).
 - `auto` inference needs a declaration visible in the translation unit;
   it does not infer returns from bodies, substitute general templates, or
   infer function-pointer call results. Trailing `auto` return declarations
