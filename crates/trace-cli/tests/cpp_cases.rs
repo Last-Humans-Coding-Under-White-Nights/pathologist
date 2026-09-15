@@ -207,6 +207,54 @@ fn cpp_auto_return_types_match_explicit_receivers() {
     );
 }
 
+/// An `auto&` local passes the value it names, as an explicit `T&` does: it
+/// must not rank `sink(Worker *)` over `sink(Worker)`.
+#[test]
+fn cpp_auto_reference_ranks_overloads_as_explicit_reference() {
+    let root = fixture("cpp_auto_return");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_, analysis) = analyze(&program);
+    let sinks = |caller: &str| {
+        let mut targets: Vec<FnId> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(&program, e.caller) == caller && fn_name(&program, e.callee) == "sink"
+            })
+            .map(|e| e.callee)
+            .collect();
+        targets.sort();
+        targets
+    };
+    let explicit = sinks("sink_explicit");
+    assert_eq!(explicit.len(), 1, "`Worker &r` picks one overload");
+    for caller in ["sink_auto", "sink_const_auto"] {
+        assert_eq!(
+            sinks(caller),
+            explicit,
+            "{caller} ranks as `Worker &r` does"
+        );
+    }
+}
+
+/// A definition spelled `N::f` looks names up in `N` when `N` is opened only by
+/// a header the unit includes.
+#[test]
+fn cpp_body_scope_sees_namespace_opened_in_header() {
+    let root = fixture("cpp_auto_return");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_, analysis) = analyze(&program);
+    let mut targets = direct_targets(&program, &analysis, "hdrns::body");
+    targets.sort();
+    targets.dedup();
+    for callee in ["hdrns::Job::go", "hdrns::Job::run"] {
+        assert!(
+            targets.iter().any(|t| t == callee),
+            "hdrns::body -> {callee}: {targets:?}"
+        );
+    }
+}
+
 /// A variable declared in a condition (`if (Worker *p = f())`) is placed where
 /// its declarator starts, as one in a plain declaration is, not at its type.
 #[test]

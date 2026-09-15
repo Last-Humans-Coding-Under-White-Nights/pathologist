@@ -133,9 +133,6 @@ struct LowerContext {
     /// Every local registered in the C++ function being lowered, with the
     /// variable of that name it hid; a block unwinds its own on exit.
     local_scope_log: Vec<(String, Option<VarId>)>,
-    /// Every named namespace this unit has opened, fully qualified: the
-    /// scope of a definition spelled `N::f` is a namespace only if listed.
-    opened_namespaces: HashSet<String>,
     /// The unit's syntax tree, for descending to a node's ancestors.
     tree: tree_sitter::Tree,
     /// Whether the unit can hold a `template_declaration` at all: a C++ unit
@@ -1999,7 +1996,6 @@ fn lower_prepared_source(
         ast_depth_warned: false,
         reference_vars: HashSet::default(),
         local_scope_log: Vec::new(),
-        opened_namespaces: HashSet::default(),
         tree: parsed.tree.clone(),
         has_templates: is_cpp && parsed.source.contains("template"),
     };
@@ -2142,6 +2138,7 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
         anonymous_classes: std::mem::take(&mut program.anonymous_classes),
         anonymous_final_classes: std::mem::take(&mut program.anonymous_final_classes),
         anonymous_bases: std::mem::take(&mut program.anonymous_bases),
+        namespaces: std::mem::take(&mut program.namespaces),
     }
 }
 
@@ -2380,7 +2377,7 @@ fn lower_namespace(program: &mut Program, ctx: &mut LowerContext, source: &str, 
     };
     for level in &levels {
         ctx.ns_stack.push(level.clone());
-        ctx.opened_namespaces.insert(ctx.namespace_scope());
+        program.namespaces.insert(ctx.namespace_scope());
     }
     // `using namespace X;` / `using X::f;` inside a namespace block are
     // scoped to the block in real C++ (a directive written here must not
@@ -3477,12 +3474,13 @@ fn lower_function_body(
     let scoped = enter_lookup_scope(ctx, lookup_scope.as_ref());
     // The body of a free function spelled `N::f` looks function names up in
     // `N` as well: open the namespaces the definition names but does not sit
-    // in. A scope no namespace of this unit spells is a class it cannot see
-    // (`Ast::Lookup` under `using namespace OHOS::Hardware`), not a namespace.
+    // in. A scope that neither this unit nor a header it includes opens as a
+    // namespace is a class it cannot see (`Ast::Lookup` under
+    // `using namespace OHOS::Hardware`), not a namespace.
     let ns_depth = ctx.ns_stack.len();
     if let Some(scope) = lookup_scope
         .as_ref()
-        .filter(|scope| eff_class.is_none() && ctx.opened_namespaces.contains(*scope))
+        .filter(|scope| eff_class.is_none() && program.namespaces.contains(*scope))
     {
         let open = ctx.namespace_scope();
         let unopened = if open.is_empty() {
@@ -4257,10 +4255,9 @@ fn pointer_layers(program: &mut Program, ty: trace_ir::TypeId, depth: usize) -> 
 
 /// The type of a local declared `decl` with base type `type_id`. An `auto`
 /// local takes its initializer's type, which already includes pointer layers
-/// (`auto *p` deduces the pointee); a reference uses the existing alias
-/// representation, which receiver_desc peels once. An initializer with fewer
-/// pointer layers than the declarator asks for (`auto *p = value()`) deduces
-/// nothing.
+/// (`auto *p` deduces the pointee); `auto&` takes it too, as the value the
+/// reference names. An initializer with fewer pointer layers than the
+/// declarator asks for (`auto *p = value()`) deduces nothing.
 fn local_type(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -4271,19 +4268,17 @@ fn local_type(
     value: Option<Node>,
 ) -> trace_ir::TypeId {
     let inferred = value
-        .filter(|_| ctx.is_cpp && type_node.kind() == "placeholder_type_specifier")
-        // A reference carries one pointer layer that only this unit's
-        // `reference_vars` peels, so one at file scope, read from other units
-        // too, is left untyped.
-        .filter(|_| ctx.current_fn.is_some() || decl.kind() != "reference_declarator")
+        .filter(|_| is_placeholder_type(ctx, type_node))
         .and_then(|value| auto_initializer_type(program, ctx, source, value))
         .filter(|desc| pointer_depth(desc) >= declarator_pointer_depth(decl));
-    let desc = match inferred {
-        Some(desc) if decl.kind() == "reference_declarator" => TypeDesc::Ptr(Box::new(desc)),
-        Some(desc) => desc,
-        None => walk_declarator_shape(decl, program.types.get(type_id).desc.clone()),
-    };
+    let desc = inferred
+        .unwrap_or_else(|| walk_declarator_shape(decl, program.types.get(type_id).desc.clone()));
     program.types.intern(desc)
+}
+
+/// A C++ `auto` type specifier.
+fn is_placeholder_type(ctx: &LowerContext, type_node: Node) -> bool {
+    ctx.is_cpp && type_node.kind() == "placeholder_type_specifier"
 }
 
 /// How many pointer layers `desc` has.
@@ -4328,7 +4323,7 @@ fn lower_declaration(
                              decl: Node,
                              value: Option<Node>| {
         let ty = local_type(program, ctx, source, type_node, type_id, decl, value);
-        lower_one_declarator(
+        let var = lower_one_declarator(
             program,
             ctx,
             source,
@@ -4339,6 +4334,11 @@ fn lower_declaration(
             storage_override,
             value,
         );
+        // An explicit reference's type carries an alias layer that readers
+        // peel; an `auto&` local's is already the value's own type.
+        if let Some(var) = var.filter(|_| is_placeholder_type(ctx, type_node)) {
+            ctx.reference_vars.remove(&var);
+        }
     };
 
     // A condition declaration (`if (auto p = f())`) stores its initializer

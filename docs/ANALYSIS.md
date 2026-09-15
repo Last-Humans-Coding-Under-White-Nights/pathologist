@@ -949,9 +949,9 @@ C++-aware only where it must be — everything else reuses the C machinery.
   C-style cast and `new T` give the type they spell, pointer layers
   included. Only a class, union or function-pointer type, under any pointer
   layers, is copied: a scalar may be the stand-in for a type name lowering
-  could not resolve. `auto&` and `const auto&` preserve the existing
-  reference representation; one at file scope stays untyped, because other
-  units do not know it is a reference. `auto *p` and `auto **p` need an
+  could not resolve. `auto&` and `const auto&` take the type of the value
+  they name, as an explicit `T&` local does, so an argument ranks overloads
+  the same either way. `auto *p` and `auto **p` need an
   initializer with at least as many pointer layers, and deduce nothing from
   one with fewer. Both `if (auto p = f())` and `if (auto p = f(); p)` are
   covered.
@@ -986,9 +986,10 @@ C++-aware only where it must be — everything else reuses the C machinery.
   unresolved call keeps its `::` spelling as the external callee, so
   `::operator new` stays that external. The parameters and body of a
   definition spelled `N::f` look type names up in `N`, class or namespace;
-  when `N` is a namespace the unit has opened, the body looks function names
-  up in it too. A scope the unit never opened as a namespace is a class it
-  cannot see (`Ast::Lookup` under `using namespace OHOS::Hardware`).
+  when `N` is a namespace the unit or a header it includes opens, the body
+  looks function names up in it too. A scope neither opens as a namespace is
+  a class the unit cannot see (`Ast::Lookup` under
+  `using namespace OHOS::Hardware`).
 - **Templates**: lowered once per primary name; `<...>` arguments stripped.
 
 Known C++ imprecision (in addition to the general list below):
@@ -1009,9 +1010,9 @@ Known C++ imprecision (in addition to the general list below):
   member (`Worker *find(int)`, `Other *find(const char *)`) share one entry,
   which keeps the first declaration's return type; an `auto` local takes it
   whichever overload the call means.
-- An `auto&` local, like a reference parameter, is typed one pointer layer
-  deeper than an explicit `T&` local, so overload ranking can prefer
-  `take(T*)` over `take(T)` for it.
+- A reference parameter is typed one pointer layer deeper than an explicit
+  `T&` local, so overload ranking can prefer `take(T*)` over `take(T)` for
+  it.
 - An out-of-line member definition under `using namespace N;` at global
   scope registers under the bare class name, apart from `N::`'s in-class
   prototypes; a call reaching the prototype stays external.

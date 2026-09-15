@@ -181,6 +181,9 @@ pub struct Program {
     /// that derives it so: `inheritance` joins every class of a name, and
     /// another file's class of the name derives from other bases.
     pub anonymous_bases: BTreeMap<String, BTreeSet<(FileId, String)>>,
+    /// Qualified names of the C++ namespaces opened (`ns::inner`), merged with
+    /// a header's types so a unit knows the namespaces its headers open.
+    pub namespaces: BTreeSet<String>,
     /// Whether configuration-variant exploration was enabled (#59).
     pub explore: bool,
     /// Maximum configuration-variant exploration budget per translation unit

@@ -160,3 +160,14 @@ void bodyns::body() { auto p = make(); p->run(); p->go(); }
 void shadowed_scope(Other *p) { if (auto p = get_worker()) { p->run(); } p->run(); }
 // A condition's variable starts where its declarator does.
 void condition_spans() { if (Worker *typed = get_worker()) {} if (auto inferred = get_worker()) {} }
+// An `auto&` argument ranks overloads as the explicit `T&` it stands for does.
+void sink(Worker w) {}
+void sink(Worker *w) {}
+void sink_explicit() { Worker &r = ref_worker(); sink(r); }
+void sink_auto() { auto &r = ref_worker(); sink(r); }
+void sink_const_auto() { const auto &r = ref_worker(); sink(r); }
+// The body of `N::f` looks names up in `N` when only an included header opens it.
+#include "header_namespace.h"
+void hdrns::Job::run() {}
+void hdrns::Job::go() {}
+void hdrns::body() { auto p = make(); p->run(); p->go(); }

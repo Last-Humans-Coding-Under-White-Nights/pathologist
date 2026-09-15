@@ -13,7 +13,7 @@ rules and their limits are in `docs/ANALYSIS.md` ("`auto` local types").
 | Corpus | Direct edges | All edges | Indirect edges | Arg-flow rows |
 |--------|--------------|-----------|----------------|---------------|
 | HDF | 42,252 → 42,252 | 75,814 → 75,836 | 4,825 | 66,253 |
-| Hiview | 9,598 → 11,241 | 29,797 → 31,726 | 90 → 91 | 10,674 → 12,129 |
+| Hiview | 9,598 → 11,243 | 29,797 → 31,726 | 90 → 91 | 10,674 → 12,132 |
 | Camera | 39,014 → 42,584 | 93,315 → 97,590 | 135 → 162 | 28,940 → 30,983 |
 
 **Exact metrics.** Every dispatch-site count and exact metric is unchanged
@@ -49,8 +49,11 @@ rested on a guess and add edges the stricter rules reach:
 - added: overloads that agree on a return type (camera's
   `CameraInput::GetCameraDeviceInfo` sites), bare `make_shared` /
   `make_unique` under `using namespace std` (hiview's BBoxDetector tests,
-  camera's `TestBufferInfo`), and `T(args)` constructions (camera's 19
-  external `ExecuteCallbackData` calls now reach the constructor).
+  camera's `TestBufferInfo`), `T(args)` constructions (camera's 19
+  external `ExecuteCallbackData` calls now reach the constructor), and bare
+  calls in an `N::f` body whose namespace only a header opens (hiview's
+  `FaultlogHilogHelper::GetHilogByPid` reaches `DoGetHilogProcess` and
+  `ReadHilogTimeout`: direct +2, external −2, arg-flow +3).
 
 **Performance.** The first build checked a return type for template
 parameters by walking the signature's ancestors with `Node::parent`, which
