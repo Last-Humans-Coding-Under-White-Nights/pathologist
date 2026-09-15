@@ -199,7 +199,7 @@ fn if_chain(
             .trim()
             .to_string();
         let open = end + 1;
-        if !tokens.get(open).is_some_and(|t| t.raw == "{") {
+        if tokens.get(open).is_none_or(|t| t.raw != "{") {
             return None;
         }
         let close = closing(tokens, open)?;
@@ -208,7 +208,7 @@ fn if_chain(
         walk(text, &tokens[open + 1..close], &taken, out);
         branch.conditions.push(format!("!({condition})"));
         i = close + 1;
-        if !tokens.get(i).is_some_and(|t| t.raw == "else") {
+        if tokens.get(i).is_none_or(|t| t.raw != "else") {
             return Some(i);
         }
         i += 1;
@@ -281,7 +281,7 @@ fn call_block(
     out: &mut Vec<Candidate>,
 ) -> Option<usize> {
     let end = closing(tokens, i + 1)?;
-    if !tokens.get(end + 1).is_some_and(|t| t.raw == "{") {
+    if tokens.get(end + 1).is_none_or(|t| t.raw != "{") {
         return Some(end + 1);
     }
     let close = closing(tokens, end + 1)?;

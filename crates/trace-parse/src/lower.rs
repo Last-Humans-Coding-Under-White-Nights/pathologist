@@ -4287,9 +4287,9 @@ fn walk_function_body(
         // directive, and never reaches the unit's alias table.
         // One declared in a function-local class belongs to that class.
         "type_definition" | "alias_declaration"
-            if !node
+            if node
                 .parent()
-                .is_some_and(|p| p.kind() == "field_declaration_list") =>
+                .is_none_or(|p| p.kind() != "field_declaration_list") =>
         {
             if let Some(alias) = declared_alias(program, ctx, source, node) {
                 ctx.local_aliases.push(alias);
@@ -5378,8 +5378,8 @@ fn confidently_takes(program: &Program, fid: FnId, arg_desc: &[TypeDesc]) -> boo
                 .get(program.symbols.variable(param).type_id)
                 .desc;
             let floating = matches!(arg.scalar_kind(), ScalarKind::Float | ScalarKind::Double);
-            !(arg.is_pointer_like() && param.scalar_kind() != ScalarKind::Aggregate)
-                && !(floating && param.is_pointer_like())
+            !(arg.is_pointer_like() && param.scalar_kind() != ScalarKind::Aggregate
+                || floating && param.is_pointer_like())
         })
 }
 
