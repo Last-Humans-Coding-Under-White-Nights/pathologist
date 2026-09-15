@@ -6311,11 +6311,10 @@ fn lower_lambda_expression(
             walk_function_body(program, ctx, source, right, caller);
         }
         let right_text = node_text(source, &right).trim();
-        if is_ref {
+        if is_ref && right.kind() == "identifier" {
             let orig_var = saved_locals
                 .get(right_text)
                 .copied()
-                .or_else(|| resolve_lvalue_var(program, ctx, source, right))
                 .or_else(|| lookup_var(ctx, program, right_text));
             if let Some(orig_var) = orig_var {
                 lambda_locals.insert(name, orig_var);

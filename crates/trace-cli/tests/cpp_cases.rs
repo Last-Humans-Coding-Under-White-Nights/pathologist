@@ -1983,6 +1983,16 @@ fn cpp_lambda_captures_resolve() {
         2,
         "both distinct invocations a() and b() should resolve to target1"
     );
+
+    // 25. Reference init-capture of struct field [&cb = h.cb]
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_ref_init_capture_field::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "reference init-capture of struct field [&cb = h.cb] should call target1"
+    );
 }
 
 #[test]

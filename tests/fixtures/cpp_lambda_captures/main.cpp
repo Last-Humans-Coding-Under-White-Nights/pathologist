@@ -343,3 +343,13 @@ static void test_repeated_call_returns() {
     b();
 }
 
+// 24. Reference init-capture of struct field [&cb = h.cb]
+static void test_ref_init_capture_field() {
+    Holder h;
+    h.cb = target1;
+    auto l = [&cb = h.cb]() {
+        cb();
+    };
+    l();
+}
+
