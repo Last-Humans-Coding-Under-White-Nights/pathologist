@@ -314,17 +314,17 @@ impl IncludeGraph {
     /// Project files reachable from `start`, including `start`.
     pub fn reachable_paths<'a>(&'a self, start: &'a Path) -> HashSet<&'a Path> {
         let mut seen: HashSet<&Path> = HashSet::default();
-        let mut queue: VecDeque<&Path> = VecDeque::new();
+        let mut stack: Vec<&Path> = Vec::new();
         if seen.insert(start) {
-            queue.push_back(start);
+            stack.push(start);
         }
-        while let Some(node) = queue.pop_front() {
+        while let Some(node) = stack.pop() {
             let Some(incs) = self.edges.get(node) else {
                 continue;
             };
             for inc in incs {
                 if self.project_files.contains(inc) && seen.insert(inc.as_path()) {
-                    queue.push_back(inc.as_path());
+                    stack.push(inc.as_path());
                 }
             }
         }

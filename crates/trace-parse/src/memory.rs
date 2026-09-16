@@ -1,6 +1,4 @@
-//! Return freed heap pages between large indexing phases on glibc.
-
-pub(crate) fn reclaim_unused_pages() {
+pub fn reclaim_unused_pages() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         unsafe extern "C" {

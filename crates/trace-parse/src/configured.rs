@@ -7,9 +7,8 @@ use super::{
     index_source_file_with_variants, project_preprocess_opts,
 };
 use crate::compile_commands::CompilationDatabase;
-use crate::merge::{merge_unit_index, merge_unit_variants, UnitIndex};
+use crate::merge::{merge_unit_index, UnitIndex, VariantMerger};
 use crate::{IncludeGraph, IndexSourceCache};
-use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -51,24 +50,30 @@ pub(super) fn build(
         database.commands.values().map(Vec::len).sum::<usize>(),
         database.commands.len()
     ));
-    let results: Vec<ConfiguredUnits> = pool.install(|| {
-        files
-            .par_iter()
-            .map(|path| {
+    let has_links = !links.targets.is_empty();
+    let empty_pch_order = crate::lower::PchOrder::default();
+    let mut consumed = FxHashSet::default();
+    let mut variants_merged = 0;
+    let mut variant_merger = VariantMerger::new();
+    let mut linked_units: Vec<UnitIndex> = Vec::new();
+    let mut file_includes: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
+    pool.install(|| {
+        crate::lower::index_in_window(
+            files,
+            jobs,
+            |path| {
                 let (configs, from_database) = configs_for(&database, &fallback, path);
                 let mut result = ConfiguredUnits {
                     units: Vec::new(),
                     includes: Vec::new(),
                 };
-                // The budget bounds exploration for the source, not for each
-                // command: N commands must not buy N times the exploration.
                 let mut budget = opts.explore_budget;
                 for (command_index, config) in configs.iter().enumerate() {
                     let mut config = config
                         .clone()
                         .for_indexing()
                         .with_inline_include_bodies(true);
-                    config.record_link_ownership = !links.targets.is_empty();
+                    config.record_link_ownership = has_links;
                     // Neither path-keyed source entries nor header expansions are valid
                     // across commands with different search paths, even if macros match.
                     // A source with no command of its own uses the one shared
@@ -86,7 +91,6 @@ pub(super) fn build(
                         config.source_cache.clone_from(&raw_sources);
                     }
                     let cache = IndexSourceCache::new();
-                    // Only read when exploration runs; skip the map otherwise.
                     let defines = candidates
                         .as_ref()
                         .map(|_| effective_defines(&config))
@@ -98,7 +102,7 @@ pub(super) fn build(
                         &config,
                         &cache,
                         None,
-                        &[],
+                        &empty_pch_order,
                         candidates.as_ref(),
                         &defines,
                         budget,
@@ -114,36 +118,32 @@ pub(super) fn build(
                     result.units.push(base);
                     result.units.extend(variants);
                 }
-                result
-            })
-            .collect()
+                (path.clone(), result)
+            },
+            |(path, result)| {
+                variants_merged += result.units.len().saturating_sub(1);
+                consumed.extend(result.includes.iter().cloned());
+                file_includes.push((path, result.includes));
+                if has_links {
+                    for unit in &result.units {
+                        consumed.extend(unit.files.iter().cloned());
+                    }
+                    linked_units.extend(result.units);
+                } else {
+                    for unit in &result.units {
+                        consumed.extend(unit.files.iter().cloned());
+                        variant_merger.merge_unit(&mut program, unit);
+                    }
+                }
+            },
+        );
     });
-    let mut consumed = FxHashSet::default();
-    let variants_merged = results
-        .iter()
-        .map(|r| r.units.len().saturating_sub(1))
-        .sum::<usize>();
-    let mut units = Vec::new();
-    for (path, result) in files.iter().zip(results) {
-        graph.add_preprocess_includes(path, &result.includes);
-        consumed.extend(result.includes);
-        // Include files introduced only by exploratory variants also must not
-        // be lowered again under an unrelated orphan-header configuration.
-        for unit in &result.units {
-            consumed.extend(unit.files.iter().cloned());
-        }
-        units.extend(result.units);
+    for (path, includes) in file_includes {
+        graph.add_preprocess_includes(&path, &includes);
     }
-    // Merge the complete configuration family together. A shared header can
-    // vary between different source files as well as between commands for one
-    // source; ordinary TU deduplication would drop its second body.
-    if !links.targets.is_empty() {
-        crate::merge::merge_linked_units(&mut program, &units, &links);
-    } else if let Some((base, variants)) = units.split_first() {
-        merge_unit_variants(&mut program, base, variants);
+    if has_links {
+        crate::merge::merge_linked_units(&mut program, &linked_units, &links);
     }
-    // `merge_unit_variants` counts variants across the whole family; this field
-    // means variants per source, so the per-file tally replaces it.
     program.variants_merged = variants_merged;
     let mut cpp_sources = FxHashSet::default();
     let mut no_c_units = true;
@@ -159,42 +159,30 @@ pub(super) fn build(
         }
     }
     let cpp_parse = graph.reachable_from(&cpp_sources);
-    let unconsumed_headers: Vec<&PathBuf> = headers
+    let unconsumed_headers: Vec<PathBuf> = headers
         .iter()
         .filter(|path| !consumed.contains(*path))
+        .cloned()
         .collect();
-    if jobs == 1 || unconsumed_headers.len() <= 1 {
-        for path in unconsumed_headers {
-            let cache = IndexSourceCache::new();
-            let config = fallback.clone().with_language(index_language(
-                path,
-                &cpp_parse,
-                no_c_units,
-                opts.language,
-            ));
-            let unit = index_source_file(path, root, &graph, &config, &cache, None, &[]);
-            merge_unit_index(&mut program, &unit);
-        }
-    } else {
-        let header_units: Vec<UnitIndex> = pool.install(|| {
-            unconsumed_headers
-                .par_iter()
-                .map(|path| {
-                    let cache = IndexSourceCache::new();
-                    let config = fallback.clone().with_language(index_language(
-                        path,
-                        &cpp_parse,
-                        no_c_units,
-                        opts.language,
-                    ));
-                    index_source_file(path, root, &graph, &config, &cache, None, &[])
-                })
-                .collect()
-        });
-        for unit in &header_units {
-            merge_unit_index(&mut program, unit);
-        }
-    }
+    pool.install(|| {
+        crate::lower::index_in_window(
+            &unconsumed_headers,
+            jobs,
+            |path| {
+                let cache = IndexSourceCache::new();
+                let config = fallback.clone().with_language(index_language(
+                    path,
+                    &cpp_parse,
+                    no_c_units,
+                    opts.language,
+                ));
+                index_source_file(path, root, &graph, &config, &cache, None, &empty_pch_order)
+            },
+            |unit| {
+                merge_unit_index(&mut program, &unit);
+            },
+        );
+    });
     program.types.complete_nested_tags();
     // Every search directory any configuration actually used, in first-seen
     // order. `fallback` carries the inferred directories the other path records.
@@ -212,6 +200,8 @@ pub(super) fn build(
         })
         .cloned()
         .collect();
+    trace_ir::release_thread_path_caches();
+    crate::memory::reclaim_unused_pages();
     finalize_program(&mut program, &graph, observed_dirs);
     Ok(program)
 }

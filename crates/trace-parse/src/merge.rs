@@ -91,7 +91,6 @@ enum MergeMode {
     Variant,
 }
 
-type SiteKey = (trace_ir::FileId, u32, u32, String);
 type LocalKey = (FnId, trace_ir::FileId, u32, u32, String);
 type TempKey = (FnId, trace_ir::FileId, u32, u32, &'static str);
 type FileVarKey = (u32, trace_ir::FileId, u32, u32, String);
@@ -253,6 +252,30 @@ impl VariantMerge {
     }
 }
 
+/// Incremental merger for compilation databases and variant exploration.
+///
+/// Binds memory accumulation across configurations by retaining `VariantDedup`
+/// state across streaming/batched unit merges rather than requiring all units
+/// to be collected into memory upfront.
+#[derive(Default)]
+pub struct VariantMerger {
+    inner: Option<VariantMerge>,
+}
+
+impl VariantMerger {
+    pub fn new() -> Self {
+        Self { inner: None }
+    }
+
+    pub fn merge_unit(&mut self, program: &mut Program, unit: &UnitIndex) {
+        if let Some(merge) = self.inner.as_mut() {
+            merge.push(program, unit);
+        } else {
+            self.inner = Some(VariantMerge::start(program, unit, true));
+        }
+    }
+}
+
 /// Index the definitions the base configuration just merged for this unit, by
 /// file and name.
 ///
@@ -347,7 +370,11 @@ fn merge_unit(
     for cls in &unit.final_classes {
         program.mark_class_final(cls);
     }
-    program.namespaces.extend(unit.namespaces.iter().cloned());
+    for ns in &unit.namespaces {
+        if !program.namespaces.contains(ns) {
+            program.namespaces.insert(ns.clone());
+        }
+    }
 
     let type_map = merge_types(
         &mut program.types,
@@ -435,21 +462,14 @@ fn merge_unit(
     } else {
         FxHashMap::default()
     };
-    // Every parameter's type, remapped into the program's id space, indexed by
-    // its unit-local `VarId`. Both places below used to scan `unit.variables`
-    // for each parameter of each function, so one unit cost
-    // O(functions x params x variables) -- and a lowered TU carries tens of
-    // thousands of variables (#83). Only parameters are indexed, which is all
-    // either lookup asks for: locals dominate that list, and `lower_parameter`
-    // is the only thing that builds a variable a function's `params` can name.
-    let unit_param_types: FxHashMap<VarId, TypeId> = unit
-        .variables
-        .iter()
-        .filter(|v| matches!(v.storage, trace_ir::StorageClass::Param))
-        .map(|v| (v.id, remap_type(v.type_id, &type_map)))
-        .collect();
+    let get_param_type = |vid: VarId| -> Option<TypeId> {
+        unit.variables
+            .get(vid.0 as usize)
+            .filter(|v| v.id == vid && matches!(v.storage, trace_ir::StorageClass::Param))
+            .map(|v| remap_type(v.type_id, &type_map))
+    };
 
-    let respelled = respelled_declarations(unit, &unit_param_types, &program.types);
+    let respelled = respelled_declarations(unit, &get_param_type, &program.types);
     for func in &unit.functions {
         let old_id = func.id;
         if respelled.contains_key(&old_id) {
@@ -511,8 +531,8 @@ fn merge_unit(
                     return true;
                 }
                 base.params.len() == func.params.len()
-                    && func.params.iter().enumerate().all(|(i, old)| {
-                        let incoming = unit_param_types.get(old).copied();
+                    && func.params.iter().enumerate().all(|(i, &old)| {
+                        let incoming = get_param_type(old);
                         let existing = base.param_type_ids.get(i).copied().or_else(|| {
                             program
                                 .symbols
@@ -593,7 +613,7 @@ fn merge_unit(
         let incoming_param_types: Vec<trace_ir::TypeId> = f
             .params
             .iter()
-            .map(|old| {
+            .map(|&old| {
                 // `Unknown`, not `TypeId(0)`. Zero is the first descriptor the
                 // prelude interns, `Void`, and no parameter has that type, so
                 // a parameter whose variable did not lower used to guarantee a
@@ -601,10 +621,7 @@ fn merge_unit(
                 // signature agreed on. `Unknown` is what the comparison
                 // already documents for a type neither side can resolve: it
                 // matches anything, leaving arity to decide.
-                unit_param_types
-                    .get(old)
-                    .copied()
-                    .unwrap_or_else(|| program.types.unknown())
+                get_param_type(old).unwrap_or_else(|| program.types.unknown())
             })
             .collect();
         let registered =
@@ -843,7 +860,6 @@ fn merge_unit(
         return;
     }
 
-    let mut call_map: FxHashMap<CallSiteId, CallSiteId> = FxHashMap::default();
     for cs in &unit.call_sites {
         if dropped_fns.contains(&cs.caller) {
             continue;
@@ -852,14 +868,14 @@ fn merge_unit(
         if program.is_dep_file(span_file) {
             continue;
         }
-        let key: SiteKey = (span_file, cs.span.line, cs.span.col, cs.callee_name.clone());
-        if !matches!(mode, MergeMode::Variant) {
-            if let Some(&existing) = program.dedup.site_keys.get(&key) {
-                call_map.insert(cs.id, existing);
-                continue;
-            }
+        if !matches!(mode, MergeMode::Variant)
+            && program
+                .dedup
+                .existing_site(span_file, cs.span.line, cs.span.col, &cs.callee_name)
+                .is_some()
+        {
+            continue;
         }
-        let old = cs.id;
         let mut site = cs.clone();
         site.caller = fn_map.get(&site.caller).copied().unwrap_or(site.caller);
         site.callee_fn_id = site.callee_fn_id.and_then(|f| fn_map.get(&f).copied());
@@ -889,15 +905,12 @@ fn merge_unit(
             // units both recover would be recorded once per unit (#59 review).
             let existing = program
                 .dedup
-                .site_keys
-                .get(&key)
-                .copied()
+                .existing_site(span_file, cs.span.line, cs.span.col, &cs.callee_name)
                 .into_iter()
                 .chain(
                     program
                         .dedup
-                        .variant_site_records
-                        .get(&key)
+                        .variant_site_records(span_file, cs.span.line, cs.span.col, &cs.callee_name)
                         .into_iter()
                         .flatten()
                         .copied(),
@@ -906,8 +919,7 @@ fn merge_unit(
                     call_site_index(&program.symbols, id)
                         .is_some_and(|idx| same_call_facts(&program.symbols.call_sites[idx], &site))
                 });
-            if let Some(existing) = existing {
-                call_map.insert(old, existing);
+            if existing.is_some() {
                 continue;
             }
         }
@@ -922,17 +934,29 @@ fn merge_unit(
             // canonical and only a site no configuration has claimed yet is
             // registered here. The record is remembered separately either way,
             // so a later variant can merge into it.
-            program
-                .dedup
-                .variant_site_records
-                .entry(key.clone())
-                .or_default()
-                .push(new_id);
-            program.dedup.site_keys.entry(key).or_insert(new_id);
+            program.dedup.push_variant_site(
+                span_file,
+                cs.span.line,
+                cs.span.col,
+                &cs.callee_name,
+                new_id,
+            );
+            program.dedup.insert_site_or_ignore(
+                span_file,
+                cs.span.line,
+                cs.span.col,
+                &cs.callee_name,
+                new_id,
+            );
         } else {
-            program.dedup.site_keys.insert(key, new_id);
+            program.dedup.insert_site(
+                span_file,
+                cs.span.line,
+                cs.span.col,
+                cs.callee_name.clone(),
+                new_id,
+            );
         }
-        call_map.insert(old, new_id);
     }
 
     if let Some(seen) = variant_dedup {
@@ -1031,8 +1055,17 @@ fn merge_types(
     merge_descs: Option<&[Arc<TypeDesc>]>,
 ) -> Vec<TypeId> {
     dst.merge_struct_declarations(src);
-    let mut map = Vec::with_capacity(src.all().len());
-    for (i, info) in src.all().iter().enumerate() {
+    let all = src.all();
+    let mut map = Vec::with_capacity(all.len());
+    // The first 11 types are the identical built-in primitive types interned in
+    // every TypeTable::new (Void..Unknown, TypeId(0)..TypeId(10)). They are
+    // invariant across all tables, so map them directly without hash lookups.
+    let num_primitives = 11.min(all.len());
+    for (i, info) in all.iter().enumerate().take(num_primitives) {
+        debug_assert_eq!(info.id, TypeId(i as u32));
+        map.push(TypeId(i as u32));
+    }
+    for (i, info) in all.iter().enumerate().skip(num_primitives) {
         // The precomputed descriptor is what the arms below would build;
         // interning it by address skips both the rebuild and the hashing.
         if let Some(desc) = merge_descs.filter(|_| !union_aggregates).map(|d| &d[i]) {
@@ -1071,9 +1104,7 @@ fn merge_types(
         map.push(new_id);
     }
     for (alias, desc) in src.all_aliases() {
-        if dst.resolve_alias(alias).is_none() {
-            dst.register_alias_ref(alias, desc);
-        }
+        dst.register_alias_arc(alias, desc);
     }
     map
 }
@@ -1117,9 +1148,16 @@ fn fields_from_layout(
 /// may name them; several candidates leave the declaration alone.
 fn respelled_declarations(
     unit: &UnitIndex,
-    param_types: &FxHashMap<VarId, TypeId>,
+    param_types: &impl Fn(VarId) -> Option<TypeId>,
     types: &trace_ir::TypeTable,
 ) -> BTreeMap<FnId, FnId> {
+    if !unit
+        .functions
+        .iter()
+        .any(|f| f.is_cpp && !f.is_defined && f.linkage == trace_ir::Linkage::Internal)
+    {
+        return BTreeMap::new();
+    }
     let undefined: FxHashSet<&str> = unit
         .functions
         .iter()
@@ -1144,9 +1182,9 @@ fn respelled_declarations(
         a.params.is_empty()
             || b.params.is_empty()
             || (a.params.len() == b.params.len()
-                && a.params.iter().zip(&b.params).all(|(x, y)| {
-                    match (param_types.get(x), param_types.get(y)) {
-                        (Some(&x), Some(&y)) => same(x, y),
+                && a.params.iter().zip(&b.params).all(|(&x, &y)| {
+                    match (param_types(x), param_types(y)) {
+                        (Some(x), Some(y)) => same(x, y),
                         _ => true,
                     }
                 }))

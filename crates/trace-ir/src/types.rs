@@ -419,19 +419,6 @@ impl TypeTable {
         self.descriptors.share(desc)
     }
 
-    /// Rewrite empty `struct Foo` / `union Foo` tags (and pointers to them)
-    /// to the most complete interned layout of that tag, when one exists.
-    ///
-    /// Deliberately shallow: a named aggregate that carries fields keeps them
-    /// as the unit that built it saw them, so one C type can still hold more
-    /// than one id when two units disagreed on how complete a nested tag was.
-    /// Rewriting nested tags here was measured and rejected -- see the #83
-    /// section of `docs/EVAL_REPORT.md`.
-    fn canonicalize_desc(&self, mut desc: TypeDesc) -> TypeDesc {
-        self.canonicalize_in_place(&mut desc);
-        desc
-    }
-
     /// [`canonicalize_desc`](Self::canonicalize_desc) without rebuilding the
     /// pointer and array boxes on the way down: on the common path nothing
     /// is rewritten, and merging re-interns every header type per unit.
@@ -518,6 +505,27 @@ impl TypeTable {
         }
         let n = self.types.len();
         for i in 0..n {
+            if self.types[i].layout.fields.is_empty() {
+                continue;
+            }
+            let any_incomplete = self.types[i].layout.fields.values().any(|fl| {
+                let desc = self.get(fl.type_id).desc.as_ref();
+                match desc {
+                    TypeDesc::Struct { name, fields } | TypeDesc::Union { name, fields } => {
+                        fields.is_empty() && !name.is_empty()
+                    }
+                    TypeDesc::Ptr(inner) => match inner.as_ref() {
+                        TypeDesc::Struct { name, fields } | TypeDesc::Union { name, fields } => {
+                            fields.is_empty() && !name.is_empty()
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            });
+            if !any_incomplete {
+                continue;
+            }
             let fids: Vec<FieldId> = self.types[i].layout.fields.keys().copied().collect();
             for fid in fids {
                 let old = self.types[i].layout.fields[&fid].type_id;
@@ -533,27 +541,34 @@ impl TypeTable {
     }
 
     fn complete_type_id(&mut self, id: TypeId) -> TypeId {
-        match self.get(id).desc.as_ref().clone() {
+        match self.get(id).desc.as_ref() {
             TypeDesc::Struct { name, fields } if fields.is_empty() && !name.is_empty() => {
-                self.type_id_by_tag(&name, TypeKind::Struct).unwrap_or(id)
+                self.type_id_by_tag(name, TypeKind::Struct).unwrap_or(id)
             }
             TypeDesc::Union { name, fields } if fields.is_empty() && !name.is_empty() => {
-                self.type_id_by_tag(&name, TypeKind::Union).unwrap_or(id)
+                self.type_id_by_tag(name, TypeKind::Union).unwrap_or(id)
             }
-            TypeDesc::Ptr(inner) => {
-                let completed = self.canonicalize_desc(*inner);
-                let richer = match &completed {
-                    TypeDesc::Struct { fields, .. } | TypeDesc::Union { fields, .. } => {
-                        !fields.is_empty()
+            TypeDesc::Ptr(inner) => match inner.as_ref() {
+                TypeDesc::Struct { name, fields } if fields.is_empty() && !name.is_empty() => {
+                    if let Some(tag_id) = self.type_id_by_tag(name, TypeKind::Struct) {
+                        if !self.get(tag_id).layout.fields.is_empty() {
+                            let completed = self.get(tag_id).desc.as_ref().clone();
+                            return self.intern(TypeDesc::Ptr(Box::new(completed)));
+                        }
                     }
-                    _ => false,
-                };
-                if richer {
-                    self.intern(TypeDesc::Ptr(Box::new(completed)))
-                } else {
                     id
                 }
-            }
+                TypeDesc::Union { name, fields } if fields.is_empty() && !name.is_empty() => {
+                    if let Some(tag_id) = self.type_id_by_tag(name, TypeKind::Union) {
+                        if !self.get(tag_id).layout.fields.is_empty() {
+                            let completed = self.get(tag_id).desc.as_ref().clone();
+                            return self.intern(TypeDesc::Ptr(Box::new(completed)));
+                        }
+                    }
+                    id
+                }
+                _ => id,
+            },
             _ => id,
         }
     }
@@ -601,6 +616,12 @@ impl TypeTable {
         if !alias.is_empty() {
             let shared = self.descriptors.share(desc);
             self.aliases.insert(alias.to_string(), shared);
+        }
+    }
+
+    pub fn register_alias_arc(&mut self, alias: &str, desc: &Arc<TypeDesc>) {
+        if !alias.is_empty() && !self.aliases.contains_key(alias) {
+            self.aliases.insert(alias.to_string(), Arc::clone(desc));
         }
     }
 

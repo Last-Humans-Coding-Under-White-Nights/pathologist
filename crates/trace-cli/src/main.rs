@@ -13,6 +13,10 @@ mod build_info;
 #[path = "../build_support.rs"]
 mod build_support;
 
+#[cfg(windows)]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(
     name = "trace",
@@ -402,6 +406,7 @@ fn run_analyze(
     let mut program =
         build_program_with_jobs(&target, &opts, jobs).map_err(|e| anyhow::anyhow!(e))?;
     program.release_merge_state();
+    trace_parse::reclaim_unused_pages();
     eprintln!(
         "index: {:.1}s ({} files, {} functions, {} flow)",
         t0.elapsed().as_secs_f64(),
@@ -420,6 +425,7 @@ fn run_analyze(
             enable_ipc: !no_ipc,
         },
     );
+    trace_parse::reclaim_unused_pages();
     let indirect = analysis
         .call_edges
         .iter()

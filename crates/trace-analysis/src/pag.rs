@@ -586,8 +586,8 @@ impl Pag {
                             let params = candidates
                                 .iter()
                                 .find(|c| !program.symbols.function(**c).params.is_empty())
-                                .map(|c| program.symbols.function(*c).params.clone());
-                            self.apply_return_model(program, dst_n, model, params.as_deref());
+                                .map(|c| program.symbols.function(*c).params.as_slice());
+                            self.apply_return_model(program, dst_n, model, params);
                         }
                     }
                 }
@@ -685,10 +685,10 @@ impl Pag {
         match program.fn_returns.get(&callee) {
             Some(flows) => {
                 let mut applied = false;
-                for flow in flows.clone() {
+                for flow in flows {
                     match flow {
                         ReturnFlow::AddrOfVar { src } => {
-                            if let Some(loc) = self.ensure_var_loc(program, src) {
+                            if let Some(loc) = self.ensure_var_loc(program, *src) {
                                 let loc_n = self.loc_node[&loc];
                                 self.add_addr_of(dst, loc_n);
                                 applied = true;
@@ -696,14 +696,14 @@ impl Pag {
                         }
                         ReturnFlow::AddrOfFn { callee: fn_id } => {
                             // Trust the merge-remapped FnId (see AddrOfFn above).
-                            if let Some(&fn_loc) = self.fn_locations.get(&fn_id) {
+                            if let Some(&fn_loc) = self.fn_locations.get(fn_id) {
                                 let loc_n = self.loc_node[&fn_loc];
                                 self.add_addr_of(dst, loc_n);
                                 applied = true;
                             }
                         }
                         ReturnFlow::Copy { src } => {
-                            let src_n = self.var_node_id(src);
+                            let src_n = self.var_node_id(*src);
                             self.add_copy(dst, src_n);
                             applied = true;
                         }
@@ -711,7 +711,7 @@ impl Pag {
                             let file = program.symbols.function(callee).file;
                             let inner_candidates =
                                 program.symbols.resolve_function_candidates_in_target(
-                                    &callee_name,
+                                    callee_name,
                                     Some(file),
                                     program.symbols.function(callee).target,
                                 );
@@ -725,12 +725,12 @@ impl Pag {
                             // realloc has no tree body): fall back to the
                             // modeled return effects.
                             if !inner_applied {
-                                if let Some(model) = models.get(&callee_name) {
+                                if let Some(model) = models.get(callee_name) {
                                     let params = inner_candidates
                                         .iter()
                                         .find(|c| !program.symbols.function(**c).params.is_empty())
-                                        .map(|c| program.symbols.function(*c).params.clone());
-                                    self.apply_return_model(program, dst, model, params.as_deref());
+                                        .map(|c| program.symbols.function(*c).params.as_slice());
+                                    self.apply_return_model(program, dst, model, params);
                                     // Modeled heap/alias facts count as applied
                                     // so outer frames do not re-apply them.
                                     inner_applied = true;

@@ -43,6 +43,10 @@ use trace_preproc::{
 };
 use walkdir::WalkDir;
 
+#[cfg(windows)]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[path = "support/gn_defines.rs"]
 mod gn_defines;
 

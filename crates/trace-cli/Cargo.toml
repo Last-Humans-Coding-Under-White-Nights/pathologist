@@ -21,6 +21,9 @@ rustc-hash.workspace = true
 walkdir.workspace = true
 tree-sitter.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+mimalloc.workspace = true
+
 [[example]]
 name = "parse_failures"
 path = "examples/parse_failures.rs"

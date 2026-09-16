@@ -83,6 +83,10 @@ struct LowerContext {
     pending: RefCell<Vec<PendingFnRef>>,
     /// C++ namespace stack; `None` = anonymous namespace level.
     ns_stack: Vec<Option<String>>,
+    /// Precomputed namespace scope prefix (e.g. "a::b"), matching `ns_stack.iter().flatten().join("::")`.
+    current_ns_prefix: String,
+    /// Stack of prefix lengths before each level was pushed to `ns_stack`.
+    ns_prefix_lens: Vec<usize>,
     /// Namespaces made visible by `using namespace X;` (bare spellings).
     using_nss: Vec<String>,
     /// Specific members imported by `using X::member;` as `(base, qual)`.
@@ -130,7 +134,7 @@ struct LowerContext {
     /// variable of that name it hid; a block unwinds its own on exit.
     local_scope_log: Vec<(String, Option<VarId>)>,
     /// The unit's syntax tree, for descending to a node's ancestors.
-    tree: tree_sitter::Tree,
+    tree: Arc<tree_sitter::Tree>,
     /// Whether the unit can hold a `template_declaration` at all: a C++ unit
     /// whose text has the keyword. Most units have none, and then no
     /// signature needs its ancestors.
@@ -149,21 +153,49 @@ struct ClassCtx {
 }
 
 impl LowerContext {
-    fn namespace_scope(&self) -> String {
-        let mut scope = String::new();
-        for segment in self.ns_stack.iter().flatten() {
-            if !scope.is_empty() {
-                scope.push_str("::");
+    fn push_namespace(&mut self, level: Option<String>) {
+        self.ns_prefix_lens.push(self.current_ns_prefix.len());
+        if let Some(ref segment) = level {
+            if !self.current_ns_prefix.is_empty() {
+                self.current_ns_prefix.push_str("::");
             }
-            scope.push_str(segment);
+            self.current_ns_prefix.push_str(segment);
         }
-        scope
+        self.ns_stack.push(level);
     }
 
+    fn pop_namespace(&mut self) -> Option<Option<String>> {
+        if let Some(len) = self.ns_prefix_lens.pop() {
+            self.current_ns_prefix.truncate(len);
+        }
+        self.ns_stack.pop()
+    }
+
+    fn truncate_namespace(&mut self, target_depth: usize) {
+        if target_depth < self.ns_stack.len() {
+            let target_len = self.ns_prefix_lens[target_depth];
+            self.current_ns_prefix.truncate(target_len);
+            self.ns_stack.truncate(target_depth);
+            self.ns_prefix_lens.truncate(target_depth);
+        }
+    }
+
+    #[inline]
+    fn namespace_scope(&self) -> String {
+        self.current_ns_prefix.clone()
+    }
+
+    #[inline]
     fn qualify(&self, name: &str) -> String {
-        let mut parts: Vec<String> = self.ns_stack.iter().flatten().cloned().collect();
-        parts.push(name.to_string());
-        parts.join("::")
+        if self.current_ns_prefix.is_empty() {
+            name.to_string()
+        } else {
+            let mut res = String::with_capacity(self.current_ns_prefix.len() + 2 + name.len());
+            res.push_str(&self.current_ns_prefix);
+            res.push_str("::");
+            res.push_str(name);
+            res
+        }
     }
 
     /// Qualify a declared function name with the enclosing class / namespace:
@@ -451,6 +483,7 @@ fn build_program_inner(
     // changed (or that only became reachable) is evicted and warmed again
     // under a fresh table. Rounds beyond the first touch only reclassified
     // headers, and the graph only grows, so this terminates.
+    let pool = index_pool(jobs)?;
     let source_cache = IndexSourceCache::new();
     let mut warmed_as: HashMap<PathBuf, Vec<Language>> = HashMap::default();
     // What a header's second-language warm run reported. The cached
@@ -503,39 +536,44 @@ fn build_program_inner(
             break;
         }
         round += 1;
+        let warm_start_t = Instant::now();
         let warm_n = headers_for_macro_warm.len();
-        index_progress(format!(
-            "warm[{round}]: {warm_n} reachable headers (jobs={jobs} after this sequential pass)"
-        ));
-        for (i, (path, languages)) in headers_for_macro_warm.iter().enumerate() {
-            let t = Instant::now();
-            index_item_progress(
-                i,
-                warm_n,
-                format!("warm: {}/{} {}", i + 1, warm_n, path.display()),
-            );
+        index_progress(format!("warm[{round}]: {warm_n} reachable headers"));
+        let base_macro_tables: [MacroTable; 2] = [
+            macro_table_from_defines(&opts.defines, Language::C),
+            macro_table_from_defines(&opts.defines, Language::Cpp),
+        ];
+        let mut base_prep_opts: [PreprocessOptions; 2] = [
+            eff_opts
+                .clone()
+                .with_accumulate_macros(true)
+                .with_language(Language::C),
+            eff_opts
+                .clone()
+                .with_accumulate_macros(true)
+                .with_language(Language::Cpp),
+        ];
+        for (path, languages) in &headers_for_macro_warm {
             if warmed_as.insert(path.clone(), languages.clone()).is_some() {
                 source_cache.evict(path, &include_graph);
                 second_language_diagnostics.remove(path);
             }
             let mut failed = false;
-            let mut warmed: Vec<(Language, Arc<std::sync::RwLock<MacroTable>>)> = Vec::new();
             for (k, language) in languages.iter().copied().enumerate() {
-                let header_macros: Arc<std::sync::RwLock<MacroTable>> = Arc::new(
-                    std::sync::RwLock::new(macro_table_from_defines(&opts.defines, language)),
-                );
-                let header_prep_opts = eff_opts
-                    .clone()
-                    .with_shared_macros(Arc::clone(&header_macros))
-                    .with_accumulate_macros(true)
-                    .with_language(language);
+                let (lang_idx, base_table) = match language {
+                    Language::C => (0, &base_macro_tables[0]),
+                    Language::Cpp => (1, &base_macro_tables[1]),
+                };
+                let header_macros: Arc<std::sync::RwLock<MacroTable>> =
+                    Arc::new(std::sync::RwLock::new(base_table.clone()));
+                base_prep_opts[lang_idx].shared_macros = Some(Arc::clone(&header_macros));
                 let result = if k == 0 {
                     source_cache
-                        .get_or_preprocess(path, &include_graph, &header_prep_opts)
+                        .get_or_preprocess(path, &include_graph, &base_prep_opts[lang_idx])
                         .map(|_| ())
                 } else {
                     source_cache
-                        .preprocess_uncached(path, &include_graph, &header_prep_opts)
+                        .preprocess_uncached(path, &include_graph, &base_prep_opts[lang_idx])
                         .map(|(src, _)| {
                             second_language_diagnostics.insert(path.clone(), src.diagnostics);
                         })
@@ -554,22 +592,15 @@ fn build_program_inner(
                     failed = true;
                     break;
                 }
-                warmed.push((language, header_macros));
             }
             if failed {
                 continue;
             }
-            index_item_progress(
-                i,
-                warm_n,
-                format!(
-                    "warm-done: {}/{} {:.1}s",
-                    i + 1,
-                    warm_n,
-                    t.elapsed().as_secs_f64()
-                ),
-            );
         }
+        index_progress(format!(
+            "warm-done[{round}]: {:.1}s ({warm_n} headers)",
+            warm_start_t.elapsed().as_secs_f64(),
+        ));
     }
 
     let reachable_from_c = include_graph.reachable_from(&c_sources);
@@ -607,8 +638,6 @@ fn build_program_inner(
         .into_iter()
         .map(|l| (l, eff_opts.clone().with_language(l)))
         .collect();
-
-    let pool = index_pool(jobs)?;
 
     // Preprocess every translation unit BEFORE choosing the PCH set, in two
     // passes.
@@ -725,7 +754,7 @@ fn build_program_inner(
     pch_headers.sort();
     pch_headers.dedup();
     pch_headers.retain(|p| !skip_headers.contains(p));
-    let pch_order = Arc::new(include_graph.index_order(&pch_headers));
+    let pch_order = Arc::new(PchOrder::new(include_graph.index_order(&pch_headers)));
     let pch_set: HashSet<PathBuf> = pch_headers.iter().cloned().collect();
     // Orphans get the same treatment: indexing a header standalone that every
     // unit already expanded for itself would reintroduce the configuration
@@ -764,19 +793,22 @@ fn build_program_inner(
     // header whose only stored expansion nothing consumed contributes
     // nothing: that is the warm pass's configuration, and if no unit
     // presents it, it is not a configuration this tree has.
-    let pch_units: Vec<(PathBuf, usize)> = pch_headers
-        .iter()
-        .flat_map(|p| {
-            let mut vs =
-                variants_to_lower(&wanted_variants, &include_expansion_cache, p, lang_of(p));
-            vs.sort_unstable();
-            vs.into_iter().map(move |v| (p.clone(), v))
-        })
-        .collect();
+    let header_variants: HashMap<PathBuf, Vec<usize>> = pool.install(|| {
+        pch_headers
+            .par_iter()
+            .map(|p| {
+                let mut vs =
+                    variants_to_lower(&wanted_variants, &include_expansion_cache, p, lang_of(p));
+                vs.sort_unstable();
+                (p.clone(), vs)
+            })
+            .collect()
+    });
+    let pch_units_len: usize = header_variants.values().map(|vs| vs.len()).sum();
     let pch_t = Instant::now();
     index_progress(format!(
-        "pch: parse {} expansions of {} headers",
-        pch_units.len(),
+        "pch: parse {} expansions of {} headers (jobs={jobs})",
+        pch_units_len,
         pch_headers.len()
     ));
     // Include-graph order (included files before includers), including
@@ -786,7 +818,7 @@ fn build_program_inner(
     // Cyclic leftovers are indexed in `index_order`, never as a parallel wave.
     let mut header_ir_map: HeaderIr = HashMap::default();
     let (pch_waves, pch_cycles) = if jobs == 1 {
-        (vec![pch_order.as_ref().clone()], Vec::new())
+        (vec![pch_order.order.clone()], Vec::new())
     } else {
         include_graph.index_waves(&pch_headers)
     };
@@ -797,10 +829,11 @@ fn build_program_inner(
         let wave_units: Vec<(PathBuf, usize)> = wave
             .iter()
             .flat_map(|p| {
-                let mut vs =
-                    variants_to_lower(&wanted_variants, &include_expansion_cache, p, lang_of(p));
-                vs.sort_unstable();
-                vs.into_iter().map(move |v| (p.clone(), v))
+                header_variants
+                    .get(p)
+                    .map(|vs| vs.iter().map(move |v| (p.clone(), *v)))
+                    .into_iter()
+                    .flatten()
             })
             .collect();
         if wave_units.is_empty() {
@@ -865,32 +898,27 @@ fn build_program_inner(
         }
     }
     for path in include_graph.index_order(&pch_cycles) {
-        let mut variants = variants_to_lower(
-            &wanted_variants,
-            &include_expansion_cache,
-            &path,
-            lang_of(&path),
-        );
-        variants.sort_unstable();
-        for variant in variants {
-            let unit = index_header_variant(
-                &path,
-                variant,
-                root,
-                &include_graph,
-                &include_expansion_cache,
-                index_language(&path, &cpp_parse, no_c_units, forced_language),
-                Some(&header_ir_map),
-                pch_order.as_ref(),
-            );
-            push_header_ir(
-                &mut header_ir_map,
-                &include_graph,
-                &path,
-                lang_of(&path),
-                variant,
-                unit,
-            );
+        if let Some(variants) = header_variants.get(&path) {
+            for variant in variants {
+                let unit = index_header_variant(
+                    &path,
+                    *variant,
+                    root,
+                    &include_graph,
+                    &include_expansion_cache,
+                    index_language(&path, &cpp_parse, no_c_units, forced_language),
+                    Some(&header_ir_map),
+                    pch_order.as_ref(),
+                );
+                push_header_ir(
+                    &mut header_ir_map,
+                    &include_graph,
+                    &path,
+                    lang_of(&path),
+                    *variant,
+                    unit,
+                );
+            }
         }
     }
     let header_ir = Arc::new(header_ir_map);
@@ -1570,12 +1598,18 @@ fn index_window(jobs: usize) -> usize {
 /// without the window: whoever panics marks the run cancelled on the way
 /// out and wakes every waiter, so no thread waits for a result that will
 /// never come, and the scope re-raises the panic once the rest have left.
-fn index_in_window<T: Send>(
+pub(crate) fn index_in_window<T: Send>(
     items: &[PathBuf],
     jobs: usize,
     index: impl Fn(&PathBuf) -> T + Sync,
     mut merge: impl FnMut(T) + Send,
 ) {
+    if jobs <= 1 || items.len() <= 1 {
+        for item in items {
+            merge(index(item));
+        }
+        return;
+    }
     struct Window<T> {
         /// Next unit a worker takes.
         next: usize,
@@ -1727,44 +1761,67 @@ fn is_index_header(path: &Path) -> bool {
 /// cached splice omits them from `included_headers` (direct-only dropped
 /// `DispatchToMessage` from `hdf_wifi_core.c` via `sidecar.h`).
 ///
+#[derive(Default)]
+pub(crate) struct PchOrder {
+    pub(crate) order: Vec<PathBuf>,
+    pub(crate) pos: HashMap<PathBuf, usize>,
+}
+
+impl PchOrder {
+    pub(crate) fn new(order: Vec<PathBuf>) -> Self {
+        let pos = order
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, p)| (p, i))
+            .collect();
+        Self { order, pos }
+    }
+}
+
 /// Order follows `pch_order` (global include topo) rather than a per-file
 /// `index_order`, which would redo Kahn's algorithm for every TU.
 fn headers_to_merge<'a>(
     graph: &'a IncludeGraph,
-    pch_order: &'a [PathBuf],
+    pch_order: &'a PchOrder,
     self_canon: &'a Path,
     included_headers: &'a [PathBuf],
     types_only: bool,
 ) -> Vec<&'a Path> {
-    let mut wanted: HashSet<&Path> = HashSet::default();
-    if types_only {
+    let mut wanted: HashSet<&Path> = if types_only {
+        let mut set = HashSet::default();
         if let Some(edges) = graph.edges.get(self_canon) {
             for h in edges {
                 if h.as_path() != self_canon && is_index_header(h) {
-                    wanted.insert(h.as_path());
+                    set.insert(h.as_path());
                 }
             }
         }
+        set
     } else {
-        for p in graph.reachable_paths(self_canon) {
-            if p != self_canon && is_index_header(p) {
-                wanted.insert(p);
-            }
-        }
-    }
+        let mut set = graph.reachable_paths(self_canon);
+        set.remove(self_canon);
+        set.retain(|p| is_index_header(p));
+        set
+    };
     for h in included_headers {
         if h.as_path() != self_canon && is_index_header(h) {
             wanted.insert(h.as_path());
         }
     }
-    let mut out = Vec::with_capacity(wanted.len());
-    for h in pch_order {
-        if wanted.remove(h.as_path()) {
-            out.push(h.as_path());
+    let mut in_pch = Vec::with_capacity(wanted.len());
+    let mut rest = Vec::new();
+    for p in wanted {
+        if let Some(&pos) = pch_order.pos.get(p) {
+            in_pch.push((p, pos));
+        } else {
+            rest.push(p);
         }
     }
-    let mut rest: Vec<&Path> = wanted.into_iter().collect();
-    rest.sort();
+    in_pch.sort_unstable_by_key(|(_, pos)| *pos);
+    rest.sort_unstable();
+    let mut out = Vec::with_capacity(in_pch.len() + rest.len());
+    out.extend(in_pch.into_iter().map(|(p, _)| p));
     out.extend(rest);
     out
 }
@@ -1884,7 +1941,7 @@ fn index_header_variant(
     cache: &trace_preproc::ExpansionCache,
     language: Language,
     header_ir: Option<&HeaderIr>,
-    pch_order: &[PathBuf],
+    pch_order: &PchOrder,
 ) -> UnitIndex {
     let expansion = cache.read().ok().and_then(|guard| {
         guard
@@ -1964,7 +2021,7 @@ fn index_source_file(
     index_opts: &PreprocessOptions,
     source_cache: &IndexSourceCache,
     header_ir: Option<&HeaderIr>,
-    pch_order: &[PathBuf],
+    pch_order: &PchOrder,
 ) -> UnitIndex {
     let mut program = Program::new(root.to_path_buf());
     match process_indexed_file(
@@ -2021,7 +2078,7 @@ fn index_source_file_with_variants(
     index_opts: &PreprocessOptions,
     source_cache: &IndexSourceCache,
     header_ir: Option<&HeaderIr>,
-    pch_order: &[PathBuf],
+    pch_order: &PchOrder,
     gn_candidates: Option<&std::collections::HashMap<String, Vec<Candidate>>>,
     base_defines: &BTreeMap<String, String>,
     explore_budget: usize,
@@ -2115,7 +2172,7 @@ fn process_indexed_file(
     index_opts: &PreprocessOptions,
     source_cache: &IndexSourceCache,
     header_ir: Option<&HeaderIr>,
-    pch_order: &[PathBuf],
+    pch_order: &PchOrder,
 ) -> Result<(), String> {
     let pre = source_cache.get_or_preprocess(path, graph, index_opts)?;
     // `index_opts` was chosen by `index_language`, so its language is the
@@ -2150,7 +2207,7 @@ fn lower_prepared_source(
     language: Language,
     record_link_ownership: bool,
     header_ir: Option<&HeaderIr>,
-    pch_order: &[PathBuf],
+    pch_order: &PchOrder,
 ) -> Result<(), String> {
     program.symbols.set_dep_roots(graph.dep_roots.clone());
     let self_canon = graph.intern_path(path);
@@ -2170,6 +2227,7 @@ fn lower_prepared_source(
             &pre.included_headers,
             types_only,
         );
+        let mut included_ids = Vec::with_capacity(headers.len());
         for h in headers {
             if let Some(units) = ir.get(h) {
                 // The expansion this unit replayed, when it has one. A
@@ -2198,11 +2256,11 @@ fn lower_prepared_source(
                     }
                 }
             }
-            let hid = program.symbols.add_file_interned(h);
-            if hid != file_id {
-                program.symbols.register_included_header(file_id, hid);
-            }
+            included_ids.push(program.symbols.add_file_interned(h));
         }
+        program
+            .symbols
+            .register_included_headers(file_id, included_ids);
         program.types.complete_nested_tags();
     }
     if let Some(dir) = std::env::var_os("TRACE_DUMP_TU_DIR") {
@@ -2225,6 +2283,7 @@ fn lower_prepared_source(
     }
 
     let is_cpp = lang == crate::parse::SourceLang::Cpp;
+    let tree = Arc::new(parsed.tree);
     let mut ctx = LowerContext {
         current_fn: None,
         current_file: file_id,
@@ -2233,6 +2292,8 @@ fn lower_prepared_source(
         primary_path: self_canon,
         pending: RefCell::new(Vec::new()),
         ns_stack: Vec::new(),
+        current_ns_prefix: String::new(),
+        ns_prefix_lens: Vec::new(),
         using_nss: Vec::new(),
         using_name_imports: Vec::new(),
         class_ctx: None,
@@ -2246,19 +2307,14 @@ fn lower_prepared_source(
         ast_depth_warned: false,
         reference_vars: HashSet::default(),
         local_scope_log: Vec::new(),
-        tree: parsed.tree.clone(),
+        tree: Arc::clone(&tree),
         has_templates: is_cpp && parsed.source.contains("template"),
         has_weak: source_may_annotate_weak(&parsed.source) || program.symbols.has_weak_symbols(),
         record_link_ownership,
         pending_flow_owners: HashMap::default(),
         pending_initializer_owners: HashMap::default(),
     };
-    lower_tree(
-        program,
-        &mut ctx,
-        parsed.source.as_ref(),
-        parsed.tree.root_node(),
-    );
+    lower_tree(program, &mut ctx, parsed.source.as_ref(), tree.root_node());
     // Pragmas apply to the entire unit, even when placed after a definition.
     // Only a unit that spells the directive needs the line scan; after include
     // expansion the text is measured in megabytes.
@@ -2715,7 +2771,7 @@ fn lower_namespace(program: &mut Program, ctx: &mut LowerContext, source: &str, 
         None => vec![None],
     };
     for level in &levels {
-        ctx.ns_stack.push(level.clone());
+        ctx.push_namespace(level.clone());
         program.namespaces.insert(ctx.namespace_scope());
     }
     // `using namespace X;` / `using X::f;` inside a namespace block are
@@ -2737,7 +2793,7 @@ fn lower_namespace(program: &mut Program, ctx: &mut LowerContext, source: &str, 
     ctx.using_nss.truncate(using_nss_len);
     ctx.using_name_imports.truncate(using_imports_len);
     for _ in &levels {
-        ctx.ns_stack.pop();
+        ctx.pop_namespace();
     }
 }
 
@@ -3990,7 +4046,7 @@ fn lower_function_body(
                 .and_then(|rest| rest.strip_prefix("::"))
         };
         for segment in unopened.into_iter().flat_map(|rest| rest.split("::")) {
-            ctx.ns_stack.push(Some(segment.to_owned()));
+            ctx.push_namespace(Some(segment.to_owned()));
         }
     }
     ctx.current_fn = Some(fn_id);
@@ -4060,7 +4116,7 @@ fn lower_function_body(
     ctx.current_fn = None;
     ctx.locals.clear();
     ctx.local_scope_log.clear();
-    ctx.ns_stack.truncate(ns_depth);
+    ctx.truncate_namespace(ns_depth);
     ctx.class_ctx = saved_class;
     if scoped {
         ctx.type_scope.borrow_mut().pop();
@@ -10701,7 +10757,7 @@ mod index_window_tests {
             Language::C,
             false,
             None,
-            &[],
+            &PchOrder::default(),
         )
         .unwrap();
         assert!(
@@ -10750,7 +10806,7 @@ mod index_window_tests {
                 },
                 &IndexSourceCache::new(),
                 None,
-                &[],
+                &PchOrder::default(),
             );
             let global = unit
                 .variables
@@ -10786,7 +10842,7 @@ mod index_window_tests {
             &PreprocessOptions::new().with_include(dir.path().to_path_buf()),
             &IndexSourceCache::new(),
             None,
-            &[],
+            &PchOrder::default(),
         );
         assert!(ordinary.global_initializer_ranges.is_empty());
         assert!(ordinary.function_flow_ranges.is_empty());
@@ -10804,7 +10860,7 @@ mod index_window_tests {
             },
             &IndexSourceCache::new(),
             None,
-            &[],
+            &PchOrder::default(),
         );
         let global = unit
             .variables
@@ -10866,7 +10922,7 @@ mod index_window_tests {
                 },
                 &IndexSourceCache::new(),
                 None,
-                &[],
+                &PchOrder::default(),
             );
             let owner = unit
                 .functions

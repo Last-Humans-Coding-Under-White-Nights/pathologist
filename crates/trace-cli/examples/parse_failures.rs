@@ -13,6 +13,10 @@ use trace_parse::{
 use trace_preproc::PreprocessOptions;
 use tree_sitter::Node;
 
+#[cfg(windows)]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let root = PathBuf::from(args.next().ok_or("--from-db requires ROOT")?);

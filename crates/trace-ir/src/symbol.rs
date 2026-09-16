@@ -308,13 +308,14 @@ pub struct SymbolTable {
     /// (`#include`d code). Scope resolution consults them so a `static`
     /// inline defined in a header stays visible to its includers after
     /// cross-TU deduplication collapsed the per-TU copies.
-    headers_of: FxHashMap<FileId, std::collections::BTreeSet<FileId>>,
+    headers_of: FxHashMap<FileId, Vec<FileId>>,
     file_by_path: FxHashMap<PathBuf, FileId>,
     /// Canonical dependency roots (`--dep`); empty for a single-tree run.
     dep_roots: Vec<PathBuf>,
-    /// `FnId -> slot in functions`. Ids are not dense (merged duplicates and
-    /// superseded rows leave gaps), so lookups need this index to stay O(1).
-    fn_slots: FxHashMap<FnId, u32>,
+    /// `FnId -> slot in functions`. Ids are dense enough (generated via
+    /// monotonically increasing `next_fn`), so a direct `Vec<u32>` provides O(1)
+    /// index lookups without hashing overhead.
+    fn_slots: Vec<u32>,
     /// Member definitions whose parameter list lacks the implicit `this`: a
     /// body lowered in a unit that never saw its class (the header include
     /// unresolved) merged with the class's in-class prototype. Recorded at
@@ -384,15 +385,34 @@ impl SymbolTable {
     /// `tu` (directly or transitively).
     pub fn register_included_header(&mut self, tu: crate::FileId, header: crate::FileId) {
         if tu != header {
-            self.headers_of.entry(tu).or_default().insert(header);
+            let vec = self.headers_of.entry(tu).or_default();
+            if let Err(pos) = vec.binary_search(&header) {
+                vec.insert(pos, header);
+            }
         }
     }
 
-    pub fn included_headers(
-        &self,
+    /// Register that multiple `headers` contribute entities lowered while indexing `tu`.
+    pub fn register_included_headers(
+        &mut self,
         tu: crate::FileId,
-    ) -> Option<&std::collections::BTreeSet<crate::FileId>> {
-        self.headers_of.get(&tu)
+        headers: impl IntoIterator<Item = crate::FileId>,
+    ) {
+        let vec = self.headers_of.entry(tu).or_default();
+        let old_len = vec.len();
+        for header in headers {
+            if tu != header {
+                vec.push(header);
+            }
+        }
+        if vec.len() > old_len {
+            vec.sort_unstable();
+            vec.dedup();
+        }
+    }
+
+    pub fn included_headers(&self, tu: crate::FileId) -> Option<&[crate::FileId]> {
+        self.headers_of.get(&tu).map(Vec::as_slice)
     }
 
     pub fn add_function(&mut self, func: Function) -> FnId {
@@ -794,7 +814,11 @@ impl SymbolTable {
         self.has_weak_symbols |= func.is_weak;
         self.has_target_scopes |= func.target.is_some();
         let id = func.id;
-        self.fn_slots.insert(id, self.functions.len() as u32);
+        let slot = self.functions.len() as u32;
+        if self.fn_slots.len() <= id.0 as usize {
+            self.fn_slots.resize(id.0 as usize + 1, u32::MAX);
+        }
+        self.fn_slots[id.0 as usize] = slot;
         self.base_by_name
             .entry(base_name_of(&func.name))
             .or_default()
@@ -805,7 +829,11 @@ impl SymbolTable {
 
     /// Slot of `id` in [`SymbolTable::functions`], O(1).
     pub fn function_index(&self, id: FnId) -> Option<usize> {
-        self.fn_slots.get(&id).map(|&s| s as usize)
+        self.fn_slots
+            .get(id.0 as usize)
+            .copied()
+            .filter(|&s| s != u32::MAX)
+            .map(|s| s as usize)
     }
 
     /// Whether an entry should become the primary `fn_by_name` entry for its
@@ -829,7 +857,10 @@ impl SymbolTable {
     /// `push_indexed` is the only writer of `functions`, and it records the
     /// slot, so the map never lags the vector.
     fn function_mut_by_id(&mut self, id: FnId) -> Option<&mut Function> {
-        let slot = *self.fn_slots.get(&id)? as usize;
+        let slot = *self
+            .fn_slots
+            .get(id.0 as usize)
+            .filter(|&&s| s != u32::MAX)? as usize;
         self.functions.get_mut(slot).filter(|f| f.id == id)
     }
 
@@ -1132,7 +1163,7 @@ impl SymbolTable {
         let headers = self.headers_of.get(&file)?;
         entries
             .iter()
-            .filter(|(f, v)| headers.contains(f) && accept(*v))
+            .filter(|(f, v)| headers.binary_search(f).is_ok() && accept(*v))
             .min_by_key(|(f, _)| *f)
             .map(|(_, v)| *v)
     }
@@ -1147,7 +1178,7 @@ impl SymbolTable {
         let headers = self.headers_of.get(&file);
         let mut seen: Vec<(FileId, T)> = entries
             .iter()
-            .filter(|(f, _)| *f == file || headers.is_some_and(|h| h.contains(f)))
+            .filter(|(f, _)| *f == file || headers.is_some_and(|h| h.binary_search(f).is_ok()))
             .copied()
             .collect();
         seen.sort_by_key(|(f, _)| (*f != file, *f));
@@ -1169,7 +1200,7 @@ impl SymbolTable {
             || self
                 .headers_of
                 .get(&file)
-                .is_some_and(|headers| headers.contains(&other))
+                .is_some_and(|headers| headers.binary_search(&other).is_ok())
     }
 
     /// Take the member definitions whose parameters lack the implicit `this`
@@ -1425,7 +1456,10 @@ impl SymbolTable {
     }
 
     pub fn function_by_id(&self, id: FnId) -> Option<&Function> {
-        let slot = *self.fn_slots.get(&id)?;
+        let slot = *self
+            .fn_slots
+            .get(id.0 as usize)
+            .filter(|&&s| s != u32::MAX)?;
         self.functions.get(slot as usize).filter(|f| f.id == id)
     }
 
