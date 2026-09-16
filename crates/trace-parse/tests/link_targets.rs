@@ -337,3 +337,68 @@ fn cmake_link_dependency_survives_coexisting_build_order_dependency() {
         vec![target(&program, "unrelated")]
     );
 }
+
+#[test]
+fn suppressing_one_weak_overload_leaves_its_same_arity_sibling_alone() {
+    // A suppressed body is demoted to a declaration. Demoting it to a
+    // declaration *without parameters* made it compatible with every
+    // same-arity entry of its name, so `hook(double)` merged into
+    // `hook(int)` and the unit's own `hook(1.0)` call wired into the wrong
+    // body.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("hook.cpp"),
+        "void from_weak_int(void);\nvoid from_weak_double(void);\n\
+         __attribute__((weak)) void hook(int) { from_weak_int(); }\n\
+         __attribute__((weak)) void hook(double) { from_weak_double(); }\n\
+         void call_double(void) { hook(1.0); }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("strong.cpp"),
+        "void from_strong(void);\nvoid hook(double) { from_strong(); }\n",
+    )
+    .unwrap();
+    write_json(
+        dir.path(),
+        "compile_commands.json",
+        json!([
+            {"directory":dir.path(),"file":"hook.cpp","output":"hook.o",
+             "arguments":["c++","-c","hook.cpp"]},
+            {"directory":dir.path(),"file":"strong.cpp","output":"strong.o",
+             "arguments":["c++","-c","strong.cpp"]}
+        ]),
+    );
+    write_json(
+        dir.path(),
+        "link_commands.json",
+        json!([
+            {"directory":dir.path(),"arguments":["c++","hook.o","strong.o","-o","full"]},
+            {"directory":dir.path(),"arguments":["c++","hook.o","-o","fallback"]}
+        ]),
+    );
+    let program = build_program(dir.path(), &PreprocessOptions::new()).unwrap();
+    assert_eq!(program.link_targets.len(), 2);
+    for (name, body) in [("full", "from_strong"), ("fallback", "from_weak_double")] {
+        let scope = target(&program, name);
+        let caller = function(&program, scope, "call_double");
+        assert_eq!(
+            callees(&program, caller),
+            BTreeSet::from(["hook".into()]),
+            "{name}"
+        );
+        let hook = program.symbols.callees_of(
+            program
+                .symbols
+                .call_sites
+                .iter()
+                .find(|site| site.caller == caller)
+                .unwrap(),
+        )[0];
+        assert_eq!(
+            callees(&program, hook),
+            BTreeSet::from([body.into()]),
+            "{name}: hook(1.0) must reach the double overload"
+        );
+    }
+}

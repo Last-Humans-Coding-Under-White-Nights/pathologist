@@ -61,7 +61,10 @@ all available commands for that source. Explicit artifact inputs and known
 `-L`/`-l` target outputs establish dependencies; library lookup stops at the
 first matching search directory. Commands are parsed as data;
 no compiler, linker, or shell is executed. Unsupported command features and
-unmapped objects produce diagnostics. Response-file expansion is bounded.
+unmapped objects produce diagnostics. Response-file expansion is bounded, and
+runs after `-Wl,`/`-Xlinker` forwarding is unwrapped, so a file handed to the
+linker as `-Wl,@objects.rsp` contributes its objects like a bare `@objects.rsp`.
+A backslash before a newline splices the two lines, as in a shell.
 Options are distinguished from inputs before extensions are consulted, so an
 soname, a Darwin loader path (`@rpath/...`, `@executable_path/...`, which share
 `@` with response-file syntax), an `-install_name` operand and MSVC switches
@@ -84,7 +87,10 @@ GNU `weak`/`__weak__` attributes (including C++ `[[gnu::weak]]` and
 `[[gnu::__weak__]]`) and active `#pragma weak name` mark functions
 and variables *with external linkage*. The `_Pragma("weak name")` operator
 spelling is **not** read — a weak body annotated that way is not suppressed, so
-both bodies' facts survive (over-approximate, not wrong). Otherwise: a `static` function, a local, a
+both bodies' facts survive (over-approximate, not wrong). The alias form,
+`#pragma weak name = target`, marks `name` weak but does not model the alias:
+no flow is emitted from `name` to `target`, so a `name` with no definition in
+the unit stays unresolved rather than resolving to `target`'s body. Otherwise: a `static` function, a local, a
 parameter and a block-scope variable have no linkage to weaken, and the
 annotation is recorded on none of them. An attribute among a declaration's
 specifiers reaches every declarator it introduces, while one written inside a
@@ -92,9 +98,10 @@ declarator reaches only that declarator
 (`void a(void) __attribute__((weak)), b(void);` weakens `a` alone). Within a target, a strong definition replaces a matching weak
 definition; strong declarations alone do not suppress a weak body. Selection
 uses the IR symbol registration/signature rules, including C++ overloads,
-rather than a separate signature comparator. Overridden weak bodies contribute
-no local variables, calls, return flows, or constraints, including writes to
-globals. Weak global initializers are excluded when a strong global definition
+rather than a separate signature comparator. An overridden weak definition is
+demoted to a declaration of the same symbol: it keeps its signature, which is
+what tells one overload of a name from another, and contributes no local
+variables, calls, return flows, or constraints, including writes to globals. Weak global initializers are excluded when a strong global definition
 exists. A C tentative definition (`int x;` with no initializer) counts as a
 strong definition and overrides a weak one, matching `-fno-common`, the default
 since GCC 10 and in Clang. Under `-fcommon` a tentative definition is a common
@@ -104,9 +111,10 @@ modeled, so that configuration resolves the other way here.
 Globals unify within a target by their *unqualified* name, which is the only
 name the IR records for a variable. That is exactly right for C, where one
 external name is one symbol per image. A global declared inside a C++ namespace
-is exempt from both that unification and weak override, because its unqualified
-name is not the name a linker resolves: `a::counter` and `b::counter` stay two
-variables, and a strong `b::cb` does not suppress a weak `a::cb`. An anonymous
+is exempt from that unification, from weak override, and from an unqualified
+`#pragma weak`, because its unqualified name is not the name a linker resolves:
+`a::counter` and `b::counter` stay two variables, a strong `b::cb` does not
+suppress a weak `a::cb`, and `#pragma weak cb` does not weaken either of them. An anonymous
 namespace counts, its members having internal linkage and so not being shared
 symbols at all. The exemption is recorded on the variable (`is_namespaced`), so
 it survives every copy the merge makes. Class-static members are not yet

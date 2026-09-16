@@ -82,7 +82,20 @@ impl LinkDatabase {
                         )
                         .ok_or("unterminated command quoting")?,
                     };
-                    let args = expand_response_files(&directory, args, 0)?;
+                    // Normalize forwarding before anything reads the operands,
+                    // so `-o` is found wherever the driver spelled it — and
+                    // before response files are expanded, because a driver
+                    // hands one to the linker as `-Wl,@objects.rsp` or
+                    // `-Xlinker @objects.rsp` as readily as bare. Expanding
+                    // first never saw those, and the leftover `.rsp` argument
+                    // is not an input spelling, so every object it listed was
+                    // lost without a diagnostic. A file's contents are link
+                    // arguments in their own right, forwarding included, so
+                    // the pair runs twice.
+                    let mut args = args;
+                    for _ in 0..2 {
+                        args = expand_response_files(&directory, forwarded_operands(&args)?, 0)?;
+                    }
                     if args.is_empty() {
                         return Err("empty command".into());
                     }
@@ -92,9 +105,6 @@ impl LinkDatabase {
                                 .into(),
                         );
                     }
-                    // Normalize forwarding before anything reads the
-                    // operands, so `-o` is found wherever the driver spelled it.
-                    let args = forwarded_operands(&args)?;
                     let output = entry
                         .output
                         .map(|p| resolve_against(&directory, &p))
@@ -659,6 +669,10 @@ const OPERAND_IS_NOT_INPUT: &[&str] = &[
     "-R",
     "-syslibroot",
     "-bundle_loader",
+    // ld64's LTO plugin, not a library named `to_library`: `-l` is stripped
+    // before the option list is consulted, so the name has to be listed here
+    // for its operand to be consumed as well.
+    "-lto_library",
     // A linker script is not an input either, and failing the command over one
     // would drop the whole target — every embedded build emits `-T`.
     "-T",
@@ -1548,5 +1562,89 @@ mod tests {
         // The object resolves back to its source only when the compilation
         // reader knew link metadata was reachable and recorded object outputs.
         assert_eq!(db.targets[0].sources, vec![root.join("main.c")]);
+    }
+
+    #[test]
+    fn a_forwarded_response_file_still_contributes_its_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        for source in ["a.c", "b.c"] {
+            std::fs::write(dir.path().join(source), "").unwrap();
+        }
+        write(
+            dir.path(),
+            "compile_commands.json",
+            json!([
+                {"directory":".","file":"a.c","arguments":["cc","-c","a.c","-o","a.o"]},
+                {"directory":".","file":"b.c","arguments":["cc","-c","b.c","-o","b.o"]}
+            ]),
+        );
+        // The driver hands the linker a response file through both spellings,
+        // and the file itself forwards an option — its contents are link
+        // arguments in their own right.
+        std::fs::write(
+            dir.path().join("objects.rsp"),
+            "a.o -Wl,-soname,liba.so.1\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("more.rsp"), "b.o\n").unwrap();
+        write(
+            dir.path(),
+            "link_commands.json",
+            json!([
+                {"directory":".","arguments":[
+                    "cc","-shared","-Wl,@objects.rsp","-Xlinker","@more.rsp","-o","liba.so"]}
+            ]),
+        );
+        let db = load(dir.path(), None, None).unwrap();
+        assert!(db.warnings.is_empty(), "{:?}", db.warnings);
+        let target = db
+            .targets
+            .iter()
+            .find(|t| t.name == "liba.so")
+            .unwrap_or_else(|| panic!("missing liba.so: {:?}", db.targets));
+        let source = |name: &str| trace_ir::canonicalize(&dir.path().join(name));
+        assert_eq!(target.sources, vec![source("a.c"), source("b.c")]);
+        // The soname the file forwarded is still not one of the inputs.
+        assert!(target.dependencies.is_empty(), "{target:?}");
+    }
+
+    #[test]
+    fn the_lto_plugin_option_is_not_a_library_and_keeps_its_operand() {
+        let dir = tempfile::tempdir().unwrap();
+        for source in ["a.c", "lto.c"] {
+            std::fs::write(dir.path().join(source), "").unwrap();
+        }
+        write(
+            dir.path(),
+            "compile_commands.json",
+            json!([
+                {"directory":".","file":"a.c","arguments":["cc","-c","a.c","-o","a.o"]},
+                {"directory":".","file":"lto.c","arguments":["cc","-c","lto.c","-o","lto.o"]}
+            ]),
+        );
+        // `-l` is stripped before the option list is consulted, so
+        // `-lto_library` used to name a library `to_library` and leave its
+        // operand behind as a positional input — which then matched a real
+        // target's output and made the plugin a dependency of the program.
+        write(
+            dir.path(),
+            "link_commands.json",
+            json!([
+                {"directory":".","arguments":["cc","-shared","lto.o","-o","libLTO.dylib"]},
+                {"directory":".","arguments":["clang","a.o","-lto_library","libLTO.dylib","-o","app"]}
+            ]),
+        );
+        let db = load(dir.path(), None, None).unwrap();
+        assert!(db.warnings.is_empty(), "{:?}", db.warnings);
+        let app = db
+            .targets
+            .iter()
+            .find(|t| t.name == "app")
+            .unwrap_or_else(|| panic!("missing app: {:?}", db.targets));
+        assert_eq!(
+            app.sources,
+            vec![trace_ir::canonicalize(&dir.path().join("a.c"))]
+        );
+        assert!(app.dependencies.is_empty(), "{app:?}");
     }
 }

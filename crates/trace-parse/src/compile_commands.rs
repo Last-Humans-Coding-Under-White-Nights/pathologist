@@ -596,6 +596,15 @@ pub(crate) fn split_command(command: &str) -> Option<Vec<String>> {
                     }
                 }
             }
+            // A backslash before a newline is a line splice, not an escape:
+            // both the argument and the line break go away. Treating the
+            // newline as escaped whitespace kept it as a token of its own, and
+            // a wrapped `cc -o \<newline> app` named its target "\n".
+            '\\' if matches!(chars.peek(), Some('\n' | '\r')) => {
+                if chars.next() == Some('\r') && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
             '\\' if matches!(chars.peek(), Some(c) if *c == '"' || *c == '\'' || c.is_whitespace()) =>
             {
                 has_token = true;
@@ -857,5 +866,22 @@ mod review_tests {
         assert_eq!(opts.quote_include_paths, vec![expected.clone()]);
         assert_eq!(opts.system_include_paths, vec![expected]);
         assert!(opts.include_paths.is_empty());
+    }
+
+    #[test]
+    fn a_wrapped_command_splices_its_lines_instead_of_yielding_newline_arguments() {
+        // Response files and databases written by hand wrap long link lines.
+        assert_eq!(
+            split_command("cc -o \\\n  app \\\r\n  main.o").unwrap(),
+            vec!["cc", "-o", "app", "main.o"]
+        );
+        // A splice inside a token joins its halves, as a shell does.
+        assert_eq!(split_command("ma\\\nin.o").unwrap(), vec!["main.o"]);
+        // The escapes that carry a path are untouched: an escaped space still
+        // joins its two words, and a Windows separator is still a separator.
+        assert_eq!(
+            split_command("-IC:\\Program\\ Files").unwrap(),
+            vec!["-IC:\\Program Files"]
+        );
     }
 }

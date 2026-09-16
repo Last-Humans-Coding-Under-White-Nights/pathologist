@@ -130,14 +130,20 @@ fn scope_unit(
     for f in &mut scoped.functions {
         f.target = Some(target);
         if removed.contains(&f.id) {
+            // What the linker leaves is a declaration of this symbol, and a
+            // declaration keeps its signature. Dropping the parameters too
+            // left an entry that `redeclaration_compatible` could only match
+            // on arity, so a suppressed `hook(double)` merged into an
+            // unrelated `hook(int)` and took its callers with it. Only the
+            // body goes.
             f.is_defined = false;
-            f.params.clear();
             f.locals.clear();
         }
     }
-    scoped
-        .variables
-        .retain(|v| !v.fn_id.is_some_and(|id| removed.contains(&id)));
+    scoped.variables.retain(|v| {
+        v.storage == trace_ir::StorageClass::Param
+            || !v.fn_id.is_some_and(|id| removed.contains(&id))
+    });
     let mut removed_globals = FxHashSet::default();
     for v in &mut scoped.variables {
         v.target = Some(target);

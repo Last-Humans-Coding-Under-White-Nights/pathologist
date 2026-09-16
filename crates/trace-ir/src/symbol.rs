@@ -264,6 +264,11 @@ pub struct SymbolTable {
     pub functions: Vec<Function>,
     pub variables: Vec<Variable>,
     pub call_sites: Vec<CallSite>,
+    /// One entry per name, the one every unqualified call site resolves
+    /// through. It is not first-wins: `should_take_primary` gives the slot to
+    /// a defined entry over any declaration, and a later definition of the
+    /// name takes it from an earlier one. Only declarations are first-wins,
+    /// and only while no definition holds the slot.
     pub fn_by_name: IndexMap<String, FnId>,
     /// Every external entry per name, overloads included (C++). Unlike
     /// `fn_by_name` this never collapses to a single id.
@@ -1267,9 +1272,10 @@ impl SymbolTable {
         {
             return Some(id);
         }
-        // `fn_by_name` is a first-wins whole-program index, so under scoping
-        // it can hold another image's entry and hide this one; the per-name
-        // bucket is the complete list.
+        // `fn_by_name` holds one entry per name across the whole program --
+        // the last definition of it, whichever image that came from -- so
+        // under scoping it can hold another image's entry and hide this one.
+        // The per-name bucket is the complete list.
         let candidates = matches!(scope, TargetScope::Image(_))
             .then(|| self.externals_by_name.get(name))
             .flatten()?;
@@ -1347,7 +1353,7 @@ impl SymbolTable {
             }
         }
         // C++ overloads: additional entries under the same name that the
-        // first-wins `fn_by_name` table hides. Unioned with the scope entries
+        // one-slot-per-name `fn_by_name` table hides. Unioned with the scope entries
         // rather than used as a fallback — a name matching both a
         // file-`static` definition and the image's external definition is
         // genuinely ambiguous, and a may-analysis expands both.

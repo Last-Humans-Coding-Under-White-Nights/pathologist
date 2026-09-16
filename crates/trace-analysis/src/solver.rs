@@ -702,9 +702,14 @@ fn solve(
                     }
                     let name = abstract_loc.desc.clone();
                     let target = pag.node_target(program, dst);
-                    for func in &program.symbols.functions {
-                        if func.name == name && func.target == target {
-                            if let Some(&fn_loc) = pag.fn_locations.get(&func.id) {
+                    // A dlsym name is a linkage name, so the global namespace
+                    // bucket holds every entry it can name — including the
+                    // `::name` spelling. Scanning the whole function table
+                    // instead cost one pass over the program per string
+                    // literal reaching a dlsym site.
+                    for id in program.symbols.functions_in_namespace("", &name) {
+                        if program.symbols.function(id).target == target {
+                            if let Some(&fn_loc) = pag.fn_locations.get(&id) {
                                 add_pts(&mut st, dst, fn_loc);
                             }
                         }

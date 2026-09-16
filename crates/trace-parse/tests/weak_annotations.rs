@@ -160,3 +160,28 @@ fn a_declarators_own_attribute_does_not_weaken_its_siblings() {
         assert_eq!(v.is_weak, expected, "{name}: {v:?}");
     }
 }
+
+#[test]
+fn a_pragma_does_not_weaken_a_namespaced_global_of_the_same_name() {
+    // A pragma names a linkage symbol. `app::cb` is mangled, so its
+    // unqualified spelling is not the name the pragma weakens -- the same
+    // invariant the weak/strong global selection enforces on both sides.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("weak_ns.cpp"),
+        "#pragma weak cb\nint cb;\nnamespace app { int cb; }\n",
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &PreprocessOptions::new()).unwrap();
+    let weak_of = |namespaced: bool| {
+        program
+            .symbols
+            .variables
+            .iter()
+            .find(|v| v.name == "cb" && v.is_namespaced == namespaced)
+            .unwrap_or_else(|| panic!("missing cb (namespaced: {namespaced})"))
+            .is_weak
+    };
+    assert!(weak_of(false), "the global the pragma names is weak");
+    assert!(!weak_of(true), "app::cb keeps its own binding");
+}

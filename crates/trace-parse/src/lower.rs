@@ -2286,8 +2286,12 @@ fn lower_prepared_source(
             function.is_weak |= function.linkage == trace_ir::Linkage::External
                 && weak_names.contains(function.name.as_str());
         }
+        // A namespaced global is excluded for the same reason the selection
+        // below excludes it: `app::cb` is mangled, so the pragma's
+        // unqualified `cb` is not the symbol it names.
         for variable in &mut program.symbols.variables {
             variable.is_weak |= variable.storage == StorageClass::Global
+                && !variable.is_namespaced
                 && weak_names.contains(variable.name.as_str());
         }
     }
