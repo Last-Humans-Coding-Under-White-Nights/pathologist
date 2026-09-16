@@ -2262,13 +2262,13 @@ fn lower_prepared_source(
     // Pragmas apply to the entire unit, even when placed after a definition.
     // Only a unit that spells the directive needs the line scan; after include
     // expansion the text is measured in megabytes.
-    let weak_names: HashSet<&str> = if ctx.has_weak && parsed.source.contains("#pragma") {
+    let weak_names: HashSet<&str> = if ctx.has_weak && parsed.source.contains("pragma") {
         parsed
             .source
             .lines()
             .filter_map(|line| {
-                let mut words = line.split_whitespace();
-                (words.next() == Some("#pragma") && words.next() == Some("weak"))
+                let mut words = line.trim_start().strip_prefix('#')?.split_whitespace();
+                (words.next() == Some("pragma") && words.next() == Some("weak"))
                     .then(|| words.next().map(|word| word.split('=').next().unwrap()))
                     .flatten()
             })
@@ -3640,7 +3640,7 @@ fn register_member_prototype(
 /// would otherwise be charged for.
 fn source_may_annotate_weak(source: &str) -> bool {
     source.contains("weak")
-        && (source.contains("__attribute__") || source.contains("[[") || source.contains("#pragma"))
+        && (source.contains("__attribute__") || source.contains("[[") || source.contains("pragma"))
 }
 
 /// Weak linkage is a property of an external symbol. A local, a parameter and
@@ -10654,6 +10654,80 @@ fn node_end_line(program: &Program, ctx: &LowerContext, node: Node, span: Span) 
 mod index_window_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn review_scoped_weak_attributes() {
+        for attribute in ["gnu::weak", "gnu::__weak__"] {
+            let source: Arc<str> = format!("[[{attribute}]] void hook() {{}}\n").into();
+            let parsed =
+                crate::parse::parse_source_with_lang(source.clone(), crate::parse::SourceLang::Cpp)
+                    .unwrap();
+            let declaration = parsed.tree.root_node().named_child(0).unwrap();
+            assert!(
+                declaration_is_weak(&source, declaration),
+                "{}",
+                parsed.tree.root_node().to_sexp()
+            );
+        }
+    }
+
+    #[test]
+    fn review_raw_spaced_pragma_marks_external_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weak.c");
+        let source = "void hook(void) {}\nint value;\nstatic int local;\n#  pragma weak hook\n#\tpragma weak value\n# pragma weak local\n";
+        std::fs::write(&path, source).unwrap();
+        let graph = IncludeGraph::build(dir.path(), std::slice::from_ref(&path), &[]);
+        let pre = PreprocessedSource {
+            text: source.into(),
+            line_map: Default::default(),
+            included_headers: Default::default(),
+            inlined_headers: Default::default(),
+            language: Language::C,
+            replayed_variants: Default::default(),
+            diagnostics: Vec::new(),
+            conditionals: Vec::new(),
+        };
+        let mut program = Program::new(dir.path().to_path_buf());
+        lower_prepared_source(
+            &mut program,
+            &path,
+            &graph,
+            Arc::new(pre),
+            Language::C,
+            false,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            program
+                .symbols
+                .functions
+                .iter()
+                .find(|f| f.name == "hook")
+                .unwrap()
+                .is_weak
+        );
+        assert!(
+            program
+                .symbols
+                .variables
+                .iter()
+                .find(|v| v.name == "value")
+                .unwrap()
+                .is_weak
+        );
+        assert!(
+            !program
+                .symbols
+                .variables
+                .iter()
+                .find(|v| v.name == "local")
+                .unwrap()
+                .is_weak
+        );
+    }
 
     #[test]
     fn weak_global_direct_initialization_has_definition_and_flow_owner() {

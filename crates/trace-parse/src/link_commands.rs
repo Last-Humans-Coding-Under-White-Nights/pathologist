@@ -121,6 +121,10 @@ impl LinkDatabase {
                 db.targets.truncate(start);
                 db.warnings
                     .push(format!("CMake metadata {}: {e}", build.display()));
+            } else if db.targets.len() > start {
+                // Use one build tree, as with a multi-config reply. Another
+                // reply can describe the same artifacts and duplicate scopes.
+                break;
             }
         }
         let mut by_output: BTreeMap<PathBuf, usize> = db
@@ -203,7 +207,6 @@ impl LinkDatabase {
                         .copied();
                     if dependency.is_none() {
                         if let Some(prefix) = &versioned {
-                            let directory = resolve_against(directory, Path::new("."));
                             dependency = by_output
                                 .iter()
                                 .find(|(output, _)| {
@@ -215,8 +218,11 @@ impl LinkDatabase {
                                 .map(|(_, &i)| i);
                         }
                     }
-                    if let Some(dependency) = dependency.filter(|&d| d != index) {
-                        target.dependencies.push(dependency);
+                    if let Some(dependency) = dependency {
+                        if dependency != index {
+                            target.dependencies.push(dependency);
+                        }
+                        break;
                     }
                 }
             }
@@ -324,6 +330,7 @@ impl LinkDatabase {
                         cmake_link_dependency(&target, dependency, &self.targets[id], &build_root)
                             .then_some(id)
                     })
+                    .filter(|&id| id != index)
                     .collect();
             }
         }
@@ -365,8 +372,10 @@ fn cmake_link_dependency(
             if command == "target_link_libraries" {
                 return true;
             }
-            ordering |= command == "add_dependencies";
-            break;
+            if command == "add_dependencies" {
+                ordering = true;
+                break;
+            }
         }
         node = current["parent"].as_u64();
     }
@@ -497,6 +506,9 @@ const VALUELESS_O_OPTIONS: &[&str] = &["-onelevel_namespace", "-output_format", 
 /// begins with `-o` — ld64's `-onelevel_namespace` — match before the real
 /// `-o <path>` later on the line and name the target after it.
 pub(crate) fn command_output<S: AsRef<str>>(args: &[S]) -> Option<&str> {
+    if args.is_empty() {
+        return None;
+    }
     // The MSVC spellings are honoured only under an MSVC driver. `/Fo` matches
     // any argument whose first three bytes are `/fo`, so unguarded it claimed
     // `-isystem /foundation/include` — and, being a left-to-right scan, it won
@@ -606,8 +618,11 @@ const OPERAND_IS_NOT_INPUT: &[&str] = &[
     // A library's own soname is not one of its inputs; left unconsumed,
     // `-Wl,-soname,libfoo.so.1` makes the target depend on itself.
     "-soname",
+    "--soname",
     "-h",
     "-rpath",
+    "--rpath",
+    "-R",
     "-syslibroot",
     "-bundle_loader",
     // A linker script is not an input either, and failing the command over one
@@ -736,6 +751,117 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, value.to_string()).unwrap();
     }
+    #[test]
+    fn review_empty_command_helpers() {
+        let args: &[&str] = &[];
+        assert_eq!(command_output(args), None);
+        assert!(!is_msvc_driver(args));
+        assert_eq!(driver_stem(args), "");
+    }
+
+    #[test]
+    fn review_library_search_stops_at_first_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        for first in ["libfoo.a", "libfoo.so.1"] {
+            write(
+                dir.path(),
+                "link_commands.json",
+                json!([
+                    {"directory":".","arguments":["cc","a.c","-o",format!("first/{first}")]},
+                    {"directory":".","arguments":["cc","b.c","-o","second/libfoo.so"]},
+                    {"directory":".","arguments":["cc","main.c","-Lfirst","-Lsecond","-lfoo","-o","app"]}
+                ]),
+            );
+            let db = load(dir.path(), None, None).unwrap();
+            assert!(db.warnings.is_empty(), "{:?}", db.warnings);
+            assert_eq!(db.targets[2].dependencies, vec![0]);
+        }
+    }
+
+    #[test]
+    fn review_wrapped_cmake_dependencies_follow_backtrace() {
+        let candidate = LinkTargetSpec {
+            name: "lib".into(),
+            output: PathBuf::from("/build/lib.a"),
+            sources: Vec::new(),
+            dependencies: Vec::new(),
+            configurations: BTreeMap::new(),
+        };
+        for (command, expected) in [("target_link_libraries", true), ("add_dependencies", false)] {
+            let target = json!({
+                "orderDependencies":[{"id":"lib"}],
+                "backtraceGraph":{"commands":["wrapper", command],
+                    "nodes":[{"command":0,"parent":1},{"command":1}]}
+            });
+            assert_eq!(
+                cmake_link_dependency(
+                    &target,
+                    &json!({"id":"lib","backtrace":0}),
+                    &candidate,
+                    Path::new("/build")
+                ),
+                expected
+            );
+        }
+    }
+
+    fn review_cmake_reply(root: &Path, reply: &str, dependencies: Value) {
+        write(
+            root,
+            &format!("{reply}/index-001.json"),
+            json!({"objects":[{"kind":"codemodel","version":{"major":2},"jsonFile":"model.json"}]}),
+        );
+        write(
+            root,
+            &format!("{reply}/model.json"),
+            json!({"paths":{"source":root,"build":root.join("build")},"configurations":[{"targets":[{"id":"a","jsonFile":"a.json"}]}]}),
+        );
+        write(
+            root,
+            &format!("{reply}/a.json"),
+            json!({"name":"a","type":"STATIC_LIBRARY","artifacts":[{"path":"liba.a"}],"sources":[{"path":"a.c"}],"dependencies":dependencies}),
+        );
+    }
+
+    #[test]
+    fn review_cmake_ignores_self_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        review_cmake_reply(dir.path(), "build/.cmake/api/v1/reply", json!([{"id":"a"}]));
+        let db = load(dir.path(), None, None).unwrap();
+        assert_eq!(db.targets.len(), 1);
+        assert!(db.targets[0].dependencies.is_empty());
+    }
+
+    #[test]
+    fn review_cmake_multiple_roots_do_not_duplicate_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        for reply in [".cmake/api/v1/reply", "build/.cmake/api/v1/reply"] {
+            review_cmake_reply(dir.path(), reply, json!([]));
+        }
+        let db = load(dir.path(), None, None).unwrap();
+        assert!(db.warnings.is_empty(), "{:?}", db.warnings);
+        assert_eq!(db.targets.len(), 1);
+    }
+
+    #[test]
+    fn review_linker_option_operands_are_not_inputs() {
+        for option in ["--rpath", "--soname", "-R"] {
+            let args = ["cc", "main.c", option, "unrelated.so", "-o", "app"].map(str::to_owned);
+            let link = parse_link(
+                Path::new("/build"),
+                &args,
+                Some(PathBuf::from("/build/app")),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                link.inputs,
+                vec![PathBuf::from("/build/main.c")],
+                "{option}"
+            );
+        }
+    }
+
     #[test]
     fn missing_explicit_metadata_is_an_error_but_malformed_auto_metadata_warns() {
         let dir = tempfile::tempdir().unwrap();

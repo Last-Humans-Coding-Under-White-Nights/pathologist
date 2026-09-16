@@ -219,7 +219,14 @@ pub fn resolve_against(directory: &Path, path: &Path) -> PathBuf {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                normalized.pop();
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
             }
             part => normalized.push(part.as_os_str()),
         }
@@ -230,6 +237,42 @@ pub fn resolve_against(directory: &Path, path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_relative_parents_survive_normalization() {
+        for (base, path, expected) in [
+            (
+                ".",
+                "../trace-unbuilt-review-artifact",
+                "../trace-unbuilt-review-artifact",
+            ),
+            (
+                "a",
+                "../../trace-unbuilt-review-artifact",
+                "../trace-unbuilt-review-artifact",
+            ),
+            (
+                "..",
+                "../trace-unbuilt-review-artifact",
+                "../../trace-unbuilt-review-artifact",
+            ),
+            (
+                "../a",
+                "../trace-unbuilt-review-artifact",
+                "../trace-unbuilt-review-artifact",
+            ),
+            (
+                "/",
+                "../trace-unbuilt-review-artifact",
+                "/trace-unbuilt-review-artifact",
+            ),
+        ] {
+            assert_eq!(
+                resolve_against(Path::new(base), Path::new(path)),
+                PathBuf::from(expected)
+            );
+        }
+    }
 
     /// `PROBE_EPOCH` is process-global, so a test that bumps it empties the
     /// memo every other probe test is reading. Take this first.

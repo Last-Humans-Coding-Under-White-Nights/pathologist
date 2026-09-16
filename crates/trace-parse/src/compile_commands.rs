@@ -653,7 +653,9 @@ pub(crate) fn driver_index<S: AsRef<str>>(args: &[S]) -> usize {
 /// The driver's program name, case-folded. `binary_stem` strips `.exe` but
 /// keeps the spelling's case, and Windows tools are invoked as `LINK.EXE`.
 pub(crate) fn driver_stem<S: AsRef<str>>(args: &[S]) -> String {
-    binary_stem(args[driver_index(args)].as_ref()).to_ascii_lowercase()
+    args.get(driver_index(args))
+        .map(|arg| binary_stem(arg.as_ref()).to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 pub(crate) fn binary_stem(arg: &str) -> &str {

@@ -48,14 +48,17 @@ link-only entries from the selected compilation database. CMake metadata is
 read through the lexically last `index-*.json` File API reply — CMake's
 timestamped names sort newest-last — and its referenced `codemodel-v2`
 objects in the root/build reply directories (also the compilation database’s
-directory). Stale, unreferenced target JSON files are ignored.
+directory). The first candidate build root that supplies targets is used;
+additional build roots are not combined, avoiding duplicate target scopes.
+Stale, unreferenced target JSON files are ignored.
 
 Compilation object outputs (`output` or `-o`) identify both the source and
 its compiler configuration. The same source built with different macros for
 two targets therefore keeps those configurations separate. CMake source
 membership without object/configuration information conservatively includes
 all available commands for that source. Explicit artifact inputs and known
-`-L`/`-l` target outputs establish dependencies. Commands are parsed as data;
+`-L`/`-l` target outputs establish dependencies; library lookup stops at the
+first matching search directory. Commands are parsed as data;
 no compiler, linker, or shell is executed. Unsupported command features and
 unmapped objects produce diagnostics. Response-file expansion is bounded.
 Options are distinguished from inputs before extensions are consulted, so an
@@ -76,7 +79,8 @@ a source shared by targets has distinct function and variable instances in
 each scope. Unmapped sources remain in an unscoped partition. Without link
 metadata, the existing indexing and whole-program merge path remains in use.
 
-GNU `weak`/`__weak__` attributes and active `#pragma weak name` mark functions
+GNU `weak`/`__weak__` attributes (including C++ `[[gnu::weak]]` and
+`[[gnu::__weak__]]`) and active `#pragma weak name` mark functions
 and variables *with external linkage*. The `_Pragma("weak name")` operator
 spelling is **not** read — a weak body annotated that way is not suppressed, so
 both bodies' facts survive (over-approximate, not wrong). Otherwise: a `static` function, a local, a
