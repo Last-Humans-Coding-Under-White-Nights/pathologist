@@ -1,4 +1,4 @@
-use crate::schema::{SCHEMA_V4, SCHEMA_VERSION};
+use crate::schema::{INDEXES_V4, SCHEMA_VERSION, TABLES_V4};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use rustc_hash::FxHashSet;
@@ -53,7 +53,7 @@ pub fn export_to_sqlite(
             "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY;",
         )?;
         conn.execute_batch("BEGIN IMMEDIATE;")?;
-        conn.execute_batch(SCHEMA_V4)?;
+        conn.execute_batch(TABLES_V4)?;
 
         let options_json = serde_json::json!({
             "include_paths": program.include_paths,
@@ -96,6 +96,7 @@ pub fn export_to_sqlite(
             export_points_to(&conn, pag, analysis)?;
         }
         export_diagnostics(&conn, program)?;
+        conn.execute_batch(INDEXES_V4)?;
         conn.execute_batch("COMMIT;")?;
     }
 
@@ -133,7 +134,7 @@ fn export_types(conn: &Connection, program: &Program) -> Result<()> {
         "INSERT INTO types (id, kind, name, size, layout_json) VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
     for ty in program.types.all() {
-        let kind = match &ty.desc {
+        let kind = match ty.desc.as_ref() {
             TypeDesc::Void => "void",
             TypeDesc::Char => "char",
             TypeDesc::Bool => "bool",

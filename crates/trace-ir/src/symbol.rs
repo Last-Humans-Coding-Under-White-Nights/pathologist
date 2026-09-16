@@ -234,11 +234,17 @@ pub struct SymbolTable {
     pub global_by_name: IndexMap<String, VarId>,
     /// File-`static` variables per file, the first registered of a name
     /// winning.
-    file_statics_by_name: FxHashMap<FileId, FxHashMap<String, VarId>>,
+    file_statics_by_name: FxHashMap<String, Vec<(FileId, VarId)>>,
     /// Internal-linkage definitions per file: `(file, name) -> FnId`.
     /// In C, a file-`static` definition shadows any external definition of
     /// the same name for references inside that file.
-    fn_by_scope: FxHashMap<FileId, FxHashMap<String, FnId>>,
+    ///
+    /// Keyed by name, then file: a name is looked up from a file whose scope
+    /// is that file plus every header it includes, which for a large
+    /// translation unit is hundreds of files, while a name is defined with
+    /// internal linkage in a few. So the lookup walks the definitions of the
+    /// name and asks whether each is in scope, not the other way round.
+    fn_by_scope: FxHashMap<String, Vec<(FileId, FnId)>>,
     /// The further C++ overloads of an entry in `fn_by_scope`, keyed by that
     /// entry: the table holds one function per file and name.
     scope_overloads: FxHashMap<FnId, Vec<FnId>>,
@@ -545,18 +551,18 @@ impl SymbolTable {
             // translation unit, headers included: a header's
             // `static void f(int);` beside the `.cpp`'s `f(double)`, or a
             // header's anonymous-namespace class member defined in the `.cpp`.
-            let own_file = self
-                .fn_by_scope
-                .get(&func.file)
-                .and_then(|scope| scope.get(&func.name))
-                .copied();
+            let entries = self.fn_by_scope.get(&func.name).map(Vec::as_slice);
+            let own_file = entries
+                .into_iter()
+                .flatten()
+                .find(|(file, _)| *file == func.file)
+                .map(|(_, id)| *id);
             let scoped = own_file.or_else(|| {
-                let headers = self.scope_files(func.file).skip(1);
-                headers.filter(|_| func.is_cpp).find_map(|file| {
-                    let id = *self.fn_by_scope.get(&file)?.get(&func.name)?;
-                    self.function_by_id(id)
-                        .is_some_and(|e| e.is_cpp)
-                        .then_some(id)
+                if !func.is_cpp {
+                    return None;
+                }
+                self.first_in_scope(func.file, entries, |id| {
+                    self.function_by_id(id).is_some_and(|e| e.is_cpp)
                 })
             });
             let overloads = func.is_cpp
@@ -646,10 +652,11 @@ impl SymbolTable {
                     self.overload_primary.insert(func.id, primary);
                 }
                 None => {
-                    self.fn_by_scope
-                        .entry(func.file)
-                        .or_default()
-                        .insert(func.name.clone(), func.id);
+                    let entries = self.fn_by_scope.entry(func.name.clone()).or_default();
+                    match entries.iter_mut().find(|(file, _)| *file == func.file) {
+                        Some(entry) => entry.1 = func.id,
+                        None => entries.push((func.file, func.id)),
+                    }
                 }
             }
             if func.declared_in_class || member_overload {
@@ -875,11 +882,13 @@ impl SymbolTable {
                 self.global_by_name.insert(var.name.clone(), id);
             }
             StorageClass::FileStatic => {
-                self.file_statics_by_name
-                    .entry(var.span.file)
-                    .or_default()
+                let entries = self
+                    .file_statics_by_name
                     .entry(var.name.clone())
-                    .or_insert(id);
+                    .or_default();
+                if !entries.iter().any(|(file, _)| *file == var.span.file) {
+                    entries.push((var.span.file, id));
+                }
             }
             _ => {}
         }
@@ -890,8 +899,8 @@ impl SymbolTable {
     /// The file-`static` variable `name` code in `file` sees: defined in
     /// `file`, else in a header it includes.
     pub fn file_static_named(&self, file: FileId, name: &str) -> Option<VarId> {
-        self.scope_files(file)
-            .find_map(|f| self.file_statics_by_name.get(&f)?.get(name).copied())
+        let entries = self.file_statics_by_name.get(name).map(Vec::as_slice);
+        self.first_in_scope(file, entries, |_| true)
     }
 
     pub fn alloc_fn_id(&mut self) -> FnId {
@@ -935,8 +944,8 @@ impl SymbolTable {
     }
 
     fn lookup_in_scopes(&self, name: &str, file: crate::FileId) -> Option<FnId> {
-        self.scope_files(file)
-            .find_map(|f| self.fn_by_scope.get(&f)?.get(name).copied())
+        let entries = self.fn_by_scope.get(name).map(Vec::as_slice);
+        self.first_in_scope(file, entries, |_| true)
     }
 
     /// The further overloads of the internal-linkage entry `id` that code in
@@ -1000,10 +1009,43 @@ impl SymbolTable {
         !self.scope_overloads.is_empty()
     }
 
-    /// `file`, then the headers it includes: where a name written in `file`
-    /// is looked for, nearest first.
-    fn scope_files(&self, file: FileId) -> impl Iterator<Item = FileId> + '_ {
-        std::iter::once(file).chain(self.headers_of.get(&file).into_iter().flatten().copied())
+    /// The nearest entry of a name that code in `file` sees and `accept`
+    /// takes: the one in `file` itself, else the one in the lowest-numbered
+    /// header `file` includes. What [`in_scope`](Self::in_scope) would list
+    /// first, without building the list: this runs per call site.
+    fn first_in_scope<T: Copy>(
+        &self,
+        file: FileId,
+        entries: Option<&[(FileId, T)]>,
+        accept: impl Fn(T) -> bool,
+    ) -> Option<T> {
+        let entries = entries?;
+        if let Some(&(_, value)) = entries.iter().find(|(f, v)| *f == file && accept(*v)) {
+            return Some(value);
+        }
+        let headers = self.headers_of.get(&file)?;
+        entries
+            .iter()
+            .filter(|(f, v)| headers.contains(f) && accept(*v))
+            .min_by_key(|(f, _)| *f)
+            .map(|(_, v)| *v)
+    }
+
+    /// The entries of a name that code in `file` sees, nearest first: the
+    /// one in `file` itself, then those in the headers it includes in
+    /// ascending file order.
+    fn in_scope<T: Copy>(&self, file: FileId, entries: Option<&[(FileId, T)]>) -> Vec<(FileId, T)> {
+        let Some(entries) = entries else {
+            return Vec::new();
+        };
+        let headers = self.headers_of.get(&file);
+        let mut seen: Vec<(FileId, T)> = entries
+            .iter()
+            .filter(|(f, _)| *f == file || headers.is_some_and(|h| h.contains(f)))
+            .copied()
+            .collect();
+        seen.sort_by_key(|(f, _)| (*f != file, *f));
+        seen
     }
 
     /// Whether a reference written in `file` can name `id`: an external
@@ -1064,9 +1106,9 @@ impl SymbolTable {
         file: Option<crate::FileId>,
     ) -> Vec<FnId> {
         let mut out = Vec::with_capacity(2);
-        for f in file.into_iter().flat_map(|file| self.scope_files(file)) {
-            if let Some(&id) = self.fn_by_scope.get(&f).and_then(|scope| scope.get(name)) {
-                let overloads = self.internal_overloads_seen_from(id, file.unwrap_or(f));
+        if let Some(file) = file {
+            for (_, id) in self.in_scope(file, self.fn_by_scope.get(name).map(Vec::as_slice)) {
+                let overloads = self.internal_overloads_seen_from(id, file);
                 for id in std::iter::once(id).chain(overloads) {
                     if !out.contains(&id) {
                         out.push(id);
@@ -1256,6 +1298,57 @@ mod tests {
             is_final: false,
             is_cpp,
         }
+    }
+
+    #[test]
+    fn scoped_lookup_prefers_the_file_then_its_headers_in_order() {
+        let mut p = Program::new(PathBuf::from("/t"));
+        let unit = p.symbols.add_file(PathBuf::from("/t/unit.c"));
+        let late = p.symbols.add_file(PathBuf::from("/t/late.h"));
+        let early = p.symbols.add_file(PathBuf::from("/t/early.h"));
+        let unrelated = p.symbols.add_file(PathBuf::from("/t/other.h"));
+        p.symbols.register_included_header(unit, late);
+        p.symbols.register_included_header(unit, early);
+        fn add(p: &mut Program, file: FileId, line: u32) -> FnId {
+            let mut f = fake_function(
+                p.symbols.alloc_fn_id(),
+                "helper",
+                Vec::new(),
+                true,
+                false,
+                file,
+                line,
+            );
+            f.linkage = Linkage::Internal;
+            p.symbols.add_function(f)
+        }
+        let in_unrelated = add(&mut p, unrelated, 1);
+        let in_late = add(&mut p, late, 2);
+        let in_early = add(&mut p, early, 3);
+        // Only headers the unit includes are in scope, lowest file id first.
+        assert_eq!(
+            p.symbols.resolve_function_in_scope("helper", Some(unit)),
+            Some(in_late)
+        );
+        assert_eq!(
+            p.symbols.resolve_function_candidates("helper", Some(unit)),
+            vec![in_late, in_early]
+        );
+        // The unit's own definition shadows every header's.
+        let own = add(&mut p, unit, 4);
+        assert_eq!(
+            p.symbols.resolve_function_in_scope("helper", Some(unit)),
+            Some(own)
+        );
+        assert_eq!(
+            p.symbols.resolve_function_candidates("helper", Some(unit)),
+            vec![own, in_late, in_early]
+        );
+        assert_eq!(
+            p.symbols
+                .resolve_function_in_scope("helper", Some(unrelated)),
+            Some(in_unrelated)
+        );
     }
 
     #[test]

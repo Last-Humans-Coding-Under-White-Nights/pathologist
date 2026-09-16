@@ -57,7 +57,7 @@ pub struct Diagnostic {
 /// `declaration_scope` is kept separately because an unqualified template
 /// argument is resolved where the derived class is declared, not relative to
 /// the namespace that qualifies the template itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TemplateBase {
     pub derived: String,
     pub spelling: String,
@@ -164,6 +164,9 @@ pub struct Program {
     /// particular template can inspect the preserved spelling
     /// (`IRemoteStub<IFoo>`).
     pub template_bases: Vec<TemplateBase>,
+    /// `template_bases` as a set: a unit's facts are re-added by every unit
+    /// merging it, and a scan of the list per fact was quadratic.
+    template_base_set: rustc_hash::FxHashSet<TemplateBase>,
     /// Declared C++ `operator->` returns, merged with a unit's types so a
     /// header's wrappers are followable from every unit that includes it.
     pub arrow_returns: Vec<ArrowReturn>,
@@ -212,6 +215,13 @@ impl Program {
             root,
             ..Default::default()
         }
+    }
+
+    /// Release merge-only lookup tables after the last merge and finalization.
+    /// Callers that intend to merge more units must retain this state.
+    pub fn release_merge_state(&mut self) {
+        self.dedup = MergeDedup::default();
+        self.template_base_set = rustc_hash::FxHashSet::default();
     }
 
     /// Dependency roots whose headers contribute declarations but whose
@@ -282,13 +292,23 @@ impl Program {
         if derived.is_empty() || base.is_empty() {
             return;
         }
-        let fact = TemplateBase {
+        self.add_template_base_fact(&TemplateBase {
             derived: derived.to_string(),
             spelling: base.to_string(),
             declaration_scope: declaration_scope.to_string(),
-        };
-        if !self.template_bases.contains(&fact) {
-            self.template_bases.push(fact);
+        });
+    }
+
+    /// [`add_template_base`](Self::add_template_base) for a fact another
+    /// unit already holds: every unit merging a header re-adds the header's
+    /// facts, so the common case is a hit that allocates nothing.
+    pub fn add_template_base_fact(&mut self, fact: &TemplateBase) {
+        if fact.derived.is_empty() || fact.spelling.is_empty() {
+            return;
+        }
+        if !self.template_base_set.contains(fact) {
+            self.template_base_set.insert(fact.clone());
+            self.template_bases.push(fact.clone());
         }
     }
 

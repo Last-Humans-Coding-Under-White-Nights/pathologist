@@ -276,7 +276,7 @@ fn solve(
     // signature-aware propagation.
     use trace_ir::TypeDesc as TD;
     for loc in &pag.locations {
-        let g = match &program.types.get(loc.type_id).desc {
+        let g = match program.types.get(loc.type_id).desc.as_ref() {
             TD::FnPtr { params, .. } if !params.is_empty() => SlotGuard::FnParams(params.len()),
             TD::Void
             | TD::Char
@@ -1164,7 +1164,7 @@ fn var_may_hold_pointee(program: &Program, var: VarId) -> bool {
     let Some(v) = program.symbols.variable_by_id(var) else {
         return false;
     };
-    let desc = &program.types.get(v.type_id).desc;
+    let desc = program.types.get(v.type_id).desc.as_ref();
     match desc {
         TD::FnPtr { .. } => true,
         TD::Ptr(inner) => matches!(

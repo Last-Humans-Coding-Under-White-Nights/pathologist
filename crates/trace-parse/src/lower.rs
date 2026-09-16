@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use trace_ir::{
     is_anonymous_tag, CallSite, Diagnostic, DiagnosticSeverity, FieldId, FlowConstraint, FnId,
@@ -31,10 +31,6 @@ use tree_sitter::Node;
 const MAX_AST_WALK_DEPTH: u32 = 512;
 const INDEX_PROGRESS_EVERY: usize = 50;
 const PREPROCESS_STAGE: &str = "preprocess";
-/// Parse tasks issued per worker in one parallel batch. Batching bounds the
-/// per-unit IR held before merging; four per worker leaves room for uneven
-/// unit sizes.
-const PARSE_BATCHES_PER_WORKER: usize = 4;
 
 fn index_progress(msg: impl std::fmt::Display) {
     let _ = writeln!(std::io::stderr(), "{msg}");
@@ -242,6 +238,18 @@ pub fn build_program(root: &Path, opts: &PreprocessOptions) -> Result<Program, S
 }
 
 pub fn build_program_with_jobs(
+    root: &Path,
+    opts: &PreprocessOptions,
+    jobs: usize,
+) -> Result<Program, String> {
+    let result = build_program_inner(root, opts, jobs);
+    trace_ir::release_thread_path_caches();
+    // All per-run caches and the indexing pool have dropped at this point.
+    crate::memory::reclaim_unused_pages();
+    result
+}
+
+fn build_program_inner(
     root: &Path,
     opts: &PreprocessOptions,
     jobs: usize,
@@ -626,13 +634,23 @@ pub fn build_program_with_jobs(
     // which is what turns an inlined body back into a shared one.
     let dirty: HashSet<PathBuf> = source_cache.units_that_inlined(&tu_paths);
     source_cache.evict_all(&dirty);
+    // Discovery keeps every text resident until the pass is over. The units
+    // that stand are spilled here, in parallel; the dirty ones are spilled by
+    // the settle pass that rebuilds them, so nothing is written twice.
+    pool.install(|| {
+        file_order
+            .par_iter()
+            .filter(|path| !dirty.contains(*path))
+            .try_for_each(|path| source_cache.spill(path, &include_graph))
+    })?;
     let settle_t = Instant::now();
     pool.install(|| {
-        dirty.par_iter().for_each(|path| {
+        dirty.par_iter().try_for_each(|path| {
             let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
             let _ = source_cache.get_or_preprocess(path, &include_graph, &index_opts[&lang]);
-        });
-    });
+            source_cache.spill(path, &include_graph)
+        })
+    })?;
     // Split the two passes apart: discovery and the settle pass have
     // different cures, so a single total hides which one to attack (#83).
     index_progress(format!(
@@ -645,6 +663,12 @@ pub fn build_program_with_jobs(
         dirty.len(),
         file_order.len()
     ));
+
+    // Preprocessing probes are not used by header/TU lowering. Drop both
+    // serial and worker memos before retaining the header IR cache.
+    trace_ir::release_thread_path_caches();
+    pool.broadcast(|_| trace_ir::release_thread_path_caches());
+    crate::memory::reclaim_unused_pages();
 
     // A header every unit expanded for itself must not ALSO get a PCH unit:
     // that unit would carry whichever configuration the warm pass happened to
@@ -705,6 +729,20 @@ pub fn build_program_with_jobs(
         orphan_headers.len(),
         file_order.len()
     ));
+    // A warmed header's text is read back only when the header is indexed on
+    // its own. Every other warmed header keeps its provenance for the
+    // queries above and drops its text without ever writing it to disk.
+    let orphan_set: HashSet<&Path> = orphan_headers.iter().map(PathBuf::as_path).collect();
+    pool.install(|| {
+        warmed_as.par_iter().try_for_each(|(path, _)| {
+            if orphan_set.contains(path.as_path()) {
+                source_cache.spill(path, &include_graph)
+            } else {
+                source_cache.release_text(path, &include_graph);
+                Ok(())
+            }
+        })
+    })?;
 
     // One unit per expansion some translation unit actually replayed. A
     // header whose only stored expansion nothing consumed contributes
@@ -774,7 +812,9 @@ pub fn build_program_with_jobs(
                 );
             }
         } else {
-            let snapshot = header_ir_map.clone();
+            // The map is only extended between waves, so workers read it in
+            // place rather than from a per-wave copy.
+            let snapshot = &header_ir_map;
             let units: Vec<(PathBuf, usize, UnitIndex)> = pool.install(|| {
                 wave_units
                     .par_iter()
@@ -789,7 +829,7 @@ pub fn build_program_with_jobs(
                                 &include_graph,
                                 &include_expansion_cache,
                                 index_language(path, &cpp_parse, no_c_units, forced_language),
-                                Some(&snapshot),
+                                Some(snapshot),
                                 pch_order.as_ref(),
                             ),
                         )
@@ -838,6 +878,7 @@ pub fn build_program_with_jobs(
         }
     }
     let header_ir = Arc::new(header_ir_map);
+    crate::memory::reclaim_unused_pages();
     index_progress(format!(
         "pch-done: {:.1}s ({} units)",
         pch_t.elapsed().as_secs_f64(),
@@ -898,7 +939,7 @@ pub fn build_program_with_jobs(
                 );
             }
         } else {
-            index_in_batches(
+            index_in_window(
                 &orphan_headers,
                 jobs,
                 |path| {
@@ -955,7 +996,7 @@ pub fn build_program_with_jobs(
                 );
             }
         } else {
-            index_in_batches(
+            index_in_window(
                 &file_order,
                 jobs,
                 |path| {
@@ -992,6 +1033,7 @@ pub fn build_program_with_jobs(
         add_preprocess_diagnostics(&mut program, &include_graph, unit_file, &diagnostics);
     }
     let inferred_dirs = include_graph.include_dirs.clone();
+    source_cache.check_load_errors()?;
     finalize_program(&mut program, &include_graph, inferred_dirs);
 
     Ok(program)
@@ -1401,42 +1443,147 @@ fn normalize_discovered_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Indexing workers recurse on deep expressions, so they need more than the
-/// default stack. Both indexing paths build their pool here to keep that true.
-/// Index `items` in parallel batches of [`PARSE_BATCHES_PER_WORKER`] per
-/// worker, merging each batch in the order given. Indexed parallel
-/// collection preserves the order of a slice, so the merge order is that of
-/// `items` regardless of scheduling, and the IR held before merging is
-/// bounded by one batch rather than by the corpus.
+/// Units the workers may take ahead of the merge, per worker, and the bounds
+/// on the total. This bounds the IR held before merging (at most the window
+/// indexed or in flight) without making anyone wait for a batch: a slow unit
+/// holds up the merge, not the other workers. The cap keeps a many-core host
+/// from holding dozens of lowered units behind one straggler; two per worker
+/// measured the same as four on Clang with eight workers.
+const INDEX_WINDOW_PER_WORKER: usize = 2;
+const INDEX_WINDOW_MIN: usize = 4;
+const INDEX_WINDOW_MAX: usize = 32;
+
+/// The window for `jobs` workers.
+fn index_window(jobs: usize) -> usize {
+    jobs.max(1)
+        .saturating_mul(INDEX_WINDOW_PER_WORKER)
+        .clamp(INDEX_WINDOW_MIN, INDEX_WINDOW_MAX)
+}
+
+/// Index `items` on `jobs` workers and merge them in the order given.
 ///
-/// The merge is serial and runs on this thread while the pool indexes the
-/// next batch, so it costs wall time only when it outruns the indexing
-/// (camera: 0.35s of merging against 1.9s of parsing). The channel holds
-/// one finished batch, which bounds what is in flight to two.
-fn index_in_batches<T: Send>(
+/// Workers take units in order and park a finished unit until the merge
+/// reaches it; the merge runs on this thread while the workers go on. A
+/// worker that is [`index_window`] units ahead of the merge waits for it, so
+/// the pending IR is bounded by the window rather than by the corpus, and
+/// the merge order is that of `items` regardless of which unit finishes
+/// first.
+///
+/// A panic in `index` or `merge` unwinds through the scope as it would
+/// without the window: whoever panics marks the run cancelled on the way
+/// out and wakes every waiter, so no thread waits for a result that will
+/// never come, and the scope re-raises the panic once the rest have left.
+fn index_in_window<T: Send>(
     items: &[PathBuf],
     jobs: usize,
     index: impl Fn(&PathBuf) -> T + Sync,
     mut merge: impl FnMut(T) + Send,
 ) {
-    let batch_size = jobs.max(1).saturating_mul(PARSE_BATCHES_PER_WORKER);
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<T>>(1);
-    let index = &index;
-    rayon::scope(move |scope| {
-        scope.spawn(move |_| {
-            for batch in items.chunks(batch_size) {
-                let results: Vec<T> = batch.par_iter().map(index).collect();
-                if tx.send(results).is_err() {
-                    return;
-                }
+    struct Window<T> {
+        /// Next unit a worker takes.
+        next: usize,
+        /// Units merged so far; the window is measured from here.
+        merged: usize,
+        /// Finished units the merge has not reached yet.
+        done: BTreeMap<usize, T>,
+        /// Set by a thread unwinding from a panic; everyone else stops.
+        cancelled: bool,
+    }
+    /// The two things waited for: the merge waits for the next unit to be
+    /// done, the workers wait for the window to move. Separate so that a
+    /// finished unit wakes only the merge and a merged one only the workers.
+    struct Signals {
+        unit_done: Condvar,
+        window_moved: Condvar,
+    }
+    /// Marks the run cancelled if the holder unwinds from a panic.
+    struct CancelOnPanic<'a, T> {
+        state: &'a Mutex<Window<T>>,
+        signals: &'a Signals,
+    }
+    impl<T> Drop for CancelOnPanic<'_, T> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .cancelled = true;
+                self.signals.unit_done.notify_all();
+                self.signals.window_moved.notify_all();
             }
-        });
-        for results in rx {
-            results.into_iter().for_each(&mut merge);
+        }
+    }
+    let jobs = jobs.max(1);
+    let window = index_window(jobs);
+    let state = Mutex::new(Window {
+        next: 0,
+        merged: 0,
+        done: BTreeMap::new(),
+        cancelled: false,
+    });
+    let signals = Signals {
+        unit_done: Condvar::new(),
+        window_moved: Condvar::new(),
+    };
+    let (index, state, signals) = (&index, &state, &signals);
+    // The critical sections below only move indices and park units, so a
+    // lock poisoned by a panic elsewhere holds a consistent window; the
+    // cancellation flag is what stops the run.
+    let lock = || state.lock().unwrap_or_else(|e| e.into_inner());
+    rayon::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(move |_| {
+                let _cancel = CancelOnPanic { state, signals };
+                loop {
+                    let i = {
+                        let mut st = lock();
+                        while !st.cancelled
+                            && st.next >= st.merged + window
+                            && st.next < items.len()
+                        {
+                            st = signals
+                                .window_moved
+                                .wait(st)
+                                .unwrap_or_else(|e| e.into_inner());
+                        }
+                        if st.cancelled || st.next >= items.len() {
+                            return;
+                        }
+                        st.next += 1;
+                        st.next - 1
+                    };
+                    let unit = index(&items[i]);
+                    lock().done.insert(i, unit);
+                    signals.unit_done.notify_one();
+                }
+            });
+        }
+        let _cancel = CancelOnPanic { state, signals };
+        for i in 0..items.len() {
+            let unit = {
+                let mut st = lock();
+                loop {
+                    if st.cancelled {
+                        // A worker's panic is re-raised by the scope.
+                        return;
+                    }
+                    if let Some(unit) = st.done.remove(&i) {
+                        break unit;
+                    }
+                    st = signals
+                        .unit_done
+                        .wait(st)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            merge(unit);
+            lock().merged = i + 1;
+            signals.window_moved.notify_all();
         }
     });
 }
 
+/// Indexing workers recurse on deep expressions and need a larger stack.
 fn index_pool(jobs: usize) -> Result<rayon::ThreadPool, String> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(jobs)
@@ -1665,7 +1812,13 @@ fn index_header_variant(
         header_ir,
         pch_order,
     ) {
-        Ok(()) => program_into_unit(path.to_path_buf(), program),
+        Ok(()) => {
+            let mut unit = program_into_unit(path.to_path_buf(), program);
+            // A header's unit is merged into every unit below it; a TU's
+            // once, which the precomputation would not pay for.
+            unit.merge_descs = crate::merge::merge_descs_of(&unit.types);
+            unit
+        }
         Err(e) => UnitIndex {
             path: path.to_path_buf(),
             diagnostics: vec![Diagnostic {
@@ -2127,6 +2280,7 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
         anonymous_final_classes: std::mem::take(&mut program.anonymous_final_classes),
         anonymous_bases: std::mem::take(&mut program.anonymous_bases),
         namespaces: std::mem::take(&mut program.namespaces),
+        merge_descs: Vec::new(),
     }
 }
 
@@ -3347,6 +3501,10 @@ fn lower_function_signature(
     };
     let ret_type = declared_return_type(program, ctx, source, node, ret_type);
     let provisional_id = program.symbols.alloc_fn_id();
+    let provisional_start = (
+        program.symbols.variables.len(),
+        program.symbols.call_sites.len(),
+    );
     let mut params = Vec::new();
     // Names in the parameters and body of a definition spelled `N::f` are
     // looked up in `N`, whether `N` is a class or a namespace (`N::f(A)`
@@ -3420,7 +3578,7 @@ fn lower_function_signature(
         is_final: flags.is_final,
         is_cpp: ctx.is_cpp,
     });
-    reassign_fn_id(program, provisional_id, fn_id);
+    reassign_fn_id(program, provisional_id, fn_id, provisional_start);
     if scoped {
         ctx.type_scope.borrow_mut().pop();
     }
@@ -3878,7 +4036,7 @@ fn call_result_type(
         let function = program.symbols.function(f);
         method_explicit_arity(program, f)
             .filter(|&arity| arity_takes(function, arity, args.len()))
-            .map(|_| &program.types.get(function.return_type).desc)
+            .map(|_| program.types.get(function.return_type).desc.as_ref())
     });
     let first = returns.next()??;
     (!matches!(first, TypeDesc::Unknown) && returns.all(|desc| desc == Some(first)))
@@ -4236,7 +4394,7 @@ fn declared_return_type(
 /// `ty` under `depth` pointer layers.
 fn pointer_layers(program: &mut Program, ty: trace_ir::TypeId, depth: usize) -> trace_ir::TypeId {
     (0..depth).fold(ty, |ty, _| {
-        let inner = program.types.get(ty).desc.clone();
+        let inner = program.types.get(ty).desc.as_ref().clone();
         program.types.ptr_to(inner)
     })
 }
@@ -4259,8 +4417,9 @@ fn local_type(
         .filter(|_| is_placeholder_type(ctx, type_node))
         .and_then(|value| auto_initializer_type(program, ctx, source, value))
         .filter(|desc| pointer_depth(desc) >= declarator_pointer_depth(decl));
-    let desc = inferred
-        .unwrap_or_else(|| walk_declarator_shape(decl, program.types.get(type_id).desc.clone()));
+    let desc = inferred.unwrap_or_else(|| {
+        walk_declarator_shape(decl, program.types.get(type_id).desc.as_ref().clone())
+    });
     program.types.intern(desc)
 }
 
@@ -4387,7 +4546,7 @@ fn lower_declaration(
                     continue;
                 }
                 let shaped_type_id = {
-                    let base = program.types.get(type_id).desc.clone();
+                    let base = program.types.get(type_id).desc.as_ref().clone();
                     program.types.intern(walk_declarator_shape(child, base))
                 };
                 lower_one_declarator(
@@ -4575,7 +4734,7 @@ fn names_type_in_scope(program: &Program, ctx: &LowerContext, name: &str) -> boo
 /// The class a declared type names, if any: a named struct, not an anonymous
 /// one.
 fn named_class(program: &Program, type_id: trace_ir::TypeId) -> Option<String> {
-    match &program.types.get(type_id).desc {
+    match program.types.get(type_id).desc.as_ref() {
         TypeDesc::Struct { name, .. } if !is_anonymous_tag(name) => Some(name.clone()),
         _ => None,
     }
@@ -4709,7 +4868,7 @@ fn lower_one_declarator(
 /// member function regardless of field identity.
 fn is_array_type(program: &Program, type_id: trace_ir::TypeId) -> bool {
     matches!(
-        program.types.get(type_id).desc,
+        program.types.get(type_id).desc.as_ref(),
         trace_ir::TypeDesc::Array { .. }
     )
 }
@@ -4827,6 +4986,10 @@ fn lower_function_decl(
         ret_type
     };
     let provisional_id = program.symbols.alloc_fn_id();
+    let provisional_start = (
+        program.symbols.variables.len(),
+        program.symbols.call_sites.len(),
+    );
     let mut params = Vec::new();
     let shape = lower_parameters(program, ctx, source, decl, provisional_id, &mut params);
     let span = node_span(program, ctx, decl);
@@ -4858,21 +5021,24 @@ fn lower_function_decl(
         is_final: false,
         is_cpp: ctx.is_cpp,
     });
-    reassign_fn_id(program, provisional_id, fn_id);
+    reassign_fn_id(program, provisional_id, fn_id, provisional_start);
 }
 
-fn reassign_fn_id(program: &mut Program, from: FnId, to: FnId) {
+fn reassign_fn_id(program: &mut Program, from: FnId, to: FnId, start: (usize, usize)) {
     if from == to {
         return;
     }
     let mut moved: Vec<VarId> = Vec::new();
-    for var in &mut program.symbols.variables {
+    // `from` was freshly allocated at `start`: earlier entities cannot refer
+    // to it. Header-heavy TUs otherwise rescan the entire imported preamble
+    // for every declaration. Keep the ownership check for nested declarations.
+    for var in &mut program.symbols.variables[start.0..] {
         if var.fn_id == Some(from) {
             var.fn_id = Some(to);
             moved.push(var.id);
         }
     }
-    for cs in &mut program.symbols.call_sites {
+    for cs in &mut program.symbols.call_sites[start.1..] {
         if cs.caller == from {
             cs.caller = to;
         }
@@ -4881,8 +5047,8 @@ fn reassign_fn_id(program: &mut Program, from: FnId, to: FnId) {
     // appending them onto the entry's existing params would double-count
     // prototype + definition parameters as distinct overload slots.
     if !moved.is_empty() {
-        if let Some(func) = program.symbols.functions.iter_mut().find(|f| f.id == to) {
-            func.params = moved;
+        if let Some(slot) = program.symbols.function_index(to) {
+            program.symbols.functions[slot].params = moved;
         }
     }
 }
@@ -5506,7 +5672,7 @@ fn arg_expr_type(
         _ => {
             if let Some(v) = resolve_expr_var(program, ctx, source, node) {
                 let tid = program.symbols.variable(v).type_id;
-                let desc = program.types.get(tid).desc.clone();
+                let desc = program.types.get(tid).desc.as_ref().clone();
                 // Field/subscript args pass the *stored value*: a pointer
                 // member is passed as its pointee (array decay), and a
                 // struct-by-value member as the struct.
@@ -5579,6 +5745,7 @@ fn rank_overloads(program: &Program, candidates: &[FnId], arg_desc: &[TypeDesc])
                     .types
                     .get(program.symbols.variable(*pv).type_id)
                     .desc
+                    .as_ref()
                     .clone();
                 let adesc = arg_desc.get(i).cloned().unwrap_or(TypeDesc::Unknown);
                 param_match_rank(&adesc, &pdesc)
@@ -5944,7 +6111,7 @@ fn lower_field_initializer_list(
                 let fid = cls_type?;
                 let info = program.types.get(fid);
                 let (_, fl) = info.layout.fields.iter().find(|(_, f)| f.name == fname)?;
-                match program.types.get(fl.type_id).desc.clone() {
+                match program.types.get(fl.type_id).desc.as_ref().clone() {
                     TypeDesc::Struct { name, .. } => Some(name),
                     _ => None,
                 }
@@ -5996,7 +6163,7 @@ fn class_field_desc(program: &Program, cls: &str, field: &str) -> Option<TypeDes
         {
             let info = program.types.get(tid);
             if let Some((_, fl)) = info.layout.fields.iter().find(|(_, f)| f.name == field) {
-                return Some(program.types.get(fl.type_id).desc.clone());
+                return Some(program.types.get(fl.type_id).desc.as_ref().clone());
             }
         }
         for base in program.bases_of(&cur) {
@@ -6078,8 +6245,16 @@ fn same_signature_loosely(program: &Program, a: FnId, b: FnId) -> bool {
         || pb.is_empty()
         || pa.iter().zip(pb).all(|(&x, &y)| {
             same_type(
-                &program.types.get(program.symbols.variable(x).type_id).desc,
-                &program.types.get(program.symbols.variable(y).type_id).desc,
+                program
+                    .types
+                    .get(program.symbols.variable(x).type_id)
+                    .desc
+                    .as_ref(),
+                program
+                    .types
+                    .get(program.symbols.variable(y).type_id)
+                    .desc
+                    .as_ref(),
             )
         })
 }
@@ -6185,6 +6360,10 @@ fn lower_lambda_expression(
         return Some(existing);
     }
     let provisional_id = program.symbols.alloc_fn_id();
+    let provisional_start = (
+        program.symbols.variables.len(),
+        program.symbols.call_sites.len(),
+    );
     let mut params = Vec::new();
     if let Some(params_node) = node
         .children(&mut node.walk())
@@ -6236,7 +6415,7 @@ fn lower_lambda_expression(
         is_final: false,
         is_cpp: true,
     });
-    reassign_fn_id(program, provisional_id, fn_id);
+    reassign_fn_id(program, provisional_id, fn_id, provisional_start);
     let saved_fn = ctx.current_fn;
     let saved_locals = ctx.locals.clone();
     let saved_class = ctx.class_ctx.clone();
@@ -6321,7 +6500,7 @@ fn lower_lambda_expression(
                     })))
             })
             .unwrap_or_else(|| program.types.int());
-        let is_ptr = matches!(program.types.get(type_id).desc, TypeDesc::Ptr(_));
+        let is_ptr = matches!(program.types.get(type_id).desc.as_ref(), TypeDesc::Ptr(_));
         program.symbols.add_variable(Variable {
             id: var_id,
             name: name.clone(),
@@ -6669,6 +6848,7 @@ fn receiver_desc(
                     .types
                     .get(program.symbols.variable(v).type_id)
                     .desc
+                    .as_ref()
                     .clone();
                 if ctx.reference_vars.contains(&v) {
                     if let TypeDesc::Ptr(inner) = desc {
@@ -7300,7 +7480,7 @@ fn infer_static_class(
 
 fn var_static_class(program: &Program, v: VarId) -> Option<String> {
     let var = program.symbols.variable(v);
-    class_name_of_desc(&program.types.get(var.type_id).desc)
+    class_name_of_desc(program.types.get(var.type_id).desc.as_ref())
 }
 
 /// Peel `Ptr` layers (including references, which lower as pointers) to a
@@ -7443,7 +7623,7 @@ fn lower_initializer_list(
 /// Declared field names of the struct type behind `base`, in order.
 fn positional_struct_fields(program: &Program, base: VarId) -> Vec<Option<String>> {
     let ty = program.symbols.variable(base).type_id;
-    let TypeDesc::Struct { name, .. } = program.types.get(ty).desc.clone() else {
+    let TypeDesc::Struct { name, .. } = program.types.get(ty).desc.as_ref().clone() else {
         return Vec::new();
     };
     if name.is_empty() {
@@ -7467,7 +7647,7 @@ fn positional_struct_fields(program: &Program, base: VarId) -> Vec<Option<String
 
 fn field_id_for(program: &Program, base: VarId, fname: &str) -> Option<trace_ir::FieldId> {
     let ty = program.symbols.variable(base).type_id;
-    let TypeDesc::Struct { name, .. } = program.types.get(ty).desc.clone() else {
+    let TypeDesc::Struct { name, .. } = program.types.get(ty).desc.as_ref().clone() else {
         return None;
     };
     let tid = program
@@ -7850,7 +8030,12 @@ fn decompose_field_path(
         && arrows.first() == Some(&true)
         && if cur.kind() == "identifier" {
             // The common case only needs a type tag, not a cloned layout.
-            match &program.types.get(variable_type_id(program, base)?).desc {
+            match program
+                .types
+                .get(variable_type_id(program, base)?)
+                .desc
+                .as_ref()
+            {
                 TypeDesc::Ptr(inner) if ctx.reference_vars.contains(&base) => {
                     matches!(**inner, TypeDesc::Ptr(_))
                 }
@@ -7910,7 +8095,7 @@ fn decompose_field_path(
         field_ids.push(fid);
         let layout = program.types.get(type_id);
         type_id = layout.layout.fields.get(&fid)?.type_id;
-        raw_pointer = matches!(program.types.get(type_id).desc, TypeDesc::Ptr(_));
+        raw_pointer = matches!(program.types.get(type_id).desc.as_ref(), TypeDesc::Ptr(_));
         type_id = peel_ptr_to_struct(program, type_id);
     }
     // Method names also pass through decomposition. Allocate only after the
@@ -7927,7 +8112,7 @@ fn decompose_field_path(
 /// one, or one whose body is not in the tree (#86) steps to the class the
 /// arrow yields when that class has a layout to look `f` up in.
 fn peel_wrapper_to_pointee(program: &Program, type_id: trace_ir::TypeId) -> trace_ir::TypeId {
-    let TypeDesc::Struct { name, .. } = &program.types.get(type_id).desc else {
+    let TypeDesc::Struct { name, .. } = program.types.get(type_id).desc.as_ref() else {
         return type_id;
     };
     if name.is_empty() {
@@ -7957,7 +8142,7 @@ fn peel_wrapper_to_pointee(program: &Program, type_id: trace_ir::TypeId) -> trac
 }
 
 fn peel_ptr_to_struct(program: &mut Program, type_id: trace_ir::TypeId) -> trace_ir::TypeId {
-    let inner = match &program.types.get(type_id).desc {
+    let inner = match program.types.get(type_id).desc.as_ref() {
         TypeDesc::Ptr(inner) => Some((**inner).clone()),
         _ => None,
     };
@@ -7967,7 +8152,7 @@ fn peel_ptr_to_struct(program: &mut Program, type_id: trace_ir::TypeId) -> trace
 fn struct_type_for_var(program: &mut Program, var: VarId) -> Option<trace_ir::TypeId> {
     let mut type_id = variable_type_id(program, var)?;
     for _ in 0..4 {
-        match &program.types.get(type_id).desc.clone() {
+        match &program.types.get(type_id).desc.as_ref().clone() {
             TypeDesc::Ptr(inner) => {
                 // A template instantiation can exist only inside this pointer
                 // descriptor so far; intern its layout before looking it up.
@@ -8768,7 +8953,10 @@ fn emit_field_fn_ptr_load(
             });
             return Some(load_var);
         }
-        if matches!(program.types.get(field_type_id).desc, TypeDesc::Ptr(_)) {
+        if matches!(
+            program.types.get(field_type_id).desc.as_ref(),
+            TypeDesc::Ptr(_)
+        ) {
             let load_var = program.symbols.alloc_var_id();
             let span = node_span(program, ctx, span_node);
             program.symbols.add_variable(Variable {
@@ -8786,12 +8974,12 @@ fn emit_field_fn_ptr_load(
                 src: gep,
             });
             current = load_var;
-            type_id = program
-                .types
-                .resolve_type_id(match &program.types.get(field_type_id).desc {
+            type_id = program.types.resolve_type_id(
+                match program.types.get(field_type_id).desc.as_ref() {
                     TypeDesc::Ptr(inner) => inner,
                     _ => unreachable!(),
-                });
+                },
+            );
         } else {
             current = gep;
         }
@@ -9079,7 +9267,7 @@ fn type_desc_from_node(
                 let fields = program
                     .types
                     .type_id_by_tag(&cls, trace_ir::TypeKind::Struct)
-                    .and_then(|id| match &program.types.get(id).desc {
+                    .and_then(|id| match program.types.get(id).desc.as_ref() {
                         TypeDesc::Struct { fields, .. } => Some(fields.clone()),
                         _ => None,
                     })
@@ -9967,6 +10155,129 @@ fn node_end_line(program: &Program, ctx: &LowerContext, node: Node, span: Span) 
                 span.line
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod index_window_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn units_merge_in_order_while_workers_run_ahead_within_the_window() {
+        let jobs = 4;
+        let items: Vec<PathBuf> = (0..40).map(|i| PathBuf::from(format!("/u{i}.c"))).collect();
+        let pool = index_pool(jobs).unwrap();
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let merged_count = AtomicUsize::new(0);
+        let mut merged: Vec<usize> = Vec::new();
+        pool.install(|| {
+            index_in_window(
+                &items,
+                jobs,
+                |path| {
+                    let i: usize = path.to_str().unwrap()[2..]
+                        .trim_end_matches(".c")
+                        .parse()
+                        .unwrap();
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    // The first unit is the straggler: everyone else finishes
+                    // long before it, and must not wait for it to be taken.
+                    let delay = if i == 0 { 40 } else { 1 };
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    // A worker can only be this far past the merge.
+                    assert!(i < merged_count.load(Ordering::SeqCst) + index_window(jobs));
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    i
+                },
+                |i| {
+                    merged.push(i);
+                    merged_count.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+        });
+        assert_eq!(merged, (0..40).collect::<Vec<_>>());
+        assert!(
+            peak.load(Ordering::SeqCst) >= 2,
+            "workers did not run in parallel"
+        );
+    }
+
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "payload of another type".to_string())
+    }
+
+    #[test]
+    fn a_panic_on_either_side_unwinds_instead_of_hanging() {
+        let jobs = 3;
+        let items: Vec<PathBuf> = (0..30).map(|i| PathBuf::from(format!("/u{i}.c"))).collect();
+        let pool = index_pool(jobs).unwrap();
+        let unit_of = |path: &PathBuf| -> usize {
+            path.to_str().unwrap()[2..]
+                .trim_end_matches(".c")
+                .parse()
+                .unwrap()
+        };
+        // A worker panics while the merge waits for its unit and the other
+        // workers wait on the window.
+        let worker = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.install(|| {
+                index_in_window(
+                    &items,
+                    jobs,
+                    |path| {
+                        let i = unit_of(path);
+                        assert!(i != 7, "unit 7 fails to index");
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        i
+                    },
+                    |_| {},
+                )
+            })
+        }));
+        let message = panic_message(worker.unwrap_err());
+        assert!(message.contains("unit 7 fails to index"), "{message}");
+        // The merge panics while workers wait on the window ahead of it.
+        let merge = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.install(|| {
+                index_in_window(
+                    &items,
+                    jobs,
+                    |path| unit_of(path),
+                    |i| assert!(i != 2, "unit 2 fails to merge"),
+                )
+            })
+        }));
+        let message = panic_message(merge.unwrap_err());
+        assert!(message.contains("unit 2 fails to merge"), "{message}");
+        // The pool is still usable afterwards.
+        let mut merged = Vec::new();
+        pool.install(|| index_in_window(&items[..5], jobs, unit_of, |i| merged.push(i)));
+        assert_eq!(merged, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn empty_and_single_worker_inputs_complete() {
+        let pool = index_pool(2).unwrap();
+        let mut seen = Vec::new();
+        pool.install(|| index_in_window(&[], 2, |_| 0usize, |i| seen.push(i)));
+        assert!(seen.is_empty());
+        let items = [PathBuf::from("/a.c"), PathBuf::from("/b.c")];
+        pool.install(|| {
+            index_in_window(
+                &items,
+                1,
+                |p| p.clone(),
+                |p| seen.push(p.to_str().unwrap().len()),
+            )
+        });
+        assert_eq!(seen, vec![4, 4]);
     }
 }
 

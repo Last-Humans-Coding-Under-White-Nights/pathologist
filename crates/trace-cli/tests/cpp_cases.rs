@@ -57,7 +57,7 @@ fn cpp_auto_return_types_match_explicit_receivers() {
             .variables
             .iter()
             .filter(move |v| v.fn_id == Some(id) && v.name == "p")
-            .map(|v| &program.types.get(v.type_id).desc)
+            .map(|v| program.types.get(v.type_id).desc.as_ref())
     };
     assert_eq!(
         program
@@ -725,7 +725,7 @@ fn arrow_fallback_skips_nested_types_and_spells_scalar_arguments_as_written() {
             .iter()
             .find(|v| v.name == var)
             .unwrap_or_else(|| panic!("{var} must be indexed"));
-        match &program.types.get(v.type_id).desc {
+        match program.types.get(v.type_id).desc.as_ref() {
             trace_ir::TypeDesc::Struct { name, .. } => name.clone(),
             other => panic!("{var}: {other:?}"),
         }
@@ -974,7 +974,7 @@ fn struct_tag_names(program: &Program) -> Vec<String> {
         .types
         .all()
         .iter()
-        .filter_map(|t| match &t.desc {
+        .filter_map(|t| match t.desc.as_ref() {
             trace_ir::TypeDesc::Struct { name, .. } if !name.is_empty() => Some(name.clone()),
             _ => None,
         })
@@ -3337,7 +3337,7 @@ fn defined_return_types(tag: &str, src: &str) -> Vec<(String, trace_ir::TypeDesc
         .map(|f| {
             (
                 f.name.clone(),
-                program.types.get(f.return_type).desc.clone(),
+                program.types.get(f.return_type).desc.as_ref().clone(),
             )
         })
         .collect();
@@ -4414,7 +4414,10 @@ fn a_pointer_typedef_to_a_struct_keeps_its_pointer() {
         .map(|v| v.type_id)
         .expect("the parameter has a type");
     assert!(
-        matches!(program.types.get(ty).desc, trace_ir::TypeDesc::Ptr(_)),
+        matches!(
+            program.types.get(ty).desc.as_ref(),
+            trace_ir::TypeDesc::Ptr(_)
+        ),
         "SessionPtr is a pointer, got {:?}",
         program.types.get(ty).desc
     );
@@ -4586,7 +4589,7 @@ fn c_typedef_self_alias_preserves_struct_pointer_type() {
         let f = program.symbols.function(id);
         let param_var = program.symbols.variable(f.params[0]);
         let param_ty = program.types.get(param_var.type_id);
-        match &param_ty.desc {
+        match param_ty.desc.as_ref() {
             trace_ir::TypeDesc::Ptr(inner) => match &**inner {
                 trace_ir::TypeDesc::Ptr(elem) => match &**elem {
                     trace_ir::TypeDesc::Struct { name, .. } => assert_eq!(name, "Session"),
@@ -4683,7 +4686,7 @@ fn bare_type_name_resolves_through_enclosing_namespaces() {
         .find(|f| f.name == "a::b::c::MakeDeep")
         .expect("MakeDeep");
     assert!(
-        matches!(&program.types.get(make.return_type).desc,
+        matches!(program.types.get(make.return_type).desc.as_ref(),
             trace_ir::TypeDesc::Ptr(inner)
                 if matches!(&**inner, trace_ir::TypeDesc::Struct { name, .. } if name == "a::b::Deep")),
         "a return type is looked up like any other type"
@@ -4806,7 +4809,7 @@ fn nested_class_is_registered_under_its_outer_class() {
         program
             .types
             .type_id_by_tag(cls, trace_ir::TypeKind::Struct)
-            .map(|id| match &program.types.get(id).desc {
+            .map(|id| match program.types.get(id).desc.as_ref() {
                 trace_ir::TypeDesc::Struct { fields, .. } => {
                     fields.iter().any(|(name, _)| name == field)
                 }
@@ -4909,7 +4912,7 @@ fn array_alias_keeps_its_shape() {
         .find(|v| v.name == "cb_table")
         .expect("cb_table");
     assert!(matches!(
-        program.types.get(table.type_id).desc,
+        program.types.get(table.type_id).desc.as_ref(),
         trace_ir::TypeDesc::Array { .. }
     ));
 }
@@ -4959,7 +4962,7 @@ fn bodyless_class_specifier_inside_a_class_names_the_member_class() {
             .types
             .type_id_by_tag(cls, trace_ir::TypeKind::Struct)
             .unwrap_or_else(|| panic!("{cls}: {tags:?}"));
-        matches!(&program.types.get(id).desc, trace_ir::TypeDesc::Struct { fields, .. }
+        matches!(program.types.get(id).desc.as_ref(), trace_ir::TypeDesc::Struct { fields, .. }
             if fields.iter().any(|(name, desc)| name == field
                 && matches!(desc, trace_ir::TypeDesc::Ptr(inner)
                     if matches!(&**inner, trace_ir::TypeDesc::Struct { name, .. } if name == target))))

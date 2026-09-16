@@ -68,6 +68,13 @@ std::thread_local! {
         RefCell::new((0, FxHashMap::default()));
 }
 
+/// Release filesystem memo storage owned by the calling thread after a phase.
+/// Subsequent lookups repopulate it without invalidating other threads' caches.
+pub fn release_thread_path_caches() {
+    CANON_CACHE.with(|cache| *cache.borrow_mut() = FxHashMap::default());
+    PROBE_CACHE.with(|cache| cache.borrow_mut().1 = FxHashMap::default());
+}
+
 /// Discard every memoized file probe: the tree may have changed since the last
 /// one was taken.
 ///
@@ -107,7 +114,7 @@ pub fn is_file_cached(path: &Path) -> bool {
             let mut cache = cache.borrow_mut();
             if cache.0 != epoch {
                 cache.0 = epoch;
-                cache.1.clear();
+                cache.1 = FxHashMap::default();
             } else if let Some(hit) = cache.1.get(key) {
                 return *hit;
             }
@@ -183,7 +190,7 @@ fn dir_listing(dir: &Path) -> Option<Arc<DirListing>> {
     let mut cache = DIR_LISTINGS.write().unwrap_or_else(|e| e.into_inner());
     if cache.0 != epoch {
         cache.0 = epoch;
-        cache.1.clear();
+        cache.1 = FxHashMap::default();
     }
     cache.1.entry(key.to_vec()).or_insert(listing).clone()
 }
@@ -263,5 +270,17 @@ mod tests {
             // one: include resolution probes directories all the time.
             assert!(!is_file_cached(here.parent().unwrap()));
         }
+    }
+    #[test]
+    fn phase_release_drops_capacity_and_preserves_lookup_results() {
+        let _guard = EPOCH.lock().unwrap();
+        let here = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/paths.rs");
+        let canonical = canonicalize(&here);
+        assert!(is_file_cached(&here));
+        release_thread_path_caches();
+        CANON_CACHE.with(|cache| assert_eq!(cache.borrow().capacity(), 0));
+        PROBE_CACHE.with(|cache| assert_eq!(cache.borrow().1.capacity(), 0));
+        assert_eq!(canonicalize(&here), canonical);
+        assert!(is_file_cached(&here));
     }
 }
