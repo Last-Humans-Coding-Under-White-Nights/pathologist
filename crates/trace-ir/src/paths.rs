@@ -2,7 +2,7 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -207,6 +207,24 @@ fn read_listing(dir: &Path) -> Option<DirListing> {
         names.insert(bytes.to_vec());
     }
     Some(DirListing { names, folded })
+}
+
+/// Resolve `path` against `directory` and fold away `.` / `..` lexically before
+/// canonicalizing, so an artifact that was never built still compares equal to
+/// the same path spelled differently by another command.
+pub fn resolve_against(directory: &Path, path: &Path) -> PathBuf {
+    let joined = directory.join(path);
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            part => normalized.push(part.as_os_str()),
+        }
+    }
+    canonicalize(&normalized)
 }
 
 #[cfg(test)]

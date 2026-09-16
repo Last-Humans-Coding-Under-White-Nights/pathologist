@@ -1,12 +1,12 @@
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 // Keep the complete public schema and the bulk-export phases in sync without
 // duplicating SQL. The exporter defers only non-unique secondary indexes.
 macro_rules! define_schema {
     ($tables:literal, $indexes:literal) => {
-        pub const SCHEMA_V4: &str = concat!($tables, $indexes);
-        pub(crate) const TABLES_V4: &str = $tables;
-        pub(crate) const INDEXES_V4: &str = $indexes;
+        pub const SCHEMA_V5: &str = concat!($tables, $indexes);
+        pub(crate) const TABLES_V5: &str = $tables;
+        pub(crate) const INDEXES_V5: &str = $indexes;
     };
 }
 
@@ -28,6 +28,24 @@ CREATE TABLE IF NOT EXISTS files (
     is_dep INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS link_targets (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    output TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS target_sources (
+    target_id INTEGER NOT NULL REFERENCES link_targets(id),
+    file_id INTEGER NOT NULL REFERENCES files(id),
+    PRIMARY KEY (target_id, file_id)
+);
+
+CREATE TABLE IF NOT EXISTS target_dependencies (
+    target_id INTEGER NOT NULL REFERENCES link_targets(id),
+    dependency_id INTEGER NOT NULL REFERENCES link_targets(id),
+    PRIMARY KEY (target_id, dependency_id)
+);
+
 CREATE TABLE IF NOT EXISTS functions (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -37,7 +55,9 @@ CREATE TABLE IF NOT EXISTS functions (
     linkage TEXT NOT NULL,
     signature TEXT NOT NULL,
     is_defined INTEGER NOT NULL,
-    is_dep INTEGER NOT NULL DEFAULT 0
+    is_dep INTEGER NOT NULL DEFAULT 0,
+    is_weak INTEGER NOT NULL DEFAULT 0,
+    target_id INTEGER REFERENCES link_targets(id)
 );
 
 CREATE TABLE IF NOT EXISTS types (
@@ -56,7 +76,9 @@ CREATE TABLE IF NOT EXISTS variables (
     type_id INTEGER NOT NULL REFERENCES types(id),
     file_id INTEGER NOT NULL REFERENCES files(id),
     line INTEGER NOT NULL,
-    col INTEGER NOT NULL DEFAULT 0
+    col INTEGER NOT NULL DEFAULT 0,
+    is_weak INTEGER NOT NULL DEFAULT 0,
+    target_id INTEGER REFERENCES link_targets(id)
 );
 
 CREATE TABLE IF NOT EXISTS call_sites (
@@ -138,6 +160,12 @@ CREATE INDEX IF NOT EXISTS idx_functions_name ON functions(name);
 CREATE INDEX IF NOT EXISTS idx_flow_edges_src ON flow_edges(src_node);
 CREATE INDEX IF NOT EXISTS idx_flow_edges_dst ON flow_edges(dst_node);
 CREATE INDEX IF NOT EXISTS idx_flow_nodes_var ON flow_nodes(var_id);
+-- Partial: without link metadata every `target_id` is NULL, and a partial
+-- index over no rows costs nothing to build or store.
+CREATE INDEX IF NOT EXISTS idx_functions_target ON functions(target_id) WHERE target_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_variables_target ON variables(target_id) WHERE target_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_target_sources_file ON target_sources(file_id);
+CREATE INDEX IF NOT EXISTS idx_target_dependencies_dependency ON target_dependencies(dependency_id);
 "#
 );
 
@@ -150,7 +178,7 @@ mod tests {
     fn deferred_indexes_preserve_schema_and_insertion_constraints() {
         let staged = Connection::open_in_memory().unwrap();
         staged.execute_batch("BEGIN IMMEDIATE;").unwrap();
-        staged.execute_batch(TABLES_V4).unwrap();
+        staged.execute_batch(TABLES_V5).unwrap();
         staged
             .execute(
                 "INSERT INTO files (id, path, sha256) VALUES (1, 'a.c', '')",
@@ -169,11 +197,11 @@ mod tests {
                 []
             )
             .is_err());
-        staged.execute_batch(INDEXES_V4).unwrap();
+        staged.execute_batch(INDEXES_V5).unwrap();
         staged.execute_batch("COMMIT;").unwrap();
 
         let complete = Connection::open_in_memory().unwrap();
-        complete.execute_batch(SCHEMA_V4).unwrap();
+        complete.execute_batch(SCHEMA_V5).unwrap();
         let schema = |conn: &Connection| {
             conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
                 .unwrap()

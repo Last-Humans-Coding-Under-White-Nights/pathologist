@@ -5,6 +5,9 @@ use std::fmt;
 pub struct FileId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TargetId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FnId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -36,6 +39,7 @@ macro_rules! impl_display_id {
 }
 
 impl_display_id!(FileId);
+impl_display_id!(TargetId);
 impl_display_id!(FnId);
 impl_display_id!(VarId);
 impl_display_id!(TypeId);

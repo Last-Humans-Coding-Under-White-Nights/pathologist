@@ -32,6 +32,7 @@ pub(super) fn build(
     headers: &[PathBuf],
     mut graph: IncludeGraph,
     database: CompilationDatabase,
+    links: crate::link_commands::LinkDatabase,
 ) -> Result<Program, String> {
     let candidates = (opts.explore && opts.explore_budget > 0)
         .then(|| crate::explore::scan_project_gn_candidates(root));
@@ -54,7 +55,7 @@ pub(super) fn build(
         files
             .par_iter()
             .map(|path| {
-                let configs = configs_for(&database, &fallback, path);
+                let (configs, from_database) = configs_for(&database, &fallback, path);
                 let mut result = ConfiguredUnits {
                     units: Vec::new(),
                     includes: Vec::new(),
@@ -62,16 +63,24 @@ pub(super) fn build(
                 // The budget bounds exploration for the source, not for each
                 // command: N commands must not buy N times the exploration.
                 let mut budget = opts.explore_budget;
-                for config in configs {
+                for (command_index, config) in configs.iter().enumerate() {
                     let mut config = config
                         .clone()
                         .for_indexing()
                         .with_inline_include_bodies(true);
+                    config.record_link_ownership = !links.targets.is_empty();
                     // Neither path-keyed source entries nor header expansions are valid
                     // across commands with different search paths, even if macros match.
-                    config.include_expansion_cache = None;
-                    config.shared_macros = None;
-                    config.accumulate_macros = false;
+                    // A source with no command of its own uses the one shared
+                    // configuration, where they are valid — and link metadata
+                    // alone routes every source through here, so discarding the
+                    // expansion cache for those would make `--link-commands`
+                    // re-expand every header of every unit.
+                    if from_database {
+                        config.include_expansion_cache = None;
+                        config.shared_macros = None;
+                        config.accumulate_macros = false;
+                    }
                     config.record_conditionals = opts.explore || opts.record_conditionals;
                     if config.source_cache.is_none() {
                         config.source_cache.clone_from(&raw_sources);
@@ -82,7 +91,7 @@ pub(super) fn build(
                         .as_ref()
                         .map(|_| effective_defines(&config))
                         .unwrap_or_default();
-                    let (base, variants) = index_source_file_with_variants(
+                    let (mut base, mut variants) = index_source_file_with_variants(
                         path,
                         root,
                         &graph,
@@ -97,6 +106,10 @@ pub(super) fn build(
                     budget = budget.saturating_sub(variants.len());
                     for (_, includes) in cache.included_by_file() {
                         result.includes.extend(includes);
+                    }
+                    base.compilation_index = Some(command_index);
+                    for unit in &mut variants {
+                        unit.compilation_index = Some(command_index);
                     }
                     result.units.push(base);
                     result.units.extend(variants);
@@ -124,7 +137,9 @@ pub(super) fn build(
     // Merge the complete configuration family together. A shared header can
     // vary between different source files as well as between commands for one
     // source; ordinary TU deduplication would drop its second body.
-    if let Some((base, variants)) = units.split_first() {
+    if !links.targets.is_empty() {
+        crate::merge::merge_linked_units(&mut program, &units, &links);
+    } else if let Some((base, variants)) = units.split_first() {
         merge_unit_variants(&mut program, base, variants);
     }
     // `merge_unit_variants` counts variants across the whole family; this field
@@ -133,7 +148,7 @@ pub(super) fn build(
     let mut cpp_sources = FxHashSet::default();
     let mut no_c_units = true;
     for path in files {
-        let configs = configs_for(&database, &fallback, path);
+        let (configs, _) = configs_for(&database, &fallback, path);
         for config in configs {
             match config.language.unwrap_or_else(|| Language::from_path(path)) {
                 Language::C => no_c_units = false,
@@ -202,16 +217,18 @@ pub(super) fn build(
 }
 
 /// The commands for `path`, or the inferred configuration when it has none.
+/// The configurations to index `path` under, and whether they came from the
+/// compilation database. Returned together so the caller cannot ask the
+/// provenance question separately and drift from the answer given here.
 fn configs_for<'a>(
     database: &'a CompilationDatabase,
     fallback: &'a PreprocessOptions,
     path: &Path,
-) -> &'a [PreprocessOptions] {
-    database
-        .commands
-        .get(path)
-        .map(Vec::as_slice)
-        .unwrap_or(std::slice::from_ref(fallback))
+) -> (&'a [PreprocessOptions], bool) {
+    match database.commands.get(path) {
+        Some(commands) => (commands.as_slice(), true),
+        None => (std::slice::from_ref(fallback), false),
+    }
 }
 
 fn effective_defines(opts: &PreprocessOptions) -> BTreeMap<String, String> {

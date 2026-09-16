@@ -74,6 +74,8 @@ trace analyze [OPTIONS] <TARGET>
 | `--include <PATH>` | Add a preprocessor `#include` search path. Repeatable. |
 | `-D <NAME>` | Define preprocessor macro `NAME=1`. Repeatable. |
 | `-D <NAME=VALUE>` | Define macro with explicit value. Repeatable. Overrides the language predefines (`__cplusplus`, `__STDC_VERSION__`, `__STDC__`) when the name matches. |
+| `--compile-commands <PATH>` | Compilation database to read. Default: auto-discovery at the target root, then `build/`. |
+| `--link-commands <PATH>` | Link commands database to read, establishing which sources each program links. Default: auto-discovery (`link_commands.json` at the target root or `build/`, link entries in the compilation database, or a CMake File API reply). Enables per-program weak-symbol resolution; see [link targets and weak symbols](docs/ANALYSIS.md#link-targets-and-weak-symbols). |
 | `--jobs <N>` | Parallel jobs for indexing (parse + lower). Default: logical CPU count. |
 | `--timeout-secs <N>` | Watchdog: abort the process after N seconds (exit 124). Useful when probing hang-prone trees. |
 | `--full-export` | Export full IR detail: all types, all variables, PAG `locations`. Slower and produces a larger database. |
@@ -128,7 +130,8 @@ trace analyze ./my_app --compile-commands ./out/compile_commands.json -o /tmp/ap
 
 - **`.c` and `.cpp`-family files** are indexed as translation units. Headers are pulled in via `#include` during preprocessing, not analyzed as standalone TUs. A C++ unit is preprocessed with `__cplusplus` (`201703L`) and `__STDC__` predefined, a C unit with `__STDC__` and `__STDC_VERSION__` (`201710L`), so `#ifdef __cplusplus` takes the C++ arm in `.cpp` units and the C arm in `.c` units, headers included. C++ support is a pragmatic first step — see [docs/ANALYSIS.md](docs/ANALYSIS.md) for scope and imprecision.
 - Line numbers in the database refer to **original** files on disk (resolved through the preprocessor's `LineMap`); call sites inside macro expansions attribute to the expansion site.
-- **Compilation database** — automatically reads `compile_commands.json` at the target root, then `build/compile_commands.json`, or an explicit `--compile-commands PATH`. Each entry supplies its working directory, ordered `-I`/`-iquote`/`-isystem` paths, ordered `-D`/`-U`, `-include`, and `-x`/`-std`. MSVC `cl`/`clang-cl` preprocessing switches (`/I`, `/D`, `/U`, `/FI`, `/TC`, `/TP`, `/Tc`, `/Tp`, `/std:`) are also supported. All commands for a source contribute facts, even without `--explore`. CLI `--include` paths precede database `-I` paths and CLI `-D` values override database macros. Files without a usable entry retain inferred configuration; a database is never required. See [compilation database support](docs/ANALYSIS.md#compilation-databases-62).
+- **Compilation database** — automatically reads `compile_commands.json` at the target root, then `build/compile_commands.json`, or an explicit `--compile-commands PATH`. Each entry supplies its working directory, ordered `-I`/`-iquote`/`-isystem` paths, ordered `-D`/`-U`, `-include`, and `-x`/`-std`. MSVC `cl`/`clang-cl` preprocessing switches (`/I`, `/D`, `/U`, `/FI`, `/TC`, `/TP`, `/Tc`, `/Tp`, `/std:`) are also supported. All applicable commands for a source contribute facts, even without `--explore`; link-object membership restricts them to their target. CLI `--include` paths precede database `-I` paths and CLI `-D` values override database macros. Files without a usable entry retain inferred configuration; a database is never required. See [compilation database support](docs/ANALYSIS.md#compilation-databases-62).
+- **Link targets and weak symbols** — `--link-commands PATH`, auto-discovered `link_commands.json`, mixed compilation/link databases, and CMake File API replies establish target scopes. Strong definitions override weak fallbacks only in targets that contain them; shared sources retain separate bindings per target. See [resolution rules and limitations](docs/ANALYSIS.md#link-targets-and-weak-symbols).
 - **`static` functions** (internal linkage) and **file-scope `static` variables** are resolved within the defining translation unit. **`static` locals** inside functions are tracked as `fn_static` storage.
 - **Dependency roots (`--dep <PATH>`)** separate what the target *uses* from what it *is*. A dependency's headers are reached and merged for their declarations — smart-pointer wrappers such as `sptr<T>`, base classes, external interfaces — so a wrapper-typed receiver resolves on the wrapped class rather than producing an edge on the wrapper. Its sources are never translation units, its unreached headers are never indexed as standalone units, and a body written in a dependency header merges as a declaration (`is_defined = 0`) with no call sites, locals, value flow or return flow. Files and functions from a dependency root export with `is_dep = 1`; `trace inspect calls --exclude-deps` drops the edges that touch them. A dependency root nested inside the analysis root is fine; one that contains or equals it is rejected at startup, since every source would become a dependency and nothing would be left to analyze.
 
@@ -164,7 +167,7 @@ instead.
 | `--to <FN>` | Filter edges where the **callee** name equals `FN` or ends with `::FN`. Same escaping as `--from`. |
 | `--file <SUBSTR>` | Filter ordinary edges by call-site or callee file; synthetic edges by caller or callee definition file. |
 | `--callgraph-filter <FILE>` | JSON file listing regex patterns over function names; edges whose caller and callee both fail to match are hidden. |
-| `--exclude-deps` | Hide call edges whose caller or callee comes from a dependency root (`is_dep = 1`). Requires a v4 database. |
+| `--exclude-deps` | Hide call edges whose caller or callee comes from a dependency root (`is_dep = 1`). Requires a v4 or later database. |
 
 Both filters may be combined. Output format:
 
@@ -423,197 +426,34 @@ So unresolved indirect sites (e.g. `sbuf->impl->readBuffer` before a fix) still 
 
 ## SQLite database schema
 
-Schema version: **v3**. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed.
+Schema version: **v5**. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed.
 
 ### Entity relationship (overview)
 
 ```text
 analysis_run
+link_targets ─┬─ target_sources → files
+              └─ target_dependencies → link_targets
 files ─┬─ functions ─┬─ call_sites ─ arg_flow_edges → variables
+       │             │  (target_id → link_targets)
        │             └─ call_edges → functions (caller and callee)
        └─ variables ─ flow_nodes ─ flow_edges → flow_nodes
-                    (fn_id → functions, type_id → types)
+                    (fn_id → functions, type_id → types,
+                     target_id → link_targets)
 types
 locations (full export / debug)
 points_to (debug only)
 diagnostics
 ```
 
-### `analysis_run`
+### Table reference
 
-Metadata for one `trace analyze` invocation.
+Every table, column and index is documented once, in
+[docs/SQLITE_SCHEMA.md](docs/SQLITE_SCHEMA.md) — including which tables each
+export mode writes, and the `is_weak` / `target_id` columns and `link_targets`
+tables added in v5. It is the canonical description; this file keeps only the
+overview above so the two cannot drift.
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INTEGER PK | Run id (always `1` per file). |
-| `trace_version` | TEXT | Full binary identity: package version, source revision, dirty state, and build date. |
-| `schema_version` | INTEGER | Database layout version (currently `4`). |
-| `target_root` | TEXT | Absolute or normalized `<TARGET>` path. |
-| `created_at` | TEXT | Unix timestamp (seconds). |
-| `options_json` | TEXT | JSON: `include_paths`, `defines`, `dep_roots`, `include_points_to`, `full_detail`. |
-
-### `files`
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INTEGER PK | Internal file id. |
-| `path` | TEXT UNIQUE | Source file path. |
-| `sha256` | TEXT | Content hash (may be empty in current export). |
-| `is_dep` | INTEGER | 1 if file resides under a dependency root (`--dep`), 0 otherwise. |
-
-### `functions`
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INTEGER PK | Internal function id. |
-| `name` | TEXT | Linkage-visible name (may duplicate across TUs before merge; ids differ). |
-| `file_id` | INTEGER FK → `files` | Defining or primary declaration file. |
-| `line_start` | INTEGER | Start line (original file). |
-| `line_end` | INTEGER | End line of the definition body; equals `line_start` for prototypes/synthesized externals. |
-| `linkage` | TEXT | `external`, `internal`, or `none`. |
-| `signature` | TEXT | Placeholder signature string (`fn_<name>`). |
-| `is_defined` | INTEGER | 1 if a body exists under the analyzed root; 0 covers prototypes and synthesized externals (libc, macro-referenced logging backends, dependency declarations). |
-| `is_dep` | INTEGER | 1 if function originates from a dependency root (`--dep`), 0 otherwise. |
-
-**Index:** `functions(name)`.
-
-### `call_sites`
-
-One row per collected call (direct name call or indirect/function-pointer syntax).
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INTEGER PK | Call site id (matches IR `CallSiteId`). |
-| `caller_fn_id` | INTEGER FK → `functions` | Containing function. |
-| `file_id` | INTEGER FK → `files` | File containing the call. |
-| `line` | INTEGER | Line (original file). |
-| `col` | INTEGER | Column. |
-| `callee_text` | TEXT | Surface syntax, e.g. `foo`, `p->handler`, `ndImpl->interFace->setIpAddr`. |
-| `is_direct` | INTEGER | `1` = direct call by name; `0` = indirect / fn-ptr / unresolved name. |
-
-### `call_edges`
-
-Resolved caller → callee edges (one row per target; indirect sites may have multiple rows).
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INTEGER PK | Edge id. |
-| `call_site_id` | INTEGER FK → `call_sites` | Call site this edge resolves; `NULL` for synthetic IPC bridge edges. |
-| `caller_fn_id` | INTEGER FK → `functions` | Resolved caller function. |
-| `callee_fn_id` | INTEGER FK → `functions` | Resolved target function. |
-| `resolution` | TEXT | `direct`, `indirect`, `ambiguous`, `external` (statically resolved but bodyless under the analyzed root), or `ipc` (synthetic proxy→stub bridge edge — no source call site, caller is the proxy method). |
-
-**Indexes:** `call_edges(callee_fn_id)`, `call_edges(call_site_id)`.
-
-### `arg_flow_edges`
-
-Maps actual arguments at a call site to callee formal parameters (when wired by analysis). Each row has **either** a variable actual **or** a function-pointer actual.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INTEGER PK | Edge id. |
-| `call_site_id` | INTEGER FK → `call_sites` | Call site. |
-| `arg_index` | INTEGER | Zero-based parameter position the argument binds to. For a C++ member function or constructor, position 0 is the implicit `this` and the first explicit argument is at 1. |
-| `actual_var_id` | INTEGER FK → `variables` | Variable passed at call site (`NULL` when actual is a function). |
-| `actual_fn_id` | INTEGER FK → `functions` | Function passed as fn-ptr actual (`NULL` when actual is a variable). |
-| `formal_var_id` | INTEGER FK → `variables` | Callee parameter variable. |
-
-A function name with several internal-linkage C++ overloads (`static` or in an anonymous namespace) is passed as each of them: one row per overload at the same `call_site_id`, `arg_index` and `formal_var_id`.
-
-**Index:** `arg_flow_edges(call_site_id)`.
-
-### `variables`
-
-Present in full export; in minimal export, only variables referenced by the
-flow graph / arg-flow edges.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INTEGER PK | Variable id. |
-| `name` | TEXT | Source name or synthetic temp (`_gepN`, `_loadN`, …). |
-| `kind` | TEXT | `global`, `file_static`, `fn_static`, `param`, `local`. |
-| `fn_id` | INTEGER FK → `functions` | Enclosing function (`NULL` for globals). |
-| `type_id` | INTEGER FK → `types` | Type id. |
-| `file_id` | INTEGER FK → `files` | Declaration file. |
-| `line` | INTEGER | Declaration line. |
-| `col` | INTEGER | Declaration column (start of the declarator). |
-
-### `flow_nodes`
-
-PAG value-flow nodes used by `trace inspect dataflow`. Always exported.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INTEGER PK | PAG node id (same id space as `points_to.var_node_id`). |
-| `kind` | TEXT | `var`, `loc`, `call_target` (indirect-call site node), or `terminator` (function-model clears event). |
-| `label` | TEXT | Variable name, `loc:…`, or `fn:…`. |
-| `detail` | TEXT | Extra context (variable kind, enclosing function, …). |
-| `var_id` | INTEGER FK → `variables` | Owning variable (`NULL` for function locations). |
-| `fn_id` | INTEGER FK → `functions` | Enclosing function, when known. |
-
-**Index:** `flow_nodes(var_id)`.
-
-### `flow_edges`
-
-Directed value-flow edges (value flows src → dst). Always exported.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INTEGER PK | Edge id. |
-| `src_node` | INTEGER FK → `flow_nodes` | Source node. |
-| `dst_node` | INTEGER FK → `flow_nodes` | Destination node. |
-| `kind` | TEXT | `copy`, `addr_of`, `load`, `store`, `gep`, `dlsym`, `points_to`, `call_arg`, or `terminates` (function-model clears event). |
-
-**Indexes:** `flow_edges(src_node)`, `flow_edges(dst_node)`.
-
-### `types`
-
-Exported only with `--full-export`.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INTEGER PK | Type id. |
-| `kind` | TEXT | `void`, `int`, `struct`, `ptr`, `fn_ptr`, … |
-| `name` | TEXT | Display name. |
-| `size` | INTEGER | Layout size in bytes. |
-| `layout_json` | TEXT | JSON field layout for structs/unions. |
-
-### `locations`
-
-PAG abstract memory locations. Exported with `--full-export`.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INTEGER PK | Location id. |
-| `kind` | TEXT | e.g. `global`, `local`, `field_summary`, `function`, `string_lit`. |
-| `desc` | TEXT | Human-readable description. |
-| `type_id` | INTEGER FK → `types` | Optional type. |
-
-### `points_to`
-
-Maps PAG variable nodes to abstract locations. Exported with `--debug-points-to`.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `var_node_id` | INTEGER | PAG node id. |
-| `loc_id` | INTEGER FK → `locations` | Points-to target. |
-
-Primary key: `(var_node_id, loc_id)`.
-
-### `diagnostics`
-
-Preprocessor, parse, and analysis messages. `preprocess` rows carry the preprocessor's own
-severity and point at the file and line where the condition occurred (a nested header, not the
-including translation unit); one row per distinct `(file, line, message)`.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INTEGER PK | Diagnostic id. |
-| `severity` | TEXT | `error`, `warning`, `info`. |
-| `file_id` | INTEGER FK → `files` | Optional file. |
-| `line` | INTEGER | Line number. |
-| `message` | TEXT | Message text. |
-| `stage` | TEXT | `preprocess`, `parse`, or `analysis`. |
 
 ## Example SQL queries
 

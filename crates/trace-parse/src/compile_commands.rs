@@ -2,7 +2,7 @@
 //! the compiler nor a shell is executed when reading a database.
 
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use trace_preproc::{CommandMacro, Language, PreprocessOptions};
 
@@ -10,6 +10,11 @@ use trace_preproc::{CommandMacro, Language, PreprocessOptions};
 pub(crate) struct CompilationDatabase {
     pub commands: BTreeMap<PathBuf, Vec<PreprocessOptions>>,
     pub warnings: Vec<String>,
+    pub path: Option<PathBuf>,
+    pub link_entries: Vec<(usize, serde_json::Value)>,
+    /// Object outputs retain the ordinal of the successfully parsed source
+    /// command, so different macro configurations never alias by source path.
+    pub objects: BTreeMap<PathBuf, BTreeSet<(PathBuf, usize)>>,
 }
 
 #[derive(Deserialize)]
@@ -18,6 +23,7 @@ struct Entry {
     file: PathBuf,
     arguments: Option<Vec<String>>,
     command: Option<String>,
+    output: Option<PathBuf>,
 }
 
 impl CompilationDatabase {
@@ -67,7 +73,24 @@ impl CompilationDatabase {
             .iter()
             .map(|dep| trace_ir::canonicalize(dep))
             .collect();
+        // Object membership only matters to the link-target reader. Resolving it
+        // costs a filesystem canonicalize and two retained paths per command —
+        // tens of thousands of syscalls on a large database — so it is skipped
+        // unless link metadata exists to consume it. Link records can also live
+        // inside this very database, which no filesystem probe can see, so the
+        // parsed entries are consulted too; that test short-circuits on any
+        // entry whose `file` names a source.
+        let wants_objects =
+            crate::link_commands::metadata_exists(directory, overrides.link_commands.as_deref())
+                || entries.iter().any(crate::link_commands::is_link_only_entry);
+        db.path = Some(path.clone());
         for (i, entry) in entries.into_iter().enumerate() {
+            // Link-only records in mixed databases are handled by the target
+            // reader; they do not supply a preprocessing configuration.
+            if crate::link_commands::is_link_only_entry(&entry) {
+                db.link_entries.push((i, entry));
+                continue;
+            }
             let entry = match serde_json::from_value::<Entry>(entry) {
                 Ok(entry) => entry,
                 Err(e) => {
@@ -84,8 +107,17 @@ impl CompilationDatabase {
             if !in_root || dep_roots.iter().any(|dep| file.starts_with(dep)) {
                 continue;
             }
-            match entry.options(directory, &file, overrides) {
-                Ok(opts) => db.commands.entry(file).or_default().push(opts),
+            match entry.options(directory, &file, overrides, wants_objects) {
+                Ok((opts, output)) => {
+                    let ordinal = db.commands.get(&file).map_or(0, Vec::len);
+                    if let Some(output) = output {
+                        db.objects
+                            .entry(output)
+                            .or_default()
+                            .insert((file.clone(), ordinal));
+                    }
+                    db.commands.entry(file).or_default().push(opts);
+                }
                 Err(e) => db.warn_entry(&path, i, e),
             }
         }
@@ -119,7 +151,8 @@ impl Entry {
         directory: PathBuf,
         file: &Path,
         overrides: &PreprocessOptions,
-    ) -> Result<PreprocessOptions, String> {
+        wants_output: bool,
+    ) -> Result<(PreprocessOptions, Option<PathBuf>), String> {
         if !file.is_file() {
             return Err(format!("source does not exist: {}", file.display()));
         }
@@ -131,46 +164,21 @@ impl Entry {
         if args.is_empty() {
             return Err("empty arguments".into());
         }
+        let output = wants_output
+            .then(|| {
+                self.output
+                    .as_deref()
+                    .or_else(|| crate::link_commands::command_output(&args).map(Path::new))
+                    .filter(|path| crate::link_commands::is_object(path))
+                    .map(|path| trace_ir::resolve_against(&directory, path))
+            })
+            .flatten();
         let mut opts = overrides.clone();
         opts.working_directory = Some(directory.clone());
         opts.strict_include_search = true;
-        // Compiler launchers wrap the real driver, and can be chained
-        // (`ccache distcc g++`). The driver decides the default language, so
-        // skip past them rather than reading the launcher's name.
-        const LAUNCHERS: [&str; 8] = [
-            "ccache",
-            "sccache",
-            "distcc",
-            "distcc-pump",
-            "gomacc",
-            "icecc",
-            "icerun",
-            "buildcache",
-        ];
-        let is_launcher = |stem: &str| {
-            let stem_lower = stem.to_ascii_lowercase();
-            LAUNCHERS.iter().any(|&l| {
-                stem_lower == l
-                    || stem_lower
-                        .strip_prefix(l)
-                        .and_then(|r| r.strip_prefix('-'))
-                        .is_some_and(|version| {
-                            // A version suffix only. `ccache-4.10` is a launcher;
-                            // a `ccache-clang++` wrapper is the driver itself, and
-                            // skipping it would eat the argument that follows.
-                            !version.is_empty()
-                                && version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
-                        })
-            })
-        };
-        let mut driver_idx = 0;
-        while driver_idx + 1 < args.len() && is_launcher(binary_stem(&args[driver_idx])) {
-            driver_idx += 1;
-        }
-        let msvc = matches!(
-            binary_stem(&args[driver_idx]).to_ascii_lowercase().as_str(),
-            "cl" | "clang-cl"
-        ) || args.iter().any(|arg| arg == "--driver-mode=cl");
+        let driver_idx = driver_index(&args);
+        let msvc = matches!(driver_stem(&args).as_str(), "cl" | "clang-cl")
+            || args.iter().any(|arg| arg == "--driver-mode=cl");
         let driver_cpp = binary_stem(&args[driver_idx]).contains("++");
         let default_language = if driver_cpp {
             Language::Cpp
@@ -494,7 +502,7 @@ impl Entry {
             .collect();
         opts.include_paths
             .retain(|p| !systems.contains(&trace_ir::canonicalize(p)));
-        Ok(opts)
+        Ok((opts, output))
     }
 }
 
@@ -549,7 +557,7 @@ fn standard_macros(standard: &str) -> Result<(Language, Vec<CommandMacro>), Stri
 /// separators, leaving a corrupted include directory that never resolves —
 /// while `-DVERSION=\"1.0\"`, the escape that does appear in generated
 /// commands, keeps working.
-fn split_command(command: &str) -> Option<Vec<String>> {
+pub(crate) fn split_command(command: &str) -> Option<Vec<String>> {
     let mut args = Vec::new();
     let mut current = String::new();
     let mut has_token = false;
@@ -603,7 +611,52 @@ fn split_command(command: &str) -> Option<Vec<String>> {
     Some(args)
 }
 
-fn binary_stem(arg: &str) -> &str {
+/// Compiler launchers wrap the real driver, and can be chained
+/// (`ccache distcc g++`). The driver decides the language and the option
+/// syntax, so readers skip past them rather than reading the launcher's name.
+const LAUNCHERS: [&str; 8] = [
+    "ccache",
+    "sccache",
+    "distcc",
+    "distcc-pump",
+    "gomacc",
+    "icecc",
+    "icerun",
+    "buildcache",
+];
+
+fn is_launcher(stem: &str) -> bool {
+    let stem_lower = stem.to_ascii_lowercase();
+    LAUNCHERS.iter().any(|&l| {
+        stem_lower == l
+            || stem_lower
+                .strip_prefix(l)
+                .and_then(|r| r.strip_prefix('-'))
+                .is_some_and(|version| {
+                    // A version suffix only. `ccache-4.10` is a launcher;
+                    // a `ccache-clang++` wrapper is the driver itself, and
+                    // skipping it would eat the argument that follows.
+                    !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                })
+    })
+}
+
+/// Index of the real driver in `args`, past any chained launchers.
+pub(crate) fn driver_index<S: AsRef<str>>(args: &[S]) -> usize {
+    let mut idx = 0;
+    while idx + 1 < args.len() && is_launcher(binary_stem(args[idx].as_ref())) {
+        idx += 1;
+    }
+    idx
+}
+
+/// The driver's program name, case-folded. `binary_stem` strips `.exe` but
+/// keeps the spelling's case, and Windows tools are invoked as `LINK.EXE`.
+pub(crate) fn driver_stem<S: AsRef<str>>(args: &[S]) -> String {
+    binary_stem(args[driver_index(args)].as_ref()).to_ascii_lowercase()
+}
+
+pub(crate) fn binary_stem(arg: &str) -> &str {
     let filename = arg.rsplit(['/', '\\']).next().unwrap_or(arg);
     // `get` rather than a slice: a compiler path may end in a multi-byte
     // character, and `filename[len - 4..]` panics when that index falls
@@ -633,12 +686,15 @@ mod review_tests {
             file: file.clone(),
             arguments: Some(args.iter().map(|s| s.to_string()).collect()),
             command: None,
+            output: None,
         }
         .options(
             trace_ir::canonicalize(dir.path()),
             &trace_ir::canonicalize(&file),
             &PreprocessOptions::new(),
+            true,
         )
+        .map(|(options, _)| options)
     }
 
     #[test]
@@ -777,6 +833,7 @@ mod review_tests {
             directory: dir.path().into(),
             file: file.clone(),
             command: None,
+            output: None,
             arguments: Some(vec![
                 "cc".into(),
                 "-Ibuild/../inc".into(),
@@ -788,8 +845,10 @@ mod review_tests {
             trace_ir::canonicalize(dir.path()),
             &trace_ir::canonicalize(&file),
             &PreprocessOptions::new(),
+            true,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         let expected = trace_ir::canonicalize(&dir.path().join("inc"));
         assert_eq!(opts.quote_include_paths, vec![expected.clone()]);
         assert_eq!(opts.system_include_paths, vec![expected]);

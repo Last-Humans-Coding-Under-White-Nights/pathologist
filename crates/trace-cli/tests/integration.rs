@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use trace_analysis::analyze;
-use trace_db::{export_to_sqlite, open_db, ExportOptions};
+use trace_db::{export_to_sqlite, open_db, ExportOptions, SCHEMA_VERSION};
 use trace_parse::build_program;
 use trace_preproc::PreprocessOptions;
 
@@ -69,7 +69,11 @@ fn export_sqlite_roundtrip() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(versions, ("0.1.0 (test000 2026-09-02)".to_owned(), 4));
+    // Track the constant: a schema change must not need this literal edited.
+    assert_eq!(
+        versions,
+        ("0.1.0 (test000 2026-09-02)".to_owned(), SCHEMA_VERSION)
+    );
 }
 
 #[test]

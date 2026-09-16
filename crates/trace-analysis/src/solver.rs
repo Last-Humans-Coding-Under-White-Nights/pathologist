@@ -701,8 +701,9 @@ fn solve(
                         continue;
                     }
                     let name = abstract_loc.desc.clone();
+                    let target = pag.node_target(program, dst);
                     for func in &program.symbols.functions {
-                        if func.name == name {
+                        if func.name == name && func.target == target {
                             if let Some(&fn_loc) = pag.fn_locations.get(&func.id) {
                                 add_pts(&mut st, dst, fn_loc);
                             }
@@ -721,24 +722,32 @@ fn solve(
                     .filter(|c| c.id == cs_id)
                     .expect("call site id in index");
                 let mut new_callees = Vec::new();
+                // Loop-invariant: this is the solver's indirect-call fixpoint.
+                let scoped = !program.link_targets.is_empty();
+                let caller_target = program.symbols.function(cs.caller).target;
                 for &loc in delta.iter() {
                     if let Some(fn_id) = fn_for_loc(pag, loc) {
+                        let callee = program.symbols.function(fn_id);
+                        if scoped && callee.target != caller_target {
+                            continue;
+                        }
                         // If the resolved callee is undefined (e.g. a weak
                         // forward declaration), also pull in defined
                         // candidates with the same name so return flows
                         // and param wiring reach the real body.
-                        if !program.symbols.function(fn_id).is_defined {
-                            let name = program.symbols.function(fn_id).name.clone();
-                            let file = Some(program.symbols.function(fn_id).file);
-                            let extra: Vec<FnId> = program
-                                .symbols
-                                .resolve_function_candidates(&name, file)
-                                .into_iter()
-                                .filter(|c| program.symbols.function(*c).is_defined)
-                                .collect();
-                            if !extra.is_empty() {
-                                new_callees.extend(extra);
-                            }
+                        if !callee.is_defined {
+                            let (name, file) = (callee.name.clone(), Some(callee.file));
+                            new_callees.extend(
+                                program
+                                    .symbols
+                                    .resolve_function_candidates_in_target(
+                                        &name,
+                                        file,
+                                        caller_target,
+                                    )
+                                    .into_iter()
+                                    .filter(|c| program.symbols.function(*c).is_defined),
+                            );
                         }
                         new_callees.push(fn_id);
                     }
@@ -804,6 +813,10 @@ fn solve(
     // may target external interface methods when the stub delegates to an
     // inherited pure-virtual; these are still emitted for call graph
     // completeness.
+    // Deliberately unfiltered by target, unlike the indirect-call loop above:
+    // a Binder call is precisely one that crosses the process — and therefore
+    // the link image — boundary, so a bridge's endpoints normally differ in
+    // `target_id` (see `docs/ANALYSIS.md`, "Link targets and weak symbols").
     for bridge in &pag.ipc_bridges {
         let callee = bridge.stub_handler;
         call_edges.push(CallGraphEdge {

@@ -6,7 +6,7 @@ trace uses inclusion-based (Andersen-style) pointer analysis to resolve indirect
 
 | Property | Value |
 |----------|-------|
-| Scope | Whole-program (all indexed `.c` TUs under target root) |
+| Scope | Whole-program C/C++; independent link-target scopes when build metadata is available |
 | Flow sensitivity | **None** (control-flow insensitive) |
 | Field handling | Field-sensitive with **instance-insensitive field summaries** |
 | Pointer analysis kind | **May-analysis** (sound over-approximation) |
@@ -39,6 +39,123 @@ flowchart TD
 1. **`Pag::build(program)`** — materialize PAG nodes/constraints from `program.flow`, expand `CallReturn` using `program.fn_returns`, attach indirect-call `Load`/`Copy` constraints.
 2. **`solve`** — worklist propagation until fixpoint; discover indirect callees when call-target points-to gains function locations.
 3. **`extract_arg_flow`** — emit `arg_flow_edges` for wired parameter copies at resolved calls.
+
+## Link targets and weak symbols
+
+`--link-commands PATH` selects a link commands database. Otherwise indexing
+checks `link_commands.json` at the analysis root, then `build/`, and reads
+link-only entries from the selected compilation database. CMake metadata is
+read through the lexically last `index-*.json` File API reply — CMake's
+timestamped names sort newest-last — and its referenced `codemodel-v2`
+objects in the root/build reply directories (also the compilation database’s
+directory). Stale, unreferenced target JSON files are ignored.
+
+Compilation object outputs (`output` or `-o`) identify both the source and
+its compiler configuration. The same source built with different macros for
+two targets therefore keeps those configurations separate. CMake source
+membership without object/configuration information conservatively includes
+all available commands for that source. Explicit artifact inputs and known
+`-L`/`-l` target outputs establish dependencies. Commands are parsed as data;
+no compiler, linker, or shell is executed. Unsupported command features and
+unmapped objects produce diagnostics. Response-file expansion is bounded.
+Options are distinguished from inputs before extensions are consulted, so an
+soname, a Darwin loader path (`@rpath/...`, `@executable_path/...`, which share
+`@` with response-file syntax), an `-install_name` operand and MSVC switches
+such as `/implib:foo.lib` are not read as link inputs, and `/out:` is matched
+case-insensitively.
+
+The IR stores `LinkTarget` records with typed `TargetId` values, direct sources,
+and dependencies. CMake edges identified as build-order-only (`add_dependencies`)
+do not import symbols; actual link relationships are retained even when an
+ordering dependency also exists. Each target gets a separate symbol scope containing its
+sources and transitive dependencies. Cycles terminate through a visited set.
+Units are lowered once per compiler configuration and reused during merging;
+weak body/initializer ownership is collected only when link metadata requires
+selection, so ordinary indexing does not allocate those range maps;
+a source shared by targets has distinct function and variable instances in
+each scope. Unmapped sources remain in an unscoped partition. Without link
+metadata, the existing indexing and whole-program merge path remains in use.
+
+GNU `weak`/`__weak__` attributes and active `#pragma weak name` mark functions
+and variables *with external linkage*. The `_Pragma("weak name")` operator
+spelling is **not** read — a weak body annotated that way is not suppressed, so
+both bodies' facts survive (over-approximate, not wrong). Otherwise: a `static` function, a local, a
+parameter and a block-scope variable have no linkage to weaken, and the
+annotation is recorded on none of them. An attribute among a declaration's
+specifiers reaches every declarator it introduces, while one written inside a
+declarator reaches only that declarator
+(`void a(void) __attribute__((weak)), b(void);` weakens `a` alone). Within a target, a strong definition replaces a matching weak
+definition; strong declarations alone do not suppress a weak body. Selection
+uses the IR symbol registration/signature rules, including C++ overloads,
+rather than a separate signature comparator. Overridden weak bodies contribute
+no local variables, calls, return flows, or constraints, including writes to
+globals. Weak global initializers are excluded when a strong global definition
+exists. A C tentative definition (`int x;` with no initializer) counts as a
+strong definition and overrides a weak one, matching `-fno-common`, the default
+since GCC 10 and in Clang. Under `-fcommon` a tentative definition is a common
+symbol that a weak definition would outrank instead; the compiler flag is not
+modeled, so that configuration resolves the other way here.
+
+Globals unify within a target by their *unqualified* name, which is the only
+name the IR records for a variable. That is exactly right for C, where one
+external name is one symbol per image. A global declared inside a C++ namespace
+is exempt from both that unification and weak override, because its unqualified
+name is not the name a linker resolves: `a::counter` and `b::counter` stay two
+variables, and a strong `b::cb` does not suppress a weak `a::cb`. An anonymous
+namespace counts, its members having internal linkage and so not being shared
+symbols at all. The exemption is recorded on the variable (`is_namespaced`), so
+it survives every copy the merge makes. Class-static members are not yet
+distinguished this way. Weak-only targets retain the fallback. Equal-strength weak function definitions from different origins
+are selected deterministically in unit order; configurations of the same weak
+body retain their union of facts. Weak global alternatives may conservatively
+contribute multiple initializer values.
+
+Target identity travels through direct calls, function addresses, transitive
+returns, indirect calls, dynamic symbol lookup, and field summaries. Types
+and immutable string literals may be shared, while mutable storage summaries
+remain within a target. The same target-aware name resolver serves call and
+return wiring; a lookup that names no image (the public resolver entry points)
+still sees every symbol, which is not the same question as naming the unscoped
+partition explicitly.
+
+**IPC bridges are the deliberate exception.** A Binder call crosses a process
+boundary, so a proxy and the stub it dispatches to are in *different* images by
+construction — a client executable and its service daemon. Proxy/stub pairing
+and the synthetic edges it produces are therefore matched across the whole
+program and are never filtered by target; they are the one kind of
+`call_edges` row whose endpoints may differ in `target_id`. See [SQLite schema](SQLITE_SCHEMA.md) for exported weak flags
+and target associations.
+
+Link metadata needs a source for each object: either a compilation database
+that names the object (`output`, or `-o` in its arguments), or link lines that
+name sources directly. `--link-commands` on its own, against a project with no
+compilation database, leaves every target with no sources and reports one
+diagnostic per unmapped object.
+
+A `-l` name resolves against known build outputs, including a versioned soname
+(`-lfoo` finds `libfoo.so.1.2.3`). MinGW `libfoo.dll.a` and MSVC `foo.lib`
+import libraries are not matched, and an unresolved `-l` is silent by design —
+it is assumed to be a system library.
+
+Two further imprecisions appear only under link metadata. A namespace-scope
+global is deliberately absent from its image's name index, so a call through a
+namespace-scope function pointer that lowering could not bind locally finds
+nothing there, where the whole-program path would have found it. And a C++
+file-scope `const`, which has internal linkage, is unified across translation
+units of one image like any other global; both values merge, so nothing is
+dropped, but the two are not kept apart as they are without link metadata.
+
+This models declared target membership, not a complete platform linker:
+archive members are conservatively included, without demand-driven extraction;
+link order, symbol versions, visibility, loader interposition, linker scripts,
+and dynamically discovered DSOs are not emulated. A weak alias pragma marks an
+existing declaration and synthesizes no body (see `PREPROCESSOR.md`), so the
+alias resolves only if something else defines it. A multi-config CMake
+reply repeats each target once per configuration, differing only in artifact
+path; only the first configuration is read — indexing every one would repeat
+the same facts at N times the cost — and a diagnostic names the ignored
+configurations. Missing metadata cannot establish which independently built
+image a symbol belongs to.
 
 ## Type storage
 
@@ -88,13 +205,13 @@ Functions record abstract return values in `program.fn_returns`:
 | `ReturnFlow` | Source |
 |--------------|--------|
 | `AddrOfVar { src }` | `return &global` / `return &file_static` |
-| `AddrOfFn { callee }` | `return &Fn` / fn identifier in `&` expression |
+| `AddrOfFn { callee }` | `return &Fn` / `return Fn` |
 | `Copy { src }` | `return local` or `return param` |
 | `Call { callee_name }` | `return Other()` (transitive; `Other` resolved in callee's file) |
 
 `return &local` is recorded as `AddrOfVar` but is **unsound** for stack locals (may-analysis may report escaped addresses). Prefer treating this as a known imprecision.
 
-At PAG build time, `CallReturn` resolves `callee_name` with **`resolve_function_candidates(name, file)`** — every function the merged name may refer to: the query file's internal-linkage entries (`fn_by_scope`, declarations included, with their further C++ overloads in `scope_overloads`) plus the canonical external definition. Name-based facts lose the calling TU's visibility context at merge time, so a name matching both a file-`static` def and an external def is genuinely ambiguous; per may-analysis semantics all candidates are expanded. Callee ids that survived lowering + merge (e.g. `AddrOfFn`) are used directly instead — they are exact.
+At PAG build time, `CallReturn` resolves `callee_name` with **`resolve_function_candidates_in_target(name, file, target)`** — every function the merged name may refer to: the query file's internal-linkage entries (`fn_by_scope`, declarations included, with their further C++ overloads in `scope_overloads`) plus the canonical external definition. Name-based facts lose the calling TU's visibility context at merge time, so a name matching both a file-`static` def and an external def is genuinely ambiguous; per may-analysis semantics all candidates are expanded. Callee ids that survived lowering + merge (e.g. `AddrOfFn`) are used directly instead — they are exact.
 
 This models patterns like:
 
@@ -111,7 +228,7 @@ subDev.subDevOps->setConfig(subDev);
 
 ### `dlsym` / `GetProcAddress`
 
-Built-in models treat `dlsym` / `dlvsym` / `GetProcAddress` as **symbol lookup**: the return destination of a call (the `CallSite.return_dst` of `f = dlsym(...)`, including `return dlsym(...)` via a temp) may point to every **in-tree** function whose exact name matches a string constant in the name argument (parameter 1). Out-of-tree names add no pointees (true external). The handle / DSO path is ignored (whole-program search). Non-literal names that never receive a string constant stay unresolved — they do **not** fan out to every exported function.
+Built-in models treat `dlsym` / `dlvsym` / `GetProcAddress` as **symbol lookup**: the return destination of a call (the `CallSite.return_dst` of `f = dlsym(...)`, including `return dlsym(...)` via a temp) may point to every **in-tree** function whose exact name matches a string constant in the name argument (parameter 1). Out-of-tree names add no pointees (true external). The handle / DSO path is ignored. Lookup searches the caller’s link target and its incorporated dependencies when link metadata exists, otherwise the whole program. Dynamically loaded targets absent from that dependency closure are not modeled. Non-literal names that never receive a string constant stay unresolved — they do **not** fan out to every exported function.
 
 ## Program Assignment Graph (PAG)
 
@@ -143,7 +260,7 @@ Built-in models treat `dlsym` / `dlvsym` / `GetProcAddress` as **symbol lookup**
 | `Local` | Parameter or stack local storage |
 | `Heap` | Reserved for allocator summaries (stub) |
 | `Field` | Specific field at a known parent object location |
-| `FieldSummary` | Instance-insensitive merge of struct field `T.f` across all instances |
+| `FieldSummary` | Instance-insensitive merge of struct field `T.f` across instances in the same link target |
 | `ArraySummary` | Unknown-index array element summary |
 | `Function` | Function entry address for indirect call targets |
 
@@ -171,7 +288,7 @@ Solving is capped at a deterministic **800 000 pops** by default. Normal corpora
 
 **`Gep` with empty base points-to**
 
-When `pts(base)` is empty (typical for pointer parameters with no incoming flow), fall back to **`FieldSummary`** for `(struct_type(base), field)` via `ensure_field_summary_for_var`. This connects field stores through parameters to later field loads on unrelated instances (may-analysis).
+When `pts(base)` is empty (typical for pointer parameters with no incoming flow), fall back to **`FieldSummary`** for `(struct_type(base), field)` via `ensure_field_summary_for_var`. This connects field stores through parameters to later field loads on unrelated instances (may-analysis). When link-target metadata is available, the summary also includes the target identity: separate link images cannot exchange field contents. Concrete field locations, heap locations, and nested summaries preserve that identity. Without target metadata the existing type-and-field summary cache is used.
 
 The same fallback also fires when the base *has* pointees but none of them yielded a field cell — e.g. `void *` heap allocations or opaque summaries, where per-pointee `ensure_field_loc` synthesizes nothing. Without this, ops fields assigned through freshly-allocated objects starve every load site that reads them (observed as missing indirect-call edges for shared-obj style code).
 
@@ -196,13 +313,13 @@ Consequence: callbacks stored through correctly-typed ops assignments resolve ex
 
 **Direct calls**
 
-Sites lowering marked `is_direct = true` saw the TU-local binding, so scope-first **`resolve_function_in_scope(callee_name, call_site.file)`** is exact per C visibility rules: a file-`static` definition shadows same-name external functions inside its own TU (backed by the `fn_by_scope` index, which includes internal *declarations* — lowering streams a file top-down and initializers like `.Read = StaticFn` must bind before the definition is lowered).
+Sites lowering marked `is_direct = true` saw the TU-local binding, so scope-first **`resolve_function_in_scope_in_target(callee_name, call_site.file, target)`** is exact per C visibility rules: a file-`static` definition shadows same-name external functions inside its own TU (backed by the `fn_by_scope` index, which includes internal *declarations* — lowering streams a file top-down and initializers like `.Read = StaticFn` must bind before the definition is lowered).
 
 Because header-defined functions are deduplicated to their header origin at merge time, `fn_by_scope` entries for them live under the header's `FileId`. Scope resolution therefore also consults **`headers_of(file)`** — the set of headers that contributed entities to a TU — so an includer still sees the header's internal-linkage definitions; TU-local definitions keep precedence on name collision.
 
 **Cross-TU direct-call recovery**
 
-A plain call whose definition lives in another TU is lowered with `is_direct = false` (the callee symbol is not visible in the calling TU). At solve time, sites that are *not* direct, have no `callee_var`, and whose callee text is a bare identifier are recovered as direct-by-name calls via `CallSite::resolves_by_name`, expanding **all** `resolve_function_candidates` (may-approximation — see `CallReturn` above). Without this, every cross-TU call to a function declared through a pointer-returning prototype (e.g. `T *f(void);`) would be dropped, because such prototypes previously also produced phantom variables — lowering now registers functions for pointer-wrapped declarators instead.
+A plain call whose definition lives in another TU is lowered with `is_direct = false` (the callee symbol is not visible in the calling TU). At solve time, sites that are *not* direct, have no `callee_var`, and whose callee text is a bare identifier are recovered as direct-by-name calls via `CallSite::resolves_by_name`, expanding **all** `resolve_function_candidates_in_target` (may-approximation — see `CallReturn` above). Without this, every cross-TU call to a function declared through a pointer-returning prototype (e.g. `T *f(void);`) would be dropped, because such prototypes previously also produced phantom variables — lowering now registers functions for pointer-wrapped declarators instead.
 
 ### Analyze options
 

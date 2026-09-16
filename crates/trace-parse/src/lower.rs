@@ -135,6 +135,10 @@ struct LowerContext {
     /// whose text has the keyword. Most units have none, and then no
     /// signature needs its ancestors.
     has_templates: bool,
+    has_weak: bool,
+    record_link_ownership: bool,
+    pending_flow_owners: HashMap<usize, FnId>,
+    pending_initializer_owners: HashMap<usize, VarId>,
 }
 
 /// C++ class scope during member lowering.
@@ -331,7 +335,18 @@ fn build_program_inner(
 
     let mut include_graph =
         IncludeGraph::build_with_deps(root, &files, &headers, &dep_roots, &dep_headers);
-    if !database.commands.is_empty() {
+    let links =
+        crate::link_commands::LinkDatabase::load(root, &database, opts.link_commands.as_deref())?;
+    for message in &links.warnings {
+        program.add_diagnostic(Diagnostic {
+            severity: DiagnosticSeverity::Warning,
+            file: None,
+            line: 0,
+            message: message.clone(),
+            stage: "link_commands".into(),
+        });
+    }
+    if !database.commands.is_empty() || !links.targets.is_empty() {
         return configured::build(
             program,
             root,
@@ -341,6 +356,7 @@ fn build_program_inner(
             &headers,
             include_graph,
             database,
+            links,
         );
     }
     index_progress(format!(
@@ -1137,8 +1153,9 @@ fn add_missing_this_params(program: &mut Program) {
         let Some(cls) = cls else {
             continue;
         };
-        let (cls, span) = (cls.to_owned(), f.span);
+        let (cls, span, target) = (cls.to_owned(), f.span, f.target);
         let this_id = add_this_param(program, &cls, fn_id, span);
+        program.symbols.variable_mut(this_id).target = target;
         let params = &mut program.symbols.functions[i].params;
         params.insert(0, this_id);
         for &param in &params[1..] {
@@ -1193,6 +1210,10 @@ fn bind_calls_past_this(program: &mut Program) {
 /// pushed directly (not via `add_function`) so they stay out of the name
 /// resolution maps and cannot shadow real definitions or feed param wiring.
 fn finalize_extern_callees(program: &mut Program) {
+    if !program.link_targets.is_empty() {
+        finalize_target_extern_callees(program);
+        return;
+    }
     let mut names: Vec<(String, trace_ir::FileId, u32)> = program
         .symbols
         .call_sites
@@ -1231,6 +1252,8 @@ fn finalize_extern_callees(program: &mut Program) {
         }
         let fid = program.symbols.alloc_fn_id();
         program.symbols.push_synthetic_function(trace_ir::Function {
+            is_weak: false,
+            target: None,
             id: fid,
             name: name.clone(),
             linkage: trace_ir::Linkage::External,
@@ -1275,6 +1298,77 @@ fn is_plain_ident(name: &str) -> bool {
 /// (`std::string::c_str`, `FileUtil::Exists`) that are not field/arrow
 /// expressions. Arrow text (`p->method`) stays indirect so fn-ptr and
 /// callable-field sites can still be resolved by the solver.
+/// An unresolved external belongs to the same image as its caller. A name
+/// present only in another image must not prevent synthesizing this declaration.
+fn finalize_target_extern_callees(program: &mut Program) {
+    // Group first, resolve once per group. Resolving per site re-walks the
+    // scope table for every call — the cost the whole-program pass above was
+    // restructured to avoid (#108).
+    let mut grouped: std::collections::BTreeMap<(&str, Option<trace_ir::TargetId>), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, cs) in program.symbols.call_sites.iter().enumerate() {
+        if cs.callee_var.is_some()
+            || cs.callee_fn_id.is_some()
+            || !is_synthesizable_extern(&cs.callee_name)
+        {
+            continue;
+        }
+        let target = program.symbols.function(cs.caller).target;
+        grouped
+            .entry((cs.callee_name.as_str(), target))
+            .or_default()
+            .push(i);
+    }
+    let missing: std::collections::BTreeMap<(String, Option<trace_ir::TargetId>), Vec<usize>> =
+        grouped
+            .into_iter()
+            .filter(|((name, target), _)| {
+                // Unscoped by file: the group spans call sites in many files,
+                // and a file-`static` visible from just one of them must not
+                // decide for the rest. Matches the whole-program pass, which
+                // asks `resolve_function` without a file.
+                program
+                    .symbols
+                    .resolve_function_candidates_in_target(name, None, *target)
+                    .is_empty()
+            })
+            .map(|((name, target), sites)| ((name.to_owned(), target), sites))
+            .collect();
+    for ((name, target), sites) in missing {
+        let span = program.symbols.call_sites[sites[0]].span;
+        let id = program.symbols.alloc_fn_id();
+        program.symbols.push_synthetic_function(Function {
+            id,
+            name,
+            target,
+            is_weak: false,
+            linkage: trace_ir::Linkage::External,
+            return_type: program.types.unknown(),
+            params: Vec::new(),
+            locals: Vec::new(),
+            span,
+            end_line: span.line,
+            file: span.file,
+            is_defined: false,
+            param_type_ids: Vec::new(),
+            explicit_arity: None,
+            owner_unresolved: false,
+            variadic: false,
+            defaulted_in_class: false,
+            declared_in_class: false,
+            default_args: 0,
+            is_virtual: false,
+            is_final: false,
+            is_cpp: false,
+        });
+        for i in sites {
+            let cs = &mut program.symbols.call_sites[i];
+            cs.callee_fn_id = Some(id);
+            cs.is_direct = true;
+        }
+    }
+}
+
 fn is_synthesizable_extern(name: &str) -> bool {
     // The space rejected here is the one a field/arrow spelling or a stray
     // declarator fragment carries. An operator name has one of its own
@@ -1391,7 +1485,10 @@ fn expand_virtual_overrides(program: &mut Program) {
             });
             targets
         };
-        targets.retain(|&t| arity_compatible(expected_arity, method_explicit_arity(program, t)));
+        targets.retain(|&t| {
+            program.symbols.function(t).target == f.target
+                && arity_compatible(expected_arity, method_explicit_arity(program, t))
+        });
         for t in targets {
             let key = (cs.caller, cs.span.line, cs.span.col, t);
             if !seen.insert(key) {
@@ -1809,6 +1906,7 @@ fn index_header_variant(
         graph,
         pre,
         language,
+        false,
         header_ir,
         pch_order,
     ) {
@@ -1985,6 +2083,7 @@ fn index_source_file_with_variants(
                     graph,
                     Arc::new(var_pre),
                     language,
+                    var_opts.record_link_ownership,
                     header_ir,
                     pch_order,
                 ) {
@@ -2026,7 +2125,16 @@ fn process_indexed_file(
     let language = index_opts
         .language
         .unwrap_or_else(|| Language::from_path(path));
-    lower_prepared_source(program, path, graph, pre, language, header_ir, pch_order)
+    lower_prepared_source(
+        program,
+        path,
+        graph,
+        pre,
+        language,
+        index_opts.record_link_ownership,
+        header_ir,
+        pch_order,
+    )
 }
 
 /// Lower already-preprocessed text into a fresh `program`.
@@ -2040,6 +2148,7 @@ fn lower_prepared_source(
     graph: &IncludeGraph,
     pre: Arc<PreprocessedSource>,
     language: Language,
+    record_link_ownership: bool,
     header_ir: Option<&HeaderIr>,
     pch_order: &[PathBuf],
 ) -> Result<(), String> {
@@ -2139,6 +2248,10 @@ fn lower_prepared_source(
         local_scope_log: Vec::new(),
         tree: parsed.tree.clone(),
         has_templates: is_cpp && parsed.source.contains("template"),
+        has_weak: source_may_annotate_weak(&parsed.source) || program.symbols.has_weak_symbols(),
+        record_link_ownership,
+        pending_flow_owners: HashMap::default(),
+        pending_initializer_owners: HashMap::default(),
     };
     lower_tree(
         program,
@@ -2146,6 +2259,62 @@ fn lower_prepared_source(
         parsed.source.as_ref(),
         parsed.tree.root_node(),
     );
+    // Pragmas apply to the entire unit, even when placed after a definition.
+    // Only a unit that spells the directive needs the line scan; after include
+    // expansion the text is measured in megabytes.
+    let weak_names: HashSet<&str> = if ctx.has_weak && parsed.source.contains("#pragma") {
+        parsed
+            .source
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                (words.next() == Some("#pragma") && words.next() == Some("weak"))
+                    .then(|| words.next().map(|word| word.split('=').next().unwrap()))
+                    .flatten()
+            })
+            .collect()
+    } else {
+        HashSet::default()
+    };
+    if !weak_names.is_empty() {
+        program.symbols.mark_has_weak_symbols();
+        // Weak binding is a property of an external symbol. A `static`
+        // function, a local, a parameter or a lowering temporary that happens
+        // to share the pragma's name has no linkage to weaken, and marking it
+        // would export a meaningless `is_weak` row.
+        for function in &mut program.symbols.functions {
+            function.is_weak |= function.linkage == trace_ir::Linkage::External
+                && weak_names.contains(function.name.as_str());
+        }
+        for variable in &mut program.symbols.variables {
+            variable.is_weak |= variable.storage == StorageClass::Global
+                && weak_names.contains(variable.name.as_str());
+        }
+    }
+    // By now the symbol table knows whether anything was actually marked, which
+    // is narrower than `has_weak` (a guess made from the source text).
+    if program.symbols.has_weak_symbols() {
+        // Weak binding is a property of the external symbol, not one spelling
+        // of its declaration. A later annotation also applies to earlier rows.
+        // A namespaced global is excluded on both sides: its unqualified name
+        // is not its symbol name, so `a::cb` must not weaken `b::cb`.
+        let shares_linkage_name =
+            |v: &Variable| v.storage == StorageClass::Global && !v.is_namespaced;
+        let weak_globals: HashSet<String> = program
+            .symbols
+            .variables
+            .iter()
+            .filter(|v| shares_linkage_name(v) && v.is_weak)
+            .map(|v| v.name.clone())
+            .collect();
+        if !weak_globals.is_empty() {
+            for variable in &mut program.symbols.variables {
+                if shares_linkage_name(variable) && weak_globals.contains(&variable.name) {
+                    variable.is_weak = true;
+                }
+            }
+        }
+    }
     resolve_pending_fn_refs(program, &ctx);
     program.types.complete_nested_tags();
     Ok(())
@@ -2194,7 +2363,8 @@ fn add_preprocess_diagnostics(
 /// after their use site are visible.
 fn resolve_pending_fn_refs(program: &mut Program, ctx: &LowerContext) {
     let pending: Vec<PendingFnRef> = ctx.pending.borrow_mut().drain(..).collect();
-    for item in pending {
+    for (index, item) in pending.into_iter().enumerate() {
+        let flow_start = program.flow.len();
         match item {
             PendingFnRef::FieldStore { dst, name, span } => {
                 if let Some(callee) = resolve_function_named(program, ctx, &name) {
@@ -2251,12 +2421,33 @@ fn resolve_pending_fn_refs(program: &mut Program, ctx: &LowerContext) {
                 }
             }
         }
+        if let Some(&owner) = ctx.pending_initializer_owners.get(&index) {
+            let end = program.flow.len();
+            if end > flow_start {
+                program
+                    .global_initializer_ranges
+                    .entry(owner)
+                    .or_default()
+                    .push(flow_start..end);
+            }
+        }
+        if let Some(&owner) = ctx.pending_flow_owners.get(&index) {
+            let end = program.flow.len();
+            if end > flow_start {
+                program
+                    .function_flow_ranges
+                    .entry(owner)
+                    .or_default()
+                    .push(flow_start..end);
+            }
+        }
     }
 }
 
 fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
     let inheritance = program.take_inheritance();
     UnitIndex {
+        compilation_index: None,
         files: program
             .symbols
             .files
@@ -2269,6 +2460,8 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
         variables: program.symbols.variables,
         call_sites: program.symbols.call_sites,
         flow: program.flow,
+        function_flow_ranges: program.function_flow_ranges,
+        global_initializer_ranges: program.global_initializer_ranges,
         fn_returns: program.fn_returns.into_iter().collect(),
         diagnostics: program.diagnostics,
         anon_type_counter: program.anon_type_counter,
@@ -3407,6 +3600,8 @@ fn register_member_prototype(
         .unwrap_or_else(|| program.types.void());
     let ret_type = declared_return_type(program, ctx, source, node, ret_type);
     program.symbols.add_function(Function {
+        is_weak: false,
+        target: None,
         id: provisional_id,
         name: full_name,
         linkage: if ctx.in_anonymous_namespace() {
@@ -3432,6 +3627,150 @@ fn register_member_prototype(
         is_final: flags.is_final,
         is_cpp: ctx.is_cpp,
     });
+}
+
+/// Whether a unit can carry a weak annotation at all, gating the per-declaration
+/// tree walks below.
+///
+/// `declaration_is_weak` only ever matches inside an attribute, and the pragma
+/// scan only inside a directive, so the bare word is not enough: `weak` occurs
+/// in `std::weak_ptr`, `weak_ordering` and any comment, which would arm the
+/// whole weak path for essentially every C++ unit that includes `<memory>`.
+/// Each `contains` is a single memchr-accelerated pass over text the tree walks
+/// would otherwise be charged for.
+fn source_may_annotate_weak(source: &str) -> bool {
+    source.contains("weak")
+        && (source.contains("__attribute__") || source.contains("[[") || source.contains("#pragma"))
+}
+
+/// Weak linkage is a property of an external symbol. A local, a parameter and
+/// a file-`static` have no linkage to weaken — GCC ignores the attribute there
+/// — so recording it would only put a meaningless `is_weak` row in the export
+/// and arm target selection against a symbol that never participates in a link.
+fn weak_global(ctx: &LowerContext, storage: StorageClass, source: &str, node: Node) -> bool {
+    storage == StorageClass::Global && ctx.has_weak && declaration_is_weak(source, node)
+}
+
+/// Whether a global's unqualified name is *not* the name a linker resolves.
+///
+/// Any enclosing namespace makes it so, anonymous ones included: those have
+/// internal linkage and are not shared symbols at all. Target-scoped
+/// unification and weak override are both keyed on the unqualified name, so
+/// they must leave such a global alone.
+fn namespaced_global(ctx: &LowerContext, storage: StorageClass) -> bool {
+    storage == StorageClass::Global && !ctx.ns_stack.is_empty()
+}
+
+/// The declarator this reference sits in, when the declaration introduces more
+/// than one (`int a, b;`). `None` for the single-declarator case, where no
+/// sibling exists to confuse and nothing needs excluding.
+///
+/// One cursor pass and no allocation: this runs for every declaration of a unit
+/// that might carry a weak annotation, and building a list just to learn "there
+/// is exactly one" cost a malloc apiece.
+fn own_declarator<'t>(decl: Node<'t>, node: Node<'t>) -> Option<Node<'t>> {
+    let mut cursor = decl.walk();
+    let (mut count, mut own) = (0usize, None);
+    if cursor.goto_first_child() {
+        loop {
+            if cursor.field_name() == Some("declarator") {
+                count += 1;
+                let declarator = cursor.node();
+                if declarator.start_byte() <= node.start_byte()
+                    && node.end_byte() <= declarator.end_byte()
+                {
+                    own = Some(declarator);
+                }
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    (count > 1).then_some(own).flatten()
+}
+
+/// Inspect declaration syntax only: never walk a function body or initializer.
+///
+/// An attribute among the declaration specifiers applies to every declarator
+/// (`__attribute__((weak)) void a(void), b(void);` weakens both), but one
+/// written inside a declarator applies only to it: in
+/// `void a(void) __attribute__((weak)), b(void);` the compiler weakens `a`
+/// alone. Scanning the whole declaration would weaken `b` too, and a spurious
+/// weak mark on `b` lets a real strong definition of `b` be suppressed.
+fn declaration_is_weak(source: &str, node: Node) -> bool {
+    let Some(decl) = enclosing_decl(
+        node,
+        &["declaration", "field_declaration", "function_definition"],
+    ) else {
+        return false;
+    };
+    let own = own_declarator(decl, node);
+    fn visit(source: &str, node: Node) -> bool {
+        if matches!(
+            node.kind(),
+            "compound_statement"
+                | "parameter_list"
+                | "initializer_list"
+                | "struct_specifier"
+                | "class_specifier"
+        ) {
+            return false;
+        }
+        if matches!(node.kind(), "attribute_specifier" | "attribute_declaration") {
+            let mut cursor = node.walk();
+            return node.named_children(&mut cursor).any(|args| {
+                let mut cursor = args.walk();
+                // Bound, not returned directly: the iterator borrows `cursor`,
+                // so the temporary has to drop before it does.
+                let found = args.named_children(&mut cursor).any(|arg| {
+                    arg.kind() == "identifier"
+                        && matches!(node_text(source, &arg), "weak" | "__weak__")
+                });
+                found
+            });
+        }
+        let value = node.child_by_field_name("value");
+        let mut cursor = node.walk();
+        let found = node
+            .named_children(&mut cursor)
+            .any(|child| Some(child) != value && visit(source, child));
+        found
+    }
+    // One scan for both shapes: with a single declarator nothing is excluded,
+    // so the multi-declarator case is the same walk with siblings filtered out.
+    let value = decl.child_by_field_name("value");
+    let mut cursor = decl.walk();
+    let mut found = false;
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            let sibling_declarator = cursor.field_name() == Some("declarator")
+                && own.is_some_and(|own| own.id() != child.id());
+            if child.is_named()
+                && !sibling_declarator
+                && Some(child) != value
+                && visit(source, child)
+            {
+                found = true;
+                break;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    // A trailing attribute after a MISSING token lands in the following ERROR
+    // node. Only meaningful for a lone declarator; with several there is no
+    // telling which one the stray attribute belonged to.
+    found
+        || (own.is_none()
+            && decl
+                .child(decl.child_count().saturating_sub(1))
+                .is_some_and(|last| last.is_missing())
+            && decl
+                .next_named_sibling()
+                .is_some_and(|next| next.is_error() && visit(source, next)))
 }
 
 fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, node: Node) {
@@ -3549,6 +3888,10 @@ fn lower_function_signature(
         node_end_line(program, ctx, node, span)
     };
     let fn_id = program.symbols.add_function(Function {
+        // Only an external symbol has linkage to weaken; GCC ignores the
+        // attribute on a `static` and lowering must not record it either.
+        is_weak: !is_static && ctx.has_weak && declaration_is_weak(source, node),
+        target: None,
         id: provisional_id,
         name: name.clone(),
         linkage: if is_static {
@@ -3617,6 +3960,12 @@ fn lower_function_body(
         eff_class,
         lookup_scope,
     } = signature;
+    let flow_start = program.flow.len();
+    let pending_start = if ctx.record_link_ownership && ctx.has_weak {
+        ctx.pending.borrow().len()
+    } else {
+        0
+    };
     let scoped = enter_lookup_scope(ctx, lookup_scope.as_ref());
     // The body of a free function spelled `N::f` looks function names up in
     // `N` as well: open the namespaces the definition names but does not sit
@@ -3691,6 +4040,19 @@ fn lower_function_body(
     ctx.using_name_imports.truncate(using_imports_len);
     ctx.local_aliases.truncate(local_aliases_len);
 
+    if ctx.record_link_ownership && ctx.has_weak {
+        let flow_end = program.flow.len();
+        if flow_end > flow_start {
+            program
+                .function_flow_ranges
+                .entry(fn_id)
+                .or_default()
+                .push(flow_start..flow_end);
+        }
+        for index in pending_start..ctx.pending.borrow().len() {
+            ctx.pending_flow_owners.insert(index, fn_id);
+        }
+    }
     ctx.current_fn = None;
     ctx.locals.clear();
     ctx.local_scope_log.clear();
@@ -3727,6 +4089,10 @@ fn add_this_param(program: &mut Program, cls: &str, fn_id: FnId, span: Span) -> 
         })));
     let this_id = program.symbols.alloc_var_id();
     program.symbols.add_variable(Variable {
+        is_defined: false,
+        is_weak: false,
+        target: None,
+        is_namespaced: false,
         id: this_id,
         name: "this".to_string(),
         type_id: this_type,
@@ -3866,6 +4232,10 @@ fn lower_parameter(
     }
     let span = node_span(program, ctx, node);
     program.symbols.add_variable(Variable {
+        is_defined: false,
+        is_weak: false,
+        target: None,
+        is_namespaced: false,
         id: var_id,
         name: name.clone(),
         type_id,
@@ -4469,6 +4839,16 @@ fn lower_declaration(
                              owner: Node,
                              decl: Node,
                              value: Option<Node>| {
+        let capture_initializer = ctx.record_link_ownership
+            && ctx.has_weak
+            && ctx.current_fn.is_none()
+            && value.is_some();
+        let flow_start = program.flow.len();
+        let pending_start = if capture_initializer {
+            ctx.pending.borrow().len()
+        } else {
+            0
+        };
         let ty = local_type(program, ctx, source, type_node, type_id, decl, value);
         let var = lower_one_declarator(
             program,
@@ -4481,6 +4861,19 @@ fn lower_declaration(
             storage_override,
             value,
         );
+        if let Some(var) = var.filter(|_| capture_initializer) {
+            let end = program.flow.len();
+            if end > flow_start {
+                program
+                    .global_initializer_ranges
+                    .entry(var)
+                    .or_default()
+                    .push(flow_start..end);
+            }
+            for index in pending_start..ctx.pending.borrow().len() {
+                ctx.pending_initializer_owners.insert(index, var);
+            }
+        }
         // An explicit reference's type carries an alias layer that readers
         // peel; an `auto&` local's is already the value's own type.
         if let Some(var) = var.filter(|_| is_placeholder_type(ctx, type_node)) {
@@ -4568,11 +4961,19 @@ fn lower_declaration(
                 }
                 let var_id = program.symbols.alloc_var_id();
                 let span = node_span(program, ctx, child);
+                let storage = storage_override.unwrap_or_else(|| storage_for(ctx, is_static));
                 program.symbols.add_variable(Variable {
+                    is_defined: ctx.current_fn.is_none() && !declaration_is_extern(source, node),
+                    // `child`, not `node`: an attribute inside a sibling
+                    // declarator is that sibling's alone. `extern` is a
+                    // declaration specifier, so it stays declaration-scoped.
+                    is_weak: weak_global(ctx, storage, source, child),
+                    target: None,
+                    is_namespaced: namespaced_global(ctx, storage),
                     id: var_id,
                     name: name.clone(),
                     type_id,
-                    storage: storage_override.unwrap_or_else(|| storage_for(ctx, is_static)),
+                    storage,
                     fn_id: ctx.current_fn,
                     param_index: None,
                     span,
@@ -4667,6 +5068,13 @@ fn lower_direct_init(
     let Some(name_node) = decl.child_by_field_name("declarator") else {
         return;
     };
+    let capture_initializer = ctx.record_link_ownership && ctx.has_weak && ctx.current_fn.is_none();
+    let flow_start = program.flow.len();
+    let pending_start = if capture_initializer {
+        ctx.pending.borrow().len()
+    } else {
+        0
+    };
     let Some(object) = lower_one_declarator(
         program,
         ctx,
@@ -4680,6 +5088,10 @@ fn lower_direct_init(
     ) else {
         return;
     };
+    if ctx.current_fn.is_none() {
+        // Even `extern T object(value)` is a definition when initialized.
+        program.symbols.variable_mut(object).is_defined = true;
+    }
     let span = node_span(program, ctx, decl);
     if program.is_dep_file(span.file) {
         return;
@@ -4695,6 +5107,19 @@ fn lower_direct_init(
                 callee: *callee,
             }),
             _ => {}
+        }
+        if capture_initializer {
+            let end = program.flow.len();
+            if end > flow_start {
+                program
+                    .global_initializer_ranges
+                    .entry(object)
+                    .or_default()
+                    .push(flow_start..end);
+            }
+            for index in pending_start..ctx.pending.borrow().len() {
+                ctx.pending_initializer_owners.insert(index, object);
+            }
         }
         return;
     };
@@ -4759,11 +5184,17 @@ fn lower_one_declarator(
         }
         let var_id = program.symbols.alloc_var_id();
         let span = node_span(program, ctx, span_node);
+        let storage = storage_override.unwrap_or_else(|| storage_for(ctx, is_static));
         program.symbols.add_variable(Variable {
+            is_defined: ctx.current_fn.is_none()
+                && (init_expr.is_some() || !declaration_is_extern(source, span_node)),
+            is_weak: weak_global(ctx, storage, source, span_node),
+            target: None,
+            is_namespaced: namespaced_global(ctx, storage),
             id: var_id,
             name: name.clone(),
             type_id,
-            storage: storage_override.unwrap_or_else(|| storage_for(ctx, is_static)),
+            storage,
             fn_id: ctx.current_fn,
             param_index: None,
             span,
@@ -4798,11 +5229,17 @@ fn lower_one_declarator(
         ctx.reference_vars.insert(var_id);
     }
     let span = node_span(program, ctx, span_node);
+    let storage = storage_override.unwrap_or_else(|| storage_for(ctx, is_static));
     program.symbols.add_variable(Variable {
+        is_defined: ctx.current_fn.is_none()
+            && (init_expr.is_some() || !declaration_is_extern(source, span_node)),
+        is_weak: weak_global(ctx, storage, source, span_node),
+        target: None,
+        is_namespaced: namespaced_global(ctx, storage),
         id: var_id,
         name: name.clone(),
         type_id,
-        storage: storage_override.unwrap_or_else(|| storage_for(ctx, is_static)),
+        storage,
         fn_id: ctx.current_fn,
         param_index: None,
         span,
@@ -4995,6 +5432,8 @@ fn lower_function_decl(
     let span = node_span(program, ctx, decl);
     let explicit_arity = Some(params.len() as u32);
     let fn_id = program.symbols.add_function(Function {
+        is_weak: !is_static && ctx.has_weak && declaration_is_weak(source, decl),
+        target: None,
         id: provisional_id,
         name,
         linkage: if is_static {
@@ -6394,6 +6833,8 @@ fn lower_lambda_expression(
     }
     let end_line = node_end_line(program, ctx, node, span);
     let fn_id = program.symbols.add_function(trace_ir::Function {
+        is_weak: false,
+        target: None,
         id: provisional_id,
         name,
         linkage: trace_ir::Linkage::Internal,
@@ -6502,6 +6943,10 @@ fn lower_lambda_expression(
             .unwrap_or_else(|| program.types.int());
         let is_ptr = matches!(program.types.get(type_id).desc.as_ref(), TypeDesc::Ptr(_));
         program.symbols.add_variable(Variable {
+            is_defined: false,
+            is_weak: false,
+            target: None,
+            is_namespaced: false,
             id: var_id,
             name: name.clone(),
             type_id,
@@ -7980,6 +8425,10 @@ fn alloc_gep_temp(
     let var_id = program.symbols.alloc_var_id();
     let span = node_span(program, ctx, span_node);
     program.symbols.add_variable(Variable {
+        is_defined: false,
+        is_weak: false,
+        target: None,
+        is_namespaced: false,
         id: var_id,
         name: format!("_gep{}", var_id.0),
         type_id: program.types.int(),
@@ -8521,10 +8970,18 @@ fn return_flow_from_expr(
         }
         "identifier" => {
             let name = node_text(source, &node);
-            if resolve_function_named(program, ctx, name).is_some() {
-                None
-            } else if let Some(src) = lookup_var(ctx, program, name) {
+            // A declared name shadows a function of the same name, so the
+            // variable is asked first. Order matters now that this arm records
+            // `AddrOfFn` rather than merely suppressing a fact: resolving the
+            // function first would drop `return local;`'s real copy flow and
+            // invent a pointer to an unrelated function.
+            if let Some(src) = lookup_var(ctx, program, name) {
                 Some(ReturnFlow::Copy { src })
+            } else if let Some(callee) = program
+                .symbols
+                .resolve_function_in_scope(name, Some(ctx.current_file))
+            {
+                Some(ReturnFlow::AddrOfFn { callee })
             } else {
                 ctx.pending.borrow_mut().push(PendingFnRef::ReturnIdent {
                     owner: fn_id,
@@ -8596,6 +9053,10 @@ fn alloc_recv_temp(
     let var_id = program.symbols.alloc_var_id();
     let span = node_span(program, ctx, span_node);
     program.symbols.add_variable(Variable {
+        is_defined: false,
+        is_weak: false,
+        target: None,
+        is_namespaced: false,
         id: var_id,
         name: format!("_recv{}", var_id.0),
         type_id: pointee,
@@ -8616,6 +9077,10 @@ fn alloc_ret_temp(program: &mut Program, ctx: &LowerContext, span_node: Node) ->
 fn alloc_ret_temp_spanned(program: &mut Program, ctx: &LowerContext, span: Span) -> VarId {
     let var_id = program.symbols.alloc_var_id();
     program.symbols.add_variable(Variable {
+        is_defined: false,
+        is_weak: false,
+        target: None,
+        is_namespaced: false,
         id: var_id,
         name: format!("_ret{}", var_id.0),
         type_id: program.types.int(),
@@ -8938,6 +9403,10 @@ fn emit_field_fn_ptr_load(
             let load_var = program.symbols.alloc_var_id();
             let span = node_span(program, ctx, span_node);
             program.symbols.add_variable(Variable {
+                is_defined: false,
+                is_weak: false,
+                target: None,
+                is_namespaced: false,
                 id: load_var,
                 name: format!("_load{}", load_var.0),
                 type_id: program.types.int(),
@@ -8960,6 +9429,10 @@ fn emit_field_fn_ptr_load(
             let load_var = program.symbols.alloc_var_id();
             let span = node_span(program, ctx, span_node);
             program.symbols.add_variable(Variable {
+                is_defined: false,
+                is_weak: false,
+                target: None,
+                is_namespaced: false,
                 id: load_var,
                 name: format!("_load{}", load_var.0),
                 type_id: field_type_id,
@@ -9115,6 +9588,25 @@ fn lookup_var(ctx: &LowerContext, program: &Program, name: &str) -> Option<VarId
     // A function-local `static` is among `locals`, as every variable declared
     // in a body is.
     program.symbols.file_static_named(ctx.current_file, name)
+}
+
+fn declaration_is_extern(source: &str, node: Node) -> bool {
+    let Some(node) = enclosing_decl(node, &["declaration", "field_declaration"]) else {
+        return false;
+    };
+    let mut cursor = node.walk();
+    let found = node.named_children(&mut cursor).any(|child| {
+        child.kind() == "storage_class_specifier" && node_text(source, &child) == "extern"
+    });
+    found
+}
+
+/// Climb to the enclosing declaration node of one of `kinds`.
+fn enclosing_decl<'t>(mut node: Node<'t>, kinds: &[&str]) -> Option<Node<'t>> {
+    while !kinds.contains(&node.kind()) {
+        node = node.parent()?;
+    }
+    Some(node)
 }
 
 fn declaration_is_static(_source: &str, node: Node) -> bool {
@@ -10162,6 +10654,174 @@ fn node_end_line(program: &Program, ctx: &LowerContext, node: Node, span: Span) 
 mod index_window_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn weak_global_direct_initialization_has_definition_and_flow_owner() {
+        for storage in ["", "extern "] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("weak.cpp");
+            std::fs::write(&path, format!("typedef void (*callback)(void);\nvoid fallback(void) {{}}\nextern callback configured __attribute__((weak));\n{storage}callback configured(fallback);\n")).unwrap();
+            let graph = IncludeGraph::build(dir.path(), std::slice::from_ref(&path), &[]);
+            let unit = index_source_file(
+                &path,
+                dir.path(),
+                &graph,
+                &PreprocessOptions {
+                    record_link_ownership: true,
+                    ..PreprocessOptions::new().with_include(dir.path().to_path_buf())
+                },
+                &IndexSourceCache::new(),
+                None,
+                &[],
+            );
+            let global = unit
+                .variables
+                .iter()
+                .rfind(|v| v.name == "configured")
+                .unwrap();
+            assert!(global.is_defined, "{global:?}");
+            assert!(global.is_weak, "{global:?}");
+            assert!(!unit.flow.is_empty());
+            let ranges = unit
+                .global_initializer_ranges
+                .get(&global.id)
+                .expect("direct initializer owner");
+            for index in 0..unit.flow.len() {
+                assert!(
+                    ranges.iter().any(|range| range.contains(&index)),
+                    "unowned direct initializer flow {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weak_global_initializer_ranges_cover_aggregate_temporaries_and_deferred_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weak.c");
+        std::fs::write(&path, "void known(void) {}\nstruct Ops { void (*first)(void); void (*second)(void); };\n__attribute__((weak)) struct Ops configured = { known, later };\nvoid later(void) {}\n").unwrap();
+        let graph = IncludeGraph::build(dir.path(), std::slice::from_ref(&path), &[]);
+        let ordinary = index_source_file(
+            &path,
+            dir.path(),
+            &graph,
+            &PreprocessOptions::new().with_include(dir.path().to_path_buf()),
+            &IndexSourceCache::new(),
+            None,
+            &[],
+        );
+        assert!(ordinary.global_initializer_ranges.is_empty());
+        assert!(ordinary.function_flow_ranges.is_empty());
+        assert!(ordinary
+            .variables
+            .iter()
+            .any(|v| v.name == "configured" && v.is_weak));
+        let unit = index_source_file(
+            &path,
+            dir.path(),
+            &graph,
+            &PreprocessOptions {
+                record_link_ownership: true,
+                ..PreprocessOptions::new().with_include(dir.path().to_path_buf())
+            },
+            &IndexSourceCache::new(),
+            None,
+            &[],
+        );
+        let global = unit
+            .variables
+            .iter()
+            .find(|v| v.name == "configured")
+            .unwrap()
+            .id;
+        assert!(
+            unit.flow.len() >= 4,
+            "aggregate must emit temp/GEP/store facts: {:?}",
+            unit.flow
+        );
+        let ranges = unit
+            .global_initializer_ranges
+            .get(&global)
+            .expect("initializer owner");
+        for index in 0..unit.flow.len() {
+            assert!(
+                ranges.iter().any(|range| range.contains(&index)),
+                "initializer flow {index} lacks owner: {:?}",
+                unit.flow
+            );
+        }
+    }
+
+    #[test]
+    fn weak_body_ranges_include_immediate_and_deferred_global_writes() {
+        for (header, annotation) in [(false, "attribute"), (false, "pragma"), (true, "attribute")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("weak.c");
+            let attr = if annotation == "attribute" {
+                "__attribute__((weak))"
+            } else {
+                ""
+            };
+            let pragma = if annotation == "pragma" {
+                "#pragma weak weak_body"
+            } else {
+                ""
+            };
+            let source = format!("void known(void) {{}}\nvoid (*global)(void);\n{attr} void weak_body(void) {{ global = known; global = later; }}\nvoid later(void) {{}}\n{pragma}\n");
+            let headers = if header {
+                let header_path = dir.path().join("weak.h");
+                std::fs::write(&header_path, source).unwrap();
+                std::fs::write(&path, "#include \"weak.h\"\n").unwrap();
+                vec![header_path]
+            } else {
+                std::fs::write(&path, source).unwrap();
+                Vec::new()
+            };
+            let graph = IncludeGraph::build(dir.path(), std::slice::from_ref(&path), &headers);
+            let unit = index_source_file(
+                &path,
+                dir.path(),
+                &graph,
+                &PreprocessOptions {
+                    record_link_ownership: true,
+                    ..PreprocessOptions::new().with_include(dir.path().to_path_buf())
+                },
+                &IndexSourceCache::new(),
+                None,
+                &[],
+            );
+            let owner = unit
+                .functions
+                .iter()
+                .find(|f| f.name == "weak_body")
+                .unwrap()
+                .id;
+            let global = unit
+                .variables
+                .iter()
+                .find(|v| v.name == "global")
+                .unwrap()
+                .id;
+            let writes: Vec<_> = unit
+                .flow
+                .iter()
+                .enumerate()
+                .filter_map(|(index, flow)| {
+                    matches!(flow, FlowConstraint::AddrOfFn { dst, .. } if *dst == global)
+                        .then_some(index)
+                })
+                .collect();
+            assert_eq!(writes.len(), 2, "{:?}", unit.flow);
+            for index in writes {
+                assert!(
+                    unit.function_flow_ranges[&owner]
+                        .iter()
+                        .any(|range| range.contains(&index)),
+                    "unowned flow {index}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn units_merge_in_order_while_workers_run_ahead_within_the_window() {

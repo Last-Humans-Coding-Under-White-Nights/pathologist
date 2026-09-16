@@ -55,9 +55,15 @@ pub struct Pag {
     /// children start at 1). Bounds recursive `obj->next->next->...`
     /// location synthesis once interprocedural flow reaches chained structs.
     pub field_depth: FxHashMap<LocId, u8>,
-    /// Per-(struct type, field) summary location for instance-insensitive field flow.
-    pub field_summary: IndexMap<(trace_ir::TypeId, FieldId), LocId, FxBuildHasher>,
+    /// Per-(link target, struct type, field) summary location for
+    /// instance-insensitive field flow. Separate images never share a mutable
+    /// storage summary; without link metadata every key carries `None`.
+    pub field_summary:
+        IndexMap<(Option<trace_ir::TargetId>, trace_ir::TypeId, FieldId), LocId, FxBuildHasher>,
     pub field_loc_to_summary: IndexMap<LocId, LocId, FxBuildHasher>,
+    /// Only scoped locations have entries; also carries scope through heap
+    /// fields and summary-rooted nested accesses that have no owning variable.
+    location_targets: FxHashMap<LocId, trace_ir::TargetId>,
     /// Fn locations parked into an array var by `ArrayFnMember` inits
     /// (`{ {.., Fn}, .. }`); reachable through any element field load.
     pub array_fn_members: FxHashMap<VarId, Vec<LocId>>,
@@ -145,6 +151,7 @@ impl Pag {
                 type_id: var.type_id,
                 desc: var.name.clone(),
             });
+            self.set_location_target(loc_id, var.target);
             self.var_location.insert(var.id, loc_id);
         }
     }
@@ -170,6 +177,7 @@ impl Pag {
             type_id: v.type_id,
             desc: v.name.clone(),
         });
+        self.set_location_target(loc_id, v.target);
         self.var_location.insert(var, loc_id);
         Some(loc_id)
     }
@@ -250,6 +258,41 @@ impl Pag {
         srcs
     }
 
+    fn set_location_target(&mut self, loc: LocId, target: Option<trace_ir::TargetId>) {
+        if let Some(target) = target {
+            self.location_targets.insert(loc, target);
+        }
+    }
+
+    /// The link image a PAG node belongs to. The single answer to that
+    /// question: consumers of points-to results must not each re-derive it,
+    /// or they disagree about node kinds the way two hand-rolled matches did.
+    pub fn node_target(&self, program: &Program, node: PagNodeId) -> Option<trace_ir::TargetId> {
+        // Gated on the feature, not on `location_targets`: that map fills in
+        // as the PAG is built, so an early query would otherwise read `None`
+        // for a variable whose target the symbol table already knows — and a
+        // heap location stamped `None` shares its field summaries with every
+        // other image.
+        if program.link_targets.is_empty() {
+            return None;
+        }
+        match self.nodes[node.0 as usize].kind {
+            PagNodeKind::Var(var) => program.symbols.variable_by_id(var).and_then(|v| v.target),
+            PagNodeKind::Loc(loc) => self.location_target(loc),
+            PagNodeKind::CallTarget(site) => program
+                .symbols
+                .call_site_by_id(site)
+                .and_then(|cs| program.symbols.function(cs.caller).target),
+        }
+    }
+
+    fn location_target(&self, loc: LocId) -> Option<trace_ir::TargetId> {
+        if self.location_targets.is_empty() {
+            return None;
+        }
+        self.location_targets.get(&loc).copied()
+    }
+
     fn alloc_field_loc(
         &mut self,
         parent_loc: LocId,
@@ -273,6 +316,7 @@ impl Pag {
         });
         let depth = self.field_depth.get(&parent_loc).copied().unwrap_or(0) + 1;
         self.field_depth.insert(loc_id, depth);
+        self.set_location_target(loc_id, self.location_target(parent_loc));
         self.field_loc.insert((parent_loc, field), loc_id);
         loc_id
     }
@@ -292,11 +336,13 @@ impl Pag {
             return Some(loc);
         }
         let parent_type = struct_type_for_loc(self, program, parent_loc)?;
+        let target = self.location_target(parent_loc);
         let field_layout = program.types.get(parent_type).layout.fields.get(&field)?;
         if self.field_depth.get(&parent_loc).copied().unwrap_or(0) >= FIELD_LOC_DEPTH_CAP {
             return Some(self.ensure_field_summary_loc(
                 program,
                 parent_type,
+                target,
                 field,
                 field_layout.type_id,
                 &field_layout.name,
@@ -307,6 +353,7 @@ impl Pag {
         let summary = self.ensure_field_summary_loc(
             program,
             parent_type,
+            target,
             field,
             field_layout.type_id,
             &field_layout.name,
@@ -319,11 +366,12 @@ impl Pag {
         &mut self,
         program: &Program,
         struct_type: trace_ir::TypeId,
+        target: Option<trace_ir::TargetId>,
         field: FieldId,
         field_type: trace_ir::TypeId,
         name: &str,
     ) -> LocId {
-        if let Some(&loc) = self.field_summary.get(&(struct_type, field)) {
+        if let Some(&loc) = self.field_summary.get(&(target, struct_type, field)) {
             return loc;
         }
         let struct_name = match program.types.get(struct_type).desc.as_ref() {
@@ -341,7 +389,9 @@ impl Pag {
             type_id: field_type,
             desc: format!("summary:{struct_name}.{name}"),
         });
-        self.field_summary.insert((struct_type, field), loc_id);
+        self.field_summary
+            .insert((target, struct_type, field), loc_id);
+        self.set_location_target(loc_id, target);
         loc_id
     }
 
@@ -397,6 +447,7 @@ impl Pag {
         Some(self.ensure_field_summary_loc(
             program,
             struct_type,
+            v.target,
             resolved_field,
             field_layout.type_id,
             &field_layout.name,
@@ -440,6 +491,7 @@ impl Pag {
                 type_id: func.return_type,
                 desc: func.name.clone(),
             });
+            self.set_location_target(loc_id, func.target);
             self.fn_locations.insert(func.id, loc_id);
         }
     }
@@ -513,9 +565,11 @@ impl Pag {
                     // May-approximation: a merged name may bind to the
                     // query file's `static` def, the external def, or both.
                     let mut visited = FxHashSet::default();
-                    let candidates: Vec<_> = program
-                        .symbols
-                        .resolve_function_candidates(callee_name, file);
+                    let candidates: Vec<_> = program.symbols.resolve_function_candidates_in_target(
+                        callee_name,
+                        file,
+                        program.symbols.variable(*dst).target,
+                    );
                     let mut any_real = false;
                     for callee in &candidates {
                         if self.expand_return_flows(program, dst_n, *callee, models, &mut visited) {
@@ -533,7 +587,7 @@ impl Pag {
                                 .iter()
                                 .find(|c| !program.symbols.function(**c).params.is_empty())
                                 .map(|c| program.symbols.function(*c).params.clone());
-                            self.apply_return_model(dst_n, model, params.as_deref());
+                            self.apply_return_model(program, dst_n, model, params.as_deref());
                         }
                     }
                 }
@@ -551,6 +605,7 @@ impl Pag {
                     let var = program.symbols.variable(*dst);
                     let type_id = var.type_id;
                     let loc = self.alloc_heap_loc("new heap".to_string());
+                    self.set_location_target(loc, var.target);
                     let loc_n = self.loc_node[&loc];
                     self.locations[loc.0 as usize].type_id = type_id;
                     self.add_addr_of(dst_n, loc_n);
@@ -654,9 +709,12 @@ impl Pag {
                         }
                         ReturnFlow::Call { callee_name } => {
                             let file = program.symbols.function(callee).file;
-                            let inner_candidates = program
-                                .symbols
-                                .resolve_function_candidates(&callee_name, Some(file));
+                            let inner_candidates =
+                                program.symbols.resolve_function_candidates_in_target(
+                                    &callee_name,
+                                    Some(file),
+                                    program.symbols.function(callee).target,
+                                );
                             let mut inner_applied = false;
                             for inner in inner_candidates.iter().copied() {
                                 if self.expand_return_flows(program, dst, inner, models, visited) {
@@ -672,7 +730,7 @@ impl Pag {
                                         .iter()
                                         .find(|c| !program.symbols.function(**c).params.is_empty())
                                         .map(|c| program.symbols.function(*c).params.clone());
-                                    self.apply_return_model(dst, model, params.as_deref());
+                                    self.apply_return_model(program, dst, model, params.as_deref());
                                     // Modeled heap/alias facts count as applied
                                     // so outer frames do not re-apply them.
                                     inner_applied = true;
@@ -695,6 +753,7 @@ impl Pag {
     /// destination whose callee has no body under the analyzed root.
     fn apply_return_model(
         &mut self,
+        program: &Program,
         dst: PagNodeId,
         model: &crate::summaries::FnModel,
         params: Option<&[VarId]>,
@@ -710,6 +769,8 @@ impl Pag {
                 Effect::ReturnHeap => {
                     let name = &model.name;
                     let loc = self.alloc_heap_loc(format!("{name}() storage"));
+                    let target = self.node_target(program, dst);
+                    self.set_location_target(loc, target);
                     let loc_n = self.loc_node[&loc];
                     self.add_addr_of(dst, loc_n);
                 }
@@ -755,7 +816,7 @@ impl Pag {
                 } else {
                     self.add_load(call_target, var_node);
                 }
-            } else if program.symbols.resolve_function(&cs.callee_name).is_none() {
+            } else if !callee_name_is_a_function(program, cs) {
                 let call_target = self.call_target_node(cs.id);
                 if let Some(v) = lookup_var_in_fn(&fn_vars, program, &cs.callee_name, cs.caller) {
                     let var_node = self.var_node_id(v);
@@ -924,6 +985,26 @@ fn struct_type_from_type_id(
     None
 }
 
+/// Whether the call's spelled name denotes a function rather than a
+/// function-pointer variable. The companion `lookup_var_in_fn` below is
+/// target-aware, so this guard has to be too: a function named `cb` in one
+/// image must not stop another image's `cb` variable from feeding its own
+/// call-target node. Without link metadata the historical whole-program
+/// lookup is kept exactly.
+fn callee_name_is_a_function(program: &Program, cs: &trace_ir::CallSite) -> bool {
+    if program.link_targets.is_empty() {
+        return program.symbols.resolve_function(&cs.callee_name).is_some();
+    }
+    program
+        .symbols
+        .resolve_function_in_scope_in_target(
+            &cs.callee_name,
+            Some(cs.span.file),
+            program.symbols.function(cs.caller).target,
+        )
+        .is_some()
+}
+
 fn lookup_var_in_fn(
     fn_vars: &FxHashMap<FnId, FxHashMap<String, VarId>>,
     program: &Program,
@@ -933,13 +1014,104 @@ fn lookup_var_in_fn(
     fn_vars
         .get(&caller)
         .and_then(|m| m.get(name).copied())
-        .or_else(|| program.symbols.global_by_name.get(name).copied())
+        .or_else(|| match program.symbols.function(caller).target {
+            Some(target) => program.symbols.target_global(target, name),
+            None => program.symbols.global_by_name.get(name).copied(),
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use trace_ir::{Span, TypeDesc, Variable};
+
+    #[test]
+    fn field_summaries_share_within_targets_but_not_between_them() {
+        let mut program = Program::new(".".into());
+        let type_id = program.types.intern(TypeDesc::Struct {
+            name: "Outer".into(),
+            fields: vec![(
+                "nested".into(),
+                TypeDesc::Struct {
+                    name: "Inner".into(),
+                    fields: vec![("value".into(), TypeDesc::Int)],
+                },
+            )],
+        });
+        let mut vars = Vec::new();
+        for target in [
+            Some(trace_ir::TargetId(0)),
+            Some(trace_ir::TargetId(0)),
+            Some(trace_ir::TargetId(1)),
+            None,
+        ] {
+            let id = program.symbols.alloc_var_id();
+            program.symbols.add_variable(Variable {
+                id,
+                name: "object".into(),
+                type_id,
+                storage: StorageClass::Global,
+                fn_id: None,
+                param_index: None,
+                span: Span::new(trace_ir::FileId(0), 1, 1),
+                is_pointer: false,
+                is_defined: true,
+                is_weak: false,
+                target,
+                is_namespaced: false,
+            });
+            program.flow.push(FlowConstraint::NewHeap { dst: id });
+            vars.push(id);
+        }
+        let mut pag = Pag::build(&program);
+        let heaps: Vec<_> = pag
+            .locations
+            .iter()
+            .filter(|loc| loc.kind == LocKind::Heap)
+            .map(|loc| loc.id)
+            .collect();
+        let heap_a = pag
+            .ensure_field_loc(&program, heaps[0], FieldId(0))
+            .unwrap();
+        let heap_b = pag
+            .ensure_field_loc(&program, heaps[2], FieldId(0))
+            .unwrap();
+        assert_ne!(
+            pag.summary_for_field_loc(heap_a),
+            pag.summary_for_field_loc(heap_b)
+        );
+        let summaries: Vec<_> = vars
+            .iter()
+            .map(|v| {
+                pag.ensure_field_summary_for_var(&program, *v, FieldId(0))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(summaries[0], summaries[1]);
+        assert_ne!(summaries[0], summaries[2]);
+        assert_ne!(summaries[0], summaries[3]);
+        let nested_a = pag
+            .ensure_field_loc(&program, summaries[0], FieldId(0))
+            .unwrap();
+        let nested_b = pag
+            .ensure_field_loc(&program, summaries[2], FieldId(0))
+            .unwrap();
+        assert_ne!(
+            pag.summary_for_field_loc(nested_a),
+            pag.summary_for_field_loc(nested_b)
+        );
+        let root_a = pag.ensure_var_loc(&program, vars[0]).unwrap();
+        let field_a = pag.ensure_field_loc(&program, root_a, FieldId(0)).unwrap();
+        assert_eq!(pag.summary_for_field_loc(field_a), Some(summaries[0]));
+        let nested_field_a = pag.ensure_field_loc(&program, field_a, FieldId(0)).unwrap();
+        let root_b = pag.ensure_var_loc(&program, vars[2]).unwrap();
+        let field_b = pag.ensure_field_loc(&program, root_b, FieldId(0)).unwrap();
+        let nested_field_b = pag.ensure_field_loc(&program, field_b, FieldId(0)).unwrap();
+        assert_ne!(
+            pag.summary_for_field_loc(nested_field_a),
+            pag.summary_for_field_loc(nested_field_b)
+        );
+    }
 
     #[test]
     fn empty_field_name_does_not_redirect_to_an_anonymous_member() {
@@ -953,6 +1125,10 @@ mod tests {
         });
         let var = program.symbols.alloc_var_id();
         program.symbols.add_variable(Variable {
+            is_defined: false,
+            is_weak: false,
+            target: None,
+            is_namespaced: false,
             id: var,
             name: "object".into(),
             type_id,

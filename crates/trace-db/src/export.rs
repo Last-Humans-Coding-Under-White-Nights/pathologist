@@ -1,4 +1,4 @@
-use crate::schema::{INDEXES_V4, SCHEMA_VERSION, TABLES_V4};
+use crate::schema::{INDEXES_V5, SCHEMA_VERSION, TABLES_V5};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use rustc_hash::FxHashSet;
@@ -53,7 +53,7 @@ pub fn export_to_sqlite(
             "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY;",
         )?;
         conn.execute_batch("BEGIN IMMEDIATE;")?;
-        conn.execute_batch(TABLES_V4)?;
+        conn.execute_batch(TABLES_V5)?;
 
         let options_json = serde_json::json!({
             "include_paths": program.include_paths,
@@ -80,6 +80,7 @@ pub fn export_to_sqlite(
         )?;
 
         export_files(&conn, program)?;
+        export_link_targets(&conn, program)?;
         export_functions(&conn, program)?;
         export_call_sites_filtered(&conn, program, analysis)?;
         export_call_edges(&conn, analysis)?;
@@ -96,7 +97,7 @@ pub fn export_to_sqlite(
             export_points_to(&conn, pag, analysis)?;
         }
         export_diagnostics(&conn, program)?;
-        conn.execute_batch(INDEXES_V4)?;
+        conn.execute_batch(INDEXES_V5)?;
         conn.execute_batch("COMMIT;")?;
     }
 
@@ -125,6 +126,34 @@ fn export_files(conn: &Connection, program: &Program) -> Result<()> {
             "",
             file.is_dep as i32
         ])?;
+    }
+    Ok(())
+}
+
+fn export_link_targets(conn: &Connection, program: &Program) -> Result<()> {
+    let mut targets =
+        conn.prepare_cached("INSERT INTO link_targets (id, name, output) VALUES (?1, ?2, ?3)")?;
+    // Insert the catalog first so forward dependency references are valid
+    // even when this helper is used with foreign-key enforcement enabled.
+    for target in &program.link_targets {
+        targets.execute(params![
+            target.id.0,
+            target.name,
+            target.output.display().to_string()
+        ])?;
+    }
+    let mut sources =
+        conn.prepare_cached("INSERT INTO target_sources (target_id, file_id) VALUES (?1, ?2)")?;
+    let mut dependencies = conn.prepare_cached(
+        "INSERT INTO target_dependencies (target_id, dependency_id) VALUES (?1, ?2)",
+    )?;
+    for target in &program.link_targets {
+        for source in &target.sources {
+            sources.execute(params![target.id.0, source.0])?;
+        }
+        for dependency in &target.dependencies {
+            dependencies.execute(params![target.id.0, dependency.0])?;
+        }
     }
     Ok(())
 }
@@ -185,10 +214,10 @@ fn type_name(desc: &TypeDesc) -> String {
     }
 }
 
+const INSERT_VARIABLE: &str = "INSERT INTO variables (id, name, kind, fn_id, type_id, file_id, line, col, is_weak, target_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+
 fn export_variables(conn: &Connection, program: &Program) -> Result<()> {
-    let mut stmt = conn.prepare_cached(
-        "INSERT INTO variables (id, name, kind, fn_id, type_id, file_id, line, col) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-    )?;
+    let mut stmt = conn.prepare_cached(INSERT_VARIABLE)?;
     for var in &program.symbols.variables {
         export_one_variable(&mut stmt, var)?;
     }
@@ -223,9 +252,7 @@ fn export_flow_and_arg_flow_vars(
     if needed.is_empty() {
         return Ok(());
     }
-    let mut stmt = conn.prepare_cached(
-        "INSERT INTO variables (id, name, kind, fn_id, type_id, file_id, line, col) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-    )?;
+    let mut stmt = conn.prepare_cached(INSERT_VARIABLE)?;
     for var in &program.symbols.variables {
         if needed.contains(&var.id) {
             export_one_variable(&mut stmt, var)?;
@@ -445,14 +472,16 @@ fn export_one_variable(stmt: &mut rusqlite::Statement<'_>, var: &trace_ir::Varia
         var.type_id.0,
         var.span.file.0,
         var.span.line,
-        var.span.col
+        var.span.col,
+        var.is_weak,
+        var.target.map(|target| target.0),
     ])?;
     Ok(())
 }
 
 fn export_functions(conn: &Connection, program: &Program) -> Result<()> {
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO functions (id, name, file_id, line_start, line_end, linkage, signature, is_defined, is_dep) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO functions (id, name, file_id, line_start, line_end, linkage, signature, is_defined, is_dep, is_weak, target_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?;
     for func in &program.symbols.functions {
         let linkage = match func.linkage {
@@ -470,6 +499,8 @@ fn export_functions(conn: &Connection, program: &Program) -> Result<()> {
             format!("fn_{}", func.name),
             func.is_defined as i32,
             program.is_dep_file(func.file) as i32,
+            func.is_weak,
+            func.target.map(|target| target.0),
         ])?;
     }
     Ok(())
@@ -607,4 +638,135 @@ fn export_diagnostics(conn: &Connection, program: &Program) -> Result<()> {
 
 pub fn open_db(path: &Path) -> Result<Connection> {
     Connection::open(path).with_context(|| format!("failed to open db at {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trace_ir::{Function, Span, TargetId, TypeId, Variable};
+
+    #[test]
+    fn exports_target_catalog_with_source_and_dependency_relations() {
+        let mut program = Program::new(PathBuf::from("/fixture"));
+        let file = program.symbols.add_file(PathBuf::from("/fixture/main.c"));
+        program.link_targets = vec![
+            trace_ir::LinkTarget {
+                id: TargetId(0),
+                name: "app".into(),
+                output: PathBuf::from("/fixture/app"),
+                sources: vec![file],
+                dependencies: vec![TargetId(1)],
+            },
+            trace_ir::LinkTarget {
+                id: TargetId(1),
+                name: "lib".into(),
+                output: PathBuf::from("/fixture/lib.so"),
+                sources: vec![],
+                dependencies: vec![],
+            },
+        ];
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(TABLES_V5).unwrap();
+        export_files(&conn, &program).unwrap();
+        export_link_targets(&conn, &program).unwrap();
+        let mut stmt = conn.prepare("SELECT t.name, t.output, f.path, d.name FROM link_targets t JOIN target_sources s ON s.target_id = t.id JOIN files f ON f.id = s.file_id JOIN target_dependencies e ON e.target_id = t.id JOIN link_targets d ON d.id = e.dependency_id").unwrap();
+        let rows: Vec<(String, String, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "app".into(),
+                "/fixture/app".into(),
+                "/fixture/main.c".into(),
+                "lib".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn exports_weak_and_target_metadata_in_both_detail_modes() {
+        let mut program = Program::new(PathBuf::from("/fixture"));
+        let file = program.symbols.add_file(PathBuf::from("/fixture/hooks.c"));
+        for (name, weak, target) in [
+            ("fallback", true, Some(TargetId(7))),
+            ("normal", false, None),
+        ] {
+            let id = program.symbols.alloc_fn_id();
+            program.symbols.add_function(Function {
+                id,
+                name: name.into(),
+                linkage: Linkage::External,
+                return_type: TypeId(0),
+                params: vec![],
+                locals: vec![],
+                span: Span::new(file, 1, 1),
+                end_line: 1,
+                file,
+                is_defined: true,
+                is_weak: weak,
+                target,
+                param_type_ids: vec![],
+                explicit_arity: Some(0),
+                owner_unresolved: false,
+                variadic: false,
+                defaulted_in_class: false,
+                declared_in_class: false,
+                default_args: 0,
+                is_virtual: false,
+                is_final: false,
+                is_cpp: false,
+            });
+            let id = program.symbols.alloc_var_id();
+            program.symbols.add_variable(Variable {
+                is_defined: true,
+                id,
+                name: name.into(),
+                type_id: TypeId(0),
+                storage: StorageClass::Global,
+                fn_id: None,
+                param_index: None,
+                span: Span::new(file, 1, 1),
+                is_pointer: true,
+                is_weak: weak,
+                target,
+                is_namespaced: false,
+            });
+        }
+        let pag = Pag::build(&program);
+        for full_detail in [false, true] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            conn.execute_batch(TABLES_V5).unwrap();
+            export_functions(&conn, &program).unwrap();
+            if full_detail {
+                export_variables(&conn, &program).unwrap();
+            } else {
+                export_flow_and_arg_flow_vars(&conn, &program, &pag, &AnalysisResult::default())
+                    .unwrap();
+            }
+            for table in ["functions", "variables"] {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT name, is_weak, target_id FROM {table} ORDER BY name"
+                    ))
+                    .unwrap();
+                let rows: Vec<(String, bool, Option<u32>)> = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert_eq!(
+                    rows,
+                    vec![
+                        ("fallback".into(), true, Some(7)),
+                        ("normal".into(), false, None)
+                    ],
+                    "{table}, full_detail={full_detail}"
+                );
+            }
+        }
+    }
 }

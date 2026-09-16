@@ -2120,11 +2120,28 @@ impl PreprocessorState {
             "line" => {}
             "pragma" => {
                 // `#pragma once` is the file's own statement that one
-                // expansion per translation unit is enough; nothing else
-                // about a pragma concerns the preprocessor. Reached inside a
+                // expansion per translation unit is enough. Weak pragmas are
+                // retained as annotation input to lowering. Reached inside a
                 // skipped arm it states nothing, so it is read only while
                 // active — and once read it holds for the rest of the run,
                 // whatever later happens to the controlling condition.
+                if self.is_active()
+                    && matches!(tokens.get(i).map(|t| &t.kind), Some(TokenKind::Identifier(n)) if n.as_str() == "weak")
+                {
+                    let tok = &tokens[i];
+                    self.emit_str("\n#pragma ", tok.line, tok.col);
+                    // `skip_to_newline` returns the index *past* the newline,
+                    // so the operands stop one short of it and the terminator
+                    // is emitted here — a directive ending at EOF gets one too.
+                    let end = Self::skip_to_newline(tokens, i);
+                    for token in &tokens[i..end] {
+                        if token.is_newline() {
+                            break;
+                        }
+                        self.emit_token(token);
+                    }
+                    self.emit_str("\n", tok.line, tok.col);
+                }
                 if self.is_active()
                     && matches!(tokens.get(i).map(|t| &t.kind), Some(TokenKind::Identifier(n)) if n.as_str() == "once")
                 {

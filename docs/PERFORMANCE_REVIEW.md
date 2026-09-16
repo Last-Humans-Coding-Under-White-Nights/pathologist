@@ -109,9 +109,9 @@ Implemented opportunities 1 and 3:
   no longer creates a temporary suffix map. The new regression test covers
   equal-offset entries, excluded boundaries, multiple original files,
   preexisting destination files, empty ranges, and ranges beyond the last entry.
-- SQLite export creates tables first, loads rows, and creates all eight
+- SQLite export creates tables first, loads rows, and creates all twelve
   secondary indexes before committing. A single SQL definition generates both
-  the complete public `SCHEMA_V4` and the separate export phases. A regression
+  the complete public `SCHEMA_V5` and the separate export phases. A regression
   test verifies primary-key/path uniqueness during loading and that phased
   creation produces the same complete schema.
 
@@ -366,3 +366,57 @@ local class with virtual members is recorded as virtual and dispatches to
 overrides. Skipping the body changes one call edge and three argument-flow
 edges on Clang. Correct, but a behavior change, so it is not part of this
 performance change.
+
+## Weak symbols and link-target scoping (#106)
+
+Measured on 2026-09-16 against `2b61ae4`, using release builds, minimal export,
+`--jobs 8`, and ten alternating before/after runs per corpus. HDF was pinned at
+`cdc75a20bb8f1a046cd22e189405a20d602d0521`; camera at
+`8ffd69dcd47f533e70b4dba428439da9008b0cae`. These corpora exercise the ordinary
+path without link metadata. Values below are medians over all ten runs, with
+the observed range in brackets; memory is MiB as reported by macOS
+`/usr/bin/time -l`.
+
+| Corpus | Elapsed before → after | Peak RSS before → after | Peak footprint before → after |
+|--------|------------------------|-------------------------|-------------------------------|
+| HDF | 3.38 → 3.35 s [3.29–3.72 / 3.33–3.45] | 362.7 → 367.9 [338–378 / 360–379] | 297.0 → 298.4 [288–328 / 271–332] |
+| Camera | 4.78 → 4.76 s [4.73–4.85 / 4.66–4.89] | 665.4 → 668.3 [641–688 / 647–737] | 740.9 → 703.8 [708–750 / 656–761] |
+
+Neither runtime nor memory shows an effect in either direction. Both elapsed
+medians move by under 1% with before-ranges that straddle the after-medians,
+and memory readings sit inside heavily overlapping ranges: peak RSS differs by +1.4% on HDF and +0.4%
+on camera, peak footprint by +0.5% and −5%. Sample size matters here — a
+five-run subset of the same data showed peak RSS up 2.5–3%, which ten runs did
+not reproduce, so RSS differences of a few percent on this workload should be
+read as noise rather than signal. The first invocation of a newly built binary
+is consistently the slowest of its session. These measurements do not establish
+performance for every build.
+
+All 12 pre-existing analysis tables matched exactly on their original columns
+for both corpora, excluding `analysis_run` metadata: identical row counts and
+identical row sets for `call_edges`, `arg_flow_edges`, `call_sites`,
+`flow_nodes`, `flow_edges`, `functions`, `variables`, `files` and
+`diagnostics`; the remaining three (`types`, `locations`, `points_to`) are
+empty under minimal export, so they match trivially. Only the three new target
+tables are added. No evaluation
+expectations needed updating. New weak/target columns were excluded from that
+comparison.
+
+The implementation preserves the ordinary indexing path when no link metadata
+exists. Weak annotation scans skip units without weak symbols, imported weak
+presence uses a monotonic symbol-table cache, and weak body/initializer ownership
+ranges are allocated only for link-aware indexing. Compilation commands are
+parsed once and object/configuration membership reuses that result. With link
+metadata, each configured unit is lowered once; target-specific IR instances
+are then merged separately. Their additional memory represents distinct target
+bindings, while type descriptors remain shared. Signature selection considers
+only names with weak definitions and indexes parameter types once per unit.
+
+Two properties bound the link-aware path's cost. Scoping rewrites a full copy
+of each unit it merges, so `merge_target` builds and merges those copies one at
+a time (`VariantMerge`, the streaming form of `merge_unit_variants`) rather than
+materializing the family first: peak memory carries one scoped unit, not a
+second copy of everything a target links. And a multi-config CMake reply lists
+each target once per configuration over identical sources, so only the first
+configuration is read; indexing all of them would multiply the whole corpus by
+the configuration count for no additional facts.

@@ -7,6 +7,7 @@ mod expansion_discovery;
 pub mod explore;
 pub mod gn_defines;
 mod index_cache;
+mod link_commands;
 mod lower;
 mod memory;
 mod merge;

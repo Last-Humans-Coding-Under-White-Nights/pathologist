@@ -89,6 +89,20 @@
 - Programmatic C API library (`crates/trace-capi`, `libtrace_capi.{so,a}`) and header (`crates/trace-capi/include/trace.h`) for indexing and querying analysis results (#40).
 - Schema v4 export and diagnostics deduplication.
 
+### M12 — Link targets & weak symbols ✅
+
+- Link metadata ingestion: `link_commands.json` discovery (target root or
+  `build/`), explicit `--link-commands PATH`, link entries inside
+  `compile_commands.json`, and CMake File API `codemodel-v2` replies (#106).
+- Per-link-image symbol scopes: a strong definition supersedes a weak one only
+  inside targets that contain it; weak-only targets keep the fallback.
+- GNU `weak` / `__weak__` attributes and active `#pragma weak` lowered to
+  `is_weak` for external functions and globals.
+- Schema v5: `link_targets`, `target_sources`, `target_dependencies` tables and
+  `is_weak` / `target_id` columns on `functions` and `variables`.
+- IPC proxy→stub bridges deliberately remain cross-image, being the one edge
+  kind that models a process boundary.
+
 ## In progress / next
 
 C++ beyond the first step is planned from the hiview corpus in
@@ -101,7 +115,7 @@ C1→C11 there with fixtures.
 | **C++ next slices** | See [CPP_ROADMAP.md](CPP_ROADMAP.md) for slice order and status; eval H7 (`REGISTER` + map), C11 (`dlsym`) |
 | **`memcpy` / `memmove` summaries** | Registered but no-op; blocks fn-ptr-through-memcpy patterns |
 | **Original-source line remapping** | Done for `#include`d code: header-origin entities carry original file/line via `LineMap` and are deduplicated across TUs |
-| **`compile_commands.json` (#62)** | Implemented: optional discovery or explicit path; per-command includes, macro operations, forced includes, language/standard; all configurations merged. Missing build dependencies remain outside its scope. |
+| **`compile_commands.json` (#62)** | Implemented: optional discovery or explicit path; per-command includes, macro operations, forced includes, language/standard; all configurations merged. Missing build dependencies remain outside its scope (link-stage membership landed separately in M12/#106). |
 | **Heap allocation modeling** | `malloc` family stubs don't allocate fresh locs yet; C++ `new T` is `NewHeap` |
 | **`__VA_OPT__`** | C23 `__VA_OPT__` (variadics, GNU `, ##args` elision and the `#` stringize operator are done) |
 | **Constant array index refinement** | Avoid merging all fn-ptr table slots |
@@ -141,6 +155,7 @@ Further index-time wins: smarter header/preprocess skipping, incremental TU cach
 | C++ first-step | `cpp_basic/`, `cpp_more/`, `cpp_flow/`, `cpp_implicit_this/`, `cpp_callable/`, `cpp_dispatch/`, `cpp_extern_c_driver/` |
 | C++ `auto` from declared returns (C1) | `cpp_auto_return/` |
 | C++ next (planned) | [CPP_ROADMAP.md](CPP_ROADMAP.md) — `DownCastTo`, `REGISTER`+map, `std::bind`/`ffrt::submit` |
+| Weak symbols / link targets | `weak_symbol_override/`, `weak_annotations/` |
 | Adversarial / limitations | `tests/fixtures/adversarial_*`, `macro_*` |
 
 Run: `cargo test --workspace`

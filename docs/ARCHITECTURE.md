@@ -35,7 +35,7 @@ flowchart LR
 | Parse + lower | `trace-parse` | Preprocessed TU | `UnitIndex` (symbols, types, flow, call sites) |
 | Merge | `trace-parse` | Per-TU indices | Single `Program` |
 | Analyze | `trace-analysis` | `Program` | `Pag` + `AnalysisResult` |
-| Export | `trace-db` | Program + analysis | SQLite v4 |
+| Export | `trace-db` | Program + analysis | SQLite v5 |
 
 The pipeline is also exposed programmatically via `trace-capi` (`libtrace_capi`), providing a C ABI (`crates/trace-capi/include/trace.h`) for indexing and database inspection.
 
@@ -44,7 +44,7 @@ The pipeline is also exposed programmatically via `trace-capi` (`libtrace_capi`)
 - **Indexed TUs**: `*.c` and `*.cpp`-family files under `<TARGET>`. Each TU selects the tree-sitter C or C++ grammar by extension.
 - **Headers**: discovered for the include graph but **not** lowered as standalone TUs. Their declarations appear in preprocessed `.c` output.
 - **Orphan headers** (never `#include`d by any project `.c`) are skipped — they contribute no reachable code.
-- **Cross-TU linking**: external symbols merged by name in `merge_unit_index` (`fn_by_name`). **`static` / internal-linkage** functions remain **per-file** and are resolved with `resolve_function_in_scope(name, file)` at analysis time; file-scope `static` variables are looked up with `SymbolTable::file_static_named`, in the file and the headers it includes.
+- **Cross-TU linking**: external symbols merged by name in `merge_unit_index` (`fn_by_name`), or per link image in `merge_linked_units` when build metadata is available (see [ANALYSIS.md](ANALYSIS.md#link-targets-and-weak-symbols)). **`static` / internal-linkage** functions remain **per-file** and are resolved with `resolve_function_in_scope(name, file)` at analysis time; file-scope `static` variables are looked up with `SymbolTable::file_static_named`, in the file and the headers it includes.
 
 ## Crate dependencies
 
