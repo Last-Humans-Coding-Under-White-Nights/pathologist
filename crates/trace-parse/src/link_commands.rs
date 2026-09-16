@@ -50,7 +50,8 @@ impl LinkDatabase {
             &root
         };
         let mut db = Self::default();
-        let link_path = database_path(root, links, "link_commands.json")?;
+        let database = compilation.path.as_ref().and_then(|p| p.parent());
+        let link_path = database_path(root, database, links, "link_commands.json")?;
         let mut batches = Vec::new();
         if let Some(path) = &compilation.path {
             batches.push((path.clone(), compilation.link_entries.clone()));
@@ -111,11 +112,7 @@ impl LinkDatabase {
                 }
             }
         }
-        let mut build_roots = BTreeSet::from([root.to_path_buf(), root.join("build")]);
-        if let Some(path) = compilation.path.as_ref().and_then(|p| p.parent()) {
-            build_roots.insert(path.to_path_buf());
-        }
-        for build in build_roots {
+        for build in metadata_roots(root, database) {
             let start = db.targets.len();
             if let Err(e) = db.read_cmake(&build) {
                 db.targets.truncate(start);
@@ -426,7 +423,11 @@ pub(crate) fn is_link_only_entry(entry: &Value) -> bool {
 /// Whether any link metadata is reachable, without reading it. Lets the
 /// compilation reader skip per-command object bookkeeping that only the target
 /// reader consumes; a handful of stats against tens of thousands of commands.
-pub(crate) fn metadata_exists(root: &Path, explicit: Option<&Path>) -> bool {
+pub(crate) fn metadata_exists(
+    root: &Path,
+    database: Option<&Path>,
+    explicit: Option<&Path>,
+) -> bool {
     if explicit.is_some() {
         return true;
     }
@@ -436,19 +437,29 @@ pub(crate) fn metadata_exists(root: &Path, explicit: Option<&Path>) -> bool {
     } else {
         root
     };
-    [
-        root.join("link_commands.json"),
-        root.join("build").join("link_commands.json"),
-    ]
-    .iter()
-    .any(|p| p.is_file())
-        || [&root, &root.join("build")]
-            .iter()
-            .any(|dir| dir.join(".cmake/api/v1/reply").is_dir())
+    metadata_roots(&root, database).iter().any(|dir| {
+        dir.join("link_commands.json").is_file() || dir.join(".cmake/api/v1/reply").is_dir()
+    })
+}
+
+/// Where link metadata is looked for, in priority order. An out-of-source
+/// build keeps its link commands and its CMake reply beside the compilation
+/// database it also wrote, which is neither the analysis root nor `root/build`
+/// — and a probe that omitted that directory answered "no metadata" for the
+/// reader that had already found it there.
+fn metadata_roots(root: &Path, database: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = vec![root.to_path_buf(), root.join("build")];
+    if let Some(directory) = database {
+        if !roots.iter().any(|dir| dir == directory) {
+            roots.push(directory.to_path_buf());
+        }
+    }
+    roots
 }
 
 fn database_path(
     root: &Path,
+    database: Option<&Path>,
     explicit: Option<&Path>,
     name: &str,
 ) -> Result<Option<PathBuf>, String> {
@@ -461,8 +472,9 @@ fn database_path(
         }
         return Ok(Some(trace_ir::canonicalize(path)));
     }
-    Ok([root.join(name), root.join("build").join(name)]
+    Ok(metadata_roots(root, database)
         .into_iter()
+        .map(|dir| dir.join(name))
         .find(|p| p.is_file()))
 }
 fn read_json(path: &Path) -> Result<Value, String> {
@@ -516,7 +528,16 @@ pub(crate) fn command_output<S: AsRef<str>>(args: &[S]) -> Option<&str> {
     let msvc = is_msvc_driver(args);
     let explicit = args.iter().enumerate().find_map(|(i, arg)| {
         let arg = arg.as_ref();
-        if arg == "-o" || arg == "--output" {
+        // `/Fo` names the object file, joined (`/Foout.obj`), joined through a
+        // colon (`/Fo:out.obj`), or — as generators and clang-cl also spell it
+        // — as its own token. The dash spelling is matched case-sensitively:
+        // case-folded, its three bytes are the head of every `-f…` option, and
+        // `-fopenmp` would name the object `penmp`.
+        let object = msvc
+            .then(|| strip_prefix_ignore_case(arg, "/Fo").or_else(|| arg.strip_prefix("-Fo")))
+            .flatten()
+            .map(|rest| rest.strip_prefix(':').unwrap_or(rest));
+        if arg == "-o" || arg == "--output" || object == Some("") {
             args.get(i + 1).map(|next| next.as_ref())
         } else {
             arg.strip_prefix("--output=")
@@ -524,7 +545,10 @@ pub(crate) fn command_output<S: AsRef<str>>(args: &[S]) -> Option<&str> {
                     msvc.then(|| strip_prefix_ignore_case(arg, "/OUT:"))
                         .flatten()
                 })
-                .or_else(|| msvc.then(|| strip_prefix_ignore_case(arg, "/Fo")).flatten())
+                .or(object)
+                // An option that carries no path names no output; taking the
+                // empty string ended the search and discarded the real one.
+                .filter(|rest| !rest.is_empty())
         }
     });
     explicit.or_else(|| {
@@ -590,9 +614,14 @@ fn expand_response_files(
     let mut expanded = Vec::new();
     for arg in args {
         // `@rpath/libfoo.dylib`, `@executable_path/...` and `@loader_path/...`
-        // are Darwin dynamic-loader paths, not response files; reading them
-        // fails and would drop the whole link command.
-        if let Some(path) = arg.strip_prefix('@').filter(|_| !is_loader_path(&arg)) {
+        // are Darwin dynamic-loader paths, not response files, and a bare `@`
+        // names no file at all — joined to the command's directory it reopens
+        // that directory. Reading any of them fails, and the error drops the
+        // whole link command.
+        if let Some(path) = arg
+            .strip_prefix('@')
+            .filter(|path| !path.is_empty() && !is_loader_path(&arg))
+        {
             let text = std::fs::read_to_string(directory.join(path))
                 .map_err(|e| format!("response file {path}: {e}"))?;
             let args = split_command(&text).ok_or("unterminated response file quoting")?;
@@ -622,6 +651,11 @@ const OPERAND_IS_NOT_INPUT: &[&str] = &[
     "-h",
     "-rpath",
     "--rpath",
+    // A search directory for a shared library's own dependencies, not an
+    // input; left unconsumed it is read as one whenever it happens to look
+    // like a library path.
+    "-rpath-link",
+    "--rpath-link",
     "-R",
     "-syslibroot",
     "-bundle_loader",
@@ -1428,5 +1462,91 @@ mod tests {
             db.targets[app.dependencies[0]].sources,
             vec![trace_ir::canonicalize(&dir.path().join("lib.c"))]
         );
+    }
+
+    #[test]
+    fn an_object_output_survives_a_space_a_colon_or_a_dash() {
+        // `cl` spells the object file `/Fo`, and generators emit every one of
+        // these. A bare `/Fo` used to yield an empty output, which is not a
+        // path at all, and `/Fo:out.obj` kept the option's colon.
+        let cases: [(&[&str], Option<&str>); 6] = [
+            (&["cl", "/c", "/Fo", "out.obj", "foo.c"], Some("out.obj")),
+            (&["cl", "/c", "/Fo:out.obj", "foo.c"], Some("out.obj")),
+            (&["cl", "/c", "/Foout.obj", "foo.c"], Some("out.obj")),
+            (&["cl", "/c", "-Fo", "out.obj", "foo.c"], Some("out.obj")),
+            (&["cl", "/c", "-Foout.obj", "foo.c"], Some("out.obj")),
+            // The dash spelling is matched case-sensitively: folded, its three
+            // bytes are the head of every `-f…` option, and `-fopenmp` would
+            // name the object `penmp`.
+            (
+                &["clang-cl", "/c", "-fopenmp", "foo.c", "-o", "out.obj"],
+                Some("out.obj"),
+            ),
+        ];
+        for (args, expected) in cases {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert_eq!(command_output(&args), expected, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_bare_at_sign_and_rpath_link_operands_keep_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.c"), "").unwrap();
+        write(
+            dir.path(),
+            "compile_commands.json",
+            json!([{"directory":".","file":"a.c","arguments":["cc","-c","a.c","-o","a.o"]}]),
+        );
+        // `@` alone names no response file; reading it opened the command's
+        // own directory and dropped the whole target. `-rpath-link` takes a
+        // directory, which left unconsumed is read as an input path.
+        write(
+            dir.path(),
+            "link_commands.json",
+            json!([
+                {"directory":".","arguments":[
+                    "cc","a.o","@","-Wl,-rpath-link,/usr/lib",
+                    "--rpath-link","/opt/lib","-o","app"]}
+            ]),
+        );
+        let db = load(dir.path(), None, None).unwrap();
+        assert!(db.warnings.is_empty(), "{:?}", db.warnings);
+        let app = db
+            .targets
+            .iter()
+            .find(|t| t.name == "app")
+            .unwrap_or_else(|| panic!("missing app: {:?}", db.targets));
+        assert_eq!(
+            app.sources,
+            vec![trace_ir::canonicalize(&dir.path().join("a.c"))]
+        );
+        assert!(app.dependencies.is_empty(), "{app:?}");
+    }
+
+    #[test]
+    fn link_metadata_is_read_beside_an_out_of_source_compilation_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = trace_ir::canonicalize(dir.path());
+        std::fs::write(root.join("main.c"), "").unwrap();
+        // An out-of-source build keeps both databases in its own directory,
+        // which is neither the analysis root nor `root/build`.
+        write(
+            &root,
+            "out/compile_commands.json",
+            json!([{"directory":root,"file":"main.c",
+                    "arguments":["cc","-c","main.c","-o","out/main.o"]}]),
+        );
+        write(
+            &root,
+            "out/link_commands.json",
+            json!([{"directory":root,"arguments":["cc","out/main.o","-o","out/app"]}]),
+        );
+        let db = load(&root, Some(&root.join("out/compile_commands.json")), None).unwrap();
+        assert!(db.warnings.is_empty(), "{:?}", db.warnings);
+        assert_eq!(db.targets.len(), 1, "{:?}", db.targets);
+        // The object resolves back to its source only when the compilation
+        // reader knew link metadata was reachable and recorded object outputs.
+        assert_eq!(db.targets[0].sources, vec![root.join("main.c")]);
     }
 }

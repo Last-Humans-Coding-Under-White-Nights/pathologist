@@ -80,9 +80,11 @@ impl CompilationDatabase {
         // inside this very database, which no filesystem probe can see, so the
         // parsed entries are consulted too; that test short-circuits on any
         // entry whose `file` names a source.
-        let wants_objects =
-            crate::link_commands::metadata_exists(directory, overrides.link_commands.as_deref())
-                || entries.iter().any(crate::link_commands::is_link_only_entry);
+        let wants_objects = crate::link_commands::metadata_exists(
+            directory,
+            Some(database_dir.as_path()),
+            overrides.link_commands.as_deref(),
+        ) || entries.iter().any(crate::link_commands::is_link_only_entry);
         db.path = Some(path.clone());
         for (i, entry) in entries.into_iter().enumerate() {
             // Link-only records in mixed databases are handled by the target

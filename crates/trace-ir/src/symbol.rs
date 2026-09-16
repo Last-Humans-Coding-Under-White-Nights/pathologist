@@ -1270,12 +1270,24 @@ impl SymbolTable {
         // `fn_by_name` is a first-wins whole-program index, so under scoping
         // it can hold another image's entry and hide this one; the per-name
         // bucket is the complete list.
-        matches!(scope, TargetScope::Image(_))
+        let candidates = matches!(scope, TargetScope::Image(_))
             .then(|| self.externals_by_name.get(name))
-            .flatten()?
-            .iter()
-            .copied()
-            .find(|&id| self.in_scope_of(id, scope))
+            .flatten()?;
+        let in_scope = || {
+            candidates
+                .iter()
+                .copied()
+                .filter(|&id| self.in_scope_of(id, scope))
+        };
+        // The bucket is in registration order, which the primary slot
+        // deliberately is not: `should_take_primary` keeps a body ahead of the
+        // declarations of its name. Taking the bucket's first entry dropped
+        // that rule inside an image, so a prototype registered before the body
+        // -- another overload, or a header the image did not merge -- answered
+        // for every call site and the solver never expanded the body.
+        in_scope()
+            .find(|&id| self.function(id).is_defined)
+            .or_else(|| in_scope().next())
     }
 
     /// All functions a post-merge name lookup may refer to.
@@ -2452,5 +2464,78 @@ mod tests {
             "::ns::Device and ns::Device must match type shape"
         );
         assert!(p.symbols.function(proto_id).is_defined);
+    }
+
+    #[test]
+    fn a_scoped_lookup_prefers_a_body_over_a_prototype_in_the_same_image() {
+        // Under link scoping `fn_by_name` can hold another image's entry, and
+        // the lookup then falls through to the per-name bucket. That bucket is
+        // in registration order, so a prototype registered ahead of the body
+        // answered for every call site in the image and the solver never
+        // expanded the body behind it.
+        let mut p = Program::new(PathBuf::from("/t"));
+        let int_ty = p.types.intern(TypeDesc::Int);
+        let double_ty = p.types.intern(TypeDesc::Double);
+        let image = crate::TargetId(1);
+        let elsewhere = crate::TargetId(2);
+
+        let header = p.symbols.add_file(PathBuf::from("/t/api.h"));
+        let mut proto = fake_function(
+            p.symbols.alloc_fn_id(),
+            "process",
+            vec![p.symbols.alloc_var_id()],
+            false,
+            true,
+            header,
+            3,
+        );
+        proto.param_type_ids = vec![double_ty];
+        proto.target = Some(image);
+        let proto_id =
+            p.symbols
+                .add_function_with_param_types(proto, Some(&[double_ty]), Some(&p.types));
+
+        let cpp = p.symbols.add_file(PathBuf::from("/t/api.cpp"));
+        let mut def = fake_function(
+            p.symbols.alloc_fn_id(),
+            "process",
+            vec![p.symbols.alloc_var_id()],
+            true,
+            true,
+            cpp,
+            10,
+        );
+        def.param_type_ids = vec![int_ty];
+        def.target = Some(image);
+        let def_id = p
+            .symbols
+            .add_function_with_param_types(def, Some(&[int_ty]), Some(&p.types));
+        assert_ne!(proto_id, def_id, "process(double) is a separate overload");
+
+        // A definition in ANOTHER image registers last and takes the primary
+        // slot, which is what pushes this image's lookup into the bucket.
+        let other = p.symbols.add_file(PathBuf::from("/t/other.cpp"));
+        let mut foreign = fake_function(
+            p.symbols.alloc_fn_id(),
+            "process",
+            vec![p.symbols.alloc_var_id()],
+            true,
+            true,
+            other,
+            4,
+        );
+        foreign.param_type_ids = vec![int_ty];
+        foreign.target = Some(elsewhere);
+        let foreign_id =
+            p.symbols
+                .add_function_with_param_types(foreign, Some(&[int_ty]), Some(&p.types));
+        assert_eq!(p.symbols.fn_by_name.get("process"), Some(&foreign_id));
+
+        assert_eq!(
+            p.symbols
+                .resolve_function_in_scope_in_target("process", None, Some(image)),
+            Some(def_id),
+            "the body in this image, not the prototype registered before it"
+        );
     }
 }

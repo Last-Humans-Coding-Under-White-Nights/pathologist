@@ -43,14 +43,15 @@ flowchart TD
 ## Link targets and weak symbols
 
 `--link-commands PATH` selects a link commands database. Otherwise indexing
-checks `link_commands.json` at the analysis root, then `build/`, and reads
-link-only entries from the selected compilation database. CMake metadata is
-read through the lexically last `index-*.json` File API reply — CMake's
-timestamped names sort newest-last — and its referenced `codemodel-v2`
-objects in the root/build reply directories (also the compilation database’s
-directory). The first candidate build root that supplies targets is used;
-additional build roots are not combined, avoiding duplicate target scopes.
-Stale, unreferenced target JSON files are ignored.
+checks `link_commands.json` at the analysis root, then `build/`, then the
+directory the selected compilation database was read from — an out-of-source
+build keeps both databases together, away from the sources — and reads
+link-only entries from that compilation database. CMake metadata is read
+through the lexically last `index-*.json` File API reply — CMake's timestamped
+names sort newest-last — and its referenced `codemodel-v2` objects in those
+same three directories. The first candidate build root that supplies targets
+is used; additional build roots are not combined, avoiding duplicate target
+scopes. Stale, unreferenced target JSON files are ignored.
 
 Compilation object outputs (`output` or `-o`) identify both the source and
 its compiler configuration. The same source built with different macros for
