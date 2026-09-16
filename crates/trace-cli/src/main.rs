@@ -13,6 +13,10 @@ mod build_info;
 #[path = "../build_support.rs"]
 mod build_support;
 
+#[cfg(windows)]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(
     name = "trace",

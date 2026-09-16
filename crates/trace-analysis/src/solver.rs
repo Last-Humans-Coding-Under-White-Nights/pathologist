@@ -64,14 +64,161 @@ pub fn analyze_with_options(program: &Program, opts: AnalyzeOptions) -> (Pag, An
         &opts.models,
         opts.solve_budget,
     );
-    let call_edges = result.call_edges.clone();
-    let wired = result.wired_arg_flow.clone();
-    extract_arg_flow(program, &call_edges, &wired, &mut result);
+    extract_arg_flow(
+        program,
+        &result.call_edges,
+        &result.wired_arg_flow,
+        &mut result.arg_flow_edges,
+    );
     (pag, result)
 }
 
+/// Compact representation of a points-to set:
+/// - Most PAG nodes point to 0, 1, or a small handful of locations.
+/// - Stores up to 6 locations completely inline without any heap allocation.
+/// - Spills to an `FxHashSet<LocId>` only when a node exceeds 6 locations.
+#[derive(Clone, Debug, Default)]
+pub enum PointsToSet {
+    #[default]
+    Empty,
+    Single(LocId),
+    Small([LocId; 6], u8),
+    Set(FxHashSet<LocId>),
+}
+
+impl PointsToSet {
+    #[inline]
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self::Empty
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Single(_) => 1,
+            Self::Small(_, len) => *len as usize,
+            Self::Set(s) => s.len(),
+        }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn contains(&self, loc: &LocId) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::Single(l) => l == loc,
+            Self::Small(arr, len) => arr[..*len as usize].contains(loc),
+            Self::Set(s) => s.contains(loc),
+        }
+    }
+
+    pub fn insert(&mut self, loc: LocId) -> bool {
+        match self {
+            Self::Empty => {
+                *self = Self::Single(loc);
+                true
+            }
+            Self::Single(existing) => {
+                if *existing == loc {
+                    false
+                } else {
+                    let first = *existing;
+                    *self = Self::Small([first, loc, LocId(0), LocId(0), LocId(0), LocId(0)], 2);
+                    true
+                }
+            }
+            Self::Small(arr, len) => {
+                let cur_len = *len as usize;
+                if arr[..cur_len].contains(&loc) {
+                    return false;
+                }
+                if cur_len < 6 {
+                    arr[cur_len] = loc;
+                    *len += 1;
+                    true
+                } else {
+                    let mut s = FxHashSet::with_capacity_and_hasher(12, FxBuildHasher);
+                    for &l in &arr[..6] {
+                        s.insert(l);
+                    }
+                    s.insert(loc);
+                    *self = Self::Set(s);
+                    true
+                }
+            }
+            Self::Set(s) => s.insert(loc),
+        }
+    }
+
+    #[inline]
+    pub fn iter(&self) -> PointsToIter<'_> {
+        match self {
+            Self::Empty => PointsToIter::Empty,
+            Self::Single(l) => PointsToIter::Single(Some(*l)),
+            Self::Small(arr, len) => PointsToIter::Small(arr[..*len as usize].iter()),
+            Self::Set(s) => PointsToIter::Set(s.iter()),
+        }
+    }
+
+    pub fn to_hash_set(&self) -> FxHashSet<LocId> {
+        match self {
+            Self::Empty => FxHashSet::default(),
+            Self::Single(l) => {
+                let mut s = FxHashSet::default();
+                s.insert(*l);
+                s
+            }
+            Self::Small(arr, len) => arr[..*len as usize].iter().copied().collect(),
+            Self::Set(s) => s.clone(),
+        }
+    }
+}
+
+pub enum PointsToIter<'a> {
+    Empty,
+    Single(Option<LocId>),
+    Small(std::slice::Iter<'a, LocId>),
+    Set(std::collections::hash_set::Iter<'a, LocId>),
+}
+
+impl<'a> Iterator for PointsToIter<'a> {
+    type Item = LocId;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            PointsToIter::Empty => None,
+            PointsToIter::Single(opt) => opt.take(),
+            PointsToIter::Small(it) => it.next().copied(),
+            PointsToIter::Set(it) => it.next().copied(),
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            PointsToIter::Empty => (0, Some(0)),
+            PointsToIter::Single(opt) => {
+                let n = if opt.is_some() { 1 } else { 0 };
+                (n, Some(n))
+            }
+            PointsToIter::Small(it) => it.size_hint(),
+            PointsToIter::Set(it) => it.size_hint(),
+        }
+    }
+}
+
+impl<'a> ExactSizeIterator for PointsToIter<'a> {}
+
 struct SolverState {
-    pts: FxHashMap<PagNodeId, FxHashSet<LocId>>,
+    pts: FxHashMap<PagNodeId, PointsToSet>,
     /// Locations added to a node's points-to since it was last processed.
     /// Difference propagation: only these flow onward on pop, which keeps
     /// total work proportional to facts discovered rather than
@@ -84,6 +231,7 @@ struct SolverState {
     delta_pending: FxHashSet<(PagNodeId, LocId)>,
     memory_pts: FxHashMap<LocId, IndexSet<LocId, FxBuildHasher>>,
     loc_nodes: FxHashMap<LocId, FxHashSet<PagNodeId>>,
+    load_subscribers: FxHashSet<PagNodeId>,
     worklist: Vec<PagNodeId>,
     queued: FxHashSet<PagNodeId>,
     /// Nodes whose one-time, points-to-independent constraint effects
@@ -120,20 +268,20 @@ enum SlotGuard {
     NotFnPtr,
 }
 
-impl SolverState {
-    /// May a function value enter the slot `slot`? Typed fn-pointer slots
-    /// accept only same-arity functions; concrete non-fn slots reject all;
-    /// unknown slots accept everything (conservative over-approximation).
-    #[inline]
-    fn arity_allows(&self, slot: LocId, fn_loc: LocId) -> bool {
-        match self.slot_guard.get(&slot) {
-            Some(SlotGuard::FnParams(n)) => match self.fn_arity.get(&fn_loc) {
-                Some(p) => p == n,
-                None => true,
-            },
-            Some(SlotGuard::NotFnPtr) => false,
+#[inline]
+fn arity_allows(
+    slot_guard: &FxHashMap<LocId, SlotGuard>,
+    fn_arity: &FxHashMap<LocId, usize>,
+    slot: LocId,
+    fn_loc: LocId,
+) -> bool {
+    match slot_guard.get(&slot) {
+        Some(SlotGuard::FnParams(n)) => match fn_arity.get(&fn_loc) {
+            Some(p) => p == n,
             None => true,
-        }
+        },
+        Some(SlotGuard::NotFnPtr) => false,
+        None => true,
     }
 }
 
@@ -144,20 +292,35 @@ impl SolverState {
         }
     }
 
+    #[inline]
+    fn register_loc_holder(&mut self, loc: LocId, node: PagNodeId) {
+        if self.load_subscribers.contains(&node) {
+            self.loc_nodes.entry(loc).or_default().insert(node);
+        }
+    }
+
+    #[inline]
+    fn register_loc_holders(&mut self, locs: &[LocId], node: PagNodeId) {
+        if self.load_subscribers.contains(&node) {
+            for &loc in locs {
+                self.loc_nodes.entry(loc).or_default().insert(node);
+            }
+        }
+    }
+
     /// A memory write changed `memory_pts[loc]`: only nodes that LOAD from
     /// `loc` (i.e. are the pointer source of a Load constraint) benefit from
-    /// re-merging.  Under difference propagation an empty delta would make
-    /// them skip, so the location is appended to their delta explicitly
-    /// (deduped).  Pushing ALL holders was the dominant budget burn on large
-    /// trees — copy-only holders re-popped with no effect.
-    fn touch_loc_holders(&mut self, loc: LocId, load_src: &FxHashMap<PagNodeId, Vec<usize>>) {
-        if let Some(nodes) = self.loc_nodes.get(&loc).cloned() {
-            for n in nodes {
-                if !load_src.contains_key(&n) {
-                    continue;
+    /// re-merging. `loc_nodes` tracks only load subscribers, so every node
+    /// visited here is relevant without filtering.
+    fn touch_loc_holders(&mut self, loc: LocId) {
+        if let Some(nodes) = self.loc_nodes.get(&loc) {
+            for &n in nodes {
+                if self.delta_pending.insert((n, loc)) {
+                    self.delta.entry(n).or_default().push(loc);
                 }
-                self.record_delta(n, &[loc]);
-                self.push(n);
+                if self.queued.insert(n) {
+                    self.worklist.push(n);
+                }
             }
         }
     }
@@ -198,25 +361,13 @@ impl SolverState {
         if cur_len <= prev_len {
             return;
         }
-        let new_locs: Vec<LocId> = (prev_len..cur_len)
-            .filter_map(|i| {
-                let loc = mem[i];
-                if self.arity_allows(mem_loc, loc) {
-                    Some(loc)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if new_locs.is_empty() {
-            self.merge_sizes.insert(key, cur_len);
-            return;
-        }
         let mut truly_new: Vec<LocId> = Vec::new();
         {
             let entry = self.pts.entry(dst).or_default();
-            for &loc in &new_locs {
-                if !entry.contains(&loc) {
+            for i in prev_len..cur_len {
+                let loc = mem[i];
+                if arity_allows(&self.slot_guard, &self.fn_arity, mem_loc, loc) && entry.insert(loc)
+                {
                     truly_new.push(loc);
                 }
             }
@@ -225,22 +376,14 @@ impl SolverState {
             self.merge_sizes.insert(key, cur_len);
             return;
         }
-        {
-            let entry = self.pts.get_mut(&dst).expect("pts entry exists");
-            for loc in &truly_new {
-                entry.insert(*loc);
-            }
-        }
-        for loc in &truly_new {
-            self.loc_nodes.entry(*loc).or_default().insert(dst);
-        }
+        self.register_loc_holders(&truly_new, dst);
         self.record_delta(dst, &truly_new);
         self.push(dst);
         self.merge_sizes.insert(key, cur_len);
     }
 }
 
-fn st_pts_stats_max(pts: &IndexMap<PagNodeId, FxHashSet<LocId>>) -> usize {
+fn st_pts_stats_max(pts: &FxHashMap<PagNodeId, PointsToSet>) -> usize {
     pts.values().map(|s| s.len()).max().unwrap_or(0)
 }
 
@@ -256,12 +399,14 @@ fn solve(
     models: &FnModelSet,
     budget_override: Option<u64>,
 ) -> AnalysisResult {
+    let load_subscribers: FxHashSet<PagNodeId> = pag.indices.load_src.keys().copied().collect();
     let mut st = SolverState {
         pts: FxHashMap::default(),
         delta: FxHashMap::default(),
         delta_pending: FxHashSet::default(),
         memory_pts: FxHashMap::default(),
         loc_nodes: FxHashMap::default(),
+        load_subscribers,
         worklist: Vec::new(),
         queued: FxHashSet::default(),
         seen_once: FxHashSet::default(),
@@ -321,7 +466,7 @@ fn solve(
                     entry.insert(loc)
                 };
                 if inserted {
-                    st.loc_nodes.entry(loc).or_default().insert(c.dst);
+                    st.register_loc_holder(loc, c.dst);
                     st.record_delta(c.dst, &[loc]);
                     st.push(c.dst);
                 }
@@ -538,15 +683,15 @@ fn solve(
         }
 
         if !delta.is_empty() {
-            if let Some(idxs) = pag.indices.store_dst.get(&node).cloned() {
-                for idx in idxs {
+            if let Some(idxs) = pag.indices.store_dst.get(&node) {
+                for &idx in idxs {
                     w_store += delta.len() as u64;
                     apply_store_to_targets(pag, idx, &mut st, Some(delta.as_slice()));
                 }
             }
 
-            if let Some(idxs) = pag.indices.store_src.get(&node).cloned() {
-                for idx in idxs {
+            if let Some(idxs) = pag.indices.store_src.get(&node) {
+                for &idx in idxs {
                     w_store += 1;
                     apply_store_to_targets(pag, idx, &mut st, None);
                 }
@@ -777,6 +922,18 @@ fn solve(
                                     if pag.constraints.len() > constraint_before {
                                         let new_srcs = pag.index_new_constraints(constraint_before);
                                         for src in new_srcs {
+                                            if pag.indices.load_src.contains_key(&src)
+                                                && st.load_subscribers.insert(src)
+                                            {
+                                                if let Some(pts) = st.pts.get(&src) {
+                                                    for loc in pts.iter() {
+                                                        st.loc_nodes
+                                                            .entry(loc)
+                                                            .or_default()
+                                                            .insert(src);
+                                                    }
+                                                }
+                                            }
                                             st.push(src);
                                         }
                                     }
@@ -823,13 +980,16 @@ fn solve(
     }
 
     let points_to = if retain_points_to {
-        st.pts.into_iter().collect()
+        st.pts
+            .iter()
+            .map(|(&node, pts)| (node, pts.to_hash_set()))
+            .collect()
     } else {
         IndexMap::new()
     };
 
     if std::env::var("TRACE_SOLVER_STATS").is_ok() {
-        let biggest = st_pts_stats_max(&points_to);
+        let biggest = st_pts_stats_max(&st.pts);
         eprintln!(
             "[solver] DONE pops={} elapsed={:?} constraints={} max_pts={} resolved_sites={}",
             pops,
@@ -970,7 +1130,7 @@ fn propagate_locs(st: &mut SolverState, dst: PagNodeId, locs: impl IntoIterator<
     {
         let entry = st.pts.entry(dst).or_default();
         for loc in locs {
-            if !entry.contains(&loc) {
+            if entry.insert(loc) {
                 new_locs.push(loc);
             }
         }
@@ -978,13 +1138,7 @@ fn propagate_locs(st: &mut SolverState, dst: PagNodeId, locs: impl IntoIterator<
     if new_locs.is_empty() {
         return;
     }
-    {
-        let entry = st.pts.get_mut(&dst).expect("entry just created");
-        for loc in &new_locs {
-            entry.insert(*loc);
-            st.loc_nodes.entry(*loc).or_default().insert(dst);
-        }
-    }
+    st.register_loc_holders(&new_locs, dst);
     st.record_delta(dst, &new_locs);
     st.push(dst);
 }
@@ -994,7 +1148,7 @@ fn propagate_slice(st: &mut SolverState, dst: PagNodeId, src: &[LocId]) {
     {
         let entry = st.pts.entry(dst).or_default();
         for &loc in src {
-            if !entry.contains(&loc) {
+            if entry.insert(loc) {
                 new_locs.push(loc);
             }
         }
@@ -1002,15 +1156,7 @@ fn propagate_slice(st: &mut SolverState, dst: PagNodeId, src: &[LocId]) {
     if new_locs.is_empty() {
         return;
     }
-    {
-        let entry = st.pts.get_mut(&dst).expect("entry just created");
-        for loc in &new_locs {
-            entry.insert(*loc);
-        }
-    }
-    for loc in &new_locs {
-        st.loc_nodes.entry(*loc).or_default().insert(dst);
-    }
+    st.register_loc_holders(&new_locs, dst);
     st.record_delta(dst, &new_locs);
     st.push(dst);
 }
@@ -1041,7 +1187,7 @@ fn apply_store_to_targets(pag: &Pag, idx: usize, st: &mut SolverState, targets: 
             owned_targets = st
                 .pts
                 .get(&c.dst)
-                .map(|s| s.iter().copied().collect())
+                .map(|s| s.iter().collect())
                 .unwrap_or_default();
             &owned_targets
         }
@@ -1060,22 +1206,16 @@ fn apply_store_to_targets(pag: &Pag, idx: usize, st: &mut SolverState, targets: 
         // loads surface them as bogus indirect-call targets. Untyped cells
         // (`void *`, unknown layouts) stay writable — conservative.
         let mut changed = false;
-        // Signature-guarded view of the source set (see comment above).
-        let filtered_src: Vec<LocId> = match src_set {
-            Some(s) => s
-                .iter()
-                .copied()
-                .filter(|&l| fn_for_loc(pag, l).is_none() || st.arity_allows(loc, l))
-                .collect(),
-            None => Vec::new(),
-        };
-        let filtered_ref: Option<&[LocId]> = src_set.map(|_| filtered_src.as_slice());
         {
             let entry = st.memory_pts.entry(loc).or_default();
             let before = entry.len();
-            if let Some(s) = filtered_ref {
-                for &l in s.iter() {
-                    entry.insert(l);
+            if let Some(s) = src_set {
+                for l in s.iter() {
+                    if fn_for_loc(pag, l).is_none()
+                        || arity_allows(&st.slot_guard, &st.fn_arity, loc, l)
+                    {
+                        entry.insert(l);
+                    }
                 }
             }
             if let Some(sl) = self_loc {
@@ -1096,7 +1236,7 @@ fn apply_store_to_targets(pag: &Pag, idx: usize, st: &mut SolverState, targets: 
                 // Same signature guard for the instance-insensitive summary
                 // cell (its declared type mirrors the field's).
                 if let Some(s) = src_set {
-                    for &l in s.iter() {
+                    for l in s.iter() {
                         if !accepts_fns && fn_for_loc(pag, l).is_some() {
                             continue;
                         }
@@ -1119,7 +1259,7 @@ fn apply_store_to_targets(pag: &Pag, idx: usize, st: &mut SolverState, targets: 
         }
     }
     for loc in requeues {
-        st.touch_loc_holders(loc, &pag.indices.load_src);
+        st.touch_loc_holders(loc);
     }
 }
 
@@ -1222,12 +1362,12 @@ fn wire_params(
     }
 }
 
-fn propagate_pts(st: &mut SolverState, dst: PagNodeId, src_pts: &FxHashSet<LocId>) {
+fn propagate_pts(st: &mut SolverState, dst: PagNodeId, src_pts: &PointsToSet) {
     let mut new_locs: Vec<LocId> = Vec::new();
     {
         let entry = st.pts.entry(dst).or_default();
-        for &loc in src_pts {
-            if !entry.contains(&loc) {
+        for loc in src_pts.iter() {
+            if entry.insert(loc) {
                 new_locs.push(loc);
             }
         }
@@ -1235,15 +1375,7 @@ fn propagate_pts(st: &mut SolverState, dst: PagNodeId, src_pts: &FxHashSet<LocId
     if new_locs.is_empty() {
         return;
     }
-    {
-        let entry = st.pts.get_mut(&dst).expect("entry just created");
-        for loc in &new_locs {
-            entry.insert(*loc);
-        }
-    }
-    for loc in &new_locs {
-        st.loc_nodes.entry(*loc).or_default().insert(dst);
-    }
+    st.register_loc_holders(&new_locs, dst);
     st.record_delta(dst, &new_locs);
     st.push(dst);
 }
@@ -1254,7 +1386,7 @@ fn add_pts(st: &mut SolverState, node: PagNodeId, loc: LocId) {
         entry.insert(loc)
     };
     if inserted {
-        st.loc_nodes.entry(loc).or_default().insert(node);
+        st.register_loc_holder(loc, node);
         st.record_delta(node, &[loc]);
         st.push(node);
     }
@@ -1273,7 +1405,7 @@ fn extract_arg_flow(
     program: &Program,
     call_edges: &[CallGraphEdge],
     wired: &FxHashSet<(CallSiteId, u32, FnId)>,
-    result: &mut AnalysisResult,
+    arg_flow_edges: &mut Vec<ArgFlowEdge>,
 ) {
     for edge in call_edges {
         // Synthetic edges (IPC bridges) have no source-level call site and no
@@ -1292,7 +1424,7 @@ fn extract_arg_flow(
             let idx = i as u32;
             if wired.contains(&(edge.call_site, idx, edge.callee)) {
                 if let Some(actual) = cs.var_args.iter().find(|(j, _)| *j == idx).map(|(_, v)| *v) {
-                    result.arg_flow_edges.push(ArgFlowEdge {
+                    arg_flow_edges.push(ArgFlowEdge {
                         call_site: edge.call_site,
                         arg_index: idx,
                         actual_var: Some(actual),
@@ -1301,7 +1433,7 @@ fn extract_arg_flow(
                     });
                 } else {
                     for &(_, fn_id) in cs.fn_args.iter().filter(|(j, _)| *j == idx) {
-                        result.arg_flow_edges.push(ArgFlowEdge {
+                        arg_flow_edges.push(ArgFlowEdge {
                             call_site: edge.call_site,
                             arg_index: idx,
                             actual_var: None,
@@ -1312,5 +1444,61 @@ fn extract_arg_flow(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_points_to_set_transitions() {
+        let mut pts = PointsToSet::new();
+        assert!(pts.is_empty());
+        assert_eq!(pts.len(), 0);
+        assert!(!pts.contains(&LocId(10)));
+
+        // Empty -> Single
+        assert!(pts.insert(LocId(10)));
+        assert!(!pts.is_empty());
+        assert_eq!(pts.len(), 1);
+        assert!(pts.contains(&LocId(10)));
+        assert!(!pts.contains(&LocId(20)));
+        // Duplicate insert
+        assert!(!pts.insert(LocId(10)));
+        assert_eq!(pts.len(), 1);
+
+        // Single -> Small (2 elements)
+        assert!(pts.insert(LocId(20)));
+        assert_eq!(pts.len(), 2);
+        assert!(pts.contains(&LocId(10)));
+        assert!(pts.contains(&LocId(20)));
+        assert!(!pts.insert(LocId(20)));
+
+        // Add up to 6 elements (Small capacity)
+        for id in 30..=60 {
+            if id % 10 == 0 {
+                assert!(pts.insert(LocId(id)));
+            }
+        }
+        assert_eq!(pts.len(), 6);
+        for id in [10, 20, 30, 40, 50, 60] {
+            assert!(pts.contains(&LocId(id)));
+        }
+
+        // 7th element -> Set
+        assert!(pts.insert(LocId(70)));
+        assert_eq!(pts.len(), 7);
+        assert!(pts.contains(&LocId(70)));
+        assert!(!pts.insert(LocId(70)));
+
+        let collected: FxHashSet<LocId> = pts.iter().collect();
+        assert_eq!(collected.len(), 7);
+        for id in [10, 20, 30, 40, 50, 60, 70] {
+            assert!(collected.contains(&LocId(id)));
+        }
+
+        let exported = pts.to_hash_set();
+        assert_eq!(exported, collected);
     }
 }

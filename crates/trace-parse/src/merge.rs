@@ -83,7 +83,6 @@ enum MergeMode {
     Variant,
 }
 
-type SiteKey = (trace_ir::FileId, u32, u32, String);
 type LocalKey = (FnId, trace_ir::FileId, u32, u32, String);
 type TempKey = (FnId, trace_ir::FileId, u32, u32, &'static str);
 type FileVarKey = (u32, trace_ir::FileId, u32, u32, String);
@@ -169,53 +168,76 @@ pub fn merge_unit_index(program: &mut Program, unit: &UnitIndex) {
 /// a set scoped to *this* unit's contribution: deduplicating against the whole
 /// program would rebuild a set of every constraint merged so far, once per
 /// variant.
-pub fn merge_unit_variants(program: &mut Program, base: &UnitIndex, variants: &[UnitIndex]) {
-    let flow_start = program.flow.len();
-    let var_start = program.symbols.variables.len();
-    merge_unit(program, base, MergeMode::Full, None);
-    if variants.is_empty() {
-        return;
+/// Incremental merger for compilation databases and variant exploration.
+///
+/// Binds memory accumulation across configurations by retaining `VariantDedup`
+/// state across streaming/batched unit merges rather than requiring all units
+/// to be collected into memory upfront.
+#[derive(Default)]
+pub struct VariantMerger {
+    seen: Option<VariantDedup>,
+}
+
+impl VariantMerger {
+    pub fn new() -> Self {
+        Self { seen: None }
     }
-    // Every unit below merges with `union_aggregates`, whatever the per-source
-    // variant tally ends up saying.
-    program.layouts_unioned = true;
-    let mut seen = VariantDedup {
-        flow: program.flow[flow_start..].iter().cloned().collect(),
-        file_vars: FxHashMap::default(),
-        source_scopes: FxHashMap::default(),
-        base_defs: base_definitions(program, base),
-    };
-    let base_scope = seen.source_scope(&base.path);
-    for v in &program.symbols.variables[var_start..] {
-        if v.fn_id.is_none() {
-            seen.file_vars.insert(
-                (
-                    base_scope,
-                    v.span.file,
-                    v.span.line,
-                    v.span.col,
-                    v.name.clone(),
-                ),
-                v.id,
-            );
-        }
-    }
-    for unit in variants {
-        merge_unit(program, unit, MergeMode::Variant, Some(&mut seen));
-        // A later configuration can introduce a definition absent from the
-        // first one. Subsequent alternatives must extend that definition too.
-        for (file, definitions) in base_definitions(program, unit) {
-            let known = seen.base_defs.entry(file).or_default();
-            for (name, ids) in definitions {
-                let candidates = known.entry(name).or_default();
-                for id in ids {
-                    if !candidates.contains(&id) {
-                        candidates.push(id);
+
+    pub fn merge_unit(&mut self, program: &mut Program, unit: &UnitIndex) {
+        if let Some(ref mut seen) = self.seen {
+            program.layouts_unioned = true;
+            merge_unit(program, unit, MergeMode::Variant, Some(seen));
+            for (file, definitions) in base_definitions(program, unit) {
+                let known = seen.base_defs.entry(file).or_default();
+                for (name, ids) in definitions {
+                    let candidates = known.entry(name).or_default();
+                    for id in ids {
+                        if !candidates.contains(&id) {
+                            candidates.push(id);
+                        }
                     }
                 }
             }
+            program.variants_merged += 1;
+        } else {
+            let flow_start = program.flow.len();
+            let var_start = program.symbols.variables.len();
+            merge_unit(program, unit, MergeMode::Full, None);
+            let mut seen = VariantDedup {
+                flow: program.flow[flow_start..].iter().cloned().collect(),
+                file_vars: FxHashMap::default(),
+                source_scopes: FxHashMap::default(),
+                base_defs: base_definitions(program, unit),
+            };
+            let base_scope = seen.source_scope(&unit.path);
+            for v in &program.symbols.variables[var_start..] {
+                if v.fn_id.is_none() {
+                    seen.file_vars.insert(
+                        (
+                            base_scope,
+                            v.span.file,
+                            v.span.line,
+                            v.span.col,
+                            v.name.clone(),
+                        ),
+                        v.id,
+                    );
+                }
+            }
+            self.seen = Some(seen);
         }
-        program.variants_merged += 1;
+    }
+}
+
+pub fn merge_unit_variants(program: &mut Program, base: &UnitIndex, variants: &[UnitIndex]) {
+    if variants.is_empty() {
+        merge_unit(program, base, MergeMode::Full, None);
+        return;
+    }
+    let mut merger = VariantMerger::new();
+    merger.merge_unit(program, base);
+    for v in variants {
+        merger.merge_unit(program, v);
     }
 }
 
@@ -313,7 +335,11 @@ fn merge_unit(
     for cls in &unit.final_classes {
         program.mark_class_final(cls);
     }
-    program.namespaces.extend(unit.namespaces.iter().cloned());
+    for ns in &unit.namespaces {
+        if !program.namespaces.contains(ns) {
+            program.namespaces.insert(ns.clone());
+        }
+    }
 
     let type_map = merge_types(
         &mut program.types,
@@ -791,9 +817,12 @@ fn merge_unit(
         if program.is_dep_file(span_file) {
             continue;
         }
-        let key: SiteKey = (span_file, cs.span.line, cs.span.col, cs.callee_name.clone());
         if !matches!(mode, MergeMode::Variant) {
-            if let Some(&existing) = program.dedup.site_keys.get(&key) {
+            if let Some(existing) =
+                program
+                    .dedup
+                    .existing_site(span_file, cs.span.line, cs.span.col, &cs.callee_name)
+            {
                 call_map.insert(cs.id, existing);
                 continue;
             }
@@ -828,15 +857,12 @@ fn merge_unit(
             // units both recover would be recorded once per unit (#59 review).
             let existing = program
                 .dedup
-                .site_keys
-                .get(&key)
-                .copied()
+                .existing_site(span_file, cs.span.line, cs.span.col, &cs.callee_name)
                 .into_iter()
                 .chain(
                     program
                         .dedup
-                        .variant_site_records
-                        .get(&key)
+                        .variant_site_records(span_file, cs.span.line, cs.span.col, &cs.callee_name)
                         .into_iter()
                         .flatten()
                         .copied(),
@@ -861,15 +887,28 @@ fn merge_unit(
             // canonical and only a site no configuration has claimed yet is
             // registered here. The record is remembered separately either way,
             // so a later variant can merge into it.
-            program
-                .dedup
-                .variant_site_records
-                .entry(key.clone())
-                .or_default()
-                .push(new_id);
-            program.dedup.site_keys.entry(key).or_insert(new_id);
+            program.dedup.push_variant_site(
+                span_file,
+                cs.span.line,
+                cs.span.col,
+                &cs.callee_name,
+                new_id,
+            );
+            program.dedup.insert_site_or_ignore(
+                span_file,
+                cs.span.line,
+                cs.span.col,
+                &cs.callee_name,
+                new_id,
+            );
         } else {
-            program.dedup.site_keys.insert(key, new_id);
+            program.dedup.insert_site(
+                span_file,
+                cs.span.line,
+                cs.span.col,
+                cs.callee_name.clone(),
+                new_id,
+            );
         }
         call_map.insert(old, new_id);
     }
@@ -1010,9 +1049,7 @@ fn merge_types(
         map.push(new_id);
     }
     for (alias, desc) in src.all_aliases() {
-        if dst.resolve_alias(alias).is_none() {
-            dst.register_alias_ref(alias, desc);
-        }
+        dst.register_alias_arc(alias, desc);
     }
     map
 }

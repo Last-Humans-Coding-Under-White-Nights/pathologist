@@ -604,6 +604,12 @@ impl TypeTable {
         }
     }
 
+    pub fn register_alias_arc(&mut self, alias: &str, desc: &Arc<TypeDesc>) {
+        if !alias.is_empty() && !self.aliases.contains_key(alias) {
+            self.aliases.insert(alias.to_string(), Arc::clone(desc));
+        }
+    }
+
     pub fn resolve_alias(&self, alias: &str) -> Option<&TypeDesc> {
         self.aliases.get(alias).map(Arc::as_ref)
     }

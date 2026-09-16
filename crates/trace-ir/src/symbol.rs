@@ -339,6 +339,20 @@ impl SymbolTable {
         }
     }
 
+    /// Register that multiple `headers` contribute entities lowered while indexing `tu`.
+    pub fn register_included_headers(
+        &mut self,
+        tu: crate::FileId,
+        headers: impl IntoIterator<Item = crate::FileId>,
+    ) {
+        let set = self.headers_of.entry(tu).or_default();
+        for header in headers {
+            if tu != header {
+                set.insert(header);
+            }
+        }
+    }
+
     pub fn included_headers(
         &self,
         tu: crate::FileId,

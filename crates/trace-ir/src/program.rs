@@ -70,12 +70,13 @@ pub struct TemplateBase {
 pub struct MergeDedup {
     /// `(file, line) → name → FnId` so a hit does not clone the function name.
     pub fn_keys: FxHashMap<(FileId, u32), FxHashMap<String, FnId>>,
-    pub site_keys: FxHashMap<(FileId, u32, u32, String), CallSiteId>,
+    /// `(file, line, col) → callee → CallSiteId` so a hit does not clone the callee name.
+    pub site_keys: FxHashMap<(FileId, u32, u32), FxHashMap<String, CallSiteId>>,
     /// Call records that configuration variants added at a site, beside the
     /// canonical one in `site_keys` (#59). Program-wide, so a fact recovered
     /// from a header by two units' variants merges instead of repeating: a
     /// header's call sites belong to every unit that includes it.
-    pub variant_site_records: FxHashMap<(FileId, u32, u32, String), Vec<CallSiteId>>,
+    pub variant_site_records: FxHashMap<(FileId, u32, u32), FxHashMap<String, Vec<CallSiteId>>>,
     /// Reports already merged into the whole program, keyed by stage as well as
     /// origin: two stages can report the same text at the same position, and
     /// one is not a duplicate of the other. Unit-local copies use different
@@ -97,6 +98,79 @@ impl MergeDedup {
             .entry((file, line))
             .or_default()
             .insert(name, id);
+    }
+
+    pub fn existing_site(
+        &self,
+        file: FileId,
+        line: u32,
+        col: u32,
+        callee: &str,
+    ) -> Option<CallSiteId> {
+        self.site_keys
+            .get(&(file, line, col))
+            .and_then(|by_name| by_name.get(callee))
+            .copied()
+    }
+
+    pub fn insert_site(
+        &mut self,
+        file: FileId,
+        line: u32,
+        col: u32,
+        callee: String,
+        id: CallSiteId,
+    ) {
+        self.site_keys
+            .entry((file, line, col))
+            .or_default()
+            .insert(callee, id);
+    }
+
+    pub fn insert_site_or_ignore(
+        &mut self,
+        file: FileId,
+        line: u32,
+        col: u32,
+        callee: &str,
+        id: CallSiteId,
+    ) {
+        let map = self.site_keys.entry((file, line, col)).or_default();
+        if !map.contains_key(callee) {
+            map.insert(callee.to_string(), id);
+        }
+    }
+
+    pub fn variant_site_records(
+        &self,
+        file: FileId,
+        line: u32,
+        col: u32,
+        callee: &str,
+    ) -> Option<&[CallSiteId]> {
+        self.variant_site_records
+            .get(&(file, line, col))
+            .and_then(|by_name| by_name.get(callee))
+            .map(Vec::as_slice)
+    }
+
+    pub fn push_variant_site(
+        &mut self,
+        file: FileId,
+        line: u32,
+        col: u32,
+        callee: &str,
+        id: CallSiteId,
+    ) {
+        let map = self
+            .variant_site_records
+            .entry((file, line, col))
+            .or_default();
+        if let Some(list) = map.get_mut(callee) {
+            list.push(id);
+        } else {
+            map.insert(callee.to_string(), vec![id]);
+        }
     }
 
     /// Record a diagnostic's origin, returning whether it is the first of its
@@ -462,13 +536,15 @@ impl Program {
     /// `root` plus every class transitively deriving from it (BFS).
     pub fn subclass_closure(&self, root: &str) -> Vec<String> {
         let mut out = vec![root.to_string()];
+        let mut visited: FxHashSet<&str> = FxHashSet::default();
+        visited.insert(root);
         let mut i = 0;
         while i < out.len() {
             let cur = out[i].clone();
             for &index in self.derived_by_class.get(&cur).into_iter().flatten() {
-                let derived = &self.inheritance[index].0;
-                if !out.iter().any(|c| c == derived) {
-                    out.push(derived.clone());
+                let derived = self.inheritance[index].0.as_str();
+                if visited.insert(derived) {
+                    out.push(derived.to_string());
                 }
             }
             i += 1;
@@ -485,6 +561,8 @@ impl Program {
         sees: &dyn Fn(FileId) -> bool,
     ) -> Vec<String> {
         let mut out = vec![root.to_string()];
+        let mut visited: FxHashSet<&str> = FxHashSet::default();
+        visited.insert(root);
         let mut i = 0;
         while i < out.len() {
             let cur = out[i].clone();
@@ -493,9 +571,9 @@ impl Program {
                 continue;
             }
             for &index in self.derived_by_class.get(&cur).into_iter().flatten() {
-                let derived = &self.inheritance[index].0;
-                if !out.iter().any(|c| c == derived) {
-                    out.push(derived.clone());
+                let derived = self.inheritance[index].0.as_str();
+                if visited.insert(derived) {
+                    out.push(derived.to_string());
                 }
             }
         }
@@ -523,11 +601,12 @@ impl Program {
         targets: &dyn Fn(FnId) -> bool,
     ) -> Vec<FnId> {
         let mut out = Vec::new();
+        let mut seen_targets: FxHashSet<FnId> = FxHashSet::default();
         for c in self.dispatch_subclass_closure(cls, kind, sees) {
             let own = self.members_among(&kind.name_on(&c), targets);
             if !own.is_empty() {
                 for id in own {
-                    if !out.contains(&id) {
+                    if seen_targets.insert(id) {
                         out.push(id);
                     }
                 }
@@ -536,7 +615,7 @@ impl Program {
             // `c`'s own lookup just missed, so start the walk at its bases
             // rather than letting the queue repeat that same query.
             let mut queue = std::collections::VecDeque::new();
-            let mut seen = std::collections::BTreeSet::new();
+            let mut seen: FxHashSet<String> = FxHashSet::default();
             queue.extend(self.bases_seen(&c, sees));
             seen.insert(c);
             while let Some(cur) = queue.pop_front() {
@@ -546,7 +625,7 @@ impl Program {
                 let ids = self.members_among(&kind.name_on(&cur), targets);
                 if !ids.is_empty() {
                     for id in ids {
-                        if !out.contains(&id) {
+                        if seen_targets.insert(id) {
                             out.push(id);
                         }
                     }
