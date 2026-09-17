@@ -875,7 +875,7 @@ impl Pag {
         });
     }
 
-    pub fn add_gep(&mut self, dst: PagNodeId, base: PagNodeId, field: FieldId, field_name: String) {
+    pub fn add_gep(&mut self, dst: PagNodeId, base: PagNodeId, field: FieldId, field_name: Box<str>) {
         self.constraints.push(Constraint {
             kind: crate::constraints::ConstraintKind::Gep,
             dst,

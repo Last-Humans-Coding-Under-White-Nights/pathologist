@@ -1677,9 +1677,9 @@ mod tests {
             callee_name: "target".into(),
             callee_var: None,
             callee_fn_id: None,
-            var_args: Vec::new(),
-            fn_args: Vec::new(),
-            addr_of_member_args: Vec::new(),
+            var_args: Box::default(),
+            fn_args: Box::default(),
+            addr_of_member_args: Box::default(),
             args_bound_past_this: false,
             span: trace_ir::Span {
                 file: trace_ir::FileId(0),

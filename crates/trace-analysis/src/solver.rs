@@ -588,7 +588,7 @@ fn solve(
                             crate::pag::struct_type_for_loc(pag, program, loc)
                         {
                             match program.types.get(parent_type).layout.fields.get(&field) {
-                                Some(fl) if fl.name == *expected => {}
+                                Some(fl) if *fl.name == **expected => {}
                                 _ if program.layouts_unioned => {
                                     if let Some(fid) =
                                         program.types.field_id_by_name(parent_type, expected)

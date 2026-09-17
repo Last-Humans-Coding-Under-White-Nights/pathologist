@@ -944,7 +944,7 @@ fn field_access_through_a_wrapper_reaches_the_pointee_field() {
         .iter()
         .filter(|f| {
             matches!(f, trace_ir::FlowConstraint::GepField { field_name, .. }
-                if field_name == "absent_payload_value")
+                if field_name.as_ref() == "absent_payload_value")
         })
         .count();
     assert_eq!(
@@ -963,7 +963,7 @@ fn field_step_follows_its_operator_on_a_wrapper() {
         .iter()
         .filter(|f| {
             matches!(f, trace_ir::FlowConstraint::GepField { field_name, .. }
-                if field_name == "own_raw")
+                if field_name.as_ref() == "own_raw")
         })
         .count();
     assert_eq!(own, 1, "`b.w.own_raw` must reach the wrapper's own field");
@@ -1095,7 +1095,7 @@ fn defined_template_head_spelled_global_finds_the_declared_class() {
         .flow
         .iter()
         .filter(|f| {
-            matches!(f, trace_ir::FlowConstraint::GepField { field_name, .. } if field_name == "df")
+            matches!(f, trace_ir::FlowConstraint::GepField { field_name, .. } if field_name.as_ref() == "df")
         })
         .count();
     assert_eq!(
@@ -1436,7 +1436,7 @@ fn wrapper_reference_and_dereference_still_unwrap_fields() {
                 else {
                     return false;
                 };
-                field_name == "payload_value"
+                field_name.as_ref() == "payload_value"
                     && program.symbols.variable(*dst).fn_id
                         == program.symbols.resolve_function(caller)
             }),
@@ -4841,7 +4841,7 @@ fn nested_class_is_registered_under_its_outer_class() {
         .iter()
         .filter(|f| {
             matches!(f, trace_ir::FlowConstraint::GepField { field_name, .. }
-                if field_name == "it")
+                if field_name.as_ref() == "it")
         })
         .count();
     assert_eq!(it_reads, 1, "`i.it` reaches the nested class's layout");

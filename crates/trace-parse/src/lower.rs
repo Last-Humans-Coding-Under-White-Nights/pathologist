@@ -5884,9 +5884,9 @@ fn collect_call_at_node(
             callee_name,
             callee_var,
             callee_fn_id: None,
-            var_args: args.var_args,
-            fn_args: args.fn_args,
-            addr_of_member_args: args.addr_of_member_args,
+            var_args: args.var_args.into_boxed_slice(),
+            fn_args: args.fn_args.into_boxed_slice(),
+            addr_of_member_args: args.addr_of_member_args.into_boxed_slice(),
             args_bound_past_this: false,
             span,
             is_direct,
@@ -5925,9 +5925,9 @@ fn collect_call_at_node(
             },
             callee_var,
             callee_fn_id: Some(t),
-            var_args: site_args.var_args,
-            fn_args: site_args.fn_args,
-            addr_of_member_args: site_args.addr_of_member_args,
+            var_args: site_args.var_args.into_boxed_slice(),
+            fn_args: site_args.fn_args.into_boxed_slice(),
+            addr_of_member_args: site_args.addr_of_member_args.into_boxed_slice(),
             args_bound_past_this: bound,
             span,
             is_direct: true,
@@ -6070,7 +6070,7 @@ fn collect_call_args(
                     let temp = alloc_ret_temp(program, ctx, arg);
                     program.flow.push(FlowConstraint::StringConst {
                         dst: temp,
-                        value: s,
+                        value: s.into_boxed_str(),
                     });
                     var_args.push((arg_index, temp));
                 } else if let Some(gep) = addr_of_field_path(program, ctx, source, arg) {
@@ -6446,13 +6446,13 @@ fn emit_unresolved_site(
         callee_name,
         callee_var: None,
         callee_fn_id: None,
-        var_args,
-        fn_args,
-        addr_of_member_args,
+        var_args: var_args.into_boxed_slice(),
+        fn_args: fn_args.into_boxed_slice(),
+        addr_of_member_args: addr_of_member_args.into_boxed_slice(),
         args_bound_past_this: true,
         span,
         is_direct: false,
-        receiver_class: Some(receiver_class),
+        receiver_class: Some(receiver_class.into_boxed_str()),
         return_dst: None,
     });
 }
@@ -6498,13 +6498,13 @@ fn emit_member_sites(
             callee_name: display,
             callee_var: None,
             callee_fn_id: None,
-            var_args,
-            fn_args,
-            addr_of_member_args,
+            var_args: var_args.into_boxed_slice(),
+            fn_args: fn_args.into_boxed_slice(),
+            addr_of_member_args: addr_of_member_args.into_boxed_slice(),
             args_bound_past_this: true,
             span,
             is_direct: false,
-            receiver_class: Some(cls.to_string()),
+            receiver_class: Some(cls.to_string().into_boxed_str()),
             return_dst: None,
         });
         return;
@@ -6521,13 +6521,13 @@ fn emit_member_sites(
             callee_name: name,
             callee_var: None,
             callee_fn_id: Some(t),
-            var_args: var_args.clone(),
-            fn_args: fn_args.clone(),
-            addr_of_member_args: addr_of_member_args.clone(),
+            var_args: var_args.clone().into_boxed_slice(),
+            fn_args: fn_args.clone().into_boxed_slice(),
+            addr_of_member_args: addr_of_member_args.clone().into_boxed_slice(),
             args_bound_past_this: true,
             span,
             is_direct: true,
-            receiver_class: Some(cls.to_string()),
+            receiver_class: Some(cls.to_string().into_boxed_str()),
             return_dst: None,
         });
     }
@@ -8236,7 +8236,7 @@ fn emit_call_return(
 ) {
     program
         .flow
-        .push(FlowConstraint::CallReturn { dst, callee_name });
+        .push(FlowConstraint::CallReturn { dst, callee_name: callee_name.into_boxed_str() });
     ctx.call_return_dst.borrow_mut().insert(call_node.id(), dst);
 }
 
@@ -8462,7 +8462,7 @@ fn alloc_gep_temp(
         dst: var_id,
         base,
         field,
-        field_name,
+        field_name: field_name.into_boxed_str(),
     });
     var_id
 }
@@ -8850,7 +8850,7 @@ fn expr_to_rhs_flow(
             Some(FlowConstraint::AddrOfFn { dst, callee })
         }
         "string_literal" | "concatenated_string" => string_literal_value(source, node)
-            .map(|value| FlowConstraint::StringConst { dst, value }),
+            .map(|value| FlowConstraint::StringConst { dst, value: value.into_boxed_str() }),
         "call_expression" => {
             if let Some(callee_name) = resolve_direct_call(program, ctx, source, node) {
                 emit_call_return(program, ctx, node, dst, callee_name);
@@ -9019,7 +9019,9 @@ fn return_flow_from_expr(
                 emit_call_return(program, ctx, node, temp, callee_name);
                 Some(ReturnFlow::Copy { src: temp })
             } else {
-                Some(ReturnFlow::Call { callee_name })
+                Some(ReturnFlow::Call {
+                    callee_name: callee_name.into_boxed_str(),
+                })
             }
         }
         "cast_expression" => node

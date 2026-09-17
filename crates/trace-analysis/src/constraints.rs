@@ -17,7 +17,7 @@ pub struct Constraint {
     pub dst: PagNodeId,
     pub src: PagNodeId,
     pub field: Option<FieldId>,
-    pub field_name: Option<String>,
+    pub field_name: Option<Box<str>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

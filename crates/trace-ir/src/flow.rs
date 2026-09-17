@@ -14,7 +14,7 @@ pub enum ReturnFlow {
     },
     /// Return value is whatever `callee` returns (expanded after all TUs are merged).
     Call {
-        callee_name: String,
+        callee_name: Box<str>,
     },
 }
 
@@ -39,12 +39,12 @@ pub enum FlowConstraint {
         dst: VarId,
         base: VarId,
         field: FieldId,
-        field_name: String,
+        field_name: Box<str>,
     },
     /// Function-pointer array initializer: any subscript may target any listed callee.
     ArrayFnMember { array: VarId, callee: FnId },
     /// `dst = callee()` — callee resolved by name after all TUs are merged.
-    CallReturn { dst: VarId, callee_name: String },
+    CallReturn { dst: VarId, callee_name: Box<str> },
     /// `dst = callee_var()` — callee resolved at analysis time from the
     /// function-pointer variable's points-to set (indirect / virtual calls).
     CallReturnIndirect { dst: VarId, callee_var: VarId },
@@ -52,5 +52,5 @@ pub enum FlowConstraint {
     /// it, so the constructor's implicit `this` has concrete pointees.
     NewHeap { dst: VarId },
     /// `dst` points at the given string literal (interned; copies propagate).
-    StringConst { dst: VarId, value: String },
+    StringConst { dst: VarId, value: Box<str> },
 }

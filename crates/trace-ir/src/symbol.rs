@@ -128,13 +128,13 @@ pub struct CallSite {
     /// call that no tree-local symbol declares (libc calls, macro-emitted
     /// logging backends). `None` for indirect sites.
     pub callee_fn_id: Option<FnId>,
-    pub var_args: Vec<(u32, VarId)>,
-    pub fn_args: Vec<(u32, FnId)>,
+    pub var_args: Box<[(u32, VarId)]>,
+    pub fn_args: Box<[(u32, FnId)]>,
     /// Argument positions recorded as `&base.member` / `&arr[i]` addresses.
     /// Lowering resolves these to the *base* variable, so function-model
     /// alias effects must not treat them as whole-object copies (copying
     /// the containing object would pollute unrelated fields).
-    pub addr_of_member_args: Vec<u32>,
+    pub addr_of_member_args: Box<[u32]>,
     /// The argument positions count the callee's implicit `this`: explicit
     /// arguments start at 1. Lowering sets it wherever it knows the callee is
     /// a member; after the merge, a site whose callee takes `this` without
@@ -145,7 +145,7 @@ pub struct CallSite {
     /// Static class of a C++ member-call receiver (`this`, typed pointer).
     /// Post-merge virtual expansion uses this so `final` types are not
     /// re-expanded from the declaring base.
-    pub receiver_class: Option<String>,
+    pub receiver_class: Option<Box<str>>,
     /// LHS of `dst = callee(...)` when the call's value is used (`CallReturn`
     /// destination). `dlsym` models write function addresses here.
     pub return_dst: Option<VarId>,
@@ -1112,7 +1112,11 @@ impl SymbolTable {
             })
             .collect();
         for (i, more) in added {
-            self.call_sites[i].fn_args.extend(more);
+            if !more.is_empty() {
+                let mut v = self.call_sites[i].fn_args.to_vec();
+                v.extend(more);
+                self.call_sites[i].fn_args = v.into_boxed_slice();
+            }
         }
     }
 
@@ -1491,9 +1495,9 @@ mod tests {
             callee_name: callee_name.into(),
             callee_var: callee_var.map(VarId),
             callee_fn_id: None,
-            var_args: Vec::new(),
-            fn_args: Vec::new(),
-            addr_of_member_args: Vec::new(),
+            var_args: Box::default(),
+            fn_args: Box::default(),
+            addr_of_member_args: Box::default(),
             args_bound_past_this: false,
             span: Span::new(FileId(0), 1, 1),
             is_direct,
