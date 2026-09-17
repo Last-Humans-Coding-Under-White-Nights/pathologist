@@ -33,12 +33,12 @@ Each stage must remain independently testable.
 2. **Soundness**: May-analysis — over-approximate when uncertain (unknown index → array summary; instance-insensitive **`FieldSummary`** for struct fields).
 3. **Phase boundaries**: Preprocessor must not depend on analysis. IR must not depend on SQLite. Analysis must not depend on SQLite.
 4. **IDs**: Use newtype IDs from `trace-ir` (`FnId`, `VarId`, `CallSiteId`, `FieldId`, etc.). Do not use raw integers in public APIs.
-5. **Internal linkage**: `static` functions are not in `fn_by_name`. A `static` class member is not one: it has external linkage wherever its body is written. Solver and `pag.expand_return_flows` must use `resolve_function_in_scope(name, Some(file))`, not external-only `resolve_function`.
+5. **Internal linkage**: `static` functions are not in `fn_by_name`. A `static` class member is not one: it has external linkage wherever its body is written. Solver and `pag.expand_return_flows` must resolve scope-first, not through external-only `resolve_function` — and through the image-aware forms, `resolve_function_in_scope_in_target` / `resolve_function_candidates_in_target`, passing the caller's target. The unscoped wrappers name no image and are for callers that genuinely have none (lowering, which runs before targets exist).
 6. **Storage classes**: file-scope `static` → `FileStatic`; function-local `static` → `FnStatic` (see `storage_for` in `lower.rs`).
-7. **IPC detection (see `docs/IPC_ROADMAP.md`)**: Proxy/stub pairs are detected from class-name suffixes (`*Proxy`/`*Client` and `*Stub`) + `SendRequest` call presence; bridges match by interface + method-name correspondence. Detection is **pure** (reads `&Program`, returns `Vec<IpcBridge>`, no `Program` mutation, no control-flow/opcode analysis) and runs during PAG build; the solver injects a synthetic `CallGraphEdge` per bridge (`call_site_id = SYNTHETIC_CALL_SITE`). Synthetic sites must never be indexed into `Program.symbols.call_sites`.
+7. **IPC detection (see `docs/IPC_ROADMAP.md`)**: Proxy/stub pairs are detected from class-name suffixes (`*Proxy`/`*Client` and `*Stub`) + `SendRequest` call presence; bridges match by interface + method-name correspondence. Detection is **pure** (reads `&Program`, returns `Vec<IpcBridge>`, no `Program` mutation, no control-flow/opcode analysis) and runs during PAG build; the solver injects a synthetic `CallGraphEdge` per bridge (`call_site_id = SYNTHETIC_CALL_SITE`). Synthetic sites must never be indexed into `Program.symbols.call_sites`. IPC pairing is deliberately **not** link-target scoped: the boundary it models is a process boundary, so proxy and stub normally belong to different link images and a bridge edge may cross `target_id` (see `docs/ANALYSIS.md`, "Link targets and weak symbols").
 8. **Dependency roots (`--dep <PATH>`)**: Dependency roots isolate external build dependencies from code under analysis. Sources under dependency roots never become translation units. Headers in dependency roots contribute declarations only: function bodies merge as declarations (`is_defined = false`) without local variables, call sites, flow constraints, or return flows. All symbols from dependency roots are marked `is_dep = true`.
 9. **Compilation databases (`--compile-commands`)**: Automatic discovery (`compile_commands.json` at target root or `build/`, or explicit flag). Commands provide per-TU include paths, macros, forced includes (`-include`), and language standards. CLI `--include` precedes compilation database `-I`, and CLI `-D` overrides database macros.
-10. **Determinism and bit-reproducibility**: The pipeline must produce identical SQLite analysis data across runs with identical inputs (excluding run metadata such as `analysis_run.created_at`). Preprocessing cache discovery publishes to the expansion cache in unit order whatever the job count (`docs/PREPROCESSOR.md`, "Parallel discovery"), so header content never depends on scheduling. Deduplication at merge time selects the first-encountered definition. Solver iterations and PAG traversal order must remain deterministic.
+10. **Determinism and bit-reproducibility**: The pipeline must produce identical SQLite analysis data across runs with identical inputs (excluding run metadata such as `analysis_run.created_at`). Preprocessing cache discovery publishes to the expansion cache in unit order whatever the job count (`docs/PREPROCESSOR.md`, "Parallel discovery"), so header content never depends on scheduling. Deduplication at merge time selects the first-encountered definition; with link metadata, a matching strong definition takes precedence over a weak one within that target (see `docs/ANALYSIS.md`, "Link targets and weak symbols"). Solver iterations and PAG traversal order must remain deterministic.
 11. **PAG and Solver monotonic convergence**: The Andersen solver uses worklist-based propagation over PAG constraints. Parameter copy wiring and points-to sets must grow monotonically toward a fixpoint. No flow-sensitive or path-sensitive branching is permitted.
 
 ## IR flow constraints (`trace-ir/src/flow.rs`)
@@ -110,6 +110,12 @@ Register external function summaries and function models (`FnModelSet`, loaded v
 - Use raw integers for entity IDs in public APIs (use `FnId`, `VarId`, etc.)
 - Use non-deterministic container iteration (e.g. iterating raw `HashSet` or unseeded `HashMap` when output order matters)
 
+## Code quality
+
+- Keep one source of truth for symbol identity, link-target ownership, and resolution precedence. Reuse the shared resolver and metadata instead of duplicating policies in lowering, analysis, or export.
+- Keep shared SQL and export behavior in one place across minimal and full modes; extend existing helpers rather than maintaining parallel implementations.
+- Preserve simple phase boundaries and explicit invariants. Avoid speculative abstractions and unnecessary scans or allocations in per-symbol and solver hot paths.
+
 ## Build commands
 
 ```bash
@@ -126,7 +132,8 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 |------|---------------|
 | Fix include resolution / graph | `trace-parse/src/deps.rs`, `trace-preproc/src/preprocessor.rs` |
 | Return-value / call assignment flow | `trace-parse/src/lower.rs`, `pag.expand_return_flows` |
-| Static / internal call resolution | `symbol.rs` (`resolve_function_in_scope`), `solver.rs`, `pag.rs` |
+| Static / internal call resolution | `symbol.rs` (`resolve_function_in_scope_in_target`), `solver.rs`, `pag.rs` |
+| Link targets / weak symbols | `link_commands.rs` (reading build metadata), `target_merge.rs` (per-image scopes and weak selection), `symbol.rs` (`TargetScope`) |
 | Fn-ptr arg-flow export | `solver.rs` (`extract_arg_flow`), `export.rs`, `arg_flow_edges.actual_fn_id` |
 | Flow-graph export / inspect queries | `export.rs` (`export_flow_graph`), `inspect.rs` |
 | Field summary / GEP fallback | `trace-analysis/src/pag.rs`, `solver.rs` |

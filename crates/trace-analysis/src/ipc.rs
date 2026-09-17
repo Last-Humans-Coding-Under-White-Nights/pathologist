@@ -30,15 +30,15 @@ type ProxyMethods = Vec<(String, String, FnId)>;
 pub fn detect_ipc_pairs(program: &Program) -> Vec<IpcBridge> {
     let (stubs, proxies) = scan(program);
 
-    let mut stub_index: FxHashMap<String, &Vec<FnId>> = FxHashMap::default();
+    let mut stub_index: FxHashMap<&str, &Vec<FnId>> = FxHashMap::default();
     for (class, handlers) in &stubs {
-        stub_index.insert(class.clone(), handlers);
+        stub_index.insert(class.as_str(), handlers);
     }
 
     let mut bridges: Vec<IpcBridge> = Vec::new();
     for (proxy_class, method, proxy_method) in &proxies {
         let stub_class = derive_stub_class(proxy_class);
-        let Some(handlers) = stub_index.get(&stub_class) else {
+        let Some(handlers) = stub_index.get(stub_class.as_str()) else {
             continue;
         };
         let matched_handlers = find_handlers(program, handlers, method);
@@ -98,7 +98,6 @@ fn scan(program: &Program) -> (StubClasses, ProxyMethods) {
 
     let mut stubs: StubClasses = Vec::new();
     let mut proxies: ProxyMethods = Vec::new();
-    let mut seen_stub = std::collections::HashSet::new();
 
     for (class, methods) in &methods_by_class {
         if is_stub_class(class) {
@@ -113,7 +112,8 @@ fn scan(program: &Program) -> (StubClasses, ProxyMethods) {
             // fallback needs to find them. A stub must have either handler
             // methods OR OnRemoteRequest (the dispatcher) to be registered.
             let has_dispatcher = methods.iter().any(|(m, _)| is_stub_entry(m));
-            if (!handlers.is_empty() || has_dispatcher) && seen_stub.insert(class.clone()) {
+            // `methods_by_class` is keyed by class, so each is visited once.
+            if !handlers.is_empty() || has_dispatcher {
                 stubs.push((class.clone(), handlers));
             }
         } else if is_proxy_class(class) {
@@ -388,6 +388,8 @@ mod tests {
     fn add_external_method(program: &mut Program, file: trace_ir::FileId, name: &str) -> FnId {
         let id = program.symbols.alloc_fn_id();
         program.symbols.push_synthetic_function(Function {
+            is_weak: false,
+            target: None,
             id,
             name: name.to_string(),
             linkage: Linkage::External,

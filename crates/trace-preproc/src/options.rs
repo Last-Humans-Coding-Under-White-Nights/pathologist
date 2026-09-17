@@ -327,6 +327,10 @@ pub struct PreprocessOptions {
     /// Explicit compilation database path; otherwise indexing checks the
     /// analysis root, then its `build` directory.
     pub compilation_database: Option<PathBuf>,
+    /// Link database path; otherwise indexing discovers root/build metadata.
+    pub link_commands: Option<PathBuf>,
+    /// Indexing-only: retain weak body/initializer ownership for link selection.
+    pub record_link_ownership: bool,
     pub include_paths: Vec<PathBuf>,
     /// Quoted includes search these before `include_paths`.
     pub quote_include_paths: Vec<PathBuf>,
@@ -425,6 +429,8 @@ impl Default for PreprocessOptions {
     fn default() -> Self {
         Self {
             compilation_database: None,
+            link_commands: None,
+            record_link_ownership: false,
             include_paths: Vec::new(),
             quote_include_paths: Vec::new(),
             system_include_paths: Vec::new(),

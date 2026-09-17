@@ -43,6 +43,9 @@ enum Commands {
         /// then TARGET/build/compile_commands.json).
         #[arg(long)]
         compile_commands: Option<PathBuf>,
+        /// Link commands database path (default: auto-discovery).
+        #[arg(long)]
+        link_commands: Option<PathBuf>,
         /// Number of parallel jobs for indexing (parse/lower).
         #[arg(long)]
         jobs: Option<usize>,
@@ -223,6 +226,7 @@ fn main() -> Result<()> {
             includes,
             defines,
             compile_commands,
+            link_commands,
             jobs,
             timeout_secs,
             debug_points_to,
@@ -238,6 +242,7 @@ fn main() -> Result<()> {
             includes,
             defines,
             compile_commands,
+            link_commands,
             jobs,
             timeout_secs,
             debug_points_to,
@@ -259,6 +264,7 @@ fn run_analyze(
     includes: Vec<PathBuf>,
     defines: Vec<String>,
     compile_commands: Option<PathBuf>,
+    link_commands: Option<PathBuf>,
     jobs: Option<usize>,
     timeout_secs: Option<u64>,
     debug_points_to: bool,
@@ -316,6 +322,7 @@ fn run_analyze(
         }
     }
     opts.compilation_database = compile_commands;
+    opts.link_commands = link_commands;
     let root_canon = trace_ir::canonicalize(&target);
     for dep in deps {
         if !dep.is_dir() {

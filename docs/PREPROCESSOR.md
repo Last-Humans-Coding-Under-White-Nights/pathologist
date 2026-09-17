@@ -100,6 +100,7 @@ flowchart LR
 | Macro rescanning | Function-like macros invoked inside another macro's expansion are expanded too (C11 6.10.3.4); uninvoked function-like names are emitted verbatim |
 | Macro hide set | Replacement-list tokens are painted with the macro name (and the invoking token's hide set) so self-referential macros such as `#define FOO FOO, BAR` terminate; nested `MIN(MIN(a,b),c)` still expands because argument tokens are not painted |
 | Compiler attribute groups | Balanced noise groups are elided at rescan boundaries after expanding arguments and chained marker aliases. GNU semantic attributes (including underscore spellings and `noreturn`) and MSVC linkage attributes survive. Directives and malformed groups are retained; elision preserves newlines and LineMap origins. |
+| Weak linkage pragmas | Active `#pragma weak name` survives preprocessing for IR annotation capture; inactive directives are discarded. Alias spelling marks the named declaration weak without synthesizing an alias body. |
 | Expansion depth cap | 256 nested expansions; further expansion is skipped with a warning (backstop if hide-set does not apply) |
 | Runaway caps | Per-file limits (defaults): 64 nested `#include`s, 64 inclusions of any one path per run (`max_file_expansions`, see the repeated-`#include` row above — depth alone does not bound repetition), 32 MiB live output, 8M tokens (macro rescan included). The token budget counts tokens **materialized**, not merely walked: a function-like invocation walks O(1) — the argument list is skipped wholesale — and then copies each argument once per parameter occurrence, so before #30 an 80k-token argument reached 397 MB of peak allocation under a 2,000-token budget. The projected replacement is charged before it is built, and the rescan charges the result again as it walks it, so a function-like expansion costs roughly twice its width against the budget. Exceeding output/token budget stops that file with an error diagnostic; include-depth and the per-path expansion cap skip the nested include. CLI `--timeout-secs N` aborts the whole process. |
 | `##` token pasting | In macro bodies after argument substitution; chained pastes (`a ## b ## c`) collapse left to right, empty operands are placemarkers on either side (the surviving operand keeps the left operand's adjacency), so an empty left parameter never pastes a preceding token; a dangling `##` with no operand is dropped |
@@ -539,3 +540,13 @@ Command-line macro replacement text is lexed without an appended newline, so a
 terminal backslash is preserved. Include lookup uses platform path semantics for
 relative paths and recognizes canonical source-cache entries in every search
 class, including the source directory and forced includes.
+
+### Weak linkage annotations
+
+Meaningful GNU attributes `weak` and `__weak__` survive macro expansion and
+are captured as weak linkage during lowering, for external functions and
+globals only. Active
+`#pragma weak name` directives are retained for the same purpose, including
+pragmas following the declaration. The alias form `#pragma weak name = target`
+marks an existing `name` weak; it does not synthesize an alias definition or
+copy the target body. Inactive conditional arms have no effect.

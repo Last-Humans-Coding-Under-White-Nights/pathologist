@@ -1,7 +1,10 @@
+#[path = "target_merge.rs"]
+mod target_merge;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+pub(crate) use target_merge::merge_linked_units;
 use trace_ir::{
     same_param_type_or_unresolved, CallSite, CallSiteId, FlowConstraint, FnId, Function, Program,
     ReturnFlow, TemplateBase, TypeDesc, TypeId, VarId, Variable,
@@ -11,6 +14,8 @@ use trace_ir::{
 #[derive(Debug, Clone, Default)]
 pub struct UnitIndex {
     pub path: PathBuf,
+    /// Successful command ordinal for this source in the compilation database.
+    pub compilation_index: Option<usize>,
     /// Unit-local file table: index == unit-local [`trace_ir::FileId`] value.
     /// Includes the TU itself plus every `#include`d origin that produced
     /// attributed entities.
@@ -20,6 +25,9 @@ pub struct UnitIndex {
     pub variables: Vec<Variable>,
     pub call_sites: Vec<CallSite>,
     pub flow: Vec<FlowConstraint>,
+    pub function_flow_ranges: FxHashMap<FnId, Vec<std::ops::Range<usize>>>,
+    /// Initializer constraints, including temporaries and deferred references.
+    pub global_initializer_ranges: FxHashMap<VarId, Vec<std::ops::Range<usize>>>,
     pub fn_returns: FxHashMap<FnId, Vec<ReturnFlow>>,
     pub diagnostics: Vec<trace_ir::Diagnostic>,
     pub anon_type_counter: u32,
@@ -170,38 +178,64 @@ pub fn merge_unit_index(program: &mut Program, unit: &UnitIndex) {
 /// program would rebuild a set of every constraint merged so far, once per
 /// variant.
 pub fn merge_unit_variants(program: &mut Program, base: &UnitIndex, variants: &[UnitIndex]) {
-    let flow_start = program.flow.len();
-    let var_start = program.symbols.variables.len();
-    merge_unit(program, base, MergeMode::Full, None);
-    if variants.is_empty() {
-        return;
-    }
-    // Every unit below merges with `union_aggregates`, whatever the per-source
-    // variant tally ends up saying.
-    program.layouts_unioned = true;
-    let mut seen = VariantDedup {
-        flow: program.flow[flow_start..].iter().cloned().collect(),
-        file_vars: FxHashMap::default(),
-        source_scopes: FxHashMap::default(),
-        base_defs: base_definitions(program, base),
-    };
-    let base_scope = seen.source_scope(&base.path);
-    for v in &program.symbols.variables[var_start..] {
-        if v.fn_id.is_none() {
-            seen.file_vars.insert(
-                (
-                    base_scope,
-                    v.span.file,
-                    v.span.line,
-                    v.span.col,
-                    v.name.clone(),
-                ),
-                v.id,
-            );
-        }
-    }
+    let mut merge = VariantMerge::start(program, base, !variants.is_empty());
     for unit in variants {
-        merge_unit(program, unit, MergeMode::Variant, Some(&mut seen));
+        merge.push(program, unit);
+    }
+}
+
+/// [`merge_unit_variants`] with the family supplied one unit at a time.
+///
+/// Units are consumed strictly in order, so a caller that has to *build* each
+/// one — target scoping clones and rewrites every unit it merges — can hold a
+/// single unit at a time instead of the whole family.
+pub(crate) struct VariantMerge {
+    /// `None` once the base is merged and no variant follows, which is the
+    /// common case and skips building the dedup index entirely.
+    seen: Option<VariantDedup>,
+}
+
+impl VariantMerge {
+    pub(crate) fn start(program: &mut Program, base: &UnitIndex, has_variants: bool) -> Self {
+        let flow_start = program.flow.len();
+        let var_start = program.symbols.variables.len();
+        merge_unit(program, base, MergeMode::Full, None);
+        if !has_variants {
+            return Self { seen: None };
+        }
+        // Every unit below merges with `union_aggregates`, whatever the
+        // per-source variant tally ends up saying.
+        program.layouts_unioned = true;
+        let mut seen = VariantDedup {
+            flow: program.flow[flow_start..].iter().cloned().collect(),
+            file_vars: FxHashMap::default(),
+            source_scopes: FxHashMap::default(),
+            base_defs: base_definitions(program, base),
+        };
+        let base_scope = seen.source_scope(&base.path);
+        for v in &program.symbols.variables[var_start..] {
+            if v.fn_id.is_none() {
+                seen.file_vars.insert(
+                    (
+                        base_scope,
+                        v.span.file,
+                        v.span.line,
+                        v.span.col,
+                        v.name.clone(),
+                    ),
+                    v.id,
+                );
+            }
+        }
+        Self { seen: Some(seen) }
+    }
+
+    pub(crate) fn push(&mut self, program: &mut Program, unit: &UnitIndex) {
+        let Some(seen) = self.seen.as_mut() else {
+            debug_assert!(false, "variant pushed after start declared none");
+            return;
+        };
+        merge_unit(program, unit, MergeMode::Variant, Some(seen));
         // A later configuration can introduce a definition absent from the
         // first one. Subsequent alternatives must extend that definition too.
         for (file, definitions) in base_definitions(program, unit) {
@@ -705,6 +739,33 @@ fn merge_unit(
             let cursor = temp_cursor.entry(*key).or_insert(0);
             if let Some(&existing) = temps_by_site.get(key).and_then(|ids| ids.get(*cursor)) {
                 *cursor += 1;
+                var_map.insert(var.id, existing);
+                continue;
+            }
+        }
+
+        // A namespaced global's unqualified name is not its symbol name, so
+        // `a::counter` and `b::counter` must not collapse into one variable.
+        if let Some(target) = var
+            .target
+            .filter(|_| var.storage == trace_ir::StorageClass::Global)
+            .filter(|_| !var.is_namespaced)
+        {
+            if let Some(existing) = program.symbols.target_global(target, &var.name) {
+                let current = program.symbols.variable(existing);
+                if var.is_defined
+                    && trace_ir::definition_supersedes(
+                        current.is_defined,
+                        current.is_weak,
+                        var.is_weak,
+                    )
+                {
+                    let mut replacement = var.clone();
+                    replacement.id = existing;
+                    replacement.type_id = remap_type(var.type_id, &type_map);
+                    replacement.span.file = span_file;
+                    *program.symbols.variable_mut(existing) = replacement;
+                }
                 var_map.insert(var.id, existing);
                 continue;
             }
@@ -1427,6 +1488,8 @@ mod tests {
             files: vec![PathBuf::from(path)],
             types,
             functions: vec![Function {
+                is_weak: false,
+                target: None,
                 id: fn_id,
                 name: "recycle".into(),
                 linkage: trace_ir::Linkage::External,
@@ -1449,6 +1512,10 @@ mod tests {
                 is_cpp: true,
             }],
             variables: vec![Variable {
+                is_defined: false,
+                is_weak: false,
+                target: None,
+                is_namespaced: false,
                 id: param,
                 name: param_name.into(),
                 type_id: param_type,

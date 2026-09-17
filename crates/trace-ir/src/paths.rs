@@ -2,7 +2,7 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -209,9 +209,70 @@ fn read_listing(dir: &Path) -> Option<DirListing> {
     Some(DirListing { names, folded })
 }
 
+/// Resolve `path` against `directory` and fold away `.` / `..` lexically before
+/// canonicalizing, so an artifact that was never built still compares equal to
+/// the same path spelled differently by another command.
+pub fn resolve_against(directory: &Path, path: &Path) -> PathBuf {
+    let joined = directory.join(path);
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            part => normalized.push(part.as_os_str()),
+        }
+    }
+    canonicalize(&normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_relative_parents_survive_normalization() {
+        for (base, path, expected) in [
+            (
+                ".",
+                "../trace-unbuilt-review-artifact",
+                "../trace-unbuilt-review-artifact",
+            ),
+            (
+                "a",
+                "../../trace-unbuilt-review-artifact",
+                "../trace-unbuilt-review-artifact",
+            ),
+            (
+                "..",
+                "../trace-unbuilt-review-artifact",
+                "../../trace-unbuilt-review-artifact",
+            ),
+            (
+                "../a",
+                "../trace-unbuilt-review-artifact",
+                "../trace-unbuilt-review-artifact",
+            ),
+            (
+                "/",
+                "../trace-unbuilt-review-artifact",
+                "/trace-unbuilt-review-artifact",
+            ),
+        ] {
+            assert_eq!(
+                resolve_against(Path::new(base), Path::new(path)),
+                PathBuf::from(expected)
+            );
+        }
+    }
 
     /// `PROBE_EPOCH` is process-global, so a test that bumps it empties the
     /// memo every other probe test is reading. Take this first.

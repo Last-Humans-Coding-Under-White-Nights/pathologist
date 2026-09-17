@@ -111,6 +111,18 @@ impl MergeDedup {
         self.diagnostic_keys
             .insert((file, line, message.to_owned(), stage.to_owned()))
     }
+
+    /// Drop the entity tables while keeping `diagnostic_keys`.
+    ///
+    /// Entity deduplication is per link image: a header's function merged into
+    /// one target must merge again into the next. A diagnostic is a
+    /// program-wide fact about a source position, so re-reporting it once per
+    /// target that happens to include the file is noise, not information.
+    pub fn clear_entities(&mut self) {
+        self.fn_keys.clear();
+        self.site_keys.clear();
+        self.variant_site_records.clear();
+    }
 }
 
 /// What a C++ class's declared `operator->` returns, kept apart from the
@@ -135,9 +147,23 @@ pub struct ArrowReturn {
     pub pointer: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct LinkTarget {
+    pub id: crate::TargetId,
+    pub name: String,
+    pub output: PathBuf,
+    pub sources: Vec<FileId>,
+    pub dependencies: Vec<crate::TargetId>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Program {
     pub root: PathBuf,
+    pub link_targets: Vec<LinkTarget>,
+    /// Per-unit ranges used to remove an overridden weak body's constraints.
+    pub function_flow_ranges: FxHashMap<FnId, Vec<std::ops::Range<usize>>>,
+    /// Initializer constraints, including temporaries and deferred references.
+    pub global_initializer_ranges: FxHashMap<crate::VarId, Vec<std::ops::Range<usize>>>,
     pub types: TypeTable,
     pub symbols: SymbolTable,
     pub flow: Vec<crate::FlowConstraint>,

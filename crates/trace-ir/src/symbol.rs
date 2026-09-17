@@ -29,6 +29,17 @@ pub struct Variable {
     pub param_index: Option<u32>,
     pub span: Span,
     pub is_pointer: bool,
+    /// True for a global definition, including C tentative definitions.
+    pub is_defined: bool,
+    /// GNU weak attribute or an active weak pragma in this translation unit.
+    pub is_weak: bool,
+    /// Link target identity; absent when no link metadata is available.
+    pub target: Option<crate::TargetId>,
+    /// Declared inside a C++ namespace, so `name` — the only name recorded for
+    /// a variable — is not the name a linker resolves. Such a global neither
+    /// claims its image's binding for that name nor takes part in weak
+    /// override, since `a::cb` and `b::cb` are different symbols.
+    pub is_namespaced: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +60,10 @@ pub struct Function {
     pub end_line: u32,
     pub file: FileId,
     pub is_defined: bool,
+    /// GNU weak attribute or an active weak pragma in this translation unit.
+    pub is_weak: bool,
+    /// Link target identity; absent when no link metadata is available.
+    pub target: Option<crate::TargetId>,
     /// Overload-signature param types in the *merged* program's TypeId space,
     /// recorded by the cross-TU merge pass. During `merge_unit_index` all
     /// functions are registered before their param variables are remapped, so
@@ -155,12 +170,28 @@ impl CallSite {
 /// definition's cache would let a later, distinct body pass the exact-id
 /// check, and `merge_unit` remaps an adopted list, which a stale cache would
 /// describe with the old list's ids.
+/// Whether an incoming definition replaces the one already registered.
+///
+/// One rule for functions and variables alike: a definition fills an entry
+/// that has none, and a strong definition displaces a weak one. Equal strength
+/// leaves the first winner in place.
+pub fn definition_supersedes(
+    existing_defined: bool,
+    existing_weak: bool,
+    incoming_weak: bool,
+) -> bool {
+    !existing_defined || (existing_weak && !incoming_weak)
+}
+
 fn absorb_redeclaration(
     existing: &mut Function,
     func: &Function,
     param_types: Option<&[TypeId]>,
     adopted_params: bool,
 ) {
+    if existing.target.is_none() || !existing.is_defined {
+        existing.is_weak |= func.is_weak;
+    }
     if adopted_params {
         existing.param_type_ids = param_types
             .map(<[TypeId]>::to_vec)
@@ -215,12 +246,29 @@ pub struct FnRegistration {
     pub adopted_params: bool,
 }
 
+/// Which link image a name lookup may see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetScope {
+    /// Unconstrained: every symbol, whatever image it belongs to.
+    Any,
+    /// One image, including the unscoped partition when the target is `None`.
+    Image(Option<crate::TargetId>),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SymbolTable {
+    has_target_scopes: bool,
+    /// Monotonic cache: avoids scanning imported symbols in each translation unit.
+    has_weak_symbols: bool,
     pub files: Vec<FileInfo>,
     pub functions: Vec<Function>,
     pub variables: Vec<Variable>,
     pub call_sites: Vec<CallSite>,
+    /// One entry per name, the one every unqualified call site resolves
+    /// through. It is not first-wins: `should_take_primary` gives the slot to
+    /// a defined entry over any declaration, and a later definition of the
+    /// name takes it from an earlier one. Only declarations are first-wins,
+    /// and only while no definition holds the slot.
     pub fn_by_name: IndexMap<String, FnId>,
     /// Every external entry per name, overloads included (C++). Unlike
     /// `fn_by_name` this never collapses to a single id.
@@ -232,6 +280,7 @@ pub struct SymbolTable {
     /// exact-name `fn_by_name`/`externals_by_name` tables cannot express.
     base_by_name: FxHashMap<String, Vec<FnId>>,
     pub global_by_name: IndexMap<String, VarId>,
+    target_globals: FxHashMap<crate::TargetId, FxHashMap<String, VarId>>,
     /// File-`static` variables per file, the first registered of a name
     /// winning.
     file_statics_by_name: FxHashMap<String, Vec<(FileId, VarId)>>,
@@ -397,6 +446,7 @@ impl SymbolTable {
         param_types: Option<&[TypeId]>,
         types: Option<&crate::TypeTable>,
     ) -> FnRegistration {
+        self.has_weak_symbols |= func.is_weak;
         let mut adopted_params = false;
         if func.linkage == Linkage::External {
             // Find existing candidates under func.name: all entries in
@@ -407,17 +457,40 @@ impl SymbolTable {
             // consulting it alone made a definition miss its own declaration
             // whenever another overload had been registered after it (#83).
             let bucket = self.externals_by_name.get(&func.name);
-            let primary = self.fn_by_name.get(&func.name).copied();
+            let primary = if func.target.is_some() {
+                bucket
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .find(|&id| self.function(id).target == func.target)
+            } else {
+                self.fn_by_name.get(&func.name).copied()
+            };
             let candidates: Vec<FnId> = if func.is_cpp && func.is_defined {
                 // A C++ definition tries UNDEFINED prototypes first, to reunite
                 // with its declaration, and only then the primary entry (for
                 // exact duplicate-definition dedup). It must not search across
-                // distinct defined overloads, which are separate bodies.
+                // distinct defined overloads, which are separate bodies — nor,
+                // under link metadata, across entries from another image.
+                //
+                // Inside an image a *defined* entry is a candidate too: one
+                // symbol per signature is linked there, so a strong definition
+                // has to reach the weak definition it supersedes. Restricting
+                // this to undefined entries let the primary — which under
+                // scoping is merely the first entry of the name in the image,
+                // often an unrelated overload — be the only defined candidate,
+                // and a strong `hook(double)` registered behind a `hook(int)`
+                // never found the weak `hook(double)` to override. Signature
+                // matching still separates genuine overloads.
+                let scoped = func.target.is_some();
                 let mut list: Vec<FnId> = bucket
                     .into_iter()
                     .flatten()
                     .copied()
-                    .filter(|&id| self.function_by_id(id).is_some_and(|f| !f.is_defined))
+                    .filter(|&id| {
+                        self.function_by_id(id)
+                            .is_some_and(|f| f.target == func.target && (scoped || !f.is_defined))
+                    })
                     .collect();
                 if let Some(primary) = primary {
                     if !list.contains(&primary) {
@@ -465,7 +538,18 @@ impl SymbolTable {
                 let mut missing_this = false;
                 if let Some(existing) = self.function_mut_by_id(existing_id) {
                     missing_this = joins_member_missing_this(existing, &func);
-                    if func.is_defined {
+                    // An unscoped program keeps its historical first-wins
+                    // overwrite; within an image, precedence decides.
+                    if func.is_defined
+                        && (func.target.is_none()
+                            || definition_supersedes(
+                                existing.is_defined,
+                                existing.is_weak,
+                                func.is_weak,
+                            ))
+                    {
+                        existing.is_weak =
+                            func.is_weak || (func.target.is_none() && existing.is_weak);
                         existing.is_defined = true;
                         existing.owner_unresolved = func.owner_unresolved;
                         existing.file = func.file;
@@ -555,14 +639,15 @@ impl SymbolTable {
             let own_file = entries
                 .into_iter()
                 .flatten()
-                .find(|(file, _)| *file == func.file)
+                .find(|(file, id)| *file == func.file && self.function(*id).target == func.target)
                 .map(|(_, id)| *id);
             let scoped = own_file.or_else(|| {
                 if !func.is_cpp {
                     return None;
                 }
                 self.first_in_scope(func.file, entries, |id| {
-                    self.function_by_id(id).is_some_and(|e| e.is_cpp)
+                    self.function_by_id(id)
+                        .is_some_and(|e| e.is_cpp && e.target == func.target)
                 })
             });
             let overloads = func.is_cpp
@@ -652,8 +737,13 @@ impl SymbolTable {
                     self.overload_primary.insert(func.id, primary);
                 }
                 None => {
+                    let replace = self.fn_by_scope.get(&func.name).and_then(|entries| {
+                        entries.iter().position(|(file, id)| {
+                            *file == func.file && self.function(*id).target == func.target
+                        })
+                    });
                     let entries = self.fn_by_scope.entry(func.name.clone()).or_default();
-                    match entries.iter_mut().find(|(file, _)| *file == func.file) {
+                    match replace.map(|i| &mut entries[i]) {
                         Some(entry) => entry.1 = func.id,
                         None => entries.push((func.file, func.id)),
                     }
@@ -692,13 +782,17 @@ impl SymbolTable {
     /// real definitions. Only the id index is maintained.
     pub fn push_synthetic_function(&mut self, func: Function) -> FnId {
         debug_assert!(
-            !self.fn_by_name.contains_key(&func.name),
-            "synthetic function must not shadow a registered name"
+            self.externals_by_name.get(&func.name).is_none_or(|ids| ids
+                .iter()
+                .all(|id| self.function(*id).target != func.target)),
+            "synthetic function must not shadow a registered name in its target"
         );
         self.push_indexed(func)
     }
 
     fn push_indexed(&mut self, func: Function) -> FnId {
+        self.has_weak_symbols |= func.is_weak;
+        self.has_target_scopes |= func.target.is_some();
         let id = func.id;
         self.fn_slots.insert(id, self.functions.len() as u32);
         self.base_by_name
@@ -766,6 +860,9 @@ impl SymbolTable {
         let both_cpp = func.is_cpp && existing_fn.map(|e| e.is_cpp).unwrap_or(false);
         existing_fn
             .map(|existing| {
+                if existing.target != func.target {
+                    return false;
+                }
                 if !func.is_cpp && !existing.is_cpp {
                     // Pure C: prototype + definition always collapse.
                     return true;
@@ -875,12 +972,44 @@ impl SymbolTable {
             .map(|v| v.type_id)
     }
 
+    pub fn has_weak_symbols(&self) -> bool {
+        self.has_weak_symbols
+    }
+
+    /// Record a weak pragma applied after the declaration was registered.
+    pub fn mark_has_weak_symbols(&mut self) {
+        self.has_weak_symbols = true;
+    }
+
+    pub fn target_global(&self, target: crate::TargetId, name: &str) -> Option<VarId> {
+        self.target_globals.get(&target)?.get(name).copied()
+    }
+
     pub fn add_variable(&mut self, var: Variable) -> VarId {
+        self.has_weak_symbols |= var.is_weak;
         let id = var.id;
         match var.storage {
-            StorageClass::Global => {
-                self.global_by_name.insert(var.name.clone(), id);
-            }
+            StorageClass::Global => match var.target {
+                // A namespaced global does not claim the image's binding for
+                // its unqualified name; an unrelated `::counter` would
+                // otherwise unify with `ns::counter`.
+                Some(target) if !var.is_namespaced => {
+                    self.target_globals
+                        .entry(target)
+                        .or_default()
+                        .entry(var.name.clone())
+                        .or_insert(id);
+                }
+                Some(_) => {}
+                // `global_by_name` is the unscoped index, and every image holds
+                // its own copy of a shared global. Letting a scoped copy
+                // overwrite the entry left it pointing at whichever target
+                // merged last, so an unscoped caller resolving through it
+                // inherited an arbitrary image's variable.
+                None => {
+                    self.global_by_name.insert(var.name.clone(), id);
+                }
+            },
             StorageClass::FileStatic => {
                 let entries = self
                     .file_statics_by_name
@@ -923,29 +1052,6 @@ impl SymbolTable {
 
     pub fn resolve_function(&self, name: &str) -> Option<FnId> {
         self.fn_by_name.get(name).copied()
-    }
-
-    /// Resolve by C scoping rules: an internal-linkage (`static`) definition
-    /// in `file` shadows any external definition of the same name for
-    /// references inside that file; otherwise fall back to the external name
-    /// table. `#include`d headers contributing entities to `file` are part
-    /// of its scope (TU-local wins over header-defined on name collision).
-    pub fn resolve_function_in_scope(
-        &self,
-        name: &str,
-        file: Option<crate::FileId>,
-    ) -> Option<FnId> {
-        if let Some(file) = file {
-            if let Some(id) = self.lookup_in_scopes(name, file) {
-                return Some(id);
-            }
-        }
-        self.fn_by_name.get(name).copied()
-    }
-
-    fn lookup_in_scopes(&self, name: &str, file: crate::FileId) -> Option<FnId> {
-        let entries = self.fn_by_scope.get(name).map(Vec::as_slice);
-        self.first_in_scope(file, entries, |_| true)
     }
 
     /// The further overloads of the internal-linkage entry `id` that code in
@@ -1078,17 +1184,116 @@ impl SymbolTable {
     /// name. The solver wires exactly these, so anything that has to agree
     /// with its wiring asks here.
     pub fn callees_of(&self, cs: &CallSite) -> Vec<FnId> {
+        // Both resolvers below fall back to the whole-program interpretation
+        // when nothing is scoped, so one tail serves either mode.
+        let target = self.caller_target(cs);
         if let Some(fid) = cs.callee_fn_id {
-            vec![fid]
-        } else if cs.is_direct {
-            self.resolve_function_in_scope(&cs.callee_name, Some(cs.span.file))
+            if !self.has_target_scopes || self.function(fid).target == target {
+                return vec![fid];
+            }
+        }
+        if cs.is_direct {
+            self.resolve_function_in_scope_in_target(&cs.callee_name, Some(cs.span.file), target)
                 .into_iter()
                 .collect()
         } else if cs.resolves_by_name() {
-            self.resolve_function_candidates(&cs.callee_name, Some(cs.span.file))
+            self.resolve_function_candidates_in_target(&cs.callee_name, Some(cs.span.file), target)
         } else {
             Vec::new()
         }
+    }
+
+    /// The image a call site resolves in: its caller's, or none at all when
+    /// no link metadata scoped the program.
+    fn caller_target(&self, cs: &CallSite) -> Option<crate::TargetId> {
+        self.has_target_scopes
+            .then(|| self.function(cs.caller).target)
+            .flatten()
+    }
+
+    /// Whether `id` is visible to a lookup confined to `scope`.
+    fn in_scope_of(&self, id: FnId, scope: TargetScope) -> bool {
+        match scope {
+            TargetScope::Any => true,
+            TargetScope::Image(target) => {
+                self.function_by_id(id).is_some_and(|f| f.target == target)
+            }
+        }
+    }
+
+    /// The image a lookup is confined to, or `Any` when it is unconstrained.
+    ///
+    /// `Image(None)` is not the same question as `Any`: it names the partition
+    /// of sources no link target claimed, and matches only symbols in it.
+    /// Collapsing the two makes every unconstrained query miss every
+    /// target-scoped symbol as soon as any link metadata exists.
+    fn image_of(&self, target: Option<crate::TargetId>) -> TargetScope {
+        if self.has_target_scopes {
+            TargetScope::Image(target)
+        } else {
+            TargetScope::Any
+        }
+    }
+
+    /// The one entry a direct call written in `file` binds to. A direct site
+    /// stays a single edge whether or not link metadata exists, so it never
+    /// widens to the candidate set below.
+    pub fn resolve_function_in_scope(
+        &self,
+        name: &str,
+        file: Option<crate::FileId>,
+    ) -> Option<FnId> {
+        self.first_in_image(name, file, TargetScope::Any)
+    }
+
+    /// [`resolve_function_in_scope`](Self::resolve_function_in_scope) confined
+    /// to one link image.
+    pub fn resolve_function_in_scope_in_target(
+        &self,
+        name: &str,
+        file: Option<FileId>,
+        target: Option<crate::TargetId>,
+    ) -> Option<FnId> {
+        self.first_in_image(name, file, self.image_of(target))
+    }
+
+    fn first_in_image(&self, name: &str, file: Option<FileId>, scope: TargetScope) -> Option<FnId> {
+        if let Some(file) = file {
+            let entries = self.fn_by_scope.get(name).map(Vec::as_slice);
+            if let Some(id) = self.first_in_scope(file, entries, |id| self.in_scope_of(id, scope)) {
+                return Some(id);
+            }
+        }
+        if let Some(id) = self
+            .fn_by_name
+            .get(name)
+            .copied()
+            .filter(|&id| self.in_scope_of(id, scope))
+        {
+            return Some(id);
+        }
+        // `fn_by_name` holds one entry per name across the whole program --
+        // the last definition of it, whichever image that came from -- so
+        // under scoping it can hold another image's entry and hide this one.
+        // The per-name bucket is the complete list.
+        let candidates = matches!(scope, TargetScope::Image(_))
+            .then(|| self.externals_by_name.get(name))
+            .flatten()?;
+        let in_scope = || {
+            candidates
+                .iter()
+                .copied()
+                .filter(|&id| self.in_scope_of(id, scope))
+        };
+        // The bucket is in registration order, which the primary slot
+        // deliberately is not: `should_take_primary` keeps a body ahead of the
+        // declarations of its name. Taking the bucket's first entry dropped
+        // that rule inside an image, so a prototype registered before the body
+        // -- another overload, or a header the image did not merge -- answered
+        // for every call site and the solver never expanded the body.
+        in_scope()
+            .find(|&id| self.function(id).is_defined)
+            .or_else(|| in_scope().next())
     }
 
     /// All functions a post-merge name lookup may refer to.
@@ -1105,27 +1310,56 @@ impl SymbolTable {
         name: &str,
         file: Option<crate::FileId>,
     ) -> Vec<FnId> {
+        self.candidates_in_image(name, file, TargetScope::Any)
+    }
+
+    /// [`resolve_function_candidates`](Self::resolve_function_candidates)
+    /// confined to one link image.
+    pub fn resolve_function_candidates_in_target(
+        &self,
+        name: &str,
+        file: Option<FileId>,
+        target: Option<crate::TargetId>,
+    ) -> Vec<FnId> {
+        self.candidates_in_image(name, file, self.image_of(target))
+    }
+
+    fn candidates_in_image(
+        &self,
+        name: &str,
+        file: Option<FileId>,
+        scope: TargetScope,
+    ) -> Vec<FnId> {
         let mut out = Vec::with_capacity(2);
         if let Some(file) = file {
             for (_, id) in self.in_scope(file, self.fn_by_scope.get(name).map(Vec::as_slice)) {
+                if !self.in_scope_of(id, scope) {
+                    continue;
+                }
+                // Two scope entries of one overload set share a primary, so
+                // they surface the same further overloads. Each id is listed
+                // once: a repeat would wire the same callee edge twice.
                 let overloads = self.internal_overloads_seen_from(id, file);
                 for id in std::iter::once(id).chain(overloads) {
-                    if !out.contains(&id) {
+                    if self.in_scope_of(id, scope) && !out.contains(&id) {
                         out.push(id);
                     }
                 }
             }
         }
         if let Some(&id) = self.fn_by_name.get(name) {
-            if !out.contains(&id) {
+            if self.in_scope_of(id, scope) && !out.contains(&id) {
                 out.push(id);
             }
         }
         // C++ overloads: additional entries under the same name that the
-        // first-wins `fn_by_name` table hides.
+        // one-slot-per-name `fn_by_name` table hides. Unioned with the scope entries
+        // rather than used as a fallback — a name matching both a
+        // file-`static` definition and the image's external definition is
+        // genuinely ambiguous, and a may-analysis expands both.
         if let Some(bucket) = self.externals_by_name.get(name) {
             for &id in bucket {
-                if !out.contains(&id) {
+                if self.in_scope_of(id, scope) && !out.contains(&id) {
                     out.push(id);
                 }
             }
@@ -1277,6 +1511,8 @@ mod tests {
         line: u32,
     ) -> Function {
         Function {
+            is_weak: false,
+            target: None,
             id,
             name: name.to_string(),
             linkage: Linkage::External,
@@ -1367,6 +1603,10 @@ mod tests {
             3,
         );
         let param = Variable {
+            is_defined: false,
+            is_weak: false,
+            target: None,
+            is_namespaced: false,
             id: proto.params[0],
             name: "$arg0".into(),
             type_id: TypeId(4),
@@ -1584,6 +1824,10 @@ mod tests {
             1,
         );
         let var_int = Variable {
+            is_defined: false,
+            is_weak: false,
+            target: None,
+            is_namespaced: false,
             id: fint.params[0],
             name: "a".into(),
             type_id: TypeId(4),
@@ -1607,6 +1851,10 @@ mod tests {
             2,
         );
         let var_double = Variable {
+            is_defined: false,
+            is_weak: false,
+            target: None,
+            is_namespaced: false,
             id: fdouble.params[0],
             name: "b".into(),
             type_id: TypeId(8),
@@ -2222,5 +2470,78 @@ mod tests {
             "::ns::Device and ns::Device must match type shape"
         );
         assert!(p.symbols.function(proto_id).is_defined);
+    }
+
+    #[test]
+    fn a_scoped_lookup_prefers_a_body_over_a_prototype_in_the_same_image() {
+        // Under link scoping `fn_by_name` can hold another image's entry, and
+        // the lookup then falls through to the per-name bucket. That bucket is
+        // in registration order, so a prototype registered ahead of the body
+        // answered for every call site in the image and the solver never
+        // expanded the body behind it.
+        let mut p = Program::new(PathBuf::from("/t"));
+        let int_ty = p.types.intern(TypeDesc::Int);
+        let double_ty = p.types.intern(TypeDesc::Double);
+        let image = crate::TargetId(1);
+        let elsewhere = crate::TargetId(2);
+
+        let header = p.symbols.add_file(PathBuf::from("/t/api.h"));
+        let mut proto = fake_function(
+            p.symbols.alloc_fn_id(),
+            "process",
+            vec![p.symbols.alloc_var_id()],
+            false,
+            true,
+            header,
+            3,
+        );
+        proto.param_type_ids = vec![double_ty];
+        proto.target = Some(image);
+        let proto_id =
+            p.symbols
+                .add_function_with_param_types(proto, Some(&[double_ty]), Some(&p.types));
+
+        let cpp = p.symbols.add_file(PathBuf::from("/t/api.cpp"));
+        let mut def = fake_function(
+            p.symbols.alloc_fn_id(),
+            "process",
+            vec![p.symbols.alloc_var_id()],
+            true,
+            true,
+            cpp,
+            10,
+        );
+        def.param_type_ids = vec![int_ty];
+        def.target = Some(image);
+        let def_id = p
+            .symbols
+            .add_function_with_param_types(def, Some(&[int_ty]), Some(&p.types));
+        assert_ne!(proto_id, def_id, "process(double) is a separate overload");
+
+        // A definition in ANOTHER image registers last and takes the primary
+        // slot, which is what pushes this image's lookup into the bucket.
+        let other = p.symbols.add_file(PathBuf::from("/t/other.cpp"));
+        let mut foreign = fake_function(
+            p.symbols.alloc_fn_id(),
+            "process",
+            vec![p.symbols.alloc_var_id()],
+            true,
+            true,
+            other,
+            4,
+        );
+        foreign.param_type_ids = vec![int_ty];
+        foreign.target = Some(elsewhere);
+        let foreign_id =
+            p.symbols
+                .add_function_with_param_types(foreign, Some(&[int_ty]), Some(&p.types));
+        assert_eq!(p.symbols.fn_by_name.get("process"), Some(&foreign_id));
+
+        assert_eq!(
+            p.symbols
+                .resolve_function_in_scope_in_target("process", None, Some(image)),
+            Some(def_id),
+            "the body in this image, not the prototype registered before it"
+        );
     }
 }

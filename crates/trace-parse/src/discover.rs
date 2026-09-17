@@ -16,7 +16,7 @@ pub const TU_EXTENSIONS: &[&str] = &["c", "cpp", "cc", "cxx", "c++", "C"];
 /// Header extensions pulled in via `#include` (and macro-warmed).
 pub const HEADER_EXTENSIONS: &[&str] = &["h", "hpp", "hh", "hxx", "h++", "H", "inl", "ipp"];
 
-fn has_extension_in(path: &Path, set: &[&str]) -> bool {
+pub(crate) fn has_extension_in(path: &Path, set: &[&str]) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| set.contains(&e))

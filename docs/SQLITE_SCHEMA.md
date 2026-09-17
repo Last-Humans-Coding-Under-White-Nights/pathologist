@@ -1,10 +1,10 @@
 # SQLite schema
 
-Schema version: **v4**
+Schema version: **v5**
 
 Export creates secondary indexes after bulk insertion, within the same
 transaction and before publishing the database. Primary keys and uniqueness
-constraints remain active during insertion. The completed v4 schema is unchanged.
+constraints remain active during insertion. The complete schema is assembled from the same table and index definitions.
 
 See also the [README](../README.md) for CLI flags that control what is exported.
 
@@ -14,6 +14,9 @@ See also the [README](../README.md) for CLI flags that control what is exported.
 |-------|-------------------|-----------------|---------------------|
 | `analysis_run` | ✓ | ✓ | ✓ |
 | `files` | ✓ | ✓ | ✓ |
+| `link_targets` | ✓ | ✓ | ✓ |
+| `target_sources` | ✓ | ✓ | ✓ |
+| `target_dependencies` | ✓ | ✓ | ✓ |
 | `functions` | ✓ | ✓ | ✓ |
 | `call_sites` | filtered | filtered | filtered |
 | `call_edges` | ✓ | ✓ | ✓ |
@@ -44,10 +47,14 @@ Unresolved indirect calls therefore appear in `call_sites` with zero `call_edges
 
 ```text
 analysis_run
+link_targets ─┬─ target_sources → files
+              └─ target_dependencies → link_targets
 files ─┬─ functions ─┬─ call_sites ─ arg_flow_edges → variables
+       │             │  (functions.target_id → link_targets)
        │             └─ call_edges → functions (caller and callee)
        ├─ variables ─ flow_nodes ─ flow_edges → flow_nodes
-       └─ variables (type_id → types when exported)
+       └─ variables (type_id → types when exported,
+                     target_id → link_targets)
 types
 locations (full export)
 points_to (debug)
@@ -62,7 +69,7 @@ diagnostics
 |--------|------|-------------|
 | `id` | INTEGER PK | Run id |
 | `trace_version` | TEXT | Full binary identity: package version, source revision, dirty state, and build date |
-| `schema_version` | INTEGER | Database layout version (currently `4`) |
+| `schema_version` | INTEGER | Database layout version (currently `5`) |
 | `target_root` | TEXT | Analyzed directory |
 | `created_at` | TEXT | Unix timestamp (seconds) |
 | `options_json` | TEXT | JSON: `include_paths`, `defines`, `dep_roots`, `include_points_to`, `full_detail`, `model_files`, `explore`, `explore_budget`, `variants_merged` |
@@ -85,6 +92,27 @@ while `defines` records user overrides, not every per-command macro environment.
 | `sha256` | TEXT | Hash placeholder (may be empty) |
 | `is_dep` | INTEGER | 1 if file resides under a dependency root (`--dep`), 0 otherwise |
 
+### Link targets
+
+Link metadata is exported in every detail mode. Without link-target metadata,
+these tables are empty and symbol `target_id` values are `NULL`.
+
+| Table | Columns | Meaning |
+|-------|---------|---------|
+| `link_targets` | `id` INTEGER PK, `name` TEXT, `output` TEXT | Link target and its output path |
+| `target_sources` | `target_id` FK → `link_targets`, `file_id` FK → `files` | Source membership; the pair is the primary key |
+| `target_dependencies` | `target_id` FK → `link_targets`, `dependency_id` FK → `link_targets` | Direct link dependencies; the pair is the primary key |
+
+**Indexes:** `target_sources(file_id)`, `target_dependencies(dependency_id)`,
+and partial indexes on `functions(target_id)` / `variables(target_id)` covering
+only non-`NULL` rows, so a run without link metadata builds and stores nothing
+for them.
+
+Weak flags and target associations accompany functions in all export modes,
+and variables whenever those variables are included in the export. These
+tables and columns are what v5 adds over v4; regenerate an older database to
+query them.
+
 ### functions
 
 | Column | Type | Description |
@@ -98,11 +126,13 @@ while `defines` records user overrides, not every per-command macro environment.
 | `signature` | TEXT | Placeholder `fn_<name>` |
 | `is_defined` | INTEGER | 1 if a body exists under the analyzed root. 0 rows include prototype-only declarations, synthesized externals (libc/logging backends never declared in-tree), and dependency declarations |
 | `is_dep` | INTEGER | 1 if function originates from a dependency root (`--dep`), 0 otherwise |
+| `is_weak` | INTEGER | 1 for a weak symbol, 0 otherwise; recorded only for external linkage — a `static` has none to weaken. |
+| `target_id` | INTEGER FK → `link_targets` | Owning link target; `NULL` when no target is known. |
 
 **Index:** `functions(name)`
 
-Header-defined functions are deduplicated across TUs at merge time (first copy
-wins, later copies redirect), so they appear once per origin.
+Header-defined functions are deduplicated across TUs within their link target
+at merge time (later copies redirect), so they appear once per origin and target.
 
 ### call_sites
 
@@ -174,6 +204,8 @@ Exactly one of `actual_var_id` or `actual_fn_id` is set per row. A function name
 | `file_id` | INTEGER FK → `files` | Declaration file |
 | `line` | INTEGER | Declaration line |
 | `col` | INTEGER | Declaration column (start of the declarator) |
+| `is_weak` | INTEGER | 1 for a weak symbol, 0 otherwise; recorded only for globals — a file-scope `static`, a local or a parameter has no linkage to weaken. |
+| `target_id` | INTEGER FK → `link_targets` | Owning link target; `NULL` when no target is known. |
 
 In minimal export, variables are limited to those referenced by the flow
 graph / arg-flow edges; use `--full-export` for every variable.
