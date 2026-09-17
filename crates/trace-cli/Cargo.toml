@@ -8,6 +8,7 @@ name = "trace"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = { version = "0.1", optional = true }
 trace-analysis = { workspace = true }
 trace-db = { workspace = true }
 trace-ir = { workspace = true }
@@ -20,6 +21,9 @@ rusqlite.workspace = true
 rustc-hash.workspace = true
 walkdir.workspace = true
 tree-sitter.workspace = true
+
+[features]
+mimalloc = ["dep:mimalloc"]
 
 [[example]]
 name = "parse_failures"
