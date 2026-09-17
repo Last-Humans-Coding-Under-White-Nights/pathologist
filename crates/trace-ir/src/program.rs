@@ -248,6 +248,14 @@ impl Program {
     pub fn release_merge_state(&mut self) {
         self.dedup = MergeDedup::default();
         self.template_base_set = rustc_hash::FxHashSet::default();
+        self.function_flow_ranges.clear();
+        self.function_flow_ranges.shrink_to_fit();
+        self.global_initializer_ranges.clear();
+        self.global_initializer_ranges.shrink_to_fit();
+        self.arrow_returns.clear();
+        self.arrow_returns.shrink_to_fit();
+        self.namespaces.clear();
+        self.symbols.release_merge_state();
     }
 
     /// Dependency roots whose headers contribute declarations but whose

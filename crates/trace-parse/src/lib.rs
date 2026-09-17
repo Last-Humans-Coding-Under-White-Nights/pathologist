@@ -20,4 +20,5 @@ pub use index_cache::IndexSourceCache;
 
 pub use discover::*;
 pub use lower::*;
+pub use memory::reclaim_unused_pages;
 pub use parse::*;

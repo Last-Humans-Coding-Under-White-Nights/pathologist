@@ -3,8 +3,8 @@
 //! include search configuration for the entire tree.
 
 use super::{
-    finalize_program, index_language, index_pool, index_progress, index_source_file,
-    index_source_file_with_variants, project_preprocess_opts,
+    finalize_program, index_in_window, index_language, index_pool, index_progress,
+    index_source_file, index_source_file_with_variants, project_preprocess_opts,
 };
 use crate::compile_commands::CompilationDatabase;
 use crate::merge::{merge_unit_index, merge_unit_variants, UnitIndex};
@@ -159,12 +159,13 @@ pub(super) fn build(
         }
     }
     let cpp_parse = graph.reachable_from(&cpp_sources);
-    let unconsumed_headers: Vec<&PathBuf> = headers
+    let unconsumed_headers: Vec<PathBuf> = headers
         .iter()
         .filter(|path| !consumed.contains(*path))
+        .cloned()
         .collect();
     if jobs == 1 || unconsumed_headers.len() <= 1 {
-        for path in unconsumed_headers {
+        for path in &unconsumed_headers {
             let cache = IndexSourceCache::new();
             let config = fallback.clone().with_language(index_language(
                 path,
@@ -176,10 +177,11 @@ pub(super) fn build(
             merge_unit_index(&mut program, &unit);
         }
     } else {
-        let header_units: Vec<UnitIndex> = pool.install(|| {
-            unconsumed_headers
-                .par_iter()
-                .map(|path| {
+        pool.install(|| {
+            index_in_window(
+                &unconsumed_headers,
+                jobs,
+                |path| {
                     let cache = IndexSourceCache::new();
                     let config = fallback.clone().with_language(index_language(
                         path,
@@ -188,12 +190,10 @@ pub(super) fn build(
                         opts.language,
                     ));
                     index_source_file(path, root, &graph, &config, &cache, None, &[])
-                })
-                .collect()
+                },
+                |unit| merge_unit_index(&mut program, &unit),
+            );
         });
-        for unit in &header_units {
-            merge_unit_index(&mut program, unit);
-        }
     }
     program.types.complete_nested_tags();
     // Every search directory any configuration actually used, in first-seen

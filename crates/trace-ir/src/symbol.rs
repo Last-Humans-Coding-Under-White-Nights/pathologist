@@ -380,6 +380,12 @@ impl SymbolTable {
         self.file_by_path.get(path).copied()
     }
 
+    /// Release merge-only tables once the whole program is assembled.
+    pub fn release_merge_state(&mut self) {
+        self.file_by_path.clear();
+        self.file_by_path.shrink_to_fit();
+    }
+
     /// Register that `header` contributes entities lowered while indexing
     /// `tu` (directly or transitively).
     pub fn register_included_header(&mut self, tu: crate::FileId, header: crate::FileId) {

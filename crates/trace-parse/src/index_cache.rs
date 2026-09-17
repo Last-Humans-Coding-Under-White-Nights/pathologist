@@ -265,7 +265,7 @@ impl IndexSourceCache {
     /// original bytes on disk. Smaller entries stay resident: the saving is
     /// not worth a temporary file each, and most units are under this.
     pub(crate) fn spill(&self, path: &Path, graph: &IncludeGraph) -> Result<(), String> {
-        const SPILL_THRESHOLD: usize = 512 * 1024;
+        const SPILL_THRESHOLD: usize = 32 * 1024;
         let canonical = graph.intern_path(path);
         let cached = self
             .inner

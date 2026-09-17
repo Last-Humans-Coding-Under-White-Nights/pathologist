@@ -56,6 +56,23 @@ pub struct UnitIndex {
     pub merge_descs: Vec<Arc<TypeDesc>>,
 }
 
+impl UnitIndex {
+    /// Discard flow constraints, call sites, and other non-declaration fields.
+    /// Used for headers once their definitions and flow have been merged into the master program:
+    /// translation unit lowering only queries header symbols and types.
+    pub(crate) fn strip_non_symbols(&mut self) {
+        self.call_sites = Vec::new();
+        self.flow = Vec::new();
+        self.function_flow_ranges = FxHashMap::default();
+        self.global_initializer_ranges = FxHashMap::default();
+        self.fn_returns = FxHashMap::default();
+        self.diagnostics = Vec::new();
+        for func in &mut self.functions {
+            func.locals = Vec::new();
+        }
+    }
+}
+
 /// See [`UnitIndex::merge_descs`].
 pub(crate) fn merge_descs_of(types: &trace_ir::TypeTable) -> Vec<Arc<TypeDesc>> {
     types
@@ -1648,5 +1665,47 @@ mod tests {
         let variant = unit_reporting("a.c", "parse");
         merge_unit_variants(&mut program, &base, std::slice::from_ref(&variant));
         assert_eq!(program.diagnostics.len(), 2, "{:?}", program.diagnostics);
+    }
+
+    #[test]
+    fn strip_non_symbols_clears_flow_call_sites_and_locals() {
+        let mut unit = unit_declaring("header.h", true, Vec::new());
+        unit.functions[0].locals = vec![trace_ir::VarId(10)];
+        unit.call_sites.push(trace_ir::CallSite {
+            id: trace_ir::CallSiteId(0),
+            caller: trace_ir::FnId(0),
+            callee_name: "target".into(),
+            callee_var: None,
+            callee_fn_id: None,
+            var_args: Vec::new(),
+            fn_args: Vec::new(),
+            addr_of_member_args: Vec::new(),
+            args_bound_past_this: false,
+            span: trace_ir::Span {
+                file: trace_ir::FileId(0),
+                line: 1,
+                col: 1,
+            },
+            is_direct: true,
+            receiver_class: None,
+            return_dst: None,
+        });
+        unit.flow.push(trace_ir::FlowConstraint::Copy {
+            dst: trace_ir::VarId(1),
+            src: trace_ir::VarId(2),
+        });
+        unit.diagnostics.push(trace_ir::Diagnostic {
+            severity: trace_ir::DiagnosticSeverity::Info,
+            file: None,
+            line: 1,
+            message: "msg".into(),
+            stage: "parse".into(),
+        });
+        unit.strip_non_symbols();
+        assert!(unit.call_sites.is_empty());
+        assert!(unit.flow.is_empty());
+        assert!(unit.diagnostics.is_empty());
+        assert!(unit.functions[0].locals.is_empty());
+        assert_eq!(unit.functions.len(), 1);
     }
 }

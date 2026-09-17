@@ -893,15 +893,13 @@ fn build_program_inner(
             );
         }
     }
-    let header_ir = Arc::new(header_ir_map);
-    crate::memory::reclaim_unused_pages();
     index_progress(format!(
         "pch-done: {:.1}s ({} units)",
         pch_t.elapsed().as_secs_f64(),
-        header_ir.len()
+        header_ir_map.len()
     ));
-    for path in include_graph.index_order(&header_ir.keys().cloned().collect::<Vec<_>>()) {
-        if let Some(units) = header_ir.get(&path) {
+    for path in include_graph.index_order(&header_ir_map.keys().cloned().collect::<Vec<_>>()) {
+        if let Some(units) = header_ir_map.get(&path) {
             // A dependency header's own unit is not a translation unit of
             // the target: merge prototypes, not its bodies' call sites (#60).
             let is_dep = program.is_dep_path(&path);
@@ -915,6 +913,16 @@ fn build_program_inner(
         }
     }
     program.types.complete_nested_tags();
+
+    for units in header_ir_map.values_mut() {
+        for (_, _, unit_arc) in units {
+            if let Some(unit) = Arc::get_mut(unit_arc) {
+                unit.strip_non_symbols();
+            }
+        }
+    }
+    let header_ir = Arc::new(header_ir_map);
+    crate::memory::reclaim_unused_pages();
 
     pool.install(|| {
         if jobs == 1 {
@@ -975,6 +983,14 @@ fn build_program_inner(
             );
         }
     });
+
+    if !opts.explore {
+        if let Ok(mut cache) = include_expansion_cache.write() {
+            cache.clear();
+            cache.shrink_to_fit();
+        }
+        crate::memory::reclaim_unused_pages();
+    }
 
     pool.install(|| {
         if jobs == 1 {
@@ -1570,7 +1586,7 @@ fn index_window(jobs: usize) -> usize {
 /// without the window: whoever panics marks the run cancelled on the way
 /// out and wakes every waiter, so no thread waits for a result that will
 /// never come, and the scope re-raises the panic once the rest have left.
-fn index_in_window<T: Send>(
+pub(crate) fn index_in_window<T: Send>(
     items: &[PathBuf],
     jobs: usize,
     index: impl Fn(&PathBuf) -> T + Sync,
