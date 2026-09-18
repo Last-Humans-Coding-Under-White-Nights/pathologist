@@ -26,6 +26,7 @@ trace-db = { path = "crates/trace-db" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 indexmap = { version = "2", features = ["serde"] }
+mimalloc = "0.1"
 petgraph = "0.7"
 regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }

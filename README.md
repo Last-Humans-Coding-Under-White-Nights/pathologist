@@ -17,6 +17,12 @@ Typical uses:
 cargo build --release
 # binary: target/release/trace
 
+# Or build CLI binary with mimalloc allocator for ~20% faster indexing on large workloads
+# (source-builds opt-in feature; prebuilt release artifacts use the system allocator;
+# measured with mimalloc 0.1 / upstream mimalloc v3):
+cargo build -p trace-cli --release --features mimalloc
+# binary: target/release/trace
+
 # Or build C API library (staticlib and cdylib)
 cargo build -p trace-capi --release
 # library: target/release/libtrace_capi.{so,dylib,dll,a}

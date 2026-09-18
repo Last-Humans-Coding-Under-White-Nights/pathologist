@@ -8,7 +8,7 @@ name = "trace"
 path = "src/main.rs"
 
 [dependencies]
-mimalloc = { version = "0.1", optional = true }
+mimalloc = { workspace = true, optional = true }
 trace-analysis = { workspace = true }
 trace-db = { workspace = true }
 trace-ir = { workspace = true }
