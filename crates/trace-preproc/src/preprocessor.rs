@@ -4172,12 +4172,24 @@ static BUILTIN_FALLBACK_MACROS: LazyLock<Vec<(String, MacroDef)>> = LazyLock::ne
     ));
     // gtest/OpenHarmony test macros: `HWTEST_F(Suite, Name, TestSize.Level1)`
     // followed by a body is unparseable unexpanded and every test body is
-    // lost. Expand to a plain function definition so bodies get indexed.
-    for name in ["HWTEST", "HWTEST_F", "HWTEST_P"] {
+    // lost. A fixture test expands to what gtest generates — a class derived
+    // from the fixture, whose `TestBody` the source's `{ ... }` defines — so
+    // the body keeps the fields and methods it inherits in scope, `this` has
+    // the derived type, and the fixture gains no member it never declared.
+    // The anonymous namespace gives the class internal linkage, as the
+    // generated one has: the same fixture and test name in two test files
+    // are two tests, not one definition and a duplicate.
+    table.push(function(
+        "HWTEST",
+        &["a", "b", "level"],
+        "static void a ## _ ## b ()",
+    ));
+    for name in ["HWTEST_F", "HWTEST_P"] {
         table.push(function(
             name,
             &["a", "b", "level"],
-            "static void a ## _ ## b ()",
+            "namespace { struct a ## _ ## b ## _Test : a { void TestBody(); }; } \
+             void a ## _ ## b ## _Test :: TestBody ()",
         ));
     }
     // gMock declarations are often the only content of a test double: left

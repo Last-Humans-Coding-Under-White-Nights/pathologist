@@ -141,6 +141,8 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 | Parse new C/C++ construct | `trace-parse/src/lower.rs` |
 | C++ virtual dispatch & hierarchy | `trace-ir/src/program.rs` (`inheritance`), `trace-parse/src/lower.rs` (`expand_virtual_overrides`) |
 | C++ smart pointer unwrapping | `trace-parse/src/lower.rs` (`ArrowReturn`), `symbol.rs` |
+| C++ class-template member return substitution | `trace-ir/src/program.rs` (`TemplateReturn`), `trace-parse/src/lower.rs` (`register_template_return`, `substituted_template_return`), `merge.rs` → `docs/ANALYSIS.md` |
+| Type of a call-expression receiver (`S::Get().Open()`) | `trace-parse/src/lower.rs` (`CallResult`, `call_result_shape`, `receiver_desc`) → `docs/ANALYSIS.md` |
 | C API functions / FFI bindings | `crates/trace-capi/src/`, `crates/trace-capi/include/trace.h`, `docs/CAPI.md`, `Doxyfile` |
 | Dependency roots (`--dep`) | `trace-parse/src/configured.rs`, `merge.rs`, `trace-db/src/inspect.rs`, `trace-cli/src/main.rs` |
 | Measure what the configuration excludes (`#if` arms not taken) | `PreprocessOptions::record_conditionals` + `PreprocessResult::conditionals` (`trace-preproc/src/conditionals.rs`), `trace-cli/examples/conditional_coverage.rs`, `scripts/gen_conditional_coverage_report.py` → `docs/CONDITIONAL_COVERAGE.md` |

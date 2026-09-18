@@ -4,6 +4,56 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### C++ caller edges (#113)
+
+Five reported call-graph queries returned no callers. Each site the fix resolves used to synthesize
+an external stub, so both the phantom function and the `external` edge to it disappear, and the
+caller shows up:
+
+- **Relative qualified calls.** `Service::Write()` written inside `namespace app` looks its scope up
+  through the enclosing namespaces, the same way a type name does; `::ns::f()` still resolves in the
+  global scope only.
+- **Call-result receivers.** `S::GetInstance().Open()` and pointer-returning chains type their
+  receiver from declared return types instead of going unresolved. A return type several
+  declarations disagree on stays unknown, a cast argument ranks no overload, and the probe never
+  registers a type of its own. Each call node is probed once per unit.
+- **Class-template member returns.** A member declared to return a bare type parameter (`T Get()`,
+  `T *Get()`) records the parameter position and pointer depth beside the class's types, so every
+  unit that includes the header can substitute a concrete receiver's argument and continue member
+  lookup and virtual dispatch through it (`Holder<Base *>::Get()` → `Base *`). Compound dependent
+  returns, function templates and overloads that are none of the above block substitution rather
+  than borrowing another declaration's return; no template body is instantiated. Inherited arguments
+  resolve in the base declaration's lexical scope, including nested arguments; dependent base
+  arguments remain unknown even when an unrelated concrete class shares their name. Partially
+  qualified template bases use the same resolved class name as inheritance, including names
+  found through enclosing namespaces and `using namespace` directives. Arrow calls preserve
+  the unwrapped pointee's template arguments for return substitution through smart pointers.
+- **Fixture test bodies.** `HWTEST_F(Fixture, Name, …)` and `HWTEST_P` expand to what gtest
+  generates — a class derived from the fixture, in an anonymous namespace, whose `TestBody` the
+  source defines — so the body keeps the fields and methods it inherits in scope and same-named
+  tests in different files stay distinct. `HWTEST` is unchanged.
+- **Callback submission.** A new `invoke { param }` function-model effect records that a callee may
+  call a zero-argument callback passed in that argument; the solver adds an indirect edge from the
+  submitting call site once the points-to sets converge, deduplicated against what the callee's own
+  body already yields. `ffrt::queue::submit` ships as a built-in model, and the effect is
+  configurable like any other (`kind = "invoke"`). Bare model names now match qualified callees,
+  with exact-name models taking precedence. See `docs/ANALYSIS.md` ("Function models") for
+  what the effect does and does not claim.
+
+Two code reviews of the above found further gaps, since fixed: a receiver substitutes through its
+pointer layers and through an instantiated class-template base it inherits the member from, however
+many classes up; a receiver spelled with its template arguments finds its class's members; a
+`using namespace` directive carries a qualified call as it already carried a bare one, and names
+the owner of an out-of-line member definition and a base clause the way the compiler does, so a
+body written under the directive merges with its header's prototype instead of hiding behind a
+bare name; a cast argument types the same whether or not it is parenthesized; and the callback
+pass shares the fixpoint's rule for what an indirect target reaches, emitting in a fixed order.
+`docs/EVAL_REPORT.md` records what each recovers.
+
+On the pinned corpora this moves `external` edges to `direct` and drops the stubs, leaving
+dispatch-site counts, diagnostics and `dlsym` edges unchanged; the counts and how they were checked
+are in `docs/EVAL_REPORT.md` ("C++ caller edges"), and `scripts/eval_expected.json` is re-captured.
+
 ### Parallel include-expansion discovery (#88)
 
 The preprocessing discovery pass, the last indexing pass on one thread, runs on the worker pool,

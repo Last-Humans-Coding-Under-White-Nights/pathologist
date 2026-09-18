@@ -1,5 +1,145 @@
 # Evaluation Report
 
+## C++ caller edges — 2026-09-18 (#113)
+
+Measurements for the missing-caller fix. The design is in `docs/ANALYSIS.md` ("C++ support") and
+`docs/PREPROCESSOR.md` (the `HWTEST_F` fallback macro).
+
+**Setup.** Release builds of origin/master (`aab086d`) and of this change, on the same machine in
+the same sitting: Apple M1 (4 performance + 4 efficiency cores), macOS, pinned checkouts,
+800,000-pop budget, `--jobs 8`.
+
+**Determinism.** The SQLite dump, minus `analysis_run`, is byte-identical for each corpus across
+`--jobs 8` and `--jobs 1`. `python3 scripts/eval_check.py` passes 93/93 against the re-captured
+expectations; `files`, `functions_defined`, `diagnostics`, `dlsym_edges`, `edges_ipc` and every
+dispatch-site and calibration probe are unchanged by the fix.
+
+| | hdf master | hdf #113 | hiview master | hiview #113 | camera master | camera #113 |
+|---|---:|---:|---:|---:|---:|---:|
+| functions_total | 12609 | 12110 | 10648 | 9946 | 23905 | 23003 |
+| functions_external | 2353 | 1853 | 2816 | 2114 | 4730 | 3828 |
+| edges_total | 75836 | 74810 | 31724 | 32480 | 97422 | 99347 |
+| edges_direct | 42252 | 44770 | 11254 | 15728 | 42652 | 54088 |
+| edges_indirect | 4825 | 4827 | 108 | 138 | 168 | 253 |
+| edges_external | 28759 | 25213 | 20348 | 16600 | 54600 | 45004 |
+| arg_flow_edges | 66253 | 68794 | 12331 | 17181 | 31113 | 40145 |
+
+The summary counts above were verified again against fresh release analyses after the PR review.
+Several tolerance-band centers in `scripts/eval_expected.json` still held earlier counts; they now
+match these measured results. The smart-pointer return fix adds three camera external edges to
+`std::list::empty` after `unique_ptr->UnwrapData()` in `movie_file_consumer.cpp` (lines 412, 447,
+469): total edges 99344 → 99347, external edges 45001 → 45004. Other measured metrics are unchanged.
+
+**The reported cases.** Four of the issue's five reports name files the pinned corpora also carry,
+at their own revisions rather than the branches the issue names. Distinct callers of the function at
+each reported line, master → this change:
+
+| query | master | #113 |
+|---|---:|---:|
+| hiview `rs_frame_monitor.cpp:71` (`RsFrameMonitor::VideoStart`) | 0 | 1 |
+| hiview `rs_frame_monitor.cpp:107` (`RsFrameMonitor::VideoStop`) | 0 | 2 |
+| hiview `ash_mem_utils.cpp:67` (`AshMemUtils::WriteBulkData`) | 0 | 3 |
+| camera `hcamera_service.cpp:223` (`HCameraService::OnStart`) | 0 | 2 |
+| camera `movie_file_controller_video.cpp:264` (`ConfigMicAudioPipeline`) | 3 | 3 |
+
+The last already resolved at the pinned revision, so it measures nothing here; the fixture
+`tests/fixtures/cpp_issue113` covers its shape. The remaining report's project, `base_location`, is
+not a pinned corpus.
+
+**Where the edges came from.** An unresolved member call synthesizes an external stub and an
+`external` edge to it, so each site the fix resolves both removes a phantom function and moves an
+edge into `direct`.
+
+HDF is the one corpus whose edge total *falls* (75836 → 74810), which that mechanism alone cannot
+produce. The cause is duplicate sites, not lost ones: at a location like
+`tools/hdi-gen/ast/ast.cpp:210:5` master emitted two call sites, one resolved to
+`OHOS::HDI::StringBuilder::Append` and one unresolved under the bare `Append`, and only the second
+disappears. `Append` sites go 1359 → 129 while the resolved ones hold at 3372, and `AppendFormat`
+converts 1:1 (1404 → 191 unresolved, 220 → 1433 resolved) because it has one declaration where
+`Append` has three. Checked directly: the set of source locations carrying at least one call site is
+unchanged on HDF and hiview and grows by 7 on camera, so no location loses coverage. Split by file, camera's `direct` edges go 24260 → 31868 under a `test`
+path and 18392 → 21969 elsewhere; hiview's 4841 → 6695 and 6413 → 8409; hdf's 8046 → 8130 and
+34206 → 35771. The test-side share is the `HWTEST_F` / `HWTEST_P` expansion, whose body now lowers
+inside a class derived from the fixture and so keeps the fields and methods it inherits in scope. The rest
+is the receiver and lookup work: relative qualified names, receivers that are themselves call
+results, and class-template members returning a bare type parameter. hdf, which is mostly C and
+whose C++ tests are few, gains almost nothing on the test side and 1565 direct edges elsewhere.
+
+**Where the indirect edges came from.** hiview's 108 → 138 is 10 lambdas submitted to
+`ffrt::queue::submit` — the new `invoke` model, and the call graph the issue's `rs_frame_monitor.cpp`
+case asks for — plus 20 callbacks reached through receivers that now have a type (`callback` 13 → 27,
+`queryCallback` 4 → 7, `func` 12 → 14, `filter` 2 → 3). Camera's 168 → 253 is all of the latter
+(`func` 0 → 75, `fun` 55 → 65); that tree has no `ffrt::queue` call sites. Camera's new `func`
+targets are the lambdas stored into `CameraTaiheWorkerQueueKeeper`'s worker queue and invoked at
+`camera_worker_queue_keeper_taihe.cpp:110`. HDF's 4825 → 4827 is the two `TextGen::TemplateVariableGen`
+lambdas passed to `Ast::WalkRound`'s `forwardCallback` and `backwardCallback` (`ast.h:382`, `:386`),
+which the review fix below recovers; this is the only expectation the review fixes move.
+
+**Review fixes.** Two code reviews of the first fix found gaps, all since fixed and covered by
+`tests/fixtures/cpp_issue113`. Reproducible ones: a receiver's pointer layers were not peeled before
+reading its template arguments (`h->Get()->Start()` stayed unresolved where `h.Get()->Start()`
+resolved); a member inherited from an instantiated class-template base substituted nothing, because
+the facts were looked up under the receiver's own spelling rather than the declaring class's
+(`struct D : Holder<Service *>`, and now however many classes up); a receiver spelled with its
+template arguments missed every member of its class, because the probe and the emitted site used
+different names for it; a relative qualified call reached through a `using namespace` directive
+still synthesized a stub; and `arg_expr_type` read a cast's kind off the unpeeled node, so `f((T)x)`
+and `f(((T)x))` ranked overloads differently. Semantic ones: a receiver probe that missed was memoized
+for the whole unit although lowering keeps filling the index (this is what moves HDF's
+`edges_indirect`); `invoke` was restricted to a bodyless callee although the callback APIs it exists
+for are templates whose body the index holds once, uninstantiated; the callback pass iterated a
+points-to hash set straight into the edge list, where the fixpoint's own loop reads its `delta`
+vector, and skipped that loop's prototype-to-definition step — both now share one rule
+(`reached_definitions`) and the pass emits in a fixed order; and the first fix typed a call's
+arguments before asking whether the callee's shape needed them, which a two-phase probe
+(`CallResult`) avoids, byte-identically.
+
+**The `using namespace` regression, and what it was.** An ungated directive lookup at call sites
+cost HDF 48 direct edges to real bodies: `hc-gen/src/ast.cpp` writes `using namespace OHOS::Hardware;`
+and then defines `AstObjectFactory::Build(...)` out of line, and lowering indexed that definition
+under the bare name, so once calls resolved through the directive they bound to the header's
+prototype `OHOS::Hardware::AstObjectFactory::Build` and lost the body. `qualify_class_name`'s own
+doc comment recorded this as a deliberate workaround — leave such bodies bare, because only the bare
+spelling reached them. With calls resolving through directives the workaround's reason is gone, so
+the owner of an out-of-line definition and a base clause now resolve through the directive as the
+compiler does, while a *type* spelling that names a class only through one is still left untyped
+(the #87 policy `cpp_auto_return_types_match_explicit_receivers` pins). HDF's phantom functions fall
+by a further 471 and that call site resolves direct; camera's `Command::Do` dispatch gains
+`TestCommand`, a subclass in a unit test whose base clause is spelled that way.
+
+**`HWTEST_F` is gtest's shape now.** The first fix expanded a fixture test to a member of the
+fixture class, which gave the body its inherited members but registered a member the fixture never
+declared and gave the body external linkage — hiview has `TraceCollectorTest_TraceCollectorTest001`
+through `005` in two test files, and those five bodies merged into one entry each
+(`functions_defined` 7832 → 7827). The expansion is now what gtest generates, a class derived from
+the fixture in an anonymous namespace whose `TestBody` the source defines; all five bodies are back.
+
+**Cost.** Wall time, median of 7 interleaved runs each:
+
+| `--jobs 8` | master | #113 |
+|---|---:|---:|
+| camera | 4.78 s | 4.90 s |
+| HDF | 3.39 s | 3.41 s |
+| hiview | 1.46 s | 1.49 s |
+
+Camera pays 2.5% for 11,436 more direct edges and 9,032 more argument-flow rows, hiview 2.1% for
+4,474 and 4,850; HDF is within run-to-run noise. Before the second review round, which added the
+directive lookups on base clauses and definition owners and the transitive base walk, camera stood
+at +0.4%. What keeps it to that, on the paths this change made hotter:
+
+- a call node's receiver type is probed once and memoized (`call_receiver_cache`), and the
+  substitution inputs a receiver decides are read once per call rather than per overload;
+- a member call reuses the override set its method-or-field test already probed rather than walking
+  the class hierarchy a second time (`emit_member_targets`);
+- a span's origin file is interned once per LineMap file instead of being path-compared per span;
+- a class lookup name borrows the spelling when it carries no template arguments
+  (`receiver_lookup_name`), which is the common case on the member-call path;
+- the scope walk a relative qualified name now performs allocates nothing for the probes that miss,
+  and they are most of them (`Symbols::candidates_in_image`);
+- the callback pass names modelled callees from the symbol table rather than from the call graph, so
+  it costs one lookup per edge and is skipped outright for a tree that declares none — which is both
+  HDF and camera.
+
 ## Parallel include-expansion discovery — 2026-09-15 (#88)
 
 Measurements for the parallel discovery pass; the design is in `docs/PREPROCESSOR.md` ("Parallel

@@ -5,7 +5,7 @@ use crate::pag::{Pag, PagNodeKind};
 use crate::summaries::{Effect, FnModelSet};
 use indexmap::{IndexMap, IndexSet};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
-use trace_ir::{CallSiteId, FnId, LocId, PagNodeId, Program, StorageClass, VarId};
+use trace_ir::{CallSiteId, FnId, LocId, PagNodeId, Program, StorageClass, TargetId, VarId};
 
 /// Sentinel `CallSiteId` used for synthetic IPC bridge call edges. Real call
 /// sites are allocated sequentially from `0`; this value marks an edge that
@@ -728,33 +728,10 @@ fn solve(
                     .expect("call site id in index");
                 let mut new_callees = Vec::new();
                 // Loop-invariant: this is the solver's indirect-call fixpoint.
-                let scoped = !program.link_targets.is_empty();
                 let caller_target = program.symbols.function(cs.caller).target;
                 for &loc in delta.iter() {
                     if let Some(fn_id) = fn_for_loc(pag, loc) {
-                        let callee = program.symbols.function(fn_id);
-                        if scoped && callee.target != caller_target {
-                            continue;
-                        }
-                        // If the resolved callee is undefined (e.g. a weak
-                        // forward declaration), also pull in defined
-                        // candidates with the same name so return flows
-                        // and param wiring reach the real body.
-                        if !callee.is_defined {
-                            let (name, file) = (callee.name.clone(), Some(callee.file));
-                            new_callees.extend(
-                                program
-                                    .symbols
-                                    .resolve_function_candidates_in_target(
-                                        &name,
-                                        file,
-                                        caller_target,
-                                    )
-                                    .into_iter()
-                                    .filter(|c| program.symbols.function(*c).is_defined),
-                            );
-                        }
-                        new_callees.push(fn_id);
+                        new_callees.extend(reached_definitions(program, fn_id, caller_target));
                     }
                 }
                 let prev = resolved_indirect.entry(cs_id).or_default();
@@ -810,6 +787,9 @@ fn solve(
             }
         }
     }
+
+    let callbacks = callback_edges(program, pag, &st, models, &call_edges);
+    call_edges.extend(callbacks);
 
     // Emit synthetic call edges for IPC proxy→stub bridges detected at PAG
     // build. These connect the proxy method to the stub handler it would
@@ -978,7 +958,10 @@ fn apply_fn_model(
                     }
                 }
             }
-            Effect::ReturnAlias { .. } | Effect::ReturnHeap | Effect::Dlsym { .. } => {}
+            Effect::ReturnAlias { .. }
+            | Effect::ReturnHeap
+            | Effect::Dlsym { .. }
+            | Effect::Invoke { .. } => {}
         }
     }
 }
@@ -1276,6 +1259,142 @@ fn add_pts(st: &mut SolverState, node: PagNodeId, loc: LocId) {
         st.record_delta(node, &[loc]);
         st.push(node);
     }
+}
+
+/// The callees a model says may invoke a callback argument, with the argument
+/// positions it names (`docs/ANALYSIS.md`, "Function models"). Read off the
+/// symbol table rather than off the call graph: a model that invokes is rare,
+/// so the index is nearly always empty or tiny, and the callback pass is
+/// skipped outright when it is empty.
+fn invoked_params(program: &Program, models: &FnModelSet) -> FxHashMap<FnId, Vec<u32>> {
+    let mut by_callee = FxHashMap::default();
+    for callee in &program.symbols.functions {
+        let Some(model) = models.get_for_callee(&callee.name) else {
+            continue;
+        };
+        let params: Vec<u32> = model
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Invoke { param } => Some(*param),
+                _ => None,
+            })
+            .collect();
+        if !params.is_empty() {
+            by_callee.insert(callee.id, params);
+        }
+    }
+    by_callee
+}
+
+/// Indirect edges for the callbacks handed to a modelled callee (`invoke`).
+/// A zero-argument callback needs no parameter wiring and its return is
+/// ignored, so this runs once on the converged points-to sets rather than
+/// inside the fixpoint. The edge is attributed to the submitting call site,
+/// which is where the caller hands the callback over, and stays inside the
+/// caller's link image like every other indirect edge.
+fn callback_edges(
+    program: &Program,
+    pag: &Pag,
+    st: &SolverState,
+    models: &FnModelSet,
+    call_edges: &[CallGraphEdge],
+) -> Vec<CallGraphEdge> {
+    let invoked = invoked_params(program, models);
+    let mut edges = Vec::new();
+    if invoked.is_empty() {
+        return edges;
+    }
+    // A callback's arity as `merge_unit` reads it: the explicit count when
+    // the declaration gives one, else the parameters it has.
+    let takes_nothing =
+        |f: &trace_ir::Function| f.explicit_arity.map_or(f.params.is_empty(), |n| n == 0);
+    // Seeded with what the call graph already holds: a callback the callee's
+    // own body reaches keeps the edge it earned there instead of gaining a
+    // second one here.
+    let mut seen: FxHashSet<(CallSiteId, FnId)> = call_edges
+        .iter()
+        .map(|edge| (edge.call_site, edge.callee))
+        .collect();
+    for edge in call_edges {
+        let Some(params) = invoked.get(&edge.callee) else {
+            continue;
+        };
+        let Some(cs) = program.symbols.call_site_by_id(edge.call_site) else {
+            continue;
+        };
+        let caller_target = program.symbols.function(cs.caller).target;
+        for param in params {
+            // A member's arguments are recorded past its `this`.
+            let Some(index) = param.checked_add(u32::from(cs.args_bound_past_this)) else {
+                continue;
+            };
+            let named = cs
+                .fn_args
+                .iter()
+                .filter(|(i, _)| *i == index)
+                .map(|(_, f)| *f);
+            let pointed = cs
+                .var_args
+                .iter()
+                .filter(|(i, _)| *i == index)
+                .filter_map(|(_, var)| pag.var_node.get(var).and_then(|n| st.pts.get(n)))
+                .flatten()
+                .filter_map(|loc| fn_for_loc(pag, *loc));
+            for callee in named.chain(pointed) {
+                for target in reached_definitions(program, callee, caller_target) {
+                    if !takes_nothing(program.symbols.function(target)) {
+                        continue;
+                    }
+                    if seen.insert((cs.id, target)) {
+                        edges.push(CallGraphEdge {
+                            call_site: cs.id,
+                            caller: cs.caller,
+                            callee: target,
+                            resolution: ResolutionKind::Indirect,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // A points-to set is a hash set; the order its members come out in must
+    // not reach the export (AGENTS.md, determinism).
+    edges.sort_by_key(|edge| (edge.call_site, edge.callee));
+    edges
+}
+
+/// The functions an indirect call from a caller in `caller_target` reaches
+/// through `fn_id`: nothing when link images are in play and the function is
+/// in another one; else, when it is a declaration (a weak forward declaration,
+/// a header prototype), the definitions under its name first, so return flows
+/// and parameter wiring reach the real body, then `fn_id` itself.
+fn reached_definitions(
+    program: &Program,
+    fn_id: FnId,
+    caller_target: Option<TargetId>,
+) -> Vec<FnId> {
+    let callee = program.symbols.function(fn_id);
+    let scoped = !program.link_targets.is_empty();
+    if scoped && callee.target != caller_target {
+        return Vec::new();
+    }
+    let mut reached = Vec::new();
+    if !callee.is_defined {
+        reached.extend(
+            program
+                .symbols
+                .resolve_function_candidates_in_target(
+                    &callee.name,
+                    Some(callee.file),
+                    caller_target,
+                )
+                .into_iter()
+                .filter(|c| program.symbols.function(*c).is_defined),
+        );
+    }
+    reached.push(fn_id);
+    reached
 }
 
 fn fn_for_loc(pag: &Pag, loc: LocId) -> Option<FnId> {

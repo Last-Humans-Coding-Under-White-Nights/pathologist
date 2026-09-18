@@ -1330,7 +1330,9 @@ impl SymbolTable {
         file: Option<FileId>,
         scope: TargetScope,
     ) -> Vec<FnId> {
-        let mut out = Vec::with_capacity(2);
+        // Most probes miss — a scope walk asks about every enclosing scope —
+        // so the vector stays unallocated until something is found.
+        let mut out = Vec::new();
         if let Some(file) = file {
             for (_, id) in self.in_scope(file, self.fn_by_scope.get(name).map(Vec::as_slice)) {
                 if !self.in_scope_of(id, scope) {

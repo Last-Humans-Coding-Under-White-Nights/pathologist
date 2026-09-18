@@ -36,6 +36,208 @@ fn direct_targets(program: &Program, analysis: &AnalysisResult, caller: &str) ->
         .collect()
 }
 
+analyzed_fixture!(cpp_issue113);
+
+#[test]
+fn cpp_relative_qualified_call_uses_enclosing_namespace() {
+    let (p, a) = cpp_issue113();
+    assert!(has_any_edge(p, a, "app::relative", "app::Service::Write"));
+}
+
+#[test]
+fn cpp_chained_call_uses_declared_return_type() {
+    let (p, a) = cpp_issue113();
+    for caller in ["app::chained", "app::chained_pointer"] {
+        assert!(
+            has_any_edge(p, a, caller, "app::Service::Start"),
+            "{caller}"
+        );
+    }
+}
+
+#[test]
+fn cpp_hwtest_fixture_keeps_member_context() {
+    let (p, a) = cpp_issue113();
+    for caller in [
+        "app::Fixture_CallsMember_Test::TestBody",
+        "app::Fixture_ParamCallsMember_Test::TestBody",
+    ] {
+        assert!(
+            has_any_edge(p, a, caller, "app::Service::Start"),
+            "{caller}"
+        );
+    }
+    assert!(has_any_edge(
+        p,
+        a,
+        "app::Standalone_CallsGlobal",
+        "app::Service::Write"
+    ));
+}
+
+#[test]
+fn cpp_template_return_preserves_receiver_and_virtual_dispatch() {
+    let (p, a) = cpp_issue113();
+    assert!(has_any_edge(
+        p,
+        a,
+        "app::Adapter::Filter",
+        "app::Video::Filter"
+    ));
+    // The member the substitution reads is itself a resolved call: a
+    // receiver spelled with its template arguments must still reach the
+    // class the index holds it under.
+    for caller in ["app::Adapter::Filter", "app::nested_holder"] {
+        assert!(has_any_edge(p, a, caller, "app::Holder::Get"), "{caller}");
+    }
+}
+
+#[test]
+fn cpp_external_queue_invokes_submitted_lambda() {
+    let (p, a) = cpp_issue113();
+    assert!(a
+        .call_edges
+        .iter()
+        .any(|e| fn_name(p, e.caller) == "app::queued"
+            && fn_name(p, e.callee).starts_with("app::queued::$lambda")));
+}
+
+#[test]
+fn cpp_callback_model_is_configurable_and_reaches_a_defined_callee() {
+    let (p, _) = cpp_issue113();
+    let models = trace_analysis::FnModelSet::from_toml_str(
+        r#"
+        [[model]]
+        name = "app::custom_submit"
+        effects = [{ kind = "invoke", param = 0 }]
+        [[model]]
+        name = "app::defined_submit"
+        effects = [{ kind = "invoke", param = 0 }]
+    "#,
+    )
+    .unwrap();
+    let (_, a) = trace_analysis::analyze_with_options(
+        p,
+        trace_analysis::AnalyzeOptions {
+            models: std::sync::Arc::new(models),
+            ..Default::default()
+        },
+    );
+    // A definition in view is not the same as the callback edge being in
+    // view: the shipped `ffrt::queue::submit` is a template whose body the
+    // index holds once, uninstantiated. Both sites carry the edge, once each.
+    let mut sites: Vec<_> = a
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(p, e.caller) == "app::configured" && fn_name(p, e.callee) == "callback")
+        .map(|e| {
+            p.symbols.call_sites[e.call_site.0 as usize]
+                .callee_name
+                .clone()
+        })
+        .collect();
+    sites.sort();
+    assert_eq!(sites, vec!["custom_submit", "defined_submit"]);
+    // A callback the model does not describe stays out: `callback_arg` takes
+    // an argument, and nothing says what would be passed to it.
+    assert!(!has_any_edge(p, &a, "app::queued_arg", "callback_arg"));
+}
+
+#[test]
+fn cpp_template_return_follows_pointers_and_inherited_bases() {
+    let (p, a) = cpp_issue113();
+    // A pointer receiver names the same class template its value form does.
+    for caller in ["app::holder_pointer", "app::Adopted::Run", "app::Far::Run"] {
+        assert!(has_any_edge(p, a, caller, "app::Holder::Get"), "{caller}");
+        assert!(
+            has_any_edge(p, a, caller, "app::Service::Start"),
+            "{caller} return"
+        );
+    }
+    // A receiver spelled with its template arguments still finds the members
+    // the index holds under the class's own name.
+    assert!(has_any_edge(p, a, "app::holder_arrow", "app::Holder::Ping"));
+}
+
+#[test]
+fn cpp_using_namespace_carries_a_qualified_call() {
+    let (p, a) = cpp_issue113();
+    assert!(has_any_edge(p, a, "via_using", "app::Service::Write"));
+    // Across translation units: the definition written under the directive
+    // is indexed under the class's own namespace and merges with the header's
+    // prototype, so the call reaches one defined entry rather than a stub.
+    assert!(has_any_edge(p, a, "via_using_remote", "rem::Remote::Call"));
+    let entries: Vec<_> = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name.ends_with("Remote::Call"))
+        .map(|f| (f.name.as_str(), f.is_defined))
+        .collect();
+    assert_eq!(entries, vec![("rem::Remote::Call", true)]);
+}
+
+#[test]
+fn cpp_callback_model_reaches_every_function_the_argument_may_hold() {
+    let (p, a) = cpp_issue113();
+    for callee in ["callback", "callback_alt"] {
+        assert!(has_any_edge(p, a, "app::queued_either", callee), "{callee}");
+    }
+}
+
+#[test]
+fn cpp_issue113_receiver_and_callback_boundaries() {
+    let (p, a) = cpp_issue113();
+    assert!(has_any_edge(
+        p,
+        a,
+        "app::nested_holder",
+        "app::Service::Start"
+    ));
+    assert!(has_any_edge(
+        p,
+        a,
+        "app::global_qualified",
+        "elsewhere::Service::Write"
+    ));
+    assert!(!has_any_edge(
+        p,
+        a,
+        "app::global_qualified",
+        "app::Service::Write"
+    ));
+    assert!(!has_any_edge(
+        p,
+        a,
+        "app::mixed_auto_return",
+        "app::Service::Start"
+    ));
+    // Unknown cast argument types must not select the operand's overload.
+    assert!(!has_any_edge(
+        p,
+        a,
+        "app::cast_chain",
+        "app::Service::Start"
+    ));
+    assert!(!has_any_edge(
+        p,
+        a,
+        "app::mixed_return",
+        "app::Service::Start"
+    ));
+    assert!(has_any_edge(p, a, "app::long_chain", "app::Chain::Finish"));
+    assert!(a
+        .call_edges
+        .iter()
+        .any(|e| fn_name(p, e.caller) == "app::queued_variable"
+            && fn_name(p, e.callee).starts_with("app::queued_variable::$lambda")));
+    assert!(!a
+        .call_edges
+        .iter()
+        .any(|e| fn_name(p, e.caller) == "app::unrelated"
+            && fn_name(p, e.callee).starts_with("app::unrelated::$lambda")));
+}
+
 #[test]
 fn cpp_auto_return_types_match_explicit_receivers() {
     let root = fixture("cpp_auto_return");
@@ -6085,4 +6287,93 @@ fn members_of_a_class_in_an_anonymous_namespace_resolve() {
         [Some(1), Some(2)],
         "one call per overload"
     );
+}
+
+#[test]
+fn cpp_inherited_template_return_uses_base_declaration_scope() {
+    let (p, a) = cpp_issue113();
+    for caller in [
+        "inherited_outside",
+        "caller_scope::inherited_elsewhere",
+        "inherited_nested",
+    ] {
+        assert!(
+            has_any_edge(p, a, caller, "base_scope::Widget::Start"),
+            "{caller}"
+        );
+        assert!(!has_any_edge(p, a, caller, "Widget::Start"));
+        assert!(!has_any_edge(p, a, caller, "caller_scope::Widget::Start"));
+    }
+}
+
+#[test]
+fn cpp_inherited_template_return_keeps_dependent_arguments_unknown() {
+    let (p, a) = cpp_issue113();
+    assert!(has_any_edge(
+        p,
+        a,
+        "DependentDerived::Run",
+        "base_scope::ScopedHolder::Get"
+    ));
+    assert!(!has_any_edge(
+        p,
+        a,
+        "DependentDerived::Run",
+        "DependentType::Start"
+    ));
+}
+
+#[test]
+fn cpp_inherited_template_return_uses_enclosing_class_scope() {
+    let (p, a) = cpp_issue113();
+    assert!(has_any_edge(
+        p,
+        a,
+        "inherited_class_scope",
+        "OuterScope::Widget::Start"
+    ));
+    assert!(!has_any_edge(
+        p,
+        a,
+        "inherited_class_scope",
+        "Widget::Start"
+    ));
+}
+
+#[test]
+fn cpp_template_return_resolves_partially_qualified_bases() {
+    let (p, a) = cpp_issue113();
+    for caller in ["partial_base::scoped", "imported_base::imported"] {
+        assert!(
+            has_any_edge(p, a, caller, "partial_base::hardware::Holder::Get"),
+            "{caller} base member"
+        );
+        assert!(
+            has_any_edge(p, a, caller, "partial_base::hardware::Widget::Start"),
+            "{caller} return"
+        );
+    }
+}
+
+#[test]
+fn cpp_template_base_keeps_arguments_on_their_own_nested_class() {
+    let (p, _) = cpp_issue113();
+    let bases = p.template_bases_of("NestedDerived");
+    assert_eq!(bases.len(), 1);
+    assert_eq!(bases[0].spelling, "NestedBase<int>::Inner<double>");
+}
+
+#[test]
+fn cpp_template_return_uses_smart_pointer_pointee_arguments() {
+    let (p, a) = cpp_issue113();
+    for caller in ["arrow_return::custom", "standard_arrow"] {
+        assert!(
+            has_any_edge(p, a, caller, "arrow_return::Holder::Get"),
+            "{caller} member"
+        );
+        assert!(
+            has_any_edge(p, a, caller, "arrow_return::Service::Start"),
+            "{caller} return"
+        );
+    }
 }

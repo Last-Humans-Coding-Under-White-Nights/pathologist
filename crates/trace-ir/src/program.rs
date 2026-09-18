@@ -55,13 +55,15 @@ pub struct Diagnostic {
 /// A templated C++ base as written on a derived class.
 ///
 /// `declaration_scope` is kept separately because an unqualified template
-/// argument is resolved where the derived class is declared, not relative to
-/// the namespace that qualifies the template itself.
+/// argument is resolved in the namespace or enclosing class where the derived
+/// class is declared, not relative to the template itself or a later caller.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TemplateBase {
     pub derived: String,
     pub spelling: String,
     pub declaration_scope: String,
+    /// The base spelling mentions an enclosing template parameter.
+    pub is_dependent: bool,
 }
 
 /// Cross-unit deduplication state used by the merge stage: entities whose
@@ -123,6 +125,16 @@ impl MergeDedup {
         self.site_keys.clear();
         self.variant_site_records.clear();
     }
+}
+
+/// A class-template member returning a bare type parameter. Kept with
+/// types across header-unit merges; looked up by class and member name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateReturn {
+    pub arity: u32,
+    /// None blocks inference for an unsupported same-arity return.
+    pub parameter: Option<usize>,
+    pub pointer_depth: usize,
 }
 
 /// What a C++ class's declared `operator->` returns, kept apart from the
@@ -196,6 +208,9 @@ pub struct Program {
     /// Declared C++ `operator->` returns, merged with a unit's types so a
     /// header's wrappers are followable from every unit that includes it.
     pub arrow_returns: Vec<ArrowReturn>,
+    /// Class -> full member name -> return substitutions. Ordered keys keep
+    /// header merges deterministic; lookups never scan unrelated functions.
+    pub template_returns: BTreeMap<String, BTreeMap<String, Vec<TemplateReturn>>>,
     /// Classes declared `final` — CHA does not walk into their subclasses.
     pub final_classes: Vec<String>,
     /// Classes defined in an anonymous namespace, with the files their
@@ -314,7 +329,13 @@ impl Program {
     }
 
     /// Preserve a templated base-class spelling once.
-    pub fn add_template_base(&mut self, derived: &str, base: &str, declaration_scope: &str) {
+    pub fn add_template_base(
+        &mut self,
+        derived: &str,
+        base: &str,
+        declaration_scope: &str,
+        is_dependent: bool,
+    ) {
         if derived.is_empty() || base.is_empty() {
             return;
         }
@@ -322,6 +343,7 @@ impl Program {
             derived: derived.to_string(),
             spelling: base.to_string(),
             declaration_scope: declaration_scope.to_string(),
+            is_dependent,
         });
     }
 
@@ -344,6 +366,32 @@ impl Program {
             .iter()
             .filter(|fact| fact.derived == cls)
             .collect()
+    }
+
+    /// Record that `member` of class template `owner` substitutes `fact`
+    /// for a concrete receiver. Every unit merging the declaring header
+    /// re-adds the header's facts, so the common case is a hit.
+    pub fn add_template_return(&mut self, owner: &str, member: &str, fact: &TemplateReturn) {
+        let facts = self
+            .template_returns
+            .entry(owner.to_string())
+            .or_default()
+            .entry(member.to_string())
+            .or_default();
+        if !facts.contains(fact) {
+            facts.push(fact.clone());
+        }
+    }
+
+    /// The substitution facts recorded for `member` of class `cls`.
+    pub fn template_returns_of(&self, cls: &str, member: &str) -> Option<&[TemplateReturn]> {
+        Some(self.template_returns.get(cls)?.get(member)?.as_slice())
+    }
+
+    /// Whether `cls` is a class template any of whose members substitutes a
+    /// return type — so a receiver spelled with arguments must keep them.
+    pub fn has_template_returns(&self, cls: &str) -> bool {
+        self.template_returns.contains_key(cls)
     }
 
     /// Record that `cls` is a `final` class.

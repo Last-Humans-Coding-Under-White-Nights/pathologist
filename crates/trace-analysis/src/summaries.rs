@@ -28,6 +28,10 @@ pub enum Effect {
     /// Return value may be the address of an in-tree function whose name
     /// equals a string constant in `param[name_param]` (`dlsym` family).
     Dlsym { name_param: u32 },
+    /// The callee may invoke this zero-argument callback. Parameter indexes
+    /// count explicit arguments, excluding a member's `this`. Not restricted
+    /// to a bodyless callee, unlike the effects above that introduce a value.
+    Invoke { param: u32 },
 }
 
 /// A per-function summary.
@@ -58,6 +62,7 @@ impl FnModelSet {
     pub fn builtin() -> Self {
         let mut set = Self::default();
         let mut reg = |name: &str, effects: Vec<Effect>| set.register(FnModel::new(name, effects));
+        reg("ffrt::queue::submit", vec![Effect::Invoke { param: 0 }]);
         for n in ["memcpy", "memmove", "strcpy", "strncpy"] {
             reg(n, vec![Effect::MemCopy { dst: 0, src: 1 }]);
         }
@@ -202,6 +207,9 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
             param: need(raw.param, "param", "return_alias")?,
         }),
         "return_heap" => Ok(Effect::ReturnHeap),
+        "invoke" => Ok(Effect::Invoke {
+            param: need(raw.param, "param", "invoke")?,
+        }),
         "clears" => Ok(Effect::Clears {
             param: need(raw.param, "param", "clears")?,
         }),
@@ -210,7 +218,7 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
         }),
         other => Err(format!(
             "unknown effect kind {other:?} (expected alias, mem_copy, content_store, \
-             return_alias, return_heap, clears, dlsym)"
+             return_alias, return_heap, clears, dlsym, invoke)"
         )),
     }
 }
