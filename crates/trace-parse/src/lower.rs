@@ -6250,10 +6250,21 @@ fn collect_call_at_node(
         // A qualified method call (`Base::m(a)`, `Cls::Static(a)`) lands here
         // too: its `this` is not one of the arguments.
         let by_arity = filter_targets_by_argc(program, candidates, argc, &arg_desc, argc == 0);
-        if by_arity.len() > 1 {
-            rank_overloads(program, &by_arity, &arg_desc)
+        let by_defined: Vec<FnId> = if by_arity
+            .iter()
+            .any(|&f| program.symbols.function(f).is_defined)
+        {
+            by_arity
+                .into_iter()
+                .filter(|&f| program.symbols.function(f).is_defined)
+                .collect()
         } else {
             by_arity
+        };
+        if by_defined.len() > 1 {
+            rank_overloads(program, &by_defined, &arg_desc)
+        } else {
+            by_defined
         }
     } else {
         Vec::new()
@@ -6664,10 +6675,9 @@ fn param_match_rank(arg: &TypeDesc, param: &TypeDesc) -> usize {
 /// `resolve_cpp_name_candidates` is the bare base name (e.g. `GetNumber`,
 /// not `GetNumber<int>`), which correctly indexes into the `base_by_name`
 /// bucket.
-fn is_bare_callee_node(func: tree_sitter::Node) -> bool {
+fn is_bare_callee_node(func: Node) -> bool {
     matches!(func.kind(), "identifier" | "template_function")
 }
-
 /// The functions a C++ callee `func`, spelled `name`, may call: ordinary and
 /// argument-dependent lookup for a bare name, enclosing-scope lookup for a
 /// qualified name (global-only when it starts with `::`).

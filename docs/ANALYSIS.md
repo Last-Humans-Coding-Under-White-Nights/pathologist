@@ -131,6 +131,20 @@ return wiring; a lookup that names no image (the public resolver entry points)
 still sees every symbol, which is not the same question as naming the unscoped
 partition explicitly.
 
+When separate translation units contribute distinct strong definitions of a
+C++ function with the same qualified name and signature (such as multiple
+implementations across modules analyzed in whole-program or unscoped mode
+without link metadata), each definition is indexed separately in the symbol
+table and the exported database.
+
+Call-site resolution respects translation-unit boundaries:
+- A translation unit that contains a definition of the function resolves direct
+  calls exclusively to its own definition, avoiding duplicate edges from other
+  units.
+- A translation unit that does not define the function (seeing only declarations
+  or prototypes) treats all matching definitions across the program as equal
+  candidates and resolves to them.
+
 **IPC bridges are the deliberate exception.** A Binder call crosses a process
 boundary, so a proxy and the stub it dispatches to are in *different* images by
 construction — a client executable and its service daemon. Proxy/stub pairing

@@ -1604,14 +1604,13 @@ mod tests {
         let proto = unit_declaring("if.h", false, vec![("objectId".into(), TypeDesc::Int)]);
         merge_unit_index(&mut program, &def);
         merge_unit_index(&mut program, &proto);
-        // A different origin bypasses source-location deduplication and
-        // exercises the symbol table's exact-signature comparison.
+        // Distinct definitions from separate compile units are indexed separately.
         let repeated = unit_declaring("other.cpp", true, Vec::new());
         merge_unit_index(&mut program, &repeated);
         assert_eq!(
             program.symbols.functions.len(),
-            1,
-            "a prototype must not change the signature used to deduplicate a definition"
+            2,
+            "distinct definitions from separate compile units are indexed separately"
         );
     }
 

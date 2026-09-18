@@ -521,10 +521,9 @@ impl SymbolTable {
             // differently -- it is the sole case that returns before
             // consulting types -- so the fallback scan is restricted to those
             // candidates rather than repeating identical work for a bucket of
-            // C++ ones.
             let mixed_language =
                 |id: FnId| !(func.is_cpp && self.function_by_id(id).is_some_and(|e| e.is_cpp));
-            let matched_id = candidates
+            let mut matched_id = candidates
                 .iter()
                 .copied()
                 .find(|&id| compatible(id, true))
@@ -535,19 +534,35 @@ impl SymbolTable {
                         .find(|&id| mixed_language(id) && compatible(id, false))
                 });
             if let Some(existing_id) = matched_id {
+                if let Some(existing) = self.function_by_id(existing_id) {
+                    if func.is_cpp && func.is_defined && existing.is_defined {
+                        let is_same_def =
+                            existing.file == func.file && existing.span.line == func.span.line;
+                        let has_weak = existing.is_weak || func.is_weak;
+                        if !is_same_def && !has_weak {
+                            matched_id = None;
+                        }
+                    }
+                }
+            }
+            if let Some(existing_id) = matched_id {
                 let mut missing_this = false;
                 if let Some(existing) = self.function_mut_by_id(existing_id) {
                     missing_this = joins_member_missing_this(existing, &func);
-                    // An unscoped program keeps its historical first-wins
-                    // overwrite; within an image, precedence decides.
-                    if func.is_defined
-                        && (func.target.is_none()
+                    // Deduplication selects the first-encountered definition for C++;
+                    // C keeps its historical overwrite for unscoped programs.
+                    // Within an image, precedence decides.
+                    let overwrite = if func.is_cpp && existing.is_cpp {
+                        definition_supersedes(existing.is_defined, existing.is_weak, func.is_weak)
+                    } else {
+                        func.target.is_none()
                             || definition_supersedes(
                                 existing.is_defined,
                                 existing.is_weak,
                                 func.is_weak,
-                            ))
-                    {
+                            )
+                    };
+                    if func.is_defined && overwrite {
                         existing.is_weak =
                             func.is_weak || (func.target.is_none() && existing.is_weak);
                         existing.is_defined = true;
@@ -1187,15 +1202,62 @@ impl SymbolTable {
         // Both resolvers below fall back to the whole-program interpretation
         // when nothing is scoped, so one tail serves either mode.
         let target = self.caller_target(cs);
+        let resolve_equal_defs = |fid: FnId| -> Vec<FnId> {
+            let f = self.function(fid);
+            if f.linkage != Linkage::External || (f.is_defined && f.file == cs.span.file) {
+                return vec![fid];
+            }
+            let defs: Vec<FnId> = self
+                .resolve_function_candidates_in_target(&f.name, Some(cs.span.file), target)
+                .into_iter()
+                .filter(|&id| {
+                    let cand = self.function(id);
+                    if !cand.is_defined
+                        || cand.params.len() != f.params.len()
+                        || cand.variadic != f.variadic
+                    {
+                        return false;
+                    }
+                    cand.params.iter().zip(&f.params).all(|(&p1, &p2)| {
+                        match (self.param_type(p1), self.param_type(p2)) {
+                            (Some(t1), Some(t2)) => t1 == t2,
+                            _ => true,
+                        }
+                    })
+                })
+                .collect();
+            if defs.len() > 1 {
+                if let Some(&local_def) = defs
+                    .iter()
+                    .find(|&&id| self.function(id).file == cs.span.file)
+                {
+                    return vec![local_def];
+                }
+                return defs;
+            }
+            if !defs.is_empty() {
+                return defs;
+            }
+            vec![fid]
+        };
         if let Some(fid) = cs.callee_fn_id {
             if !self.has_target_scopes || self.function(fid).target == target {
-                return vec![fid];
+                if !cs.is_direct {
+                    return vec![fid];
+                }
+                return resolve_equal_defs(fid);
             }
         }
         if cs.is_direct {
-            self.resolve_function_in_scope_in_target(&cs.callee_name, Some(cs.span.file), target)
-                .into_iter()
-                .collect()
+            let direct = self.resolve_function_in_scope_in_target(
+                &cs.callee_name,
+                Some(cs.span.file),
+                target,
+            );
+            if let Some(fid) = direct {
+                return resolve_equal_defs(fid);
+            }
+            Vec::new()
         } else if cs.resolves_by_name() {
             self.resolve_function_candidates_in_target(&cs.callee_name, Some(cs.span.file), target)
         } else {

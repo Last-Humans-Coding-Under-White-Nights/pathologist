@@ -6356,6 +6356,91 @@ fn cpp_template_return_resolves_partially_qualified_bases() {
 }
 
 #[test]
+fn relative_qualified_callee_in_enclosing_namespace_and_using_directive() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_relative_qual_")
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("connection.h"),
+        r#"
+namespace OHOS {
+namespace Runtime {
+namespace Utils {
+void RemoveConn(long id);
+}
+}
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a_conn.cpp"),
+        r#"
+#include "connection.h"
+namespace OHOS {
+namespace Runtime {
+namespace Utils {
+void RemoveConn(long id) {}
+}
+void CallerA() {
+    Utils::RemoveConn(1);
+}
+}
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b_manager.cpp"),
+        r#"
+#include "connection.h"
+using namespace OHOS::Runtime;
+namespace OHOS {
+namespace Manager {
+void CallerB() {
+    Utils::RemoveConn(2);
+}
+}
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let target_fn = program
+        .symbols
+        .resolve_function("OHOS::Runtime::Utils::RemoveConn")
+        .expect("resolved RemoveConn");
+    let func = program.symbols.function(target_fn);
+    assert!(func.is_defined);
+    assert_eq!(
+        &program.symbols.files[func.file.0 as usize].path,
+        root.join("a_conn.cpp").as_path()
+    );
+
+    let (_pag, analysis) = analyze(&program);
+    let callers = ["OHOS::Runtime::CallerA", "OHOS::Manager::CallerB"];
+    for caller in callers {
+        let caller_id = program
+            .symbols
+            .resolve_function(caller)
+            .unwrap_or_else(|| panic!("missing {caller}"));
+        let callees: Vec<FnId> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| e.caller == caller_id && e.resolution == ResolutionKind::Direct)
+            .map(|e| e.callee)
+            .collect();
+        assert_eq!(
+            callees,
+            vec![target_fn],
+            "{caller} must resolve directly to OHOS::Runtime::Utils::RemoveConn"
+        );
+    }
+}
+
+#[test]
 fn cpp_template_base_keeps_arguments_on_their_own_nested_class() {
     let (p, _) = cpp_issue113();
     let bases = p.template_bases_of("NestedDerived");
@@ -6376,4 +6461,99 @@ fn cpp_template_return_uses_smart_pointer_pointee_arguments() {
             "{caller} return"
         );
     }
+}
+
+#[test]
+fn distinct_definitions_indexed_separately_and_context_aware_call_resolution() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_distinct_defs_")
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+namespace Ns {
+void Common(int x);
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a_first.cpp"),
+        r#"
+#include "common.h"
+namespace Ns {
+void Common(int x) {}
+void CallInA() { Common(1); }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b_second.cpp"),
+        r#"
+#include "common.h"
+namespace Ns {
+void Common(int x) {}
+void CallInB() { Common(2); }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("c_manager.cpp"),
+        r#"
+#include "common.h"
+namespace Ns {
+void CallInC() { Common(3); }
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let defs: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Ns::Common" && f.is_defined)
+        .collect();
+    assert_eq!(defs.len(), 2, "both definitions must be indexed separately");
+    let fn_a = defs
+        .iter()
+        .find(|f| program.symbols.files[f.file.0 as usize].path == root.join("a_first.cpp"))
+        .unwrap()
+        .id;
+    let fn_b = defs
+        .iter()
+        .find(|f| program.symbols.files[f.file.0 as usize].path == root.join("b_second.cpp"))
+        .unwrap()
+        .id;
+
+    let (_pag, analysis) = analyze(&program);
+
+    let get_callees = |caller_name: &str| -> Vec<FnId> {
+        let caller_id = program
+            .symbols
+            .resolve_function(caller_name)
+            .unwrap_or_else(|| panic!("missing {caller_name}"));
+        analysis
+            .call_edges
+            .iter()
+            .filter(|e| e.caller == caller_id && e.resolution == ResolutionKind::Direct)
+            .map(|e| e.callee)
+            .collect()
+    };
+
+    // Caller in unit A resolves exclusively to definition in A:
+    assert_eq!(get_callees("Ns::CallInA"), vec![fn_a]);
+    // Caller in unit B resolves exclusively to definition in B:
+    assert_eq!(get_callees("Ns::CallInB"), vec![fn_b]);
+    // Caller in unit C (which saw only the header declaration) treats definitions as equal and resolves to both:
+    let mut callees_c = get_callees("Ns::CallInC");
+    callees_c.sort();
+    let mut expected_c = vec![fn_a, fn_b];
+    expected_c.sort();
+    assert_eq!(callees_c, expected_c);
 }
