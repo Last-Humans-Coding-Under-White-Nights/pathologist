@@ -1,3 +1,7 @@
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

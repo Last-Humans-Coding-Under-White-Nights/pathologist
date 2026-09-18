@@ -23,6 +23,11 @@ only HDF and Camera diagnostic totals decrease after normalization.
 
 ### Added
 
+- Optional mimalloc global allocator support in `trace-cli` (`--features mimalloc`): builds the
+  CLI binary with `mimalloc` as the global allocator, enabling approximately a 20% reduction in
+  execution time on large workloads (measured with mimalloc 0.1 / upstream mimalloc v3). The feature
+  is opt-in for source builds; library embedders (`trace-capi`) and default builds retain the system
+  allocator.
 - Compilation database support (`compile_commands.json`, #62): automatically reads `compile_commands.json`
   at the analysis root, then `build/compile_commands.json`, or an explicit `--compile-commands PATH`.
   Each entry supplies its working directory, ordered `-I`/`-iquote`/`-isystem` search paths, ordered
