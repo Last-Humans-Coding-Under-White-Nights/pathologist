@@ -22,7 +22,9 @@ caller shows up:
   unit that includes the header can substitute a concrete receiver's argument and continue member
   lookup and virtual dispatch through it (`Holder<Base *>::Get()` → `Base *`). Compound dependent
   returns, function templates and overloads that are none of the above block substitution rather
-  than borrowing another declaration's return; no template body is instantiated.
+  than borrowing another declaration's return; no template body is instantiated. Inherited arguments
+  resolve in the base declaration's lexical scope, including nested arguments; dependent base
+  arguments remain unknown even when an unrelated concrete class shares their name.
 - **Fixture test bodies.** `HWTEST_F(Fixture, Name, …)` and `HWTEST_P` expand to what gtest
   generates — a class derived from the fixture, in an anonymous namespace, whose `TestBody` the
   source defines — so the body keeps the fields and methods it inherits in scope and same-named

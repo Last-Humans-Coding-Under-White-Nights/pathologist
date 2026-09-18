@@ -1166,8 +1166,10 @@ C++-aware only where it must be — everything else reuses the C machinery.
   virtual dispatch, through its pointer layers and through an instantiated
   class-template base it inherits the member from (`struct D : Holder<T *>`).
   The argument is resolved from the scope it is spelled in, keeping its own
-  template arguments so a nested `Holder<Holder<T>>` substitutes again. Compound dependent returns and function templates remain
-  unknown; no template bodies are instantiated.
+  template arguments so a nested `Holder<Holder<T>>` substitutes again. Inherited arguments
+  resolve in the base declaration's lexical scope, not the caller's; dependent base spellings
+  are recorded at lowering and excluded from concrete return substitution. Compound dependent
+  returns and function templates remain unknown; no template bodies are instantiated.
 - **Lambda captures**: explicit (`[var]`, `[&var]`, `[this]`, `[*this]`), default (`[&]`, `[=]`), and init-captures (`[x = expr]`, `[&x = expr]`) bind the enclosing scope's variables, members, and `this` into the lowered lambda body.
 
 Known C++ imprecision (in addition to the general list below):

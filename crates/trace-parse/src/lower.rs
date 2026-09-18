@@ -3040,7 +3040,20 @@ fn lower_struct_specifier(
                         } else {
                             ctx.qualify(&template_spelling)
                         };
-                        program.add_template_base(&derived, &qualified, &ctx.namespace_scope());
+                        let is_dependent =
+                            spelling_is_dependent(ctx, source, base, base_text, Spelling::Source);
+                        let declaration_scope = ctx
+                            .type_scope
+                            .borrow()
+                            .last()
+                            .cloned()
+                            .unwrap_or_else(|| ctx.namespace_scope());
+                        program.add_template_base(
+                            &derived,
+                            &qualified,
+                            &declaration_scope,
+                            is_dependent,
+                        );
                     }
                     let base = through_directive
                         .unwrap_or_else(|| qualify_class_name(program, ctx, &short));
@@ -4572,12 +4585,12 @@ fn substituted_template_return(
 ) -> Option<TypeDesc> {
     let (owner, _) = member.rsplit_once("::")?;
     let facts = program.template_returns_of(owner, member)?;
-    let args = template_arguments_for(program, receiver, owner);
+    let (args, scope) = template_arguments_for(program, receiver, owner)?;
     agreed(
         facts
             .iter()
             .filter(|fact| fact.arity as usize == arity)
-            .map(|fact| substituted_parameter(program, ctx, &args, fact)),
+            .map(|fact| substituted_parameter(program, ctx, &args, scope, fact)),
     )
 }
 
@@ -4585,10 +4598,14 @@ fn substituted_template_return(
 /// that class template, else those of the base it inherits `owner` through.
 /// Only a base spelled with arguments substitutes; `struct D : Holder<T>`
 /// inside another template names no concrete type to substitute.
-fn template_arguments_for(program: &Program, receiver: &str, owner: &str) -> Vec<String> {
+fn template_arguments_for<'a>(
+    program: &'a Program,
+    receiver: &str,
+    owner: &str,
+) -> Option<(Vec<String>, Option<&'a str>)> {
     let cls = receiver_lookup_name(receiver);
     if cls == owner {
-        return template_arguments(receiver);
+        return Some((template_arguments(receiver), None));
     }
     // However many classes up, walked as `declared_members_upward` walks them.
     let mut queue = std::collections::VecDeque::from([cls.into_owned()]);
@@ -4599,7 +4616,12 @@ fn template_arguments_for(program: &Program, receiver: &str, owner: &str) -> Vec
             .iter()
             .find(|base| receiver_lookup_name(&base.spelling) == owner)
         {
-            return template_arguments(&base.spelling);
+            return (!base.is_dependent).then(|| {
+                (
+                    template_arguments(&base.spelling),
+                    Some(base.declaration_scope.as_str()),
+                )
+            });
         }
         for base in program.bases_of(&cur) {
             if seen.len() < MAX_BASE_LOOKUP && seen.insert(base.clone()) {
@@ -4607,7 +4629,7 @@ fn template_arguments_for(program: &Program, receiver: &str, owner: &str) -> Vec
             }
         }
     }
-    Vec::new()
+    None
 }
 
 /// One fact substituted: the template argument at the parameter position it
@@ -4618,16 +4640,18 @@ fn substituted_parameter(
     program: &Program,
     ctx: &LowerContext,
     args: &[String],
+    scope: Option<&str>,
     fact: &trace_ir::TemplateReturn,
 ) -> Option<TypeDesc> {
     let (base, suffix) = split_pointer_suffix(args.get(fact.parameter?)?);
     let base = sanitize_type_name(base);
-    // An argument is spelled where the receiver or its base is written, not
-    // where its class is declared, so it resolves from this scope through the
-    // same helper a smart pointer's argument does. Its own template arguments
-    // are kept, so a nested `Holder<Holder<T>>` substitutes again.
-    let name = held_class(program, ctx, &base)
-        .or_else(|| is_std_smart_ptr_name(&receiver_lookup_name(&base)).then(|| base.clone()))?;
+    // Inherited arguments belong to the base declaration, regardless of
+    // where the receiver is used. Direct receiver spellings use call scope.
+    let name = match scope {
+        Some(scope) => held_class_in_declaration_scope(program, scope, &base),
+        None => held_class(program, ctx, &base),
+    }
+    .or_else(|| is_std_smart_ptr_name(&receiver_lookup_name(&base)).then(|| base.clone()))?;
     let mut desc = TypeDesc::Struct {
         name,
         fields: Vec::new(),
@@ -4636,6 +4660,49 @@ fn substituted_parameter(
         desc = TypeDesc::Ptr(Box::new(desc));
     }
     Some(desc)
+}
+
+/// Resolve a stored base argument without consulting the caller's scope.
+fn held_class_in_declaration_scope(
+    program: &Program,
+    declaration_scope: &str,
+    arg: &str,
+) -> Option<String> {
+    let lookup = receiver_lookup_name(arg);
+    let mut scope = declaration_scope;
+    let name = loop {
+        let candidate = if lookup.starts_with("::") || scope.is_empty() {
+            lookup.strip_prefix("::").unwrap_or(&lookup).to_string()
+        } else {
+            format!("{scope}::{lookup}")
+        };
+        if let Some(name) = declared_class_name(program, &candidate) {
+            break name;
+        }
+        if scope.is_empty() || lookup.starts_with("::") {
+            if is_std_smart_ptr_name(&lookup) {
+                break lookup.into_owned();
+            }
+            return None;
+        }
+        scope = scope.rsplit_once("::").map_or("", |(parent, _)| parent);
+    };
+    if !arg.contains('<') {
+        return Some(name);
+    }
+    // A later chained call will substitute these arguments from another
+    // receiver, so retain their declaration scope in the spelling too.
+    let args = template_arguments(arg)
+        .into_iter()
+        .map(|arg| {
+            let (base, suffix) = split_pointer_suffix(&arg);
+            let base = sanitize_type_name(base);
+            let qualified =
+                held_class_in_declaration_scope(program, declaration_scope, &base).unwrap_or(base);
+            format!("{qualified}{suffix}")
+        })
+        .collect::<Vec<_>>();
+    Some(format!("{name}<{}>{}", args.join(","), template_tail(arg)))
 }
 
 /// `desc` when it can type a receiver: a class, union or function pointer

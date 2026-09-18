@@ -6288,3 +6288,54 @@ fn members_of_a_class_in_an_anonymous_namespace_resolve() {
         "one call per overload"
     );
 }
+
+#[test]
+fn cpp_inherited_template_return_uses_base_declaration_scope() {
+    let (p, a) = cpp_issue113();
+    for caller in [
+        "inherited_outside",
+        "caller_scope::inherited_elsewhere",
+        "inherited_nested",
+    ] {
+        assert!(
+            has_any_edge(p, a, caller, "base_scope::Widget::Start"),
+            "{caller}"
+        );
+        assert!(!has_any_edge(p, a, caller, "Widget::Start"));
+        assert!(!has_any_edge(p, a, caller, "caller_scope::Widget::Start"));
+    }
+}
+
+#[test]
+fn cpp_inherited_template_return_keeps_dependent_arguments_unknown() {
+    let (p, a) = cpp_issue113();
+    assert!(has_any_edge(
+        p,
+        a,
+        "DependentDerived::Run",
+        "base_scope::ScopedHolder::Get"
+    ));
+    assert!(!has_any_edge(
+        p,
+        a,
+        "DependentDerived::Run",
+        "DependentType::Start"
+    ));
+}
+
+#[test]
+fn cpp_inherited_template_return_uses_enclosing_class_scope() {
+    let (p, a) = cpp_issue113();
+    assert!(has_any_edge(
+        p,
+        a,
+        "inherited_class_scope",
+        "OuterScope::Widget::Start"
+    ));
+    assert!(!has_any_edge(
+        p,
+        a,
+        "inherited_class_scope",
+        "Widget::Start"
+    ));
+}

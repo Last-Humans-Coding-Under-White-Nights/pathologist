@@ -55,13 +55,15 @@ pub struct Diagnostic {
 /// A templated C++ base as written on a derived class.
 ///
 /// `declaration_scope` is kept separately because an unqualified template
-/// argument is resolved where the derived class is declared, not relative to
-/// the namespace that qualifies the template itself.
+/// argument is resolved in the namespace or enclosing class where the derived
+/// class is declared, not relative to the template itself or a later caller.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TemplateBase {
     pub derived: String,
     pub spelling: String,
     pub declaration_scope: String,
+    /// The base spelling mentions an enclosing template parameter.
+    pub is_dependent: bool,
 }
 
 /// Cross-unit deduplication state used by the merge stage: entities whose
@@ -327,7 +329,13 @@ impl Program {
     }
 
     /// Preserve a templated base-class spelling once.
-    pub fn add_template_base(&mut self, derived: &str, base: &str, declaration_scope: &str) {
+    pub fn add_template_base(
+        &mut self,
+        derived: &str,
+        base: &str,
+        declaration_scope: &str,
+        is_dependent: bool,
+    ) {
         if derived.is_empty() || base.is_empty() {
             return;
         }
@@ -335,6 +343,7 @@ impl Program {
             derived: derived.to_string(),
             spelling: base.to_string(),
             declaration_scope: declaration_scope.to_string(),
+            is_dependent,
         });
     }
 

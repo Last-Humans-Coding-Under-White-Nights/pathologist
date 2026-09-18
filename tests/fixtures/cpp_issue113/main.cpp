@@ -90,3 +90,28 @@ using namespace rem;
 // same directive, which names `rem::Remote::Call` — the header's prototype —
 // so the call here reaches that body.
 void via_using_remote() { Remote::Call(); }
+
+namespace base_scope {
+struct Widget { void Start() {} };
+template<class U> struct ScopedHolder { U Get(); };
+struct Derived : ScopedHolder<Widget*> {};
+struct Nested : ScopedHolder<ScopedHolder<Widget*>*> {};
+}
+struct Widget { void Start() {} };
+void inherited_outside(base_scope::Derived &d) { d.Get()->Start(); }
+void inherited_nested(base_scope::Nested &d) { d.Get()->Get()->Start(); }
+namespace caller_scope {
+struct Widget { void Start() {} };
+void inherited_elsewhere(base_scope::Derived &d) { d.Get()->Start(); }
+}
+struct DependentType { void Start() {} };
+template<class DependentType>
+struct DependentDerived : base_scope::ScopedHolder<DependentType*> {
+    void Run() { this->Get()->Start(); }
+};
+
+struct OuterScope {
+    struct Widget { void Start() {} };
+    struct Derived : base_scope::ScopedHolder<Widget*> {};
+};
+void inherited_class_scope(OuterScope::Derived &d) { d.Get()->Start(); }
