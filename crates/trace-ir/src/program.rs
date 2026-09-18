@@ -282,6 +282,12 @@ impl Program {
         self.symbols.file_is_dep(file)
     }
 
+    /// Resolve callee functions for a call site, consulting `types` for shape-aware
+    /// overload and definition matching.
+    pub fn callees_of(&self, cs: &crate::CallSite) -> Vec<crate::FnId> {
+        self.symbols.callees_of_with_types(cs, Some(&self.types))
+    }
+
     /// Record a `(derived, base)` edge once.
     ///
     /// Only a direct self-loop is rejected. A cycle through two or more

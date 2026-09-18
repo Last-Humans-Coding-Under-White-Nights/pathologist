@@ -465,9 +465,13 @@ fn merge_unit(
             continue;
         }
         let span_file = map_file(func.span.file);
-        let mut canonical = program
-            .dedup
-            .existing_fn(span_file, &func.name, func.span.line);
+        let mut canonical = if func.linkage == trace_ir::Linkage::Internal {
+            None
+        } else {
+            program
+                .dedup
+                .existing_fn(span_file, &func.name, func.span.line)
+        };
         if canonical.is_none() && matches!(mode, MergeMode::Variant) && func.is_defined {
             // The two arms of an `#ifdef X / #else` pair put one function's
             // implementations on different lines, so the line-keyed dedup misses
@@ -585,6 +589,7 @@ fn merge_unit(
         f.id = new_id;
         f.span.file = span_file;
         f.file = span_file;
+        f.tu = Some(primary_file_id);
         f.return_type = remap_type(f.return_type, &type_map);
         // A body written in a dependency header is not the target's code:
         // keep the signature, drop everything the body would contribute (#60).
@@ -631,9 +636,11 @@ fn merge_unit(
             remap_params.insert(merged);
         }
         fn_map.insert(old_id, merged);
-        program
-            .dedup
-            .insert_fn(span_file, func.name.clone(), func.span.line, merged);
+        if func.linkage != trace_ir::Linkage::Internal {
+            program
+                .dedup
+                .insert_fn(span_file, func.name.clone(), func.span.line, merged);
+        }
     }
 
     for (&declaration, &definition) in &respelled {
@@ -861,7 +868,12 @@ fn merge_unit(
             continue;
         }
         let key: SiteKey = (span_file, cs.span.line, cs.span.col, cs.callee_name.clone());
-        if !matches!(mode, MergeMode::Variant) {
+        let mapped_caller = fn_map.get(&cs.caller).copied().unwrap_or(cs.caller);
+        let is_internal_caller = program
+            .symbols
+            .function_by_id(mapped_caller)
+            .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal);
+        if !matches!(mode, MergeMode::Variant) && !is_internal_caller {
             if let Some(&existing) = program.dedup.site_keys.get(&key) {
                 call_map.insert(cs.id, existing);
                 continue;
@@ -869,7 +881,7 @@ fn merge_unit(
         }
         let old = cs.id;
         let mut site = cs.clone();
-        site.caller = fn_map.get(&site.caller).copied().unwrap_or(site.caller);
+        site.caller = mapped_caller;
         site.callee_fn_id = site.callee_fn_id.and_then(|f| fn_map.get(&f).copied());
         site.callee_var = site.callee_var.and_then(|v| var_map.get(&v).copied());
         site.var_args = site
@@ -921,24 +933,27 @@ fn merge_unit(
         }
         let new_id = program.symbols.alloc_call_id();
         site.id = new_id;
+        site.tu = Some(primary_file_id);
         program.symbols.call_sites.push(site);
-        if matches!(mode, MergeMode::Variant) {
-            // A variant adds records at a site the base configuration may
-            // already own. The key stands for the site across the whole
-            // program, and a later unit that reaches it is in the base
-            // configuration, not this variant's — so the base record stays
-            // canonical and only a site no configuration has claimed yet is
-            // registered here. The record is remembered separately either way,
-            // so a later variant can merge into it.
-            program
-                .dedup
-                .variant_site_records
-                .entry(key.clone())
-                .or_default()
-                .push(new_id);
-            program.dedup.site_keys.entry(key).or_insert(new_id);
-        } else {
-            program.dedup.site_keys.insert(key, new_id);
+        if !is_internal_caller {
+            if matches!(mode, MergeMode::Variant) {
+                // A variant adds records at a site the base configuration may
+                // already own. The key stands for the site across the whole
+                // program, and a later unit that reaches it is in the base
+                // configuration, not this variant's — so the base record stays
+                // canonical and only a site no configuration has claimed yet is
+                // registered here. The record is remembered separately either way,
+                // so a later variant can merge into it.
+                program
+                    .dedup
+                    .variant_site_records
+                    .entry(key.clone())
+                    .or_default()
+                    .push(new_id);
+                program.dedup.site_keys.entry(key).or_insert(new_id);
+            } else {
+                program.dedup.site_keys.insert(key, new_id);
+            }
         }
         call_map.insert(old, new_id);
     }
@@ -1518,6 +1533,7 @@ mod tests {
                 is_virtual: false,
                 is_final: false,
                 is_cpp: true,
+                tu: None,
             }],
             variables: vec![Variable {
                 is_defined: false,

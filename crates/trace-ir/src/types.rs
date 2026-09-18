@@ -582,6 +582,10 @@ impl TypeTable {
         self.prelude_id(&TypeDesc::Int)
     }
 
+    pub fn double(&self) -> TypeId {
+        self.prelude_id(&TypeDesc::Double)
+    }
+
     /// The placeholder a lookup that resolves nothing falls back to.
     pub fn unknown(&self) -> TypeId {
         self.prelude_id(&TypeDesc::Unknown)
@@ -1295,6 +1299,7 @@ mod tests {
         let t = TypeTable::new();
         assert_eq!(t.get(t.void()).desc.as_ref(), &TypeDesc::Void);
         assert_eq!(t.get(t.int()).desc.as_ref(), &TypeDesc::Int);
+        assert_eq!(t.get(t.double()).desc.as_ref(), &TypeDesc::Double);
         assert_eq!(t.get(t.unknown()).desc.as_ref(), &TypeDesc::Unknown);
     }
 

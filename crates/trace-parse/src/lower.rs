@@ -1285,6 +1285,7 @@ fn finalize_extern_callees(program: &mut Program) {
             declared_in_class: false,
             is_virtual: false,
             is_final: false,
+            tu: None,
         });
         for &i in &sites_by_name[name.as_str()] {
             let cs = &mut program.symbols.call_sites[i];
@@ -1367,6 +1368,7 @@ fn finalize_target_extern_callees(program: &mut Program) {
             is_virtual: false,
             is_final: false,
             is_cpp: false,
+            tu: None,
         });
         for i in sites {
             let cs = &mut program.symbols.call_sites[i];
@@ -1517,6 +1519,7 @@ fn expand_virtual_overrides(program: &mut Program) {
                 is_direct: true,
                 receiver_class: cs.receiver_class.clone(),
                 return_dst: cs.return_dst,
+                tu: cs.tu,
             });
         }
     }
@@ -3667,6 +3670,7 @@ fn register_member_prototype(
         is_virtual: flags.is_virtual,
         is_final: flags.is_final,
         is_cpp: ctx.is_cpp,
+        tu: Some(ctx.current_file),
     });
 }
 
@@ -3970,6 +3974,7 @@ fn lower_function_signature(
         is_virtual: flags.is_virtual,
         is_final: flags.is_final,
         is_cpp: ctx.is_cpp,
+        tu: Some(ctx.current_file),
     });
     reassign_fn_id(program, provisional_id, fn_id, provisional_start);
     if scoped {
@@ -5827,6 +5832,7 @@ fn lower_function_decl(
         is_virtual: false,
         is_final: false,
         is_cpp: ctx.is_cpp,
+        tu: Some(ctx.current_file),
     });
     reassign_fn_id(program, provisional_id, fn_id, provisional_start);
 }
@@ -6250,21 +6256,33 @@ fn collect_call_at_node(
         // A qualified method call (`Base::m(a)`, `Cls::Static(a)`) lands here
         // too: its `this` is not one of the arguments.
         let by_arity = filter_targets_by_argc(program, candidates, argc, &arg_desc, argc == 0);
-        let by_defined: Vec<FnId> = if by_arity
-            .iter()
-            .any(|&f| program.symbols.function(f).is_defined)
-        {
-            by_arity
-                .into_iter()
-                .filter(|&f| program.symbols.function(f).is_defined)
-                .collect()
+        let ranked = if by_arity.len() > 1 {
+            rank_overloads(program, &by_arity, &arg_desc)
         } else {
             by_arity
         };
-        if by_defined.len() > 1 {
-            rank_overloads(program, &by_defined, &arg_desc)
+        if ranked.len() > 1
+            && ranked
+                .iter()
+                .any(|&f| program.symbols.function(f).is_defined)
+        {
+            ranked
+                .iter()
+                .copied()
+                .filter(|&cand| {
+                    let fc = program.symbols.function(cand);
+                    if fc.is_defined {
+                        return true;
+                    }
+                    !ranked.iter().any(|&other| {
+                        other != cand
+                            && program.symbols.function(other).is_defined
+                            && has_same_signature(program, cand, other)
+                    })
+                })
+                .collect()
         } else {
-            by_defined
+            ranked
         }
     } else {
         Vec::new()
@@ -6286,6 +6304,7 @@ fn collect_call_at_node(
             is_direct,
             receiver_class: None,
             return_dst,
+            tu: Some(ctx.current_file),
         });
         return;
     }
@@ -6323,6 +6342,7 @@ fn collect_call_at_node(
             is_direct: true,
             receiver_class: None,
             return_dst,
+            tu: Some(ctx.current_file),
         });
     }
 }
@@ -6678,6 +6698,37 @@ fn param_match_rank(arg: &TypeDesc, param: &TypeDesc) -> usize {
 fn is_bare_callee_node(func: Node) -> bool {
     matches!(func.kind(), "identifier" | "template_function")
 }
+
+fn has_same_signature(program: &Program, a: FnId, b: FnId) -> bool {
+    let fa = program.symbols.function(a);
+    let fb = program.symbols.function(b);
+    let a_skip = usize::from(has_this_param(program, a));
+    let b_skip = usize::from(has_this_param(program, b));
+    let a_params = &fa.params[a_skip..];
+    let b_params = &fb.params[b_skip..];
+    if a_params.len() != b_params.len() || fa.variadic != fb.variadic {
+        return false;
+    }
+    let param_t = |f: &Function, skip: usize, idx: usize| -> Option<trace_ir::TypeId> {
+        f.param_type_ids.get(skip + idx).copied().or_else(|| {
+            f.params
+                .get(skip + idx)
+                .map(|&v| program.symbols.variable(v).type_id)
+        })
+    };
+    for i in 0..a_params.len() {
+        match (param_t(fa, a_skip, i), param_t(fb, b_skip, i)) {
+            (Some(ta), Some(tb)) => {
+                if !trace_ir::same_param_type(&program.types, ta, tb) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// The functions a C++ callee `func`, spelled `name`, may call: ordinary and
 /// argument-dependent lookup for a bare name, enclosing-scope lookup for a
 /// qualified name (global-only when it starts with `::`).
@@ -6892,6 +6943,7 @@ fn emit_unresolved_site(
         is_direct: false,
         receiver_class: Some(receiver_class),
         return_dst: None,
+        tu: program.symbols.function_by_id(caller).and_then(|f| f.tu),
     });
 }
 
@@ -6909,6 +6961,7 @@ fn emit_member_sites(
     args: CallArgs,
     span: Span,
 ) {
+    let tu = program.symbols.function_by_id(caller).and_then(|f| f.tu);
     let cls = receiver_lookup_name(cls);
     let targets = member_targets_upward(program, &cls, kind);
     emit_member_targets(program, caller, &cls, kind, receiver, args, span, targets);
@@ -6951,6 +7004,7 @@ fn emit_member_targets(
             is_direct: false,
             receiver_class: Some(cls.to_string()),
             return_dst: None,
+            tu,
         });
         return;
     }
@@ -6976,6 +7030,7 @@ fn emit_member_targets(
             is_direct: true,
             receiver_class: Some(cls.to_string()),
             return_dst: None,
+            tu,
         });
     }
 }
@@ -7322,6 +7377,7 @@ fn lower_lambda_expression(
         is_virtual: false,
         is_final: false,
         is_cpp: true,
+        tu: Some(ctx.current_file),
     });
     reassign_fn_id(program, provisional_id, fn_id, provisional_start);
     let saved_fn = ctx.current_fn;

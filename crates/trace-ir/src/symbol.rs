@@ -115,6 +115,9 @@ pub struct Function {
     /// A C `.c` definition merging into a C++-parsed `.h` prototype clears
     /// this flag so a later TU merge does not treat the pair as overloads.
     pub is_cpp: bool,
+    /// Originating translation unit, recorded by merge. Absent before merge or
+    /// on synthesized entries.
+    pub tu: Option<crate::FileId>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +152,8 @@ pub struct CallSite {
     /// LHS of `dst = callee(...)` when the call's value is used (`CallReturn`
     /// destination). `dlsym` models write function addresses here.
     pub return_dst: Option<VarId>,
+    /// Originating translation unit, recorded by merge. Absent before merge.
+    pub tu: Option<crate::FileId>,
 }
 
 impl CallSite {
@@ -523,28 +528,28 @@ impl SymbolTable {
             // candidates rather than repeating identical work for a bucket of
             let mixed_language =
                 |id: FnId| !(func.is_cpp && self.function_by_id(id).is_some_and(|e| e.is_cpp));
-            let mut matched_id = candidates
-                .iter()
-                .copied()
-                .find(|&id| compatible(id, true))
-                .or_else(|| {
-                    candidates
-                        .iter()
-                        .copied()
-                        .find(|&id| mixed_language(id) && compatible(id, false))
-                });
-            if let Some(existing_id) = matched_id {
+            let is_incompatible_def = |existing_id: FnId| -> bool {
                 if let Some(existing) = self.function_by_id(existing_id) {
                     if func.is_cpp && func.is_defined && existing.is_defined {
                         let is_same_def =
                             existing.file == func.file && existing.span.line == func.span.line;
                         let has_weak = existing.is_weak || func.is_weak;
                         if !is_same_def && !has_weak {
-                            matched_id = None;
+                            return true;
                         }
                     }
                 }
-            }
+                false
+            };
+            let matched_id = candidates
+                .iter()
+                .copied()
+                .find(|&id| compatible(id, true) && !is_incompatible_def(id))
+                .or_else(|| {
+                    candidates.iter().copied().find(|&id| {
+                        mixed_language(id) && compatible(id, false) && !is_incompatible_def(id)
+                    })
+                });
             if let Some(existing_id) = matched_id {
                 let mut missing_this = false;
                 if let Some(existing) = self.function_mut_by_id(existing_id) {
@@ -570,6 +575,7 @@ impl SymbolTable {
                         existing.file = func.file;
                         existing.span = func.span;
                         existing.end_line = func.end_line;
+                        existing.tu = func.tu;
                         if !func.params.is_empty() {
                             existing.params = func.params.clone();
                             adopted_params = true;
@@ -1199,12 +1205,25 @@ impl SymbolTable {
     /// name. The solver wires exactly these, so anything that has to agree
     /// with its wiring asks here.
     pub fn callees_of(&self, cs: &CallSite) -> Vec<FnId> {
+        self.callees_of_with_types(cs, None)
+    }
+
+    pub fn callees_of_with_types(
+        &self,
+        cs: &CallSite,
+        types: Option<&crate::TypeTable>,
+    ) -> Vec<FnId> {
         // Both resolvers below fall back to the whole-program interpretation
         // when nothing is scoped, so one tail serves either mode.
         let target = self.caller_target(cs);
+        let caller_tu = cs
+            .tu
+            .or_else(|| self.function_by_id(cs.caller).and_then(|f| f.tu))
+            .unwrap_or(cs.span.file);
         let resolve_equal_defs = |fid: FnId| -> Vec<FnId> {
             let f = self.function(fid);
-            if f.linkage != Linkage::External || (f.is_defined && f.file == cs.span.file) {
+            let f_tu = f.tu.unwrap_or(f.file);
+            if f.linkage != Linkage::External || (f.is_defined && f_tu == caller_tu) {
                 return vec![fid];
             }
             let defs: Vec<FnId> = self
@@ -1218,19 +1237,32 @@ impl SymbolTable {
                     {
                         return false;
                     }
-                    cand.params.iter().zip(&f.params).all(|(&p1, &p2)| {
-                        match (self.param_type(p1), self.param_type(p2)) {
-                            (Some(t1), Some(t2)) => t1 == t2,
-                            _ => true,
-                        }
-                    })
+                    cand.params
+                        .iter()
+                        .zip(&f.params)
+                        .enumerate()
+                        .all(|(i, (&p1, &p2))| {
+                            let t1 = self
+                                .param_type(p1)
+                                .or_else(|| cand.param_type_ids.get(i).copied());
+                            let t2 = self
+                                .param_type(p2)
+                                .or_else(|| f.param_type_ids.get(i).copied());
+                            match (t1, t2) {
+                                (Some(a), Some(b)) => match types {
+                                    Some(ty) => crate::same_param_type(ty, a, b),
+                                    None => a == b,
+                                },
+                                _ => true,
+                            }
+                        })
                 })
                 .collect();
             if defs.len() > 1 {
-                if let Some(&local_def) = defs
-                    .iter()
-                    .find(|&&id| self.function(id).file == cs.span.file)
-                {
+                if let Some(&local_def) = defs.iter().find(|&&id| {
+                    let cand = self.function(id);
+                    cand.tu.unwrap_or(cand.file) == caller_tu
+                }) {
                     return vec![local_def];
                 }
                 return defs;
@@ -1557,6 +1589,7 @@ mod tests {
             is_direct,
             receiver_class: None,
             return_dst: None,
+            tu: None,
         };
         assert!(mk("OsalMemCalloc", None, false).resolves_by_name());
         assert!(mk("f", None, true).resolves_by_name());
@@ -1597,6 +1630,7 @@ mod tests {
             is_virtual: false,
             is_final: false,
             is_cpp,
+            tu: None,
         }
     }
 

@@ -718,6 +718,7 @@ mod tests {
                 is_virtual: false,
                 is_final: false,
                 is_cpp: false,
+                tu: None,
             });
             let id = program.symbols.alloc_var_id();
             program.symbols.add_variable(Variable {

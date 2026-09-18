@@ -410,6 +410,7 @@ mod tests {
             is_virtual: true,
             is_final: false,
             is_cpp: true,
+            tu: None,
         });
         id
     }
