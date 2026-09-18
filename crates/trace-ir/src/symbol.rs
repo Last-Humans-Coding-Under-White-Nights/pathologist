@@ -660,15 +660,24 @@ impl SymbolTable {
             let own_file = entries
                 .into_iter()
                 .flatten()
-                .find(|(file, id)| *file == func.file && self.function(*id).target == func.target)
+                .find(|(file, id)| {
+                    *file == func.file
+                        && self.function(*id).target == func.target
+                        && (!func.is_cpp
+                            || self.function(*id).tu == func.tu
+                            || (!self.function(*id).is_defined && func.is_defined))
+                })
                 .map(|(_, id)| *id);
             let scoped = own_file.or_else(|| {
                 if !func.is_cpp {
                     return None;
                 }
                 self.first_in_scope(func.file, entries, |id| {
-                    self.function_by_id(id)
-                        .is_some_and(|e| e.is_cpp && e.target == func.target)
+                    self.function_by_id(id).is_some_and(|e| {
+                        e.is_cpp
+                            && e.target == func.target
+                            && (e.tu == func.tu || (!e.is_defined && func.is_defined))
+                    })
                 })
             });
             let overloads = func.is_cpp
@@ -711,6 +720,7 @@ impl SymbolTable {
                         existing.file = func.file;
                         existing.span = func.span;
                         existing.end_line = func.end_line;
+                        existing.tu = func.tu;
                         if !func.params.is_empty() {
                             existing.params = func.params.clone();
                             adopted_params = true;
@@ -760,7 +770,11 @@ impl SymbolTable {
                 None => {
                     let replace = self.fn_by_scope.get(&func.name).and_then(|entries| {
                         entries.iter().position(|(file, id)| {
-                            *file == func.file && self.function(*id).target == func.target
+                            *file == func.file
+                                && self.function(*id).target == func.target
+                                && (!func.is_cpp
+                                    || self.function(*id).tu == func.tu
+                                    || (!self.function(*id).is_defined && func.is_defined))
                         })
                     });
                     let entries = self.fn_by_scope.entry(func.name.clone()).or_default();
@@ -1093,7 +1107,7 @@ impl SymbolTable {
             .flatten()
             .copied();
         std::iter::once(primary)
-            .filter(move |&primary| primary != id)
+            .filter(move |&primary| primary != id && self.function_visible_from(primary, file))
             .chain(further.filter(move |&overload| {
                 overload != id && self.function_visible_from(overload, file)
             }))
@@ -1179,8 +1193,22 @@ impl SymbolTable {
     /// entry is named everywhere, an internal one only in its own file and in
     /// the files that include the header it is in.
     pub fn function_visible_from(&self, id: FnId, file: FileId) -> bool {
-        self.function_by_id(id)
-            .is_some_and(|f| f.linkage != Linkage::Internal || self.file_sees(file, f.file))
+        self.function_by_id(id).is_some_and(|f| {
+            if f.linkage == Linkage::Internal {
+                if f.is_cpp {
+                    if let Some(tu) = f.tu {
+                        let in_tu = file == tu
+                            || self.headers_of.get(&tu).is_some_and(|h| h.contains(&file));
+                        if !in_tu {
+                            return false;
+                        }
+                    }
+                }
+                self.file_sees(file, f.file)
+            } else {
+                true
+            }
+        })
     }
 
     /// Whether code in `file` sees what `other` defines: `other` is `file`, or
@@ -1229,7 +1257,7 @@ impl SymbolTable {
             let f_skip = usize::from(self.has_this_param(fid));
             let f_explicit_len = f.params.len().saturating_sub(f_skip);
             let defs: Vec<FnId> = self
-                .resolve_function_candidates_in_target(&f.name, Some(cs.span.file), target)
+                .resolve_function_candidates_in_target(&f.name, Some(caller_tu), target)
                 .into_iter()
                 .filter(|&id| {
                     let cand = self.function(id);
@@ -1292,17 +1320,14 @@ impl SymbolTable {
             }
         }
         if cs.is_direct {
-            let direct = self.resolve_function_in_scope_in_target(
-                &cs.callee_name,
-                Some(cs.span.file),
-                target,
-            );
+            let direct =
+                self.resolve_function_in_scope_in_target(&cs.callee_name, Some(caller_tu), target);
             if let Some(fid) = direct {
                 return resolve_equal_defs(fid);
             }
             Vec::new()
         } else if cs.resolves_by_name() {
-            self.resolve_function_candidates_in_target(&cs.callee_name, Some(cs.span.file), target)
+            self.resolve_function_candidates_in_target(&cs.callee_name, Some(caller_tu), target)
         } else {
             Vec::new()
         }
@@ -1365,7 +1390,9 @@ impl SymbolTable {
     fn first_in_image(&self, name: &str, file: Option<FileId>, scope: TargetScope) -> Option<FnId> {
         if let Some(file) = file {
             let entries = self.fn_by_scope.get(name).map(Vec::as_slice);
-            if let Some(id) = self.first_in_scope(file, entries, |id| self.in_scope_of(id, scope)) {
+            if let Some(id) = self.first_in_scope(file, entries, |id| {
+                self.in_scope_of(id, scope) && self.function_visible_from(id, file)
+            }) {
                 return Some(id);
             }
         }
@@ -1440,7 +1467,7 @@ impl SymbolTable {
         let mut out = Vec::new();
         if let Some(file) = file {
             for (_, id) in self.in_scope(file, self.fn_by_scope.get(name).map(Vec::as_slice)) {
-                if !self.in_scope_of(id, scope) {
+                if !self.in_scope_of(id, scope) || !self.function_visible_from(id, file) {
                     continue;
                 }
                 // Two scope entries of one overload set share a primary, so
@@ -1448,7 +1475,10 @@ impl SymbolTable {
                 // once: a repeat would wire the same callee edge twice.
                 let overloads = self.internal_overloads_seen_from(id, file);
                 for id in std::iter::once(id).chain(overloads) {
-                    if self.in_scope_of(id, scope) && !out.contains(&id) {
+                    if self.in_scope_of(id, scope)
+                        && self.function_visible_from(id, file)
+                        && !out.contains(&id)
+                    {
                         out.push(id);
                     }
                 }

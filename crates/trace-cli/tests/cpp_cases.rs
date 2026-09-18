@@ -6687,10 +6687,7 @@ void Caller() {
     );
 }
 
-#[test]
-fn regression_call_inside_header_helper_resolves_to_local_def() {
-    // Comment 2: Header-static function calling external function resolves exclusively
-    // to the local definition in the translation unit containing the call.
+fn check_header_helper(with_compile_commands: bool) {
     let dir = tempfile::Builder::new()
         .prefix("trace_header_helper_")
         .tempdir()
@@ -6730,15 +6727,17 @@ void CallerB() {
 "#,
     )
     .unwrap();
-    std::fs::write(
-        root.join("compile_commands.json"),
-        serde_json::json!([
-            {"directory": root, "file": "a.cpp", "arguments": ["c++", "-c", "a.cpp"]},
-            {"directory": root, "file": "b.cpp", "arguments": ["c++", "-c", "b.cpp"]}
-        ])
-        .to_string(),
-    )
-    .unwrap();
+    if with_compile_commands {
+        std::fs::write(
+            root.join("compile_commands.json"),
+            serde_json::json!([
+                {"directory": root, "file": "a.cpp", "arguments": ["c++", "-c", "a.cpp"]},
+                {"directory": root, "file": "b.cpp", "arguments": ["c++", "-c", "b.cpp"]}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+    }
     let program = build_program(root, &default_opts(root)).expect("build");
     let defs: Vec<_> = program
         .symbols
@@ -6759,6 +6758,20 @@ void CallerB() {
         .id;
 
     let (_pag, analysis) = analyze(&program);
+
+    for edge in &analysis.call_edges {
+        assert!(
+            program.symbols.function_by_id(edge.caller).is_some(),
+            "edge caller {:?} must exist in program.symbols",
+            edge.caller
+        );
+        assert!(
+            program.symbols.function_by_id(edge.callee).is_some(),
+            "edge callee {:?} must exist in program.symbols",
+            edge.callee
+        );
+    }
+
     let a_file_id = program
         .symbols
         .files
@@ -6825,6 +6838,64 @@ void CallerB() {
         .map(|e| e.callee)
         .collect();
     assert_eq!(edge_b, vec![fn_b]);
+
+    let helpers: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Helper")
+        .collect();
+    assert_eq!(
+        helpers.len(),
+        2,
+        "both translation units must have their own internal Helper function"
+    );
+    let helper_a = helpers.iter().find(|h| h.tu == Some(a_file_id)).unwrap().id;
+    let helper_b = helpers.iter().find(|h| h.tu == Some(b_file_id)).unwrap().id;
+    assert_ne!(helper_a, helper_b);
+
+    let caller_a = program.symbols.resolve_function("CallerA").unwrap();
+    let caller_b = program.symbols.resolve_function("CallerB").unwrap();
+
+    let caller_a_edges: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == caller_a && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(caller_a_edges, vec![helper_a]);
+
+    let helper_a_edges: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == helper_a && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(helper_a_edges, vec![fn_a]);
+
+    let caller_b_edges: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == caller_b && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(caller_b_edges, vec![helper_b]);
+
+    let helper_b_edges: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == helper_b && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(helper_b_edges, vec![fn_b]);
+}
+
+#[test]
+fn regression_call_inside_header_helper_resolves_to_local_def() {
+    // Comment 2: Header-static function calling external function resolves exclusively
+    // to the local definition in the translation unit containing the call.
+    check_header_helper(true);
+    check_header_helper(false);
 }
 
 #[test]

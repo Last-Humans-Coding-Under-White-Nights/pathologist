@@ -7,7 +7,8 @@ use crate::discover::discover_source_files;
 use crate::gn_defines::Candidate;
 use crate::index_cache::{IndexSourceCache, PreprocessedSource};
 use crate::merge::{
-    merge_unit_index, merge_unit_symbols, merge_unit_types, merge_unit_variants, UnitIndex,
+    merge_unit_header_preamble, merge_unit_index, merge_unit_symbols, merge_unit_types,
+    merge_unit_variants, UnitIndex,
 };
 use crate::parse::node_text;
 use rayon::prelude::*;
@@ -916,7 +917,7 @@ fn build_program_inner(
                 if is_dep {
                     merge_unit_symbols(&mut program, unit.as_ref());
                 } else {
-                    merge_unit_index(&mut program, unit.as_ref());
+                    merge_unit_header_preamble(&mut program, unit.as_ref());
                 }
             }
         }
@@ -1719,7 +1720,7 @@ fn project_preprocess_opts(
     eff
 }
 
-fn is_index_header(path: &Path) -> bool {
+pub(crate) fn is_index_header(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
         crate::discover::HEADER_EXTENSIONS
             .iter()
@@ -6965,7 +6966,6 @@ fn emit_member_sites(
     args: CallArgs,
     span: Span,
 ) {
-    let tu = program.symbols.function_by_id(caller).and_then(|f| f.tu);
     let cls = receiver_lookup_name(cls);
     let targets = member_targets_upward(program, &cls, kind);
     emit_member_targets(program, caller, &cls, kind, receiver, args, span, targets);
@@ -6986,6 +6986,7 @@ fn emit_member_targets(
     span: Span,
     targets: Vec<FnId>,
 ) {
+    let tu = program.symbols.function_by_id(caller).and_then(|f| f.tu);
     let mut args = args.bind_past_this(receiver);
     let argc = args.argc;
     let targets = filter_targets_by_argc(program, targets, argc as usize, &args.arg_desc, true);

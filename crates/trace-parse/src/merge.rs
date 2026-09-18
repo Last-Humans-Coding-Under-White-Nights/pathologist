@@ -85,10 +85,11 @@ pub(crate) fn merge_descs_of(types: &trace_ir::TypeTable) -> Vec<Arc<TypeDesc>> 
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MergeMode {
+pub enum MergeMode {
     Full,
     TypesOnly,
     SymbolsOnly,
+    HeaderPreamble,
     Variant,
 }
 
@@ -169,6 +170,10 @@ fn same_call_facts(a: &CallSite, b: &CallSite) -> bool {
 
 pub fn merge_unit_index(program: &mut Program, unit: &UnitIndex) {
     merge_unit(program, unit, MergeMode::Full, None);
+}
+
+pub fn merge_unit_header_preamble(program: &mut Program, unit: &UnitIndex) {
+    merge_unit(program, unit, MergeMode::HeaderPreamble, None);
 }
 
 /// Merge a translation unit together with its configuration variants (#59).
@@ -398,7 +403,10 @@ fn merge_unit(
         }
     }
 
-    if matches!(mode, MergeMode::Full | MergeMode::Variant) {
+    if matches!(
+        mode,
+        MergeMode::Full | MergeMode::HeaderPreamble | MergeMode::Variant
+    ) {
         for diagnostic in &unit.diagnostics {
             let diagnostic = trace_ir::Diagnostic {
                 file: diagnostic.file.map(map_file),
@@ -464,8 +472,16 @@ fn merge_unit(
             dropped_fns.insert(old_id);
             continue;
         }
+        if matches!(mode, MergeMode::HeaderPreamble)
+            && func.linkage == trace_ir::Linkage::Internal
+            && func.is_defined
+            && func.is_cpp
+        {
+            dropped_fns.insert(old_id);
+            continue;
+        }
         let span_file = map_file(func.span.file);
-        let mut canonical = if func.linkage == trace_ir::Linkage::Internal {
+        let mut canonical = if func.linkage == trace_ir::Linkage::Internal && func.is_cpp {
             None
         } else {
             program
@@ -636,7 +652,7 @@ fn merge_unit(
             remap_params.insert(merged);
         }
         fn_map.insert(old_id, merged);
-        if func.linkage != trace_ir::Linkage::Internal {
+        if !(func.linkage == trace_ir::Linkage::Internal && func.is_cpp) {
             program
                 .dedup
                 .insert_fn(span_file, func.name.clone(), func.span.line, merged);
@@ -786,6 +802,18 @@ fn merge_unit(
             }
         }
 
+        if matches!(mode, MergeMode::SymbolsOnly)
+            && var.storage == trace_ir::StorageClass::Local
+            && !mapped_fn_id.is_some_and(|fid| {
+                program
+                    .symbols
+                    .function_by_id(fid)
+                    .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal && f.is_cpp)
+            })
+        {
+            continue;
+        }
+
         let new_id = program.symbols.alloc_var_id();
         let mut v = var.clone();
         let old = v.id;
@@ -854,25 +882,26 @@ fn merge_unit(
         }
     }
 
-    if matches!(mode, MergeMode::SymbolsOnly) {
-        return;
-    }
-
     let mut call_map: FxHashMap<CallSiteId, CallSiteId> = FxHashMap::default();
     for cs in &unit.call_sites {
         if dropped_fns.contains(&cs.caller) {
             continue;
         }
+        let Some(&mapped_caller) = fn_map.get(&cs.caller) else {
+            continue;
+        };
         let span_file = map_file(cs.span.file);
         if program.is_dep_file(span_file) {
             continue;
         }
         let key: SiteKey = (span_file, cs.span.line, cs.span.col, cs.callee_name.clone());
-        let mapped_caller = fn_map.get(&cs.caller).copied().unwrap_or(cs.caller);
         let is_internal_caller = program
             .symbols
             .function_by_id(mapped_caller)
-            .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal);
+            .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal && f.is_cpp);
+        if matches!(mode, MergeMode::SymbolsOnly) && !is_internal_caller {
+            continue;
+        }
         if !matches!(mode, MergeMode::Variant) && !is_internal_caller {
             if let Some(&existing) = program.dedup.site_keys.get(&key) {
                 call_map.insert(cs.id, existing);
@@ -958,9 +987,28 @@ fn merge_unit(
         call_map.insert(old, new_id);
     }
 
+    let valid_flow = |flow: &FlowConstraint| {
+        flow_vars(flow).all(|v| var_map.contains_key(&v))
+            && flow_fns(flow).all(|f| fn_map.contains_key(&f))
+    };
+
+    let is_internal_flow = |flow: &FlowConstraint| {
+        flow_vars(flow).any(|v| {
+            var_map
+                .get(&v)
+                .and_then(|&nv| program.symbols.variable_by_id(nv))
+                .and_then(|var| var.fn_id)
+                .and_then(|fid| program.symbols.function_by_id(fid))
+                .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal && f.is_cpp)
+        })
+    };
+
     if let Some(seen) = variant_dedup {
         for flow in &unit.flow {
-            if !flow_vars(flow).all(|v| var_map.contains_key(&v)) {
+            if matches!(mode, MergeMode::SymbolsOnly) && !is_internal_flow(flow) {
+                continue;
+            }
+            if !valid_flow(flow) {
                 continue;
             }
             let remapped = remap_flow(flow, &fn_map, &var_map);
@@ -970,7 +1018,10 @@ fn merge_unit(
         }
     } else {
         for flow in &unit.flow {
-            if !flow_vars(flow).all(|v| var_map.contains_key(&v)) {
+            if matches!(mode, MergeMode::SymbolsOnly) && !is_internal_flow(flow) {
+                continue;
+            }
+            if !valid_flow(flow) {
                 continue;
             }
             program.flow.push(remap_flow(flow, &fn_map, &var_map));
@@ -991,9 +1042,21 @@ fn merge_unit(
         {
             continue;
         }
+        if matches!(mode, MergeMode::SymbolsOnly) {
+            let is_internal = program
+                .symbols
+                .function_by_id(new_fn)
+                .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal && f.is_cpp);
+            if !is_internal {
+                continue;
+            }
+        }
         let remapped: Vec<ReturnFlow> = flows
             .iter()
-            .filter(|f| return_flow_vars(f).all(|v| var_map.contains_key(&v)))
+            .filter(|f| {
+                return_flow_vars(f).all(|v| var_map.contains_key(&v))
+                    && return_flow_fns(f).all(|callee| fn_map.contains_key(&callee))
+            })
             .map(|f| remap_return_flow(f, &fn_map, &var_map))
             .collect();
         let target = program.fn_returns.entry(new_fn).or_default();
@@ -1030,11 +1093,29 @@ fn flow_vars(flow: &FlowConstraint) -> impl Iterator<Item = VarId> + '_ {
     .into_iter()
 }
 
+fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> + '_ {
+    match flow {
+        FlowConstraint::AddrOfFn { callee, .. } | FlowConstraint::ArrayFnMember { callee, .. } => {
+            vec![*callee]
+        }
+        _ => Vec::new(),
+    }
+    .into_iter()
+}
+
 fn return_flow_vars(flow: &ReturnFlow) -> impl Iterator<Item = VarId> + '_ {
     match flow {
         ReturnFlow::AddrOfVar { src } => vec![*src],
         ReturnFlow::Copy { src } => vec![*src],
         ReturnFlow::AddrOfFn { .. } | ReturnFlow::Call { .. } => Vec::new(),
+    }
+    .into_iter()
+}
+
+fn return_flow_fns(flow: &ReturnFlow) -> impl Iterator<Item = FnId> + '_ {
+    match flow {
+        ReturnFlow::AddrOfFn { callee } => vec![*callee],
+        _ => Vec::new(),
     }
     .into_iter()
 }
