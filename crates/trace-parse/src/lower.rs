@@ -12,7 +12,8 @@ use crate::merge::{
 use crate::parse::node_text;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::cell::RefCell;
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -77,6 +78,9 @@ struct LowerContext {
     /// fall back to TU-anchored spans.
     line_map: Option<std::sync::Arc<trace_preproc::LineMap>>,
     primary_path: PathBuf,
+    /// Lazy LineMap file-index -> symbol file ID. Preserve first-encounter
+    /// interning order while avoiding path comparisons/hashing per span.
+    origin_file_ids: Vec<Cell<Option<trace_ir::FileId>>>,
     /// Function references deferred to end-of-unit resolution.
     /// `RefCell` keeps `&LowerContext` receivers usable in expression
     /// helpers while still allowing deferred entries to be recorded.
@@ -117,6 +121,9 @@ struct LowerContext {
     /// through `resolve_callee` names its receiver variable, which a cached
     /// bare `None` would have dropped.
     callee_load_cache: RefCell<HashMap<usize, CalleeRef>>,
+    /// A call node has one lexical scope and static return type. Reuse
+    /// receiver probes across outer-chain lookup and the body's later walk.
+    call_receiver_cache: RefCell<HashMap<usize, TypeDesc>>,
     /// `call_expression` node id → `CallReturn` destination, so the matching
     /// `CallSite` can carry `return_dst` for `dlsym` models.
     call_return_dst: RefCell<HashMap<usize, VarId>>,
@@ -2231,6 +2238,7 @@ fn lower_prepared_source(
         locals: HashMap::default(),
         line_map: Some(std::sync::Arc::clone(&pre.line_map)),
         primary_path: self_canon,
+        origin_file_ids: vec![Cell::new(None); pre.line_map.files.len()],
         pending: RefCell::new(Vec::new()),
         ns_stack: Vec::new(),
         using_nss: Vec::new(),
@@ -2241,6 +2249,7 @@ fn lower_prepared_source(
         is_cpp,
         handled_new_exprs: RefCell::new(HashSet::default()),
         callee_load_cache: RefCell::new(HashMap::default()),
+        call_receiver_cache: RefCell::new(HashMap::default()),
         call_return_dst: RefCell::new(HashMap::default()),
         ast_depth: 0,
         ast_depth_warned: false,
@@ -2472,6 +2481,7 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
         inheritance,
         template_bases: std::mem::take(&mut program.template_bases),
         arrow_returns: std::mem::take(&mut program.arrow_returns),
+        template_returns: std::mem::take(&mut program.template_returns),
         final_classes: std::mem::take(&mut program.final_classes),
         anonymous_classes: std::mem::take(&mut program.anonymous_classes),
         anonymous_final_classes: std::mem::take(&mut program.anonymous_final_classes),
@@ -3012,17 +3022,28 @@ fn lower_struct_specifier(
                         | "namespace_identifier"
                 ) {
                     let base_text = node_text(source, &base);
+                    let raw = normalize_qualified(base_text);
+                    let short = strip_template_args(&raw);
+                    // A base clause names a class, and names it through a
+                    // `using namespace` directive as readily as through the
+                    // enclosing scopes — which are asked first, as always.
+                    let through_directive = declared_class_in_scope(program, ctx, &short)
+                        .is_none()
+                        .then(|| class_seen_from(program, ctx, &short))
+                        .flatten();
                     let template_spelling = normalize_template_spelling(base_text);
-                    if template_spelling.contains('<') {
+                    if let Some(at) = template_spelling.find('<') {
                         let qualified = if template_spelling.contains("::") {
                             template_spelling
+                        } else if let Some(cls) = &through_directive {
+                            format!("{cls}{}", &template_spelling[at..])
                         } else {
                             ctx.qualify(&template_spelling)
                         };
                         program.add_template_base(&derived, &qualified, &ctx.namespace_scope());
                     }
-                    let raw = normalize_qualified(base_text);
-                    let base = qualify_class_name(program, ctx, &strip_template_args(&raw));
+                    let base = through_directive
+                        .unwrap_or_else(|| qualify_class_name(program, ctx, &short));
                     if let Some(file) = anonymous_in {
                         program.add_anonymous_base(&derived, file, &base);
                     }
@@ -3602,7 +3623,7 @@ fn register_member_prototype(
         .child_by_field_name("type")
         .map(|t| parse_type_node(program, ctx, source, t))
         .unwrap_or_else(|| program.types.void());
-    let ret_type = declared_return_type(program, ctx, source, node, ret_type);
+    let ret_type = declared_return_type(program, ctx, source, node, ret_type, &full_name);
     program.symbols.add_function(Function {
         is_weak: false,
         target: None,
@@ -3816,13 +3837,22 @@ fn lower_function_signature(
     if raw_name.is_empty() {
         return None;
     }
-    let name = ctx.qualify_decl(&raw_name);
+    let mut name = ctx.qualify_decl(&raw_name);
     // Out-of-class member definitions (`void Cls::f() {}`, ctors, dtors):
     // recover the owning class from the longest `::`-prefix that names a
-    // known class type.
+    // known class type — or, when none does, the class a `using namespace`
+    // directive brings the prefix to. hdf's hc-gen writes
+    // `AstObject::IsNode()` under `using namespace OHOS::Hardware`; that
+    // defines `OHOS::Hardware::AstObject::IsNode`, where the header declared
+    // it, and the definition merges into the prototype's entry.
     let eff_class: Option<String> = match &ctx.class_ctx {
         Some(c) => Some(c.qual_name.clone()),
-        None => derive_owner_class(program, &name),
+        None => derive_owner_class(program, &name).or_else(|| {
+            let (prefix, member) = name.rsplit_once("::")?;
+            let cls = class_seen_from(program, ctx, prefix)?;
+            name = format!("{cls}::{member}");
+            Some(cls)
+        }),
     };
     if let Some(prefix) = name.strip_suffix("::operator->") {
         // Without the class header in the tree there is no tag to derive
@@ -3842,7 +3872,7 @@ fn lower_function_signature(
             None => program.types.int(),
         },
     };
-    let ret_type = declared_return_type(program, ctx, source, node, ret_type);
+    let ret_type = declared_return_type(program, ctx, source, node, ret_type, &name);
     let provisional_id = program.symbols.alloc_fn_id();
     let provisional_start = (
         program.symbols.variables.len(),
@@ -4266,7 +4296,19 @@ fn auto_initializer_type(
 ) -> Option<TypeDesc> {
     let value = peel_expression(value);
     let desc = if value.kind() == "call_expression" {
-        call_result_type(program, ctx, source, value)?
+        match call_result_shape(program, ctx, source, value)? {
+            CallResult::Decided(desc) => desc?,
+            CallResult::Overload {
+                candidates,
+                receiver,
+            } => {
+                let args: Vec<TypeDesc> = call_arg_nodes(value)
+                    .into_iter()
+                    .map(|arg| arg_expr_type(program, ctx, source, arg))
+                    .collect();
+                call_result_among(program, ctx, source, value, candidates, receiver, &args)?
+            }
+        }
     } else {
         // A cast or `new` spells its type in the source; any other expression
         // has the type lowering gave its variable or field.
@@ -4299,67 +4341,122 @@ fn auto_initializer_type(
     receiver_type(program, ctx, desc)
 }
 
-/// The type a call expression yields, when one declaration decides it.
-fn call_result_type(
-    program: &mut Program,
-    ctx: &mut LowerContext,
+/// The argument expressions of a call, in the positions overload ranking
+/// counts them by. A comment is not an argument; [`collect_call_args`] reads
+/// the same list off the punctuation, for the arguments lowering emits.
+fn call_arg_nodes(call: Node) -> Vec<Node> {
+    match call.child_by_field_name("arguments") {
+        Some(list) => list
+            .named_children(&mut list.walk())
+            .filter(|n| n.kind() != "comment")
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// What a call expression's result type is decided by, before any argument
+/// is typed. Typing an argument probes receivers and, at a cast, interns a
+/// type, so a caller types them only for a shape that reads them: the
+/// two-phase form of "the type a call yields, when one declaration decides it".
+enum CallResult {
+    /// The callee's shape alone decides the type — or that there is none.
+    Decided(Option<TypeDesc>),
+    /// One of several declarations' return types, chosen by argument types.
+    Overload {
+        candidates: Overloads,
+        /// The receiver's spelling: the class template whose arguments a
+        /// member's bare-parameter return substitutes.
+        receiver: Option<String>,
+    },
+}
+
+/// The declarations a call's result is chosen among.
+enum Overloads {
+    Declared(Vec<FnId>),
+    /// A free function looked up by name once the argument types are known:
+    /// argument-dependent lookup reads them.
+    ByName(String),
+}
+
+/// The first phase of [`CallResult`]: everything the callee's shape decides.
+/// `None` when the call has no result type at all — the callee is a variable,
+/// or the receiver cannot be typed.
+fn call_result_shape(
+    program: &Program,
+    ctx: &LowerContext,
     source: &str,
     value: Node,
-) -> Option<TypeDesc> {
+) -> Option<CallResult> {
     // Kinds are read off the callee as written, as collect_call_at_node reads
     // them: a parenthesized name is not a bare name.
     let func = value.child_by_field_name("function")?;
     let raw = normalize_spacing(node_text(source, &func));
     let name = strip_template_args(&raw);
     if let Some(wrapper) = smart_ptr_factory(ctx, &name) {
-        return smart_ptr_type(program, ctx, source, value, wrapper, &raw, Spelling::Source);
+        return Some(CallResult::Decided(smart_ptr_type(
+            program,
+            ctx,
+            source,
+            value,
+            wrapper,
+            &raw,
+            Spelling::Source,
+        )));
     }
     if matches!(func.kind(), "identifier" | "qualified_identifier") {
         let spelled = normalize_qualified(node_text(source, &func));
         if lookup_var(ctx, program, &spelled).is_none() {
             // `T(args)` constructs a `T`, as the call site reads it.
             if let Some(cls) = constructed_class(program, ctx, &spelled) {
-                return (!spelling_is_dependent(ctx, source, value, &spelled, Spelling::Source))
+                let desc = (!spelling_is_dependent(ctx, source, value, &spelled, Spelling::Source))
                     .then_some(TypeDesc::Struct {
                         name: cls,
                         fields: Vec::new(),
                     });
+                return Some(CallResult::Decided(desc));
             }
         }
     }
-    let args: Vec<TypeDesc> = match value.child_by_field_name("arguments") {
-        Some(list) => list
-            .named_children(&mut list.walk())
-            .filter(|n| n.kind() != "comment")
-            .map(|arg| arg_expr_type(program, ctx, source, arg))
-            .collect(),
-        None => Vec::new(),
-    };
+    let mut receiver = None;
     let candidates = if func.kind() == "field_expression" {
         let recv = func.child_by_field_name("argument")?;
         let field = normalize_qualified(node_text(source, &func.child_by_field_name("field")?));
         let arrow = is_arrow_access(func);
-        if args.is_empty() && !arrow {
-            if let Some(TypeDesc::Struct { name, .. }) = receiver_desc(program, ctx, source, recv) {
-                if let Some(strong) = weak_ptr_upgrade(program, &name, &field) {
-                    return smart_ptr_type(
+        let desc = receiver_desc(program, ctx, source, recv)?;
+        if !arrow && call_arg_nodes(value).is_empty() {
+            if let TypeDesc::Struct { name, .. } = &desc {
+                if let Some(strong) = weak_ptr_upgrade(program, name, &field) {
+                    return Some(CallResult::Decided(smart_ptr_type(
                         program,
                         ctx,
                         source,
                         value,
                         &strong,
-                        &name,
+                        name,
                         Spelling::Lowered,
-                    );
+                    )));
                 }
             }
         }
-        let cls = member_receiver_class(program, ctx, source, recv, arrow)?;
-        declared_members_upward(
+        // Under its pointer layers, as `class_name_of_desc` reads it: `h->Get()`
+        // substitutes on the same class template `h.Get()` does.
+        let mut under = &desc;
+        while let TypeDesc::Ptr(inner) = under {
+            under = inner;
+        }
+        if let TypeDesc::Struct { name, .. } = under {
+            receiver = Some(name.clone());
+        }
+        let cls = if arrow {
+            resolve_operator_arrow(program, desc)?
+        } else {
+            class_name_of_desc(&desc)?
+        };
+        Overloads::Declared(declared_members_upward(
             program,
             &cls,
             &trace_ir::MethodKind::Named(strip_template_args(&field)),
-        )
+        ))
     } else {
         let (name, _, var) = resolve_callee(program, ctx, source, func);
         if var.is_some() {
@@ -4376,9 +4473,36 @@ fn call_result_type(
             _ => Vec::new(),
         };
         if members.is_empty() {
-            cpp_callee_candidates(program, ctx, func, &name, &args)
+            Overloads::ByName(name)
         } else {
-            members
+            // `Get()` in a member body is `this->Get()`, so the enclosing
+            // class is the receiver a base's substitution facts apply to.
+            receiver = ctx.class_ctx.as_ref().map(|cc| cc.qual_name.clone());
+            Overloads::Declared(members)
+        }
+    };
+    Some(CallResult::Overload {
+        candidates,
+        receiver,
+    })
+}
+
+/// The second phase of [`CallResult`]: the one return type the candidates
+/// that take `args` agree on.
+fn call_result_among(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    value: Node,
+    candidates: Overloads,
+    receiver: Option<String>,
+    args: &[TypeDesc],
+) -> Option<TypeDesc> {
+    let candidates = match candidates {
+        Overloads::Declared(found) => found,
+        Overloads::ByName(name) => {
+            let func = value.child_by_field_name("function")?;
+            cpp_callee_candidates(program, ctx, func, &name, args)
         }
     };
     // A member of a template parameter -- the receiver's class (`T *t`), the
@@ -4396,25 +4520,122 @@ fn call_result_type(
             return None;
         }
     }
-    let candidates =
-        filter_targets_by_argc(program, candidates, args.len(), &args, args.is_empty());
+    let candidates = filter_targets_by_argc(program, candidates, args.len(), args, args.is_empty());
     // Unknown arguments score as ties in call-edge ranking, so they rank
     // nothing out. The candidates left must all take the arguments and agree
     // on one return type; a partial match is no evidence for one of several.
     let candidates = if args.contains(&TypeDesc::Unknown) {
         candidates
     } else {
-        rank_overloads(program, &candidates, &args)
+        rank_overloads(program, &candidates, args)
     };
-    let mut returns = candidates.iter().map(|&f| {
+    agreed(candidates.iter().map(|&f| {
         let function = program.symbols.function(f);
-        method_explicit_arity(program, f)
-            .filter(|&arity| arity_takes(function, arity, args.len()))
-            .map(|_| program.types.get(function.return_type).desc.as_ref())
-    });
-    let first = returns.next()??;
-    (!matches!(first, TypeDesc::Unknown) && returns.all(|desc| desc == Some(first)))
-        .then(|| first.clone())
+        let arity = method_explicit_arity(program, f)?;
+        if !arity_takes(function, arity, args.len()) {
+            return None;
+        }
+        let desc = program.types.get(function.return_type).desc.as_ref();
+        if !matches!(desc, TypeDesc::Unknown) {
+            return Some(desc.clone());
+        }
+        substituted_template_return(program, ctx, receiver.as_deref()?, &function.name, arity)
+    }))
+}
+
+/// The one value a candidate set agrees on: nothing when it is empty, when a
+/// candidate names no value, or when two candidates disagree. A partial match
+/// is no evidence for one of several.
+fn agreed<T: PartialEq>(mut candidates: impl Iterator<Item = Option<T>>) -> Option<T> {
+    let first = candidates.next()??;
+    candidates
+        .all(|value| value.as_ref() == Some(&first))
+        .then_some(first)
+}
+
+/// What a class-template member declared to return a bare type parameter
+/// yields for a receiver that names its arguments: `Holder<Widget *>::Get`
+/// returns `Widget *`. Substitution facts are shared by same-name
+/// declarations (in-class prototypes carry no parameter types), so the
+/// same-arity ones must agree on one return.
+///
+/// The facts belong to the class that declares `member`, which a receiver
+/// inherits it from (`struct Adapter : Holder<Widget *>`) as readily as it
+/// spells it. The arguments to substitute are then the ones the receiver's
+/// own spelling carries, or the ones its base spelling names.
+fn substituted_template_return(
+    program: &Program,
+    ctx: &LowerContext,
+    receiver: &str,
+    member: &str,
+    arity: usize,
+) -> Option<TypeDesc> {
+    let (owner, _) = member.rsplit_once("::")?;
+    let facts = program.template_returns_of(owner, member)?;
+    let args = template_arguments_for(program, receiver, owner);
+    agreed(
+        facts
+            .iter()
+            .filter(|fact| fact.arity as usize == arity)
+            .map(|fact| substituted_parameter(program, ctx, &args, fact)),
+    )
+}
+
+/// The template arguments `receiver` gives `owner`: its own, when it spells
+/// that class template, else those of the base it inherits `owner` through.
+/// Only a base spelled with arguments substitutes; `struct D : Holder<T>`
+/// inside another template names no concrete type to substitute.
+fn template_arguments_for(program: &Program, receiver: &str, owner: &str) -> Vec<String> {
+    let cls = receiver_lookup_name(receiver);
+    if cls == owner {
+        return template_arguments(receiver);
+    }
+    // However many classes up, walked as `declared_members_upward` walks them.
+    let mut queue = std::collections::VecDeque::from([cls.into_owned()]);
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(cur) = queue.pop_front() {
+        if let Some(base) = program
+            .template_bases_of(&cur)
+            .iter()
+            .find(|base| receiver_lookup_name(&base.spelling) == owner)
+        {
+            return template_arguments(&base.spelling);
+        }
+        for base in program.bases_of(&cur) {
+            if seen.len() < MAX_BASE_LOOKUP && seen.insert(base.clone()) {
+                queue.push_back(base);
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// One fact substituted: the template argument at the parameter position it
+/// records, under the pointer layers the argument spells plus the ones the
+/// declaration adds (`T *Get()`). An argument naming no class in view is no
+/// receiver type, so it yields nothing rather than a name to invent members on.
+fn substituted_parameter(
+    program: &Program,
+    ctx: &LowerContext,
+    args: &[String],
+    fact: &trace_ir::TemplateReturn,
+) -> Option<TypeDesc> {
+    let (base, suffix) = split_pointer_suffix(args.get(fact.parameter?)?);
+    let base = sanitize_type_name(base);
+    // An argument is spelled where the receiver or its base is written, not
+    // where its class is declared, so it resolves from this scope through the
+    // same helper a smart pointer's argument does. Its own template arguments
+    // are kept, so a nested `Holder<Holder<T>>` substitutes again.
+    let name = held_class(program, ctx, &base)
+        .or_else(|| is_std_smart_ptr_name(&receiver_lookup_name(&base)).then(|| base.clone()))?;
+    let mut desc = TypeDesc::Struct {
+        name,
+        fields: Vec::new(),
+    };
+    for _ in 0..suffix.matches('*').count() + fact.pointer_depth {
+        desc = TypeDesc::Ptr(Box::new(desc));
+    }
+    Some(desc)
 }
 
 /// `desc` when it can type a receiver: a class, union or function pointer
@@ -4432,7 +4653,7 @@ fn receiver_type(program: &Program, ctx: &LowerContext, desc: TypeDesc) -> Optio
         TypeDesc::Struct { ref name, .. } if is_std_smart_ptr_name(&receiver_lookup_name(name)) => {
             let held = template_arguments(name)
                 .first()
-                .map(|arg| receiver_lookup_name(arg.trim()));
+                .map(|arg| receiver_lookup_name(arg.trim()).into_owned());
             let ambiguous = held.is_some_and(|held| {
                 declared_class_name(program, &held).is_none()
                     && class_seen_from(program, ctx, &held).is_some_and(|seen| seen != held)
@@ -4657,25 +4878,32 @@ fn spelling_mentions(spelling: &str, from: Spelling, name: &str) -> bool {
     })
 }
 
-/// Template return types require substitution, which C1 deliberately does
-/// not attempt. Check names in all enclosing template parameter lists.
+/// Dependent returns stay unknown in the shared function signature. Bare
+/// class parameters have separate substitution facts for concrete receivers.
+/// Check names in all enclosing template parameter lists.
 fn return_is_dependent(ctx: &LowerContext, source: &str, node: Node) -> bool {
-    if !ctx.has_templates {
-        return false;
-    }
+    ctx.has_templates
+        && return_is_dependent_under(source, &ancestors(ctx, node).collect::<Vec<_>>(), node)
+}
+
+/// [`return_is_dependent`] against an ancestor path already walked.
+/// `ancestors` rescans from the root once per level, so a caller with more
+/// than one question about the enclosing templates walks it once.
+fn return_is_dependent_under(source: &str, path: &[Node], node: Node) -> bool {
     // The declaration whose `type` is the return type: `node` itself, or the
     // nearest ancestor with one (a prototype's declarator sits under it).
-    let mut path: Vec<Node> = ancestors(ctx, node).collect();
-    path.push(node);
-    let Some((at, ty)) = path
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(i, n)| Some((i, n.child_by_field_name("type")?)))
+    let Some((enclosing, ty)) = node
+        .child_by_field_name("type")
+        .map(|ty| (path, ty))
+        .or_else(|| {
+            path.iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, n)| Some((&path[..i], n.child_by_field_name("type")?)))
+        })
     else {
         return false;
     };
-    let enclosing = &path[..at];
     enclosing.iter().any(|n| n.kind() == "template_declaration")
         && spelling_names_dependent_type(source, enclosing, node_text(source, &ty), 0)
 }
@@ -4748,20 +4976,92 @@ fn type_is_dependent(ctx: &LowerContext, source: &str, node: Node, desc: &TypeDe
     }
 }
 
+/// Only a bare parameter of the owning class template can be substituted.
+/// Function templates and dependent compound types remain unknown. `path` is
+/// `node`'s ancestors and `pointer_depth` its declarator's pointer layers,
+/// both already computed by [`declared_return_type`].
+fn register_template_return(
+    program: &mut Program,
+    source: &str,
+    path: &[Node],
+    node: Node,
+    name: &str,
+    pointer_depth: usize,
+) {
+    let Some((owner, _)) = name.rsplit_once("::") else {
+        return;
+    };
+    let Some(ty) = node.child_by_field_name("type") else {
+        return;
+    };
+    let spelling = node_text(source, &ty).trim();
+    let Some((depth, template, class)) = path
+        .iter()
+        .rev()
+        .filter(|n| n.kind() == "template_declaration")
+        .enumerate()
+        .find_map(|(depth, template)| {
+            let class = template
+                .named_children(&mut template.walk())
+                .find(|n| matches!(n.kind(), "class_specifier" | "struct_specifier"))?;
+            Some((depth, *template, class))
+        })
+    else {
+        return;
+    };
+    let Some(class_name) = class.child_by_field_name("name") else {
+        return;
+    };
+    if node_text(source, &class_name) != last_type_segment(owner) {
+        return;
+    }
+    let Some(params) = template.child_by_field_name("parameters") else {
+        return;
+    };
+    // Facts are shared by same-name/same-arity declarations. An unsupported
+    // overload must block substitution, not borrow another overload's return.
+    let parameter = (depth == 0)
+        .then(|| {
+            template_parameter_names(source, params)
+                .iter()
+                .position(|p| *p == Some(spelling))
+        })
+        .flatten();
+    let arity = find_params(node).map_or(0, |p| declared_param_counts(source, p).0);
+    let fact = trace_ir::TemplateReturn {
+        arity,
+        parameter,
+        pointer_depth,
+    };
+    program.add_template_return(owner, name, &fact);
+}
+
 fn declared_return_type(
     program: &mut Program,
     ctx: &LowerContext,
     source: &str,
     node: Node,
     base: trace_ir::TypeId,
+    name: &str,
 ) -> trace_ir::TypeId {
-    if return_is_dependent(ctx, source, node) {
-        return program.types.unknown();
-    }
     let depth = node
         .child_by_field_name("declarator")
         .and_then(fn_decl_under_pointer)
         .map_or(0, |(_, depth, _)| depth);
+    if !ctx.has_templates {
+        return pointer_layers(program, base, depth);
+    }
+    // One ancestor walk answers both questions the enclosing templates
+    // decide: whether the return is dependent, and which parameter a
+    // concrete receiver substitutes for it.
+    let path: Vec<Node> = ancestors(ctx, node).collect();
+    let dependent = return_is_dependent_under(source, &path, node);
+    if dependent || matches!(program.types.get(base).desc.as_ref(), TypeDesc::Unknown) {
+        register_template_return(program, source, &path, node, name, depth);
+    }
+    if dependent {
+        return program.types.unknown();
+    }
     pointer_layers(program, base, depth)
 }
 
@@ -5682,13 +5982,94 @@ fn collect_call_at_node(
                         })
                     {
                         // `p->m()` looks `m` up on what `p`'s `operator->`
-                        // yields, not on `p`'s own class (#64).
-                        let Some(cls) =
-                            member_receiver_class(program, ctx, source, recv, op_is_arrow)
-                        else {
-                            // The wrapper's `operator->` names no class, so
-                            // neither does `m`. Record the site unresolved
-                            // instead of inventing a member on the wrapper.
+                        // yields, not on `p`'s own class (#64). `r.m()` looks
+                        // it up on `r`'s own class, which is already in hand.
+                        let cls = if op_is_arrow {
+                            let Some(cls) = member_receiver_class(program, ctx, source, recv, true)
+                            else {
+                                // The wrapper's `operator->` names no class, so
+                                // neither does `m`. Record the site unresolved
+                                // instead of inventing a member on the wrapper.
+                                let call_args = collect_call_args(
+                                    program,
+                                    ctx,
+                                    source,
+                                    node.child_by_field_name("arguments"),
+                                );
+                                emit_unresolved_site(
+                                    program,
+                                    caller,
+                                    field_callee_text(source, func),
+                                    recv_cls,
+                                    call_args,
+                                    span,
+                                );
+                                return;
+                            };
+                            cls
+                        } else {
+                            recv_cls
+                        };
+                        // The name the index holds the class under. A receiver
+                        // spelled with its template arguments — which a class
+                        // template with substitution facts keeps — would
+                        // otherwise miss every member it declares.
+                        let cls = receiver_lookup_name(&cls).into_owned();
+                        let kind = if field.kind() == "destructor_name" {
+                            trace_ir::MethodKind::Dtor
+                        } else {
+                            trace_ir::MethodKind::Named(strip_template_args(&normalize_qualified(
+                                node_text(source, &field),
+                            )))
+                        };
+                        let targets = member_targets_upward(program, &cls, &kind);
+                        if !targets.is_empty() {
+                            let call_args = collect_call_args(
+                                program,
+                                ctx,
+                                source,
+                                node.child_by_field_name("arguments"),
+                            );
+                            emit_member_targets(
+                                program, caller, &cls, &kind, None, call_args, span, targets,
+                            );
+                            return;
+                        }
+                        // Functor field: `h->cb()` where `cb` is a class
+                        // with `operator()`, not a method named `cb`.
+                        if let Some(field_cls) = infer_static_class(program, ctx, source, func) {
+                            let field_cls = receiver_lookup_name(&field_cls).into_owned();
+                            let op = trace_ir::MethodKind::Named("operator()".to_string());
+                            let field_targets = member_targets_upward(program, &field_cls, &op);
+                            if !field_targets.is_empty() {
+                                let call_args = collect_call_args(
+                                    program,
+                                    ctx,
+                                    source,
+                                    node.child_by_field_name("arguments"),
+                                );
+                                emit_member_targets(
+                                    program,
+                                    caller,
+                                    &field_cls,
+                                    &op,
+                                    None,
+                                    call_args,
+                                    span,
+                                    field_targets,
+                                );
+                                return;
+                            }
+                        }
+                        // Callable data members (`std::function`, fn-ptr
+                        // fields) are not methods: fall through to the
+                        // generic field-load path so they resolve like
+                        // C function pointers. Anything else names no member
+                        // of the class, so the site stays unresolved and the
+                        // solver synthesizes an external entry for it.
+                        let field_name =
+                            strip_template_args(&normalize_qualified(node_text(source, &field)));
+                        if !class_has_data_field(program, &cls, &field_name) {
                             let call_args = collect_call_args(
                                 program,
                                 ctx,
@@ -5698,62 +6079,11 @@ fn collect_call_at_node(
                             emit_unresolved_site(
                                 program,
                                 caller,
-                                field_callee_text(source, func),
-                                recv_cls,
+                                kind.name_on(&cls),
+                                cls,
                                 call_args,
                                 span,
                             );
-                            return;
-                        };
-                        let kind = if field.kind() == "destructor_name" {
-                            trace_ir::MethodKind::Dtor
-                        } else {
-                            trace_ir::MethodKind::Named(strip_template_args(&normalize_qualified(
-                                node_text(source, &field),
-                            )))
-                        };
-                        let field_name =
-                            strip_template_args(&normalize_qualified(node_text(source, &field)));
-                        let has_method = !member_targets_upward(program, &cls, &kind).is_empty();
-                        if has_method {
-                            let call_args = collect_call_args(
-                                program,
-                                ctx,
-                                source,
-                                node.child_by_field_name("arguments"),
-                            );
-                            emit_member_sites(program, caller, &cls, &kind, None, call_args, span);
-                            return;
-                        }
-                        // Functor field: `h->cb()` where `cb` is a class
-                        // with `operator()`, not a method named `cb`.
-                        if let Some(field_cls) = infer_static_class(program, ctx, source, func) {
-                            let op = trace_ir::MethodKind::Named("operator()".to_string());
-                            if !member_targets_upward(program, &field_cls, &op).is_empty() {
-                                let call_args = collect_call_args(
-                                    program,
-                                    ctx,
-                                    source,
-                                    node.child_by_field_name("arguments"),
-                                );
-                                emit_member_sites(
-                                    program, caller, &field_cls, &op, None, call_args, span,
-                                );
-                                return;
-                            }
-                        }
-                        // Callable data members (`std::function`, fn-ptr
-                        // fields) are not methods: fall through to the
-                        // generic field-load path so they resolve like
-                        // C function pointers.
-                        if !class_has_data_field(program, &cls, &field_name) {
-                            let call_args = collect_call_args(
-                                program,
-                                ctx,
-                                source,
-                                node.child_by_field_name("arguments"),
-                            );
-                            emit_member_sites(program, caller, &cls, &kind, None, call_args, span);
                             return;
                         }
                     }
@@ -5767,17 +6097,21 @@ fn collect_call_at_node(
     // unqualified external stub (`OnEvent` vs `Plugin::OnEvent`).
     if ctx.is_cpp && func.kind() == "identifier" {
         if let Some(cls) = ctx.class_ctx.as_ref().map(|c| c.qual_name.clone()) {
+            let cls = receiver_lookup_name(&cls).into_owned();
             let short = strip_template_args(&normalize_qualified(node_text(source, &func)));
             if lookup_var(ctx, program, &short).is_none() {
                 let kind = trace_ir::MethodKind::Named(short);
-                if !member_targets_upward(program, &cls, &kind).is_empty() {
+                let targets = member_targets_upward(program, &cls, &kind);
+                if !targets.is_empty() {
                     let call_args = collect_call_args(
                         program,
                         ctx,
                         source,
                         node.child_by_field_name("arguments"),
                     );
-                    emit_member_sites(program, caller, &cls, &kind, None, call_args, span);
+                    emit_member_targets(
+                        program, caller, &cls, &kind, None, call_args, span, targets,
+                    );
                     return;
                 }
             }
@@ -5835,7 +6169,8 @@ fn collect_call_at_node(
     //     (global, enclosing namespaces, `using namespace` directives)
     //     merged with ADL namespaces drawn from the argument types, so
     //     `std::swap(a, b)` and cross-namespace free functions resolve;
-    //   * qualified names (`ns::f`): exact lookup over the candidates.
+    //   * qualified names (`ns::f`): enclosing-scope lookup, with `::`
+    //     restricting lookup to the global scope.
     // Arity filters the set; an arity-filtered empty set falls back to every
     // candidate so varargs declarations keep their targets. When several
     // same-arity overloads survive, rank them by argument/parameter types so
@@ -5885,11 +6220,7 @@ fn collect_call_at_node(
     // function reached by its qualified name is `this`.
     for (i, &t) in chosen.iter().enumerate() {
         let is_last = i + 1 == chosen.len();
-        let site_args = if is_last {
-            std::mem::replace(&mut args, CallArgs::empty())
-        } else {
-            args.clone()
-        };
+        let site_args = args.take_for(is_last);
         let bound = argc > 0 && ctx.is_cpp && is_member_function(program, t);
         let site_args = if bound {
             site_args.bind_past_this(None)
@@ -5960,6 +6291,16 @@ impl CallArgs {
             addr_of_member_args: Vec::new(),
             argc: 0,
             arg_desc: Vec::new(),
+        }
+    }
+
+    /// One argument list for each of several sites emitted from one call: the
+    /// last site takes it, the ones before it copy.
+    fn take_for(&mut self, last: bool) -> Self {
+        if last {
+            std::mem::replace(self, Self::empty())
+        } else {
+            self.clone()
         }
     }
 }
@@ -6084,6 +6425,10 @@ fn arg_expr_type(
     source: &str,
     node: Node,
 ) -> TypeDesc {
+    // A parenthesized cast is the same argument as a bare one, and
+    // `known_arg_type` peels before it answers. Reading the kind off the
+    // unpeeled node ranked `f((T)x)` and `f(((T)x))` differently.
+    let node = peel_expression(node);
     match node.kind() {
         "cast_expression" => {
             if let Some(ty) = node.child_by_field_name("type") {
@@ -6107,6 +6452,16 @@ fn arg_expr_type(
             }
             TypeDesc::Unknown
         }
+        _ => known_arg_type(program, ctx, source, node),
+    }
+}
+
+fn known_arg_type(program: &Program, ctx: &LowerContext, source: &str, node: Node) -> TypeDesc {
+    let node = peel_expression(node);
+    match node.kind() {
+        // A cast's operand type is not the type of the expression. Probing
+        // a receiver cannot register a new type, so keep it unknown.
+        "cast_expression" => TypeDesc::Unknown,
         "number_literal" => number_literal_desc(node_text(source, &node)),
         "char_literal" => TypeDesc::Char,
         "true" | "false" => TypeDesc::Bool,
@@ -6238,8 +6593,7 @@ fn param_match_rank(arg: &TypeDesc, param: &TypeDesc) -> usize {
 
 /// True when the callee is a bare unqualified identifier — the only shape
 /// to which ADL and `using`/`using namespace` lookup apply. Qualified
-/// identifiers (`ns::f`) and template/field/pointer callees keep exact
-/// lookup.
+/// identifiers (`ns::f`) and template/field/pointer callees do not use ADL.
 ///
 /// `template_function` is included because `resolve_callee` already strips
 /// the `<...>` argument list, so the `callee_name` passed to
@@ -6251,7 +6605,8 @@ fn is_bare_callee_node(func: tree_sitter::Node) -> bool {
 }
 
 /// The functions a C++ callee `func`, spelled `name`, may call: ordinary and
-/// argument-dependent lookup for a bare name, exact lookup for a qualified one.
+/// argument-dependent lookup for a bare name, enclosing-scope lookup for a
+/// qualified name (global-only when it starts with `::`).
 fn cpp_callee_candidates(
     program: &Program,
     ctx: &LowerContext,
@@ -6261,6 +6616,31 @@ fn cpp_callee_candidates(
 ) -> Vec<FnId> {
     if is_bare_callee_node(func) {
         resolve_cpp_name_candidates(program, ctx, name, arg_desc)
+    } else if func.kind() == "qualified_identifier" {
+        let lookup = |candidate: &str| {
+            let found = program
+                .symbols
+                .resolve_function_candidates(candidate, Some(ctx.current_file));
+            (!found.is_empty()).then_some(found)
+        };
+        find_in_scope(program, ctx, name, |candidate, _| lookup(candidate))
+            .or_else(|| {
+                // A `using namespace` directive makes the namespace's own
+                // scopes visible too, so `Service::Write()` under
+                // `using namespace app` names `app::Service::Write` — as the
+                // bare-name path already resolves `Write()`.
+                if name.starts_with("::") {
+                    return None;
+                }
+                // A prototype is as good a hit as a body: lowering sees one
+                // unit, and the definition in another merges into the same
+                // entry — which is why a definition written under the
+                // directive qualifies the same way (`qualify_class_name`).
+                ctx.using_nss
+                    .iter()
+                    .find_map(|ns| lookup(&format!("{ns}::{name}")))
+            })
+            .unwrap_or_default()
     } else {
         program
             .symbols
@@ -6456,21 +6836,28 @@ fn emit_member_sites(
     span: Span,
 ) {
     let cls = receiver_lookup_name(cls);
-    let cls = cls.as_str();
-    let CallArgs {
-        var_args,
-        fn_args,
-        addr_of_member_args,
-        argc,
-        arg_desc,
-    } = args.bind_past_this(receiver);
-    let targets = filter_targets_by_argc(
-        program,
-        member_targets_upward(program, cls, kind),
-        argc as usize,
-        &arg_desc,
-        true,
-    );
+    let targets = member_targets_upward(program, &cls, kind);
+    emit_member_targets(program, caller, &cls, kind, receiver, args, span, targets);
+}
+
+/// [`emit_member_sites`] for a caller that already probed the override set —
+/// telling a method apart from a callable data member needs it, and the probe
+/// is the expensive half. `cls` is the lookup name `targets` were found under,
+/// so both name the same class.
+#[allow(clippy::too_many_arguments)]
+fn emit_member_targets(
+    program: &mut Program,
+    caller: FnId,
+    cls: &str,
+    kind: &trace_ir::MethodKind,
+    receiver: Option<VarId>,
+    args: CallArgs,
+    span: Span,
+    targets: Vec<FnId>,
+) {
+    let mut args = args.bind_past_this(receiver);
+    let argc = args.argc;
+    let targets = filter_targets_by_argc(program, targets, argc as usize, &args.arg_desc, true);
     let display = kind.name_on(cls);
     if targets.is_empty() {
         // Unknown method: keep an unresolved site; the solver synthesizes
@@ -6482,9 +6869,9 @@ fn emit_member_sites(
             callee_name: display,
             callee_var: None,
             callee_fn_id: None,
-            var_args,
-            fn_args,
-            addr_of_member_args,
+            var_args: args.var_args,
+            fn_args: args.fn_args,
+            addr_of_member_args: args.addr_of_member_args,
             args_bound_past_this: true,
             span,
             is_direct: false,
@@ -6493,7 +6880,9 @@ fn emit_member_sites(
         });
         return;
     }
-    for t in targets {
+    let last_index = targets.len() - 1;
+    for (index, t) in targets.into_iter().enumerate() {
+        let site_args = args.take_for(index == last_index);
         let (call_id, name) = {
             let id = program.symbols.alloc_call_id();
             let nm = program.symbols.function(t).name.clone();
@@ -6505,9 +6894,9 @@ fn emit_member_sites(
             callee_name: name,
             callee_var: None,
             callee_fn_id: Some(t),
-            var_args: var_args.clone(),
-            fn_args: fn_args.clone(),
-            addr_of_member_args: addr_of_member_args.clone(),
+            var_args: site_args.var_args,
+            fn_args: site_args.fn_args,
+            addr_of_member_args: site_args.addr_of_member_args,
             args_bound_past_this: true,
             span,
             is_direct: true,
@@ -7087,8 +7476,16 @@ fn declares_arrow(program: &Program, cls: &str) -> bool {
 /// keeps its arguments in its name (`sptr<CaptureSession>`) so that a `->` on
 /// it can substitute them; the class itself is spelled without them, whether
 /// the wrapper is declared or not (#86).
-fn receiver_lookup_name(name: &str) -> String {
-    strip_template_args(name)
+/// Borrowed when the spelling already is that name, which is the common case
+/// on the member-call path: [`strip_template_args`] takes the same fast path
+/// but always allocates.
+fn receiver_lookup_name(name: &str) -> Cow<'_, str> {
+    let trimmed = name.trim_end();
+    if trimmed.ends_with('>') {
+        Cow::Owned(strip_template_args(trimmed))
+    } else {
+        Cow::Borrowed(trimmed)
+    }
 }
 
 /// `name` when the index declares a class by it, else the class a `typedef`
@@ -7183,7 +7580,7 @@ fn resolve_operator_arrow(program: &Program, desc: TypeDesc) -> Option<String> {
                 if is_std_smart_ptr_name(&cls) {
                     return args
                         .first()
-                        .map(|s| receiver_lookup_name(&sanitize_type_name(s)));
+                        .map(|s| receiver_lookup_name(&sanitize_type_name(s)).into_owned());
                 }
                 // A nested type of a template whose body is not in the tree
                 // (`Outer<A>::Inner`, an iterator) has nothing to look the
@@ -7328,6 +7725,34 @@ fn receiver_desc(
                 Some("&") => Some(TypeDesc::Ptr(Box::new(desc))),
                 _ => None,
             }
+        }
+        "call_expression" => {
+            if let Some(cached) = ctx.call_receiver_cache.borrow().get(&node.id()) {
+                return Some(cached.clone());
+            }
+            let desc = match call_result_shape(program, ctx, source, node) {
+                Some(CallResult::Decided(desc)) => desc,
+                Some(CallResult::Overload {
+                    candidates,
+                    receiver,
+                }) => {
+                    let args: Vec<TypeDesc> = call_arg_nodes(node)
+                        .into_iter()
+                        .map(|arg| known_arg_type(program, ctx, source, arg))
+                        .collect();
+                    call_result_among(program, ctx, source, node, candidates, receiver, &args)
+                }
+                None => None,
+            };
+            // Only a hit is memoized. A miss can be the index being
+            // incomplete at probe time — lowering keeps registering types and
+            // substitution facts as it walks — so it is asked again.
+            if let Some(desc) = &desc {
+                ctx.call_receiver_cache
+                    .borrow_mut()
+                    .insert(node.id(), desc.clone());
+            }
+            desc
         }
         "new_expression" => Some(TypeDesc::Ptr(Box::new(TypeDesc::Struct {
             name: new_expression_class(program, ctx, source, node)?,
@@ -7592,11 +8017,12 @@ fn qualify_template_spelling_under(
 /// standing for the class it names. Where nothing is declared, the spelling
 /// qualifies to the innermost namespace as it always did.
 ///
-/// Namespaces a `using namespace` brought in are deliberately not searched:
-/// an out-of-line member definition written under one is indexed under the
-/// bare class name (hdf's hc-gen defines `AstObject::IsNode` that way while
-/// the class is `OHOS::Hardware::AstObject`), and only the bare spelling
-/// reaches those bodies rather than the header's prototypes.
+/// A `using namespace` directive is not searched: a type spelling that names
+/// a class only through one is ambiguous with the spelling the index holds,
+/// and is left untyped rather than guessed (`receiver_type`). The two places
+/// that *name* a class rather than type a value — a base clause, and the
+/// owner of an out-of-line member definition — resolve through the directive
+/// themselves, as the compiler does (`class_seen_from`).
 fn qualify_class_name(program: &Program, ctx: &LowerContext, name: &str) -> String {
     declared_class_in_scope(program, ctx, name).unwrap_or_else(
         // Tags are registered without the global-scope prefix, so a `::T`
@@ -7922,6 +8348,7 @@ fn infer_static_class(
                 None
             }
         }
+        "call_expression" => class_name_of_desc(&receiver_desc(program, ctx, source, node)?),
         "new_expression" => new_expression_class(program, ctx, source, node),
         _ => None,
     }
@@ -7938,7 +8365,7 @@ fn var_static_class(program: &Program, v: VarId) -> Option<String> {
 /// is the arrow's business, see [`resolve_operator_arrow`].
 fn class_name_of_desc(desc: &TypeDesc) -> Option<String> {
     match desc {
-        TypeDesc::Struct { name, .. } => Some(receiver_lookup_name(name)),
+        TypeDesc::Struct { name, .. } => Some(receiver_lookup_name(name).into_owned()),
         TypeDesc::Ptr(inner) => class_name_of_desc(inner),
         _ => None,
     }
@@ -9759,6 +10186,7 @@ fn type_desc_from_node(
             if !program.types.is_struct_defined(&cls)
                 || declares_arrow(program, &cls)
                 || is_std_smart_ptr_name(&cls)
+                || program.has_template_returns(&cls)
             {
                 let fields = program
                     .types
@@ -10599,20 +11027,43 @@ fn find_params(decl: Node) -> Option<Node> {
     None
 }
 
+/// The symbol `FileId` a LineMap entry's origin file is interned under,
+/// memoized per unit by LineMap file index: a span's origin is asked for once
+/// per node, and the path comparison and hash behind it once per file.
+/// `resolve` is how the caller turns an origin path into an id — interning it
+/// when it may add one, looking it up when it may not.
+fn origin_file_id(
+    ctx: &LowerContext,
+    line_map: &trace_preproc::LineMap,
+    entry: &trace_preproc::LineMapEntry,
+    resolve: impl FnOnce(&Path) -> Option<trace_ir::FileId>,
+) -> Option<trace_ir::FileId> {
+    let cached = &ctx.origin_file_ids[entry.file as usize];
+    if let Some(fid) = cached.get() {
+        return Some(fid);
+    }
+    let origin = line_map.path_of(entry);
+    let fid = if origin != ctx.primary_path {
+        resolve(origin)?
+    } else {
+        ctx.current_file
+    };
+    cached.set(Some(fid));
+    Some(fid)
+}
+
 fn node_span(program: &mut Program, ctx: &LowerContext, node: Node) -> Span {
     if let Some(line_map) = &ctx.line_map {
         if let Some(entry) = line_map.lookup(node.start_byte()) {
-            let origin = line_map.path_of(entry);
             // Always report original-file coordinates. Code from an
             // `#include`d file is attributed to its original header;
             // TU-local code keeps the primary file but gets its original
             // (pre-expansion) line/col, so reported lines match what a
             // user sees in their editor (AGENTS.md LineMap invariant).
-            let fid = if origin != ctx.primary_path {
-                program.symbols.add_file_interned(origin)
-            } else {
-                ctx.current_file
-            };
+            let fid = origin_file_id(ctx, line_map, entry, |origin| {
+                Some(program.symbols.add_file_interned(origin))
+            })
+            .unwrap_or(ctx.current_file);
             return Span::new(fid, entry.line, entry.col);
         }
     }
@@ -10634,12 +11085,9 @@ fn node_end_line(program: &Program, ctx: &LowerContext, node: Node, span: Span) 
             let entry = line_map.lookup(node.end_byte().saturating_sub(1));
             let same_origin = entry
                 .map(|entry| {
-                    let origin = line_map.path_of(entry);
-                    let fid = if origin != ctx.primary_path {
+                    let fid = origin_file_id(ctx, line_map, entry, |origin| {
                         program.symbols.file_by_path(origin)
-                    } else {
-                        Some(ctx.current_file)
-                    };
+                    });
                     fid == Some(span.file)
                 })
                 .unwrap_or(false);

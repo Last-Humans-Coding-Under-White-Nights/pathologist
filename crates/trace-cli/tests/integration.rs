@@ -114,7 +114,7 @@ fn builtin_macro_fallbacks_fixture() {
         "expected no parse diagnostics, got: {parse_diags:?}"
     );
     for name in [
-        "FooTest_Bar",
+        "FooTest_Bar_Test::TestBody",
         "DevRead",
         "DevInit",
         "DevExit",

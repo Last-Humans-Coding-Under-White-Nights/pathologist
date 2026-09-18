@@ -493,6 +493,7 @@ defined in-tree, so project-specific wrappers can be described too.
 | `return_heap` | returns a fresh storage location | fresh `Heap` loc per call site into the destination |
 | `clears { param }` | **terminator**: memory reachable via `param[param]` is zeroed by this call | no value introduction; terminator event exported |
 | `dlsym { param }` | return value may be the address of the in-tree function named by string constants in `param[param]` | `Dlsym` PAG constraint; unknown names add nothing |
+| `invoke { param }` | may invoke a zero-argument callback passed in `param[param]` | adds an indirect edge from the submitting caller at the submission site after points-to convergence; callback return values and scheduling are ignored. Unlike the value-introducing effects this is not restricted to a bodyless callee — a callback API is routinely a template whose body the index holds once, uninstantiated — and an edge the callee's own body already yields is not added twice |
 
 Effects attach to parameter positions (0-based) of the *actual arguments* recorded at
 the call site. Arguments that are not IR variables or functions (literals like
@@ -526,6 +527,7 @@ entries:
 | `malloc`, `calloc`, `zalloc`, `kmalloc` | `return_heap` |
 | `realloc` | `return_alias param=0`, `return_heap` |
 | `dlsym`, `dlvsym`, `GetProcAddress` | `dlsym param=1` (symbol-name argument) |
+| `ffrt::queue::submit` | `invoke param=0` (explicit callback argument, excluding implicit `this`) |
 
 ### Configuration format
 
@@ -1143,7 +1145,29 @@ C++-aware only where it must be — everything else reuses the C machinery.
   looks function names up in it too. A scope neither opens as a namespace is
   a class the unit cannot see (`Ast::Lookup` under
   `using namespace OHOS::Hardware`).
-- **Templates**: lowered once per primary name; `<...>` arguments stripped.
+  Relative qualified calls (`Service::Write()` inside `namespace app`)
+  use the same enclosing-scope lookup as type names, and fall back to the
+  `using namespace` directives in scope, as a bare name already did.
+- **`using namespace` and class names**: a base clause, and the owner of an
+  out-of-line member definition (`void AstObject::IsNode()` written under
+  `using namespace OHOS::Hardware`), resolve through the directives in scope
+  as the compiler does, so the definition is indexed as
+  `OHOS::Hardware::AstObject::IsNode` and merges with the header's prototype.
+  A *type* spelling that names a class only through a directive is still
+  left untyped rather than guessed: it is ambiguous with the spelling the
+  index holds (`std::shared_ptr<Strategy>` under `using namespace hdfx`).
+- **Call-result receivers**: `S::GetInstance().Open()` and pointer-returning
+  chains reuse declared return-type inference. Ambiguous return types stay
+  unknown; receiver probes do not mutate the index.
+- **Templates**: lowered once per primary name. Class-template members
+  returning a bare type parameter (`T Get()`, `T *Get()`) preserve its
+  parameter position and pointer depth as type metadata across header merges.
+  A concrete receiver substitutes its arguments before member lookup and
+  virtual dispatch, through its pointer layers and through an instantiated
+  class-template base it inherits the member from (`struct D : Holder<T *>`).
+  The argument is resolved from the scope it is spelled in, keeping its own
+  template arguments so a nested `Holder<Holder<T>>` substitutes again. Compound dependent returns and function templates remain
+  unknown; no template bodies are instantiated.
 - **Lambda captures**: explicit (`[var]`, `[&var]`, `[this]`, `[*this]`), default (`[&]`, `[=]`), and init-captures (`[x = expr]`, `[&x = expr]`) bind the enclosing scope's variables, members, and `this` into the lowered lambda body.
 
 Known C++ imprecision (in addition to the general list below):
@@ -1154,10 +1178,8 @@ Known C++ imprecision (in addition to the general list below):
   infer function-pointer call results. Trailing `auto` return declarations
   remain unknown. Named casts (`auto p = static_cast<T *>(v)`) parse as calls
   to the cast and stay unknown until C2, as do conditional expressions
-  (`auto p = c ? a : b`). A
-  call whose receiver is itself a call result (`S::GetInstance().Open()`,
-  `auto p = w->self()->self()`) has no static receiver type, whether or not
-  the result is stored in an `auto` local. `shared_ptr::get` and
+  (`auto p = c ? a : b`). Cast arguments in a call-result receiver probe are
+  conservatively unknown for overload ranking. `shared_ptr::get` and
   `unique_ptr::release` are not unwrapped to the held class.
 - In-class prototypes carry no parameter types, so same-arity overloads of a
   member (`Worker *find(int)`, `Other *find(const char *)`) share one entry,

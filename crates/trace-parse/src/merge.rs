@@ -37,6 +37,7 @@ pub struct UnitIndex {
     pub template_bases: Vec<TemplateBase>,
     /// Per-unit declared `operator->` returns (C++), merged in every mode.
     pub arrow_returns: Vec<trace_ir::ArrowReturn>,
+    pub template_returns: BTreeMap<String, BTreeMap<String, Vec<trace_ir::TemplateReturn>>>,
     /// Classes declared `final` in this unit.
     pub final_classes: Vec<String>,
     /// Classes this unit defines in an anonymous namespace, by unit-local file.
@@ -342,6 +343,13 @@ fn merge_unit(
     for fact in &unit.arrow_returns {
         if !program.arrow_returns.contains(fact) {
             program.arrow_returns.push(fact.clone());
+        }
+    }
+    for (class, methods) in &unit.template_returns {
+        for (name, facts) in methods {
+            for fact in facts {
+                program.add_template_return(class, name, fact);
+            }
         }
     }
     for cls in &unit.final_classes {

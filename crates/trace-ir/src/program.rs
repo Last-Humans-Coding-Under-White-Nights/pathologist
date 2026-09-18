@@ -125,6 +125,16 @@ impl MergeDedup {
     }
 }
 
+/// A class-template member returning a bare type parameter. Kept with
+/// types across header-unit merges; looked up by class and member name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateReturn {
+    pub arity: u32,
+    /// None blocks inference for an unsupported same-arity return.
+    pub parameter: Option<usize>,
+    pub pointer_depth: usize,
+}
+
 /// What a C++ class's declared `operator->` returns, kept apart from the
 /// function's own return type so that it reaches the units that include the
 /// declaring header: those merge a header's *types* only, and a wrapper-typed
@@ -196,6 +206,9 @@ pub struct Program {
     /// Declared C++ `operator->` returns, merged with a unit's types so a
     /// header's wrappers are followable from every unit that includes it.
     pub arrow_returns: Vec<ArrowReturn>,
+    /// Class -> full member name -> return substitutions. Ordered keys keep
+    /// header merges deterministic; lookups never scan unrelated functions.
+    pub template_returns: BTreeMap<String, BTreeMap<String, Vec<TemplateReturn>>>,
     /// Classes declared `final` — CHA does not walk into their subclasses.
     pub final_classes: Vec<String>,
     /// Classes defined in an anonymous namespace, with the files their
@@ -344,6 +357,32 @@ impl Program {
             .iter()
             .filter(|fact| fact.derived == cls)
             .collect()
+    }
+
+    /// Record that `member` of class template `owner` substitutes `fact`
+    /// for a concrete receiver. Every unit merging the declaring header
+    /// re-adds the header's facts, so the common case is a hit.
+    pub fn add_template_return(&mut self, owner: &str, member: &str, fact: &TemplateReturn) {
+        let facts = self
+            .template_returns
+            .entry(owner.to_string())
+            .or_default()
+            .entry(member.to_string())
+            .or_default();
+        if !facts.contains(fact) {
+            facts.push(fact.clone());
+        }
+    }
+
+    /// The substitution facts recorded for `member` of class `cls`.
+    pub fn template_returns_of(&self, cls: &str, member: &str) -> Option<&[TemplateReturn]> {
+        Some(self.template_returns.get(cls)?.get(member)?.as_slice())
+    }
+
+    /// Whether `cls` is a class template any of whose members substitutes a
+    /// return type — so a receiver spelled with arguments must keep them.
+    pub fn has_template_returns(&self, cls: &str) -> bool {
+        self.template_returns.contains_key(cls)
     }
 
     /// Record that `cls` is a `final` class.
