@@ -724,13 +724,28 @@ impl Pag {
                             applied = true;
                         }
                         ReturnFlow::Call { callee_name } => {
-                            let file = program.symbols.function(callee).file;
-                            let inner_candidates =
+                            let caller_func = program.symbols.function(callee);
+                            let file = caller_func.file;
+                            let caller_tu = caller_func.tu.or(Some(file));
+                            let mut inner_candidates =
                                 program.symbols.resolve_function_candidates_in_target(
                                     &callee_name,
                                     Some(file),
-                                    program.symbols.function(callee).target,
+                                    caller_func.target,
                                 );
+                            if let Some(tu) = caller_tu {
+                                let local_defs: Vec<_> = inner_candidates
+                                    .iter()
+                                    .copied()
+                                    .filter(|&c| {
+                                        let cand = program.symbols.function(c);
+                                        cand.is_defined && cand.tu.unwrap_or(cand.file) == tu
+                                    })
+                                    .collect();
+                                if !local_defs.is_empty() {
+                                    inner_candidates = local_defs;
+                                }
+                            }
                             let mut inner_applied = false;
                             for inner in inner_candidates.iter().copied() {
                                 if self.expand_return_flows(program, dst, inner, models, visited) {

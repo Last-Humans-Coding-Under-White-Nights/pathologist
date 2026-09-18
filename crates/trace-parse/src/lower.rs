@@ -1190,7 +1190,7 @@ fn bind_calls_past_this(program: &mut Program) {
             Some(callee) => is_member_function(program, callee),
             None => {
                 cs.callee_name.contains("::") && {
-                    let callees = program.symbols.callees_of(cs);
+                    let callees = program.callees_of(cs);
                     !callees.is_empty() && callees.iter().all(|&f| is_member_function(program, f))
                 }
             }
@@ -4480,7 +4480,7 @@ fn call_result_shape(
         // An implicit member hides an outer free function of the same name,
         // just as it does for collect_call_at_node.
         let members = match &ctx.class_ctx {
-            Some(cc) if is_bare_callee_node(func) => declared_members_upward(
+            Some(cc) if is_bare_callee_node(func, &name) => declared_members_upward(
                 program,
                 &cc.qual_name,
                 &trace_ir::MethodKind::Named(name.clone()),
@@ -6421,11 +6421,7 @@ fn shift_past_this(
 /// Whether parameter 0 of `fid` is the implicit `this` lowering prepends to
 /// a member function's definition (static members included).
 fn has_this_param(program: &Program, fid: FnId) -> bool {
-    let f = program.symbols.function(fid);
-    f.is_cpp
-        && f.params
-            .first()
-            .is_some_and(|&p| program.symbols.variable(p).name == "this")
+    program.symbols.has_this_param(fid)
 }
 
 /// Whether `fid` is a member function. An in-class prototype carries no
@@ -6695,18 +6691,26 @@ fn param_match_rank(arg: &TypeDesc, param: &TypeDesc) -> usize {
 /// `resolve_cpp_name_candidates` is the bare base name (e.g. `GetNumber`,
 /// not `GetNumber<int>`), which correctly indexes into the `base_by_name`
 /// bucket.
-fn is_bare_callee_node(func: Node) -> bool {
-    matches!(func.kind(), "identifier" | "template_function")
+fn is_bare_callee_node(func: Node, name: &str) -> bool {
+    matches!(func.kind(), "identifier" | "template_function") && !name.contains("::")
 }
 
 fn has_same_signature(program: &Program, a: FnId, b: FnId) -> bool {
     let fa = program.symbols.function(a);
     let fb = program.symbols.function(b);
+    if fa.variadic != fb.variadic {
+        return false;
+    }
     let a_skip = usize::from(has_this_param(program, a));
     let b_skip = usize::from(has_this_param(program, b));
     let a_params = &fa.params[a_skip..];
     let b_params = &fb.params[b_skip..];
-    if a_params.len() != b_params.len() || fa.variadic != fb.variadic {
+    if a_params.is_empty() || b_params.is_empty() {
+        let a_arity = fa.explicit_arity.or(Some(a_params.len() as u32));
+        let b_arity = fb.explicit_arity.or(Some(b_params.len() as u32));
+        return a_arity.zip(b_arity).is_none_or(|(ea, eb)| ea == eb);
+    }
+    if a_params.len() != b_params.len() {
         return false;
     }
     let param_t = |f: &Function, skip: usize, idx: usize| -> Option<trace_ir::TypeId> {
@@ -6739,9 +6743,9 @@ fn cpp_callee_candidates(
     name: &str,
     arg_desc: &[TypeDesc],
 ) -> Vec<FnId> {
-    if is_bare_callee_node(func) {
+    if is_bare_callee_node(func, name) {
         resolve_cpp_name_candidates(program, ctx, name, arg_desc)
-    } else if func.kind() == "qualified_identifier" {
+    } else if func.kind() == "qualified_identifier" || func.kind() == "template_function" {
         let lookup = |candidate: &str| {
             let found = program
                 .symbols

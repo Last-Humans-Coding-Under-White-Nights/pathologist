@@ -6996,3 +6996,387 @@ void Caller() {
         "Caller in b.cpp must resolve to Process in a.cpp via shape equivalence"
     );
 }
+
+#[test]
+fn regression_transitive_return_flow_call_tu_isolation() {
+    // Review Comment 1: Align ReturnFlow::Call dataflow expansion with translation-unit call resolution.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_transitive_return_iso_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+int* GetPtr();
+int* Forward();
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a.cpp"),
+        r#"
+#include "common.h"
+static int val_a = 10;
+int* GetPtr() {
+    return &val_a;
+}
+int* Forward() {
+    return GetPtr();
+}
+void CallerA() {
+    int* p = Forward();
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.cpp"),
+        r#"
+#include "common.h"
+static int val_b = 20;
+int* GetPtr() {
+    return &val_b;
+}
+int* Forward() {
+    return GetPtr();
+}
+void CallerB() {
+    int* q = Forward();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (pag, analysis) = trace_analysis::analyze_with_options(
+        &program,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+
+    let val_a_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "val_a")
+        .unwrap()
+        .id;
+    let val_b_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "val_b")
+        .unwrap()
+        .id;
+    let p_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "p")
+        .unwrap()
+        .id;
+    let q_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "q")
+        .unwrap()
+        .id;
+
+    let val_a_loc = pag.var_location[&val_a_var];
+    let val_b_loc = pag.var_location[&val_b_var];
+    let p_node = pag.var_node[&p_var];
+    let q_node = pag.var_node[&q_var];
+
+    let p_pts = analysis.points_to.get(&p_node);
+    let q_pts = analysis.points_to.get(&q_node);
+
+    assert!(
+        p_pts.is_some_and(|pts| pts.contains(&val_a_loc)),
+        "p must point to val_a via transitive ReturnFlow::Call"
+    );
+    assert!(
+        !p_pts.is_some_and(|pts| pts.contains(&val_b_loc)),
+        "p must NOT receive points-to from b.cpp (val_b) via ReturnFlow::Call"
+    );
+
+    assert!(
+        q_pts.is_some_and(|pts| pts.contains(&val_b_loc)),
+        "q must point to val_b via transitive ReturnFlow::Call"
+    );
+    assert!(
+        !q_pts.is_some_and(|pts| pts.contains(&val_a_loc)),
+        "q must NOT receive points-to from a.cpp (val_a) via ReturnFlow::Call"
+    );
+}
+
+#[test]
+fn regression_relative_qualified_template_callee() {
+    // Review Comment 2: Avoid treating relative qualified template calls like Utils::Run<int>(x) as bare callee nodes.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_rel_qual_tmpl_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("test.cpp"),
+        r#"
+namespace Ns {
+    struct Utils {
+        template <typename T>
+        static void Run(T x);
+    };
+    template <typename T>
+    void Utils::Run(T x) {}
+
+    void Caller() {
+        Utils::Run<int>(42);
+    }
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let caller_id = program.symbols.resolve_function("Ns::Caller").unwrap();
+    let run_id = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "Ns::Utils::Run" && f.is_defined)
+        .expect("Ns::Utils::Run definition must exist")
+        .id;
+
+    let callees: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == caller_id && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(
+        callees,
+        vec![run_id],
+        "Utils::Run<int>(42) inside namespace Ns must resolve to Ns::Utils::Run"
+    );
+}
+
+#[test]
+fn regression_in_class_member_decl_dedup_against_definition() {
+    // Review Comment 3: Account for explicit_arity in has_same_signature for in-class member declarations.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_in_class_dedup_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("worker.h"),
+        r#"
+#pragma once
+struct Worker {
+    static void Work(int a, int b);
+};
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("worker.cpp"),
+        r#"
+#include "worker.h"
+void Worker::Work(int a, int b) {}
+void Trigger() {
+    Worker::Work(1, 2);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let trigger_id = program.symbols.resolve_function("Trigger").unwrap();
+    let work_def = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "Worker::Work" && f.is_defined)
+        .expect("Worker::Work definition must exist")
+        .id;
+
+    let callees: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == trigger_id && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(
+        callees,
+        vec![work_def],
+        "Call to Worker::Work must resolve solely to definition, filtering out prototype declaration"
+    );
+}
+
+#[test]
+fn regression_cross_tu_member_fn_implicit_this_and_explicit_arity() {
+    // Review Comment 4: Account for implicit this and parameterless prototypes in resolve_equal_defs.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_member_cross_tu_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("calc.h"),
+        r#"
+#pragma once
+struct Calculator {
+    int Compute(int x);
+    void Reset();
+};
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("calc.cpp"),
+        r#"
+#include "calc.h"
+int Calculator::Compute(int x) { return x * 2; }
+void Calculator::Reset() {}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("user.cpp"),
+        r#"
+#include "calc.h"
+void User(Calculator* c) {
+    c->Compute(10);
+    c->Reset();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let user_id = program.symbols.resolve_function("User").unwrap();
+    let compute_def = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "Calculator::Compute" && f.is_defined)
+        .expect("Calculator::Compute definition")
+        .id;
+    let reset_def = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "Calculator::Reset" && f.is_defined)
+        .expect("Calculator::Reset definition")
+        .id;
+
+    let callees: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == user_id && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert!(
+        callees.contains(&compute_def),
+        "User call to c->Compute must resolve across TUs to Calculator::Compute definition"
+    );
+    assert!(
+        callees.contains(&reset_def),
+        "User call to c->Reset must resolve across TUs to Calculator::Reset definition"
+    );
+}
+
+#[test]
+fn regression_merge_c_and_cpp_def_order_symmetric() {
+    // Review Comment 5: Symmetrize is_incompatible_def check across C and C++ definitions to avoid merge-order non-determinism.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_c_cpp_order_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("impl_cpp.cpp"),
+        r#"
+extern "C" void SharedTask() {}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("impl_c.c"),
+        r#"
+void SharedTask() {}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    assert!(
+        program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "SharedTask"),
+        "SharedTask should be indexed without error"
+    );
+}
+
+#[test]
+fn regression_bind_calls_past_this_shape_aware() {
+    // Review Comment 6: Update bind_calls_past_this to call program.callees_of(cs) to preserve shape-aware type equivalence.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_bind_past_this_shape_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+struct Service {
+    typedef int RequestId;
+    void Handle(RequestId req, int flags);
+};
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("service.cpp"),
+        r#"
+#include "common.h"
+void Service::Handle(int req, int flags) {}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("caller.cpp"),
+        r#"
+#include "common.h"
+void Dispatch(Service* s) {
+    s->Handle(101, 1);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let cs = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|c| c.callee_name.contains("Handle"))
+        .expect("Handle call site must exist");
+    assert!(
+        cs.args_bound_past_this,
+        "Call site to Service::Handle must have args_bound_past_this set via shape-aware callees_of"
+    );
+}

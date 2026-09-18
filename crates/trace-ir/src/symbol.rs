@@ -240,7 +240,7 @@ pub struct FileInfo {
 }
 
 /// What [`SymbolTable::register_function`] did with a function.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FnRegistration {
     /// The surviving entry: either the id the caller allocated, or the
     /// earlier entry this redeclaration merged into.
@@ -530,7 +530,7 @@ impl SymbolTable {
                 |id: FnId| !(func.is_cpp && self.function_by_id(id).is_some_and(|e| e.is_cpp));
             let is_incompatible_def = |existing_id: FnId| -> bool {
                 if let Some(existing) = self.function_by_id(existing_id) {
-                    if func.is_cpp && func.is_defined && existing.is_defined {
+                    if func.is_cpp && existing.is_cpp && func.is_defined && existing.is_defined {
                         let is_same_def =
                             existing.file == func.file && existing.span.line == func.span.line;
                         let has_weak = existing.is_weak || func.is_weak;
@@ -1226,36 +1226,47 @@ impl SymbolTable {
             if f.linkage != Linkage::External || (f.is_defined && f_tu == caller_tu) {
                 return vec![fid];
             }
+            let f_skip = usize::from(self.has_this_param(fid));
+            let f_explicit_len = f.params.len().saturating_sub(f_skip);
             let defs: Vec<FnId> = self
                 .resolve_function_candidates_in_target(&f.name, Some(cs.span.file), target)
                 .into_iter()
                 .filter(|&id| {
                     let cand = self.function(id);
-                    if !cand.is_defined
-                        || cand.params.len() != f.params.len()
-                        || cand.variadic != f.variadic
-                    {
+                    if !cand.is_defined || cand.variadic != f.variadic {
                         return false;
                     }
-                    cand.params
-                        .iter()
-                        .zip(&f.params)
-                        .enumerate()
-                        .all(|(i, (&p1, &p2))| {
-                            let t1 = self
-                                .param_type(p1)
-                                .or_else(|| cand.param_type_ids.get(i).copied());
-                            let t2 = self
-                                .param_type(p2)
-                                .or_else(|| f.param_type_ids.get(i).copied());
-                            match (t1, t2) {
-                                (Some(a), Some(b)) => match types {
-                                    Some(ty) => crate::same_param_type(ty, a, b),
-                                    None => a == b,
-                                },
-                                _ => true,
-                            }
-                        })
+                    let cand_skip = usize::from(self.has_this_param(id));
+                    let cand_explicit_len = cand.params.len().saturating_sub(cand_skip);
+                    let both_cpp = f.is_cpp && cand.is_cpp;
+                    if f.params.is_empty() || cand.params.is_empty() {
+                        if !both_cpp {
+                            return true;
+                        }
+                        let f_arity = f.explicit_arity.or(Some(f_explicit_len as u32));
+                        let cand_arity = cand.explicit_arity.or(Some(cand_explicit_len as u32));
+                        return f_arity.zip(cand_arity).is_none_or(|(a, b)| a == b);
+                    }
+                    if cand_explicit_len != f_explicit_len {
+                        return false;
+                    }
+                    (0..cand_explicit_len).all(|i| {
+                        let p1 = cand.params[cand_skip + i];
+                        let p2 = f.params[f_skip + i];
+                        let t1 = self
+                            .param_type(p1)
+                            .or_else(|| cand.param_type_ids.get(cand_skip + i).copied());
+                        let t2 = self
+                            .param_type(p2)
+                            .or_else(|| f.param_type_ids.get(f_skip + i).copied());
+                        match (t1, t2) {
+                            (Some(a), Some(b)) => match types {
+                                Some(ty) => crate::same_param_type(ty, a, b),
+                                None => a == b,
+                            },
+                            _ => true,
+                        }
+                    })
                 })
                 .collect();
             if defs.len() > 1 {
@@ -1528,6 +1539,14 @@ impl SymbolTable {
     pub fn function(&self, id: FnId) -> &Function {
         self.function_by_id(id)
             .unwrap_or_else(|| panic!("unknown function id {}", id.0))
+    }
+
+    pub fn has_this_param(&self, fid: FnId) -> bool {
+        let f = self.function(fid);
+        f.is_cpp
+            && f.params
+                .first()
+                .is_some_and(|&p| self.variable_by_id(p).map(|v| v.name.as_str()) == Some("this"))
     }
 
     pub fn variable_by_id(&self, id: VarId) -> Option<&Variable> {
@@ -2640,6 +2659,43 @@ mod tests {
                 .resolve_function_in_scope_in_target("process", None, Some(image)),
             Some(def_id),
             "the body in this image, not the prototype registered before it"
+        );
+    }
+
+    #[test]
+    fn test_c_and_cpp_definition_merge_order_symmetry() {
+        let mut p1 = Program::default();
+        let f1 = p1.symbols.add_file(PathBuf::from("/t/a.cpp"));
+        let f2 = p1.symbols.add_file(PathBuf::from("/t/b.c"));
+        let v1 = p1.symbols.alloc_var_id();
+        let v2 = p1.symbols.alloc_var_id();
+        let id_cpp1 = p1.symbols.alloc_fn_id();
+        let id_c1 = p1.symbols.alloc_fn_id();
+        let fn_cpp1 = fake_function(id_cpp1, "collide", vec![v1], true, true, f1, 10);
+        let fn_c1 = fake_function(id_c1, "collide", vec![v2], true, false, f2, 20);
+
+        // Order 1: C++ first, C second
+        let r_cpp1 = p1.symbols.register_function(fn_cpp1, None, None);
+        let r_c1 = p1.symbols.register_function(fn_c1, None, None);
+
+        let mut p2 = Program::default();
+        let f1_2 = p2.symbols.add_file(PathBuf::from("/t/a.cpp"));
+        let f2_2 = p2.symbols.add_file(PathBuf::from("/t/b.c"));
+        let v1_2 = p2.symbols.alloc_var_id();
+        let v2_2 = p2.symbols.alloc_var_id();
+        let id_c2 = p2.symbols.alloc_fn_id();
+        let id_cpp2 = p2.symbols.alloc_fn_id();
+        let fn_c2 = fake_function(id_c2, "collide", vec![v2_2], true, false, f2_2, 20);
+        let fn_cpp2 = fake_function(id_cpp2, "collide", vec![v1_2], true, true, f1_2, 10);
+
+        // Order 2: C first, C++ second
+        let r_c2 = p2.symbols.register_function(fn_c2, None, None);
+        let r_cpp2 = p2.symbols.register_function(fn_cpp2, None, None);
+
+        assert_eq!(
+            r_cpp1.id == r_c1.id,
+            r_c2.id == r_cpp2.id,
+            "C and C++ definitions must merge (or stay separate) symmetrically regardless of order"
         );
     }
 }
