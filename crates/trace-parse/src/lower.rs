@@ -3031,14 +3031,19 @@ fn lower_struct_specifier(
                         .is_none()
                         .then(|| class_seen_from(program, ctx, &short))
                         .flatten();
+                    // Both inheritance and template substitution name the same
+                    // resolved class, including partially qualified spellings.
+                    let resolved_base = through_directive
+                        .unwrap_or_else(|| qualify_class_name(program, ctx, &short));
                     let template_spelling = normalize_template_spelling(base_text);
                     if let Some(at) = template_spelling.find('<') {
-                        let qualified = if template_spelling.contains("::") {
-                            template_spelling
-                        } else if let Some(cls) = &through_directive {
-                            format!("{cls}{}", &template_spelling[at..])
+                        let qualified = if template_tail(&template_spelling).is_empty() {
+                            format!("{resolved_base}{}", &template_spelling[at..])
                         } else {
-                            ctx.qualify(&template_spelling)
+                            // Outer<A>::Inner<B> has arguments on separate
+                            // classes; appending from the first '<' would
+                            // duplicate Inner and attach A to the wrong class.
+                            template_spelling
                         };
                         let is_dependent =
                             spelling_is_dependent(ctx, source, base, base_text, Spelling::Source);
@@ -3055,12 +3060,10 @@ fn lower_struct_specifier(
                             is_dependent,
                         );
                     }
-                    let base = through_directive
-                        .unwrap_or_else(|| qualify_class_name(program, ctx, &short));
                     if let Some(file) = anonymous_in {
-                        program.add_anonymous_base(&derived, file, &base);
+                        program.add_anonymous_base(&derived, file, &resolved_base);
                     }
-                    program.add_inheritance(&derived, &base);
+                    program.add_inheritance(&derived, &resolved_base);
                 }
             }
         }
@@ -4451,20 +4454,14 @@ fn call_result_shape(
                 }
             }
         }
-        // Under its pointer layers, as `class_name_of_desc` reads it: `h->Get()`
-        // substitutes on the same class template `h.Get()` does.
-        let mut under = &desc;
-        while let TypeDesc::Ptr(inner) = under {
-            under = inner;
-        }
-        if let TypeDesc::Struct { name, .. } = under {
-            receiver = Some(name.clone());
-        }
-        let cls = if arrow {
-            resolve_operator_arrow(program, desc)?
+        // An arrow substitutes on its pointee, keeping template arguments
+        // that member-name lookup deliberately strips.
+        receiver = Some(if arrow {
+            resolve_operator_arrow_receiver(program, desc)?
         } else {
-            class_name_of_desc(&desc)?
-        };
+            class_spelling_of_desc(&desc)?.to_string()
+        });
+        let cls = receiver_lookup_name(receiver.as_deref()?);
         Overloads::Declared(declared_members_upward(
             program,
             &cls,
@@ -7588,11 +7585,21 @@ fn declared_class_name(program: &Program, name: &str) -> Option<String> {
 /// an edge to an undefined external function, indistinguishable downstream
 /// from a real call out of tree.
 fn resolve_operator_arrow(program: &Program, desc: TypeDesc) -> Option<String> {
+    let name = resolve_operator_arrow_receiver(program, desc)?;
+    Some(if name.trim_end().ends_with('>') {
+        strip_template_args(&name)
+    } else {
+        name
+    })
+}
+
+/// The arrow target's full spelling, for template return substitution.
+fn resolve_operator_arrow_receiver(program: &Program, desc: TypeDesc) -> Option<String> {
     let mut current = desc;
     let mut seen = HashSet::default();
     for _ in 0..=MAX_ARROW_DEPTH {
         if let TypeDesc::Ptr(inner) = current {
-            return class_name_of_desc(&inner);
+            return class_spelling_of_desc(&inner).map(str::to_string);
         }
         let TypeDesc::Struct { ref name, .. } = current else {
             return None;
@@ -7615,7 +7622,11 @@ fn resolve_operator_arrow(program: &Program, desc: TypeDesc) -> Option<String> {
             let [arg] = args.as_slice() else {
                 return None;
             };
-            return declared_class_name(program, &receiver_lookup_name(arg));
+            let head = declared_class_name(program, &receiver_lookup_name(arg))?;
+            return Some(match arg.find('<') {
+                Some(at) => format!("{head}{}", &arg[at..]),
+                None => head,
+            });
         }
         if !seen.insert(name.clone()) {
             return None;
@@ -7645,9 +7656,7 @@ fn resolve_operator_arrow(program: &Program, desc: TypeDesc) -> Option<String> {
                 // Preserve the existing standard-library fallback, whose
                 // pointee declaration may also live outside the tree.
                 if is_std_smart_ptr_name(&cls) {
-                    return args
-                        .first()
-                        .map(|s| receiver_lookup_name(&sanitize_type_name(s)).into_owned());
+                    return args.first().map(|s| sanitize_type_name(s));
                 }
                 // A nested type of a template whose body is not in the tree
                 // (`Outer<A>::Inner`, an iterator) has nothing to look the
@@ -8431,9 +8440,13 @@ fn var_static_class(program: &Program, v: VarId) -> Option<String> {
 /// class here (`sptr<T>` yields `sptr`, for `sp.Get()`); what it points to
 /// is the arrow's business, see [`resolve_operator_arrow`].
 fn class_name_of_desc(desc: &TypeDesc) -> Option<String> {
+    class_spelling_of_desc(desc).map(|name| receiver_lookup_name(name).into_owned())
+}
+
+fn class_spelling_of_desc(desc: &TypeDesc) -> Option<&str> {
     match desc {
-        TypeDesc::Struct { name, .. } => Some(receiver_lookup_name(name).into_owned()),
-        TypeDesc::Ptr(inner) => class_name_of_desc(inner),
+        TypeDesc::Struct { name, .. } => Some(name),
+        TypeDesc::Ptr(inner) => class_spelling_of_desc(inner),
         _ => None,
     }
 }

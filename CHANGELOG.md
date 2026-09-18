@@ -24,7 +24,10 @@ caller shows up:
   returns, function templates and overloads that are none of the above block substitution rather
   than borrowing another declaration's return; no template body is instantiated. Inherited arguments
   resolve in the base declaration's lexical scope, including nested arguments; dependent base
-  arguments remain unknown even when an unrelated concrete class shares their name.
+  arguments remain unknown even when an unrelated concrete class shares their name. Partially
+  qualified template bases use the same resolved class name as inheritance, including names
+  found through enclosing namespaces and `using namespace` directives. Arrow calls preserve
+  the unwrapped pointee's template arguments for return substitution through smart pointers.
 - **Fixture test bodies.** `HWTEST_F(Fixture, Name, …)` and `HWTEST_P` expand to what gtest
   generates — a class derived from the fixture, in an anonymous namespace, whose `TestBody` the
   source defines — so the body keeps the fields and methods it inherits in scope and same-named
@@ -33,7 +36,8 @@ caller shows up:
   call a zero-argument callback passed in that argument; the solver adds an indirect edge from the
   submitting call site once the points-to sets converge, deduplicated against what the callee's own
   body already yields. `ffrt::queue::submit` ships as a built-in model, and the effect is
-  configurable like any other (`kind = "invoke"`). See `docs/ANALYSIS.md` ("Function models") for
+  configurable like any other (`kind = "invoke"`). Bare model names now match qualified callees,
+  with exact-name models taking precedence. See `docs/ANALYSIS.md` ("Function models") for
   what the effect does and does not claim.
 
 Two code reviews of the above found further gaps, since fixed: a receiver substitutes through its

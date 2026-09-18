@@ -115,3 +115,31 @@ struct OuterScope {
     struct Derived : base_scope::ScopedHolder<Widget*> {};
 };
 void inherited_class_scope(OuterScope::Derived &d) { d.Get()->Start(); }
+
+namespace partial_base {
+namespace hardware {
+template<class T> struct Holder { T Get(); };
+struct Widget { void Start() {} };
+}
+struct Scoped : hardware::Holder<hardware::Widget*> {};
+void scoped(Scoped &d) { d.Get()->Start(); }
+}
+namespace imported_base {
+using namespace partial_base;
+struct Imported : hardware::Holder<partial_base::hardware::Widget*> {};
+void imported(Imported &d) { d.Get()->Start(); }
+}
+
+template<class T> struct NestedBase { template<class U> struct Inner {}; };
+struct NestedDerived : NestedBase<int>::Inner<double> {};
+
+namespace arrow_return {
+struct Service { void Start() {} };
+template<class T> struct Holder { T Get(); };
+template<class T> struct Pointer { T *operator->(); };
+void custom(Pointer<Holder<Service*>> &p) { p->Get()->Start(); }
+}
+namespace std { template<class T> class shared_ptr; }
+void standard_arrow(std::shared_ptr<arrow_return::Holder<arrow_return::Service*>> &p) {
+    p->Get()->Start();
+}

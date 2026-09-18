@@ -1269,7 +1269,7 @@ fn add_pts(st: &mut SolverState, node: PagNodeId, loc: LocId) {
 fn invoked_params(program: &Program, models: &FnModelSet) -> FxHashMap<FnId, Vec<u32>> {
     let mut by_callee = FxHashMap::default();
     for callee in &program.symbols.functions {
-        let Some(model) = models.get(&callee.name) else {
+        let Some(model) = models.get_for_callee(&callee.name) else {
             continue;
         };
         let params: Vec<u32> = model

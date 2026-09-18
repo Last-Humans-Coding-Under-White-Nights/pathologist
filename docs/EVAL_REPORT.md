@@ -18,11 +18,17 @@ dispatch-site and calibration probe are unchanged by the fix.
 |---|---:|---:|---:|---:|---:|---:|
 | functions_total | 12609 | 12110 | 10648 | 9946 | 23905 | 23003 |
 | functions_external | 2353 | 1853 | 2816 | 2114 | 4730 | 3828 |
-| edges_total | 75836 | 74810 | 31724 | 32480 | 97422 | 99344 |
+| edges_total | 75836 | 74810 | 31724 | 32480 | 97422 | 99347 |
 | edges_direct | 42252 | 44770 | 11254 | 15728 | 42652 | 54088 |
 | edges_indirect | 4825 | 4827 | 108 | 138 | 168 | 253 |
-| edges_external | 28759 | 25213 | 20348 | 16600 | 54600 | 45001 |
+| edges_external | 28759 | 25213 | 20348 | 16600 | 54600 | 45004 |
 | arg_flow_edges | 66253 | 68794 | 12331 | 17181 | 31113 | 40145 |
+
+The summary counts above were verified again against fresh release analyses after the PR review.
+Several tolerance-band centers in `scripts/eval_expected.json` still held earlier counts; they now
+match these measured results. The smart-pointer return fix adds three camera external edges to
+`std::list::empty` after `unique_ptr->UnwrapData()` in `movie_file_consumer.cpp` (lines 412, 447,
+469): total edges 99344 → 99347, external edges 45001 → 45004. Other measured metrics are unchanged.
 
 **The reported cases.** Four of the issue's five reports name files the pinned corpora also carry,
 at their own revisions rather than the branches the issue names. Distinct callers of the function at
@@ -44,7 +50,7 @@ not a pinned corpus.
 `external` edge to it, so each site the fix resolves both removes a phantom function and moves an
 edge into `direct`.
 
-HDF is the one corpus whose edge total *falls* (75836 → 74613), which that mechanism alone cannot
+HDF is the one corpus whose edge total *falls* (75836 → 74810), which that mechanism alone cannot
 produce. The cause is duplicate sites, not lost ones: at a location like
 `tools/hdi-gen/ast/ast.cpp:210:5` master emitted two call sites, one resolved to
 `OHOS::HDI::StringBuilder::Append` and one unresolved under the bare `Append`, and only the second

@@ -6339,3 +6339,41 @@ fn cpp_inherited_template_return_uses_enclosing_class_scope() {
         "Widget::Start"
     ));
 }
+
+#[test]
+fn cpp_template_return_resolves_partially_qualified_bases() {
+    let (p, a) = cpp_issue113();
+    for caller in ["partial_base::scoped", "imported_base::imported"] {
+        assert!(
+            has_any_edge(p, a, caller, "partial_base::hardware::Holder::Get"),
+            "{caller} base member"
+        );
+        assert!(
+            has_any_edge(p, a, caller, "partial_base::hardware::Widget::Start"),
+            "{caller} return"
+        );
+    }
+}
+
+#[test]
+fn cpp_template_base_keeps_arguments_on_their_own_nested_class() {
+    let (p, _) = cpp_issue113();
+    let bases = p.template_bases_of("NestedDerived");
+    assert_eq!(bases.len(), 1);
+    assert_eq!(bases[0].spelling, "NestedBase<int>::Inner<double>");
+}
+
+#[test]
+fn cpp_template_return_uses_smart_pointer_pointee_arguments() {
+    let (p, a) = cpp_issue113();
+    for caller in ["arrow_return::custom", "standard_arrow"] {
+        assert!(
+            has_any_edge(p, a, caller, "arrow_return::Holder::Get"),
+            "{caller} member"
+        );
+        assert!(
+            has_any_edge(p, a, caller, "arrow_return::Service::Start"),
+            "{caller} return"
+        );
+    }
+}
