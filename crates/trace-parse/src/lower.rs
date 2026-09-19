@@ -7,7 +7,8 @@ use crate::discover::discover_source_files;
 use crate::gn_defines::Candidate;
 use crate::index_cache::{IndexSourceCache, PreprocessedSource};
 use crate::merge::{
-    merge_unit_index, merge_unit_symbols, merge_unit_types, merge_unit_variants, UnitIndex,
+    merge_unit_header_preamble, merge_unit_index, merge_unit_symbols, merge_unit_types,
+    merge_unit_variants, UnitIndex,
 };
 use crate::parse::node_text;
 use rayon::prelude::*;
@@ -916,7 +917,7 @@ fn build_program_inner(
                 if is_dep {
                     merge_unit_symbols(&mut program, unit.as_ref());
                 } else {
-                    merge_unit_index(&mut program, unit.as_ref());
+                    merge_unit_header_preamble(&mut program, unit.as_ref());
                 }
             }
         }
@@ -1190,7 +1191,7 @@ fn bind_calls_past_this(program: &mut Program) {
             Some(callee) => is_member_function(program, callee),
             None => {
                 cs.callee_name.contains("::") && {
-                    let callees = program.symbols.callees_of(cs);
+                    let callees = program.callees_of(cs);
                     !callees.is_empty() && callees.iter().all(|&f| is_member_function(program, f))
                 }
             }
@@ -1285,6 +1286,7 @@ fn finalize_extern_callees(program: &mut Program) {
             declared_in_class: false,
             is_virtual: false,
             is_final: false,
+            tu: None,
         });
         for &i in &sites_by_name[name.as_str()] {
             let cs = &mut program.symbols.call_sites[i];
@@ -1367,6 +1369,7 @@ fn finalize_target_extern_callees(program: &mut Program) {
             is_virtual: false,
             is_final: false,
             is_cpp: false,
+            tu: None,
         });
         for i in sites {
             let cs = &mut program.symbols.call_sites[i];
@@ -1517,6 +1520,7 @@ fn expand_virtual_overrides(program: &mut Program) {
                 is_direct: true,
                 receiver_class: cs.receiver_class.clone(),
                 return_dst: cs.return_dst,
+                tu: cs.tu,
             });
         }
     }
@@ -1716,7 +1720,7 @@ fn project_preprocess_opts(
     eff
 }
 
-fn is_index_header(path: &Path) -> bool {
+pub(crate) fn is_index_header(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
         crate::discover::HEADER_EXTENSIONS
             .iter()
@@ -2163,37 +2167,20 @@ fn lower_prepared_source(
     let self_canon = graph.intern_path(path);
     let file_id = program.symbols.add_file_interned(&self_canon);
     add_preprocess_diagnostics(program, graph, file_id, &pre.diagnostics);
+    let types_only = is_index_header(path);
+    let headers = headers_to_merge(
+        graph,
+        pch_order,
+        &self_canon,
+        &pre.included_headers,
+        types_only,
+    );
     if let Some(ir) = header_ir {
-        // Nested PCH copies types/typedefs only so ancestor units stay small.
-        // TUs merge prototypes from every reachable header (the defining
-        // unit keeps call sites/flow). Direct-edges + included_headers used
-        // to miss `sidecar.h` for `hdf_wifi_core.c`, dropping
-        // `DispatchToMessage` from `DeviceNodeExtDispatch`.
-        let types_only = is_index_header(path);
-        let headers = headers_to_merge(
-            graph,
-            pch_order,
-            &self_canon,
-            &pre.included_headers,
-            types_only,
-        );
-        for h in headers {
-            if let Some(units) = ir.get(h) {
-                // The expansion this unit replayed, when it has one. A
-                // header it reached only through another header's cached
-                // expansion leaves no record here — `PreprocessedSource`
-                // carries the includer's `nested_variants` for exactly the
-                // headers that entry pulled in, and anything still missing
-                // is merged from every stored expansion, which is additive
-                // for the declarations these two modes copy.
+        for h in &headers {
+            if let Some(units) = ir.get(*h) {
                 for (unit_lang, variant, unit) in units {
-                    // A header reached from both C and C++ is lowered once,
-                    // in the language `index_language` chose. A unit of the
-                    // other language recorded an index into that language's
-                    // own variant list, where it means something else, so it
-                    // is not a record for this unit at all.
                     let wanted = (*unit_lang == language)
-                        .then(|| pre.replayed_variants.get(h))
+                        .then(|| pre.replayed_variants.get(*h))
                         .flatten();
                     if wanted.is_some_and(|w| !w.contains(variant)) {
                         continue;
@@ -2205,12 +2192,14 @@ fn lower_prepared_source(
                     }
                 }
             }
-            let hid = program.symbols.add_file_interned(h);
-            if hid != file_id {
-                program.symbols.register_included_header(file_id, hid);
-            }
         }
         program.types.complete_nested_tags();
+    }
+    for h in headers {
+        let hid = program.symbols.add_file_interned(h);
+        if hid != file_id {
+            program.symbols.register_included_header(file_id, hid);
+        }
     }
     if let Some(dir) = std::env::var_os("TRACE_DUMP_TU_DIR") {
         let fname = format!(
@@ -3667,6 +3656,7 @@ fn register_member_prototype(
         is_virtual: flags.is_virtual,
         is_final: flags.is_final,
         is_cpp: ctx.is_cpp,
+        tu: Some(ctx.current_file),
     });
 }
 
@@ -3970,6 +3960,7 @@ fn lower_function_signature(
         is_virtual: flags.is_virtual,
         is_final: flags.is_final,
         is_cpp: ctx.is_cpp,
+        tu: Some(ctx.current_file),
     });
     reassign_fn_id(program, provisional_id, fn_id, provisional_start);
     if scoped {
@@ -4475,7 +4466,7 @@ fn call_result_shape(
         // An implicit member hides an outer free function of the same name,
         // just as it does for collect_call_at_node.
         let members = match &ctx.class_ctx {
-            Some(cc) if is_bare_callee_node(func) => declared_members_upward(
+            Some(cc) if is_bare_callee_node(func, &name) => declared_members_upward(
                 program,
                 &cc.qual_name,
                 &trace_ir::MethodKind::Named(name.clone()),
@@ -5302,7 +5293,43 @@ fn lower_declaration(
                             storage_override,
                             args,
                         ),
-                        None => lower_function_decl(program, ctx, source, fdecl, ty, is_static),
+                        None => {
+                            if let Some(caller) = ctx.current_fn {
+                                if let Some(inner) = fdecl.child_by_field_name("declarator") {
+                                    if inner.kind() == "structured_binding_declarator" {
+                                        let type_name = node_text(source, &type_node).to_string();
+                                        let callee_var = lookup_var(ctx, program, &type_name);
+                                        let callee_name = format!("{}[...]", type_name);
+                                        let span = node_span(program, ctx, node);
+                                        let args = collect_call_args(
+                                            program,
+                                            ctx,
+                                            source,
+                                            fdecl.child_by_field_name("parameters"),
+                                        );
+                                        let call_id = program.symbols.alloc_call_id();
+                                        program.symbols.call_sites.push(CallSite {
+                                            id: call_id,
+                                            caller,
+                                            callee_name,
+                                            callee_var,
+                                            callee_fn_id: None,
+                                            var_args: args.var_args,
+                                            fn_args: args.fn_args,
+                                            addr_of_member_args: args.addr_of_member_args,
+                                            args_bound_past_this: false,
+                                            span,
+                                            is_direct: false,
+                                            receiver_class: None,
+                                            return_dst: None,
+                                            tu: Some(ctx.current_file),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                            lower_function_decl(program, ctx, source, fdecl, ty, is_static)
+                        }
                     }
                     continue;
                 }
@@ -5827,6 +5854,7 @@ fn lower_function_decl(
         is_virtual: false,
         is_final: false,
         is_cpp: ctx.is_cpp,
+        tu: Some(ctx.current_file),
     });
     reassign_fn_id(program, provisional_id, fn_id, provisional_start);
 }
@@ -6250,10 +6278,33 @@ fn collect_call_at_node(
         // A qualified method call (`Base::m(a)`, `Cls::Static(a)`) lands here
         // too: its `this` is not one of the arguments.
         let by_arity = filter_targets_by_argc(program, candidates, argc, &arg_desc, argc == 0);
-        if by_arity.len() > 1 {
+        let ranked = if by_arity.len() > 1 {
             rank_overloads(program, &by_arity, &arg_desc)
         } else {
             by_arity
+        };
+        if ranked.len() > 1
+            && ranked
+                .iter()
+                .any(|&f| program.symbols.function(f).is_defined)
+        {
+            ranked
+                .iter()
+                .copied()
+                .filter(|&cand| {
+                    let fc = program.symbols.function(cand);
+                    if fc.is_defined {
+                        return true;
+                    }
+                    !ranked.iter().any(|&other| {
+                        other != cand
+                            && program.symbols.function(other).is_defined
+                            && has_same_signature(program, cand, other)
+                    })
+                })
+                .collect()
+        } else {
+            ranked
         }
     } else {
         Vec::new()
@@ -6275,6 +6326,7 @@ fn collect_call_at_node(
             is_direct,
             receiver_class: None,
             return_dst,
+            tu: Some(ctx.current_file),
         });
         return;
     }
@@ -6312,6 +6364,7 @@ fn collect_call_at_node(
             is_direct: true,
             receiver_class: None,
             return_dst,
+            tu: Some(ctx.current_file),
         });
     }
 }
@@ -6390,11 +6443,7 @@ fn shift_past_this(
 /// Whether parameter 0 of `fid` is the implicit `this` lowering prepends to
 /// a member function's definition (static members included).
 fn has_this_param(program: &Program, fid: FnId) -> bool {
-    let f = program.symbols.function(fid);
-    f.is_cpp
-        && f.params
-            .first()
-            .is_some_and(|&p| program.symbols.variable(p).name == "this")
+    program.symbols.has_this_param(fid)
 }
 
 /// Whether `fid` is a member function. An in-class prototype carries no
@@ -6664,8 +6713,46 @@ fn param_match_rank(arg: &TypeDesc, param: &TypeDesc) -> usize {
 /// `resolve_cpp_name_candidates` is the bare base name (e.g. `GetNumber`,
 /// not `GetNumber<int>`), which correctly indexes into the `base_by_name`
 /// bucket.
-fn is_bare_callee_node(func: tree_sitter::Node) -> bool {
-    matches!(func.kind(), "identifier" | "template_function")
+fn is_bare_callee_node(func: Node, name: &str) -> bool {
+    matches!(func.kind(), "identifier" | "template_function") && !name.contains("::")
+}
+
+fn has_same_signature(program: &Program, a: FnId, b: FnId) -> bool {
+    let fa = program.symbols.function(a);
+    let fb = program.symbols.function(b);
+    if fa.variadic != fb.variadic {
+        return false;
+    }
+    let a_skip = usize::from(has_this_param(program, a));
+    let b_skip = usize::from(has_this_param(program, b));
+    let a_params = &fa.params[a_skip..];
+    let b_params = &fb.params[b_skip..];
+    if a_params.is_empty() || b_params.is_empty() {
+        let a_arity = fa.explicit_arity.or(Some(a_params.len() as u32));
+        let b_arity = fb.explicit_arity.or(Some(b_params.len() as u32));
+        return a_arity.zip(b_arity).is_none_or(|(ea, eb)| ea == eb);
+    }
+    if a_params.len() != b_params.len() {
+        return false;
+    }
+    let param_t = |f: &Function, skip: usize, idx: usize| -> Option<trace_ir::TypeId> {
+        f.param_type_ids.get(skip + idx).copied().or_else(|| {
+            f.params
+                .get(skip + idx)
+                .map(|&v| program.symbols.variable(v).type_id)
+        })
+    };
+    for i in 0..a_params.len() {
+        match (param_t(fa, a_skip, i), param_t(fb, b_skip, i)) {
+            (Some(ta), Some(tb)) => {
+                if !trace_ir::same_param_type(&program.types, ta, tb) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// The functions a C++ callee `func`, spelled `name`, may call: ordinary and
@@ -6678,9 +6765,9 @@ fn cpp_callee_candidates(
     name: &str,
     arg_desc: &[TypeDesc],
 ) -> Vec<FnId> {
-    if is_bare_callee_node(func) {
+    if is_bare_callee_node(func, name) {
         resolve_cpp_name_candidates(program, ctx, name, arg_desc)
-    } else if func.kind() == "qualified_identifier" {
+    } else if func.kind() == "qualified_identifier" || func.kind() == "template_function" {
         let lookup = |candidate: &str| {
             let found = program
                 .symbols
@@ -6882,6 +6969,7 @@ fn emit_unresolved_site(
         is_direct: false,
         receiver_class: Some(receiver_class),
         return_dst: None,
+        tu: program.symbols.function_by_id(caller).and_then(|f| f.tu),
     });
 }
 
@@ -6919,6 +7007,7 @@ fn emit_member_targets(
     span: Span,
     targets: Vec<FnId>,
 ) {
+    let tu = program.symbols.function_by_id(caller).and_then(|f| f.tu);
     let mut args = args.bind_past_this(receiver);
     let argc = args.argc;
     let targets = filter_targets_by_argc(program, targets, argc as usize, &args.arg_desc, true);
@@ -6941,6 +7030,7 @@ fn emit_member_targets(
             is_direct: false,
             receiver_class: Some(cls.to_string()),
             return_dst: None,
+            tu,
         });
         return;
     }
@@ -6966,6 +7056,7 @@ fn emit_member_targets(
             is_direct: true,
             receiver_class: Some(cls.to_string()),
             return_dst: None,
+            tu,
         });
     }
 }
@@ -7312,6 +7403,7 @@ fn lower_lambda_expression(
         is_virtual: false,
         is_final: false,
         is_cpp: true,
+        tu: Some(ctx.current_file),
     });
     reassign_fn_id(program, provisional_id, fn_id, provisional_start);
     let saved_fn = ctx.current_fn;

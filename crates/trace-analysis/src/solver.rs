@@ -369,7 +369,7 @@ fn solve(
         // sites resolve by name as before. Any callee without a definition
         // under the analyzed root (prototype-only or synthesized) yields an
         // External edge and no param wiring — there is no body to wire into.
-        for callee in program.symbols.callees_of(cs) {
+        for callee in program.callees_of(cs) {
             let f = program.symbols.function(callee);
             let external = !f.is_defined;
             let has_formals = !f.params.is_empty();

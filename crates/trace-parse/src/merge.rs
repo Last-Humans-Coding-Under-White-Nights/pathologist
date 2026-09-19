@@ -85,10 +85,11 @@ pub(crate) fn merge_descs_of(types: &trace_ir::TypeTable) -> Vec<Arc<TypeDesc>> 
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MergeMode {
+pub enum MergeMode {
     Full,
     TypesOnly,
     SymbolsOnly,
+    HeaderPreamble,
     Variant,
 }
 
@@ -169,6 +170,10 @@ fn same_call_facts(a: &CallSite, b: &CallSite) -> bool {
 
 pub fn merge_unit_index(program: &mut Program, unit: &UnitIndex) {
     merge_unit(program, unit, MergeMode::Full, None);
+}
+
+pub fn merge_unit_header_preamble(program: &mut Program, unit: &UnitIndex) {
+    merge_unit(program, unit, MergeMode::HeaderPreamble, None);
 }
 
 /// Merge a translation unit together with its configuration variants (#59).
@@ -398,7 +403,10 @@ fn merge_unit(
         }
     }
 
-    if matches!(mode, MergeMode::Full | MergeMode::Variant) {
+    if matches!(
+        mode,
+        MergeMode::Full | MergeMode::HeaderPreamble | MergeMode::Variant
+    ) {
         for diagnostic in &unit.diagnostics {
             let diagnostic = trace_ir::Diagnostic {
                 file: diagnostic.file.map(map_file),
@@ -464,10 +472,22 @@ fn merge_unit(
             dropped_fns.insert(old_id);
             continue;
         }
+        if matches!(mode, MergeMode::HeaderPreamble)
+            && func.linkage == trace_ir::Linkage::Internal
+            && func.is_defined
+            && func.is_cpp
+        {
+            dropped_fns.insert(old_id);
+            continue;
+        }
         let span_file = map_file(func.span.file);
-        let mut canonical = program
-            .dedup
-            .existing_fn(span_file, &func.name, func.span.line);
+        let mut canonical = if func.linkage == trace_ir::Linkage::Internal && func.is_cpp {
+            None
+        } else {
+            program
+                .dedup
+                .existing_fn(span_file, &func.name, func.span.line)
+        };
         if canonical.is_none() && matches!(mode, MergeMode::Variant) && func.is_defined {
             // The two arms of an `#ifdef X / #else` pair put one function's
             // implementations on different lines, so the line-keyed dedup misses
@@ -585,6 +605,7 @@ fn merge_unit(
         f.id = new_id;
         f.span.file = span_file;
         f.file = span_file;
+        f.tu = Some(primary_file_id);
         f.return_type = remap_type(f.return_type, &type_map);
         // A body written in a dependency header is not the target's code:
         // keep the signature, drop everything the body would contribute (#60).
@@ -631,9 +652,11 @@ fn merge_unit(
             remap_params.insert(merged);
         }
         fn_map.insert(old_id, merged);
-        program
-            .dedup
-            .insert_fn(span_file, func.name.clone(), func.span.line, merged);
+        if !(func.linkage == trace_ir::Linkage::Internal && func.is_cpp) {
+            program
+                .dedup
+                .insert_fn(span_file, func.name.clone(), func.span.line, merged);
+        }
     }
 
     for (&declaration, &definition) in &respelled {
@@ -779,6 +802,19 @@ fn merge_unit(
             }
         }
 
+        if matches!(mode, MergeMode::SymbolsOnly)
+            && var.storage == trace_ir::StorageClass::Local
+            && var.fn_id.is_some()
+            && !mapped_fn_id.is_some_and(|fid| {
+                program
+                    .symbols
+                    .function_by_id(fid)
+                    .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal && f.is_cpp)
+            })
+        {
+            continue;
+        }
+
         let new_id = program.symbols.alloc_var_id();
         let mut v = var.clone();
         let old = v.id;
@@ -847,7 +883,7 @@ fn merge_unit(
         }
     }
 
-    if matches!(mode, MergeMode::SymbolsOnly) {
+    if program.is_dep_file(primary_file_id) {
         return;
     }
 
@@ -856,12 +892,22 @@ fn merge_unit(
         if dropped_fns.contains(&cs.caller) {
             continue;
         }
+        let Some(&mapped_caller) = fn_map.get(&cs.caller) else {
+            continue;
+        };
         let span_file = map_file(cs.span.file);
         if program.is_dep_file(span_file) {
             continue;
         }
         let key: SiteKey = (span_file, cs.span.line, cs.span.col, cs.callee_name.clone());
-        if !matches!(mode, MergeMode::Variant) {
+        let is_internal_caller = program
+            .symbols
+            .function_by_id(mapped_caller)
+            .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal && f.is_cpp);
+        if matches!(mode, MergeMode::SymbolsOnly) && !is_internal_caller {
+            continue;
+        }
+        if !matches!(mode, MergeMode::Variant) && !is_internal_caller {
             if let Some(&existing) = program.dedup.site_keys.get(&key) {
                 call_map.insert(cs.id, existing);
                 continue;
@@ -869,7 +915,7 @@ fn merge_unit(
         }
         let old = cs.id;
         let mut site = cs.clone();
-        site.caller = fn_map.get(&site.caller).copied().unwrap_or(site.caller);
+        site.caller = mapped_caller;
         site.callee_fn_id = site.callee_fn_id.and_then(|f| fn_map.get(&f).copied());
         site.callee_var = site.callee_var.and_then(|v| var_map.get(&v).copied());
         site.var_args = site
@@ -921,31 +967,140 @@ fn merge_unit(
         }
         let new_id = program.symbols.alloc_call_id();
         site.id = new_id;
+        site.tu = Some(primary_file_id);
         program.symbols.call_sites.push(site);
-        if matches!(mode, MergeMode::Variant) {
-            // A variant adds records at a site the base configuration may
-            // already own. The key stands for the site across the whole
-            // program, and a later unit that reaches it is in the base
-            // configuration, not this variant's — so the base record stays
-            // canonical and only a site no configuration has claimed yet is
-            // registered here. The record is remembered separately either way,
-            // so a later variant can merge into it.
-            program
-                .dedup
-                .variant_site_records
-                .entry(key.clone())
-                .or_default()
-                .push(new_id);
-            program.dedup.site_keys.entry(key).or_insert(new_id);
-        } else {
-            program.dedup.site_keys.insert(key, new_id);
+        if !is_internal_caller {
+            if matches!(mode, MergeMode::Variant) {
+                // A variant adds records at a site the base configuration may
+                // already own. The key stands for the site across the whole
+                // program, and a later unit that reaches it is in the base
+                // configuration, not this variant's — so the base record stays
+                // canonical and only a site no configuration has claimed yet is
+                // registered here. The record is remembered separately either way,
+                // so a later variant can merge into it.
+                program
+                    .dedup
+                    .variant_site_records
+                    .entry(key.clone())
+                    .or_default()
+                    .push(new_id);
+                program.dedup.site_keys.entry(key).or_insert(new_id);
+            } else {
+                program.dedup.site_keys.insert(key, new_id);
+            }
         }
         call_map.insert(old, new_id);
     }
 
+    let valid_flow = |flow: &FlowConstraint| {
+        flow_vars(flow).all(|v| var_map.contains_key(&v))
+            && flow_fns(flow).all(|f| fn_map.contains_key(&f))
+    };
+
+    let symbols = &program.symbols;
+    let is_internal_fn = |fid: FnId| {
+        symbols
+            .function_by_id(fid)
+            .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal && f.is_cpp)
+    };
+
+    let is_internal_flow = |flow: &FlowConstraint| {
+        flow_vars(flow).any(|v| {
+            var_map
+                .get(&v)
+                .and_then(|&nv| symbols.variable_by_id(nv))
+                .and_then(|var| var.fn_id)
+                .is_some_and(is_internal_fn)
+        })
+    };
+
+    let references_this_tus_internal_function = |flow: &FlowConstraint| {
+        flow_fns(flow).any(|f| fn_map.get(&f).copied().is_some_and(is_internal_fn))
+    };
+
+    let mut internal_init_vars: FxHashSet<VarId> = FxHashSet::default();
+    if matches!(mode, MergeMode::SymbolsOnly) {
+        let file_scope_vars: FxHashSet<VarId> = unit
+            .variables
+            .iter()
+            .filter(|v| v.fn_id.is_none())
+            .map(|v| v.id)
+            .collect();
+        for flow in &unit.flow {
+            if references_this_tus_internal_function(flow) {
+                for v in flow_vars(flow) {
+                    if file_scope_vars.contains(&v) {
+                        internal_init_vars.insert(v);
+                    }
+                }
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for flow in &unit.flow {
+                match flow {
+                    FlowConstraint::Store { dst, src }
+                    | FlowConstraint::Copy { dst, src }
+                    | FlowConstraint::Load { dst, src }
+                    | FlowConstraint::AddrOfVar { dst, src }
+                        if file_scope_vars.contains(dst) && file_scope_vars.contains(src) =>
+                    {
+                        let has_dst = internal_init_vars.contains(dst);
+                        let has_src = internal_init_vars.contains(src);
+                        if (has_dst || has_src) && (!has_dst || !has_src) {
+                            internal_init_vars.insert(*dst);
+                            internal_init_vars.insert(*src);
+                            changed = true;
+                        }
+                    }
+                    FlowConstraint::GepField { dst, base, .. }
+                        if file_scope_vars.contains(dst) && file_scope_vars.contains(base) =>
+                    {
+                        let has_dst = internal_init_vars.contains(dst);
+                        let has_base = internal_init_vars.contains(base);
+                        if (has_dst || has_base) && (!has_dst || !has_base) {
+                            internal_init_vars.insert(*dst);
+                            internal_init_vars.insert(*base);
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let is_supporting_flow = |flow: &FlowConstraint| {
+        if internal_init_vars.is_empty() {
+            return false;
+        }
+        match flow {
+            FlowConstraint::Store { dst, src }
+            | FlowConstraint::Copy { dst, src }
+            | FlowConstraint::Load { dst, src }
+            | FlowConstraint::AddrOfVar { dst, src } => {
+                internal_init_vars.contains(dst) && internal_init_vars.contains(src)
+            }
+            FlowConstraint::GepField { dst, base, .. } => {
+                internal_init_vars.contains(dst) && internal_init_vars.contains(base)
+            }
+            _ => false,
+        }
+    };
+
+    let replay_in_tu = |flow: &FlowConstraint| {
+        is_internal_flow(flow)
+            || references_this_tus_internal_function(flow)
+            || is_supporting_flow(flow)
+    };
+
     if let Some(seen) = variant_dedup {
         for flow in &unit.flow {
-            if !flow_vars(flow).all(|v| var_map.contains_key(&v)) {
+            if matches!(mode, MergeMode::SymbolsOnly) && !replay_in_tu(flow) {
+                continue;
+            }
+            if !valid_flow(flow) {
                 continue;
             }
             let remapped = remap_flow(flow, &fn_map, &var_map);
@@ -955,7 +1110,10 @@ fn merge_unit(
         }
     } else {
         for flow in &unit.flow {
-            if !flow_vars(flow).all(|v| var_map.contains_key(&v)) {
+            if matches!(mode, MergeMode::SymbolsOnly) && !replay_in_tu(flow) {
+                continue;
+            }
+            if !valid_flow(flow) {
                 continue;
             }
             program.flow.push(remap_flow(flow, &fn_map, &var_map));
@@ -976,9 +1134,21 @@ fn merge_unit(
         {
             continue;
         }
+        if matches!(mode, MergeMode::SymbolsOnly) {
+            let is_internal = program
+                .symbols
+                .function_by_id(new_fn)
+                .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal && f.is_cpp);
+            if !is_internal {
+                continue;
+            }
+        }
         let remapped: Vec<ReturnFlow> = flows
             .iter()
-            .filter(|f| return_flow_vars(f).all(|v| var_map.contains_key(&v)))
+            .filter(|f| {
+                return_flow_vars(f).all(|v| var_map.contains_key(&v))
+                    && return_flow_fns(f).all(|callee| fn_map.contains_key(&callee))
+            })
             .map(|f| remap_return_flow(f, &fn_map, &var_map))
             .collect();
         let target = program.fn_returns.entry(new_fn).or_default();
@@ -1015,11 +1185,29 @@ fn flow_vars(flow: &FlowConstraint) -> impl Iterator<Item = VarId> + '_ {
     .into_iter()
 }
 
+fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> {
+    match flow {
+        FlowConstraint::AddrOfFn { callee, .. } | FlowConstraint::ArrayFnMember { callee, .. } => {
+            Some(*callee)
+        }
+        _ => None,
+    }
+    .into_iter()
+}
+
 fn return_flow_vars(flow: &ReturnFlow) -> impl Iterator<Item = VarId> + '_ {
     match flow {
         ReturnFlow::AddrOfVar { src } => vec![*src],
         ReturnFlow::Copy { src } => vec![*src],
         ReturnFlow::AddrOfFn { .. } | ReturnFlow::Call { .. } => Vec::new(),
+    }
+    .into_iter()
+}
+
+fn return_flow_fns(flow: &ReturnFlow) -> impl Iterator<Item = FnId> {
+    match flow {
+        ReturnFlow::AddrOfFn { callee } => Some(*callee),
+        _ => None,
     }
     .into_iter()
 }
@@ -1518,6 +1706,7 @@ mod tests {
                 is_virtual: false,
                 is_final: false,
                 is_cpp: true,
+                tu: None,
             }],
             variables: vec![Variable {
                 is_defined: false,
@@ -1604,14 +1793,13 @@ mod tests {
         let proto = unit_declaring("if.h", false, vec![("objectId".into(), TypeDesc::Int)]);
         merge_unit_index(&mut program, &def);
         merge_unit_index(&mut program, &proto);
-        // A different origin bypasses source-location deduplication and
-        // exercises the symbol table's exact-signature comparison.
+        // Distinct definitions from separate compile units are indexed separately.
         let repeated = unit_declaring("other.cpp", true, Vec::new());
         merge_unit_index(&mut program, &repeated);
         assert_eq!(
             program.symbols.functions.len(),
-            1,
-            "a prototype must not change the signature used to deduplicate a definition"
+            2,
+            "distinct definitions from separate compile units are indexed separately"
         );
     }
 

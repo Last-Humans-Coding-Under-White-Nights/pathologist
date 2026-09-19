@@ -131,6 +131,20 @@ return wiring; a lookup that names no image (the public resolver entry points)
 still sees every symbol, which is not the same question as naming the unscoped
 partition explicitly.
 
+When separate translation units contribute distinct strong definitions of a
+C++ function with the same qualified name and signature (such as multiple
+implementations across modules analyzed in whole-program or unscoped mode
+without link metadata), each definition is indexed separately in the symbol
+table and the exported database.
+
+Call-site resolution respects translation-unit boundaries:
+- A translation unit that contains a definition of the function resolves direct
+  calls exclusively to its own definition, avoiding duplicate edges from other
+  units.
+- A translation unit that does not define the function (seeing only declarations
+  or prototypes) treats all matching definitions across the program as equal
+  candidates and resolves to them.
+
 **IPC bridges are the deliberate exception.** A Binder call crosses a process
 boundary, so a proxy and the stub it dispatches to are in *different* images by
 construction — a client executable and its service daemon. Proxy/stub pairing
@@ -224,7 +238,7 @@ Functions record abstract return values in `program.fn_returns`:
 
 `return &local` is recorded as `AddrOfVar` but is **unsound** for stack locals (may-analysis may report escaped addresses). Prefer treating this as a known imprecision.
 
-At PAG build time, `CallReturn` resolves `callee_name` with **`resolve_function_candidates_in_target(name, file, target)`** — every function the merged name may refer to: the query file's internal-linkage entries (`fn_by_scope`, declarations included, with their further C++ overloads in `scope_overloads`) plus the canonical external definition. Name-based facts lose the calling TU's visibility context at merge time, so a name matching both a file-`static` def and an external def is genuinely ambiguous; per may-analysis semantics all candidates are expanded. Callee ids that survived lowering + merge (e.g. `AddrOfFn`) are used directly instead — they are exact.
+At PAG build time, `CallReturn` and transitive `ReturnFlow::Call` resolve `callee_name` with **`resolve_function_candidates_in_target(name, file, target)`** — every function the merged name may refer to: the query file's internal-linkage entries (`fn_by_scope`, declarations included, with their further C++ overloads in `scope_overloads`) plus external definitions. When the caller translation unit defines the function, return-flow expansion isolates exclusively to that unit's definition, avoiding cross-TU points-to leaks. When no unit-local definition exists, all matching definitions are expanded per may-analysis semantics. Callee ids that survived lowering + merge (e.g. `AddrOfFn`) are used directly instead — they are exact.
 
 This models patterns like:
 

@@ -115,6 +115,9 @@ pub struct Function {
     /// A C `.c` definition merging into a C++-parsed `.h` prototype clears
     /// this flag so a later TU merge does not treat the pair as overloads.
     pub is_cpp: bool,
+    /// Originating translation unit, recorded by merge. Absent before merge or
+    /// on synthesized entries.
+    pub tu: Option<crate::FileId>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +152,8 @@ pub struct CallSite {
     /// LHS of `dst = callee(...)` when the call's value is used (`CallReturn`
     /// destination). `dlsym` models write function addresses here.
     pub return_dst: Option<VarId>,
+    /// Originating translation unit, recorded by merge. Absent before merge.
+    pub tu: Option<crate::FileId>,
 }
 
 impl CallSite {
@@ -235,7 +240,7 @@ pub struct FileInfo {
 }
 
 /// What [`SymbolTable::register_function`] did with a function.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FnRegistration {
     /// The surviving entry: either the id the caller allocated, or the
     /// earlier entry this redeclaration merged into.
@@ -521,33 +526,48 @@ impl SymbolTable {
             // differently -- it is the sole case that returns before
             // consulting types -- so the fallback scan is restricted to those
             // candidates rather than repeating identical work for a bucket of
-            // C++ ones.
             let mixed_language =
                 |id: FnId| !(func.is_cpp && self.function_by_id(id).is_some_and(|e| e.is_cpp));
+            let is_incompatible_def = |existing_id: FnId| -> bool {
+                if let Some(existing) = self.function_by_id(existing_id) {
+                    if func.is_cpp && existing.is_cpp && func.is_defined && existing.is_defined {
+                        let is_same_def =
+                            existing.file == func.file && existing.span.line == func.span.line;
+                        let has_weak = existing.is_weak || func.is_weak;
+                        if !is_same_def && !has_weak {
+                            return true;
+                        }
+                    }
+                }
+                false
+            };
             let matched_id = candidates
                 .iter()
                 .copied()
-                .find(|&id| compatible(id, true))
+                .find(|&id| compatible(id, true) && !is_incompatible_def(id))
                 .or_else(|| {
-                    candidates
-                        .iter()
-                        .copied()
-                        .find(|&id| mixed_language(id) && compatible(id, false))
+                    candidates.iter().copied().find(|&id| {
+                        mixed_language(id) && compatible(id, false) && !is_incompatible_def(id)
+                    })
                 });
             if let Some(existing_id) = matched_id {
                 let mut missing_this = false;
                 if let Some(existing) = self.function_mut_by_id(existing_id) {
                     missing_this = joins_member_missing_this(existing, &func);
-                    // An unscoped program keeps its historical first-wins
-                    // overwrite; within an image, precedence decides.
-                    if func.is_defined
-                        && (func.target.is_none()
+                    // Deduplication selects the first-encountered definition for C++;
+                    // C keeps its historical overwrite for unscoped programs.
+                    // Within an image, precedence decides.
+                    let overwrite = if func.is_cpp && existing.is_cpp {
+                        definition_supersedes(existing.is_defined, existing.is_weak, func.is_weak)
+                    } else {
+                        func.target.is_none()
                             || definition_supersedes(
                                 existing.is_defined,
                                 existing.is_weak,
                                 func.is_weak,
-                            ))
-                    {
+                            )
+                    };
+                    if func.is_defined && overwrite {
                         existing.is_weak =
                             func.is_weak || (func.target.is_none() && existing.is_weak);
                         existing.is_defined = true;
@@ -555,6 +575,7 @@ impl SymbolTable {
                         existing.file = func.file;
                         existing.span = func.span;
                         existing.end_line = func.end_line;
+                        existing.tu = func.tu;
                         if !func.params.is_empty() {
                             existing.params = func.params.clone();
                             adopted_params = true;
@@ -639,15 +660,24 @@ impl SymbolTable {
             let own_file = entries
                 .into_iter()
                 .flatten()
-                .find(|(file, id)| *file == func.file && self.function(*id).target == func.target)
+                .find(|(file, id)| {
+                    *file == func.file
+                        && self.function(*id).target == func.target
+                        && (!func.is_cpp
+                            || self.function(*id).tu == func.tu
+                            || (!self.function(*id).is_defined && func.is_defined))
+                })
                 .map(|(_, id)| *id);
             let scoped = own_file.or_else(|| {
                 if !func.is_cpp {
                     return None;
                 }
                 self.first_in_scope(func.file, entries, |id| {
-                    self.function_by_id(id)
-                        .is_some_and(|e| e.is_cpp && e.target == func.target)
+                    self.function_by_id(id).is_some_and(|e| {
+                        e.is_cpp
+                            && e.target == func.target
+                            && (e.tu == func.tu || (!e.is_defined && func.is_defined))
+                    })
                 })
             });
             let overloads = func.is_cpp
@@ -690,6 +720,7 @@ impl SymbolTable {
                         existing.file = func.file;
                         existing.span = func.span;
                         existing.end_line = func.end_line;
+                        existing.tu = func.tu;
                         if !func.params.is_empty() {
                             existing.params = func.params.clone();
                             adopted_params = true;
@@ -739,7 +770,11 @@ impl SymbolTable {
                 None => {
                     let replace = self.fn_by_scope.get(&func.name).and_then(|entries| {
                         entries.iter().position(|(file, id)| {
-                            *file == func.file && self.function(*id).target == func.target
+                            *file == func.file
+                                && self.function(*id).target == func.target
+                                && (!func.is_cpp
+                                    || self.function(*id).tu == func.tu
+                                    || (!self.function(*id).is_defined && func.is_defined))
                         })
                     });
                     let entries = self.fn_by_scope.entry(func.name.clone()).or_default();
@@ -1072,7 +1107,7 @@ impl SymbolTable {
             .flatten()
             .copied();
         std::iter::once(primary)
-            .filter(move |&primary| primary != id)
+            .filter(move |&primary| primary != id && self.function_visible_from(primary, file))
             .chain(further.filter(move |&overload| {
                 overload != id && self.function_visible_from(overload, file)
             }))
@@ -1158,8 +1193,22 @@ impl SymbolTable {
     /// entry is named everywhere, an internal one only in its own file and in
     /// the files that include the header it is in.
     pub fn function_visible_from(&self, id: FnId, file: FileId) -> bool {
-        self.function_by_id(id)
-            .is_some_and(|f| f.linkage != Linkage::Internal || self.file_sees(file, f.file))
+        self.function_by_id(id).is_some_and(|f| {
+            if f.linkage == Linkage::Internal {
+                if f.is_cpp {
+                    if let Some(tu) = f.tu {
+                        let in_tu = file == tu
+                            || self.headers_of.get(&tu).is_some_and(|h| h.contains(&file));
+                        if !in_tu {
+                            return false;
+                        }
+                    }
+                }
+                self.file_sees(file, f.file)
+            } else {
+                true
+            }
+        })
     }
 
     /// Whether code in `file` sees what `other` defines: `other` is `file`, or
@@ -1184,20 +1233,101 @@ impl SymbolTable {
     /// name. The solver wires exactly these, so anything that has to agree
     /// with its wiring asks here.
     pub fn callees_of(&self, cs: &CallSite) -> Vec<FnId> {
+        self.callees_of_with_types(cs, None)
+    }
+
+    pub fn callees_of_with_types(
+        &self,
+        cs: &CallSite,
+        types: Option<&crate::TypeTable>,
+    ) -> Vec<FnId> {
         // Both resolvers below fall back to the whole-program interpretation
         // when nothing is scoped, so one tail serves either mode.
         let target = self.caller_target(cs);
+        let caller_tu = cs
+            .tu
+            .or_else(|| self.function_by_id(cs.caller).and_then(|f| f.tu))
+            .unwrap_or(cs.span.file);
+        let resolve_equal_defs = |fid: FnId| -> Vec<FnId> {
+            let f = self.function(fid);
+            let f_tu = f.tu.unwrap_or(f.file);
+            if f.linkage != Linkage::External || (f.is_defined && f_tu == caller_tu) {
+                return vec![fid];
+            }
+            let f_skip = usize::from(self.has_this_param(fid));
+            let f_explicit_len = f.params.len().saturating_sub(f_skip);
+            let defs: Vec<FnId> = self
+                .resolve_function_candidates_in_target(&f.name, Some(caller_tu), target)
+                .into_iter()
+                .filter(|&id| {
+                    let cand = self.function(id);
+                    if !cand.is_defined || cand.variadic != f.variadic {
+                        return false;
+                    }
+                    let cand_skip = usize::from(self.has_this_param(id));
+                    let cand_explicit_len = cand.params.len().saturating_sub(cand_skip);
+                    let both_cpp = f.is_cpp && cand.is_cpp;
+                    if f.params.is_empty() || cand.params.is_empty() {
+                        if !both_cpp {
+                            return true;
+                        }
+                        let f_arity = f.explicit_arity.or(Some(f_explicit_len as u32));
+                        let cand_arity = cand.explicit_arity.or(Some(cand_explicit_len as u32));
+                        return f_arity.zip(cand_arity).is_none_or(|(a, b)| a == b);
+                    }
+                    if cand_explicit_len != f_explicit_len {
+                        return false;
+                    }
+                    (0..cand_explicit_len).all(|i| {
+                        let p1 = cand.params[cand_skip + i];
+                        let p2 = f.params[f_skip + i];
+                        let t1 = self
+                            .param_type(p1)
+                            .or_else(|| cand.param_type_ids.get(cand_skip + i).copied());
+                        let t2 = self
+                            .param_type(p2)
+                            .or_else(|| f.param_type_ids.get(f_skip + i).copied());
+                        match (t1, t2) {
+                            (Some(a), Some(b)) => match types {
+                                Some(ty) => crate::same_param_type(ty, a, b),
+                                None => a == b,
+                            },
+                            _ => true,
+                        }
+                    })
+                })
+                .collect();
+            if defs.len() > 1 {
+                if let Some(&local_def) = defs.iter().find(|&&id| {
+                    let cand = self.function(id);
+                    cand.tu.unwrap_or(cand.file) == caller_tu
+                }) {
+                    return vec![local_def];
+                }
+                return defs;
+            }
+            if !defs.is_empty() {
+                return defs;
+            }
+            vec![fid]
+        };
         if let Some(fid) = cs.callee_fn_id {
             if !self.has_target_scopes || self.function(fid).target == target {
-                return vec![fid];
+                if !cs.is_direct {
+                    return vec![fid];
+                }
+                return resolve_equal_defs(fid);
             }
         }
         if cs.is_direct {
-            self.resolve_function_in_scope_in_target(&cs.callee_name, Some(cs.span.file), target)
-                .into_iter()
-                .collect()
+            let direct =
+                self.resolve_function_in_scope_in_target(&cs.callee_name, Some(caller_tu), target);
+            if let Some(fid) = direct {
+                return resolve_equal_defs(fid);
+            }
+            Vec::new()
         } else if cs.resolves_by_name() {
-            self.resolve_function_candidates_in_target(&cs.callee_name, Some(cs.span.file), target)
+            self.resolve_function_candidates_in_target(&cs.callee_name, Some(caller_tu), target)
         } else {
             Vec::new()
         }
@@ -1260,7 +1390,9 @@ impl SymbolTable {
     fn first_in_image(&self, name: &str, file: Option<FileId>, scope: TargetScope) -> Option<FnId> {
         if let Some(file) = file {
             let entries = self.fn_by_scope.get(name).map(Vec::as_slice);
-            if let Some(id) = self.first_in_scope(file, entries, |id| self.in_scope_of(id, scope)) {
+            if let Some(id) = self.first_in_scope(file, entries, |id| {
+                self.in_scope_of(id, scope) && self.function_visible_from(id, file)
+            }) {
                 return Some(id);
             }
         }
@@ -1335,7 +1467,7 @@ impl SymbolTable {
         let mut out = Vec::new();
         if let Some(file) = file {
             for (_, id) in self.in_scope(file, self.fn_by_scope.get(name).map(Vec::as_slice)) {
-                if !self.in_scope_of(id, scope) {
+                if !self.in_scope_of(id, scope) || !self.function_visible_from(id, file) {
                     continue;
                 }
                 // Two scope entries of one overload set share a primary, so
@@ -1343,7 +1475,10 @@ impl SymbolTable {
                 // once: a repeat would wire the same callee edge twice.
                 let overloads = self.internal_overloads_seen_from(id, file);
                 for id in std::iter::once(id).chain(overloads) {
-                    if self.in_scope_of(id, scope) && !out.contains(&id) {
+                    if self.in_scope_of(id, scope)
+                        && self.function_visible_from(id, file)
+                        && !out.contains(&id)
+                    {
                         out.push(id);
                     }
                 }
@@ -1436,6 +1571,14 @@ impl SymbolTable {
             .unwrap_or_else(|| panic!("unknown function id {}", id.0))
     }
 
+    pub fn has_this_param(&self, fid: FnId) -> bool {
+        let f = self.function(fid);
+        f.is_cpp
+            && f.params
+                .first()
+                .is_some_and(|&p| self.variable_by_id(p).map(|v| v.name.as_str()) == Some("this"))
+    }
+
     pub fn variable_by_id(&self, id: VarId) -> Option<&Variable> {
         self.variables.get(id.0 as usize).filter(|v| v.id == id)
     }
@@ -1495,6 +1638,7 @@ mod tests {
             is_direct,
             receiver_class: None,
             return_dst: None,
+            tu: None,
         };
         assert!(mk("OsalMemCalloc", None, false).resolves_by_name());
         assert!(mk("f", None, true).resolves_by_name());
@@ -1535,6 +1679,7 @@ mod tests {
             is_virtual: false,
             is_final: false,
             is_cpp,
+            tu: None,
         }
     }
 
@@ -2544,6 +2689,43 @@ mod tests {
                 .resolve_function_in_scope_in_target("process", None, Some(image)),
             Some(def_id),
             "the body in this image, not the prototype registered before it"
+        );
+    }
+
+    #[test]
+    fn test_c_and_cpp_definition_merge_order_symmetry() {
+        let mut p1 = Program::default();
+        let f1 = p1.symbols.add_file(PathBuf::from("/t/a.cpp"));
+        let f2 = p1.symbols.add_file(PathBuf::from("/t/b.c"));
+        let v1 = p1.symbols.alloc_var_id();
+        let v2 = p1.symbols.alloc_var_id();
+        let id_cpp1 = p1.symbols.alloc_fn_id();
+        let id_c1 = p1.symbols.alloc_fn_id();
+        let fn_cpp1 = fake_function(id_cpp1, "collide", vec![v1], true, true, f1, 10);
+        let fn_c1 = fake_function(id_c1, "collide", vec![v2], true, false, f2, 20);
+
+        // Order 1: C++ first, C second
+        let r_cpp1 = p1.symbols.register_function(fn_cpp1, None, None);
+        let r_c1 = p1.symbols.register_function(fn_c1, None, None);
+
+        let mut p2 = Program::default();
+        let f1_2 = p2.symbols.add_file(PathBuf::from("/t/a.cpp"));
+        let f2_2 = p2.symbols.add_file(PathBuf::from("/t/b.c"));
+        let v1_2 = p2.symbols.alloc_var_id();
+        let v2_2 = p2.symbols.alloc_var_id();
+        let id_c2 = p2.symbols.alloc_fn_id();
+        let id_cpp2 = p2.symbols.alloc_fn_id();
+        let fn_c2 = fake_function(id_c2, "collide", vec![v2_2], true, false, f2_2, 20);
+        let fn_cpp2 = fake_function(id_cpp2, "collide", vec![v1_2], true, true, f1_2, 10);
+
+        // Order 2: C first, C++ second
+        let r_c2 = p2.symbols.register_function(fn_c2, None, None);
+        let r_cpp2 = p2.symbols.register_function(fn_cpp2, None, None);
+
+        assert_eq!(
+            r_cpp1.id == r_c1.id,
+            r_c2.id == r_cpp2.id,
+            "C and C++ definitions must merge (or stay separate) symmetrically regardless of order"
         );
     }
 }
