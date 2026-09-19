@@ -6898,6 +6898,386 @@ fn regression_call_inside_header_helper_resolves_to_local_def() {
     check_header_helper(false);
 }
 
+fn check_header_callback_initializer(with_compile_commands: bool) {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_header_cb_init_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+static void callback() {}
+static void (*handler)() = callback;
+static void helper() {
+    handler();
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a.cpp"),
+        r#"
+#include "common.h"
+void caller_a() {
+    helper();
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.cpp"),
+        r#"
+#include "common.h"
+void caller_b() {
+    helper();
+}
+"#,
+    )
+    .unwrap();
+    if with_compile_commands {
+        std::fs::write(
+            root.join("compile_commands.json"),
+            serde_json::json!([
+                {"directory": root, "file": "a.cpp", "arguments": ["c++", "-c", "a.cpp"]},
+                {"directory": root, "file": "b.cpp", "arguments": ["c++", "-c", "b.cpp"]}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    for edge in &analysis.call_edges {
+        assert!(
+            program.symbols.function_by_id(edge.caller).is_some(),
+            "caller {:?} must exist in symbols",
+            edge.caller
+        );
+        assert!(
+            program.symbols.function_by_id(edge.callee).is_some(),
+            "callee {:?} must exist in symbols",
+            edge.callee
+        );
+    }
+
+    let a_file_id = program
+        .symbols
+        .files
+        .iter()
+        .position(|f| f.path == root.join("a.cpp"))
+        .map(|i| trace_ir::FileId(i as u32))
+        .unwrap();
+    let b_file_id = program
+        .symbols
+        .files
+        .iter()
+        .position(|f| f.path == root.join("b.cpp"))
+        .map(|i| trace_ir::FileId(i as u32))
+        .unwrap();
+
+    let helpers: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "helper" && f.is_defined)
+        .collect();
+    assert_eq!(helpers.len(), 2, "must have separate helper per TU");
+
+    let callbacks: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "callback" && f.is_defined)
+        .collect();
+    assert_eq!(callbacks.len(), 2, "must have separate callback per TU");
+
+    let helper_a = helpers.iter().find(|f| f.tu == Some(a_file_id)).unwrap().id;
+    let helper_b = helpers.iter().find(|f| f.tu == Some(b_file_id)).unwrap().id;
+    let cb_a = callbacks
+        .iter()
+        .find(|f| f.tu == Some(a_file_id))
+        .unwrap()
+        .id;
+    let cb_b = callbacks
+        .iter()
+        .find(|f| f.tu == Some(b_file_id))
+        .unwrap()
+        .id;
+
+    assert_ne!(helper_a, helper_b);
+    assert_ne!(cb_a, cb_b);
+
+    let edges_from_helper_a: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == helper_a)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(
+        edges_from_helper_a,
+        vec![cb_a],
+        "helper in TU a must resolve indirect call to callback in TU a"
+    );
+
+    let edges_from_helper_b: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == helper_b)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(
+        edges_from_helper_b,
+        vec![cb_b],
+        "helper in TU b must resolve indirect call to callback in TU b"
+    );
+}
+
+fn check_header_array_callback_initializer(with_compile_commands: bool) {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_header_arr_cb_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+static void cb0() {}
+static void cb1() {}
+static void (*handlers[])() = { cb0, cb1 };
+static void helper(int idx) {
+    handlers[idx]();
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a.cpp"),
+        r#"
+#include "common.h"
+void caller_a() {
+    helper(0);
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.cpp"),
+        r#"
+#include "common.h"
+void caller_b() {
+    helper(1);
+}
+"#,
+    )
+    .unwrap();
+    if with_compile_commands {
+        std::fs::write(
+            root.join("compile_commands.json"),
+            serde_json::json!([
+                {"directory": root, "file": "a.cpp", "arguments": ["c++", "-c", "a.cpp"]},
+                {"directory": root, "file": "b.cpp", "arguments": ["c++", "-c", "b.cpp"]}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    for edge in &analysis.call_edges {
+        assert!(
+            program.symbols.function_by_id(edge.caller).is_some(),
+            "caller {:?} must exist in symbols",
+            edge.caller
+        );
+        assert!(
+            program.symbols.function_by_id(edge.callee).is_some(),
+            "callee {:?} must exist in symbols",
+            edge.callee
+        );
+    }
+
+    let a_file_id = program
+        .symbols
+        .files
+        .iter()
+        .position(|f| f.path == root.join("a.cpp"))
+        .map(|i| trace_ir::FileId(i as u32))
+        .unwrap();
+    let b_file_id = program
+        .symbols
+        .files
+        .iter()
+        .position(|f| f.path == root.join("b.cpp"))
+        .map(|i| trace_ir::FileId(i as u32))
+        .unwrap();
+
+    let helpers: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "helper" && f.is_defined)
+        .collect();
+    assert_eq!(helpers.len(), 2, "must have separate helper per TU");
+
+    let helper_a = helpers.iter().find(|f| f.tu == Some(a_file_id)).unwrap().id;
+    let helper_b = helpers.iter().find(|f| f.tu == Some(b_file_id)).unwrap().id;
+
+    let cb0_a = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "cb0" && f.is_defined && f.tu == Some(a_file_id))
+        .unwrap()
+        .id;
+    let cb1_a = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "cb1" && f.is_defined && f.tu == Some(a_file_id))
+        .unwrap()
+        .id;
+    let cb0_b = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "cb0" && f.is_defined && f.tu == Some(b_file_id))
+        .unwrap()
+        .id;
+    let cb1_b = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "cb1" && f.is_defined && f.tu == Some(b_file_id))
+        .unwrap()
+        .id;
+
+    let mut edges_from_helper_a: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == helper_a)
+        .map(|e| e.callee)
+        .collect();
+    edges_from_helper_a.sort();
+    let mut expected_a = vec![cb0_a, cb1_a];
+    expected_a.sort();
+    assert_eq!(
+        edges_from_helper_a, expected_a,
+        "helper in TU a must resolve array indirect calls to cb0/cb1 in TU a"
+    );
+
+    let mut edges_from_helper_b: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == helper_b)
+        .map(|e| e.callee)
+        .collect();
+    edges_from_helper_b.sort();
+    let mut expected_b = vec![cb0_b, cb1_b];
+    expected_b.sort();
+    assert_eq!(
+        edges_from_helper_b, expected_b,
+        "helper in TU b must resolve array indirect calls to cb0/cb1 in TU b"
+    );
+}
+
+fn check_header_struct_callback_initializer(with_compile_commands: bool) {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_header_struct_cb_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+struct Ops {
+    void (*fn)();
+};
+static void callback() {}
+static Ops ops = { callback };
+static void helper() {
+    ops.fn();
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a.cpp"),
+        r#"
+#include "common.h"
+void caller_a() {
+    helper();
+}
+"#,
+    )
+    .unwrap();
+    if with_compile_commands {
+        std::fs::write(
+            root.join("compile_commands.json"),
+            serde_json::json!([
+                {"directory": root, "file": "a.cpp", "arguments": ["c++", "-c", "a.cpp"]}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let helper = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "helper" && f.is_defined)
+        .unwrap()
+        .id;
+    let callback = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "callback" && f.is_defined)
+        .unwrap()
+        .id;
+
+    let edges: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == helper)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(
+        edges,
+        vec![callback],
+        "helper must resolve struct member indirect call to callback"
+    );
+}
+
+#[test]
+fn regression_header_callback_initializer_scalar() {
+    check_header_callback_initializer(true);
+    check_header_callback_initializer(false);
+}
+
+#[test]
+fn regression_header_callback_initializer_array() {
+    check_header_array_callback_initializer(true);
+    check_header_array_callback_initializer(false);
+}
+
+#[test]
+fn regression_header_callback_initializer_struct() {
+    check_header_struct_callback_initializer(true);
+    check_header_struct_callback_initializer(false);
+}
+
 #[test]
 fn regression_call_return_dataflow_isolation_across_tus() {
     // Comment 7: Align CallReturn dataflow expansion with translation-unit call resolution.

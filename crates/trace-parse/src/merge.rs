@@ -804,6 +804,7 @@ fn merge_unit(
 
         if matches!(mode, MergeMode::SymbolsOnly)
             && var.storage == trace_ir::StorageClass::Local
+            && var.fn_id.is_some()
             && !mapped_fn_id.is_some_and(|fid| {
                 program
                     .symbols
@@ -880,6 +881,10 @@ fn merge_unit(
                 .filter_map(|v| var_map.get(v).copied())
                 .collect();
         }
+    }
+
+    if program.is_dep_file(primary_file_id) {
+        return;
     }
 
     let mut call_map: FxHashMap<CallSiteId, CallSiteId> = FxHashMap::default();
@@ -992,20 +997,108 @@ fn merge_unit(
             && flow_fns(flow).all(|f| fn_map.contains_key(&f))
     };
 
+    let symbols = &program.symbols;
+    let is_internal_fn = |fid: FnId| {
+        symbols
+            .function_by_id(fid)
+            .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal && f.is_cpp)
+    };
+
     let is_internal_flow = |flow: &FlowConstraint| {
         flow_vars(flow).any(|v| {
             var_map
                 .get(&v)
-                .and_then(|&nv| program.symbols.variable_by_id(nv))
+                .and_then(|&nv| symbols.variable_by_id(nv))
                 .and_then(|var| var.fn_id)
-                .and_then(|fid| program.symbols.function_by_id(fid))
-                .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal && f.is_cpp)
+                .is_some_and(is_internal_fn)
         })
+    };
+
+    let references_this_tus_internal_function = |flow: &FlowConstraint| {
+        flow_fns(flow).any(|f| fn_map.get(&f).copied().is_some_and(is_internal_fn))
+    };
+
+    let file_scope_vars: FxHashSet<VarId> = unit
+        .variables
+        .iter()
+        .filter(|v| v.fn_id.is_none())
+        .map(|v| v.id)
+        .collect();
+
+    let mut internal_init_vars: FxHashSet<VarId> = FxHashSet::default();
+    if matches!(mode, MergeMode::SymbolsOnly) {
+        for flow in &unit.flow {
+            if references_this_tus_internal_function(flow) {
+                for v in flow_vars(flow) {
+                    if file_scope_vars.contains(&v) {
+                        internal_init_vars.insert(v);
+                    }
+                }
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for flow in &unit.flow {
+                match flow {
+                    FlowConstraint::Store { dst, src }
+                    | FlowConstraint::Copy { dst, src }
+                    | FlowConstraint::Load { dst, src }
+                    | FlowConstraint::AddrOfVar { dst, src }
+                        if file_scope_vars.contains(dst) && file_scope_vars.contains(src) =>
+                    {
+                        let has_dst = internal_init_vars.contains(dst);
+                        let has_src = internal_init_vars.contains(src);
+                        if (has_dst || has_src) && (!has_dst || !has_src) {
+                            internal_init_vars.insert(*dst);
+                            internal_init_vars.insert(*src);
+                            changed = true;
+                        }
+                    }
+                    FlowConstraint::GepField { dst, base, .. }
+                        if file_scope_vars.contains(dst) && file_scope_vars.contains(base) =>
+                    {
+                        let has_dst = internal_init_vars.contains(dst);
+                        let has_base = internal_init_vars.contains(base);
+                        if (has_dst || has_base) && (!has_dst || !has_base) {
+                            internal_init_vars.insert(*dst);
+                            internal_init_vars.insert(*base);
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let is_supporting_flow = |flow: &FlowConstraint| {
+        if internal_init_vars.is_empty() {
+            return false;
+        }
+        match flow {
+            FlowConstraint::Store { dst, src }
+            | FlowConstraint::Copy { dst, src }
+            | FlowConstraint::Load { dst, src }
+            | FlowConstraint::AddrOfVar { dst, src } => {
+                internal_init_vars.contains(dst) && internal_init_vars.contains(src)
+            }
+            FlowConstraint::GepField { dst, base, .. } => {
+                internal_init_vars.contains(dst) && internal_init_vars.contains(base)
+            }
+            _ => false,
+        }
+    };
+
+    let replay_in_tu = |flow: &FlowConstraint| {
+        is_internal_flow(flow)
+            || references_this_tus_internal_function(flow)
+            || is_supporting_flow(flow)
     };
 
     if let Some(seen) = variant_dedup {
         for flow in &unit.flow {
-            if matches!(mode, MergeMode::SymbolsOnly) && !is_internal_flow(flow) {
+            if matches!(mode, MergeMode::SymbolsOnly) && !replay_in_tu(flow) {
                 continue;
             }
             if !valid_flow(flow) {
@@ -1018,7 +1111,7 @@ fn merge_unit(
         }
     } else {
         for flow in &unit.flow {
-            if matches!(mode, MergeMode::SymbolsOnly) && !is_internal_flow(flow) {
+            if matches!(mode, MergeMode::SymbolsOnly) && !replay_in_tu(flow) {
                 continue;
             }
             if !valid_flow(flow) {

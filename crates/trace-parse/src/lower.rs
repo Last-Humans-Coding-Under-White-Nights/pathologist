@@ -2167,37 +2167,20 @@ fn lower_prepared_source(
     let self_canon = graph.intern_path(path);
     let file_id = program.symbols.add_file_interned(&self_canon);
     add_preprocess_diagnostics(program, graph, file_id, &pre.diagnostics);
+    let types_only = is_index_header(path);
+    let headers = headers_to_merge(
+        graph,
+        pch_order,
+        &self_canon,
+        &pre.included_headers,
+        types_only,
+    );
     if let Some(ir) = header_ir {
-        // Nested PCH copies types/typedefs only so ancestor units stay small.
-        // TUs merge prototypes from every reachable header (the defining
-        // unit keeps call sites/flow). Direct-edges + included_headers used
-        // to miss `sidecar.h` for `hdf_wifi_core.c`, dropping
-        // `DispatchToMessage` from `DeviceNodeExtDispatch`.
-        let types_only = is_index_header(path);
-        let headers = headers_to_merge(
-            graph,
-            pch_order,
-            &self_canon,
-            &pre.included_headers,
-            types_only,
-        );
-        for h in headers {
-            if let Some(units) = ir.get(h) {
-                // The expansion this unit replayed, when it has one. A
-                // header it reached only through another header's cached
-                // expansion leaves no record here — `PreprocessedSource`
-                // carries the includer's `nested_variants` for exactly the
-                // headers that entry pulled in, and anything still missing
-                // is merged from every stored expansion, which is additive
-                // for the declarations these two modes copy.
+        for h in &headers {
+            if let Some(units) = ir.get(*h) {
                 for (unit_lang, variant, unit) in units {
-                    // A header reached from both C and C++ is lowered once,
-                    // in the language `index_language` chose. A unit of the
-                    // other language recorded an index into that language's
-                    // own variant list, where it means something else, so it
-                    // is not a record for this unit at all.
                     let wanted = (*unit_lang == language)
-                        .then(|| pre.replayed_variants.get(h))
+                        .then(|| pre.replayed_variants.get(*h))
                         .flatten();
                     if wanted.is_some_and(|w| !w.contains(variant)) {
                         continue;
@@ -2209,12 +2192,14 @@ fn lower_prepared_source(
                     }
                 }
             }
-            let hid = program.symbols.add_file_interned(h);
-            if hid != file_id {
-                program.symbols.register_included_header(file_id, hid);
-            }
         }
         program.types.complete_nested_tags();
+    }
+    for h in headers {
+        let hid = program.symbols.add_file_interned(h);
+        if hid != file_id {
+            program.symbols.register_included_header(file_id, hid);
+        }
     }
     if let Some(dir) = std::env::var_os("TRACE_DUMP_TU_DIR") {
         let fname = format!(
@@ -5308,7 +5293,43 @@ fn lower_declaration(
                             storage_override,
                             args,
                         ),
-                        None => lower_function_decl(program, ctx, source, fdecl, ty, is_static),
+                        None => {
+                            if let Some(caller) = ctx.current_fn {
+                                if let Some(inner) = fdecl.child_by_field_name("declarator") {
+                                    if inner.kind() == "structured_binding_declarator" {
+                                        let type_name = node_text(source, &type_node).to_string();
+                                        let callee_var = lookup_var(ctx, program, &type_name);
+                                        let callee_name = format!("{}[...]", type_name);
+                                        let span = node_span(program, ctx, node);
+                                        let args = collect_call_args(
+                                            program,
+                                            ctx,
+                                            source,
+                                            fdecl.child_by_field_name("parameters"),
+                                        );
+                                        let call_id = program.symbols.alloc_call_id();
+                                        program.symbols.call_sites.push(CallSite {
+                                            id: call_id,
+                                            caller,
+                                            callee_name,
+                                            callee_var,
+                                            callee_fn_id: None,
+                                            var_args: args.var_args,
+                                            fn_args: args.fn_args,
+                                            addr_of_member_args: args.addr_of_member_args,
+                                            args_bound_past_this: false,
+                                            span,
+                                            is_direct: false,
+                                            receiver_class: None,
+                                            return_dst: None,
+                                            tu: Some(ctx.current_file),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                            lower_function_decl(program, ctx, source, fdecl, ty, is_static)
+                        }
                     }
                     continue;
                 }
