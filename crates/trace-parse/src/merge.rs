@@ -1018,15 +1018,14 @@ fn merge_unit(
         flow_fns(flow).any(|f| fn_map.get(&f).copied().is_some_and(is_internal_fn))
     };
 
-    let file_scope_vars: FxHashSet<VarId> = unit
-        .variables
-        .iter()
-        .filter(|v| v.fn_id.is_none())
-        .map(|v| v.id)
-        .collect();
-
     let mut internal_init_vars: FxHashSet<VarId> = FxHashSet::default();
     if matches!(mode, MergeMode::SymbolsOnly) {
+        let file_scope_vars: FxHashSet<VarId> = unit
+            .variables
+            .iter()
+            .filter(|v| v.fn_id.is_none())
+            .map(|v| v.id)
+            .collect();
         for flow in &unit.flow {
             if references_this_tus_internal_function(flow) {
                 for v in flow_vars(flow) {
@@ -1186,12 +1185,12 @@ fn flow_vars(flow: &FlowConstraint) -> impl Iterator<Item = VarId> + '_ {
     .into_iter()
 }
 
-fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> + '_ {
+fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> {
     match flow {
         FlowConstraint::AddrOfFn { callee, .. } | FlowConstraint::ArrayFnMember { callee, .. } => {
-            vec![*callee]
+            Some(*callee)
         }
-        _ => Vec::new(),
+        _ => None,
     }
     .into_iter()
 }
@@ -1205,10 +1204,10 @@ fn return_flow_vars(flow: &ReturnFlow) -> impl Iterator<Item = VarId> + '_ {
     .into_iter()
 }
 
-fn return_flow_fns(flow: &ReturnFlow) -> impl Iterator<Item = FnId> + '_ {
+fn return_flow_fns(flow: &ReturnFlow) -> impl Iterator<Item = FnId> {
     match flow {
-        ReturnFlow::AddrOfFn { callee } => vec![*callee],
-        _ => Vec::new(),
+        ReturnFlow::AddrOfFn { callee } => Some(*callee),
+        _ => None,
     }
     .into_iter()
 }
