@@ -147,14 +147,6 @@ impl VariantDedup {
 /// Merged programs allocate call ids in append order, so the id is the index.
 /// The scan is a fallback for a caller that built a sparse call table.
 #[inline]
-fn call_site_index(symbols: &trace_ir::SymbolTable, id: CallSiteId) -> Option<usize> {
-    let index = id.0 as usize;
-    if symbols.call_sites.get(index).is_some_and(|s| s.id == id) {
-        return Some(index);
-    }
-    symbols.call_sites.iter().position(|s| s.id == id)
-}
-
 pub fn merge_unit_index(program: &mut Program, unit: &UnitIndex) {
     merge_unit(program, unit, MergeMode::Full, None);
 }
@@ -957,10 +949,11 @@ fn merge_unit(
         site.return_dst = site.return_dst.and_then(|v| var_map.get(&v).copied());
         site.span.file = span_file;
         // Grouping records by their facts is a remerge concern only, so an
-        // ordinary site never pays for the fingerprint. Present exactly when
-        // `remerge` holds, which is what the registration below keys off.
+        // ordinary site never pays for the fingerprint — and being the one
+        // spelling of "this is a remerge" from here on, it cannot disagree
+        // with the registration below.
         let facts = remerge.then(|| site.fact_fingerprint());
-        if remerge {
+        if let Some(facts) = facts {
             // Several configurations can call the same spelled callee at the
             // same source site with different callbacks, receivers or outputs.
             // Keep separate records: solver argument binding uses one actual
@@ -973,23 +966,21 @@ fn merge_unit(
             // units both recover would be recorded once per unit (#59 review).
             let primary = program.dedup.site_keys.get(&key).copied();
             let states_site = |id: CallSiteId| {
-                call_site_index(&program.symbols, id)
-                    .is_some_and(|idx| program.symbols.call_sites[idx].same_facts(&site))
+                program
+                    .symbols
+                    .call_site_by_id(id)
+                    .is_some_and(|held| held.same_facts(&site))
             };
             // The base record need not be in the variant buckets, so it is
             // asked for separately; the buckets answer the rest with one
             // probe, which keeps a site whose facts differ in each of N
             // contributing units linear in N rather than quadratic.
             let existing = primary.filter(|&id| states_site(id)).or_else(|| {
-                program
-                    .dedup
-                    .variant_site_records
-                    .get(&key)
-                    .and_then(|buckets| buckets.get(&facts?))
-                    .into_iter()
-                    .flatten()
+                let bucket = program.dedup.variant_site_records.get(&key)?.get(&facts)?;
+                bucket
+                    .iter()
                     .copied()
-                    // Skip only the repeated ID, not the first variant blindly.
+                    // `primary` was tested just above; skip the repeat probe.
                     .find(|&id| Some(id) != primary && states_site(id))
             });
             if let Some(existing) = existing {
