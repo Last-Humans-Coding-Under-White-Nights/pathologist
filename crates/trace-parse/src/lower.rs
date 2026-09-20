@@ -71,6 +71,15 @@ enum PendingFnRef {
     ReturnAddrOf { owner: FnId, name: String },
 }
 
+impl LowerContext {
+    /// Whether an internal C++ body originating in `origin` can be shared
+    /// with other units, so its expanded text is worth keeping: only header
+    /// code is, and a TU's own bodies never leave it (docs/ANALYSIS.md).
+    fn shares_definition(&self, origin: trace_ir::FileId) -> bool {
+        self.header_unit || origin != self.current_file
+    }
+}
+
 struct LowerContext {
     current_fn: Option<FnId>,
     current_file: trace_ir::FileId,
@@ -145,6 +154,9 @@ struct LowerContext {
     has_templates: bool,
     has_weak: bool,
     record_link_ownership: bool,
+    /// The unit is a header indexed on its own: its own bodies are replayed
+    /// into includers, so their definition text is kept (#116).
+    header_unit: bool,
     pending_flow_owners: HashMap<usize, FnId>,
     pending_initializer_owners: HashMap<usize, VarId>,
 }
@@ -1918,6 +1930,7 @@ fn index_header_variant(
         pre,
         language,
         false,
+        true,
         header_ir,
         pch_order,
     ) {
@@ -2095,6 +2108,7 @@ fn index_source_file_with_variants(
                     Arc::new(var_pre),
                     language,
                     var_opts.record_link_ownership,
+                    false,
                     header_ir,
                     pch_order,
                 ) {
@@ -2143,6 +2157,7 @@ fn process_indexed_file(
         pre,
         language,
         index_opts.record_link_ownership,
+        false,
         header_ir,
         pch_order,
     )
@@ -2160,6 +2175,7 @@ fn lower_prepared_source(
     pre: Arc<PreprocessedSource>,
     language: Language,
     record_link_ownership: bool,
+    header_unit: bool,
     header_ir: Option<&HeaderIr>,
     pch_order: &[PathBuf],
 ) -> Result<(), String> {
@@ -2248,6 +2264,7 @@ fn lower_prepared_source(
         has_templates: is_cpp && parsed.source.contains("template"),
         has_weak: source_may_annotate_weak(&parsed.source) || program.symbols.has_weak_symbols(),
         record_link_ownership,
+        header_unit,
         pending_flow_owners: HashMap::default(),
         pending_initializer_owners: HashMap::default(),
     };
@@ -2459,6 +2476,7 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
         path,
         types: program.types,
         functions: program.symbols.functions,
+        internal_definitions: program.dedup.internal_definitions,
         variables: program.symbols.variables,
         call_sites: program.symbols.call_sites,
         flow: program.flow,
@@ -4001,6 +4019,16 @@ fn lower_function_body(
         eff_class,
         lookup_scope,
     } = signature;
+    let function = program.symbols.function(fn_id);
+    if function.linkage == Linkage::Internal
+        && function.is_cpp
+        && ctx.shares_definition(function.span.file)
+    {
+        program
+            .dedup
+            .internal_definitions
+            .insert(fn_id, Arc::from(&source[node.byte_range()]));
+    }
     let flow_start = program.flow.len();
     let pending_start = if ctx.record_link_ownership && ctx.has_weak {
         ctx.pending.borrow().len()
@@ -7406,6 +7434,12 @@ fn lower_lambda_expression(
         tu: Some(ctx.current_file),
     });
     reassign_fn_id(program, provisional_id, fn_id, provisional_start);
+    if ctx.shares_definition(span.file) {
+        program
+            .dedup
+            .internal_definitions
+            .insert(fn_id, Arc::from(&source[node.byte_range()]));
+    }
     let saved_fn = ctx.current_fn;
     let saved_locals = ctx.locals.clone();
     let saved_class = ctx.class_ctx.clone();
@@ -11319,6 +11353,7 @@ mod index_window_tests {
             &graph,
             Arc::new(pre),
             Language::C,
+            false,
             false,
             None,
             &[],

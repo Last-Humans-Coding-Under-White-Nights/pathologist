@@ -1,5 +1,84 @@
 # Evaluation Report
 
+## Shared header functions — 2026-09-20 (#116)
+
+The behavior and resolver ownership are defined in
+[Shared header functions](ANALYSIS.md#shared-header-functions).
+
+Compared release builds of `03f102b` and this fix on the same machine, using
+`--jobs 8`, the default 800,000-pop solver budget and minimal SQLite export.
+The ability-runtime checkout is OpenHarmony-7.0-Release at
+`6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8` (3,331 TUs). Timings below are
+one sequential before/after pair, with no other analysis running concurrently.
+Both ability runs exhaust the default solver budget, as in the issue report.
+
+| ability_ability_runtime | Before | After |
+|---|---:|---:|
+| functions | 91,932 | 79,108 |
+| call_sites | 714,554 | 555,424 |
+| call_edges | 993,472 | 729,131 |
+| IR flow constraints | 225,404 | 152,126 |
+| SQLite bytes | 377,061,376 | 312,238,080 |
+| index seconds | 43.4 | 45.7 |
+| analyze seconds | 18.0 | 4.2 |
+| export seconds | 5.2 | 4.0 |
+| end-to-end seconds | 66.9 | 54.9 |
+
+The function count is 0.075% above the issue's 79,049 distinct source-location
+count. Including nested header lambdas removes roughly 3,000 additional
+duplicate functions compared with deduplicating ordinary functions alone.
+Index time is not improved: merging still examines each unit's lowered facts.
+Peak resident memory on ability-runtime (three `--jobs 8` runs of each
+binary on the same machine) is 1,361–1,466 MB before and 1,321–1,568 MB
+after. The ranges overlap and both peak at the end of the index phase, so
+the change keeps peak memory within run-to-run variance.
+
+Pinned eval corpora, using the same budget:
+
+| Corpus | Functions before / after | Sites before / after | Edges before / after |
+|---|---:|---:|---:|
+| hdf | 15,912 / 12,150 | 72,976 / 71,811 | 75,973 / 75,390 |
+| hiview | 16,707 / 10,103 | 41,160 / 34,492 | 40,217 / 33,549 |
+| camera | 24,714 / 23,632 | 110,551 / 108,869 | 102,815 / 102,033 |
+
+Comparing edges by caller/callee source identity and call-site coordinates,
+no distinct edge disappears in any corpus. Hiview and camera have identical
+sets before/after. HDF gains 582 indirect edges at the fixed budget because
+less duplicate work permits more propagation. With
+`TRACE_SOLVE_BUDGET_POPS=0`, HDF has exactly the same **75,372 distinct edges**
+before and after (5,362 indirect rows in each); total edge rows fall from
+76,555 to 75,390 solely through removal of duplicates.
+
+The checked-in eval expectations already miss **21 of 93** checks on
+`03f102b`; this change misses **17 of 93**. They were not widened or
+re-captured to conceal that baseline mismatch. Remaining failed checks are:
+
+- hdf: `edges_total`, `edges_indirect`, `arg_flow_edges`,
+  `HdfDeviceUnlaunchNode`, `arg_flow_rows_per_call_edge`.
+- hiview: `functions_total`, `functions_defined`, `edges_total`,
+  `edges_direct`, `edges_indirect`, `arg_flow_edges`.
+- camera: `functions_total`, `functions_defined`, `edges_total`,
+  `edges_direct`, `edges_indirect`, `arg_flow_edges`.
+
+Determinism: all 15 SQLite analysis-data tables are identical between
+`--jobs 8` and `--jobs 1` on ability-runtime (ordered row SHA-256 comparisons,
+excluding only `analysis_run` metadata).
+
+Validation: `cargo test --workspace` passes 928 tests;
+`cargo clippy --workspace --all-targets -- -D warnings` passes.
+Regression coverage includes header visibility, distinct macro expansions,
+captured callbacks, mutable per-TU callback storage, direct calls with and
+without a TU-local definition, and transitive return-value propagation.
+Review regressions additionally cover function-local static callback storage,
+header-function identity across two link targets with two TUs each, and the
+definition-text lifecycle described in
+[Shared header functions](ANALYSIS.md#shared-header-functions).
+Release validation of the allocation and metadata-lifecycle refinements
+preserved all 15 ability-runtime analysis-data table hashes from the
+determinism check above. A further regression checks shared-flow counts
+across successive TU exploration families with one and eight workers,
+covering flows introduced by both base configurations and variants.
+
 ## C++ caller edges — 2026-09-18 (#113)
 
 Measurements for the missing-caller fix. The design is in `docs/ANALYSIS.md` ("C++ support") and

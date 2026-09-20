@@ -309,6 +309,10 @@ pub struct SymbolTable {
     /// class (`Cls::m`) without a file, and `fn_by_scope` answers only per
     /// file, so without this such members were never found.
     internal_members_by_name: FxHashMap<String, Vec<FnId>>,
+    /// Lookup contexts retained by coalesced header call records.
+    shared_call_tus: FxHashMap<CallSiteId, std::collections::BTreeSet<FileId>>,
+    /// Includers contributing each exact expanded header definition.
+    shared_header_tus: FxHashMap<FnId, std::collections::BTreeSet<FileId>>,
     /// Headers whose entities were attributed to this TU during lowering
     /// (`#include`d code). Scope resolution consults them so a `static`
     /// inline defined in a header stays visible to its includers after
@@ -1189,25 +1193,47 @@ impl SymbolTable {
         seen
     }
 
-    /// Whether a reference written in `file` can name `id`: an external
-    /// entry is named everywhere, an internal one only in its own file and in
-    /// the files that include the header it is in.
+    /// Record the TUs contributing an identical expanded header definition.
+    pub fn share_header_function(&mut self, id: FnId, tu: FileId) {
+        self.shared_header_tus.entry(id).or_default().insert(tu);
+    }
+
+    /// Retain lookup contexts when identical header call records coalesce.
+    pub fn share_header_call(&mut self, id: CallSiteId, tu: FileId) {
+        self.shared_call_tus.entry(id).or_default().insert(tu);
+    }
+
+    pub fn is_shared_header_function(&self, id: FnId) -> bool {
+        self.shared_header_tus.contains_key(&id)
+    }
+
+    /// Whether a reference in this file can see the function, respecting the
+    /// contributing TU set of shared definitions.
     pub fn function_visible_from(&self, id: FnId, file: FileId) -> bool {
         self.function_by_id(id).is_some_and(|f| {
-            if f.linkage == Linkage::Internal {
-                if f.is_cpp {
-                    if let Some(tu) = f.tu {
-                        let in_tu = file == tu
-                            || self.headers_of.get(&tu).is_some_and(|h| h.contains(&file));
-                        if !in_tu {
-                            return false;
-                        }
-                    }
-                }
-                self.file_sees(file, f.file)
-            } else {
-                true
+            if f.linkage != Linkage::Internal {
+                return true;
             }
+            if f.is_cpp {
+                let in_tu = |tu: &FileId| {
+                    file == *tu || self.headers_of.get(tu).is_some_and(|h| h.contains(&file))
+                };
+                // A shared body is visible in every contributing unit and the
+                // files those units include (docs/ANALYSIS.md). Callers
+                // mostly ask from a unit or the header itself; the scan over
+                // contributors' headers is the fallback.
+                if let Some(tus) = self.shared_header_tus.get(&id) {
+                    return f.file == file
+                        || tus.contains(&file)
+                        || tus
+                            .iter()
+                            .any(|tu| self.headers_of.get(tu).is_some_and(|h| h.contains(&file)));
+                }
+                if f.tu.is_some_and(|tu| !in_tu(&tu)) {
+                    return false;
+                }
+            }
+            self.file_sees(file, f.file)
         })
     }
 
@@ -1219,6 +1245,46 @@ impl SymbolTable {
                 .headers_of
                 .get(&file)
                 .is_some_and(|headers| headers.contains(&other))
+    }
+
+    /// The TUs a function stands for: every includer of a shared header body,
+    /// otherwise the one unit that lowered it.
+    fn contributing_tus(&self, id: FnId) -> impl Iterator<Item = FileId> + '_ {
+        let shared = self.shared_header_tus.get(&id);
+        let own = shared.is_none().then(|| {
+            let f = self.function(id);
+            f.tu.unwrap_or(f.file)
+        });
+        shared.into_iter().flatten().copied().chain(own)
+    }
+
+    /// Whether this definition represents the given TU, including shared bodies.
+    fn defined_in_tu(&self, id: FnId, tu: FileId) -> bool {
+        self.function(id).is_defined && self.contributing_tus(id).any(|t| t == tu)
+    }
+
+    /// Resolve a name-based return fact in every context represented by its
+    /// caller. A shared header body unions its includers' bindings, while an
+    /// ordinary body keeps the TU-local definition precedence.
+    pub fn return_flow_candidates(&self, caller: FnId, name: &str) -> Vec<FnId> {
+        let function = self.function(caller);
+        // `(tu, lookup file)` per context: a shared body looks up from each
+        // includer, an ordinary one from its own file.
+        let shared = self.is_shared_header_function(caller);
+        let contexts: Vec<(FileId, FileId)> = self
+            .contributing_tus(caller)
+            .map(|tu| (tu, if shared { tu } else { function.file }))
+            .collect();
+        let mut result = Vec::new();
+        for (tu, file) in contexts {
+            let mut candidates =
+                self.resolve_function_candidates_in_target(name, Some(file), function.target);
+            if candidates.iter().any(|&c| self.defined_in_tu(c, tu)) {
+                candidates.retain(|&c| self.defined_in_tu(c, tu));
+            }
+            push_unique(&mut result, candidates);
+        }
+        result
     }
 
     /// Take the member definitions whose parameters lack the implicit `this`
@@ -1241,17 +1307,32 @@ impl SymbolTable {
         cs: &CallSite,
         types: Option<&crate::TypeTable>,
     ) -> Vec<FnId> {
-        // Both resolvers below fall back to the whole-program interpretation
-        // when nothing is scoped, so one tail serves either mode.
-        let target = self.caller_target(cs);
+        if let Some(tus) = self.shared_call_tus.get(&cs.id) {
+            let mut result = Vec::new();
+            for &tu in tus {
+                push_unique(&mut result, self.callees_in_tu(cs, types, tu));
+            }
+            return result;
+        }
         let caller_tu = cs
             .tu
             .or_else(|| self.function_by_id(cs.caller).and_then(|f| f.tu))
             .unwrap_or(cs.span.file);
+        self.callees_in_tu(cs, types, caller_tu)
+    }
+
+    fn callees_in_tu(
+        &self,
+        cs: &CallSite,
+        types: Option<&crate::TypeTable>,
+        caller_tu: FileId,
+    ) -> Vec<FnId> {
+        // Both resolvers fall back to whole-program interpretation when
+        // nothing is scoped, so one tail serves either mode.
+        let target = self.caller_target(cs);
         let resolve_equal_defs = |fid: FnId| -> Vec<FnId> {
             let f = self.function(fid);
-            let f_tu = f.tu.unwrap_or(f.file);
-            if f.linkage != Linkage::External || (f.is_defined && f_tu == caller_tu) {
+            if f.linkage != Linkage::External || self.defined_in_tu(fid, caller_tu) {
                 return vec![fid];
             }
             let f_skip = usize::from(self.has_this_param(fid));
@@ -1298,10 +1379,8 @@ impl SymbolTable {
                 })
                 .collect();
             if defs.len() > 1 {
-                if let Some(&local_def) = defs.iter().find(|&&id| {
-                    let cand = self.function(id);
-                    cand.tu.unwrap_or(cand.file) == caller_tu
-                }) {
+                if let Some(&local_def) = defs.iter().find(|&&id| self.defined_in_tu(id, caller_tu))
+                {
                     return vec![local_def];
                 }
                 return defs;
@@ -1614,6 +1693,15 @@ fn base_name_of(name: &str) -> String {
     match name.rsplit("::").next() {
         Some(seg) if !seg.is_empty() => seg.to_string(),
         _ => name.to_string(),
+    }
+}
+
+/// Append the ids not already present, keeping first-seen order.
+fn push_unique(out: &mut Vec<FnId>, ids: impl IntoIterator<Item = FnId>) {
+    for id in ids {
+        if !out.contains(&id) {
+            out.push(id);
+        }
     }
 }
 

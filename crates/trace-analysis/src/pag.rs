@@ -557,35 +557,16 @@ impl Pag {
                 }
                 FlowConstraint::CallReturn { dst, callee_name } => {
                     let dst_n = self.var_node_id(*dst);
-                    let caller_fn = program
-                        .symbols
-                        .variable(*dst)
-                        .fn_id
-                        .map(|f| program.symbols.function(f));
-                    let file = caller_fn.map(|f| f.file);
-                    let caller_tu = caller_fn.and_then(|f| f.tu.or(Some(f.file)));
-                    // May-approximation: a merged name may bind to the
-                    // query file's `static` def, the external def, or both.
+                    let dst_var = program.symbols.variable(*dst);
                     let mut visited = FxHashSet::default();
-                    let mut candidates: Vec<_> =
-                        program.symbols.resolve_function_candidates_in_target(
+                    let candidates = match dst_var.fn_id {
+                        Some(caller) => program.symbols.return_flow_candidates(caller, callee_name),
+                        None => program.symbols.resolve_function_candidates_in_target(
                             callee_name,
-                            file,
-                            program.symbols.variable(*dst).target,
-                        );
-                    if let Some(tu) = caller_tu {
-                        let local_defs: Vec<_> = candidates
-                            .iter()
-                            .copied()
-                            .filter(|&c| {
-                                let cand = program.symbols.function(c);
-                                cand.is_defined && cand.tu.unwrap_or(cand.file) == tu
-                            })
-                            .collect();
-                        if !local_defs.is_empty() {
-                            candidates = local_defs;
-                        }
-                    }
+                            None,
+                            dst_var.target,
+                        ),
+                    };
                     let mut any_real = false;
                     for callee in &candidates {
                         if self.expand_return_flows(program, dst_n, *callee, models, &mut visited) {
@@ -724,28 +705,8 @@ impl Pag {
                             applied = true;
                         }
                         ReturnFlow::Call { callee_name } => {
-                            let caller_func = program.symbols.function(callee);
-                            let file = caller_func.file;
-                            let caller_tu = caller_func.tu.or(Some(file));
-                            let mut inner_candidates =
-                                program.symbols.resolve_function_candidates_in_target(
-                                    &callee_name,
-                                    Some(file),
-                                    caller_func.target,
-                                );
-                            if let Some(tu) = caller_tu {
-                                let local_defs: Vec<_> = inner_candidates
-                                    .iter()
-                                    .copied()
-                                    .filter(|&c| {
-                                        let cand = program.symbols.function(c);
-                                        cand.is_defined && cand.tu.unwrap_or(cand.file) == tu
-                                    })
-                                    .collect();
-                                if !local_defs.is_empty() {
-                                    inner_candidates = local_defs;
-                                }
-                            }
+                            let inner_candidates =
+                                program.symbols.return_flow_candidates(callee, &callee_name);
                             let mut inner_applied = false;
                             for inner in inner_candidates.iter().copied() {
                                 if self.expand_return_flows(program, dst, inner, models, visited) {

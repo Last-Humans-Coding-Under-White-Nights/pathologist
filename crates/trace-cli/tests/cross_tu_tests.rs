@@ -643,3 +643,357 @@ fn cross_struct_field_id_no_pollution() {
         all_indirect
     );
 }
+
+#[test]
+fn identical_header_statics_share_bodies_and_keep_visibility() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("util.h"), "static int helper(int x) { return x + 1; }\n[[maybe_unused]] static int helper2(int x) { return helper(x); }\n").unwrap();
+    std::fs::write(
+        root.join("other.h"),
+        "static int helper(int x) { return x + 2; }\n",
+    )
+    .unwrap();
+    for n in 1..=3 {
+        std::fs::write(
+            root.join(format!("t{n}.cpp")),
+            format!("#include \"util.h\"\nint use{n}() {{ return helper2({n}); }}\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        root.join("other.cpp"),
+        "#include \"other.h\"\nint other() { return helper(0); }\n",
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).unwrap();
+    // Identical header bodies must be shared.
+    let helper = only_function(&program, "helper2");
+    assert_eq!(
+        program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|s| s.caller == helper)
+            .count(),
+        1
+    );
+    let (_, analysis) = analyze(&program);
+    for n in 1..=3 {
+        assert!(has_edge(
+            &program,
+            &analysis,
+            &format!("use{n}"),
+            "helper2",
+            ResolutionKind::Direct
+        ));
+        let tu = file_id(&program, root, &format!("t{n}.cpp"));
+        assert!(program.symbols.function_visible_from(helper, tu));
+    }
+    let other = file_id(&program, root, "other.cpp");
+    assert!(!program.symbols.function_visible_from(helper, other));
+    let other_caller = program.symbols.resolve_function("other").unwrap();
+    let other_edges: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == other_caller)
+        .collect();
+    assert_eq!(other_edges.len(), 1);
+    assert_eq!(
+        program.symbols.function(other_edges[0].callee).file,
+        file_id(&program, root, "other.h")
+    );
+    let edges: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == helper)
+        .collect();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(
+        program.symbols.function(edges[0].callee).file,
+        file_id(&program, root, "util.h")
+    );
+}
+
+#[test]
+fn header_static_macro_expansions_remain_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("util.h"),
+        "static int helper() { return VALUE; }\n",
+    )
+    .unwrap();
+    for (n, value) in [(1, 10), (2, 20), (3, 10)] {
+        std::fs::write(
+            root.join(format!("t{n}.cpp")),
+            format!(
+                "#define VALUE {value}\n#include \"util.h\"\nint use{n}() {{ return helper(); }}\n"
+            ),
+        )
+        .unwrap();
+    }
+    for configured in [false, true] {
+        if configured {
+            write_compile_commands(root, &["t1.cpp", "t2.cpp", "t3.cpp"]);
+        }
+        let program = build_program(root, &default_opts(root)).unwrap();
+        let helpers: Vec<_> = program
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == "helper")
+            .collect();
+        assert_eq!(helpers.len(), 2, "different expansions must stay distinct");
+        let targets: Vec<_> = (1..=3)
+            .map(|n| {
+                let caller = program
+                    .symbols
+                    .resolve_function(&format!("use{n}"))
+                    .unwrap();
+                let site = program
+                    .symbols
+                    .call_sites
+                    .iter()
+                    .find(|s| s.caller == caller)
+                    .unwrap();
+                program.callees_of(site)
+            })
+            .collect();
+        assert_eq!(targets[0].len(), 1);
+        assert_eq!(targets[0], targets[2]);
+        assert_ne!(targets[0], targets[1]);
+    }
+}
+
+#[test]
+fn shared_header_return_flow_keeps_each_tus_definition() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("util.h"), "int *target();\nstatic int *helper() { int *p = target(); return p; }\nstatic int *forward() { return target(); }\n").unwrap();
+    for n in 1..=2 {
+        std::fs::write(root.join(format!("t{n}.cpp")), format!("#include \"util.h\"\nint value{n};\nint *target() {{ return &value{n}; }}\nint *use{n}() {{ return helper(); }}\nint *pass{n}() {{ int *q{n} = forward(); return q{n}; }}\n")).unwrap();
+    }
+    let program = build_program(root, &default_opts(root)).unwrap();
+    let (pag, analysis) = trace_analysis::analyze_with_options(
+        &program,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    for name in ["p", "q1", "q2"] {
+        let pointer = program
+            .symbols
+            .variables
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap();
+        for n in 1..=2 {
+            let value = program
+                .symbols
+                .variables
+                .iter()
+                .find(|v| v.name == format!("value{n}"))
+                .unwrap();
+            assert!(
+                analysis
+                    .points_to
+                    .get(&pag.var_node[&pointer.id])
+                    .is_some_and(|pts| pts.contains(&pag.var_location[&value.id])),
+                "{name} lost TU {n}'s return value"
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_header_call_keeps_the_context_without_a_local_definition() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("util.h"),
+        "void target(); static void helper() { target(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a.cpp"),
+        "#include \"util.h\"\nvoid target() {} void usea() { helper(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.cpp"),
+        "#include \"util.h\"\nvoid useb() { helper(); }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("c.cpp"), "void target() {}\n").unwrap();
+    let program = build_program(root, &default_opts(root)).unwrap();
+    let helper = only_function(&program, "helper");
+    let sites: Vec<_> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|s| s.caller == helper)
+        .collect();
+    assert_eq!(sites.len(), 1);
+    assert_eq!(
+        program.callees_of(sites[0]).len(),
+        2,
+        "the includer without a definition must retain both candidates"
+    );
+}
+
+#[test]
+fn header_static_lambdas_share_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("util.h"), "static void helper(void (*value)()) { auto callback = [value]() { value(); }; callback(); }\n").unwrap();
+    for n in 1..=3 {
+        std::fs::write(
+            root.join(format!("t{n}.cpp")),
+            format!("#include \"util.h\"\nvoid target{n}() {{}}\nvoid use{n}() {{ helper(target{n}); }}\n"),
+        )
+        .unwrap();
+    }
+    let program = build_program(root, &default_opts(root)).unwrap();
+    let lambdas: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name.contains("$lambda"))
+        .collect();
+    assert_eq!(lambdas.len(), 1);
+    assert_eq!(
+        program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|s| s.caller == lambdas[0].id)
+            .count(),
+        1
+    );
+    let (_, analysis) = analyze(&program);
+    for n in 1..=3 {
+        assert!(
+            analysis
+                .call_edges
+                .iter()
+                .any(|edge| edge.caller == lambdas[0].id
+                    && fn_name(&program, edge.callee) == format!("target{n}")),
+            "shared capture lost callback from TU {n}"
+        );
+    }
+}
+
+#[test]
+fn shared_header_fn_static_callback_storage_unions_tu_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("util.h"),
+        r#"
+typedef void (*Callback)();
+static Callback file_saved;
+static void helper(Callback cb) {
+    static Callback saved;
+    saved = cb;
+    saved();
+}
+"#,
+    )
+    .unwrap();
+    for n in 1..=2 {
+        std::fs::write(root.join(format!("t{n}.cpp")), format!("#include \"util.h\"\nvoid target{n}() {{}}\nvoid use{n}() {{ file_saved = target{n}; file_saved(); helper(target{n}); }}\n")).unwrap();
+    }
+    for configured in [false, true] {
+        if configured {
+            write_compile_commands(root, &["t1.cpp", "t2.cpp"]);
+        }
+        let program = build_program(root, &default_opts(root)).unwrap();
+        let saved: Vec<_> = program
+            .symbols
+            .variables
+            .iter()
+            .filter(|v| v.name == "saved")
+            .collect();
+        assert_eq!(
+            saved.len(),
+            1,
+            "function-local static storage shares the body identity"
+        );
+        assert_eq!(saved[0].storage, trace_ir::StorageClass::FnStatic);
+        let file_vars: Vec<_> = program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|s| s.callee_name == "file_saved")
+            .map(|s| s.callee_var.unwrap())
+            .collect();
+        assert_eq!(file_vars.len(), 2);
+        assert_ne!(file_vars[0], file_vars[1]);
+        for id in file_vars {
+            assert_eq!(
+                program.symbols.variable(id).storage,
+                trace_ir::StorageClass::FileStatic
+            );
+        }
+        let helper = saved[0].fn_id.unwrap();
+        let (_, analysis) = analyze(&program);
+        let mut callbacks: Vec<_> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| e.caller == helper)
+            .map(|e| fn_name(&program, e.callee))
+            .collect();
+        callbacks.sort();
+        assert_eq!(callbacks, ["target1", "target2"]);
+    }
+}
+
+#[test]
+fn shared_header_flows_are_not_repeated_by_later_tu_variants() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("util.h"), "static int *helper(int *p) { int *q = p; return q; }\n#ifdef EXTRA\nstatic int *extra_helper(int *p) { int *q = p; return q; }\n#endif\n").unwrap();
+    std::fs::write(
+        root.join("BUILD.gn"),
+        "config(\"features\") { defines = [\"EXTRA\"] }\n",
+    )
+    .unwrap();
+    for n in 1..=2 {
+        std::fs::write(root.join(format!("t{n}.cpp")), format!("#include \"util.h\"\nint *use{n}(int *p) {{ return helper(p); }}\n#ifdef EXTRA\nvoid extra{n}() {{}}\n#endif\n")).unwrap();
+    }
+    for jobs in [1, 8] {
+        let program = build_program_with_jobs(
+            root,
+            &default_opts(root).with_explore(true).with_explore_budget(1),
+            jobs,
+        )
+        .unwrap();
+        assert_eq!(
+            program.variants_merged, 2,
+            "each TU must contribute a variant"
+        );
+        for name in ["helper", "extra_helper"] {
+            let helper = program
+                .symbols
+                .functions
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap()
+                .id;
+            let local = program
+                .symbols
+                .variables
+                .iter()
+                .find(|v| v.fn_id == Some(helper) && v.name == "q")
+                .unwrap()
+                .id;
+            let copies = program.flow.iter().filter(|flow| matches!(flow, trace_ir::FlowConstraint::Copy { dst, .. } if *dst == local)).count();
+            assert_eq!(
+                copies, 1,
+                "later TU variants must not replay a previously shared {name} flow"
+            );
+        }
+    }
+}

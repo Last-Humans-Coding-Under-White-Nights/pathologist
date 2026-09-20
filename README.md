@@ -409,6 +409,10 @@ discover .c/.cpp → preprocess → parse → lower IR → build PAG → solve �
 
 Analysis is **may-analysis** (sound over-approximation): if a call target is possible, it may appear as an edge.
 
+Header-function identity and visibility follow the
+[shared header function rules](docs/ANALYSIS.md#shared-header-functions).
+Measured changes are recorded in the [evaluation report](docs/EVAL_REPORT.md).
+
 ## Export modes
 
 | Mode | Flags | Database contents |
