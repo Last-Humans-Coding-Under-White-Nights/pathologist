@@ -1,6 +1,6 @@
 use crate::{CallSiteId, FileId, FnId, Span, TypeId, VarId};
 use indexmap::IndexMap;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -166,6 +166,66 @@ impl CallSite {
             && !self.callee_name.contains("->")
             && !self.callee_name.contains('.')
     }
+
+    /// What this record states about the call, borrowed from it.
+    fn facts(&self) -> CallFacts<'_> {
+        CallFacts {
+            caller: self.caller,
+            callee_fn_id: self.callee_fn_id,
+            callee_var: self.callee_var,
+            var_args: &self.var_args,
+            fn_args: &self.fn_args,
+            addr_of_member_args: &self.addr_of_member_args,
+            args_bound_past_this: self.args_bound_past_this,
+            is_direct: self.is_direct,
+            receiver_class: self.receiver_class.as_deref(),
+            return_dst: self.return_dst,
+        }
+    }
+
+    /// Whether two records standing at one source site state the same call.
+    #[must_use]
+    pub fn same_facts(&self, other: &Self) -> bool {
+        self.facts() == other.facts()
+    }
+
+    /// A hash of the same facts [`CallSite::same_facts`] compares, so records
+    /// at one site can be grouped and probed instead of scanned.
+    ///
+    /// Equal facts always give an equal fingerprint; the converse is not
+    /// guaranteed, so a match found this way is still confirmed with
+    /// `same_facts`, and a collision costs one comparison rather than a wrong
+    /// merge. The grouping only pays while distinct facts mostly land in
+    /// distinct buckets, which the crate's hasher gives at a fraction of
+    /// SipHash's cost.
+    #[must_use]
+    pub fn fact_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        self.facts().hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+/// The facts a record states about a call, borrowed from it.
+///
+/// Identity, span and originating unit are deliberately absent: the question
+/// these answer is whether a record the program already holds says what an
+/// incoming one says, so the merge can coalesce them. Deriving both the
+/// comparison and the hash from this one field list is what keeps them from
+/// drifting — a field added to `CallSite` and weighed here reaches both.
+#[derive(PartialEq, Eq, Hash)]
+struct CallFacts<'a> {
+    caller: FnId,
+    callee_fn_id: Option<FnId>,
+    callee_var: Option<VarId>,
+    var_args: &'a [(u32, VarId)],
+    fn_args: &'a [(u32, FnId)],
+    addr_of_member_args: &'a [u32],
+    args_bound_past_this: bool,
+    is_direct: bool,
+    receiver_class: Option<&'a str>,
+    return_dst: Option<VarId>,
 }
 
 /// What a surviving entry takes from any redeclaration merged into it,
@@ -309,11 +369,21 @@ pub struct SymbolTable {
     /// class (`Cls::m`) without a file, and `fn_by_scope` answers only per
     /// file, so without this such members were never found.
     internal_members_by_name: FxHashMap<String, Vec<FnId>>,
+    /// Lookup contexts retained by coalesced header call records.
+    shared_call_tus: FxHashMap<CallSiteId, std::collections::BTreeSet<FileId>>,
+    /// Includers contributing each exact expanded header definition.
+    shared_header_tus: FxHashMap<FnId, std::collections::BTreeSet<FileId>>,
     /// Headers whose entities were attributed to this TU during lowering
     /// (`#include`d code). Scope resolution consults them so a `static`
     /// inline defined in a header stays visible to its includers after
     /// cross-TU deduplication collapsed the per-TU copies.
     headers_of: FxHashMap<FileId, std::collections::BTreeSet<FileId>>,
+    /// `headers_of` inverted: the TUs each header was attributed to. Visibility
+    /// of a shared header body asks whether some unit holding it also includes
+    /// the querying file, and that question is answered from whichever of the
+    /// two sets is smaller only if both directions are indexed. Unordered,
+    /// unlike its forward twin: nothing reads it but a membership test.
+    includers_of: FxHashMap<FileId, FxHashSet<FileId>>,
     file_by_path: FxHashMap<PathBuf, FileId>,
     /// Canonical dependency roots (`--dep`); empty for a single-tree run.
     dep_roots: Vec<PathBuf>,
@@ -390,6 +460,7 @@ impl SymbolTable {
     pub fn register_included_header(&mut self, tu: crate::FileId, header: crate::FileId) {
         if tu != header {
             self.headers_of.entry(tu).or_default().insert(header);
+            self.includers_of.entry(header).or_default().insert(tu);
         }
     }
 
@@ -1189,26 +1260,63 @@ impl SymbolTable {
         seen
     }
 
-    /// Whether a reference written in `file` can name `id`: an external
-    /// entry is named everywhere, an internal one only in its own file and in
-    /// the files that include the header it is in.
+    /// Record the TUs contributing an identical expanded header definition.
+    pub fn share_header_function(&mut self, id: FnId, tu: FileId) {
+        self.shared_header_tus.entry(id).or_default().insert(tu);
+    }
+
+    /// Retain lookup contexts when identical header call records coalesce.
+    pub fn share_header_call(&mut self, id: CallSiteId, tu: FileId) {
+        self.shared_call_tus.entry(id).or_default().insert(tu);
+    }
+
+    pub fn is_shared_header_function(&self, id: FnId) -> bool {
+        self.shared_header_tus.contains_key(&id)
+    }
+
+    /// Whether a reference in this file can see the function, respecting the
+    /// contributing TU set of shared definitions.
     pub fn function_visible_from(&self, id: FnId, file: FileId) -> bool {
         self.function_by_id(id).is_some_and(|f| {
-            if f.linkage == Linkage::Internal {
-                if f.is_cpp {
-                    if let Some(tu) = f.tu {
-                        let in_tu = file == tu
-                            || self.headers_of.get(&tu).is_some_and(|h| h.contains(&file));
-                        if !in_tu {
-                            return false;
-                        }
-                    }
-                }
-                self.file_sees(file, f.file)
-            } else {
-                true
+            if f.linkage != Linkage::Internal {
+                return true;
             }
+            if f.is_cpp {
+                // A shared body is visible in every contributing unit and the
+                // files those units include (docs/ANALYSIS.md).
+                if let Some(tus) = self.shared_header_tus.get(&id) {
+                    return f.file == file || self.any_unit_sees(tus, file);
+                }
+                if f.tu.is_some_and(|tu| !self.file_sees(tu, file)) {
+                    return false;
+                }
+            }
+            self.file_sees(file, f.file)
         })
+    }
+
+    /// [`SymbolTable::file_sees`] lifted over a set of units: whether any of
+    /// `tus` is `file` or includes it.
+    ///
+    /// Walking `tus` would cost one probe per unit, and a header carrying a
+    /// shared body can have thousands. `file`'s own includers answer the same
+    /// question, so the shorter side is walked: a body shared by the whole
+    /// tree is tested against the few units that include the querying file
+    /// rather than the other way round.
+    fn any_unit_sees(&self, tus: &std::collections::BTreeSet<FileId>, file: FileId) -> bool {
+        if tus.contains(&file) {
+            return true;
+        }
+        let Some(includers) = self.includers_of.get(&file) else {
+            return false;
+        };
+        // The two sets are different types, so each direction spells its own
+        // walk; both ask exactly `includers ∩ tus ≠ ∅`.
+        if includers.len() <= tus.len() {
+            includers.iter().any(|tu| tus.contains(tu))
+        } else {
+            tus.iter().any(|tu| includers.contains(tu))
+        }
     }
 
     /// Whether code in `file` sees what `other` defines: `other` is `file`, or
@@ -1219,6 +1327,46 @@ impl SymbolTable {
                 .headers_of
                 .get(&file)
                 .is_some_and(|headers| headers.contains(&other))
+    }
+
+    /// The TUs a function stands for: every includer of a shared header body,
+    /// otherwise the one unit that lowered it.
+    fn contributing_tus(&self, id: FnId) -> impl Iterator<Item = FileId> + '_ {
+        let shared = self.shared_header_tus.get(&id);
+        let own = shared.is_none().then(|| {
+            let f = self.function(id);
+            f.tu.unwrap_or(f.file)
+        });
+        shared.into_iter().flatten().copied().chain(own)
+    }
+
+    /// Whether this definition represents the given TU, including shared bodies.
+    fn defined_in_tu(&self, id: FnId, tu: FileId) -> bool {
+        self.function(id).is_defined && self.contributing_tus(id).any(|t| t == tu)
+    }
+
+    /// Resolve a name-based return fact in every context represented by its
+    /// caller. A shared header body unions its includers' bindings, while an
+    /// ordinary body keeps the TU-local definition precedence.
+    pub fn return_flow_candidates(&self, caller: FnId, name: &str) -> Vec<FnId> {
+        let function = self.function(caller);
+        // `(tu, lookup file)` per context: a shared body looks up from each
+        // includer, an ordinary one from its own file.
+        let shared = self.is_shared_header_function(caller);
+        let contexts: Vec<(FileId, FileId)> = self
+            .contributing_tus(caller)
+            .map(|tu| (tu, if shared { tu } else { function.file }))
+            .collect();
+        let mut result = Vec::new();
+        for (tu, file) in contexts {
+            let mut candidates =
+                self.resolve_function_candidates_in_target(name, Some(file), function.target);
+            if candidates.iter().any(|&c| self.defined_in_tu(c, tu)) {
+                candidates.retain(|&c| self.defined_in_tu(c, tu));
+            }
+            push_unique(&mut result, candidates);
+        }
+        result
     }
 
     /// Take the member definitions whose parameters lack the implicit `this`
@@ -1241,17 +1389,32 @@ impl SymbolTable {
         cs: &CallSite,
         types: Option<&crate::TypeTable>,
     ) -> Vec<FnId> {
-        // Both resolvers below fall back to the whole-program interpretation
-        // when nothing is scoped, so one tail serves either mode.
-        let target = self.caller_target(cs);
+        if let Some(tus) = self.shared_call_tus.get(&cs.id) {
+            let mut result = Vec::new();
+            for &tu in tus {
+                push_unique(&mut result, self.callees_in_tu(cs, types, tu));
+            }
+            return result;
+        }
         let caller_tu = cs
             .tu
             .or_else(|| self.function_by_id(cs.caller).and_then(|f| f.tu))
             .unwrap_or(cs.span.file);
+        self.callees_in_tu(cs, types, caller_tu)
+    }
+
+    fn callees_in_tu(
+        &self,
+        cs: &CallSite,
+        types: Option<&crate::TypeTable>,
+        caller_tu: FileId,
+    ) -> Vec<FnId> {
+        // Both resolvers fall back to whole-program interpretation when
+        // nothing is scoped, so one tail serves either mode.
+        let target = self.caller_target(cs);
         let resolve_equal_defs = |fid: FnId| -> Vec<FnId> {
             let f = self.function(fid);
-            let f_tu = f.tu.unwrap_or(f.file);
-            if f.linkage != Linkage::External || (f.is_defined && f_tu == caller_tu) {
+            if f.linkage != Linkage::External || self.defined_in_tu(fid, caller_tu) {
                 return vec![fid];
             }
             let f_skip = usize::from(self.has_this_param(fid));
@@ -1298,10 +1461,8 @@ impl SymbolTable {
                 })
                 .collect();
             if defs.len() > 1 {
-                if let Some(&local_def) = defs.iter().find(|&&id| {
-                    let cand = self.function(id);
-                    cand.tu.unwrap_or(cand.file) == caller_tu
-                }) {
+                if let Some(&local_def) = defs.iter().find(|&&id| self.defined_in_tu(id, caller_tu))
+                {
                     return vec![local_def];
                 }
                 return defs;
@@ -1617,10 +1778,61 @@ fn base_name_of(name: &str) -> String {
     }
 }
 
+/// Append the ids not already present, keeping first-seen order.
+fn push_unique(out: &mut Vec<FnId>, ids: impl IntoIterator<Item = FnId>) {
+    for id in ids {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Program, TypeDesc};
+
+    /// `CallFacts` ties the comparison and the fingerprint to one field list,
+    /// so they cannot drift. What a derive cannot state is which fields belong
+    /// on that list: a record's identity, position and originating unit are
+    /// not facts about the call, and letting one in would split records the
+    /// merge has to coalesce, leaving a duplicate per contributing unit.
+    #[test]
+    fn call_facts_ignore_identity_position_and_unit() {
+        let base = CallSite {
+            id: crate::CallSiteId(7),
+            caller: FnId(3),
+            callee_name: "handler".into(),
+            callee_var: Some(VarId(1)),
+            callee_fn_id: Some(FnId(9)),
+            var_args: vec![(1, VarId(4))],
+            fn_args: vec![(2, FnId(5))],
+            addr_of_member_args: vec![1],
+            args_bound_past_this: false,
+            span: Span::new(FileId(2), 10, 3),
+            is_direct: true,
+            receiver_class: Some("Cls".into()),
+            return_dst: Some(VarId(6)),
+            tu: Some(FileId(2)),
+        };
+        let elsewhere = CallSite {
+            id: crate::CallSiteId(11),
+            callee_name: "other".into(),
+            span: Span::new(FileId(5), 99, 1),
+            tu: Some(FileId(5)),
+            ..base.clone()
+        };
+        assert!(base.same_facts(&elsewhere));
+        assert_eq!(base.fact_fingerprint(), elsewhere.fact_fingerprint());
+
+        // And a fact that does differ still separates them, both ways.
+        let rebound = CallSite {
+            var_args: vec![(1, VarId(8))],
+            ..base.clone()
+        };
+        assert!(!base.same_facts(&rebound));
+        assert_ne!(base.fact_fingerprint(), rebound.fact_fingerprint());
+    }
 
     #[test]
     fn resolves_by_name_classifies_plain_identifiers() {
@@ -1681,6 +1893,65 @@ mod tests {
             is_cpp,
             tu: None,
         }
+    }
+
+    /// A shared body reaches the headers its contributors include. The search
+    /// walks whichever of the two sides is shorter, so both orders are put to
+    /// the same questions here and must answer alike.
+    #[test]
+    fn shared_body_is_visible_through_a_contributor_s_other_headers() {
+        let mut p = Program::new(PathBuf::from("/t"));
+        let shared = p.symbols.add_file(PathBuf::from("/t/shared.h"));
+        // Narrow: one includer, against a body many units contribute.
+        let narrow = p.symbols.add_file(PathBuf::from("/t/narrow.h"));
+        // Wide: many includers, only the first of which holds the body.
+        let wide = p.symbols.add_file(PathBuf::from("/t/wide.h"));
+        let outsider = p.symbols.add_file(PathBuf::from("/t/outsider.h"));
+
+        let units: Vec<FileId> = (0..8)
+            .map(|i| p.symbols.add_file(PathBuf::from(format!("/t/u{i}.cpp"))))
+            .collect();
+        let stranger = p.symbols.add_file(PathBuf::from("/t/stranger.cpp"));
+        for &unit in &units {
+            p.symbols.register_included_header(unit, shared);
+        }
+        p.symbols.register_included_header(units[0], narrow);
+        p.symbols.register_included_header(units[0], wide);
+        for &unit in &units[1..] {
+            p.symbols.register_included_header(unit, wide);
+        }
+        p.symbols.register_included_header(stranger, outsider);
+        p.symbols.register_included_header(stranger, wide);
+
+        let mut f = fake_function(
+            p.symbols.alloc_fn_id(),
+            "helper",
+            Vec::new(),
+            true,
+            true,
+            shared,
+            1,
+        );
+        f.linkage = Linkage::Internal;
+        let id = p.symbols.add_function(f);
+        // Only the first unit contributes, so `wide` has more includers than
+        // the body has contributors and the walk goes the other way.
+        p.symbols.share_header_function(id, units[0]);
+        assert!(p.symbols.function_visible_from(id, narrow));
+        assert!(p.symbols.function_visible_from(id, wide));
+        assert!(!p.symbols.function_visible_from(id, outsider));
+
+        // Every unit contributes: now the contributor set is the longer side.
+        for &unit in &units[1..] {
+            p.symbols.share_header_function(id, unit);
+        }
+        assert!(p.symbols.function_visible_from(id, narrow));
+        assert!(p.symbols.function_visible_from(id, wide));
+        assert!(
+            !p.symbols.function_visible_from(id, outsider),
+            "a unit that never included the header must not open the body up"
+        );
+        assert!(!p.symbols.function_visible_from(id, stranger));
     }
 
     #[test]

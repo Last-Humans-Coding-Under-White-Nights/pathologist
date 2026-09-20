@@ -298,3 +298,63 @@ fn ipc_bridges_span_link_targets() {
         "proxy and stub live in different images"
     );
 }
+
+#[test]
+fn shared_header_functions_deduplicate_within_each_link_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(
+        root.join("util.h"),
+        "static void leaf() {}\nstatic void helper() { leaf(); }\n",
+    )
+    .unwrap();
+    let mut commands = Vec::new();
+    for name in ["a1", "a2", "b1", "b2"] {
+        fs::write(
+            root.join(format!("{name}.cpp")),
+            format!("#include \"util.h\"\nvoid use_{name}() {{ helper(); }}\n"),
+        )
+        .unwrap();
+        commands.push(json!({"directory":root,"file":format!("{name}.cpp"),"output":format!("{name}.o"),"arguments":["c++","-c",format!("{name}.cpp"),"-o",format!("{name}.o")]}));
+    }
+    fs::write(
+        root.join("compile_commands.json"),
+        json!(commands).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("link_commands.json"),
+        json!([
+            {"directory":root,"output":"a","arguments":["c++","a1.o","a2.o","-o","a"]},
+            {"directory":root,"output":"b","arguments":["c++","b1.o","b2.o","-o","b"]}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    for jobs in [1, 8] {
+        let (_db, conn) = analyze(root, Some(jobs));
+        for name in ["helper", "leaf"] {
+            let instances: Vec<(i64, i64)> = conn
+                .prepare("SELECT id, target_id FROM functions WHERE name = ?1 ORDER BY target_id")
+                .unwrap()
+                .query_map([name], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(instances.len(), 2, "one {name} per target, not per TU");
+            assert_ne!(instances[0].0, instances[1].0);
+            assert_ne!(instances[0].1, instances[1].1);
+        }
+        let cross_target: i64 = conn.query_row("SELECT COUNT(*) FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id JOIN functions callee ON callee.id=e.callee_fn_id WHERE caller.target_id IS NULL OR callee.target_id IS NULL OR caller.target_id != callee.target_id", [], |row| row.get(0)).unwrap();
+        assert_eq!(cross_target, 0);
+        let body_sites: i64 = conn.query_row("SELECT COUNT(*) FROM call_sites s JOIN functions f ON f.id=s.caller_fn_id WHERE f.name='helper'", [], |row| row.get(0)).unwrap();
+        assert_eq!(body_sites, 2);
+        let edges: i64 = conn
+            .query_row("SELECT COUNT(*) FROM call_edges", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            edges, 6,
+            "four callers and one helper-to-leaf edge per target"
+        );
+    }
+}

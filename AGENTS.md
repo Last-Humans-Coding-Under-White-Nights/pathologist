@@ -113,6 +113,7 @@ Register external function summaries and function models (`FnModelSet`, loaded v
 ## Code quality
 
 - Keep one source of truth for symbol identity, link-target ownership, and resolution precedence. Reuse the shared resolver and metadata instead of duplicating policies in lowering, analysis, or export.
+- Keep documentation rules in one authoritative section and link to it from summaries, comments, and change descriptions. Update that section when behavior changes; keep measurements in `docs/EVAL_REPORT.md`. For header-function sharing and lookup ownership, use `docs/ANALYSIS.md`, "Shared header functions".
 - Keep shared SQL and export behavior in one place across minimal and full modes; extend existing helpers rather than maintaining parallel implementations.
 - Preserve simple phase boundaries and explicit invariants. Avoid speculative abstractions and unnecessary scans or allocations in per-symbol and solver hot paths.
 

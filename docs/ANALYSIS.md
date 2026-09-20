@@ -40,6 +40,58 @@ flowchart TD
 2. **`solve`** — worklist propagation until fixpoint; discover indirect callees when call-target points-to gains function locations.
 3. **`extract_arg_flow`** — emit `arg_flow_edges` for wired parameter copies at resolved calls.
 
+## Shared header functions
+
+This section defines header-function sharing. `SymbolTable` owns visibility
+and resolution: call consumers use `Program::callees_of` (or the symbol-table
+equivalent), and name-based return facts use
+`SymbolTable::return_flow_candidates`. Merge records contributing contexts;
+analysis and export reuse those resolvers rather than reconstructing the rules.
+
+C++ internal-linkage definitions originating in an included header share one
+function entry when their source position, name and exact preprocessed
+definition text agree (#116), including lambdas nested in header bodies.
+Different macro expansions remain separate. Text identity is the whole
+test: a body whose meaning differs per unit through an earlier `typedef`,
+`using` alias or `enum` constant is still one entry, and it keeps the first
+contributing unit's parameter and return types. That is a known
+approximation, not a separator. The comparison uses expanded text, rather
+than original source or a hash alone, and does not depend on worker
+scheduling. Deduplication is confined
+to each link image; source-file definitions retain their TU identity.
+
+The symbol table records the TUs contributing each shared definition, so it
+is visible only in those units and their included files. Visibility uses
+recorded include relationships, since included files can have arbitrary
+extensions. Parameters and
+body locals are shared, and merging unions distinct call, flow and return
+facts. Base configurations and variants use the same shared-flow index across
+TU families within a link image, including facts first introduced by a variant.
+Identical call records retain all contributing lookup contexts and are
+exported once; records referring to different TU-local callees or mutable
+callback objects remain separate.
+File-scope static variables (`FileStatic`, with no owning function) still
+represent distinct objects per TU. Function-local static variables (`FnStatic`)
+share the canonical body's abstract locations alongside its other locals.
+C++ gives each TU its own such object; sharing these locations unions their
+possible values as a deliberate may-analysis over-approximation.
+Name-based return lookup considers every contributing TU with the usual
+local-definition precedence: for matching external definitions, a TU that
+defines the function selects its own definition; a TU without one considers
+all matching definitions in its target. This is a context-insensitive approximation:
+a shared helper can propagate values from any of its includers, while no
+contributing binding is discarded. Internal definitions without expansion
+metadata retain their existing merge behavior.
+
+Expanded definition text travels through `UnitIndex::internal_definitions`.
+Cached-header replay retains it in the temporary TU preamble so
+`program_into_unit` can transfer it to the unit. The final merge keeps the
+header-deduplication index without copying text into a second
+`internal_definitions` index. CLI and C API call `Program::release_merge_state`
+after indexing and before analysis, releasing these merge-only tables in both
+scoped and unscoped runs. Rust callers that will merge more units retain the
+state until their final merge is complete.
+
 ## Link targets and weak symbols
 
 `--link-commands PATH` selects a link commands database. Otherwise indexing
@@ -234,11 +286,16 @@ Functions record abstract return values in `program.fn_returns`:
 | `AddrOfVar { src }` | `return &global` / `return &file_static` |
 | `AddrOfFn { callee }` | `return &Fn` / `return Fn` |
 | `Copy { src }` | `return local` or `return param` |
-| `Call { callee_name }` | `return Other()` (transitive; `Other` resolved in callee's file) |
+| `Call { callee_name }` | `return Other()` (transitive; resolved in the returning function's contexts) |
 
 `return &local` is recorded as `AddrOfVar` but is **unsound** for stack locals (may-analysis may report escaped addresses). Prefer treating this as a known imprecision.
 
-At PAG build time, `CallReturn` and transitive `ReturnFlow::Call` resolve `callee_name` with **`resolve_function_candidates_in_target(name, file, target)`** — every function the merged name may refer to: the query file's internal-linkage entries (`fn_by_scope`, declarations included, with their further C++ overloads in `scope_overloads`) plus external definitions. When the caller translation unit defines the function, return-flow expansion isolates exclusively to that unit's definition, avoiding cross-TU points-to leaks. When no unit-local definition exists, all matching definitions are expanded per may-analysis semantics. Callee ids that survived lowering + merge (e.g. `AddrOfFn`) are used directly instead — they are exact.
+At PAG build time, `CallReturn` and transitive `ReturnFlow::Call` use
+`SymbolTable::return_flow_candidates(caller, callee_name)`. This shared resolver
+applies target scope and TU-local definition precedence; header-body contexts
+follow [Shared header functions](#shared-header-functions). A `CallReturn`
+without an owning function falls back to target-scoped candidate lookup.
+Callee ids that survived lowering and merge (e.g. `AddrOfFn`) are used directly.
 
 This models patterns like:
 
@@ -340,13 +397,22 @@ Consequence: callbacks stored through correctly-typed ops assignments resolve ex
 
 **Direct calls**
 
-Sites lowering marked `is_direct = true` saw the TU-local binding, so scope-first **`resolve_function_in_scope_in_target(callee_name, call_site.file, target)`** is exact per C visibility rules: a file-`static` definition shadows same-name external functions inside its own TU (backed by the `fn_by_scope` index, which includes internal *declarations* — lowering streams a file top-down and initializers like `.Read = StaticFn` must bind before the definition is lowered).
-
-Because header-defined functions are deduplicated to their header origin at merge time, `fn_by_scope` entries for them live under the header's `FileId`. Scope resolution therefore also consults **`headers_of(file)`** — the set of headers that contributed entities to a TU — so an includer still sees the header's internal-linkage definitions; TU-local definitions keep precedence on name collision.
+Direct-call consumers use `Program::callees_of`, which delegates to the
+symbol table's target-aware resolver. It uses the lowering binding when
+available and otherwise resolves by name in the calling TU. A file-`static`
+definition shadows a same-name external definition in that scope. Internal
+declarations also participate, so an initializer can bind a callback before
+its definition is lowered. Header identity, visibility, and coalesced lookup
+contexts follow [Shared header functions](#shared-header-functions).
 
 **Cross-TU direct-call recovery**
 
-A plain call whose definition lives in another TU is lowered with `is_direct = false` (the callee symbol is not visible in the calling TU). At solve time, sites that are *not* direct, have no `callee_var`, and whose callee text is a bare identifier are recovered as direct-by-name calls via `CallSite::resolves_by_name`, expanding **all** `resolve_function_candidates_in_target` (may-approximation — see `CallReturn` above). Without this, every cross-TU call to a function declared through a pointer-returning prototype (e.g. `T *f(void);`) would be dropped, because such prototypes previously also produced phantom variables — lowering now registers functions for pointer-wrapped declarators instead.
+A plain call whose callee symbol is not visible in its TU is lowered with
+`is_direct = false`. `CallSite::resolves_by_name` identifies recoverable calls
+with no `callee_var` and a bare callee name. The same `Program::callees_of`
+entry point resolves these through target-scoped candidate lookup. Lowering
+also registers pointer-returning prototypes (e.g. `T *f(void);`) as functions,
+so those declarations participate in lookup instead of creating phantom variables.
 
 ### Analyze options
 
@@ -1469,6 +1535,7 @@ exist. This trades some header parsing time for isolation between explicit
 include configurations. Unreached project headers retain standalone indexing;
 dependency headers contribute declarations only.
 
+Function sharing follows [Shared header functions](#shared-header-functions).
 The complete set of configured units uses the variant-preserving merge, so a
 shared header's differing bodies survive across both commands for one source and
 commands for different sources. Source IDs, locals, call facts, flow constraints

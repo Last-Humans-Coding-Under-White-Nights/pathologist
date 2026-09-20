@@ -6845,49 +6845,31 @@ void CallerB() {
         .iter()
         .filter(|f| f.name == "Helper")
         .collect();
+    assert_eq!(helpers.len(), 1, "identical header definitions are shared");
+    let helper = helpers[0].id;
+    for name in ["CallerA", "CallerB"] {
+        let caller = program.symbols.resolve_function(name).unwrap();
+        let edges: Vec<_> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| e.caller == caller)
+            .map(|e| e.callee)
+            .collect();
+        assert_eq!(edges, vec![helper]);
+    }
+    let mut targets: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == helper)
+        .map(|e| e.callee)
+        .collect();
+    targets.sort();
+    let mut expected = vec![fn_a, fn_b];
+    expected.sort();
     assert_eq!(
-        helpers.len(),
-        2,
-        "both translation units must have their own internal Helper function"
+        targets, expected,
+        "sharing retains both TU-specific bindings"
     );
-    let helper_a = helpers.iter().find(|h| h.tu == Some(a_file_id)).unwrap().id;
-    let helper_b = helpers.iter().find(|h| h.tu == Some(b_file_id)).unwrap().id;
-    assert_ne!(helper_a, helper_b);
-
-    let caller_a = program.symbols.resolve_function("CallerA").unwrap();
-    let caller_b = program.symbols.resolve_function("CallerB").unwrap();
-
-    let caller_a_edges: Vec<FnId> = analysis
-        .call_edges
-        .iter()
-        .filter(|e| e.caller == caller_a && e.resolution == ResolutionKind::Direct)
-        .map(|e| e.callee)
-        .collect();
-    assert_eq!(caller_a_edges, vec![helper_a]);
-
-    let helper_a_edges: Vec<FnId> = analysis
-        .call_edges
-        .iter()
-        .filter(|e| e.caller == helper_a && e.resolution == ResolutionKind::Direct)
-        .map(|e| e.callee)
-        .collect();
-    assert_eq!(helper_a_edges, vec![fn_a]);
-
-    let caller_b_edges: Vec<FnId> = analysis
-        .call_edges
-        .iter()
-        .filter(|e| e.caller == caller_b && e.resolution == ResolutionKind::Direct)
-        .map(|e| e.callee)
-        .collect();
-    assert_eq!(caller_b_edges, vec![helper_b]);
-
-    let helper_b_edges: Vec<FnId> = analysis
-        .call_edges
-        .iter()
-        .filter(|e| e.caller == helper_b && e.resolution == ResolutionKind::Direct)
-        .map(|e| e.callee)
-        .collect();
-    assert_eq!(helper_b_edges, vec![fn_b]);
 }
 
 #[test]
@@ -6964,76 +6946,51 @@ void caller_b() {
         );
     }
 
-    let a_file_id = program
-        .symbols
-        .files
-        .iter()
-        .position(|f| f.path == root.join("a.cpp"))
-        .map(|i| trace_ir::FileId(i as u32))
-        .unwrap();
-    let b_file_id = program
-        .symbols
-        .files
-        .iter()
-        .position(|f| f.path == root.join("b.cpp"))
-        .map(|i| trace_ir::FileId(i as u32))
-        .unwrap();
-
     let helpers: Vec<_> = program
         .symbols
         .functions
         .iter()
         .filter(|f| f.name == "helper" && f.is_defined)
         .collect();
-    assert_eq!(helpers.len(), 2, "must have separate helper per TU");
-
+    assert_eq!(helpers.len(), 1);
+    let helper = helpers[0].id;
     let callbacks: Vec<_> = program
         .symbols
         .functions
         .iter()
         .filter(|f| f.name == "callback" && f.is_defined)
         .collect();
-    assert_eq!(callbacks.len(), 2, "must have separate callback per TU");
+    assert_eq!(callbacks.len(), 1);
+    let expected = vec![callbacks[0].id];
+    assert_each_site_of_targets(&program, &analysis, helper, &expected);
+}
 
-    let helper_a = helpers.iter().find(|f| f.tu == Some(a_file_id)).unwrap().id;
-    let helper_b = helpers.iter().find(|f| f.tu == Some(b_file_id)).unwrap().id;
-    let cb_a = callbacks
+/// Every call site in `helper` resolves to exactly `expected` (sorted). Each
+/// TU retains its own mutable callback storage, and both stores must remain
+/// initialized even though their function targets are shared.
+fn assert_each_site_of_targets(
+    program: &Program,
+    analysis: &AnalysisResult,
+    helper: FnId,
+    expected: &[FnId],
+) {
+    let sites: Vec<_> = program
+        .symbols
+        .call_sites
         .iter()
-        .find(|f| f.tu == Some(a_file_id))
-        .unwrap()
-        .id;
-    let cb_b = callbacks
-        .iter()
-        .find(|f| f.tu == Some(b_file_id))
-        .unwrap()
-        .id;
-
-    assert_ne!(helper_a, helper_b);
-    assert_ne!(cb_a, cb_b);
-
-    let edges_from_helper_a: Vec<FnId> = analysis
-        .call_edges
-        .iter()
-        .filter(|e| e.caller == helper_a)
-        .map(|e| e.callee)
+        .filter(|s| s.caller == helper)
         .collect();
-    assert_eq!(
-        edges_from_helper_a,
-        vec![cb_a],
-        "helper in TU a must resolve indirect call to callback in TU a"
-    );
-
-    let edges_from_helper_b: Vec<FnId> = analysis
-        .call_edges
-        .iter()
-        .filter(|e| e.caller == helper_b)
-        .map(|e| e.callee)
-        .collect();
-    assert_eq!(
-        edges_from_helper_b,
-        vec![cb_b],
-        "helper in TU b must resolve indirect call to callback in TU b"
-    );
+    assert!(!sites.is_empty());
+    for site in sites {
+        let mut targets: Vec<_> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| e.call_site == site.id)
+            .map(|e| e.callee)
+            .collect();
+        targets.sort();
+        assert_eq!(targets, expected);
+    }
 }
 
 fn check_header_array_callback_initializer(with_compile_commands: bool) {
@@ -7103,88 +7060,27 @@ void caller_b() {
         );
     }
 
-    let a_file_id = program
-        .symbols
-        .files
-        .iter()
-        .position(|f| f.path == root.join("a.cpp"))
-        .map(|i| trace_ir::FileId(i as u32))
-        .unwrap();
-    let b_file_id = program
-        .symbols
-        .files
-        .iter()
-        .position(|f| f.path == root.join("b.cpp"))
-        .map(|i| trace_ir::FileId(i as u32))
-        .unwrap();
-
     let helpers: Vec<_> = program
         .symbols
         .functions
         .iter()
         .filter(|f| f.name == "helper" && f.is_defined)
         .collect();
-    assert_eq!(helpers.len(), 2, "must have separate helper per TU");
-
-    let helper_a = helpers.iter().find(|f| f.tu == Some(a_file_id)).unwrap().id;
-    let helper_b = helpers.iter().find(|f| f.tu == Some(b_file_id)).unwrap().id;
-
-    let cb0_a = program
-        .symbols
-        .functions
-        .iter()
-        .find(|f| f.name == "cb0" && f.is_defined && f.tu == Some(a_file_id))
-        .unwrap()
-        .id;
-    let cb1_a = program
-        .symbols
-        .functions
-        .iter()
-        .find(|f| f.name == "cb1" && f.is_defined && f.tu == Some(a_file_id))
-        .unwrap()
-        .id;
-    let cb0_b = program
-        .symbols
-        .functions
-        .iter()
-        .find(|f| f.name == "cb0" && f.is_defined && f.tu == Some(b_file_id))
-        .unwrap()
-        .id;
-    let cb1_b = program
-        .symbols
-        .functions
-        .iter()
-        .find(|f| f.name == "cb1" && f.is_defined && f.tu == Some(b_file_id))
-        .unwrap()
-        .id;
-
-    let mut edges_from_helper_a: Vec<FnId> = analysis
-        .call_edges
-        .iter()
-        .filter(|e| e.caller == helper_a)
-        .map(|e| e.callee)
-        .collect();
-    edges_from_helper_a.sort();
-    let mut expected_a = vec![cb0_a, cb1_a];
-    expected_a.sort();
-    assert_eq!(
-        edges_from_helper_a, expected_a,
-        "helper in TU a must resolve array indirect calls to cb0/cb1 in TU a"
-    );
-
-    let mut edges_from_helper_b: Vec<FnId> = analysis
-        .call_edges
-        .iter()
-        .filter(|e| e.caller == helper_b)
-        .map(|e| e.callee)
-        .collect();
-    edges_from_helper_b.sort();
-    let mut expected_b = vec![cb0_b, cb1_b];
-    expected_b.sort();
-    assert_eq!(
-        edges_from_helper_b, expected_b,
-        "helper in TU b must resolve array indirect calls to cb0/cb1 in TU b"
-    );
+    assert_eq!(helpers.len(), 1);
+    let helper = helpers[0].id;
+    let mut expected = Vec::new();
+    for name in ["cb0", "cb1"] {
+        let callbacks: Vec<_> = program
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == name && f.is_defined)
+            .collect();
+        assert_eq!(callbacks.len(), 1);
+        expected.push(callbacks[0].id);
+    }
+    expected.sort();
+    assert_each_site_of_targets(&program, &analysis, helper, &expected);
 }
 
 fn check_header_struct_callback_initializer(with_compile_commands: bool) {

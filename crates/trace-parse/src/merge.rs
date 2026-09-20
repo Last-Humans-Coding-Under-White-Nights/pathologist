@@ -22,6 +22,8 @@ pub struct UnitIndex {
     pub files: Vec<PathBuf>,
     pub types: trace_ir::TypeTable,
     pub functions: Vec<Function>,
+    /// Exact expanded C++ internal definitions, independent of TU-local IDs.
+    pub internal_definitions: FxHashMap<FnId, Arc<str>>,
     pub variables: Vec<Variable>,
     pub call_sites: Vec<CallSite>,
     pub flow: Vec<FlowConstraint>,
@@ -145,29 +147,6 @@ impl VariantDedup {
 /// Merged programs allocate call ids in append order, so the id is the index.
 /// The scan is a fallback for a caller that built a sparse call table.
 #[inline]
-fn call_site_index(symbols: &trace_ir::SymbolTable, id: CallSiteId) -> Option<usize> {
-    let index = id.0 as usize;
-    if symbols.call_sites.get(index).is_some_and(|s| s.id == id) {
-        return Some(index);
-    }
-    symbols.call_sites.iter().position(|s| s.id == id)
-}
-
-#[inline]
-#[must_use]
-fn same_call_facts(a: &CallSite, b: &CallSite) -> bool {
-    a.caller == b.caller
-        && a.callee_fn_id == b.callee_fn_id
-        && a.callee_var == b.callee_var
-        && a.var_args == b.var_args
-        && a.fn_args == b.fn_args
-        && a.addr_of_member_args == b.addr_of_member_args
-        && a.args_bound_past_this == b.args_bound_past_this
-        && a.is_direct == b.is_direct
-        && a.receiver_class == b.receiver_class
-        && a.return_dst == b.return_dst
-}
-
 pub fn merge_unit_index(program: &mut Program, unit: &UnitIndex) {
     merge_unit(program, unit, MergeMode::Full, None);
 }
@@ -320,7 +299,9 @@ pub fn merge_unit_types(program: &mut Program, unit: &UnitIndex) {
     merge_unit(program, unit, MergeMode::TypesOnly, None);
 }
 
-/// TU preamble: types plus prototypes; header flow stays on the defining unit.
+/// TU preamble: types and symbols, with internal C++ body facts replayed for
+/// the receiving unit. Header sharing is defined in docs/ANALYSIS.md,
+/// "Shared header functions"; the full merge coalesces those contributions.
 ///
 /// Also the mode for a dependency-root header's own unit: its bodies are not
 /// the target's code, so they contribute prototypes and stop there (#60).
@@ -442,28 +423,27 @@ fn merge_unit(
     let mut dropped_fns: FxHashSet<FnId> = FxHashSet::default();
     let mut remap_params: FxHashSet<FnId> = FxHashSet::default();
     let mut variant_param_map: FxHashMap<VarId, VarId> = FxHashMap::default();
-    let mut variant_extended_fns: FxHashSet<FnId> = FxHashSet::default();
-    let unit_var_names: FxHashMap<VarId, &str> = if matches!(mode, MergeMode::Variant) {
-        unit.variables
-            .iter()
-            .map(|v| (v.id, v.name.as_str()))
-            .collect()
-    } else {
-        FxHashMap::default()
-    };
-    // Every parameter's type, remapped into the program's id space, indexed by
-    // its unit-local `VarId`. Both places below used to scan `unit.variables`
-    // for each parameter of each function, so one unit cost
+    // Functions this unit merged into an entry the program already held: a
+    // variant's re-lowered bodies, or shared header bodies (#116).
+    let mut remerged_fns: FxHashSet<FnId> = FxHashSet::default();
+    // Whether any function of this unit is a shared header body, so the flow
+    // pass can skip the per-flow owner lookup for the common case.
+    let mut unit_shares_headers = false;
+    // Every parameter's name and type (remapped into the program's id space),
+    // indexed by its unit-local `VarId`. Both places below used to scan
+    // `unit.variables` for each parameter of each function, so one unit cost
     // O(functions x params x variables) -- and a lowered TU carries tens of
     // thousands of variables (#83). Only parameters are indexed, which is all
     // either lookup asks for: locals dominate that list, and `lower_parameter`
     // is the only thing that builds a variable a function's `params` can name.
-    let unit_param_types: FxHashMap<VarId, TypeId> = unit
-        .variables
-        .iter()
-        .filter(|v| matches!(v.storage, trace_ir::StorageClass::Param))
-        .map(|v| (v.id, remap_type(v.type_id, &type_map)))
-        .collect();
+    let mut unit_var_names: FxHashMap<VarId, &str> = FxHashMap::default();
+    let mut unit_param_types: FxHashMap<VarId, TypeId> = FxHashMap::default();
+    for v in &unit.variables {
+        if v.storage == trace_ir::StorageClass::Param {
+            unit_var_names.insert(v.id, v.name.as_str());
+            unit_param_types.insert(v.id, remap_type(v.type_id, &type_map));
+        }
+    }
 
     let respelled = respelled_declarations(unit, &unit_param_types, &program.types);
     for func in &unit.functions {
@@ -481,13 +461,21 @@ fn merge_unit(
             continue;
         }
         let span_file = map_file(func.span.file);
-        let mut canonical = if func.linkage == trace_ir::Linkage::Internal && func.is_cpp {
-            None
-        } else {
-            program
+        let internal_cpp = func.linkage == trace_ir::Linkage::Internal && func.is_cpp;
+        // Only a body that originates in an included header can be shared.
+        let header_definition = unit
+            .internal_definitions
+            .get(&old_id)
+            .filter(|_| span_file != primary_file_id);
+        let origin = trace_ir::Span::new(span_file, func.span.line, func.span.col);
+        let shared = header_definition
+            .and_then(|text| program.dedup.existing_header_fn(origin, &func.name, text));
+        let mut canonical = shared;
+        if canonical.is_none() && !internal_cpp {
+            canonical = program
                 .dedup
-                .existing_fn(span_file, &func.name, func.span.line)
-        };
+                .existing_fn(span_file, &func.name, func.span.line);
+        }
         if canonical.is_none() && matches!(mode, MergeMode::Variant) && func.is_defined {
             // The two arms of an `#ifdef X / #else` pair put one function's
             // implementations on different lines, so the line-keyed dedup misses
@@ -561,8 +549,14 @@ fn merge_unit(
         }
         if let Some(canonical) = canonical {
             fn_map.insert(old_id, canonical);
-            if matches!(mode, MergeMode::Variant) {
-                variant_extended_fns.insert(canonical);
+            if shared.is_some() {
+                program
+                    .symbols
+                    .share_header_function(canonical, primary_file_id);
+                unit_shares_headers = true;
+            }
+            if matches!(mode, MergeMode::Variant) || shared.is_some() {
+                remerged_fns.insert(canonical);
                 if let Some(idx) = program.symbols.function_index(canonical) {
                     // Pair parameters by NAME, never by position. A variant
                     // routinely inserts a parameter *ahead* of the ones the
@@ -652,7 +646,27 @@ fn merge_unit(
             remap_params.insert(merged);
         }
         fn_map.insert(old_id, merged);
-        if !(func.linkage == trace_ir::Linkage::Internal && func.is_cpp) {
+        // Cached header bodies enter a temporary TU Program through this
+        // mode. program_into_unit transfers their text into UnitIndex for
+        // the later full merge; final programs need no second text index.
+        if matches!(mode, MergeMode::SymbolsOnly) {
+            if let Some(text) = unit.internal_definitions.get(&old_id) {
+                program
+                    .dedup
+                    .internal_definitions
+                    .insert(merged, Arc::clone(text));
+            }
+        }
+        if let Some(text) = header_definition {
+            program
+                .dedup
+                .insert_header_fn(origin, func.name.clone(), Arc::clone(text), merged);
+            program
+                .symbols
+                .share_header_function(merged, primary_file_id);
+            unit_shares_headers = true;
+        }
+        if !internal_cpp {
             program
                 .dedup
                 .insert_fn(span_file, func.name.clone(), func.span.line, merged);
@@ -701,7 +715,7 @@ fn merge_unit(
     // them in on both sides.
     let mut local_by_site: FxHashMap<LocalKey, VarId> = FxHashMap::default();
     let mut temps_by_site: FxHashMap<TempKey, Vec<VarId>> = FxHashMap::default();
-    for &fn_id in &variant_extended_fns {
+    for &fn_id in &remerged_fns {
         for &var_id in &program.symbols.function(fn_id).locals {
             if let Some(var) = program.symbols.variable_by_id(var_id) {
                 let coords = (fn_id, var.span.file, var.span.line, var.span.col);
@@ -755,7 +769,7 @@ fn merge_unit(
             }
         }
 
-        let extended_fn = mapped_fn_id.filter(|id| variant_extended_fns.contains(id));
+        let extended_fn = mapped_fn_id.filter(|id| remerged_fns.contains(id));
         let temp_key = extended_fn
             .zip(temp_prefix(&var.name))
             .map(|(id, prefix)| (id, span_file, var.span.line, var.span.col, prefix) as TempKey);
@@ -864,7 +878,7 @@ fn merge_unit(
         // `solver` reads `params.len()` as the arity of an indirect-call
         // target, so growing it would stop base call edges from resolving.
         if let Some(canon_fn) = mapped_fn_id {
-            let is_param = var.param_index.is_some() && !variant_extended_fns.contains(&canon_fn);
+            let is_param = var.param_index.is_some() && !remerged_fns.contains(&canon_fn);
             if !is_param {
                 if let Some(idx) = program.symbols.function_index(canon_fn) {
                     program.symbols.functions[idx].locals.push(new_id);
@@ -904,6 +918,10 @@ fn merge_unit(
             .symbols
             .function_by_id(mapped_caller)
             .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal && f.is_cpp);
+        let shared_caller = program.symbols.is_shared_header_function(mapped_caller);
+        // The site's body is being merged into an entry the program already
+        // holds: a variant configuration or a shared header body.
+        let remerge = matches!(mode, MergeMode::Variant) || shared_caller;
         if matches!(mode, MergeMode::SymbolsOnly) && !is_internal_caller {
             continue;
         }
@@ -930,7 +948,12 @@ fn merge_unit(
             .collect();
         site.return_dst = site.return_dst.and_then(|v| var_map.get(&v).copied());
         site.span.file = span_file;
-        if matches!(mode, MergeMode::Variant) {
+        // Grouping records by their facts is a remerge concern only, so an
+        // ordinary site never pays for the fingerprint — and being the one
+        // spelling of "this is a remerge" from here on, it cannot disagree
+        // with the registration below.
+        let facts = remerge.then(|| site.fact_fingerprint());
+        if let Some(facts) = facts {
             // Several configurations can call the same spelled callee at the
             // same source site with different callbacks, receivers or outputs.
             // Keep separate records: solver argument binding uses one actual
@@ -941,26 +964,29 @@ fn merge_unit(
             // list is program-wide because a site in a header belongs to every
             // unit that includes it: scoped to one unit's variants, a fact two
             // units both recover would be recorded once per unit (#59 review).
-            let existing = program
-                .dedup
-                .site_keys
-                .get(&key)
-                .copied()
-                .into_iter()
-                .chain(
-                    program
-                        .dedup
-                        .variant_site_records
-                        .get(&key)
-                        .into_iter()
-                        .flatten()
-                        .copied(),
-                )
-                .find(|&id| {
-                    call_site_index(&program.symbols, id)
-                        .is_some_and(|idx| same_call_facts(&program.symbols.call_sites[idx], &site))
-                });
+            let primary = program.dedup.site_keys.get(&key).copied();
+            let states_site = |id: CallSiteId| {
+                program
+                    .symbols
+                    .call_site_by_id(id)
+                    .is_some_and(|held| held.same_facts(&site))
+            };
+            // The base record need not be in the variant buckets, so it is
+            // asked for separately; the buckets answer the rest with one
+            // probe, which keeps a site whose facts differ in each of N
+            // contributing units linear in N rather than quadratic.
+            let existing = primary.filter(|&id| states_site(id)).or_else(|| {
+                let bucket = program.dedup.variant_site_records.get(&key)?.get(&facts)?;
+                bucket
+                    .iter()
+                    .copied()
+                    // `primary` was tested just above; skip the repeat probe.
+                    .find(|&id| Some(id) != primary && states_site(id))
+            });
             if let Some(existing) = existing {
+                if shared_caller {
+                    program.symbols.share_header_call(existing, primary_file_id);
+                }
                 call_map.insert(old, existing);
                 continue;
             }
@@ -969,8 +995,11 @@ fn merge_unit(
         site.id = new_id;
         site.tu = Some(primary_file_id);
         program.symbols.call_sites.push(site);
-        if !is_internal_caller {
-            if matches!(mode, MergeMode::Variant) {
+        if shared_caller {
+            program.symbols.share_header_call(new_id, primary_file_id);
+        }
+        if !is_internal_caller || shared_caller {
+            if let Some(facts) = facts {
                 // A variant adds records at a site the base configuration may
                 // already own. The key stands for the site across the whole
                 // program, and a later unit that reaches it is in the base
@@ -982,6 +1011,8 @@ fn merge_unit(
                     .dedup
                     .variant_site_records
                     .entry(key.clone())
+                    .or_default()
+                    .entry(facts)
                     .or_default()
                     .push(new_id);
                 program.dedup.site_keys.entry(key).or_insert(new_id);
@@ -1012,6 +1043,21 @@ fn merge_unit(
                 .and_then(|var| var.fn_id)
                 .is_some_and(is_internal_fn)
         })
+    };
+    // Unit variables owned by a shared header body, so the flow pass below
+    // asks one set instead of three lookups per variable of every flow.
+    let shared_vars: FxHashSet<VarId> = if unit_shares_headers {
+        unit.variables
+            .iter()
+            .filter(|v| {
+                v.fn_id
+                    .and_then(|f| fn_map.get(&f))
+                    .is_some_and(|&f| symbols.is_shared_header_function(f))
+            })
+            .map(|v| v.id)
+            .collect()
+    } else {
+        FxHashSet::default()
     };
 
     let references_this_tus_internal_function = |flow: &FlowConstraint| {
@@ -1095,29 +1141,28 @@ fn merge_unit(
             || is_supporting_flow(flow)
     };
 
-    if let Some(seen) = variant_dedup {
-        for flow in &unit.flow {
-            if matches!(mode, MergeMode::SymbolsOnly) && !replay_in_tu(flow) {
-                continue;
-            }
-            if !valid_flow(flow) {
-                continue;
-            }
-            let remapped = remap_flow(flow, &fn_map, &var_map);
-            if seen.flow.insert(remapped.clone()) {
-                program.flow.push(remapped);
-            }
+    // Shared header facts span TU families, whereas variant facts are local
+    // to one family. Every flow of a shared body passes through the
+    // program-wide header index, which therefore subsumes the family's own.
+    for flow in &unit.flow {
+        if matches!(mode, MergeMode::SymbolsOnly) && !replay_in_tu(flow) {
+            continue;
         }
-    } else {
-        for flow in &unit.flow {
-            if matches!(mode, MergeMode::SymbolsOnly) && !replay_in_tu(flow) {
-                continue;
-            }
-            if !valid_flow(flow) {
-                continue;
-            }
-            program.flow.push(remap_flow(flow, &fn_map, &var_map));
+        if !valid_flow(flow) {
+            continue;
         }
+        let remapped = remap_flow(flow, &fn_map, &var_map);
+        let shared_body =
+            !shared_vars.is_empty() && flow_vars(flow).any(|v| shared_vars.contains(&v));
+        let seen = if shared_body {
+            Some(&mut program.dedup.header_flow)
+        } else {
+            variant_dedup.as_deref_mut().map(|seen| &mut seen.flow)
+        };
+        if seen.is_some_and(|seen| !seen.insert(remapped.clone())) {
+            continue;
+        }
+        program.flow.push(remapped);
     }
 
     for (old_fn, flows) in &unit.fn_returns {
@@ -1152,11 +1197,9 @@ fn merge_unit(
             .map(|f| remap_return_flow(f, &fn_map, &var_map))
             .collect();
         let target = program.fn_returns.entry(new_fn).or_default();
-        if matches!(mode, MergeMode::Variant) {
-            // Only a variant re-lowers a body the program already holds, so
-            // only a variant can repeat a return flow. Scanning for duplicates
-            // on the base path would cost a linear search per return flow in
-            // every unit, to reject something that cannot arise there.
+        if matches!(mode, MergeMode::Variant) || symbols.is_shared_header_function(new_fn) {
+            // Variants and shared header bodies may repeat return facts.
+            // Ordinary, unshared bodies need no duplicate search.
             for rf in remapped {
                 if !target.contains(&rf) {
                     target.push(rf);
@@ -1724,6 +1767,25 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn internal_definition_text_is_retained_only_for_tu_preambles() {
+        let mut unit = unit_declaring("util.h", true, Vec::new());
+        unit.functions[0].linkage = trace_ir::Linkage::Internal;
+        let text: Arc<str> = Arc::from("static void recycle(Svc *object) {}");
+        unit.internal_definitions
+            .insert(unit.functions[0].id, Arc::clone(&text));
+        let mut preamble = Program::new(PathBuf::from("root"));
+        merge_unit_symbols(&mut preamble, &unit);
+        let id = preamble.symbols.functions[0].id;
+        assert_eq!(preamble.dedup.internal_definitions.get(&id), Some(&text));
+        let mut merged = Program::new(PathBuf::from("root"));
+        merge_unit_index(&mut merged, &unit);
+        assert!(
+            merged.dedup.internal_definitions.is_empty(),
+            "the final merge must not retain a second definition-text index"
+        );
     }
 
     /// The merge has to hand the symbol table the type table its remapped

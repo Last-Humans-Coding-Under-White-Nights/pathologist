@@ -24,6 +24,47 @@ pub fn fn_name(program: &Program, id: trace_ir::FnId) -> String {
     program.symbols.function(id).name.clone()
 }
 
+/// The one function entry named `name`; fails if there are none or several.
+pub fn only_function(program: &Program, name: &str) -> trace_ir::FnId {
+    let found: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == name)
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one `{name}`, got {found:?}"
+    );
+    found[0].id
+}
+
+/// The `FileId` of `path` under `root`. Files are interned by canonical
+/// path, which a temporary directory's path need not be.
+pub fn file_id(program: &Program, root: &Path, path: &str) -> trace_ir::FileId {
+    let canonical = root.join(path).canonicalize().unwrap();
+    program
+        .symbols
+        .file_by_path(&canonical)
+        .unwrap_or_else(|| panic!("{path} is not a file of the program"))
+}
+
+/// A `compile_commands.json` in `root` compiling each of `files` as C++.
+pub fn write_compile_commands(root: &Path, files: &[&str]) {
+    let commands: Vec<_> = files
+        .iter()
+        .map(|file| {
+            serde_json::json!({"directory": root, "file": file, "arguments": ["c++", "-c", file]})
+        })
+        .collect();
+    std::fs::write(
+        root.join("compile_commands.json"),
+        serde_json::to_string(&commands).unwrap(),
+    )
+    .unwrap();
+}
+
 pub fn has_edge(
     program: &Program,
     analysis: &AnalysisResult,

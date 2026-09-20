@@ -1,11 +1,12 @@
 use crate::flow::ReturnFlow;
 use crate::symbol::{Linkage, SymbolTable};
 use crate::types::TypeTable;
-use crate::{CallSiteId, FileId, FnId};
+use crate::{CallSiteId, FileId, FnId, Span};
 use indexmap::IndexMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticSeverity {
@@ -66,18 +67,39 @@ pub struct TemplateBase {
     pub is_dependent: bool,
 }
 
+type HeaderFunctions = FxHashMap<String, FxHashMap<Arc<str>, FnId>>;
+
+/// Call records at one site, grouped by [`CallSite::fact_fingerprint`].
+///
+/// A group holds every record whose fingerprint collided, so it is one entry
+/// deep except on a hash collision and the merge confirms each candidate.
+pub type CallFactBuckets = FxHashMap<u64, Vec<CallSiteId>>;
+
 /// Cross-unit deduplication state used by the merge stage: entities whose
 /// origin (header file + position) was already merged map to the first copy.
 #[derive(Debug, Clone, Default)]
 pub struct MergeDedup {
     /// `(file, line) → name → FnId` so a hit does not clone the function name.
     pub fn_keys: FxHashMap<(FileId, u32), FxHashMap<String, FnId>>,
+    /// Expanded definitions recorded by lowering or replayed from cached headers
+    /// into a TU preamble; program_into_unit transfers these to UnitIndex.
+    pub internal_definitions: FxHashMap<FnId, Arc<str>>,
+    /// Header definitions are shared only within one link image and expansion.
+    header_functions: FxHashMap<Span, HeaderFunctions>,
+    pub header_flow: FxHashSet<crate::FlowConstraint>,
     pub site_keys: FxHashMap<(FileId, u32, u32, String), CallSiteId>,
     /// Call records that configuration variants added at a site, beside the
     /// canonical one in `site_keys` (#59). Program-wide, so a fact recovered
     /// from a header by two units' variants merges instead of repeating: a
     /// header's call sites belong to every unit that includes it.
-    pub variant_site_records: FxHashMap<(FileId, u32, u32, String), Vec<CallSiteId>>,
+    ///
+    /// Bucketed by a fingerprint of the call facts the merge compares, so a
+    /// site whose facts differ per contributing unit costs one probe rather
+    /// than a scan of every record already standing there: a shared header
+    /// body reached from N units would otherwise be quadratic in N. The
+    /// fingerprint only groups; the merge still confirms a candidate field by
+    /// field, so a collision costs a comparison and never a wrong merge.
+    pub variant_site_records: FxHashMap<(FileId, u32, u32, String), CallFactBuckets>,
     /// Reports already merged into the whole program, keyed by stage as well as
     /// origin: two stages can report the same text at the same position, and
     /// one is not a duplicate of the other. Unit-local copies use different
@@ -87,6 +109,24 @@ pub struct MergeDedup {
 }
 
 impl MergeDedup {
+    /// Borrow both name and definition text on the repeated-header path.
+    pub fn existing_header_fn(&self, origin: Span, name: &str, text: &str) -> Option<FnId> {
+        self.header_functions
+            .get(&origin)?
+            .get(name)?
+            .get(text)
+            .copied()
+    }
+
+    pub fn insert_header_fn(&mut self, origin: Span, name: String, text: Arc<str>, id: FnId) {
+        self.header_functions
+            .entry(origin)
+            .or_default()
+            .entry(name)
+            .or_default()
+            .insert(text, id);
+    }
+
     pub fn existing_fn(&self, file: FileId, name: &str, line: u32) -> Option<FnId> {
         self.fn_keys
             .get(&(file, line))
@@ -122,6 +162,9 @@ impl MergeDedup {
     /// target that happens to include the file is noise, not information.
     pub fn clear_entities(&mut self) {
         self.fn_keys.clear();
+        self.internal_definitions.clear();
+        self.header_functions.clear();
+        self.header_flow.clear();
         self.site_keys.clear();
         self.variant_site_records.clear();
     }
