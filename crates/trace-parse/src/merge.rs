@@ -155,21 +155,6 @@ fn call_site_index(symbols: &trace_ir::SymbolTable, id: CallSiteId) -> Option<us
     symbols.call_sites.iter().position(|s| s.id == id)
 }
 
-#[inline]
-#[must_use]
-fn same_call_facts(a: &CallSite, b: &CallSite) -> bool {
-    a.caller == b.caller
-        && a.callee_fn_id == b.callee_fn_id
-        && a.callee_var == b.callee_var
-        && a.var_args == b.var_args
-        && a.fn_args == b.fn_args
-        && a.addr_of_member_args == b.addr_of_member_args
-        && a.args_bound_past_this == b.args_bound_past_this
-        && a.is_direct == b.is_direct
-        && a.receiver_class == b.receiver_class
-        && a.return_dst == b.return_dst
-}
-
 pub fn merge_unit_index(program: &mut Program, unit: &UnitIndex) {
     merge_unit(program, unit, MergeMode::Full, None);
 }
@@ -971,6 +956,10 @@ fn merge_unit(
             .collect();
         site.return_dst = site.return_dst.and_then(|v| var_map.get(&v).copied());
         site.span.file = span_file;
+        // Grouping records by their facts is a remerge concern only, so an
+        // ordinary site never pays for the fingerprint. Present exactly when
+        // `remerge` holds, which is what the registration below keys off.
+        let facts = remerge.then(|| site.fact_fingerprint());
         if remerge {
             // Several configurations can call the same spelled callee at the
             // same source site with different callbacks, receivers or outputs.
@@ -983,24 +972,26 @@ fn merge_unit(
             // unit that includes it: scoped to one unit's variants, a fact two
             // units both recover would be recorded once per unit (#59 review).
             let primary = program.dedup.site_keys.get(&key).copied();
-            let existing = primary
-                .into_iter()
-                .chain(
-                    program
-                        .dedup
-                        .variant_site_records
-                        .get(&key)
-                        .into_iter()
-                        .flatten()
-                        .copied()
-                        // A base record need not be in the variant list. Skip
-                        // only the repeated ID, not the first variant blindly.
-                        .filter(|&id| Some(id) != primary),
-                )
-                .find(|&id| {
-                    call_site_index(&program.symbols, id)
-                        .is_some_and(|idx| same_call_facts(&program.symbols.call_sites[idx], &site))
-                });
+            let states_site = |id: CallSiteId| {
+                call_site_index(&program.symbols, id)
+                    .is_some_and(|idx| program.symbols.call_sites[idx].same_facts(&site))
+            };
+            // The base record need not be in the variant buckets, so it is
+            // asked for separately; the buckets answer the rest with one
+            // probe, which keeps a site whose facts differ in each of N
+            // contributing units linear in N rather than quadratic.
+            let existing = primary.filter(|&id| states_site(id)).or_else(|| {
+                program
+                    .dedup
+                    .variant_site_records
+                    .get(&key)
+                    .and_then(|buckets| buckets.get(&facts?))
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    // Skip only the repeated ID, not the first variant blindly.
+                    .find(|&id| Some(id) != primary && states_site(id))
+            });
             if let Some(existing) = existing {
                 if shared_caller {
                     program.symbols.share_header_call(existing, primary_file_id);
@@ -1017,7 +1008,7 @@ fn merge_unit(
             program.symbols.share_header_call(new_id, primary_file_id);
         }
         if !is_internal_caller || shared_caller {
-            if remerge {
+            if let Some(facts) = facts {
                 // A variant adds records at a site the base configuration may
                 // already own. The key stands for the site across the whole
                 // program, and a later unit that reaches it is in the base
@@ -1029,6 +1020,8 @@ fn merge_unit(
                     .dedup
                     .variant_site_records
                     .entry(key.clone())
+                    .or_default()
+                    .entry(facts)
                     .or_default()
                     .push(new_id);
                 program.dedup.site_keys.entry(key).or_insert(new_id);

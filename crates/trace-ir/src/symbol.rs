@@ -166,6 +166,52 @@ impl CallSite {
             && !self.callee_name.contains("->")
             && !self.callee_name.contains('.')
     }
+
+    /// Whether two records standing at one source site state the same call.
+    ///
+    /// Identity, span and originating unit are deliberately excluded: the
+    /// question is whether a record the program already holds says what an
+    /// incoming one says, so the merge can coalesce them.
+    ///
+    /// Keep the field list in step with [`CallSite::fact_fingerprint`].
+    #[must_use]
+    pub fn same_facts(&self, other: &Self) -> bool {
+        self.caller == other.caller
+            && self.callee_fn_id == other.callee_fn_id
+            && self.callee_var == other.callee_var
+            && self.var_args == other.var_args
+            && self.fn_args == other.fn_args
+            && self.addr_of_member_args == other.addr_of_member_args
+            && self.args_bound_past_this == other.args_bound_past_this
+            && self.is_direct == other.is_direct
+            && self.receiver_class == other.receiver_class
+            && self.return_dst == other.return_dst
+    }
+
+    /// A hash of exactly the fields [`CallSite::same_facts`] compares, so
+    /// records at one site can be grouped and probed instead of scanned.
+    ///
+    /// Equal facts always give an equal fingerprint; the converse is not
+    /// guaranteed, so a match found this way is still confirmed with
+    /// `same_facts`. SipHash rather than the crate's fast hasher: the input is
+    /// a run of small dense ids, and the grouping is only worth its cost while
+    /// distinct facts land in distinct buckets.
+    #[must_use]
+    pub fn fact_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.caller.hash(&mut hasher);
+        self.callee_fn_id.hash(&mut hasher);
+        self.callee_var.hash(&mut hasher);
+        self.var_args.hash(&mut hasher);
+        self.fn_args.hash(&mut hasher);
+        self.addr_of_member_args.hash(&mut hasher);
+        self.args_bound_past_this.hash(&mut hasher);
+        self.is_direct.hash(&mut hasher);
+        self.receiver_class.hash(&mut hasher);
+        self.return_dst.hash(&mut hasher);
+        hasher.finish()
+    }
 }
 
 /// What a surviving entry takes from any redeclaration merged into it,
@@ -318,6 +364,11 @@ pub struct SymbolTable {
     /// inline defined in a header stays visible to its includers after
     /// cross-TU deduplication collapsed the per-TU copies.
     headers_of: FxHashMap<FileId, std::collections::BTreeSet<FileId>>,
+    /// `headers_of` inverted: the TUs each header was attributed to. Visibility
+    /// of a shared header body asks whether some unit holding it also includes
+    /// the querying file, and that question is answered from whichever of the
+    /// two sets is smaller only if both directions are indexed.
+    includers_of: FxHashMap<FileId, std::collections::BTreeSet<FileId>>,
     file_by_path: FxHashMap<PathBuf, FileId>,
     /// Canonical dependency roots (`--dep`); empty for a single-tree run.
     dep_roots: Vec<PathBuf>,
@@ -394,6 +445,7 @@ impl SymbolTable {
     pub fn register_included_header(&mut self, tu: crate::FileId, header: crate::FileId) {
         if tu != header {
             self.headers_of.entry(tu).or_default().insert(header);
+            self.includers_of.entry(header).or_default().insert(tu);
         }
     }
 
@@ -1220,14 +1272,12 @@ impl SymbolTable {
                 };
                 // A shared body is visible in every contributing unit and the
                 // files those units include (docs/ANALYSIS.md). Callers
-                // mostly ask from a unit or the header itself; the scan over
+                // mostly ask from a unit or the header itself; the search over
                 // contributors' headers is the fallback.
                 if let Some(tus) = self.shared_header_tus.get(&id) {
                     return f.file == file
                         || tus.contains(&file)
-                        || tus
-                            .iter()
-                            .any(|tu| self.headers_of.get(tu).is_some_and(|h| h.contains(&file)));
+                        || self.shares_a_unit_with(tus, file);
                 }
                 if f.tu.is_some_and(|tu| !in_tu(&tu)) {
                     return false;
@@ -1235,6 +1285,24 @@ impl SymbolTable {
             }
             self.file_sees(file, f.file)
         })
+    }
+
+    /// Whether any of `tus` includes `file`.
+    ///
+    /// Walking `tus` would cost one probe per contributing unit, and a header
+    /// carrying a shared body can have thousands. `file`'s own includers
+    /// answer the same question, so the smaller side is walked: a body shared
+    /// by the whole tree is then tested against the few units that include the
+    /// querying file rather than the other way round.
+    fn shares_a_unit_with(&self, tus: &std::collections::BTreeSet<FileId>, file: FileId) -> bool {
+        let Some(includers) = self.includers_of.get(&file) else {
+            return false;
+        };
+        if includers.len() <= tus.len() {
+            includers.iter().any(|tu| tus.contains(tu))
+        } else {
+            tus.iter().any(|tu| includers.contains(tu))
+        }
     }
 
     /// Whether code in `file` sees what `other` defines: `other` is `file`, or
@@ -1710,6 +1778,131 @@ mod tests {
     use super::*;
     use crate::{Program, TypeDesc};
 
+    /// Every field `same_facts` weighs must reach `fact_fingerprint`, or the
+    /// merge would bucket records it then refuses to coalesce and keep a
+    /// duplicate per contributing unit. The converse drift — hashing a field
+    /// the comparison ignores — splits records that ought to merge, so each
+    /// mutation has to move both together.
+    #[test]
+    fn call_fact_fingerprint_covers_every_compared_field() {
+        let base = CallSite {
+            id: crate::CallSiteId(7),
+            caller: FnId(3),
+            callee_name: "handler".into(),
+            callee_var: Some(VarId(1)),
+            callee_fn_id: Some(FnId(9)),
+            var_args: vec![(1, VarId(4))],
+            fn_args: vec![(2, FnId(5))],
+            addr_of_member_args: vec![1],
+            args_bound_past_this: false,
+            span: Span::new(FileId(2), 10, 3),
+            is_direct: true,
+            receiver_class: Some("Cls".into()),
+            return_dst: Some(VarId(6)),
+            tu: Some(FileId(2)),
+        };
+
+        let twin = base.clone();
+        assert!(base.same_facts(&twin));
+        assert_eq!(base.fact_fingerprint(), twin.fact_fingerprint());
+
+        let compared: Vec<(&str, CallSite)> = vec![
+            (
+                "caller",
+                CallSite {
+                    caller: FnId(4),
+                    ..base.clone()
+                },
+            ),
+            (
+                "callee_fn_id",
+                CallSite {
+                    callee_fn_id: None,
+                    ..base.clone()
+                },
+            ),
+            (
+                "callee_var",
+                CallSite {
+                    callee_var: None,
+                    ..base.clone()
+                },
+            ),
+            (
+                "var_args",
+                CallSite {
+                    var_args: vec![(1, VarId(8))],
+                    ..base.clone()
+                },
+            ),
+            (
+                "fn_args",
+                CallSite {
+                    fn_args: Vec::new(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "addr_of_member_args",
+                CallSite {
+                    addr_of_member_args: vec![2],
+                    ..base.clone()
+                },
+            ),
+            (
+                "args_bound_past_this",
+                CallSite {
+                    args_bound_past_this: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "is_direct",
+                CallSite {
+                    is_direct: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "receiver_class",
+                CallSite {
+                    receiver_class: None,
+                    ..base.clone()
+                },
+            ),
+            (
+                "return_dst",
+                CallSite {
+                    return_dst: None,
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (field, other) in compared {
+            assert!(
+                !base.same_facts(&other),
+                "{field} must separate two records"
+            );
+            assert_ne!(
+                base.fact_fingerprint(),
+                other.fact_fingerprint(),
+                "{field} separates records but does not reach the fingerprint"
+            );
+        }
+
+        // Identity, position and originating unit are not facts about the
+        // call, so they must leave both in agreement.
+        let elsewhere = CallSite {
+            id: crate::CallSiteId(11),
+            callee_name: "other".into(),
+            span: Span::new(FileId(5), 99, 1),
+            tu: Some(FileId(5)),
+            ..base.clone()
+        };
+        assert!(base.same_facts(&elsewhere));
+        assert_eq!(base.fact_fingerprint(), elsewhere.fact_fingerprint());
+    }
+
     #[test]
     fn resolves_by_name_classifies_plain_identifiers() {
         let mk = |callee_name: &str, callee_var: Option<u32>, is_direct: bool| CallSite {
@@ -1769,6 +1962,65 @@ mod tests {
             is_cpp,
             tu: None,
         }
+    }
+
+    /// A shared body reaches the headers its contributors include. The search
+    /// walks whichever of the two sides is shorter, so both orders are put to
+    /// the same questions here and must answer alike.
+    #[test]
+    fn shared_body_is_visible_through_a_contributor_s_other_headers() {
+        let mut p = Program::new(PathBuf::from("/t"));
+        let shared = p.symbols.add_file(PathBuf::from("/t/shared.h"));
+        // Narrow: one includer, against a body many units contribute.
+        let narrow = p.symbols.add_file(PathBuf::from("/t/narrow.h"));
+        // Wide: many includers, only the first of which holds the body.
+        let wide = p.symbols.add_file(PathBuf::from("/t/wide.h"));
+        let outsider = p.symbols.add_file(PathBuf::from("/t/outsider.h"));
+
+        let units: Vec<FileId> = (0..8)
+            .map(|i| p.symbols.add_file(PathBuf::from(format!("/t/u{i}.cpp"))))
+            .collect();
+        let stranger = p.symbols.add_file(PathBuf::from("/t/stranger.cpp"));
+        for &unit in &units {
+            p.symbols.register_included_header(unit, shared);
+        }
+        p.symbols.register_included_header(units[0], narrow);
+        p.symbols.register_included_header(units[0], wide);
+        for &unit in &units[1..] {
+            p.symbols.register_included_header(unit, wide);
+        }
+        p.symbols.register_included_header(stranger, outsider);
+        p.symbols.register_included_header(stranger, wide);
+
+        let mut f = fake_function(
+            p.symbols.alloc_fn_id(),
+            "helper",
+            Vec::new(),
+            true,
+            true,
+            shared,
+            1,
+        );
+        f.linkage = Linkage::Internal;
+        let id = p.symbols.add_function(f);
+        // Only the first unit contributes, so `wide` has more includers than
+        // the body has contributors and the walk goes the other way.
+        p.symbols.share_header_function(id, units[0]);
+        assert!(p.symbols.function_visible_from(id, narrow));
+        assert!(p.symbols.function_visible_from(id, wide));
+        assert!(!p.symbols.function_visible_from(id, outsider));
+
+        // Every unit contributes: now the contributor set is the longer side.
+        for &unit in &units[1..] {
+            p.symbols.share_header_function(id, unit);
+        }
+        assert!(p.symbols.function_visible_from(id, narrow));
+        assert!(p.symbols.function_visible_from(id, wide));
+        assert!(
+            !p.symbols.function_visible_from(id, outsider),
+            "a unit that never included the header must not open the body up"
+        );
+        assert!(!p.symbols.function_visible_from(id, stranger));
     }
 
     #[test]
