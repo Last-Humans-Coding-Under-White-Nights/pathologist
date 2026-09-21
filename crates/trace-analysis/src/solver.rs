@@ -21,9 +21,17 @@ pub struct AnalyzeOptions {
     /// Function models matched by callee name (built-ins plus any user
     /// configuration). See `docs/ANALYSIS.md`, "Function models".
     pub models: std::sync::Arc<FnModelSet>,
-    /// Solver pop budget (None = unlimited). Override via
-    /// `TRACE_SOLVE_BUDGET_POPS=<n>` env var; =0 restores unlimited.
-    pub solve_budget: Option<u64>,
+    /// Explicit solver pop budget (CLI `--solve-budget-pops`). `None`
+    /// derives a default from the PAG constraint count; `Some(0)` means
+    /// unlimited. `TRACE_SOLVE_BUDGET_POPS=<n>` overrides either (0 =
+    /// unlimited).
+    pub solve_budget_pops: Option<u64>,
+    /// Wall-clock solver budget in seconds (CLI `--solve-budget-secs`).
+    /// `None` = no time limit; `Some(0)` also disables it. The check is
+    /// periodic, so a run can overshoot by at most one checkpoint. A time
+    /// cap is non-deterministic by nature: two runs of the same inputs on
+    /// differently loaded machines stop at different points.
+    pub solve_budget_secs: Option<u64>,
     /// Emit synthetic IPC proxy→stub bridge edges (detected from class-name
     /// patterns). Disable to keep the call graph free of synthetic edges.
     pub enable_ipc: bool,
@@ -34,9 +42,79 @@ impl Default for AnalyzeOptions {
         Self {
             retain_points_to: false,
             models: std::sync::Arc::new(FnModelSet::builtin()),
-            solve_budget: Some(800_000),
+            solve_budget_pops: None,
+            solve_budget_secs: None,
             enable_ipc: true,
         }
+    }
+}
+
+/// How a solver run ended, recorded in `analysis_run.options_json`
+/// (`solver_partial`, `solver_pops`, `solve_budget_pops`, `solve_budget_secs`)
+/// and as an `analyze`-stage diagnostic when the run stopped early, so a
+/// consumer can tell a complete database from a budget-truncated one.
+#[derive(Debug, Default, Clone)]
+pub struct SolveOutcome {
+    /// `true` when the worklist drained to the fixpoint: no budget
+    /// interrupted the solve.
+    pub converged: bool,
+    /// Pops (`worklist.pop`) processed.
+    pub pops: u64,
+    /// The pop budget in force during the solve (`None` = unlimited pops).
+    pub budget_pops: Option<u64>,
+    /// The time budget in force during the solve (`None` = no time limit).
+    pub budget_secs: Option<u64>,
+    /// PAG constraint count the solve built from.
+    pub constraints: usize,
+    /// Wall-clock seconds the solve took.
+    pub elapsed_secs: f64,
+}
+
+/// The derived default pop budget for a PAG with `constraints` constraints.
+///
+/// 800 000 pops (the old unconditional default) covers convergence on the
+/// eval corpora (the largest, HDF, needs ~42k). Larger trees need far more:
+/// `ability_ability_runtime` (257 K constraints) converges at 1.68 M pops.
+/// Scaling linearly keeps small corpora on the old effective budget while
+/// letting mid-size and large trees finish their normal convergence instead
+/// of stopping at a partial result. The override knobs (`--solve-budget-pops`,
+/// `TRACE_SOLVE_BUDGET_POPS`) still apply on top.
+pub fn default_pops_budget(constraints: usize) -> u64 {
+    800_000 + 6 * constraints as u64
+}
+
+/// Resolve the pop budget in force for a solve.
+///
+/// Precedence: an `TRACE_SOLVE_BUDGET_POPS` env override first (`=0` means
+/// unlimited; unparseable values fall through to the explicit/derived
+/// budget), then the explicit per-run budget (CLI `--solve-budget-pops`,
+/// `Some(0)` = unlimited), then the derived default that scales with the
+/// PAG's constraint count. Split out for direct testing of every path.
+fn pop_budget_for(
+    explicit_pops_budget: Option<u64>,
+    env_override: Option<&str>,
+    constraints: usize,
+) -> Option<u64> {
+    // `Some(0)` on the explicit budget means "unlimited", `None` means
+    // "no explicit budget; derive the default". They must stay distinct
+    // until the last step (an explicit 0 must not fall back to the derived
+    // default).
+    let from_explicit = |derived: u64| -> Option<u64> {
+        match explicit_pops_budget {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => Some(derived),
+        }
+    };
+    let derived = default_pops_budget(constraints);
+    match env_override {
+        Some(v) if v.trim() == "0" => None,
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => from_explicit(derived),
+        },
+        None => from_explicit(derived),
     }
 }
 
@@ -49,6 +127,10 @@ pub struct AnalysisResult {
     /// Applied `clears` effects: `(call site, cleared parameter index)`.
     /// Exported as terminator nodes/edges in the flow graph.
     pub terminator_events: Vec<(CallSiteId, u32)>,
+    /// How the solver run ended: converged or budget-truncated. A truncated
+    /// run exports a `solver_partial` marker and an `analyze`-stage
+    /// diagnostic so the database is distinguishable from a complete one.
+    pub solve: SolveOutcome,
 }
 
 pub fn analyze(program: &Program) -> (Pag, AnalysisResult) {
@@ -62,7 +144,8 @@ pub fn analyze_with_options(program: &Program, opts: AnalyzeOptions) -> (Pag, An
         program,
         opts.retain_points_to,
         &opts.models,
-        opts.solve_budget,
+        opts.solve_budget_pops,
+        opts.solve_budget_secs,
     );
     let call_edges = result.call_edges.clone();
     let wired = result.wired_arg_flow.clone();
@@ -407,7 +490,8 @@ fn solve(
     program: &Program,
     retain_points_to: bool,
     models: &FnModelSet,
-    budget_override: Option<u64>,
+    explicit_pops_budget: Option<u64>,
+    explicit_secs_budget: Option<u64>,
 ) -> AnalysisResult {
     let mut st = SolverState {
         pts: FxHashMap::default(),
@@ -579,13 +663,20 @@ fn solve(
     // Work budget: on huge corpora the dynamic param-copy wiring can make
     // solving diverge in practice (points-to sets keep growing for hours).
     // A deterministic pop cap converts a hang into a partial result plus a
-    // visible warning; normal corpora converge far below it. Override with
-    // TRACE_SOLVE_BUDGET_POPS=<n>; =0 restores unlimited solving.
-    let solve_budget: Option<u64> = match std::env::var("TRACE_SOLVE_BUDGET_POPS") {
-        Ok(v) if v.trim() == "0" => None,
-        Ok(v) => v.parse::<u64>().ok().or(budget_override),
-        Err(_) => budget_override,
-    };
+    // visible warning; normal corpora converge far below it. The default
+    // scales with the PAG's constraint count (see `default_pops_budget`),
+    // so small corpora keep the old 800 000-pop behaviour while large trees
+    // finish their normal convergence. `TRACE_SOLVE_BUDGET_POPS=<n>` as an
+    // environment override; `=0` restores unlimited solving. The time budget
+    // is opt-in (`--solve-budget-secs`) and checked periodically, so it can
+    // overshoot by at most one checkpoint.
+    let solve_budget: Option<u64> = pop_budget_for(
+        explicit_pops_budget,
+        std::env::var("TRACE_SOLVE_BUDGET_POPS").ok().as_deref(),
+        pag.constraints.len(),
+    );
+    // `Some(0)` on the CLI means "no time limit", mirroring the pop flag.
+    let solve_time_budget: Option<u64> = explicit_secs_budget.filter(|&n| n != 0);
 
     if stats_enabled {
         eprintln!(
@@ -594,14 +685,22 @@ fn solve(
             program.symbols.variables.len()
         );
     }
+    let mut converged = true;
+    // `Some(&str)` describes which budget stopped the solve, for the stderr
+    // message and the exported diagnostic.
+    let mut stopped_by: Option<&'static str> = None;
     while let Some(node) = st.worklist.pop() {
         st.queued.remove(&node);
-        pops += 1;
+        // A budget of N allows exactly N pops of work: the (N+1)-th node is
+        // popped off the worklist and dropped unprocessed, and `pops` keeps
+        // counting only processed work, so "after N pops" matches reality.
         if let Some(budget) = solve_budget {
-            if pops > budget {
+            if pops >= budget {
+                converged = false;
+                stopped_by = Some("pop budget");
                 eprintln!(
                     "[solver] pop budget {} exhausted after {} pops / {:?}; stopping, results are partial \
-                     (set TRACE_SOLVE_BUDGET_POPS to raise, or 0 for unlimited)",
+                     (raise --solve-budget-pops, set TRACE_SOLVE_BUDGET_POPS higher, or 0 for unlimited)",
                     budget,
                     pops,
                     t0.elapsed()
@@ -609,7 +708,27 @@ fn solve(
                 break;
             }
         }
-        if stats_enabled && pops.is_multiple_of(100_000) {
+        if let Some(secs) = solve_time_budget {
+            // Checked every checkpoint rather than per pop: the per-pop check
+            // cost a measurable fraction of solve time on large corpora. The
+            // pop in flight when the clock runs out still finishes, and a run
+            // that converges in under 10k pops never checks the clock, so the
+            // overshoot is "up to one pop in flight plus the checkpoint
+            // interval", not a hard `budget + 1`.
+            if pops > 0 && pops.is_multiple_of(10_000) && t0.elapsed().as_secs() >= secs {
+                converged = false;
+                stopped_by = Some("time budget");
+                eprintln!(
+                    "[solver] time budget {secs}s exhausted after {} pops / {:?}; stopping, results are partial \
+                     (raise --solve-budget-secs, or 0 for no time limit)",
+                    pops,
+                    t0.elapsed()
+                );
+                break;
+            }
+        }
+        pops += 1;
+        if stats_enabled && pops > 0 && pops.is_multiple_of(100_000) {
             let biggest = st.pts.values().map(|s| s.len()).max().unwrap_or(0);
             eprintln!(
                 "[solver] pops={} elapsed={:?} constraints={} queued={} max_pts={} total_pts={} locs={} copy={} load={} store={} gep={}",
@@ -1023,7 +1142,23 @@ fn solve(
             biggest,
             resolved_indirect.len()
         );
+        if !converged {
+            eprintln!(
+                "[solver] PARTIAL stopped by {reason}: {pops} pops processed; result is a truncated \
+                 fixpoint (see analysis_run.options_json.solver_partial)",
+                reason = stopped_by.unwrap_or("budget")
+            );
+        }
     }
+
+    let solve = SolveOutcome {
+        converged,
+        pops,
+        budget_pops: solve_budget,
+        budget_secs: solve_time_budget,
+        constraints: pag.constraints.len(),
+        elapsed_secs: t0.elapsed().as_secs_f64(),
+    };
 
     AnalysisResult {
         points_to,
@@ -1031,6 +1166,7 @@ fn solve(
         arg_flow_edges: Vec::new(),
         wired_arg_flow,
         terminator_events,
+        solve,
     }
 }
 
@@ -1755,5 +1891,29 @@ mod tests {
             .view(FnFilter::Arity(1), &[], &pag, &fn_arity)
             .is_empty());
         assert!(views.view(FnFilter::None, &[], &pag, &fn_arity).is_empty());
+    }
+
+    #[test]
+    fn pop_budget_resolution_precedence() {
+        // Derived default scales with the constraint count; small corpora
+        // keep the historical 800 000-pop floor.
+        assert_eq!(default_pops_budget(0), 800_000);
+        assert_eq!(default_pops_budget(257_318), 2_343_908);
+
+        // No env override: explicit beats derived, Some(0) = unlimited.
+        assert_eq!(pop_budget_for(None, None, 0), Some(800_000));
+        assert_eq!(pop_budget_for(Some(1), None, 0), Some(1));
+        assert_eq!(pop_budget_for(Some(0), None, 0), None);
+
+        // Invalid explicit value is impossible at the CLI (u64 arg) but the
+        // API normalizes Some(0) to unlimited.
+        assert_eq!(pop_budget_for(Some(0), Some("999"), 0), Some(999));
+
+        // Env override wins: `=0` is unlimited, an unparseable value falls
+        // back to the explicit budget.
+        assert_eq!(pop_budget_for(Some(1), Some("0"), 0), None);
+        assert_eq!(pop_budget_for(Some(2), Some("garbage"), 0), Some(2));
+        assert_eq!(pop_budget_for(None, Some("garbage"), 0), Some(800_000));
+        assert_eq!(pop_budget_for(Some(2), Some("5000"), 0), Some(5000));
     }
 }

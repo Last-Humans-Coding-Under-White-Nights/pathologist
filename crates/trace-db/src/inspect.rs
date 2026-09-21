@@ -4,7 +4,7 @@
 //! All lookups work purely off the exported SQLite database — no re-analysis.
 
 use anyhow::{bail, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub use trace_analysis::LocKind;
@@ -34,6 +34,52 @@ impl Direction {
 /// short, which is display-only.
 pub fn basename(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// Solver work-budget facts recorded in `analysis_run.options_json` at
+/// export time. Lets an end-user of a queried database tell a complete run
+/// from one whose solver stopped early on its work budget. Absent in
+/// databases exported before this feature; `Default` covers those.
+#[derive(Debug, Clone, Default)]
+pub struct SolverInfo {
+    /// `true` when the solver stopped before reaching the fixpoint.
+    pub partial: bool,
+    /// Worklist pops processed by the solver run.
+    pub pops: u64,
+    /// Pop budget in force (`None` = unlimited).
+    pub budget_pops: Option<u64>,
+    /// Time budget in force (`None` = no time limit).
+    pub budget_secs: Option<u64>,
+}
+
+/// Read the solver outcome of the run that produced this database.
+///
+/// Keyed off `options_json`, so it works on any `trace inspect` input
+/// without re-analysis.
+pub fn solver_outcome(conn: &Connection) -> Result<SolverInfo> {
+    let row: Option<String> = conn
+        .query_row(
+            "SELECT options_json FROM analysis_run ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(json) = row else {
+        return Ok(SolverInfo::default());
+    };
+    let value: serde_json::Value = serde_json::from_str(&json)?;
+    Ok(SolverInfo {
+        partial: value
+            .get("solver_partial")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        pops: value
+            .get("solver_pops")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        budget_pops: value.get("solve_budget_pops").and_then(|v| v.as_u64()),
+        budget_secs: value.get("solve_budget_secs").and_then(|v| v.as_u64()),
+    })
 }
 
 #[derive(Debug, Clone)]
