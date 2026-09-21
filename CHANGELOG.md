@@ -9,8 +9,9 @@ All notable changes to `trace` are documented in this file.
 The solver's pop budget is no longer a fixed 800 000. The default now derives
 from the PAG's constraint count (`800 000 + 6 × constraints`), so rare-large
 trees reach their real convergence instead of stopping at a partial result
-(`ability_ability_runtime`, 257 K constraints, needs 1.68 M pops; the old flat
-budget cut it off at 800 K with ~40% of indirect edges missing). A stop is
+(ability runtime: 189,675 constraints derive a 1,938,050-pop budget, and the
+solve converges at 1,642,728 pops; the old flat 800 000 cut it off at 451 of
+its 757 indirect edges). A stop is
 recorded, never silent: `analysis_run.options_json` gains `solver_partial`,
 `solver_pops`, `solve_budget_pops` and `solve_budget_secs`, an `analyze`-stage
 `warning` diagnostic is exported, and `trace inspect` warns when it opens such

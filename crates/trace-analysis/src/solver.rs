@@ -73,12 +73,14 @@ pub struct SolveOutcome {
 /// The derived default pop budget for a PAG with `constraints` constraints.
 ///
 /// 800 000 pops (the old unconditional default) covers convergence on the
-/// eval corpora (the largest, HDF, needs ~42k). Larger trees need far more:
-/// `ability_ability_runtime` (257 K constraints) converges at 1.68 M pops.
+/// eval corpora (the largest, HDF, needs ~42k). Larger trees need far more,
+/// so the budget scales a floor of 800 000 by the PAG's own constraint count.
 /// Scaling linearly keeps small corpora on the old effective budget while
 /// letting mid-size and large trees finish their normal convergence instead
-/// of stopping at a partial result. The override knobs (`--solve-budget-pops`,
-/// `TRACE_SOLVE_BUDGET_POPS`) still apply on top.
+/// of stopping at a partial result. The measurements that sized the linear
+/// factor are recorded in `docs/EVAL_REPORT.md` ("Solver work budget"). The
+/// override knobs (`--solve-budget-pops`, `TRACE_SOLVE_BUDGET_POPS`) still
+/// apply on top.
 pub fn default_pops_budget(constraints: usize) -> u64 {
     800_000 + 6 * constraints as u64
 }
