@@ -208,7 +208,12 @@ out-of-band value is an error instead of silently running in one direction.
   filtered like `trace calls --from/--to/--file`. `caller_path` is the
   *caller's own file* (not the call-site file), so it stays meaningful for
   synthetic IPC-bridge edges that have no call site; `path`/`line`/`col` are
-  the actual call site and are empty (0) for synthetic edges.
+  the actual call site and are empty (0) for synthetic edges. `callee_path`
+  is NULL when the callee was synthesized because it was never declared
+  in-tree (libc, `std::` members): it has no source file of its own. A
+  prototype-only external still carries its declaration path. Callers must
+  null-check `callee_path` before treating it as a string; it is not
+  synonymous with `resolution == TRACE_RESOLUTION_EXTERNAL`.
 - **Call graphs.** `trace_db_callgraph(db, root_fn_id, direction, depth)` BFS
   over `call_edges`. Node `id`s are `functions.id`; node `kind` is
   `TRACE_NODE_UNKNOWN` (call-graph nodes are functions, not PAG nodes). Edges

@@ -4,6 +4,17 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### External callee locations
+
+A synthesized external (an undefined callee with no in-tree declaration, such as libc or a `std::`
+member) no longer presents the first referencing call site as its own location. Lowering exports
+`line_start`/`line_end` 0, and the C API's `trace_call_edge.callee_path` is now NULL for them, so
+call-graph nodes read `name ([external])` and `calls` rows `-> name (external)` instead of
+`name (somefile.c:N [external])`; `--file` and `--line` no longer match them through their
+arbitrary stored file. Prototype-only externals keep their declaration line. C consumers must
+null-check `callee_path` (the shipped `ctrace` example assumed it was never NULL and segfaulted on
+the first libc edge). See `docs/CAPI.md` and `docs/INSPECT_REPORT.md`.
+
 ### Faster analyze phase (#117)
 
 Points-to propagation no longer allocates per step, and a store filters its

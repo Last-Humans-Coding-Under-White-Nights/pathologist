@@ -36,6 +36,7 @@ Defaults: `--direction down`; `dataflow` depth default 3. Both are bounded BFS t
 
 - Symbol lookup: `--file` is a **path substring** (basename or full path); function names match exactly or by C++ qualified suffix; the line must lie inside a function body (header line prints `name (file.c:S-E)`).
 - Edges: `-direct->` / `-indirect->` / `-external->`, followed by `(callee.c:N)` and the call site `(caller.c:N)`; `[external]` marks external callees.
+- A callee synthesized because it was never declared in-tree has no source location: it keeps the `[external]` marker but no `(file:N)` span. Graph nodes show `name ([external])`, `calls` rows show `-> name (external)`, and the `callchain` header prints `name [external]`. `--file`/`--line` never match it (its stored file is only an internal scope fallback).
 - Dedup: a callee re-reached at a different call site renders `(see above; also main.c:49)`.
 - Truncation: a live frontier at the depth limit prints `(truncated at --depth N; increase to see more)`, exit 0.
 - Ambiguity is a note, not an error: `note: 3 candidates on this line; using pa (others: pb, x)` (nearest column). Dataflow falls back to the nearest declaration listed in the line: `note: no declaration exactly at main.cpp:26:17; using w (local) in drive main.cpp:26:12`.
@@ -387,11 +388,11 @@ Fixture `cpp_ctor_callback` — `test_callback_dispatch` (main.c:11-26):
 callgraph from test_callback_dispatch (main.c:11-26) (callees, depth 2):
 * test_callback_dispatch (main.c:11)
   -direct-> RegisterConstructor (impl.cpp:7) (main.c:12)
-    -external-> std::string (impl.cpp:8 [external]) (impl.cpp:8)
+    -external-> std::string ([external]) (impl.cpp:8)
   -direct-> CreateService (impl.cpp:12) (main.c:13)
-    -external-> std::map::find (impl.cpp:13 [external]) (impl.cpp:13)
-    -external-> std::string (impl.cpp:8 [external]) (see above; also impl.cpp:13)
-    -external-> std::map::end (impl.cpp:14 [external]) (impl.cpp:14)
+    -external-> std::map::find ([external]) (impl.cpp:13)
+    -external-> std::string ([external]) (see above; also impl.cpp:13)
+    -external-> std::map::end ([external]) (impl.cpp:14)
   -indirect-> SampleDriverInit (impl.cpp:35) (main.c:21)   # entry.Init (registry entry)
   -indirect-> SampleDispatch (impl.cpp:21) (main.c:23)     # dev.service->Dispatch
 8 functions, 8 edges
@@ -415,7 +416,7 @@ callgraph from main (main.cpp:18-31) (callees, depth 2):
   -direct-> f (main.cpp:15) (main.cpp:26)   # f(s) -> f(short)
   -direct-> f (main.cpp:16) (main.cpp:27)   # f(1, 2) -> f(int, int)
   -direct-> Box::read (main.cpp:10) (main.cpp:29)
-    -external-> T (main.cpp:6 [external]) (main.cpp:10)
+    -external-> T ([external]) (main.cpp:10)
 9 functions, 9 edges
 ```
 
@@ -436,7 +437,7 @@ from their `template_declaration` body):
 
 ```text
 inspect calls --from GetNumber :
-FieldValue::GetNumber (main.cpp:6) -> T [main.cpp] (external)   # template body `return T();`
+FieldValue::GetNumber (main.cpp:6) -> T (external)   # template body `return T();`
 ```
 
 The call sites themselves are direct (`8/8` edges, 0 indirect, no unresolved

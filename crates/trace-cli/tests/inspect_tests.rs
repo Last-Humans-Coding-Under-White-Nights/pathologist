@@ -8,8 +8,9 @@ use common::TempDb;
 use std::process::Command;
 use trace_analysis::analyze;
 use trace_db::{
-    call_graph, dataflow_graph, export_to_sqlite, find_functions_at, open_db, require_function_at,
-    require_symbols_at, Direction, ExportOptions, QueryGraph,
+    call_edges, call_graph, dataflow_graph, export_to_sqlite, find_functions_at,
+    find_functions_by_name, open_db, require_function_at, require_symbols_at, CallEdgeFilter,
+    Direction, ExportOptions, QueryGraph,
 };
 use trace_parse::build_program;
 use trace_preproc::PreprocessOptions;
@@ -86,6 +87,121 @@ fn function_line_ranges_exported() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(rows, vec![("helper".into(), 1, 3), ("caller".into(), 5, 7)]);
+}
+
+/// Synthesized externals (never declared in the tree) must not present an
+/// arbitrary call site as their own source location: `functions` exports
+/// line 0 for them, call edges report no callee path, and the call-graph
+/// node renders as a bare `[external]`. Prototype-only externals keep their
+/// real declaration location.
+#[test]
+fn external_callees_carry_no_fabricated_location() {
+    let db = build_and_export("extern_call");
+    let conn = open_db(&db).unwrap();
+
+    let no_location = |name: &str| -> Result<(i64, i64), _> {
+        conn.query_row(
+            "SELECT f.line_start, f.line_end FROM functions f WHERE f.name = ?1",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    };
+    // `undeclared_stub` is synthesized (no tree declaration); `ext_helper`
+    // is a real prototype whose location must survive.
+    assert_eq!(no_location("undeclared_stub").unwrap(), (0, 0));
+    assert!(no_location("ext_helper").unwrap().0 > 0);
+
+    let edges = call_edges(
+        &conn,
+        &CallEdgeFilter {
+            from: None,
+            to: None,
+            file: None,
+            exclude_deps: false,
+        },
+    )
+    .unwrap();
+    let by_callee = |name: &str| edges.iter().find(|e| e.callee_name == name).unwrap();
+    assert_eq!(by_callee("undeclared_stub").callee_path, None);
+    assert!(by_callee("ext_helper").callee_path.is_some());
+    assert_eq!(by_callee("undeclared_stub").resolution, "external");
+
+    // Browsing the call graph down from `local_wrap` (main.c:12) must show
+    // the synthesized callee without a made-up file:line, both in the node
+    // detail and in the text the real binary prints (the label closure lives
+    // in the binary crate, so only running it pins the rendered form).
+    let start = require_function_at(&conn, "main.c", 12).unwrap();
+    let g = call_graph(&conn, start.id, Direction::Down, 3).unwrap();
+    let external_node = g
+        .nodes
+        .values()
+        .find(|n| n.label == "undeclared_stub")
+        .unwrap();
+    assert_eq!(external_node.detail, "[external]", "{:?}", external_node);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_trace"))
+        .args([
+            "inspect",
+            db.to_str().unwrap(),
+            "callgraph",
+            "--file",
+            "main.c",
+            "--line",
+            "12",
+        ])
+        .output()
+        .expect("callgraph runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("-external-> undeclared_stub ([external]) (main.c:12)"),
+        "rendered call graph must mark the external without a location:\n{text}"
+    );
+    assert!(!text.contains("main.c:0"), "{text}");
+}
+
+/// The 0-sentinel must not become a queryable location: `--line 0` is not a
+/// source line, so it resolves to nothing (matching master), and a `--file`
+/// filter must not match a synthesized external through its arbitrary stored
+/// call-site file.
+#[test]
+fn locationless_externals_are_not_matched_by_file_or_line_filters() {
+    let db = build_and_export("extern_call");
+    let conn = open_db(&db).unwrap();
+
+    assert!(
+        find_functions_at(&conn, "main.c", 0).unwrap().is_empty(),
+        "line 0 must not match a location-less external"
+    );
+    assert!(
+        require_function_at(&conn, "main.c", 0).is_err(),
+        "`callgraph --line 0` must fail like master"
+    );
+
+    // Findable by name, but not by an unrelated file.
+    assert_eq!(
+        find_functions_by_name(&conn, "undeclared_stub", None)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        find_functions_by_name(&conn, "undeclared_stub", Some("main.c"))
+            .unwrap()
+            .is_empty(),
+        "a synthesized external is in no file, so --file must not match it"
+    );
+    // A prototype-only external keeps matching its real declaration file.
+    assert_eq!(
+        find_functions_by_name(&conn, "ext_helper", Some("main.c"))
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]

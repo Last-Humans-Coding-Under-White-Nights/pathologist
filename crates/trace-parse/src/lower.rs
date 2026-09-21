@@ -1234,7 +1234,7 @@ fn finalize_extern_callees(program: &mut Program) {
         finalize_target_extern_callees(program);
         return;
     }
-    let mut names: Vec<(String, trace_ir::FileId, u32)> = program
+    let mut names: Vec<(String, trace_ir::FileId)> = program
         .symbols
         .call_sites
         .iter()
@@ -1244,7 +1244,7 @@ fn finalize_extern_callees(program: &mut Program) {
                 && cs.callee_fn_id.is_none()
                 && is_synthesizable_extern(&cs.callee_name)
         })
-        .map(|cs| (cs.callee_name.clone(), cs.span.file, cs.span.line))
+        .map(|cs| (cs.callee_name.clone(), cs.span.file))
         .collect();
     names.sort();
     names.dedup_by(|a, b| a.0 == b.0);
@@ -1252,7 +1252,7 @@ fn finalize_extern_callees(program: &mut Program) {
     // of the whole table per name was quadratic (1.5s of camera's index).
     let mut sites_by_name: HashMap<&str, Vec<usize>> = names
         .iter()
-        .map(|(name, _, _)| (name.as_str(), Vec::new()))
+        .map(|(name, _)| (name.as_str(), Vec::new()))
         .collect();
     for (i, cs) in program.symbols.call_sites.iter().enumerate() {
         if !cs.is_direct && cs.callee_var.is_none() {
@@ -1261,7 +1261,7 @@ fn finalize_extern_callees(program: &mut Program) {
             }
         }
     }
-    for (name, file, line) in &names {
+    for (name, file) in &names {
         // A symbol already exists for this name (in-tree prototype or
         // definition): leave the site untouched so the solver's name-based
         // recovery classifies it — defined-elsewhere resolves to a real
@@ -1271,6 +1271,12 @@ fn finalize_extern_callees(program: &mut Program) {
             continue;
         }
         let fid = program.symbols.alloc_fn_id();
+        // The entry has no source location: it was never declared in the
+        // tree. After `names.sort()` + dedup the retained file is the
+        // lowest-FileId one (not the first call site), kept only as a scope
+        // fallback; export line 0 so call-graph consumers do not present an
+        // arbitrary call site as the function's own location. The
+        // target-scoped pass below genuinely uses its first call site.
         program.symbols.push_synthetic_function(trace_ir::Function {
             is_weak: false,
             target: None,
@@ -1283,10 +1289,10 @@ fn finalize_extern_callees(program: &mut Program) {
             is_cpp: false,
             span: trace_ir::Span {
                 file: *file,
-                line: *line,
+                line: 0,
                 col: 0,
             },
-            end_line: *line,
+            end_line: 0,
             file: *file,
             is_defined: false,
             param_type_ids: Vec::new(),
@@ -1356,7 +1362,15 @@ fn finalize_target_extern_callees(program: &mut Program) {
             .map(|((name, target), sites)| ((name.to_owned(), target), sites))
             .collect();
     for ((name, target), sites) in missing {
-        let span = program.symbols.call_sites[sites[0]].span;
+        // Synthesized externals were never declared in the tree, so they have
+        // no source location: keep the first call site's file as a scope
+        // fallback but export line 0, so call-graph consumers do not present
+        // an arbitrary call site as the function's own location.
+        let span = trace_ir::Span {
+            file: program.symbols.call_sites[sites[0]].span.file,
+            line: 0,
+            col: 0,
+        };
         let id = program.symbols.alloc_fn_id();
         program.symbols.push_synthetic_function(Function {
             id,
@@ -1368,7 +1382,7 @@ fn finalize_target_extern_callees(program: &mut Program) {
             params: Vec::new(),
             locals: Vec::new(),
             span,
-            end_line: span.line,
+            end_line: 0,
             file: span.file,
             is_defined: false,
             param_type_ids: Vec::new(),

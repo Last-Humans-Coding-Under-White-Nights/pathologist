@@ -119,9 +119,9 @@ query them.
 |--------|------|-------------|
 | `id` | INTEGER PK | Function id |
 | `name` | TEXT | Linkage-visible name |
-| `file_id` | INTEGER FK → `files` | Defining file (original header if include-originated) |
-| `line_start` | INTEGER | Start line (always original-file coordinates via LineMap) |
-| `line_end` | INTEGER | End line of the definition body; equals `line_start` for prototypes and synthesized externals |
+| `file_id` | INTEGER FK → `files` | Defining file (original header if include-originated). For a synthesized external (`line_start = 0`, `is_defined = 0`) this is only a resolver scope fallback — an arbitrary call-site file, not a declaration — so file filters must gate on `line_start > 0` |
+| `line_start` | INTEGER | Start line (always original-file coordinates via LineMap); `0` iff the function was synthesized (never declared in-tree) |
+| `line_end` | INTEGER | End line of the definition body; equals `line_start` for prototypes and synthesized externals (both `0` for a synthesized external) |
 | `linkage` | TEXT | `external`, `internal`, `none` |
 | `signature` | TEXT | Placeholder `fn_<name>` |
 | `is_defined` | INTEGER | 1 if a body exists under the analyzed root. 0 rows include prototype-only declarations, synthesized externals (libc/logging backends never declared in-tree), and dependency declarations |
