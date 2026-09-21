@@ -1,5 +1,195 @@
 # Evaluation Report
 
+## Analyze-phase performance — 2026-09-21 (#117)
+
+What the solver now does about allocation and store filtering is defined in
+[Propagation highlights](ANALYSIS.md#propagation-highlights); name-lookup
+ordering is in [Shared header functions](ANALYSIS.md#shared-header-functions).
+
+Baseline: `8f5af325b4c739a9499020c24c824d482b83b376`. Candidate: the commit
+containing this report. Both measured executables are
+`cargo build --release -p trace-cli` of those two trees; the commits, not
+executable hashes, identify them, because a rebuild in a target directory
+that has also held `--all-features` artifacts does not reproduce the same
+bytes. Builds used Rust `1.100.0-nightly (bff8e12ff 2026-08-26)` on an Apple
+M1 MacBook Air (`MacBookAir10,1`), 8 cores and 8 GB memory.
+
+| Corpus | Revision |
+|---|---|
+| HDF | `cdc75a20bb8f1a046cd22e189405a20d602d0521` |
+| hiview | `92408e2072bd6dc8fb0d980773e80b6ec898710c` |
+| camera | `8ffd69dcd47f533e70b4dba428439da9008b0cae` |
+| ability runtime | `6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8` |
+
+### The issue's profile no longer describes the code
+
+The issue was filed against `03f102b` with a profile attributing ~75 % of the
+analyze phase to visibility probes under `SymbolTable::callees_of_with_types`,
+and `CovertFileName` with 1,704 scope entries as the example. That profile is
+stale: `8f5af32` (#125) collapses identical header-static bodies, which is
+exactly the duplication that produced those buckets. Measured on this
+baseline, resolving all 619,209 ability-runtime call sites into 727,621
+callees costs **0.23 s**, against a worklist of 19.7 s — about one per cent
+of the phase. Call resolution is not the bottleneck; points-to propagation
+is.
+
+### Where the time actually went
+
+A 20-second `sample` of the baseline analyze phase on ability-runtime, started
+at the analyze boundary, puts 15,962 of 16,227 samples in
+`analyze_with_options` and almost all of those in `solve` — and almost all of
+`solve` in `apply_store_to_targets` and `merge_memory_into`. The three largest
+stacks are allocation and re-filtering, not set logic:
+
+| Baseline stack | Samples |
+|---|---:|
+| `merge_memory_into` building its two result vectors per call | 4,451 |
+| `apply_store_to_targets` → `IndexSet::insert_full` into cell memory | 3,681 |
+| `apply_store_to_targets` building one filtered source copy **per target** | 3,496 |
+| the rest of `solve` | ~4,000 |
+
+A store writes the same source points-to set into every location its pointer
+may address. The old code rebuilt a signature-filtered copy of that set for
+each of those locations, so a store into *t* targets with a source set of *s*
+locations allocated *t* vectors and did *t·s* filter tests before any
+propagation happened. `merge_memory_into` allocated a vector of arity-accepted
+locations and a second of not-yet-present ones on every call, `touch_loc_holders`
+cloned a location's entire holder set on every write, and `propagate_slice` /
+`propagate_locs` allocated a result vector each time. Sampled down to the leaf,
+more of the phase sat in `malloc`/`realloc` than in hashing or comparison.
+
+### The same work, cheaper
+
+The clearest evidence that nothing about the analysis changed is the solver's
+own progress counters. Run at `TRACE_SOLVER_STATS=1` on ability-runtime with
+no pop budget, the two binaries report **identical** values at every
+100,000-pop checkpoint — pops, constraints, queued nodes, largest and total
+points-to sizes, locations, and the copy/load/store/GEP work counters — and
+both converge at 1,642,728 pops with 189,946 constraints. Only the clock
+differs:
+
+| Worklist, ability-runtime, unlimited | Baseline | Candidate |
+|---|---:|---:|
+| at 1,300,000 pops | 10.520 s | 6.372 s |
+| at 1,500,000 pops | 15.710 s | 9.397 s |
+| at fixpoint (1,642,728 pops) | 19.683 s | 11.633 s |
+
+Same pops, same constraints, same points-to sets, same edges (729,437 call
+edges, 757 indirect on both). Each unit of work simply got cheaper.
+
+### What changed
+
+Three replacements, each a no-op-for-no-op substitution (see
+[Propagation highlights](ANALYSIS.md#propagation-highlights)):
+
+1. Reusable buffers (`Scratch`) in place of a per-step vector, everywhere
+   propagation allocates.
+2. One filtered source view per distinct slot guard (`StoreViews`) instead of
+   one per target — and none at all when the source set holds no function
+   values, which no guard can reject.
+3. Within one store, the repeated writes of a shared field summary are
+   skipped. Many of a store's targets are field cells of the same struct type
+   and field; memory only grows, so after the first write the rest insert
+   nothing. The `SUMMARY_MEM_CAP` check that those writes would still perform
+   is kept.
+
+Name lookup keeps the parts of the earlier work that cost nothing — buckets
+sorted by file ID so a first-match lookup can stop early, threshold-based
+candidate deduplication, and the sole-binding shortcut past the candidate walk
+— and drops the per-lookup memo that came with them. The most that memo could
+save is a fraction of the 0.23 s resolution takes; what it cost was measured
+at 138 MB of peak RSS on ability-runtime and 9.6 ms of camera analyze time.
+
+A fresh 8-second sample of the candidate's analyze phase shows the shape that
+remains: `solve` is still essentially all of it, and `apply_store_to_targets`
+is still most of `solve` — but what is left there is the `IndexSet` insertion
+into cell memory itself, not the allocation and re-filtering around it.
+
+### Alternating release measurements
+
+Each corpus/budget pair ran six alternating baseline/candidate pairs at
+`--jobs 8` with minimal export. The first pair warms caches and is excluded;
+the tables report the remaining measured runs as median (minimum–maximum).
+Phase boundaries are timestamped in the parent process from the child's own
+stderr lines, so they are not limited to the CLI's 0.1-second printing.
+`/usr/bin/time -l` reports peak RSS, converted to decimal MB. No profiler,
+build or test workload ran during these measurements.
+
+The sweep ran against an earlier build of this same change; the code was then
+refactored without altering behavior, which the 18 dump comparisons below
+confirm byte for byte. The final build was re-measured on the two corpora that
+move: HDF unlimited analyze 1.628 s → 0.922 s, and ability-runtime unlimited
+21.287 s → 13.048 s (−38.7 %), the same ratio the table reports. The refactor
+is not a performance change and the table stands for the committed code.
+
+| Corpus | Pop budget (0 = unlimited) | Build | Index, s | Analyze, s | Export, s | Peak RSS, MB |
+|---|---:|---|---:|---:|---:|---:|
+| HDF | 800000 | baseline | 1.819 (1.811–1.830) | 1.586 (1.572–1.605) | 0.452 (0.448–0.455) | 401.1 (399.5–403.0) |
+| HDF | 800000 | candidate | 1.824 (1.805–1.852) | 1.039 (1.024–1.049) | 0.454 (0.447–0.467) | 399.9 (392.6–405.8) |
+| hiview | 800000 | baseline | 1.136 (1.130–1.168) | 0.049 (0.049–0.049) | 0.257 (0.255–0.258) | 265.8 (262.1–271.1) |
+| hiview | 800000 | candidate | 1.145 (1.126–1.177) | 0.049 (0.047–0.052) | 0.262 (0.257–0.268) | 266.7 (262.9–267.7) |
+| camera | 800000 | baseline | 4.301 (4.247–4.333) | 0.101 (0.099–0.111) | 0.575 (0.572–0.582) | 813.2 (812.0–825.7) |
+| camera | 800000 | candidate | 4.308 (4.222–4.344) | 0.095 (0.095–0.104) | 0.573 (0.571–0.589) | 821.4 (816.0–826.6) |
+| ability runtime | 800000 | baseline | 46.161 (45.463–46.334) | 1.506 (1.443–1.531) | 3.800 (3.743–3.859) | 1553.6 (1431.0–1647.4) |
+| ability runtime | 800000 | candidate | 46.119 (45.507–46.488) | 1.397 (1.361–1.441) | 3.753 (3.743–3.781) | 1569.2 (1431.7–1586.3) |
+| HDF | 0 | baseline | 2.129 (2.049–2.291) | 1.591 (1.578–1.610) | 0.452 (0.450–0.456) | 399.3 (395.7–401.7) |
+| HDF | 0 | candidate | 2.111 (2.058–2.361) | 1.045 (1.028–1.053) | 0.449 (0.445–0.470) | 394.0 (390.4–399.6) |
+| hiview | 0 | baseline | 1.285 (1.267–1.318) | 0.056 (0.056–0.068) | 0.261 (0.258–0.262) | 265.9 (264.0–267.9) |
+| hiview | 0 | candidate | 1.287 (1.266–1.305) | 0.054 (0.054–0.060) | 0.262 (0.256–0.272) | 265.9 (265.7–266.2) |
+| camera | 0 | baseline | 4.587 (4.523–4.663) | 0.115 (0.100–0.125) | 0.589 (0.586–0.615) | 803.2 (774.9–819.7) |
+| camera | 0 | candidate | 4.675 (4.632–4.739) | 0.097 (0.096–0.100) | 0.581 (0.568–0.585) | 800.9 (765.4–832.8) |
+| ability runtime | 0 | baseline | 41.045 (39.350–46.550) | 20.648 (20.409–20.797) | 3.899 (3.877–3.903) | 1454.9 (1371.9–1510.9) |
+| ability runtime | 0 | candidate | 40.082 (38.360–42.871) | 12.491 (12.236–12.516) | 3.866 (3.824–3.925) | 1546.7 (1420.3–1656.8) |
+
+Analyze-phase medians, candidate against baseline:
+
+| Corpus | Default budget | Unlimited |
+|---|---:|---:|
+| HDF | −34.5 % | −34.3 % |
+| hiview | +0.1 % | −3.5 % |
+| camera | −5.1 % | −15.0 % |
+| ability runtime | −7.2 % | **−39.5 %** (20.648 s → 12.491 s) |
+
+No phase regresses on any corpus: index and export medians sit inside each
+other's ranges everywhere, and hiview's analyze is 49 ms, below what this
+harness resolves. Peak RSS is flat except ability-runtime at the unlimited
+budget, where the median rises 91.8 MB (6.3 %) across overlapping ranges
+(1371.9–1510.9 MB baseline, 1420.3–1656.8 MB candidate). That corpus's peak
+RSS is not a stable measurement on this machine: the baseline alone spans
+139 MB across its own four runs, and the machine pages heavily while a 1.5 GB
+process runs in 8 GB of memory. The difference is reported, not claimed as a
+real increase. At the default budget, which is what runs unless
+`TRACE_SOLVE_BUDGET_POPS` says otherwise, the same corpus is +1.0 %.
+
+### Verification
+
+- `cargo fmt --all -- --check`, strict all-target/all-feature Clippy and
+  `cargo test --workspace --all-features` pass (936 tests; baseline 930).
+- **All 18 SQLite dump comparisons pass.** Baseline vs candidate and
+  `--jobs 1` vs `--jobs 8` on all four corpora at both budgets, plus the HDF
+  `--full-export --debug-points-to` pair, so points-to sets are compared
+  directly. Only `analysis_run` rows are excluded. The driver runs under
+  `set -euo pipefail` in a fresh `mktemp -d` and exits non-zero on any
+  failure.
+- **Pinned eval gate: unchanged, and already red on baseline.** Both binaries
+  produce byte-identical `eval_check` output: 93 checks, the same 17 failures,
+  the same numbers on every passing check. `scripts/eval_expected.json` is
+  unchanged. These are pre-existing expectation mismatches, not something this
+  change introduces or fixes.
+
+### What is still open
+
+The issue asks for the unlimited analyze phase well under ten seconds. This
+work does not get there: ability-runtime's unlimited analyze is 12.491 s,
+against 20.648 s on baseline. Every remaining second is in the same place —
+writing a store's source set into cell memory. Cutting it further means
+propagating only the locations a store's source set newly gained, or
+replacing the hash-set points-to representation with bitsets. Both change the
+order locations enter cell memory, and with a pop budget the solver stops at a
+partial result that depends on that order, so either would change exported
+databases. That is a decision for the issue, not something to slip into a
+performance change.
+
 ## Shared header functions — 2026-09-20 (#116)
 
 The behavior and resolver ownership are defined in

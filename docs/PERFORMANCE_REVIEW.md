@@ -420,3 +420,12 @@ second copy of everything a target links. And a multi-config CMake reply lists
 each target once per configuration over identical sources, so only the first
 configuration is read; indexing all of them would multiply the whole corpus by
 the configuration count for no additional facts.
+
+## Analyze-phase performance (#117)
+
+Profiles, the alternating A/B measurements and the output-equivalence results
+are recorded in the
+[evaluation report](EVAL_REPORT.md#analyze-phase-performance--2026-09-21-117).
+What the solver does about allocation and store filtering is defined in
+[Propagation highlights](ANALYSIS.md#propagation-highlights); name-lookup
+ordering is in [Shared header functions](ANALYSIS.md#shared-header-functions).

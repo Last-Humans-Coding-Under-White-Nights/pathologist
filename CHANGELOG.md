@@ -4,6 +4,13 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Faster analyze phase (#117)
+
+Points-to propagation no longer allocates per step, and a store filters its
+source set once per pointer-slot signature instead of once per target
+location. Exported databases are byte-identical. See
+[Propagation highlights](docs/ANALYSIS.md#propagation-highlights).
+
 ### C++ caller edges (#113)
 
 Five reported call-graph queries returned no callers. Each site the fix resolves used to synthesize

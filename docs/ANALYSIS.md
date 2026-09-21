@@ -92,6 +92,26 @@ after indexing and before analysis, releasing these merge-only tables in both
 scoped and unscoped runs. Rust callers that will merge more units retain the
 state until their final merge is complete.
 
+**Lookup order in name buckets**
+
+Internal-function and file-`static` variable name buckets are kept sorted by
+file ID, equal-file function entries staying in registration order. A
+first-match lookup therefore never walks a whole bucket: the own-file entries
+form one contiguous run, and among the header entries the first accepted one
+is already the lowest-numbered — the result the ordering rules call for.
+Candidate lists switch to a membership set for deduplication only once they
+grow past a threshold, and the ordered vector stays authoritative, so no hash
+map or membership set decides result order.
+
+An external that is already bound and is the only entry under its name cannot
+resolve to an alternative definition — nothing else can be named — so the
+candidate walk is skipped for it, prototype-only bindings included
+(`is_sole_binding_of_name`). Resolution policy itself is unchanged: every
+lookup still goes through `resolve_function_in_scope_in_target` /
+`resolve_function_candidates_in_target` with the caller's target (invariant 5).
+The solver resolves and wires call sites sequentially, in call-site order.
+`TRACE_SOLVER_STATS` reports resolution separately from worklist time.
+
 ## Link targets and weak symbols
 
 `--link-commands PATH` selects a link commands database. Otherwise indexing
@@ -388,6 +408,47 @@ Wrong-type pointer casts put unrelated objects into a pointer's points-to; a sto
 - The same guard applies when `merge_memory_into` lifts cell contents into points-to sets, and when a `Gep` passes fn values from the base node's set into the field node — except registered `array_fn_members` table members, which always pass (see "Arrays and function-pointer tables").
 
 Consequence: callbacks stored through correctly-typed ops assignments resolve exactly as before, while cross-signature leaks (e.g. a 2-param `AddService` callback surfacing at 4-param `Dispatch` sites) are cut. Documented imprecision: old-style casts that stash fn pointers in `void *`-typed cells then call them through typed loads still work (unknown cells accept everything), but calls through cells whose declared type is structurally wrong for the stored fn are no longer reported.
+
+**Propagation without per-step allocation**
+
+Every propagation step used to allocate. A fresh vector of newly-added
+locations per propagate/merge call; a clone of a location's entire holder set
+on every store; and — by far the largest — one signature-filtered copy of a
+store's source points-to set per *target location it writes*. A profile of the
+analyze phase on the biggest corpus attributed more time to the allocator than
+to the set logic itself.
+
+Three changes remove that overhead without changing a single propagated fact:
+
+- Propagation steps take the buffer they need (`Scratch`) as an argument
+  instead of allocating one, so a step that used to allocate now refills a
+  buffer that already has capacity. The buffers live beside the solver state
+  rather than in it, which is what lets the borrow checker reject two steps
+  sharing one.
+- A store filters its source set at most once per distinct slot guard
+  (`StoreViews`), not once per target: which locations a guard admits depends
+  only on the guard, and a source set carrying no function values at all needs
+  no filtering for any target.
+- Within one store, a shared `FieldSummary` cell is written once. Many of a
+  store's targets are field cells of the same struct type and field, and they
+  all write that one summary; since cell memory only grows, every write of it
+  after the first inserts nothing. The `SUMMARY_MEM_CAP` check those writes
+  would still perform is kept, and so is the requeue they would still trigger.
+  A location is likewise requeued once per store — repeats are no-ops that
+  still re-walk its holder set.
+
+All three are order-preserving by construction: the buffers are filled in the
+same sequence as the vectors they replace, filtering only ever drops elements,
+and the skipped writes are provably empty. Memory cells, delta vectors and the
+worklist therefore see the identical sequence of operations and the exported
+database is byte-identical. Measurements are in the
+[evaluation report](EVAL_REPORT.md#analyze-phase-performance--2026-09-21-117).
+
+What is *not* done here: propagating only a store's newly-gained source
+locations instead of its whole source set, and bitset points-to sets. Both
+would cut more, and both change the order locations enter cell memory, which
+changes the partial result the default pop budget stops at. That is a
+deliberate trade-off to make explicitly, not a free win.
 
 **Indirect calls**
 
