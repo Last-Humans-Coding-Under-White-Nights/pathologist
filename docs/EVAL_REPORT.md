@@ -1,5 +1,53 @@
 # Evaluation Report
 
+## Solver work budget — 2026-09-21 (#119)
+
+The budget formula, the precedence of the override knobs and the recording of
+a truncated run are defined in [Work budget](ANALYSIS.md#work-budget), not
+repeated here. This section records the measurements that sized the linear
+term of `default_pops_budget` (`crates/trace-analysis/src/solver.rs`;
+`800 000 + 6 × PAG constraints` pops).
+
+Release builds of the same source at base `bd93bda` (the last commit before
+the change) and head `424b078` (this change) analyzed the clean ability-runtime
+checkout `6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8` with the default budget
+(no override), `--jobs 8`, minimal export and `TRACE_SOLVER_STATS=1`:
+
+```sh
+cargo build --release -p trace-cli
+target/release/trace analyze <ability-runtime-checkout> --jobs 8 \
+  -o /tmp/ab_runtime.db
+```
+
+| ability runtime, default budget | Base | Head |
+|---|---:|---:|
+| PAG constraints (budget input) | 189,675 | 189,675 |
+| pops spent at the end of the solve | 800,000 | 1,642,728 |
+| indirect edges | 451 | 757 |
+| CLI analyze stage, s | 1.5 | 14.5 |
+| whole run, s | 68.05 | 69.60 |
+
+The head build converges at 1,642,728 pops, comfortably inside its 1,938,050
+pop budget; the base build stops at the old flat 800 000. That stop is the
+whole story of the old default on this corpus: it cut the run off at 451
+indirect edges against 757 at full convergence (roughly 40 % of the indirect
+edges missing). The head build's slower analyze stage (14.5 s vs 1.5 s) is
+the price of doing that remaining work instead of stopping early. Both runs
+are single observations, not a statistical performance comparison.
+
+Full convergence is the same everywhere: the unlimited solve at this
+revision (`TRACE_SOLVE_BUDGET_POPS=0`, `--jobs 8`, minimal export) also
+converges at 1,642,728 pops with the same 757 indirect edges (see
+[Analyze-phase performance](#analyze-phase-performance--2026-09-21-117)), so
+the derived-budget run is the fixpoint, not a new truncation.
+
+The new default must not change what a pinned 800,000-pop run exports. The
+eval harness still pins `TRACE_SOLVE_BUDGET_POPS=800000`, and on the clean
+HDF checkout `cdc75a20bb8f1a046cd22e189405a20d602d0521` (`--jobs 8`, minimal
+export, one run each) all 15 analysis-data tables outside `analysis_run` compare
+equal between the base and head builds (whole run 4.44 s base / 4.30 s head),
+so the pinned gate stays byte-identical.
+
 ## Analyze-phase performance — 2026-09-21 (#117)
 
 What the solver now does about allocation and store filtering is defined in

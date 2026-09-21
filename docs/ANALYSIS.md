@@ -378,7 +378,27 @@ Worklist algorithm with **constraint adjacency index** (`SolverIndices`) for O(1
 
 ### Work budget
 
-Solving is capped at a deterministic **800 000 pops** by default. Normal corpora converge far below the cap (the HDF framework corpus needs ~42k). The cap trades late-stage target recall for bounded runtime. Override via `TRACE_SOLVE_BUDGET_POPS=<n>`; `=0` restores unlimited solving. The budget is deterministic, so repeated runs produce identical databases.
+Solving runs under a **deterministic pop budget** and optionally a **wall-clock budget**. The pop budget converts a divergent solve on a huge corpus into a partial result plus a visible warning instead of an hours-long hang; normal corpora converge far below it.
+
+- **Derived default**: `800 000 + 6 × (PAG constraint count)` pops (`default_pops_budget`). The flat 800 000 floor is the historical default and covers the eval corpora (the largest, HDF, needs ~42k pops). The linear term lets mid-size and large trees finish their normal convergence instead of stopping under the flat cap at a partial result; the corpus measurements that sized it are in the [Solver work budget](EVAL_REPORT.md#solver-work-budget--2026-09-21-119) section of the evaluation report.
+- **`--solve-budget-pops <N>`**: explicit budget; `N=0` means unlimited. Beats the derived default.
+- **`TRACE_SOLVE_BUDGET_POPS=<n>`**: environment override (highest precedence; `=0` = unlimited); unparseable values fall back to the CLI/derived value. The eval harness pins this to `800_000` so eval corpora keep their exact exported databases.
+- **`--solve-budget-secs <N>`**: optional wall-clock budget (`N=0` = no time limit). Checked every 10 000 pops, so a run can overshoot by the checkpoint interval plus the time of the one pop in flight; a run that converges in under 10 000 pops never checks the clock. A time cap is inherently **non-deterministic**: the stop point depends on machine load, so two runs of the same inputs may stop at different points.
+
+**Partial results are recorded, never silent.** When a budget stops the solve before the worklist drains:
+
+- the stderr progress line says the solve is partial, with the budget that stopped it;
+- `analysis_run.options_json` gets `solver_partial: true`, `solver_pops`, `solve_budget_pops`, `solve_budget_secs`;
+- an `analyze`-stage `warning` diagnostic (NULL `file_id`, line 0) is exported;
+- `trace inspect` warns on opening such a database.
+
+Points-to sets always grow monotonically, so a partial result is a monotone **prefix** of
+the fixpoint: every recorded edge and flow is real, but flows that had not propagated yet
+when the budget hit are absent. That cuts against may-analysis — a query asked "can this
+pointer reach the sink?" can answer "no" when the true fixpoint would say yes, so do not
+treat a truncated database as a sound may-answer. The truncation is always visible
+(`solver_partial` + diagnostics), and the conservative response to a `partial` database is
+to re-run with a higher budget rather than trust a "no".
 
 ### State
 

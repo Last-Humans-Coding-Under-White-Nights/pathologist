@@ -80,6 +80,17 @@ enum Commands {
         /// Maximum number of configuration variants to explore per translation unit (#59).
         #[arg(long, default_value_t = 4)]
         explore_budget: usize,
+        /// Solver work budget in worklist pops. The default scales with the
+        /// PAG constraint count (800 000 + 6/constraint); 0 = unlimited.
+        /// `TRACE_SOLVE_BUDGET_POPS` overrides this for experimentation.
+        #[arg(long)]
+        solve_budget_pops: Option<u64>,
+        /// Solver wall-clock budget in seconds. Off by default; 0 = no time
+        /// limit. Checked every 10 000 pops, so a run can overshoot by the
+        /// checkpoint interval plus the pop in flight, and the stop point is
+        /// non-deterministic across runs with different machine load.
+        #[arg(long)]
+        solve_budget_secs: Option<u64>,
     },
     /// Inspect an existing analysis database.
     Inspect {
@@ -240,6 +251,8 @@ fn main() -> Result<()> {
             no_ipc,
             explore,
             explore_budget,
+            solve_budget_pops,
+            solve_budget_secs,
         } => run_analyze(
             target,
             output,
@@ -256,6 +269,8 @@ fn main() -> Result<()> {
             no_ipc,
             explore,
             explore_budget,
+            solve_budget_pops,
+            solve_budget_secs,
         ),
         Commands::Inspect { db, command } => run_inspect(db, command),
     }
@@ -278,6 +293,8 @@ fn run_analyze(
     no_ipc: bool,
     explore: bool,
     explore_budget: usize,
+    solve_budget_pops: Option<u64>,
+    solve_budget_secs: Option<u64>,
 ) -> Result<()> {
     if let Some(secs) = timeout_secs {
         std::thread::spawn(move || {
@@ -420,10 +437,27 @@ fn run_analyze(
         AnalyzeOptions {
             retain_points_to: debug_points_to,
             models,
-            solve_budget: Some(800_000),
+            solve_budget_pops,
+            solve_budget_secs,
             enable_ipc: !no_ipc,
         },
     );
+    if !analysis.solve.converged {
+        eprintln!(
+            "warning: solver stopped before convergence ({} pops of {}{}), results are partial — \
+             see the `analyze` diagnostic and analysis_run.options_json.solver_partial in {}",
+            analysis.solve.pops,
+            match analysis.solve.budget_pops {
+                Some(b) => b.to_string(),
+                None => "unlimited".to_owned(),
+            },
+            match analysis.solve.budget_secs {
+                Some(s) => format!("; {}s time budget", s),
+                None => String::new(),
+            },
+            output.display()
+        );
+    }
     let indirect = analysis
         .call_edges
         .iter()
@@ -494,6 +528,21 @@ fn run_analyze(
 
 fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
     let conn = open_db(&db)?;
+    if let Ok(info) = trace_db::solver_outcome(&conn) {
+        if info.partial {
+            let budget = match (info.budget_pops, info.budget_secs) {
+                (Some(p), Some(s)) => format!("{p} pops / {s}s"),
+                (Some(p), None) => format!("{p} pops"),
+                (None, Some(s)) => format!("unlimited pops / {s}s"),
+                (None, None) => "unlimited".to_owned(),
+            };
+            eprintln!(
+                "warning: this database holds a partial solve ({} pops under {}, converged=false); \
+                 treat queries as answering a truncated fixpoint",
+                info.pops, budget
+            );
+        }
+    }
     match command {
         InspectCommands::Calls {
             from,

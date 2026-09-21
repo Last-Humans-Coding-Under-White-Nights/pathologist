@@ -4,6 +4,26 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Solver work budget
+
+The solver's pop budget is no longer a fixed 800 000. The default now derives
+from the PAG's constraint count (`800 000 + 6 × constraints`), so rare-large
+trees reach their real convergence instead of stopping at a partial result
+(ability runtime: 189,675 constraints derive a 1,938,050-pop budget, and the
+solve converges at 1,642,728 pops; the old flat 800 000 cut it off at 451 of
+its 757 indirect edges). A stop is
+recorded, never silent: `analysis_run.options_json` gains `solver_partial`,
+`solver_pops`, `solve_budget_pops` and `solve_budget_secs`, an `analyze`-stage
+`warning` diagnostic is exported, and `trace inspect` warns when it opens such
+a database. Points-to sets are monotone, so a partial result is a prefix of the
+fixpoint — recorded facts are real, but flows that had not propagated are
+absent (may-flow queries can under-report). New flags: `--solve-budget-pops <N>`
+(`0` = unlimited) and `--solve-budget-secs <N>` (opt-in wall clock, `0` = no
+time limit; checked every 10 000 pops). `TRACE_SOLVE_BUDGET_POPS` remains as a
+highest-precedence override; the eval harness still pins it to `800 000`, so
+the pinned corpora are byte-identical. See
+[docs/ANALYSIS.md](docs/ANALYSIS.md#work-budget).
+
 ### External callee locations
 
 A synthesized external (an undefined callee with no in-tree declaration, such as libc or a `std::`

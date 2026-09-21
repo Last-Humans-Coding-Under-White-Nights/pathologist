@@ -15,6 +15,7 @@ pub use constraints::{
 pub use ipc::detect_ipc_pairs;
 pub use pag::*;
 pub use solver::{
-    analyze, analyze_with_options, AnalysisResult, AnalyzeOptions, SYNTHETIC_CALL_SITE,
+    analyze, analyze_with_options, default_pops_budget, AnalysisResult, AnalyzeOptions,
+    SolveOutcome, SYNTHETIC_CALL_SITE,
 };
 pub use summaries::*;

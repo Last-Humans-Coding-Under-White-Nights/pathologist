@@ -91,6 +91,8 @@ trace analyze [OPTIONS] <TARGET>
 | `--explore` | Enable bounded conditional-variant exploration. Discovers candidate macro definitions from project GN files (`BUILD.gn`, `*.gni`), evaluates semantic feasibility of excluded `#if`/`#ifdef`/`#elif` arms, preprocesses and lowers feasible variants independently, and unions their facts into the merged program (preserving body and call facts plus struct fields across configurations; conditional signatures retain the base arity, see [limits](docs/ANALYSIS.md#limits-of---explore)). Off by default. |
 | `--explore-budget <N>` | Maximum additional configurations per translation unit (default: 4). Budget diagnostics count omitted candidate activation goals, not proven reachable configurations. |
 | `--no-ipc` | Disable IPC proxy→stub bridge edge detection (enabled by default). Bridge edges are synthetic (`resolution = 'ipc'`, `call_site_id = NULL`) and connect a `*Proxy*` method to its `*Stub*` handler across the opaque Binder boundary. See `docs/IPC_ROADMAP.md`. |
+| `--solve-budget-pops <N>` | Solver work budget in worklist pops. Default derives from the PAG constraint count (`800000 + 6×constraints`), so normal trees converge and huge ones finish instead of stopping at a partial result; `0` = unlimited. `TRACE_SOLVE_BUDGET_POPS` overrides it for experimentation. A truncated run is recorded, not silent: `analysis_run.options_json.solver_partial`, an `analyze`-stage diagnostic, and a `trace inspect` warning. |
+| `--solve-budget-secs <N>` | Solver wall-clock budget in seconds (default: off; `0` = no time limit). Checked periodically, so lead time can overshoot by up to one checkpoint, and the stop point varies with machine load. |
 
 **Progress output** (stderr):
 

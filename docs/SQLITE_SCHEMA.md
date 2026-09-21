@@ -72,7 +72,7 @@ diagnostics
 | `schema_version` | INTEGER | Database layout version (currently `5`) |
 | `target_root` | TEXT | Analyzed directory |
 | `created_at` | TEXT | Unix timestamp (seconds) |
-| `options_json` | TEXT | JSON: `include_paths`, `defines`, `dep_roots`, `include_points_to`, `full_detail`, `model_files`, `explore`, `explore_budget`, `variants_merged` |
+| `options_json` | TEXT | JSON: `include_paths`, `defines`, `dep_roots`, `include_points_to`, `full_detail`, `model_files`, `explore`, `explore_budget`, `variants_merged`, `solver_partial`, `solver_pops`, `solve_budget_pops`, `solve_budget_secs` |
 
 `explore` and `explore_budget` record what the run *requested*; `variants_merged`
 records how many variant units it actually merged. They come apart: a run can ask
@@ -82,6 +82,16 @@ consumer asking whether a database contains cross-variant facts must read
 additional commands for a source without exploration; those additional units
 also count. `include_paths` is the union of paths observed across configurations,
 while `defines` records user overrides, not every per-command macro environment.
+
+`solver_partial` (`false` / `true`), `solver_pops`, `solve_budget_pops` (`null` =
+unlimited) and `solve_budget_secs` (`null` = no time limit) describe how the
+solver run ended. `solver_partial: true` means the run stopped on its work
+budget before reaching the fixpoint; every table then answers a **monotone
+prefix of the fixpoint** — every recorded edge and flow is real, but flows that
+had not propagated when the budget hit are absent, so a may-analysis query can
+under-report ("no path found" when the true fixpoint has one). The same fact is
+recorded as an `analyze`-stage `warning` diagnostic (see [`diagnostics`](#diagnostics)).
+Databases exported before this feature have none of the four keys.
 
 ### files
 
@@ -296,13 +306,18 @@ PK: `(var_node_id, loc_id)`
 | `file_id` | INTEGER FK → `files` | Optional |
 | `line` | INTEGER | Line |
 | `message` | TEXT | Text |
-| `stage` | TEXT | `preprocess`, `parse`, `analysis`, `explore` |
+| `stage` | TEXT | `preprocess`, `parse`, `analyze`, `explore`, `compile_commands`, `link_commands` |
 
 `preprocess` rows are the preprocessor's own diagnostics (missing includes, unknown directives,
 unterminated `#if`, mid-file stops), attributed to the file and line where the condition
 occurred — a nested header, not the including translation unit — and deduplicated on
 `(file_id, line, message)` across translation units. `parse` rows are per unit (`parse errors
-in <path>`, `file_id` NULL). See `docs/PREPROCESSOR.md`, "Error recovery".
+in <path>`, `file_id` NULL). `compile_commands` and `link_commands` rows report unreadable or
+inconsistent build databases. See `docs/PREPROCESSOR.md`, "Error recovery".
+
+`analyze` rows carry whole-run solver results and always have `file_id` NULL and `line` 0.
+The only current one is the budget-truncation warning (`solver_partial` in
+`analysis_run.options_json` is the same fact in machine-readable form).
 
 ## Example queries
 

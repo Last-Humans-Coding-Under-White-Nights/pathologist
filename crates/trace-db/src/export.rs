@@ -65,6 +65,10 @@ pub fn export_to_sqlite(
             "explore": program.explore,
             "explore_budget": program.explore_budget,
             "variants_merged": program.variants_merged,
+            "solver_partial": !analysis.solve.converged,
+            "solver_pops": analysis.solve.pops,
+            "solve_budget_pops": analysis.solve.budget_pops,
+            "solve_budget_secs": analysis.solve.budget_secs,
         })
         .to_string();
 
@@ -96,7 +100,7 @@ pub fn export_to_sqlite(
         if opts.include_points_to {
             export_points_to(&conn, pag, analysis)?;
         }
-        export_diagnostics(&conn, program)?;
+        export_diagnostics(&conn, program, analysis)?;
         conn.execute_batch(INDEXES_V5)?;
         conn.execute_batch("COMMIT;")?;
     }
@@ -611,26 +615,52 @@ fn export_points_to(conn: &Connection, _pag: &Pag, analysis: &AnalysisResult) ->
     Ok(())
 }
 
-fn export_diagnostics(conn: &Connection, program: &Program) -> Result<()> {
-    if program.diagnostics.is_empty() {
-        return Ok(());
-    }
+fn export_diagnostics(
+    conn: &Connection,
+    program: &Program,
+    analysis: &AnalysisResult,
+) -> Result<()> {
     let mut stmt = conn.prepare_cached(
         "INSERT INTO diagnostics (id, severity, file_id, line, message, stage) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
-    for (i, d) in program.diagnostics.iter().enumerate() {
-        let severity = match d.severity {
-            trace_ir::DiagnosticSeverity::Error => "error",
-            trace_ir::DiagnosticSeverity::Warning => "warning",
-            trace_ir::DiagnosticSeverity::Info => "info",
-        };
+    let mut next_id: i64 = 1;
+    if !program.diagnostics.is_empty() {
+        for d in program.diagnostics.iter() {
+            let severity = match d.severity {
+                trace_ir::DiagnosticSeverity::Error => "error",
+                trace_ir::DiagnosticSeverity::Warning => "warning",
+                trace_ir::DiagnosticSeverity::Info => "info",
+            };
+            stmt.execute(params![
+                next_id,
+                severity,
+                d.file.map(|f| f.0),
+                d.line,
+                d.message,
+                d.stage
+            ])?;
+            next_id += 1;
+        }
+    }
+    // A budget-truncated solve is a property of the whole analysis run, not
+    // of any source file: it goes in with a NULL file and stage "analyze",
+    // and consumers can also read `analysis_run.options_json.solver_partial`.
+    if !analysis.solve.converged {
         stmt.execute(params![
-            i as i64 + 1,
-            severity,
-            d.file.map(|f| f.0),
-            d.line,
-            d.message,
-            d.stage
+            next_id,
+            "warning",
+            None::<i64>,
+            0i64,
+            format!(
+                "solver stopped early: {} of {} worklist pops processed; the result is a monotone partial \
+                 fixpoint (converged=false; see analysis_run.options_json.solve_budget_pops / \
+                 solve_budget_secs)",
+                analysis.solve.pops,
+                analysis.solve.budget_pops
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "unlimited".into())
+            ),
+            "analyze"
         ])?;
     }
     Ok(())
