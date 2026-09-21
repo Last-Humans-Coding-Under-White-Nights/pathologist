@@ -348,6 +348,7 @@ pub struct SymbolTable {
     target_globals: FxHashMap<crate::TargetId, FxHashMap<String, VarId>>,
     /// File-`static` variables per file, the first registered of a name
     /// winning.
+    /// One entry per file, kept sorted by FileId (see `insert_by_file`).
     file_statics_by_name: FxHashMap<String, Vec<(FileId, VarId)>>,
     /// Internal-linkage definitions per file: `(file, name) -> FnId`.
     /// In C, a file-`static` definition shadows any external definition of
@@ -358,6 +359,8 @@ pub struct SymbolTable {
     /// translation unit is hundreds of files, while a name is defined with
     /// internal linkage in a few. So the lookup walks the definitions of the
     /// name and asks whether each is in scope, not the other way round.
+    /// Kept sorted by FileId, equal-file entries in registration order
+    /// (see `insert_by_file`).
     fn_by_scope: FxHashMap<String, Vec<(FileId, FnId)>>,
     /// The further C++ overloads of an entry in `fn_by_scope`, keyed by that
     /// entry: the table holds one function per file and name.
@@ -728,12 +731,15 @@ impl SymbolTable {
             // `static void f(int);` beside the `.cpp`'s `f(double)`, or a
             // header's anonymous-namespace class member defined in the `.cpp`.
             let entries = self.fn_by_scope.get(&func.name).map(Vec::as_slice);
+            // Same run, same rule as the replacement search below: the
+            // bucket is sorted, so the entries for this file are found
+            // rather than scanned for.
             let own_file = entries
-                .into_iter()
-                .flatten()
-                .find(|(file, id)| {
-                    *file == func.file
-                        && self.function(*id).target == func.target
+                .map(|entries| file_run(entries, func.file).1)
+                .unwrap_or_default()
+                .iter()
+                .find(|(_, id)| {
+                    self.function(*id).target == func.target
                         && (!func.is_cpp
                             || self.function(*id).tu == func.tu
                             || (!self.function(*id).is_defined && func.is_defined))
@@ -840,18 +846,20 @@ impl SymbolTable {
                 }
                 None => {
                     let replace = self.fn_by_scope.get(&func.name).and_then(|entries| {
-                        entries.iter().position(|(file, id)| {
-                            *file == func.file
-                                && self.function(*id).target == func.target
-                                && (!func.is_cpp
-                                    || self.function(*id).tu == func.tu
-                                    || (!self.function(*id).is_defined && func.is_defined))
-                        })
+                        let (start, run) = file_run(entries, func.file);
+                        run.iter()
+                            .position(|(_, id)| {
+                                self.function(*id).target == func.target
+                                    && (!func.is_cpp
+                                        || self.function(*id).tu == func.tu
+                                        || (!self.function(*id).is_defined && func.is_defined))
+                            })
+                            .map(|offset| start + offset)
                     });
                     let entries = self.fn_by_scope.entry(func.name.clone()).or_default();
                     match replace.map(|i| &mut entries[i]) {
                         Some(entry) => entry.1 = func.id,
-                        None => entries.push((func.file, func.id)),
+                        None => insert_by_file(entries, func.file, func.id),
                     }
                 }
             }
@@ -1121,8 +1129,9 @@ impl SymbolTable {
                     .file_statics_by_name
                     .entry(var.name.clone())
                     .or_default();
-                if !entries.iter().any(|(file, _)| *file == var.span.file) {
-                    entries.push((var.span.file, id));
+                // First registration of a name in a file wins.
+                if file_run(entries, var.span.file).1.is_empty() {
+                    insert_by_file(entries, var.span.file, id);
                 }
             }
             _ => {}
@@ -1225,6 +1234,7 @@ impl SymbolTable {
     /// takes: the one in `file` itself, else the one in the lowest-numbered
     /// header `file` includes. What [`in_scope`](Self::in_scope) would list
     /// first, without building the list: this runs per call site.
+    /// `entries` must be sorted by FileId, with stable equal-file ordering.
     fn first_in_scope<T: Copy>(
         &self,
         file: FileId,
@@ -1232,14 +1242,16 @@ impl SymbolTable {
         accept: impl Fn(T) -> bool,
     ) -> Option<T> {
         let entries = entries?;
-        if let Some(&(_, value)) = entries.iter().find(|(f, v)| *f == file && accept(*v)) {
+        // Own-file entries are one contiguous run, and the header entries
+        // ascend, so the first accepted header entry is the lowest-numbered
+        // one: neither branch has to look at the whole bucket.
+        if let Some(&(_, value)) = file_run(entries, file).1.iter().find(|(_, v)| accept(*v)) {
             return Some(value);
         }
         let headers = self.headers_of.get(&file)?;
         entries
             .iter()
-            .filter(|(f, v)| headers.contains(f) && accept(*v))
-            .min_by_key(|(f, _)| *f)
+            .find(|(f, v)| headers.contains(f) && accept(*v))
             .map(|(_, v)| *v)
     }
 
@@ -1415,6 +1427,11 @@ impl SymbolTable {
         let resolve_equal_defs = |fid: FnId| -> Vec<FnId> {
             let f = self.function(fid);
             if f.linkage != Linkage::External || self.defined_in_tu(fid, caller_tu) {
+                return vec![fid];
+            }
+            // Nothing else can be named, so nothing else can be an equal
+            // definition: skip the candidate walk entirely.
+            if self.is_sole_binding_of_name(fid, &f.name) {
                 return vec![fid];
             }
             let f_skip = usize::from(self.has_this_param(fid));
@@ -1617,6 +1634,18 @@ impl SymbolTable {
         self.candidates_in_image(name, file, self.image_of(target))
     }
 
+    /// Is `fid` the only function any lookup of `name` can reach — no
+    /// internal-linkage entry anywhere and the one external binding? Then a
+    /// name lookup cannot produce an alternative definition of it. True for
+    /// prototype-only bindings too, which have no body to choose between.
+    fn is_sole_binding_of_name(&self, fid: FnId, name: &str) -> bool {
+        !self.fn_by_scope.contains_key(name)
+            && self
+                .externals_by_name
+                .get(name)
+                .is_some_and(|ids| ids.as_slice() == [fid])
+    }
+
     fn candidates_in_image(
         &self,
         name: &str,
@@ -1625,7 +1654,7 @@ impl SymbolTable {
     ) -> Vec<FnId> {
         // Most probes miss — a scope walk asks about every enclosing scope —
         // so the vector stays unallocated until something is found.
-        let mut out = Vec::new();
+        let mut out = CandidateSet::default();
         if let Some(file) = file {
             for (_, id) in self.in_scope(file, self.fn_by_scope.get(name).map(Vec::as_slice)) {
                 if !self.in_scope_of(id, scope) || !self.function_visible_from(id, file) {
@@ -1635,18 +1664,16 @@ impl SymbolTable {
                 // they surface the same further overloads. Each id is listed
                 // once: a repeat would wire the same callee edge twice.
                 let overloads = self.internal_overloads_seen_from(id, file);
-                for id in std::iter::once(id).chain(overloads) {
-                    if self.in_scope_of(id, scope)
-                        && self.function_visible_from(id, file)
-                        && !out.contains(&id)
-                    {
+                out.push(id);
+                for id in overloads {
+                    if self.in_scope_of(id, scope) {
                         out.push(id);
                     }
                 }
             }
         }
         if let Some(&id) = self.fn_by_name.get(name) {
-            if self.in_scope_of(id, scope) && !out.contains(&id) {
+            if self.in_scope_of(id, scope) {
                 out.push(id);
             }
         }
@@ -1657,12 +1684,12 @@ impl SymbolTable {
         // genuinely ambiguous, and a may-analysis expands both.
         if let Some(bucket) = self.externals_by_name.get(name) {
             for &id in bucket {
-                if self.in_scope_of(id, scope) && !out.contains(&id) {
+                if self.in_scope_of(id, scope) {
                     out.push(id);
                 }
             }
         }
-        out
+        out.into_vec()
     }
 
     /// Every external entry declared or defined under `name` (overloads
@@ -1770,6 +1797,62 @@ impl SymbolTable {
     }
 }
 
+/// The entries of a name-keyed bucket that belong to `file`.
+///
+/// Buckets are kept sorted by [`FileId`] (see [`insert_by_file`]), so the
+/// entries for one file are a contiguous run that binary search finds and
+/// everything after it is in ascending file order. Both lookup shapes the
+/// scope rules need — "the one in this file" and "the one in the
+/// lowest-numbered header" — read off that.
+fn file_run<T>(entries: &[(FileId, T)], file: FileId) -> (usize, &[(FileId, T)]) {
+    let start = entries.partition_point(|(f, _)| *f < file);
+    let len = entries[start..].partition_point(|(f, _)| *f == file);
+    (start, &entries[start..start + len])
+}
+
+/// Insert into a bucket, keeping it sorted by [`FileId`] and keeping equal-file
+/// entries in registration order. The single writer of that invariant.
+fn insert_by_file<T>(entries: &mut Vec<(FileId, T)>, file: FileId, value: T) {
+    let at = entries.partition_point(|(f, _)| *f <= file);
+    debug_assert!(at == 0 || entries[at - 1].0 <= file);
+    debug_assert!(at == entries.len() || entries[at].0 > file);
+    entries.insert(at, (file, value));
+}
+
+/// A candidate list that never lists an id twice.
+///
+/// The ordered vector stays authoritative — it is what callers get back, and
+/// its order is the resolution order. A membership set appears only once the
+/// list is long enough for the linear scan to cost more than it saves, since
+/// nearly every candidate list is a handful of entries.
+#[derive(Default)]
+struct CandidateSet {
+    out: Vec<FnId>,
+    seen: Option<FxHashSet<FnId>>,
+}
+
+impl CandidateSet {
+    /// Index size past which a membership set beats scanning the vector.
+    const INDEX_AT: usize = 16;
+
+    fn push(&mut self, id: FnId) {
+        if self.seen.is_none() && self.out.len() >= Self::INDEX_AT {
+            self.seen = Some(self.out.iter().copied().collect());
+        }
+        let fresh = match &mut self.seen {
+            Some(seen) => seen.insert(id),
+            None => !self.out.contains(&id),
+        };
+        if fresh {
+            self.out.push(id);
+        }
+    }
+
+    fn into_vec(self) -> Vec<FnId> {
+        self.out
+    }
+}
+
 /// Last `::` segment of a function name, for base-name indexing.
 fn base_name_of(name: &str) -> String {
     match name.rsplit("::").next() {
@@ -1857,6 +1940,142 @@ mod tests {
         assert!(!mk("ops->Dispatch", None, false).resolves_by_name());
         assert!(!mk("obj.fn", None, false).resolves_by_name());
         assert!(!mk("fp", Some(3), false).resolves_by_name());
+    }
+
+    #[test]
+    fn scope_lookup_preserves_file_priority_and_equal_file_order() {
+        let mut s = SymbolTable::default();
+        let mut ids = Vec::new();
+        for (file, target) in [(9, 0), (2, 0), (2, 1), (6, 0)] {
+            let mut f = fake_function(
+                s.alloc_fn_id(),
+                "local",
+                vec![],
+                true,
+                false,
+                FileId(file),
+                1,
+            );
+            f.linkage = Linkage::Internal;
+            f.target = Some(crate::TargetId(target));
+            ids.push(s.add_function(f));
+        }
+        for header in [9, 2, 6] {
+            s.register_included_header(FileId(20), FileId(header));
+        }
+        assert_eq!(
+            s.resolve_function_in_scope("local", Some(FileId(20))),
+            Some(ids[1])
+        );
+        assert_eq!(
+            s.resolve_function_in_scope("local", Some(FileId(9))),
+            Some(ids[0])
+        );
+        assert_eq!(
+            s.resolve_function_candidates("local", Some(FileId(20))),
+            vec![ids[1], ids[2], ids[3], ids[0]]
+        );
+    }
+
+    #[test]
+    fn file_static_lookup_preserves_header_priority_and_late_own_file() {
+        let mut s = SymbolTable::default();
+        let mut ids = Vec::new();
+        for file in [9, 2, 6, 4] {
+            let id = s.alloc_var_id();
+            ids.push(s.add_variable(Variable {
+                id,
+                name: "local".into(),
+                type_id: TypeId(0),
+                storage: StorageClass::FileStatic,
+                fn_id: None,
+                param_index: None,
+                span: Span::new(FileId(file), 1, 1),
+                is_pointer: false,
+                is_defined: true,
+                is_weak: false,
+                target: None,
+                is_namespaced: false,
+            }));
+        }
+        for header in [9, 2, 6] {
+            s.register_included_header(FileId(4), FileId(header));
+            s.register_included_header(FileId(20), FileId(header));
+        }
+        assert_eq!(s.file_static_named(FileId(20), "local"), Some(ids[1]));
+        assert_eq!(s.file_static_named(FileId(4), "local"), Some(ids[3]));
+    }
+
+    #[test]
+    fn sole_binding_shortcut_agrees_with_the_candidate_walk() {
+        let mut p = Program::new(PathBuf::from("/t"));
+        let caller_file = p.symbols.add_file(PathBuf::from("/t/c.c"));
+        let callee_file = p.symbols.add_file(PathBuf::from("/t/d.c"));
+        let entry = fake_function(
+            p.symbols.alloc_fn_id(),
+            "entry",
+            vec![],
+            true,
+            false,
+            caller_file,
+            1,
+        );
+        let caller = p.symbols.add_function(entry);
+        let f = fake_function(
+            p.symbols.alloc_fn_id(),
+            "f",
+            vec![],
+            true,
+            false,
+            callee_file,
+            1,
+        );
+        let callee = p.symbols.add_function(f);
+        let cs = CallSite {
+            id: CallSiteId(0),
+            caller,
+            callee_name: "f".into(),
+            callee_var: None,
+            callee_fn_id: Some(callee),
+            var_args: vec![],
+            fn_args: vec![],
+            addr_of_member_args: vec![],
+            args_bound_past_this: false,
+            span: Span::new(caller_file, 1, 1),
+            is_direct: true,
+            receiver_class: None,
+            return_dst: None,
+            tu: Some(caller_file),
+        };
+        // The shortcut applies, and the walk it replaces yields the same edge.
+        assert!(p.symbols.is_sole_binding_of_name(callee, "f"));
+        assert_eq!(p.callees_of(&cs), vec![callee]);
+        assert_eq!(
+            p.symbols
+                .resolve_function_candidates("f", Some(caller_file)),
+            vec![callee]
+        );
+    }
+
+    #[test]
+    fn an_internal_entry_under_the_name_defeats_the_sole_binding_shortcut() {
+        // A file-`static` definition shadows a same-name external inside its
+        // own TU, so the shortcut must never skip the candidate walk while
+        // any internal-linkage entry is registered under the name.
+        let mut p = Program::new(PathBuf::from("/t"));
+        let source = p.symbols.add_file(PathBuf::from("/t/d.c"));
+        let header = p.symbols.add_file(PathBuf::from("/t/h.h"));
+        let ext = fake_function(p.symbols.alloc_fn_id(), "f", vec![], true, false, source, 1);
+        let ext = p.symbols.add_function(ext);
+        assert!(p.symbols.is_sole_binding_of_name(ext, "f"));
+        let mut shadow =
+            fake_function(p.symbols.alloc_fn_id(), "f", vec![], true, false, header, 5);
+        shadow.linkage = Linkage::Internal;
+        p.symbols.add_function(shadow);
+        assert!(
+            !p.symbols.is_sole_binding_of_name(ext, "f"),
+            "an internal-linkage entry under the name must still be walked"
+        );
     }
 
     fn fake_function(

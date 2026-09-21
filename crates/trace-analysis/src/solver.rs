@@ -89,8 +89,6 @@ struct SolverState {
     /// Nodes whose one-time, points-to-independent constraint effects
     /// (addr-of seeding, GEP summary fallback) have already been applied.
     seen_once: FxHashSet<PagNodeId>,
-    /// Summary locations that hit `SUMMARY_MEM_CAP` and stopped growing.
-    saturated_summaries: FxHashSet<LocId>,
     /// Dedup for dynamically added parameter-copy constraints: the same
     /// (actual → formal) pair recurs across many call sites and re-adding it
     /// per discovered edge explodes constraint volume on large trees.
@@ -104,37 +102,156 @@ struct SolverState {
     /// declarations stay unfiltered).
     fn_arity: FxHashMap<LocId, usize>,
     /// Last-seen `memory_pts[loc]` size per `(dst, loc)` pair, used to skip
-    /// redundant `merge_memory_into` iterations when memory hasn't grown.
+    /// redundant merge iterations when memory hasn't grown.
     merge_sizes: FxHashMap<(PagNodeId, LocId), usize>,
+}
+
+/// Buffers reused across propagation steps.
+///
+/// Propagation runs millions of times on a large tree and every step used to
+/// allocate a fresh vector; on a 20-second profile of the biggest corpus the
+/// allocator, not the set logic, was the solver's largest single cost. These
+/// hold nothing between calls, so they live beside `SolverState` rather than
+/// in it and are passed to the step that needs them — which lets the borrow
+/// checker keep two steps from sharing one buffer.
+#[derive(Default)]
+struct Scratch {
+    /// `apply_store_to_targets`: the store's source set, materialized once.
+    store_src: Vec<LocId>,
+    /// `apply_store_to_targets`: every location the store writes.
+    store_targets: Vec<LocId>,
+    /// `apply_store_to_targets`: locations whose loaders must be requeued.
+    store_requeues: Vec<LocId>,
+    /// `apply_store_to_targets`: signature-filtered views of the source set.
+    store_views: StoreViews,
+    /// `apply_store_to_targets`: summary cells this store has written.
+    summaries_written: FxHashSet<LocId>,
+    /// `apply_store_to_targets`: locations this store has already requeued.
+    requeued: FxHashSet<LocId>,
+    /// `merge_memory_into_if_grown` / `propagate_locs`: the locations one
+    /// step adds.
+    fresh: Vec<LocId>,
+    /// `wire_params`: the actual argument's points-to, snapshotted so the
+    /// formal can be written while it is read.
+    wire_src: Vec<LocId>,
+    /// `touch_loc_holders`: the loading nodes to requeue.
+    holders: Vec<PagNodeId>,
+}
+
+/// Which function values a memory cell admits, read off its [`SlotGuard`].
+/// Non-function values always pass, whatever the guard.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FnFilter {
+    /// No guard, or a guard that constrains nothing: everything passes, so
+    /// no filtered view of the source set is needed at all.
+    Any,
+    /// A concrete non-fn-pointer cell (struct, array, scalar pointer): a
+    /// bare function address cannot occur there in valid C.
+    None,
+    /// A typed fn-pointer slot: same-arity functions, plus those whose
+    /// arity is unknown (old-style `()` declarations stay unfiltered).
+    Arity(usize),
+}
+
+impl FnFilter {
+    /// The filter a memory cell's guard imposes.
+    fn of(guard: Option<&SlotGuard>) -> Self {
+        match guard {
+            Option::None => Self::Any,
+            Some(SlotGuard::NotFnPtr) => Self::None,
+            Some(&SlotGuard::FnParams(n)) => Self::Arity(n),
+        }
+    }
+
+    /// Does the guard admit `loc` on its own terms, with no exemption for
+    /// non-function values?
+    ///
+    /// Note what `None` means here: a cell whose declared type is a concrete
+    /// non-fn-pointer object admits *nothing*, not merely no function value.
+    /// Only the memory merge asks the question this way — see
+    /// [`SolverState::merge_memory_into_if_grown`].
+    fn guard_admits(self, fn_arity: &FxHashMap<LocId, usize>, loc: LocId) -> bool {
+        match self {
+            Self::Any => true,
+            Self::None => false,
+            Self::Arity(n) => fn_arity.get(&loc).is_none_or(|p| *p == n),
+        }
+    }
+
+    /// May `loc` be *stored* into a cell guarded by `self`? Function values
+    /// are filtered; everything else flows unfiltered, which is what keeps
+    /// the store path sound.
+    fn admits(self, fn_arity: &FxHashMap<LocId, usize>, pag: &Pag, loc: LocId) -> bool {
+        fn_for_loc(pag, loc).is_none() || self.guard_admits(fn_arity, loc)
+    }
+}
+
+/// The signature-filtered views of one store's source points-to set.
+///
+/// Which locations may enter a target cell depends only on that cell's
+/// [`FnFilter`], not on the cell itself, so a single filtered view serves
+/// every target sharing a filter. Building one filtered copy per *target*
+/// was the largest cost in the solver on large corpora. Views are built
+/// lazily, and `Any` never needs one: the source set itself is the view.
+///
+/// `live` views describe the current store; the rest are past stores' and
+/// keep their capacity for reuse.
+#[derive(Default)]
+struct StoreViews {
+    views: Vec<(FnFilter, Vec<LocId>)>,
+    live: usize,
+}
+
+impl StoreViews {
+    /// Invalidate every view: the next store has a different source set.
+    fn reset(&mut self) {
+        self.live = 0;
+    }
+
+    /// The source set as `filter` sees it, built at most once per store.
+    fn view<'a>(
+        &'a mut self,
+        filter: FnFilter,
+        src: &'a [LocId],
+        pag: &Pag,
+        fn_arity: &FxHashMap<LocId, usize>,
+    ) -> &'a [LocId] {
+        if filter == FnFilter::Any {
+            return src;
+        }
+        if let Some(at) = self.views[..self.live]
+            .iter()
+            .position(|(k, _)| *k == filter)
+        {
+            return &self.views[at].1;
+        }
+        if self.live == self.views.len() {
+            self.views.push((filter, Vec::new()));
+        }
+        let at = self.live;
+        self.live += 1;
+        let (key, view) = &mut self.views[at];
+        *key = filter;
+        view.clear();
+        view.extend(
+            src.iter()
+                .copied()
+                .filter(|&l| filter.admits(fn_arity, pag, l)),
+        );
+        &self.views[at].1
+    }
 }
 
 /// Declared content type of a memory cell / points-to slot, as far as it is
 /// known, used to keep incompatible function values out under wrong-type
 /// pointer flow.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum SlotGuard {
     /// Slot is a `FnPtr` taking `n` parameters.
     FnParams(usize),
     /// Slot is a concrete non-fn-pointer type (e.g. a struct object);
     /// storing a bare function address there cannot occur in valid C.
     NotFnPtr,
-}
-
-impl SolverState {
-    /// May a function value enter the slot `slot`? Typed fn-pointer slots
-    /// accept only same-arity functions; concrete non-fn slots reject all;
-    /// unknown slots accept everything (conservative over-approximation).
-    #[inline]
-    fn arity_allows(&self, slot: LocId, fn_loc: LocId) -> bool {
-        match self.slot_guard.get(&slot) {
-            Some(SlotGuard::FnParams(n)) => match self.fn_arity.get(&fn_loc) {
-                Some(p) => p == n,
-                None => true,
-            },
-            Some(SlotGuard::NotFnPtr) => false,
-            None => true,
-        }
-    }
 }
 
 impl SolverState {
@@ -150,93 +267,128 @@ impl SolverState {
     /// them skip, so the location is appended to their delta explicitly
     /// (deduped).  Pushing ALL holders was the dominant budget burn on large
     /// trees — copy-only holders re-popped with no effect.
-    fn touch_loc_holders(&mut self, loc: LocId, load_src: &FxHashMap<PagNodeId, Vec<usize>>) {
-        if let Some(nodes) = self.loc_nodes.get(&loc).cloned() {
-            for n in nodes {
-                if !load_src.contains_key(&n) {
-                    continue;
-                }
-                self.record_delta(n, &[loc]);
-                self.push(n);
-            }
+    fn touch_loc_holders(
+        &mut self,
+        holders: &mut Vec<PagNodeId>,
+        loc: LocId,
+        load_src: &FxHashMap<PagNodeId, Vec<usize>>,
+    ) {
+        // Collected into a scratch buffer in the set's own iteration order:
+        // every write used to clone the whole holder set, which on hub
+        // locations is thousands of nodes.
+        holders.clear();
+        if let Some(nodes) = self.loc_nodes.get(&loc) {
+            holders.extend(nodes.iter().copied().filter(|n| load_src.contains_key(n)));
+        }
+        for &n in holders.iter() {
+            self.record_delta(n, &[loc]);
+            self.push(n);
         }
     }
 
     /// Record freshly inserted locations for difference propagation.
     fn record_delta(&mut self, node: PagNodeId, new_locs: &[LocId]) {
-        for &loc in new_locs {
-            if self.delta_pending.insert((node, loc)) {
-                self.delta.entry(node).or_default().push(loc);
+        match new_locs {
+            [] => {}
+            // `touch_loc_holders` records one location per holder and usually
+            // finds it already pending, so that path must not touch `delta`
+            // unless it actually records something.
+            &[loc] => {
+                if self.delta_pending.insert((node, loc)) {
+                    self.delta.entry(node).or_default().push(loc);
+                }
+            }
+            _ => {
+                let Self {
+                    delta,
+                    delta_pending,
+                    ..
+                } = self;
+                let delta = delta.entry(node).or_default();
+                for &loc in new_locs {
+                    if delta_pending.insert((node, loc)) {
+                        delta.push(loc);
+                    }
+                }
             }
         }
     }
 
-    /// Skip `merge_memory_into` when `memory_pts[mem_loc]` hasn't grown
-    /// since the last merge for this `(dst, mem_loc)` pair.  Breaks the
-    /// touch_loc_holders → re-merge cycle that dominated budget on large
-    /// trees.
-    fn merge_memory_into_if_grown(&mut self, dst: PagNodeId, mem_loc: LocId) {
-        let cur = self.memory_pts.get(&mem_loc).map(|m| m.len()).unwrap_or(0);
-        let key = (dst, mem_loc);
-        let prev = self.merge_sizes.get(&key).copied().unwrap_or(0);
-        if cur > prev {
-            self.merge_memory_into(dst, mem_loc);
-            self.merge_sizes.insert(key, cur);
-        }
-    }
-
-    /// Merge `memory_pts[mem_loc]` into `pts[dst]` without cloning.
-    /// Iterates only entries added since the last merge for this pair
-    /// (index-based since `memory_pts` uses `IndexSet`).
-    fn merge_memory_into(&mut self, dst: PagNodeId, mem_loc: LocId) {
-        let Some(mem) = self.memory_pts.get(&mem_loc) else {
-            return;
-        };
+    /// Merge whatever `memory_pts[mem_loc]` gained since the last merge for
+    /// this `(dst, mem_loc)` pair into `pts[dst]`, without cloning. Skipping
+    /// an ungrown memory breaks the `touch_loc_holders` → re-merge cycle that
+    /// dominated budget on large trees.
+    ///
+    /// Note the asymmetry with the store path: this applies the cell's guard
+    /// to *every* location it holds, not only to function values, so a cell
+    /// declared as a concrete non-fn-pointer object contributes nothing at
+    /// all to a points-to set. That is `arity_allows`'s behavior carried over
+    /// unchanged — this change is required to keep exports byte-identical, so
+    /// it is preserved, not endorsed.
+    fn merge_memory_into_if_grown(
+        &mut self,
+        fresh: &mut Vec<LocId>,
+        dst: PagNodeId,
+        mem_loc: LocId,
+    ) {
         let key = (dst, mem_loc);
         let prev_len = self.merge_sizes.get(&key).copied().unwrap_or(0);
-        let cur_len = mem.len();
+        let Some(cur_len) = self.memory_pts.get(&mem_loc).map(IndexSet::len) else {
+            return;
+        };
         if cur_len <= prev_len {
             return;
         }
-        let new_locs: Vec<LocId> = (prev_len..cur_len)
-            .filter_map(|i| {
+        // The cell's own filter is the same for every element it holds, so it
+        // is read once here rather than once per element.
+        let filter = FnFilter::of(self.slot_guard.get(&mem_loc));
+        fresh.clear();
+        // Collect first, insert second. Fusing the two — `pts.insert(loc)` in
+        // place of `!pts.contains(&loc)` — looks equivalent and saves a hash
+        // per added location, but it measurably reorders `pts` and changes the
+        // exported `points_to` rows on the HDF corpus. Whatever the mechanism,
+        // this pass is not the place to find out: keep the two passes.
+        {
+            let Self {
+                memory_pts,
+                pts,
+                fn_arity,
+                ..
+            } = self;
+            let mem = memory_pts.get(&mem_loc).expect("memory checked above");
+            let pts = pts.entry(dst).or_default();
+            for i in prev_len..cur_len {
                 let loc = mem[i];
-                if self.arity_allows(mem_loc, loc) {
-                    Some(loc)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if new_locs.is_empty() {
-            self.merge_sizes.insert(key, cur_len);
-            return;
-        }
-        let mut truly_new: Vec<LocId> = Vec::new();
-        {
-            let entry = self.pts.entry(dst).or_default();
-            for &loc in &new_locs {
-                if !entry.contains(&loc) {
-                    truly_new.push(loc);
+                if filter.guard_admits(fn_arity, loc) && !pts.contains(&loc) {
+                    fresh.push(loc);
                 }
             }
         }
-        if truly_new.is_empty() {
-            self.merge_sizes.insert(key, cur_len);
-            return;
-        }
-        {
-            let entry = self.pts.get_mut(&dst).expect("pts entry exists");
-            for loc in &truly_new {
-                entry.insert(*loc);
-            }
-        }
-        for loc in &truly_new {
-            self.loc_nodes.entry(*loc).or_default().insert(dst);
-        }
-        self.record_delta(dst, &truly_new);
-        self.push(dst);
         self.merge_sizes.insert(key, cur_len);
+        if fresh.is_empty() {
+            return;
+        }
+        {
+            let pts = self.pts.get_mut(&dst).expect("pts entry exists");
+            for &loc in fresh.iter() {
+                pts.insert(loc);
+            }
+        }
+        self.commit_fresh(dst, fresh);
+    }
+
+    /// Finish a step that just added `fresh` to `pts[dst]`: index the new
+    /// locations, record them for difference propagation, and requeue the
+    /// node. Shared by every write path so the sequence stays in one place.
+    fn commit_fresh(&mut self, dst: PagNodeId, fresh: &[LocId]) {
+        if fresh.is_empty() {
+            return;
+        }
+        for &loc in fresh {
+            self.loc_nodes.entry(loc).or_default().insert(dst);
+        }
+        self.record_delta(dst, fresh);
+        self.push(dst);
     }
 }
 
@@ -245,8 +397,9 @@ fn st_pts_stats_max(pts: &IndexMap<PagNodeId, FxHashSet<LocId>>) -> usize {
 }
 
 /// Maximum distinct locations remembered per instance-insensitive summary
-/// location. Past this, further stores are dropped (see saturation note in
-/// `apply_store_to_targets`).
+/// location. Past this, further stores to it are dropped — deliberate
+/// imprecision that bounds the cost of a hub summary on large trees. See the
+/// cap check in `apply_store_to_targets`.
 const SUMMARY_MEM_CAP: usize = 1024;
 
 fn solve(
@@ -265,13 +418,15 @@ fn solve(
         worklist: Vec::new(),
         queued: FxHashSet::default(),
         seen_once: FxHashSet::default(),
-        saturated_summaries: FxHashSet::default(),
         wired_copies: FxHashSet::default(),
         wired_model_edges: FxHashSet::default(),
         slot_guard: FxHashMap::default(),
         fn_arity: FxHashMap::default(),
         merge_sizes: FxHashMap::default(),
     };
+    // Lives beside the state, not in it: passing a buffer to the step that
+    // needs it makes two steps sharing one a compile error.
+    let mut scratch = Scratch::default();
     // Per-location slot guards and per-function parameter counts for
     // signature-aware propagation.
     use trace_ir::TypeDesc as TD;
@@ -356,6 +511,11 @@ fn solve(
         }
     }
 
+    // Read once: the phase timings, the periodic progress lines and the
+    // summary are one switch.
+    let stats_enabled = std::env::var("TRACE_SOLVER_STATS").is_ok();
+    let resolve_started = std::time::Instant::now();
+    let mut resolved_callees = 0usize;
     for cs in &program.symbols.call_sites {
         // Direct sites: lowering saw the TU-local binding, so scope-first
         // resolution is exact per C visibility rules (file-`static` shadows
@@ -370,6 +530,7 @@ fn solve(
         // under the analyzed root (prototype-only or synthesized) yields an
         // External edge and no param wiring — there is no body to wire into.
         for callee in program.callees_of(cs) {
+            resolved_callees += 1;
             let f = program.symbols.function(callee);
             let external = !f.is_defined;
             let has_formals = !f.params.is_empty();
@@ -387,10 +548,26 @@ fn solve(
             // prototype-only targets still carry parameter information.
             // Synthesized externals have none, so this skips them for free.
             if has_formals {
-                wire_params(pag, program, cs, callee, &mut st, &mut wired_arg_flow);
+                wire_params(
+                    pag,
+                    program,
+                    cs,
+                    callee,
+                    &mut st,
+                    &mut scratch,
+                    &mut wired_arg_flow,
+                );
             }
             apply_fn_model(pag, &mut st, cs, &f.name, models, &mut terminator_events);
         }
+    }
+    if stats_enabled {
+        eprintln!(
+            "[solver] RESOLVE sites={} callees={} elapsed={:?}",
+            program.symbols.call_sites.len(),
+            resolved_callees,
+            resolve_started.elapsed()
+        );
     }
 
     let t0 = std::time::Instant::now();
@@ -410,15 +587,13 @@ fn solve(
         Err(_) => budget_override,
     };
 
-    if std::env::var("TRACE_SOLVER_STATS").is_ok() {
+    if stats_enabled {
         eprintln!(
             "[solver] START constraints={} vars={}",
             pag.constraints.len(),
             program.symbols.variables.len()
         );
     }
-    let stats_enabled = std::env::var("TRACE_SOLVER_STATS").is_ok();
-
     while let Some(node) = st.worklist.pop() {
         st.queued.remove(&node);
         pops += 1;
@@ -496,8 +671,8 @@ fn solve(
                                 pag.ensure_field_summary_for_var(program, base_var, field)
                             };
                             if let Some(summary) = summary_opt {
-                                propagate_locs(&mut st, dst, [summary]);
-                                st.merge_memory_into_if_grown(dst, summary);
+                                propagate_locs(&mut st, &mut scratch.fresh, dst, [summary]);
+                                st.merge_memory_into_if_grown(&mut scratch.fresh, dst, summary);
                             }
                         }
                     }
@@ -510,7 +685,7 @@ fn solve(
             for &idx in idxs {
                 let dst = pag.constraints[idx].dst;
                 w_copy += delta.len() as u64;
-                propagate_slice(&mut st, dst, &delta);
+                propagate_locs(&mut st, &mut scratch.fresh, dst, delta.iter().copied());
             }
         }
 
@@ -531,24 +706,27 @@ fn solve(
                         add_pts(&mut st, dst, loc);
                     } else {
                         w_load += 1;
-                        st.merge_memory_into_if_grown(dst, loc);
+                        st.merge_memory_into_if_grown(&mut scratch.fresh, dst, loc);
                     }
                 }
             }
         }
 
+        // Read by reference: `apply_store_to_targets` only needs `&Pag`, so
+        // these index lists need no per-pop copy (the `gep` branch below
+        // still does — it synthesizes locations through `&mut pag`).
         if !delta.is_empty() {
-            if let Some(idxs) = pag.indices.store_dst.get(&node).cloned() {
-                for idx in idxs {
+            if let Some(idxs) = pag.indices.store_dst.get(&node) {
+                for &idx in idxs {
                     w_store += delta.len() as u64;
-                    apply_store_to_targets(pag, idx, &mut st, Some(delta.as_slice()));
+                    apply_store_to_targets(pag, idx, &mut st, &mut scratch, Some(delta.as_slice()));
                 }
             }
 
-            if let Some(idxs) = pag.indices.store_src.get(&node).cloned() {
-                for idx in idxs {
+            if let Some(idxs) = pag.indices.store_src.get(&node) {
+                for &idx in idxs {
                     w_store += 1;
-                    apply_store_to_targets(pag, idx, &mut st, None);
+                    apply_store_to_targets(pag, idx, &mut st, &mut scratch, None);
                 }
             }
         }
@@ -640,6 +818,7 @@ fn solve(
                         let targets = [Some(field_loc), pag.summary_for_field_loc(field_loc)];
                         propagate_locs(
                             &mut st,
+                            &mut scratch.fresh,
                             dst,
                             targets.iter().filter_map(|t| t.as_ref().copied()),
                         );
@@ -648,7 +827,7 @@ fn solve(
                         // loaded) still observe stores that lowering recorded
                         // against the cell without an intervening load temp.
                         for fl in targets.into_iter().flatten() {
-                            st.merge_memory_into_if_grown(dst, fl);
+                            st.merge_memory_into_if_grown(&mut scratch.fresh, dst, fl);
                         }
                         // ArrayFnMember element fns: reachable through
                         // the array itself or any pointer to an element.
@@ -683,8 +862,8 @@ fn solve(
                             pag.ensure_field_summary_for_var(program, base_var, field)
                         };
                         if let Some(summary) = summary_opt {
-                            propagate_locs(&mut st, dst, [summary]);
-                            st.merge_memory_into_if_grown(dst, summary);
+                            propagate_locs(&mut st, &mut scratch.fresh, dst, [summary]);
+                            st.merge_memory_into_if_grown(&mut scratch.fresh, dst, summary);
                         }
                     }
                     continue 'gep;
@@ -744,7 +923,15 @@ fn solve(
                             callee,
                             resolution: ResolutionKind::Indirect,
                         });
-                        wire_params(pag, program, cs, callee, &mut st, &mut wired_arg_flow);
+                        wire_params(
+                            pag,
+                            program,
+                            cs,
+                            callee,
+                            &mut st,
+                            &mut scratch,
+                            &mut wired_arg_flow,
+                        );
                         // Expand return flows from the callee into the
                         // `CallReturnIndirect` destination so the return
                         // value reaches the assignment LHS (e.g.
@@ -826,7 +1013,7 @@ fn solve(
         IndexMap::new()
     };
 
-    if std::env::var("TRACE_SOLVER_STATS").is_ok() {
+    if stats_enabled {
         let biggest = st_pts_stats_max(&points_to);
         eprintln!(
             "[solver] DONE pops={} elapsed={:?} constraints={} max_pts={} resolved_sites={}",
@@ -966,54 +1153,33 @@ fn apply_fn_model(
     }
 }
 
-fn propagate_locs(st: &mut SolverState, dst: PagNodeId, locs: impl IntoIterator<Item = LocId>) {
-    let mut new_locs: Vec<LocId> = Vec::new();
+/// Add `locs` to `pts[dst]`, indexing and requeueing whatever is new.
+///
+/// The single write path: `Copy` propagation, GEP results, memory merges and
+/// parameter wiring all funnel through here, so the order in which fresh
+/// locations reach `delta` is defined in one place.
+fn propagate_locs(
+    st: &mut SolverState,
+    fresh: &mut Vec<LocId>,
+    dst: PagNodeId,
+    locs: impl IntoIterator<Item = LocId>,
+) {
+    fresh.clear();
     {
         let entry = st.pts.entry(dst).or_default();
         for loc in locs {
             if !entry.contains(&loc) {
-                new_locs.push(loc);
+                fresh.push(loc);
             }
         }
     }
-    if new_locs.is_empty() {
-        return;
-    }
     {
         let entry = st.pts.get_mut(&dst).expect("entry just created");
-        for loc in &new_locs {
-            entry.insert(*loc);
-            st.loc_nodes.entry(*loc).or_default().insert(dst);
+        for &loc in fresh.iter() {
+            entry.insert(loc);
         }
     }
-    st.record_delta(dst, &new_locs);
-    st.push(dst);
-}
-
-fn propagate_slice(st: &mut SolverState, dst: PagNodeId, src: &[LocId]) {
-    let mut new_locs: Vec<LocId> = Vec::new();
-    {
-        let entry = st.pts.entry(dst).or_default();
-        for &loc in src {
-            if !entry.contains(&loc) {
-                new_locs.push(loc);
-            }
-        }
-    }
-    if new_locs.is_empty() {
-        return;
-    }
-    {
-        let entry = st.pts.get_mut(&dst).expect("entry just created");
-        for loc in &new_locs {
-            entry.insert(*loc);
-        }
-    }
-    for loc in &new_locs {
-        st.loc_nodes.entry(*loc).or_default().insert(dst);
-    }
-    st.record_delta(dst, &new_locs);
-    st.push(dst);
+    st.commit_fresh(dst, fresh);
 }
 
 /// Store `*ptr = value`: write the value side's current points-to (plus its
@@ -1021,34 +1187,61 @@ fn propagate_slice(st: &mut SolverState, dst: PagNodeId, src: &[LocId]) {
 /// locations. `targets == None` means every location currently in the pointer
 /// node's set; `Some(delta)` restricts writes to newly gained targets
 /// (difference propagation — their memory is written for the first time).
-fn apply_store_to_targets(pag: &Pag, idx: usize, st: &mut SolverState, targets: Option<&[LocId]>) {
+fn apply_store_to_targets(
+    pag: &Pag,
+    idx: usize,
+    st: &mut SolverState,
+    scratch: &mut Scratch,
+    targets: Option<&[LocId]>,
+) {
     let c = &pag.constraints[idx];
-    // Clone-free store: `pts` and `memory_pts` are disjoint fields, so the
-    // destination set can be iterated by reference while memory is mutated.
-    let src_set = st.pts.get(&c.src);
-    let self_loc = match pag.nodes[c.src.0 as usize].kind {
+    let (src_node, dst_node) = (c.src, c.dst);
+    let self_loc = match pag.nodes[src_node.0 as usize].kind {
         PagNodeKind::Var(v) => pag.var_location.get(&v).copied(),
         _ => None,
     };
-    if src_set.map(|s| s.is_empty()).unwrap_or(true) && self_loc.is_none() {
+    let src_empty = st.pts.get(&src_node).map(|s| s.is_empty()).unwrap_or(true);
+    if src_empty && self_loc.is_none() {
         return;
     }
-    let owned_targets: Vec<LocId>;
-    let target_iter: &[LocId] = match targets {
+
+    let target_slice: &[LocId] = match targets {
         // `ts` borrows the caller-owned delta vector, disjoint from `st`:
         // iterate it directly, no copy needed.
         Some(ts) => ts,
         None => {
-            owned_targets = st
-                .pts
-                .get(&c.dst)
-                .map(|s| s.iter().copied().collect())
-                .unwrap_or_default();
-            &owned_targets
+            scratch.store_targets.clear();
+            if let Some(s) = st.pts.get(&dst_node) {
+                scratch.store_targets.extend(s.iter().copied());
+            }
+            &scratch.store_targets
         }
     };
-    let mut requeues: Vec<LocId> = Vec::new();
-    for &loc in target_iter.iter() {
+    if target_slice.is_empty() {
+        return;
+    }
+
+    // Clone-free store: `pts` and `memory_pts` are disjoint fields, so the
+    // source set is snapshotted once — in its own iteration order — and every
+    // target writes that same snapshot. A filter can only ever reject a
+    // *function* value, so a source carrying none needs no view at all.
+    let src = &mut scratch.store_src;
+    src.clear();
+    let mut src_has_fns = false;
+    if let Some(s) = st.pts.get(&src_node) {
+        for &l in s.iter() {
+            src_has_fns |= fn_for_loc(pag, l).is_some();
+            src.push(l);
+        }
+    }
+    let src = &scratch.store_src;
+    let views = &mut scratch.store_views;
+    views.reset();
+    scratch.summaries_written.clear();
+    scratch.requeued.clear();
+    scratch.store_requeues.clear();
+
+    for &loc in target_slice {
         if fn_for_loc(pag, loc).is_some() {
             continue;
         }
@@ -1061,66 +1254,72 @@ fn apply_store_to_targets(pag: &Pag, idx: usize, st: &mut SolverState, targets: 
         // loads surface them as bogus indirect-call targets. Untyped cells
         // (`void *`, unknown layouts) stay writable — conservative.
         let mut changed = false;
-        // Signature-guarded view of the source set (see comment above).
-        let filtered_src: Vec<LocId> = match src_set {
-            Some(s) => s
-                .iter()
-                .copied()
-                .filter(|&l| fn_for_loc(pag, l).is_none() || st.arity_allows(loc, l))
-                .collect(),
-            None => Vec::new(),
+        let filter = if src_has_fns {
+            FnFilter::of(st.slot_guard.get(&loc))
+        } else {
+            FnFilter::Any
         };
-        let filtered_ref: Option<&[LocId]> = src_set.map(|_| filtered_src.as_slice());
         {
+            let view = views.view(filter, src, pag, &st.fn_arity);
             let entry = st.memory_pts.entry(loc).or_default();
             let before = entry.len();
-            if let Some(s) = filtered_ref {
-                for &l in s.iter() {
-                    entry.insert(l);
-                }
+            for &l in view {
+                entry.insert(l);
             }
             if let Some(sl) = self_loc {
                 entry.insert(sl);
             }
             changed |= entry.len() > before;
         }
-        let mut summary_loc = None;
-        if let Some(summary) = pag.summary_for_field_loc(loc) {
-            summary_loc = Some(summary);
-            let summary_entry = st.memory_pts.entry(summary).or_default();
-            let before_summary = summary_entry.len();
-            if summary_entry.len() < SUMMARY_MEM_CAP {
-                let accepts_fns = matches!(
-                    st.slot_guard.get(&summary),
-                    None | Some(SlotGuard::FnParams(_))
-                );
-                // Same signature guard for the instance-insensitive summary
-                // cell (its declared type mirrors the field's).
-                if let Some(s) = src_set {
-                    for &l in s.iter() {
-                        if !accepts_fns && fn_for_loc(pag, l).is_some() {
-                            continue;
-                        }
-                        summary_entry.insert(l);
-                    }
+        let summary_loc = pag.summary_for_field_loc(loc);
+        if let Some(summary) = summary_loc {
+            let entry = st.memory_pts.entry(summary).or_default();
+            let before_summary = entry.len();
+            // Past the cap the summary stops growing: this store's writes to
+            // it are dropped, and every later one is too, since cell memory
+            // never shrinks.
+            if before_summary < SUMMARY_MEM_CAP && scratch.summaries_written.insert(summary) {
+                // Many of a store's targets are field cells of the same
+                // struct type and field, and they all share that summary.
+                // Memory only grows, so once this store has written the
+                // summary every later write of it in the same store is an
+                // insert-by-insert no-op, and is skipped.
+                //
+                // The summary cell mirrors the field's declared type, but
+                // only its function-vs-not distinction: a typed fn-pointer
+                // summary takes function values of any arity.
+                let summary_filter = match st.slot_guard.get(&summary) {
+                    Some(SlotGuard::NotFnPtr) if src_has_fns => FnFilter::None,
+                    _ => FnFilter::Any,
+                };
+                let view = views.view(summary_filter, src, pag, &st.fn_arity);
+                let entry = st.memory_pts.entry(summary).or_default();
+                for &l in view {
+                    entry.insert(l);
                 }
                 if let Some(sl) = self_loc {
-                    summary_entry.insert(sl);
+                    entry.insert(sl);
                 }
-            } else if !st.saturated_summaries.contains(&summary) {
-                st.saturated_summaries.insert(summary);
+                changed |= entry.len() > before_summary;
             }
-            changed |= summary_entry.len() > before_summary;
         }
         if changed {
-            requeues.push(loc);
+            scratch.store_requeues.push(loc);
             if let Some(summary) = summary_loc {
-                requeues.push(summary);
+                scratch.store_requeues.push(summary);
             }
         }
     }
-    for loc in requeues {
-        st.touch_loc_holders(loc, &pag.indices.load_src);
+
+    // Requeuing a location twice is a no-op the second time (its delta and
+    // worklist entries are already there), but re-walking its holder set is
+    // not. Shared summaries make that duplicate common; first-occurrence
+    // order is kept, so the surviving calls run in the order they did.
+    for i in 0..scratch.store_requeues.len() {
+        let loc = scratch.store_requeues[i];
+        if scratch.requeued.insert(loc) {
+            st.touch_loc_holders(&mut scratch.holders, loc, &pag.indices.load_src);
+        }
     }
 }
 
@@ -1186,6 +1385,7 @@ fn wire_params(
     cs: &trace_ir::CallSite,
     callee: FnId,
     st: &mut SolverState,
+    scratch: &mut Scratch,
     wired: &mut FxHashSet<(CallSiteId, u32, FnId)>,
 ) {
     let callee_fn = program.symbols.function(callee);
@@ -1206,8 +1406,17 @@ fn wire_params(
             {
                 ensure_param_copy(pag, st, actual_node, formal_node);
             }
-            if let Some(actual_pts) = st.pts.get(&actual_node).cloned() {
-                propagate_pts(st, formal_node, &actual_pts);
+            if let Some(actual_pts) = st.pts.get(&actual_node) {
+                // Snapshotted rather than cloned: this used to copy the
+                // actual's whole points-to set once per wired argument.
+                scratch.wire_src.clear();
+                scratch.wire_src.extend(actual_pts.iter().copied());
+                propagate_locs(
+                    st,
+                    &mut scratch.fresh,
+                    formal_node,
+                    scratch.wire_src.iter().copied(),
+                );
             }
             wired.insert((cs.id, idx, callee));
         } else if cs.fn_args.iter().any(|(j, _)| *j == idx) {
@@ -1221,32 +1430,6 @@ fn wire_params(
             wired.insert((cs.id, idx, callee));
         }
     }
-}
-
-fn propagate_pts(st: &mut SolverState, dst: PagNodeId, src_pts: &FxHashSet<LocId>) {
-    let mut new_locs: Vec<LocId> = Vec::new();
-    {
-        let entry = st.pts.entry(dst).or_default();
-        for &loc in src_pts {
-            if !entry.contains(&loc) {
-                new_locs.push(loc);
-            }
-        }
-    }
-    if new_locs.is_empty() {
-        return;
-    }
-    {
-        let entry = st.pts.get_mut(&dst).expect("entry just created");
-        for loc in &new_locs {
-            entry.insert(*loc);
-        }
-    }
-    for loc in &new_locs {
-        st.loc_nodes.entry(*loc).or_default().insert(dst);
-    }
-    st.record_delta(dst, &new_locs);
-    st.push(dst);
 }
 
 fn add_pts(st: &mut SolverState, node: PagNodeId, loc: LocId) {
@@ -1449,5 +1632,128 @@ fn extract_arg_flow(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constraints::AbstractLocation;
+    use trace_ir::{LocId, TypeId};
+
+    fn loc(id: u32, is_fn: bool) -> AbstractLocation {
+        AbstractLocation {
+            id: LocId(id),
+            kind: if is_fn {
+                LocKind::Function
+            } else {
+                LocKind::Global
+            },
+            var: None,
+            fn_id: is_fn.then_some(FnId(id)),
+            field: None,
+            type_id: TypeId(0),
+            desc: String::new(),
+        }
+    }
+
+    /// Locations 0-2 are function values of arity 1, 2 and unknown; 3-4 are
+    /// ordinary objects, which no slot guard may reject.
+    fn store_fixture() -> (Pag, FxHashMap<LocId, usize>, Vec<LocId>) {
+        let mut pag = Pag::default();
+        for i in 0..5u32 {
+            pag.locations.push(loc(i, i < 3));
+        }
+        let mut fn_arity = FxHashMap::default();
+        fn_arity.insert(LocId(0), 1);
+        fn_arity.insert(LocId(1), 2);
+        (pag, fn_arity, (0..5).map(LocId).collect())
+    }
+
+    /// `StoreViews` replaces the filtered copy the old solver built per
+    /// target location with one view per filter. Each view must select
+    /// exactly what the element-wise predicate selects.
+    #[test]
+    fn store_views_match_element_wise_filtering() {
+        let (pag, fn_arity, src) = store_fixture();
+        let mut views = StoreViews::default();
+        for filter in [
+            FnFilter::Any,
+            FnFilter::None,
+            FnFilter::Arity(1),
+            FnFilter::Arity(2),
+            FnFilter::Arity(3),
+        ] {
+            views.reset();
+            let view = views.view(filter, &src, &pag, &fn_arity).to_vec();
+            let expected: Vec<LocId> = src
+                .iter()
+                .copied()
+                .filter(|&l| filter.admits(&fn_arity, &pag, l))
+                .collect();
+            assert_eq!(view, expected, "filter {filter:?}");
+        }
+    }
+
+    /// Every `SlotGuard` maps to the filter that reproduces it, so the guard
+    /// rule has one implementation rather than one per call site.
+    #[test]
+    fn slot_guards_map_to_the_filter_they_describe() {
+        let (_, fn_arity, _) = store_fixture();
+        assert_eq!(FnFilter::of(None), FnFilter::Any);
+        assert_eq!(FnFilter::of(Some(&SlotGuard::NotFnPtr)), FnFilter::None);
+        assert_eq!(
+            FnFilter::of(Some(&SlotGuard::FnParams(2))),
+            FnFilter::Arity(2)
+        );
+        // An unguarded slot takes anything; a non-fn-pointer slot takes no
+        // function value; a typed slot takes its own arity and unknowns.
+        assert!(FnFilter::Any.guard_admits(&fn_arity, LocId(0)));
+        assert!(!FnFilter::None.guard_admits(&fn_arity, LocId(0)));
+        assert!(FnFilter::Arity(1).guard_admits(&fn_arity, LocId(0)));
+        assert!(!FnFilter::Arity(2).guard_admits(&fn_arity, LocId(0)));
+        assert!(
+            FnFilter::Arity(9).guard_admits(&fn_arity, LocId(2)),
+            "unknown arity passes"
+        );
+    }
+
+    /// Within one store a repeated filter reuses the view already built; a
+    /// `reset` invalidates every view so the next store, whose source set is
+    /// a different one, cannot be answered from it.
+    #[test]
+    fn store_views_are_reused_within_a_store_and_dropped_between_stores() {
+        let (pag, fn_arity, src) = store_fixture();
+        let mut views = StoreViews::default();
+
+        views.reset();
+        // `Any` is the source set itself and never occupies a view slot.
+        assert_eq!(views.view(FnFilter::Any, &src, &pag, &fn_arity), src);
+        assert_eq!(views.live, 0);
+        assert_eq!(
+            views.view(FnFilter::Arity(1), &src, &pag, &fn_arity).len(),
+            4
+        );
+        assert_eq!(views.live, 1);
+        assert_eq!(
+            views.view(FnFilter::Arity(1), &src, &pag, &fn_arity).len(),
+            4
+        );
+        assert_eq!(views.live, 1, "a repeated filter reuses its view");
+        assert_eq!(
+            views.view(FnFilter::Arity(2), &src, &pag, &fn_arity).len(),
+            4
+        );
+        assert_eq!(views.live, 2);
+        assert_eq!(
+            views.view(FnFilter::None, &src, &pag, &fn_arity),
+            [LocId(3), LocId(4)]
+        );
+
+        views.reset();
+        assert!(views
+            .view(FnFilter::Arity(1), &[], &pag, &fn_arity)
+            .is_empty());
+        assert!(views.view(FnFilter::None, &[], &pag, &fn_arity).is_empty());
     }
 }
