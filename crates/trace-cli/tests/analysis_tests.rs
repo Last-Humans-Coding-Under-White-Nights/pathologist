@@ -153,7 +153,7 @@ fn in_out_ptr_has_store_flow() {
             .any(|f| matches!(f, trace_ir::FlowConstraint::Store { .. })),
         "expected Store constraint from *pp = &global_x"
     );
-    let (_pag, analysis) = analyze(&program);
+    let (pag, analysis) = analyze_with_pts(&program);
     assert!(has_edge(
         &program,
         &analysis,
@@ -161,6 +161,8 @@ fn in_out_ptr_has_store_flow() {
         "init",
         ResolutionKind::Direct
     ));
+    // Issue #127: `init(&p)` passes p's address.
+    assert_points_to(&program, &pag, &analysis, "pp", "p");
 }
 
 #[test]
@@ -888,4 +890,634 @@ fn preprocess_diagnostics_survive_second_language_warm() {
     assert_eq!(hits.len(), 1, "{rows:?}");
     assert!(hits[0].2.ends_with("shared.h"), "{rows:?}");
     assert_eq!(hits[0].3, 2, "{rows:?}");
+}
+
+fn analyze_with_pts(
+    program: &trace_ir::Program,
+) -> (trace_analysis::Pag, trace_analysis::AnalysisResult) {
+    trace_analysis::analyze_with_options(
+        program,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// Issue #127 (R1): a load through `int **` returns what the store wrote.
+#[test]
+fn load_through_pointer_typed_cell_keeps_flow() {
+    let root = fixture("load_ptr_cell");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    assert_points_to(&program, &pag, &analysis, "direct", "g");
+    assert_points_to(&program, &pag, &analysis, "viaload", "g");
+}
+
+/// Issue #127 (R4): out-parameter written through `int **`, read back by the
+/// caller through the same cell (`*t`).
+#[test]
+fn out_param_via_variable_reaches_caller() {
+    let root = fixture("load_ptr_cell");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    assert_points_to(&program, &pag, &analysis, "taken_via_var", "g");
+}
+
+/// Issue #127: a `Ptr`-typed cell holding a struct address loads it back.
+#[test]
+fn load_through_cell_holding_aggregate_address() {
+    let root = fixture("load_ptr_cell");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    assert_points_to(&program, &pag, &analysis, "boxload", "bx");
+}
+
+/// Issue #127 (R5): the formal of `f(&r)` points to `r`.
+#[test]
+fn addr_of_argument_passes_the_address() {
+    let root = fixture("addr_of_arg");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    assert_points_to(&program, &pag, &analysis, "seen", "r");
+}
+
+/// Issue #127 (R2): `get_buf(&q)` passes q's address, so formal `out` points to `q`.
+#[test]
+fn addr_of_arg_passes_address_to_formal() {
+    let root = fixture("addr_of_arg");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    assert_local_points_to(&program, &pag, &analysis, "get_buf", "out", "q");
+}
+
+/// Issue #127 (R7): `f(&s)` with `s = &x` passes s's address, not x.
+#[test]
+fn addr_of_initialized_pointer_passes_address_not_pointee() {
+    let root = fixture("addr_of_arg");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    assert_points_to(&program, &pag, &analysis, "seen", "s");
+    assert_not_points_to(&program, &pag, &analysis, "seen", "x");
+}
+
+fn var_cell_sync() -> (
+    trace_ir::Program,
+    trace_analysis::Pag,
+    trace_analysis::AnalysisResult,
+) {
+    let root = fixture("var_cell_sync");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    (program, pag, analysis)
+}
+
+/// Issue #127 (R9, R10): a store through `&v` is visible to a direct read of `v`.
+#[test]
+fn cell_store_reaches_direct_read() {
+    let (program, pag, analysis) = var_cell_sync();
+    assert_points_to(&program, &pag, &analysis, "loc_ident", "g");
+    assert_points_to(&program, &pag, &analysis, "glob_ident", "g");
+}
+
+/// Issue #127 (R11, R12): a direct write to `v` is visible to a load through `&v`,
+/// and a global's self-location seed never leaks into its cell.
+#[test]
+fn direct_write_reaches_load_through_cell() {
+    let (program, pag, analysis) = var_cell_sync();
+    assert_points_to(&program, &pag, &analysis, "rev_local", "h");
+    assert_points_to(&program, &pag, &analysis, "rev_glob", "h");
+    assert_not_points_to(&program, &pag, &analysis, "rev_glob", "G2");
+}
+
+/// Issue #127 (R13): a callback returned through an out-parameter is called.
+#[test]
+fn out_param_callback_resolves_indirect_call() {
+    let (program, _pag, analysis) = var_cell_sync();
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_cb",
+        "handler",
+        ResolutionKind::Indirect
+    ));
+}
+
+/// Issue #127 (R8): the issue's own last example, `get_buf(&q); taken = q;`.
+#[test]
+fn addr_of_out_param_reaches_direct_read() {
+    let root = fixture("addr_of_arg");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    assert_points_to(&program, &pag, &analysis, "taken", "g");
+}
+
+/// Issue #127: only variables whose address is taken are synced. `p = G3`
+/// copies G3's value (plus the solver's self-location seed), so `*p = &k`
+/// writes what G3 points to, never G3 itself.
+#[test]
+fn store_through_value_copy_does_not_write_the_global() {
+    let (program, pag, analysis) = var_cell_sync();
+    assert_points_to(&program, &pag, &analysis, "seed_read", "slot");
+    assert_not_points_to(&program, &pag, &analysis, "seed_read", "k");
+}
+
+/// Issue #127 review: `f(&r)` with a C++ reference `r` passes the referent's
+/// address, which is what the reference variable itself holds.
+#[test]
+fn addr_of_reference_passes_the_referent() {
+    let root = fixture("cpp_out_param");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    assert_points_to(&program, &pag, &analysis, "seen", "global");
+    assert_not_points_to(&program, &pag, &analysis, "seen", "r");
+}
+
+/// Issue #127 review: taking `&G4` somewhere does not make the solver's
+/// self-location seed a real address: `p = G4; *p = &k` still writes what
+/// G4 points to, never G4.
+#[test]
+fn address_taken_global_keeps_value_copies_apart() {
+    let (program, pag, analysis) = var_cell_sync();
+    assert_points_to(&program, &pag, &analysis, "g4_read", "slot");
+    assert_not_points_to(&program, &pag, &analysis, "g4_read", "k");
+}
+
+/// Issue #127 review: `*out = &fn` and `*out = (cb_t)fn` store the function
+/// like `*out = fn` does.
+#[test]
+fn out_param_callback_by_address_or_cast_resolves() {
+    let root = fixture("cpp_out_param");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_by_address",
+        "by_address",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_by_cast",
+        "by_cast",
+        ResolutionKind::Indirect
+    ));
+}
+
+/// Issue #127 review: deferred stores' temporaries belong to the function
+/// whose body produced them.
+#[test]
+fn deferred_store_temps_have_a_function() {
+    let (program, _pag, analysis) = var_cell_sync();
+    let orphans: Vec<_> = program
+        .symbols
+        .variables
+        .iter()
+        .filter(|v| v.name.starts_with("_ret") && v.fn_id.is_none())
+        .map(|v| (v.name.clone(), v.span.line))
+        .collect();
+    assert!(orphans.is_empty(), "temps without a function: {orphans:?}");
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_later_fn",
+        "later_fn",
+        ResolutionKind::Indirect
+    ));
+}
+
+/// Issue #127 review: a cell created mid-solve gets its slot guard, so a
+/// function value cast into an `int *` cell is not lifted back out.
+#[test]
+fn mid_solve_cell_keeps_its_slot_guard() {
+    let (program, _pag, analysis) = var_cell_sync();
+    assert!(!has_edge(
+        &program,
+        &analysis,
+        "mid_solve_guard",
+        "two_args",
+        ResolutionKind::Indirect
+    ));
+}
+
+/// Issue #127 review: an `AddrOf` that `expand_return_flows` adds mid-solve
+/// (`return &v` behind an indirect call) seeds its destination.
+#[test]
+fn mid_solve_return_address_reaches_the_caller() {
+    let (program, pag, analysis) = var_cell_sync();
+    assert_local_points_to(
+        &program,
+        &pag,
+        &analysis,
+        "mid_solve_guard",
+        "c",
+        "made_mid_solve",
+    );
+}
+
+/// Issue #127 review (P1): HDF's driver-loader singleton. The constructor
+/// stores the methods through `HdfDriverLoader.super`, the caller loads them
+/// through `IDriverLoader *`; both must reach one field summary.
+#[test]
+fn driver_loader_methods_resolve_through_the_interface() {
+    let root = fixture("object_manager_loader");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    for callee in ["HdfDriverLoaderGetDriver", "HdfDriverLoaderReclaimDriver"] {
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                "DevHostServiceAddDevice",
+                callee,
+                ResolutionKind::Indirect
+            ),
+            "DevHostServiceAddDevice must reach {callee}"
+        );
+    }
+}
+
+/// Issue #127 review: a function stored through a `void **` out-parameter
+/// reaches the caller's `void *`: untyped cells accept function values.
+#[test]
+fn void_pointer_cell_accepts_a_function() {
+    let (program, _pag, analysis) = var_cell_sync();
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_sym",
+        "sym_handler",
+        ResolutionKind::Indirect
+    ));
+}
+
+/// Issue #127 review: C declarators bind inside-out, so `int *t[4]` is an
+/// array of pointers and `void (*h[4])(void)` an array of function pointers.
+#[test]
+fn declarators_bind_the_c_way() {
+    use trace_ir::TypeDesc as TD;
+    let (program, _pag, _analysis) = var_cell_sync();
+    let desc = |name: &str| {
+        let v = program
+            .symbols
+            .variables
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap();
+        program.types.get(v.type_id).desc.as_ref().clone()
+    };
+    assert!(
+        matches!(desc("ptr_table"), TD::Array { elem, .. } if matches!(*elem, TD::Ptr(ref i) if **i == TD::Int)),
+        "ptr_table: {:?}",
+        desc("ptr_table")
+    );
+    assert!(
+        matches!(desc("handler_table"), TD::Array { elem, .. } if matches!(*elem, TD::Ptr(ref i) if matches!(**i, TD::FnPtr { .. }))),
+        "handler_table: {:?}",
+        desc("handler_table")
+    );
+    assert!(
+        matches!(desc("int_getter"), TD::Ptr(f) if matches!(*f, TD::FnPtr { ref ret, .. } if matches!(**ret, TD::Ptr(_)))),
+        "int_getter: {:?}",
+        desc("int_getter")
+    );
+}
+
+/// Issue #127 review: an array of pointers keeps the storage seed, so a
+/// callee writing through it reaches the elements.
+#[test]
+fn array_of_pointers_is_storage() {
+    let (program, pag, analysis) = var_cell_sync();
+    assert_points_to(&program, &pag, &analysis, "table_read", "g");
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_handler_table",
+        "table_handler",
+        ResolutionKind::Indirect
+    ));
+}
+
+/// Issue #127 review: a variable whose address an indirect call returns has
+/// its current value in its cell, like one whose address is taken directly.
+#[test]
+fn late_address_taken_cell_holds_the_current_value() {
+    let (program, _pag, analysis) = var_cell_sync();
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "use_cache",
+        "cache_handler",
+        ResolutionKind::Indirect
+    ));
+}
+
+/// Issue #127 review: a store of a pointer's value forges no address for it,
+/// and a store of its address still hands the address out.
+#[test]
+fn stores_hand_out_values_and_addresses_as_written() {
+    let (program, pag, analysis) = var_cell_sync();
+    assert_points_to(&program, &pag, &analysis, "g5_read", "slot");
+    assert_not_points_to(&program, &pag, &analysis, "g5_read", "k");
+    assert_points_to(&program, &pag, &analysis, "g6_seen", "slot");
+}
+
+/// Issue #127 review: `p = &r` for a C++ reference is the referent's address.
+#[test]
+fn address_of_reference_in_assignment_is_the_referent() {
+    let root = fixture("cpp_out_param");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    assert_points_to(&program, &pag, &analysis, "seen_through_ref", "global");
+    assert_not_points_to(&program, &pag, &analysis, "seen_through_ref", "r2");
+}
+
+/// Issue #127 review: `&a` for an `auto &a` binding is the referent's address.
+#[test]
+fn addr_of_auto_reference_passes_the_referent() {
+    let root = fixture("cpp_out_param");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    assert_points_to(&program, &pag, &analysis, "seen_auto_ref", "inst");
+    assert_not_points_to(&program, &pag, &analysis, "seen_auto_ref", "a");
+}
+
+/// Issue #127 review: a pointer static that is never assigned in the analysed
+/// code (so no longer seeded with its own location) keeps its field flow when
+/// the type's summary fills past `SUMMARY_MEM_CAP`: its GEP falls back to the
+/// summary itself, which a store writes directly — the cap only limits
+/// summaries written *through* a concrete field cell.
+#[test]
+fn unassigned_pointer_static_keeps_its_own_field_flow() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut src = String::from(
+        "struct Mgr { void (*cb)(void); };\nstatic struct Mgr *g_mgr;\n\
+         static void mgr_target(void) {}\n\
+         void set_mgr_cb(void) { g_mgr->cb = mgr_target; }\n\
+         void run_mgr_cb(void) { g_mgr->cb(); }\n",
+    );
+    for i in 0..1100 {
+        src.push_str(&format!("void filler{i}(void) {{}}\n"));
+    }
+    src.push_str("void fill(struct Mgr *m) {\n");
+    for i in 0..1100 {
+        src.push_str(&format!("    m->cb = filler{i};\n"));
+    }
+    src.push_str("}\n");
+    std::fs::write(dir.path().join("main.c"), src).unwrap();
+    let root = dir.path().to_path_buf();
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_mgr_cb",
+        "mgr_target",
+        ResolutionKind::Indirect
+    ));
+}
+
+/// Issue #127 review: the arg-flow row of `get_buf(&q)` names `q` — the object
+/// the argument addresses — not the temporary lowering passes in its place.
+#[test]
+fn addr_of_argument_flow_names_the_object() {
+    let root = fixture("addr_of_arg");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    let actuals: Vec<String> = analysis
+        .arg_flow_edges
+        .iter()
+        .filter_map(|e| e.actual_var)
+        .map(|v| program.symbols.variable(v).name.clone())
+        .collect();
+    assert!(actuals.iter().any(|n| n == "q"), "actuals: {actuals:?}");
+    assert!(
+        !actuals.iter().any(|n| n.starts_with("_ret")),
+        "actuals: {actuals:?}"
+    );
+}
+
+/// Issue #127 review: `*out = &ns::fn` and `*out = Cls::fn` store the function.
+#[test]
+fn qualified_function_designators_are_stored() {
+    let root = fixture("cpp_out_param");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "run_ns", "ns::ns_cb"));
+    assert!(has_any_edge(&program, &analysis, "run_cls", "Cls::handler"));
+}
+
+/// Review round 4: a `void *` table accepts function values like a `void *`.
+#[test]
+fn void_pointer_table_accepts_a_function() {
+    let (program, _pag, analysis) = var_cell_sync();
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_void_table",
+        "void_table_handler",
+        ResolutionKind::Indirect
+    ));
+}
+
+/// Review round 4: `*p = (void *)&s.b` stores the member's address.
+#[test]
+fn cast_member_address_is_stored_as_the_member() {
+    let (program, _pag, _analysis) = var_cell_sync();
+    let var = |name: &str| {
+        program
+            .symbols
+            .variables
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap()
+            .id
+    };
+    let mp = var("mp");
+    let stored: Vec<String> = program
+        .flow
+        .iter()
+        .filter_map(|f| match f {
+            trace_ir::FlowConstraint::Store { dst, src } if *dst == mp => {
+                Some(program.symbols.variable(*src).name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        stored.iter().all(|n| n.starts_with("_gep")) && !stored.is_empty(),
+        "stored: {stored:?}"
+    );
+}
+
+/// Review round 4: `memcpy((void *)&s.a, ..)` is a member address for models.
+#[test]
+fn cast_member_address_argument_is_flagged() {
+    let (program, _pag, _analysis) = var_cell_sync();
+    let site = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|cs| cs.callee_name == "memcpy" && fn_name(&program, cs.caller) == "copy_cast_member")
+        .expect("memcpy site");
+    assert_eq!(site.addr_of_member_args, vec![0]);
+}
+
+/// Review round 4: `drv.ops[i]()` and `pd->ops[i]()` call the table's element.
+#[test]
+fn field_dispatch_table_calls_resolve() {
+    let (program, _pag, analysis) = var_cell_sync();
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_field_table",
+        "op_handler",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_ptr_field_table",
+        "op_handler",
+        ResolutionKind::Indirect
+    ));
+}
+
+/// Review round 4: a callback argument under a cast is still passed.
+#[test]
+fn cast_callback_argument_is_passed() {
+    let (program, _pag, analysis) = var_cell_sync();
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "reg_cb",
+        "reg_target",
+        ResolutionKind::Indirect
+    ));
+}
+
+/// Review round 4: `static_cast<X *>(&x)` passes x's address.
+#[test]
+fn named_cast_around_address_passes_the_address() {
+    let root = fixture("cpp_out_param");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    assert_points_to(&program, &pag, &analysis, "seen_cast", "cast_target");
+}
+
+/// Review of #127: a field array element read by an initializer, an
+/// assignment, a table-to-table copy or an argument reads the field that
+/// `s.table[i] = fn` stored into.
+#[test]
+fn field_array_element_reads_see_stores() {
+    let (program, _pag, analysis) = var_cell_sync();
+    for caller in ["read_elem", "assign_elem", "call_copy", "reg_cb"] {
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                caller,
+                "elem_handler",
+                ResolutionKind::Indirect
+            ),
+            "{caller} must reach elem_handler"
+        );
+    }
+}
+
+/// Review of #127: multi-dimensional callback tables, plain and as a struct
+/// field, store and call their elements.
+#[test]
+fn multi_dimensional_tables_resolve() {
+    let (program, _pag, analysis) = var_cell_sync();
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_matrix",
+        "matrix_handler",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_state",
+        "state_handler",
+        ResolutionKind::Indirect
+    ));
+}
+
+/// Review of #127: C++ named casts carry pointer flow through assignments,
+/// returns and arguments like C casts do.
+#[test]
+fn named_casts_carry_pointer_flow() {
+    let root = fixture("cpp_out_param");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    for var in ["assigned_cast", "ret_seen", "arg_seen"] {
+        assert_points_to(&program, &pag, &analysis, var, "global");
+    }
+}
+
+/// Review of #127: a field-array element argument or callee under
+/// parentheses or a cast is loaded like a bare one.
+#[test]
+fn wrapped_field_array_element_arguments_are_loaded() {
+    let (program, _pag, analysis) = var_cell_sync();
+    for callee in ["invoke_paren", "invoke_cast", "call_cast_elem"] {
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                callee,
+                "elem_handler",
+                ResolutionKind::Indirect
+            ),
+            "{callee} must reach elem_handler"
+        );
+    }
+}
+
+/// PR review: `return &r` for a C++ reference returns the referent's address.
+#[test]
+fn returning_address_of_reference_returns_the_referent() {
+    let root = fixture("cpp_out_param");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    assert_points_to(&program, &pag, &analysis, "seen_ref_return", "global");
+    assert_not_points_to(&program, &pag, &analysis, "seen_ref_return", "r3");
+}
+
+/// PR review: a formal of `f(&x)` gets its one argument edge from the
+/// address temp; the arg-flow row names `x`, but `x`'s own value does not
+/// flow into the formal, so the flow graph adds no `x -> formal` edge.
+#[test]
+fn addr_of_argument_has_one_ingress_edge_in_the_flow_graph() {
+    let root = fixture("addr_of_arg");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze(&program);
+    let db = export_program(&program, &pag, &analysis);
+    let conn = trace_db::open_db(&db).expect("open db");
+    let edges: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT s.label, e.kind FROM flow_edges e \
+             JOIN flow_nodes s ON s.id = e.src_node JOIN flow_nodes d ON d.id = e.dst_node \
+             JOIN variables v ON v.id = d.var_id JOIN functions f ON f.id = v.fn_id \
+             WHERE d.label = 'out' AND f.name = 'get_buf' AND e.kind IN ('copy', 'call_arg')",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        edges.len(),
+        1,
+        "ingress edges into get_buf's out: {edges:?}"
+    );
+    assert!(
+        edges[0].0.starts_with("_ret"),
+        "from the address temp: {edges:?}"
+    );
 }

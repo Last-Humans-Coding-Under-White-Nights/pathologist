@@ -755,6 +755,38 @@ impl TypeTable {
         }
     }
 
+    /// The type standing for `id`'s declaration: a named `struct`/`union`
+    /// maps to its tag's richest interned id. Nested aggregates are recorded
+    /// structurally, so one declaration interns under several ids that differ
+    /// in how completely a nested tag was known (`IDriverLoader` reached
+    /// through `HdfDriverLoader.super` vs directly), or in members a
+    /// configuration compiled out. A member's identity within the tag is its
+    /// name; callers that key by position remap through
+    /// [`field_id_by_name`](Self::field_id_by_name). An anonymous aggregate's
+    /// tag is a per-unit counter, not a declaration, so it — like a scalar —
+    /// is its own identity.
+    pub fn tag_identity(&self, id: TypeId) -> TypeId {
+        self.tag_declaration(self.get(id).desc.as_ref())
+            .unwrap_or(id)
+    }
+
+    /// The declaration a named, non-anonymous `struct`/`union` descriptor
+    /// stands for: its tag's richest interned id (see
+    /// [`tag_identity`](Self::tag_identity)). Answers from the descriptor
+    /// alone, so a snapshot that was never interned in this table (an
+    /// explored variant's nested member) still finds its declaration.
+    pub fn tag_declaration(&self, desc: &TypeDesc) -> Option<TypeId> {
+        match desc {
+            TypeDesc::Struct { name, .. } if !is_anonymous_tag(name) => {
+                self.type_id_by_tag(name, TypeKind::Struct)
+            }
+            TypeDesc::Union { name, .. } if !is_anonymous_tag(name) => {
+                self.type_id_by_tag(name, TypeKind::Union)
+            }
+            _ => None,
+        }
+    }
+
     pub fn type_id_by_tag(&self, name: &str, kind: TypeKind) -> Option<TypeId> {
         match kind {
             TypeKind::Struct => self.struct_tags.get(name).copied(),
@@ -1194,6 +1226,60 @@ fn align_up(value: u64, align: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn struct_desc(name: &str, fields: Vec<(&str, TypeDesc)>) -> TypeDesc {
+        TypeDesc::Struct {
+            name: name.into(),
+            fields: fields.into_iter().map(|(n, d)| (n.into(), d)).collect(),
+        }
+    }
+
+    /// Issue #127 review: one declaration interned under two ids — a nested
+    /// member recorded before and after its tag was complete — has one
+    /// identity, and so does a configuration's variant with other members.
+    #[test]
+    fn tag_identity_joins_snapshots_of_one_declaration() {
+        let mut t = TypeTable::new();
+        let get = TypeDesc::FnPtr {
+            ret: Box::new(TypeDesc::Int),
+            params: Vec::new(),
+        };
+        let before = t.intern(struct_desc(
+            "IDriverLoader",
+            vec![
+                ("object", struct_desc("HdfObject", vec![])),
+                ("GetDriver", get.clone()),
+            ],
+        ));
+        let object = struct_desc("HdfObject", vec![("objectId", TypeDesc::Int)]);
+        let after = t.intern(struct_desc(
+            "IDriverLoader",
+            vec![("object", object), ("GetDriver", get)],
+        ));
+        assert_ne!(before, after, "the fixture must intern two snapshots");
+        assert_eq!(t.tag_identity(before), t.tag_identity(after));
+
+        let other = t.intern(struct_desc(
+            "IDriverLoader",
+            vec![("unrelated", TypeDesc::Int)],
+        ));
+        assert_eq!(t.tag_identity(other), t.tag_identity(after));
+        assert_eq!(t.tag_identity(t.int()), t.int());
+    }
+
+    /// An anonymous aggregate's tag is a per-unit counter (`anon_1`), not a
+    /// declaration: two units' `struct { .. }` with the same member names are
+    /// still unrelated types.
+    #[test]
+    fn tag_identity_keeps_anonymous_aggregates_apart() {
+        let mut t = TypeTable::new();
+        let ints = t.intern(struct_desc("anon_1", vec![("x", TypeDesc::Int)]));
+        let ptrs = t.intern(struct_desc(
+            "anon_1",
+            vec![("x", TypeDesc::Ptr(Box::new(TypeDesc::Char)))],
+        ));
+        assert_ne!(t.tag_identity(ints), t.tag_identity(ptrs));
+    }
 
     #[test]
     fn descriptors_share_storage_but_layout_completion_is_local() {

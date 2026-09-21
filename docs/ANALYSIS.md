@@ -279,6 +279,8 @@ function and file-static lookups are indexed by name and filtered by the
 asking file's scope, rather than walking every header of the scope per name.
 See the [Clang benchmark](PERFORMANCE_REVIEW.md#clang-source-benchmark-header-import-and-lowering).
 
+**Declarator shapes.** C declarators bind inside-out: in `T D`, a declarator `*D1` gives `D1` the type "pointer to T", `D1[n]` "array of T" and `D1(..)` "function returning T", and the identifier gets what is left after the last layer (`walk_declarator_shape`). So `int *t[4]` is `Array(Ptr(Int))`, `void (*h[4])(int)` is `Array(Ptr(FnPtr))`, `int *(*get)(void)` is `Ptr(FnPtr { ret: Ptr(Int) })`, and a fn-pointer variable `void (*fp)(int)` is `Ptr(FnPtr)`. Before #127 the walker wrapped outside-in: `int *t[4]` was `Ptr(Array(Int))` (exported `int[]*`), `int *(*get)(void)` was `Ptr(Ptr(FnPtr { ret: Int }))` (exported `fn_ptr**`), and `void (*h[4])(int)` was `Ptr(FnPtr { ret: Array(Void) })` — exported `fn_ptr*`, because an exported type name does not spell a function's return type.
+
 ## IR flow constraints (`trace-ir`)
 
 Lowered from C during parse. Mapped to PAG in `Pag::build_flow_constraints`.
@@ -412,7 +414,7 @@ to re-run with a higher budget rather than trust a "no".
 
 **`Gep` with empty base points-to**
 
-When `pts(base)` is empty (typical for pointer parameters with no incoming flow), fall back to **`FieldSummary`** for `(struct_type(base), field)` via `ensure_field_summary_for_var`. This connects field stores through parameters to later field loads on unrelated instances (may-analysis). When link-target metadata is available, the summary also includes the target identity: separate link images cannot exchange field contents. Concrete field locations, heap locations, and nested summaries preserve that identity. Without target metadata the existing type-and-field summary cache is used.
+When `pts(base)` is empty (typical for pointer parameters with no incoming flow), fall back to **`FieldSummary`** for `(struct_type(base), field)` via `ensure_field_summary_for_var`. The summary is keyed by the struct's declaration identity (see "Field sensitivity"). This connects field stores through parameters to later field loads on unrelated instances (may-analysis). When link-target metadata is available, the summary also includes the target identity: separate link images cannot exchange field contents. Concrete field locations, heap locations, and nested summaries preserve that identity. Without target metadata the existing type-and-field summary cache is used.
 
 The same fallback also fires when the base *has* pointees but none of them yielded a field cell — e.g. `void *` heap allocations or opaque summaries, where per-pointee `ensure_field_loc` synthesizes nothing. Without this, ops fields assigned through freshly-allocated objects starve every load site that reads them (observed as missing indirect-call edges for shared-obj style code).
 
@@ -424,10 +426,29 @@ The same fallback also fires when the base *has* pointees but none of them yield
 
 Wrong-type pointer casts put unrelated objects into a pointer's points-to; a store through such a pointer would otherwise write callback addresses into alien layouts, where later field loads surface them as bogus indirect-call targets. The solver therefore filters **function values only** (all non-function flow stays unfiltered, preserving soundness):
 
-- A fn value may enter `memory_pts[cell]` / a summary cell only when the cell's declared type accepts it: `FnPtr` slots require the same parameter count; concrete non-fn-pointer cells (`struct`, array, scalar-pointer, union) reject all fn values; unknown/untyped cells stay writable.
-- The same guard applies when `merge_memory_into` lifts cell contents into points-to sets, and when a `Gep` passes fn values from the base node's set into the field node — except registered `array_fn_members` table members, which always pass (see "Arrays and function-pointer tables").
+- A fn value may enter `memory_pts[cell]` / a summary cell only when the cell's declared type accepts it (`slot_guard_for`): `FnPtr` slots — a fn-pointer field (`FnPtr`) or variable (`Ptr(FnPtr)`) — require the same parameter count; a table of fn pointers or of untyped pointers (`void *ops[]`) takes its element's guard, a multi-dimensional one its leaf element's; other concrete non-fn-pointer cells (`struct`, array, scalar-pointer, union) reject all fn values; unknown/untyped cells, `void *` included, stay writable (a dlsym-style `GetSymbol(name, void **out)` stores a function there).
+- The same guard applies when `merge_memory_into` lifts cell contents into points-to sets — to **function values only**, exactly as on the store path: a load through a `NotFnPtr` cell (declared pointer, `struct`, `union`, array) returns every non-function value stored there. (Before #127 the load applied the guard to every value, so such cells yielded nothing — e.g. `viaload = *pp` with `int **pp` lost `&g`.) The guard also applies when a `Gep` passes fn values from the base node's set into the field node — except registered `array_fn_members` table members, which always pass (see "Arrays and function-pointer tables").
 
 Consequence: callbacks stored through correctly-typed ops assignments resolve exactly as before, while cross-signature leaks (e.g. a 2-param `AddService` callback surfacing at 4-param `Dispatch` sites) are cut. Documented imprecision: old-style casts that stash fn pointers in `void *`-typed cells then call them through typed loads still work (unknown cells accept everything), but calls through cells whose declared type is structurally wrong for the stored fn are no longer reported.
+
+**Variable cells: a variable's value and its memory cell are one object**
+
+A variable whose address is taken (`&v`, or `return &v`) has two representations in the solver: its PAG node (`pts[Var(v)]`, read and written by `Copy` — `x = v`, `v = y`) and its memory cell (`memory_pts[loc(v)]`, read by `Load` and written by `Store` through any pointer to `v`). The solver keeps them in step, in both directions, for every pointer-like variable (`var_is_pointer_like`: `is_pointer`, or a declared `Ptr`/`FnPtr` type, never an array) whose cell is the source of an `AddrOf` constraint. It is deliberately wider than `var_may_hold_pointee`, which parameter wiring uses and which leaves out `int *` / `void *`: an out-parameter of buffer type must still reach its direct reads.
+
+- **Registration.** The first time a cell's address is taken (`seed_addr_of`, at solve start or when `expand_return_flows` adds `return &v` mid-solve), the cell gets its slot guard if it has none, and `register_synced_cell` records `node ↔ cell` and syncs what each side already holds — the address may be taken long after the variable got its value.
+- **Node → cell.** When `pts[Var(v)]` gains locations, they are written into `memory_pts[loc(v)]`, filtered by the cell's slot guard exactly like a store (`FnFilter::admits`). The cell's loaders are requeued so pending loads see the growth.
+- **Cell → node.** When a store grows `memory_pts[loc(v)]`, the cell is merged into `pts[Var(v)]` through the load path (`merge_memory_into_if_grown`, same guard).
+
+Only a real address may reach a synced cell, so a name that denotes a *value* never stands for its own address. One rule, `seeds_own_location` / `var_is_pointer_like`, decides both places the solver used to assume it did:
+
+- **The static-storage seed.** `solve` starts a global/static's node holding its own location only when its name denotes its storage (an aggregate, an array). A pointer static's name denotes only its value: seeding it would make `p = G; *p = &k;` write `k` into `G`'s cell, and syncing would turn that into `G = &k`. (The flow graph's `points_to` edges are a different thing — storage connectivity, drawn for every variable with a location; see `docs/SQLITE_SCHEMA.md`.)
+- **The store's `self_loc`.** A store `*p = v` also writes `v`'s own location only when `v`'s name denotes its storage (`*p = arr`, an array decaying). For a pointer `v` it stores the value alone; `*out = &G` lowers to an explicit `AddrOfVar` temp (see "Argument flow"), so the address is a real, address-taken one.
+
+Consequences: `get_buf(&q); x = q;` sees what `get_buf` stored (the out-parameter idiom), `v = &h; x = *(&v);` sees `h`, and `cb_t cb; get_cb(&cb); cb();` resolves the callback `get_cb` stored with `*out = handler`, `*out = &handler`, `*out = (cb_t)handler` or a qualified `*out = &ns::handler`. A function designator stored through a pointer lowers like a field store of one (`AddrOfFn` temp + `Store`; `fn_designator` for both paths), and a function-pointer variable's own cell gets the fn-pointer slot guard (see "Signature-guarded function-value propagation"). Aggregate variables (`struct`/`union`/array objects) are not pointer-like and are not synced: their contents live in field cells and summaries; a table's elements are its cell, so `table[i]()` lowers as a load from `table` (which also passes through the functions its initializer placed), and a field array's elements are its field's cell: `s.ops[i] = fn` stores into the field, and every read of an element — a call `s.ops[i]()` / `p->ops[i]()`, an initializer or assignment `f = s.ops[i]`, an argument, or the source of `t.a[i] = s.b[j]` — loads from it (`field_table`, which also peels `s.m[i][j]`; `matrix[i][j]()` likewise loads from `matrix`).
+
+Lazily created *field* cells get no slot guard: their recorded type can be another same-named field's (HDF's `UartDriverData` has a fn-pointer `config` and a nested `params.config` struct), and guarding them by it dropped real edges.
+
+Before #127 the two representations were disjoint, and both idioms lost all flow. The pointer seed had also hidden a missed field-summary join, keyed by declaration since (see "Field sensitivity"); what that cost on the corpora and how it was recovered is in [EVAL_REPORT.md](EVAL_REPORT.md), "Pointer cells and `&x` arguments".
 
 **Propagation without per-step allocation**
 
@@ -544,7 +565,10 @@ limitations.
 - `GepField` in IR becomes PAG `Gep` with field id.
 - **`FieldSummary`** locations unify all instances of `struct T.field` for sound may-analysis (e.g. vtable writes through a parameter pointer visible at unrelated call sites).
 - Unknown or non-struct base → GEP may no-op.
-- **Struct identity is per-TypeDesc**: types intern by full `(tag, fields)` equality. Field summaries and layouts of divergent copies diverge too (stores through one copy are invisible to loads through another), so lowering must produce *identical* descs for the same logical struct in every TU. In particular, a typedef'd anonymous struct (`typedef struct { .. } Alias;`) takes `Alias` as its tag — per-unit `anon_N` counters would otherwise split one shared-header type into several TypeIds after merge.
+- **Struct identity is per-TypeDesc**: types intern by full `(tag, fields)` equality, so layouts of divergent copies diverge, and lowering must produce *identical* descs for the same logical struct in every TU. In particular, a typedef'd anonymous struct (`typedef struct { .. } Alias;`) takes `Alias` as its tag — per-unit `anon_N` counters would otherwise split one shared-header type into several TypeIds after merge.
+- **Field summaries are keyed by declaration, not by desc**: nested aggregates are recorded structurally, so one declaration can still intern under several ids that differ only in how completely a nested member's tag was known — `IDriverLoader` reached through `HdfDriverLoader.super` vs named directly. `TypeTable::tag_identity` (from a descriptor: `tag_declaration`) maps a named, non-anonymous struct/union to its tag's richest id; the pointer lookups (`struct_type_for_loc`, `struct_type_from_type_id`) and `ensure_field_summary_loc` all use it, the latter remapping the field **by name** into that declaration, so a store through one snapshot meets a load through the other (#127 review: HDF's `driverLoader->GetDriver` / `->ReclaimDriver`), including a snapshot that lacks a member another configuration compiled in. A member the declaration's richest layout lacks keeps the snapshot's own summary; an anonymous aggregate (`anon_N`, a per-unit counter) is its own identity. The mapping is memoized per `(type, field)` (`Pag::declared_member`).
+- **A location's struct type** (`struct_type_for_loc`) is the type its field positions refer to: a variable's own snapshot, or the tag's definition when the variable was declared with a forward-declared (empty) tag, as lowering numbers such fields (`struct_type_for_var`); through pointers and arrays, the pointee or element; for a non-variable location (heap, field, table element) the same through its recorded type. A scalar has none. Variable-based summary lookup uses the same type resolver, including forward-declared tags, so it selects the same member as concrete field lookup.
+- **The GEP field-name guard** rejects a pointee whose struct type lacks the GEP's named field at that position, and a pointee with no struct type at all, so a wrong-type pointer cannot pull fields out of an unrelated layout. Function values are not judged by it: a table's initializer places its functions directly in the table's points-to (`ArrayFnMember`), and they reach `table[i].func` through the table-member and arity rules instead (HDF's local `dispatchFunc[i].func(..)` tables).
 
 ## Arrays and function-pointer tables
 
@@ -607,8 +631,9 @@ occupants of the "no target" indirect bucket.
 
 When a call edge is created (direct or indirect), actuals are connected to callee formals:
 
-- **Pointer variables** → PAG `Copy` from actual var node to formal var node
+- **Pointer variables** → PAG `Copy` from actual var node to formal var node, persistent for pointers whose pointees can hold callbacks (`var_may_hold_pointee`: fn pointers, pointers to fn-pointer slots such as `cb_t *out` or a table row, and pointers to aggregates or unknown types)
 - **Function identifiers** passed as fn-ptr args → `add_pts(formal, fn_loc)`
+- **Address of a plain variable** (`f(&x)`, through parentheses and casts — C `(T)` and C++ `static_cast` / `reinterpret_cast` / `const_cast` / `dynamic_cast`, one peeling rule, `peel_casts`, at every value entry point: stored values, assignments and initializers, return values, arguments and callback arguments) → lowering materializes a temp with `AddrOfVar { dst: temp, src: x }` (`addr_of_temp`) and records the temp as the actual, so the formal points to `x` (the out-parameter idiom: `get_buf(&q)` gives `out -> q`). Before #127 the actual was `x` itself, which handed the callee `x`'s *pointees* instead of its address. The same temp carries a stored `&x` (`*p = &x`, `.f = &x`). `&base.member` / `&arr[i]` keep their base-variable handling (see "Documented imprecision" under function models; a stored `(void *)&s.f` is the member's field address, and a cast `memcpy((void *)&s.f, ..)` argument is still flagged as a member address), and so does `&r` for any C++ reference binding `r`, `auto &r` included (`reference_bindings`): the reference already holds its referent's address, so `&r` — as an argument, a stored value, `p = &r` or `return &r` — is `r`'s value (`names_reference_binding`). A qualified name (`&ns::var`) is not resolved, like any qualified variable reference in expression lowering. The position is recorded in `CallSite::addr_of_args`: consumers that report the argument's *object* rather than its value — arg-flow rows (`actual_var`), `clears` terminators, and the `alias` / `mem_copy` models (`model_copy_side`) — name `x` through `Pag::argument_var` / `Pag::addressed_var`, so `memcpy_s(&dst, .., &src, ..)` still copies between the objects.
 
 After fixpoint, `extract_arg_flow` records:
 
@@ -1719,7 +1744,10 @@ and feature implementations by exploring feasible configuration variants indepen
      its own map and leaves the field empty. Synthesized temporaries are paired by
      position — the k-th temporary of a kind at a source position — because lowering
      names them after the unit-local id it just allocated, so two configurations of the
-     same expression never agree on the name.
+     same expression never agree on the name. The count is kept per incoming body: one
+     unit can carry the same shared header body twice (a cached header expansion and its
+     own copy), and the second copy's k-th temporary is the first copy's k-th, or each call
+     in the body is recorded twice (#127 review).
    - Parameters are paired with the base signature **by name, never by position**. A
      variant routinely inserts a parameter ahead of the ones the base has (`#ifdef
      DEBUG_LOG` file/line pairs); positional pairing would map the variant's first
@@ -1796,6 +1824,7 @@ and feature implementations by exploring feasible configuration variants indepen
 - All paths merged; no null-check refinement.
 - `free` does not invalidate pointers.
 - `FieldSummary` may connect unrelated struct instances.
+- **Lazily created field cells carry no slot guard** (see "Variable cells"): their recorded type is not reliable enough to guard by.
 - Multiple vtable/ops targets reported for one indirect site (may-analysis).
 - **Casts of struct instances to another ops type** (`svc = (IOps *)&inst`):
   the whole instance flows into the target-typed slot, so field loads on it

@@ -732,8 +732,12 @@ fn merge_unit(
             }
         }
     }
-    // How many temporaries at each position the incoming unit has consumed.
-    let mut temp_cursor: FxHashMap<TempKey, usize> = FxHashMap::default();
+    // How many temporaries at each position each incoming body has consumed.
+    // Keyed by the unit-local function as well: a unit can carry the same
+    // header body twice (a cached header expansion and its own copy), and the
+    // second copy's k-th temporary is the first copy's k-th, not the one
+    // after it.
+    let mut temp_cursor: FxHashMap<(Option<FnId>, TempKey), usize> = FxHashMap::default();
 
     for var in &unit.variables {
         if var
@@ -781,7 +785,7 @@ fn merge_unit(
             continue;
         }
         if let Some(key) = &temp_key {
-            let cursor = temp_cursor.entry(*key).or_insert(0);
+            let cursor = temp_cursor.entry((var.fn_id, *key)).or_insert(0);
             if let Some(&existing) = temps_by_site.get(key).and_then(|ids| ids.get(*cursor)) {
                 *cursor += 1;
                 var_map.insert(var.id, existing);
@@ -845,7 +849,7 @@ fn merge_unit(
             // A temporary the base has no counterpart for: record it so a later
             // variant matches it rather than allocating a third copy.
             temps_by_site.entry(key).or_default().push(new_id);
-            *temp_cursor.entry(key).or_insert(0) += 1;
+            *temp_cursor.entry((var.fn_id, key)).or_insert(0) += 1;
         }
         if var.fn_id.is_none() {
             if let Some(seen) = variant_dedup.as_deref_mut() {
@@ -1767,6 +1771,105 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// Issue #127 review: one unit can carry the same header body twice (a
+    /// cached header expansion plus the translation unit's own copy). Both
+    /// merge into one function; the second copy's temporaries must match the
+    /// first's, or each call in the body is recorded twice.
+    #[test]
+    fn a_header_body_twice_in_one_unit_keeps_one_record_per_call() {
+        let header = trace_ir::FileId(1);
+        let body = |id: u32| Function {
+            is_weak: false,
+            target: None,
+            id: FnId(id),
+            name: "Unmarshal".into(),
+            linkage: trace_ir::Linkage::Internal,
+            return_type: TypeId(0),
+            params: vec![VarId(id * 10)],
+            locals: Vec::new(),
+            span: trace_ir::Span::new(header, 81, 1),
+            end_line: 90,
+            file: header,
+            is_defined: true,
+            param_type_ids: Vec::new(),
+            explicit_arity: Some(1),
+            default_args: 0,
+            owner_unresolved: false,
+            variadic: false,
+            defaulted_in_class: false,
+            declared_in_class: false,
+            is_virtual: false,
+            is_final: false,
+            is_cpp: true,
+            tu: None,
+        };
+        let var = |id: u32, name: String, owner: u32, param: bool| Variable {
+            is_defined: false,
+            is_weak: false,
+            target: None,
+            is_namespaced: false,
+            id: VarId(id),
+            name,
+            type_id: TypeId(0),
+            storage: if param {
+                trace_ir::StorageClass::Param
+            } else {
+                trace_ir::StorageClass::Local
+            },
+            fn_id: Some(FnId(owner)),
+            param_index: param.then_some(0),
+            span: trace_ir::Span::new(
+                header,
+                if param { 81 } else { 86 },
+                if param { 30 } else { 75 },
+            ),
+            is_pointer: true,
+        };
+        let site = |id: u32, owner: u32| CallSite {
+            id: trace_ir::CallSiteId(id),
+            caller: FnId(owner),
+            callee_name: "ReadBuffer".into(),
+            callee_var: None,
+            callee_fn_id: None,
+            var_args: vec![(0, VarId(owner * 10)), (2, VarId(owner * 10 + 1))],
+            fn_args: Vec::new(),
+            addr_of_member_args: Vec::new(),
+            addr_of_args: vec![2],
+            args_bound_past_this: false,
+            span: trace_ir::Span::new(header, 86, 10),
+            is_direct: true,
+            receiver_class: None,
+            return_dst: None,
+            tu: None,
+        };
+        let text: Arc<str> = Arc::from("static inline int Unmarshal(struct Buf *data) { .. }");
+        let mut unit = UnitIndex {
+            path: PathBuf::from("main.cpp"),
+            files: vec![PathBuf::from("main.cpp"), PathBuf::from("sample.h")],
+            functions: vec![body(1), body(2)],
+            variables: vec![
+                var(10, "data".into(), 1, true),
+                var(11, "_ret11".into(), 1, false),
+                var(20, "data".into(), 2, true),
+                var(21, "_ret21".into(), 2, false),
+            ],
+            call_sites: vec![site(0, 1), site(1, 2)],
+            ..Default::default()
+        };
+        unit.internal_definitions.insert(FnId(1), Arc::clone(&text));
+        unit.internal_definitions.insert(FnId(2), text);
+        let mut program = Program::new(PathBuf::from("root"));
+        merge_unit_index(&mut program, &unit);
+        let records = program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|cs| cs.callee_name == "ReadBuffer")
+            .count();
+        assert_eq!(program.symbols.functions.len(), 1, "one function");
+        assert_eq!(records, 1, "one record for the one call");
     }
 
     #[test]

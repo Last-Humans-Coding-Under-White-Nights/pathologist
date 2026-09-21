@@ -255,7 +255,10 @@ Edge kinds:
 - `points_to` — implicit var → storage-location edge derived from the final
   var→location map.
 - `call_arg` — actual-to-formal argument passing from `arg_flow_edges`,
-  exported when no stronger constraint already connects the pair.
+  exported when no stronger constraint already connects the pair. The source
+  is the value passed: for an `&x` argument that is the temporary holding
+  `&x` (reached from `x`'s location through `addr_of`), even though the
+  `arg_flow_edges` row names `x`.
 - `terminates` — terminator visibility edge from a function-model `clears`
   effect (e.g. `memset_s(dst, …)`): the actual-argument node flows into a
   synthetic `terminator` node recording the call site. No points-to value

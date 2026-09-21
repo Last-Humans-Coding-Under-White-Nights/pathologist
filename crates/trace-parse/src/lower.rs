@@ -54,12 +54,14 @@ fn index_item_progress(i: usize, n: usize, msg: impl std::fmt::Display) {
 /// forward declaration for these uses when the definition appears later
 /// in the same file, so lowering must not depend on encounter order.
 enum PendingFnRef {
-    /// `base.field = FnName`: emit `AddrOfFn` into a temp and `Store` it
-    /// into the already-materialized field address `dst`.
-    FieldStore {
+    /// `base.field = FnName` / `*p = FnName`: emit `AddrOfFn` into a temp of
+    /// `owner` and `Store` it through `dst` (a field address or a plain
+    /// pointer).
+    FnNameStore {
         dst: VarId,
         name: String,
         span: Span,
+        owner: Option<FnId>,
     },
     /// `dst = FnName` in an initializer/assignment RHS.
     RhsIdent { dst: VarId, name: String },
@@ -142,7 +144,12 @@ struct LowerContext {
     /// `binary_expression` nodes).
     ast_depth: u32,
     ast_depth_warned: bool,
+    /// References whose type carries an alias layer that type readers peel
+    /// (an `auto&` local's type is already the value's own, so it is not one).
     reference_vars: HashSet<VarId>,
+    /// Every variable declared as a reference, `auto&` included: it holds its
+    /// referent's address, so `&r` is `r`'s value rather than a cell of r's.
+    reference_bindings: HashSet<VarId>,
     /// Every local registered in the C++ function being lowered, with the
     /// variable of that name it hid; a block unwinds its own on exit.
     local_scope_log: Vec<(String, Option<VarId>)>,
@@ -1216,6 +1223,7 @@ fn bind_calls_past_this(program: &mut Program) {
             &mut site.var_args,
             &mut site.fn_args,
             &mut site.addr_of_member_args,
+            &mut site.addr_of_args,
         );
         site.args_bound_past_this = true;
     }
@@ -1541,6 +1549,7 @@ fn expand_virtual_overrides(program: &mut Program) {
                 var_args: cs.var_args.clone(),
                 fn_args: cs.fn_args.clone(),
                 addr_of_member_args: cs.addr_of_member_args.clone(),
+                addr_of_args: cs.addr_of_args.clone(),
                 args_bound_past_this: cs.args_bound_past_this,
                 span: cs.span,
                 is_direct: true,
@@ -2273,6 +2282,7 @@ fn lower_prepared_source(
         ast_depth: 0,
         ast_depth_warned: false,
         reference_vars: HashSet::default(),
+        reference_bindings: HashSet::default(),
         local_scope_log: Vec::new(),
         tree: parsed.tree.clone(),
         has_templates: is_cpp && parsed.source.contains("template"),
@@ -2399,9 +2409,14 @@ fn resolve_pending_fn_refs(program: &mut Program, ctx: &LowerContext) {
     for (index, item) in pending.into_iter().enumerate() {
         let flow_start = program.flow.len();
         match item {
-            PendingFnRef::FieldStore { dst, name, span } => {
+            PendingFnRef::FnNameStore {
+                dst,
+                name,
+                span,
+                owner,
+            } => {
                 if let Some(callee) = resolve_function_named(program, ctx, &name) {
-                    let tmp = alloc_ret_temp_spanned(program, ctx, span);
+                    let tmp = alloc_ret_temp_spanned(program, owner, span);
                     program
                         .flow
                         .push(FlowConstraint::AddrOfFn { dst: tmp, callee });
@@ -4312,6 +4327,7 @@ fn lower_parameter(
     let var_id = program.symbols.alloc_var_id();
     if declarator.is_some_and(|d| d.kind() == "reference_declarator") {
         ctx.reference_vars.insert(var_id);
+        ctx.reference_bindings.insert(var_id);
     }
     let span = node_span(program, ctx, node);
     program.symbols.add_variable(Variable {
@@ -5359,6 +5375,7 @@ fn lower_declaration(
                                             var_args: args.var_args,
                                             fn_args: args.fn_args,
                                             addr_of_member_args: args.addr_of_member_args,
+                                            addr_of_args: args.addr_of_args,
                                             args_bound_past_this: false,
                                             span,
                                             is_direct: false,
@@ -5664,6 +5681,7 @@ fn lower_one_declarator(
     let var_id = program.symbols.alloc_var_id();
     if decl.kind() == "reference_declarator" {
         ctx.reference_vars.insert(var_id);
+        ctx.reference_bindings.insert(var_id);
     }
     let span = node_span(program, ctx, span_node);
     let storage = storage_override.unwrap_or_else(|| storage_for(ctx, is_static));
@@ -6363,6 +6381,7 @@ fn collect_call_at_node(
             var_args: args.var_args,
             fn_args: args.fn_args,
             addr_of_member_args: args.addr_of_member_args,
+            addr_of_args: args.addr_of_args,
             args_bound_past_this: false,
             span,
             is_direct,
@@ -6401,6 +6420,7 @@ fn collect_call_at_node(
             var_args: site_args.var_args,
             fn_args: site_args.fn_args,
             addr_of_member_args: site_args.addr_of_member_args,
+            addr_of_args: site_args.addr_of_args,
             args_bound_past_this: bound,
             span,
             is_direct: true,
@@ -6420,6 +6440,7 @@ struct CallArgs {
     var_args: Vec<(u32, VarId)>,
     fn_args: Vec<(u32, FnId)>,
     addr_of_member_args: Vec<u32>,
+    addr_of_args: Vec<u32>,
     argc: u32,
     /// One slot per argument position (aligned with `argc`), holding the
     /// best-effort static type of the passed expression (literals, casts,
@@ -6436,6 +6457,7 @@ impl CallArgs {
             &mut self.var_args,
             &mut self.fn_args,
             &mut self.addr_of_member_args,
+            &mut self.addr_of_args,
         );
         if let Some(receiver) = receiver {
             self.var_args.insert(0, (0, receiver));
@@ -6448,6 +6470,7 @@ impl CallArgs {
             var_args: Vec::new(),
             fn_args: Vec::new(),
             addr_of_member_args: Vec::new(),
+            addr_of_args: Vec::new(),
             argc: 0,
             arg_desc: Vec::new(),
         }
@@ -6470,6 +6493,7 @@ fn shift_past_this(
     var_args: &mut [(u32, VarId)],
     fn_args: &mut [(u32, FnId)],
     addr_of_member_args: &mut [u32],
+    addr_of_args: &mut [u32],
 ) {
     for (index, _) in var_args {
         *index += 1;
@@ -6477,7 +6501,7 @@ fn shift_past_this(
     for (index, _) in fn_args {
         *index += 1;
     }
-    for index in addr_of_member_args {
+    for index in addr_of_member_args.iter_mut().chain(addr_of_args) {
         *index += 1;
     }
 }
@@ -6511,6 +6535,7 @@ fn collect_call_args(
     let mut var_args = Vec::new();
     let mut fn_args = Vec::new();
     let mut addr_of_member_args = Vec::new();
+    let mut addr_of_args = Vec::new();
     let mut arg_desc = Vec::new();
     let mut arg_index = 0u32;
     if let Some(args_node) = args_node {
@@ -6524,12 +6549,26 @@ fn collect_call_args(
                 // (e.g. `memcpy_s(d, sizeof(*d), s, n)` recording `s` at
                 // position 1) and corrupt both interprocedural wiring and
                 // function-model effects.
+                //
+                // `&x` passes x's address (docs/ANALYSIS.md, "Argument
+                // flow"): the formal must point to `x`, not receive x's own
+                // pointees.
+                if let Some(v) = addr_of_plain_var(program, ctx, source, arg) {
+                    var_args.push((arg_index, addr_of_temp(program, ctx, arg, v)));
+                    addr_of_args.push(arg_index);
+                    arg_desc.push(adesc);
+                    arg_index += 1;
+                    continue;
+                }
                 if let Some(v) = resolve_expr_var(program, ctx, source, arg) {
                     // A field/subscript argument passes the *value* stored in
                     // that memory (e.g. `take(g_h.h, 0)` passes the fn-ptr in
                     // `g_h.h`). `resolve_expr_var` yields the base object, so
                     // materialize a load temp and pass that instead.
-                    if matches!(arg.kind(), "field_expression" | "subscript_expression") {
+                    if matches!(
+                        peel_casts(source, arg).kind(),
+                        "field_expression" | "subscript_expression"
+                    ) {
                         let temp = alloc_ret_temp(program, ctx, arg);
                         if let Some(flow) = expr_to_rhs_flow(program, ctx, source, arg, temp) {
                             program.flow.push(flow);
@@ -6567,6 +6606,7 @@ fn collect_call_args(
         var_args,
         fn_args,
         addr_of_member_args,
+        addr_of_args,
         argc: arg_index,
         arg_desc,
     }
@@ -6993,6 +7033,7 @@ fn emit_unresolved_site(
         var_args,
         fn_args,
         addr_of_member_args,
+        addr_of_args,
         argc: _,
         arg_desc: _,
     } = args.bind_past_this(None);
@@ -7006,6 +7047,7 @@ fn emit_unresolved_site(
         var_args,
         fn_args,
         addr_of_member_args,
+        addr_of_args,
         args_bound_past_this: true,
         span,
         is_direct: false,
@@ -7067,6 +7109,7 @@ fn emit_member_targets(
             var_args: args.var_args,
             fn_args: args.fn_args,
             addr_of_member_args: args.addr_of_member_args,
+            addr_of_args: args.addr_of_args,
             args_bound_past_this: true,
             span,
             is_direct: false,
@@ -7093,6 +7136,7 @@ fn emit_member_targets(
             var_args: site_args.var_args,
             fn_args: site_args.fn_args,
             addr_of_member_args: site_args.addr_of_member_args,
+            addr_of_args: site_args.addr_of_args,
             args_bound_past_this: true,
             span,
             is_direct: true,
@@ -8632,6 +8676,10 @@ fn extract_flow_from_expr(
                 if let Some(ptr) = resolve_lvalue_var(program, ctx, source, arg) {
                     if let Some(src) = expr_to_store_src(program, ctx, source, rhs) {
                         program.flow.push(FlowConstraint::Store { dst: ptr, src });
+                    } else if let Some(name) = fn_designator(source, rhs) {
+                        // `*out = handler`: a function designator stored
+                        // through a pointer.
+                        emit_fn_name_store(program, ctx, source, node, ptr, name);
                     } else if rhs.kind() == "call_expression" {
                         if let Some(callee_name) = resolve_direct_call(program, ctx, source, rhs) {
                             let ret_temp = alloc_ret_temp(program, ctx, node);
@@ -8646,6 +8694,10 @@ fn extract_flow_from_expr(
             }
         } else if lhs.kind() == "field_expression" {
             emit_field_store(program, ctx, source, lhs, rhs);
+        } else if let Some(table) = field_table(lhs) {
+            // `s.table[i] = v`: an element of a field array is the field's
+            // cell, index-insensitively, as any array element is.
+            emit_field_store(program, ctx, source, table, rhs);
         } else if let Some(dst) = resolve_lvalue_var(program, ctx, source, lhs) {
             if let Some(flow) = expr_to_rhs_flow(program, ctx, source, rhs, dst) {
                 program.flow.push(flow);
@@ -8840,22 +8892,41 @@ fn peel_expression(mut node: Node) -> Node {
     node
 }
 
-fn peel_casts(mut node: Node) -> Node {
+/// Strip parentheses and casts — C `(T)x` and C++ `static_cast<T>(x)` /
+/// `reinterpret_cast` / `const_cast` / `dynamic_cast`, which the grammar
+/// parses as calls of a template — down to the operand.
+fn peel_casts<'t>(source: &str, mut node: Node<'t>) -> Node<'t> {
     loop {
         node = peel_expression(node);
-        if node.kind() != "cast_expression" {
-            break;
-        }
-        let Some(inner) = node
-            .child_by_field_name("value")
-            .or_else(|| node.child_by_field_name("expression"))
-            .or_else(|| node.named_child(1))
-        else {
-            break;
+        let inner = match node.kind() {
+            "cast_expression" => node
+                .child_by_field_name("value")
+                .or_else(|| node.child_by_field_name("expression"))
+                .or_else(|| node.named_child(1)),
+            "call_expression" if is_named_cast(source, node) => node
+                .child_by_field_name("arguments")
+                .and_then(|args| args.named_child(0)),
+            _ => None,
         };
-        node = inner;
+        match inner {
+            Some(inner) => node = inner,
+            None => break,
+        }
     }
     node
+}
+
+/// `static_cast<T>(x)` and its siblings: a call of a named-cast template.
+fn is_named_cast(source: &str, call: Node) -> bool {
+    call.child_by_field_name("function")
+        .filter(|f| f.kind() == "template_function")
+        .and_then(|f| f.child_by_field_name("name"))
+        .is_some_and(|name| {
+            matches!(
+                node_text(source, &name),
+                "static_cast" | "reinterpret_cast" | "const_cast" | "dynamic_cast"
+            )
+        })
 }
 
 fn emit_call_return(
@@ -8880,7 +8951,7 @@ fn is_symbol_lookup_callee(name: &str) -> bool {
 
 /// Decode a C/C++ string literal or concatenated string into its contents.
 fn string_literal_value(source: &str, node: Node) -> Option<String> {
-    let node = peel_casts(node);
+    let node = peel_casts(source, node);
     match node.kind() {
         "string_literal" => decode_c_string_literal(node_text(source, &node)),
         "concatenated_string" => {
@@ -8963,6 +9034,81 @@ fn emit_field_store(
     );
 }
 
+/// The table an element access indexes: `t` in `t[i]`, `t[i][j]`,
+/// `s.t[i]`. `None` when `node` is not a subscript.
+fn subscript_table(node: Node) -> Option<Node> {
+    let mut node = peel_expression(node);
+    if node.kind() != "subscript_expression" {
+        return None;
+    }
+    while node.kind() == "subscript_expression" {
+        node = peel_expression(node.child_by_field_name("argument")?);
+    }
+    Some(node)
+}
+
+/// `s.table[i]` / `p->table[i]` / `s.matrix[i][j]`: the field expression
+/// naming the array. An element of a field array is the field's cell,
+/// index-insensitively, so every access through it reads or writes the field.
+fn field_table(node: Node) -> Option<Node> {
+    subscript_table(node).filter(|n| n.kind() == "field_expression")
+}
+
+/// A plain or qualified name (`x`, `ns::f`, `Cls::f`).
+fn is_name(node: Node) -> bool {
+    matches!(node.kind(), "identifier" | "qualified_identifier")
+}
+
+/// `&name` through parentheses and casts: the name whose address is taken.
+fn addr_of_name<'t>(source: &str, node: Node<'t>) -> Option<Node<'t>> {
+    let node = peel_casts(source, node);
+    if pointer_op(source, node).as_deref() != Some("&") {
+        return None;
+    }
+    Some(peel_expression(pointer_arg(node)?)).filter(|n| is_name(*n))
+}
+
+/// The function a store's value names, if it is a function designator:
+/// `fn`, `&fn`, a qualified `ns::fn` / `Cls::fn`, or any of them under casts
+/// (`(cb_t)fn`). Returns the name; whether it is a function is decided when
+/// it is resolved.
+fn fn_designator<'t>(source: &str, node: Node<'t>) -> Option<Node<'t>> {
+    addr_of_name(source, node).or_else(|| Some(peel_casts(source, node)).filter(|n| is_name(*n)))
+}
+
+/// `*dst = FnName` (a field address or a plain pointer): emit `AddrOfFn`
+/// into a temp and `Store` it through `dst`. A function defined later in the
+/// unit (no forward declaration) is deferred until the whole symbol table is
+/// populated ([`PendingFnRef::FnNameStore`]).
+fn emit_fn_name_store(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    span_node: Node,
+    dst: VarId,
+    name_node: Node,
+) {
+    let name = normalize_qualified(node_text(source, &name_node));
+    let name = name.as_str();
+    if let Some(callee) = resolve_function_named(program, ctx, name) {
+        let src_temp = alloc_ret_temp(program, ctx, span_node);
+        program.flow.push(FlowConstraint::AddrOfFn {
+            dst: src_temp,
+            callee,
+        });
+        program
+            .flow
+            .push(FlowConstraint::Store { dst, src: src_temp });
+    } else {
+        ctx.pending.borrow_mut().push(PendingFnRef::FnNameStore {
+            dst,
+            name: name.to_string(),
+            span: node_span(program, ctx, span_node),
+            owner: ctx.current_fn,
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_field_value_store(
     program: &mut Program,
@@ -8987,27 +9133,8 @@ fn emit_field_value_store(
             );
             if let Some(src) = expr_to_store_src(program, ctx, source, value_node) {
                 program.flow.push(FlowConstraint::Store { dst: gep, src });
-            } else if value_node.kind() == "identifier" {
-                let name = node_text(source, &value_node);
-                if let Some(callee) = resolve_function_named(program, ctx, name) {
-                    let src_temp = alloc_ret_temp(program, ctx, span_node);
-                    program.flow.push(FlowConstraint::AddrOfFn {
-                        dst: src_temp,
-                        callee,
-                    });
-                    program.flow.push(FlowConstraint::Store {
-                        dst: gep,
-                        src: src_temp,
-                    });
-                } else {
-                    // Defined later in the unit (no forward declaration):
-                    // defer until the whole symbol table is populated.
-                    ctx.pending.borrow_mut().push(PendingFnRef::FieldStore {
-                        dst: gep,
-                        name: name.to_string(),
-                        span: node_span(program, ctx, span_node),
-                    });
-                }
+            } else if let Some(name) = fn_designator(source, value_node) {
+                emit_fn_name_store(program, ctx, source, span_node, gep, name);
             } else if value_node.kind() == "lambda_expression" && ctx.is_cpp {
                 if let Some(callee) = lower_lambda_expression(program, ctx, source, value_node) {
                     let src_temp = alloc_ret_temp(program, ctx, span_node);
@@ -9398,6 +9525,20 @@ fn expr_to_store_src(
     source: &str,
     node: Node,
 ) -> Option<VarId> {
+    // `&x` stores x's address, not x's value (docs/ANALYSIS.md, "Argument
+    // flow").
+    if let Some(v) = addr_of_plain_var(program, ctx, source, node) {
+        return Some(addr_of_temp(program, ctx, node, v));
+    }
+    // `(void *)&s.f` stores the member's address like `&s.f` does.
+    let node = peel_casts(source, node);
+    // `t.a[i] = s.b[j]` stores the value read from the field `b`.
+    if let Some(table) = field_table(node) {
+        let temp = alloc_ret_temp(program, ctx, node);
+        let flow = expr_to_rhs_flow(program, ctx, source, table, temp)?;
+        program.flow.push(flow);
+        return Some(temp);
+    }
     match node.kind() {
         "pointer_expression" => {
             let op = pointer_op(source, node);
@@ -9420,6 +9561,11 @@ fn expr_to_rhs_flow(
     node: Node,
     dst: VarId,
 ) -> Option<FlowConstraint> {
+    let node = peel_casts(source, node);
+    // `f = s.ops[i]` reads the field `ops`.
+    if let Some(table) = field_table(node) {
+        return expr_to_rhs_flow(program, ctx, source, table, dst);
+    }
     match node.kind() {
         "identifier" => {
             let name = node_text(source, &node);
@@ -9451,7 +9597,11 @@ fn expr_to_rhs_flow(
                     // The gep temp's pts-to is the field's own location.
                     Some(FlowConstraint::Copy { dst, src: gep })
                 } else if let Some(src) = resolve_lvalue_var(program, ctx, source, arg) {
-                    Some(FlowConstraint::AddrOfVar { dst, src })
+                    Some(if names_reference_binding(ctx, arg, src) {
+                        FlowConstraint::Copy { dst, src }
+                    } else {
+                        FlowConstraint::AddrOfVar { dst, src }
+                    })
                 } else {
                     if arg.kind() == "identifier" {
                         // Might be a function defined later in the unit.
@@ -9469,13 +9619,6 @@ fn expr_to_rhs_flow(
                 None
             }
         }
-        "cast_expression" => node
-            .child_by_field_name("expression")
-            .or_else(|| node.named_child(1))
-            .and_then(|inner| expr_to_rhs_flow(program, ctx, source, inner, dst)),
-        "parenthesized_expression" => node
-            .named_child(0)
-            .and_then(|inner| expr_to_rhs_flow(program, ctx, source, inner, dst)),
         "lambda_expression" if ctx.is_cpp => {
             let callee = lower_lambda_expression(program, ctx, source, node)?;
             Some(FlowConstraint::AddrOfFn { dst, callee })
@@ -9592,7 +9735,7 @@ fn return_flow_from_expr(
     node: Node,
     fn_id: FnId,
 ) -> Option<ReturnFlow> {
-    let node = peel_expression(node);
+    let node = peel_casts(source, node);
     match node.kind() {
         "pointer_expression" => {
             let op = pointer_op(source, node);
@@ -9607,7 +9750,11 @@ fn return_flow_from_expr(
                     return Some(ReturnFlow::Copy { src: gep });
                 }
                 if let Some(src) = resolve_lvalue_var(program, ctx, source, arg) {
-                    return Some(ReturnFlow::AddrOfVar { src });
+                    return Some(if names_reference_binding(ctx, arg, src) {
+                        ReturnFlow::Copy { src }
+                    } else {
+                        ReturnFlow::AddrOfVar { src }
+                    });
                 }
                 if arg.kind() == "identifier" {
                     ctx.pending.borrow_mut().push(PendingFnRef::ReturnAddrOf {
@@ -9653,13 +9800,6 @@ fn return_flow_from_expr(
                 Some(ReturnFlow::Call { callee_name })
             }
         }
-        "cast_expression" => node
-            .child_by_field_name("expression")
-            .or_else(|| node.named_child(1))
-            .and_then(|inner| return_flow_from_expr(program, ctx, source, inner, fn_id)),
-        "parenthesized_expression" => node
-            .named_child(0)
-            .and_then(|inner| return_flow_from_expr(program, ctx, source, inner, fn_id)),
         _ => None,
     }
 }
@@ -9720,12 +9860,41 @@ fn alloc_recv_temp(
     var_id
 }
 
-fn alloc_ret_temp(program: &mut Program, ctx: &LowerContext, span_node: Node) -> VarId {
+/// A temporary of type `type_id` holding the value a load reads, local to
+/// the current body.
+fn alloc_load_temp(
+    program: &mut Program,
+    ctx: &LowerContext,
+    span_node: Node,
+    type_id: trace_ir::TypeId,
+) -> VarId {
+    let load_var = program.symbols.alloc_var_id();
     let span = node_span(program, ctx, span_node);
-    alloc_ret_temp_spanned(program, ctx, span)
+    program.symbols.add_variable(Variable {
+        is_defined: false,
+        is_weak: false,
+        target: None,
+        is_namespaced: false,
+        id: load_var,
+        name: format!("_load{}", load_var.0),
+        type_id,
+        storage: StorageClass::Local,
+        fn_id: ctx.current_fn,
+        param_index: None,
+        span,
+        is_pointer: true,
+    });
+    load_var
 }
 
-fn alloc_ret_temp_spanned(program: &mut Program, ctx: &LowerContext, span: Span) -> VarId {
+fn alloc_ret_temp(program: &mut Program, ctx: &LowerContext, span_node: Node) -> VarId {
+    let span = node_span(program, ctx, span_node);
+    alloc_ret_temp_spanned(program, ctx.current_fn, span)
+}
+
+/// A return/value temporary local to `owner`. Deferred resolution runs after
+/// the body, so it names the owner instead of reading `ctx.current_fn`.
+fn alloc_ret_temp_spanned(program: &mut Program, owner: Option<FnId>, span: Span) -> VarId {
     let var_id = program.symbols.alloc_var_id();
     program.symbols.add_variable(Variable {
         is_defined: false,
@@ -9736,7 +9905,7 @@ fn alloc_ret_temp_spanned(program: &mut Program, ctx: &LowerContext, span: Span)
         name: format!("_ret{}", var_id.0),
         type_id: program.types.int(),
         storage: StorageClass::Local,
-        fn_id: ctx.current_fn,
+        fn_id: owner,
         param_index: None,
         span,
         is_pointer: true,
@@ -9777,24 +9946,51 @@ fn resolve_lvalue_var(
     }
 }
 
+/// `&x` (through parentheses and casts) naming a plain variable: the
+/// argument is x's *address*. `&base.member` / `&arr[i]` are not plain —
+/// they keep their base-variable handling — and neither is a C++ reference:
+/// a reference variable already holds its referent's address, so `&r` is
+/// `r`'s value, not a cell of its own.
+fn addr_of_plain_var(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<VarId> {
+    // Qualified variable names are not resolved anywhere in expression
+    // lowering, so only a plain one qualifies.
+    let name = addr_of_name(source, node).filter(|n| n.kind() == "identifier")?;
+    lookup_var(ctx, program, node_text(source, &name))
+        .filter(|v| !names_reference_binding(ctx, name, *v))
+}
+
+/// Whether `&operand` names the C++ reference binding `var` itself: the
+/// reference already holds its referent's address, so `&r` is `r`'s value.
+fn names_reference_binding(ctx: &LowerContext, operand: Node, var: VarId) -> bool {
+    peel_expression(operand).kind() == "identifier" && ctx.reference_bindings.contains(&var)
+}
+
+/// A temporary holding `&v`, for a value position that must carry v's
+/// address rather than v itself.
+fn addr_of_temp(program: &mut Program, ctx: &LowerContext, span_node: Node, v: VarId) -> VarId {
+    let temp = alloc_ret_temp(program, ctx, span_node);
+    program
+        .flow
+        .push(FlowConstraint::AddrOfVar { dst: temp, src: v });
+    temp
+}
+
 /// True when `node` is a `&base.member` or `&arr[i]` address expression.
 /// Such arguments resolve to the base variable, so alias-style function
 /// models must not treat them as whole-object copies.
 fn is_addr_of_member(source: &str, node: Node) -> bool {
-    if node.kind() != "pointer_expression" || pointer_op(source, node).as_deref() != Some("&") {
+    let node = peel_casts(source, node);
+    if pointer_op(source, node).as_deref() != Some("&") {
         return false;
     }
-    let mut inner = match pointer_arg(node) {
-        Some(arg) => arg,
-        None => return false,
-    };
-    while matches!(inner.kind(), "parenthesized_expression" | "cast_expression") {
-        inner = match inner.named_child(0) {
-            Some(child) => child,
-            None => return false,
-        };
-    }
-    matches!(inner.kind(), "field_expression" | "subscript_expression")
+    pointer_arg(node)
+        .map(|inner| peel_casts(source, inner))
+        .is_some_and(|inner| matches!(inner.kind(), "field_expression" | "subscript_expression"))
 }
 
 /// The real declarator of a definition whose `declarator` field is nothing
@@ -9934,8 +10130,8 @@ fn resolve_call_fn_arg(
 ) -> Option<FnId> {
     // `Worker w((OnReady));` passes the function in parentheses, the usual
     // spelling that keeps a direct initialization from reading as a
-    // declaration.
-    let node = peel_expression(node);
+    // declaration; `reg((cb_t)fn)` passes it under a cast.
+    let node = peel_casts(source, node);
     if ctx.is_cpp && node.kind() == "lambda_expression" {
         return lower_lambda_expression(program, ctx, source, node);
     }
@@ -9981,8 +10177,9 @@ fn resolve_callee_with_loads(
     source: &str,
     node: Node,
 ) -> CalleeRef {
-    let node = peel_expression(node);
-    if node.kind() != "field_expression" {
+    // `((cb_t)s.ops[i])()` calls the element as `s.ops[i]()` does.
+    let node = peel_casts(source, node);
+    if !matches!(node.kind(), "field_expression" | "subscript_expression") {
         return resolve_callee(program, ctx, source, node);
     }
     // Answer before decomposition: it emits loads and allocates a summary
@@ -9992,7 +10189,36 @@ fn resolve_callee_with_loads(
         return cached.clone();
     }
     let mut result = None;
-    if let Some((base, field_ids, field_names)) = decompose_field_path(program, ctx, source, node) {
+    if let Some((base, field_ids, field_names)) =
+        field_table(node).and_then(|table| decompose_field_path(program, ctx, source, table))
+    {
+        // `s.table[i]()` / `p->table[i]()` calls an element of a field array:
+        // a load from the field, where `s.table[i] = fn` stores.
+        let text = field_callee_text(source, node);
+        if let Some(load_var) =
+            emit_field_fn_ptr_load(program, ctx, source, node, base, &field_ids, &field_names)
+        {
+            result = Some((text, false, Some(load_var)));
+        }
+    } else if node.kind() == "subscript_expression" {
+        // `table[i]()` calls the element: a load from the table, which reads
+        // what was stored in it and passes through the functions its
+        // initializer placed (`ArrayFnMember`).
+        let table = subscript_table(node).filter(|n| n.kind() == "identifier");
+        if let Some(table) = table {
+            let name = node_text(source, &table);
+            if let Some(table_var) = lookup_var(ctx, program, name) {
+                let load_var = alloc_load_temp(program, ctx, node, program.types.int());
+                program.flow.push(FlowConstraint::Load {
+                    dst: load_var,
+                    src: table_var,
+                });
+                result = Some((format!("{name}[...]"), false, Some(load_var)));
+            }
+        }
+    } else if let Some((base, field_ids, field_names)) =
+        decompose_field_path(program, ctx, source, node)
+    {
         let text = field_callee_text(source, node);
         if let Some(load_var) =
             emit_field_fn_ptr_load(program, ctx, source, node, base, &field_ids, &field_names)
@@ -10051,22 +10277,7 @@ fn emit_field_fn_ptr_load(
         let field_type_id = program.types.get(type_id).layout.fields.get(fid)?.type_id;
         type_id = field_type_id;
         if i + 1 == field_ids.len() {
-            let load_var = program.symbols.alloc_var_id();
-            let span = node_span(program, ctx, span_node);
-            program.symbols.add_variable(Variable {
-                is_defined: false,
-                is_weak: false,
-                target: None,
-                is_namespaced: false,
-                id: load_var,
-                name: format!("_load{}", load_var.0),
-                type_id: program.types.int(),
-                storage: StorageClass::Local,
-                fn_id: ctx.current_fn,
-                param_index: None,
-                span,
-                is_pointer: true,
-            });
+            let load_var = alloc_load_temp(program, ctx, span_node, program.types.int());
             program.flow.push(FlowConstraint::Load {
                 dst: load_var,
                 src: gep,
@@ -10077,22 +10288,7 @@ fn emit_field_fn_ptr_load(
             program.types.get(field_type_id).desc.as_ref(),
             TypeDesc::Ptr(_)
         ) {
-            let load_var = program.symbols.alloc_var_id();
-            let span = node_span(program, ctx, span_node);
-            program.symbols.add_variable(Variable {
-                is_defined: false,
-                is_weak: false,
-                target: None,
-                is_namespaced: false,
-                id: load_var,
-                name: format!("_load{}", load_var.0),
-                type_id: field_type_id,
-                storage: StorageClass::Local,
-                fn_id: ctx.current_fn,
-                param_index: None,
-                span,
-                is_pointer: true,
-            });
+            let load_var = alloc_load_temp(program, ctx, span_node, field_type_id);
             program.flow.push(FlowConstraint::Load {
                 dst: load_var,
                 src: gep,
@@ -10199,6 +10395,7 @@ fn resolve_expr_var(
     source: &str,
     node: Node,
 ) -> Option<VarId> {
+    let node = peel_casts(source, node);
     match node.kind() {
         "identifier" => {
             let name = node_text(source, &node);
@@ -10214,14 +10411,6 @@ fn resolve_expr_var(
         }
         "field_expression" | "subscript_expression" => node
             .child_by_field_name("argument")
-            .and_then(|n| resolve_expr_var(program, ctx, source, n)),
-        "parenthesized_expression" => node
-            .named_child(0)
-            .and_then(|n| resolve_expr_var(program, ctx, source, n)),
-        "cast_expression" => node
-            .child_by_field_name("value")
-            .or_else(|| node.child_by_field_name("expression"))
-            .or_else(|| node.named_child(1))
             .and_then(|n| resolve_expr_var(program, ctx, source, n)),
         _ => None,
     }
@@ -10565,65 +10754,36 @@ fn typedef_underlying_desc(
 }
 
 fn walk_declarator_shape(node: Node, base: TypeDesc) -> TypeDesc {
-    match node.kind() {
-        "pointer_declarator" => {
-            let inner = node
-                .child_by_field_name("declarator")
-                .map(|n| walk_declarator_shape(n, base.clone()))
-                .unwrap_or(base);
-            TypeDesc::Ptr(Box::new(inner))
-        }
-        "array_declarator" => {
-            let inner = node
-                .child_by_field_name("declarator")
-                .map(|n| walk_declarator_shape(n, base.clone()))
-                .unwrap_or(base);
+    // C declarators bind inside-out: in `T *D`, `D` has type "pointer to T",
+    // so each layer wraps the type built so far and hands it down to the
+    // identifier. `int *t[4]` is an array of pointers, `void (*h[4])(void)` an
+    // array of function pointers, `typedef void (*Name)(..)` a pointer to a
+    // function and `typedef int f_t(int)` a bare function type.
+    let (inner, shaped) = match node.kind() {
+        "pointer_declarator" => (
+            node.child_by_field_name("declarator"),
+            TypeDesc::Ptr(Box::new(base)),
+        ),
+        "array_declarator" => (
+            node.child_by_field_name("declarator"),
             TypeDesc::Array {
-                elem: Box::new(inner),
+                elem: Box::new(base),
                 size: None,
-            }
-        }
-        "function_declarator" => {
-            let inner = node.child_by_field_name("declarator");
-            // `typedef void (*Name)(...)`: the pointer sits INSIDE the
-            // parenthesized declarator, so it binds to the identifier first
-            // and the function suffix applies outside it — the alias is
-            // pointer-to-function, not function-returning-pointer. A plain
-            // `typedef int f_t(int)` stays a bare FnPtr.
-            let ptr_wrapped = inner.and_then(peel_paren_declarator).and_then(|n| {
-                if n.kind() == "pointer_declarator" {
-                    n.child_by_field_name("declarator")
-                } else {
-                    None
-                }
-            });
-            if let Some(under) = ptr_wrapped {
-                let ret = walk_declarator_shape(under, base);
-                return TypeDesc::Ptr(Box::new(TypeDesc::FnPtr {
-                    ret: Box::new(ret),
-                    params: Vec::new(),
-                }));
-            }
-            let ret = inner
-                .map(|n| walk_declarator_shape(n, base.clone()))
-                .unwrap_or(base);
+            },
+        ),
+        "function_declarator" => (
+            node.child_by_field_name("declarator"),
             TypeDesc::FnPtr {
-                ret: Box::new(ret),
+                ret: Box::new(base),
                 params: Vec::new(),
-            }
-        }
-        "parenthesized_declarator" => node
-            .named_child(0)
-            .map(|n| walk_declarator_shape(n, base.clone()))
-            .unwrap_or(base),
-        _ => base,
-    }
-}
-
-fn peel_paren_declarator(node: Node) -> Option<Node> {
-    match node.kind() {
-        "parenthesized_declarator" => node.named_child(0),
-        _ => Some(node),
+            },
+        ),
+        "parenthesized_declarator" => (node.named_child(0), base),
+        _ => return base,
+    };
+    match inner {
+        Some(inner) => walk_declarator_shape(inner, shaped),
+        None => shaped,
     }
 }
 

@@ -151,10 +151,11 @@ pub fn analyze_with_options(program: &Program, opts: AnalyzeOptions) -> (Pag, An
     );
     let call_edges = result.call_edges.clone();
     let wired = result.wired_arg_flow.clone();
-    extract_arg_flow(program, &call_edges, &wired, &mut result);
+    extract_arg_flow(program, &pag, &call_edges, &wired, &mut result);
     (pag, result)
 }
 
+#[derive(Default)]
 struct SolverState {
     pts: FxHashMap<PagNodeId, FxHashSet<LocId>>,
     /// Locations added to a node's points-to since it was last processed.
@@ -189,6 +190,17 @@ struct SolverState {
     /// Last-seen `memory_pts[loc]` size per `(dst, loc)` pair, used to skip
     /// redundant merge iterations when memory hasn't grown.
     merge_sizes: FxHashMap<(PagNodeId, LocId), usize>,
+    /// Locations that are the source of an `AddrOf` constraint.
+    addr_taken: FxHashSet<LocId>,
+    /// Variable node → the memory cell kept in step with it, and back
+    /// (docs/ANALYSIS.md, "Variable cells"). Filled when the cell's address is
+    /// first taken ([`register_synced_cell`]), so the per-pop hooks are one
+    /// lookup each.
+    synced_cell: FxHashMap<PagNodeId, LocId>,
+    cell_owner: FxHashMap<LocId, PagNodeId>,
+    /// `(call site, parameter)` terminator events already recorded, so each
+    /// is recorded once without scanning the event list.
+    terminators_seen: FxHashSet<(CallSiteId, u32)>,
 }
 
 /// Buffers reused across propagation steps.
@@ -221,6 +233,8 @@ struct Scratch {
     wire_src: Vec<LocId>,
     /// `touch_loc_holders`: the loading nodes to requeue.
     holders: Vec<PagNodeId>,
+    /// `register_synced_cell`: what a variable held when its cell was synced.
+    held: Vec<LocId>,
 }
 
 /// Which function values a memory cell admits, read off its [`SlotGuard`].
@@ -248,13 +262,8 @@ impl FnFilter {
         }
     }
 
-    /// Does the guard admit `loc` on its own terms, with no exemption for
-    /// non-function values?
-    ///
-    /// Note what `None` means here: a cell whose declared type is a concrete
-    /// non-fn-pointer object admits *nothing*, not merely no function value.
-    /// Only the memory merge asks the question this way — see
-    /// [`SolverState::merge_memory_into_if_grown`].
+    /// The guard's rule for a function value `loc`. Callers exempt
+    /// non-function values first ([`FnFilter::admits`]).
     fn guard_admits(self, fn_arity: &FxHashMap<LocId, usize>, loc: LocId) -> bool {
         match self {
             Self::Any => true,
@@ -263,11 +272,12 @@ impl FnFilter {
         }
     }
 
-    /// May `loc` be *stored* into a cell guarded by `self`? Function values
-    /// are filtered; everything else flows unfiltered, which is what keeps
-    /// the store path sound.
+    /// May `loc` be stored into, or loaded out of, a cell guarded by
+    /// `self`? Function values are filtered; everything else flows
+    /// unfiltered, which is what keeps both paths sound.
     fn admits(self, fn_arity: &FxHashMap<LocId, usize>, pag: &Pag, loc: LocId) -> bool {
-        fn_for_loc(pag, loc).is_none() || self.guard_admits(fn_arity, loc)
+        // `Any` answers before the `fn_for_loc` lookup: most cells are unguarded.
+        self == Self::Any || fn_for_loc(pag, loc).is_none() || self.guard_admits(fn_arity, loc)
     }
 }
 
@@ -404,14 +414,11 @@ impl SolverState {
     /// an ungrown memory breaks the `touch_loc_holders` → re-merge cycle that
     /// dominated budget on large trees.
     ///
-    /// Note the asymmetry with the store path: this applies the cell's guard
-    /// to *every* location it holds, not only to function values, so a cell
-    /// declared as a concrete non-fn-pointer object contributes nothing at
-    /// all to a points-to set. That is `arity_allows`'s behavior carried over
-    /// unchanged — this change is required to keep exports byte-identical, so
-    /// it is preserved, not endorsed.
+    /// Filters exactly like the store path ([`FnFilter::admits`]): only
+    /// function values are subject to the cell's guard.
     fn merge_memory_into_if_grown(
         &mut self,
+        pag: &Pag,
         fresh: &mut Vec<LocId>,
         dst: PagNodeId,
         mem_loc: LocId,
@@ -444,7 +451,7 @@ impl SolverState {
             let pts = pts.entry(dst).or_default();
             for i in prev_len..cur_len {
                 let loc = mem[i];
-                if filter.guard_admits(fn_arity, loc) && !pts.contains(&loc) {
+                if filter.admits(fn_arity, pag, loc) && !pts.contains(&loc) {
                     fresh.push(loc);
                 }
             }
@@ -495,47 +502,16 @@ fn solve(
     explicit_pops_budget: Option<u64>,
     explicit_secs_budget: Option<u64>,
 ) -> AnalysisResult {
-    let mut st = SolverState {
-        pts: FxHashMap::default(),
-        delta: FxHashMap::default(),
-        delta_pending: FxHashSet::default(),
-        memory_pts: FxHashMap::default(),
-        loc_nodes: FxHashMap::default(),
-        worklist: Vec::new(),
-        queued: FxHashSet::default(),
-        seen_once: FxHashSet::default(),
-        wired_copies: FxHashSet::default(),
-        wired_model_edges: FxHashSet::default(),
-        slot_guard: FxHashMap::default(),
-        fn_arity: FxHashMap::default(),
-        merge_sizes: FxHashMap::default(),
-    };
+    let mut st = SolverState::default();
     // Lives beside the state, not in it: passing a buffer to the step that
     // needs it makes two steps sharing one a compile error.
     let mut scratch = Scratch::default();
     // Per-location slot guards and per-function parameter counts for
     // signature-aware propagation.
-    use trace_ir::TypeDesc as TD;
     for loc in &pag.locations {
-        let g = match program.types.get(loc.type_id).desc.as_ref() {
-            TD::FnPtr { params, .. } if !params.is_empty() => SlotGuard::FnParams(params.len()),
-            TD::Void
-            | TD::Char
-            | TD::Bool
-            | TD::Short
-            | TD::Int
-            | TD::Long
-            | TD::LongLong
-            | TD::Float
-            | TD::Double
-            | TD::SizeT
-            | TD::Unknown => continue,
-            TD::Struct { .. } | TD::Union { .. } | TD::Ptr(_) | TD::Array { .. } => {
-                SlotGuard::NotFnPtr
-            }
-            TD::FnPtr { .. } => continue,
-        };
-        st.slot_guard.insert(loc.id, g);
+        if let Some(g) = slot_guard_for(program, loc.type_id) {
+            st.slot_guard.insert(loc.id, g);
+        }
     }
     for (&fn_id, &loc) in &pag.fn_locations {
         let f = program.symbols.function(fn_id);
@@ -555,19 +531,7 @@ fn solve(
     // actual propagation) and dramatically improves worklist drain on
     // large PAGs where LIFO ordering buries early-pushed nodes.
     for c in pag.constraints.iter() {
-        if matches!(c.kind, ConstraintKind::AddrOf) {
-            if let PagNodeKind::Loc(loc) = pag.nodes[c.src.0 as usize].kind {
-                let inserted = {
-                    let entry = st.pts.entry(c.dst).or_default();
-                    entry.insert(loc)
-                };
-                if inserted {
-                    st.loc_nodes.entry(loc).or_default().insert(c.dst);
-                    st.record_delta(c.dst, &[loc]);
-                    st.push(c.dst);
-                }
-            }
-        }
+        seed_addr_of(pag, program, &mut st, &mut scratch, c);
     }
 
     // Mark all nodes that received pre-seeded addr-of points as
@@ -585,10 +549,7 @@ fn solve(
     let mut terminator_events: Vec<(CallSiteId, u32)> = Vec::new();
 
     for var in &program.symbols.variables {
-        if !matches!(
-            var.storage,
-            StorageClass::Global | StorageClass::FileStatic | StorageClass::FnStatic
-        ) {
+        if !seeds_own_location(program, var.id) {
             continue;
         }
         if let Some(&loc) = pag.var_location.get(&var.id) {
@@ -793,7 +754,12 @@ fn solve(
                             };
                             if let Some(summary) = summary_opt {
                                 propagate_locs(&mut st, &mut scratch.fresh, dst, [summary]);
-                                st.merge_memory_into_if_grown(&mut scratch.fresh, dst, summary);
+                                st.merge_memory_into_if_grown(
+                                    pag,
+                                    &mut scratch.fresh,
+                                    dst,
+                                    summary,
+                                );
                             }
                         }
                     }
@@ -801,6 +767,7 @@ fn solve(
             }
             continue;
         }
+        sync_var_to_cell(pag, &mut st, &mut scratch.holders, node, &delta);
 
         if let Some(idxs) = pag.indices.copy_src.get(&node) {
             for &idx in idxs {
@@ -827,7 +794,7 @@ fn solve(
                         add_pts(&mut st, dst, loc);
                     } else {
                         w_load += 1;
-                        st.merge_memory_into_if_grown(&mut scratch.fresh, dst, loc);
+                        st.merge_memory_into_if_grown(pag, &mut scratch.fresh, dst, loc);
                     }
                 }
             }
@@ -840,14 +807,21 @@ fn solve(
             if let Some(idxs) = pag.indices.store_dst.get(&node) {
                 for &idx in idxs {
                     w_store += delta.len() as u64;
-                    apply_store_to_targets(pag, idx, &mut st, &mut scratch, Some(delta.as_slice()));
+                    apply_store_to_targets(
+                        pag,
+                        program,
+                        idx,
+                        &mut st,
+                        &mut scratch,
+                        Some(delta.as_slice()),
+                    );
                 }
             }
 
             if let Some(idxs) = pag.indices.store_src.get(&node) {
                 for &idx in idxs {
                     w_store += 1;
-                    apply_store_to_targets(pag, idx, &mut st, &mut scratch, None);
+                    apply_store_to_targets(pag, program, idx, &mut st, &mut scratch, None);
                 }
             }
         }
@@ -868,6 +842,8 @@ fn solve(
                 // the access still needs the type-keyed summary to see
                 // stores from other instances of the same struct type.
                 let mut produced_cell = false;
+                // A table's members pass once per step, not once per member.
+                let mut table_members_passed = false;
                 for &loc in delta.iter() {
                     let mut effective_field = field;
                     // Cross-struct FieldId guard: if the GEP carries a
@@ -882,9 +858,17 @@ fn solve(
                     // enough: with no variant merged nothing was unioned, and
                     // relaxing the guard would only let unrelated structs
                     // through.
-                    if let Some(ref expected) = expected_name {
-                        if let Some(parent_type) =
-                            crate::pag::struct_type_for_loc(pag, program, loc)
+                    // Function values are judged by the table-member and
+                    // arity rules below, not by a struct field name.
+                    if let Some(expected) = expected_name
+                        .as_ref()
+                        .filter(|_| fn_for_loc(pag, loc).is_none())
+                    {
+                        // A pointee with no struct type has no such field.
+                        let Some(parent_type) = crate::pag::struct_type_for_loc(pag, program, loc)
+                        else {
+                            continue;
+                        };
                         {
                             match program.types.get(parent_type).layout.fields.get(&field) {
                                 Some(fl) if fl.name == *expected => {}
@@ -912,8 +896,11 @@ fn solve(
                         let mut passed = false;
                         if let PagNodeKind::Var(base_var) = pag.nodes[src.0 as usize].kind {
                             if let Some(fn_locs) = pag.array_fn_members.get(&base_var) {
-                                for fl in fn_locs.iter().copied() {
-                                    add_pts(&mut st, dst, fl);
+                                if !table_members_passed {
+                                    for fl in fn_locs.iter().copied() {
+                                        add_pts(&mut st, dst, fl);
+                                    }
+                                    table_members_passed = true;
                                 }
                                 passed = true;
                             }
@@ -948,7 +935,7 @@ fn solve(
                         // loaded) still observe stores that lowering recorded
                         // against the cell without an intervening load temp.
                         for fl in targets.into_iter().flatten() {
-                            st.merge_memory_into_if_grown(&mut scratch.fresh, dst, fl);
+                            st.merge_memory_into_if_grown(pag, &mut scratch.fresh, dst, fl);
                         }
                         // ArrayFnMember element fns: reachable through
                         // the array itself or any pointer to an element.
@@ -984,7 +971,7 @@ fn solve(
                         };
                         if let Some(summary) = summary_opt {
                             propagate_locs(&mut st, &mut scratch.fresh, dst, [summary]);
-                            st.merge_memory_into_if_grown(&mut scratch.fresh, dst, summary);
+                            st.merge_memory_into_if_grown(pag, &mut scratch.fresh, dst, summary);
                         }
                     }
                     continue 'gep;
@@ -1074,6 +1061,12 @@ fn solve(
                                     // and push their sources onto the worklist so the solver
                                     // processes them.
                                     if pag.constraints.len() > constraint_before {
+                                        // `return &v` / `return fn` hand out an
+                                        // address: seed it like the ones present
+                                        // at solve start.
+                                        for c in &pag.constraints[constraint_before..] {
+                                            seed_addr_of(pag, program, &mut st, &mut scratch, c);
+                                        }
                                         let new_srcs = pag.index_new_constraints(constraint_before);
                                         for src in new_srcs {
                                             st.push(src);
@@ -1178,19 +1171,9 @@ fn solve(
 /// source-side field cells (the address temp itself is never used for
 /// loads). Pointer-typed actuals (`memcpy(d, s, n)`) stay at their own node.
 fn model_copy_side(pag: &Pag, node: PagNodeId) -> PagNodeId {
-    if let Some(idxs) = pag.indices.addr_of_dst.get(&node) {
-        for &idx in idxs {
-            let c = &pag.constraints[idx];
-            if let PagNodeKind::Loc(loc) = pag.nodes[c.src.0 as usize].kind {
-                if let Some(v) = pag.locations[loc.0 as usize].var {
-                    if let Some(&var_node) = pag.var_node.get(&v) {
-                        return var_node;
-                    }
-                }
-            }
-        }
-    }
-    node
+    pag.addressed_var(node)
+        .and_then(|v| pag.var_node.get(&v).copied())
+        .unwrap_or(node)
 }
 
 /// Apply a callee's function model at one resolved call site: attach
@@ -1278,7 +1261,7 @@ fn apply_fn_model(
             Effect::Clears { param } => {
                 if arg_node(pag, *param).is_some() {
                     let event = (cs.id, *param);
-                    if !terminator_events.contains(&event) {
+                    if st.terminators_seen.insert(event) {
                         terminator_events.push(event);
                     }
                 }
@@ -1327,6 +1310,7 @@ fn propagate_locs(
 /// (difference propagation — their memory is written for the first time).
 fn apply_store_to_targets(
     pag: &Pag,
+    program: &Program,
     idx: usize,
     st: &mut SolverState,
     scratch: &mut Scratch,
@@ -1334,8 +1318,14 @@ fn apply_store_to_targets(
 ) {
     let c = &pag.constraints[idx];
     let (src_node, dst_node) = (c.src, c.dst);
+    // An object whose name denotes its storage (an aggregate, an array) is
+    // stored by address, like the static seed; a pointer's name is only its
+    // value, and `*out = &p` lowers to an explicit `AddrOfVar` temp
+    // (docs/ANALYSIS.md, "Variable cells").
     let self_loc = match pag.nodes[src_node.0 as usize].kind {
-        PagNodeKind::Var(v) => pag.var_location.get(&v).copied(),
+        PagNodeKind::Var(v) if !var_is_pointer_like(program, v) => {
+            pag.var_location.get(&v).copied()
+        }
         _ => None,
     };
     let src_empty = st.pts.get(&src_node).map(|s| s.is_empty()).unwrap_or(true);
@@ -1457,6 +1447,7 @@ fn apply_store_to_targets(
         let loc = scratch.store_requeues[i];
         if scratch.requeued.insert(loc) {
             st.touch_loc_holders(&mut scratch.holders, loc, &pag.indices.load_src);
+            sync_cell_to_var(pag, st, &mut scratch.fresh, loc);
         }
     }
 }
@@ -1490,6 +1481,199 @@ fn ensure_param_copy(
     }
 }
 
+/// The guard a memory cell of declared type `cell_type` imposes, if any.
+fn slot_guard_for(program: &Program, cell_type: trace_ir::TypeId) -> Option<SlotGuard> {
+    slot_guard_of(program.types.get(cell_type).desc.as_ref())
+}
+
+fn slot_guard_of(desc: &trace_ir::TypeDesc) -> Option<SlotGuard> {
+    use trace_ir::TypeDesc as TD;
+    let desc = match desc {
+        // A fn-pointer *variable* lowers as `Ptr(FnPtr)`, a field as bare
+        // `FnPtr`; both are fn-pointer slots (docs/ANALYSIS.md, "Variable
+        // cells").
+        TD::Ptr(inner) if matches!(inner.as_ref(), TD::FnPtr { .. }) => inner.as_ref(),
+        // `void *` / an unknown pointer is untyped storage: it may hold any
+        // address, a function's included.
+        TD::Ptr(inner) if matches!(inner.as_ref(), TD::Void | TD::Unknown) => return None,
+        // A table of function pointers, or of untyped pointers, holds what
+        // its elements hold; a multi-dimensional one, what its leaves hold.
+        TD::Array { elem, .. }
+            if matches!(elem.as_ref(), TD::FnPtr { .. } | TD::Array { .. })
+                || matches!(elem.as_ref(), TD::Ptr(f)
+                    if matches!(f.as_ref(), TD::FnPtr { .. } | TD::Void | TD::Unknown)) =>
+        {
+            return slot_guard_of(elem);
+        }
+        desc => desc,
+    };
+    match desc {
+        TD::FnPtr { params, .. } if !params.is_empty() => Some(SlotGuard::FnParams(params.len())),
+        TD::Void
+        | TD::Char
+        | TD::Bool
+        | TD::Short
+        | TD::Int
+        | TD::Long
+        | TD::LongLong
+        | TD::Float
+        | TD::Double
+        | TD::SizeT
+        | TD::Unknown
+        | TD::FnPtr { .. } => None,
+        TD::Struct { .. } | TD::Union { .. } | TD::Ptr(_) | TD::Array { .. } => {
+            Some(SlotGuard::NotFnPtr)
+        }
+    }
+}
+
+/// Apply an `AddrOf` constraint: its destination points to the source
+/// object, whose address is now taken. Other constraints are ignored.
+///
+/// The first time an object's address is taken it gets its slot guard, if the
+/// solve-start pass did not give it one (a variable cell `expand_return_flows`
+/// creates mid-solve for `return &v`), and a pointer variable's cell starts
+/// being kept in step with the variable. Any location reaching this is
+/// guarded; in practice `AddrOf` sources are variable and function locations
+/// only (`ensure_var_loc`; member addresses lower to `Gep`), so lazily created
+/// field cells, whose recorded type is not reliable enough to guard by, never
+/// arrive here (docs/ANALYSIS.md, "Variable cells").
+fn seed_addr_of(
+    pag: &Pag,
+    program: &Program,
+    st: &mut SolverState,
+    scratch: &mut Scratch,
+    c: &Constraint,
+) {
+    let (ConstraintKind::AddrOf, PagNodeKind::Loc(loc)) =
+        (c.kind, pag.nodes[c.src.0 as usize].kind)
+    else {
+        return;
+    };
+    if st.addr_taken.insert(loc) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = st.slot_guard.entry(loc) {
+            if let Some(g) = slot_guard_for(program, pag.locations[loc.0 as usize].type_id) {
+                slot.insert(g);
+            }
+        }
+        register_synced_cell(pag, program, st, scratch, loc);
+    }
+    add_pts(st, c.dst, loc);
+}
+
+/// Does the solver start `var`'s node out holding `var`'s own location? A
+/// static-storage object's name denotes its storage (an array decays to it);
+/// a pointer's name denotes only the value it holds, and seeding it would
+/// forge an address no `&G` produced (docs/ANALYSIS.md, "Variable cells").
+fn seeds_own_location(program: &Program, var: VarId) -> bool {
+    program.symbols.variable_by_id(var).is_some_and(|v| {
+        matches!(
+            v.storage,
+            StorageClass::Global | StorageClass::FileStatic | StorageClass::FnStatic
+        )
+    }) && !var_is_pointer_like(program, var)
+}
+
+/// Does `var` hold a pointer? Such a variable's node and memory cell are one
+/// value (docs/ANALYSIS.md, "Variable cells"). An array never does, whatever
+/// its elements: its name denotes its storage. Deliberately wider than
+/// [`var_may_hold_pointee`], which leaves out `int *` / `void *` to bound
+/// interprocedural wiring: a buffer pointer's out-parameter still has to
+/// reach its direct reads.
+fn var_is_pointer_like(program: &Program, var: VarId) -> bool {
+    program.symbols.variable_by_id(var).is_some_and(|v| {
+        match program.types.get(v.type_id).desc.as_ref() {
+            trace_ir::TypeDesc::Array { .. } => false,
+            desc => v.is_pointer || desc.is_pointer_like(),
+        }
+    })
+}
+
+/// Start keeping `cell` in step with its variable's node, if it is a pointer
+/// variable's own cell. Whatever each side already holds reaches the other:
+/// the address may be taken long after the variable got its value.
+fn register_synced_cell(
+    pag: &Pag,
+    program: &Program,
+    st: &mut SolverState,
+    scratch: &mut Scratch,
+    cell: LocId,
+) {
+    let Some(v) = pag.locations[cell.0 as usize].var else {
+        return;
+    };
+    // Field cells and summaries also carry `var`: only the variable's own
+    // cell is synced.
+    if pag.var_location.get(&v) != Some(&cell) || !var_is_pointer_like(program, v) {
+        return;
+    }
+    let Some(&node) = pag.var_node.get(&v) else {
+        return;
+    };
+    st.synced_cell.insert(node, cell);
+    st.cell_owner.insert(cell, node);
+    scratch.held.clear();
+    if let Some(held) = st.pts.get(&node) {
+        scratch.held.extend(held.iter().copied());
+    }
+    // Into the ordered cell in a fixed order, not the hash set's.
+    scratch.held.sort_unstable();
+    write_to_cell(pag, st, &mut scratch.holders, cell, &scratch.held);
+    st.merge_memory_into_if_grown(pag, &mut scratch.fresh, node, cell);
+}
+
+/// Write `locs` into `cell`, filtered like a store, and requeue its loaders
+/// if it grew.
+fn write_to_cell(
+    pag: &Pag,
+    st: &mut SolverState,
+    holders: &mut Vec<PagNodeId>,
+    cell: LocId,
+    locs: &[LocId],
+) {
+    let filter = FnFilter::of(st.slot_guard.get(&cell));
+    let grew = {
+        let SolverState {
+            memory_pts,
+            fn_arity,
+            ..
+        } = &mut *st;
+        let entry = memory_pts.entry(cell).or_default();
+        let before = entry.len();
+        for &l in locs {
+            if filter.admits(fn_arity, pag, l) {
+                entry.insert(l);
+            }
+        }
+        entry.len() > before
+    };
+    if grew {
+        st.touch_loc_holders(holders, cell, &pag.indices.load_src);
+    }
+}
+
+/// Node → cell half of the variable-cell rule (docs/ANALYSIS.md, "Variable
+/// cells"): what a variable's node gains is written into its memory cell.
+fn sync_var_to_cell(
+    pag: &Pag,
+    st: &mut SolverState,
+    holders: &mut Vec<PagNodeId>,
+    node: PagNodeId,
+    delta: &[LocId],
+) {
+    if let Some(&cell) = st.synced_cell.get(&node) {
+        write_to_cell(pag, st, holders, cell, delta);
+    }
+}
+
+/// Cell → node half of the variable-cell rule: a store that grew a
+/// variable's cell makes the variable itself see the new contents.
+fn sync_cell_to_var(pag: &Pag, st: &mut SolverState, fresh: &mut Vec<LocId>, cell: LocId) {
+    if let Some(&node) = st.cell_owner.get(&cell) {
+        st.merge_memory_into_if_grown(pag, fresh, node, cell);
+    }
+}
+
 /// Only parameters whose pointees can influence call-target resolution get
 /// persistent interprocedural copy constraints: function pointers directly,
 /// opaque/unknown pointees that may hide them, and aggregates (op tables,
@@ -1505,10 +1689,13 @@ fn var_may_hold_pointee(program: &Program, var: VarId) -> bool {
     let desc = program.types.get(v.type_id).desc.as_ref();
     match desc {
         TD::FnPtr { .. } => true,
-        TD::Ptr(inner) => matches!(
-            inner.as_ref(),
-            TD::FnPtr { .. } | TD::Unknown | TD::Struct { .. } | TD::Union { .. }
-        ),
+        // A pointer to a fn-pointer slot (`cb_t *out`, a table row) reaches
+        // callbacks through its pointee just as a struct pointer does.
+        TD::Ptr(inner) => match inner.as_ref() {
+            TD::FnPtr { .. } | TD::Unknown | TD::Struct { .. } | TD::Union { .. } => true,
+            TD::Ptr(slot) => matches!(slot.as_ref(), TD::FnPtr { .. }),
+            _ => false,
+        },
         // Pointer-flagged variable whose recorded shape degraded to a scalar
         // (e.g. synthesized load temps typed `int`): participate
         // conservatively.
@@ -1729,6 +1916,7 @@ fn fn_for_loc(pag: &Pag, loc: LocId) -> Option<FnId> {
 
 fn extract_arg_flow(
     program: &Program,
+    pag: &Pag,
     call_edges: &[CallGraphEdge],
     wired: &FxHashSet<(CallSiteId, u32, FnId)>,
     result: &mut AnalysisResult,
@@ -1749,7 +1937,7 @@ fn extract_arg_flow(
         for (i, formal) in callee.params.iter().enumerate() {
             let idx = i as u32;
             if wired.contains(&(edge.call_site, idx, edge.callee)) {
-                if let Some(actual) = cs.var_args.iter().find(|(j, _)| *j == idx).map(|(_, v)| *v) {
+                if let Some(actual) = pag.argument_var(cs, idx) {
                     result.arg_flow_edges.push(ArgFlowEdge {
                         call_site: edge.call_site,
                         arg_index: idx,
@@ -1831,6 +2019,58 @@ mod tests {
                 .collect();
             assert_eq!(view, expected, "filter {filter:?}");
         }
+    }
+
+    /// Issue #127: a load through a guarded cell lifts every data value and
+    /// only the function values the guard admits — and keeps doing so when
+    /// the cell grows between merges.
+    #[test]
+    fn merge_admits_data_and_filters_functions() {
+        // store_fixture: locs 0..3 are functions (0: arity 1, 1: arity 2,
+        // 2: unknown arity); 3..5 are data. Cell ids only index `memory_pts`
+        // and `slot_guard`, never `pag.locations`, so they may lie past 5.
+        let (pag, fn_arity, _) = store_fixture();
+        let (not_fn_cell, arity2_cell) = (LocId(10), LocId(11));
+        let (dst_a, dst_b) = (PagNodeId(0), PagNodeId(1));
+        let mut st = SolverState {
+            fn_arity,
+            ..Default::default()
+        };
+        st.slot_guard.insert(not_fn_cell, SlotGuard::NotFnPtr);
+        st.slot_guard.insert(arity2_cell, SlotGuard::FnParams(2));
+        let mut fresh = Vec::new();
+        let pts = |st: &SolverState, n: PagNodeId| {
+            let mut v: Vec<u32> = st.pts.get(&n).into_iter().flatten().map(|l| l.0).collect();
+            v.sort();
+            v
+        };
+
+        // NotFnPtr cell: data passes, every function value is rejected.
+        st.memory_pts
+            .entry(not_fn_cell)
+            .or_default()
+            .extend([LocId(3), LocId(0)]);
+        st.merge_memory_into_if_grown(&pag, &mut fresh, dst_a, not_fn_cell);
+        assert_eq!(pts(&st, dst_a), [3]);
+
+        // The cell grows: the second merge lifts only the new data value.
+        st.memory_pts
+            .entry(not_fn_cell)
+            .or_default()
+            .extend([LocId(1), LocId(4)]);
+        st.merge_memory_into_if_grown(&pag, &mut fresh, dst_a, not_fn_cell);
+        assert_eq!(pts(&st, dst_a), [3, 4]);
+
+        // FnParams(2) cell: data, same-arity and unknown-arity functions pass;
+        // the arity-1 function is rejected.
+        st.memory_pts.entry(arity2_cell).or_default().extend([
+            LocId(0),
+            LocId(1),
+            LocId(2),
+            LocId(3),
+        ]);
+        st.merge_memory_into_if_grown(&pag, &mut fresh, dst_b, arity2_cell);
+        assert_eq!(pts(&st, dst_b), [1, 2, 3]);
     }
 
     /// Every `SlotGuard` maps to the filter that reproduces it, so the guard
