@@ -89,8 +89,6 @@ struct SolverState {
     /// Nodes whose one-time, points-to-independent constraint effects
     /// (addr-of seeding, GEP summary fallback) have already been applied.
     seen_once: FxHashSet<PagNodeId>,
-    /// Summary locations that hit `SUMMARY_MEM_CAP` and stopped growing.
-    saturated_summaries: FxHashSet<LocId>,
     /// Dedup for dynamically added parameter-copy constraints: the same
     /// (actual → formal) pair recurs across many call sites and re-adding it
     /// per discovered edge explodes constraint volume on large trees.
@@ -399,8 +397,9 @@ fn st_pts_stats_max(pts: &IndexMap<PagNodeId, FxHashSet<LocId>>) -> usize {
 }
 
 /// Maximum distinct locations remembered per instance-insensitive summary
-/// location. Past this, further stores are dropped (see saturation note in
-/// `apply_store_to_targets`).
+/// location. Past this, further stores to it are dropped — deliberate
+/// imprecision that bounds the cost of a hub summary on large trees. See the
+/// cap check in `apply_store_to_targets`.
 const SUMMARY_MEM_CAP: usize = 1024;
 
 fn solve(
@@ -419,7 +418,6 @@ fn solve(
         worklist: Vec::new(),
         queued: FxHashSet::default(),
         seen_once: FxHashSet::default(),
-        saturated_summaries: FxHashSet::default(),
         wired_copies: FxHashSet::default(),
         wired_model_edges: FxHashSet::default(),
         slot_guard: FxHashMap::default(),
@@ -1277,16 +1275,15 @@ fn apply_store_to_targets(
         if let Some(summary) = summary_loc {
             let entry = st.memory_pts.entry(summary).or_default();
             let before_summary = entry.len();
-            if before_summary >= SUMMARY_MEM_CAP {
-                st.saturated_summaries.insert(summary);
-            } else if scratch.summaries_written.insert(summary) {
+            // Past the cap the summary stops growing: this store's writes to
+            // it are dropped, and every later one is too, since cell memory
+            // never shrinks.
+            if before_summary < SUMMARY_MEM_CAP && scratch.summaries_written.insert(summary) {
                 // Many of a store's targets are field cells of the same
                 // struct type and field, and they all share that summary.
                 // Memory only grows, so once this store has written the
                 // summary every later write of it in the same store is an
-                // insert-by-insert no-op: skip it, but keep the cap check
-                // above, which is the only part that can still have an
-                // effect.
+                // insert-by-insert no-op, and is skipped.
                 //
                 // The summary cell mirrors the field's declared type, but
                 // only its function-vs-not distinction: a typed fn-pointer
