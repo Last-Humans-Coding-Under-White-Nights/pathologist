@@ -52,6 +52,10 @@ jobs:
           ./target/ctrace inspect /tmp/capi.db calls --from entry
           ./target/ctrace inspect /tmp/capi.db callgraph --file main.c --line 8
           ./target/ctrace inspect /tmp/capi.db dataflow --file main.c --line 8 --col 9
+          # Externals with no in-tree declaration yield a NULL callee_path;
+          # make sure the example's `calls` rendering tolerates it.
+          ./target/ctrace analyze tests/fixtures/extern_call -o /tmp/capi_ext.db
+          ./target/ctrace inspect /tmp/capi_ext.db calls --from local_wrap
 
       - name: Install Doxygen
         run: |

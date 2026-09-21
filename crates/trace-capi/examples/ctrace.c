@@ -158,9 +158,13 @@ static int cmd_functions(trace_db *db, const char *file, long long line) {
     }
     for (size_t i = 0; i < fns.count; i++) {
         const trace_function *f = &fns.items[i];
-        printf("%s (%s:%lld-%lld)%s\n", f->name, basename(f->path),
-               (long long)f->line_start, (long long)f->line_end,
-               f->is_defined ? "" : " [external]");
+        /* A synthesized external has no source location of its own. */
+        if (f->line_start > 0)
+            printf("%s (%s:%lld-%lld)%s\n", f->name, basename(f->path),
+                   (long long)f->line_start, (long long)f->line_end,
+                   f->is_defined ? "" : " [external]");
+        else
+            printf("%s [external]\n", f->name);
     }
     if (fns.count == 0) printf("no function contains %s:%lld\n", file, line);
     trace_function_list_free(&fns);
@@ -200,17 +204,19 @@ static int cmd_calls(trace_db *db, const char *from, const char *to, const char 
     }
     for (size_t i = 0; i < edges.count; i++) {
         const trace_call_edge *e = &edges.items[i];
-        /* Synthetic IPC-bridge edges carry no call site (path == NULL). */
-        if (e->path) {
-            printf("%s (%s:%d) -> %s (%s) [%s] (%s)\n",
-                   e->caller_name, basename(e->caller_path), (int)e->line,
-                   e->callee_name, basename(e->callee_path),
-                   res_str(e->resolution), basename(e->path));
-        } else {
-            printf("%s -> %s [%s] (%s)\n",
-                   e->caller_name, e->callee_name,
-                   res_str(e->resolution), basename(e->callee_path));
-        }
+        /* Synthesized externals carry no callee file of their own; a `(file)`
+         * tag would present an arbitrary call site's file as theirs. */
+        const char *callee_loc = e->callee_path ? basename(e->callee_path) : NULL;
+        if (e->path)
+            printf("%s (%s:%d) -> %s", e->caller_name, basename(e->caller_path),
+                   (int)e->line, e->callee_name);
+        else
+            /* Synthetic IPC-bridge edges carry no call site (path == NULL). */
+            printf("%s -> %s", e->caller_name, e->callee_name);
+        if (callee_loc) printf(" (%s)", callee_loc);
+        printf(" [%s]", res_str(e->resolution));
+        if (e->path) printf(" (%s)", basename(e->path));
+        printf("\n");
     }
     if (edges.count == 0) printf("no call edges\n");
     trace_call_edge_list_free(&edges);

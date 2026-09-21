@@ -194,8 +194,8 @@ typedef struct trace_function {
     int64_t     id;         /**< Unique function ID in the database. */
     const char *name;       /**< Function name (unmangled or demangled). */
     const char *path;       /**< Source file path where the function is declared or defined. */
-    int64_t     line_start; /**< 1-based start line in the source file. */
-    int64_t     line_end;   /**< 1-based end line in the source file. */
+    int64_t     line_start; /**< 1-based start line in the source file; 0 for a synthesized external (never declared in-tree). */
+    int64_t     line_end;   /**< 1-based end line in the source file; 0 for a synthesized external. */
     int32_t     is_defined; /**< Non-zero if definition body is present; 0 if declaration only. */
 } trace_function;
 
@@ -255,7 +255,7 @@ typedef struct trace_call_edge {
     const char        *caller_name; /**< Caller function name. */
     const char        *caller_path; /**< Caller's own source file path. */
     const char        *callee_name; /**< Callee function name. */
-    const char        *callee_path; /**< Callee source file path, or NULL if external. */
+    const char        *callee_path; /**< Callee source file path, or NULL if synthesized (never declared in-tree). Own declaration path survives for prototype-only externals. */
     trace_resolution   resolution;  /**< Edge resolution kind (#trace_resolution). */
     const char        *path;        /**< Call-site source file path (NULL for synthetic IPC edges). */
     int32_t            line;        /**< 1-based call-site line (0 for synthetic IPC edges). */

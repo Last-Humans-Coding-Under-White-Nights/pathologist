@@ -367,7 +367,9 @@ pub unsafe extern "C" fn trace_db_call_edges(
                     // meaningful for synthetic edges that have no call site.
                     caller_path: arena.add(&e.caller_path),
                     callee_name: arena.add(&e.callee_name),
-                    callee_path: arena.add(&e.callee_path),
+                    // NULL for synthesized externals, which have no file of
+                    // their own (see `trace_call_edge.callee_path` docs).
+                    callee_path: arena.add_opt(e.callee_path.as_deref()),
                     resolution: resolution_from_str(&e.resolution),
                     path,
                     line,
@@ -1078,6 +1080,53 @@ mod tests {
         assert!(cstr_show(e.caller_path).ends_with("main.c"));
         assert!(cstr_show(e.callee_path).ends_with("lib.c"));
         assert_eq!(e.line, 2);
+        unsafe { trace_call_edge_list_free(&mut list) };
+        unsafe { trace_db_close(db) };
+    }
+
+    #[test]
+    fn synthesized_external_has_no_callee_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("main.c"),
+            "void known(void);\nint main(void) { known(); zap(); return 0; }\n",
+        )
+        .unwrap();
+        let db = analyze_fixture(dir.path());
+        let mut list = TraceCallEdgeList {
+            items: ptr::null_mut(),
+            count: 0,
+            _impl: ptr::null_mut(),
+        };
+        let mut err: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                trace_db_call_edges(
+                    db,
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    &mut list,
+                    &mut err,
+                )
+            },
+            TraceStatus::TraceOk as c_int,
+            "err={}",
+            cstr_show(err)
+        );
+        let edge = |name: &str| {
+            (0..list.count)
+                .map(|i| unsafe { &*list.items.add(i) })
+                .find(|e| cstr_show(e.callee_name) == name)
+        };
+        // `zap` is never declared in-tree: the synthesized external carries no
+        // callee file, so the API hands back a NULL callee_path rather than a
+        // fabricated call-site file.
+        let zap = edge("zap").unwrap();
+        assert!(zap.callee_path.is_null(), "{}", cstr_show(zap.callee_path));
+        // `known` is a real prototype: its declaration path survives.
+        let known = edge("known").unwrap();
+        assert!(cstr_show(known.callee_path).ends_with("main.c"));
         unsafe { trace_call_edge_list_free(&mut list) };
         unsafe { trace_db_close(db) };
     }

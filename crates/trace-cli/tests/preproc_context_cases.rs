@@ -58,17 +58,21 @@ fn two_tus_get_their_own_expansions() {
     );
 
     // Both arms were really lowered, each at its own line, rather than one
-    // expansion being replayed into both units.
-    let arm_line = |name: &str| {
+    // expansion being replayed into both units. The arm bodies' calls are
+    // the per-arm facts here: synthesized externals (`fast_path`,
+    // `slow_path`) carry no source location of their own, so the arms are
+    // told apart by their call sites.
+    let arm_call_lines = |name: &str| {
         program
             .symbols
-            .functions
+            .call_sites
             .iter()
-            .find(|f| f.name == name)
-            .map(|f| f.span.line)
+            .filter(|cs| cs.callee_name == name)
+            .map(|cs| cs.span.line)
+            .collect::<Vec<_>>()
     };
-    assert_eq!(arm_line("fast_path"), Some(4));
-    assert_eq!(arm_line("slow_path"), Some(6));
+    assert_eq!(arm_call_lines("fast_path"), vec![4]);
+    assert_eq!(arm_call_lines("slow_path"), vec![6]);
 
     // The two definitions are external `impl`s of the same signature, so the
     // symbol table holds one of them and it carries both configurations'

@@ -521,22 +521,27 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
                         continue;
                     }
                 }
+                // Synthesized externals carry no callee file of their own; a
+                // `[file]` tag would present an arbitrary call site's file.
+                let callee_tag = e
+                    .callee_path
+                    .as_deref()
+                    .map(|p| format!(" [{}]", basename(p)))
+                    .unwrap_or_default();
                 match (e.call_site_path, e.call_site_line) {
                     // Real call sites.
                     (Some(cf), Some(l)) => println!(
-                        "{caller} ({basename_of_call_site}:{l}) -> {callee} [{basename_of_callee}] \
+                        "{caller} ({basename_of_call_site}:{l}) -> {callee}{callee_tag} \
                          ({res})",
                         basename_of_call_site = basename(&cf),
                         callee = e.callee_name,
-                        basename_of_callee = basename(&e.callee_path),
                         res = e.resolution,
                         caller = e.caller_name,
                     ),
                     // Synthetic IPC bridge edges have no source call site.
                     _ => println!(
-                        "{caller} -> {callee} [{basename_of_callee}] ({res})",
+                        "{caller} -> {callee}{callee_tag} ({res})",
                         callee = e.callee_name,
-                        basename_of_callee = basename(&e.callee_path),
                         res = e.resolution,
                         caller = e.caller_name,
                     ),

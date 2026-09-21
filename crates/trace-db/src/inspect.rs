@@ -46,9 +46,27 @@ pub struct FunctionRef {
     pub is_defined: bool,
 }
 
+/// True when `line_start` denotes a real source location. Synthesized
+/// externals are never declared in the tree, so lowering exports line 0 for
+/// them; their `functions.file_id` is only a resolver scope fallback and must
+/// not be matched by file/line filters nor presented as a location. This is
+/// the one predicate every location-sensitive query and renderer shares.
+pub fn has_source_location(line_start: i64) -> bool {
+    line_start > 0
+}
+
+/// SQL form of [`has_source_location`] for a `functions` row aliased `alias`.
+fn has_source_location_sql(alias: &str) -> String {
+    format!("{alias}.line_start > 0")
+}
+
 impl std::fmt::Display for FunctionRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let base = basename(&self.path);
+        // No source location: a bare external, never a fake `file:0-0`.
+        if !has_source_location(self.line_start) {
+            return write!(f, "{} [external]", self.name);
+        }
         write!(
             f,
             "{} ({}:{}-{}){}",
@@ -178,11 +196,15 @@ pub fn find_functions_at(
     if file_substring.is_empty() {
         bail!("file filter must not be empty");
     }
-    let mut stmt = conn.prepare(
+    // `line_start > 0` keeps location-less synthesized externals out (see
+    // `has_source_location`): `line` is 1-based, so line 0 resolves to nothing.
+    let sql = format!(
         "SELECT f.id, f.name, p.path, f.line_start, f.line_end, f.is_defined \
          FROM functions f JOIN files p ON p.id = f.file_id \
-         WHERE p.path LIKE ?1 AND f.line_start <= ?2 AND f.line_end >= ?2",
-    )?;
+         WHERE p.path LIKE ?1 AND {} AND f.line_start <= ?2 AND f.line_end >= ?2",
+        has_source_location_sql("f")
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let pattern = format!("%{file_substring}%");
     let rows = stmt.query_map(rusqlite::params![pattern, line], |row| {
         Ok(FunctionRef {
@@ -222,7 +244,12 @@ pub fn load_function_labels(conn: &Connection) -> Result<FxHashMap<i64, GraphNod
             GraphNode {
                 id,
                 label: name,
-                detail: if defined != 0 {
+                // A synthesized external (never declared in the tree) exports
+                // line_start 0 and must not present an arbitrary call site as
+                // its own location.
+                detail: if !has_source_location(line) {
+                    "[external]".to_string()
+                } else if defined != 0 {
                     format!("{file_name}:{line}")
                 } else {
                     format!("{file_name}:{line} [external]")
@@ -355,7 +382,9 @@ pub struct CallEdgeRef {
     /// 1-based call-site column; `None` for synthetic edges.
     pub call_site_col: Option<i64>,
     pub callee_name: String,
-    pub callee_path: String,
+    /// Callee's own source file; `None` for synthesized externals (never
+    /// declared in the tree, so they have no file).
+    pub callee_path: Option<String>,
     pub resolution: String,
 }
 
@@ -366,7 +395,7 @@ pub fn call_edges(conn: &Connection, filter: &CallEdgeFilter<'_>) -> Result<Vec<
     require_call_edge_caller(conn)?;
     let mut sql = String::from(
         "SELECT caller.id, caller.name, caller_f.path, csf.path, cs.line, cs.col, callee.name, \
-                 callee_f.path, ce.resolution \
+                 callee_f.path, callee.line_start, ce.resolution \
                  FROM call_edges ce \
                  LEFT JOIN call_sites cs ON cs.id = ce.call_site_id \
                  LEFT JOIN files csf ON csf.id = cs.file_id \
@@ -394,9 +423,13 @@ pub fn call_edges(conn: &Connection, filter: &CallEdgeFilter<'_>) -> Result<Vec<
     if let Some(p) = filter.file {
         params.push(format!("%{}%", like_escape(p)));
         let n = params.len();
+        // A synthesized external's stored file is an arbitrary call site, so
+        // it must not match a `--file` filter as if it were the callee's own.
         sql.push_str(&format!(
-            " AND (csf.path LIKE ?{n} ESCAPE '!' OR callee_f.path LIKE ?{n} ESCAPE '!' OR \
-             (ce.call_site_id IS NULL AND caller_f.path LIKE ?{n} ESCAPE '!'))"
+            " AND (csf.path LIKE ?{n} ESCAPE '!' OR \
+             ({} AND callee_f.path LIKE ?{n} ESCAPE '!') OR \
+             (ce.call_site_id IS NULL AND caller_f.path LIKE ?{n} ESCAPE '!'))",
+            has_source_location_sql("callee")
         ));
     }
     // Sort real call sites first; synthetic (IPC bridge) edges have a NULL
@@ -406,6 +439,7 @@ pub fn call_edges(conn: &Connection, filter: &CallEdgeFilter<'_>) -> Result<Vec<
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         let line: Option<i64> = row.get(4)?;
         let col: Option<i64> = row.get(5)?;
+        let callee_line: i64 = row.get(8)?;
         Ok(CallEdgeRef {
             caller_id: row.get(0)?,
             caller_name: row.get(1)?,
@@ -414,8 +448,10 @@ pub fn call_edges(conn: &Connection, filter: &CallEdgeFilter<'_>) -> Result<Vec<
             call_site_line: line,
             call_site_col: col,
             callee_name: row.get(6)?,
-            callee_path: row.get(7)?,
-            resolution: row.get(8)?,
+            // A synthesized external has no source file of its own (see
+            // `has_source_location`).
+            callee_path: has_source_location(callee_line).then_some(row.get(7)?),
+            resolution: row.get(9)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1172,7 +1208,13 @@ pub fn find_functions_by_name(
     if let Some(fs) = file_substring {
         params.push(format!("%{}%", like_escape(fs)));
         let idx = params.len();
-        sql.push_str(&format!(" AND p.path LIKE ?{idx} ESCAPE '!'"));
+        // A synthesized external has no file of its own (its stored `file_id`
+        // is an arbitrary call-site fallback), so file filters must not match
+        // it — otherwise which file "contains" it depends on FileId ordering.
+        sql.push_str(&format!(
+            " AND {} AND p.path LIKE ?{idx} ESCAPE '!'",
+            has_source_location_sql("f")
+        ));
     }
     sql.push_str(" ORDER BY f.is_defined DESC, (f.line_end - f.line_start) ASC, f.name ASC");
     let mut stmt = conn.prepare(&sql)?;
