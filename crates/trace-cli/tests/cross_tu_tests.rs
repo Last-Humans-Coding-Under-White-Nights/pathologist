@@ -886,6 +886,102 @@ fn header_static_lambdas_share_bodies() {
 }
 
 #[test]
+fn header_member_lambdas_share_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("util.h"),
+        "bool nonzero(int v) { return v != 0; }\nstruct Rec { int s_; bool Any() { auto f = [](int v) { return nonzero(v); }; return f(s_); } };\n",
+    )
+    .unwrap();
+    for n in 1..=3 {
+        std::fs::write(
+            root.join(format!("t{n}.cpp")),
+            format!("#include \"util.h\"\nvoid use{n}() {{ Rec r; r.Any(); }}\n"),
+        )
+        .unwrap();
+    }
+    let program = build_program(root, &default_opts(root)).unwrap();
+    let lambdas: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name.contains("$lambda"))
+        .collect();
+    assert_eq!(lambdas.len(), 1, "header member lambdas={lambdas:?}");
+    assert_eq!(
+        program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|s| s.caller == lambdas[0].id)
+            .count(),
+        1
+    );
+}
+
+/// Instantiating `DelayedSingleton` with a different `T` per TU varies the
+/// template argument, but the header-sharing key is `(header span, name,
+/// definition text)` and templates are never instantiated during lowering, so
+/// `T` never reaches the key. This therefore exercises the same merge path as
+/// [`header_member_lambdas_share_bodies`]; the `instance` static below is where
+/// an over- or under-eager merge would both be visible.
+#[test]
+fn class_template_member_lambdas_share_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("singleton.h"),
+        "template<typename T> class DelayedSingleton { public: static std::shared_ptr<T> GetInstance() { static std::once_flag onceFlag; static std::shared_ptr<T> instance; std::call_once(onceFlag, []() { instance = std::make_shared<T>(); }); return instance; } };\n",
+    )
+    .unwrap();
+    for n in 1..=3 {
+        std::fs::write(
+            root.join(format!("t{n}.cpp")),
+            format!(
+                "#include \"singleton.h\"\nstruct W{n} {{ int x; }};\nvoid use{n}() {{ DelayedSingleton<W{n}>::GetInstance(); }}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let program = build_program(root, &default_opts(root)).unwrap();
+    let lambdas: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name.contains("$lambda"))
+        .collect();
+    assert_eq!(
+        lambdas.len(),
+        1,
+        "class-template member lambdas={lambdas:?}"
+    );
+    assert_eq!(
+        program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|s| s.caller == lambdas[0].id)
+            .count(),
+        1
+    );
+    // The three TUs instantiate `DelayedSingleton` with three different `T`s,
+    // so the shared body must still own a single function-local static for
+    // each: `instance` in particular is where an over- or under-eager merge
+    // would both be visible.
+    for name in ["onceFlag", "instance"] {
+        let statics: Vec<_> = program
+            .symbols
+            .variables
+            .iter()
+            .filter(|v| v.name == name)
+            .collect();
+        assert_eq!(statics.len(), 1, "{name} storage={statics:?}");
+        assert_eq!(statics[0].storage, trace_ir::StorageClass::FnStatic);
+    }
+}
+
+#[test]
 fn shared_header_fn_static_callback_storage_unions_tu_values() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
