@@ -52,9 +52,12 @@ deduplicated together. Calls spelled as macro arguments keep the argument's own
 source position and have no macro-body expansion span. For a member call whose
 called member is spelled in the replacement list, lowering reads that member
 token rather than the receiver's first token; therefore `ARG->member()` still
-points to `member` when `ARG` came from a macro argument. When the member itself
-is a macro argument, lowering retains the call start instead, preserving
-distinct replacement-list receivers such as `a.ARG()` and `b.ARG()`.
+points to `member` when `ARG` came from a macro argument. When the receiver is
+also macro-spelled, lowering retains the call start instead, preserving
+distinct replacement-list receivers such as `a.ARG()` and `b.ARG()`. This also
+applies when `ARG` expands from another macro: that nested expansion gives both
+member tokens the same spelling and expansion coordinates, while the receiver
+tokens still identify the two calls.
 
 Semantic ownership and visibility use the expansion file when it is present.
 Consequently, invoking a macro declared under a dependency root still produces

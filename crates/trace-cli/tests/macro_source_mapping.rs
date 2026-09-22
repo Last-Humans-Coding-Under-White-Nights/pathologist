@@ -211,3 +211,45 @@ fn member_argument_calls_keep_distinct_macro_spelled_receivers() {
     callbacks.dedup();
     assert_eq!(callbacks, ["first", "second"]);
 }
+
+#[test]
+fn macro_valued_member_argument_keeps_distinct_macro_spelled_receivers() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        "void first() {}\nvoid second() {}\nstruct Obj { void send(void (*cb)()) { cb(); } };\n#define METHOD send\n#define BOTH(m) a.m(first); b.m(second)\nvoid caller() { Obj a; Obj b; BOTH(METHOD); }\n",
+    )
+    .unwrap();
+
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let main = file_id(&program, dir.path(), "main.cpp");
+    let mut sites = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|site| {
+            fn_name(&program, site.caller) == "caller" && site.callee_name == "Obj::send"
+        })
+        .collect::<Vec<_>>();
+    sites.sort_by_key(|site| site.span.col);
+
+    assert_eq!(sites.len(), 2, "both replacement-list calls must survive");
+    assert!(sites
+        .iter()
+        .all(|site| site.span.file == main && site.span.line == 5));
+    assert_ne!(sites[0].span.col, sites[1].span.col);
+    assert!(sites
+        .iter()
+        .all(|site| { site.expansion_span == Some(trace_ir::Span::new(main, 6, 31)) }));
+
+    let (_pag, analysis) = analyze(&program);
+    let mut callbacks = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(&program, edge.caller) == "Obj::send")
+        .map(|edge| fn_name(&program, edge.callee))
+        .collect::<Vec<_>>();
+    callbacks.sort_unstable();
+    callbacks.dedup();
+    assert_eq!(callbacks, ["first", "second"]);
+}

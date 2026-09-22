@@ -18,9 +18,10 @@ target at repeated macro invocations. They also drive internal-overload lookup,
 PAG name resolution, synthesized-external ownership, function end ranges, and
 `inspect calls --file`. Cache fingerprints include spelling provenance, and
 token pasting keeps source files and coordinates paired from one operand.
-Member calls derive their mapping from a macro-spelled member token, including
-when the receiver is a macro argument. When the member is a macro argument,
-they retain the call start so separate macro-spelled receivers stay distinct.
+Member calls derive their mapping from a macro-spelled member token when the
+receiver is a macro argument. When the receiver is also macro-spelled, they
+retain the call start so separate receivers stay distinct, including when a
+member argument expands from another macro and shares one member location.
 Replacement-token emission caches each spelling file's `LineMap` ID to avoid
 repeated linear file-table scans.
 The SQLite schema is now v6; existing databases must be regenerated.
