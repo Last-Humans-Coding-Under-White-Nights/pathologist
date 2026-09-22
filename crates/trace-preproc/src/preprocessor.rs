@@ -151,6 +151,10 @@ struct PreprocessorState {
     /// Interned index of `current_file` in `line_map.files`; `u32::MAX`
     /// means "not interned yet" (re-interned lazily when the file changes).
     lm_cur_file: u32,
+    /// Replacement-list spelling paths already interned in `line_map`.
+    /// Macro emission is per token, so scanning the file table there would
+    /// make repeated expansions quadratic in the number of mapped files.
+    lm_spelling_files: FxHashMap<PathBuf, u32>,
     /// Current nested macro-expansion depth (hide-set rescan frames).
     expansion_depth: u32,
     expansion_limit_warned: bool,
@@ -288,6 +292,7 @@ impl PreprocessorState {
             current_line: 1,
             emitted_bytes: FxHashMap::default(),
             lm_cur_file: u32::MAX,
+            lm_spelling_files: FxHashMap::default(),
             expansion_depth: 0,
             expansion_limit_warned: false,
             tokens_processed: 0,
@@ -860,6 +865,16 @@ impl PreprocessorState {
         self.line_map.intern_file(path)
     }
 
+    /// Intern a replacement-list spelling path once per preprocessing run.
+    fn lm_spelling_file(&mut self, path: &Path) -> u32 {
+        if let Some(&file) = self.lm_spelling_files.get(path) {
+            return file;
+        }
+        let file = self.line_map.intern_file(path);
+        self.lm_spelling_files.insert(path.to_path_buf(), file);
+        file
+    }
+
     /// Index of the current file in the line-map table, re-interned only
     /// when `current_file` changed since the last call.
     fn lm_current_file(&mut self) -> u32 {
@@ -885,7 +900,7 @@ impl PreprocessorState {
             if let (Some(spelling_file), Some((expansion_line, expansion_col))) =
                 (&tok.spelling_file, tok.origin)
             {
-                let spelling_fid = self.lm_intern(spelling_file);
+                let spelling_fid = self.lm_spelling_file(spelling_file);
                 let expansion_fid = self.lm_current_file();
                 self.line_map.push_expansion(
                     offset,

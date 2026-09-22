@@ -132,3 +132,40 @@ fn macro_provided_closing_brace_keeps_the_function_end_line() {
         "the function-at-line query must include caller's body"
     );
 }
+
+#[test]
+fn member_calls_use_the_macro_spelled_member_with_an_argument_receiver() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("api.h"),
+        "struct Obj { void send(); };\n#define BOTH(o) o->send(); o->send()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        "#include \"api.h\"\nvoid Obj::send() {}\nvoid caller(Obj *p) { BOTH(p); }\n",
+    )
+    .unwrap();
+
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let api = file_id(&program, dir.path(), "api.h");
+    let main = file_id(&program, dir.path(), "main.cpp");
+    let mut sites = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|site| {
+            fn_name(&program, site.caller) == "caller" && site.callee_name == "Obj::send"
+        })
+        .collect::<Vec<_>>();
+    sites.sort_by_key(|site| site.span.col);
+
+    assert_eq!(sites.len(), 2, "both replacement-list calls must survive");
+    assert!(sites
+        .iter()
+        .all(|site| site.span.file == api && site.span.line == 2));
+    assert_ne!(sites[0].span.col, sites[1].span.col);
+    assert!(sites
+        .iter()
+        .all(|site| { site.expansion_span == Some(trace_ir::Span::new(main, 3, 23)) }));
+}

@@ -651,6 +651,23 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_binding_undefined_after_the_lookup_still_blocks() {
+        let tree = Tree::new(&[
+            ("a.h", "#define A 1\n"),
+            ("with_a.c", "#include \"a.h\"\n#include \"h.h\"\n"),
+            (
+                "undefines_after.c",
+                "#include \"a.h\"\n#include \"h.h\"\n#undef A\n",
+            ),
+        ]);
+        let cache = new_cache();
+        let run = tree.run("undefines_after.c", &cache, true);
+        let with_a = tree.run("with_a.c", &cache, true);
+        assert!(commit(&with_a, &cache).is_some());
+        assert!(commit(&run, &cache).is_none());
+    }
+
+    #[test]
     fn entries_shown_from_a_journal_ahead_have_to_be_stored_first() {
         let tree = Tree::new(&[
             ("first.c", "#include \"h.h\"\n"),

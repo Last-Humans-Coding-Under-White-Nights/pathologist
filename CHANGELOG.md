@@ -18,6 +18,9 @@ target at repeated macro invocations. They also drive internal-overload lookup,
 PAG name resolution, synthesized-external ownership, function end ranges, and
 `inspect calls --file`. Cache fingerprints include spelling provenance, and
 token pasting keeps source files and coordinates paired from one operand.
+Member calls derive their mapping from the called member token, including when
+the receiver is a macro argument, and replacement-token emission caches each
+spelling file's `LineMap` ID to avoid repeated linear file-table scans.
 The SQLite schema is now v6; existing databases must be regenerated.
 
 On the pinned evaluation corpora, hiview and camera are unchanged. HDF gains

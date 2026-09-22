@@ -6127,8 +6127,22 @@ fn collect_call_at_node(
         Some(f) => f,
         None => return,
     };
-    let span = node_call_span(program, ctx, node);
-    let expansion_span = node_expansion_span(program, ctx, node);
+    // A member call node starts at its receiver. In a composite macro call
+    // that receiver may be an argument even when the member is spelled in the
+    // replacement list, so source both locations from the member token. Keep
+    // the historical whole-call start for an ordinary, unexpanded call.
+    let source_node = if func.kind() == "field_expression" {
+        let field = func.child_by_field_name("field").unwrap_or(func);
+        if node_has_expansion_location(ctx, func) || node_has_expansion_location(ctx, field) {
+            field
+        } else {
+            node
+        }
+    } else {
+        node
+    };
+    let span = node_call_span(program, ctx, source_node);
+    let expansion_span = node_expansion_span(program, ctx, source_node);
     let return_dst = ctx.call_return_dst.borrow().get(&node.id()).copied();
 
     // ---- C++ member calls with statically-typed receivers ----
@@ -11552,6 +11566,14 @@ fn node_expansion_span(program: &mut Program, ctx: &LowerContext, node: Node) ->
         ctx.current_file
     };
     Some(Span::new(fid, entry.expansion_line, entry.expansion_col))
+}
+
+fn node_has_expansion_location(ctx: &LowerContext, node: Node) -> bool {
+    ctx.line_map.as_ref().is_some_and(|line_map| {
+        line_map
+            .lookup(node.start_byte())
+            .is_some_and(|entry| line_map.expansion_path_of(entry).is_some())
+    })
 }
 
 /// Original-file end line of `node`, for range queries like "which function
