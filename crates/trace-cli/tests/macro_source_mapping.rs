@@ -231,7 +231,55 @@ fn macro_valued_member_argument_keeps_distinct_macro_spelled_receivers() {
             fn_name(&program, site.caller) == "caller" && site.callee_name == "Obj::send"
         })
         .collect::<Vec<_>>();
-    sites.sort_by_key(|site| site.span.col);
+    sites.sort_by_key(|site| site.occurrence().span.col);
+
+    assert_eq!(sites.len(), 2, "both replacement-list calls must survive");
+    assert!(sites
+        .iter()
+        .all(|site| site.span == trace_ir::Span::new(main, 4, 16)));
+    assert!(sites
+        .iter()
+        .all(|site| { site.expansion_span == Some(trace_ir::Span::new(main, 6, 36)) }));
+    assert!(sites
+        .iter()
+        .all(|site| site.occurrence().span.file == main && site.occurrence().span.line == 5));
+    assert_ne!(
+        sites[0].occurrence().span.col,
+        sites[1].occurrence().span.col
+    );
+
+    let (_pag, analysis) = analyze(&program);
+    let mut callbacks = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(&program, edge.caller) == "Obj::send")
+        .map(|edge| fn_name(&program, edge.callee))
+        .collect::<Vec<_>>();
+    callbacks.sort_unstable();
+    callbacks.dedup();
+    assert_eq!(callbacks, ["first", "second"]);
+}
+
+#[test]
+fn macro_valued_receiver_argument_keeps_distinct_macro_spelled_members() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        "void first() {}\nvoid second() {}\nstruct Obj { void send(void (*cb)()) { cb(); } };\n#define OBJECT p\n#define BOTH(o) o->send(first); o->send(second)\nvoid caller(Obj *p) { BOTH(OBJECT); }\n",
+    )
+    .unwrap();
+
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let main = file_id(&program, dir.path(), "main.cpp");
+    let mut sites = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|site| {
+            fn_name(&program, site.caller) == "caller" && site.callee_name == "Obj::send"
+        })
+        .collect::<Vec<_>>();
+    sites.sort_by_key(|site| site.occurrence().span.col);
 
     assert_eq!(sites.len(), 2, "both replacement-list calls must survive");
     assert!(sites
@@ -240,7 +288,11 @@ fn macro_valued_member_argument_keeps_distinct_macro_spelled_receivers() {
     assert_ne!(sites[0].span.col, sites[1].span.col);
     assert!(sites
         .iter()
-        .all(|site| { site.expansion_span == Some(trace_ir::Span::new(main, 6, 31)) }));
+        .all(|site| { site.expansion_span == Some(trace_ir::Span::new(main, 6, 23)) }));
+    assert_ne!(
+        sites[0].occurrence().span.col,
+        sites[1].occurrence().span.col
+    );
 
     let (_pag, analysis) = analyze(&program);
     let mut callbacks = analysis

@@ -74,6 +74,9 @@ type HeaderFunctions = FxHashMap<String, FxHashMap<Arc<str>, FnId>>;
 /// A group holds every record whose fingerprint collided, so it is one entry
 /// deep except on a hash collision and the merge confirms each candidate.
 pub type CallFactBuckets = FxHashMap<u64, Vec<CallSiteId>>;
+/// Stable call-occurrence coordinates plus callee name. For macro member
+/// calls these coordinates come from the replacement-list access operator,
+/// independently of the request position exported for the call.
 pub type CallSourceKey = (FileId, u32, u32, Option<(FileId, u32, u32)>, String);
 
 /// Cross-unit deduplication state used by the merge stage: entities whose

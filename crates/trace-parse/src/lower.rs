@@ -21,9 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use trace_ir::{
-    is_anonymous_tag, CallSite, Diagnostic, DiagnosticSeverity, FieldId, FlowConstraint, FnId,
-    Function, Linkage, Program, ReturnFlow, ScalarKind, Span, StorageClass, TypeDesc, VarId,
-    Variable,
+    is_anonymous_tag, CallOccurrence, CallSite, Diagnostic, DiagnosticSeverity, FieldId,
+    FlowConstraint, FnId, Function, Linkage, Program, ReturnFlow, ScalarKind, Span, StorageClass,
+    TypeDesc, VarId, Variable,
 };
 use trace_preproc::{macro_table_from_defines, Language, MacroTable, PreprocessOptions};
 use tree_sitter::Node;
@@ -1440,8 +1440,9 @@ fn expand_virtual_overrides(program: &mut Program) {
         .call_sites
         .iter()
         .filter_map(|cs| {
+            let occurrence = cs.occurrence();
             cs.callee_fn_id
-                .map(|c| (cs.caller, cs.span, cs.expansion_span, c))
+                .map(|c| (cs.caller, occurrence.span, occurrence.expansion_span, c))
         })
         .collect();
     let snapshot = program.symbols.call_sites.clone();
@@ -1536,7 +1537,8 @@ fn expand_virtual_overrides(program: &mut Program) {
                 && arity_compatible(expected_arity, method_explicit_arity(program, t))
         });
         for t in targets {
-            let key = (cs.caller, cs.span, cs.expansion_span, t);
+            let occurrence = cs.occurrence();
+            let key = (cs.caller, occurrence.span, occurrence.expansion_span, t);
             if !seen.insert(key) {
                 continue;
             }
@@ -1555,6 +1557,7 @@ fn expand_virtual_overrides(program: &mut Program) {
                 args_bound_past_this: cs.args_bound_past_this,
                 span: cs.span,
                 expansion_span: cs.expansion_span,
+                occurrence: cs.occurrence,
                 is_direct: true,
                 receiver_class: cs.receiver_class.clone(),
                 return_dst: cs.return_dst,
@@ -5384,6 +5387,7 @@ fn lower_declaration(
                                             args_bound_past_this: false,
                                             span,
                                             expansion_span,
+                                            occurrence: None,
                                             is_direct: false,
                                             receiver_class: None,
                                             return_dst: None,
@@ -6123,19 +6127,43 @@ fn collect_call_at_node(
     node: Node,
     caller: FnId,
 ) {
+    let occurrence_node = node
+        .child_by_field_name("function")
+        .filter(|func| func.kind() == "field_expression")
+        .and_then(member_access_token)
+        .filter(|token| node_has_expansion_location(ctx, *token));
+    let first_site = program.symbols.call_sites.len();
+    collect_call_at_node_inner(program, ctx, source, node, caller);
+    let Some(occurrence_node) = occurrence_node else {
+        return;
+    };
+    let occurrence = CallOccurrence {
+        span: node_call_span(program, ctx, occurrence_node),
+        expansion_span: node_expansion_span(program, ctx, occurrence_node),
+    };
+    for site in &mut program.symbols.call_sites[first_site..] {
+        site.occurrence = Some(occurrence);
+    }
+}
+
+fn collect_call_at_node_inner(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+    caller: FnId,
+) {
     let func = match node.child_by_field_name("function") {
         Some(f) => f,
         None => return,
     };
-    // A member call node starts at its receiver. When only the member is
-    // spelled in a replacement list, source both locations from that token so
-    // a macro-argument receiver cannot hide its provenance. If the receiver
-    // also has expansion provenance, keep the call start: a member supplied as
-    // an argument can itself expand from another macro, and its shared member
-    // location must not collapse distinct replacement-list receivers.
+    // A member call node starts at its receiver. When the member is spelled in
+    // a replacement list, display that token so a macro-argument receiver
+    // cannot hide its provenance. `CallSite::occurrence` independently keeps
+    // repeated calls distinct when this token came from a shared argument.
     let source_node = if func.kind() == "field_expression" {
         let field = func.child_by_field_name("field").unwrap_or(func);
-        if node_has_expansion_location(ctx, field) && !node_has_expansion_location(ctx, func) {
+        if node_has_expansion_location(ctx, field) {
             field
         } else {
             node
@@ -6445,6 +6473,7 @@ fn collect_call_at_node(
             args_bound_past_this: false,
             span,
             expansion_span,
+            occurrence: None,
             is_direct,
             receiver_class: None,
             return_dst,
@@ -6485,6 +6514,7 @@ fn collect_call_at_node(
             args_bound_past_this: bound,
             span,
             expansion_span,
+            occurrence: None,
             is_direct: true,
             receiver_class: None,
             return_dst,
@@ -7114,6 +7144,7 @@ fn emit_unresolved_site(
         args_bound_past_this: true,
         span,
         expansion_span,
+        occurrence: None,
         is_direct: false,
         receiver_class: Some(receiver_class),
         return_dst: None,
@@ -7190,6 +7221,7 @@ fn emit_member_targets(
             args_bound_past_this: true,
             span,
             expansion_span,
+            occurrence: None,
             is_direct: false,
             receiver_class: Some(cls.to_string()),
             return_dst: None,
@@ -7218,6 +7250,7 @@ fn emit_member_targets(
             args_bound_past_this: true,
             span,
             expansion_span,
+            occurrence: None,
             is_direct: true,
             receiver_class: Some(cls.to_string()),
             return_dst: None,
@@ -8623,6 +8656,14 @@ fn member_access_op(node: Node) -> (bool, bool) {
         }
     }
     (arrow || dot, arrow)
+}
+
+/// The punctuation owned by this member expression. Unlike a substituted
+/// receiver or member name, each `.` / `->` in a replacement list identifies
+/// one syntactic call occurrence.
+fn member_access_token(node: Node) -> Option<Node> {
+    node.children(&mut node.walk())
+        .find(|child| matches!(child.kind(), "." | "->"))
 }
 
 /// Static class of a receiver expression, when inferable from declared

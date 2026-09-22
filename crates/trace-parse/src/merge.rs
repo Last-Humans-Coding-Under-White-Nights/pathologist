@@ -914,7 +914,9 @@ fn merge_unit(
             continue;
         };
         let span_file = map_file(cs.span.file);
-        let expansion = cs
+        let occurrence = cs.occurrence();
+        let occurrence_file = map_file(occurrence.span.file);
+        let occurrence_expansion = occurrence
             .expansion_span
             .map(|span| (map_file(span.file), span.line, span.col));
         // Dependency roots suppress bodies, not project code emitted by a
@@ -926,10 +928,10 @@ fn merge_unit(
             continue;
         }
         let key: SiteKey = (
-            span_file,
-            cs.span.line,
-            cs.span.col,
-            expansion,
+            occurrence_file,
+            occurrence.span.line,
+            occurrence.span.col,
+            occurrence_expansion,
             cs.callee_name.clone(),
         );
         let is_internal_caller = program
@@ -969,6 +971,14 @@ fn merge_unit(
         site.expansion_span = site.expansion_span.map(|mut span| {
             span.file = map_file(span.file);
             span
+        });
+        site.occurrence = site.occurrence.map(|mut occurrence| {
+            occurrence.span.file = map_file(occurrence.span.file);
+            occurrence.expansion_span = occurrence.expansion_span.map(|mut span| {
+                span.file = map_file(span.file);
+                span
+            });
+            occurrence
         });
         // Grouping records by their facts is a remerge concern only, so an
         // ordinary site never pays for the fingerprint — and being the one
@@ -1858,6 +1868,7 @@ mod tests {
             args_bound_past_this: false,
             span: trace_ir::Span::new(header, 86, 10),
             expansion_span: None,
+            occurrence: None,
             is_direct: true,
             receiver_class: None,
             return_dst: None,

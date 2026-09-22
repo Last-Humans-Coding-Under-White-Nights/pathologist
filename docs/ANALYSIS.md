@@ -46,18 +46,21 @@ A call token written in a source macro replacement list uses the token's
 spelling location in the macro definition as `CallSite::span`. Its optional
 `CallSite::expansion_span` identifies the outermost invocation that emitted the
 token. This makes the spelling location usable as a source request while still
-distinguishing repeated expansions of the same macro body. The merge key
-contains both locations, so calls from different invocations are not
-deduplicated together. Calls spelled as macro arguments keep the argument's own
-source position and have no macro-body expansion span. For a member call whose
-called member is spelled in the replacement list, lowering reads that member
-token rather than the receiver's first token; therefore `ARG->member()` still
-points to `member` when `ARG` came from a macro argument. When the receiver is
-also macro-spelled, lowering retains the call start instead, preserving
-distinct replacement-list receivers such as `a.ARG()` and `b.ARG()`. This also
-applies when `ARG` expands from another macro: that nested expansion gives both
-member tokens the same spelling and expansion coordinates, while the receiver
-tokens still identify the two calls.
+distinguishing repeated expansions of the same macro body. Calls spelled as
+macro arguments keep the argument's own source position and have no macro-body
+expansion span. For a member call whose called member is spelled in a
+replacement list, lowering displays that member token rather than the
+receiver's first token; therefore `ARG->member()` still points to `member` when
+`ARG` came from a macro argument.
+
+Displayed coordinates are not the call's merge identity. A receiver or member
+argument may expand from another macro, giving several calls the same displayed
+spelling and expansion pair. Macro member calls therefore retain a separate
+internal occurrence pair from their replacement-list `.` or `->` token. Each
+syntactic access has its own punctuation token, while repeated invocations have
+different expansion coordinates. Merge and virtual-target deduplication use
+this occurrence pair; database export and source requests continue to use
+`span` and `expansion_span`.
 
 Semantic ownership and visibility use the expansion file when it is present.
 Consequently, invoking a macro declared under a dependency root still produces
