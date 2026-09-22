@@ -1,4 +1,4 @@
-use crate::schema::{INDEXES_V5, SCHEMA_VERSION, TABLES_V5};
+use crate::schema::{INDEXES_V6, SCHEMA_VERSION, TABLES_V6};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use rustc_hash::FxHashSet;
@@ -53,7 +53,7 @@ pub fn export_to_sqlite(
             "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY;",
         )?;
         conn.execute_batch("BEGIN IMMEDIATE;")?;
-        conn.execute_batch(TABLES_V5)?;
+        conn.execute_batch(TABLES_V6)?;
 
         let options_json = serde_json::json!({
             "include_paths": program.include_paths,
@@ -101,7 +101,7 @@ pub fn export_to_sqlite(
             export_points_to(&conn, pag, analysis)?;
         }
         export_diagnostics(&conn, program, analysis)?;
-        conn.execute_batch(INDEXES_V5)?;
+        conn.execute_batch(INDEXES_V6)?;
         conn.execute_batch("COMMIT;")?;
     }
 
@@ -532,7 +532,7 @@ fn export_call_sites_filtered(
     }
 
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO call_sites (id, caller_fn_id, file_id, line, col, callee_text, is_direct) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO call_sites (id, caller_fn_id, file_id, line, col, expansion_file_id, expansion_line, expansion_col, callee_text, is_direct) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
     for cs in &program.symbols.call_sites {
         let export = with_edge.contains(&cs.id) || with_arg_flow.contains(&cs.id) || !cs.is_direct;
@@ -545,6 +545,9 @@ fn export_call_sites_filtered(
             cs.span.file.0,
             cs.span.line,
             cs.span.col,
+            cs.expansion_span.map(|span| span.file.0),
+            cs.expansion_span.map(|span| span.line),
+            cs.expansion_span.map(|span| span.col),
             cs.callee_name,
             cs.is_direct as i32
         ])?;
@@ -703,7 +706,7 @@ mod tests {
             },
         ];
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(TABLES_V5).unwrap();
+        conn.execute_batch(TABLES_V6).unwrap();
         export_files(&conn, &program).unwrap();
         export_link_targets(&conn, &program).unwrap();
         let mut stmt = conn.prepare("SELECT t.name, t.output, f.path, d.name FROM link_targets t JOIN target_sources s ON s.target_id = t.id JOIN files f ON f.id = s.file_id JOIN target_dependencies e ON e.target_id = t.id JOIN link_targets d ON d.id = e.dependency_id").unwrap();
@@ -777,7 +780,7 @@ mod tests {
         for full_detail in [false, true] {
             let conn = Connection::open_in_memory().unwrap();
             conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-            conn.execute_batch(TABLES_V5).unwrap();
+            conn.execute_batch(TABLES_V6).unwrap();
             export_functions(&conn, &program).unwrap();
             if full_detail {
                 export_variables(&conn, &program).unwrap();

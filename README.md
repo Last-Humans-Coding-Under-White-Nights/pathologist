@@ -438,7 +438,7 @@ So unresolved indirect sites (e.g. `sbuf->impl->readBuffer` before a fix) still 
 
 ## SQLite database schema
 
-Schema version: **v5**. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed.
+Schema version: **v6**. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation.
 
 ### Entity relationship (overview)
 

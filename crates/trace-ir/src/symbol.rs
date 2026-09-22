@@ -148,6 +148,9 @@ pub struct CallSite {
     /// it is bound there (a callee whose class its unit never saw).
     pub args_bound_past_this: bool,
     pub span: Span,
+    /// Outermost macro invocation that produced the call token. Present only
+    /// when `span` points into a macro replacement list.
+    pub expansion_span: Option<Span>,
     pub is_direct: bool,
     /// Static class of a C++ member-call receiver (`this`, typed pointer).
     /// Post-merge virtual expansion uses this so `final` types are not
@@ -1900,6 +1903,7 @@ mod tests {
             addr_of_args: Vec::new(),
             args_bound_past_this: false,
             span: Span::new(FileId(2), 10, 3),
+            expansion_span: None,
             is_direct: true,
             receiver_class: Some("Cls".into()),
             return_dst: Some(VarId(6)),
@@ -1938,6 +1942,7 @@ mod tests {
             addr_of_args: Vec::new(),
             args_bound_past_this: false,
             span: Span::new(FileId(0), 1, 1),
+            expansion_span: None,
             is_direct,
             receiver_class: None,
             return_dst: None,
@@ -2051,6 +2056,7 @@ mod tests {
             addr_of_args: vec![],
             args_bound_past_this: false,
             span: Span::new(caller_file, 1, 1),
+            expansion_span: None,
             is_direct: true,
             receiver_class: None,
             return_dst: None,

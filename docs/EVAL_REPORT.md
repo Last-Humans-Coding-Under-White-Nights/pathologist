@@ -235,6 +235,44 @@ taken. D closes it for the rest by not seeding pointer statics. Both rules
 are in [ANALYSIS.md](ANALYSIS.md), "Variable cells"; the regression tests
 are `store_through_value_copy_does_not_write_the_global` and
 `address_taken_global_keeps_value_copies_apart`.
+## Macro-body call positions — 2026-09-22
+
+The mapping and database columns are defined in
+[Call source locations](ANALYSIS.md#call-source-locations) and
+[LineMap](PREPROCESSOR.md#linemap). Measurements use release builds of clean
+`master` at `aeac15e` and this change, the three revisions pinned in
+`scripts/eval_expected.json`, `--jobs 8`, the pinned 800,000-pop solver budget,
+and minimal SQLite export. Both builds ran on the same machine in the same
+sitting.
+
+| Corpus | Call sites before / after | Call edges before / after | External edges before / after |
+|---|---:|---:|---:|
+| hdf | 71,811 / 71,818 | 75,390 / 75,397 | 25,215 / 25,222 |
+| hiview | 34,492 / 34,492 | 33,549 / 33,549 | 16,658 / 16,658 |
+| camera | 108,869 / 108,869 | 102,033 / 102,033 | 45,006 / 45,006 |
+
+All function, diagnostic, argument-flow, IPC, indirect-edge and dlsym counts
+are unchanged. HDF gains seven real external edges. The `HCS_OBJECT_LENGTH`
+replacement list in `framework/utils/include/hcs_blob_if.h` contains two
+`strlen` calls at line 78, columns 65 and 85. Seven callers expand that body.
+Previously both calls mapped to the one invocation coordinate and the merge
+discarded one; their spelling columns now keep both records and both edges.
+
+The new database contains 30,157 macro-body call sites in hdf, 233 in hiview,
+and 9,122 in camera, each with a definition spelling position and an outer
+invocation position. The eval dispatch-site line filter now uses
+`COALESCE(expansion_line, line)`: those probes identify an invocation in a
+caller, while `line` is deliberately the macro-body request position. This
+keeps camera's `CaptureSession::AddOutput CanAddOutput` probe at 19 targets.
+
+The standard gate reports the same 17 pre-existing expectation failures on the
+clean baseline and this change (93 checks total). `scripts/eval_expected.json`
+is therefore unchanged: recapturing its stale #113 centers would conceal the
+unrelated drift already documented under
+[Shared header functions](#shared-header-functions--2026-09-20-116). The seven
+new HDF edges remain within the existing external-edge tolerance; the already
+failing total-edge check moves by exactly those seven rows.
+
 ## Solver work budget — 2026-09-21 (#119)
 
 The budget formula, the precedence of the override knobs and the recording of

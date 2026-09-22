@@ -882,9 +882,25 @@ impl PreprocessorState {
         let text = token_as_str(&tok.kind);
         self.output.push_str(text);
         if self.opts.track_line_map {
-            let fid = self.lm_current_file();
-            let (line, col) = tok.expansion_site();
-            self.line_map.push(offset, fid, line, col);
+            if let (Some(spelling_file), Some((expansion_line, expansion_col))) =
+                (&tok.spelling_file, tok.origin)
+            {
+                let spelling_fid = self.lm_intern(spelling_file);
+                let expansion_fid = self.lm_current_file();
+                self.line_map.push_expansion(
+                    offset,
+                    spelling_fid,
+                    tok.line,
+                    tok.col,
+                    expansion_fid,
+                    expansion_line,
+                    expansion_col,
+                );
+            } else {
+                let fid = self.lm_current_file();
+                let (line, col) = tok.expansion_site();
+                self.line_map.push(offset, fid, line, col);
+            }
         }
         if matches!(tok.kind, TokenKind::Newline) {
             self.current_line += 1;
@@ -2462,6 +2478,10 @@ impl PreprocessorState {
                 return Ok(i);
             };
             let mut replacement = read_replacement_list(tokens, &mut i);
+            let definition_file = Arc::new(self.current_file.clone());
+            for token in &mut replacement {
+                token.spelling_file = Some(Arc::clone(&definition_file));
+            }
             // Normalize at define time: a named GNU variadic (`args...`)
             // whose body nevertheless spells `__VA_ARGS__` (gcc rejects the
             // mix; real corpora contain it) aliases the tail parameter, so
@@ -2487,7 +2507,11 @@ impl PreprocessorState {
             );
             return Ok(i);
         }
-        let replacement = read_replacement_list(tokens, &mut i);
+        let mut replacement = read_replacement_list(tokens, &mut i);
+        let definition_file = Arc::new(self.current_file.clone());
+        for token in &mut replacement {
+            token.spelling_file = Some(Arc::clone(&definition_file));
+        }
         self.insert_macro(
             name,
             MacroDef::Object {
@@ -4221,6 +4245,10 @@ fn paste_two_tokens(left: &Token, right: &Token) -> Token {
         col: left.col,
         hidden: Token::union_hidden(left, right),
         origin: left.origin.or(right.origin),
+        spelling_file: left
+            .spelling_file
+            .clone()
+            .or_else(|| right.spelling_file.clone()),
         // Whatever separated `left` from the token before it still
         // separates the pasted result from it.
         adjacent_before: left.adjacent_before,
@@ -8312,8 +8340,8 @@ int from_late;
         );
     }
 
-    /// Every replacement-list token maps to the invocation (AGENTS.md
-    /// LineMap invariant); an argument token keeps its own source position.
+    /// Every replacement-list token maps to its definition spelling and
+    /// retains the outer invocation; an argument keeps its own position.
     #[test]
     fn replacement_tokens_map_to_expansion_site() {
         let src = "#define ADD(x) x + 1\n#define TWICE(x) ADD(x) * 2\n\nint a = TWICE(v);\n";
@@ -8322,9 +8350,31 @@ int from_late;
         let result = preprocess_string(src, Path::new("t.c"), &opts);
         let site = (4, col_of(src, 4, "TWICE("));
         let plus = lookup_at(&result, "+");
-        assert_eq!((plus.line, plus.col), site, "{:?}", result.line_map);
+        assert_eq!(
+            (plus.line, plus.col),
+            (1, col_of(src, 1, "+")),
+            "{:?}",
+            result.line_map
+        );
+        assert_eq!(
+            (plus.expansion_line, plus.expansion_col),
+            site,
+            "{:?}",
+            result.line_map
+        );
         let star = lookup_at(&result, "*");
-        assert_eq!((star.line, star.col), site, "{:?}", result.line_map);
+        assert_eq!(
+            (star.line, star.col),
+            (2, col_of(src, 2, "*")),
+            "{:?}",
+            result.line_map
+        );
+        assert_eq!(
+            (star.expansion_line, star.expansion_col),
+            site,
+            "{:?}",
+            result.line_map
+        );
         let v = lookup_at(&result, "v");
         assert_eq!(
             (v.line, v.col),
@@ -8614,6 +8664,41 @@ int from_late;
         let tail = |text: &str| text[text.find("int value").unwrap()..].to_string();
         assert_eq!(tail(&live.output), "int value= 2 ;\n");
         assert_eq!(tail(&replay.output), tail(&live.output));
+    }
+
+    #[test]
+    fn cached_macro_call_mapping_matches_live_expansion() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("calls.h"),
+            "#define TRACE_REQUEST() target()\n",
+        )
+        .unwrap();
+        let path = dir.path().join("main.c");
+        fs::write(
+            &path,
+            "#include \"calls.h\"\nvoid f(void) { TRACE_REQUEST(); }\n",
+        )
+        .unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path().to_path_buf())
+            .with_include_expansion_cache(cache);
+        let live = preprocess_file(&path, &opts).unwrap();
+        let cached = preprocess_file(&path, &opts.with_frozen_expansion_cache(true)).unwrap();
+        assert_eq!(cached.output, live.output);
+        assert_eq!(cached.line_map, live.line_map);
+
+        let call = live.output.find("target").unwrap();
+        let entry = live.line_map.lookup(call).unwrap();
+        assert!(live.line_map.path_of(entry).ends_with("calls.h"));
+        assert_eq!((entry.line, entry.col), (1, 25));
+        assert!(live
+            .line_map
+            .expansion_path_of(entry)
+            .unwrap()
+            .ends_with("main.c"));
+        assert_eq!((entry.expansion_line, entry.expansion_col), (2, 16));
     }
 
     #[test]

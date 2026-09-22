@@ -503,6 +503,41 @@ fn cpp_virtual_dispatch_expands_to_overrides() {
 }
 
 #[test]
+fn repeated_macro_virtual_calls_each_gain_cross_tu_override() {
+    let root = fixture("macro_virtual_cross_tu");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let derived = program
+        .symbols
+        .functions
+        .iter()
+        .find(|function| function.name == "Derived::run")
+        .expect("derived override")
+        .id;
+    let mut sites = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|site| {
+            fn_name(&program, site.caller) == "invoke" && site.callee_fn_id == Some(derived)
+        })
+        .collect::<Vec<_>>();
+    sites.sort_by_key(|site| site.expansion_span.map(|span| span.line));
+    assert_eq!(sites.len(), 2, "each macro invocation needs the override");
+    assert_eq!(sites[0].span, sites[1].span);
+    assert_ne!(sites[0].expansion_span, sites[1].expansion_span);
+
+    let (_pag, analysis) = analyze(&program);
+    assert_eq!(
+        analysis
+            .call_edges
+            .iter()
+            .filter(|edge| { fn_name(&program, edge.caller) == "invoke" && edge.callee == derived })
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn cpp_non_virtual_member_call_exact() {
     let root = fixture("cpp_basic");
     let program = build_program(&root, &default_opts(&root)).expect("build");

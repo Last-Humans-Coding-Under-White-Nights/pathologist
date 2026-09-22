@@ -74,6 +74,7 @@ type HeaderFunctions = FxHashMap<String, FxHashMap<Arc<str>, FnId>>;
 /// A group holds every record whose fingerprint collided, so it is one entry
 /// deep except on a hash collision and the merge confirms each candidate.
 pub type CallFactBuckets = FxHashMap<u64, Vec<CallSiteId>>;
+pub type CallSourceKey = (FileId, u32, u32, Option<(FileId, u32, u32)>, String);
 
 /// Cross-unit deduplication state used by the merge stage: entities whose
 /// origin (header file + position) was already merged map to the first copy.
@@ -87,7 +88,7 @@ pub struct MergeDedup {
     /// Header definitions are shared only within one link image and expansion.
     header_functions: FxHashMap<Span, HeaderFunctions>,
     pub header_flow: FxHashSet<crate::FlowConstraint>,
-    pub site_keys: FxHashMap<(FileId, u32, u32, String), CallSiteId>,
+    pub site_keys: FxHashMap<CallSourceKey, CallSiteId>,
     /// Call records that configuration variants added at a site, beside the
     /// canonical one in `site_keys` (#59). Program-wide, so a fact recovered
     /// from a header by two units' variants merges instead of repeating: a
@@ -99,7 +100,7 @@ pub struct MergeDedup {
     /// body reached from N units would otherwise be quadratic in N. The
     /// fingerprint only groups; the merge still confirms a candidate field by
     /// field, so a collision costs a comparison and never a wrong merge.
-    pub variant_site_records: FxHashMap<(FileId, u32, u32, String), CallFactBuckets>,
+    pub variant_site_records: FxHashMap<CallSourceKey, CallFactBuckets>,
     /// Reports already merged into the whole program, keyed by stage as well as
     /// origin: two stages can report the same text at the same position, and
     /// one is not a duplicate of the other. Unit-local copies use different

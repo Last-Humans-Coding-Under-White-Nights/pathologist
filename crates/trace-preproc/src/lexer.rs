@@ -1,6 +1,7 @@
 use crate::Language;
 use rustc_hash::FxHashSet;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,10 +53,13 @@ pub struct Token {
     /// For a token that came out of a macro replacement list: the
     /// `(line, col)` of the outermost invocation that produced it, in the
     /// file being processed. `line`/`col` keep the definition-site
-    /// coordinates; this is what the [`crate::LineMap`] and `__LINE__` report, so
-    /// macro-expanded code attributes to its expansion site even through
-    /// forwarding macros.
+    /// coordinates. The [`crate::LineMap`] records both; `__LINE__` reads the
+    /// invocation coordinates, inherited through forwarding macros.
     pub(crate) origin: Option<(u32, u32)>,
+    /// File containing this token's spelling when it came from a source
+    /// macro replacement list. The invocation file is the preprocessor's
+    /// current file when the token is emitted.
+    pub(crate) spelling_file: Option<Arc<PathBuf>>,
 }
 
 impl Token {
@@ -67,6 +71,7 @@ impl Token {
             col,
             hidden: None,
             origin: None,
+            spelling_file: None,
             adjacent_before: false,
         }
     }
@@ -124,6 +129,7 @@ impl Token {
             col: self.col,
             hidden: Some(Arc::new(set)),
             origin: Some(origin.expansion_site()),
+            spelling_file: self.spelling_file.clone(),
             adjacent_before: self.adjacent_before,
         }
     }

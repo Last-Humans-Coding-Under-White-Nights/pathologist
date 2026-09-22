@@ -412,3 +412,38 @@ fn target_header_reached_through_dependency_keeps_its_body() {
         "target header body was discarded by its dependency includer"
     );
 }
+
+#[test]
+fn target_call_expanded_from_dependency_macro_is_retained() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dep = tmp.path().join("dep");
+    std::fs::create_dir(&dep).unwrap();
+    std::fs::write(
+        dep.join("api.h"),
+        "void dep_target(void);\n#define DEP_CALL() dep_target()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.c"),
+        "#include <api.h>\nvoid caller(void) { DEP_CALL(); }\n",
+    )
+    .unwrap();
+
+    let program =
+        build_program_with_jobs(tmp.path(), &PreprocessOptions::new().with_dep(&dep), 1).unwrap();
+    let site = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|site| site.callee_name == "dep_target")
+        .expect("project call emitted by dependency macro");
+    assert!(program.is_dep_file(site.span.file));
+    assert!(site
+        .expansion_span
+        .is_some_and(|span| !program.is_dep_file(span.file)));
+
+    let (_pag, analysis) = analyze(&program);
+    assert!(analysis.call_edges.iter().any(|edge| {
+        fn_name(&program, edge.caller) == "caller" && fn_name(&program, edge.callee) == "dep_target"
+    }));
+}

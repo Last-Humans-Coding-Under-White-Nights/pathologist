@@ -111,7 +111,7 @@ Implemented opportunities 1 and 3:
   preexisting destination files, empty ranges, and ranges beyond the last entry.
 - SQLite export creates tables first, loads rows, and creates all twelve
   secondary indexes before committing. A single SQL definition generates both
-  the complete public `SCHEMA_V5` and the separate export phases. A regression
+  the complete public `SCHEMA_V6` and the separate export phases. A regression
   test verifies primary-key/path uniqueness during loading and that phased
   creation produces the same complete schema.
 
