@@ -138,6 +138,10 @@ pub struct CallSite {
     /// alias effects must not treat them as whole-object copies (copying
     /// the containing object would pollute unrelated fields).
     pub addr_of_member_args: Vec<u32>,
+    /// Argument positions recorded as `&x` for a plain variable `x`: the
+    /// actual there is a temporary holding x's address, and consumers that
+    /// report the argument's object (arg-flow rows, terminators) name `x`.
+    pub addr_of_args: Vec<u32>,
     /// The argument positions count the callee's implicit `this`: explicit
     /// arguments start at 1. Lowering sets it wherever it knows the callee is
     /// a member; after the merge, a site whose callee takes `this` without
@@ -176,6 +180,7 @@ impl CallSite {
             var_args: &self.var_args,
             fn_args: &self.fn_args,
             addr_of_member_args: &self.addr_of_member_args,
+            addr_of_args: &self.addr_of_args,
             args_bound_past_this: self.args_bound_past_this,
             is_direct: self.is_direct,
             receiver_class: self.receiver_class.as_deref(),
@@ -222,6 +227,7 @@ struct CallFacts<'a> {
     var_args: &'a [(u32, VarId)],
     fn_args: &'a [(u32, FnId)],
     addr_of_member_args: &'a [u32],
+    addr_of_args: &'a [u32],
     args_bound_past_this: bool,
     is_direct: bool,
     receiver_class: Option<&'a str>,
@@ -1891,6 +1897,7 @@ mod tests {
             var_args: vec![(1, VarId(4))],
             fn_args: vec![(2, FnId(5))],
             addr_of_member_args: vec![1],
+            addr_of_args: Vec::new(),
             args_bound_past_this: false,
             span: Span::new(FileId(2), 10, 3),
             is_direct: true,
@@ -1928,6 +1935,7 @@ mod tests {
             var_args: Vec::new(),
             fn_args: Vec::new(),
             addr_of_member_args: Vec::new(),
+            addr_of_args: Vec::new(),
             args_bound_past_this: false,
             span: Span::new(FileId(0), 1, 1),
             is_direct,
@@ -2040,6 +2048,7 @@ mod tests {
             var_args: vec![],
             fn_args: vec![],
             addr_of_member_args: vec![],
+            addr_of_args: vec![],
             args_bound_past_this: false,
             span: Span::new(caller_file, 1, 1),
             is_direct: true,

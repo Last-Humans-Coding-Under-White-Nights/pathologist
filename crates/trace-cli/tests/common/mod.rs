@@ -227,3 +227,119 @@ pub fn has_fn_arg_flow(
             && e.actual_fn == Some(actual_id)
     })
 }
+
+/// Names of the variables whose storage location is in `var`'s points-to
+/// set, sorted. `var` must name exactly one variable; use
+/// [`assert_local_points_to`] for a name several functions declare. Needs an
+/// analysis run with `retain_points_to: true`.
+pub fn points_to_names(
+    program: &Program,
+    pag: &trace_analysis::Pag,
+    analysis: &AnalysisResult,
+    var: &str,
+) -> Vec<String> {
+    pts_names_of(program, pag, analysis, None, var)
+}
+
+fn pts_names_of(
+    program: &Program,
+    pag: &trace_analysis::Pag,
+    analysis: &AnalysisResult,
+    function: Option<&str>,
+    var: &str,
+) -> Vec<String> {
+    let found: Vec<_> = program
+        .symbols
+        .variables
+        .iter()
+        .filter(|v| v.name == var)
+        .filter(|v| function.is_none_or(|f| v.fn_id.is_some_and(|id| fn_name(program, id) == f)))
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one `{var}` in {function:?}, got {}",
+        found.len()
+    );
+    let v = found[0];
+    let Some(pts) = pag
+        .var_node
+        .get(&v.id)
+        .and_then(|n| analysis.points_to.get(n))
+    else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = program
+        .symbols
+        .variables
+        .iter()
+        .filter(|w| pag.var_location.get(&w.id).is_some_and(|l| pts.contains(l)))
+        .map(|w| w.name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Pointee names are matched program-wide, so a target must name exactly one
+/// variable; a name several functions declare would make the check ambiguous.
+fn require_unique_target(program: &Program, target: &str) {
+    let count = program
+        .symbols
+        .variables
+        .iter()
+        .filter(|v| v.name == target)
+        .count();
+    assert_eq!(
+        count, 1,
+        "target `{target}` must name exactly one variable, found {count}"
+    );
+}
+
+/// Assert that `var` points to `target`, printing the whole set on failure.
+pub fn assert_points_to(
+    program: &Program,
+    pag: &trace_analysis::Pag,
+    analysis: &AnalysisResult,
+    var: &str,
+    target: &str,
+) {
+    require_unique_target(program, target);
+    let names = points_to_names(program, pag, analysis, var);
+    assert!(
+        names.iter().any(|n| n == target),
+        "{var} should point to {target}; points-to = {names:?}"
+    );
+}
+
+/// Assert that `var` does not point to `target`, printing the whole set on failure.
+pub fn assert_not_points_to(
+    program: &Program,
+    pag: &trace_analysis::Pag,
+    analysis: &AnalysisResult,
+    var: &str,
+    target: &str,
+) {
+    require_unique_target(program, target);
+    let names = points_to_names(program, pag, analysis, var);
+    assert!(
+        !names.iter().any(|n| n == target),
+        "{var} must not point to {target}; points-to = {names:?}"
+    );
+}
+
+/// Assert that `function`'s local or parameter `var` points to `target`.
+pub fn assert_local_points_to(
+    program: &Program,
+    pag: &trace_analysis::Pag,
+    analysis: &AnalysisResult,
+    function: &str,
+    var: &str,
+    target: &str,
+) {
+    require_unique_target(program, target);
+    let names = pts_names_of(program, pag, analysis, Some(function), var);
+    assert!(
+        names.iter().any(|n| n == target),
+        "{function}::{var} should point to {target}; points-to = {names:?}"
+    );
+}

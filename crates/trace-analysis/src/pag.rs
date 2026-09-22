@@ -61,6 +61,10 @@ pub struct Pag {
     pub field_summary:
         IndexMap<(Option<trace_ir::TargetId>, trace_ir::TypeId, FieldId), LocId, FxBuildHasher>,
     pub field_loc_to_summary: IndexMap<LocId, LocId, FxBuildHasher>,
+    /// `(struct type, field)` as a location records it → the declaration
+    /// member its summary is keyed by. Memoized: resolving it compares tag
+    /// and member names, and the GEP fallback asks on every pop.
+    declared_member: FxHashMap<(trace_ir::TypeId, FieldId), (trace_ir::TypeId, FieldId)>,
     /// Only scoped locations have entries; also carries scope through heap
     /// fields and summary-rooted nested accesses that have no owning variable.
     location_targets: FxHashMap<LocId, trace_ir::TargetId>,
@@ -371,6 +375,26 @@ impl Pag {
         field_type: trace_ir::TypeId,
         name: &str,
     ) -> LocId {
+        // One summary per declaration member, whichever snapshot of the
+        // declaration the base's type records (docs/ANALYSIS.md, "Field
+        // sensitivity"). A member the declaration's richest layout lacks keeps
+        // the snapshot's own summary.
+        let (struct_type, field) = *self
+            .declared_member
+            .entry((struct_type, field))
+            .or_insert_with(|| {
+                // The member's own name, read off the layout, so the answer
+                // depends only on the memo's key.
+                let Some(member) = program.types.get(struct_type).layout.fields.get(&field) else {
+                    return (struct_type, field);
+                };
+                let member_name = member.name.as_str();
+                let declared = program.types.tag_identity(struct_type);
+                match program.types.field_id_by_name(declared, member_name) {
+                    Some(member) if declared != struct_type => (declared, member),
+                    _ => (struct_type, field),
+                }
+            });
         if let Some(&loc) = self.field_summary.get(&(target, struct_type, field)) {
             return loc;
         }
@@ -818,6 +842,37 @@ impl Pag {
         }
     }
 
+    /// The variable whose address `node` was assigned (`node = &v`), if any.
+    pub fn addressed_var(&self, node: PagNodeId) -> Option<VarId> {
+        self.indices
+            .addr_of_dst
+            .get(&node)?
+            .iter()
+            .find_map(
+                |&idx| match self.nodes[self.constraints[idx].src.0 as usize].kind {
+                    PagNodeKind::Loc(loc) => self.locations[loc.0 as usize].var,
+                    _ => None,
+                },
+            )
+    }
+
+    /// The variable argument `idx` of `cs` stands for: its actual, or for an
+    /// `&x` argument ([`trace_ir::CallSite::addr_of_args`]) the `x` whose
+    /// address the actual temporary holds.
+    pub fn argument_var(&self, cs: &trace_ir::CallSite, idx: u32) -> Option<VarId> {
+        let actual = cs.var_args.iter().find(|(j, _)| *j == idx)?.1;
+        let addressed = cs
+            .addr_of_args
+            .contains(&idx)
+            .then(|| {
+                self.var_node
+                    .get(&actual)
+                    .and_then(|&n| self.addressed_var(n))
+            })
+            .flatten();
+        Some(addressed.unwrap_or(actual))
+    }
+
     pub fn call_target_node(&mut self, cs: trace_ir::CallSiteId) -> PagNodeId {
         if let Some(&id) = self.call_targets.get(&cs) {
             return id;
@@ -894,33 +949,7 @@ pub(crate) fn struct_type_for_loc(
     loc: LocId,
 ) -> Option<trace_ir::TypeId> {
     if let Some(var) = pag.locations[loc.0 as usize].var {
-        let mut type_id = program.symbols.variable_by_id(var)?.type_id;
-        for _ in 0..4 {
-            match program.types.get(type_id).desc.as_ref() {
-                trace_ir::TypeDesc::Ptr(inner) => {
-                    type_id = match inner.as_ref() {
-                        trace_ir::TypeDesc::Struct { name, .. } => program
-                            .types
-                            .type_id_by_tag(name, trace_ir::TypeKind::Struct)
-                            .unwrap_or_else(|| program.types.resolve_type_id(inner)),
-                        trace_ir::TypeDesc::Union { name, .. } => program
-                            .types
-                            .type_id_by_tag(name, trace_ir::TypeKind::Union)
-                            .unwrap_or_else(|| program.types.resolve_type_id(inner)),
-                        _ => program.types.resolve_type_id(inner),
-                    };
-                }
-                // Arrays of structs: resolve fields against the element type.
-                trace_ir::TypeDesc::Array { elem, .. } => {
-                    type_id = program.types.resolve_type_id(inner_or_elem(elem));
-                }
-                trace_ir::TypeDesc::Struct { .. } | trace_ir::TypeDesc::Union { .. } => {
-                    return Some(type_id);
-                }
-                _ => return Some(type_id),
-            }
-        }
-        return Some(type_id);
+        return struct_type_from_type_id(program, program.symbols.variable_by_id(var)?.type_id);
     }
     type_id_of_loc(pag, program, loc)
 }
@@ -939,10 +968,18 @@ fn type_id_of_loc(pag: &Pag, program: &Program, loc: LocId) -> Option<trace_ir::
             trace_ir::TypeDesc::Ptr(inner) => {
                 type_id = program.types.resolve_type_id(inner);
             }
+            // A table of structs: its elements' fields.
+            trace_ir::TypeDesc::Array { elem, .. } => {
+                type_id = program.types.resolve_type_id(inner_or_elem(elem));
+            }
             _ => break,
         }
     }
-    Some(type_id)
+    matches!(
+        program.types.get(type_id).desc.as_ref(),
+        trace_ir::TypeDesc::Struct { .. } | trace_ir::TypeDesc::Union { .. }
+    )
+    .then_some(type_id)
 }
 
 fn struct_type_from_type_id(
@@ -952,24 +989,25 @@ fn struct_type_from_type_id(
     for _ in 0..6 {
         match program.types.get(type_id).desc.as_ref() {
             trace_ir::TypeDesc::Ptr(inner) => {
-                type_id = match inner.as_ref() {
-                    trace_ir::TypeDesc::Struct { name, .. } => program
-                        .types
-                        .type_id_by_tag(name, trace_ir::TypeKind::Struct)
-                        .unwrap_or_else(|| program.types.resolve_type_id(inner)),
-                    trace_ir::TypeDesc::Union { name, .. } => program
-                        .types
-                        .type_id_by_tag(name, trace_ir::TypeKind::Union)
-                        .unwrap_or_else(|| program.types.resolve_type_id(inner)),
-                    _ => program.types.resolve_type_id(inner),
-                };
+                type_id = program
+                    .types
+                    .tag_declaration(inner)
+                    .unwrap_or_else(|| program.types.resolve_type_id(inner));
             }
             // Arrays of structs: resolve fields against the element type.
             trace_ir::TypeDesc::Array { elem, .. } => {
                 type_id = program.types.resolve_type_id(inner_or_elem(elem));
             }
-            trace_ir::TypeDesc::Struct { .. } | trace_ir::TypeDesc::Union { .. } => {
-                return Some(type_id);
+            trace_ir::TypeDesc::Struct { fields, .. }
+            | trace_ir::TypeDesc::Union { fields, .. } => {
+                // Lowering numbers fields against the definition for an empty
+                // forward declaration; nonempty snapshots keep their positions.
+                let desc = program.types.get(type_id).desc.as_ref();
+                return Some(if fields.is_empty() {
+                    program.types.tag_declaration(desc).unwrap_or(type_id)
+                } else {
+                    type_id
+                });
             }
             _ => return None,
         }
@@ -1015,7 +1053,7 @@ fn lookup_var_in_fn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trace_ir::{Span, TypeDesc, Variable};
+    use trace_ir::{Span, TypeDesc, TypeId, Variable};
 
     #[test]
     fn field_summaries_share_within_targets_but_not_between_them() {
@@ -1103,6 +1141,139 @@ mod tests {
             pag.summary_for_field_loc(nested_field_a),
             pag.summary_for_field_loc(nested_field_b)
         );
+    }
+
+    /// Issue #127 review: a store through `Outer.inner.GetDriver` and a load
+    /// through `IDriverLoader *->GetDriver` share one summary even when the
+    /// nested snapshot lacks a member the richest definition has (an
+    /// `#ifdef`-only field). A member only the snapshot has keeps its own.
+    #[test]
+    fn field_summaries_follow_the_declaration_by_member_name() {
+        let get = TypeDesc::FnPtr {
+            ret: Box::new(TypeDesc::Int),
+            params: Vec::new(),
+        };
+        let loader = |fields: Vec<(&str, TypeDesc)>| TypeDesc::Struct {
+            name: "IDriverLoader".into(),
+            fields: fields.into_iter().map(|(n, d)| (n.into(), d)).collect(),
+        };
+        let mut program = Program::new(".".into());
+        let snapshot = program.types.intern(loader(vec![
+            ("object", TypeDesc::Int),
+            ("GetDriver", get.clone()),
+            ("only_here", TypeDesc::Int),
+        ]));
+        let richest = loader(vec![
+            ("object", TypeDesc::Int),
+            ("debug_hook", TypeDesc::Int),
+            ("GetDriver", get.clone()),
+            ("ReclaimDriver", get),
+        ]);
+        program.types.intern(richest.clone());
+        let through_ptr = program.types.intern(TypeDesc::Ptr(Box::new(richest)));
+        let loader_ptr = program.symbols.alloc_var_id();
+        program.symbols.add_variable(Variable {
+            id: loader_ptr,
+            name: "loader".into(),
+            type_id: through_ptr,
+            storage: StorageClass::Global,
+            fn_id: None,
+            param_index: None,
+            span: Span::new(trace_ir::FileId(0), 1, 1),
+            is_pointer: true,
+            is_defined: true,
+            is_weak: false,
+            target: None,
+            is_namespaced: false,
+        });
+        // The key follows the layout's own member name, not the caller's:
+        // asked first with a wrong name, the member still maps by its own.
+        let mut fresh = Pag::build(&program);
+        let ty = program.types.get(snapshot).layout.fields[&FieldId(1)].type_id;
+        let misnamed =
+            fresh.ensure_field_summary_loc(&program, snapshot, None, FieldId(1), ty, "misnamed");
+        let by_ptr = fresh
+            .ensure_field_summary_for_var(&program, loader_ptr, FieldId(2))
+            .unwrap();
+        assert_eq!(misnamed, by_ptr);
+
+        let mut pag = Pag::build(&program);
+        let field = |pag: &mut Pag, id: u32, name: &str| {
+            let ty = program.types.get(snapshot).layout.fields[&FieldId(id)].type_id;
+            pag.ensure_field_summary_loc(&program, snapshot, None, FieldId(id), ty, name)
+        };
+        let stored = field(&mut pag, 1, "GetDriver");
+        let loaded = pag
+            .ensure_field_summary_for_var(&program, loader_ptr, FieldId(2))
+            .unwrap();
+        assert_eq!(stored, loaded, "GetDriver must share a summary");
+        let own = field(&mut pag, 2, "only_here");
+        assert_ne!(own, loaded, "only_here is not GetDriver");
+        assert_ne!(
+            own,
+            pag.ensure_field_summary_for_var(&program, loader_ptr, FieldId(3))
+                .unwrap()
+        );
+    }
+
+    fn global_of(program: &mut Program, name: &str, type_id: TypeId) -> VarId {
+        let id = program.symbols.alloc_var_id();
+        program.symbols.add_variable(Variable {
+            id,
+            name: name.into(),
+            type_id,
+            storage: StorageClass::Global,
+            fn_id: None,
+            param_index: None,
+            span: Span::new(trace_ir::FileId(0), 1, 1),
+            is_pointer: false,
+            is_defined: true,
+            is_weak: false,
+            target: None,
+            is_namespaced: false,
+        });
+        id
+    }
+
+    /// Review of #127: a variable declared with a forward-declared tag
+    /// (`struct Svc; extern struct Svc g;`, interned before any unit defines
+    /// `Svc`) resolves its fields against the tag's definition, as lowering
+    /// numbers them (`struct_type_for_var`).
+    #[test]
+    fn a_forward_declared_tag_variable_resolves_fields_against_its_definition() {
+        let mut program = Program::new(".".into());
+        let empty = program.types.intern(TypeDesc::Struct {
+            name: "Svc".into(),
+            fields: Vec::new(),
+        });
+        program.types.intern(TypeDesc::Struct {
+            name: "Svc".into(),
+            fields: vec![("cb".into(), TypeDesc::Int)],
+        });
+        let g = global_of(&mut program, "g", empty);
+        let mut pag = Pag::build(&program);
+        let loc = pag.var_location[&g];
+        let concrete = pag.ensure_field_loc(&program, loc, FieldId(0)).unwrap();
+        let summary = pag
+            .ensure_field_summary_for_var(&program, g, FieldId(0))
+            .expect("a forward-declared variable must resolve its field summary");
+        assert_eq!(pag.field_loc_to_summary[&concrete], summary);
+    }
+
+    /// Review of #127: a scalar, however many pointers deep, has no struct.
+    #[test]
+    fn scalars_have_no_struct_type() {
+        let mut program = Program::new(".".into());
+        let mut desc = TypeDesc::Int;
+        let mut deep = program.types.int();
+        for _ in 0..4 {
+            desc = TypeDesc::Ptr(Box::new(desc));
+            deep = program.types.intern(desc.clone());
+        }
+        let p = global_of(&mut program, "p", deep);
+        let pag = Pag::build(&program);
+        let loc = pag.var_location[&p];
+        assert_eq!(struct_type_for_loc(&pag, &program, loc), None);
     }
 
     #[test]

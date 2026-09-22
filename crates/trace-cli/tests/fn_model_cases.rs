@@ -128,6 +128,17 @@ fn terminator_event_recorded_and_exported() {
         )
         .expect("terminates edge count");
     assert_eq!(n_edges, 1);
+    // Issue #127 review: the edge leaves the cleared object, not the `&x`
+    // temporary lowering passes in its place.
+    let cleared: String = conn
+        .query_row(
+            "SELECT s.label FROM flow_edges e JOIN flow_nodes s ON s.id = e.src_node \
+             WHERE e.kind='terminates'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("terminates edge source");
+    assert_eq!(cleared, "g_cleared");
 }
 
 #[test]

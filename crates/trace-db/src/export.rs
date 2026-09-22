@@ -367,8 +367,10 @@ fn export_flow_graph(
         };
         edge_rows.push((c.src.0, c.dst.0, kind));
     }
-    // Implicit var → storage-location edges mirror the solver's direct
-    // points-to seeding (no constraint exists for it in the PAG).
+    // Implicit var → storage-location edges: storage connectivity, so a
+    // dataflow walk goes from a value into its location and on through `&x`.
+    // Drawn for every variable with a location; which of them the solver
+    // seeds with their own location is a separate question (`seeds_own_location`).
     for (&var, &loc) in &pag.var_location {
         if let Some(&node) = pag.loc_node.get(&loc) {
             if let Some(&var_node) = pag.var_node.get(&var) {
@@ -395,7 +397,17 @@ fn export_flow_graph(
         };
         match (e.actual_var, e.actual_fn) {
             (Some(actual), _) => {
-                let Some(actual_node) = pag.var_node.get(&actual) else {
+                // The row names the argument's object (`x` for `f(&x)`); the
+                // value the formal receives is the call site's actual, the
+                // temporary holding `&x`, which the graph reaches from `x`'s
+                // location through `addr_of`.
+                let passed = program
+                    .symbols
+                    .call_site_by_id(e.call_site)
+                    .filter(|cs| cs.addr_of_args.contains(&e.arg_index))
+                    .and_then(|cs| cs.var_args.iter().find(|(i, _)| *i == e.arg_index))
+                    .map_or(actual, |(_, temp)| *temp);
+                let Some(actual_node) = pag.var_node.get(&passed) else {
                     continue;
                 };
                 if wired_pairs.contains(&(actual_node.0, formal_node.0)) {
@@ -425,12 +437,7 @@ fn export_flow_graph(
         let Some(site) = program.symbols.call_site_by_id(cs_id) else {
             continue;
         };
-        let Some(&actual) = site
-            .var_args
-            .iter()
-            .find(|(j, _)| *j == param)
-            .map(|(_, v)| v)
-        else {
+        let Some(actual) = pag.argument_var(site, param) else {
             continue;
         };
         let Some(&actual_node) = pag.var_node.get(&actual) else {

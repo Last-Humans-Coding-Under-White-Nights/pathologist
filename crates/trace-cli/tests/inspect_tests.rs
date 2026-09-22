@@ -924,3 +924,29 @@ int main(void) {
     assert!(stdout_filt_lim0.contains("keep"));
     assert!(stdout_filt_lim0.contains("1 chain found"));
 }
+
+/// Issue #127 review: the flow graph keeps each variable's edge to its own
+/// storage location — the connectivity a dataflow walk needs to go from a
+/// value into `&x` — independently of which variables the solver seeds.
+#[test]
+fn dataflow_passes_through_an_address_taken_local() {
+    let db = build_and_export("addr_taken_local");
+    let conn = open_db(&db).unwrap();
+    let (line, col): (i64, i64) = conn
+        .query_row(
+            "SELECT line, col FROM variables WHERE name = 'y'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let syms = require_symbols_at(&conn, "addr_taken_local", line, col).unwrap();
+    assert_eq!(syms[0].name, "y");
+    let down = dataflow_graph(&conn, &syms[..1], Direction::Down, 8).unwrap();
+    let reached = visited_names(&conn, &down);
+    for name in ["x", "ptr", "p"] {
+        assert!(
+            reached.contains(&name.to_string()),
+            "{name} unreachable from y; got {reached:?}"
+        );
+    }
+}

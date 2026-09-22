@@ -1,5 +1,240 @@
 # Evaluation Report
 
+## Pointer cells and `&x` arguments — 2026-09-21 (#127)
+
+The rules are defined in [ANALYSIS.md](ANALYSIS.md): the load guard under
+"Signature-guarded function-value propagation", `&x` arguments under
+"Argument flow", variable-cell synchronization and the pointer-static seed
+under "Variable cells", and declaration-keyed field summaries under "Field
+sensitivity".
+
+Baseline: `master` at `bd93bdaf7a1b65e232db0bc3353a3722f5e65b59`. The fix was
+measured in nine cumulative steps, each a `cargo build --release -p trace-cli`
+of the working tree, with `scripts/eval_check.py` at `budget_pops` 800000 and
+`--jobs 8`:
+
+- A: the load guard.
+- B: `&x` arguments.
+- C: variable-cell sync, the `*p = FnName` store and the `Ptr(FnPtr)` slot
+  guard.
+- D: the review round. Pointer-like statics lose the self-location seed; `&r`
+  for a C++ reference passes the referent; `*p = &fn` and `*p = (T)fn`
+  store; deferred stores resolve later globals and keep their function;
+  mid-solve `AddrOf` seeds its destination and guards the new cell.
+- E: field summaries keyed by struct declaration (`TypeTable::tag_identity`).
+- F: the third review round: C declarators bind inside-out, `&x` in stores
+  and `auto&` references, the `self_loc` and seed rule shared
+  (`seeds_own_location`), `void *` and fn-pointer-table slot guards,
+  `table[i]()` as a load, late `return &v` cell sync, declaration-keyed
+  summaries remapping fields by name, `addr_of_args`, and one temp cursor per
+  incoming header body in the merge.
+- G: the fourth review round: one cast-peeling rule (`peel_casts`, C++ named
+  casts included) for stored values, member-address flags and callback
+  arguments; `void *` tables accept function values; field arrays
+  (`s.ops[i] = fn`, `p->ops[i]()`) store into and load from the field; the
+  flow-graph `points_to` storage edges are drawn for every variable again.
+- H: the fifth review round: every read of a field-array element loads the
+  field; multi-dimensional tables; `peel_casts` at every value entry point
+  (assignments, initializers, returns); pointers to fn-pointer slots are
+  wired persistently.
+- I: the sixth review round: element arguments and callees under parentheses
+  or casts load the element; a forward-declared tag resolves against its
+  definition, arrays of structs are looked through and scalars have no
+  struct type; function values bypass the GEP field-name guard.
+
+Rust `1.100.0-nightly (bff8e12ff 2026-08-26)`, Apple M1 MacBook Air
+(`MacBookAir10,1`), 8 cores, 8 GB. Corpora at the pinned revisions, clean.
+
+### The baseline had already drifted
+
+`master` itself fails 17 checks: #115 (distinct TU definitions) and #125
+(header static dedup) changed output without re-capturing. Every function
+count, hiview's and camera's edge and arg-flow counts, and camera's
+`edges_indirect` (253 → 251) are this drift: the baseline run measures exactly
+the re-captured values. `HdfDeviceUnlaunchNode` had drifted too (113 → 115
+targets). The expectations hold the step-I numbers, so they absorb both.
+
+### What #127 moved
+
+Only hdf's call graph moves up to step E; hiview and camera are identical to
+the baseline in every checked metric through E. F removes duplicate records on
+hdf and camera (below).
+
+| hdf metric | baseline | A | B | C | D | E | F | G |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| edges_total | 75390 | 75390 | 75398 | 75398 | 75357 | 75420 | 75414 | 75433 |
+| edges_direct | 44813 | 44813 | 44815 | 44815 | 44815 | 44815 | 44812 | 44812 |
+| edges_indirect | 5362 | 5362 | 5368 | 5368 | 5327 | 5390 | 5390 | 5409 |
+| arg_flow_edges | 70035 | 70035 | 70051 | 70051 | 69945 | 70100 | 70094 | 70146 |
+| `HdfDeviceUnlaunchNode` targets | 115 | 115 | 115 | 115 | 113 | 117 | 117 | 117 |
+| flow_graph_nodes | 158243 | 158249 | 165376 | 165399 | 164719 | 164593 | 164794 | 165688 |
+
+- **A (load guard)** leaves every corpus's call-edge and arg-flow *sets*
+  unchanged. hdf reorders some row ids and gains 6 field locations; hiview
+  and camera are byte-identical.
+- **B (`&x` arguments)** adds the edges below. The flow graph grows by one
+  temp and one `addr_of` edge per `&x` argument (camera: 6041 → 10694
+  `addr_of` edges, with no call-graph change).
+  - `+2 direct`: `DataBlockBlockUnmarshalling → HdfSbufReadBuffer`
+    (`sample_hdi.h:86`, `:106`) gains a duplicate call-site *record*, not a
+    new resolution. That header body is merged from three units, and one
+    unit's temporaries never map onto the canonical ones: base already holds
+    16 `_ret` temps at 8 positions there. `&readSize` used to record the named
+    local, which does map, so the unit's site matched an existing record. It
+    now records an unmapped temp, so the facts differ. The gap was in
+    header-body temp dedup; F fixes it.
+  - `+6 indirect`: `UartAdapterIoctlInner`'s `fp->f_op->unlocked_ioctl(...)`
+    (`uart_adapter.c:192`) now also reaches six audio control ops
+    (`AudioCodecSapm{Get,Set}{,Enum}CtrlOps`, `AudioInfo{,Enum}CtrlOps`).
+    This is over-approximation, not a real resolution. `fp` is loaded from
+    the `void *` `host->priv` summary, and its points-to set grows from 1
+    to 513 locations: addresses of callers' locals that hub functions now
+    receive through `f(&x)` formals, which is correct flow but
+    context-insensitive. Before, `f(&x)` handed the formal `x`'s pointees,
+    which were usually empty.
+  - `+16 arg_flow`: the arg-flow rows of those sites.
+- **C (variable cells)** changes no checked metric on any corpus: its edge
+  set equals B's.
+- **D (review round)**: `-41 indirect` and `-106 arg_flow`, all from the
+  unseeded pointer statics; the other review fixes are neutral on every
+  corpus. Two groups of targets go:
+  - five `HdfIoDispatcher` implementations (`DeviceManagerDispatch`,
+    `HdfKIoServiceDispatch`, …) at each of seven IPC proxy `Dispatch` sites.
+    Those were seed pollution; every site keeps its `HdfRemoteDispatcher`
+    targets, including the true stub.
+  - `HdfDriverLoader{,Full}ReclaimDriver` / `HdfDriverLoaderGetDriver` at
+    `HdfDeviceUnlaunchNode`, `DevHostServiceAddDevice` and
+    `HdfDeviceObjectRegister`. These are **real**, and losing them breaks
+    may-analysis soundness, so E fixes the cause.
+
+  The same change shrinks `HdfObjectManagerGetObject`'s `object` from 494
+  locations to 5 and `DevHostServiceAddDevice`'s `driverLoader` from 496
+  to 5.
+
+  A first cut of D also guarded lazily created field cells. It dropped 3 real
+  edges (`Asr582xUartConfig` at `udd->config(udd)`, `uart_asr.c`), because
+  the cell's recorded type was the nested `params.config` struct's, so only
+  cells created through `AddrOf` are guarded now.
+- **E (declaration-keyed summaries)** restores every edge master had: hdf's
+  edge set is a superset of the baseline's.
+  - **The cause:** the driver-loader constructor stores the methods through
+    `HdfDriverLoader.super`, and the caller loads them through
+    `IDriverLoader *`. Those name two interned snapshots of `IDriverLoader`
+    (ids 14 and 15), which differ only in whether the nested `HdfObject`
+    was complete. That gives two `summary:IDriverLoader.GetDriver`
+    locations, so the store and the load never met, and only the seed's
+    pollution bridged them. Now the summary key is the declaration.
+  - **Relative to C**, E loses only the six `AudioCodec*` false targets at
+    `uart_adapter.c:192` (B's `+6`) and gains 28:
+    - real overrides reached through nested `super` interfaces:
+      `DeviceNodeExt`/`DeviceServiceStub` `PublishService`/`RemoveService`
+      at `hdf_device_object.c:309`, `:326` and `hdf_device_node.c:209`
+      (hence `HdfDeviceUnlaunchNode` 117); `HdfDeviceAttach` /
+      `HdfDeviceDetachWithDevid` in `devhost_test.cpp`; and
+      `ModuleSysEventHandle`.
+    - the five `HdfIoDispatcher` implementations at the three
+      `HdfRemoteDispatcher` sites `devsvc_manager_proxy.c:197`,
+      `devmgr_client.c:41` and `sample_hdi_service.cpp:58`, which keep all
+      six baseline targets. This is over-approximation: `HdfIoService` and
+      `HdfRemoteService` both begin with `struct HdfObject`, both flow
+      through the `HdfObject *` factories that now resolve, and both have a
+      field named `dispatcher`.
+  - **Pinned by** the fixture test
+    `driver_loader_methods_resolve_through_the_interface` and the hdf probe
+    "DevHostServiceAddDevice reaches the driver loader's GetDriver and both
+    ReclaimDriver bodies".
+
+- **F (third review round)** leaves every corpus's edge *set* unchanged against
+  E and the baseline; only duplicate rows go.
+  - hdf `-3 direct`, `-3 external`, `-6 arg_flow`: `DataBlockBlockUnmarshalling`
+    and `DataBlockBlockMarshalling` in `sample_hdi.h` are merged twice from
+    one unit (a cached header expansion and the unit's own copy), and the
+    second copy's temporaries missed the first's. That split the call records
+    of B's `+2 direct` and, already on the baseline, of
+    `DataBlockBlockMarshalling:126`. Hence one below the baseline.
+  - camera `-2 direct`, `-4 arg_flow`: the same duplicate in a lambda body of
+    `camera_napi_adaptor.h:64-65`.
+
+- **G (fourth review round)**: hdf `+19 indirect` net.
+  - `+26`: `OsalThreadFn`'s `thread->threadEntry(para)`
+    (`osal_thread.c:139`) now reaches the thread entry functions registered
+    with `OsalThreadCreate(&t, (OsalThreadEntry)Fn, ..)`. That callback
+    argument is under a cast, which used to drop it.
+  - `-6`: `WdtAdapterIoctlInner`'s `fp->f_op->unlocked_ioctl(fp, cmd, arg)`
+    (`watchdog_adapter.c:47`) no longer reaches six audio `kcontrol`
+    handlers, which take two parameters and so cannot be the target of that
+    three-argument call. They came from `s.ops[i] = Fn` being lowered as a
+    function value of the whole struct variable, which then flowed wherever
+    the struct did. With field arrays stored into the field, those targets
+    go. The baseline had them too, so this is the one edge the baseline
+    reached that G does not, and it is noise.
+  - hiview `+9 arg_flow`: arguments under a C++ named cast
+    (`Append(reinterpret_cast<uint8_t *>(&paramCnt), ..)`) are now passed
+    and named by their object.
+  - camera is unchanged.
+
+- **H (fifth review round)** changes no edge on any corpus against G.
+  - Arg-flow rows rise: hdf 70146 → 70190, hiview 17867 → 17895, camera
+    40952 → 41172. These are element reads and named-cast arguments that
+    are now passed.
+  - hiview's `dlsym_edges` goes 1 → 2:
+    `getInterface = reinterpret_cast<..>(dlsym(handle, GET_INSTANCE))` in
+    `GraphicMemoryCollectorImpl::GetGraphicUsage` now models the lookup.
+
+- **I (sixth review round)**: hdf `edges_indirect` 5409 → 4850.
+  - `-583`: every one is a dispatcher of the other type.
+    - `HdfIoService` dispatch sites (`service->dispatcher->Dispatch`, typed
+      `struct HdfIoDispatcher *`) lose the six `HdfRemoteDispatcher` stubs
+      (`DevHostServiceStubDispatch`, `DevmgrServiceStubDispatch`, ..).
+    - The 17 remote proxy sites (`remote->dispatcher->Dispatch`) lose the
+      five `HdfIoDispatcher` implementations.
+    - Each site keeps exactly its own type's targets: `AdcClose:103` keeps
+      `HdfSyscallAdapterDispatch` and its four siblings;
+      `DevmgrServiceProxyAttachDeviceHost:61` keeps its six stubs.
+    - The two types had been mixed by `Dispatch((struct HdfObject
+      *)svcmgrInst->iosvc, ..)` (`svcmgr_ioservice.c:38`), a cast
+      field-element argument that passed the whole `svcmgrInst` instead of
+      the `iosvc` field's value. The baseline mixed them too.
+  - `+24`: `HdmiIoDispatch` and `HdmiCecMsgHandle` reach the handlers their
+    local `{cmd, func}` tables list (`dispatchFunc[i].func(..)`,
+    `hdmi_dispatch.c:291`). The field-name guard used to reject the
+    table's function values before the table-member rule saw them.
+  - hiview and camera are unchanged. The driver-loader probe and
+    `HdfDeviceUnlaunchNode` (117) hold.
+  - Cost: hdf's solve rises from ~0.97 s to ~1.56 s (282,342 pops, up from
+    267,375), the propagation behind the 24 real handlers. Wall time is
+    4.25 s against the baseline's 3.37 s.
+
+The only decreases were D's, traced to the seed rather than to a limit, and
+E recovers them; F's are duplicate records; G's are the cross-signature
+noise above; I's are the other dispatcher type. No run hit the pop budget.
+
+### Cost, and the address-taken gate
+
+| Wall time / peak RSS | baseline | A | B | C | D | E | F | G |
+|---|---|---|---|---|---|---|---|---|
+| hdf | 3.37 s / 388 MB | 4.27 s / 343 MB | 4.34 s / 433 MB | 4.80 s / 439 MB | 3.79 s / 382 MB | 3.80 s / 392 MB | 3.51 s / 387 MB | 3.38 s / 378 MB |
+| hiview | 1.52 s / 253 MB | 2.08 s / 250 MB | 1.61 s / 259 MB | 1.56 s / 266 MB | 1.47 s / 253 MB | 1.46 s / 247 MB | 1.53 s / 260 MB | 1.53 s / 254 MB |
+| camera | 5.32 s / 708 MB | 6.37 s / 694 MB | 5.02 s / 729 MB | 4.82 s / 707 MB | 4.91 s / 722 MB | 4.91 s / 688 MB | 5.01 s / 706 MB | 5.11 s / 694 MB |
+
+Single runs, so the ±1 s swings on the small corpora are noise. The solver's
+own timing is steadier: `TRACE_SOLVER_STATS=1` reports hdf's solve at 1.85 s
+(308,745 pops) at B, 2.25 s (317,319 pops) at C, 1.36 s (298,798 pops) at D
+1.37 s (306,936 pops) at E, 1.03 s (284,930 pops) at F and 0.87 s (260,192
+pops) at G, where the smaller hub sets and the one-lookup cell sync make it
+cheaper than master.
+
+The first cut of C synced every pointer-like variable. That took hdf's solve
+to 7.5 s (428,780 pops) and *removed* the six `+6 indirect` edges above, a
+decrease where C should only add flow. Disabling one piece at a time put all
+of it on the cell → node direction: through a global's self-location seed,
+`p = G; *p = x;` became `G = x`, which polluted globals across the tree and
+filled field summaries past `SUMMARY_MEM_CAP` in a different order. The
+address-taken gate closed that route for globals whose address is never
+taken. D closes it for the rest by not seeding pointer statics. Both rules
+are in [ANALYSIS.md](ANALYSIS.md), "Variable cells"; the regression tests
+are `store_through_value_copy_does_not_write_the_global` and
+`address_taken_global_keeps_value_copies_apart`.
 ## Solver work budget — 2026-09-21 (#119)
 
 The budget formula, the precedence of the override knobs and the recording of
