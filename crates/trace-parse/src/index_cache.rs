@@ -88,7 +88,7 @@ impl CachedSource {
 }
 
 /// Bytes of one serialized `LineMapEntry` in a spill file.
-const LINE_MAP_ENTRY_BYTES: usize = 28;
+const LINE_MAP_ENTRY_BYTES: usize = 36;
 
 /// `src` with its text and mappings dropped: what the provenance queries
 /// need, and nothing that a spill or release keeps out of memory.
@@ -136,6 +136,7 @@ impl SpilledSource {
                 {
                     entry[slot * 4..slot * 4 + 4].copy_from_slice(&value.to_le_bytes());
                 }
+                entry[28..36].copy_from_slice(&e.expansion_id.to_le_bytes());
                 writer.write_all(&entry)?;
             }
             writer.flush()?;
@@ -182,6 +183,7 @@ impl SpilledSource {
                             expansion_file: value(16),
                             expansion_line: value(20),
                             expansion_col: value(24),
+                            expansion_id: u64::from_le_bytes(entry[28..36].try_into().unwrap()),
                         }
                     }),
             );

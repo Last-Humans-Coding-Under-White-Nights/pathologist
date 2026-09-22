@@ -56,11 +56,13 @@ receiver's first token; therefore `ARG->member()` still points to `member` when
 Displayed coordinates are not the call's merge identity. A receiver or member
 argument may expand from another macro, giving several calls the same displayed
 spelling and expansion pair. Macro member calls therefore retain a separate
-internal occurrence pair from their replacement-list `.` or `->` token. Each
-syntactic access has its own punctuation token, while repeated invocations have
-different expansion coordinates. Merge and virtual-target deduplication use
-this occurrence pair; database export and source requests continue to use
-`span` and `expansion_span`.
+internal occurrence identity from their replacement-list `.` or `->` token.
+That identity contains the punctuation spelling, outermost expansion, and the
+preprocessor's deterministic expansion-chain fingerprint. The chain preserves
+intermediate helper invocations and parameter-substitution positions, so two
+expansions of the same helper token inside one outer invocation remain distinct.
+Merge and virtual-target deduplication use this occurrence identity; database
+export and source requests continue to use `span` and `expansion_span`.
 
 Semantic ownership and visibility use the expansion file when it is present.
 Consequently, invoking a macro declared under a dependency root still produces

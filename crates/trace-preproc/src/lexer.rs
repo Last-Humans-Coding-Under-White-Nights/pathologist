@@ -56,6 +56,9 @@ pub struct Token {
     /// coordinates. The [`crate::LineMap`] records both; `__LINE__` reads the
     /// invocation coordinates, inherited through forwarding macros.
     pub(crate) origin: Option<(u32, u32)>,
+    /// Deterministic fingerprint of the macro invocation and parameter-
+    /// substitution chain that produced this token. Zero denotes source text.
+    pub(crate) expansion_id: u64,
     /// File containing this token's spelling when it came from a source
     /// macro replacement list. The invocation file is the preprocessor's
     /// current file when the token is emitted.
@@ -71,6 +74,7 @@ impl Token {
             col,
             hidden: None,
             origin: None,
+            expansion_id: 0,
             spelling_file: None,
             adjacent_before: false,
         }
@@ -129,9 +133,26 @@ impl Token {
             col: self.col,
             hidden: Some(Arc::new(set)),
             origin: Some(origin.expansion_site()),
+            expansion_id: expansion_fingerprint(origin, name, None, self.expansion_id),
             spelling_file: self.spelling_file.clone(),
             adjacent_before: self.adjacent_before,
         }
+    }
+
+    /// Mark an argument token with the replacement-list parameter occurrence
+    /// that substituted it. Two uses of one argument therefore keep separate
+    /// expansion chains even before a nested macro rescans them.
+    #[must_use]
+    pub(crate) fn with_substitution_provenance(
+        &self,
+        origin: &Token,
+        macro_name: &str,
+        parameter: &Token,
+    ) -> Token {
+        let mut token = self.clone();
+        token.expansion_id =
+            expansion_fingerprint(origin, macro_name, Some(parameter), self.expansion_id);
+        token
     }
 
     #[must_use]
@@ -146,6 +167,45 @@ impl Token {
             }
         }
     }
+}
+
+/// Stable FNV-1a fingerprint for an expansion-chain step. File paths and
+/// coordinates describe source identity; no allocation order or process hash
+/// seed enters the value, so cached and parallel preprocessing agree.
+fn expansion_fingerprint(
+    origin: &Token,
+    macro_name: &str,
+    parameter: Option<&Token>,
+    prior: u64,
+) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    let mut bytes = |value: &[u8]| {
+        for &byte in value {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(PRIME);
+    };
+    bytes(&origin.expansion_id.to_le_bytes());
+    bytes(&prior.to_le_bytes());
+    bytes(macro_name.as_bytes());
+    bytes(&origin.line.to_le_bytes());
+    bytes(&origin.col.to_le_bytes());
+    if let Some(path) = &origin.spelling_file {
+        bytes(path.to_string_lossy().as_bytes());
+    }
+    if let Some(parameter) = parameter {
+        bytes(&parameter.line.to_le_bytes());
+        bytes(&parameter.col.to_le_bytes());
+        if let Some(path) = &parameter.spelling_file {
+            bytes(path.to_string_lossy().as_bytes());
+        }
+    }
+    // Reserve zero for tokens that have no expansion provenance.
+    hash.max(1)
 }
 
 /// Tokenizer for one file. Translation phase 2 happens here, at the

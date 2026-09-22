@@ -1435,14 +1435,21 @@ fn is_synthesizable_extern(name: &str) -> bool {
 /// `Derived` is declared — or `Plugin::OnEvent` overrides in other TUs —
 /// would otherwise keep a single target.
 fn expand_virtual_overrides(program: &mut Program) {
-    let mut seen: std::collections::HashSet<(FnId, Span, Option<Span>, FnId)> = program
+    let mut seen: std::collections::HashSet<(FnId, Span, Option<Span>, u64, FnId)> = program
         .symbols
         .call_sites
         .iter()
         .filter_map(|cs| {
             let occurrence = cs.occurrence();
-            cs.callee_fn_id
-                .map(|c| (cs.caller, occurrence.span, occurrence.expansion_span, c))
+            cs.callee_fn_id.map(|c| {
+                (
+                    cs.caller,
+                    occurrence.span,
+                    occurrence.expansion_span,
+                    occurrence.expansion_id,
+                    c,
+                )
+            })
         })
         .collect();
     let snapshot = program.symbols.call_sites.clone();
@@ -1538,7 +1545,13 @@ fn expand_virtual_overrides(program: &mut Program) {
         });
         for t in targets {
             let occurrence = cs.occurrence();
-            let key = (cs.caller, occurrence.span, occurrence.expansion_span, t);
+            let key = (
+                cs.caller,
+                occurrence.span,
+                occurrence.expansion_span,
+                occurrence.expansion_id,
+                t,
+            );
             if !seen.insert(key) {
                 continue;
             }
@@ -6140,6 +6153,7 @@ fn collect_call_at_node(
     let occurrence = CallOccurrence {
         span: node_call_span(program, ctx, occurrence_node),
         expansion_span: node_expansion_span(program, ctx, occurrence_node),
+        expansion_id: node_expansion_id(ctx, occurrence_node),
     };
     for site in &mut program.symbols.call_sites[first_site..] {
         site.occurrence = Some(occurrence);
@@ -11617,6 +11631,13 @@ fn node_has_expansion_location(ctx: &LowerContext, node: Node) -> bool {
             .lookup(node.start_byte())
             .is_some_and(|entry| line_map.expansion_path_of(entry).is_some())
     })
+}
+
+fn node_expansion_id(ctx: &LowerContext, node: Node) -> u64 {
+    ctx.line_map
+        .as_ref()
+        .and_then(|line_map| line_map.lookup(node.start_byte()))
+        .map_or(0, |entry| entry.expansion_id)
 }
 
 /// Original-file end line of `node`, for range queries like "which function

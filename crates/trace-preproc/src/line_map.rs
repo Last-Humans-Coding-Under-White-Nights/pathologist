@@ -23,6 +23,9 @@ pub struct LineMapEntry {
     pub expansion_file: u32,
     pub expansion_line: u32,
     pub expansion_col: u32,
+    /// Stable fingerprint of the full macro expansion/substitution chain.
+    /// Zero denotes source text without macro provenance.
+    pub expansion_id: u64,
 }
 
 impl LineMap {
@@ -49,6 +52,7 @@ impl LineMap {
             expansion_file: u32::MAX,
             expansion_line: 0,
             expansion_col: 0,
+            expansion_id: 0,
         });
     }
 
@@ -62,6 +66,7 @@ impl LineMap {
         expansion_file: u32,
         expansion_line: u32,
         expansion_col: u32,
+        expansion_id: u64,
     ) {
         self.entries.push(LineMapEntry {
             output_offset: output_offset as u32,
@@ -71,6 +76,7 @@ impl LineMap {
             expansion_file,
             expansion_line,
             expansion_col,
+            expansion_id,
         });
     }
 
@@ -136,6 +142,7 @@ impl LineMap {
                 },
                 expansion_line: e.expansion_line,
                 expansion_col: e.expansion_col,
+                expansion_id: e.expansion_id,
             })
             .collect();
         out.entries = entries;
@@ -173,6 +180,7 @@ impl LineMap {
                 },
                 expansion_line: e.expansion_line,
                 expansion_col: e.expansion_col,
+                expansion_id: e.expansion_id,
             });
         }
     }
@@ -210,6 +218,7 @@ impl LineMap {
                     expansion_file,
                     expansion_line: e.expansion_line,
                     expansion_col: e.expansion_col,
+                    expansion_id: e.expansion_id,
                 });
             }
             return;
@@ -235,6 +244,7 @@ impl LineMap {
                 },
                 expansion_line: e.expansion_line,
                 expansion_col: e.expansion_col,
+                expansion_id: e.expansion_id,
             });
         }
     }

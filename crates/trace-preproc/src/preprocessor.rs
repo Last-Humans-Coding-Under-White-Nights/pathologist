@@ -910,6 +910,7 @@ impl PreprocessorState {
                     expansion_fid,
                     expansion_line,
                     expansion_col,
+                    tok.expansion_id,
                 );
             } else {
                 let fid = self.lm_current_file();
@@ -4021,9 +4022,13 @@ fn substitute_macro(
             if let Some(idx) = params.iter().position(|p| p == name) {
                 let first = out.len();
                 if is_variadic_tail(params, variadic, idx) {
-                    out.extend(args.variadic_tokens(idx));
+                    out.extend(args.variadic_tokens(idx).into_iter().map(|token| {
+                        token.with_substitution_provenance(origin, macro_name, &body[i])
+                    }));
                 } else if let Some(arg) = args.args.get(idx) {
-                    out.extend(arg.iter().cloned());
+                    out.extend(arg.iter().map(|token| {
+                        token.with_substitution_provenance(origin, macro_name, &body[i])
+                    }));
                 }
                 // Whether the argument touches what precedes it in the
                 // body is the parameter's adjacency, not what happened to
@@ -4271,6 +4276,7 @@ fn paste_two_tokens(left: &Token, right: &Token) -> Token {
         col,
         hidden: Token::union_hidden(left, right),
         origin: left.origin.or(right.origin),
+        expansion_id: left.expansion_id ^ right.expansion_id.rotate_left(1),
         spelling_file,
         // Whatever separated `left` from the token before it still
         // separates the pasted result from it.
@@ -8728,6 +8734,54 @@ int from_late;
             .unwrap()
             .ends_with("main.c"));
         assert_eq!((entry.expansion_line, entry.expansion_col), (2, 16));
+    }
+
+    #[test]
+    fn cached_nested_helper_expansions_keep_distinct_chain_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("calls.h"),
+            "#define CALL(o,m,cb) o->m(cb)\n#define BOTH(o) CALL(o,send,first); CALL(o,send,second)\n",
+        )
+        .unwrap();
+        let path = dir.path().join("main.c");
+        fs::write(
+            &path,
+            "#include \"calls.h\"\nvoid f(void *p) { BOTH(p); }\n",
+        )
+        .unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path().to_path_buf())
+            .with_include_expansion_cache(cache);
+        let live = preprocess_file(&path, &opts).unwrap();
+        let cached = preprocess_file(&path, &opts.with_frozen_expansion_cache(true)).unwrap();
+        assert_eq!(cached.output, live.output);
+        assert_eq!(cached.line_map, live.line_map);
+
+        let arrows = live
+            .output
+            .match_indices("->")
+            .map(|(offset, _)| live.line_map.lookup(offset).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(arrows.len(), 2);
+        assert_eq!(
+            (arrows[0].file, arrows[0].line, arrows[0].col),
+            (arrows[1].file, arrows[1].line, arrows[1].col)
+        );
+        assert_eq!(
+            (
+                arrows[0].expansion_file,
+                arrows[0].expansion_line,
+                arrows[0].expansion_col,
+            ),
+            (
+                arrows[1].expansion_file,
+                arrows[1].expansion_line,
+                arrows[1].expansion_col,
+            )
+        );
+        assert_ne!(arrows[0].expansion_id, arrows[1].expansion_id);
     }
 
     #[test]

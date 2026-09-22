@@ -932,6 +932,7 @@ fn merge_unit(
             occurrence.span.line,
             occurrence.span.col,
             occurrence_expansion,
+            occurrence.expansion_id,
             cs.callee_name.clone(),
         );
         let is_internal_caller = program

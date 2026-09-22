@@ -305,3 +305,57 @@ fn macro_valued_receiver_argument_keeps_distinct_macro_spelled_members() {
     callbacks.dedup();
     assert_eq!(callbacks, ["first", "second"]);
 }
+
+#[test]
+fn repeated_nested_helper_expansions_keep_distinct_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        "void first() {}\nvoid second() {}\nstruct Obj { void send(void (*cb)()) { cb(); } };\n#define CALL(o,m,cb) o->m(cb)\n#define BOTH(o) CALL(o,send,first); CALL(o,send,second)\nvoid caller(Obj *p) { BOTH(p); }\n",
+    )
+    .unwrap();
+
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let main = file_id(&program, dir.path(), "main.cpp");
+    let mut sites = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|site| {
+            fn_name(&program, site.caller) == "caller" && site.callee_name == "Obj::send"
+        })
+        .collect::<Vec<_>>();
+    sites.sort_by_key(|site| site.span.col);
+
+    assert_eq!(sites.len(), 2, "both nested helper calls must survive");
+    assert_eq!(
+        sites.iter().map(|site| site.span).collect::<Vec<_>>(),
+        [
+            trace_ir::Span::new(main, 5, 24),
+            trace_ir::Span::new(main, 5, 44),
+        ]
+    );
+    assert!(sites
+        .iter()
+        .all(|site| { site.expansion_span == Some(trace_ir::Span::new(main, 6, 23)) }));
+    assert_eq!(sites[0].occurrence().span, sites[1].occurrence().span);
+    assert_eq!(
+        sites[0].occurrence().expansion_span,
+        sites[1].occurrence().expansion_span
+    );
+    assert_ne!(
+        sites[0].occurrence().expansion_id,
+        sites[1].occurrence().expansion_id
+    );
+
+    let (_pag, analysis) = analyze(&program);
+    let mut callbacks = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| fn_name(&program, edge.caller) == "Obj::send")
+        .map(|edge| fn_name(&program, edge.callee))
+        .collect::<Vec<_>>();
+    callbacks.sort_unstable();
+    callbacks.dedup();
+    assert_eq!(callbacks, ["first", "second"]);
+}

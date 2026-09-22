@@ -123,11 +123,14 @@ pub struct Function {
 /// Stable identity of one syntactic call occurrence. The displayed request
 /// span may come from a substituted receiver or member token whose provenance
 /// is shared by several calls; this location remains tied to the call's own
-/// replacement-list tokens.
+/// replacement-list tokens and carries the intermediate expansion chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CallOccurrence {
     pub span: Span,
     pub expansion_span: Option<Span>,
+    /// Deterministic preprocessor fingerprint of nested macro invocations and
+    /// parameter substitutions leading to this occurrence.
+    pub expansion_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +186,7 @@ impl CallSite {
         self.occurrence.unwrap_or(CallOccurrence {
             span: self.span,
             expansion_span: self.expansion_span,
+            expansion_id: 0,
         })
     }
 
@@ -1946,6 +1950,7 @@ mod tests {
             occurrence: Some(CallOccurrence {
                 span: Span::new(FileId(5), 98, 7),
                 expansion_span: Some(Span::new(FileId(6), 12, 4)),
+                expansion_id: 9,
             }),
             tu: Some(FileId(5)),
             ..base.clone()

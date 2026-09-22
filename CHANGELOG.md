@@ -19,9 +19,10 @@ PAG name resolution, synthesized-external ownership, function end ranges, and
 `inspect calls --file`. Cache fingerprints include spelling provenance, and
 token pasting keeps source files and coordinates paired from one operand.
 Member calls derive their displayed mapping from a macro-spelled member token.
-Their internal merge identity instead uses the replacement-list `.` or `->`,
-so calls remain distinct when either the receiver or member argument expands
-from a macro alias and shares its displayed coordinates with another call.
+Their internal merge identity instead uses the replacement-list `.` or `->`
+plus a deterministic expansion-chain fingerprint, so calls remain distinct
+when either argument expands from a macro alias or the same helper token is
+expanded repeatedly inside one outer invocation.
 Replacement-token emission caches each spelling file's `LineMap` ID to avoid
 repeated linear file-table scans.
 The SQLite schema is now v6; existing databases must be regenerated.
