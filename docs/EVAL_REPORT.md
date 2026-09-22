@@ -280,8 +280,9 @@ analysis work, the combined release build passes all 94 checks. HDF has 74,881
 edges, seven above master's 74,874 center, and 25,219 external edges, seven
 above master's 25,212 center; hiview and camera call-edge counts remain at
 33,549 and 102,031. Hiview's exact diagnostic expectation remains 2,988.
-The follow-up member-token selection and spelling-file interning cache leave
-all 94 evaluation checks and these corpus counts unchanged.
+The follow-up member-token selection, including preserving macro-spelled
+receivers when the member is an argument, and spelling-file interning cache
+leave all 94 evaluation checks and these corpus counts unchanged.
 
 ## Solver work budget — 2026-09-21 (#119)
 

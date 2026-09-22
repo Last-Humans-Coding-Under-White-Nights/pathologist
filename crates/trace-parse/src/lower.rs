@@ -6127,13 +6127,14 @@ fn collect_call_at_node(
         Some(f) => f,
         None => return,
     };
-    // A member call node starts at its receiver. In a composite macro call
-    // that receiver may be an argument even when the member is spelled in the
-    // replacement list, so source both locations from the member token. Keep
-    // the historical whole-call start for an ordinary, unexpanded call.
+    // A member call node starts at its receiver. When the member itself is
+    // spelled in a replacement list, source both locations from that token so
+    // a macro-argument receiver cannot hide its provenance. A member supplied
+    // as a macro argument has no expansion location; keep the call start in
+    // that case so distinct replacement-list receivers remain distinct.
     let source_node = if func.kind() == "field_expression" {
         let field = func.child_by_field_name("field").unwrap_or(func);
-        if node_has_expansion_location(ctx, func) || node_has_expansion_location(ctx, field) {
+        if node_has_expansion_location(ctx, field) {
             field
         } else {
             node

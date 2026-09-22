@@ -49,10 +49,12 @@ token. This makes the spelling location usable as a source request while still
 distinguishing repeated expansions of the same macro body. The merge key
 contains both locations, so calls from different invocations are not
 deduplicated together. Calls spelled as macro arguments keep the argument's own
-source position and have no macro-body expansion span. For a member call,
-lowering reads the called member token rather than the receiver's first token;
-therefore `ARG->member()` still points to `member` in the replacement list
-when `ARG` came from a macro argument.
+source position and have no macro-body expansion span. For a member call whose
+called member is spelled in the replacement list, lowering reads that member
+token rather than the receiver's first token; therefore `ARG->member()` still
+points to `member` when `ARG` came from a macro argument. When the member itself
+is a macro argument, lowering retains the call start instead, preserving
+distinct replacement-list receivers such as `a.ARG()` and `b.ARG()`.
 
 Semantic ownership and visibility use the expansion file when it is present.
 Consequently, invoking a macro declared under a dependency root still produces
