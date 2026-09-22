@@ -1252,7 +1252,7 @@ fn finalize_extern_callees(program: &mut Program) {
                 && cs.callee_fn_id.is_none()
                 && is_synthesizable_extern(&cs.callee_name)
         })
-        .map(|cs| (cs.callee_name.clone(), cs.span.file))
+        .map(|cs| (cs.callee_name.clone(), cs.scope_file()))
         .collect();
     names.sort();
     names.dedup_by(|a, b| a.0 == b.0);
@@ -1374,8 +1374,9 @@ fn finalize_target_extern_callees(program: &mut Program) {
         // no source location: keep the first call site's file as a scope
         // fallback but export line 0, so call-graph consumers do not present
         // an arbitrary call site as the function's own location.
+        let site = &program.symbols.call_sites[sites[0]];
         let span = trace_ir::Span {
-            file: program.symbols.call_sites[sites[0]].span.file,
+            file: site.scope_file(),
             line: 0,
             col: 0,
         };
@@ -1472,7 +1473,7 @@ fn expand_virtual_overrides(program: &mut Program) {
         // A callee bound to such a member was looked up where its class is
         // seen, which a header can make another file than the call's.
         let bound_in = (f.linkage == trace_ir::Linkage::Internal).then_some(f.file);
-        let call_file = cs.expansion_span.map_or(cs.span.file, |span| span.file);
+        let call_file = cs.scope_file();
         let sees = |file: trace_ir::FileId| {
             program.symbols.file_sees(call_file, file)
                 || bound_in.is_some_and(|b| program.symbols.file_sees(b, file))
@@ -11564,16 +11565,20 @@ fn node_end_line(program: &Program, ctx: &LowerContext, node: Node, span: Span) 
         None => node.end_position().row as u32 + 1,
         Some(line_map) => {
             let entry = line_map.lookup(node.end_byte().saturating_sub(1));
-            let same_origin = entry
-                .map(|entry| {
-                    let fid = origin_file_id(ctx, line_map, entry, |origin| {
-                        program.symbols.file_by_path(origin)
-                    });
-                    fid == Some(span.file)
-                })
-                .unwrap_or(false);
-            if same_origin {
-                entry.map(|e| e.line).unwrap_or(span.line)
+            let end = entry.and_then(|entry| {
+                let (origin, line) = match line_map.expansion_path_of(entry) {
+                    Some(origin) => (origin, entry.expansion_line),
+                    None => (line_map.path_of(entry), entry.line),
+                };
+                let fid = if origin == ctx.primary_path {
+                    Some(ctx.current_file)
+                } else {
+                    program.symbols.file_by_path(origin)
+                };
+                (fid == Some(span.file)).then_some(line)
+            });
+            if let Some(line) = end {
+                line
             } else {
                 // End originates in another file (or is unmappable): a body
                 // has no meaningful single-file range, so report the start.

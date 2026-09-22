@@ -1,6 +1,6 @@
 #include "calls.h"
 
-void target(void) {}
+// target is defined in another translation unit.
 
 void first(void) { TRACE_REQUEST(); }
 void second(void) { TRACE_REQUEST(); }

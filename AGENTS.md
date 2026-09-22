@@ -29,7 +29,7 @@ Each stage must remain independently testable.
 
 ## Invariants
 
-1. **LineMap**: Preprocessor must preserve mappable `(original_file, line, col)` for output offsets. All exported spans use **original** file/line/col (resolved via LineMap, cached expansions included); code inside macro expansions attributes to the expansion site's origin. Header-origin entities are deduplicated across TUs at merge time.
+1. **LineMap**: Preprocessor must preserve mappable `(original_file, line, col)` for output offsets. All exported spans use **original** file/line/col (resolved via LineMap, cached expansions included). General entities inside macro expansions attribute to the expansion site. Calls spelled in source macro replacement lists instead use the macro-body spelling as their request position and retain the outermost invocation in `CallSite::expansion_span`; semantic scope and ownership use that expansion span (see [Call source locations](docs/ANALYSIS.md#call-source-locations)). Header-origin entities are deduplicated across TUs at merge time.
 2. **Soundness**: May-analysis — over-approximate when uncertain (unknown index → array summary; instance-insensitive **`FieldSummary`** for struct fields).
 3. **Phase boundaries**: Preprocessor must not depend on analysis. IR must not depend on SQLite. Analysis must not depend on SQLite.
 4. **IDs**: Use newtype IDs from `trace-ir` (`FnId`, `VarId`, `CallSiteId`, `FieldId`, etc.). Do not use raw integers in public APIs.

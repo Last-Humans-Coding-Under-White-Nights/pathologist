@@ -3,6 +3,7 @@ mod common;
 use common::*;
 use rusqlite::Connection;
 use trace_analysis::analyze;
+use trace_db::{call_edges, find_functions_at, CallEdgeFilter};
 use trace_parse::build_program;
 
 #[test]
@@ -86,5 +87,48 @@ fn macro_body_calls_export_spelling_and_expansion_positions() {
     assert_eq!(
         macro_rows, 0,
         "the macro must not become a database function"
+    );
+
+    let filtered = call_edges(
+        &conn,
+        &CallEdgeFilter {
+            from: None,
+            to: Some("target"),
+            file: Some("main.c"),
+            exclude_deps: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        filtered.len(),
+        2,
+        "--file must match the macro invocation file"
+    );
+}
+
+#[test]
+fn macro_provided_closing_brace_keeps_the_function_end_line() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.c"),
+        "#define END }\nvoid target(void) {}\n\nvoid caller(void) {\n    target();\nEND\n",
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let caller = program
+        .symbols
+        .functions
+        .iter()
+        .find(|function| function.name == "caller")
+        .expect("caller");
+    assert_eq!((caller.span.line, caller.end_line), (4, 6));
+
+    let (pag, analysis) = analyze(&program);
+    let db = export_program(&program, &pag, &analysis);
+    let conn = Connection::open(db.path()).expect("open export");
+    let functions = find_functions_at(&conn, "main.c", 5).unwrap();
+    assert!(
+        functions.iter().any(|function| function.name == "caller"),
+        "the function-at-line query must include caller's body"
     );
 }

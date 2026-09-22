@@ -921,7 +921,7 @@ fn merge_unit(
         // macro declared in a dependency header. For a macro-body call the
         // expansion is its semantic ownership location; the spelling remains
         // the exported request position.
-        let ownership_file = expansion.map_or(span_file, |(file, _, _)| file);
+        let ownership_file = map_file(cs.scope_file());
         if program.is_dep_file(ownership_file) {
             continue;
         }
@@ -1857,6 +1857,7 @@ mod tests {
             addr_of_args: vec![2],
             args_bound_past_this: false,
             span: trace_ir::Span::new(header, 86, 10),
+            expansion_span: None,
             is_direct: true,
             receiver_class: None,
             return_dst: None,

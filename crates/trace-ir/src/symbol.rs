@@ -164,6 +164,13 @@ pub struct CallSite {
 }
 
 impl CallSite {
+    /// File whose lexical scope contains this invocation. Macro-body calls
+    /// retain their replacement-list spelling in `span`, while name lookup,
+    /// ownership, and visibility follow the expansion site.
+    pub fn scope_file(&self) -> FileId {
+        self.expansion_span.map_or(self.span.file, |span| span.file)
+    }
+
     /// Whether the site denotes a direct call recoverable by name: lowering
     /// recorded no callee variable and the callee text is no field or arrow
     /// expression. Cross-TU calls satisfy this: lowering marks them indirect
@@ -1219,7 +1226,7 @@ impl SymbolTable {
             .map(|(i, site)| {
                 let mut more: Vec<(u32, FnId)> = Vec::new();
                 for &(index, callee) in &site.fn_args {
-                    for overload in self.internal_overloads_seen_from(callee, site.span.file) {
+                    for overload in self.internal_overloads_seen_from(callee, site.scope_file()) {
                         let arg = (index, overload);
                         if !site.fn_args.contains(&arg) && !more.contains(&arg) {
                             more.push(arg);
@@ -1420,7 +1427,7 @@ impl SymbolTable {
         let caller_tu = cs
             .tu
             .or_else(|| self.function_by_id(cs.caller).and_then(|f| f.tu))
-            .unwrap_or(cs.span.file);
+            .unwrap_or_else(|| cs.scope_file());
         self.callees_in_tu(cs, types, caller_tu)
     }
 

@@ -420,12 +420,12 @@ fn target_call_expanded_from_dependency_macro_is_retained() {
     std::fs::create_dir(&dep).unwrap();
     std::fs::write(
         dep.join("api.h"),
-        "void dep_target(void);\n#define DEP_CALL() dep_target()\n",
+        "void dep_target(void);\n#define DEP_CALL() dep_target()\n#define LOG_IT() undeclared_logger()\n",
     )
     .unwrap();
     std::fs::write(
         tmp.path().join("main.c"),
-        "#include <api.h>\nvoid caller(void) { DEP_CALL(); }\n",
+        "#include <api.h>\nvoid caller(void) { DEP_CALL(); LOG_IT(); }\n",
     )
     .unwrap();
 
@@ -446,4 +446,43 @@ fn target_call_expanded_from_dependency_macro_is_retained() {
     assert!(analysis.call_edges.iter().any(|edge| {
         fn_name(&program, edge.caller) == "caller" && fn_name(&program, edge.callee) == "dep_target"
     }));
+
+    let logger = program
+        .symbols
+        .functions
+        .iter()
+        .find(|function| function.name == "undeclared_logger")
+        .expect("synthesized logger");
+    assert!(!program.is_dep_file(logger.file));
+    assert!(analysis.call_edges.iter().any(|edge| {
+        fn_name(&program, edge.caller) == "caller"
+            && fn_name(&program, edge.callee) == "undeclared_logger"
+    }));
+
+    let db = TempDb::new("dep_macro_external.db");
+    export_to_sqlite(
+        &program,
+        &_pag,
+        &analysis,
+        &ExportOptions {
+            output: db.to_path_buf(),
+            trace_version: env!("CARGO_PKG_VERSION").to_owned(),
+            include_points_to: false,
+            full_detail: false,
+            model_files: Vec::new(),
+        },
+    )
+    .unwrap();
+    let conn = open_db(&db).unwrap();
+    let visible = trace_db::call_edges(
+        &conn,
+        &CallEdgeFilter {
+            from: Some("caller"),
+            to: Some("undeclared_logger"),
+            file: None,
+            exclude_deps: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(visible.len(), 1);
 }

@@ -538,6 +538,37 @@ fn repeated_macro_virtual_calls_each_gain_cross_tu_override() {
 }
 
 #[test]
+fn header_macro_passes_all_visible_static_overloads_as_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("reg.h"),
+        "void reg(void (*f)(int));\n#define REG(x) reg(x)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        "#include \"reg.h\"\nstatic void cb(int) {}\nstatic void cb(double) {}\nvoid via_macro() { REG(cb); }\nvoid direct() { reg(cb); }\n",
+    )
+    .unwrap();
+
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let macro_site = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|site| fn_name(&program, site.caller) == "via_macro" && site.callee_name == "reg")
+        .expect("macro call");
+    let mut overload_lines = macro_site
+        .fn_args
+        .iter()
+        .filter(|(index, _)| *index == 0)
+        .map(|(_, function)| program.symbols.function(*function).span.line)
+        .collect::<Vec<_>>();
+    overload_lines.sort_unstable();
+    assert_eq!(overload_lines, vec![2, 3]);
+}
+
+#[test]
 fn cpp_non_virtual_member_call_exact() {
     let root = fixture("cpp_basic");
     let program = build_program(&root, &default_opts(&root)).expect("build");

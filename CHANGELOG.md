@@ -14,7 +14,10 @@ merge, cached and live preprocessing produce the same mapping, and macro
 definitions remain preprocessing metadata rather than IR functions or methods.
 Expansion coordinates also govern semantic ownership and visibility, preserving
 project calls emitted by dependency-header macros and every cross-TU virtual
-target at repeated macro invocations.
+target at repeated macro invocations. They also drive internal-overload lookup,
+PAG name resolution, synthesized-external ownership, function end ranges, and
+`inspect calls --file`. Cache fingerprints include spelling provenance, and
+token pasting keeps source files and coordinates paired from one operand.
 The SQLite schema is now v6; existing databases must be regenerated.
 
 On the pinned evaluation corpora, hiview and camera are unchanged. HDF gains

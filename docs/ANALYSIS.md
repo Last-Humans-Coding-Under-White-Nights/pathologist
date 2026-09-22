@@ -56,13 +56,16 @@ Consequently, invoking a macro declared under a dependency root still produces
 a call in project code, while a call actually expanded inside a dependency body
 remains excluded. Post-merge virtual-target deduplication uses both spelling and
 expansion spans, so repeated invocations of one macro-body virtual call each
-receive overrides discovered in other translation units.
+receive overrides discovered in other translation units. `CallSite::scope_file`
+is the shared source of this semantic file for name lookup, internal-overload
+argument flow, synthesized-external ownership, and PAG resolution.
 
 The SQLite `call_sites.file_id/line/col` columns export the spelling location;
 the nullable `expansion_file_id/expansion_line/expansion_col` columns export the
 invocation. These facts come from the preprocessor `LineMap`, including cached
 header expansions. Macro definitions remain preprocessing metadata and never
-become IR functions or methods.
+become IR functions or methods. `trace inspect calls --file` matches either the
+spelling file or expansion file and orders macro calls by their invocation.
 
 ## Shared header functions
 

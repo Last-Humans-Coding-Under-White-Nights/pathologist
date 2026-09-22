@@ -408,8 +408,8 @@ pub struct CallEdgeFilter<'a> {
     pub from: Option<&'a str>,
     /// Substring/qualified-suffix filter on the callee name.
     pub to: Option<&'a str>,
-    /// File-substring filter matching the call-site path, the callee path, or
-    /// (for site-less edges) the caller's own path.
+    /// File-substring filter matching the call-site spelling or expansion
+    /// path, the callee path, or (for site-less edges) the caller's own path.
     pub file: Option<&'a str>,
     /// Exclude edges where caller or callee is in a dependency root.
     pub exclude_deps: bool,
@@ -445,6 +445,7 @@ pub fn call_edges(conn: &Connection, filter: &CallEdgeFilter<'_>) -> Result<Vec<
                  FROM call_edges ce \
                  LEFT JOIN call_sites cs ON cs.id = ce.call_site_id \
                  LEFT JOIN files csf ON csf.id = cs.file_id \
+                 LEFT JOIN files cse ON cse.id = cs.expansion_file_id \
                  JOIN functions caller ON caller.id = ce.caller_fn_id \
                  JOIN files caller_f ON caller_f.id = caller.file_id \
                  JOIN functions callee ON callee.id = ce.callee_fn_id \
@@ -473,6 +474,7 @@ pub fn call_edges(conn: &Connection, filter: &CallEdgeFilter<'_>) -> Result<Vec<
         // it must not match a `--file` filter as if it were the callee's own.
         sql.push_str(&format!(
             " AND (csf.path LIKE ?{n} ESCAPE '!' OR \
+             cse.path LIKE ?{n} ESCAPE '!' OR \
              ({} AND callee_f.path LIKE ?{n} ESCAPE '!') OR \
              (ce.call_site_id IS NULL AND caller_f.path LIKE ?{n} ESCAPE '!'))",
             has_source_location_sql("callee")
@@ -480,7 +482,10 @@ pub fn call_edges(conn: &Connection, filter: &CallEdgeFilter<'_>) -> Result<Vec<
     }
     // Sort real call sites first; synthetic (IPC bridge) edges have a NULL
     // path/line so SQLite would otherwise sort them to the top.
-    sql.push_str(" ORDER BY CASE WHEN csf.path IS NULL THEN 1 ELSE 0 END, csf.path, cs.line");
+    sql.push_str(
+        " ORDER BY CASE WHEN csf.path IS NULL THEN 1 ELSE 0 END, \
+         COALESCE(cse.path, csf.path), COALESCE(cs.expansion_line, cs.line)",
+    );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         let line: Option<i64> = row.get(4)?;

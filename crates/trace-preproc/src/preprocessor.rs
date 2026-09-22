@@ -4239,16 +4239,24 @@ fn paste_two_tokens(left: &Token, right: &Token) -> Token {
         token_paste_fragment(&left.kind),
         token_paste_fragment(&right.kind)
     );
+    // Keep spelling coordinates and their file atomic. A parameter token has
+    // no `spelling_file`; if it is pasted on the left of a replacement-list
+    // token, borrowing only the right token's file would pair a header path
+    // with argument coordinates from the invocation.
+    let (line, col, spelling_file) = if left.spelling_file.is_some() {
+        (left.line, left.col, left.spelling_file.clone())
+    } else if right.spelling_file.is_some() {
+        (right.line, right.col, right.spelling_file.clone())
+    } else {
+        (left.line, left.col, None)
+    };
     Token {
         kind: TokenKind::Identifier(text),
-        line: left.line,
-        col: left.col,
+        line,
+        col,
         hidden: Token::union_hidden(left, right),
         origin: left.origin.or(right.origin),
-        spelling_file: left
-            .spelling_file
-            .clone()
-            .or_else(|| right.spelling_file.clone()),
+        spelling_file,
         // Whatever separated `left` from the token before it still
         // separates the pasted result from it.
         adjacent_before: left.adjacent_before,
@@ -4511,9 +4519,9 @@ impl MacroEnv<'_> {
 }
 
 /// Content hash of a macro binding, for [`crate::MacroFingerprint`].
-/// Hashes what a consumer could observe: the replacement token stream
-/// (spelling and adjacency, which is all `#` and `##` depend on), the
-/// parameter list, and whether the name is only a builtin fallback.
+/// Hashes what a consumer could observe: the replacement token stream,
+/// including source spelling provenance and adjacency, the parameter list,
+/// and whether the name is only a builtin fallback.
 pub(crate) fn hash_macro_binding(def: &MacroDef, fallback: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -4521,6 +4529,12 @@ pub(crate) fn hash_macro_binding(def: &MacroDef, fallback: bool) -> u64 {
     let hash_tokens = |h: &mut std::collections::hash_map::DefaultHasher, toks: &[Token]| {
         for t in toks {
             t.adjacent_before.hash(h);
+            t.spelling_file.hash(h);
+            if t.spelling_file.is_some() {
+                // The path was hashed with the option discriminant above.
+                t.line.hash(h);
+                t.col.hash(h);
+            }
             match &t.kind {
                 TokenKind::Identifier(sp) | TokenKind::Number(sp) => (0u8, sp.as_str()).hash(h),
                 TokenKind::String(sp) => (1u8, sp.as_str()).hash(h),
@@ -8699,6 +8713,70 @@ int from_late;
             .unwrap()
             .ends_with("main.c"));
         assert_eq!((entry.expansion_line, entry.expansion_col), (2, 16));
+    }
+
+    #[test]
+    fn cache_rejects_identical_macro_body_from_a_different_definition_location() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("body.h"), "void f(void) { CALL(); }\n").unwrap();
+        let a = dir.path().join("a.c");
+        let b = dir.path().join("b.c");
+        fs::write(&a, "#define CALL() target_call()\n#include \"body.h\"\n").unwrap();
+        fs::write(
+            &b,
+            "\n\n#define CALL() target_call()\n#include \"body.h\"\n",
+        )
+        .unwrap();
+
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let cached_opts = PreprocessOptions::new()
+            .with_include(dir.path().to_path_buf())
+            .with_include_expansion_cache(cache);
+        preprocess_file(&a, &cached_opts).unwrap();
+        let cached =
+            preprocess_file(&b, &cached_opts.clone().with_frozen_expansion_cache(true)).unwrap();
+        let uncached = preprocess_file(
+            &b,
+            &PreprocessOptions::new().with_include(dir.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(cached.output, uncached.output);
+        assert_eq!(cached.line_map, uncached.line_map);
+        let offset = cached.output.find("target_call").unwrap();
+        let entry = cached.line_map.lookup(offset).unwrap();
+        assert!(cached.line_map.path_of(entry).ends_with("b.c"));
+        assert_eq!((entry.line, entry.col), (3, 16));
+    }
+
+    #[test]
+    fn pasted_token_keeps_spelling_file_and_coordinates_from_one_operand() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = "#define SUFFIX_CALL(x) x ## _call()\n";
+        fs::write(dir.path().join("calls.h"), header).unwrap();
+        let path = dir.path().join("main.c");
+        fs::write(
+            &path,
+            "#include \"calls.h\"\nvoid f(void) { SUFFIX_CALL(target); }\n",
+        )
+        .unwrap();
+        let result = preprocess_file(
+            &path,
+            &PreprocessOptions::new().with_include(dir.path().to_path_buf()),
+        )
+        .unwrap();
+
+        let offset = result.output.find("target_call").unwrap();
+        let entry = result.line_map.lookup(offset).unwrap();
+        assert!(result.line_map.path_of(entry).ends_with("calls.h"));
+        assert_eq!(entry.line, 1);
+        assert_eq!(entry.col, header.find("_call").unwrap() as u32 + 1);
+        assert!(result
+            .line_map
+            .expansion_path_of(entry)
+            .unwrap()
+            .ends_with("main.c"));
+        assert_eq!(entry.expansion_line, 2);
     }
 
     #[test]
