@@ -1371,18 +1371,55 @@ impl SymbolTable {
         // `(tu, lookup file)` per context: a shared body looks up from each
         // includer, an ordinary one from its own file.
         let shared = self.is_shared_header_function(caller);
-        let contexts: Vec<(FileId, FileId)> = self
+        let contexts = self
             .contributing_tus(caller)
-            .map(|tu| (tu, if shared { tu } else { function.file }))
-            .collect();
+            .map(|tu| (tu, if shared { tu } else { function.file }));
+        self.candidates_in_contexts(contexts, function.target, name)
+    }
+
+    /// Resolve the callee of `dst = name()`. With a caller this is
+    /// [`return_flow_candidates`](Self::return_flow_candidates); without one
+    /// (a file-scope initializer) `dst`'s own file serves as both the unit
+    /// and the lookup file. Policy: `docs/ANALYSIS.md`, "Return-value flow".
+    pub fn call_return_candidates(
+        &self,
+        caller: Option<FnId>,
+        dst: VarId,
+        name: &str,
+    ) -> Vec<FnId> {
+        match caller {
+            Some(caller) => self.return_flow_candidates(caller, name),
+            None => {
+                let var = self.variable(dst);
+                let file = var.span.file;
+                self.candidates_in_contexts([(file, file)], var.target, name)
+            }
+        }
+    }
+
+    /// The one resolution policy behind both entry points above: per
+    /// `(tu, lookup file)` context, the image-scoped candidates seen from the
+    /// file, narrowed to the unit's own definitions when it has any.
+    fn candidates_in_contexts(
+        &self,
+        contexts: impl IntoIterator<Item = (FileId, FileId)>,
+        target: Option<crate::TargetId>,
+        name: &str,
+    ) -> Vec<FnId> {
         let mut result = Vec::new();
         for (tu, file) in contexts {
             let mut candidates =
-                self.resolve_function_candidates_in_target(name, Some(file), function.target);
+                self.resolve_function_candidates_in_target(name, Some(file), target);
             if candidates.iter().any(|&c| self.defined_in_tu(c, tu)) {
                 candidates.retain(|&c| self.defined_in_tu(c, tu));
             }
-            push_unique(&mut result, candidates);
+            // The resolver already deduplicates, so the first context's set
+            // is taken as is.
+            if result.is_empty() {
+                result = candidates;
+            } else {
+                push_unique(&mut result, candidates);
+            }
         }
         result
     }
@@ -1985,26 +2022,55 @@ mod tests {
         );
     }
 
+    /// #132 resolver: a file-scope initializer resolves from the destination's
+    /// file, exactly as a caller in that file would.
+    #[test]
+    fn call_return_candidates_resolve_from_the_call_site_file() {
+        let mut s = SymbolTable::default();
+        let mut statics = Vec::new();
+        let mut globals = Vec::new();
+        for file in [1, 2] {
+            let mut f = fake_function(s.alloc_fn_id(), "ret", vec![], true, false, FileId(file), 1);
+            f.linkage = Linkage::Internal;
+            statics.push(s.add_function(f));
+            let g = fake_variable(s.alloc_var_id(), "g", StorageClass::Global, FileId(file), 3);
+            globals.push(s.add_variable(g));
+        }
+        let use_fn = fake_function(s.alloc_fn_id(), "use", vec![], true, false, FileId(1), 5);
+        let caller = s.add_function(use_fn);
+
+        assert_eq!(
+            s.call_return_candidates(None, globals[0], "ret"),
+            vec![statics[0]]
+        );
+        assert_eq!(
+            s.call_return_candidates(None, globals[0], "ret"),
+            s.call_return_candidates(Some(caller), globals[0], "ret")
+        );
+        // With a caller the destination's file plays no part (#132).
+        assert_eq!(
+            s.call_return_candidates(Some(caller), globals[1], "ret"),
+            vec![statics[0]]
+        );
+        assert_eq!(
+            s.call_return_candidates(None, globals[1], "ret"),
+            vec![statics[1]]
+        );
+    }
+
     #[test]
     fn file_static_lookup_preserves_header_priority_and_late_own_file() {
         let mut s = SymbolTable::default();
         let mut ids = Vec::new();
         for file in [9, 2, 6, 4] {
-            let id = s.alloc_var_id();
-            ids.push(s.add_variable(Variable {
-                id,
-                name: "local".into(),
-                type_id: TypeId(0),
-                storage: StorageClass::FileStatic,
-                fn_id: None,
-                param_index: None,
-                span: Span::new(FileId(file), 1, 1),
-                is_pointer: false,
-                is_defined: true,
-                is_weak: false,
-                target: None,
-                is_namespaced: false,
-            }));
+            let v = fake_variable(
+                s.alloc_var_id(),
+                "local",
+                StorageClass::FileStatic,
+                FileId(file),
+                1,
+            );
+            ids.push(s.add_variable(v));
         }
         for header in [9, 2, 6] {
             s.register_included_header(FileId(4), FileId(header));
@@ -2085,6 +2151,29 @@ mod tests {
             !p.symbols.is_sole_binding_of_name(ext, "f"),
             "an internal-linkage entry under the name must still be walked"
         );
+    }
+
+    fn fake_variable(
+        id: VarId,
+        name: &str,
+        storage: StorageClass,
+        file: FileId,
+        line: u32,
+    ) -> Variable {
+        Variable {
+            id,
+            name: name.to_string(),
+            type_id: TypeId(0),
+            storage,
+            fn_id: None,
+            param_index: None,
+            span: Span::new(file, line, 1),
+            is_pointer: false,
+            is_defined: true,
+            is_weak: false,
+            target: None,
+            is_namespaced: false,
+        }
     }
 
     fn fake_function(

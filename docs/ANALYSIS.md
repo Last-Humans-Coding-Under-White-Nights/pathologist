@@ -45,8 +45,9 @@ flowchart TD
 This section defines header-function sharing. `SymbolTable` owns visibility
 and resolution: call consumers use `Program::callees_of` (or the symbol-table
 equivalent), and name-based return facts use
-`SymbolTable::return_flow_candidates`. Merge records contributing contexts;
-analysis and export reuse those resolvers rather than reconstructing the rules.
+`SymbolTable::call_return_candidates` / `return_flow_candidates`. Merge records
+contributing contexts; analysis and export reuse those resolvers rather than
+reconstructing the rules.
 
 C++ internal-linkage definitions originating in an included header share one
 function entry when their source position, name and exact preprocessed
@@ -294,7 +295,7 @@ Lowered from C during parse. Mapped to PAG in `Pag::build_flow_constraints`.
 | `Store { dst, src }` | store through pointer | `*p = y`, `field = val` |
 | `GepField { dst, base, field }` | field address | `&obj.field`, `p->field` |
 | `ArrayFnMember { array, callee }` | fn-ptr array init member | `{ fn0, fn1 }` |
-| `CallReturn { dst, callee_name }` | `dst = callee()` | `p = GetOps()` |
+| `CallReturn { dst, callee_name, caller }` | `dst = callee()` written in `caller` (`None` for a file-scope initializer) | `p = GetOps()`; `void *g = GetOps();` |
 | `CallReturnIndirect { dst, callee_var }` | `dst = *callee_var()` | `sbuf->impl->readBuffer(...)` (indirect return) |
 | `NewHeap { dst }` | heap allocation | `new T(...)` (C++ ctor result) |
 | `StringConst { dst, value }` | `dst` points at a string literal | `p = "target"`; `dlsym(h, "target")` |
@@ -312,12 +313,17 @@ Functions record abstract return values in `program.fn_returns`:
 
 `return &local` is recorded as `AddrOfVar` but is **unsound** for stack locals (may-analysis may report escaped addresses). Prefer treating this as a known imprecision.
 
-At PAG build time, `CallReturn` and transitive `ReturnFlow::Call` use
-`SymbolTable::return_flow_candidates(caller, callee_name)`. This shared resolver
-applies target scope and TU-local definition precedence; header-body contexts
-follow [Shared header functions](#shared-header-functions). A `CallReturn`
-without an owning function falls back to target-scoped candidate lookup.
-Callee ids that survived lowering and merge (e.g. `AddrOfFn`) are used directly.
+At PAG build time, `CallReturn` resolves through
+`SymbolTable::call_return_candidates` and transitive `ReturnFlow::Call` through
+`SymbolTable::return_flow_candidates`. Both scope the lookup by the function
+the call is written in, never by the destination's owner, so a global or
+file-static `g = f()` inside `use` sees a `static` `f` exactly as a local
+would (#132). The resolver applies target scope and TU-local definition
+precedence; header-body contexts follow
+[Shared header functions](#shared-header-functions). A `CallReturn` with no
+caller (a file-scope initializer, `void *g = f();`) resolves in `g`'s own file
+with the same precedence. Callee ids that survived lowering and merge (e.g.
+`AddrOfFn`) are used directly.
 
 This models patterns like:
 
@@ -1436,9 +1442,10 @@ Known C++ imprecision (in addition to the general list below):
   `GUARDED_BY`. Either macro alone is handled; only the pair defeats it,
   because the repair the two need lives in different nodes.
 - Objects at namespace scope emit no ctor/dtor sites (no enclosing function).
-- A file-scope initializer written in a header (`static Cb cb = OnReady;`)
-  does not reach the analysis, so a call through that pointer from a file
-  including the header has no target.
+- A file-scope initializer written in a header (`static Cb cb = OnReady;`,
+  `static void *p = f();`) is lowered for the header's own unit only; the
+  copies the including units see carry no initializer flow, so a call
+  through that pointer from a file including the header has no target.
 - **ADL namespace derivation is spelling-based**: only arguments whose
   `Struct`/`Union` tag carries an explicit `::` in the source contribute
   their namespace; enum-typed arguments and types referenced by a *bare*

@@ -43,8 +43,14 @@ pub enum FlowConstraint {
     },
     /// Function-pointer array initializer: any subscript may target any listed callee.
     ArrayFnMember { array: VarId, callee: FnId },
-    /// `dst = callee()` — callee resolved by name after all TUs are merged.
-    CallReturn { dst: VarId, callee_name: String },
+    /// `dst = callee()` — callee resolved by name at PAG build in the scope
+    /// of `caller`, the function the call is written in (`None` for a
+    /// file-scope initializer). See `docs/ANALYSIS.md`, "Return-value flow".
+    CallReturn {
+        dst: VarId,
+        callee_name: String,
+        caller: Option<FnId>,
+    },
     /// `dst = callee_var()` — callee resolved at analysis time from the
     /// function-pointer variable's points-to set (indirect / virtual calls).
     CallReturnIndirect { dst: VarId, callee_var: VarId },

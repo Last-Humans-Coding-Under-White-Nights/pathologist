@@ -8936,9 +8936,11 @@ fn emit_call_return(
     dst: VarId,
     callee_name: String,
 ) {
-    program
-        .flow
-        .push(FlowConstraint::CallReturn { dst, callee_name });
+    program.flow.push(FlowConstraint::CallReturn {
+        dst,
+        callee_name,
+        caller: ctx.current_fn,
+    });
     ctx.call_return_dst.borrow_mut().insert(call_node.id(), dst);
 }
 
