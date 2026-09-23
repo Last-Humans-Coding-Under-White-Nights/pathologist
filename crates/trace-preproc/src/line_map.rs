@@ -18,6 +18,14 @@ pub struct LineMapEntry {
     pub file: u32,
     pub line: u32,
     pub col: u32,
+    /// Invocation location for a token whose primary location is its spelling
+    /// in a macro replacement list. `u32::MAX` means no expansion location.
+    pub expansion_file: u32,
+    pub expansion_line: u32,
+    pub expansion_col: u32,
+    /// Stable fingerprint of the full macro expansion/substitution chain.
+    /// Zero denotes source text without macro provenance.
+    pub expansion_id: u64,
 }
 
 impl LineMap {
@@ -41,7 +49,41 @@ impl LineMap {
             file,
             line,
             col,
+            expansion_file: u32::MAX,
+            expansion_line: 0,
+            expansion_col: 0,
+            expansion_id: 0,
         });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_expansion(
+        &mut self,
+        output_offset: usize,
+        file: u32,
+        line: u32,
+        col: u32,
+        expansion_file: u32,
+        expansion_line: u32,
+        expansion_col: u32,
+        expansion_id: u64,
+    ) {
+        self.entries.push(LineMapEntry {
+            output_offset: output_offset as u32,
+            file,
+            line,
+            col,
+            expansion_file,
+            expansion_line,
+            expansion_col,
+            expansion_id,
+        });
+    }
+
+    #[must_use]
+    pub fn expansion_path_of(&self, entry: &LineMapEntry) -> Option<&Path> {
+        (entry.expansion_file != u32::MAX)
+            .then(|| self.files[entry.expansion_file as usize].as_path())
     }
 
     #[must_use]
@@ -89,6 +131,18 @@ impl LineMap {
                 file: remap[e.file as usize],
                 line: e.line,
                 col: e.col,
+                expansion_file: if e.expansion_file == u32::MAX {
+                    u32::MAX
+                } else {
+                    if remap[e.expansion_file as usize] == u32::MAX {
+                        remap[e.expansion_file as usize] =
+                            out.intern_file(&self.files[e.expansion_file as usize]);
+                    }
+                    remap[e.expansion_file as usize]
+                },
+                expansion_line: e.expansion_line,
+                expansion_col: e.expansion_col,
+                expansion_id: e.expansion_id,
             })
             .collect();
         out.entries = entries;
@@ -119,6 +173,14 @@ impl LineMap {
                 file: remap[e.file as usize],
                 line: e.line,
                 col: e.col,
+                expansion_file: if e.expansion_file == u32::MAX {
+                    u32::MAX
+                } else {
+                    remap[e.expansion_file as usize]
+                },
+                expansion_line: e.expansion_line,
+                expansion_col: e.expansion_col,
+                expansion_id: e.expansion_id,
             });
         }
     }
@@ -145,26 +207,44 @@ impl LineMap {
         if end - start <= 2 {
             for e in &other.entries[start..end] {
                 let file = self.intern_file(&other.files[e.file as usize]);
+                let expansion_file = other
+                    .expansion_path_of(e)
+                    .map_or(u32::MAX, |path| self.intern_file(path));
                 self.entries.push(LineMapEntry {
                     output_offset: (e.output_offset as usize - range.start + offset) as u32,
                     file,
                     line: e.line,
                     col: e.col,
+                    expansion_file,
+                    expansion_line: e.expansion_line,
+                    expansion_col: e.expansion_col,
+                    expansion_id: e.expansion_id,
                 });
             }
             return;
         }
         let mut remap = vec![u32::MAX; other.files.len()];
         for e in &other.entries[start..end] {
-            let file = &mut remap[e.file as usize];
-            if *file == u32::MAX {
-                *file = self.intern_file(&other.files[e.file as usize]);
+            if remap[e.file as usize] == u32::MAX {
+                remap[e.file as usize] = self.intern_file(&other.files[e.file as usize]);
+            }
+            if e.expansion_file != u32::MAX && remap[e.expansion_file as usize] == u32::MAX {
+                remap[e.expansion_file as usize] =
+                    self.intern_file(&other.files[e.expansion_file as usize]);
             }
             self.entries.push(LineMapEntry {
                 output_offset: (e.output_offset as usize - range.start + offset) as u32,
-                file: *file,
+                file: remap[e.file as usize],
                 line: e.line,
                 col: e.col,
+                expansion_file: if e.expansion_file == u32::MAX {
+                    u32::MAX
+                } else {
+                    remap[e.expansion_file as usize]
+                },
+                expansion_line: e.expansion_line,
+                expansion_col: e.expansion_col,
+                expansion_id: e.expansion_id,
             });
         }
     }

@@ -173,7 +173,12 @@ def check_global(name, got, spec):
 def check_site(db, site):
     global FAILS, CHECKS
     CHECKS += 1
-    line_filter = "AND cs.line = :line" if site.get("line") else ""
+    # Macro-body calls use their replacement-list spelling as the request
+    # position and retain the invocation separately. Dispatch probes name the
+    # caller's source line, so filter on the invocation when one exists.
+    line_filter = (
+        "AND COALESCE(cs.expansion_line, cs.line) = :line"
+        if site.get("line") else "")
     res_filter = "AND e.resolution = :res" if site.get("resolution") not in (None, "all") else ""
     file_filter = "AND f.path LIKE :file" if site.get("caller_file") else ""
     args = {"caller": site["caller"], "line": site.get("line", 0),

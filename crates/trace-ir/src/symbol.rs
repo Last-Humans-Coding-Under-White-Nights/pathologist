@@ -120,6 +120,19 @@ pub struct Function {
     pub tu: Option<crate::FileId>,
 }
 
+/// Stable identity of one syntactic call occurrence. The displayed request
+/// span may come from a substituted receiver or member token whose provenance
+/// is shared by several calls; this location remains tied to the call's own
+/// replacement-list tokens and carries the intermediate expansion chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CallOccurrence {
+    pub span: Span,
+    pub expansion_span: Option<Span>,
+    /// Deterministic preprocessor fingerprint of nested macro invocations and
+    /// parameter substitutions leading to this occurrence.
+    pub expansion_id: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct CallSite {
     pub id: crate::CallSiteId,
@@ -148,6 +161,12 @@ pub struct CallSite {
     /// it is bound there (a callee whose class its unit never saw).
     pub args_bound_past_this: bool,
     pub span: Span,
+    /// Outermost macro invocation that produced the call token. Present only
+    /// when `span` points into a macro replacement list.
+    pub expansion_span: Option<Span>,
+    /// Separate merge/deduplication identity when the displayed macro source
+    /// coordinates can be shared by multiple member-call occurrences.
+    pub occurrence: Option<CallOccurrence>,
     pub is_direct: bool,
     /// Static class of a C++ member-call receiver (`this`, typed pointer).
     /// Post-merge virtual expansion uses this so `final` types are not
@@ -161,6 +180,23 @@ pub struct CallSite {
 }
 
 impl CallSite {
+    /// Source coordinates that identify this syntactic call independently of
+    /// the coordinates displayed as its request position.
+    pub fn occurrence(&self) -> CallOccurrence {
+        self.occurrence.unwrap_or(CallOccurrence {
+            span: self.span,
+            expansion_span: self.expansion_span,
+            expansion_id: 0,
+        })
+    }
+
+    /// File whose lexical scope contains this invocation. Macro-body calls
+    /// retain their replacement-list spelling in `span`, while name lookup,
+    /// ownership, and visibility follow the expansion site.
+    pub fn scope_file(&self) -> FileId {
+        self.expansion_span.map_or(self.span.file, |span| span.file)
+    }
+
     /// Whether the site denotes a direct call recoverable by name: lowering
     /// recorded no callee variable and the callee text is no field or arrow
     /// expression. Cross-TU calls satisfy this: lowering marks them indirect
@@ -1216,7 +1252,7 @@ impl SymbolTable {
             .map(|(i, site)| {
                 let mut more: Vec<(u32, FnId)> = Vec::new();
                 for &(index, callee) in &site.fn_args {
-                    for overload in self.internal_overloads_seen_from(callee, site.span.file) {
+                    for overload in self.internal_overloads_seen_from(callee, site.scope_file()) {
                         let arg = (index, overload);
                         if !site.fn_args.contains(&arg) && !more.contains(&arg) {
                             more.push(arg);
@@ -1417,7 +1453,7 @@ impl SymbolTable {
         let caller_tu = cs
             .tu
             .or_else(|| self.function_by_id(cs.caller).and_then(|f| f.tu))
-            .unwrap_or(cs.span.file);
+            .unwrap_or_else(|| cs.scope_file());
         self.callees_in_tu(cs, types, caller_tu)
     }
 
@@ -1900,6 +1936,8 @@ mod tests {
             addr_of_args: Vec::new(),
             args_bound_past_this: false,
             span: Span::new(FileId(2), 10, 3),
+            expansion_span: None,
+            occurrence: None,
             is_direct: true,
             receiver_class: Some("Cls".into()),
             return_dst: Some(VarId(6)),
@@ -1909,6 +1947,11 @@ mod tests {
             id: crate::CallSiteId(11),
             callee_name: "other".into(),
             span: Span::new(FileId(5), 99, 1),
+            occurrence: Some(CallOccurrence {
+                span: Span::new(FileId(5), 98, 7),
+                expansion_span: Some(Span::new(FileId(6), 12, 4)),
+                expansion_id: 9,
+            }),
             tu: Some(FileId(5)),
             ..base.clone()
         };
@@ -1938,6 +1981,8 @@ mod tests {
             addr_of_args: Vec::new(),
             args_bound_past_this: false,
             span: Span::new(FileId(0), 1, 1),
+            expansion_span: None,
+            occurrence: None,
             is_direct,
             receiver_class: None,
             return_dst: None,
@@ -2051,6 +2096,8 @@ mod tests {
             addr_of_args: vec![],
             args_bound_past_this: false,
             span: Span::new(caller_file, 1, 1),
+            expansion_span: None,
+            occurrence: None,
             is_direct: true,
             receiver_class: None,
             return_dst: None,

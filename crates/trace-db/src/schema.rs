@@ -1,12 +1,12 @@
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 // Keep the complete public schema and the bulk-export phases in sync without
 // duplicating SQL. The exporter defers only non-unique secondary indexes.
 macro_rules! define_schema {
     ($tables:literal, $indexes:literal) => {
-        pub const SCHEMA_V5: &str = concat!($tables, $indexes);
-        pub(crate) const TABLES_V5: &str = $tables;
-        pub(crate) const INDEXES_V5: &str = $indexes;
+        pub const SCHEMA_V6: &str = concat!($tables, $indexes);
+        pub(crate) const TABLES_V6: &str = $tables;
+        pub(crate) const INDEXES_V6: &str = $indexes;
     };
 }
 
@@ -87,6 +87,9 @@ CREATE TABLE IF NOT EXISTS call_sites (
     file_id INTEGER NOT NULL REFERENCES files(id),
     line INTEGER NOT NULL,
     col INTEGER NOT NULL,
+    expansion_file_id INTEGER REFERENCES files(id),
+    expansion_line INTEGER,
+    expansion_col INTEGER,
     callee_text TEXT NOT NULL,
     is_direct INTEGER NOT NULL
 );
@@ -178,7 +181,7 @@ mod tests {
     fn deferred_indexes_preserve_schema_and_insertion_constraints() {
         let staged = Connection::open_in_memory().unwrap();
         staged.execute_batch("BEGIN IMMEDIATE;").unwrap();
-        staged.execute_batch(TABLES_V5).unwrap();
+        staged.execute_batch(TABLES_V6).unwrap();
         staged
             .execute(
                 "INSERT INTO files (id, path, sha256) VALUES (1, 'a.c', '')",
@@ -197,11 +200,11 @@ mod tests {
                 []
             )
             .is_err());
-        staged.execute_batch(INDEXES_V5).unwrap();
+        staged.execute_batch(INDEXES_V6).unwrap();
         staged.execute_batch("COMMIT;").unwrap();
 
         let complete = Connection::open_in_memory().unwrap();
-        complete.execute_batch(SCHEMA_V5).unwrap();
+        complete.execute_batch(SCHEMA_V6).unwrap();
         let schema = |conn: &Connection| {
             conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
                 .unwrap()

@@ -627,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn each_lookup_is_judged_by_the_macros_it_had_at_the_time() {
+    fn each_lookup_is_judged_by_its_macro_state_and_spelling_provenance() {
         let tree = Tree::new(&[
             ("with_a.c", "#define A 1\n#include \"h.h\"\n"),
             // `A` is unbound at the include and bound when the run ends.
@@ -638,13 +638,33 @@ mod tests {
                 "#define A 1\n#include \"h.h\"\n#undef A\n",
             ),
         ]);
-        for (unit, commits) in [("defines_after.c", true), ("undefines_after.c", false)] {
+        // Both runs commit. The first was unbound at lookup; the second had
+        // the same macro text from another source file, whose observable
+        // spelling provenance cannot reuse `with_a.c`'s cached expansion.
+        for unit in ["defines_after.c", "undefines_after.c"] {
             let cache = new_cache();
             let run = tree.run(unit, &cache, true);
             let with_a = tree.run("with_a.c", &cache, true);
             assert!(commit(&with_a, &cache).is_some());
-            assert_eq!(commit(&run, &cache).is_some(), commits, "{unit}");
+            assert!(commit(&run, &cache).is_some(), "{unit}");
         }
+    }
+
+    #[test]
+    fn a_shared_binding_undefined_after_the_lookup_still_blocks() {
+        let tree = Tree::new(&[
+            ("a.h", "#define A 1\n"),
+            ("with_a.c", "#include \"a.h\"\n#include \"h.h\"\n"),
+            (
+                "undefines_after.c",
+                "#include \"a.h\"\n#include \"h.h\"\n#undef A\n",
+            ),
+        ]);
+        let cache = new_cache();
+        let run = tree.run("undefines_after.c", &cache, true);
+        let with_a = tree.run("with_a.c", &cache, true);
+        assert!(commit(&with_a, &cache).is_some());
+        assert!(commit(&run, &cache).is_none());
     }
 
     #[test]

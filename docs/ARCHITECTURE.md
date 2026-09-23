@@ -35,7 +35,7 @@ flowchart LR
 | Parse + lower | `trace-parse` | Preprocessed TU | `UnitIndex` (symbols, types, flow, call sites) |
 | Merge | `trace-parse` | Per-TU indices | Single `Program` |
 | Analyze | `trace-analysis` | `Program` | `Pag` + `AnalysisResult` |
-| Export | `trace-db` | Program + analysis | SQLite v5 |
+| Export | `trace-db` | Program + analysis | SQLite v6 |
 
 The pipeline is also exposed programmatically via `trace-capi` (`libtrace_capi`), providing a C ABI (`crates/trace-capi/include/trace.h`) for indexing and database inspection.
 

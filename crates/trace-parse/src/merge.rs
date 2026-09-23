@@ -95,7 +95,7 @@ pub enum MergeMode {
     Variant,
 }
 
-type SiteKey = (trace_ir::FileId, u32, u32, String);
+type SiteKey = trace_ir::CallSourceKey;
 type LocalKey = (FnId, trace_ir::FileId, u32, u32, String);
 type TempKey = (FnId, trace_ir::FileId, u32, u32, &'static str);
 type FileVarKey = (u32, trace_ir::FileId, u32, u32, String);
@@ -914,10 +914,27 @@ fn merge_unit(
             continue;
         };
         let span_file = map_file(cs.span.file);
-        if program.is_dep_file(span_file) {
+        let occurrence = cs.occurrence();
+        let occurrence_file = map_file(occurrence.span.file);
+        let occurrence_expansion = occurrence
+            .expansion_span
+            .map(|span| (map_file(span.file), span.line, span.col));
+        // Dependency roots suppress bodies, not project code emitted by a
+        // macro declared in a dependency header. For a macro-body call the
+        // expansion is its semantic ownership location; the spelling remains
+        // the exported request position.
+        let ownership_file = map_file(cs.scope_file());
+        if program.is_dep_file(ownership_file) {
             continue;
         }
-        let key: SiteKey = (span_file, cs.span.line, cs.span.col, cs.callee_name.clone());
+        let key: SiteKey = (
+            occurrence_file,
+            occurrence.span.line,
+            occurrence.span.col,
+            occurrence_expansion,
+            occurrence.expansion_id,
+            cs.callee_name.clone(),
+        );
         let is_internal_caller = program
             .symbols
             .function_by_id(mapped_caller)
@@ -952,6 +969,18 @@ fn merge_unit(
             .collect();
         site.return_dst = site.return_dst.and_then(|v| var_map.get(&v).copied());
         site.span.file = span_file;
+        site.expansion_span = site.expansion_span.map(|mut span| {
+            span.file = map_file(span.file);
+            span
+        });
+        site.occurrence = site.occurrence.map(|mut occurrence| {
+            occurrence.span.file = map_file(occurrence.span.file);
+            occurrence.expansion_span = occurrence.expansion_span.map(|mut span| {
+                span.file = map_file(span.file);
+                span
+            });
+            occurrence
+        });
         // Grouping records by their facts is a remerge concern only, so an
         // ordinary site never pays for the fingerprint — and being the one
         // spelling of "this is a remerge" from here on, it cannot disagree
@@ -1839,6 +1868,8 @@ mod tests {
             addr_of_args: vec![2],
             args_bound_past_this: false,
             span: trace_ir::Span::new(header, 86, 10),
+            expansion_span: None,
+            occurrence: None,
             is_direct: true,
             receiver_class: None,
             return_dst: None,

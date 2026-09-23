@@ -151,6 +151,10 @@ struct PreprocessorState {
     /// Interned index of `current_file` in `line_map.files`; `u32::MAX`
     /// means "not interned yet" (re-interned lazily when the file changes).
     lm_cur_file: u32,
+    /// Replacement-list spelling paths already interned in `line_map`.
+    /// Macro emission is per token, so scanning the file table there would
+    /// make repeated expansions quadratic in the number of mapped files.
+    lm_spelling_files: FxHashMap<PathBuf, u32>,
     /// Current nested macro-expansion depth (hide-set rescan frames).
     expansion_depth: u32,
     expansion_limit_warned: bool,
@@ -288,6 +292,7 @@ impl PreprocessorState {
             current_line: 1,
             emitted_bytes: FxHashMap::default(),
             lm_cur_file: u32::MAX,
+            lm_spelling_files: FxHashMap::default(),
             expansion_depth: 0,
             expansion_limit_warned: false,
             tokens_processed: 0,
@@ -860,6 +865,16 @@ impl PreprocessorState {
         self.line_map.intern_file(path)
     }
 
+    /// Intern a replacement-list spelling path once per preprocessing run.
+    fn lm_spelling_file(&mut self, path: &Path) -> u32 {
+        if let Some(&file) = self.lm_spelling_files.get(path) {
+            return file;
+        }
+        let file = self.line_map.intern_file(path);
+        self.lm_spelling_files.insert(path.to_path_buf(), file);
+        file
+    }
+
     /// Index of the current file in the line-map table, re-interned only
     /// when `current_file` changed since the last call.
     fn lm_current_file(&mut self) -> u32 {
@@ -882,9 +897,26 @@ impl PreprocessorState {
         let text = token_as_str(&tok.kind);
         self.output.push_str(text);
         if self.opts.track_line_map {
-            let fid = self.lm_current_file();
-            let (line, col) = tok.expansion_site();
-            self.line_map.push(offset, fid, line, col);
+            if let (Some(spelling_file), Some((expansion_line, expansion_col))) =
+                (&tok.spelling_file, tok.origin)
+            {
+                let spelling_fid = self.lm_spelling_file(spelling_file);
+                let expansion_fid = self.lm_current_file();
+                self.line_map.push_expansion(
+                    offset,
+                    spelling_fid,
+                    tok.line,
+                    tok.col,
+                    expansion_fid,
+                    expansion_line,
+                    expansion_col,
+                    tok.expansion_id,
+                );
+            } else {
+                let fid = self.lm_current_file();
+                let (line, col) = tok.expansion_site();
+                self.line_map.push(offset, fid, line, col);
+            }
         }
         if matches!(tok.kind, TokenKind::Newline) {
             self.current_line += 1;
@@ -2462,6 +2494,10 @@ impl PreprocessorState {
                 return Ok(i);
             };
             let mut replacement = read_replacement_list(tokens, &mut i);
+            let definition_file = Arc::new(self.current_file.clone());
+            for token in &mut replacement {
+                token.spelling_file = Some(Arc::clone(&definition_file));
+            }
             // Normalize at define time: a named GNU variadic (`args...`)
             // whose body nevertheless spells `__VA_ARGS__` (gcc rejects the
             // mix; real corpora contain it) aliases the tail parameter, so
@@ -2487,7 +2523,11 @@ impl PreprocessorState {
             );
             return Ok(i);
         }
-        let replacement = read_replacement_list(tokens, &mut i);
+        let mut replacement = read_replacement_list(tokens, &mut i);
+        let definition_file = Arc::new(self.current_file.clone());
+        for token in &mut replacement {
+            token.spelling_file = Some(Arc::clone(&definition_file));
+        }
         self.insert_macro(
             name,
             MacroDef::Object {
@@ -3982,9 +4022,13 @@ fn substitute_macro(
             if let Some(idx) = params.iter().position(|p| p == name) {
                 let first = out.len();
                 if is_variadic_tail(params, variadic, idx) {
-                    out.extend(args.variadic_tokens(idx));
+                    out.extend(args.variadic_tokens(idx).into_iter().map(|token| {
+                        token.with_substitution_provenance(origin, macro_name, &body[i])
+                    }));
                 } else if let Some(arg) = args.args.get(idx) {
-                    out.extend(arg.iter().cloned());
+                    out.extend(arg.iter().map(|token| {
+                        token.with_substitution_provenance(origin, macro_name, &body[i])
+                    }));
                 }
                 // Whether the argument touches what precedes it in the
                 // body is the parameter's adjacency, not what happened to
@@ -4215,12 +4259,25 @@ fn paste_two_tokens(left: &Token, right: &Token) -> Token {
         token_paste_fragment(&left.kind),
         token_paste_fragment(&right.kind)
     );
+    // Keep spelling coordinates and their file atomic. A parameter token has
+    // no `spelling_file`; if it is pasted on the left of a replacement-list
+    // token, borrowing only the right token's file would pair a header path
+    // with argument coordinates from the invocation.
+    let (line, col, spelling_file) = if left.spelling_file.is_some() {
+        (left.line, left.col, left.spelling_file.clone())
+    } else if right.spelling_file.is_some() {
+        (right.line, right.col, right.spelling_file.clone())
+    } else {
+        (left.line, left.col, None)
+    };
     Token {
         kind: TokenKind::Identifier(text),
-        line: left.line,
-        col: left.col,
+        line,
+        col,
         hidden: Token::union_hidden(left, right),
         origin: left.origin.or(right.origin),
+        expansion_id: left.expansion_id ^ right.expansion_id.rotate_left(1),
+        spelling_file,
         // Whatever separated `left` from the token before it still
         // separates the pasted result from it.
         adjacent_before: left.adjacent_before,
@@ -4483,9 +4540,9 @@ impl MacroEnv<'_> {
 }
 
 /// Content hash of a macro binding, for [`crate::MacroFingerprint`].
-/// Hashes what a consumer could observe: the replacement token stream
-/// (spelling and adjacency, which is all `#` and `##` depend on), the
-/// parameter list, and whether the name is only a builtin fallback.
+/// Hashes what a consumer could observe: the replacement token stream,
+/// including source spelling provenance and adjacency, the parameter list,
+/// and whether the name is only a builtin fallback.
 pub(crate) fn hash_macro_binding(def: &MacroDef, fallback: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -4493,6 +4550,12 @@ pub(crate) fn hash_macro_binding(def: &MacroDef, fallback: bool) -> u64 {
     let hash_tokens = |h: &mut std::collections::hash_map::DefaultHasher, toks: &[Token]| {
         for t in toks {
             t.adjacent_before.hash(h);
+            t.spelling_file.hash(h);
+            if t.spelling_file.is_some() {
+                // The path was hashed with the option discriminant above.
+                t.line.hash(h);
+                t.col.hash(h);
+            }
             match &t.kind {
                 TokenKind::Identifier(sp) | TokenKind::Number(sp) => (0u8, sp.as_str()).hash(h),
                 TokenKind::String(sp) => (1u8, sp.as_str()).hash(h),
@@ -8312,8 +8375,8 @@ int from_late;
         );
     }
 
-    /// Every replacement-list token maps to the invocation (AGENTS.md
-    /// LineMap invariant); an argument token keeps its own source position.
+    /// Every replacement-list token maps to its definition spelling and
+    /// retains the outer invocation; an argument keeps its own position.
     #[test]
     fn replacement_tokens_map_to_expansion_site() {
         let src = "#define ADD(x) x + 1\n#define TWICE(x) ADD(x) * 2\n\nint a = TWICE(v);\n";
@@ -8322,9 +8385,31 @@ int from_late;
         let result = preprocess_string(src, Path::new("t.c"), &opts);
         let site = (4, col_of(src, 4, "TWICE("));
         let plus = lookup_at(&result, "+");
-        assert_eq!((plus.line, plus.col), site, "{:?}", result.line_map);
+        assert_eq!(
+            (plus.line, plus.col),
+            (1, col_of(src, 1, "+")),
+            "{:?}",
+            result.line_map
+        );
+        assert_eq!(
+            (plus.expansion_line, plus.expansion_col),
+            site,
+            "{:?}",
+            result.line_map
+        );
         let star = lookup_at(&result, "*");
-        assert_eq!((star.line, star.col), site, "{:?}", result.line_map);
+        assert_eq!(
+            (star.line, star.col),
+            (2, col_of(src, 2, "*")),
+            "{:?}",
+            result.line_map
+        );
+        assert_eq!(
+            (star.expansion_line, star.expansion_col),
+            site,
+            "{:?}",
+            result.line_map
+        );
         let v = lookup_at(&result, "v");
         assert_eq!(
             (v.line, v.col),
@@ -8614,6 +8699,153 @@ int from_late;
         let tail = |text: &str| text[text.find("int value").unwrap()..].to_string();
         assert_eq!(tail(&live.output), "int value= 2 ;\n");
         assert_eq!(tail(&replay.output), tail(&live.output));
+    }
+
+    #[test]
+    fn cached_macro_call_mapping_matches_live_expansion() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("calls.h"),
+            "#define TRACE_REQUEST() target()\n",
+        )
+        .unwrap();
+        let path = dir.path().join("main.c");
+        fs::write(
+            &path,
+            "#include \"calls.h\"\nvoid f(void) { TRACE_REQUEST(); }\n",
+        )
+        .unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path().to_path_buf())
+            .with_include_expansion_cache(cache);
+        let live = preprocess_file(&path, &opts).unwrap();
+        let cached = preprocess_file(&path, &opts.with_frozen_expansion_cache(true)).unwrap();
+        assert_eq!(cached.output, live.output);
+        assert_eq!(cached.line_map, live.line_map);
+
+        let call = live.output.find("target").unwrap();
+        let entry = live.line_map.lookup(call).unwrap();
+        assert!(live.line_map.path_of(entry).ends_with("calls.h"));
+        assert_eq!((entry.line, entry.col), (1, 25));
+        assert!(live
+            .line_map
+            .expansion_path_of(entry)
+            .unwrap()
+            .ends_with("main.c"));
+        assert_eq!((entry.expansion_line, entry.expansion_col), (2, 16));
+    }
+
+    #[test]
+    fn cached_nested_helper_expansions_keep_distinct_chain_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("calls.h"),
+            "#define CALL(o,m,cb) o->m(cb)\n#define BOTH(o) CALL(o,send,first); CALL(o,send,second)\n",
+        )
+        .unwrap();
+        let path = dir.path().join("main.c");
+        fs::write(
+            &path,
+            "#include \"calls.h\"\nvoid f(void *p) { BOTH(p); }\n",
+        )
+        .unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = PreprocessOptions::new()
+            .with_include(dir.path().to_path_buf())
+            .with_include_expansion_cache(cache);
+        let live = preprocess_file(&path, &opts).unwrap();
+        let cached = preprocess_file(&path, &opts.with_frozen_expansion_cache(true)).unwrap();
+        assert_eq!(cached.output, live.output);
+        assert_eq!(cached.line_map, live.line_map);
+
+        let arrows = live
+            .output
+            .match_indices("->")
+            .map(|(offset, _)| live.line_map.lookup(offset).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(arrows.len(), 2);
+        assert_eq!(
+            (arrows[0].file, arrows[0].line, arrows[0].col),
+            (arrows[1].file, arrows[1].line, arrows[1].col)
+        );
+        assert_eq!(
+            (
+                arrows[0].expansion_file,
+                arrows[0].expansion_line,
+                arrows[0].expansion_col,
+            ),
+            (
+                arrows[1].expansion_file,
+                arrows[1].expansion_line,
+                arrows[1].expansion_col,
+            )
+        );
+        assert_ne!(arrows[0].expansion_id, arrows[1].expansion_id);
+    }
+
+    #[test]
+    fn cache_rejects_identical_macro_body_from_a_different_definition_location() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("body.h"), "void f(void) { CALL(); }\n").unwrap();
+        let a = dir.path().join("a.c");
+        let b = dir.path().join("b.c");
+        fs::write(&a, "#define CALL() target_call()\n#include \"body.h\"\n").unwrap();
+        fs::write(
+            &b,
+            "\n\n#define CALL() target_call()\n#include \"body.h\"\n",
+        )
+        .unwrap();
+
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let cached_opts = PreprocessOptions::new()
+            .with_include(dir.path().to_path_buf())
+            .with_include_expansion_cache(cache);
+        preprocess_file(&a, &cached_opts).unwrap();
+        let cached =
+            preprocess_file(&b, &cached_opts.clone().with_frozen_expansion_cache(true)).unwrap();
+        let uncached = preprocess_file(
+            &b,
+            &PreprocessOptions::new().with_include(dir.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(cached.output, uncached.output);
+        assert_eq!(cached.line_map, uncached.line_map);
+        let offset = cached.output.find("target_call").unwrap();
+        let entry = cached.line_map.lookup(offset).unwrap();
+        assert!(cached.line_map.path_of(entry).ends_with("b.c"));
+        assert_eq!((entry.line, entry.col), (3, 16));
+    }
+
+    #[test]
+    fn pasted_token_keeps_spelling_file_and_coordinates_from_one_operand() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = "#define SUFFIX_CALL(x) x ## _call()\n";
+        fs::write(dir.path().join("calls.h"), header).unwrap();
+        let path = dir.path().join("main.c");
+        fs::write(
+            &path,
+            "#include \"calls.h\"\nvoid f(void) { SUFFIX_CALL(target); }\n",
+        )
+        .unwrap();
+        let result = preprocess_file(
+            &path,
+            &PreprocessOptions::new().with_include(dir.path().to_path_buf()),
+        )
+        .unwrap();
+
+        let offset = result.output.find("target_call").unwrap();
+        let entry = result.line_map.lookup(offset).unwrap();
+        assert!(result.line_map.path_of(entry).ends_with("calls.h"));
+        assert_eq!(entry.line, 1);
+        assert_eq!(entry.col, header.find("_call").unwrap() as u32 + 1);
+        assert!(result
+            .line_map
+            .expansion_path_of(entry)
+            .unwrap()
+            .ends_with("main.c"));
+        assert_eq!(entry.expansion_line, 2);
     }
 
     #[test]

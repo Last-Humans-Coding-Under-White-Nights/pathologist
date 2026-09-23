@@ -88,7 +88,7 @@ impl CachedSource {
 }
 
 /// Bytes of one serialized `LineMapEntry` in a spill file.
-const LINE_MAP_ENTRY_BYTES: usize = 16;
+const LINE_MAP_ENTRY_BYTES: usize = 36;
 
 /// `src` with its text and mappings dropped: what the provenance queries
 /// need, and nothing that a spill or release keeps out of memory.
@@ -122,12 +122,21 @@ impl SpilledSource {
             // copy of the map on the heap while it is being shed.
             let mut entry = [0u8; LINE_MAP_ENTRY_BYTES];
             for e in &src.line_map.entries {
-                for (slot, value) in [e.output_offset, e.file, e.line, e.col]
-                    .into_iter()
-                    .enumerate()
+                for (slot, value) in [
+                    e.output_offset,
+                    e.file,
+                    e.line,
+                    e.col,
+                    e.expansion_file,
+                    e.expansion_line,
+                    e.expansion_col,
+                ]
+                .into_iter()
+                .enumerate()
                 {
                     entry[slot * 4..slot * 4 + 4].copy_from_slice(&value.to_le_bytes());
                 }
+                entry[28..36].copy_from_slice(&e.expansion_id.to_le_bytes());
                 writer.write_all(&entry)?;
             }
             writer.flush()?;
@@ -171,6 +180,10 @@ impl SpilledSource {
                             file: value(4),
                             line: value(8),
                             col: value(12),
+                            expansion_file: value(16),
+                            expansion_line: value(20),
+                            expansion_col: value(24),
+                            expansion_id: u64::from_le_bytes(entry[28..36].try_into().unwrap()),
                         }
                     }),
             );
@@ -556,7 +569,10 @@ mod tests {
             let CachedSource::Spilled(src) = &guard[&graph.intern_path(&path)] else {
                 panic!("reserved map allocation was retained")
             };
-            assert_eq!(std::fs::metadata(&src.file).unwrap().len(), 3 + 16);
+            assert_eq!(
+                std::fs::metadata(&src.file).unwrap().len(),
+                3 + LINE_MAP_ENTRY_BYTES as u64
+            );
         }
         let loaded = cache
             .get_or_preprocess(&path, &graph, &PreprocessOptions::default())

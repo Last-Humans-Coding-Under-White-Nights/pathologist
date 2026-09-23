@@ -1,6 +1,6 @@
 # SQLite schema
 
-Schema version: **v5**
+Schema version: **v6**
 
 Export creates secondary indexes after bulk insertion, within the same
 transaction and before publishing the database. Primary keys and uniqueness
@@ -150,19 +150,22 @@ at merge time (later copies redirect), so they appear once per origin and target
 |--------|------|-------------|
 | `id` | INTEGER PK | Call site id |
 | `caller_fn_id` | INTEGER FK → `functions` | Containing function |
-| `file_id` | INTEGER FK → `files` | Call location file |
-| `line` | INTEGER | Line (always original-file coordinates via LineMap; macro-expansion sites map to the expansion origin) |
-| `col` | INTEGER | Column |
+| `file_id` | INTEGER FK → `files` | Call spelling file; for a macro-body call, the macro definition file |
+| `line` | INTEGER | Spelling line (original-file coordinates via LineMap) |
+| `col` | INTEGER | Spelling column |
+| `expansion_file_id` | INTEGER FK → `files`, nullable | Outermost macro invocation file for a macro-body call |
+| `expansion_line` | INTEGER, nullable | Outermost invocation line |
+| `expansion_col` | INTEGER, nullable | Outermost invocation column |
 | `callee_text` | TEXT | Surface syntax (`foo`, `p->handler`, …) |
 | `is_direct` | INTEGER | `1` direct by name; `0` indirect |
 
 Call sites inside header-defined functions are deduplicated by
-`(origin file, line, col, callee)` across TUs. Under `--explore`, variant calls
+`(spelling file, line, col, expansion file, line, col, callee)` across TUs. Under `--explore`, variant calls
 at that same location retain distinct IDs when their arguments, receiver, callee
 binding, or return destination differ. Identical call facts are deduplicated.
 Consequently, raw `call_edges` counts can increase without adding a distinct
-source-location/target pair; group by caller, callee, source file/line/column and
-resolution when comparing source-level coverage.
+source-location/target pair; group by caller, callee, spelling and expansion
+file/line/column, and resolution when comparing invocation-level coverage.
 
 ### call_edges
 

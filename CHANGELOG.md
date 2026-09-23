@@ -4,6 +4,35 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Macro-body call source locations
+
+Calls written in macro replacement lists now retain both source positions:
+`call_sites.file_id/line/col` points to the call token as spelled in the macro
+definition, while nullable `expansion_file_id/expansion_line/expansion_col`
+records the outermost invocation. Repeated expansions remain distinct during
+merge, cached and live preprocessing produce the same mapping, and macro
+definitions remain preprocessing metadata rather than IR functions or methods.
+Expansion coordinates also govern semantic ownership and visibility, preserving
+project calls emitted by dependency-header macros and every cross-TU virtual
+target at repeated macro invocations. They also drive internal-overload lookup,
+PAG name resolution, synthesized-external ownership, function end ranges, and
+`inspect calls --file`. Cache fingerprints include spelling provenance, and
+token pasting keeps source files and coordinates paired from one operand.
+Member calls derive their displayed mapping from a macro-spelled member token.
+Their internal merge identity instead uses the replacement-list `.` or `->`
+plus a deterministic expansion-chain fingerprint, so calls remain distinct
+when either argument expands from a macro alias or the same helper token is
+expanded repeatedly inside one outer invocation.
+Replacement-token emission caches each spelling file's `LineMap` ID to avoid
+repeated linear file-table scans.
+The SQLite schema is now v6; existing databases must be regenerated.
+
+On the pinned evaluation corpora, hiview and camera are unchanged. HDF gains
+seven call-site rows and seven external `strlen` edges because seven expansions
+of `HCS_OBJECT_LENGTH` each contain two separately spelled calls that the old
+expansion-only position conflated. See
+[docs/EVAL_REPORT.md](docs/EVAL_REPORT.md#macro-body-call-positions--2026-09-22).
+
 ### Solver work budget
 
 The solver's pop budget is no longer a fixed 800 000. The default now derives

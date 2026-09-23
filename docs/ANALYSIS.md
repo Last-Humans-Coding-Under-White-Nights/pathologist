@@ -40,6 +40,46 @@ flowchart TD
 2. **`solve`** — worklist propagation until fixpoint; discover indirect callees when call-target points-to gains function locations.
 3. **`extract_arg_flow`** — emit `arg_flow_edges` for wired parameter copies at resolved calls.
 
+## Call source locations
+
+A call token written in a source macro replacement list uses the token's
+spelling location in the macro definition as `CallSite::span`. Its optional
+`CallSite::expansion_span` identifies the outermost invocation that emitted the
+token. This makes the spelling location usable as a source request while still
+distinguishing repeated expansions of the same macro body. Calls spelled as
+macro arguments keep the argument's own source position and have no macro-body
+expansion span. For a member call whose called member is spelled in a
+replacement list, lowering displays that member token rather than the
+receiver's first token; therefore `ARG->member()` still points to `member` when
+`ARG` came from a macro argument.
+
+Displayed coordinates are not the call's merge identity. A receiver or member
+argument may expand from another macro, giving several calls the same displayed
+spelling and expansion pair. Macro member calls therefore retain a separate
+internal occurrence identity from their replacement-list `.` or `->` token.
+That identity contains the punctuation spelling, outermost expansion, and the
+preprocessor's deterministic expansion-chain fingerprint. The chain preserves
+intermediate helper invocations and parameter-substitution positions, so two
+expansions of the same helper token inside one outer invocation remain distinct.
+Merge and virtual-target deduplication use this occurrence identity; database
+export and source requests continue to use `span` and `expansion_span`.
+
+Semantic ownership and visibility use the expansion file when it is present.
+Consequently, invoking a macro declared under a dependency root still produces
+a call in project code, while a call actually expanded inside a dependency body
+remains excluded. Post-merge virtual-target deduplication uses both spelling and
+expansion spans, so repeated invocations of one macro-body virtual call each
+receive overrides discovered in other translation units. `CallSite::scope_file`
+is the shared source of this semantic file for name lookup, internal-overload
+argument flow, synthesized-external ownership, and PAG resolution.
+
+The SQLite `call_sites.file_id/line/col` columns export the spelling location;
+the nullable `expansion_file_id/expansion_line/expansion_col` columns export the
+invocation. These facts come from the preprocessor `LineMap`, including cached
+header expansions. Macro definitions remain preprocessing metadata and never
+become IR functions or methods. `trace inspect calls --file` matches either the
+spelling file or expansion file and orders macro calls by their invocation.
+
 ## Shared header functions
 
 This section defines header-function sharing. `SymbolTable` owns visibility

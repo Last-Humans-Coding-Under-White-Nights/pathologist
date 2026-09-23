@@ -235,6 +235,55 @@ taken. D closes it for the rest by not seeding pointer statics. Both rules
 are in [ANALYSIS.md](ANALYSIS.md), "Variable cells"; the regression tests
 are `store_through_value_copy_does_not_write_the_global` and
 `address_taken_global_keeps_value_copies_apart`.
+
+## Macro-body call positions — 2026-09-22
+
+The mapping and database columns are defined in
+[Call source locations](ANALYSIS.md#call-source-locations) and
+[LineMap](PREPROCESSOR.md#linemap). Measurements use release builds of clean
+`master` at `aeac15e` and this change, the three revisions pinned in
+`scripts/eval_expected.json`, `--jobs 8`, the pinned 800,000-pop solver budget,
+and minimal SQLite export. Both builds ran on the same machine in the same
+sitting.
+
+| Corpus | Call sites before / after | Call edges before / after | External edges before / after |
+|---|---:|---:|---:|
+| hdf | 71,811 / 71,818 | 75,390 / 75,397 | 25,215 / 25,222 |
+| hiview | 34,492 / 34,492 | 33,549 / 33,549 | 16,658 / 16,658 |
+| camera | 108,869 / 108,869 | 102,033 / 102,033 | 45,006 / 45,006 |
+
+All function, argument-flow, IPC, indirect-edge and dlsym counts are unchanged.
+HDF gains seven real external edges. The `HCS_OBJECT_LENGTH`
+replacement list in `framework/utils/include/hcs_blob_if.h` contains two
+`strlen` calls at line 78, columns 65 and 85. Seven callers expand that body.
+Previously both calls mapped to the one invocation coordinate and the merge
+discarded one; their spelling columns now keep both records and both edges.
+
+The new database contains 30,157 macro-body call sites in hdf, 233 in hiview,
+and 9,122 in camera, each with a definition spelling position and an outer
+invocation position. The eval dispatch-site line filter now uses
+`COALESCE(expansion_line, line)`: those probes identify an invocation in a
+caller, while `line` is deliberately the macro-body request position. This
+keeps camera's `CaptureSession::AddOutput CanAddOutput` probe at 19 targets.
+
+The review fixes were re-evaluated after adding spelling provenance to cache
+fingerprints. Call sites, call edges, functions, argument flow, and all exact
+dispatch probes remain at the values above. Hiview diagnostics move from 2,989
+to 2,988: the same `encoded_param.h` parse-error message is emitted three times
+instead of four, while the set of diagnostic messages is unchanged. The exact
+hiview diagnostic expectation is re-captured accordingly.
+
+On the original `aeac15e` base, the standard gate still reported the same 17
+pre-existing expectation failures as the clean baseline. After rebasing onto
+`84e1d96` (#131), whose evaluation expectations include that intervening
+analysis work, the combined release build passes all 94 checks. HDF has 74,881
+edges, seven above master's 74,874 center, and 25,219 external edges, seven
+above master's 25,212 center; hiview and camera call-edge counts remain at
+33,549 and 102,031. Hiview's exact diagnostic expectation remains 2,988.
+The follow-up member-token mapping, expansion-chain call occurrence identity,
+and spelling-file interning cache leave all 94 evaluation checks and these
+corpus counts unchanged.
+
 ## Solver work budget — 2026-09-21 (#119)
 
 The budget formula, the precedence of the override knobs and the recording of

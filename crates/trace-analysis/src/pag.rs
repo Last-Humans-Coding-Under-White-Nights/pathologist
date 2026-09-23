@@ -1029,7 +1029,7 @@ fn callee_name_is_a_function(program: &Program, cs: &trace_ir::CallSite) -> bool
         .symbols
         .resolve_function_in_scope_in_target(
             &cs.callee_name,
-            Some(cs.span.file),
+            Some(cs.scope_file()),
             program.symbols.function(cs.caller).target,
         )
         .is_some()

@@ -21,9 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use trace_ir::{
-    is_anonymous_tag, CallSite, Diagnostic, DiagnosticSeverity, FieldId, FlowConstraint, FnId,
-    Function, Linkage, Program, ReturnFlow, ScalarKind, Span, StorageClass, TypeDesc, VarId,
-    Variable,
+    is_anonymous_tag, CallOccurrence, CallSite, Diagnostic, DiagnosticSeverity, FieldId,
+    FlowConstraint, FnId, Function, Linkage, Program, ReturnFlow, ScalarKind, Span, StorageClass,
+    TypeDesc, VarId, Variable,
 };
 use trace_preproc::{macro_table_from_defines, Language, MacroTable, PreprocessOptions};
 use tree_sitter::Node;
@@ -1252,7 +1252,7 @@ fn finalize_extern_callees(program: &mut Program) {
                 && cs.callee_fn_id.is_none()
                 && is_synthesizable_extern(&cs.callee_name)
         })
-        .map(|cs| (cs.callee_name.clone(), cs.span.file))
+        .map(|cs| (cs.callee_name.clone(), cs.scope_file()))
         .collect();
     names.sort();
     names.dedup_by(|a, b| a.0 == b.0);
@@ -1374,8 +1374,9 @@ fn finalize_target_extern_callees(program: &mut Program) {
         // no source location: keep the first call site's file as a scope
         // fallback but export line 0, so call-graph consumers do not present
         // an arbitrary call site as the function's own location.
+        let site = &program.symbols.call_sites[sites[0]];
         let span = trace_ir::Span {
-            file: program.symbols.call_sites[sites[0]].span.file,
+            file: site.scope_file(),
             line: 0,
             col: 0,
         };
@@ -1434,13 +1435,21 @@ fn is_synthesizable_extern(name: &str) -> bool {
 /// `Derived` is declared — or `Plugin::OnEvent` overrides in other TUs —
 /// would otherwise keep a single target.
 fn expand_virtual_overrides(program: &mut Program) {
-    let mut seen: std::collections::HashSet<(FnId, u32, u32, FnId)> = program
+    let mut seen: std::collections::HashSet<(FnId, Span, Option<Span>, u64, FnId)> = program
         .symbols
         .call_sites
         .iter()
         .filter_map(|cs| {
-            cs.callee_fn_id
-                .map(|c| (cs.caller, cs.span.line, cs.span.col, c))
+            let occurrence = cs.occurrence();
+            cs.callee_fn_id.map(|c| {
+                (
+                    cs.caller,
+                    occurrence.span,
+                    occurrence.expansion_span,
+                    occurrence.expansion_id,
+                    c,
+                )
+            })
         })
         .collect();
     let snapshot = program.symbols.call_sites.clone();
@@ -1472,8 +1481,9 @@ fn expand_virtual_overrides(program: &mut Program) {
         // A callee bound to such a member was looked up where its class is
         // seen, which a header can make another file than the call's.
         let bound_in = (f.linkage == trace_ir::Linkage::Internal).then_some(f.file);
+        let call_file = cs.scope_file();
         let sees = |file: trace_ir::FileId| {
-            program.symbols.file_sees(cs.span.file, file)
+            program.symbols.file_sees(call_file, file)
                 || bound_in.is_some_and(|b| program.symbols.file_sees(b, file))
         };
         let visible = |t: FnId| {
@@ -1534,7 +1544,14 @@ fn expand_virtual_overrides(program: &mut Program) {
                 && arity_compatible(expected_arity, method_explicit_arity(program, t))
         });
         for t in targets {
-            let key = (cs.caller, cs.span.line, cs.span.col, t);
+            let occurrence = cs.occurrence();
+            let key = (
+                cs.caller,
+                occurrence.span,
+                occurrence.expansion_span,
+                occurrence.expansion_id,
+                t,
+            );
             if !seen.insert(key) {
                 continue;
             }
@@ -1552,6 +1569,8 @@ fn expand_virtual_overrides(program: &mut Program) {
                 addr_of_args: cs.addr_of_args.clone(),
                 args_bound_past_this: cs.args_bound_past_this,
                 span: cs.span,
+                expansion_span: cs.expansion_span,
+                occurrence: cs.occurrence,
                 is_direct: true,
                 receiver_class: cs.receiver_class.clone(),
                 return_dst: cs.return_dst,
@@ -5358,7 +5377,7 @@ fn lower_declaration(
                                         let type_name = node_text(source, &type_node).to_string();
                                         let callee_var = lookup_var(ctx, program, &type_name);
                                         let callee_name = format!("{}[...]", type_name);
-                                        let span = node_span(program, ctx, node);
+                                        let span = node_call_span(program, ctx, node);
                                         let args = collect_call_args(
                                             program,
                                             ctx,
@@ -5366,6 +5385,8 @@ fn lower_declaration(
                                             fdecl.child_by_field_name("parameters"),
                                         );
                                         let call_id = program.symbols.alloc_call_id();
+                                        let expansion_span =
+                                            node_expansion_span(program, ctx, node);
                                         program.symbols.call_sites.push(CallSite {
                                             id: call_id,
                                             caller,
@@ -5378,6 +5399,8 @@ fn lower_declaration(
                                             addr_of_args: args.addr_of_args,
                                             args_bound_past_this: false,
                                             span,
+                                            expansion_span,
+                                            occurrence: None,
                                             is_direct: false,
                                             receiver_class: None,
                                             return_dst: None,
@@ -5580,6 +5603,8 @@ fn lower_direct_init(
     let Some(caller) = ctx.current_fn else {
         return;
     };
+    let call_span = node_call_span(program, ctx, decl);
+    let expansion_span = node_expansion_span(program, ctx, decl);
     emit_member_sites(
         program,
         caller,
@@ -5587,7 +5612,8 @@ fn lower_direct_init(
         &trace_ir::MethodKind::Ctor,
         Some(object),
         args,
-        span,
+        call_span,
+        expansion_span,
     );
 }
 
@@ -5725,7 +5751,8 @@ fn lower_one_declarator(
                     .find(|c| c.kind() == "argument_list"),
             };
             if ctor_args.is_some() {
-                let span = node_span(program, ctx, span_node);
+                let span = node_call_span(program, ctx, span_node);
+                let expansion_span = node_expansion_span(program, ctx, span_node);
                 let call_args = collect_call_args(program, ctx, source, ctor_args);
                 // The implicit `this` points to the object being constructed.
                 emit_member_sites(
@@ -5736,6 +5763,7 @@ fn lower_one_declarator(
                     Some(var_id),
                     call_args,
                     span,
+                    expansion_span,
                 );
             }
         }
@@ -6011,7 +6039,8 @@ fn walk_function_body(
                     let args = node
                         .children(&mut node.walk())
                         .find(|c| c.kind() == "argument_list");
-                    let span = node_span(program, ctx, node);
+                    let span = node_call_span(program, ctx, node);
+                    let expansion_span = node_expansion_span(program, ctx, node);
                     let call_args = collect_call_args(program, ctx, source, args);
                     // `this` stays unwired; the solver creates an imprecise
                     // summary node for it (sound over-approximation).
@@ -6023,6 +6052,7 @@ fn walk_function_body(
                         None,
                         call_args,
                         span,
+                        expansion_span,
                     );
                 }
             }
@@ -6034,7 +6064,8 @@ fn walk_function_body(
                 .last();
             if let Some(operand) = operand {
                 if let Some(cls) = infer_static_class(program, ctx, source, operand) {
-                    let span = node_span(program, ctx, node);
+                    let span = node_call_span(program, ctx, node);
+                    let expansion_span = node_expansion_span(program, ctx, node);
                     emit_member_sites(
                         program,
                         caller,
@@ -6043,6 +6074,7 @@ fn walk_function_body(
                         None,
                         CallArgs::empty(),
                         span,
+                        expansion_span,
                     );
                 }
             }
@@ -6108,11 +6140,53 @@ fn collect_call_at_node(
     node: Node,
     caller: FnId,
 ) {
+    let occurrence_node = node
+        .child_by_field_name("function")
+        .filter(|func| func.kind() == "field_expression")
+        .and_then(member_access_token)
+        .filter(|token| node_has_expansion_location(ctx, *token));
+    let first_site = program.symbols.call_sites.len();
+    collect_call_at_node_inner(program, ctx, source, node, caller);
+    let Some(occurrence_node) = occurrence_node else {
+        return;
+    };
+    let occurrence = CallOccurrence {
+        span: node_call_span(program, ctx, occurrence_node),
+        expansion_span: node_expansion_span(program, ctx, occurrence_node),
+        expansion_id: node_expansion_id(ctx, occurrence_node),
+    };
+    for site in &mut program.symbols.call_sites[first_site..] {
+        site.occurrence = Some(occurrence);
+    }
+}
+
+fn collect_call_at_node_inner(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+    caller: FnId,
+) {
     let func = match node.child_by_field_name("function") {
         Some(f) => f,
         None => return,
     };
-    let span = node_span(program, ctx, node);
+    // A member call node starts at its receiver. When the member is spelled in
+    // a replacement list, display that token so a macro-argument receiver
+    // cannot hide its provenance. `CallSite::occurrence` independently keeps
+    // repeated calls distinct when this token came from a shared argument.
+    let source_node = if func.kind() == "field_expression" {
+        let field = func.child_by_field_name("field").unwrap_or(func);
+        if node_has_expansion_location(ctx, field) {
+            field
+        } else {
+            node
+        }
+    } else {
+        node
+    };
+    let span = node_call_span(program, ctx, source_node);
+    let expansion_span = node_expansion_span(program, ctx, source_node);
     let return_dst = ctx.call_return_dst.borrow().get(&node.id()).copied();
 
     // ---- C++ member calls with statically-typed receivers ----
@@ -6155,6 +6229,7 @@ fn collect_call_at_node(
                                     recv_cls,
                                     call_args,
                                     span,
+                                    expansion_span,
                                 );
                                 return;
                             };
@@ -6183,7 +6258,15 @@ fn collect_call_at_node(
                                 node.child_by_field_name("arguments"),
                             );
                             emit_member_targets(
-                                program, caller, &cls, &kind, None, call_args, span, targets,
+                                program,
+                                caller,
+                                &cls,
+                                &kind,
+                                None,
+                                call_args,
+                                span,
+                                expansion_span,
+                                targets,
                             );
                             return;
                         }
@@ -6208,6 +6291,7 @@ fn collect_call_at_node(
                                     None,
                                     call_args,
                                     span,
+                                    expansion_span,
                                     field_targets,
                                 );
                                 return;
@@ -6235,6 +6319,7 @@ fn collect_call_at_node(
                                 cls,
                                 call_args,
                                 span,
+                                expansion_span,
                             );
                             return;
                         }
@@ -6262,7 +6347,15 @@ fn collect_call_at_node(
                         node.child_by_field_name("arguments"),
                     );
                     emit_member_targets(
-                        program, caller, &cls, &kind, None, call_args, span, targets,
+                        program,
+                        caller,
+                        &cls,
+                        &kind,
+                        None,
+                        call_args,
+                        span,
+                        expansion_span,
+                        targets,
                     );
                     return;
                 }
@@ -6287,7 +6380,16 @@ fn collect_call_at_node(
         if let Some((cls, kind)) = target {
             let call_args =
                 collect_call_args(program, ctx, source, node.child_by_field_name("arguments"));
-            emit_member_sites(program, caller, &cls, &kind, None, call_args, span);
+            emit_member_sites(
+                program,
+                caller,
+                &cls,
+                &kind,
+                None,
+                call_args,
+                span,
+                expansion_span,
+            );
             return;
         }
     }
@@ -6384,6 +6486,8 @@ fn collect_call_at_node(
             addr_of_args: args.addr_of_args,
             args_bound_past_this: false,
             span,
+            expansion_span,
+            occurrence: None,
             is_direct,
             receiver_class: None,
             return_dst,
@@ -6423,6 +6527,8 @@ fn collect_call_at_node(
             addr_of_args: site_args.addr_of_args,
             args_bound_past_this: bound,
             span,
+            expansion_span,
+            occurrence: None,
             is_direct: true,
             receiver_class: None,
             return_dst,
@@ -7028,6 +7134,7 @@ fn emit_unresolved_site(
     receiver_class: String,
     args: CallArgs,
     span: Span,
+    expansion_span: Option<Span>,
 ) {
     let CallArgs {
         var_args,
@@ -7050,6 +7157,8 @@ fn emit_unresolved_site(
         addr_of_args,
         args_bound_past_this: true,
         span,
+        expansion_span,
+        occurrence: None,
         is_direct: false,
         receiver_class: Some(receiver_class),
         return_dst: None,
@@ -7062,6 +7171,7 @@ fn emit_unresolved_site(
 /// declaring class and expanding its subclasses. `args` are the explicit
 /// arguments, bound here past the member's `this`, which is `receiver` when
 /// the caller has the object (#93, #94).
+#[allow(clippy::too_many_arguments)]
 fn emit_member_sites(
     program: &mut Program,
     caller: FnId,
@@ -7070,10 +7180,21 @@ fn emit_member_sites(
     receiver: Option<VarId>,
     args: CallArgs,
     span: Span,
+    expansion_span: Option<Span>,
 ) {
     let cls = receiver_lookup_name(cls);
     let targets = member_targets_upward(program, &cls, kind);
-    emit_member_targets(program, caller, &cls, kind, receiver, args, span, targets);
+    emit_member_targets(
+        program,
+        caller,
+        &cls,
+        kind,
+        receiver,
+        args,
+        span,
+        expansion_span,
+        targets,
+    );
 }
 
 /// [`emit_member_sites`] for a caller that already probed the override set —
@@ -7089,6 +7210,7 @@ fn emit_member_targets(
     receiver: Option<VarId>,
     args: CallArgs,
     span: Span,
+    expansion_span: Option<Span>,
     targets: Vec<FnId>,
 ) {
     let tu = program.symbols.function_by_id(caller).and_then(|f| f.tu);
@@ -7112,6 +7234,8 @@ fn emit_member_targets(
             addr_of_args: args.addr_of_args,
             args_bound_past_this: true,
             span,
+            expansion_span,
+            occurrence: None,
             is_direct: false,
             receiver_class: Some(cls.to_string()),
             return_dst: None,
@@ -7139,6 +7263,8 @@ fn emit_member_targets(
             addr_of_args: site_args.addr_of_args,
             args_bound_past_this: true,
             span,
+            expansion_span,
+            occurrence: None,
             is_direct: true,
             receiver_class: Some(cls.to_string()),
             return_dst: None,
@@ -7195,7 +7321,8 @@ fn lower_field_initializer_list(
             let args = fi
                 .children(&mut fi.walk())
                 .find(|c| matches!(c.kind(), "argument_list" | "initializer_list"));
-            let span = node_span(program, ctx, fi);
+            let span = node_call_span(program, ctx, fi);
+            let expansion_span = node_expansion_span(program, ctx, fi);
             let call_args = collect_call_args(program, ctx, source, args);
             emit_member_sites(
                 program,
@@ -7205,6 +7332,7 @@ fn lower_field_initializer_list(
                 None,
                 call_args,
                 span,
+                expansion_span,
             );
         }
     }
@@ -8544,6 +8672,14 @@ fn member_access_op(node: Node) -> (bool, bool) {
     (arrow || dot, arrow)
 }
 
+/// The punctuation owned by this member expression. Unlike a substituted
+/// receiver or member name, each `.` / `->` in a replacement list identifies
+/// one syntactic call occurrence.
+fn member_access_token(node: Node) -> Option<Node> {
+    node.children(&mut node.walk())
+        .find(|child| matches!(child.kind(), "." | "->"))
+}
+
 /// Static class of a receiver expression, when inferable from declared
 /// types (`this`, locals/globals, fields along typed chains, casts, news).
 fn infer_static_class(
@@ -9666,7 +9802,8 @@ fn expr_to_rhs_flow(
                 let args = node
                     .children(&mut node.walk())
                     .find(|c| c.kind() == "argument_list");
-                let span = node_span(program, ctx, node);
+                let span = node_call_span(program, ctx, node);
+                let expansion_span = node_expansion_span(program, ctx, node);
                 let call_args = collect_call_args(program, ctx, source, args);
                 if let Some(caller) = ctx.current_fn {
                     emit_member_sites(
@@ -9677,6 +9814,7 @@ fn expr_to_rhs_flow(
                         Some(alloc_tmp),
                         call_args,
                         span,
+                        expansion_span,
                     );
                 }
                 ctx.handled_new_exprs.borrow_mut().insert(node.id());
@@ -11435,6 +11573,14 @@ fn origin_file_id(
 fn node_span(program: &mut Program, ctx: &LowerContext, node: Node) -> Span {
     if let Some(line_map) = &ctx.line_map {
         if let Some(entry) = line_map.lookup(node.start_byte()) {
+            if let Some(origin) = line_map.expansion_path_of(entry) {
+                let fid = if origin != ctx.primary_path {
+                    program.symbols.add_file_interned(origin)
+                } else {
+                    ctx.current_file
+                };
+                return Span::new(fid, entry.expansion_line, entry.expansion_col);
+            }
             // Always report original-file coordinates. Code from an
             // `#include`d file is attributed to its original header;
             // TU-local code keeps the primary file but gets its original
@@ -11452,6 +11598,48 @@ fn node_span(program: &mut Program, ctx: &LowerContext, node: Node) -> Span {
     Span::new(ctx.current_file, line, col)
 }
 
+/// The token spelling for a call request. Unlike general entity spans, a
+/// macro-body call points into its replacement-list definition.
+fn node_call_span(program: &mut Program, ctx: &LowerContext, node: Node) -> Span {
+    if let Some(line_map) = &ctx.line_map {
+        if let Some(entry) = line_map.lookup(node.start_byte()) {
+            let fid = origin_file_id(ctx, line_map, entry, |origin| {
+                Some(program.symbols.add_file_interned(origin))
+            })
+            .unwrap_or(ctx.current_file);
+            return Span::new(fid, entry.line, entry.col);
+        }
+    }
+    node_span(program, ctx, node)
+}
+
+fn node_expansion_span(program: &mut Program, ctx: &LowerContext, node: Node) -> Option<Span> {
+    let line_map = ctx.line_map.as_ref()?;
+    let entry = line_map.lookup(node.start_byte())?;
+    let origin = line_map.expansion_path_of(entry)?;
+    let fid = if origin != ctx.primary_path {
+        program.symbols.add_file_interned(origin)
+    } else {
+        ctx.current_file
+    };
+    Some(Span::new(fid, entry.expansion_line, entry.expansion_col))
+}
+
+fn node_has_expansion_location(ctx: &LowerContext, node: Node) -> bool {
+    ctx.line_map.as_ref().is_some_and(|line_map| {
+        line_map
+            .lookup(node.start_byte())
+            .is_some_and(|entry| line_map.expansion_path_of(entry).is_some())
+    })
+}
+
+fn node_expansion_id(ctx: &LowerContext, node: Node) -> u64 {
+    ctx.line_map
+        .as_ref()
+        .and_then(|line_map| line_map.lookup(node.start_byte()))
+        .map_or(0, |entry| entry.expansion_id)
+}
+
 /// Original-file end line of `node`, for range queries like "which function
 /// contains this line". The end maps back through the LineMap only when the
 /// last byte originates from the same file as `span.file` — a body that ends
@@ -11463,16 +11651,20 @@ fn node_end_line(program: &Program, ctx: &LowerContext, node: Node, span: Span) 
         None => node.end_position().row as u32 + 1,
         Some(line_map) => {
             let entry = line_map.lookup(node.end_byte().saturating_sub(1));
-            let same_origin = entry
-                .map(|entry| {
-                    let fid = origin_file_id(ctx, line_map, entry, |origin| {
-                        program.symbols.file_by_path(origin)
-                    });
-                    fid == Some(span.file)
-                })
-                .unwrap_or(false);
-            if same_origin {
-                entry.map(|e| e.line).unwrap_or(span.line)
+            let end = entry.and_then(|entry| {
+                let (origin, line) = match line_map.expansion_path_of(entry) {
+                    Some(origin) => (origin, entry.expansion_line),
+                    None => (line_map.path_of(entry), entry.line),
+                };
+                let fid = if origin == ctx.primary_path {
+                    Some(ctx.current_file)
+                } else {
+                    program.symbols.file_by_path(origin)
+                };
+                (fid == Some(span.file)).then_some(line)
+            });
+            if let Some(line) = end {
+                line
             } else {
                 // End originates in another file (or is unmappable): a body
                 // has no meaningful single-file range, so report the start.
