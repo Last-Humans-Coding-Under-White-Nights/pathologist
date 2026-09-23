@@ -60,3 +60,33 @@ pub enum FlowConstraint {
     /// `dst` points at the given string literal (interned; copies propagate).
     StringConst { dst: VarId, value: String },
 }
+
+impl FlowConstraint {
+    /// Every variable the constraint names, destination first.
+    pub fn vars(&self) -> impl Iterator<Item = VarId> {
+        let (first, second) = match *self {
+            FlowConstraint::Copy { dst, src }
+            | FlowConstraint::Load { dst, src }
+            | FlowConstraint::Store { dst, src }
+            | FlowConstraint::AddrOfVar { dst, src } => (dst, Some(src)),
+            FlowConstraint::GepField { dst, base, .. } => (dst, Some(base)),
+            FlowConstraint::CallReturnIndirect { dst, callee_var } => (dst, Some(callee_var)),
+            FlowConstraint::ArrayFnMember { array, .. } => (array, None),
+            FlowConstraint::AddrOfFn { dst, .. }
+            | FlowConstraint::CallReturn { dst, .. }
+            | FlowConstraint::NewHeap { dst }
+            | FlowConstraint::StringConst { dst, .. } => (dst, None),
+        };
+        std::iter::once(first).chain(second)
+    }
+}
+
+impl ReturnFlow {
+    /// The variable the return names, if any.
+    pub fn var(&self) -> Option<VarId> {
+        match *self {
+            ReturnFlow::AddrOfVar { src } | ReturnFlow::Copy { src } => Some(src),
+            ReturnFlow::AddrOfFn { .. } | ReturnFlow::Call { .. } => None,
+        }
+    }
+}

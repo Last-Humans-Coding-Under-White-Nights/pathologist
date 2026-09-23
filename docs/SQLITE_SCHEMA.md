@@ -220,12 +220,17 @@ Exactly one of `actual_var_id` or `actual_fn_id` is set per row. A function name
 | `is_weak` | INTEGER | 1 for a weak symbol, 0 otherwise; recorded only for globals — a file-scope `static`, a local or a parameter has no linkage to weaken. |
 | `target_id` | INTEGER FK → `link_targets` | Owning link target; `NULL` when no target is known. |
 
-In minimal export, variables are limited to those referenced by the flow
-graph / arg-flow edges; use `--full-export` for every variable.
+In minimal export, variables are limited to every global and static (with
+or without a flow node) and the locals and parameters the flow graph /
+arg-flow edges reference; use `--full-export` for every variable. A global no
+fact names is listed so `trace inspect` finds it by its own declaration;
+`inspect dataflow` then reports it has no flow node.
 
 ### flow_nodes
 
-PAG value-flow nodes (`trace inspect dataflow`). Always exported.
+PAG value-flow nodes (`trace inspect dataflow`). Always exported. A global
+or static that no flow, return or call site names has no node (see
+[Program Assignment Graph](ANALYSIS.md#program-assignment-graph-pag)).
 
 | Column | Type | Description |
 |--------|------|-------------|

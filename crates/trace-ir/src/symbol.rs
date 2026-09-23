@@ -35,11 +35,52 @@ pub struct Variable {
     pub is_weak: bool,
     /// Link target identity; absent when no link metadata is available.
     pub target: Option<crate::TargetId>,
-    /// Declared inside a C++ namespace, so `name` — the only name recorded for
-    /// a variable — is not the name a linker resolves. Such a global neither
-    /// claims its image's binding for that name nor takes part in weak
-    /// override, since `a::cb` and `b::cb` are different symbols.
+    /// Declared at a C++ namespace's scope, or a class's `static` data member:
+    /// source metadata only, set exactly when `qualified_name` is. Identity —
+    /// target unification and weak override included — goes through
+    /// `lookup_name`/`external_symbol_name`, never this flag.
     pub is_namespaced: bool,
+    /// Canonical scoped spelling (`ns::ptr`, `outer::inner::ptr`), without a
+    /// leading `::`. `None` for a local, a parameter, a temporary, or any
+    /// variable declared outside a namespace — the common case, so most
+    /// variables carry no extra allocation. `name` stays the token written at
+    /// the declaration site, for display and export; identity for lookup and
+    /// external-symbol purposes goes through `lookup_name`/
+    /// `external_symbol_name` instead. See `docs/ANALYSIS.md`, "Canonical
+    /// variable identity".
+    pub qualified_name: Option<String>,
+    /// Declared with C language linkage (`extern "C"`): its linker symbol is
+    /// the bare `name`, whatever namespace it is declared in, while lookup
+    /// still goes through the qualified name. See `docs/ANALYSIS.md`,
+    /// "Canonical variable identity".
+    pub c_linkage: bool,
+}
+
+impl Variable {
+    /// The name every symbol-table index keys a variable on: the canonical
+    /// qualified spelling when one was registered, else the plain `name`.
+    pub fn lookup_name(&self) -> &str {
+        self.qualified_name.as_deref().unwrap_or(&self.name)
+    }
+
+    /// The linker-visible symbol name, or `None` for a variable with no
+    /// external symbol at all (a local, a file `static`, or any other
+    /// internal-linkage binding). Lowering registers `static` and
+    /// anonymous-namespace variables, and a static data member of a class
+    /// declared in one, as `FileStatic`. A C++ `const`/`constexpr` variable
+    /// at file or namespace scope, internal-linkage though it is, stays
+    /// `Global` and so reports a symbol (`docs/ANALYSIS.md`, "Link targets
+    /// and weak symbols"). Image unification and weak override key on this
+    /// name. A C-linkage variable's symbol is its bare name.
+    pub fn external_symbol_name(&self) -> Option<&str> {
+        (self.storage == StorageClass::Global).then(|| {
+            if self.c_linkage {
+                self.name.as_str()
+            } else {
+                self.lookup_name()
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -392,6 +433,14 @@ pub struct SymbolTable {
     /// winning.
     /// One entry per file, kept sorted by FileId (see `insert_by_file`).
     file_statics_by_name: FxHashMap<String, Vec<(FileId, VarId)>>,
+    /// The last `::` segment of every variable's `qualified_name`: whether a
+    /// written name could mean a scoped variable at all, asked before
+    /// lowering walks the enclosing scopes for one.
+    scoped_variable_leaves: FxHashSet<String>,
+    /// The last `::` segment of every function name that has one: whether a
+    /// written name could mean a class's or namespace's function, asked
+    /// before lowering walks the enclosing scopes for one.
+    scoped_function_leaves: FxHashSet<String>,
     /// Internal-linkage definitions per file: `(file, name) -> FnId`.
     /// In C, a file-`static` definition shadows any external definition of
     /// the same name for references inside that file.
@@ -951,10 +1000,11 @@ impl SymbolTable {
         self.has_target_scopes |= func.target.is_some();
         let id = func.id;
         self.fn_slots.insert(id, self.functions.len() as u32);
-        self.base_by_name
-            .entry(base_name_of(&func.name))
-            .or_default()
-            .push(id);
+        let base = base_name_of(&func.name);
+        if base.len() != func.name.len() && !self.scoped_function_leaves.contains(&base) {
+            self.scoped_function_leaves.insert(base.clone());
+        }
+        self.base_by_name.entry(base).or_default().push(id);
         self.functions.push(func);
         id
     }
@@ -1143,43 +1193,66 @@ impl SymbolTable {
 
     pub fn add_variable(&mut self, var: Variable) -> VarId {
         self.has_weak_symbols |= var.is_weak;
+        if let Some(qualified) = &var.qualified_name {
+            let leaf = qualified.rsplit("::").next().unwrap_or(qualified);
+            if !self.scoped_variable_leaves.contains(leaf) {
+                self.scoped_variable_leaves.insert(leaf.to_string());
+            }
+        }
         let id = var.id;
-        match var.storage {
-            StorageClass::Global => match var.target {
-                // A namespaced global does not claim the image's binding for
-                // its unqualified name; an unrelated `::counter` would
-                // otherwise unify with `ns::counter`.
-                Some(target) if !var.is_namespaced => {
+        if let Some(symbol) = var.external_symbol_name() {
+            match var.target {
+                // Keyed by the linker symbol: the canonical name
+                // (docs/ANALYSIS.md, "Canonical variable identity"), so
+                // `a::ptr`, `b::ptr` and a bare `ptr` are three symbols of
+                // the image, and a C-linkage variable's bare name, which
+                // every C-linkage declaration of that name shares whatever
+                // its namespace. Lookup goes through `global_named`.
+                Some(target) => {
                     self.target_globals
                         .entry(target)
                         .or_default()
-                        .entry(var.name.clone())
+                        .entry(symbol.to_string())
                         .or_insert(id);
                 }
-                Some(_) => {}
                 // `global_by_name` is the unscoped index, and every image holds
                 // its own copy of a shared global. Letting a scoped copy
                 // overwrite the entry left it pointing at whichever target
                 // merged last, so an unscoped caller resolving through it
-                // inherited an arbitrary image's variable.
+                // inherited an arbitrary image's variable. It is a lookup
+                // index, so it keys on the name lookup spells, not a
+                // C-linkage symbol's bare name.
                 None => {
-                    self.global_by_name.insert(var.name.clone(), id);
-                }
-            },
-            StorageClass::FileStatic => {
-                let entries = self
-                    .file_statics_by_name
-                    .entry(var.name.clone())
-                    .or_default();
-                // First registration of a name in a file wins.
-                if file_run(entries, var.span.file).1.is_empty() {
-                    insert_by_file(entries, var.span.file, id);
+                    self.global_by_name
+                        .insert(var.lookup_name().to_string(), id);
                 }
             }
-            _ => {}
+        } else if var.storage == StorageClass::FileStatic {
+            let entries = self
+                .file_statics_by_name
+                .entry(var.lookup_name().to_string())
+                .or_default();
+            // First registration of a name in a file wins.
+            if file_run(entries, var.span.file).1.is_empty() {
+                insert_by_file(entries, var.span.file, id);
+            }
         }
         self.variables.push(var);
         id
+    }
+
+    /// Whether some variable with a `qualified_name` (a namespace-scope
+    /// variable or a static data member) ends in the segment `leaf`. When
+    /// none does, no scope-relative spelling of `leaf` can name a variable.
+    pub fn has_scoped_variable_leaf(&self, leaf: &str) -> bool {
+        self.scoped_variable_leaves.contains(leaf)
+    }
+
+    /// Whether some function with a scope-qualified name (`ns::f`, `C::m`)
+    /// ends in the segment `leaf`. When none does, no scope-relative
+    /// spelling of `leaf` can name a function.
+    pub fn has_scoped_function_leaf(&self, leaf: &str) -> bool {
+        self.scoped_function_leaves.contains(leaf)
     }
 
     /// The file-`static` variable `name` code in `file` sees: defined in
@@ -1187,6 +1260,43 @@ impl SymbolTable {
     pub fn file_static_named(&self, file: FileId, name: &str) -> Option<VarId> {
         let entries = self.file_statics_by_name.get(name).map(Vec::as_slice);
         self.first_in_scope(file, entries, |_| true)
+    }
+
+    /// Exact scope probe over a variable's canonical name
+    /// ([`Variable::lookup_name`]): the file's internal (file-`static`)
+    /// binding first, then the unscoped external binding. Lowering is its
+    /// only caller and runs before link targets exist, so it names no image.
+    /// This performs no fallback stripping — an unresolved `missing::name`
+    /// never retries as `name`; a caller that wants scope-relative candidates
+    /// (`inner::ptr` meaning `outer::inner::ptr` from inside `outer`) builds
+    /// the candidate spelling itself and probes each in turn. See
+    /// `docs/ANALYSIS.md`, "Canonical variable identity".
+    pub fn variable_named_in_scope(&self, canonical_name: &str, file: FileId) -> Option<VarId> {
+        self.file_static_named(file, canonical_name)
+            .or_else(|| self.global_named(None, canonical_name))
+    }
+
+    /// The external variable lookup spells `lookup_name`
+    /// ([`Variable::lookup_name`]) in `target`'s image, `None` meaning the
+    /// unscoped partition. An image is indexed by linker symbol. Every
+    /// declaration of a C-linkage variable of one name, in any namespace, is
+    /// the same variable, and the image keeps one of them under the bare
+    /// symbol: a qualified spelling (`ns::cb`) is also asked under its last
+    /// segment, which answers only for a C-linkage variable.
+    pub fn global_named(
+        &self,
+        target: Option<crate::TargetId>,
+        lookup_name: &str,
+    ) -> Option<VarId> {
+        let Some(target) = target else {
+            return self.global_by_name.get(lookup_name).copied();
+        };
+        let symbols = self.target_globals.get(&target)?;
+        let leaf = lookup_name.rsplit("::").next().unwrap_or(lookup_name);
+        symbols
+            .get(lookup_name)
+            .or_else(|| symbols.get(leaf).filter(|&&id| self.variable(id).c_linkage))
+            .copied()
     }
 
     pub fn alloc_fn_id(&mut self) -> FnId {
@@ -2125,6 +2235,55 @@ mod tests {
         assert_eq!(s.file_static_named(FileId(4), "local"), Some(ids[3]));
     }
 
+    /// #133 Stage 1: a file-`static` binding of a canonical name must win
+    /// over an external one of the same canonical name — the same
+    /// internal-before-external precedence `lookup_var` already gives plain
+    /// names, extended to the exact probe.
+    #[test]
+    fn variable_named_in_scope_prefers_internal_binding_over_external() {
+        let mut s = SymbolTable::default();
+        let file = FileId(1);
+        let global_var = s.alloc_var_id();
+        let global_id = s.add_variable(fake_variable(
+            global_var,
+            "cfg",
+            StorageClass::Global,
+            file,
+            1,
+        ));
+        let internal_var = s.alloc_var_id();
+        let internal_id = s.add_variable(fake_variable(
+            internal_var,
+            "cfg",
+            StorageClass::FileStatic,
+            file,
+            2,
+        ));
+        assert_ne!(global_id, internal_id);
+        assert_eq!(s.variable_named_in_scope("cfg", file), Some(internal_id));
+        // A file with no internal binding of its own still reaches the
+        // external one.
+        assert_eq!(s.variable_named_in_scope("cfg", FileId(9)), Some(global_id));
+    }
+
+    /// #133: only a variable with a canonical qualified name registers its
+    /// last segment as a scoped leaf, so a bare global leaves lowering on its
+    /// plain lookup path.
+    #[test]
+    fn scoped_variable_leaves_track_qualified_names_only() {
+        let mut s = SymbolTable::default();
+        let file = FileId(1);
+        let bare = s.alloc_var_id();
+        s.add_variable(fake_variable(bare, "cfg", StorageClass::Global, file, 1));
+        let scoped = s.alloc_var_id();
+        let mut member = fake_variable(scoped, "member", StorageClass::Global, file, 2);
+        member.qualified_name = Some("ns::Holder::member".to_string());
+        s.add_variable(member);
+        assert!(s.has_scoped_variable_leaf("member"));
+        assert!(!s.has_scoped_variable_leaf("cfg"));
+        assert!(!s.has_scoped_variable_leaf("Holder"));
+    }
+
     #[test]
     fn sole_binding_shortcut_agrees_with_the_candidate_walk() {
         let mut p = Program::new(PathBuf::from("/t"));
@@ -2220,7 +2379,52 @@ mod tests {
             is_weak: false,
             target: None,
             is_namespaced: false,
+            qualified_name: None,
+            c_linkage: false,
         }
+    }
+
+    /// A C-linkage namespace variable is looked up by its qualified name
+    /// and linked by its bare one.
+    #[test]
+    fn c_linkage_variable_links_by_bare_name_and_looks_up_qualified() {
+        let file = FileId(0);
+        let qualified = |id, target| Variable {
+            is_namespaced: true,
+            qualified_name: Some("ns::cb".to_string()),
+            c_linkage: true,
+            target,
+            ..fake_variable(VarId(id), "cb", StorageClass::Global, file, 1)
+        };
+        let mut unscoped = SymbolTable::default();
+        unscoped.add_variable(qualified(0, None));
+        assert_eq!(qualified(0, None).external_symbol_name(), Some("cb"));
+        assert_eq!(
+            unscoped.variable_named_in_scope("ns::cb", file),
+            Some(VarId(0))
+        );
+        assert_eq!(unscoped.variable_named_in_scope("cb", file), None);
+
+        let target = crate::TargetId(0);
+        let mut linked = SymbolTable::default();
+        linked.add_variable(qualified(0, Some(target)));
+        assert_eq!(linked.target_global(target, "cb"), Some(VarId(0)));
+        // In the image every declaration of the C symbol is the one
+        // variable, `ns::cb` and `::cb` alike; a non-C spelling is not.
+        assert_eq!(linked.global_named(Some(target), "ns::cb"), Some(VarId(0)));
+        assert_eq!(linked.global_named(Some(target), "cb"), Some(VarId(0)));
+        assert_eq!(
+            linked.global_named(Some(target), "other::cb"),
+            Some(VarId(0))
+        );
+
+        let mut plain = SymbolTable::default();
+        plain.add_variable(Variable {
+            target: Some(target),
+            ..fake_variable(VarId(0), "x", StorageClass::Global, file, 1)
+        });
+        assert_eq!(plain.global_named(Some(target), "x"), Some(VarId(0)));
+        assert_eq!(plain.global_named(Some(target), "ns::x"), None);
     }
 
     fn fake_function(
@@ -2389,6 +2593,8 @@ mod tests {
             is_weak: false,
             target: None,
             is_namespaced: false,
+            qualified_name: None,
+            c_linkage: false,
             id: proto.params[0],
             name: "$arg0".into(),
             type_id: TypeId(4),
@@ -2610,6 +2816,8 @@ mod tests {
             is_weak: false,
             target: None,
             is_namespaced: false,
+            qualified_name: None,
+            c_linkage: false,
             id: fint.params[0],
             name: "a".into(),
             type_id: TypeId(4),
@@ -2637,6 +2845,8 @@ mod tests {
             is_weak: false,
             target: None,
             is_namespaced: false,
+            qualified_name: None,
+            c_linkage: false,
             id: fdouble.params[0],
             name: "b".into(),
             type_id: TypeId(8),

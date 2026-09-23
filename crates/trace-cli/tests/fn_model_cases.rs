@@ -191,3 +191,59 @@ fn realloc_return_alias_keeps_pointees() {
         "heap loc kind must be used for modeled allocations"
     );
 }
+
+/// A `content_store` model adds its store mid-solve, after the value's
+/// pointees may already have propagated: its first firing must still write
+/// them. Covers both wiring paths — a direct call (models applied before the
+/// worklist) and a call through a function pointer (applied when the edge is
+/// discovered, after `f`'s set has settled).
+#[test]
+fn content_store_model_writes_values_present_before_wiring() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("store.c"),
+        "typedef int (*op_t)(int);\n\
+         static int impl_a(int x) { return x; }\n\
+         static int impl_b(int x) { return x; }\n\
+         void set_slot(op_t *slot, op_t fn);\n\
+         op_t g_direct;\n\
+         op_t g_indirect;\n\
+         void (*g_setter)(op_t *, op_t) = set_slot;\n\
+         void store_direct(void) { op_t f = impl_a; set_slot(&g_direct, f); (void)g_direct(1); }\n\
+         void store_indirect(void) { op_t f = impl_b; g_setter(&g_indirect, f); (void)g_indirect(2); }\n",
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+
+    let base = analyze_no_models(&program);
+    for caller in ["store_direct", "store_indirect"] {
+        let targets = indirect_targets(&program, &base, caller);
+        assert!(
+            !targets.iter().any(|t| t.starts_with("impl_")),
+            "{caller} must not resolve through the unmodeled setter: {targets:?}"
+        );
+    }
+
+    let models = trace_analysis::FnModelSet::from_toml_str(
+        "version = 1\n\
+         [[model]]\n\
+         name = \"set_slot\"\n\
+         effects = [ { kind = \"content_store\", ptr = 0, value = 1 } ]\n",
+    )
+    .expect("parse toml");
+    let with = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            models: Arc::new(models),
+            ..Default::default()
+        },
+    )
+    .1;
+    for (caller, target) in [("store_direct", "impl_a"), ("store_indirect", "impl_b")] {
+        let targets = indirect_targets(&program, &with, caller);
+        assert!(
+            targets.contains(&target.to_string()),
+            "{caller}: expected {target} stored through the modeled setter: {targets:?}"
+        );
+    }
+}

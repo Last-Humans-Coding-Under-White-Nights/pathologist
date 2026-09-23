@@ -236,6 +236,22 @@ fn export_flow_and_arg_flow_vars(
     analysis: &AnalysisResult,
 ) -> Result<()> {
     let mut needed: FxHashSet<VarId> = FxHashSet::default();
+    // Every global and static, with or without a PAG node: inspect finds a
+    // symbol by its declaration, and one no fact names must be found as
+    // itself (and reported flowless), never as a neighbour.
+    needed.extend(
+        program
+            .symbols
+            .variables
+            .iter()
+            .filter(|v| {
+                matches!(
+                    v.storage,
+                    StorageClass::Global | StorageClass::FileStatic | StorageClass::FnStatic
+                )
+            })
+            .map(|v| v.id),
+    );
     for edge in &analysis.arg_flow_edges {
         if let Some(v) = edge.actual_var {
             needed.insert(v);
@@ -775,7 +791,14 @@ mod tests {
                 is_weak: weak,
                 target,
                 is_namespaced: false,
+                qualified_name: None,
+                c_linkage: false,
             });
+            // A flow fact puts the variable in the graph minimal export
+            // writes variables from.
+            program
+                .flow
+                .push(trace_ir::FlowConstraint::NewHeap { dst: id });
         }
         let pag = Pag::build(&program);
         for full_detail in [false, true] {

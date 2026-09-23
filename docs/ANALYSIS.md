@@ -153,6 +153,253 @@ lookup still goes through `resolve_function_in_scope_in_target` /
 The solver resolves and wires call sites sequentially, in call-site order.
 `TRACE_SOLVER_STATS` reports resolution separately from worklist time.
 
+## Canonical variable identity
+
+This section is the authoritative description of how a scoped variable is
+identified and looked up; other sections link here instead of restating the
+rules (see "Link targets and weak symbols" below for how an image unifies and
+overrides globals by the external symbol name defined here).
+
+`Variable::name` stays the token written at the declaration site — what
+display and export show. `Variable::qualified_name` additionally carries the
+canonical scoped spelling (`ns::ptr`, `outer::inner::ptr`, `Holder::member`,
+`nest::Box::member`, no leading `::`) when the variable was declared at the
+scope of a named C++ namespace — whatever its linkage, so a namespace
+`static` is `ns::p` too, while a top-level anonymous namespace adds no
+segment and qualifies nothing — or is a class's `static` data member; it is `None` for a local,
+a parameter, a temporary, or anything declared at plain global or file scope,
+so the ordinary case adds no allocation. `Variable::lookup_name()`
+returns the qualified spelling when present, else `name`, and is what every
+symbol-table index that identifies a variable by name keys on: `a::ptr`,
+`b::ptr` and a bare `ptr` register under three distinct keys in
+`global_by_name` / `target_globals` / `file_statics_by_name` instead of
+colliding on `"ptr"`. No separate index competes with these three; canonical
+identity only changes the key they are stored under.
+`Variable::external_symbol_name()` gives that same string, but only for
+`StorageClass::Global` — the one storage class that denotes a linker-visible
+symbol. Internal-linkage variables are registered `FileStatic`: a file
+`static`, a namespace `static`, a variable of an anonymous namespace
+(`storage_for` in `trace-parse/src/lower.rs`), and a static data member of a
+class declared in one. The exception is a C++ `const`/`constexpr` variable at
+file or namespace scope, which has internal linkage but stays `Global` (see
+the imprecision under "Link targets and weak symbols" below). So an anonymous
+namespace's `hidden` is the file's own
+storage in every unit that includes it, never an image's symbol named
+`hidden`. `global_by_name`/`target_globals` are keyed by
+`external_symbol_name()`, and image unification, weak strength, weak
+propagation and `#pragma weak` all compare it (below). `is_namespaced` is
+source metadata only, set exactly when `qualified_name` is; no identity
+decision reads it.
+
+`SymbolTable::variable_named_in_scope(canonical_name, file)` is the exact
+probe over that identity: the file's internal (file-`static`) binding first,
+then the unscoped external binding (`global_by_name`). It names no image:
+its one caller is lowering, and link targets are assigned after lowering, at
+merge time. It performs no fallback stripping: an unresolved `missing::name`
+never retries as `name`. `SymbolTable::global_named(target, lookup_name)` is
+the external part, for one image or (`None`) the unscoped partition; the PAG's
+name fallback for a call through a variable asks it with the caller's image.
+An image is indexed by linker symbol. Every declaration of a C-linkage
+variable of one name, in any namespace, is the same variable, and the image
+keeps one of them under the bare symbol, so `cb` and `ns::cb` both find it;
+a qualified spelling falls back to its last segment only for a C-linkage
+variable.
+
+Lowering qualifies a namespace-scope global at registration with
+`LowerContext::qualify`, the same enclosing-namespace-path helper
+`qualify_decl` uses for function names. A variable declared with C language
+linkage (`namespace ns { extern "C" CB cb; }`, or anything inside an
+`extern "C" { ... }` block) keeps `ns::cb` for lookup but links by its bare
+name: `Variable::c_linkage` makes `external_symbol_name` return `cb`, so it is
+the same image symbol as a C or `extern "C"` definition of `cb` in another
+unit, and `#pragma weak cb` weakens it. A nested `extern "C++"` restores C++
+linkage. `extern "C" T x;` without braces declares `x`, as `extern T x;` does.
+A later redeclaration or definition of the variable keeps the C linkage its
+first declaration gave it (`extern "C" CB cb; CB cb = f;`). A static data
+member never has C linkage, even when defined inside `extern "C"`. A
+namespace variable whose first declaration this unit sees is qualified
+(`extern "C" CB ns::cb;`, `ns` an opened namespace) takes the linkage
+around it, as the unqualified declaration would. Lowering spells a C-linkage
+variable by its qualified name: in one unit its bare symbol does not answer
+lookup (in a linked image it does, above). A written reference that may be
+qualified (`inner::ptr` inside `namespace outer`, meaning `outer::inner::ptr`)
+resolves through `find_in_scope`'s existing class/namespace traversal, which
+tries each enclosing scope's spelling as the canonical-name probe, innermost
+first, the same way a type or function name resolves from the current scope;
+outside any C++ class or namespace, an unqualified name takes the plain path:
+the body's locals, then `variable_named_in_scope` (the file's own `static`
+before an external global). That is the scope walk's precedence too, so the
+two paths never disagree. Inside a class or namespace, an unqualified name
+not bound by a local takes the traversal (`ptr` inside `namespace a`
+reads `a::ptr` before `::ptr`; `member` inside `Holder`'s member functions
+reads `Holder::member`). `lookup_var` in `trace-parse/src/lower.rs` is that one
+lookup, and every expression position reaches it through `lookup_var_node`
+for an `identifier` or `qualified_identifier`: values, assignment targets,
+arguments (`&a::ptr` passes the cell as `&x` does; see [Argument flow](#argument-flow)), returns
+(`return a::ptr` copies, `return &a::ptr` returns the cell), stores through
+pointers, call receivers, and indirect callees (`a::cb()` calls through the
+variable, `ns::f()` on a callable object calls its `operator()`, and
+`H::table[i]()` and `h.table[i]()` load the element). A variable the name resolves to takes
+precedence; otherwise a
+qualified name falls back to the function it spells (`&a::handler`), and an
+unresolved one yields no flow. A scope written with template arguments
+(`Box<int>::member`) designates no variable: stripping the arguments could
+bind an unrelated one.
+
+`using` brings namespace variables into scope as it does functions.
+A `using ns::name;` declaration in a function body counts as a local: it is
+asked right after the body's locals and hides everything outside the body,
+functions included. Outside the body, `find_in_enclosing_scopes` walks the
+enclosing classes and namespaces; a `using ns::name;` written in a namespace
+declares the name there, so it is asked next, before the global scope. A
+file-scope `using ns::name;` and then a `using namespace ns;` directive are
+asked after the global scope (`ImportScope`; functions resolve in the same
+order):
+`using namespace OHOS;` makes `key` read `OHOS::key` and `Foo::inst_` read
+`OHOS::Foo::inst_`. The innermost declaration or directive is asked first
+(`LowerContext::directive_namespaces` for directives). Within one
+declaration or directive, a relative spelling means the enclosing namespace's
+entry before the global one: `using namespace A;` inside `Outer` asks
+`Outer::A` before `A`. A globally qualified target (`using ::ns::x;`) means
+`ns::x` only. A function of the name declared at file scope hides
+what a directive brings in.
+
+In a value (`out = name;`) and a bare call (`name()`), a declared name
+shadows a function of the same name: a variable (local, parameter, or one the
+lookup above finds), then an instance field read through `this` in a member
+body, and only then the function, as a return already asks. `&name` asks
+the same way, so `&x` takes a variable's address even where a function `x`
+is visible.
+
+A function named as a value resolves the way a call's name does
+(`resolve_function_named`): through the enclosing classes (their bases
+included) and namespaces, innermost first, then what a `using` brings in,
+then the spelling as written. So `cb_t H::cb = Handler;` and
+`out = Handler;` in a member body take `H::Handler`, `out = f;` inside
+`namespace N` takes `N::f` over a global `f`, and `inner::g` inside `outer`
+is `outer::inner::g`. Every value position asks it: initializers, direct
+initialization arguments, assignments, `&f`, arguments, returns, and stores
+through pointers. A direct call's return flow records the function under
+that canonical name (`N::get` for `get()` inside `N`), because it is expanded
+after merge, outside the call's scope.
+
+The scope walk runs only when it could find something. `SymbolTable` keeps the
+set of last segments of every registered `qualified_name`
+(`has_scoped_variable_leaf`). Outside every class and namespace, a name whose
+last segment is not in that set takes the plain path with no walk and no
+allocation. Inside one, it still takes the walk when a variable outside every
+scope holds the name, so a nearer declaration can hide it, whether or not some
+unrelated scoped variable shares the name. A qualified spelling whose leaf is
+absent can only be `::leaf`, a plain global.
+
+Not modeled:
+- A namespace alias does not bring a variable into scope.
+- A parenthesized declarator with a typedef'd type (`CB (H::cb) = f;`,
+  `CB (x) = f;`) parses as an expression statement at file scope, so it
+  defines nothing. That is a parser limitation, not specific to members.
+- A qualified name does not search the named class's bases. `Derived::m` for
+  a member declared in `Base` resolves to nothing. A member access through an
+  object does search bases (below).
+- Pointer-to-member objects (`int X::*pm`) and dependent template
+  instantiations are out of scope.
+- A class defined inside another declaration (`typedef struct T {...} T_t;`,
+  `struct S {...} s;`) registers its static members, but neither its member
+  function bodies nor its in-class initializers are lowered. That is a
+  limitation of member lowering generally.
+
+### Static data member storage
+
+A class's `static` data member (`struct Holder { static int *member; };`,
+and a union's, since a C++ union is a class) has
+one shared storage for the whole program, not a per-instance slot, so it is
+registered as a canonical `Variable` — the same identity mechanism a
+namespace-scope global uses — instead of being swept into the class's
+instance-field layout (`trace-parse/src/lower.rs`, `lower_struct_specifier`'s
+field loop routes a `static` member to `register_static_data_member` and
+`continue`s past the `fields.push` an ordinary field takes). Its canonical
+name is `{class}::{member}` (`Holder::member`, `nest::Box::member`), keyed the
+same way `register_member_prototype` keys a member function; `static` here
+means "one shared instance", not the file-scope rule an ordinary `static`
+declaration gets from `storage_for` — the member's `StorageClass` is `Global`
+unless its class itself has internal linkage (declared in an anonymous
+namespace), in which case it is `FileStatic`. Either way it is indexed by its
+canonical name, so its bare name never claims a slot in `global_by_name` /
+`target_globals`. A class that declares a static data member is C++-only, so a
+data-only struct nested in another registers under its nested spelling
+(`Outer::Inner`) rather than keeping a C file-scope tag. That keeps its members'
+in-class keys equal to their out-of-class definitions' keys.
+
+A member access that names a static data member (`h.m`, `p->m`, `this->m`,
+or `d.m` for a member of `d`'s base class) is that member's variable, the
+same storage `Holder::m` names. It is not an instance field.
+`static_member_access` in `trace-parse/src/lower.rs` types the receiver and
+probes `{class}::{member}`, then each base class. The value, store,
+address-of and argument positions ask it before they take the field path.
+An instance field never pays for receiver typing: the leaf pre-filter
+(above) answers first. A call through such an access (`h.cb()`) calls through
+the member variable, as `H::cb()` does, rather than a member function of that
+name. The access also types a call receiver (`h.m.run()`), and `return h.m;`
+returns the member's value. A field path through the member (`h.obj.cb`) is
+rooted at the member's variable, as `Holder::obj.cb` is. A class's own
+instance field or member function hides a base's static member of the same
+name, and so does any such declaration nearer than an outer scope's variable
+(a namespace's function hides it whether external or file `static`).
+The scope walk stops there (`scoped_variable_unless_hidden`), so `d.cb()`
+calls `D::cb`, not base `B`'s static callback. A hidden name reads no
+variable, now or in the deferred end-of-unit pass; an instance field it names
+is read through `this`, and a bare call through one in a member body
+(`cb()`) loads `this->cb`, as `this->cb()` does. A reference member is
+recorded as a reference binding, so `&H::ref` and `&h.ref` are the
+referent's address. A callable member called through an object (`h.fun()`)
+calls its class's `operator()`, as `H::fun()` does. Every declarator of one member declaration
+(`inline static CB a = f, b = g;`) is its own member with its own
+initializer.
+
+A member declared in-class and defined out-of-class (`int *Holder::member;`
+or `int *Holder::member = &object;` at namespace scope) share one `VarId`:
+lowering an out-of-class variable definition recognizes a scope-qualified
+declarator (any name `parse_declarator_name` resolved through a
+`qualified_identifier`, pointer- and function-pointer-wrapped ones included)
+and probes `variable_named_in_scope` for the in-class entry instead of
+allocating a second variable, the same way an out-of-class member function
+definition reunites with its in-class prototype
+(`SymbolTable::register_function`). The raw spelling is resolved to that
+canonical key with `LowerContext::qualify_decl` — the same relative-to-
+enclosing-namespace resolution an out-of-class member function definition's
+name gets — so `Box::member` written inside `namespace nest { ... }` and
+`nest::Box::member` written outside it key the same entry a nested class's
+in-class registration used. On a match, the definition takes precedence for
+`is_defined` and `span`, mirroring a function definition superseding its
+prototype's span; a miss (no matching in-class declaration in this TU) falls
+back to registering fresh storage under the canonical name rather than
+dropping the initializer's flow facts. When the enclosing-namespace
+spelling names no variable, the owner class is resolved through a
+`using namespace` directive (`class_seen_from`), as for an out-of-class member
+function definition. `using namespace OHOS; cb_t FooTest::proxy_ = f;` defines
+`OHOS::FooTest::proxy_`, also in a unit that only forward-declares the class,
+so it links with the member other units declare. The definition can be any
+declarator form: initialized, uninitialized with a bare qualified declarator
+(`cb_t H::cb;`), or direct-initialized (`cb_t H::direct(f);`) when the name is
+a known variable. A known variable is always defined there, never declared
+as a function: its arguments are looked up in the member's class, as a copy
+initializer's are, and one that does not resolve passes no value. An `extern` qualified redeclaration (`extern CB n::cb;`) defines
+nothing. `__attribute__((weak))` on the in-class declaration makes the member
+weak, as it does on the out-of-class definition. A pointer-to-member declarator (`int *Foo::*pm`) is none of these
+and registers as an ordinary variable. The definition's initializer looks its
+names up in the member's class, as an out-of-class member function body does
+(`CB I::target = source;` reads `I::source`). A weak definition
+(`__attribute__((weak)) CB H::cb = f;`) makes the member weak. An in-class initializer
+(`inline static int *member = &object;`) lowers once, in
+`lower_class_definitions`'s member-body pass (the field-layout pass that
+registers the member's identity has no mutable `LowerContext` to lower an
+expression with), and its facts belong to the member's definition, so a strong
+definition elsewhere in the image drops a weak one's initializer as it does
+any weak global's. An `inline` member is a definition with or without an
+initializer (`inline static CB cb;` is zero-initialized). Lowering has no link targets yet, so every probe here is
+untargeted (`target: None`); cross-TU reconciliation (image unification and
+weak selection) is the merge's job, not lowering's, and keys a member on its
+external symbol name like any other global.
+
 ## Link targets and weak symbols
 
 `--link-commands PATH` selects a link commands database. Otherwise indexing
@@ -221,17 +468,19 @@ since GCC 10 and in Clang. Under `-fcommon` a tentative definition is a common
 symbol that a weak definition would outrank instead; the compiler flag is not
 modeled, so that configuration resolves the other way here.
 
-Globals unify within a target by their *unqualified* name, which is the only
-name the IR records for a variable. That is exactly right for C, where one
-external name is one symbol per image. A global declared inside a C++ namespace
-is exempt from that unification, from weak override, and from an unqualified
-`#pragma weak`, because its unqualified name is not the name a linker resolves:
-`a::counter` and `b::counter` stay two variables, a strong `b::cb` does not
-suppress a weak `a::cb`, and `#pragma weak cb` does not weaken either of them. An anonymous
-namespace counts, its members having internal linkage and so not being shared
-symbols at all. The exemption is recorded on the variable (`is_namespaced`), so
-it survives every copy the merge makes. Class-static members are not yet
-distinguished this way. Weak-only targets retain the fallback. Equal-strength weak function definitions from different origins
+Globals unify within a target by their external symbol name
+(`Variable::external_symbol_name`, see "Canonical variable identity" above):
+the plain name for C, the canonical qualified name for a C++ namespace-scope
+global or static data member. One external symbol is one variable per image,
+so a caller's `a::cb` and another unit's definition of `a::cb` are one
+variable, while `a::counter` and `b::counter` stay two and neither unifies
+with a plain `counter`. Weak strength and weak propagation key on the same
+name: a strong `a::cb` supersedes a weak `a::cb` in its image, never a weak
+`b::cb`. A `#pragma weak` word is compared with that name, so `#pragma weak
+cb` weakens `::cb` and never `app::cb`. An internal-linkage variable has no
+external symbol name and takes part in none of this: each unit keeps its own
+copy, even of one declared in a shared header.
+Weak-only targets retain the fallback. Equal-strength weak function definitions from different origins
 are selected deterministically in unit order; configurations of the same weak
 body retain their union of facts. Weak global alternatives may conservatively
 contribute multiple initializer values.
@@ -277,13 +526,13 @@ A `-l` name resolves against known build outputs, including a versioned soname
 import libraries are not matched, and an unresolved `-l` is silent by design —
 it is assumed to be a system library.
 
-Two further imprecisions appear only under link metadata. A namespace-scope
-global is deliberately absent from its image's name index, so a call through a
-namespace-scope function pointer that lowering could not bind locally finds
-nothing there, where the whole-program path would have found it. And a C++
-file-scope `const`, which has internal linkage, is unified across translation
-units of one image like any other global; both values merge, so nothing is
-dropped, but the two are not kept apart as they are without link metadata.
+One further imprecision appears only under link metadata: a C++ `const` or
+`constexpr` variable at file or namespace scope (not `extern`, not `inline`)
+has internal linkage but is registered `Global`, so it is unified by its
+external symbol name across translation units of one image like any other
+global — `KEY` at file scope, `ns::KEY` in a namespace; both values merge, so
+nothing is dropped, but the two are not kept apart as they are without link
+metadata.
 
 This models declared target membership, not a complete platform linker:
 archive members are conservatively included, without demand-driven extraction;
@@ -392,6 +641,18 @@ Built-in models treat `dlsym` / `dlvsym` / `GetProcAddress` as **symbol lookup**
 | `Loc(LocId)` | Abstract memory / function location |
 | `CallTarget(CallSiteId)` | Synthetic node for indirect call resolution |
 
+Every local, parameter and temporary gets a `Var` node. A global or static
+gets its `Var` node and its location only when some flow constraint, return
+flow or call site (callee variable, return destination or argument) names it
+(`Pag::build_variables`). A header's declaration repeated into every
+including unit, with no use in that unit, would otherwise be an isolated node
+holding only its own address. Nodes are still created in variable order.
+Anything that reaches such a global later, such as the by-name callee
+fallback or an `&x` address, creates both on demand (`Pag::ensure_var_loc`).
+Such globals get no `flow_nodes` row and no self points-to fact, and they
+leave the minimal export's `variables` table, which lists what the flow
+graph names; `--full-export` still lists every variable.
+
 ### PAG constraint kinds
 
 | Kind | Semantics |
@@ -467,6 +728,21 @@ The same fallback also fires when the base *has* pointees but none of them yield
 **Stores to field summaries**
 
 `apply_store` propagates into both concrete field locs and their `FieldSummary`, keeping summary memory in sync with instance stores.
+
+A store is difference-propagated on both sides. A pointer that gains
+targets writes the value's whole set into those new targets only. A value
+that gains locations writes only those into every existing target, because
+each target already holds the rest (`StoreSource::New`). The new locations
+are taken in the value set's own iteration order, so each memory cell
+receives them in the same order a whole-set write would insert them. The
+cell iteration order that later loads follow is unchanged. Guards cannot
+make the two writes differ: a slot guard is set once and never loosened,
+and function arities are fixed before solving. A store a function
+model adds mid-solve (`content_store`) never saw the values its sides
+already held, and a side that has settled pops with an empty delta, which
+fires nothing. Wiring therefore fires it once with both whole sets
+(`apply_fn_model`); from then on it is difference-propagated like any
+other store.
 
 **Signature-guarded function-value propagation**
 
@@ -679,7 +955,7 @@ When a call edge is created (direct or indirect), actuals are connected to calle
 
 - **Pointer variables** → PAG `Copy` from actual var node to formal var node, persistent for pointers whose pointees can hold callbacks (`var_may_hold_pointee`: fn pointers, pointers to fn-pointer slots such as `cb_t *out` or a table row, and pointers to aggregates or unknown types)
 - **Function identifiers** passed as fn-ptr args → `add_pts(formal, fn_loc)`
-- **Address of a plain variable** (`f(&x)`, through parentheses and casts — C `(T)` and C++ `static_cast` / `reinterpret_cast` / `const_cast` / `dynamic_cast`, one peeling rule, `peel_casts`, at every value entry point: stored values, assignments and initializers, return values, arguments and callback arguments) → lowering materializes a temp with `AddrOfVar { dst: temp, src: x }` (`addr_of_temp`) and records the temp as the actual, so the formal points to `x` (the out-parameter idiom: `get_buf(&q)` gives `out -> q`). Before #127 the actual was `x` itself, which handed the callee `x`'s *pointees* instead of its address. The same temp carries a stored `&x` (`*p = &x`, `.f = &x`). `&base.member` / `&arr[i]` keep their base-variable handling (see "Documented imprecision" under function models; a stored `(void *)&s.f` is the member's field address, and a cast `memcpy((void *)&s.f, ..)` argument is still flagged as a member address), and so does `&r` for any C++ reference binding `r`, `auto &r` included (`reference_bindings`): the reference already holds its referent's address, so `&r` — as an argument, a stored value, `p = &r` or `return &r` — is `r`'s value (`names_reference_binding`). A qualified name (`&ns::var`) is not resolved, like any qualified variable reference in expression lowering. The position is recorded in `CallSite::addr_of_args`: consumers that report the argument's *object* rather than its value — arg-flow rows (`actual_var`), `clears` terminators, and the `alias` / `mem_copy` models (`model_copy_side`) — name `x` through `Pag::argument_var` / `Pag::addressed_var`, so `memcpy_s(&dst, .., &src, ..)` still copies between the objects.
+- **Address of a plain variable** (`f(&x)`, through parentheses and casts — C `(T)` and C++ `static_cast` / `reinterpret_cast` / `const_cast` / `dynamic_cast`, one peeling rule, `peel_casts`, at every value entry point: stored values, assignments and initializers, return values, arguments and callback arguments) → lowering materializes a temp with `AddrOfVar { dst: temp, src: x }` (`addr_of_temp`) and records the temp as the actual, so the formal points to `x` (the out-parameter idiom: `get_buf(&q)` gives `out -> q`). Before #127 the actual was `x` itself, which handed the callee `x`'s *pointees* instead of its address. The same temp carries a stored `&x` (`*p = &x`, `.f = &x`). `&base.member` / `&arr[i]` keep their base-variable handling (see "Documented imprecision" under function models; a stored `(void *)&s.f` is the member's field address, and a cast `memcpy((void *)&s.f, ..)` argument is still flagged as a member address), and so does `&r` for any C++ reference binding `r`, `auto &r` included (`reference_bindings`): the reference already holds its referent's address, so `&r` — as an argument, a stored value, `p = &r` or `return &r` — is `r`'s value (`names_reference_binding`). A qualified name (`&ns::var`, `&(ns::var)`) takes the same path once it resolves (see [Canonical variable identity](#canonical-variable-identity)), a qualified reference binding included. The position is recorded in `CallSite::addr_of_args`: consumers that report the argument's *object* rather than its value — arg-flow rows (`actual_var`), `clears` terminators, and the `alias` / `mem_copy` models (`model_copy_side`) — name `x` through `Pag::argument_var` / `Pag::addressed_var`, so `memcpy_s(&dst, .., &src, ..)` still copies between the objects.
 
 After fixpoint, `extract_arg_flow` records:
 
@@ -1342,6 +1618,16 @@ C++-aware only where it must be — everything else reuses the C machinery.
   w((OnReady));`, is an argument like the bare name.
   A reference spelled the same way, `T &r(a);`, binds `r` to `a` and
   constructs nothing; lowering records neither a constructor call nor `r`.
+  Inside a body, a parenthesized name that resolves to nothing and names no
+  type in scope (an enumerator such as `Json::arrayValue`, a macro constant)
+  is a value too, so `Json::Value log(Json::arrayValue);` defines `log`.
+  C++ reads the line as a declaration only when the name is a type, and a
+  block-scope function declaration is rare. One whose name is a function in
+  scope (`Widget make(Config);` with `make` declared or defined in the unit)
+  redeclares it. When the unit knows neither the function nor the parameter
+  type (both in an unindexed header or another unit), the line reads as a
+  local object: a documented imprecision. At file scope such a name still
+  makes the line a declaration.
 - **References** lower as pointers (aliasing stores land on caller memory).
 - **C++ locals** live until the end of their block, or of the `if`, `for`,
   `while`, `switch` or `catch` whose condition or init-statement declares

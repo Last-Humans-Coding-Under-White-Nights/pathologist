@@ -130,13 +130,21 @@ impl Pag {
         id
     }
 
+    /// A node per variable, and a location per global or static that some
+    /// fact names. A global no flow, return or call site names (a header's
+    /// declaration repeated into every including unit) would be an isolated
+    /// node holding only its own address; it gets none, and a later lookup
+    /// that reaches it creates both through [`Pag::ensure_var_loc`]. Nodes
+    /// keep variable order either way.
     fn build_variables(&mut self, program: &Program) {
+        let named = named_statics(program);
         for var in &program.symbols.variables {
+            let is_static = has_static_storage(var.storage);
+            if is_static && !named.contains(&var.id) {
+                continue;
+            }
             self.var_node_id(var.id);
-            if !matches!(
-                var.storage,
-                StorageClass::Global | StorageClass::FileStatic | StorageClass::FnStatic
-            ) {
+            if !is_static {
                 continue;
             }
             let kind = match var.storage {
@@ -160,11 +168,14 @@ impl Pag {
         }
     }
 
+    /// `var`'s location, created on first use along with its node, so every
+    /// variable with a location has a node.
     pub fn ensure_var_loc(&mut self, program: &Program, var: VarId) -> Option<LocId> {
         if let Some(&loc) = self.var_location.get(&var) {
             return Some(loc);
         }
         let v = program.symbols.variable_by_id(var)?;
+        self.var_node_id(var);
         let kind = match v.storage {
             StorageClass::Global => LocKind::Global,
             StorageClass::FileStatic => LocKind::FileStatic,
@@ -184,6 +195,18 @@ impl Pag {
         self.set_location_target(loc_id, v.target);
         self.var_location.insert(var, loc_id);
         Some(loc_id)
+    }
+
+    /// Give a global or static reached after [`Pag::build_variables`] the
+    /// location it would have had there.
+    fn ensure_static_var(&mut self, program: &Program, var: VarId) {
+        if program
+            .symbols
+            .variable_by_id(var)
+            .is_some_and(|v| has_static_storage(v.storage))
+        {
+            self.ensure_var_loc(program, var);
+        }
     }
 
     fn build_indices(&mut self, program: &Program) {
@@ -834,6 +857,8 @@ impl Pag {
             } else if !callee_name_is_a_function(program, cs) {
                 let call_target = self.call_target_node(cs.id);
                 if let Some(v) = lookup_var_in_fn(&fn_vars, program, &cs.callee_name, cs.caller) {
+                    // Found by name, so possibly a global no fact named.
+                    self.ensure_static_var(program, v);
                     let var_node = self.var_node_id(v);
                     self.add_load(call_target, var_node);
                 }
@@ -1034,6 +1059,40 @@ fn callee_name_is_a_function(program: &Program, cs: &trace_ir::CallSite) -> bool
         .is_some()
 }
 
+/// The globals and statics some flow constraint, return or call site
+/// names: every static [`Pag::build_variables`] gives a node and location
+/// up front.
+fn named_statics(program: &Program) -> FxHashSet<VarId> {
+    let mut named: FxHashSet<VarId> = program.flow.iter().flat_map(FlowConstraint::vars).collect();
+    named.extend(
+        program
+            .fn_returns
+            .values()
+            .flatten()
+            .filter_map(ReturnFlow::var),
+    );
+    for site in &program.symbols.call_sites {
+        named.extend(site.callee_var);
+        named.extend(site.return_dst);
+        named.extend(site.var_args.iter().map(|&(_, v)| v));
+    }
+    named.retain(|&v| {
+        program
+            .symbols
+            .variable_by_id(v)
+            .is_some_and(|var| has_static_storage(var.storage))
+    });
+    named
+}
+
+/// Storage that outlives a call, and so has a location of its own.
+fn has_static_storage(storage: StorageClass) -> bool {
+    matches!(
+        storage,
+        StorageClass::Global | StorageClass::FileStatic | StorageClass::FnStatic
+    )
+}
+
 fn lookup_var_in_fn(
     fn_vars: &FxHashMap<FnId, FxHashMap<String, VarId>>,
     program: &Program,
@@ -1043,9 +1102,10 @@ fn lookup_var_in_fn(
     fn_vars
         .get(&caller)
         .and_then(|m| m.get(name).copied())
-        .or_else(|| match program.symbols.function(caller).target {
-            Some(target) => program.symbols.target_global(target, name),
-            None => program.symbols.global_by_name.get(name).copied(),
+        .or_else(|| {
+            program
+                .symbols
+                .global_named(program.symbols.function(caller).target, name)
         })
 }
 
@@ -1053,6 +1113,55 @@ fn lookup_var_in_fn(
 mod tests {
     use super::*;
     use trace_ir::{Span, TypeDesc, TypeId, Variable};
+
+    /// Stage 6 (#133): a global no fact names gets neither a node nor a
+    /// location; one a flow names gets both, in variable order.
+    #[test]
+    fn only_named_globals_get_nodes_and_locations() {
+        let mut program = Program::new(".".into());
+        let int = program.types.int();
+        let global = |program: &mut Program, name: &str| {
+            let id = program.symbols.alloc_var_id();
+            program.symbols.add_variable(Variable {
+                id,
+                name: name.into(),
+                type_id: int,
+                storage: StorageClass::Global,
+                fn_id: None,
+                param_index: None,
+                span: Span::new(trace_ir::FileId(0), 1, 1),
+                is_pointer: false,
+                is_defined: false,
+                is_weak: false,
+                target: None,
+                is_namespaced: true,
+                qualified_name: Some(format!("H::{name}")),
+                c_linkage: false,
+            });
+            id
+        };
+        let unused = global(&mut program, "unused");
+        let read = global(&mut program, "read");
+        let out = global(&mut program, "out");
+        program.flow.push(FlowConstraint::Copy {
+            dst: out,
+            src: read,
+        });
+
+        let mut pag = Pag::build(&program);
+        assert!(!pag.var_node.contains_key(&unused));
+        assert!(!pag.var_location.contains_key(&unused));
+        for named in [read, out] {
+            assert!(pag.var_node.contains_key(&named));
+            assert!(pag.var_location.contains_key(&named));
+        }
+        assert!(pag.var_node[&read] < pag.var_node[&out], "variable order");
+
+        // A later lookup gives the global both, as the build would have.
+        pag.ensure_static_var(&program, unused);
+        assert!(pag.var_node.contains_key(&unused));
+        assert!(pag.var_location.contains_key(&unused));
+    }
 
     #[test]
     fn field_summaries_share_within_targets_but_not_between_them() {
@@ -1088,6 +1197,8 @@ mod tests {
                 is_weak: false,
                 target,
                 is_namespaced: false,
+                qualified_name: None,
+                c_linkage: false,
             });
             program.flow.push(FlowConstraint::NewHeap { dst: id });
             vars.push(id);
@@ -1184,6 +1295,8 @@ mod tests {
             is_weak: false,
             target: None,
             is_namespaced: false,
+            qualified_name: None,
+            c_linkage: false,
         });
         // The key follows the layout's own member name, not the caller's:
         // asked first with a wrong name, the member still maps by its own.
@@ -1230,6 +1343,8 @@ mod tests {
             is_weak: false,
             target: None,
             is_namespaced: false,
+            qualified_name: None,
+            c_linkage: false,
         });
         id
     }
@@ -1251,7 +1366,7 @@ mod tests {
         });
         let g = global_of(&mut program, "g", empty);
         let mut pag = Pag::build(&program);
-        let loc = pag.var_location[&g];
+        let loc = pag.ensure_var_loc(&program, g).unwrap();
         let concrete = pag.ensure_field_loc(&program, loc, FieldId(0)).unwrap();
         let summary = pag
             .ensure_field_summary_for_var(&program, g, FieldId(0))
@@ -1270,8 +1385,8 @@ mod tests {
             deep = program.types.intern(desc.clone());
         }
         let p = global_of(&mut program, "p", deep);
-        let pag = Pag::build(&program);
-        let loc = pag.var_location[&p];
+        let mut pag = Pag::build(&program);
+        let loc = pag.ensure_var_loc(&program, p).unwrap();
         assert_eq!(struct_type_for_loc(&pag, &program, loc), None);
     }
 
@@ -1291,6 +1406,8 @@ mod tests {
             is_weak: false,
             target: None,
             is_namespaced: false,
+            qualified_name: None,
+            c_linkage: false,
             id: var,
             name: "object".into(),
             type_id,
