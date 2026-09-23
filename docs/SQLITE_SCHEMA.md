@@ -72,7 +72,7 @@ diagnostics
 | `schema_version` | INTEGER | Database layout version (currently `5`) |
 | `target_root` | TEXT | Analyzed directory |
 | `created_at` | TEXT | Unix timestamp (seconds) |
-| `options_json` | TEXT | JSON: `include_paths`, `defines`, `dep_roots`, `include_points_to`, `full_detail`, `model_files`, `explore`, `explore_budget`, `variants_merged`, `solver_partial`, `solver_pops`, `solve_budget_pops`, `solve_budget_secs` |
+| `options_json` | TEXT | JSON: `include_paths`, `defines`, `dep_roots`, `ignored_macros`, `include_points_to`, `full_detail`, `model_files`, `explore`, `explore_budget`, `variants_merged`, `solver_partial`, `solver_pops`, `solve_budget_pops`, `solve_budget_secs` |
 
 `explore` and `explore_budget` record what the run *requested*; `variants_merged`
 records how many variant units it actually merged. They come apart: a run can ask

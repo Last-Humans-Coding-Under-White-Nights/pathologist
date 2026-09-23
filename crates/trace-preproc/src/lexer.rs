@@ -59,6 +59,8 @@ pub struct Token {
     /// Deterministic fingerprint of the macro invocation and parameter-
     /// substitution chain that produced this token. Zero denotes source text.
     pub(crate) expansion_id: u64,
+    /// Name of the outermost macro whose expansion produced this token.
+    pub(crate) expansion_macro: Option<Arc<str>>,
     /// File containing this token's spelling when it came from a source
     /// macro replacement list. The invocation file is the preprocessor's
     /// current file when the token is emitted.
@@ -75,6 +77,7 @@ impl Token {
             hidden: None,
             origin: None,
             expansion_id: 0,
+            expansion_macro: None,
             spelling_file: None,
             adjacent_before: false,
         }
@@ -127,6 +130,10 @@ impl Token {
             set.extend(h.iter().cloned());
         }
         set.insert(name.to_string());
+        let expansion_macro = origin
+            .expansion_macro
+            .clone()
+            .or_else(|| Some(Arc::from(name)));
         Token {
             kind: self.kind.clone(),
             line: self.line,
@@ -134,6 +141,7 @@ impl Token {
             hidden: Some(Arc::new(set)),
             origin: Some(origin.expansion_site()),
             expansion_id: expansion_fingerprint(origin, name, None, self.expansion_id),
+            expansion_macro,
             spelling_file: self.spelling_file.clone(),
             adjacent_before: self.adjacent_before,
         }
@@ -152,6 +160,10 @@ impl Token {
         let mut token = self.clone();
         token.expansion_id =
             expansion_fingerprint(origin, macro_name, Some(parameter), self.expansion_id);
+        token.expansion_macro = origin
+            .expansion_macro
+            .clone()
+            .or_else(|| Some(Arc::from(macro_name)));
         token
     }
 

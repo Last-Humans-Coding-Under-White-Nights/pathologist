@@ -423,6 +423,9 @@ pub struct PreprocessOptions {
     pub explore: bool,
     /// Maximum number of configuration variants to explore per translation unit (#59).
     pub explore_budget: usize,
+    /// Macros whose expansions are ignored during lowering (no call sites,
+    /// flow constraints, or local variables). Supports wildcards (e.g. `TAG_LOG*`).
+    pub ignored_macros: Vec<String>,
 }
 
 impl Default for PreprocessOptions {
@@ -459,6 +462,7 @@ impl Default for PreprocessOptions {
             dep_roots: Vec::new(),
             explore: false,
             explore_budget: 4,
+            ignored_macros: Vec::new(),
         }
     }
 }
@@ -665,6 +669,18 @@ impl PreprocessOptions {
     #[must_use]
     pub fn with_explore_budget(mut self, budget: usize) -> Self {
         self.explore_budget = budget;
+        self
+    }
+
+    #[must_use]
+    pub fn with_ignored_macro(mut self, name: impl Into<String>) -> Self {
+        self.ignored_macros.push(name.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_ignored_macros(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.ignored_macros.extend(names);
         self
     }
 }

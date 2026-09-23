@@ -1,5 +1,47 @@
 # Evaluation Report
 
+## Noise macro filtering (`--ignore-macro`, `--ignore-logging`) — 2026-09-23 (#124)
+
+Noise macro filtering allows opting out of call sites, flow constraints, and local variables
+introduced by boilerplate logging and diagnostic macros (e.g., `TAG_LOG*`, `HILOG_*`).
+The mechanism is documented in [ANALYSIS.md](ANALYSIS.md#noise-macro-filtering---ignore-macro---ignore-logging-noise)
+and the preprocessor provenance contract in [PREPROCESSOR.md](PREPROCESSOR.md#macro-expansion-provenance-and-attribution).
+
+Evaluated on a clean checkout of `ability_ability_runtime` at revision `6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`.
+
+Commands:
+- Base: `cargo run -p trace-cli --release -- analyze <root> --jobs 8 -o base.db`
+- Head (default): `cargo run -p trace-cli --release -- analyze <root> --jobs 8 -o head_default.db`
+- Head (filtered): `cargo run -p trace-cli --release -- analyze <root> --jobs 8 --ignore-logging -o head_filtered.db`
+
+### Measurements on `ability_ability_runtime`
+
+Historical evaluation comparing base `478e8da3b1093d33d0eaebd15c9a11aa07b2a7c4` with initial head `50fda6a5cac32004924800a696bc52ce9035abde`:
+
+| Metric | Base (`478e8da`) | Head, default (`50fda6a`) | Head, filtered (`50fda6a`, `--ignore-logging`) |
+|---|---:|---:|---:|
+| Wall seconds | 77.1 | 75.4 | 70.9 |
+| Call sites | 594,217 | 594,217 | 286,748 (-51.7%) |
+| Call edges | 768,217 | 768,217 | 458,536 (-40.3%) |
+| SQLite bytes | 344,596,480 | 344,596,480 | 290,164,736 (-54.4 MB) |
+| Indirect edges | 805 | 805 | 805 (100% retained) |
+| IPC edges | 1,059 | 1,059 | 1,059 (100% retained) |
+
+Fresh release validation on revised head `dcae10a2c5376634d487fe9f437a3c2db2a3c5db`:
+
+| Metric | Default | Filtered (`--ignore-logging`) |
+|---|---:|---:|
+| Wall seconds | 113.1 | 87.9 |
+| Call sites | 594,217 | 286,748 (-51.7%) |
+| Call edges | 768,217 | 458,536 (-40.3%) |
+| SQLite bytes | 344,596,480 | 290,164,736 (-54.4 MB) |
+| Indirect edges | 805 | 805 (100% retained) |
+| IPC edges | 1,059 | 1,059 (100% retained) |
+
+All solvers converged without partial results (default worklist pop limits were 2,090,270 for Base / default runs, and 2,086,868 for filtered runs).
+These are single sequential timing runs, not a statistical timing study; the base was not re-timed and the broader three-corpus evaluation was not rerun.
+Comparing Base vs. Head (default), all 15 non-metadata SQLite tables are 100% bit-identical, confirming that the token provenance tracking in the preprocessor and LineMap incurs zero drift and negligible overhead when filtering is inactive.
+
 ## Pointer cells and `&x` arguments — 2026-09-21 (#127)
 
 The rules are defined in [ANALYSIS.md](ANALYSIS.md): the load guard under

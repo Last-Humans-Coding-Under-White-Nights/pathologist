@@ -166,6 +166,8 @@ struct LowerContext {
     header_unit: bool,
     pending_flow_owners: HashMap<usize, FnId>,
     pending_initializer_owners: HashMap<usize, VarId>,
+    ignored_macros: Arc<[String]>,
+    ignored_macro_cache: RefCell<HashMap<String, bool>>,
 }
 
 /// C++ class scope during member lowering.
@@ -176,6 +178,23 @@ struct ClassCtx {
 }
 
 impl LowerContext {
+    fn is_macro_ignored(&self, name: &str) -> bool {
+        if self.ignored_macros.is_empty() {
+            return false;
+        }
+        if let Some(&ignored) = self.ignored_macro_cache.borrow().get(name) {
+            return ignored;
+        }
+        let ignored = self
+            .ignored_macros
+            .iter()
+            .any(|pattern| macro_pattern_matches(pattern, name));
+        self.ignored_macro_cache
+            .borrow_mut()
+            .insert(name.to_string(), ignored);
+        ignored
+    }
+
     fn namespace_scope(&self) -> String {
         let mut scope = String::new();
         for segment in self.ns_stack.iter().flatten() {
@@ -307,6 +326,7 @@ fn build_program_inner(
         .collect();
     program.explore = opts.explore;
     program.explore_budget = opts.explore_budget;
+    program.ignored_macros = opts.ignored_macros.clone();
 
     // A dependency root contributes headers only: its sources are never
     // translation units, even when the root sits inside the analyzed tree,
@@ -844,6 +864,7 @@ fn build_program_inner(
                     index_language(path, &cpp_parse, no_c_units, forced_language),
                     Some(&header_ir_map),
                     pch_order.as_ref(),
+                    &opts.ignored_macros,
                 );
                 push_header_ir(
                     &mut header_ir_map,
@@ -874,6 +895,7 @@ fn build_program_inner(
                                 index_language(path, &cpp_parse, no_c_units, forced_language),
                                 Some(snapshot),
                                 pch_order.as_ref(),
+                                &opts.ignored_macros,
                             ),
                         )
                     })
@@ -909,6 +931,7 @@ fn build_program_inner(
                 index_language(&path, &cpp_parse, no_c_units, forced_language),
                 Some(&header_ir_map),
                 pch_order.as_ref(),
+                &opts.ignored_macros,
             );
             push_header_ir(
                 &mut header_ir_map,
@@ -1950,6 +1973,7 @@ fn index_header_variant(
     language: Language,
     header_ir: Option<&HeaderIr>,
     pch_order: &[PathBuf],
+    ignored_macros: &[String],
 ) -> UnitIndex {
     let expansion = cache.read().ok().and_then(|guard| {
         guard
@@ -1965,6 +1989,7 @@ fn index_header_variant(
     };
     let pre = Arc::new(PreprocessedSource::from_expansion(&expansion, language));
     let mut program = Program::new(root.to_path_buf());
+    program.ignored_macros = ignored_macros.to_vec();
     match lower_prepared_source(
         &mut program,
         path,
@@ -2033,6 +2058,7 @@ fn index_source_file(
     pch_order: &[PathBuf],
 ) -> UnitIndex {
     let mut program = Program::new(root.to_path_buf());
+    program.ignored_macros = index_opts.ignored_macros.clone();
     match process_indexed_file(
         &mut program,
         path,
@@ -2143,6 +2169,7 @@ fn index_source_file_with_variants(
         match source_cache.preprocess_uncached(path, graph, &var_opts) {
             Ok((var_pre, _)) => {
                 let mut var_program = Program::new(root.to_path_buf());
+                var_program.ignored_macros = var_opts.ignored_macros.clone();
                 match lower_prepared_source(
                     &mut var_program,
                     path,
@@ -2310,6 +2337,8 @@ fn lower_prepared_source(
         header_unit,
         pending_flow_owners: HashMap::default(),
         pending_initializer_owners: HashMap::default(),
+        ignored_macros: Arc::from(program.ignored_macros.clone()),
+        ignored_macro_cache: RefCell::new(HashMap::default()),
     };
     lower_tree(
         program,
@@ -5263,6 +5292,9 @@ fn lower_declaration(
     node: Node,
     storage_override: Option<StorageClass>,
 ) {
+    if node_is_from_ignored_macro(ctx, node) {
+        return;
+    }
     let type_node = match node.child_by_field_name("type") {
         Some(t) => t,
         None => return,
@@ -5657,6 +5689,9 @@ fn lower_one_declarator(
     storage_override: Option<StorageClass>,
     init_expr: Option<Node>,
 ) -> Option<VarId> {
+    if node_is_from_ignored_macro(ctx, decl) || node_is_from_ignored_macro(ctx, span_node) {
+        return None;
+    }
     if is_function_pointer_declarator(decl) {
         let (name, _is_ptr) = parse_declarator_name(source, decl);
         if name.is_empty() {
@@ -5685,12 +5720,16 @@ fn lower_one_declarator(
             return Some(var_id);
         }
         if let Some(init) = init_expr {
-            if init.kind() == "initializer_list"
-                && (is_array_type(program, type_id) || declarator_is_array(decl))
+            if !node_is_from_ignored_macro(ctx, init)
+                && !node_is_from_ignored_macro(ctx, peel_casts(source, init))
             {
-                lower_fn_ptr_array_init(program, ctx, source, var_id, init);
+                if init.kind() == "initializer_list"
+                    && (is_array_type(program, type_id) || declarator_is_array(decl))
+                {
+                    lower_fn_ptr_array_init(program, ctx, source, var_id, init);
+                }
+                extract_flow_from_expr(program, ctx, source, init, Some(var_id));
             }
-            extract_flow_from_expr(program, ctx, source, init, Some(var_id));
         }
         return Some(var_id);
     }
@@ -5769,7 +5808,11 @@ fn lower_one_declarator(
         }
     }
     if let Some(init) = init_expr {
-        if init.kind() != "argument_list" && !braced_ctor {
+        if !node_is_from_ignored_macro(ctx, init)
+            && !node_is_from_ignored_macro(ctx, peel_casts(source, init))
+            && init.kind() != "argument_list"
+            && !braced_ctor
+        {
             // A ctor argument list is not a value flowing into the object.
             if init.kind() == "initializer_list"
                 && (is_array_type(program, type_id) || declarator_is_array(decl))
@@ -6007,14 +6050,17 @@ fn walk_function_body(
         // function-body directive never leaks into other functions (a leak
         // could let the name ranking collapse away the correct in-scope
         // edge: an under-approximation).
-        "using_declaration" if ctx.is_cpp => lower_using_declaration(ctx, source, node),
+        "using_declaration" if ctx.is_cpp && !node_is_from_ignored_macro(ctx, node) => {
+            lower_using_declaration(ctx, source, node);
+        }
         // A typedef or `using` alias in a body is scoped to its block like a
         // directive, and never reaches the unit's alias table.
         // One declared in a function-local class belongs to that class.
         "type_definition" | "alias_declaration"
-            if node
-                .parent()
-                .is_none_or(|p| p.kind() != "field_declaration_list") =>
+            if !node_is_from_ignored_macro(ctx, node)
+                && node
+                    .parent()
+                    .is_none_or(|p| p.kind() != "field_declaration_list") =>
         {
             if let Some(alias) = declared_alias(program, ctx, source, node) {
                 ctx.local_aliases.push(alias);
@@ -6025,6 +6071,10 @@ fn walk_function_body(
         }
         "call_expression" => collect_call_at_node(program, ctx, source, node, caller),
         "lambda_expression" if ctx.is_cpp => {
+            if node_is_from_ignored_macro(ctx, node) {
+                ctx.ast_depth = ctx.ast_depth.saturating_sub(1);
+                return;
+            }
             let _ = lower_lambda_expression(program, ctx, source, node);
             ctx.ast_depth = ctx.ast_depth.saturating_sub(1);
             return;
@@ -6033,8 +6083,10 @@ fn walk_function_body(
         // C++ object lifecycle: constructor invocations and destructor runs.
         #[allow(clippy::collapsible_match)]
         "new_expression" if ctx.is_cpp => {
-            // Skip if already handled by expr_to_rhs_flow (declaration init).
-            if !ctx.handled_new_exprs.borrow().contains(&node.id()) {
+            // Skip if already handled by expr_to_rhs_flow (declaration init) or ignored macro.
+            if !node_is_from_ignored_macro(ctx, node)
+                && !ctx.handled_new_exprs.borrow().contains(&node.id())
+            {
                 if let Some(cls) = new_expression_class(program, ctx, source, node) {
                     let args = node
                         .children(&mut node.walk())
@@ -6057,7 +6109,7 @@ fn walk_function_body(
                 }
             }
         }
-        "delete_expression" if ctx.is_cpp => {
+        "delete_expression" if ctx.is_cpp && !node_is_from_ignored_macro(ctx, node) => {
             let operand = node
                 .children(&mut node.walk())
                 .filter(|c| c.is_named())
@@ -6079,7 +6131,7 @@ fn walk_function_body(
                 }
             }
         }
-        "field_initializer_list" if ctx.is_cpp => {
+        "field_initializer_list" if ctx.is_cpp && !node_is_from_ignored_macro(ctx, node) => {
             lower_field_initializer_list(program, ctx, source, node, caller);
         }
         _ => {}
@@ -6140,6 +6192,9 @@ fn collect_call_at_node(
     node: Node,
     caller: FnId,
 ) {
+    if node_is_from_ignored_macro(ctx, node) {
+        return;
+    }
     let occurrence_node = node
         .child_by_field_name("function")
         .filter(|func| func.kind() == "field_expression")
@@ -6185,6 +6240,12 @@ fn collect_call_at_node_inner(
     } else {
         node
     };
+    if node_is_from_ignored_macro(ctx, node)
+        || node_is_from_ignored_macro(ctx, func)
+        || node_is_from_ignored_macro(ctx, source_node)
+    {
+        return;
+    }
     let span = node_call_span(program, ctx, source_node);
     let expansion_span = node_expansion_span(program, ctx, source_node);
     let return_dst = ctx.call_return_dst.borrow().get(&node.id()).copied();
@@ -8797,6 +8858,9 @@ fn extract_flow_from_expr(
     node: Node,
     assign_target: Option<VarId>,
 ) {
+    if node_is_from_ignored_macro(ctx, node) {
+        return;
+    }
     if node.kind() == "assignment_expression" {
         let lhs = peel_expression(
             node.child_by_field_name("left")
@@ -8807,6 +8871,11 @@ fn extract_flow_from_expr(
             .child_by_field_name("right")
             .or_else(|| node.named_child(1))
             .unwrap();
+        if node_is_from_ignored_macro(ctx, rhs)
+            || node_is_from_ignored_macro(ctx, peel_casts(source, rhs))
+        {
+            return;
+        }
         if is_deref_lhs(source, lhs) {
             if let Some(arg) = deref_operand(lhs) {
                 if let Some(ptr) = resolve_lvalue_var(program, ctx, source, arg) {
@@ -9670,6 +9739,9 @@ fn expr_to_store_src(
     }
     // `(void *)&s.f` stores the member's address like `&s.f` does.
     let node = peel_casts(source, node);
+    if node_is_from_ignored_macro(ctx, node) {
+        return None;
+    }
     // `t.a[i] = s.b[j]` stores the value read from the field `b`.
     if let Some(table) = field_table(node) {
         let temp = alloc_ret_temp(program, ctx, node);
@@ -9699,7 +9771,13 @@ fn expr_to_rhs_flow(
     node: Node,
     dst: VarId,
 ) -> Option<FlowConstraint> {
+    if node_is_from_ignored_macro(ctx, node) {
+        return None;
+    }
     let node = peel_casts(source, node);
+    if node_is_from_ignored_macro(ctx, node) {
+        return None;
+    }
     // `f = s.ops[i]` reads the field `ops`.
     if let Some(table) = field_table(node) {
         return expr_to_rhs_flow(program, ctx, source, table, dst);
@@ -9844,13 +9922,19 @@ fn collect_return_statement(
     node: Node,
     fn_id: FnId,
 ) {
+    if node_is_from_ignored_macro(ctx, node) {
+        return;
+    }
     let value = node
         .child_by_field_name("value")
         .or_else(|| node.named_child(0));
     let Some(value) = value else {
         return;
     };
-    if value.kind() == ";" {
+    if value.kind() == ";"
+        || node_is_from_ignored_macro(ctx, value)
+        || node_is_from_ignored_macro(ctx, peel_casts(source, value))
+    {
         return;
     }
     collect_return_flow(program, ctx, source, value, fn_id);
@@ -9875,7 +9959,13 @@ fn return_flow_from_expr(
     node: Node,
     fn_id: FnId,
 ) -> Option<ReturnFlow> {
+    if node_is_from_ignored_macro(ctx, node) {
+        return None;
+    }
     let node = peel_casts(source, node);
+    if node_is_from_ignored_macro(ctx, node) {
+        return None;
+    }
     match node.kind() {
         "pointer_expression" => {
             let op = pointer_op(source, node);
@@ -11640,6 +11730,63 @@ fn node_expansion_id(ctx: &LowerContext, node: Node) -> u64 {
         .as_ref()
         .and_then(|line_map| line_map.lookup(node.start_byte()))
         .map_or(0, |entry| entry.expansion_id)
+}
+
+fn macro_pattern_matches(pattern: &str, name: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return pattern == name;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 2 {
+        let (prefix, suffix) = (parts[0], parts[1]);
+        return name.len() >= prefix.len() + suffix.len()
+            && name.starts_with(prefix)
+            && name.ends_with(suffix);
+    }
+    let mut remainder = name;
+    if !parts[0].is_empty() {
+        if !remainder.starts_with(parts[0]) {
+            return false;
+        }
+        remainder = &remainder[parts[0].len()..];
+    }
+    for &part in &parts[1..parts.len() - 1] {
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(pos) = remainder.find(part) {
+            remainder = &remainder[pos + part.len()..];
+        } else {
+            return false;
+        }
+    }
+    if let Some(&last) = parts.last() {
+        if !last.is_empty() && !remainder.ends_with(last) {
+            return false;
+        }
+    }
+    true
+}
+
+fn node_expansion_macro<'a>(ctx: &'a LowerContext, node: Node) -> Option<&'a str> {
+    let line_map = ctx.line_map.as_ref()?;
+    let entry = line_map.lookup(node.start_byte())?;
+    line_map.expansion_macro_of(entry)
+}
+
+fn node_is_from_ignored_macro(ctx: &LowerContext, node: Node) -> bool {
+    if ctx.ignored_macros.is_empty() {
+        return false;
+    }
+    if let Some(macro_name) = node_expansion_macro(ctx, node) {
+        if ctx.is_macro_ignored(macro_name) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Original-file end line of `node`, for range queries like "which function

@@ -68,6 +68,12 @@ enum Commands {
         /// Function-model TOML file (repeatable; overrides built-ins by name).
         #[arg(long = "models")]
         models: Vec<PathBuf>,
+        /// Macro whose expansions are ignored during lowering (repeatable; supports wildcards like TAG_LOG*).
+        #[arg(long = "ignore-macro")]
+        ignore_macros: Vec<String>,
+        /// Ignore standard OpenHarmony logging macros (HILOG_*, TAG_LOG*, HIVIEW_LOG*, MEDIA_*_LOG, LOGD, LOGI, LOGW, LOGE, LOGF).
+        #[arg(long)]
+        ignore_logging: bool,
         /// Dependency root: a tree the target builds against but that is not
         /// under analysis (repeatable). Its headers contribute declarations;
         /// its sources are never translation units and its bodies contribute
@@ -247,6 +253,8 @@ fn main() -> Result<()> {
             debug_points_to,
             full_export,
             models,
+            ignore_macros,
+            ignore_logging,
             deps,
             no_ipc,
             explore,
@@ -265,6 +273,8 @@ fn main() -> Result<()> {
             debug_points_to,
             full_export,
             models,
+            ignore_macros,
+            ignore_logging,
             deps,
             no_ipc,
             explore,
@@ -275,6 +285,18 @@ fn main() -> Result<()> {
         Commands::Inspect { db, command } => run_inspect(db, command),
     }
 }
+
+const OPENHARMONY_LOGGING_MACROS: &[&str] = &[
+    "HILOG_*",
+    "TAG_LOG*",
+    "HIVIEW_LOG*",
+    "MEDIA_*_LOG",
+    "LOGD",
+    "LOGI",
+    "LOGW",
+    "LOGE",
+    "LOGF",
+];
 
 #[allow(clippy::too_many_arguments)]
 fn run_analyze(
@@ -289,6 +311,8 @@ fn run_analyze(
     debug_points_to: bool,
     full_export: bool,
     model_files: Vec<PathBuf>,
+    ignore_macros: Vec<String>,
+    ignore_logging: bool,
     deps: Vec<PathBuf>,
     no_ipc: bool,
     explore: bool,
@@ -388,6 +412,24 @@ fn run_analyze(
     opts = opts
         .with_explore(explore)
         .with_explore_budget(explore_budget);
+
+    let mut effective_ignored_macros = Vec::new();
+    if ignore_logging {
+        for &m in OPENHARMONY_LOGGING_MACROS {
+            effective_ignored_macros.push(m.to_string());
+        }
+    }
+    for m in models.noise_macros() {
+        if !effective_ignored_macros.contains(m) {
+            effective_ignored_macros.push(m.clone());
+        }
+    }
+    for m in ignore_macros {
+        if !effective_ignored_macros.contains(&m) {
+            effective_ignored_macros.push(m);
+        }
+    }
+    opts.ignored_macros = effective_ignored_macros;
 
     // Include paths pointing outside the analyzed tree make twin headers
     // (same basename, different tree) resolve to the wrong copy, which

@@ -173,6 +173,8 @@ typedef struct trace_index_options {
     int32_t                debug_points_to; /**< Non-zero to retain and export points-to sets. */
     const char *const     *models;          /**< Array of TOML function model file paths, or NULL if none. */
     size_t                 n_models;        /**< Number of model files in @p models. */
+    const char *const     *ignore_macros;   /**< Array of macro names/patterns to ignore during lowering, or NULL if none. */
+    size_t                 n_ignore_macros; /**< Number of patterns in @p ignore_macros. */
 } trace_index_options;
 
 /**

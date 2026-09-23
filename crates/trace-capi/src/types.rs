@@ -216,6 +216,8 @@ pub struct TraceIndexOptions {
     pub debug_points_to: i32,
     pub models: *const *const c_char,
     pub n_models: usize,
+    pub ignore_macros: *const *const c_char,
+    pub n_ignore_macros: usize,
 }
 
 /// Summary counters filled by `trace_index` on success.

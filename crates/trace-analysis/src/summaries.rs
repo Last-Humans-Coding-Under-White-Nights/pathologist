@@ -55,6 +55,7 @@ impl FnModel {
 #[derive(Debug, Default, Clone)]
 pub struct FnModelSet {
     by_name: FxHashMap<String, FnModel>,
+    noise_macros: Vec<String>,
 }
 
 impl FnModelSet {
@@ -132,6 +133,17 @@ impl FnModelSet {
         self.by_name.values()
     }
 
+    pub fn noise_macros(&self) -> &[String] {
+        &self.noise_macros
+    }
+
+    pub fn add_noise_macro(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        if !self.noise_macros.contains(&name) {
+            self.noise_macros.push(name);
+        }
+    }
+
     /// Parse a TOML configuration string (the contents of one `--models`
     /// file). Entries override same-name models already in `self`.
     pub fn merge_toml_str(&mut self, s: &str) -> Result<(), String> {
@@ -148,6 +160,11 @@ impl FnModelSet {
                 name: raw.name,
                 effects,
             });
+        }
+        if let Some(noise) = cfg.noise {
+            for m in noise.macros {
+                self.add_noise_macro(m);
+            }
         }
         Ok(())
     }
@@ -167,6 +184,14 @@ struct ModelsConfig {
     version: Option<u64>,
     #[serde(rename = "model", default)]
     model: Vec<RawModel>,
+    #[serde(default)]
+    noise: Option<RawNoise>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawNoise {
+    #[serde(default)]
+    macros: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -317,5 +342,15 @@ effects = [ { kind = "dlsym", param = 1 } ]
         assert!(set.get("memcpy").unwrap().effects.is_empty());
         // Unrelated built-ins stay intact.
         assert!(!set.get("memset_s").unwrap().effects.is_empty());
+    }
+
+    #[test]
+    fn noise_macros_parsed_from_toml() {
+        let cfg = r#"
+[noise]
+macros = ["TAG_LOG*", "HILOG_*", "LOGD"]
+"#;
+        let set = FnModelSet::from_toml_str(cfg).unwrap();
+        assert_eq!(set.noise_macros(), &["TAG_LOG*", "HILOG_*", "LOGD"]);
     }
 }

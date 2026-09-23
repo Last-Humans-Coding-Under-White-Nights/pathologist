@@ -1,15 +1,27 @@
+use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 
 /// Maps output byte offsets back to original source locations.
 ///
 /// File paths are interned in [`LineMap::files`]; entries store the index so
 /// per-token recording stays allocation-free and cache-friendly.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct LineMap {
     /// Interned origin paths; entry `file` indexes into this vec.
     pub files: Vec<PathBuf>,
+    /// Interned macro names; entry `expansion_macro` indexes into this vec.
+    pub macros: Vec<String>,
+    #[doc(hidden)]
+    macro_indices: FxHashMap<String, u32>,
     pub entries: Vec<LineMapEntry>,
 }
+
+impl PartialEq for LineMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.files == other.files && self.macros == other.macros && self.entries == other.entries
+    }
+}
+impl Eq for LineMap {}
 
 /// One mapping: byte offset in preprocessed output → original location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,12 +38,32 @@ pub struct LineMapEntry {
     /// Stable fingerprint of the full macro expansion/substitution chain.
     /// Zero denotes source text without macro provenance.
     pub expansion_id: u64,
+    /// Interned macro name for the outermost macro invocation. `u32::MAX` means none.
+    pub expansion_macro: u32,
 }
 
 impl LineMap {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn from_raw_parts(
+        files: Vec<PathBuf>,
+        macros: Vec<String>,
+        entries: Vec<LineMapEntry>,
+    ) -> Self {
+        let mut macro_indices = FxHashMap::default();
+        for (idx, m) in macros.iter().enumerate() {
+            macro_indices.insert(m.clone(), idx as u32);
+        }
+        Self {
+            files,
+            macros,
+            macro_indices,
+            entries,
+        }
     }
 
     /// Intern a path, returning its entry index.
@@ -41,6 +73,25 @@ impl LineMap {
         }
         self.files.push(path.to_path_buf());
         (self.files.len() - 1) as u32
+    }
+
+    /// Intern a macro name, returning its entry index.
+    pub fn intern_macro(&mut self, name: &str) -> u32 {
+        if let Some(&pos) = self.macro_indices.get(name) {
+            return pos;
+        }
+        if self.macro_indices.is_empty() && !self.macros.is_empty() {
+            for (idx, m) in self.macros.iter().enumerate() {
+                self.macro_indices.insert(m.clone(), idx as u32);
+            }
+            if let Some(&pos) = self.macro_indices.get(name) {
+                return pos;
+            }
+        }
+        let pos = self.macros.len() as u32;
+        self.macros.push(name.to_string());
+        self.macro_indices.insert(name.to_string(), pos);
+        pos
     }
 
     pub fn push(&mut self, output_offset: usize, file: u32, line: u32, col: u32) {
@@ -53,6 +104,7 @@ impl LineMap {
             expansion_line: 0,
             expansion_col: 0,
             expansion_id: 0,
+            expansion_macro: u32::MAX,
         });
     }
 
@@ -67,6 +119,7 @@ impl LineMap {
         expansion_line: u32,
         expansion_col: u32,
         expansion_id: u64,
+        expansion_macro: u32,
     ) {
         self.entries.push(LineMapEntry {
             output_offset: output_offset as u32,
@@ -77,6 +130,7 @@ impl LineMap {
             expansion_line,
             expansion_col,
             expansion_id,
+            expansion_macro,
         });
     }
 
@@ -84,6 +138,12 @@ impl LineMap {
     pub fn expansion_path_of(&self, entry: &LineMapEntry) -> Option<&Path> {
         (entry.expansion_file != u32::MAX)
             .then(|| self.files[entry.expansion_file as usize].as_path())
+    }
+
+    #[must_use]
+    pub fn expansion_macro_of(&self, entry: &LineMapEntry) -> Option<&str> {
+        (entry.expansion_macro != u32::MAX)
+            .then(|| self.macros[entry.expansion_macro as usize].as_str())
     }
 
     #[must_use]
@@ -119,9 +179,15 @@ impl LineMap {
             .partition_point(|e| (e.output_offset as usize) < start);
         let mut out = LineMap::new();
         let mut remap = vec![u32::MAX; self.files.len()];
+        let mut macro_remap = vec![u32::MAX; self.macros.len()];
         for e in &self.entries[idx..] {
             if remap[e.file as usize] == u32::MAX {
                 remap[e.file as usize] = out.intern_file(&self.files[e.file as usize]);
+            }
+            if e.expansion_macro != u32::MAX && macro_remap[e.expansion_macro as usize] == u32::MAX
+            {
+                macro_remap[e.expansion_macro as usize] =
+                    out.intern_macro(&self.macros[e.expansion_macro as usize]);
             }
         }
         let entries = self.entries[idx..]
@@ -143,6 +209,11 @@ impl LineMap {
                 expansion_line: e.expansion_line,
                 expansion_col: e.expansion_col,
                 expansion_id: e.expansion_id,
+                expansion_macro: if e.expansion_macro == u32::MAX {
+                    u32::MAX
+                } else {
+                    macro_remap[e.expansion_macro as usize]
+                },
             })
             .collect();
         out.entries = entries;
@@ -167,6 +238,7 @@ impl LineMap {
     /// Append `other`'s entries shifted by `offset`, renumbering its file
     /// indices through `remap` (indexed by `other`'s file table).
     pub fn splice(&mut self, other: &LineMap, offset: usize, remap: &[u32]) {
+        let macro_remap: Vec<u32> = other.macros.iter().map(|m| self.intern_macro(m)).collect();
         for e in &other.entries {
             self.entries.push(LineMapEntry {
                 output_offset: e.output_offset + offset as u32,
@@ -181,6 +253,11 @@ impl LineMap {
                 expansion_line: e.expansion_line,
                 expansion_col: e.expansion_col,
                 expansion_id: e.expansion_id,
+                expansion_macro: if e.expansion_macro == u32::MAX {
+                    u32::MAX
+                } else {
+                    macro_remap[e.expansion_macro as usize]
+                },
             });
         }
     }
@@ -210,6 +287,9 @@ impl LineMap {
                 let expansion_file = other
                     .expansion_path_of(e)
                     .map_or(u32::MAX, |path| self.intern_file(path));
+                let expansion_macro = other
+                    .expansion_macro_of(e)
+                    .map_or(u32::MAX, |m| self.intern_macro(m));
                 self.entries.push(LineMapEntry {
                     output_offset: (e.output_offset as usize - range.start + offset) as u32,
                     file,
@@ -219,11 +299,13 @@ impl LineMap {
                     expansion_line: e.expansion_line,
                     expansion_col: e.expansion_col,
                     expansion_id: e.expansion_id,
+                    expansion_macro,
                 });
             }
             return;
         }
         let mut remap = vec![u32::MAX; other.files.len()];
+        let mut macro_remap = vec![u32::MAX; other.macros.len()];
         for e in &other.entries[start..end] {
             if remap[e.file as usize] == u32::MAX {
                 remap[e.file as usize] = self.intern_file(&other.files[e.file as usize]);
@@ -231,6 +313,11 @@ impl LineMap {
             if e.expansion_file != u32::MAX && remap[e.expansion_file as usize] == u32::MAX {
                 remap[e.expansion_file as usize] =
                     self.intern_file(&other.files[e.expansion_file as usize]);
+            }
+            if e.expansion_macro != u32::MAX && macro_remap[e.expansion_macro as usize] == u32::MAX
+            {
+                macro_remap[e.expansion_macro as usize] =
+                    self.intern_macro(&other.macros[e.expansion_macro as usize]);
             }
             self.entries.push(LineMapEntry {
                 output_offset: (e.output_offset as usize - range.start + offset) as u32,
@@ -245,6 +332,11 @@ impl LineMap {
                 expansion_line: e.expansion_line,
                 expansion_col: e.expansion_col,
                 expansion_id: e.expansion_id,
+                expansion_macro: if e.expansion_macro == u32::MAX {
+                    u32::MAX
+                } else {
+                    macro_remap[e.expansion_macro as usize]
+                },
             });
         }
     }

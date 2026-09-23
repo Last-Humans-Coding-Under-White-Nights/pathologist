@@ -23,6 +23,7 @@ struct IndexConfig {
     full_export: bool,
     debug_points_to: bool,
     models: Vec<PathBuf>,
+    ignore_macros: Vec<String>,
 }
 
 unsafe fn read_config(opts: &TraceIndexOptions) -> Result<IndexConfig, ApiError> {
@@ -45,6 +46,7 @@ unsafe fn read_config(opts: &TraceIndexOptions) -> Result<IndexConfig, ApiError>
         .into_iter()
         .map(PathBuf::from)
         .collect();
+    let ignore_macros = crate::util::str_array(opts.ignore_macros, opts.n_ignore_macros)?;
     let jobs = if opts.jobs <= 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -63,6 +65,7 @@ unsafe fn read_config(opts: &TraceIndexOptions) -> Result<IndexConfig, ApiError>
         full_export: opts.full_export != 0,
         debug_points_to: opts.debug_points_to != 0,
         models,
+        ignore_macros,
     })
 }
 
@@ -185,6 +188,13 @@ fn run_index(cfg: &IndexConfig) -> Result<(TraceIndexResult, String), ApiError> 
     for (name, value) in &cfg.defines {
         popts = popts.with_define(name, value);
     }
+    let mut effective_ignored_macros = models.noise_macros().to_vec();
+    for m in &cfg.ignore_macros {
+        if !effective_ignored_macros.contains(m) {
+            effective_ignored_macros.push(m.clone());
+        }
+    }
+    popts.ignored_macros = effective_ignored_macros;
 
     let mut program =
         build_program_with_jobs(&cfg.root, &popts, cfg.jobs).map_err(ApiError::Analysis)?;

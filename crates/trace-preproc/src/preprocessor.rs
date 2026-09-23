@@ -155,6 +155,8 @@ struct PreprocessorState {
     /// Macro emission is per token, so scanning the file table there would
     /// make repeated expansions quadratic in the number of mapped files.
     lm_spelling_files: FxHashMap<PathBuf, u32>,
+    /// Macro names already interned in `line_map`. Avoids O(N) scans on every emitted token.
+    lm_macros: FxHashMap<Arc<str>, u32>,
     /// Current nested macro-expansion depth (hide-set rescan frames).
     expansion_depth: u32,
     expansion_limit_warned: bool,
@@ -293,6 +295,7 @@ impl PreprocessorState {
             emitted_bytes: FxHashMap::default(),
             lm_cur_file: u32::MAX,
             lm_spelling_files: FxHashMap::default(),
+            lm_macros: FxHashMap::default(),
             expansion_depth: 0,
             expansion_limit_warned: false,
             tokens_processed: 0,
@@ -875,6 +878,16 @@ impl PreprocessorState {
         file
     }
 
+    /// Intern a macro name once per preprocessing run.
+    fn lm_macro(&mut self, name: &Arc<str>) -> u32 {
+        if let Some(&id) = self.lm_macros.get(name) {
+            return id;
+        }
+        let id = self.line_map.intern_macro(name);
+        self.lm_macros.insert(Arc::clone(name), id);
+        id
+    }
+
     /// Index of the current file in the line-map table, re-interned only
     /// when `current_file` changed since the last call.
     fn lm_current_file(&mut self) -> u32 {
@@ -897,6 +910,12 @@ impl PreprocessorState {
         let text = token_as_str(&tok.kind);
         self.output.push_str(text);
         if self.opts.track_line_map {
+            let macro_id = tok
+                .expansion_macro
+                .as_ref()
+                .map(|m| self.lm_macro(m))
+                .unwrap_or(u32::MAX);
+
             if let (Some(spelling_file), Some((expansion_line, expansion_col))) =
                 (&tok.spelling_file, tok.origin)
             {
@@ -911,6 +930,29 @@ impl PreprocessorState {
                     expansion_line,
                     expansion_col,
                     tok.expansion_id,
+                    macro_id,
+                );
+            } else if macro_id != u32::MAX {
+                // Tokens without a disk definition file (CLI -D defines, builtin fallbacks,
+                // stringized literals) or substituted macro argument tokens:
+                // map to expansion_site() without fabricating a macro-body expansion span,
+                // while recording outermost macro attribution for filtering.
+                let fid = tok
+                    .spelling_file
+                    .as_deref()
+                    .map(|sf| self.lm_spelling_file(sf))
+                    .unwrap_or_else(|| self.lm_current_file());
+                let (line, col) = tok.expansion_site();
+                self.line_map.push_expansion(
+                    offset,
+                    fid,
+                    line,
+                    col,
+                    u32::MAX,
+                    0,
+                    0,
+                    tok.expansion_id,
+                    macro_id,
                 );
             } else {
                 let fid = self.lm_current_file();
@@ -4277,6 +4319,10 @@ fn paste_two_tokens(left: &Token, right: &Token) -> Token {
         hidden: Token::union_hidden(left, right),
         origin: left.origin.or(right.origin),
         expansion_id: left.expansion_id ^ right.expansion_id.rotate_left(1),
+        expansion_macro: left
+            .expansion_macro
+            .clone()
+            .or_else(|| right.expansion_macro.clone()),
         spelling_file,
         // Whatever separated `left` from the token before it still
         // separates the pasted result from it.

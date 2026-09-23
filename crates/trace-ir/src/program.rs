@@ -296,6 +296,9 @@ pub struct Program {
     /// for a unioned layout — a field moved off the index the configuration
     /// that lowered the access gave it — must key on this.
     pub layouts_unioned: bool,
+    /// Macros whose expansions are ignored during lowering (no call sites,
+    /// flow constraints, or local variables).
+    pub ignored_macros: Vec<String>,
 }
 
 impl Program {
