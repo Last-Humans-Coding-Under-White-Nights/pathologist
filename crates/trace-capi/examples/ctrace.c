@@ -4,7 +4,7 @@
  * Demonstrates the index + inspect surfaces:
  *
  *   ctrace analyze ROOT -o DB [-I dir] [-D NAME=VALUE] [--full-export]
- *                        [--debug-points-to] [--jobs N] [--models FILE]
+ *                        [--debug-points-to] [--jobs N] [--models FILE] [--ignore-macro NAME]
  *   ctrace inspect DB functions FILE LINE
  *   ctrace inspect DB symbols FILE LINE COL
  *   ctrace inspect DB calls [--from FN] [--to FN] [--file SUBSTR]
@@ -83,7 +83,7 @@ static void print_err(char **err) {
 static int cmd_analyze(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: ctrace analyze ROOT [-o db] [-I dir] [-D NAME=VALUE] "
-                        "[--full-export] [--debug-points-to] [--jobs N] [--models FILE]\n");
+                        "[--full-export] [--debug-points-to] [--jobs N] [--models FILE] [--ignore-macro NAME]\n");
         return 2;
     }
     const char *root = argv[1];
@@ -91,19 +91,39 @@ static int cmd_analyze(int argc, char **argv) {
     const char *includes[64];
     const char *defines[64];
     const char *models[16];
-    size_t n_inc = 0, n_def = 0, n_mod = 0;
+    const char *ignore_macros[64];
+    size_t n_inc = 0, n_def = 0, n_mod = 0, n_ign = 0;
     int32_t jobs = 0;
     int32_t full_export = 0, debug_points_to = 0;
 
     for (int i = 2; i < argc; i++) {
-        if (!strcmp(argv[i], "-o") && i + 1 < argc) output = argv[++i];
-        else if (!strcmp(argv[i], "-I") && i + 1 < argc && n_inc < 64) includes[n_inc++] = argv[++i];
-        else if (!strcmp(argv[i], "-D") && i + 1 < argc && n_def < 64) defines[n_def++] = argv[++i];
-        else if (!strcmp(argv[i], "--full-export")) full_export = 1;
-        else if (!strcmp(argv[i], "--debug-points-to")) debug_points_to = 1;
-        else if (!strcmp(argv[i], "--jobs") && i + 1 < argc) jobs = (int32_t)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--models") && i + 1 < argc && n_mod < 16) models[n_mod++] = argv[++i];
-        else {
+        if (!strcmp(argv[i], "-o")) {
+            if (i + 1 >= argc) { fprintf(stderr, "-o requires an argument\n"); return 2; }
+            output = argv[++i];
+        } else if (!strcmp(argv[i], "-I")) {
+            if (i + 1 >= argc) { fprintf(stderr, "-I requires an argument\n"); return 2; }
+            if (n_inc >= 64) { fprintf(stderr, "too many -I arguments (max 64)\n"); return 2; }
+            includes[n_inc++] = argv[++i];
+        } else if (!strcmp(argv[i], "-D")) {
+            if (i + 1 >= argc) { fprintf(stderr, "-D requires an argument\n"); return 2; }
+            if (n_def >= 64) { fprintf(stderr, "too many -D arguments (max 64)\n"); return 2; }
+            defines[n_def++] = argv[++i];
+        } else if (!strcmp(argv[i], "--full-export")) {
+            full_export = 1;
+        } else if (!strcmp(argv[i], "--debug-points-to")) {
+            debug_points_to = 1;
+        } else if (!strcmp(argv[i], "--jobs")) {
+            if (i + 1 >= argc) { fprintf(stderr, "--jobs requires an argument\n"); return 2; }
+            jobs = (int32_t)atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--models")) {
+            if (i + 1 >= argc) { fprintf(stderr, "--models requires an argument\n"); return 2; }
+            if (n_mod >= 16) { fprintf(stderr, "too many --models arguments (max 16)\n"); return 2; }
+            models[n_mod++] = argv[++i];
+        } else if (!strcmp(argv[i], "--ignore-macro")) {
+            if (i + 1 >= argc) { fprintf(stderr, "--ignore-macro requires an argument\n"); return 2; }
+            if (n_ign >= 64) { fprintf(stderr, "too many --ignore-macro arguments (max 64)\n"); return 2; }
+            ignore_macros[n_ign++] = argv[++i];
+        } else {
             fprintf(stderr, "unknown argument: %s\n", argv[i]);
             return 2;
         }
@@ -123,6 +143,8 @@ static int cmd_analyze(int argc, char **argv) {
     opts.debug_points_to = debug_points_to;
     opts.models = n_mod ? models : NULL;
     opts.n_models = n_mod;
+    opts.ignore_macros = n_ign ? ignore_macros : NULL;
+    opts.n_ignore_macros = n_ign;
 
     trace_index_result r;
     char *err = NULL;

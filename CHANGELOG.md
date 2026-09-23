@@ -4,6 +4,33 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Noise macro filtering
+
+Repetitive logging and diagnostic macros (e.g., OpenHarmony `TAG_LOG*`, `HILOG_*`)
+expand into boilerplate calls (`__builtin_strrchr`, `std::string::c_str`, string
+constructors, tag formatters) that dominate call graph edges and points-to sets.
+Macro filtering suppresses these expansions during AST lowering, omitting their
+call sites, local variables, and flow constraints while preserving surviving call
+sites and line numbers.
+
+- **CLI `--ignore-macro <NAME>`**: Ignore expansions of the specified macro (repeatable;
+  supports wildcards, e.g. `--ignore-macro 'LOG*'`).
+- **CLI `--ignore-logging`**: Pre-configured preset for common OpenHarmony and standard
+  logging macros (`HILOG_*`, `TAG_LOG*`, `HIVIEW_LOG*`, `MEDIA_*_LOG`, `LOGD`, `LOGI`,
+  `LOGW`, `LOGE`, `LOGF`).
+- **Models TOML `[noise]` table**: In files loaded via `--models <FILE>`, a `[noise]`
+  table can specify `macros = [...]`.
+- **C API**: Configured via `trace_index_options.ignore_macros` and `n_ignore_macros`.
+- **Export**: Configured macro patterns are recorded in `analysis_run.options_json`
+  under `"ignored_macros"`.
+
+On `ability_ability_runtime` (clean checkout at `6c18fdc9bdef`), `--ignore-logging` eliminates
+over 307,000 call sites (-51.7%) and 309,000 call edges (-40.3%), dropping SQLite database
+size from 344 MB to 290 MB (-54.4 MB), with no impact on IPC or indirect edges. Default
+runs without flags remain 100% bit-identical. See
+[docs/ANALYSIS.md](docs/ANALYSIS.md#noise-macro-filtering---ignore-macro---ignore-logging-noise)
+and [docs/EVAL_REPORT.md](docs/EVAL_REPORT.md#noise-macro-filtering---ignore-macro---ignore-logging--2026-09-23-124).
+
 ### Macro-body call source locations
 
 Calls written in macro replacement lists now retain both source positions:

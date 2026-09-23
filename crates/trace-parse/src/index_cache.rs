@@ -88,7 +88,7 @@ impl CachedSource {
 }
 
 /// Bytes of one serialized `LineMapEntry` in a spill file.
-const LINE_MAP_ENTRY_BYTES: usize = 36;
+const LINE_MAP_ENTRY_BYTES: usize = 40;
 
 /// `src` with its text and mappings dropped: what the provenance queries
 /// need, and nothing that a spill or release keeps out of memory.
@@ -108,6 +108,7 @@ struct SpilledSource {
     text_len: usize,
     entry_count: usize,
     origin_files: Vec<PathBuf>,
+    origin_macros: Vec<String>,
 }
 
 impl SpilledSource {
@@ -137,6 +138,7 @@ impl SpilledSource {
                     entry[slot * 4..slot * 4 + 4].copy_from_slice(&value.to_le_bytes());
                 }
                 entry[28..36].copy_from_slice(&e.expansion_id.to_le_bytes());
+                entry[36..40].copy_from_slice(&e.expansion_macro.to_le_bytes());
                 writer.write_all(&entry)?;
             }
             writer.flush()?;
@@ -147,6 +149,7 @@ impl SpilledSource {
             text_len: src.text.len(),
             entry_count: src.line_map.entries.len(),
             origin_files: src.line_map.files.clone(),
+            origin_macros: src.line_map.macros.clone(),
         })
     }
 
@@ -184,6 +187,7 @@ impl SpilledSource {
                             expansion_line: value(20),
                             expansion_col: value(24),
                             expansion_id: u64::from_le_bytes(entry[28..36].try_into().unwrap()),
+                            expansion_macro: value(36),
                         }
                     }),
             );
@@ -191,10 +195,11 @@ impl SpilledSource {
         }
         let mut src = self.metadata.clone();
         src.text = Arc::from(text);
-        src.line_map = Arc::new(LineMap {
-            files: self.origin_files.clone(),
+        src.line_map = Arc::new(LineMap::from_raw_parts(
+            self.origin_files.clone(),
+            self.origin_macros.clone(),
             entries,
-        });
+        ));
         Ok(src)
     }
 }
@@ -553,10 +558,8 @@ mod tests {
         let graph = IncludeGraph::default();
         let cache = IndexSourceCache::new();
         let mut src = PreprocessedSource::raw(Arc::from("abc"));
-        let mut map = LineMap {
-            files: vec![path.clone()],
-            entries: Vec::with_capacity(65536),
-        };
+        let mut map =
+            LineMap::from_raw_parts(vec![path.clone()], Vec::new(), Vec::with_capacity(65536));
         map.push(0, 0, 1, 1);
         src.line_map = Arc::new(map);
         cache.inner.write().unwrap().insert(

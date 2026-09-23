@@ -59,6 +59,7 @@ pub fn export_to_sqlite(
             "include_paths": program.include_paths,
             "defines": program.defines,
             "dep_roots": program.dep_roots(),
+            "ignored_macros": program.ignored_macros,
             "include_points_to": opts.include_points_to,
             "full_detail": opts.full_detail,
             "model_files": opts.model_files,

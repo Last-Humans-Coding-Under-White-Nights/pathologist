@@ -782,6 +782,8 @@ mod tests {
             debug_points_to: 0,
             models: ptr::null(),
             n_models: 0,
+            ignore_macros: ptr::null(),
+            n_ignore_macros: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,
@@ -1153,6 +1155,8 @@ mod tests {
             debug_points_to: 0,
             models: ptr::null(),
             n_models: 0,
+            ignore_macros: ptr::null(),
+            n_ignore_macros: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,
@@ -1195,6 +1199,8 @@ mod tests {
             debug_points_to: 0,
             models: models.as_ptr(),
             n_models: 1,
+            ignore_macros: ptr::null(),
+            n_ignore_macros: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,
@@ -1239,6 +1245,8 @@ mod tests {
             debug_points_to: 0,
             models: ptr::null(),
             n_models: 0,
+            ignore_macros: ptr::null(),
+            n_ignore_macros: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,
@@ -1286,6 +1294,8 @@ mod tests {
             debug_points_to: 0,
             models: ptr::null(),
             n_models: 0,
+            ignore_macros: ptr::null(),
+            n_ignore_macros: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,
@@ -1335,6 +1345,8 @@ mod tests {
             debug_points_to: 0,
             models: ptr::null(),
             n_models: 0,
+            ignore_macros: ptr::null(),
+            n_ignore_macros: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,
@@ -1384,6 +1396,8 @@ mod tests {
             debug_points_to: 0,
             models: ptr::null(),
             n_models: 0,
+            ignore_macros: ptr::null(),
+            n_ignore_macros: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,
@@ -1774,5 +1788,59 @@ mod tests {
         unsafe { trace_string_free(err) };
 
         unsafe { trace_db_close(db) };
+    }
+
+    #[test]
+    fn ignore_macros_capi_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = r#"
+void helper(void);
+#define LOG_EVENT() helper()
+void test_fn(void) {
+    LOG_EVENT();
+}
+"#;
+        std::fs::write(dir.path().join("main.c"), src).unwrap();
+        let root = CString::new(dir.path().to_str().unwrap()).unwrap();
+        let out_path = dir.path().join("out.db");
+        let out_c = CString::new(out_path.to_str().unwrap()).unwrap();
+        let macro_name = CString::new("LOG_EVENT").unwrap();
+        let ignore_macros = [macro_name.as_ptr()];
+
+        let opts = TraceIndexOptions {
+            size: std::mem::size_of::<TraceIndexOptions>(),
+            root: root.as_ptr(),
+            output_db: out_c.as_ptr(),
+            includes: ptr::null(),
+            n_includes: 0,
+            defines: ptr::null(),
+            n_defines: 0,
+            jobs: 1,
+            full_export: 1,
+            debug_points_to: 0,
+            models: ptr::null(),
+            n_models: 0,
+            ignore_macros: ignore_macros.as_ptr(),
+            n_ignore_macros: 1,
+        };
+        let mut result = TraceIndexResult {
+            files: 0,
+            functions: 0,
+            call_edges: 0,
+            arg_flow_edges: 0,
+        };
+        let mut warnings: *mut c_char = ptr::null_mut();
+        let mut err: *mut c_char = ptr::null_mut();
+        let status = unsafe { trace_index_ext(&opts, &mut result, &mut warnings, &mut err) };
+        assert_eq!(
+            status,
+            TraceStatus::TraceOk as c_int,
+            "err={}",
+            cstr_show(err)
+        );
+        assert_eq!(
+            result.call_edges, 0,
+            "call to helper inside LOG_EVENT should be ignored"
+        );
     }
 }

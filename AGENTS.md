@@ -153,4 +153,5 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 | Parallel discovery pass (expansion-cache writes) | `trace-parse/src/expansion_discovery.rs`, `trace-preproc/src/journal.rs` → `docs/PREPROCESSOR.md` |
 | Compilation database (`--compile-commands`) | `trace-parse/src/compile_commands.rs`, `configured.rs`, `merge_unit_variants` → `docs/ANALYSIS.md` |
 | Function models / summaries | `trace-analysis/src/summaries.rs` (`FnModelSet`, `--models`) → `docs/ANALYSIS.md` |
+| Noise macro filtering (`--ignore-macro`, `--ignore-logging`) | `trace-preproc/src/line_map.rs`, `trace-parse/src/lower.rs`, `trace-analysis/src/summaries.rs` → `docs/ANALYSIS.md` |
 | Builtin fallback macros | `trace-preproc/src/preprocessor.rs`, `tests/fixtures/builtin_macros/` → `docs/PREPROCESSOR.md` |

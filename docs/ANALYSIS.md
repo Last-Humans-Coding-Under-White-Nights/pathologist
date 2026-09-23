@@ -810,6 +810,31 @@ effects = []
   analyzed root; defined functions keep their exact return flow.
 - Terminators kill nothing (see above).
 
+## Noise macro filtering (`--ignore-macro`, `--ignore-logging`, `[noise]`)
+
+Repetitive diagnostic and logging macros (such as OpenHarmony `HILOG_*`, `TAG_LOG*`, or vendor logging frameworks) expand into boilerplate call sites, intermediate temporary strings, and helper invocations (`__builtin_strrchr`, `std::string::c_str`, format string conversions) that can dominate call-graph edges and points-to sets without contributing meaningful domain logic.
+
+To suppress this noise during analysis, trace provides opt-in macro filtering during AST lowering:
+
+- **CLI `--ignore-macro <NAME>`**: Ignore expansions of the named macro (repeatable). Glob wildcards (`*`) are supported (e.g. `--ignore-macro 'LOG*'`).
+- **CLI `--ignore-logging`**: Pre-configured preset targeting common OpenHarmony and standard logging macros (`HILOG_*`, `TAG_LOG*`, `HIVIEW_LOG*`, `MEDIA_*_LOG`, `LOGD`, `LOGI`, `LOGW`, `LOGE`, `LOGF`).
+- **Models TOML `[noise]` section**: In any file passed to `--models <FILE>`, a `[noise]` table can specify macros to ignore:
+  ```toml
+  [noise]
+  macros = ["LOG", "HILOG_*", "TAG_LOG*"]
+  ```
+- **C API**: Configured via `trace_index_options.ignore_macros` and `trace_index_options.n_ignore_macros`.
+
+### Mechanism
+
+1. **Preprocessing & LineMap attribution**: During preprocessing, emitted tokens carry the name of their outermost macro invocation. When token slices are committed to the `LineMap`, macro identifiers are interned and preserved across AST lowering and disk-spill caching (`IndexCache`). See [Macro expansion provenance and attribution](PREPROCESSOR.md#macro-expansion-provenance-and-attribution) in the preprocessor specification for the exact provenance contract (outermost attribution, argument forwarding, builtin/CLI fallback definitions, and cache replay).
+2. **Lowering filter**: During AST lowering (`walk_function_body`), statements, declarations, call expressions, return statements, and local variables whose source tokens expand from an ignored macro are discarded:
+   - No call sites or call-graph edges are emitted.
+   - No local variables or storage locations are allocated.
+   - No flow constraints or return flows are generated.
+   - Call sites and variable line numbers in surrounding code are preserved exactly.
+3. **Auditability**: Configured ignored macro patterns are stored in `Program.ignored_macros` and exported into the SQLite database under `analysis_run.options_json` in the `"ignored_macros"` array.
+
 ## C++ support (first step)
 
 `.cpp/.cc/.cxx/C++` files are indexed as TUs and parsed with tree-sitter-cpp
