@@ -40,6 +40,33 @@ pub fn only_function(program: &Program, name: &str) -> trace_ir::FnId {
     found[0].id
 }
 
+/// The one variable named `name`; fails if there are none or several.
+pub fn only_variable(program: &Program, name: &str) -> trace_ir::VarId {
+    unique_variable(program, None, name).id
+}
+
+/// The one variable named `name`, owned by `function` when given; fails if
+/// there are none or several.
+fn unique_variable<'a>(
+    program: &'a Program,
+    function: Option<&str>,
+    name: &str,
+) -> &'a trace_ir::Variable {
+    let found: Vec<_> = program
+        .symbols
+        .variables
+        .iter()
+        .filter(|v| v.name == name)
+        .filter(|v| function.is_none_or(|f| v.fn_id.is_some_and(|id| fn_name(program, id) == f)))
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one `{name}` in {function:?}, got {found:?}"
+    );
+    found[0]
+}
+
 /// The `FileId` of `path` under `root`. Files are interned by canonical
 /// path, which a temporary directory's path need not be.
 pub fn file_id(program: &Program, root: &Path, path: &str) -> trace_ir::FileId {
@@ -248,20 +275,7 @@ fn pts_names_of(
     function: Option<&str>,
     var: &str,
 ) -> Vec<String> {
-    let found: Vec<_> = program
-        .symbols
-        .variables
-        .iter()
-        .filter(|v| v.name == var)
-        .filter(|v| function.is_none_or(|f| v.fn_id.is_some_and(|id| fn_name(program, id) == f)))
-        .collect();
-    assert_eq!(
-        found.len(),
-        1,
-        "expected exactly one `{var}` in {function:?}, got {}",
-        found.len()
-    );
-    let v = found[0];
+    let v = unique_variable(program, function, var);
     let Some(pts) = pag
         .var_node
         .get(&v.id)
@@ -283,16 +297,7 @@ fn pts_names_of(
 /// Pointee names are matched program-wide, so a target must name exactly one
 /// variable; a name several functions declare would make the check ambiguous.
 fn require_unique_target(program: &Program, target: &str) {
-    let count = program
-        .symbols
-        .variables
-        .iter()
-        .filter(|v| v.name == target)
-        .count();
-    assert_eq!(
-        count, 1,
-        "target `{target}` must name exactly one variable, found {count}"
-    );
+    only_variable(program, target);
 }
 
 /// Assert that `var` points to `target`, printing the whole set on failure.

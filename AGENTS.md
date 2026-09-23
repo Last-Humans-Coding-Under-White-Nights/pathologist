@@ -53,7 +53,7 @@ Current kinds:
 - `Store { dst, src }`: Store through pointer (`*p = y`, `field = val`).
 - `GepField { dst, base, field, field_name }`: Field address or access (`&obj.field`, `p->field`). `field_name` disambiguates structurally distinct types sharing positional field offsets.
 - `ArrayFnMember { array, callee }`: Function-pointer array initializer member (`{ fn0, fn1 }`).
-- `CallReturn { dst, callee_name }`: Direct call assignment (`dst = callee()`), expanded during PAG construction using `fn_returns`.
+- `CallReturn { dst, callee_name, caller }`: Direct call assignment (`dst = callee()`), expanded during PAG construction using `fn_returns` in `caller`'s scope (`None` for a file-scope initializer; see `docs/ANALYSIS.md`, "Return-value flow").
 - `CallReturnIndirect { dst, callee_var }`: Indirect/virtual call assignment (`dst = callee_var()`), callee resolved at analysis time from points-to sets.
 - `NewHeap { dst }`: Heap allocation (`new T(...)`), allocates fresh heap location so constructor's implicit `this` has concrete pointees.
 - `StringConst { dst, value }`: String literal constant interned as abstract location, enabling dynamic symbol lookup (`dlsym`, `GetProcAddress`).

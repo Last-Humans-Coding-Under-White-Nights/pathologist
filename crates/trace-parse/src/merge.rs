@@ -1266,6 +1266,9 @@ fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> {
         FlowConstraint::AddrOfFn { callee, .. } | FlowConstraint::ArrayFnMember { callee, .. } => {
             Some(*callee)
         }
+        // A call follows the function it is written in: dropped with it in
+        // `valid_flow`, replayed with it in `MergeMode::SymbolsOnly`.
+        FlowConstraint::CallReturn { caller, .. } => *caller,
         _ => None,
     }
     .into_iter()
@@ -1503,9 +1506,14 @@ fn remap_flow(
             array: rv(*array),
             callee: rf(*callee),
         },
-        FlowConstraint::CallReturn { dst, callee_name } => FlowConstraint::CallReturn {
+        FlowConstraint::CallReturn {
+            dst,
+            callee_name,
+            caller,
+        } => FlowConstraint::CallReturn {
             dst: rv(*dst),
             callee_name: callee_name.clone(),
+            caller: caller.map(rf),
         },
         FlowConstraint::CallReturnIndirect { dst, callee_var } => {
             FlowConstraint::CallReturnIndirect {

@@ -373,16 +373,93 @@ fn static_call_return_expands() {
     );
 }
 
+/// #132 end to end: non-local destinations of `dst = f()` see the calling
+/// file's `static f`, and not another unit's.
+#[test]
+fn static_call_return_reaches_non_local_destinations() {
+    let root = fixture("static_return_to_global");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze_with_pts(&program);
+    for (caller, callee) in [
+        ("use_a", "ret_static"),
+        ("use_b", "ret_static"),
+        ("use_c", "ret_static_cpp"),
+    ] {
+        assert!(
+            has_edge(&program, &analysis, caller, callee, ResolutionKind::Direct),
+            "{caller} -> {callee}"
+        );
+    }
+    // Two units define `ret_static`; use_b's edge must land on b.c's.
+    let use_b = only_function(&program, "use_b");
+    let callee_files: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == use_b)
+        .map(|e| {
+            let f = program.symbols.function(e.callee);
+            program.symbols.files[f.file.0 as usize].path.clone()
+        })
+        .collect();
+    assert_eq!(callee_files.len(), 1, "{callee_files:?}");
+    assert!(callee_files[0].ends_with("b.c"), "{callee_files:?}");
+    for (var, loc) in [
+        ("seen_a", "global_a"),        // global destination
+        ("seen_static_a", "global_a"), // file-static destination
+        ("seen_init_a", "global_a"),   // file-scope initializer (no caller)
+        ("seen_b", "global_b"),        // b.c's own static, not a.c's
+        ("cpp_seen", "global_c"),
+        ("cpp_seen_static", "global_c"),
+        ("cpp_seen_init", "global_c"),
+    ] {
+        assert_eq!(
+            points_to_names(&program, &pag, &analysis, var),
+            vec![loc.to_string()],
+            "{var}"
+        );
+    }
+}
+
+/// `CallReturn.caller` is the function the call is written in, remapped to
+/// the merged program's ids; a file-scope initializer has none.
+#[test]
+fn call_return_records_its_enclosing_function() {
+    let root = fixture("static_return_to_global");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let caller_of = |dst: trace_ir::VarId| {
+        program
+            .flow
+            .iter()
+            .find_map(|f| match f {
+                trace_ir::FlowConstraint::CallReturn { dst: d, caller, .. } if *d == dst => {
+                    Some(*caller)
+                }
+                _ => None,
+            })
+            .expect("CallReturn for the destination")
+    };
+    for (dst, caller) in [
+        ("seen_a", Some("use_a")),
+        ("seen_static_a", Some("use_a")),
+        ("seen_b", Some("use_b")),
+        ("cpp_seen", Some("use_c")),
+        ("cpp_seen_static", Some("use_c")),
+        ("seen_init_a", None),
+        ("cpp_seen_init", None),
+    ] {
+        assert_eq!(
+            caller_of(only_variable(&program, dst)),
+            caller.map(|c| only_function(&program, c)),
+            "{dst}"
+        );
+    }
+}
+
 #[test]
 fn fn_static_local_variable() {
     let root = fixture("fn_static_local");
     let program = build_program(&root, &default_opts(&root)).expect("build");
-    let handler = program
-        .symbols
-        .variables
-        .iter()
-        .find(|v| v.name == "handler")
-        .expect("handler variable");
+    let handler = program.symbols.variable(only_variable(&program, "handler"));
     assert_eq!(
         handler.storage,
         trace_ir::StorageClass::FnStatic,
@@ -1160,12 +1237,7 @@ fn declarators_bind_the_c_way() {
     use trace_ir::TypeDesc as TD;
     let (program, _pag, _analysis) = var_cell_sync();
     let desc = |name: &str| {
-        let v = program
-            .symbols
-            .variables
-            .iter()
-            .find(|v| v.name == name)
-            .unwrap();
+        let v = program.symbols.variable(only_variable(&program, name));
         program.types.get(v.type_id).desc.as_ref().clone()
     };
     assert!(
@@ -1326,16 +1398,7 @@ fn void_pointer_table_accepts_a_function() {
 #[test]
 fn cast_member_address_is_stored_as_the_member() {
     let (program, _pag, _analysis) = var_cell_sync();
-    let var = |name: &str| {
-        program
-            .symbols
-            .variables
-            .iter()
-            .find(|v| v.name == name)
-            .unwrap()
-            .id
-    };
-    let mp = var("mp");
+    let mp = only_variable(&program, "mp");
     let stored: Vec<String> = program
         .flow
         .iter()

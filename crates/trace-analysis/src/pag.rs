@@ -579,18 +579,17 @@ impl Pag {
                             .push(fn_loc);
                     }
                 }
-                FlowConstraint::CallReturn { dst, callee_name } => {
+                FlowConstraint::CallReturn {
+                    dst,
+                    callee_name,
+                    caller,
+                } => {
                     let dst_n = self.var_node_id(*dst);
-                    let dst_var = program.symbols.variable(*dst);
                     let mut visited = FxHashSet::default();
-                    let candidates = match dst_var.fn_id {
-                        Some(caller) => program.symbols.return_flow_candidates(caller, callee_name),
-                        None => program.symbols.resolve_function_candidates_in_target(
-                            callee_name,
-                            None,
-                            dst_var.target,
-                        ),
-                    };
+                    let candidates =
+                        program
+                            .symbols
+                            .call_return_candidates(*caller, *dst, callee_name);
                     let mut any_real = false;
                     for callee in &candidates {
                         if self.expand_return_flows(program, dst_n, *callee, models, &mut visited) {
