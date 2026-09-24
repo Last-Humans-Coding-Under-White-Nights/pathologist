@@ -1,5 +1,110 @@
 # Evaluation Report
 
+## Smart-pointer value flow — 2026-09-24 (#141)
+
+The rules are defined in [Smart-pointer unwrap](ANALYSIS.md#smart-pointer-unwrap)
+and [Weak-pointer promotion](ANALYSIS.md#weak-pointer-promotion). This section
+records what the change moved and what it cost.
+
+Baseline: `master` at `58a81a8315bc8c5cf3aad384ae50af2572bb4e4e`. Candidate:
+the commit that adds this section. It was measured as a release build of the
+branch's pre-squash checkpoint `4eb3486`. The review fixes made since then
+touch shapes none of the corpora contain: full exports of hdf, hiview and
+camera (every table except `analysis_run`) are identical before and after
+them, so the counts and timings below stand.
+Both are release builds (`cargo build -p trace-cli --release`), rustc
+`1.100.0-nightly (bff8e12ff 2026-08-26)`, Apple M1 MacBook Air
+(`MacBookAir10,1`, 8 cores, 8 GB, macOS 26.6.2), `TRACE_SOLVE_BUDGET_POPS=800000`,
+minimal export, on hdf `cdc75a2`, hiview `92408e2` and camera `8ffd69d`, all clean.
+
+### What moved
+
+`python3 scripts/eval_check.py` passes all 94 checks with no expectation
+changed: call edges, indirect edges and arg-flow edges are identical to the
+baseline on all three corpora. The change adds value-flow facts only.
+
+| Corpus | Flow facts (index line) | `flow_edges` rows | `unwrap` edges |
+|---|---:|---:|---:|
+| hdf | 78,282 → 78,327 | 147,446 → 147,491 | 44 |
+| hiview | 22,325 → 22,564 | 41,803 → 42,052 | 214 |
+| camera | 41,641 → 43,813 | 79,929 → 82,189 | 1,222 |
+
+Flow facts after each change (index line, jobs 8); none of them moved call
+or arg-flow edges:
+
+| After | hdf | hiview | camera |
+|---|---:|---:|---:|
+| baseline `58a81a8` | 78,282 | 22,325 | 41,641 |
+| typed unwrap of field paths | 78,327 | 22,548 | 42,930 |
+| weak-pointer promotion | 78,327 | 22,563 | 43,730 |
+| call, dereferenced-member and parenthesized promotions | 78,327 | 22,563 | 43,731 |
+| reference receivers; field stores of the receiver value | 78,327 | 22,564 | 43,813 |
+| wrapper variables as pointers; call-result roots | 78,327 | 22,564 | 43,813 |
+
+The issue's reproduction, `filemanagement_dfs_service`, is not a pinned
+corpus. A shallow clone of the public mirror at `bec9c84`, analyzed with
+default options, puts the reported `cloudSyncCallback` at
+`cloud_sync_napi.cpp:130` (147 at the issue's revision). The baseline shows
+it as `1 flow nodes, 0 flow edges` in both directions. The candidate reaches
+it from `msg`'s loaded `cloudSyncCallback_` field (and on to the caller's
+`new` object), and reaches `env_` and `cbOnRef_` from it through `unwrap`.
+Function, call-edge and arg-flow counts there equal the baseline's.
+
+Determinism: the fixture's full export with `--debug-points-to`, and camera's
+minimal export, are identical at `--jobs 1` and `--jobs 8` (every table except
+`analysis_run`).
+
+### Performance — accepted
+
+**Criterion.** For every corpus, jobs setting and metric (wall, user+sys CPU,
+peak RSS, each phase), the candidate median may exceed the baseline median by
+at most the larger of 2% and the baseline's own spread ((max − min) / median).
+Phases whose baseline median is under 1.0 s are compared absolutely, allowing
+one 0.1 s reporting step.
+
+**Method.** Five rounds per configuration, alternating which binary ran first,
+each on a fresh database; `/usr/bin/time -l` for wall, user+sys and peak RSS,
+the CLI's `index` / `analyze` / `export` lines for phases. Each cell is the
+baseline median → candidate median of 5, with the change of the median in
+parentheses. The last column is the acceptance tolerance for wall / CPU /
+peak RSS in that configuration: the larger of 2% and the baseline's own
+spread in this run.
+
+| Corpus | Jobs | Wall s | CPU s | Peak RSS MB | index s | analyze s | export s | Tolerance (wall / CPU / RSS) |
+|---|---:|---|---|---|---|---|---|---|
+| hdf | 1 | 7.00 → 7.16 (+2.3%) | 7.81 → 7.89 (+1.0%) | 428.2 → 369.2 (−13.8%) | 5.7 → 5.8 | 0.9 → 0.9 | 0.5 → 0.5 | 6.0% / 3.3% / 13.1% |
+| hdf | 8 | 3.58 → 3.52 (−1.7%) | 12.17 → 12.15 (−0.2%) | 445.9 → 432.3 (−3.1%) | 2.2 → 2.2 | 0.8 → 0.8 | 0.5 → 0.5 | 3.1% / 3.6% / 13.9% |
+| hiview | 1 | 3.05 → 3.07 (+0.7%) | 3.88 → 3.87 (−0.3%) | 287.3 → 276.8 (−3.7%) | 2.8 → 2.8 | 0.0 → 0.0 | 0.2 → 0.2 | 2.6% / 2.1% / 15.1% |
+| hiview | 8 | 1.49 → 1.51 (+1.3%) | 5.44 → 5.45 (+0.2%) | 331.1 → 325.5 (−1.7%) | 1.2 → 1.2 | 0.0 → 0.0 | 0.2 → 0.2 | 2.0% / 2.0% / 5.3% |
+| camera | 1 | 12.22 → 12.29 (+0.6%) | 13.27 → 13.27 (0.0%) | 653.8 → 634.9 (−2.9%) | 11.6 → 11.6 | 0.1 → 0.1 | 0.5 → 0.6 | 4.2% / 3.2% / 5.5% |
+| camera | 8 | 5.35 → 5.34 (−0.2%) | 19.57 → 19.48 (−0.5%) | 808.0 → 721.9 (−10.7%) | 4.7 → 4.7 | 0.1 → 0.1 | 0.6 → 0.5 | 2.8% / 3.4% / 13.6% |
+
+Every metric passes. Wall time moves between −1.7% and +2.3% and CPU between
+−0.5% and +1.0%; the largest increase is hdf jobs-1 wall (+2.3%, tolerance
+6.0%). Peak RSS is noisy on this 8 GB machine, so the memory comparison is
+weaker than the time comparison: every median went down (−1.7% to −13.8%),
+mostly within the baselines' own spread (hdf jobs-1's −13.8% slightly exceeds
+its 13.1%). Nothing in the change reduces memory, so this should not be read
+as a gain.
+Earlier runs of the same gate on the branch's intermediate checkpoints also
+passed every metric.
+
+**Baseline variability.** Before any change, the baseline alone (5 runs per
+configuration, medians with spread) measured: hdf jobs 1 wall 7.16 s (9.4%),
+CPU 7.89 s (4.8%), RSS 415.4 MB (19.3%); hdf jobs 8 3.51 s (2.8%), 12.19 s
+(2.4%), 468.2 MB (9.4%); hiview jobs 1 3.05 s (3.6%), 3.87 s (1.3%),
+321.6 MB (14.9%); hiview jobs 8 1.48 s (2.7%), 5.41 s (1.7%), 331.8 MB (4.7%);
+camera jobs 1 12.47 s (1.6%), 13.50 s (1.3%), 636.4 MB (5.2%); camera jobs 8
+5.59 s (13.6%), 19.48 s (2.7%), 751.7 MB (18.8%). Phase timings print in
+0.1 s steps, hence the absolute rule for sub-second phases.
+
+**Why it is cheap.** The solver adds one indexed lookup per popped unwrap
+source and one memoized type decision per (location type, pointee) pair; the
+lowering work runs only where a wrapper crossing or a `lock`/`promote` call
+appears, and the method name is checked before the receiver is typed. Marking
+wrapper variables as pointers is one pass over the variables after merging,
+memoized per type.
+
 ## Qualified variables — 2026-09-23 (#133)
 
 The rules are defined in [Canonical variable identity](ANALYSIS.md#canonical-variable-identity)

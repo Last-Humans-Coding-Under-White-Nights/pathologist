@@ -581,6 +581,26 @@ impl Program {
         self.base_names(cls).map(str::to_owned).collect()
     }
 
+    /// Whether `derived` inherits from `base`, directly or transitively.
+    /// Walks up from `derived`, so the cost is bounded by its ancestry, not
+    /// by `base`'s subclass closure. Carries a visited set (see
+    /// [`Self::add_inheritance`]).
+    pub fn derives_from(&self, derived: &str, base: &str) -> bool {
+        let mut seen: FxHashSet<&str> = FxHashSet::default();
+        let mut pending = vec![derived];
+        while let Some(cls) = pending.pop() {
+            for parent in self.base_names(cls) {
+                if parent == base {
+                    return true;
+                }
+                if seen.insert(parent) {
+                    pending.push(parent);
+                }
+            }
+        }
+        false
+    }
+
     /// [`Self::bases_of`], borrowed.
     pub fn base_names(&self, cls: &str) -> impl Iterator<Item = &str> {
         self.bases_by_class

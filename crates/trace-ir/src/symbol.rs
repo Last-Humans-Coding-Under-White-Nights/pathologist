@@ -28,6 +28,9 @@ pub struct Variable {
     pub fn_id: Option<FnId>,
     pub param_index: Option<u32>,
     pub span: Span,
+    /// The variable's value is an address: a raw or function pointer, a
+    /// synthesized pointer temporary, or a smart pointer (set after merging;
+    /// see `docs/ANALYSIS.md`, "Smart-pointer unwrap").
     pub is_pointer: bool,
     /// True for a global definition, including C tentative definitions.
     pub is_defined: bool,

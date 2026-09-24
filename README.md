@@ -285,8 +285,10 @@ trace inspect <DB> dataflow --file SUBSTR --line N --col C [--depth N] [--direct
 | `--format` | Output format: `text` (default), `json`, `graphviz`, or `mermaid`. |
 
 Edges show how values move: `copy`, `addr_of`, `load`, `store`, `gep`,
-`points_to` (variable → storage), and `call_arg` (argument passing into a
-callee formal). Function-pointer values appear as `fn:<name>` nodes.
+`points_to` (variable → storage), `call_arg` (argument passing into a
+callee formal), and `unwrap` (a smart pointer's `->` into its pointee; see
+[Smart-pointer unwrap](docs/ANALYSIS.md#smart-pointer-unwrap)).
+Function-pointer values appear as `fn:<name>` nodes.
 
 The same C parameter may exist as several IR variables (one per TU that sees
 its declaration). If nothing flows through the queried copy, the traversal

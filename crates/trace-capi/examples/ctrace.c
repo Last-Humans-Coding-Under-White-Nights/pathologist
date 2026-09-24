@@ -50,6 +50,7 @@ static const char *flow_str(trace_flow_kind k) {
     case TRACE_FLOW_CALL_ARG: return "call_arg";
     case TRACE_FLOW_TERMINATES: return "terminates";
     case TRACE_FLOW_DLSYM: return "dlsym";
+    case TRACE_FLOW_UNWRAP: return "unwrap";
     default: return "?";
     }
 }

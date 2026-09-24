@@ -59,6 +59,11 @@ pub enum FlowConstraint {
     NewHeap { dst: VarId },
     /// `dst` points at the given string literal (interned; copies propagate).
     StringConst { dst: VarId, value: String },
+    /// `sp->field`: step through a smart pointer's overloaded `->`/`*`. `src`
+    /// holds the wrapper value; `dst` is the pointee-typed receiver, and its
+    /// type is the one the solver admits locations by. See
+    /// `docs/ANALYSIS.md`, "Smart-pointer unwrap".
+    UnwrapPointer { dst: VarId, src: VarId },
 }
 
 impl FlowConstraint {
@@ -68,7 +73,8 @@ impl FlowConstraint {
             FlowConstraint::Copy { dst, src }
             | FlowConstraint::Load { dst, src }
             | FlowConstraint::Store { dst, src }
-            | FlowConstraint::AddrOfVar { dst, src } => (dst, Some(src)),
+            | FlowConstraint::AddrOfVar { dst, src }
+            | FlowConstraint::UnwrapPointer { dst, src } => (dst, Some(src)),
             FlowConstraint::GepField { dst, base, .. } => (dst, Some(base)),
             FlowConstraint::CallReturnIndirect { dst, callee_var } => (dst, Some(callee_var)),
             FlowConstraint::ArrayFnMember { array, .. } => (array, None),

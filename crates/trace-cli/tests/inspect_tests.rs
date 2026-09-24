@@ -10,7 +10,7 @@ use trace_analysis::analyze;
 use trace_db::{
     call_edges, call_graph, dataflow_graph, export_to_sqlite, find_functions_at,
     find_functions_by_name, open_db, require_function_at, require_symbols_at, CallEdgeFilter,
-    Direction, ExportOptions, QueryGraph,
+    Direction, ExportOptions, QueryGraph, SymbolRef,
 };
 use trace_parse::build_program;
 use trace_preproc::PreprocessOptions;
@@ -27,6 +27,11 @@ fn build_and_export(name: &str) -> TempDb {
 
 /// Build the tree at `root` and export it minimally to a scratch database.
 fn export_tree(root: &std::path::Path, name: &str) -> TempDb {
+    export_tree_with(root, name, false)
+}
+
+/// Build the tree at `root` and export it, with full detail or minimally.
+fn export_tree_with(root: &std::path::Path, name: &str, full_detail: bool) -> TempDb {
     let root = root.to_path_buf();
     let opts = PreprocessOptions::new()
         .with_include(root.clone())
@@ -44,7 +49,7 @@ fn export_tree(root: &std::path::Path, name: &str) -> TempDb {
             output: out.to_path_buf(),
             trace_version: env!("CARGO_PKG_VERSION").to_owned(),
             include_points_to: false,
-            full_detail: false,
+            full_detail,
             model_files: Vec::new(),
         },
     )
@@ -975,4 +980,223 @@ fn a_flowless_global_is_found_as_itself() {
     assert_eq!(syms[0].name, "unused_global");
     let err = dataflow_graph(&conn, &syms[..1], Direction::Down, 3).unwrap_err();
     assert!(err.to_string().contains("unused_global"), "{err}");
+}
+
+// --- cpp_smart_pointer_value_flow: exported dataflow (#141) ---
+
+/// The symbol for variable `name` declared in function `func`, found the
+/// way the CLI finds it: by the coordinates the variables table records.
+/// The name must be unique in `func`, so a fixture that later declares a
+/// second one fails here instead of silently testing either.
+fn symbol_in(conn: &rusqlite::Connection, func: &str, name: &str) -> SymbolRef {
+    let positions: Vec<(String, i64, i64)> = conn
+        .prepare(
+            "SELECT fl.path, v.line, v.col FROM variables v \
+             JOIN functions f ON f.id = v.fn_id JOIN files fl ON fl.id = v.file_id \
+             WHERE f.name = ?1 AND v.name = ?2",
+        )
+        .unwrap()
+        .query_map([func, name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(positions.len(), 1, "{func}::{name}: {positions:?}");
+    let (path, line, col) = &positions[0];
+    require_symbols_at(conn, path, *line, *col)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.name == name && s.fn_name.as_deref() == Some(func))
+        .unwrap_or_else(|| panic!("{func}::{name} at {path}:{line}:{col}"))
+}
+
+#[test]
+fn smart_pointer_dataflow_exports_unwrap_edges() {
+    let root = fixture("cpp_smart_pointer_value_flow");
+    for full_detail in [false, true] {
+        let db = export_tree_with(&root, "smart_pointer_unwrap", full_detail);
+        let conn = open_db(&db).unwrap();
+        let unwraps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flow_edges e \
+                 JOIN flow_nodes s ON s.id = e.src_node JOIN variables sv ON sv.id = s.var_id \
+                 JOIN flow_nodes d ON d.id = e.dst_node JOIN variables dv ON dv.id = d.var_id \
+                 JOIN functions f ON f.id = sv.fn_id \
+                 WHERE e.kind = 'unwrap' AND f.name = 'read' AND sv.name = 'sp' \
+                   AND dv.name LIKE '\\_recv%' ESCAPE '\\'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unwraps, 2, "full={full_detail}: sp->value and sp->cb");
+
+        let sp = symbol_in(&conn, "read", "sp");
+        let down = dataflow_graph(&conn, &[sp], Direction::Down, 12).unwrap();
+        assert!(
+            down.edges.iter().any(|e| e.label == "unwrap"),
+            "full={full_detail}: the inspector labels the crossing unwrap"
+        );
+        assert!(
+            visited_names(&conn, &down).contains(&"value".to_string()),
+            "full={full_detail}: sp reaches value"
+        );
+    }
+}
+
+/// Whether `names` has `want`, or a name starting with `want`'s stem when
+/// it ends in `*` (generated temporaries: `_recv*`, `_gep*`, `_load*`).
+fn has_node(names: &[String], want: &str) -> bool {
+    match want.strip_suffix('*') {
+        Some(stem) => names.iter().any(|name| name.starts_with(stem)),
+        None => names.iter().any(|name| name == want),
+    }
+}
+
+/// A dataflow walk the fixture must support: from `var` in `func`, in `dir`,
+/// reaching every node in `nodes` over edges including every kind in `kinds`.
+struct DataflowRow {
+    func: &'static str,
+    var: &'static str,
+    dir: Direction,
+    nodes: &'static [&'static str],
+    kinds: &'static [&'static str],
+}
+
+#[test]
+fn smart_pointer_dataflow_connects_wrappers_and_promotions() {
+    let rows = [
+        DataflowRow {
+            func: "read",
+            var: "sp",
+            dir: Direction::Down,
+            nodes: &["_recv*", "_gep*", "value"],
+            kinds: &["unwrap", "gep", "load"],
+        },
+        DataflowRow {
+            func: "promote_local",
+            var: "wp",
+            dir: Direction::Down,
+            nodes: &["promoted", "promoted_value"],
+            kinds: &["copy", "unwrap"],
+        },
+        DataflowRow {
+            func: "promote_local",
+            var: "promoted",
+            dir: Direction::Up,
+            nodes: &["wp"],
+            kinds: &["copy"],
+        },
+        DataflowRow {
+            func: "promote_field",
+            var: "msg",
+            dir: Direction::Down,
+            nodes: &["_gep*", "_load*", "field_promoted", "field_value"],
+            kinds: &["gep", "load", "copy", "unwrap"],
+        },
+        DataflowRow {
+            func: "promote_field",
+            var: "field_promoted",
+            dir: Direction::Up,
+            nodes: &["_load*", "_gep*", "msg"],
+            kinds: &["copy", "load", "gep"],
+        },
+        DataflowRow {
+            func: "promote_into_field",
+            var: "wp",
+            dir: Direction::Down,
+            nodes: &["_gep*"],
+            kinds: &["store"],
+        },
+    ];
+    let root = fixture("cpp_smart_pointer_value_flow");
+    for full_detail in [false, true] {
+        let db = export_tree_with(&root, "smart_pointer_dataflow", full_detail);
+        let conn = open_db(&db).unwrap();
+        for row in &rows {
+            let (func, var, dir) = (row.func, row.var, row.dir);
+            let start = symbol_in(&conn, func, var);
+            let graph = dataflow_graph(&conn, &[start], dir, 12).unwrap();
+            let names = visited_names(&conn, &graph);
+            for node in row.nodes {
+                assert!(
+                    has_node(&names, node),
+                    "full={full_detail} {func}::{var} {dir:?}: missing {node} in {names:?}"
+                );
+            }
+            for kind in row.kinds {
+                assert!(
+                    graph.edges.iter().any(|e| e.label == *kind),
+                    "full={full_detail} {func}::{var} {dir:?}: no {kind} edge"
+                );
+            }
+        }
+        // The direct field read is visible at the CLI's default depth.
+        let sp = symbol_in(&conn, "read", "sp");
+        let shallow = dataflow_graph(&conn, &[sp], Direction::Down, 3).unwrap();
+        assert!(
+            has_node(&visited_names(&conn, &shallow), "value"),
+            "full={full_detail}"
+        );
+    }
+}
+
+#[test]
+fn smart_pointer_dataflow_cli_reports_both_directions() {
+    for export_flag in [None, Some("--full-export")] {
+        cli_reports_both_directions(export_flag);
+    }
+}
+
+fn cli_reports_both_directions(export_flag: Option<&str>) {
+    let bin = env!("CARGO_BIN_EXE_trace");
+    let db = TempDb::new("smart_pointer_cli.db");
+    let fixture = fixture("cpp_smart_pointer_value_flow");
+    let out = Command::new(bin)
+        .args([
+            "analyze",
+            fixture.to_str().unwrap(),
+            "-o",
+            db.to_str().unwrap(),
+        ])
+        .args(export_flag)
+        .output()
+        .expect("analyze runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let conn = open_db(&db).unwrap();
+    for (func, var, direction, reached) in [
+        ("read", "sp", "down", "value"),
+        ("promote_field", "field_promoted", "up", "msg"),
+    ] {
+        let start = symbol_in(&conn, func, var);
+        let (line, col) = (start.line.to_string(), start.col.to_string());
+        let out = Command::new(bin)
+            .args([
+                "inspect",
+                db.to_str().unwrap(),
+                "dataflow",
+                "--file",
+                &start.path,
+                "--line",
+                &line,
+                "--col",
+                &col,
+                "--direction",
+                direction,
+            ])
+            .output()
+            .expect("dataflow runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains(&format!("{reached} (")),
+            "{export_flag:?} {func}::{var} {direction} must reach {reached}:\n{text}"
+        );
+    }
 }

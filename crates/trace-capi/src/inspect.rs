@@ -423,6 +423,7 @@ fn flow_kind_from_str(s: &str) -> TraceFlowKind {
         "call_arg" => TraceFlowKind::TraceFlowCallArg,
         "terminates" => TraceFlowKind::TraceFlowTerminates,
         "dlsym" => TraceFlowKind::TraceFlowDlsym,
+        "unwrap" => TraceFlowKind::TraceFlowUnwrap,
         _ => TraceFlowKind::TraceFlowUnknown,
     }
 }

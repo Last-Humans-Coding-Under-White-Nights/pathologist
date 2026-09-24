@@ -45,6 +45,11 @@ pub fn only_variable(program: &Program, name: &str) -> trace_ir::VarId {
     unique_variable(program, None, name).id
 }
 
+/// The one variable named `name` declared in function `function`.
+pub fn local_variable(program: &Program, function: &str, name: &str) -> trace_ir::VarId {
+    unique_variable(program, Some(function), name).id
+}
+
 /// The one variable named `name`, owned by `function` when given; fails if
 /// there are none or several.
 fn unique_variable<'a>(
@@ -275,10 +280,24 @@ fn pts_names_of(
     function: Option<&str>,
     var: &str,
 ) -> Vec<String> {
-    let v = unique_variable(program, function, var);
+    points_to_names_of_var(
+        program,
+        pag,
+        analysis,
+        unique_variable(program, function, var).id,
+    )
+}
+
+/// Sorted names of the variables whose storage `var` points to.
+pub fn points_to_names_of_var(
+    program: &Program,
+    pag: &trace_analysis::Pag,
+    analysis: &AnalysisResult,
+    var: trace_ir::VarId,
+) -> Vec<String> {
     let Some(pts) = pag
         .var_node
-        .get(&v.id)
+        .get(&var)
         .and_then(|n| analysis.points_to.get(n))
     else {
         return Vec::new();

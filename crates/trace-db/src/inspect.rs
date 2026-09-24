@@ -1070,6 +1070,7 @@ pub fn dataflow_graph(
                 "call_arg" => "call_arg",
                 "terminates" => "terminates",
                 "dlsym" => "dlsym",
+                "unwrap" => "unwrap",
                 _ => "flow",
             };
             fwd.entry(src)
