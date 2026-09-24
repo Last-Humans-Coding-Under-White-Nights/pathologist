@@ -1145,3 +1145,239 @@ fn a_block_scope_redeclaration_of_a_visible_function_declares_it() {
         "`make` is no local object"
     );
 }
+
+/// Assignment to an implicit `this` member variable emits a GEP temp and a Store.
+#[test]
+fn assignment_to_implicit_and_explicit_this_member_variable() {
+    let program = build_cpp(
+        "struct Target { int val; };\n\
+         class Observer {\n\
+             Target *target_ = nullptr;\n\
+             Target *other_ = nullptr;\n\
+         public:\n\
+             void SetTarget(Target *t) {\n\
+                 target_ = t;\n\
+                 this->other_ = t;\n\
+             }\n\
+         };\n",
+    );
+    let gep_fields: Vec<_> = program
+        .flow
+        .iter()
+        .filter_map(|f| match f {
+            FlowConstraint::GepField {
+                base,
+                field_name,
+                dst,
+                ..
+            } => {
+                let base_name = program.symbols.variable(*base).name.as_str();
+                Some((*dst, base_name, field_name.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        gep_fields
+            .iter()
+            .map(|(_, b, f)| (*b, *f))
+            .collect::<Vec<_>>(),
+        vec![("this", "target_"), ("this", "other_")]
+    );
+
+    let stores: Vec<_> = program
+        .flow
+        .iter()
+        .filter_map(|f| match f {
+            FlowConstraint::Store { dst, src } => {
+                let src_name = program.symbols.variable(*src).name.as_str();
+                Some((*dst, src_name))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stores,
+        vec![(gep_fields[0].0, "t"), (gep_fields[1].0, "t")],
+        "flow constraints: {:?}",
+        program.flow
+    );
+}
+
+#[test]
+fn nested_implicit_this_member_assignment_and_load() {
+    let program = build_cpp(
+        "struct Inner { int *val; };\n\
+         class Container {\n\
+             Inner inner_;\n\
+         public:\n\
+             void Set(int *p) {\n\
+                 inner_.val = p;\n\
+             }\n\
+             int* Get() {\n\
+                 return inner_.val;\n\
+             }\n\
+         };\n",
+    );
+    let gep_names: Vec<_> = program
+        .flow
+        .iter()
+        .filter_map(|f| match f {
+            FlowConstraint::GepField {
+                base,
+                field_name,
+                dst,
+                ..
+            } => {
+                let base_name = program.symbols.variable(*base).name.as_str();
+                Some((*dst, base_name, field_name.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        gep_names
+            .iter()
+            .any(|(_, b, f)| *b == "this" && *f == "inner_"),
+        "must emit GEP for this->inner_"
+    );
+    assert!(
+        gep_names.iter().any(|(_, _, f)| *f == "val"),
+        "must emit GEP for inner_.val"
+    );
+
+    let has_store = program.flow.iter().any(|f| match f {
+        FlowConstraint::Store { src, .. } => program.symbols.variable(*src).name == "p",
+        _ => false,
+    });
+    assert!(has_store, "must emit Store of p into inner_.val");
+
+    let get_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.ends_with("Get"))
+        .expect("Get fn");
+    let returns = program.fn_returns.get(&get_fn.id).expect("Get returns");
+    assert!(
+        !returns.is_empty(),
+        "Get() returning inner_.val must emit return flow"
+    );
+}
+
+#[test]
+fn inherited_implicit_this_member_assignment() {
+    let program = build_cpp(
+        "struct Base {\n\
+             int *base_val_;\n\
+         };\n\
+         class Derived : public Base {\n\
+         public:\n\
+             void SetBase(int *p) {\n\
+                 base_val_ = p;\n\
+             }\n\
+             int* GetBase() {\n\
+                 return base_val_;\n\
+             }\n\
+         };\n",
+    );
+    let gep_base = program
+        .flow
+        .iter()
+        .find_map(|f| match f {
+            FlowConstraint::GepField {
+                base,
+                field_name,
+                dst,
+                ..
+            } if field_name == "base_val_" && program.symbols.variable(*base).name == "this" => {
+                Some(*dst)
+            }
+            _ => None,
+        })
+        .expect("must emit GEP for this->base_val_ in Derived");
+
+    let has_store = program.flow.iter().any(|f| match f {
+        FlowConstraint::Store { dst, src } => {
+            *dst == gep_base && program.symbols.variable(*src).name == "p"
+        }
+        _ => false,
+    });
+    assert!(has_store, "must emit Store of p into this->base_val_");
+
+    let get_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.ends_with("GetBase"))
+        .expect("GetBase fn");
+    let returns = program.fn_returns.get(&get_fn.id).expect("GetBase returns");
+    assert!(
+        !returns.is_empty(),
+        "GetBase() returning base_val_ must emit return flow"
+    );
+}
+
+#[test]
+fn implicit_this_member_array_subscript_and_fn_ptr() {
+    let program = build_cpp(
+        "typedef void (*Callback)(int);\n\
+         void handler(int x);\n\
+         class Dispatcher {\n\
+             Callback handlers_[4];\n\
+             Callback single_cb_;\n\
+         public:\n\
+             void Init() {\n\
+                 handlers_[0] = handler;\n\
+                 single_cb_ = handler;\n\
+             }\n\
+             void Run() {\n\
+                 handlers_[0](42);\n\
+                 single_cb_(42);\n\
+             }\n\
+         };\n",
+    );
+    let gep_handlers = program
+        .flow
+        .iter()
+        .find_map(|f| match f {
+            FlowConstraint::GepField {
+                base,
+                field_name,
+                dst,
+                ..
+            } if field_name == "handlers_" && program.symbols.variable(*base).name == "this" => {
+                Some(*dst)
+            }
+            _ => None,
+        })
+        .expect("must emit GEP for this->handlers_");
+
+    let gep_single = program
+        .flow
+        .iter()
+        .find_map(|f| match f {
+            FlowConstraint::GepField {
+                base,
+                field_name,
+                dst,
+                ..
+            } if field_name == "single_cb_" && program.symbols.variable(*base).name == "this" => {
+                Some(*dst)
+            }
+            _ => None,
+        })
+        .expect("must emit GEP for this->single_cb_");
+
+    let has_handlers_store = program.flow.iter().any(|f| match f {
+        FlowConstraint::Store { dst, .. } => *dst == gep_handlers,
+        _ => false,
+    });
+    assert!(has_handlers_store, "must emit Store to handlers_ array");
+
+    let has_single_store = program.flow.iter().any(|f| match f {
+        FlowConstraint::Store { dst, .. } => *dst == gep_single,
+        _ => false,
+    });
+    assert!(has_single_store, "must emit Store to single_cb_");
+}

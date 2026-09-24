@@ -1,5 +1,37 @@
 # Evaluation Report
 
+## Implicit this member variable access and assignments — 2026-09-24 (#145)
+
+The rules are defined in [Implicit this member variable access](ANALYSIS.md#implicit-this-member-variable-access).
+This change fixes a bug where unqualified variable accesses inside C++ instance methods
+referring to class member fields were dropped during AST lowering.
+
+### Problem & Fix
+
+- In C++, `member_ = val;` is semantically `this->member_ = val;`. Previously,
+  unqualified identifiers on the LHS of assignments only looked up locals and
+  parameters, and `"this"` was not recognized in `resolve_lvalue_var` or
+  `resolve_expr_var`. Assignments to implicit and explicit `this` member variables
+  were silently dropped.
+- In `trace-parse`, lowering now resolves implicit `this` member identifiers and
+  array subscripts via `resolve_implicit_this_member`, emits stores through
+  `emit_store_to_location`, searches base class hierarchies (`bases_of`), supports
+  nested member paths (`inner_.val = p;`) in `decompose_field_path`, and models
+  element subscripts, member callback calls (`table_[i]()`), and return flows.
+- Real-world impact: in OpenHarmony `resourceschedule_memmgr`
+  (`services/memmgrservice/src/event/memory_pressure_observer.cpp`),
+  `handlerInfo_ = (struct LevelHandler*)curEpollEvent->data.ptr;` now emits
+  a store into `this->handlerInfo_`, preserving pointer flow from the epoll
+  event loop to the callback handler.
+
+### Pinned Corpus Validation
+
+Evaluated with `python3 scripts/eval_check.py --skip-rev-check` on release build:
+- **Pass rate**: **94 checks, 0 failures** across hdf (`cdc75a2`), hiview (`92408e2`),
+  and camera (`8ffd69d`).
+- No regressions in call graph edges, indirect calls, IPC bridges, or arg flow edges.
+- Diagnostics and points-to fixpoints converge cleanly within budget.
+
 ## Smart-pointer value flow — 2026-09-24 (#141)
 
 The rules are defined in [Smart-pointer unwrap](ANALYSIS.md#smart-pointer-unwrap)
