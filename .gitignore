@@ -3,3 +3,4 @@
 *.db.tmp
 __pycache__/
 *.pyc
+/.superpowers/

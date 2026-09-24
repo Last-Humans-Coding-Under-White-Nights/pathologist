@@ -1036,7 +1036,8 @@ pub fn dataflow_graph(
     if starts.is_empty() {
         bail!(
             "no value-flow node for symbol(s): {}; \
-             the database may predate flow-graph export",
+             no pointer flow reads or writes it, or the database predates \
+             flow-graph export",
             symbols
                 .iter()
                 .map(|s| s.name.as_str())

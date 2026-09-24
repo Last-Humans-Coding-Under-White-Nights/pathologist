@@ -215,6 +215,8 @@ struct SolverState {
 struct Scratch {
     /// `apply_store_to_targets`: the store's source set, materialized once.
     store_src: Vec<LocId>,
+    /// `in_set_order`: a popped node's new locations, as a set.
+    store_src_new: FxHashSet<LocId>,
     /// `apply_store_to_targets`: every location the store writes.
     store_targets: Vec<LocId>,
     /// `apply_store_to_targets`: locations whose loaders must be requeued.
@@ -506,6 +508,9 @@ fn solve(
     // Lives beside the state, not in it: passing a buffer to the step that
     // needs it makes two steps sharing one a compile error.
     let mut scratch = Scratch::default();
+    // A popped node's new locations in its set's order, shared by every store
+    // it feeds: outside `scratch`, which each store borrows.
+    let mut new_in_order: Vec<LocId> = Vec::new();
     // Per-location slot guards and per-function parameter counts for
     // signature-aware propagation.
     for loc in &pag.locations {
@@ -605,7 +610,16 @@ fn solve(
                     &mut wired_arg_flow,
                 );
             }
-            apply_fn_model(pag, &mut st, cs, &f.name, models, &mut terminator_events);
+            apply_fn_model(
+                pag,
+                program,
+                &mut st,
+                &mut scratch,
+                cs,
+                &f.name,
+                models,
+                &mut terminator_events,
+            );
         }
     }
     if stats_enabled {
@@ -814,14 +828,31 @@ fn solve(
                         &mut st,
                         &mut scratch,
                         Some(delta.as_slice()),
+                        StoreSource::Whole,
                     );
                 }
             }
 
             if let Some(idxs) = pag.indices.store_src.get(&node) {
+                // Every target already holds what the source held before
+                // this pop, so only its new locations are written.
+                in_set_order(
+                    st.pts.get(&node),
+                    &delta,
+                    &mut scratch.store_src_new,
+                    &mut new_in_order,
+                );
                 for &idx in idxs {
                     w_store += 1;
-                    apply_store_to_targets(pag, program, idx, &mut st, &mut scratch, None);
+                    apply_store_to_targets(
+                        pag,
+                        program,
+                        idx,
+                        &mut st,
+                        &mut scratch,
+                        None,
+                        StoreSource::New(&new_in_order),
+                    );
                 }
             }
         }
@@ -1077,7 +1108,9 @@ fn solve(
                         }
                         apply_fn_model(
                             pag,
+                            program,
                             &mut st,
+                            &mut scratch,
                             cs,
                             &program.symbols.function(callee).name,
                             models,
@@ -1181,9 +1214,12 @@ fn model_copy_side(pag: &Pag, node: PagNodeId) -> PagNodeId {
 /// flows through bodyless callees, and record terminator events.
 /// `ReturnAlias` / `ReturnHeap` are handled at PAG build time (they target
 /// the `CallReturn` destination, not call arguments).
+#[allow(clippy::too_many_arguments)]
 fn apply_fn_model(
     pag: &mut Pag,
+    program: &Program,
     st: &mut SolverState,
+    scratch: &mut Scratch,
     cs: &trace_ir::CallSite,
     callee_name: &str,
     models: &FnModelSet,
@@ -1251,10 +1287,19 @@ fn apply_fn_model(
                         });
                         pag.indices.store_dst.entry(p).or_default().push(idx);
                         pag.indices.store_src.entry(v).or_default().push(idx);
-                        // Either side gaining pointees must re-fire the store;
-                        // evaluate both immediately with current knowledge.
-                        st.push(p);
-                        st.push(v);
+                        // Fire once with everything both sides hold now: a
+                        // side that has settled pops with an empty delta and
+                        // would never fire it. From here on, each side's
+                        // growth fires it through the indices like any store.
+                        apply_store_to_targets(
+                            pag,
+                            program,
+                            idx,
+                            st,
+                            scratch,
+                            None,
+                            StoreSource::Whole,
+                        );
                     }
                 }
             }
@@ -1303,11 +1348,43 @@ fn propagate_locs(
     st.commit_fresh(dst, fresh);
 }
 
+/// Which of a store's source locations [`apply_store_to_targets`] writes.
+#[derive(Clone, Copy)]
+enum StoreSource<'a> {
+    /// The source's whole current set: for targets written for the first
+    /// time, and a model store's firing when it is wired.
+    Whole,
+    /// Only these newly gained locations, in the source set's own order
+    /// ([`in_set_order`]): every target already holds the rest (difference
+    /// propagation on the value side).
+    New(&'a [LocId]),
+}
+
+/// The members of `set` that `delta` names, in `set`'s iteration order: the
+/// order a whole-set store writes them, so a store of only the new locations
+/// fills each cell as a whole-set one would (docs/ANALYSIS.md, "Propagation
+/// highlights").
+fn in_set_order(
+    set: Option<&FxHashSet<LocId>>,
+    delta: &[LocId],
+    members: &mut FxHashSet<LocId>,
+    out: &mut Vec<LocId>,
+) {
+    out.clear();
+    members.clear();
+    members.extend(delta.iter().copied());
+    if let Some(set) = set {
+        out.extend(set.iter().copied().filter(|l| members.contains(l)));
+    }
+}
+
 /// Store `*ptr = value`: write the value side's current points-to (plus its
 /// own storage location for var nodes) into the memories of the given target
 /// locations. `targets == None` means every location currently in the pointer
 /// node's set; `Some(delta)` restricts writes to newly gained targets
 /// (difference propagation — their memory is written for the first time).
+/// `written` says which source locations go: the whole set, or only the
+/// new ones, in the order the whole set would write them.
 fn apply_store_to_targets(
     pag: &Pag,
     program: &Program,
@@ -1315,6 +1392,7 @@ fn apply_store_to_targets(
     st: &mut SolverState,
     scratch: &mut Scratch,
     targets: Option<&[LocId]>,
+    written: StoreSource,
 ) {
     let c = &pag.constraints[idx];
     let (src_node, dst_node) = (c.src, c.dst);
@@ -1355,13 +1433,15 @@ fn apply_store_to_targets(
     // *function* value, so a source carrying none needs no view at all.
     let src = &mut scratch.store_src;
     src.clear();
-    let mut src_has_fns = false;
-    if let Some(s) = st.pts.get(&src_node) {
-        for &l in s.iter() {
-            src_has_fns |= fn_for_loc(pag, l).is_some();
-            src.push(l);
+    match written {
+        StoreSource::Whole => {
+            if let Some(s) = st.pts.get(&src_node) {
+                src.extend(s.iter().copied());
+            }
         }
+        StoreSource::New(locs) => src.extend_from_slice(locs),
     }
+    let src_has_fns = src.iter().any(|&l| fn_for_loc(pag, l).is_some());
     let src = &scratch.store_src;
     let views = &mut scratch.store_views;
     views.reset();

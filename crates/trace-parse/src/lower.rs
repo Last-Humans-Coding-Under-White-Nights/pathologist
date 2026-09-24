@@ -99,11 +99,17 @@ struct LowerContext {
     pending: RefCell<Vec<PendingFnRef>>,
     /// C++ namespace stack; `None` = anonymous namespace level.
     ns_stack: Vec<Option<String>>,
-    /// Namespaces made visible by `using namespace X;` (bare spellings).
+    /// Namespaces made visible by `using namespace X;` (bare spellings),
+    /// innermost directive last and each directive's candidates reversed;
+    /// read through [`LowerContext::directive_namespaces`].
     using_nss: Vec<String>,
-    /// Specific members imported by `using X::member;` as `(base, qual)`.
-    /// A bare `member()` call then resolves to the exact `qual` entry.
-    using_name_imports: Vec<(String, String)>,
+    /// Specific members imported by `using X::member;`, one entry per
+    /// declaration, innermost last. A bare `member()` call then resolves to
+    /// the exact entries the declaration's spelling may denote.
+    using_name_imports: Vec<UsingImport>,
+    /// Inside `extern "C"`: a namespace variable declared here links by its
+    /// bare name (`Variable::c_linkage`).
+    c_linkage: bool,
     /// Enclosing class while lowering in-class member definitions.
     class_ctx: Option<ClassCtx>,
     /// Fully qualified classes whose scope a type name is looked up in,
@@ -178,6 +184,14 @@ struct ClassCtx {
 }
 
 impl LowerContext {
+    /// The namespaces `using namespace` directives in scope make visible:
+    /// the innermost directive first, and within one directive the enclosing
+    /// namespace's entry before the global one (docs/ANALYSIS.md, "Canonical
+    /// variable identity").
+    fn directive_namespaces(&self) -> impl Iterator<Item = &str> {
+        self.using_nss.iter().rev().map(String::as_str)
+    }
+
     fn is_macro_ignored(&self, name: &str) -> bool {
         if self.ignored_macros.is_empty() {
             return false;
@@ -2317,6 +2331,7 @@ fn lower_prepared_source(
         ns_stack: Vec::new(),
         using_nss: Vec::new(),
         using_name_imports: Vec::new(),
+        c_linkage: false,
         class_ctx: None,
         type_scope: RefCell::new(Vec::new()),
         local_aliases: Vec::new(),
@@ -2373,34 +2388,34 @@ fn lower_prepared_source(
             function.is_weak |= function.linkage == trace_ir::Linkage::External
                 && weak_names.contains(function.name.as_str());
         }
-        // A namespaced global is excluded for the same reason the selection
-        // below excludes it: `app::cb` is mangled, so the pragma's
-        // unqualified `cb` is not the symbol it names.
+        // Matched on the external symbol name, as a function is on its
+        // qualified name: the pragma's bare `cb` names `::cb`, never
+        // `app::cb`, and an internal-linkage variable has no symbol at all.
         for variable in &mut program.symbols.variables {
-            variable.is_weak |= variable.storage == StorageClass::Global
-                && !variable.is_namespaced
-                && weak_names.contains(variable.name.as_str());
+            variable.is_weak |= variable
+                .external_symbol_name()
+                .is_some_and(|symbol| weak_names.contains(symbol));
         }
     }
     // By now the symbol table knows whether anything was actually marked, which
     // is narrower than `has_weak` (a guess made from the source text).
     if program.symbols.has_weak_symbols() {
         // Weak binding is a property of the external symbol, not one spelling
-        // of its declaration. A later annotation also applies to earlier rows.
-        // A namespaced global is excluded on both sides: its unqualified name
-        // is not its symbol name, so `a::cb` must not weaken `b::cb`.
-        let shares_linkage_name =
-            |v: &Variable| v.storage == StorageClass::Global && !v.is_namespaced;
+        // of its declaration. A later annotation also applies to earlier rows
+        // of the same symbol — `a::cb`'s, never `b::cb`'s.
         let weak_globals: HashSet<String> = program
             .symbols
             .variables
             .iter()
-            .filter(|v| shares_linkage_name(v) && v.is_weak)
-            .map(|v| v.name.clone())
+            .filter(|v| v.is_weak)
+            .filter_map(|v| v.external_symbol_name().map(str::to_string))
             .collect();
         if !weak_globals.is_empty() {
             for variable in &mut program.symbols.variables {
-                if shares_linkage_name(variable) && weak_globals.contains(&variable.name) {
+                if variable
+                    .external_symbol_name()
+                    .is_some_and(|symbol| weak_globals.contains(symbol))
+                {
                     variable.is_weak = true;
                 }
             }
@@ -2741,19 +2756,28 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
     ctx.ast_depth += 1;
     match node.kind() {
         "function_definition" => lower_function(program, ctx, source, node),
-        "declaration" => lower_declaration(program, ctx, source, node, None),
+        "declaration" => {
+            lower_class_defined_in(program, ctx, source, node);
+            lower_declaration(program, ctx, source, node, None);
+        }
         "struct_specifier" | "union_specifier" | "class_specifier" => {
-            let tag = lower_struct_specifier(program, ctx, source, node);
-            // In C++, `struct` is identical to `class` except for default
-            // visibility — structs may have constructors, destructors, and
-            // member functions that must be lowered just like classes.
-            if node.kind() == "class_specifier" || (ctx.is_cpp && node.kind() == "struct_specifier")
-            {
-                lower_class_members(program, ctx, source, node, &tag);
-            }
+            lower_class_specifier(program, ctx, source, node);
         }
         "namespace_definition" => lower_namespace(program, ctx, source, node),
         "using_declaration" => lower_using_declaration(ctx, source, node),
+        // `extern "C" { ... }` / `extern "C" T x;`: what it declares links by
+        // its bare name; a nested `extern "C++"` restores C++ linkage.
+        "linkage_specification" => {
+            let outer = ctx.c_linkage;
+            ctx.c_linkage = node
+                .child_by_field_name("value")
+                .is_some_and(|v| node_text(source, &v) == "\"C\"");
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                lower_tree(program, ctx, source, child);
+            }
+            ctx.c_linkage = outer;
+        }
         // Templates are lowered once, as a merged representative of all
         // instantiations; explicit specializations fold into the same entry
         // (documented imprecision). The inner definition carries everything.
@@ -2766,7 +2790,10 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
                 lower_tree(program, ctx, source, child);
             }
         }
-        "type_definition" | "alias_declaration" => lower_alias(program, ctx, source, node),
+        "type_definition" | "alias_declaration" => {
+            lower_class_defined_in(program, ctx, source, node);
+            lower_alias(program, ctx, source, node);
+        }
         _ => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -2775,6 +2802,32 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
         }
     }
     ctx.ast_depth = ctx.ast_depth.saturating_sub(1);
+}
+
+/// A class specifier: its layout, and, as in C++ `struct` and `union` are
+/// classes with other defaults, its members — constructors, destructors,
+/// member functions and static data members.
+fn lower_class_specifier(program: &mut Program, ctx: &mut LowerContext, source: &str, node: Node) {
+    let tag = lower_struct_specifier(program, ctx, source, node);
+    if node.kind() == "class_specifier" || ctx.is_cpp {
+        lower_class_members(program, ctx, source, node, &tag);
+    }
+}
+
+/// The class a C++ declaration or typedef defines (`struct S { ... } s;`,
+/// `typedef struct T { ... } TA;`), lowered as one standing alone is. The
+/// declaration's own type lowering registers the layout again, which is
+/// idempotent (`register_static_data_member` included).
+fn lower_class_defined_in(program: &mut Program, ctx: &mut LowerContext, source: &str, node: Node) {
+    if !ctx.is_cpp {
+        return;
+    }
+    if let Some(spec) = node
+        .child_by_field_name("type")
+        .filter(|t| is_named_class_definition(*t))
+    {
+        lower_class_specifier(program, ctx, source, spec);
+    }
 }
 
 fn lower_namespace(program: &mut Program, ctx: &mut LowerContext, source: &str, node: Node) {
@@ -2835,20 +2888,40 @@ fn lower_namespace(program: &mut Program, ctx: &mut LowerContext, source: &str, 
     }
 }
 
-/// Enclosing namespaces of the current scope, innermost first, as joined
-/// prefixes (`namespace a { namespace b { … } }` yields `a::b`, `a`).
-/// When `include_self` is true the innermost namespace itself is also
-/// included (needed by `expand_using_target` so that `using namespace detail;`
-/// written inside `relns::directive_host` also yields `relns::directive_host`
-/// as a prefix — C++ resolves the first segment against the enclosing scope).
-fn enclosing_namespace_prefixes(ctx: &LowerContext, include_self: bool) -> Vec<String> {
+/// The namespaces enclosing the current scope, the innermost (the current
+/// namespace itself) first, as joined prefixes: `namespace a { namespace b
+/// { … } }` yields `a::b`, `a`. The global scope is no prefix.
+fn enclosing_namespace_prefixes(ctx: &LowerContext) -> Vec<String> {
     let chain: Vec<&str> = ctx.ns_stack.iter().flatten().map(String::as_str).collect();
-    let end = if include_self {
-        chain.len()
-    } else {
-        chain.len().saturating_sub(1)
-    };
-    (0..=end).rev().map(|len| chain[..len].join("::")).collect()
+    (1..=chain.len())
+        .rev()
+        .map(|len| chain[..len].join("::"))
+        .collect()
+}
+
+/// One `using X::member;` declaration.
+#[derive(Debug, Clone, PartialEq)]
+struct UsingImport {
+    /// The imported name, `member`.
+    base: String,
+    /// What `X::member` may denote from the declaration's scope, innermost
+    /// enclosing namespace first ([`expand_using_target`]).
+    candidates: Vec<String>,
+    /// Where the declaration is written, which decides what it hides.
+    scope: ImportScope,
+}
+
+/// Where a `using X::member;` declaration is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportScope {
+    /// A function body: it hides everything declared outside the body, as a
+    /// local does.
+    Body,
+    /// A namespace: it declares `member` there, so it hides the global scope.
+    Namespace,
+    /// File scope: it declares `member` at the global scope, beside the
+    /// global declarations, which are asked first.
+    File,
 }
 
 /// All namespaces a relative `using` target may denote: the target with its
@@ -2858,18 +2931,18 @@ fn enclosing_namespace_prefixes(ctx: &LowerContext, include_self: bool) -> Vec<S
 /// mean `detail` **or** `a::detail`; `using inner::fold;` may mean
 /// `inner::fold` or `a::inner::fold`. Recording every plausible form keeps
 /// the lookup sound (over-approximation) — a resolve-time miss would degrade
-/// the call to an external stub. Leading-`::` targets are already globally
-/// qualified and returned unchanged.
+/// the call to an external stub. A leading-`::` target is already global
+/// and yields its canonical spelling, without the `::`.
 fn expand_using_target(ctx: &LowerContext, target: &str) -> Vec<String> {
+    if let Some(global) = target.strip_prefix("::") {
+        return vec![global.to_string()];
+    }
     let (first, rest) = match target.find("::") {
         Some(idx) => (&target[..idx], Some(&target[idx + 2..])),
         None => (target, None),
     };
-    if first.is_empty() {
-        return vec![target.to_string()];
-    }
     let mut out: Vec<String> = Vec::new();
-    for prefix in enclosing_namespace_prefixes(ctx, true) {
+    for prefix in enclosing_namespace_prefixes(ctx) {
         let qualified_first = format!("{prefix}::{first}");
         match rest {
             Some(r) => out.push(format!("{qualified_first}::{r}")),
@@ -2894,7 +2967,8 @@ fn lower_using_declaration(ctx: &mut LowerContext, source: &str, node: Node) {
     }
     if let Some(t) = target {
         if is_ns_using {
-            for qualified in expand_using_target(ctx, &t) {
+            // Reversed, so `directive_namespaces` reads them innermost first.
+            for qualified in expand_using_target(ctx, &t).into_iter().rev() {
                 if !ctx.using_nss.contains(&qualified) {
                     ctx.using_nss.push(qualified);
                 }
@@ -2905,12 +2979,19 @@ fn lower_using_declaration(ctx: &mut LowerContext, source: &str, node: Node) {
             // considers the exact imported entry (sound over-approximation:
             // the declaration specifically names this function). Relative
             // spellings are expanded against the enclosing namespaces too.
-            let base = t.rsplit("::").next().unwrap_or(&t).to_string();
-            for qualified in expand_using_target(ctx, &t) {
-                let pair = (base.clone(), qualified);
-                if !ctx.using_name_imports.contains(&pair) {
-                    ctx.using_name_imports.push(pair);
-                }
+            let import = UsingImport {
+                base: t.rsplit("::").next().unwrap_or(&t).to_string(),
+                candidates: expand_using_target(ctx, &t),
+                scope: if ctx.current_fn.is_some() {
+                    ImportScope::Body
+                } else if ctx.ns_stack.is_empty() {
+                    ImportScope::File
+                } else {
+                    ImportScope::Namespace
+                },
+            };
+            if !ctx.using_name_imports.contains(&import) {
+                ctx.using_name_imports.push(import);
             }
         }
     }
@@ -3033,10 +3114,14 @@ fn lower_struct_specifier(
         name = format!("anon_{}", program.anon_type_counter);
     }
 
-    // Classes (and C++ structs, which are classes with different defaults)
-    // register under their fully qualified tag so type references, owner-class
-    // derivation and member resolution all agree on one name.
-    let is_cpp_class = ctx.is_cpp && matches!(node.kind(), "class_specifier" | "struct_specifier");
+    // Classes (and C++ structs and unions, which are classes with different
+    // defaults) register under their fully qualified tag so type references,
+    // owner-class derivation and member resolution all agree on one name.
+    let is_cpp_class = ctx.is_cpp
+        && matches!(
+            node.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        );
     let member_tag = member_class_tag(ctx, source, node);
     let reg_name = match &member_tag {
         Some(tag) if tag.nests => tag.spelling.clone(),
@@ -3178,6 +3263,15 @@ fn lower_struct_specifier(
                             continue;
                         }
                     }
+                    // A `static` data member has one shared storage, not a
+                    // per-instance slot: register it as a canonical variable
+                    // instead of sweeping it into this class's instance-field
+                    // layout. See docs/ANALYSIS.md, "Canonical variable
+                    // identity".
+                    if is_cpp_class && declaration_is_static(child) {
+                        register_static_data_member(program, ctx, source, child, &reg_name);
+                        continue;
+                    }
                     if let Some((fname, field_type)) =
                         type_desc_from_field_declaration(program, ctx, source, child)
                     {
@@ -3218,6 +3312,181 @@ fn lower_struct_specifier(
         }
     }
     reg_name
+}
+
+/// Register a `static` data member's storage: one canonical variable per
+/// member, keyed the same way `register_member_prototype` keys a member
+/// function (`{cls_qual}::{name}`), so `Holder::member` and
+/// `nest::Box::member` never collide and an out-of-class definition can find
+/// this entry again through `reconcile_static_member_definition`. Only
+/// identity/storage is registered here: this runs in the field-layout pass,
+/// which carries a shared `&LowerContext` and cannot itself lower an
+/// initializer's flow (that needs `&mut`). An in-class initializer
+/// (`inline static int *m = &x;`) is lowered once `lower_class_definitions`
+/// reaches this member with a mutable context, by
+/// `lower_static_data_member`.
+///
+/// `static` on a data member means "one shared instance", not the
+/// file-scope rule `storage_for` applies to a `static` local/global
+/// declaration: the member has external linkage unless its class does not
+/// (an anonymous-namespace class), so linkage is read off the class's own
+/// scope instead.
+fn register_static_data_member(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    field: Node,
+    cls_qual: &str,
+) {
+    let Some(type_node) = field.child_by_field_name("type") else {
+        return;
+    };
+    let base_type_id = parse_type_node(program, ctx, source, type_node);
+    let span = node_span(program, ctx, field);
+    // `static` on a member is not the file-scope `static`: the member links
+    // like a namespace-scope variable of its class's scope.
+    let storage = storage_for(ctx, false);
+    // `inline static T m;` defines the member, zero-initialized.
+    let is_inline = has_storage_specifier(source, field, "inline");
+    for (decl, init_expr) in field_declarators(field) {
+        let (name, is_ptr) = parse_declarator_name(source, decl);
+        if name.is_empty() {
+            continue;
+        }
+        let qualified_name = format!("{cls_qual}::{name}");
+        // A class lowered again (`struct S { ... } s;`) keeps the variable
+        // its declaration registered.
+        if program
+            .symbols
+            .variable_named_in_scope(&qualified_name, ctx.current_file)
+            .is_some_and(|id| program.symbols.variable(id).span == span)
+        {
+            continue;
+        }
+        let base_desc = program.types.get(base_type_id).desc.as_ref().clone();
+        let type_id = program.types.intern(walk_declarator_shape(decl, base_desc));
+        let is_fn_ptr = is_function_pointer_declarator(decl);
+        let var_id = program.symbols.alloc_var_id();
+        program.symbols.add_variable(Variable {
+            is_defined: is_inline || init_expr.is_some(),
+            is_weak: weak_global(ctx, storage, source, decl),
+            target: None,
+            is_namespaced: true,
+            qualified_name: Some(qualified_name),
+            c_linkage: false,
+            id: var_id,
+            name,
+            type_id,
+            storage,
+            fn_id: None,
+            param_index: None,
+            span,
+            is_pointer: is_fn_ptr || is_ptr,
+        });
+    }
+}
+
+/// The declarators of a `field_declaration`, each with the `default_value`
+/// written after it: `static T a = x, b = y;` spells both as flat siblings.
+fn field_declarators(field: Node) -> Vec<(Node, Option<Node>)> {
+    let mut declarators: Vec<(Node, Option<Node>)> = Vec::new();
+    let mut cursor = field.walk();
+    if !cursor.goto_first_child() {
+        return declarators;
+    }
+    loop {
+        match cursor.field_name() {
+            Some("declarator") => declarators.push((cursor.node(), None)),
+            Some("default_value") => {
+                if let Some((_, init)) = declarators.last_mut() {
+                    *init = Some(cursor.node());
+                }
+            }
+            _ => {}
+        }
+        if !cursor.goto_next_sibling() {
+            return declarators;
+        }
+    }
+}
+
+/// The `&mut`-context half of [`register_static_data_member`], once each
+/// member's canonical `VarId` exists: records a reference member as a
+/// reference binding and lowers an in-class initializer. `field` must be the
+/// same `field_declaration` node `register_static_data_member` registered; a
+/// member without a `default_value` (the common case — the initializer lives
+/// in a separate out-of-class definition instead) lowers no flow.
+fn lower_static_data_member(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    field: Node,
+    cls_qual: &str,
+) {
+    let span = node_span(program, ctx, field);
+    let in_dep = program.is_dep_file(span.file);
+    for (decl, init) in field_declarators(field) {
+        let (name, _) = parse_declarator_name(source, decl);
+        if name.is_empty() {
+            continue;
+        }
+        let canonical = format!("{cls_qual}::{name}");
+        let Some(var_id) = program
+            .symbols
+            .variable_named_in_scope(&canonical, ctx.current_file)
+        else {
+            continue;
+        };
+        mark_reference_binding(ctx, decl, var_id);
+        let Some(init) = init.filter(|_| !in_dep) else {
+            continue;
+        };
+        let type_id = program.symbols.variable(var_id).type_id;
+        let capture = start_initializer_capture(program, ctx);
+        lower_var_initializer(program, ctx, source, var_id, type_id, decl, init);
+        finish_initializer_capture(program, ctx, capture, var_id);
+    }
+}
+
+/// Where a global initializer's facts start, when merge needs to know whose
+/// they are: a weak definition's initializer is dropped with the definition
+/// a strong one supersedes. `None` when no weak symbol makes that matter.
+fn start_initializer_capture(program: &Program, ctx: &LowerContext) -> Option<(usize, usize)> {
+    (ctx.record_link_ownership && ctx.has_weak && ctx.current_fn.is_none())
+        .then(|| (program.flow.len(), ctx.pending.borrow().len()))
+}
+
+/// Attribute the facts emitted since `start` (flow, and deferred function
+/// references) to the initializer of `owner`.
+fn finish_initializer_capture(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    start: Option<(usize, usize)>,
+    owner: VarId,
+) {
+    let Some((flow_start, pending_start)) = start else {
+        return;
+    };
+    let end = program.flow.len();
+    if end > flow_start {
+        program
+            .global_initializer_ranges
+            .entry(owner)
+            .or_default()
+            .push(flow_start..end);
+    }
+    for index in pending_start..ctx.pending.borrow().len() {
+        ctx.pending_initializer_owners.insert(index, owner);
+    }
+}
+
+/// Record `var_id`, declared by `decl`, as a C++ reference when it is one:
+/// its value is its referent's address, and `&r` names the referent.
+fn mark_reference_binding(ctx: &mut LowerContext, decl: Node, var_id: VarId) {
+    if decl.kind() == "reference_declarator" {
+        ctx.reference_vars.insert(var_id);
+        ctx.reference_bindings.insert(var_id);
+    }
 }
 
 /// Lower the member functions of a class body: prototypes first (so later
@@ -3321,6 +3590,18 @@ fn lower_class_definitions(
     let saved = ctx.class_ctx.replace(ClassCtx {
         qual_name: cls_qual.to_string(),
     });
+    // A static data member's own VarId was already registered by the
+    // field-layout pass (`register_static_data_member`); an in-class
+    // initializer needs the mutable context this pass carries, so it is
+    // lowered here rather than there.
+    for &m in &members {
+        if m.kind() == "field_declaration"
+            && !member_decl_is_function(m)
+            && declaration_is_static(m)
+        {
+            lower_static_data_member(program, ctx, source, m, cls_qual);
+        }
+    }
     let signatures: Vec<_> = members
         .iter()
         .map(|&m| {
@@ -3347,10 +3628,12 @@ fn lower_class_definitions(
     ctx.type_scope.borrow_mut().pop();
 }
 
-/// A `class` / `struct` specifier with a name.
+/// A `class` / `struct` / `union` specifier with a name.
 fn is_named_class_specifier(node: Node) -> bool {
-    matches!(node.kind(), "class_specifier" | "struct_specifier")
-        && node.child_by_field_name("name").is_some()
+    matches!(
+        node.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier"
+    ) && node.child_by_field_name("name").is_some()
 }
 
 /// A `class` / `struct` specifier with a name and a body.
@@ -3431,12 +3714,17 @@ fn enclosing_member_class(spec: Node) -> Option<Node> {
     let body = member
         .parent()
         .filter(|b| b.kind() == "field_declaration_list")?;
-    body.parent()
-        .filter(|o| matches!(o.kind(), "class_specifier" | "struct_specifier"))
+    body.parent().filter(|o| {
+        matches!(
+            o.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        )
+    })
 }
 
 /// Whether a class specifier uses anything a C struct cannot: the `class`
-/// keyword, a template head, bases, or members other than data fields.
+/// keyword, a template head, bases, or members other than instance data
+/// fields (a `static` data member is C++-only).
 fn is_cpp_only_class(spec: Node) -> bool {
     if spec.kind() == "class_specifier"
         || spec
@@ -3456,7 +3744,7 @@ fn is_cpp_only_class(spec: Node) -> bool {
     };
     body.named_children(&mut body.walk())
         .any(|m| match m.kind() {
-            "field_declaration" => member_decl_is_function(m),
+            "field_declaration" => member_decl_is_function(m) || declaration_is_static(m),
             kind => matches!(
                 kind,
                 "function_definition"
@@ -3777,14 +4065,14 @@ fn weak_global(ctx: &LowerContext, storage: StorageClass, source: &str, node: No
     storage == StorageClass::Global && ctx.has_weak && declaration_is_weak(source, node)
 }
 
-/// Whether a global's unqualified name is *not* the name a linker resolves.
-///
-/// Any enclosing namespace makes it so, anonymous ones included: those have
-/// internal linkage and are not shared symbols at all. Target-scoped
-/// unification and weak override are both keyed on the unqualified name, so
-/// they must leave such a global alone.
-fn namespaced_global(ctx: &LowerContext, storage: StorageClass) -> bool {
-    storage == StorageClass::Global && !ctx.ns_stack.is_empty()
+/// Whether a variable of `storage` is declared at namespace scope inside a
+/// named C++ namespace, and so is identified by its canonical qualified name
+/// (`docs/ANALYSIS.md`, "Canonical variable identity") whatever its linkage:
+/// `ns::p` names a namespace `static` as it names an external global. An
+/// anonymous namespace adds no segment, so one at top level qualifies nothing.
+fn namespace_scoped(ctx: &LowerContext, storage: StorageClass) -> bool {
+    matches!(storage, StorageClass::Global | StorageClass::FileStatic)
+        && ctx.ns_stack.iter().any(Option::is_some)
 }
 
 /// The declarator this reference sits in, when the declaration introduces more
@@ -4008,7 +4296,7 @@ fn lower_function_signature(
     // wherever its definition is written: after the namespace closes, or in
     // the `.cpp` including the class's header.
     let definition_file = node_span(program, ctx, node).file;
-    let is_static = (eff_class.is_none() && declaration_is_static(source, node))
+    let is_static = (eff_class.is_none() && declaration_is_static(node))
         || ctx.in_anonymous_namespace()
         || eff_class.as_ref().is_some_and(|cls| {
             program.class_is_anonymous_in(cls, |f| program.symbols.file_sees(definition_file, f))
@@ -4215,12 +4503,7 @@ fn derive_owner_class(program: &Program, qualified_name: &str) -> Option<String>
     qualified_name
         .rmatch_indices("::")
         .map(|(at, _)| &qualified_name[..at])
-        .find(|prefix| {
-            program
-                .types
-                .type_id_by_tag(prefix, trace_ir::TypeKind::Struct)
-                .is_some()
-        })
+        .find(|prefix| program.types.class_type_id(prefix).is_some())
         .map(str::to_owned)
 }
 
@@ -4239,6 +4522,8 @@ fn add_this_param(program: &mut Program, cls: &str, fn_id: FnId, span: Span) -> 
         is_weak: false,
         target: None,
         is_namespaced: false,
+        qualified_name: None,
+        c_linkage: false,
         id: this_id,
         name: "this".to_string(),
         type_id: this_type,
@@ -4373,9 +4658,8 @@ fn lower_parameter(
     };
     let type_id = program.types.intern(type_desc);
     let var_id = program.symbols.alloc_var_id();
-    if declarator.is_some_and(|d| d.kind() == "reference_declarator") {
-        ctx.reference_vars.insert(var_id);
-        ctx.reference_bindings.insert(var_id);
+    if let Some(declarator) = declarator {
+        mark_reference_binding(ctx, declarator, var_id);
     }
     let span = node_span(program, ctx, node);
     program.symbols.add_variable(Variable {
@@ -4383,6 +4667,8 @@ fn lower_parameter(
         is_weak: false,
         target: None,
         is_namespaced: false,
+        qualified_name: None,
+        c_linkage: false,
         id: var_id,
         name: name.clone(),
         type_id,
@@ -4518,7 +4804,7 @@ fn call_result_shape(
     }
     if matches!(func.kind(), "identifier" | "qualified_identifier") {
         let spelled = normalize_qualified(node_text(source, &func));
-        if lookup_var(ctx, program, &spelled).is_none() {
+        if lookup_var_node(program, ctx, source, func).is_none() {
             // `T(args)` constructs a `T`, as the call site reads it.
             if let Some(cls) = constructed_class(program, ctx, &spelled) {
                 let desc = (!spelling_is_dependent(ctx, source, value, &spelled, Spelling::Source))
@@ -4857,8 +5143,7 @@ fn class_seen_from(program: &Program, ctx: &LowerContext, name: &str) -> Option<
                 None => break,
             }
         }
-        ctx.using_nss
-            .iter()
+        ctx.directive_namespaces()
             .find_map(|ns| declared_class_name(program, &format!("{ns}::{bare}")))
     })
 }
@@ -4880,11 +5165,10 @@ fn smart_ptr_factory(ctx: &LowerContext, name: &str) -> Option<&'static str> {
         .find(|(factory, _)| {
             *factory == name
                 || factory.strip_prefix("std::") == Some(name)
-                    && (ctx.using_nss.iter().any(|ns| ns == "std")
-                        || ctx
-                            .using_name_imports
-                            .iter()
-                            .any(|(base, qualified)| base == name && qualified == factory))
+                    && (ctx.directive_namespaces().any(|ns| ns == "std")
+                        || ctx.using_name_imports.iter().any(|import| {
+                            import.base == name && import.candidates.iter().any(|q| q == factory)
+                        }))
         })
         .map(|&(_, wrapper)| wrapper)
 }
@@ -5300,23 +5584,14 @@ fn lower_declaration(
         None => return,
     };
     let type_id = parse_type_node(program, ctx, source, type_node);
-    let is_static = declaration_is_static(source, node);
+    let is_static = declaration_is_static(node);
 
     let lower_initialized = |program: &mut Program,
                              ctx: &mut LowerContext,
                              owner: Node,
                              decl: Node,
                              value: Option<Node>| {
-        let capture_initializer = ctx.record_link_ownership
-            && ctx.has_weak
-            && ctx.current_fn.is_none()
-            && value.is_some();
-        let flow_start = program.flow.len();
-        let pending_start = if capture_initializer {
-            ctx.pending.borrow().len()
-        } else {
-            0
-        };
+        let capture = start_initializer_capture(program, ctx).filter(|_| value.is_some());
         let ty = local_type(program, ctx, source, type_node, type_id, decl, value);
         let var = lower_one_declarator(
             program,
@@ -5329,18 +5604,8 @@ fn lower_declaration(
             storage_override,
             value,
         );
-        if let Some(var) = var.filter(|_| capture_initializer) {
-            let end = program.flow.len();
-            if end > flow_start {
-                program
-                    .global_initializer_ranges
-                    .entry(var)
-                    .or_default()
-                    .push(flow_start..end);
-            }
-            for index in pending_start..ctx.pending.borrow().len() {
-                ctx.pending_initializer_owners.insert(index, var);
-            }
+        if let Some(var) = var {
+            finish_initializer_capture(program, ctx, capture, var);
         }
         // An explicit reference's type carries an alias layer that readers
         // peel; an `auto&` local's is already the value's own type.
@@ -5406,9 +5671,16 @@ fn lower_declaration(
                             if let Some(caller) = ctx.current_fn {
                                 if let Some(inner) = fdecl.child_by_field_name("declarator") {
                                     if inner.kind() == "structured_binding_declarator" {
-                                        let type_name = node_text(source, &type_node).to_string();
-                                        let callee_var = lookup_var(ctx, program, &type_name);
-                                        let callee_name = format!("{}[...]", type_name);
+                                        // `ns::table[i]();` parses as a declaration
+                                        // of a structured binding: a call through
+                                        // the table's element.
+                                        let type_name =
+                                            normalize_qualified(node_text(source, &type_node));
+                                        let callee_var =
+                                            lookup_var(ctx, program, &type_name).map(|table| {
+                                                load_table_element(program, ctx, node, table)
+                                            });
+                                        let callee_name = format!("{type_name}[...]");
                                         let span = node_call_span(program, ctx, node);
                                         let args = collect_call_args(
                                             program,
@@ -5463,6 +5735,25 @@ fn lower_declaration(
                     None,
                 );
             }
+            // `cb_t H::cb;`: an uninitialized out-of-class definition whose
+            // declarator is the bare qualified name (not the declaration's
+            // type, which may be spelled qualified too).
+            "qualified_identifier"
+                if ctx.current_fn.is_none()
+                    && node.child_by_field_name("type").map(|t| t.id()) != Some(child.id()) =>
+            {
+                lower_one_declarator(
+                    program,
+                    ctx,
+                    source,
+                    child,
+                    child,
+                    type_id,
+                    is_static,
+                    storage_override,
+                    None,
+                );
+            }
             "identifier" => {
                 let name = node_text(source, &child).to_string();
                 if name.is_empty() {
@@ -5471,6 +5762,10 @@ fn lower_declaration(
                 let var_id = program.symbols.alloc_var_id();
                 let span = node_span(program, ctx, child);
                 let storage = storage_override.unwrap_or_else(|| storage_for(ctx, is_static));
+                let is_namespaced = namespace_scoped(ctx, storage);
+                let qualified_name = is_namespaced.then(|| ctx.qualify(&name));
+                let c_linkage =
+                    declared_c_linkage(program, ctx, qualified_name.as_deref().unwrap_or(&name));
                 program.symbols.add_variable(Variable {
                     is_defined: ctx.current_fn.is_none() && !declaration_is_extern(source, node),
                     // `child`, not `node`: an attribute inside a sibling
@@ -5478,7 +5773,9 @@ fn lower_declaration(
                     // declaration specifier, so it stays declaration-scoped.
                     is_weak: weak_global(ctx, storage, source, child),
                     target: None,
-                    is_namespaced: namespaced_global(ctx, storage),
+                    is_namespaced,
+                    qualified_name,
+                    c_linkage,
                     id: var_id,
                     name: name.clone(),
                     type_id,
@@ -5503,6 +5800,11 @@ fn lower_declaration(
 /// in scope is an argument list. `T w();` stays a declaration, as it is in C++.
 /// At file scope a name counts as a global or file `static` variable (the
 /// file's own or an included header's) or a function.
+///
+/// `cb_t H::direct(f);` naming a known static member (or namespace variable)
+/// always defines it: its arguments are looked up in the owner's scope, as a
+/// copy initializer's are, and one lowering cannot resolve passes no actual.
+/// An unknown qualified name stays a declaration.
 fn direct_init_arguments(
     program: &Program,
     ctx: &LowerContext,
@@ -5512,52 +5814,156 @@ fn direct_init_arguments(
     if !ctx.is_cpp || decl.kind() != "function_declarator" {
         return None;
     }
-    if decl.child_by_field_name("declarator")?.kind() != "identifier" {
-        return None;
-    }
+    let declared = decl.child_by_field_name("declarator")?;
     let params = decl.child_by_field_name("parameters")?;
+    let args = match declared.kind() {
+        // In a body, a name lowering cannot resolve and that names no type
+        // is a value (an enumerator, a macro constant), so `T w(E::kind);`
+        // defines `w`: C++ reads it as a declaration only when the name is a
+        // type, and a block-scope function declaration is rare. One naming
+        // a function in scope (`Widget make(Config);`) redeclares it.
+        "identifier" => {
+            let unresolved_is_value = ctx.current_fn.is_some()
+                && resolve_function_named(program, ctx, node_text(source, &declared)).is_none();
+            direct_init_call_args(
+                program,
+                ctx,
+                source,
+                params,
+                UnresolvedArg::from(unresolved_is_value),
+            )
+        }
+        "qualified_identifier" if ctx.current_fn.is_none() => {
+            let raw = normalize_qualified(node_text(source, &declared));
+            let canonical = static_member_canonical_name(program, ctx, &raw);
+            program
+                .symbols
+                .variable_named_in_scope(&canonical, ctx.current_file)?;
+            let owner = canonical
+                .rsplit_once("::")
+                .map(|(owner, _)| owner.to_string());
+            let scoped = enter_lookup_scope(ctx, owner.as_ref());
+            let args = direct_init_call_args(program, ctx, source, params, UnresolvedArg::Defines);
+            if scoped {
+                ctx.type_scope.borrow_mut().pop();
+            }
+            args
+        }
+        _ => None,
+    };
+    // `T w();` and `T H::m();` declare functions, as they do in C++.
+    args.filter(|a| a.argc > 0)
+}
+
+/// What [`direct_init_call_args`] makes of a parenthesized name it cannot
+/// read as an argument.
+#[derive(Clone, Copy, PartialEq)]
+enum UnresolvedArg {
+    /// The declaration is known to define an object: any such position
+    /// passes no actual, as a literal's does.
+    Defines,
+    /// A name that resolves to nothing and names no type is a value that
+    /// passes no actual; a type makes the declaration a function's.
+    IsValue,
+    /// Either makes the declaration a function's.
+    Declares,
+}
+
+impl From<bool> for UnresolvedArg {
+    /// `IsValue` when `unresolved_is_value`, else `Declares`.
+    fn from(unresolved_is_value: bool) -> Self {
+        if unresolved_is_value {
+            Self::IsValue
+        } else {
+            Self::Declares
+        }
+    }
+}
+
+/// The arguments [`direct_init_arguments`] reads from `params`. `None` once
+/// one reads as a parameter (a type, or a declarator), as `unresolved`
+/// decides.
+fn direct_init_call_args(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    params: Node,
+    unresolved: UnresolvedArg,
+) -> Option<CallArgs> {
     let mut args = CallArgs::empty();
     for param in params.named_children(&mut params.walk()) {
         if param.kind() == "comment" {
             continue;
         }
-        if param.kind() != "parameter_declaration"
-            || param.child_by_field_name("declarator").is_some()
-        {
-            return None;
-        }
-        let name_node = param.child_by_field_name("type")?;
-        if !matches!(name_node.kind(), "type_identifier" | "qualified_identifier") {
-            return None;
-        }
-        let name = normalize_qualified(node_text(source, &name_node));
         let index = args.argc;
-        if let Some(&var) = ctx.locals.get(&name) {
-            args.var_args.push((index, var));
-        } else if names_type_in_scope(program, ctx, &name) {
-            // A type declared nearer than any global of that name hides it:
-            // `using Value = int;` makes `Worker make(Value);` a declaration.
-            return None;
-        } else if ctx
-            .class_ctx
-            .as_ref()
-            .is_some_and(|c| class_has_data_field(program, &c.qual_name, &name))
-        {
-            // A data member is a value, so this defines an object:
-            // `std::lock_guard<std::mutex> g(mu_);`. Its value is not a
-            // variable here, and the position stays without an actual, as a
-            // literal's does. Checked before `lookup_var`: in class scope the
-            // member hides a variable of its name outside the class.
-        } else if let Some(var) = lookup_var(ctx, program, &name) {
-            args.var_args.push((index, var));
-        } else {
-            args.fn_args
-                .push((index, resolve_function_named(program, ctx, &name)?));
+        match direct_init_argument(program, ctx, source, param) {
+            Some(DirectInitArg::Var(var)) => args.var_args.push((index, var)),
+            Some(DirectInitArg::Fn(callee)) => args.fn_args.push((index, callee)),
+            Some(DirectInitArg::Value) => {}
+            Some(DirectInitArg::Unresolved) if unresolved != UnresolvedArg::Declares => {}
+            None if unresolved == UnresolvedArg::Defines => {}
+            Some(DirectInitArg::Unresolved) | None => return None,
         }
         args.argc += 1;
         args.arg_desc.push(TypeDesc::Unknown);
     }
-    (args.argc > 0).then_some(args)
+    Some(args)
+}
+
+/// What one parenthesized name of `T w(a, b);` passes.
+enum DirectInitArg {
+    Var(VarId),
+    Fn(FnId),
+    /// A value that is not a variable here (a data member).
+    Value,
+    /// A name that resolves to nothing and names no type in scope.
+    Unresolved,
+}
+
+/// `param` read as an argument of `T w(a, b);`; `None` when it reads as a
+/// parameter declaration instead.
+fn direct_init_argument(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    param: Node,
+) -> Option<DirectInitArg> {
+    if param.kind() != "parameter_declaration" || param.child_by_field_name("declarator").is_some()
+    {
+        return None;
+    }
+    let name_node = param.child_by_field_name("type")?;
+    if !matches!(name_node.kind(), "type_identifier" | "qualified_identifier") {
+        return None;
+    }
+    let name = normalize_qualified(node_text(source, &name_node));
+    if let Some(&var) = ctx.locals.get(&name) {
+        return Some(DirectInitArg::Var(var));
+    }
+    if names_type_in_scope(program, ctx, &name) {
+        // A type declared nearer than any global of that name hides it:
+        // `using Value = int;` makes `Worker make(Value);` a declaration.
+        return None;
+    }
+    if ctx
+        .class_ctx
+        .as_ref()
+        .is_some_and(|c| class_has_data_field(program, &c.qual_name, &name))
+    {
+        // A data member is a value, so this defines an object:
+        // `std::lock_guard<std::mutex> g(mu_);`. Its value is not a
+        // variable here, and the position stays without an actual, as a
+        // literal's does. Checked before `lookup_var`: in class scope the
+        // member hides a variable of its name outside the class.
+        return Some(DirectInitArg::Value);
+    }
+    if let Some(var) = lookup_var(ctx, program, &name) {
+        return Some(DirectInitArg::Var(var));
+    }
+    Some(
+        resolve_function_named(program, ctx, &name)
+            .map_or(DirectInitArg::Unresolved, DirectInitArg::Fn),
+    )
 }
 
 /// Lower `T w(args);` as the object definition [`direct_init_arguments`]
@@ -5577,13 +5983,7 @@ fn lower_direct_init(
     let Some(name_node) = decl.child_by_field_name("declarator") else {
         return;
     };
-    let capture_initializer = ctx.record_link_ownership && ctx.has_weak && ctx.current_fn.is_none();
-    let flow_start = program.flow.len();
-    let pending_start = if capture_initializer {
-        ctx.pending.borrow().len()
-    } else {
-        0
-    };
+    let capture = start_initializer_capture(program, ctx);
     let Some(object) = lower_one_declarator(
         program,
         ctx,
@@ -5617,19 +6017,7 @@ fn lower_direct_init(
             }),
             _ => {}
         }
-        if capture_initializer {
-            let end = program.flow.len();
-            if end > flow_start {
-                program
-                    .global_initializer_ranges
-                    .entry(object)
-                    .or_default()
-                    .push(flow_start..end);
-            }
-            for index in pending_start..ctx.pending.borrow().len() {
-                ctx.pending_initializer_owners.insert(index, object);
-            }
-        }
+        finish_initializer_capture(program, ctx, capture, object);
         return;
     };
     let Some(caller) = ctx.current_fn else {
@@ -5659,10 +6047,7 @@ fn names_type_in_scope(program: &Program, ctx: &LowerContext, name: &str) -> boo
         || find_in_scope(program, ctx, name, |candidate, global| {
             let class = !global
                 && (program.types.is_struct_declared(candidate)
-                    || program
-                        .types
-                        .type_id_by_tag(candidate, trace_ir::TypeKind::Struct)
-                        .is_some());
+                    || program.types.class_type_id(candidate).is_some());
             (class || program.types.resolve_alias(candidate).is_some()).then_some(())
         })
         .is_some()
@@ -5692,20 +6077,44 @@ fn lower_one_declarator(
     if node_is_from_ignored_macro(ctx, decl) || node_is_from_ignored_macro(ctx, span_node) {
         return None;
     }
-    if is_function_pointer_declarator(decl) {
-        let (name, _is_ptr) = parse_declarator_name(source, decl);
-        if name.is_empty() {
-            return None;
-        }
+    if decl.kind() == "function_declarator" && !is_function_pointer_declarator(decl) {
+        lower_function_decl(program, ctx, source, decl, type_id, is_static);
+        return None;
+    }
+    let is_fn_ptr = is_function_pointer_declarator(decl);
+    let (name, is_ptr) = parse_declarator_name(source, decl);
+    if name.is_empty() {
+        return None;
+    }
+    // An out-of-class static data member definition (`T Cls::member = ...;`,
+    // callback-typed ones included) names a scope. Its storage was already
+    // registered in-class (`register_static_data_member`); this reuses that
+    // VarId instead of allocating a second one for the same storage.
+    // `parse_declarator_name` already resolves through pointer /
+    // function-pointer layers to the `qualified_identifier` root, so a
+    // `::`-bearing name is all the recognition a variable declarator needs
+    // here — no separate structural walk duplicates it.
+    if ctx.current_fn.is_none() && names_scoped_variable(&name) {
+        return reconcile_static_member_definition(
+            program, ctx, source, span_node, decl, type_id, is_fn_ptr, is_ptr, &name, init_expr,
+        );
+    }
+    if is_fn_ptr {
         let var_id = program.symbols.alloc_var_id();
         let span = node_span(program, ctx, span_node);
         let storage = storage_override.unwrap_or_else(|| storage_for(ctx, is_static));
+        let is_namespaced = namespace_scoped(ctx, storage);
+        let qualified_name = is_namespaced.then(|| ctx.qualify(&name));
+        let c_linkage =
+            declared_c_linkage(program, ctx, qualified_name.as_deref().unwrap_or(&name));
         program.symbols.add_variable(Variable {
             is_defined: ctx.current_fn.is_none()
                 && (init_expr.is_some() || !declaration_is_extern(source, span_node)),
             is_weak: weak_global(ctx, storage, source, span_node),
             target: None,
-            is_namespaced: namespaced_global(ctx, storage),
+            is_namespaced,
+            qualified_name,
+            c_linkage,
             id: var_id,
             name: name.clone(),
             type_id,
@@ -5720,42 +6129,26 @@ fn lower_one_declarator(
             return Some(var_id);
         }
         if let Some(init) = init_expr {
-            if !node_is_from_ignored_macro(ctx, init)
-                && !node_is_from_ignored_macro(ctx, peel_casts(source, init))
-            {
-                if init.kind() == "initializer_list"
-                    && (is_array_type(program, type_id) || declarator_is_array(decl))
-                {
-                    lower_fn_ptr_array_init(program, ctx, source, var_id, init);
-                }
-                extract_flow_from_expr(program, ctx, source, init, Some(var_id));
-            }
+            lower_var_initializer(program, ctx, source, var_id, type_id, decl, init);
         }
         return Some(var_id);
     }
 
-    if decl.kind() == "function_declarator" && !is_function_pointer_declarator(decl) {
-        lower_function_decl(program, ctx, source, decl, type_id, is_static);
-        return None;
-    }
-
-    let (name, is_ptr) = parse_declarator_name(source, decl);
-    if name.is_empty() {
-        return None;
-    }
     let var_id = program.symbols.alloc_var_id();
-    if decl.kind() == "reference_declarator" {
-        ctx.reference_vars.insert(var_id);
-        ctx.reference_bindings.insert(var_id);
-    }
+    mark_reference_binding(ctx, decl, var_id);
     let span = node_span(program, ctx, span_node);
     let storage = storage_override.unwrap_or_else(|| storage_for(ctx, is_static));
+    let is_namespaced = namespace_scoped(ctx, storage);
+    let qualified_name = is_namespaced.then(|| ctx.qualify(&name));
+    let c_linkage = declared_c_linkage(program, ctx, qualified_name.as_deref().unwrap_or(&name));
     program.symbols.add_variable(Variable {
         is_defined: ctx.current_fn.is_none()
             && (init_expr.is_some() || !declaration_is_extern(source, span_node)),
         is_weak: weak_global(ctx, storage, source, span_node),
         target: None,
-        is_namespaced: namespaced_global(ctx, storage),
+        is_namespaced,
+        qualified_name,
+        c_linkage,
         id: var_id,
         name: name.clone(),
         type_id,
@@ -5808,21 +6201,193 @@ fn lower_one_declarator(
         }
     }
     if let Some(init) = init_expr {
-        if !node_is_from_ignored_macro(ctx, init)
-            && !node_is_from_ignored_macro(ctx, peel_casts(source, init))
-            && init.kind() != "argument_list"
-            && !braced_ctor
-        {
+        if init.kind() != "argument_list" && !braced_ctor {
             // A ctor argument list is not a value flowing into the object.
-            if init.kind() == "initializer_list"
-                && (is_array_type(program, type_id) || declarator_is_array(decl))
-            {
-                lower_fn_ptr_array_init(program, ctx, source, var_id, init);
-            }
-            extract_flow_from_expr(program, ctx, source, init, Some(var_id));
+            lower_var_initializer(program, ctx, source, var_id, type_id, decl, init);
         }
     }
     Some(var_id)
+}
+
+/// Whether a declarator's name is a scope-qualified identifier (`Cls::m`,
+/// `ns::x`): not a pointer to member (`Cls::*pm`), whose last segment is
+/// the declared name behind a `*`, and not an operator.
+fn names_scoped_variable(name: &str) -> bool {
+    let Some((_, leaf)) = scope_part(name).rsplit_once("::") else {
+        return false;
+    };
+    leaf.starts_with(|c: char| c.is_alphabetic() || c == '_')
+        && leaf.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Whether a variable registered under `lookup_name` has C language
+/// linkage: declared inside `extern "C"`, or, outside a body, redeclaring a
+/// variable one such declaration already gave C linkage
+/// (`extern "C" CB cb; CB cb = f;`), as C++ keeps a variable's first
+/// language linkage.
+fn declared_c_linkage(program: &Program, ctx: &LowerContext, lookup_name: &str) -> bool {
+    ctx.c_linkage
+        || ctx.current_fn.is_none()
+            && program
+                .symbols
+                .variable_named_in_scope(lookup_name, ctx.current_file)
+                .is_some_and(|earlier| program.symbols.variable(earlier).c_linkage)
+}
+
+/// The canonical name an out-of-class variable definition spelled `raw_name`
+/// defines: relative to the enclosing namespaces, or, when that names no
+/// variable, through the class a `using namespace` directive brings the
+/// owner to — the same recovery an out-of-class member function definition
+/// gets (`class_seen_from`). The class alone decides: a unit that only
+/// forward-declares it still defines the member other units declare.
+fn static_member_canonical_name(program: &Program, ctx: &LowerContext, raw_name: &str) -> String {
+    let canonical = ctx.qualify_decl(raw_name);
+    if program
+        .symbols
+        .variable_named_in_scope(&canonical, ctx.current_file)
+        .is_some()
+    {
+        return canonical;
+    }
+    canonical
+        .rsplit_once("::")
+        .and_then(|(owner, member)| {
+            class_seen_from(program, ctx, owner).map(|cls| format!("{cls}::{member}"))
+        })
+        .unwrap_or(canonical)
+}
+
+/// Reconcile an out-of-class static data member definition
+/// (`T Cls::member = ...;`) with the canonical variable
+/// `register_static_data_member` registered in-class, so declaration and
+/// definition share one `VarId` and one initializer instead of two
+/// unrelated variables under the same display name. `ctx.qualify_decl`
+/// resolves `raw_name` the same way an out-of-class member *function*
+/// definition's name is resolved — relative to the enclosing namespace,
+/// an already-fully-qualified spelling left alone — so `Box::member`
+/// written inside `namespace nest { ... }` and `nest::Box::member` written
+/// outside it both key the same canonical name a nested class's in-class
+/// registration used.
+///
+/// Lowering has no link targets yet (`docs/ANALYSIS.md`, "Canonical
+/// variable identity"), so the probe is untargeted; cross-TU reconciliation
+/// (weak selection, header dedup) belongs to `merge.rs`, not here. A miss —
+/// no matching in-class declaration in this TU — falls back to registering
+/// fresh storage under the canonical name rather than silently dropping the
+/// initializer's flow facts.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_static_member_definition(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    span_node: Node,
+    decl: Node,
+    type_id: trace_ir::TypeId,
+    is_fn_ptr: bool,
+    is_ptr: bool,
+    raw_name: &str,
+    init_expr: Option<Node>,
+) -> Option<VarId> {
+    let canonical = static_member_canonical_name(program, ctx, raw_name);
+    let owner = canonical
+        .rsplit_once("::")
+        .map(|(owner, _)| owner.to_string());
+    let span = node_span(program, ctx, span_node);
+    // `extern T ns::x;` redeclares; it defines nothing.
+    let defines = init_expr.is_some() || !declaration_is_extern(source, span_node);
+    let var_id = match program
+        .symbols
+        .variable_named_in_scope(&canonical, ctx.current_file)
+    {
+        Some(id) => {
+            // Definition precedence: the out-of-class definition's span
+            // takes over from the in-class declaration's, the same way a
+            // function definition's span supersedes its prototype's
+            // (`SymbolTable::register_function`). Weakness is the
+            // definition's own annotation.
+            let is_weak = weak_global(ctx, program.symbols.variable(id).storage, source, span_node);
+            if is_weak {
+                program.symbols.mark_has_weak_symbols();
+            }
+            let var = program.symbols.variable_mut(id);
+            var.is_weak |= is_weak;
+            if defines {
+                var.is_defined = true;
+                var.span = span;
+            }
+            id
+        }
+        None => {
+            let leaf = raw_name.rsplit("::").next().unwrap_or(raw_name).to_string();
+            let var_id = program.symbols.alloc_var_id();
+            // The class's own linkage is unknown here; an anonymous namespace
+            // around the definition still makes it internal.
+            let storage = storage_for(ctx, false);
+            // A static data member never has C language linkage. A namespace
+            // variable first declared by its qualified name (its namespace's
+            // declaration was not seen) takes the `extern "C"` around it.
+            let c_linkage = ctx.c_linkage
+                && owner
+                    .as_ref()
+                    .is_some_and(|owner| program.namespaces.contains(owner));
+            program.symbols.add_variable(Variable {
+                is_defined: defines,
+                is_weak: weak_global(ctx, storage, source, span_node),
+                target: None,
+                is_namespaced: true,
+                qualified_name: Some(canonical),
+                c_linkage,
+                id: var_id,
+                name: leaf,
+                type_id,
+                storage,
+                fn_id: None,
+                param_index: None,
+                span,
+                is_pointer: is_fn_ptr || is_ptr,
+            });
+            var_id
+        }
+    };
+    mark_reference_binding(ctx, decl, var_id);
+    if program.is_dep_file(span.file) {
+        return Some(var_id);
+    }
+    if let Some(init) = init_expr {
+        // The initializer of `T I::m = e;` looks its names up in `I`, as the
+        // body of an out-of-class member function does.
+        let scoped = enter_lookup_scope(ctx, owner.as_ref());
+        lower_var_initializer(program, ctx, source, var_id, type_id, decl, init);
+        if scoped {
+            ctx.type_scope.borrow_mut().pop();
+        }
+    }
+    Some(var_id)
+}
+
+/// Lower `init` as the initializer of `var_id`, declared with `type_id` by
+/// `decl`: a braced table of an array also records its function members. An
+/// initializer spelled by an ignored macro contributes nothing.
+fn lower_var_initializer(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    var_id: VarId,
+    type_id: trace_ir::TypeId,
+    decl: Node,
+    init: Node,
+) {
+    if node_is_from_ignored_macro(ctx, init)
+        || node_is_from_ignored_macro(ctx, peel_casts(source, init))
+    {
+        return;
+    }
+    if init.kind() == "initializer_list"
+        && (is_array_type(program, type_id) || declarator_is_array(decl))
+    {
+        lower_fn_ptr_array_init(program, ctx, source, var_id, init);
+    }
+    extract_flow_from_expr(program, ctx, source, init, Some(var_id));
 }
 
 /// `ArrayFnMember` facts are only sound for array-typed tables (unknown-index
@@ -6254,8 +6819,12 @@ fn collect_call_at_node_inner(
     // `recv.method(args)` / `p->method(args)` / explicit `x.~T()` /
     // virtual dispatch through base pointers. Receivers we cannot type
     // fall through to the generic indirect handling below (vtable-slot
-    // style flow resolution), preserving soundness.
-    if ctx.is_cpp && func.kind() == "field_expression" {
+    // style flow resolution), preserving soundness. So does a static
+    // callback member (`h.cb()`), which is called through its variable.
+    let static_member = (ctx.is_cpp && func.kind() == "field_expression")
+        .then(|| static_member_access(program, ctx, source, func))
+        .flatten();
+    if ctx.is_cpp && func.kind() == "field_expression" && static_member.is_none() {
         let (op_is_member_access, op_is_arrow) = member_access_op(func);
         if op_is_member_access {
             if let Some(field) = func.child_by_field_name("field") {
@@ -6423,20 +6992,34 @@ fn collect_call_at_node_inner(
             }
         }
     }
+    // A static callable member called through an object (`h.fun()`).
+    if let Some((cls, kind)) = static_member.and_then(|v| callable_operator(program, v)) {
+        let call_args =
+            collect_call_args(program, ctx, source, node.child_by_field_name("arguments"));
+        emit_member_sites(
+            program,
+            caller,
+            &cls,
+            &kind,
+            None,
+            call_args,
+            span,
+            expansion_span,
+        );
+        return;
+    }
     if ctx.is_cpp && matches!(func.kind(), "identifier" | "qualified_identifier") {
         let spelled = normalize_qualified(node_text(source, &func));
-        let target = match lookup_var(ctx, program, &spelled) {
+        let target = match lookup_var_node(program, ctx, source, func) {
             // `T(args)` where `T` names a class with a declared constructor
             // constructs one. Inside a member class the outer class is no
             // longer the implicit `this`, which is what used to catch
             // `Outer(*this)` in a nested builder (#92).
             None => constructed_class(program, ctx, &spelled)
                 .map(|cls| (cls, trace_ir::MethodKind::Ctor)),
-            // Functor / callable object: `f()` where `f` has `operator()`.
-            Some(v) if func.kind() == "identifier" => var_static_class(program, v)
-                .map(|cls| (cls, trace_ir::MethodKind::Named("operator()".to_string())))
-                .filter(|(cls, kind)| !member_targets_upward(program, cls, kind).is_empty()),
-            Some(_) => None,
+            // Functor / callable object: `f()` / `ns::f()` where `f` has
+            // `operator()`.
+            Some(v) => callable_operator(program, v),
         };
         if let Some((cls, kind)) = target {
             let call_args =
@@ -7036,8 +7619,7 @@ fn cpp_callee_candidates(
                 // unit, and the definition in another merges into the same
                 // entry — which is why a definition written under the
                 // directive qualifies the same way (`qualify_class_name`).
-                ctx.using_nss
-                    .iter()
+                ctx.directive_namespaces()
                     .find_map(|ns| lookup(&format!("{ns}::{name}")))
             })
             .unwrap_or_default()
@@ -7146,7 +7728,7 @@ fn resolve_cpp_name_candidates(
     // Phase 2: using namespace directives (always add, never hide — they
     // make the named namespace's declarations visible in the directive's
     // scope, alongside any enclosing-namespace candidates).
-    for ns in &ctx.using_nss {
+    for ns in ctx.directive_namespaces() {
         for id in program.symbols.functions_in_namespace(ns, base) {
             if !out.contains(&id) {
                 out.push(id);
@@ -7164,8 +7746,11 @@ fn resolve_cpp_name_candidates(
     // Phase 4: `using X::f;` imports: the exact qualified entry may not
     // fall under any of the ordinary/ADL namespaces above (e.g. nested
     // `X::Y::f`).
-    for (import_base, import_qual) in &ctx.using_name_imports {
-        if import_base == base {
+    for import in &ctx.using_name_imports {
+        if import.base != base {
+            continue;
+        }
+        for import_qual in &import.candidates {
             // Resolve within the current file's scope so a `static`
             // definition (or header-static) imported via `using X::f;`
             // resolves instead of degrading to an external stub.
@@ -7349,9 +7934,7 @@ fn lower_field_initializer_list(
     };
     let cls = cc.qual_name;
     let bases = program.bases_of(&cls);
-    let cls_type = program
-        .types
-        .type_id_by_tag(&cls, trace_ir::TypeKind::Struct);
+    let cls_type = program.types.class_type_id(&cls);
     for fi in node.children(&mut node.walk()) {
         if fi.kind() != "field_initializer" {
             continue;
@@ -7419,10 +8002,7 @@ fn class_field_desc(program: &Program, cls: &str, field: &str) -> Option<TypeDes
     queue.push_back(cls.to_string());
     seen.insert(cls.to_string());
     while let Some(cur) = queue.pop_front() {
-        if let Some(tid) = program
-            .types
-            .type_id_by_tag(&cur, trace_ir::TypeKind::Struct)
-        {
+        if let Some(tid) = program.types.class_type_id(&cur) {
             let info = program.types.get(tid);
             if let Some((_, fl)) = info.layout.fields.iter().find(|(_, f)| f.name == field) {
                 return Some(program.types.get(fl.type_id).desc.as_ref().clone());
@@ -7777,6 +8357,8 @@ fn lower_lambda_expression(
             is_weak: false,
             target: None,
             is_namespaced: false,
+            qualified_name: None,
+            c_linkage: false,
             id: var_id,
             name: name.clone(),
             type_id,
@@ -8120,6 +8702,21 @@ fn deref_desc(program: &Program, desc: TypeDesc) -> Option<TypeDesc> {
     }
 }
 
+/// A variable receiver's declared type; a reference is the value it refers
+/// to.
+fn var_receiver_desc(program: &Program, ctx: &LowerContext, v: VarId) -> TypeDesc {
+    let desc = program
+        .types
+        .get(program.symbols.variable(v).type_id)
+        .desc
+        .as_ref()
+        .clone();
+    match desc {
+        TypeDesc::Ptr(inner) if ctx.reference_vars.contains(&v) => *inner,
+        desc => desc,
+    }
+}
+
 /// The receiver's declared type with its pointer layers intact — unlike
 /// [`infer_static_class`], which peels them — so that `->` can tell a raw
 /// pointer (built-in arrow, the pointee's members) from a class value
@@ -8138,19 +8735,8 @@ fn receiver_desc(
             fields: Vec::new(),
         }))),
         "identifier" => {
-            if let Some(v) = lookup_var(ctx, program, node_text(source, &node)) {
-                let mut desc = program
-                    .types
-                    .get(program.symbols.variable(v).type_id)
-                    .desc
-                    .as_ref()
-                    .clone();
-                if ctx.reference_vars.contains(&v) {
-                    if let TypeDesc::Ptr(inner) = desc {
-                        desc = *inner;
-                    }
-                }
-                return Some(desc);
+            if let Some(v) = lookup_var_node(program, ctx, source, node) {
+                return Some(var_receiver_desc(program, ctx, v));
             }
             class_field_desc(
                 program,
@@ -8158,7 +8744,13 @@ fn receiver_desc(
                 node_text(source, &node),
             )
         }
+        "qualified_identifier" => {
+            lookup_var_node(program, ctx, source, node).map(|v| var_receiver_desc(program, ctx, v))
+        }
         "field_expression" => {
+            if let Some(member) = static_member_access(program, ctx, source, node) {
+                return Some(var_receiver_desc(program, ctx, member));
+            }
             let base = node.child_by_field_name("argument")?;
             let cls = member_receiver_class(program, ctx, source, base, is_arrow_access(node))?;
             class_field_desc(
@@ -8557,6 +9149,34 @@ fn names_function(program: &Program, ctx: &LowerContext, name: &str) -> bool {
 /// hierarchy is rarely deeper, and a cyclic one must not loop.
 const MAX_BASE_LOOKUP: usize = 32;
 
+/// Ask `probe` about `cls`, then about its bases breadth first, at most
+/// [`MAX_BASE_LOOKUP`] distinct ones (a diamond's shared base is asked
+/// about once); the first answer wins.
+fn find_in_class_or_bases<T>(
+    program: &Program,
+    cls: &str,
+    mut probe: impl FnMut(&str) -> Option<T>,
+) -> Option<T> {
+    if let Some(hit) = probe(cls) {
+        return Some(hit);
+    }
+    let mut bases: Vec<&str> = program.base_names(cls).collect();
+    let mut seen = 0;
+    while seen < bases.len() && seen < MAX_BASE_LOOKUP {
+        let class = bases[seen];
+        if let Some(hit) = probe(class) {
+            return Some(hit);
+        }
+        for base in program.base_names(class) {
+            if base != cls && !bases.contains(&base) {
+                bases.push(base);
+            }
+        }
+        seen += 1;
+    }
+    None
+}
+
 /// Look a type name up the way C++ does from the current scope (#90): in the
 /// class being lowered, its bases, and each class around it, then in each
 /// enclosing namespace, innermost first, and last at the global scope. `probe`
@@ -8569,8 +9189,21 @@ fn find_in_scope<T>(
     name: &str,
     mut probe: impl FnMut(&str, bool) -> Option<T>,
 ) -> Option<T> {
-    if let Some(global) = name.strip_prefix("::") {
-        return probe(global, true);
+    find_in_enclosing_scopes(program, ctx, name, &mut probe)
+        .or_else(|| probe(global_lookup_name(name), true))
+}
+
+/// [`find_in_scope`] short of its last, global, candidate: for a lookup
+/// that asks what a `using` declaration brings in before the global scope.
+/// A `::`-prefixed name has no enclosing candidate.
+fn find_in_enclosing_scopes<T>(
+    program: &Program,
+    ctx: &LowerContext,
+    name: &str,
+    probe: &mut impl FnMut(&str, bool) -> Option<T>,
+) -> Option<T> {
+    if name.starts_with("::") {
+        return None;
     }
     // Held across the probes: they only read the type and symbol tables, and
     // a clone of the class names per lookup would allocate on a hot path.
@@ -8610,20 +9243,10 @@ fn find_in_scope<T>(
                     .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
             })
         {
-            if let Some(hit) = ask(prefix) {
-                return Some(hit);
-            }
             // A class's members include those of its bases, before the scopes
             // around it: `Node` in `struct D : Base` is `Base::Node`.
-            let mut bases: Vec<&str> = program.base_names(prefix).collect();
-            let mut seen = 0;
-            while seen < bases.len() && seen < MAX_BASE_LOOKUP {
-                let base = bases[seen];
-                if let Some(hit) = ask(base) {
-                    return Some(hit);
-                }
-                bases.extend(program.base_names(base));
-                seen += 1;
+            if let Some(hit) = find_in_class_or_bases(program, prefix, &mut ask) {
+                return Some(hit);
             }
             prefix = prefix.rfind("::").map_or("", |at| &prefix[..at]);
         }
@@ -8640,18 +9263,29 @@ fn find_in_scope<T>(
             return Some(hit);
         }
     }
-    probe(name, true)
+    None
 }
 
 /// What a C++ type name spelled in the current scope denotes, found through
-/// [`find_in_scope`]: a class declared under a candidate spelling, or a
-/// typedef registered under one, with the alias's pointer shape kept. A bare
+/// [`find_in_scope`]: a class declared under a candidate spelling (a union's
+/// is a `Union`, as its layout is), or a typedef registered under one, with
+/// the alias's pointer shape kept. A bare
 /// alias at the global scope is left to the caller, which reads the flat
 /// alias table after the primitive spellings as C does; one spelled `::T` is
 /// answered here.
 fn scoped_type_desc(program: &Program, ctx: &LowerContext, name: &str) -> Option<TypeDesc> {
     let spelled_global = name.starts_with("::");
     find_in_scope(program, ctx, name, |candidate, global| {
+        if program
+            .types
+            .type_id_by_tag(candidate, trace_ir::TypeKind::Union)
+            .is_some()
+        {
+            return Some(TypeDesc::Union {
+                name: candidate.to_owned(),
+                fields: Vec::new(),
+            });
+        }
         if program.types.is_struct_declared(candidate)
             || program
                 .types
@@ -8763,6 +9397,9 @@ fn infer_static_class(
             let cls = ctx.class_ctx.as_ref()?.qual_name.clone();
             class_field_static_class(program, &cls, name)
         }
+        "qualified_identifier" => {
+            var_static_class(program, lookup_var_node(program, ctx, source, node)?)
+        }
         "pointer_expression" => {
             let op = pointer_op(source, node);
             if op.as_deref() == Some("*") {
@@ -8777,6 +9414,9 @@ fn infer_static_class(
             None
         }
         "field_expression" => {
+            if let Some(member) = static_member_access(program, ctx, source, node) {
+                return var_static_class(program, member);
+            }
             let base = node.child_by_field_name("argument")?;
             let field = node.child_by_field_name("field")?;
             let base_cls = infer_static_class(program, ctx, source, base)?;
@@ -8795,11 +9435,7 @@ fn infer_static_class(
             let type_node = descriptor.child_by_field_name("type").unwrap_or(descriptor);
             let raw = normalize_qualified(node_text(source, &type_node));
             let qualified = qualify_class_name(program, ctx, &strip_template_args(&raw));
-            if program
-                .types
-                .type_id_by_tag(&qualified, trace_ir::TypeKind::Struct)
-                .is_some()
-            {
+            if program.types.class_type_id(&qualified).is_some() {
                 Some(qualified)
             } else {
                 None
@@ -9222,6 +9858,12 @@ fn emit_field_store(
     lhs: Node,
     rhs: Node,
 ) {
+    if let Some(dst) = static_member_access(program, ctx, source, lhs) {
+        if let Some(flow) = expr_to_rhs_flow(program, ctx, source, rhs, dst) {
+            program.flow.push(flow);
+        }
+        return;
+    }
     let Some((base, field_ids, field_names)) = decompose_field_path(program, ctx, source, lhs)
     else {
         return;
@@ -9414,6 +10056,8 @@ fn alloc_gep_temp(
         is_weak: false,
         target: None,
         is_namespaced: false,
+        qualified_name: None,
+        c_linkage: false,
         id: var_id,
         name: format!("_gep{}", var_id.0),
         type_id: program.types.int(),
@@ -9446,13 +10090,21 @@ fn decompose_field_path(
     let mut field_names = Vec::new();
     let mut arrows = Vec::new();
     let mut cur = peel_expression(node);
-    while cur.kind() == "field_expression" {
+    // A static data member along the chain (`h.obj` in `h.obj.cb`) is an
+    // object of its own, not a field: the path is rooted at its variable.
+    while cur.kind() == "field_expression"
+        && static_member_access(program, ctx, source, cur).is_none()
+    {
         field_names.push(field_name_from_node(source, cur)?);
         arrows.push(is_arrow_access(cur));
         // Peel inside the walk, not only at the root: `(a->b)->c` is one
         // chain, and stopping at the parentheses would resolve `c` against
         // `a`'s layout — the base `resolve_lvalue_var` peels down to anyway.
         cur = peel_expression(cur.child_by_field_name("argument")?);
+    }
+    if field_names.is_empty() && cur.kind() == "field_expression" {
+        // The access is the static member itself: no field path to decompose.
+        return None;
     }
     let mut base = resolve_lvalue_var(program, ctx, source, cur)?;
     field_names.reverse();
@@ -9567,11 +10219,7 @@ fn peel_wrapper_to_pointee(program: &Program, type_id: trace_ir::TypeId) -> trac
         fields: Vec::new(),
     };
     resolve_operator_arrow(program, desc)
-        .and_then(|pointee| {
-            program
-                .types
-                .type_id_by_tag(&pointee, trace_ir::TypeKind::Struct)
-        })
+        .and_then(|pointee| program.types.class_type_id(&pointee))
         .unwrap_or(type_id)
 }
 
@@ -9670,18 +10318,12 @@ fn resolve_implicit_this_member(
     source: &str,
     node: Node,
 ) -> Option<VarId> {
-    if !ctx.is_cpp {
-        return None;
-    }
-    let cls = ctx.class_ctx.as_ref()?;
-    let cls_name = &cls.qual_name;
-    let struct_tid = program
-        .types
-        .type_id_by_tag(cls_name, trace_ir::TypeKind::Struct)?;
     let field_name = node_text(source, &node);
-    let field_id = program.types.field_id_by_name(struct_tid, field_name)?;
-    let fn_id = ctx.current_fn?;
-    let this_var = *program.symbols.function(fn_id).params.first()?;
+    let field_id = class_ctx_field(program, ctx, field_name)?;
+    // The body's `this`: a member's own, or the one a lambda captured. A
+    // lambda's first parameter is no `this`, and one that captures none
+    // reads no member.
+    let this_var = *ctx.locals.get("this")?;
     Some(alloc_gep_temp(
         program,
         ctx,
@@ -9690,6 +10332,17 @@ fn resolve_implicit_this_member(
         field_id,
         field_name.to_string(),
     ))
+}
+
+/// The instance field `name` of the C++ class whose member is being lowered.
+fn class_ctx_field(program: &Program, ctx: &LowerContext, name: &str) -> Option<trace_ir::FieldId> {
+    if !ctx.is_cpp {
+        return None;
+    }
+    let cls = program
+        .types
+        .class_type_id(&ctx.class_ctx.as_ref()?.qual_name)?;
+    program.types.field_id_by_name(cls, name)
 }
 
 /// Lower `&base.f1.f2` into a gep-temp chain so the resulting pointer
@@ -9702,6 +10355,13 @@ fn addr_of_field_path(
     arg: Node,
 ) -> Option<VarId> {
     let peeled = peel_expression(arg);
+    if let Some(member) = static_member_access(program, ctx, source, peeled) {
+        // A reference member already holds its referent's address.
+        if ctx.reference_bindings.contains(&member) {
+            return Some(member);
+        }
+        return Some(addr_of_temp(program, ctx, peeled, member));
+    }
     // &field_expression → direct field path
     if peeled.kind() == "field_expression" {
         let (base, field_ids, field_names) = decompose_field_path(program, ctx, source, peeled)?;
@@ -9785,15 +10445,19 @@ fn expr_to_rhs_flow(
     match node.kind() {
         "identifier" => {
             let name = node_text(source, &node);
-            if let Some(callee) = program
-                .symbols
-                .resolve_function_in_scope(name, Some(ctx.current_file))
-            {
-                Some(FlowConstraint::AddrOfFn { dst, callee })
-            } else if let Some(src) = lookup_var(ctx, program, name) {
+            // A declared name shadows a function of the same name, as in the
+            // return arm: a variable first, then an instance field (read
+            // through `this`), then the function. A name a nearer field or
+            // function hides reads no variable.
+            let found = lookup_var_unless_hidden(ctx, program, name);
+            if let Some(Some(src)) = found {
                 Some(FlowConstraint::Copy { dst, src })
             } else if let Some(gep) = resolve_implicit_this_member(program, ctx, source, node) {
                 Some(FlowConstraint::Load { dst, src: gep })
+            } else if let Some(callee) = resolve_function_named(program, ctx, name) {
+                Some(FlowConstraint::AddrOfFn { dst, callee })
+            } else if found.is_some() {
+                None
             } else {
                 // Might be a function defined later in the unit.
                 ctx.pending.borrow_mut().push(PendingFnRef::RhsIdent {
@@ -9801,6 +10465,14 @@ fn expr_to_rhs_flow(
                     name: name.to_string(),
                 });
                 None
+            }
+        }
+        "qualified_identifier" => {
+            if let Some(src) = lookup_var_node(program, ctx, source, node) {
+                Some(FlowConstraint::Copy { dst, src })
+            } else {
+                resolve_qualified_fn(program, ctx, source, node)
+                    .map(|callee| FlowConstraint::AddrOfFn { dst, callee })
             }
         }
         "pointer_expression" => {
@@ -9853,6 +10525,9 @@ fn expr_to_rhs_flow(
             None
         }
         "field_expression" => {
+            if let Some(src) = static_member_access(program, ctx, source, node) {
+                return Some(FlowConstraint::Copy { dst, src });
+            }
             let (base, field_ids, field_names) = decompose_field_path(program, ctx, source, node)?;
             let mut current = base;
             for (i, fid) in field_ids.iter().enumerate() {
@@ -9873,10 +10548,7 @@ fn expr_to_rhs_flow(
                 let alloc_tmp = alloc_ret_temp(program, ctx, node);
                 // Give alloc_tmp the class pointer type so the heap location
                 // created by NewHeap carries the correct struct type.
-                if let Some(struct_tid) = program
-                    .types
-                    .type_id_by_tag(&cls, trace_ir::TypeKind::Struct)
-                {
+                if let Some(struct_tid) = program.types.class_type_id(&cls) {
                     program.symbols.variable_mut(alloc_tmp).type_id = struct_tid;
                 }
                 let args = node
@@ -10002,20 +10674,32 @@ fn return_flow_from_expr(
             // variable is asked first. Order matters now that this arm records
             // `AddrOfFn` rather than merely suppressing a fact: resolving the
             // function first would drop `return local;`'s real copy flow and
-            // invent a pointer to an unrelated function.
-            if let Some(src) = lookup_var(ctx, program, name) {
+            // invent a pointer to an unrelated function. A name a nearer field
+            // or function hides reads no variable, now or when deferred.
+            let found = lookup_var_unless_hidden(ctx, program, name);
+            if let Some(Some(src)) = found {
                 Some(ReturnFlow::Copy { src })
-            } else if let Some(callee) = program
-                .symbols
-                .resolve_function_in_scope(name, Some(ctx.current_file))
-            {
+            } else if let Some(callee) = resolve_function_named(program, ctx, name) {
                 Some(ReturnFlow::AddrOfFn { callee })
+            } else if found.is_some() {
+                None
             } else {
                 ctx.pending.borrow_mut().push(PendingFnRef::ReturnIdent {
                     owner: fn_id,
                     name: name.to_string(),
                 });
                 None
+            }
+        }
+        "field_expression" => {
+            static_member_access(program, ctx, source, node).map(|src| ReturnFlow::Copy { src })
+        }
+        "qualified_identifier" => {
+            if let Some(src) = lookup_var_node(program, ctx, source, node) {
+                Some(ReturnFlow::Copy { src })
+            } else {
+                resolve_qualified_fn(program, ctx, source, node)
+                    .map(|callee| ReturnFlow::AddrOfFn { callee })
             }
         }
         "call_expression" => {
@@ -10027,7 +10711,9 @@ fn return_flow_from_expr(
                 emit_call_return(program, ctx, node, temp, callee_name);
                 Some(ReturnFlow::Copy { src: temp })
             } else {
-                Some(ReturnFlow::Call { callee_name })
+                Some(ReturnFlow::Call {
+                    callee_name: canonical_call_name(program, ctx, callee_name),
+                })
             }
         }
         _ => None,
@@ -10056,7 +10742,23 @@ fn resolve_direct_call(
     if lookup_var(ctx, program, &name).is_some() {
         return None;
     }
-    Some(name)
+    Some(canonical_call_name(program, ctx, name))
+}
+
+/// The name a direct call spelled `name` records for its return flow, which
+/// is expanded after merge, out of the call's scope: the function the scoped
+/// lookup finds (`N::get` for `get()` inside `N`, `H::Get` in `H`'s member
+/// body), else `name` as written.
+fn canonical_call_name(program: &Program, ctx: &LowerContext, name: String) -> String {
+    if !ctx.is_cpp {
+        return name;
+    }
+    match resolve_function_named(program, ctx, &name) {
+        Some(id) if program.symbols.function(id).name != name => {
+            program.symbols.function(id).name.clone()
+        }
+        _ => name,
+    }
 }
 
 /// A receiver standing for the object an overloaded `->` yields, typed as
@@ -10078,6 +10780,8 @@ fn alloc_recv_temp(
         is_weak: false,
         target: None,
         is_namespaced: false,
+        qualified_name: None,
+        c_linkage: false,
         id: var_id,
         name: format!("_recv{}", var_id.0),
         type_id: pointee,
@@ -10105,6 +10809,8 @@ fn alloc_load_temp(
         is_weak: false,
         target: None,
         is_namespaced: false,
+        qualified_name: None,
+        c_linkage: false,
         id: load_var,
         name: format!("_load{}", load_var.0),
         type_id,
@@ -10131,6 +10837,8 @@ fn alloc_ret_temp_spanned(program: &mut Program, owner: Option<FnId>, span: Span
         is_weak: false,
         target: None,
         is_namespaced: false,
+        qualified_name: None,
+        c_linkage: false,
         id: var_id,
         name: format!("_ret{}", var_id.0),
         type_id: program.types.int(),
@@ -10150,10 +10858,7 @@ fn resolve_lvalue_var(
     node: Node,
 ) -> Option<VarId> {
     match node.kind() {
-        "identifier" => {
-            let name = node_text(source, &node);
-            lookup_var(ctx, program, name)
-        }
+        "identifier" | "qualified_identifier" => lookup_var_node(program, ctx, source, node),
         "pointer_expression" => {
             let op = pointer_op(source, node);
             let arg = pointer_arg(node)?;
@@ -10162,9 +10867,12 @@ fn resolve_lvalue_var(
             }
             resolve_lvalue_var(program, ctx, source, arg)
         }
-        "field_expression" | "subscript_expression" => node
-            .child_by_field_name("argument")
-            .and_then(|n| resolve_lvalue_var(program, ctx, source, n)),
+        "field_expression" | "subscript_expression" => {
+            static_member_access(program, ctx, source, node).or_else(|| {
+                node.child_by_field_name("argument")
+                    .and_then(|n| resolve_lvalue_var(program, ctx, source, n))
+            })
+        }
         "parenthesized_expression" => node
             .named_child(0)
             .and_then(|n| resolve_lvalue_var(program, ctx, source, n)),
@@ -10178,26 +10886,32 @@ fn resolve_lvalue_var(
 
 /// `&x` (through parentheses and casts) naming a plain variable: the
 /// argument is x's *address*. `&base.member` / `&arr[i]` are not plain —
-/// they keep their base-variable handling — and neither is a C++ reference:
-/// a reference variable already holds its referent's address, so `&r` is
-/// `r`'s value, not a cell of its own.
+/// they keep their base-variable handling — unless the member is a static
+/// data member, whose address is its own variable's. Nor is a C++
+/// reference: a reference variable already holds its referent's address, so
+/// `&r` is `r`'s value, not a cell of its own.
 fn addr_of_plain_var(
     program: &Program,
     ctx: &LowerContext,
     source: &str,
     node: Node,
 ) -> Option<VarId> {
-    // Qualified variable names are not resolved anywhere in expression
-    // lowering, so only a plain one qualifies.
-    let name = addr_of_name(source, node).filter(|n| n.kind() == "identifier")?;
-    lookup_var(ctx, program, node_text(source, &name))
-        .filter(|v| !names_reference_binding(ctx, name, *v))
+    if let Some(name) = addr_of_name(source, node) {
+        return lookup_var_node(program, ctx, source, name)
+            .filter(|v| !names_reference_binding(ctx, name, *v));
+    }
+    let node = peel_casts(source, node);
+    if pointer_op(source, node).as_deref() != Some("&") {
+        return None;
+    }
+    static_member_access(program, ctx, source, peel_expression(pointer_arg(node)?))
+        .filter(|v| !ctx.reference_bindings.contains(v))
 }
 
 /// Whether `&operand` names the C++ reference binding `var` itself: the
 /// reference already holds its referent's address, so `&r` is `r`'s value.
 fn names_reference_binding(ctx: &LowerContext, operand: Node, var: VarId) -> bool {
-    peel_expression(operand).kind() == "identifier" && ctx.reference_bindings.contains(&var)
+    is_name(peel_expression(operand)) && ctx.reference_bindings.contains(&var)
 }
 
 /// A temporary holding `&v`, for a value position that must carry v's
@@ -10376,18 +11090,94 @@ fn resolve_call_fn_arg(
     None
 }
 
+/// The function `name` designates as a value from the current scope, as a
+/// call's name resolves: through the enclosing classes (their bases
+/// included) and namespaces, innermost first, so `Handler` in `H`'s scope is
+/// `H::Handler` and `inner::f` inside `outer` is `outer::inner::f`; then
+/// what a `using` brings in; then the spelling as written, externals
+/// included. A file's own internal definition precedes an external one at
+/// each probe. A name no scoped function ends in skips the walk.
 fn resolve_function_named(program: &Program, ctx: &LowerContext, name: &str) -> Option<FnId> {
-    program
-        .symbols
-        .resolve_function_in_scope(name, Some(ctx.current_file))
+    let in_scope = |candidate: &str| {
+        program
+            .symbols
+            .resolve_function_in_scope(candidate, Some(ctx.current_file))
+    };
+    // No scoped function ends in the name: only its spelling can answer,
+    // with no walk and no allocation.
+    let leaf = name.rsplit("::").next().unwrap_or(name);
+    if !ctx.is_cpp || !program.symbols.has_scoped_function_leaf(leaf) {
+        return in_scope(name).or_else(|| program.symbols.resolve_function(name));
+    }
+    let mut probe = |candidate: &str, _global: bool| in_scope(candidate);
+    find_in_enclosing_scopes(program, ctx, name, &mut probe)
+        .or_else(|| {
+            imported_by_declaration(
+                ctx,
+                name,
+                &[ImportScope::Body, ImportScope::Namespace],
+                in_scope,
+            )
+        })
+        .or_else(|| in_scope(global_lookup_name(name)))
+        .or_else(|| imported_by_declaration(ctx, name, &[ImportScope::File], in_scope))
+        .or_else(|| imported_by_directive(ctx, name, in_scope))
         .or_else(|| program.symbols.resolve_function(name))
 }
 
-fn resolve_fn_ref(program: &Program, ctx: &LowerContext, source: &str, node: Node) -> Option<FnId> {
-    if node.kind() == "identifier" {
-        return resolve_function_named(program, ctx, node_text(source, &node));
+/// What the innermost `using X::name;` declaration written in one of
+/// `scopes` makes the bare `name` designate, each declaration's candidates in
+/// order: `probe` answers for one canonical spelling.
+fn imported_by_declaration<T>(
+    ctx: &LowerContext,
+    name: &str,
+    scopes: &[ImportScope],
+    probe: impl Fn(&str) -> Option<T>,
+) -> Option<T> {
+    ctx.using_name_imports
+        .iter()
+        .rev()
+        .filter(|import| import.base == name && scopes.contains(&import.scope))
+        .find_map(|import| import.candidates.iter().find_map(|q| probe(q)))
+}
+
+/// What a `using namespace X;` directive in scope makes `name` designate,
+/// the innermost directive first. A globally qualified `::name` it cannot.
+fn imported_by_directive<T>(
+    ctx: &LowerContext,
+    name: &str,
+    probe: impl Fn(&str) -> Option<T>,
+) -> Option<T> {
+    if !ctx.is_cpp || name.starts_with("::") {
+        return None;
     }
-    None
+    ctx.directive_namespaces()
+        .find_map(|ns| probe(&format!("{ns}::{name}")))
+}
+
+/// The function a name designates: `fn`, or a qualified `ns::fn` /
+/// `Cls::fn`, when it names no variable — a declared name shadows a function
+/// of the same spelling (docs/ANALYSIS.md, "Canonical variable identity").
+fn resolve_fn_ref(program: &Program, ctx: &LowerContext, source: &str, node: Node) -> Option<FnId> {
+    if lookup_var_node(program, ctx, source, node).is_some() {
+        return None;
+    }
+    match node.kind() {
+        "identifier" => resolve_function_named(program, ctx, node_text(source, &node)),
+        "qualified_identifier" => resolve_qualified_fn(program, ctx, source, node),
+        _ => None,
+    }
+}
+
+/// The function a `qualified_identifier` spells, not asking whether it names
+/// a variable: for a caller that already has.
+fn resolve_qualified_fn(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<FnId> {
+    resolve_function_named(program, ctx, &normalize_qualified(node_text(source, &node)))
 }
 
 fn resolve_callee_var(
@@ -10409,7 +11199,10 @@ fn resolve_callee_with_loads(
 ) -> CalleeRef {
     // `((cb_t)s.ops[i])()` calls the element as `s.ops[i]()` does.
     let node = peel_casts(source, node);
-    if !matches!(node.kind(), "field_expression" | "subscript_expression") {
+    // Only a name the member's class declares as a field can be one.
+    let implicit_member = node.kind() == "identifier"
+        && class_ctx_field(program, ctx, node_text(source, &node)).is_some();
+    if !implicit_member && !matches!(node.kind(), "field_expression" | "subscript_expression") {
         return resolve_callee(program, ctx, source, node);
     }
     // Answer before decomposition: it emits loads and allocates a summary
@@ -10419,7 +11212,26 @@ fn resolve_callee_with_loads(
         return cached.clone();
     }
     let mut result = None;
-    if let Some((base, field_ids, field_names)) =
+    if implicit_member {
+        // `cb()` in a member body, `cb` an instance field: a load from
+        // `this->cb`, as `this->cb()` is. The field hides a function of its
+        // name outside the class; a variable in scope (a local) hides it.
+        let name = node_text(source, &node);
+        let field_load = lookup_var(ctx, program, name).is_none().then(|| {
+            resolve_implicit_this_member(program, ctx, source, node).map(|gep| {
+                let load_var = alloc_load_temp(program, ctx, node, program.types.int());
+                program.flow.push(FlowConstraint::Load {
+                    dst: load_var,
+                    src: gep,
+                });
+                load_var
+            })
+        });
+        result = Some(match field_load.flatten() {
+            Some(load) => (name.to_string(), false, Some(load)),
+            None => resolve_callee(program, ctx, source, node),
+        });
+    } else if let Some((base, field_ids, field_names)) =
         field_table(node).and_then(|table| decompose_field_path(program, ctx, source, table))
     {
         // `s.table[i]()` / `p->table[i]()` calls an element of a field array:
@@ -10433,16 +11245,17 @@ fn resolve_callee_with_loads(
     } else if node.kind() == "subscript_expression" {
         // `table[i]()` calls the element: a load from the table, which reads
         // what was stored in it and passes through the functions its
-        // initializer placed (`ArrayFnMember`).
-        let table = subscript_table(node).filter(|n| n.kind() == "identifier");
-        if let Some(table) = table {
-            let name = node_text(source, &table);
-            if let Some(table_var) = lookup_var(ctx, program, name) {
-                let load_var = alloc_load_temp(program, ctx, node, program.types.int());
-                program.flow.push(FlowConstraint::Load {
-                    dst: load_var,
-                    src: table_var,
-                });
+        // initializer placed (`ArrayFnMember`). So does `h.table[i]()` on a
+        // static member table, which is no field path.
+        if let Some(table) = subscript_table(node) {
+            let table_var = if is_name(table) {
+                lookup_var_node(program, ctx, source, table)
+            } else {
+                static_member_access(program, ctx, source, table)
+            };
+            if let Some(table_var) = table_var {
+                let load_var = load_table_element(program, ctx, node, table_var);
+                let name = node_text(source, &table);
                 result = Some((format!("{name}[...]"), false, Some(load_var)));
             }
         }
@@ -10461,6 +11274,31 @@ fn resolve_callee_with_loads(
         .borrow_mut()
         .insert(node.id(), result.clone());
     result
+}
+
+/// The `operator()` a call through callable object variable `v` reaches:
+/// its class and the method kind, when the class declares one.
+fn callable_operator(program: &Program, v: VarId) -> Option<(String, trace_ir::MethodKind)> {
+    let cls = var_static_class(program, v)?;
+    let kind = trace_ir::MethodKind::Named("operator()".to_string());
+    (!member_targets_upward(program, &cls, &kind).is_empty()).then_some((cls, kind))
+}
+
+/// A temp holding an element of `table` (`table[i]`), for a call through
+/// it: a load from the table, which reads what was stored in it and passes
+/// through the functions its initializer placed (`ArrayFnMember`).
+fn load_table_element(
+    program: &mut Program,
+    ctx: &LowerContext,
+    span_node: Node,
+    table: VarId,
+) -> VarId {
+    let load_var = alloc_load_temp(program, ctx, span_node, program.types.int());
+    program.flow.push(FlowConstraint::Load {
+        dst: load_var,
+        src: table,
+    });
+    load_var
 }
 
 fn field_callee_text(source: &str, node: Node) -> String {
@@ -10573,8 +11411,13 @@ fn resolve_callee(
             (name, false, None)
         }
         // C++: `ns::fn`, `Cls::static_fn` — normalized text resolves by name
-        // in the caller; template spellings drop their argument list.
-        "qualified_identifier" => (normalize_qualified(node_text(source, &node)), false, None),
+        // in the caller; template spellings drop their argument list. A
+        // qualified callback variable (`ns::cb`) is called through.
+        "qualified_identifier" => (
+            normalize_qualified(node_text(source, &node)),
+            false,
+            lookup_var_node(program, ctx, source, node),
+        ),
         "template_function" => {
             let raw = node_text(source, &node);
             let name = strip_template_args(&normalize_qualified(raw));
@@ -10594,6 +11437,9 @@ fn resolve_callee(
             .map(|inner| resolve_callee(program, ctx, source, inner))
             .unwrap_or(("<indirect>".into(), false, None)),
         "field_expression" => {
+            if let Some(member) = static_member_access(program, ctx, source, node) {
+                return (field_callee_text(source, node), false, Some(member));
+            }
             let field = node
                 .child_by_field_name("field")
                 .map(|n| node_text(source, &n).to_string())
@@ -10627,10 +11473,7 @@ fn resolve_expr_var(
 ) -> Option<VarId> {
     let node = peel_casts(source, node);
     match node.kind() {
-        "identifier" => {
-            let name = node_text(source, &node);
-            lookup_var(ctx, program, name)
-        }
+        "identifier" | "qualified_identifier" => lookup_var_node(program, ctx, source, node),
         "pointer_expression" => {
             let op = pointer_op(source, node);
             let arg = pointer_arg(node)?;
@@ -10639,34 +11482,241 @@ fn resolve_expr_var(
             }
             resolve_expr_var(program, ctx, source, arg)
         }
-        "field_expression" | "subscript_expression" => node
-            .child_by_field_name("argument")
-            .and_then(|n| resolve_expr_var(program, ctx, source, n)),
+        "field_expression" | "subscript_expression" => {
+            static_member_access(program, ctx, source, node).or_else(|| {
+                node.child_by_field_name("argument")
+                    .and_then(|n| resolve_expr_var(program, ctx, source, n))
+            })
+        }
         _ => None,
     }
 }
 
+/// The variable a written name designates: the shared lookup of every
+/// expression position (docs/ANALYSIS.md, "Canonical variable identity").
+/// `name` is `identifier` text or a normalized `qualified_identifier`
+/// spelling. An unqualified name asks the body's locals first. Scoped
+/// candidates are walked only inside a C++ class or namespace, and only when
+/// some scoped variable ends in the name's last segment
+/// ([`trace_ir::SymbolTable::has_scoped_variable_leaf`]); otherwise the plain
+/// global/file-static path answers, allocation-free. The walk is
+/// [`find_in_scope`]'s class/namespace traversal, probing
+/// [`trace_ir::SymbolTable::variable_named_in_scope`] with each candidate
+/// canonical spelling, innermost scope first. A qualified name never consults
+/// locals, a leading `::` is asked about at the global scope only, and a
+/// spelling that matches nothing never falls back to a shorter one.
 fn lookup_var(ctx: &LowerContext, program: &Program, name: &str) -> Option<VarId> {
-    if ctx.current_fn.is_some() {
-        if let Some(&id) = ctx.locals.get(name) {
-            return Some(id);
+    lookup_var_unless_hidden(ctx, program, name).flatten()
+}
+
+/// [`lookup_var`], telling a name nothing declares (`None`) from one a
+/// nearer field or function hides from every variable (`Some(None)`): the
+/// latter must not fall back to a variable of that name later.
+fn lookup_var_unless_hidden(
+    ctx: &LowerContext,
+    program: &Program,
+    name: &str,
+) -> Option<Option<VarId>> {
+    let leaf = name.rsplit("::").next().unwrap_or(name);
+    let may_be_scoped = program.symbols.has_scoped_variable_leaf(leaf);
+    // What a `using` brings in can only be a scoped variable.
+    let imported = |scopes: &[ImportScope]| {
+        may_be_scoped
+            .then(|| variable_imported_by_declaration(ctx, program, name, scopes))
+            .flatten()
+    };
+    let by_directive = || {
+        may_be_scoped
+            .then(|| variable_imported_by_directive(ctx, program, name))
+            .flatten()
+    };
+    if leaf.len() == name.len() {
+        if ctx.current_fn.is_some() {
+            if let Some(&id) = ctx.locals.get(name) {
+                return Some(Some(id));
+            }
+            // A `using ns::name;` in the body hides outer names, as a local.
+            if let Some(id) = imported(&[ImportScope::Body]) {
+                return Some(Some(id));
+            }
         }
+        if ctx.ns_stack.is_empty() && ctx.type_scope.borrow().is_empty() {
+            return unscoped_var_named(ctx, program, name)
+                .or_else(|| imported(&[ImportScope::File]))
+                .or_else(by_directive)
+                .map(Some);
+        }
+        // Only a variable outside every class and namespace can answer,
+        // unless a nearer declaration hides it: an instance field (inside a
+        // class) or a scoped function of the name. The walk is paid only
+        // when one could.
+        if !may_be_scoped {
+            let global = unscoped_var_named(ctx, program, name)?;
+            if ctx.type_scope.borrow().is_empty() && !program.symbols.has_scoped_function_leaf(name)
+            {
+                return Some(Some(global));
+            }
+        }
+    } else if !may_be_scoped {
+        // No scoped variable ends in `leaf`: only `::leaf` can still name one.
+        return name
+            .strip_prefix("::")
+            .filter(|global| *global == leaf)
+            .and_then(|global| unscoped_var_named(ctx, program, global))
+            .map(Some);
     }
-    if let Some(&id) = program.symbols.global_by_name.get(name) {
-        return Some(id);
+    // A namespace's `using ns::name;` declares the name in that namespace,
+    // so it is asked before the global scope; a file-scope one and a
+    // directive only after it.
+    let mut probe =
+        |candidate: &str, _global: bool| scoped_variable_unless_hidden(program, ctx, candidate);
+    find_in_enclosing_scopes(program, ctx, name, &mut probe)
+        .or_else(|| imported(&[ImportScope::Namespace]).map(Some))
+        .or_else(|| probe(global_lookup_name(name), true))
+        .or_else(|| {
+            imported(&[ImportScope::File])
+                .or_else(by_directive)
+                .map(Some)
+        })
+}
+
+/// The variable the innermost `using ns::name;` declaration written in one
+/// of `scopes` makes `name` spell.
+fn variable_imported_by_declaration(
+    ctx: &LowerContext,
+    program: &Program,
+    name: &str,
+    scopes: &[ImportScope],
+) -> Option<VarId> {
+    imported_by_declaration(ctx, name, scopes, |qualified| {
+        program
+            .symbols
+            .variable_named_in_scope(qualified, ctx.current_file)
+    })
+}
+
+/// The variable a `using namespace ns;` directive in scope makes `name`
+/// spell, as it does for a function. A function declared at file scope hides
+/// what a directive brings in.
+fn variable_imported_by_directive(
+    ctx: &LowerContext,
+    program: &Program,
+    name: &str,
+) -> Option<VarId> {
+    if names_function(program, ctx, name) {
+        return None;
     }
-    // A function-local `static` is among `locals`, as every variable declared
-    // in a body is.
-    program.symbols.file_static_named(ctx.current_file, name)
+    imported_by_directive(ctx, name, |qualified| {
+        program
+            .symbols
+            .variable_named_in_scope(qualified, ctx.current_file)
+    })
+}
+
+/// A global or file-`static` variable declared outside any class or
+/// namespace, with the scope walk's precedence: the file's own `static`
+/// first. A function-local `static` is among `locals`, as every variable
+/// declared in a body is.
+fn unscoped_var_named(ctx: &LowerContext, program: &Program, name: &str) -> Option<VarId> {
+    program
+        .symbols
+        .variable_named_in_scope(name, ctx.current_file)
+}
+
+/// [`lookup_var`] for a name node: an `identifier`, or a `qualified_identifier`
+/// without template arguments — stripping them could bind an unrelated
+/// variable, so a templated scope designates none.
+fn lookup_var_node(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<VarId> {
+    let text = node_text(source, &node);
+    match node.kind() {
+        "identifier" => lookup_var(ctx, program, text),
+        // Only a spelling with whitespace (`a :: b`, from a macro) needs
+        // normalizing; `lookup_var`'s leaf pre-filter answers the rest.
+        "qualified_identifier" if !text.contains('<') => {
+            if text.contains(char::is_whitespace) {
+                lookup_var(ctx, program, &normalize_qualified(text))
+            } else {
+                lookup_var(ctx, program, text)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The static data member a member access (`obj.m`, `p->m`, `this->m`)
+/// names: its one storage, as `Cls::m` names it, looked up on the receiver's
+/// class and then its bases. `None` for an instance field, the common case,
+/// answered by the scoped-leaf set before the receiver is typed.
+fn static_member_access(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<VarId> {
+    if node.kind() != "field_expression" {
+        return None;
+    }
+    let field = node_text(source, &node.child_by_field_name("field")?);
+    if !program.symbols.has_scoped_variable_leaf(field) {
+        return None;
+    }
+    let recv = node.child_by_field_name("argument")?;
+    let cls = member_receiver_class(program, ctx, source, recv, is_arrow_access(node))?;
+    find_in_class_or_bases(program, &cls, |cls| {
+        scoped_variable_unless_hidden(program, ctx, &format!("{cls}::{field}"))
+    })
+    .flatten()
+}
+
+/// The probe of a scope walk for variable `candidate` (`{scope}::{name}`):
+/// `Some(Some(v))` when that scope's variable is found, `Some(None)` when the
+/// scope declares `name` otherwise — an instance field or a function (a file
+/// `static` one included), which hides any variable further out (a base's
+/// static member, an outer scope's variable) — and `None` to keep walking.
+fn scoped_variable_unless_hidden(
+    program: &Program,
+    ctx: &LowerContext,
+    candidate: &str,
+) -> Option<Option<VarId>> {
+    if let Some(var) = program
+        .symbols
+        .variable_named_in_scope(candidate, ctx.current_file)
+    {
+        return Some(Some(var));
+    }
+    let (scope, name) = candidate.rsplit_once("::")?;
+    let declares_field = program.types.class_type_id(scope).is_some_and(|tid| {
+        program
+            .types
+            .get(tid)
+            .layout
+            .fields
+            .iter()
+            .any(|(_, f)| f.name == name)
+    });
+    (declares_field || names_function(program, ctx, candidate)).then_some(None)
 }
 
 fn declaration_is_extern(source: &str, node: Node) -> bool {
-    let Some(node) = enclosing_decl(node, &["declaration", "field_declaration"]) else {
-        return false;
-    };
-    let mut cursor = node.walk();
-    let found = node.named_children(&mut cursor).any(|child| {
-        child.kind() == "storage_class_specifier" && node_text(source, &child) == "extern"
+    enclosing_decl(node, &["declaration", "field_declaration"]).is_some_and(|decl| {
+        has_storage_specifier(source, decl, "extern")
+            // `extern "C" T x;`, a linkage specification's one declaration
+            // without braces, is `extern` too.
+            || decl.parent().is_some_and(|p| p.kind() == "linkage_specification")
+    })
+}
+
+/// Whether declaration `decl` spells storage class specifier `keyword`
+/// (`extern`, `inline`).
+fn has_storage_specifier(source: &str, decl: Node, keyword: &str) -> bool {
+    let mut cursor = decl.walk();
+    let found = decl.named_children(&mut cursor).any(|child| {
+        child.kind() == "storage_class_specifier" && node_text(source, &child) == keyword
     });
     found
 }
@@ -10679,7 +11729,7 @@ fn enclosing_decl<'t>(mut node: Node<'t>, kinds: &[&str]) -> Option<Node<'t>> {
     Some(node)
 }
 
-fn declaration_is_static(_source: &str, node: Node) -> bool {
+fn declaration_is_static(node: Node) -> bool {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() != "storage_class_specifier" {
@@ -10744,7 +11794,10 @@ fn storage_for(ctx: &LowerContext, is_static: bool) -> StorageClass {
         } else {
             StorageClass::Local
         }
-    } else if is_static {
+    } else if is_static || ctx.in_anonymous_namespace() {
+        // An anonymous namespace gives its variables internal linkage, as
+        // `static` does: they are the file's own storage, never an external
+        // symbol (`Variable::external_symbol_name`).
         StorageClass::FileStatic
     } else {
         StorageClass::Global
@@ -10829,7 +11882,7 @@ fn type_desc_from_node(
             {
                 let fields = program
                     .types
-                    .type_id_by_tag(&cls, trace_ir::TypeKind::Struct)
+                    .class_type_id(&cls)
                     .and_then(|id| match program.types.get(id).desc.as_ref() {
                         TypeDesc::Struct { fields, .. } => Some(fields.clone()),
                         _ => None,
@@ -10864,7 +11917,7 @@ fn type_desc_from_node(
         let tag_hit = !scoped
             && program
                 .types
-                .type_id_by_tag(&ctx.qualify(&stripped), trace_ir::TypeKind::Struct)
+                .class_type_id(&ctx.qualify(&stripped))
                 .is_some();
         let looks_class = stripped.contains("::")
             || stripped != raw // had template args stripped
@@ -12434,5 +13487,207 @@ mod conversion_target_properties {
                 }
             }
         }
+    }
+}
+
+/// #133: `lookup_var` (the variable lookup every expression position shares),
+/// exercised directly against a hand-built `LowerContext` rather than through
+/// parsing and full lowering — these cases test scope precedence and
+/// canonical-name resolution, not AST dispatch.
+#[cfg(test)]
+mod qualified_variable_lookup_tests {
+    use super::*;
+
+    /// A `LowerContext` with just the fields `lookup_var` and the helper it
+    /// calls (`find_in_scope`) read: an empty parse tree stands in for the
+    /// unit being lowered, since none of these calls walk it.
+    fn test_ctx(
+        current_file: trace_ir::FileId,
+        current_fn: Option<FnId>,
+        ns_stack: Vec<Option<String>>,
+        locals: HashMap<String, VarId>,
+    ) -> LowerContext {
+        let parsed = crate::parse::parse_source_with_lang("", crate::parse::SourceLang::Cpp)
+            .expect("empty source parses");
+        LowerContext {
+            current_fn,
+            current_file,
+            locals,
+            line_map: None,
+            primary_path: PathBuf::new(),
+            origin_file_ids: Vec::new(),
+            pending: RefCell::new(Vec::new()),
+            ns_stack,
+            using_nss: Vec::new(),
+            using_name_imports: Vec::new(),
+            c_linkage: false,
+            class_ctx: None,
+            type_scope: RefCell::new(Vec::new()),
+            local_aliases: Vec::new(),
+            is_cpp: true,
+            handled_new_exprs: RefCell::new(HashSet::default()),
+            callee_load_cache: RefCell::new(HashMap::default()),
+            call_receiver_cache: RefCell::new(HashMap::default()),
+            call_return_dst: RefCell::new(HashMap::default()),
+            ast_depth: 0,
+            ast_depth_warned: false,
+            reference_vars: HashSet::default(),
+            reference_bindings: HashSet::default(),
+            local_scope_log: Vec::new(),
+            tree: parsed.tree,
+            has_templates: false,
+            has_weak: false,
+            record_link_ownership: false,
+            header_unit: false,
+            pending_flow_owners: HashMap::default(),
+            pending_initializer_owners: HashMap::default(),
+            ignored_macros: Arc::from(Vec::<String>::new()),
+            ignored_macro_cache: RefCell::new(HashMap::default()),
+        }
+    }
+
+    /// Register a global variable directly (bypassing lowering), optionally
+    /// carrying a canonical `qualified_name`.
+    fn global_var(
+        program: &mut Program,
+        file: trace_ir::FileId,
+        name: &str,
+        qualified_name: Option<&str>,
+    ) -> VarId {
+        let id = program.symbols.alloc_var_id();
+        let int_ty = program.types.int();
+        program.symbols.add_variable(Variable {
+            id,
+            name: name.to_string(),
+            type_id: int_ty,
+            storage: StorageClass::Global,
+            fn_id: None,
+            param_index: None,
+            span: Span::new(file, 1, 1),
+            is_pointer: true,
+            is_defined: true,
+            is_weak: false,
+            target: None,
+            is_namespaced: qualified_name.is_some(),
+            qualified_name: qualified_name.map(str::to_string),
+            c_linkage: false,
+        });
+        id
+    }
+
+    #[test]
+    fn local_wins_for_a_plain_name() {
+        let mut program = Program::new(PathBuf::from("/t"));
+        let file = program.symbols.add_file(PathBuf::from("/t/ns.cpp"));
+        let global_id = global_var(&mut program, file, "ptr", None);
+        let local_id = program.symbols.alloc_var_id();
+        let mut locals = HashMap::default();
+        locals.insert("ptr".to_string(), local_id);
+        let ctx = test_ctx(file, Some(FnId(0)), Vec::new(), locals);
+
+        assert_eq!(lookup_var(&ctx, &program, "ptr"), Some(local_id));
+        assert_ne!(local_id, global_id);
+    }
+
+    #[test]
+    fn leading_double_colon_bypasses_locals_and_selects_the_global() {
+        let mut program = Program::new(PathBuf::from("/t"));
+        let file = program.symbols.add_file(PathBuf::from("/t/ns.cpp"));
+        let global_id = global_var(&mut program, file, "ptr", None);
+        let local_id = program.symbols.alloc_var_id();
+        let mut locals = HashMap::default();
+        locals.insert("ptr".to_string(), local_id);
+        let ctx = test_ctx(file, Some(FnId(0)), Vec::new(), locals);
+
+        assert_eq!(lookup_var(&ctx, &program, "::ptr"), Some(global_id));
+    }
+
+    #[test]
+    fn a_qualified_name_selects_its_namespace() {
+        let mut program = Program::new(PathBuf::from("/t"));
+        let file = program.symbols.add_file(PathBuf::from("/t/ns.cpp"));
+        global_var(&mut program, file, "ptr", None);
+        let a_ptr = global_var(&mut program, file, "ptr", Some("a::ptr"));
+        let ctx = test_ctx(file, None, Vec::new(), HashMap::default());
+
+        assert_eq!(lookup_var(&ctx, &program, "a::ptr"), Some(a_ptr));
+    }
+
+    #[test]
+    fn a_relatively_qualified_name_resolves_through_the_enclosing_namespace() {
+        let mut program = Program::new(PathBuf::from("/t"));
+        let file = program.symbols.add_file(PathBuf::from("/t/ns.cpp"));
+        let outer_inner_ptr = global_var(&mut program, file, "ptr", Some("outer::inner::ptr"));
+        let ctx = test_ctx(
+            file,
+            None,
+            vec![Some("outer".to_string())],
+            HashMap::default(),
+        );
+
+        assert_eq!(
+            lookup_var(&ctx, &program, "inner::ptr"),
+            Some(outer_inner_ptr)
+        );
+    }
+
+    /// One precedence on every path: a file's own `static` shadows an external
+    /// global of that name whether or not some scoped variable shares the leaf
+    /// (which sends the lookup through the scope walk instead of the fast path).
+    #[test]
+    fn a_file_static_shadows_a_global_on_every_lookup_path() {
+        let mut program = Program::new(PathBuf::from("/t"));
+        let file = program.symbols.add_file(PathBuf::from("/t/ns.cpp"));
+        global_var(&mut program, file, "cfg", None);
+        let internal = program.symbols.alloc_var_id();
+        let int_ty = program.types.int();
+        program.symbols.add_variable(Variable {
+            id: internal,
+            name: "cfg".to_string(),
+            type_id: int_ty,
+            storage: StorageClass::FileStatic,
+            fn_id: None,
+            param_index: None,
+            span: Span::new(file, 2, 1),
+            is_pointer: true,
+            is_defined: true,
+            is_weak: false,
+            target: None,
+            is_namespaced: false,
+            qualified_name: None,
+            c_linkage: false,
+        });
+        let ns_ctx = test_ctx(file, None, vec![Some("a".to_string())], HashMap::default());
+        assert_eq!(
+            lookup_var(&ns_ctx, &program, "cfg"),
+            Some(internal),
+            "fast path"
+        );
+        assert_eq!(
+            lookup_var(&ns_ctx, &program, "::cfg"),
+            Some(internal),
+            "fast path"
+        );
+        global_var(&mut program, file, "cfg", Some("b::cfg"));
+        assert_eq!(
+            lookup_var(&ns_ctx, &program, "cfg"),
+            Some(internal),
+            "scope walk"
+        );
+        assert_eq!(
+            lookup_var(&ns_ctx, &program, "::cfg"),
+            Some(internal),
+            "scope walk"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_qualified_name_never_falls_back_to_the_bare_name() {
+        let mut program = Program::new(PathBuf::from("/t"));
+        let file = program.symbols.add_file(PathBuf::from("/t/ns.cpp"));
+        global_var(&mut program, file, "ptr", None);
+        let ctx = test_ctx(file, None, Vec::new(), HashMap::default());
+
+        assert_eq!(lookup_var(&ctx, &program, "missing::ptr"), None);
     }
 }

@@ -147,7 +147,11 @@ string `Vec` moves the `CString` values but not the buffers they own.
 - **ABI guard on `trace_index_options`.** `opts->size` must be at least
   `sizeof(trace_index_options)`; smaller values are rejected with
   `TRACE_ERR_INVALID_ARG` (forward compatible: larger structs are accepted).
-  `size == 0` opts out of the check for easy zero-init callers.
+  `size == 0` opts out of the check for easy zero-init callers. The library
+  then reads every field of the struct it was built with, so lenient mode is
+  only for a caller compiled against the same header: one built against an
+  older, shorter struct must set `size` to be rejected cleanly instead of
+  having fields read past its allocation.
 - **`*out_err` is cleared on entry.** Every function nulls `*out_err` before
   doing anything, and writes it only on failure. A caller that reuses one
   buffer across calls can never observe a stale (already-freed) pointer; the

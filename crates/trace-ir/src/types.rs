@@ -787,6 +787,13 @@ impl TypeTable {
         }
     }
 
+    /// The layout of the C++ class `name` names: a struct's, else a union's
+    /// (a union is a class, and the two share one tag namespace).
+    pub fn class_type_id(&self, name: &str) -> Option<TypeId> {
+        self.type_id_by_tag(name, TypeKind::Struct)
+            .or_else(|| self.type_id_by_tag(name, TypeKind::Union))
+    }
+
     pub fn type_id_by_tag(&self, name: &str, kind: TypeKind) -> Option<TypeId> {
         match kind {
             TypeKind::Struct => self.struct_tags.get(name).copied(),

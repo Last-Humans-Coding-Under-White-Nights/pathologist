@@ -22,7 +22,12 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn build_and_export(name: &str) -> TempDb {
-    let root = fixture(name);
+    export_tree(&fixture(name), name)
+}
+
+/// Build the tree at `root` and export it minimally to a scratch database.
+fn export_tree(root: &std::path::Path, name: &str) -> TempDb {
+    let root = root.to_path_buf();
     let opts = PreprocessOptions::new()
         .with_include(root.clone())
         .with_include(
@@ -949,4 +954,25 @@ fn dataflow_passes_through_an_address_taken_local() {
             "{name} unreachable from y; got {reached:?}"
         );
     }
+}
+
+/// #142 review: a global nothing reads or writes has no flow node, but the
+/// minimal export still lists it, so inspect finds it by its own declaration
+/// and says it has no flow rather than answering for a neighbour.
+#[test]
+fn a_flowless_global_is_found_as_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("unused.c"),
+        "int *neighbour;\n\
+         int unused_global;\n\
+         void f(void) { static int x; neighbour = &x; }\n",
+    )
+    .unwrap();
+    let db = export_tree(dir.path(), "unused");
+    let conn = open_db(db.path()).unwrap();
+    let syms = require_symbols_at(&conn, "unused.c", 2, 5).unwrap();
+    assert_eq!(syms[0].name, "unused_global");
+    let err = dataflow_graph(&conn, &syms[..1], Direction::Down, 3).unwrap_err();
+    assert!(err.to_string().contains("unused_global"), "{err}");
 }

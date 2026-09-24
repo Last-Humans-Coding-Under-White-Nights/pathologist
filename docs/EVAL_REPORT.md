@@ -1,5 +1,410 @@
 # Evaluation Report
 
+## Qualified variables — 2026-09-23 (#133)
+
+The rules are defined in [Canonical variable identity](ANALYSIS.md#canonical-variable-identity)
+and, for linking, "Link targets and weak symbols" in ANALYSIS.md. This section
+explains the correctness movement only; performance is not measured here.
+
+Baseline: `master` at `478e8da3b1093d33d0eaebd15c9a11aa07b2a7c4`. Candidate:
+branch `feat/issue-133-qualified-variables` at `e7bb510`. Both are release
+builds (`cargo build --release -p trace-cli`) run through
+`python3 scripts/eval_check.py --bin <binary> --jobs 8` at `budget_pops`
+800000, minimal export, on the corpora pinned in `scripts/eval_expected.json`
+(hdf `cdc75a2`, hiview `92408e2`, camera `8ffd69d`), all clean. Rust
+`1.100.0-nightly (bff8e12ff 2026-08-26)`, Apple M1 MacBook Air
+(`MacBookAir10,1`), 8 cores, 8 GB.
+
+The baseline fails four checks, all of them re-captured here. The candidate
+passes all 94.
+
+| Corpus | Metric | Baseline | Candidate |
+|---|---|---:|---:|
+| hdf | `edges_indirect` (exact) | 4,850 | 4,948 |
+| hdf | `arg_flow_edges`, `arg_flow_rows_per_call_edge` | 68,869 | 69,055 |
+| hdf | `edges_external` (band) | 25,219 | 25,150 |
+| hdf | `edges_total` (band) | 74,881 | 74,910 |
+| hiview | `arg_flow_edges` | 17,895 | 18,199 |
+| hiview | `edges_external` (band) | 16,658 | 16,676 |
+| hiview | `functions_external` (band) | 2,113 | 2,104 |
+| camera | `arg_flow_edges` (band) | 41,172 | 41,275 |
+| camera | `edges_direct` / `edges_external` (band) | 56,772 / 45,006 | 56,784 / 44,994 |
+
+### Performance — Stage 6 (accepted with exceptions)
+
+The acceptance criterion was no reproducible slowdown and no peak-memory
+regression in any configuration. The candidate is faster in wall time in six
+of eight configurations, and was **accepted with two recorded exceptions**:
+a +2–5.5% peak-memory increase (hiview, camera jobs 1), and a
++0.3–0.4% wall / +0.5–0.7% CPU increase in the camera configurations. Both
+come from modeling in-class static data members as the storage they are
+(see "What remains").
+
+**Method.** The baseline is `478e8da` in a detached worktree; the candidate is
+`ca337f8`. Both were built with `cargo build -p trace-cli --release --locked`
+using rustc `1.100.0-nightly (bff8e12ff 2026-08-26)`, on an Apple M1
+`MacBookAir10,1` (8 cores, 8 GB, macOS 26.6.2). Runs used
+`--solve-budget-pops 800000` and a fresh database each, on hdf `cdc75a2`,
+hiview `92408e2` and camera `8ffd69d`.
+
+Each configuration got one warm-up run per binary, then 9 pairs run one after
+another, alternating which binary went first. Measurements come from
+`/usr/bin/time -l` (wall, user+sys, peak RSS) and the CLI's phase timings.
+No run hit the pop budget, and each binary's result counts were identical
+across all its runs. Against the current expectations, `eval_check.py` gives
+the candidate PASS 94/94 and the baseline FAIL 12: exactly the values
+re-captured above. The camera jobs-8 rows come from a repeated batch: the
+first was disturbed by other load (wall 5.3–14.4 s).
+
+Medians of 9 pairs. "k/9" counts the pairs in which the candidate was
+higher:
+
+| Configuration | Wall, baseline → candidate (s) | CPU Δ | Peak RSS, baseline → candidate (MB) |
+|---|---:|---:|---:|
+| hdf, jobs 8 | 4.22 → 3.46 (-18.0%, 0/9) | -5.5% (0/9) | 442 → 429 (-6.0%, 3/9) |
+| hiview, jobs 8 | 1.52 → 1.45 (-3.9%, 0/9) | -0.4% (2/9) | 306 → 318 (+3.2%, 8/9) |
+| camera, jobs 8 | 5.34 → 5.23 (-2.8%, 0/9) | +0.6% (7/9) | 757 → 746 (-2.4%, 4/9) |
+| camera full/debug, jobs 8 | 5.68 → 5.62 (-1.8%, 1/9) | +0.7% (8/9) | 756 → 731 (-2.5%, 3/9) |
+| hdf, jobs 1 | 7.79 → 6.97 (-10.3%, 0/9) | -8.4% (0/9) | 450 → 455 (+1.3%, 8/9) |
+| hiview, jobs 1 | 2.97 → 2.95 (-1.0%, 2/9) | -0.8% (2/9) | 294 → 313 (+5.5%, 9/9) |
+| camera, jobs 1 | 11.36 → 11.40 (+0.4%, 7/9) | +0.1% (6/9) | 866 → 883 (+2.3%, 6/9) |
+| camera full/debug, jobs 1 | 11.49 → 11.56 (+0.3%, 5/9) | +0.5% (7/9) | 779 → 866 (+2.1%, 5/9) |
+
+**How we got here.** The first measurement was on `a83b3ad`, the branch
+before any Stage 6 change. It was 2–5% slower in every configuration. Three
+commits changed that, each without changing any result:
+
+- `8dd7833` skips the new scope walks for names no scoped function or
+  variable ends in. A profile had traced camera's +0.3 s index phase to those
+  walks.
+- `4f1c7e6` builds a PAG node and location only for globals that some fact
+  names (see [Program Assignment Graph](ANALYSIS.md#program-assignment-graph-pag)).
+  The header static member declarations each unit repeats no longer cost a
+  node, a location and a self points-to fact apiece; camera's export phase is
+  0.1 s faster.
+- `ca337f8` makes a store write only its value's new locations into
+  existing targets (see [Propagation highlights](ANALYSIS.md#propagation-highlights)).
+  hdf's solve drops from about 1.8 s to 0.8 s, which also pays for the flow
+  this branch recovers. All 1,039,526 points-to rows and every call edge on
+  hdf, and camera's, are identical before and after.
+
+**What remains.**
+
+- **Peak memory** (hiview +3.2% / +5.5%, camera jobs 1 +2%). The peak is at
+  the end of indexing, when the merged program is built; every earlier phase
+  peaks lower than the baseline. The merged program now holds one variable
+  per unit for each in-class static member a header declares: hiview's
+  globals go from 28,252 to 37,212. The baseline modeled these members as
+  instance fields, whose field summaries were shared across units, so it
+  held none of these per-unit copies. Without link metadata a global is kept
+  once per unit (docs/ANALYSIS.md, "Link targets and weak symbols"), and
+  these declarations follow that policy. Pruning them per unit at merge
+  was tried and reverted: a header's shared unit is merged separately from
+  the units that read its variables, so real flow was dropped.
+- **Lowering CPU** (camera index phase +0.1–0.2 s). Registering static data
+  members in every unit that includes their header costs about 80 samples in
+  profiles (`lower_struct_specifier`, `lower_class_definitions`). The
+  remaining lookup costs are within profile noise.
+
+**Why these were accepted.** The costs come from keeping static members as
+real storage, one copy per unit, which is the policy for every global when
+there is no link metadata. Removing them would mean keeping one variable per
+in-class static member declaration across such units. That is a merge-policy
+change: it would move results, and it answers a correctness question rather
+than a performance one. Without link metadata, a static member written
+through an object in one unit is not seen by reads in another, and the
+baseline's field model did share it. That change is left to a follow-up
+issue with its own design and tests, and is not made here to save memory.
+
+**Synthetic scaling.** The generated trees have N namespace variables in N/2
+namespaces. Every namespace declares the same leaf `ptr` plus a `val`, and
+both are read qualified from outside and bare from inside. Each size has a
+matching C control that uses plain identifiers. Sources are split over 20
+units, and each size ran 5 alternating pairs. Both binaries scale linearly:
+
+| Tree | Wall, baseline → candidate (s) | Peak RSS, baseline → candidate (MB) |
+|---|---:|---:|
+| C++ 10,000, jobs 1 | 0.67 → 0.70 (+6.0%) | 66.7 → 76.4 (+13.3%) |
+| C++ 10,000, jobs 8 | 0.31 → 0.33 (+6.5%) | 93.3 → 101.7 (+12.8%) |
+| C++ 5,000, jobs 1 | 0.33 → 0.35 (+3.0%) | 35.0 → 37.2 |
+| C control 10,000, jobs 1 | 0.41 → 0.43 (+4.9%) | 57.3 → 57.8 |
+| C control 10,000, jobs 8 | 0.20 → 0.21 (±0) | 79.4 → 78.8 |
+
+The C++ cost buys the recovered flow. With `--debug-points-to` on C++ 1,000,
+all 500 of the candidate's `out_i` point to their `obj_i`; none of the
+baseline's do.
+
+Pruning unreferenced declarations per unit at merge was tried and reverted.
+A header's shared unit is merged separately from the units that read its
+variables, so a per-unit reference set dropped real flow (`H::read` in a
+reader unit). Options that remain need a decision: building PAG nodes and
+locations lazily, only for variables some constraint names (this changes
+what the flow-graph export contains); unifying header declarations across
+units; or solver work to offset the recovered propagation.
+
+### What moved in hdf
+
+The 98 new indirect edges were external before. There are 19
+`ioService->dispatcher->Dispatch` sites in
+`framework/core/manager/test/unittest/common/hdf_pm_test.cpp`. They now read
+the static data member `HdfPmTest::ioService` and reach its five dispatchers
+(`DeviceManagerDispatch`, `DeviceNodeExtDispatch`, `DeviceSvcMgrDispatch`,
+`HdfKIoServiceDispatch`, `HdfSyscallAdapterDispatch`), which accounts for 95
+edges. The other three are `adapter/uhdf2/host/test/unittest/devmgr_test.cpp`
+lines 106, 110 and 113, which resolve to `DevmgrUnloadDevice` and
+`HDIServMgrGetService`.
+
+The argument-flow gain comes from 110 call sites with new rows: the
+`hdf_pm_test` `Dispatch` arguments, `hdf_ioservice_test` listener
+registration, and the hdi-gen `ASTAttr` / `ASTType` emitters. No call site
+loses rows.
+
+hdf loses 47 `cCodeEmitters_["..."]->OutPut(...)` call sites in
+`framework/tools/hdi-gen/codegen/code_generator.cpp` lines 164–319, along with
+their 47 name-only external `OutPut` edges. `CodeGenerator::cCodeEmitters_` is
+now a known static member. Its callee text therefore keeps the string
+subscript, and a pre-existing rule drops callee text that contains a quote.
+Master already applies that rule to every known variable (`g["x"]->f()`), so
+this member now gets the same treatment rather than an exemption. The rule
+itself is unrelated to qualified names. Relaxing it would be a separate
+change.
+
+### What moved in hiview
+
+hiview's argument flow is a net change. 375 call sites gain rows:
+`SysEvent::SetEventValue` / `GetEventValue` key constants, the
+`statInfoWrapper_` static members, and five namespace `static constexpr` keys
+passed to `ReadParticipationInfo` in
+`hiretrieval/frameworks/src/hiretrieval_mgr.cpp` lines 193–276. Meanwhile 204
+call sites, about 270 rows, lose them.
+
+Every loss is a namespace-scope variable read unqualified through a
+`using namespace` directive. Examples:
+- `TEST_SHARED_PATH`, `TEST_SPECIAL_PATH` and `TRACE_TEST_ID1`–`3` from
+  `OHOS::HiviewDFX` (`include/test_trace_state_machine.h`), read in
+  `framework/native/unified_collection/collector/impl/trace/test/trace_strategy_test.cpp`.
+- `FIELD_*` in `plugins/usage_event_report/fold/cache/fold_app_usage_db_helper.cpp`.
+- `KEY_OF_*` in `usage_event_report.cpp` and `json_parser.cpp`.
+
+Keying variables by bare name used to resolve these by accident. A later
+review round resolves them through the directive (see "Review follow-ups").
+
+### camera
+
+No check fails. Argument flow gains 103 rows, and no call site loses rows.
+Thirteen external edges become direct `CameraManager::GetServiceProxy` /
+`InitCameraManager` edges. All of this is within band.
+
+### Review follow-ups
+
+Two defects found in review after the re-capture were fixed:
+- A static member of a data-only nested struct registered under the struct's
+  C tag, which split declaration from definition.
+- A static member read through an object (`h.m`, `p->m`) reached no storage.
+
+A later review round closed four more gaps:
+- Calls through an object to a static callback member (`h.cb()`).
+- Name lookup in an out-of-class definition's initializer, which now uses the
+  member's class.
+- Declarations with several static member declarators.
+- Weak out-of-class definitions.
+
+None of these fixes moves any checked metric. `eval_check.py` passes all 94
+checks with every fix in place, and the values equal the re-captured
+expectations above.
+
+A third round did move one count. Static members reached through an object
+now type a call's receiver, and file-static precedence is shared by both
+lookup paths. Camera gains one external edge (`edges_total` 102,031 →
+102,032, `edges_external` 44,994 → 44,995), within band. The new edge is
+`sketchWrapper->g_sketchEnableRatioMap_.clear()` at
+`frameworks/native/camera/test/unittest/framework_native/output/src/sketch_wrapper_unittest.cpp`
+line 450. `g_sketchEnableRatioMap_` is a static `std::map` member, so the call
+now reaches `std::map::clear`. No other checked metric moves.
+
+A fourth round addressed:
+- hiding of a base's static member by a derived member;
+- field paths through a static member object;
+- static reference members;
+- pointer-to-member declarators;
+- qualified callable objects and table calls;
+- out-of-class definitions that are uninitialized, direct-initialized, or
+  written under `using namespace`.
+
+It leaves every checked count unchanged except hdf `flow_graph_nodes`
+(167,799 → 167,796, a minimum-only check). Two out-of-class definitions
+written under a `using namespace` directive used to register a second
+variable beside the header's declaration. They now define the declared
+member, removing each duplicate and its location:
+- `Lexer::keyWords_` in `framework/tools/hc-gen/src/lexer.cpp` (under
+  `using namespace OHOS::Hardware`);
+- `ObjectCollector::instance_` in
+  `adapter/uhdf2/hdi/src/object_collector.cpp` (under
+  `using namespace OHOS::HDI`).
+
+The third removed node is a GEP temporary in `Lexer::LexFromLiteral`, whose
+later temporaries renumber.
+
+A fifth round (candidate `36185cb` → the commit that re-captures hiview) moves
+three kinds of count. Measured with the same commands, each against the
+previous commit's binary, on every corpus:
+
+- **hiview `arg_flow_edges` 18,199 → 18,522 (re-captured).** A `using
+  namespace` directive or a `using ns::x;` declaration now brings a namespace
+  variable into scope for variable lookup, as it does for functions. Of the
+  317 distinct new rows, 203 are master rows the qualified keying had lost
+  (the `TEST_SHARED_PATH` / `FIELD_*` / `KEY_OF_*` reads above). The other 114
+  are qualified reads through a directive, which master could not resolve at
+  all: `EventTable::TABLE` under `using namespace
+  OHOS::HiviewDFX::SubscribeStore` in
+  `adapter/plugins/eventservice/service/idl/src/data_share_store.cpp`, and
+  `CommonDef::*_ATTR_NAME` in `hiretrieval/interfaces/*/src/hiretrieval_*_util.cpp`.
+  The 18 rows that disappear come back under renumbered temporaries.
+- **External edges drop, within band:** hdf 25,150 → 25,146, camera
+  44,995 → 44,938, hiview 16,676 → 16,629 (`functions_external` −3 / −38 /
+  −25 with them). Each lost edge went to a callee that does not exist.
+  - A bare call through an instance field in a member body (`callback_()`,
+    `processCallback_()`, `comp_()`) used to make an external stub named
+    after the field. It is now a load through `this`, as `this->callback_()`
+    is.
+  - In hiview's `trace_strategy_test.cpp`, `TraceFlowController
+    flowController(FlowControlName::TELEMETRY, TEST_DB_PATH, ...)` read as a
+    function declaration while `TEST_DB_PATH` was unresolved, so
+    `flowController.InitTelemetryQuota()` became an external call by the
+    member's bare name. It now defines the object. The member call stays
+    unresolved: a local's class type spelled bare under a `using namespace`
+    is not resolved, which is an existing limit of local type lookup.
+- **hdf `flow_graph_nodes` 167,796 → 167,808** (a minimum-only check): the new
+  loads and the recovered reads add nodes.
+
+No indirect or direct edge is lost on any corpus.
+
+A sixth round makes a function named without its class or namespace, used as
+a value, resolve through the enclosing classes and namespaces (and `using`),
+as a call's name does. It also stops reading a body line such as
+`Json::Value log(Json::arrayValue);` as a function declaration when an
+argument resolves to nothing and names no type. Compared with the previous
+commit's binary, it moves nine checked values, all re-captured:
+
+| Corpus | Metric | Before | After |
+|---|---|---:|---:|
+| hdf | `edges_indirect` (exact) | 4,948 | 4,969 |
+| hdf | `HdfDeviceLaunchNode` targets | 126 | 127 |
+| hiview | `edges_indirect` (exact) | 151 | 160 |
+| hiview | `functions_total` / `functions_external` (band) | 10,065 / 2,075 | 9,976 / 1,986 |
+| camera | `edges_indirect` (exact) | 251 | 286 |
+| camera | `functions_total` / `functions_external` (band) | 23,593 / 3,791 | 23,510 / 3,708 |
+| camera | `arg_flow_edges` (band) | 41,275 | 41,629 |
+
+- **New indirect edges, all real flow.** Every one is a function assigned
+  by bare name inside its namespace:
+  - hdf: test callbacks such as `listener.onReceive = OnDevEventReceived`,
+    `g_dump = TestDump` and `entry.Init = HdfTestInit`. That last one is the
+    127th `HdfDeviceLaunchNode` target (`adapter/uhdf2/host/test/unittest/devhost_test.cpp`
+    line 280), dispatched like the other 126 driver entries.
+  - hiview: the `ADDER_FUNCS[]` table in `base/event_report/event/logger_event.cpp`,
+    and the `CreateLogFileFilter` lambdas returned through `filter`.
+  - camera: fuzzer tables `g_testFuncs[] = { Test, ... }`.
+- **Calls recovered.** camera gains 162 direct edges to
+  `OHOS::CameraStandard::WAIT`, a namespace function
+  (`camera_base_function_moduletest.cpp` line 130). Its all-caps name had made
+  every bare `WAIT(...)` call look like a macro while the bare-name lookup
+  could not find it. Constructors and methods of locals that are now objects
+  add the rest of the direct edges (`SysEventDocReader`, `LogParse`,
+  `Profile`, `AutoRegister`).
+- **Fake functions and their callers disappear.** Each local that used to be
+  read as a function declaration registered a function of its name; those go
+  (`functions_total` −89 hiview, −83 camera), along with the external calls
+  that used a member's bare name on such an object (`WriteData`, `Flush` and
+  `Close` in hdf, `SetKeyValue` in hiview). Those calls now type through the
+  object's class; library members show up as their own externals
+  (`std::ifstream::is_open`).
+- **No flow is lost.** Every direct edge that disappears reappears at the
+  same site with the same target, only under a duplicate row's new callee
+  text. The 1,160 camera argument rows that disappear all come back once
+  temporaries and callee text are normalized. The 328 new rows are `WAIT`
+  arguments and constructor arguments of the new objects.
+
+Before, the value lookup could also reach one of these fake functions: in
+hiview, `eventJson[...] = externalLogJson;` stored the address of a fake
+`OHOS::HiviewDFX::externalLogJson` into every `Json::Value`. Reading such
+lines as object definitions removes that.
+
+A seventh round, after rebasing onto `204ce3c` (#139), addressed:
+- a qualified first declaration inside `extern "C"` (`extern "C" CB ns::cb;`),
+  which now links by its bare name;
+- a `content_store` model wired mid-solve, whose store never fired when both
+  sides had settled: a node popped with an empty delta fires nothing, so the
+  store now fires once in full when wired;
+- static data members of a C++ union, which took the instance-field path.
+
+`eval_check.py` passes all 94 checks, and every checked value is identical
+to the rebased commit's before these fixes.
+
+Its follow-up lowers a union's members (in-class static initializers
+included) as a class's, nested unions too; reads `T H::m();` as a function
+declaration, as `T w();` is; and drops the unused image-scoped form of
+`variable_named_in_scope`. Every checked value is again unchanged.
+
+A third follow-up makes a returned name that a field hides read no global,
+has `&x` take a variable's address before a function `x`, spells
+`using ::ns::x;` without its `::`, asks the innermost `using namespace`
+directive first, keeps a file-scope definition's C linkage, and looks a
+C-linkage variable up by its qualified name in a linked image. Every checked
+value is again unchanged.
+
+A `/code-review` pass then fixed eight more findings. A namespace's `using`
+declaration now hides a global name. An implicit member read inside a lambda
+goes through the captured `this`. A union's data members are data. A class
+defined in a declaration or typedef gets its members lowered. In a linked
+image, every spelling of a C-linkage symbol finds its one variable. A
+block-scope redeclaration of a visible function stays a declaration. Stores
+order a popped node's new locations once per pop instead of once per
+constraint, and only names the class declares as fields take the bare-call
+member path. `eval_check.py` passes all 94 checks. Four counts move, within
+band, and each move is recovered flow:
+
+| Corpus | Metric | Before | After |
+|---|---|---:|---:|
+| hdf | `flow_graph_nodes` (minimum) | 164,865 | 164,866 |
+| hiview | `arg_flow_edges` | 18,596 | 18,601 |
+| camera | `functions_total` / `functions_defined` / `functions_external` | 23,510 / 19,802 / 3,708 | 23,513 / 19,806 / 3,707 |
+| camera | `edges_total` / `edges_direct` / `edges_external` | 102,071 / 56,954 / 44,829 | 102,082 / 56,955 / 44,839 |
+
+- **camera:** `interfaces/inner_api/native/camera/include/effect_suggestion_info_parse.h`
+  defines `EffectSuggestionInfo::to_string` and
+  `EffectSuggestionModeInfo::to_string`, and their lambdas, inside
+  `typedef struct ... { ... }`. Their bodies are now lowered. The call at
+  `capture_session_for_sys.cpp` line 614 becomes direct, and the bodies add
+  their own `std::` external calls.
+- **hiview:** `trace_manager_test.cpp` line 1091 passes
+  `TraceDbStoreCallback::OnCreate` / `OnUpgrade`, which now resolve. In
+  `js_faultlog_extension.cpp` lines 238, 259 and 277, a `[=]` lambda passes
+  the member `jsObj_`, now read through the captured `this`.
+- **hdf:** in `framework/tools/hc-gen/src/bytecode_gen.cpp` line 195, a
+  `[this]` lambda reads `writeSize_`. The read used to go through the
+  lambda's first parameter (`current`); it now goes through `this`, which
+  adds the `ByteCodeGen.writeSize_` summary node.
+
+Two runs on hiview still give identical databases apart from `analysis_run`.
+
+A later review found that the minimal export had dropped every global and
+static that no fact names from `variables`, because those variables no longer
+get a flow node. `trace inspect`, which matches a declaration within two
+lines, could then answer for a neighbouring variable. The minimal export
+lists every global and static again; they still get no flow node. No checked
+value moves. Minimal databases grow over the previous commit but stay smaller
+than master's, since the flow-node pruning is kept:
+
+| Corpus | `variables` rows: master / before / after | Database bytes: master / before / after |
+|---|---:|---:|
+| hdf | 123,086 / 122,209 / 123,708 | 35,205,120 / 35,037,184 / 35,098,624 |
+| hiview | 74,589 / 46,938 / 84,708 | 23,302,144 / 17,096,704 / 18,792,448 |
+| camera | 147,247 / 106,507 / 175,224 | 55,554,048 / 45,731,840 / 49,139,712 |
+
+The rows above master's are the per-unit copies of in-class static member
+declarations (see "What remains").
+
 ## Noise macro filtering (`--ignore-macro`, `--ignore-logging`) — 2026-09-23 (#124)
 
 Noise macro filtering allows opting out of call sites, flow constraints, and local variables

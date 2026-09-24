@@ -158,7 +158,10 @@ typedef struct trace_db trace_db;
  * @brief Options for #trace_index and #trace_index_ext.
  *
  * Set `size = sizeof(trace_index_options)` as an ABI guard.
- * Alternatively, leave `size` as 0 for lenient mode (no size check).
+ * Alternatively, leave `size` as 0 for lenient mode (no size check). Lenient
+ * mode reads the whole struct as this header declares it, so only a caller
+ * compiled against this header may use it; one built against an older,
+ * shorter struct must set `size`.
  */
 typedef struct trace_index_options {
     size_t                 size;            /**< sizeof(trace_index_options); ABI guard. Set 0 for lenient mode. */

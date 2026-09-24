@@ -793,14 +793,11 @@ fn merge_unit(
             }
         }
 
-        // A namespaced global's unqualified name is not its symbol name, so
-        // `a::counter` and `b::counter` must not collapse into one variable.
-        if let Some(target) = var
-            .target
-            .filter(|_| var.storage == trace_ir::StorageClass::Global)
-            .filter(|_| !var.is_namespaced)
-        {
-            if let Some(existing) = program.symbols.target_global(target, &var.name) {
+        // One external symbol is one variable per image, keyed by its
+        // canonical name: `a::counter` and `b::counter` stay two, and an
+        // internal-linkage variable has no symbol to unify under.
+        if let (Some(target), Some(symbol)) = (var.target, var.external_symbol_name()) {
+            if let Some(existing) = program.symbols.target_global(target, symbol) {
                 let current = program.symbols.variable(existing);
                 if var.is_defined
                     && trace_ir::definition_supersedes(
@@ -1057,7 +1054,7 @@ fn merge_unit(
     }
 
     let valid_flow = |flow: &FlowConstraint| {
-        flow_vars(flow).all(|v| var_map.contains_key(&v))
+        flow.vars().all(|v| var_map.contains_key(&v))
             && flow_fns(flow).all(|f| fn_map.contains_key(&f))
     };
 
@@ -1069,7 +1066,7 @@ fn merge_unit(
     };
 
     let is_internal_flow = |flow: &FlowConstraint| {
-        flow_vars(flow).any(|v| {
+        flow.vars().any(|v| {
             var_map
                 .get(&v)
                 .and_then(|&nv| symbols.variable_by_id(nv))
@@ -1107,7 +1104,7 @@ fn merge_unit(
             .collect();
         for flow in &unit.flow {
             if references_this_tus_internal_function(flow) {
-                for v in flow_vars(flow) {
+                for v in flow.vars() {
                     if file_scope_vars.contains(&v) {
                         internal_init_vars.insert(v);
                     }
@@ -1185,8 +1182,7 @@ fn merge_unit(
             continue;
         }
         let remapped = remap_flow(flow, &fn_map, &var_map);
-        let shared_body =
-            !shared_vars.is_empty() && flow_vars(flow).any(|v| shared_vars.contains(&v));
+        let shared_body = !shared_vars.is_empty() && flow.vars().any(|v| shared_vars.contains(&v));
         let seen = if shared_body {
             Some(&mut program.dedup.header_flow)
         } else {
@@ -1224,7 +1220,7 @@ fn merge_unit(
         let remapped: Vec<ReturnFlow> = flows
             .iter()
             .filter(|f| {
-                return_flow_vars(f).all(|v| var_map.contains_key(&v))
+                f.var().into_iter().all(|v| var_map.contains_key(&v))
                     && return_flow_fns(f).all(|callee| fn_map.contains_key(&callee))
             })
             .map(|f| remap_return_flow(f, &fn_map, &var_map))
@@ -1244,23 +1240,6 @@ fn merge_unit(
     }
 }
 
-fn flow_vars(flow: &FlowConstraint) -> impl Iterator<Item = VarId> + '_ {
-    match flow {
-        FlowConstraint::Copy { dst, src }
-        | FlowConstraint::Load { dst, src }
-        | FlowConstraint::Store { dst, src } => vec![*dst, *src],
-        FlowConstraint::AddrOfVar { dst, src } => vec![*dst, *src],
-        FlowConstraint::AddrOfFn { dst, .. } => vec![*dst],
-        FlowConstraint::GepField { dst, base, .. } => vec![*dst, *base],
-        FlowConstraint::ArrayFnMember { array, .. } => vec![*array],
-        FlowConstraint::CallReturn { dst, .. } => vec![*dst],
-        FlowConstraint::CallReturnIndirect { dst, callee_var } => vec![*dst, *callee_var],
-        FlowConstraint::NewHeap { dst, .. } => vec![*dst],
-        FlowConstraint::StringConst { dst, .. } => vec![*dst],
-    }
-    .into_iter()
-}
-
 fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> {
     match flow {
         FlowConstraint::AddrOfFn { callee, .. } | FlowConstraint::ArrayFnMember { callee, .. } => {
@@ -1270,15 +1249,6 @@ fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> {
         // `valid_flow`, replayed with it in `MergeMode::SymbolsOnly`.
         FlowConstraint::CallReturn { caller, .. } => *caller,
         _ => None,
-    }
-    .into_iter()
-}
-
-fn return_flow_vars(flow: &ReturnFlow) -> impl Iterator<Item = VarId> + '_ {
-    match flow {
-        ReturnFlow::AddrOfVar { src } => vec![*src],
-        ReturnFlow::Copy { src } => vec![*src],
-        ReturnFlow::AddrOfFn { .. } | ReturnFlow::Call { .. } => Vec::new(),
     }
     .into_iter()
 }
@@ -1797,6 +1767,8 @@ mod tests {
                 is_weak: false,
                 target: None,
                 is_namespaced: false,
+                qualified_name: None,
+                c_linkage: false,
                 id: param,
                 name: param_name.into(),
                 type_id: param_type,
@@ -1847,6 +1819,8 @@ mod tests {
             is_weak: false,
             target: None,
             is_namespaced: false,
+            qualified_name: None,
+            c_linkage: false,
             id: VarId(id),
             name,
             type_id: TypeId(0),

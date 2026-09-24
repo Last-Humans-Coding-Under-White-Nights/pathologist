@@ -82,24 +82,24 @@ fn in_dep_root(program: &Program, unit: &UnitIndex, file: trace_ir::FileId) -> b
 }
 
 fn merge_target(program: &mut Program, units: &[&UnitIndex], target: TargetId) {
-    // A namespaced global's unqualified name is not its link-time symbol name,
-    // so it neither contributes strength nor can be overridden by it: a strong
-    // `b::cb` must not silence a weak `a::cb`.
-    let global = |v: &Variable| v.storage == trace_ir::StorageClass::Global && !v.is_namespaced;
-    // Strength only matters where a weak global exists to be overridden, and
-    // most targets have none. Checking that first keeps the common case off
-    // the full variable scan, which is dominated by lowering temporaries.
-    let strong_globals: FxHashSet<&str> = if units
-        .iter()
-        .any(|u| u.variables.iter().any(|v| global(v) && v.is_weak))
-    {
+    // Strength is keyed by the external symbol name, so a strong `b::cb` does
+    // not silence a weak `a::cb`, and an internal-linkage variable neither
+    // lends nor loses it. It only matters where a weak global exists to be
+    // overridden, and most targets have none. Checking that first keeps the
+    // common case off the full variable scan, which is dominated by lowering
+    // temporaries.
+    let strong_globals: FxHashSet<&str> = if units.iter().any(|u| {
+        u.variables
+            .iter()
+            .any(|v| v.is_weak && v.external_symbol_name().is_some())
+    }) {
         units
             .iter()
             .flat_map(|unit| unit.variables.iter().map(move |v| (*unit, v)))
             .filter(|(unit, v)| {
-                global(v) && v.is_defined && !v.is_weak && !in_dep_root(program, unit, v.span.file)
+                v.is_defined && !v.is_weak && !in_dep_root(program, unit, v.span.file)
             })
-            .map(|(_, v)| v.name.as_str())
+            .filter_map(|(_, v)| v.external_symbol_name())
             .collect()
     } else {
         FxHashSet::default()
@@ -147,10 +147,9 @@ fn scope_unit(
     let mut removed_globals = FxHashSet::default();
     for v in &mut scoped.variables {
         v.target = Some(target);
-        if v.storage == trace_ir::StorageClass::Global
-            && v.is_weak
-            && !v.is_namespaced
-            && strong_globals.contains(v.name.as_str())
+        if v.is_weak
+            && v.external_symbol_name()
+                .is_some_and(|symbol| strong_globals.contains(symbol))
         {
             removed_globals.insert(v.id);
             v.is_defined = false;
@@ -175,9 +174,7 @@ fn scope_unit(
             .flow
             .into_iter()
             .enumerate()
-            .filter_map(|(n, f)| {
-                (!excluded[n] && flow_vars(&f).all(|v| vars.contains(&v))).then_some(f)
-            })
+            .filter_map(|(n, f)| (!excluded[n] && f.vars().all(|v| vars.contains(&v))).then_some(f))
             .collect();
     }
     // The ranges index `unit.flow`, which the filter above renumbers. Selection
