@@ -511,6 +511,10 @@ fn solve(
     // A popped node's new locations in its set's order, shared by every store
     // it feeds: outside `scratch`, which each store borrows.
     let mut new_in_order: Vec<LocId> = Vec::new();
+    // `UnwrapPointer` verdicts by (location type, receiver pointee type): one
+    // hierarchy walk per pair instead of one per propagated location.
+    let mut unwrap_memo: FxHashMap<(trace_ir::TypeId, trace_ir::TypeId), bool> =
+        FxHashMap::default();
     // Per-location slot guards and per-function parameter counts for
     // signature-aware propagation.
     for loc in &pag.locations {
@@ -788,6 +792,19 @@ fn solve(
                 let dst = pag.constraints[idx].dst;
                 w_copy += delta.len() as u64;
                 propagate_locs(&mut st, &mut scratch.fresh, dst, delta.iter().copied());
+            }
+        }
+
+        if let Some(unwraps) = pag.indices.unwrap_src.get(&node) {
+            for &(idx, pointee) in unwraps {
+                let dst = pag.constraints[idx].dst;
+                // Counted with copies in the `[solver]` stats line.
+                w_copy += delta.len() as u64;
+                let admitted = delta
+                    .iter()
+                    .copied()
+                    .filter(|&loc| unwrap_admits(program, pag, &mut unwrap_memo, loc, pointee));
+                propagate_locs(&mut st, &mut scratch.fresh, dst, admitted);
             }
         }
 
@@ -1319,6 +1336,53 @@ fn apply_fn_model(
     }
 }
 
+/// Whether an `UnwrapPointer` into a receiver whose pointee declaration is
+/// `pointee` admits `loc`, by the table in `docs/ANALYSIS.md`,
+/// "Smart-pointer unwrap".
+fn unwrap_admits(
+    program: &Program,
+    pag: &Pag,
+    memo: &mut FxHashMap<(trace_ir::TypeId, trace_ir::TypeId), bool>,
+    loc: LocId,
+    pointee: trace_ir::TypeId,
+) -> bool {
+    let loc = &pag.locations[loc.0 as usize];
+    if matches!(loc.kind, LocKind::Function | LocKind::StringLit) {
+        return false;
+    }
+    *memo
+        .entry((loc.type_id, pointee))
+        .or_insert_with(|| object_type_is_pointee(program, loc.type_id, pointee))
+}
+
+fn object_type_is_pointee(
+    program: &Program,
+    object: trace_ir::TypeId,
+    pointee: trace_ir::TypeId,
+) -> bool {
+    use trace_ir::TypeDesc as TD;
+    match program.types.get(object).desc.as_ref() {
+        TD::Unknown | TD::Void => true,
+        // Index-insensitive: an array's location stands for its elements.
+        TD::Array { elem, .. } => {
+            object_type_is_pointee(program, program.types.resolve_type_id(elem), pointee)
+        }
+        TD::Struct { name, .. } | TD::Union { name, .. } => {
+            if program.types.tag_identity(object) == pointee {
+                return true;
+            }
+            match program.types.get(pointee).desc.as_ref() {
+                TD::Struct { name: base, .. } | TD::Union { name: base, .. } => {
+                    program.derives_from(name, base)
+                }
+                // An unresolved pointee cannot rule an object out.
+                _ => true,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Add `locs` to `pts[dst]`, indexing and requeueing whatever is new.
 ///
 /// The single write path: `Copy` propagation, GEP results, memory merges and
@@ -1776,9 +1840,9 @@ fn var_may_hold_pointee(program: &Program, var: VarId) -> bool {
             TD::Ptr(slot) => matches!(slot.as_ref(), TD::FnPtr { .. }),
             _ => false,
         },
-        // Pointer-flagged variable whose recorded shape degraded to a scalar
-        // (e.g. synthesized load temps typed `int`): participate
-        // conservatively.
+        // Pointer-flagged variable whose recorded shape is not a pointer: a
+        // synthesized temp typed `int`, or a smart-pointer variable (its
+        // value is its pointee's address): participate conservatively.
         _ if v.is_pointer => true,
         _ => false,
     }
@@ -2045,7 +2109,7 @@ fn extract_arg_flow(
 mod tests {
     use super::*;
     use crate::constraints::AbstractLocation;
-    use trace_ir::{LocId, TypeId};
+    use trace_ir::{FlowConstraint, LocId, TypeDesc, TypeId};
 
     fn loc(id: u32, is_fn: bool) -> AbstractLocation {
         AbstractLocation {
@@ -2237,5 +2301,320 @@ mod tests {
         assert_eq!(pop_budget_for(Some(2), Some("garbage"), 0), Some(2));
         assert_eq!(pop_budget_for(None, Some("garbage"), 0), Some(800_000));
         assert_eq!(pop_budget_for(Some(2), Some("5000"), 0), Some(5000));
+    }
+
+    // --- `UnwrapPointer` (docs/ANALYSIS.md, "Smart-pointer unwrap") ---
+
+    /// A program whose `sp` (a `shared_ptr<Payload>` value) feeds a
+    /// `Payload`-typed receiver through `UnwrapPointer`.
+    struct UnwrapFixture {
+        program: Program,
+        payload: TypeId,
+        wrapper: TypeId,
+        sp: VarId,
+        recv: VarId,
+    }
+
+    impl UnwrapFixture {
+        fn new() -> Self {
+            let mut program = Program::new(".".into());
+            let payload = program.types.intern(TypeDesc::Struct {
+                name: "Payload".into(),
+                fields: vec![("value".into(), TypeDesc::Int)],
+            });
+            let wrapper = program.types.intern(TypeDesc::Struct {
+                name: "std::shared_ptr<Payload>".into(),
+                fields: Vec::new(),
+            });
+            let sp = add_var(&mut program, "sp", wrapper);
+            let recv = add_var(&mut program, "_recv", payload);
+            UnwrapFixture {
+                program,
+                payload,
+                wrapper,
+                sp,
+                recv,
+            }
+        }
+
+        /// `sp` gains `&obj` for a new object typed `type_id`.
+        fn point_sp_at(&mut self, name: &str, type_id: TypeId) -> VarId {
+            let obj = add_var(&mut self.program, name, type_id);
+            self.program.flow.push(FlowConstraint::AddrOfVar {
+                dst: self.sp,
+                src: obj,
+            });
+            obj
+        }
+
+        fn unwrap(&mut self) {
+            self.program.flow.push(FlowConstraint::UnwrapPointer {
+                dst: self.recv,
+                src: self.sp,
+            });
+        }
+
+        /// Names of the locations the receiver points to, sorted.
+        fn receiver_pointees(&self) -> Vec<String> {
+            pointee_names(&self.program, self.recv)
+        }
+    }
+
+    fn add_var(program: &mut Program, name: &str, type_id: TypeId) -> VarId {
+        let id = program.symbols.alloc_var_id();
+        program.symbols.add_variable(trace_ir::Variable {
+            id,
+            name: name.into(),
+            type_id,
+            storage: trace_ir::StorageClass::Local,
+            fn_id: None,
+            param_index: None,
+            span: trace_ir::Span::new(trace_ir::FileId(0), 1, 1),
+            is_pointer: false,
+            is_defined: true,
+            is_weak: false,
+            target: None,
+            is_namespaced: false,
+            qualified_name: None,
+            c_linkage: false,
+        });
+        id
+    }
+
+    fn pointee_names(program: &Program, var: VarId) -> Vec<String> {
+        let opts = AnalyzeOptions {
+            retain_points_to: true,
+            ..AnalyzeOptions::default()
+        };
+        let (pag, result) = analyze_with_options(program, opts);
+        let mut names: Vec<String> = result
+            .points_to
+            .get(&pag.var_node[&var])
+            .into_iter()
+            .flatten()
+            .map(|loc| pag.locations[loc.0 as usize].desc.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn unwrap_admits_pointee_derived_and_untyped_objects() {
+        let mut fx = UnwrapFixture::new();
+        let derived = fx.program.types.intern(TypeDesc::Struct {
+            name: "Derived".into(),
+            fields: vec![("value".into(), TypeDesc::Int)],
+        });
+        fx.program.add_inheritance("Derived", "Payload");
+        let unknown = fx.program.types.unknown();
+        let void = fx.program.types.intern(TypeDesc::Void);
+        let payload = fx.payload;
+        fx.point_sp_at("payload_obj", payload);
+        fx.point_sp_at("derived_obj", derived);
+        fx.point_sp_at("unknown_obj", unknown);
+        fx.point_sp_at("void_obj", void);
+        fx.unwrap();
+        assert_eq!(
+            fx.receiver_pointees(),
+            ["derived_obj", "payload_obj", "unknown_obj", "void_obj"]
+        );
+    }
+
+    #[test]
+    fn unwrap_into_an_unresolved_pointee_admits_every_object() {
+        // May-analysis: with no pointee class to compare against, an object
+        // cannot be ruled out; storage that is no object still is.
+        let mut program = Program::new(".".into());
+        let unknown = program.types.unknown();
+        let payload = program.types.intern(TypeDesc::Struct {
+            name: "Payload".into(),
+            fields: vec![("value".into(), TypeDesc::Int)],
+        });
+        let int = program.types.int();
+        let sp = add_var(&mut program, "sp", unknown);
+        let recv = add_var(&mut program, "_recv", unknown);
+        for (name, type_id) in [("payload_obj", payload), ("int_obj", int)] {
+            let obj = add_var(&mut program, name, type_id);
+            program
+                .flow
+                .push(FlowConstraint::AddrOfVar { dst: sp, src: obj });
+        }
+        program
+            .flow
+            .push(FlowConstraint::UnwrapPointer { dst: recv, src: sp });
+        assert_eq!(pointee_names(&program, recv), ["payload_obj"]);
+    }
+
+    #[test]
+    fn unwrap_admits_an_array_of_the_pointee() {
+        // Index-insensitive: `&pool[i]` is the array's own location.
+        let mut fx = UnwrapFixture::new();
+        let pool = fx.program.types.intern(TypeDesc::Array {
+            elem: Box::new(TypeDesc::Struct {
+                name: "Payload".into(),
+                fields: vec![("value".into(), TypeDesc::Int)],
+            }),
+            size: Some(4),
+        });
+        fx.point_sp_at("pool", pool);
+        fx.unwrap();
+        assert_eq!(fx.receiver_pointees(), ["pool"]);
+    }
+
+    #[test]
+    fn unwrap_rejects_wrapper_unrelated_pointer_and_non_object_locations() {
+        let mut fx = UnwrapFixture::new();
+        let other = fx.program.types.intern(TypeDesc::Struct {
+            name: "Other".into(),
+            // Same member name and position as `Payload`: the GEP guard
+            // alone would not tell them apart.
+            fields: vec![("value".into(), TypeDesc::Int)],
+        });
+        let payload_ptr = fx
+            .program
+            .types
+            .intern(TypeDesc::Ptr(Box::new(TypeDesc::Struct {
+                name: "Payload".into(),
+                fields: vec![("value".into(), TypeDesc::Int)],
+            })));
+        let int = fx.program.types.int();
+        let wrapper = fx.wrapper;
+        fx.point_sp_at("wrapper_obj", wrapper);
+        fx.point_sp_at("other_obj", other);
+        fx.point_sp_at("pointer_cell", payload_ptr);
+        fx.point_sp_at("int_obj", int);
+        let sp = fx.sp;
+        fx.program.flow.push(FlowConstraint::StringConst {
+            dst: sp,
+            value: "literal".into(),
+        });
+        let file = fx.program.symbols.add_file(".".into());
+        let callee = fx.program.symbols.alloc_fn_id();
+        fx.program
+            .symbols
+            .push_synthetic_function(trace_ir::Function {
+                is_weak: false,
+                target: None,
+                id: callee,
+                name: "Handler".into(),
+                linkage: trace_ir::Linkage::External,
+                return_type: TypeId(0),
+                params: Vec::new(),
+                locals: Vec::new(),
+                span: trace_ir::Span::new(file, 1, 1),
+                end_line: 1,
+                file,
+                is_defined: true,
+                param_type_ids: Vec::new(),
+                explicit_arity: None,
+                default_args: 0,
+                owner_unresolved: false,
+                variadic: false,
+                defaulted_in_class: false,
+                declared_in_class: false,
+                is_virtual: false,
+                is_final: false,
+                is_cpp: true,
+                tu: None,
+            });
+        fx.program
+            .flow
+            .push(FlowConstraint::AddrOfFn { dst: sp, callee });
+        fx.unwrap();
+        let sp_pointees = pointee_names(&fx.program, sp);
+        assert_eq!(sp_pointees.len(), 6, "every source location reached sp");
+        assert_eq!(fx.receiver_pointees(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn unwrap_rejects_wrapper_typed_field_cells() {
+        // `h.item` is a `shared_ptr<Payload>` member: its field cell and its
+        // summary are wrapper storage, not a `Payload`.
+        let mut fx = UnwrapFixture::new();
+        let holder = fx.program.types.intern(TypeDesc::Struct {
+            name: "Holder".into(),
+            fields: vec![(
+                "item".into(),
+                TypeDesc::Struct {
+                    name: "std::shared_ptr<Payload>".into(),
+                    fields: Vec::new(),
+                },
+            )],
+        });
+        let item = fx
+            .program
+            .types
+            .field_id_by_name(holder, "item")
+            .expect("Holder.item");
+        let holder_obj = add_var(&mut fx.program, "holder_obj", holder);
+        let untyped = fx.program.types.unknown();
+        let holder_ptr = add_var(&mut fx.program, "hp", untyped);
+        fx.program.flow.push(FlowConstraint::AddrOfVar {
+            dst: holder_ptr,
+            src: holder_obj,
+        });
+        let sp = fx.sp;
+        fx.program.flow.push(FlowConstraint::GepField {
+            dst: sp,
+            base: holder_ptr,
+            field: item,
+            field_name: "item".into(),
+        });
+        fx.unwrap();
+        assert!(
+            !pointee_names(&fx.program, sp).is_empty(),
+            "the field cell reached sp"
+        );
+        assert_eq!(fx.receiver_pointees(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn unwrap_forwards_locations_arriving_on_later_iterations() {
+        // The unwrap is built before the copies that feed its source.
+        let mut fx = UnwrapFixture::new();
+        fx.unwrap();
+        let payload = fx.payload;
+        let first = add_var(&mut fx.program, "first", fx.wrapper);
+        let second = add_var(&mut fx.program, "second", fx.wrapper);
+        let obj = add_var(&mut fx.program, "late_obj", payload);
+        let sp = fx.sp;
+        fx.program.flow.extend([
+            FlowConstraint::Copy {
+                dst: sp,
+                src: second,
+            },
+            FlowConstraint::Copy {
+                dst: second,
+                src: first,
+            },
+            FlowConstraint::AddrOfVar {
+                dst: first,
+                src: obj,
+            },
+        ]);
+        assert_eq!(fx.receiver_pointees(), ["late_obj"]);
+    }
+
+    #[test]
+    fn unwrapped_receiver_without_pointees_keeps_the_field_summary() {
+        // Regression guard (passes before `UnwrapPointer` propagates): an
+        // empty `pts(sp)` still reads `Payload.value` through the summary.
+        let mut fx = UnwrapFixture::new();
+        fx.unwrap();
+        let value = fx
+            .program
+            .types
+            .field_id_by_name(fx.payload, "value")
+            .expect("Payload.value");
+        let int = fx.program.types.int();
+        let gep = add_var(&mut fx.program, "gep", int);
+        let recv = fx.recv;
+        fx.program.flow.push(FlowConstraint::GepField {
+            dst: gep,
+            base: recv,
+            field: value,
+            field_name: "value".into(),
+        });
+        assert_eq!(pointee_names(&fx.program, gep), ["summary:Payload.value"]);
     }
 }

@@ -588,6 +588,7 @@ Lowered from C during parse. Mapped to PAG in `Pag::build_flow_constraints`.
 | `CallReturnIndirect { dst, callee_var }` | `dst = *callee_var()` | `sbuf->impl->readBuffer(...)` (indirect return) |
 | `NewHeap { dst }` | heap allocation | `new T(...)` (C++ ctor result) |
 | `StringConst { dst, value }` | `dst` points at a string literal | `p = "target"`; `dlsym(h, "target")` |
+| `UnwrapPointer { dst, src }` | cross a smart-pointer wrapper into its pointee; `dst` is the pointee-typed receiver (see [Smart-pointer unwrap](#smart-pointer-unwrap)) | C++ `sp->field`, `(*sp).field` |
 
 ### Return-value flow
 
@@ -627,6 +628,46 @@ subDev.subDevOps->setConfig(subDev);
 
 **`StringConst`** intern a C string literal as an abstract location (`LocKind::StringLit`). Assignments (`const char *n = "foo"`), copies, and call arguments intern the same way, so a later `dlsym(h, n)` still sees `"foo"`. Concatenated literals (`"ta" "rget"`) are folded. No `sprintf` / buffer writes.
 
+### Smart-pointer unwrap
+
+`UnwrapPointer { dst, src }` is the step through a smart pointer's overloaded `operator->` or `operator*`. `src` holds the wrapper value (`sp`, or the loaded `h.item`); `dst` is the pointee-typed receiver temporary (`_recv`) that field accesses continue from. The receiver's type is the pointee class, and it is the only type the constraint consults, so merge remaps nothing but the two variables.
+
+The wrapper and its pointee are separate objects. A plain `Copy` would let the wrapper's own storage reach GEPs typed for the pointee, and the GEP field-name guard cannot tell two classes apart when they share a field name at the same position. The PAG kind therefore filters: `pts(dst) ⊇ { o ∈ pts(src) | o is compatible with dst's pointee type P }`, where a location is judged by its recorded type:
+
+| Location type | Decision |
+|---|---|
+| Struct/union whose declaration (`tag_identity`) is `P`, or a class deriving from `P` | admitted |
+| Any other struct/union, wrapper storage included | rejected, unless the receiver's pointee type is itself unresolved: then every struct/union is admitted |
+| `Unknown` or `void` (untyped storage, e.g. a modeled `ReturnHeap` location) | admitted conservatively |
+| Array whose element type is admitted (`&pool[i]` is the array's location, index-insensitively) | admitted |
+| Pointer or scalar (the storage of a pointer variable), or an array of one | rejected: not a pointee object |
+| Function or string literal | rejected: not a pointee object |
+
+A field location is judged by its own type, which is the field's type, so `&h.item` (a wrapper-typed field) is rejected.
+
+The unwrap adds no fallback of its own. The receiver's GEPs already fall back to the pointee type's field summary when the receiver has no pointees or none of them yields a field cell (see [Propagation highlights](#propagation-highlights)), so `sp->cb` and `raw->cb` still share `summary:Payload.cb` when `pts(sp)` is empty, which is the common case for parameters and for standard wrappers whose headers are not in the tree. In those cases the unwrap's value is the traversable `unwrap` edge in the exported flow graph; it carries concrete locations only when the wrapper value has some.
+
+A wrapper variable is a pointer to its pointee as far as the solver is concerned: after merging, `mark_wrapper_values` (`lower.rs`) sets `is_pointer` on every variable whose type `operator->` steps through. Its value and its storage are therefore kept in step ([Variable cells](#propagation-highlights)), so an object stored through `&sp` (`Fill(&sp)` writing `*out = &obj`) reaches `sp->f`, and `(*w)->f` sees `sp = x` copies; and a wrapper argument is wired to its parameter by a persistent copy, as a raw pointer is.
+
+A field path may also start at a call's result when it crosses a wrapper at its root (`GetSp()->cb()`, `GetSp()->value`): the path validates first, then the call's result is lowered into a temporary (`CallReturn`) that the unwrap reads. Only a direct call by plain name has a return flow to read; a qualified or member call (`Foo::GetInstance()->f`) is not decomposed, and a call returning a raw pointer keeps its previous handling. Evaluating any root expression as a value, which would lift both restrictions, is the direction [#151](https://github.com/Last-Humans-Coding-Under-White-Nights/pathologist/issues/151) proposes.
+
+Limits. Each leaves the receiver on the pointee's field summary, which is what every smart-pointer field access resolved through before `UnwrapPointer` existed:
+
+- **Subclasses are those the inheritance graph records.** A class deriving from the pointee through a template parameter (`class Foo : public IRemoteStub<IFoo>` with `template<class I> class IRemoteStub : public I`) is not known to derive from `IFoo`, so its objects are rejected, as virtual dispatch through the same graph would not see them either ([#150](https://github.com/Last-Humans-Coding-Under-White-Nights/pathologist/issues/150)).
+
+### Weak-pointer promotion
+
+`wp.lock()` on a `weak_ptr<T>` and `wp.promote()` on a `wptr<T>` whose body is not in the tree lower to `Copy { dst: result, src: receiver value }`: the strong result may alias the weak pointer's value. One recognizer (`weak_promotion` in `lower.rs`) decides both this and the result's type ([C++ support](#c-support-first-step), `auto` locals), so the rules match:
+
+- a `.` call with no arguments, named `lock`/`promote` as `WEAK_PTR_UPGRADES` pairs them with the receiver's weak pointer class;
+- the receiver's class has no body in the tree. A declared wrapper's own `promote()` is an ordinary member call, and another class's `lock()` (`Mutex::lock`) is never a promotion.
+
+The result's type additionally needs a held class the call site can name; the value flow does not, so a promotion whose type stays unknown still carries its receiver's value.
+
+The receiver value is the variable for a plain name, and the object it names for a reference (`const wptr<T> &weak` is loaded through). Otherwise it is a temporary filled by ordinary expression lowering: `msg->weak.lock()` copies the loaded `weak` field, not `msg`; `get_weak().lock()` copies the call's return; `(*h->weak).lock()` loads through the `weak` member's value. The copy is emitted wherever a call result lands: an initializer or assignment to a local, and, as a direct store of the receiver value, a store into a field (`s->strong = wp.lock()`) or through a pointer (`*out = wp.lock()`, parenthesized or not). The call site itself is recorded as before, so the call edge to the external `lock`/`promote` remains.
+
+This is a may-alias relation. Expiry, a null result, and ownership counts are not modeled. `return wp.lock();` records no return flow: `ReturnFlow` has no receiver form.
+
 ### `dlsym` / `GetProcAddress`
 
 Built-in models treat `dlsym` / `dlvsym` / `GetProcAddress` as **symbol lookup**: the return destination of a call (the `CallSite.return_dst` of `f = dlsym(...)`, including `return dlsym(...)` via a temp) may point to every **in-tree** function whose exact name matches a string constant in the name argument (parameter 1). Out-of-tree names add no pointees (true external). The handle / DSO path is ignored. Lookup searches the caller’s link target and its incorporated dependencies when link metadata exists, otherwise the whole program. Dynamically loaded targets absent from that dependency closure are not modeled. Non-literal names that never receive a string constant stay unresolved — they do **not** fan out to every exported function.
@@ -662,6 +703,7 @@ graph names; `--full-export` still lists every variable.
 | `Load` | for each `o ∈ pts(src)`: merge `memory_pts(o)` into `pts(dst)`; function locs copied directly |
 | `Store` | for each `o ∈ pts(dst)`: merge `pts(src)` into `memory_pts(o)` and field summaries |
 | `Gep` | field projection from base object locations (+ summary fallback) |
+| `UnwrapPointer` | `pts(dst) ⊇ { o ∈ pts(src) \| o compatible with dst's pointee type }` (see [Smart-pointer unwrap](#smart-pointer-unwrap)) |
 
 ### Abstract location kinds
 
@@ -1662,10 +1704,12 @@ C++-aware only where it must be — everything else reuses the C machinery.
   or `using std::make_shared;` is in scope, with cv-qualifiers dropped and
   template arguments kept (`make_shared<const Box<int>>`). These models
   require a class the call site can name, through its scopes or a `using`
-  directive. They infer types only: they do not synthesize allocation or
-  additional value flows. A standard smart pointer copied from a declared
-  return type whose argument names no class as written, while the scopes
-  name one by it (`std::shared_ptr<TraceStrategy>` declared under
+  directive. Factories infer types only: they do not synthesize allocation
+  or additional value flows. A promotion also carries its receiver's value
+  into the result (see [Weak-pointer promotion](#weak-pointer-promotion)).
+  A standard smart pointer copied from a declared return type whose
+  argument names no class as written, while the scopes name one by it
+  (`std::shared_ptr<TraceStrategy>` declared under
   `using namespace OHOS::HiviewDFX`), is left untyped rather than guessed.
   Unresolved callees and template-dependent types remain unknown. A type is
   dependent when it names a parameter of an enclosing template, directly or

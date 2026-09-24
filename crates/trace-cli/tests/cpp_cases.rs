@@ -1693,6 +1693,39 @@ fn wrapper_fields_share_pointee_callback_summaries() {
 }
 
 #[test]
+fn wrapper_storage_stays_out_of_the_pointee() {
+    // `IsoWrapper::cb` and `IsoPayload::cb` share name and position, so only
+    // the unwrap's type filter keeps the address-taken wrapper's own storage
+    // from reaching pointee accesses (#141).
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in [
+        "IsoReadArrow",
+        "IsoReadDeref",
+        "IsoReadReference",
+        "IsoReadPointerArrow",
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, "IsoPointeeTarget"),
+            "{caller} reads the pointee's cb"
+        );
+        assert!(
+            must_not_have_edge(program, analysis, caller, "IsoWrapperTarget"),
+            "{caller} must not read the wrapper's own cb"
+        );
+    }
+    for caller in ["IsoReadWrapperDot", "IsoReadWrapperRaw"] {
+        assert!(
+            has_any_edge(program, analysis, caller, "IsoWrapperTarget"),
+            "{caller} reads the wrapper's own cb"
+        );
+        assert!(
+            must_not_have_edge(program, analysis, caller, "IsoPointeeTarget"),
+            "{caller} must not read the pointee's cb"
+        );
+    }
+}
+
+#[test]
 fn wrapper_reference_and_dereference_still_unwrap_fields() {
     let (program, _) = cpp_smart_ptr();
     for caller in ["RawWrapperReference", "RawWrapperDereference"] {
@@ -7791,5 +7824,515 @@ void Dispatch(Service* s) {
     assert!(
         cs.args_bound_past_this,
         "Call site to Service::Handle must have args_bound_past_this set via shape-aware callees_of"
+    );
+}
+
+// --- cpp_smart_pointer_value_flow: value flow through wrappers (#141) ---
+
+analyzed_fixture!(
+    /// The `cpp_smart_pointer_value_flow` fixture, analysed once.
+    cpp_smart_pointer_value_flow
+);
+
+/// Facts lowered into function `func`, by their destination's owner.
+fn flows_in<'a>(
+    program: &'a Program,
+    func: &str,
+) -> impl Iterator<Item = &'a trace_ir::FlowConstraint> {
+    let fn_id = common::only_function(program, func);
+    program.flow.iter().filter(move |flow| {
+        let dst = flow.vars().next().expect("every fact names a destination");
+        program.symbols.variable(dst).fn_id == Some(fn_id)
+    })
+}
+
+/// `(src, dst)` of every `UnwrapPointer` in `func`.
+fn unwraps_in(program: &Program, func: &str) -> Vec<(trace_ir::VarId, trace_ir::VarId)> {
+    flows_in(program, func)
+        .filter_map(|flow| match *flow {
+            trace_ir::FlowConstraint::UnwrapPointer { dst, src } => Some((src, dst)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether the lowered facts carry a value from `from` to `to`, following
+/// copies, unwraps, field projections and loads forward.
+fn value_reaches(program: &Program, from: trace_ir::VarId, to: trace_ir::VarId) -> bool {
+    use trace_ir::FlowConstraint as F;
+    let mut seen = std::collections::HashSet::from([from]);
+    let mut stack = vec![from];
+    while let Some(cur) = stack.pop() {
+        if cur == to {
+            return true;
+        }
+        for flow in &program.flow {
+            let next = match *flow {
+                F::Copy { dst, src } | F::Load { dst, src } | F::UnwrapPointer { dst, src }
+                    if src == cur =>
+                {
+                    dst
+                }
+                F::GepField { dst, base, .. } if base == cur => dst,
+                _ => continue,
+            };
+            if seen.insert(next) {
+                stack.push(next);
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn smart_pointer_flow_reaches_fields_through_the_wrapper_value() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let input = common::local_variable(program, "read", "input");
+    let sp = common::local_variable(program, "read", "sp");
+    let value = common::local_variable(program, "read", "value");
+    assert!(
+        unwraps_in(program, "read")
+            .iter()
+            .any(|&(src, _)| src == sp),
+        "sp->field unwraps sp itself"
+    );
+    assert!(value_reaches(program, input, value), "input -> sp -> value");
+}
+
+#[test]
+fn smart_pointer_flow_keeps_the_pointee_callback_summary() {
+    // Regression guard: passes before #141 through the type-keyed summary.
+    let (program, analysis) = cpp_smart_pointer_value_flow();
+    assert!(has_any_edge(program, analysis, "read", "PayloadTarget"));
+}
+
+#[test]
+fn smart_pointer_flow_loads_a_wrapper_member_before_unwrapping_it() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    for (func, result, unwraps) in [
+        ("nested", "nested_value", 1),
+        ("nested_dot", "dot_value", 1),
+        ("twice", "twice_value", 2),
+        ("deref_dot", "deref_dot_value", 1),
+        ("deref_twice", "deref_twice_value", 2),
+    ] {
+        let h = common::local_variable(program, func, "h");
+        let found = unwraps_in(program, func);
+        assert_eq!(
+            found.len(),
+            unwraps,
+            "{func}: one unwrap per overloaded arrow"
+        );
+        // The unwrap into the `Payload` receiver reads the loaded `item`
+        // value, never the holder.
+        let (item_value, _) = *found.last().expect("an unwrap");
+        assert_ne!(item_value, h, "{func}: the holder is not the wrapper");
+        assert!(
+            flows_in(program, func).any(|flow| matches!(
+                flow,
+                trace_ir::FlowConstraint::GepField { field_name, .. } if field_name == "item"
+            )),
+            "{func}: the path keeps its item prefix"
+        );
+        assert!(
+            flows_in(program, func).any(|flow| matches!(
+                *flow,
+                trace_ir::FlowConstraint::Load { dst, .. } if dst == item_value
+            )),
+            "{func}: the unwrapped item is a loaded value"
+        );
+        let result = common::local_variable(program, func, result);
+        assert!(value_reaches(program, h, result), "{func}: h -> {result:?}");
+    }
+}
+
+#[test]
+fn smart_pointer_flow_method_call_leaves_no_receiver() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let fn_id = common::only_function(program, "method_probe");
+    assert!(unwraps_in(program, "method_probe").is_empty());
+    assert!(
+        !program
+            .symbols
+            .variables
+            .iter()
+            .any(|v| v.fn_id == Some(fn_id) && v.name.starts_with('_')),
+        "no temporaries for a method call"
+    );
+}
+
+/// Write `files` under a fresh temporary root and build it.
+fn build_tree(
+    files: &[(&str, &str)],
+    opts: impl Fn(&std::path::Path) -> trace_preproc::PreprocessOptions,
+) -> (tempfile::TempDir, Program) {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, text) in files {
+        std::fs::write(dir.path().join(name), text).unwrap();
+    }
+    let program = build_program(dir.path(), &opts(dir.path())).expect("build");
+    (dir, program)
+}
+
+/// Every unwrap names live variables of one function; returns that function
+/// per unwrap.
+fn unwrap_owners(program: &Program) -> Vec<FnId> {
+    program
+        .flow
+        .iter()
+        .filter_map(|flow| match *flow {
+            trace_ir::FlowConstraint::UnwrapPointer { dst, src } => {
+                let dst = program.symbols.variable_by_id(dst).expect("live receiver");
+                let src = program.symbols.variable_by_id(src).expect("live source");
+                assert_eq!(dst.fn_id, src.fn_id, "an unwrap stays in one function");
+                assert!(dst.name.starts_with("_recv"), "{}", dst.name);
+                dst.fn_id
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+const SMART_PAYLOAD: &str = "struct Payload { void (*cb)(); };\n";
+
+#[test]
+fn smart_pointer_flow_shared_header_unwrap_merges_once() {
+    let header =
+        format!("{SMART_PAYLOAD}inline void Touch(std::shared_ptr<Payload> sp) {{ sp->cb(); }}\n");
+    let (_dir, program) = build_tree(
+        &[
+            ("payload.h", &header),
+            ("a.cpp", "#include \"payload.h\"\nvoid UseA() {}\n"),
+            ("b.cpp", "#include \"payload.h\"\nvoid UseB() {}\n"),
+        ],
+        default_opts,
+    );
+    let touch = common::only_function(&program, "Touch");
+    assert_eq!(
+        unwrap_owners(&program),
+        [touch],
+        "one remapped unwrap for the shared body"
+    );
+}
+
+#[test]
+fn smart_pointer_flow_explored_variants_keep_their_own_receivers() {
+    let source = format!(
+        "{SMART_PAYLOAD}#if defined(FEATURE_ALPHA)\nvoid Alpha(std::shared_ptr<Payload> sp) {{ sp->cb(); }}\n#else\nvoid Beta(std::shared_ptr<Payload> sp) {{ sp->cb(); }}\n#endif\n"
+    );
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "BUILD.gn",
+                "config(\"c\") { defines = [ \"FEATURE_ALPHA\" ] }\n",
+            ),
+            ("main.cpp", &source),
+        ],
+        |_| {
+            trace_preproc::PreprocessOptions::new()
+                .with_explore(true)
+                .with_explore_budget(4)
+        },
+    );
+    let mut owners = unwrap_owners(&program);
+    owners.sort();
+    let mut expected = vec![
+        common::only_function(&program, "Alpha"),
+        common::only_function(&program, "Beta"),
+    ];
+    expected.sort();
+    assert_eq!(owners, expected, "one receiver per variant's body");
+}
+
+#[test]
+fn smart_pointer_flow_summaries_stay_in_their_link_target() {
+    // Regression guard: each image's receivers read its own `Payload.cb`
+    // summary, so `A` and `B` never see each other's callback.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("payload.h"), SMART_PAYLOAD).unwrap();
+    let mut compiles = Vec::new();
+    let mut links = Vec::new();
+    for image in ["A", "B"] {
+        let name = image.to_lowercase();
+        std::fs::write(
+            root.join(format!("{name}.cpp")),
+            format!(
+                "#include \"payload.h\"\nvoid Target{image}() {{}}\nvoid Set{image}(Payload *p) {{ p->cb = Target{image}; }}\nvoid Read{image}(std::shared_ptr<Payload> sp) {{ sp->cb(); }}\n"
+            ),
+        )
+        .unwrap();
+        compiles.push(serde_json::json!({"directory": root, "file": format!("{name}.cpp"), "output": format!("{name}.o"), "arguments": ["c++", "-c", format!("{name}.cpp"), "-o", format!("{name}.o")]}));
+        links.push(serde_json::json!({"directory": root, "output": name, "arguments": ["c++", format!("{name}.o"), "-o", name]}));
+    }
+    std::fs::write(
+        root.join("compile_commands.json"),
+        serde_json::json!(compiles).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("link_commands.json"),
+        serde_json::json!(links).to_string(),
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "ReadA", "TargetA"));
+    assert!(has_any_edge(&program, &analysis, "ReadB", "TargetB"));
+    assert!(must_not_have_edge(&program, &analysis, "ReadA", "TargetB"));
+    assert!(must_not_have_edge(&program, &analysis, "ReadB", "TargetA"));
+}
+
+#[test]
+fn smart_pointer_promotion_result_aliases_the_receiver() {
+    let (program, analysis) = cpp_smart_pointer_value_flow();
+    // The call itself is recorded as before.
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "promote_local",
+        "std::weak_ptr::lock"
+    ));
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "promote_ohos",
+        "OHOS::wptr::promote"
+    ));
+    for (func, results) in [
+        ("promote_local", &["promoted", "promoted_value"][..]),
+        ("promote_assign", &["assigned", "assigned_value"]),
+        ("promote_ohos", &["strong"]),
+        ("promote_nested_ns", &["nested_strong"]),
+        ("promote_unnamed", &["unnamed"]),
+    ] {
+        let wp = common::local_variable(program, func, "wp");
+        for result in results {
+            let result_var = common::local_variable(program, func, result);
+            assert!(
+                value_reaches(program, wp, result_var),
+                "{func}: wp -> {result}"
+            );
+        }
+    }
+}
+
+#[test]
+fn smart_pointer_promotion_of_a_field_reads_the_loaded_weak_value() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    for (func, result) in [
+        ("promote_field", "field_promoted"),
+        ("promote_paren", "paren_promoted"),
+    ] {
+        let msg = common::local_variable(program, func, "msg");
+        let promoted = common::local_variable(program, func, result);
+        let weak_value = promotion_source(program, func, result);
+        assert_ne!(
+            weak_value, msg,
+            "{func}: the receiver is msg->weak, not msg"
+        );
+        assert!(
+            flows_in(program, func).any(|flow| matches!(
+                *flow,
+                trace_ir::FlowConstraint::Load { dst, .. } if dst == weak_value
+            )),
+            "{func}: the weak value is loaded from the field"
+        );
+        assert!(
+            value_reaches(program, msg, promoted),
+            "{func}: msg -> {result}"
+        );
+    }
+    let msg = common::local_variable(program, "promote_field", "msg");
+    let field_value = common::local_variable(program, "promote_field", "field_value");
+    assert!(value_reaches(program, msg, field_value));
+}
+
+#[test]
+fn smart_pointer_promotion_ignores_non_promotions() {
+    let (program, analysis) = cpp_smart_pointer_value_flow();
+    for (func, receiver, result) in [
+        ("mutex_lock", "m", "locked"),
+        ("promote_custom", "wp", "custom_strong"),
+        ("promote_with_arg", "wp", "with_arg"),
+    ] {
+        let receiver = common::local_variable(program, func, receiver);
+        let result_var = common::local_variable(program, func, result);
+        assert!(
+            !value_reaches(program, receiver, result_var),
+            "{func}: {result} must not alias the receiver"
+        );
+    }
+    // The defined wrapper's own member is still the call's target.
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "promote_custom",
+        "custom::wptr::promote"
+    ));
+}
+
+/// The source of the one receiver copy into `result` in `func`.
+fn promotion_source(program: &Program, func: &str, result: &str) -> trace_ir::VarId {
+    let result = common::local_variable(program, func, result);
+    let sources: Vec<_> = flows_in(program, func)
+        .filter_map(|flow| match *flow {
+            trace_ir::FlowConstraint::Copy { dst, src } if dst == result => Some(src),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sources.len(), 1, "{func}: one receiver copy");
+    sources[0]
+}
+
+#[test]
+fn smart_pointer_promotion_of_a_call_result_reads_the_returned_value() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let src = promotion_source(program, "promote_call_result", "call_promoted");
+    assert!(
+        flows_in(program, "promote_call_result").any(|flow| matches!(
+            flow,
+            trace_ir::FlowConstraint::CallReturn { dst, callee_name, .. }
+                if *dst == src && callee_name == "get_weak"
+        )),
+        "the receiver value is get_weak()'s result"
+    );
+}
+
+#[test]
+fn smart_pointer_promotion_of_a_dereferenced_member_reads_the_member() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let func = "promote_deref_field";
+    let h = common::local_variable(program, func, "h");
+    let promoted = common::local_variable(program, func, "deref_promoted");
+    assert!(
+        !flows_in(program, func)
+            .any(|flow| matches!(*flow, trace_ir::FlowConstraint::Load { src, .. } if src == h)),
+        "the holder is not loaded through"
+    );
+    assert!(
+        flows_in(program, func).any(|flow| matches!(
+            flow,
+            trace_ir::FlowConstraint::GepField { field_name, .. } if field_name == "weak"
+        )),
+        "the weak member is read"
+    );
+    assert!(value_reaches(program, h, promoted));
+}
+
+#[test]
+fn smart_pointer_promotion_of_a_reference_reads_through_it() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let weak = common::local_variable(program, "promote_ref", "weak");
+    let src = promotion_source(program, "promote_ref", "ref_strong");
+    assert!(
+        flows_in(program, "promote_ref").any(|flow| matches!(
+            *flow,
+            trace_ir::FlowConstraint::Load { dst, src: from } if dst == src && from == weak
+        )),
+        "the wptr the reference names is loaded, not the reference copied"
+    );
+}
+
+#[test]
+fn smart_pointer_promotion_stores_the_receiver_value_directly() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    for func in [
+        "promote_into_field",
+        "promote_into_field_paren",
+        "promote_into_deref",
+        "promote_into_deref_paren",
+    ] {
+        let wp = common::local_variable(program, func, "wp");
+        assert!(
+            flows_in(program, func).any(
+                |flow| matches!(*flow, trace_ir::FlowConstraint::Store { src, .. } if src == wp)
+            ),
+            "{func}: no temporary between the receiver and the store"
+        );
+    }
+}
+
+#[test]
+fn smart_pointer_flow_dereferenced_member_value_has_the_wrapper_type() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    for func in ["deref_dot", "deref_twice"] {
+        let (member_value, _) = *unwraps_in(program, func).last().expect("an unwrap");
+        let type_id = program.symbols.variable(member_value).type_id;
+        let desc = program.types.get(type_id).desc.as_ref().clone();
+        assert!(
+            !matches!(&desc, trace_ir::TypeDesc::Struct { name, .. } if name == "Holder"),
+            "{func}: the loaded member is not typed as its holder: {desc:?}"
+        );
+    }
+}
+
+/// The `cpp_smart_pointer_value_flow` fixture's points-to sets, solved once
+/// with `retain_points_to`.
+fn smart_pointer_points_to() -> &'static (trace_analysis::Pag, AnalysisResult) {
+    static CACHE: OnceLock<(trace_analysis::Pag, AnalysisResult)> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let (program, _) = cpp_smart_pointer_value_flow();
+        trace_analysis::analyze_with_options(
+            program,
+            trace_analysis::AnalyzeOptions {
+                retain_points_to: true,
+                ..Default::default()
+            },
+        )
+    })
+}
+
+/// Names of the variables whose storage each unwrap receiver in `func`
+/// points to, one sorted list per receiver, in lowering order.
+fn receiver_pointees(func: &str) -> Vec<Vec<String>> {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let (pag, analysis) = smart_pointer_points_to();
+    unwraps_in(program, func)
+        .into_iter()
+        .map(|(_, receiver)| common::points_to_names_of_var(program, pag, analysis, receiver))
+        .collect()
+}
+
+#[test]
+fn smart_pointer_flow_storage_and_value_stay_in_step() {
+    // Stored through `&filled`, read as `filled`; copied into `copied`, read
+    // through `*w`.
+    assert_eq!(receiver_pointees("ReadFilled"), [["g_filled"]]);
+    assert_eq!(receiver_pointees("ReadThrough"), [["g_copied"]]);
+}
+
+#[test]
+fn smart_pointer_flow_argument_reaches_the_parameter() {
+    assert_eq!(receiver_pointees("UseArg"), [["g_passed"]]);
+    assert_eq!(receiver_pointees("UseLate"), [["g_late"]]);
+}
+
+#[test]
+fn smart_pointer_flow_path_rooted_at_a_call_result() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let unwraps = unwraps_in(program, "ReadReturned");
+    assert_eq!(unwraps.len(), 2, "GetSp()->cb and GetSp()->value");
+    for (wrapper_value, _) in &unwraps {
+        assert!(
+            flows_in(program, "ReadReturned").any(|flow| matches!(
+                flow,
+                trace_ir::FlowConstraint::CallReturn { dst, callee_name, .. }
+                    if dst == wrapper_value && callee_name == "GetSp"
+            )),
+            "each unwrap reads GetSp()'s result"
+        );
+        let type_id = program.symbols.variable(*wrapper_value).type_id;
+        assert!(
+            matches!(
+                program.types.get(type_id).desc.as_ref(),
+                trace_ir::TypeDesc::Struct { name, .. } if name == "OHOS::sptr<Payload>"
+            ),
+            "the call's result is typed as the wrapper it returns"
+        );
+    }
+    assert_eq!(
+        receiver_pointees("ReadReturned"),
+        [["g_returned"], ["g_returned"]]
     );
 }

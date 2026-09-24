@@ -49,3 +49,29 @@ class FlowParenMid { public: FlowPayload *child; };
 void FlowSetParen(FlowParenMid *m) { m->child->read_cb = FlowReadTarget; }
 void FlowReadParen(FlowParenMid *m) { (m->child)->read_cb(); }
 void FlowReadParenWrapper(missing<FlowParenMid> m) { (m->child)->read_cb(); }
+
+// Wrapper storage stays out of the pointee once wrapper values carry
+// locations (#141): an address-taken wrapper whose own member has the same
+// name and position as its pointee's.
+class IsoPayload { public: void (*cb)(); };
+template<class T> class IsoWrapper {
+public:
+    void (*cb)();
+    T *operator->();
+    T &operator*();
+};
+void IsoPointeeTarget() {}
+void IsoWrapperTarget() {}
+IsoWrapper<IsoPayload> iso_wrapper;
+IsoWrapper<IsoPayload> *iso_wrapper_addr = &iso_wrapper;
+void IsoSetPointee(IsoPayload *p) { p->cb = IsoPointeeTarget; }
+void IsoSetWrapperDot() { iso_wrapper.cb = IsoWrapperTarget; }
+void IsoSetWrapperRaw(IsoWrapper<IsoPayload> *w) { w->cb = IsoWrapperTarget; }
+void IsoReadArrow() { iso_wrapper->cb(); }
+void IsoReadDeref() { (*iso_wrapper).cb(); }
+void IsoReadReference(IsoWrapper<IsoPayload> &w) { w->cb(); }
+void IsoCallReference() { IsoReadReference(iso_wrapper); }
+void IsoReadPointerArrow(IsoWrapper<IsoPayload> *w) { (*w)->cb(); }
+void IsoCallPointerArrow() { IsoReadPointerArrow(&iso_wrapper); }
+void IsoReadWrapperDot() { iso_wrapper.cb(); }
+void IsoReadWrapperRaw() { iso_wrapper_addr->cb(); }

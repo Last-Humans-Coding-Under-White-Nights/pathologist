@@ -131,6 +131,7 @@ typedef enum trace_flow_kind {
     TRACE_FLOW_CALL_ARG = 6,   /**< Interprocedural argument flow into a function call. */
     TRACE_FLOW_TERMINATES = 7, /**< Flow terminated by a clearing function model. */
     TRACE_FLOW_DLSYM = 8,      /**< Dynamic symbol lookup (`dlsym`, `GetProcAddress`). */
+    TRACE_FLOW_UNWRAP = 9,     /**< Smart-pointer `->`/`*` into the pointee (`sp->field`). */
     TRACE_FLOW_UNKNOWN = -1,   /**< Unrecognized or unknown flow constraint kind. */
 } trace_flow_kind;
 

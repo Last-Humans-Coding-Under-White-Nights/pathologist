@@ -30,6 +30,9 @@ pub struct SolverIndices {
     pub store_src: FxHashMap<PagNodeId, Vec<usize>>,
     pub gep_src: FxHashMap<PagNodeId, Vec<usize>>,
     pub dlsym_src: FxHashMap<PagNodeId, Vec<usize>>,
+    /// `UnwrapPointer` constraints by source, each with its receiver's
+    /// pointee declaration so propagation needs no further lookup.
+    pub unwrap_src: FxHashMap<PagNodeId, Vec<(usize, trace_ir::TypeId)>>,
     pub indirect_by_target: FxHashMap<PagNodeId, Vec<trace_ir::CallSiteId>>,
 }
 
@@ -231,6 +234,21 @@ impl Pag {
                 ConstraintKind::Dlsym => {
                     self.indices.dlsym_src.entry(c.src).or_default().push(i);
                 }
+                ConstraintKind::UnwrapPointer => {
+                    // The receiver's type is the pointee's: its declaration,
+                    // resolved once here, is what the solver admits by.
+                    let PagNodeKind::Var(receiver) = self.nodes[c.dst.0 as usize].kind else {
+                        unreachable!("an unwrap's destination is its receiver variable");
+                    };
+                    let pointee = program
+                        .types
+                        .tag_identity(program.symbols.variable(receiver).type_id);
+                    self.indices
+                        .unwrap_src
+                        .entry(c.src)
+                        .or_default()
+                        .push((i, pointee));
+                }
             }
         }
         for cs in &program.symbols.call_sites {
@@ -279,6 +297,11 @@ impl Pag {
                 ConstraintKind::Dlsym => {
                     self.indices.dlsym_src.entry(c.src).or_default().push(i);
                     srcs.push(c.src);
+                }
+                ConstraintKind::UnwrapPointer => {
+                    unreachable!(
+                        "unwraps are lowered facts, built with the PAG, not added while solving"
+                    )
                 }
             }
         }
@@ -659,6 +682,11 @@ impl Pag {
                     let loc_n = self.loc_node[&loc];
                     self.add_addr_of(dst_n, loc_n);
                 }
+                FlowConstraint::UnwrapPointer { dst, src } => {
+                    let dst_n = self.var_node_id(*dst);
+                    let src_n = self.var_node_id(*src);
+                    self.add_unwrap(dst_n, src_n);
+                }
             }
         }
     }
@@ -909,6 +937,16 @@ impl Pag {
     pub fn add_copy(&mut self, dst: PagNodeId, src: PagNodeId) {
         self.constraints.push(Constraint {
             kind: crate::constraints::ConstraintKind::Copy,
+            dst,
+            src,
+            field: None,
+            field_name: None,
+        });
+    }
+
+    fn add_unwrap(&mut self, dst: PagNodeId, src: PagNodeId) {
+        self.constraints.push(Constraint {
+            kind: crate::constraints::ConstraintKind::UnwrapPointer,
             dst,
             src,
             field: None,

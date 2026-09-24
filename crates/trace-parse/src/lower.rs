@@ -1140,6 +1140,31 @@ fn finalize_program(
     bind_calls_past_this(program);
     expand_virtual_overrides(program);
     expand_internal_overload_refs(program);
+    mark_wrapper_values(program);
+}
+
+/// A smart pointer's value is its pointee's address, which is how
+/// `UnwrapPointer` reads it: mark each wrapper-typed variable a pointer, so
+/// the solver keeps its node in step with its storage and wires it across
+/// calls as it does a raw pointer. After merging, once every variable has its
+/// final type (docs/ANALYSIS.md, "Smart-pointer unwrap").
+fn mark_wrapper_values(program: &mut Program) {
+    let mut is_wrapper: HashMap<trace_ir::TypeId, bool> = HashMap::default();
+    let wrappers: Vec<VarId> = program
+        .symbols
+        .variables
+        .iter()
+        .filter(|v| !v.is_pointer)
+        .filter(|v| {
+            *is_wrapper
+                .entry(v.type_id)
+                .or_insert_with(|| peel_wrapper_to_pointee(program, v.type_id) != v.type_id)
+        })
+        .map(|v| v.id)
+        .collect();
+    for var in wrappers {
+        program.symbols.variable_mut(var).is_pointer = true;
+    }
 }
 
 /// Widen each reference to a function by name to every overload the name may
@@ -4816,27 +4841,23 @@ fn call_result_shape(
             }
         }
     }
+    if let Some(promotion) = weak_promotion(program, ctx, source, value) {
+        return Some(CallResult::Decided(smart_ptr_type(
+            program,
+            ctx,
+            source,
+            value,
+            &promotion.strong,
+            &promotion.weak,
+            Spelling::Lowered,
+        )));
+    }
     let mut receiver = None;
     let candidates = if func.kind() == "field_expression" {
         let recv = func.child_by_field_name("argument")?;
         let field = normalize_qualified(node_text(source, &func.child_by_field_name("field")?));
         let arrow = is_arrow_access(func);
         let desc = receiver_desc(program, ctx, source, recv)?;
-        if !arrow && call_arg_nodes(value).is_empty() {
-            if let TypeDesc::Struct { name, .. } = &desc {
-                if let Some(strong) = weak_ptr_upgrade(program, name, &field) {
-                    return Some(CallResult::Decided(smart_ptr_type(
-                        program,
-                        ctx,
-                        source,
-                        value,
-                        &strong,
-                        name,
-                        Spelling::Lowered,
-                    )));
-                }
-            }
-        }
         // An arrow substitutes on its pointee, keeping template arguments
         // that member-name lookup deliberately strips.
         receiver = Some(if arrow {
@@ -5194,6 +5215,130 @@ fn weak_ptr_upgrade(program: &Program, name: &str, method: &str) -> Option<Strin
         .iter()
         .find(|(weak, upgrade, _)| *weak == last && *upgrade == method)?;
     Some(format!("{}{strong}", &cls[..cls.len() - last.len()]))
+}
+
+/// A recognized weak-pointer promotion: `wp.lock()` / `wp.promote()` with no
+/// arguments, on a weak pointer [`weak_ptr_upgrade`] recognizes.
+struct WeakPromotion<'t> {
+    /// The receiver expression (`wp`, `msg->weak`, `get_weak()`).
+    receiver: Node<'t>,
+    /// The weak pointer's class, qualified and with its arguments
+    /// (`std::weak_ptr<Payload>`).
+    weak: String,
+    /// The strong pointer template the promotion yields, without arguments
+    /// (`std::shared_ptr`, `OHOS::sptr`); `smart_ptr_type` instantiates it
+    /// with the weak pointer's argument.
+    strong: String,
+}
+
+/// The one place promotions are recognized, for result typing
+/// ([`call_result_shape`]) and for receiver value flow
+/// ([`promoted_receiver_value`]).
+fn weak_promotion<'t>(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    call: Node<'t>,
+) -> Option<WeakPromotion<'t>> {
+    // `(wp.lock())` is the same promotion at every call-result site.
+    let call = peel_expression(call);
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let func = call.child_by_field_name("function")?;
+    if func.kind() != "field_expression" {
+        return None;
+    }
+    // The method name settles almost every call before anything allocates
+    // or the receiver is typed.
+    let method = node_text(source, &func.child_by_field_name("field")?);
+    if !WEAK_PTR_UPGRADES
+        .iter()
+        .any(|&(_, upgrade, _)| upgrade == method)
+        || is_arrow_access(func)
+        || !call_arg_nodes(call).is_empty()
+    {
+        return None;
+    }
+    let receiver = func.child_by_field_name("argument")?;
+    let TypeDesc::Struct { name: weak, .. } = receiver_desc(program, ctx, source, receiver)? else {
+        return None;
+    };
+    let strong = weak_ptr_upgrade(program, &weak, method)?;
+    Some(WeakPromotion {
+        receiver,
+        weak,
+        strong,
+    })
+}
+
+/// For a weak-pointer promotion `call`, the variable holding its receiver's
+/// value: the strong result may alias it (docs/ANALYSIS.md, "Weak-pointer
+/// promotion"). Every call-result site asks before resolving a callee.
+fn promoted_receiver_value(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    call: Node,
+) -> Option<VarId> {
+    let promotion = weak_promotion(program, ctx, source, call)?;
+    let weak = program
+        .types
+        .class_type_id(&promotion.weak)
+        .unwrap_or_else(|| program.types.unknown());
+    receiver_value(program, ctx, source, promotion.receiver, weak)
+}
+
+/// The variable holding a call receiver's value, typed `type_id` where a
+/// temporary is needed: the variable itself for a plain name, the object a
+/// reference names, else a temporary the ordinary expression lowering fills
+/// (`msg->weak` loads the field, `get_weak()` receives the call's return).
+fn receiver_value(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    receiver: Node,
+    type_id: trace_ir::TypeId,
+) -> Option<VarId> {
+    let receiver = peel_expression(receiver);
+    if receiver.kind() == "identifier" {
+        if let Some(var) = lookup_var(ctx, program, node_text(source, &receiver)) {
+            // `const wptr<T> &weak` holds the weak pointer's address.
+            return Some(if ctx.reference_bindings.contains(&var) {
+                emit_load(program, ctx, receiver, var, type_id)
+            } else {
+                var
+            });
+        }
+    }
+    // `(*h->weak).lock()`: load through the pointer the operand's value
+    // holds. The general `*x` read resolves `x` to its root variable, which
+    // for a member path is the holder, not the member.
+    if let Some(pointer) =
+        pointer_arg(receiver).filter(|_| pointer_op(source, receiver).as_deref() == Some("*"))
+    {
+        if matches!(
+            receiver_desc(program, ctx, source, pointer),
+            Some(TypeDesc::Ptr(_))
+        ) {
+            let unknown = program.types.unknown();
+            let pointer = receiver_value(program, ctx, source, pointer, unknown)?;
+            return Some(emit_load(program, ctx, receiver, pointer, type_id));
+        }
+    }
+    let value = alloc_load_temp(program, ctx, receiver, type_id);
+    match expr_to_rhs_flow(program, ctx, source, receiver, value) {
+        Some(flow) => program.flow.push(flow),
+        // A call receiver's result is recorded as it is lowered, as the
+        // call's return destination, rather than returned.
+        None if ctx
+            .call_return_dst
+            .borrow()
+            .get(&peel_casts(source, receiver).id())
+            == Some(&value) => {}
+        None => return None,
+    }
+    Some(value)
 }
 
 /// `wrapper<class>` for a smart-pointer model whose one template argument is
@@ -9515,16 +9660,22 @@ fn extract_flow_from_expr(
         if is_deref_lhs(source, lhs) {
             if let Some(arg) = deref_operand(lhs) {
                 if let Some(ptr) = resolve_lvalue_var(program, ctx, source, arg) {
+                    // `*out = (f())` stores the result as `*out = f()` does.
+                    let call = peel_expression(rhs);
                     if let Some(src) = expr_to_store_src(program, ctx, source, rhs) {
                         program.flow.push(FlowConstraint::Store { dst: ptr, src });
                     } else if let Some(name) = fn_designator(source, rhs) {
                         // `*out = handler`: a function designator stored
                         // through a pointer.
                         emit_fn_name_store(program, ctx, source, node, ptr, name);
-                    } else if rhs.kind() == "call_expression" {
-                        if let Some(callee_name) = resolve_direct_call(program, ctx, source, rhs) {
+                    } else if call.kind() == "call_expression" {
+                        if let Some(src) = promoted_receiver_value(program, ctx, source, call) {
+                            program.flow.push(FlowConstraint::Store { dst: ptr, src });
+                        } else if let Some(callee_name) =
+                            resolve_direct_call(program, ctx, source, call)
+                        {
                             let ret_temp = alloc_ret_temp(program, ctx, node);
-                            emit_call_return(program, ctx, rhs, ret_temp, callee_name);
+                            emit_call_return(program, ctx, call, ret_temp, callee_name);
                             program.flow.push(FlowConstraint::Store {
                                 dst: ptr,
                                 src: ret_temp,
@@ -9868,9 +10019,6 @@ fn emit_field_store(
     else {
         return;
     };
-    if field_ids.is_empty() {
-        return;
-    }
     emit_field_value_store(
         program,
         ctx,
@@ -9969,74 +10117,71 @@ fn emit_field_value_store(
     field_names: &[String],
     value_node: Node,
 ) {
-    let mut current = base;
-    for (i, fid) in field_ids.iter().enumerate() {
-        if i + 1 == field_ids.len() {
-            let gep = alloc_gep_temp(
-                program,
-                ctx,
-                span_node,
-                current,
-                *fid,
-                field_names[i].clone(),
-            );
-            if let Some(src) = expr_to_store_src(program, ctx, source, value_node) {
-                program.flow.push(FlowConstraint::Store { dst: gep, src });
-            } else if let Some(name) = fn_designator(source, value_node) {
-                emit_fn_name_store(program, ctx, source, span_node, gep, name);
-            } else if value_node.kind() == "lambda_expression" && ctx.is_cpp {
-                if let Some(callee) = lower_lambda_expression(program, ctx, source, value_node) {
-                    let src_temp = alloc_ret_temp(program, ctx, span_node);
-                    program.flow.push(FlowConstraint::AddrOfFn {
-                        dst: src_temp,
-                        callee,
-                    });
-                    program.flow.push(FlowConstraint::Store {
-                        dst: gep,
-                        src: src_temp,
-                    });
-                }
+    let Some((&last, prefix)) = field_ids.split_last() else {
+        return;
+    };
+    let current = emit_gep_chain(
+        program,
+        ctx,
+        span_node,
+        base,
+        prefix,
+        &field_names[..prefix.len()],
+    );
+    let gep = alloc_gep_temp(
+        program,
+        ctx,
+        span_node,
+        current,
+        last,
+        field_names[prefix.len()].clone(),
+    );
+    if let Some(src) = expr_to_store_src(program, ctx, source, value_node) {
+        program.flow.push(FlowConstraint::Store { dst: gep, src });
+    } else if let Some(name) = fn_designator(source, value_node) {
+        emit_fn_name_store(program, ctx, source, span_node, gep, name);
+    } else if value_node.kind() == "lambda_expression" && ctx.is_cpp {
+        if let Some(callee) = lower_lambda_expression(program, ctx, source, value_node) {
+            let src_temp = alloc_ret_temp(program, ctx, span_node);
+            program.flow.push(FlowConstraint::AddrOfFn {
+                dst: src_temp,
+                callee,
+            });
+            program.flow.push(FlowConstraint::Store {
+                dst: gep,
+                src: src_temp,
+            });
+        }
+    } else if let Some(src) = promoted_receiver_value(program, ctx, source, value_node) {
+        // The receiver value itself, as `*out = wp.lock()` stores it.
+        program.flow.push(FlowConstraint::Store { dst: gep, src });
+    } else {
+        let ret_temp = alloc_ret_temp(program, ctx, span_node);
+        let emitted = if value_node.kind() == "call_expression" {
+            if let Some(callee_name) = resolve_direct_call(program, ctx, source, value_node) {
+                emit_call_return(program, ctx, value_node, ret_temp, callee_name);
+                true
+            } else if let Some(callee_var) = resolve_callee_var(program, ctx, source, value_node) {
+                program.flow.push(FlowConstraint::CallReturnIndirect {
+                    dst: ret_temp,
+                    callee_var,
+                });
+                true
             } else {
-                let ret_temp = alloc_ret_temp(program, ctx, span_node);
-                let emitted = if value_node.kind() == "call_expression" {
-                    if let Some(callee_name) = resolve_direct_call(program, ctx, source, value_node)
-                    {
-                        emit_call_return(program, ctx, value_node, ret_temp, callee_name);
-                        true
-                    } else if let Some(callee_var) =
-                        resolve_callee_var(program, ctx, source, value_node)
-                    {
-                        program.flow.push(FlowConstraint::CallReturnIndirect {
-                            dst: ret_temp,
-                            callee_var,
-                        });
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    expr_to_rhs_flow(program, ctx, source, value_node, ret_temp)
-                        .map(|flow| {
-                            program.flow.push(flow);
-                        })
-                        .is_some()
-                };
-                if emitted {
-                    program.flow.push(FlowConstraint::Store {
-                        dst: gep,
-                        src: ret_temp,
-                    });
-                }
+                false
             }
         } else {
-            current = alloc_gep_temp(
-                program,
-                ctx,
-                span_node,
-                current,
-                *fid,
-                field_names[i].clone(),
-            );
+            expr_to_rhs_flow(program, ctx, source, value_node, ret_temp)
+                .map(|flow| {
+                    program.flow.push(flow);
+                })
+                .is_some()
+        };
+        if emitted {
+            program.flow.push(FlowConstraint::Store {
+                dst: gep,
+                src: ret_temp,
+            });
         }
     }
 }
@@ -10081,6 +10226,10 @@ fn field_name_from_node(source: &str, node: Node) -> Option<String> {
         .map(|n| node_text(source, &n).to_string())
 }
 
+/// The field path `node` spells: its root (a variable, the last smart-pointer
+/// receiver, or a call's result) and the fields after it. `None`, with
+/// nothing emitted, when `node` has no field path or a field lookup fails,
+/// so callers never see an empty path.
 fn decompose_field_path(
     program: &mut Program,
     ctx: &LowerContext,
@@ -10102,42 +10251,63 @@ fn decompose_field_path(
         // `a`'s layout — the base `resolve_lvalue_var` peels down to anyway.
         cur = peel_expression(cur.child_by_field_name("argument")?);
     }
-    if field_names.is_empty() && cur.kind() == "field_expression" {
-        // The access is the static member itself: no field path to decompose.
+    if field_names.is_empty() {
+        // No field path: `cur` is no field access, or the static member
+        // itself. Nothing to decompose, and nothing emitted.
         return None;
     }
-    let mut base = resolve_lvalue_var(program, ctx, source, cur)?;
     field_names.reverse();
     arrows.reverse();
 
-    // Keep the receiver's pointer provenance before layout lookup strips it.
-    // References and explicit dereferences denote the referred-to value.
-    let mut raw_pointer = ctx.is_cpp
-        && arrows.first() == Some(&true)
-        && if cur.kind() == "identifier" {
-            // The common case only needs a type tag, not a cloned layout.
-            match program
-                .types
-                .get(variable_type_id(program, base)?)
-                .desc
-                .as_ref()
-            {
-                TypeDesc::Ptr(inner) if ctx.reference_vars.contains(&base) => {
-                    matches!(**inner, TypeDesc::Ptr(_))
-                }
-                TypeDesc::Ptr(_) => true,
-                _ => false,
-            }
-        } else {
-            matches!(
-                receiver_desc(program, ctx, source, cur),
-                Some(TypeDesc::Ptr(_))
-            )
-        };
-    let mut type_id = struct_type_for_var(program, base)?;
+    // The path's root: a variable, or the smart pointer a direct call returns
+    // (`GetSp()->field`), whose result is lowered only once the path validates.
+    let root = if ctx.is_cpp && cur.kind() == "call_expression" {
+        PathRoot::Call(call_root(program, ctx, source, cur, &arrows)?)
+    } else {
+        PathRoot::Var(resolve_lvalue_var(program, ctx, source, cur)?)
+    };
+    let (mut raw_pointer, mut type_id) = match &root {
+        // A wrapper value: the arrow is overloaded, never built in.
+        PathRoot::Call(call) => (false, call.wrapper),
+        PathRoot::Var(base) => {
+            let base = *base;
+            // Keep the receiver's pointer provenance before layout lookup
+            // strips it. References and explicit dereferences denote the
+            // referred-to value.
+            let raw_pointer = ctx.is_cpp
+                && arrows.first() == Some(&true)
+                && if cur.kind() == "identifier" {
+                    // The common case only needs a type tag, not a cloned layout.
+                    match program
+                        .types
+                        .get(variable_type_id(program, base)?)
+                        .desc
+                        .as_ref()
+                    {
+                        TypeDesc::Ptr(inner) if ctx.reference_vars.contains(&base) => {
+                            matches!(**inner, TypeDesc::Ptr(_))
+                        }
+                        TypeDesc::Ptr(_) => true,
+                        _ => false,
+                    }
+                } else {
+                    matches!(
+                        receiver_desc(program, ctx, source, cur),
+                        Some(TypeDesc::Ptr(_))
+                    )
+                };
+            (raw_pointer, struct_type_for_var(program, base)?)
+        }
+    };
     let mut field_ids = Vec::new();
-    let mut path_start = 0;
-    let mut summary_receiver = None;
+    // Validate the whole path before publishing anything: method names also
+    // pass through decomposition, and a failed lookup must leave no
+    // receiver or fact behind.
+    let mut boundaries = Vec::new();
+    // A dereferenced wrapper-valued member (`(*h.item).field`) and its
+    // wrapper type: the wrapper is the member's value, not the root
+    // `resolve_lvalue_var` reduced it to.
+    let mut deref_member = None;
     // `(*sp).field` crosses into the same separate object as `sp->field`.
     // Resolving the lvalue base alone retains `sp`'s layout. Only an
     // overloaded dereference needs a summary receiver; `(*raw).field`
@@ -10146,17 +10316,27 @@ fn decompose_field_path(
         && cur.kind() == "pointer_expression"
         && pointer_op(source, cur).as_deref() == Some("*")
     {
-        if let Some(operand @ TypeDesc::Struct { .. }) = cur
-            .named_child(0)
-            .and_then(|operand| receiver_desc(program, ctx, source, operand))
+        let operand_node = pointer_arg(cur)?;
+        if let Some(operand @ TypeDesc::Struct { .. }) =
+            receiver_desc(program, ctx, source, operand_node)
         {
+            let wrapper = program.types.resolve_type_id(&operand);
             let TypeDesc::Struct { name, .. } = deref_desc(program, operand)? else {
                 return None;
             };
-            type_id = program
-                .types
-                .type_id_by_tag(&name, trace_ir::TypeKind::Struct)?;
-            summary_receiver = Some(type_id);
+            let pointee = program.types.class_type_id(&name)?;
+            boundaries.push(WrapperBoundary {
+                step: 0,
+                wrapper,
+                pointee,
+            });
+            type_id = pointee;
+            let member = peel_expression(operand_node);
+            if member.kind() == "field_expression"
+                && static_member_access(program, ctx, source, member).is_none()
+            {
+                deref_member = Some((member, wrapper));
+            }
         }
     }
     for (step, (fname, arrow)) in field_names.iter().zip(arrows).enumerate() {
@@ -10166,14 +10346,13 @@ fn decompose_field_path(
         if arrow && !raw_pointer {
             let pointee = peel_wrapper_to_pointee(program, type_id);
             if pointee != type_id {
-                // An overloaded arrow crosses into a separate object. Give
-                // the GEP a pointee-typed receiver so PAG's existing summary
-                // fallback connects it to raw-pointer accesses to that type.
-                // Keeping the wrapper prefix would model an inline subobject
-                // and resolve fields against the wrong layout in the solver.
-                summary_receiver = Some(pointee);
-                field_ids.clear();
-                path_start = step;
+                // An overloaded arrow crosses into a separate object, so the
+                // rest of the path resolves against the pointee's layout.
+                boundaries.push(WrapperBoundary {
+                    step,
+                    wrapper: type_id,
+                    pointee,
+                });
                 type_id = pointee;
             }
         }
@@ -10184,13 +10363,172 @@ fn decompose_field_path(
         raw_pointer = matches!(program.types.get(type_id).desc.as_ref(), TypeDesc::Ptr(_));
         type_id = peel_ptr_to_struct(program, type_id);
     }
-    // Method names also pass through decomposition. Allocate only after the
-    // whole path resolves to fields, and only for the final overloaded arrow.
-    if let Some(pointee) = summary_receiver {
-        base = alloc_recv_temp(program, ctx, node, pointee);
-    }
+    // The path is a field chain: publish its wrapper crossings. Callers
+    // continue from the last receiver with the fields after it. Facts for a
+    // path whose caller then emits nothing stay sound (may-analysis). A
+    // dereferenced member roots the crossings at the member's loaded value;
+    // its own path decomposes (and validates) only now, so a failure above
+    // has published nothing.
+    let base = match root {
+        PathRoot::Var(base) => base,
+        PathRoot::Call(call) => {
+            let result = alloc_ret_temp(program, ctx, cur);
+            program.symbols.variable_mut(result).type_id = call.wrapper;
+            emit_call_return(program, ctx, cur, result, call.callee);
+            result
+        }
+    };
+    let base = match deref_member {
+        Some((member, wrapper)) => {
+            let cell = addr_of_field_path(program, ctx, source, member)?;
+            emit_load(program, ctx, node, cell, wrapper)
+        }
+        None => base,
+    };
+    let (base, path_start) = emit_wrapper_boundaries(
+        program,
+        ctx,
+        node,
+        base,
+        &field_ids,
+        &field_names,
+        &boundaries,
+    );
+    field_ids.drain(..path_start);
     field_names.drain(..path_start);
     Some((base, field_ids, field_names))
+}
+
+/// Where a field path starts.
+enum PathRoot {
+    Var(VarId),
+    Call(CallRoot),
+}
+
+/// A direct call returning a smart pointer, as a field path's root.
+struct CallRoot {
+    callee: String,
+    wrapper: trace_ir::TypeId,
+}
+
+/// `call` as a path root: a direct call by plain name, followed by `->`,
+/// returning a smart pointer; see `docs/ANALYSIS.md`, "Smart-pointer
+/// unwrap". Any other call root is left to the callers' own handling;
+/// evaluating an arbitrary root expression as a value is the direction #151
+/// proposes. The cheap syntactic checks run before the call is typed.
+fn call_root(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    call: Node,
+    arrows: &[bool],
+) -> Option<CallRoot> {
+    if arrows.first() != Some(&true) {
+        return None;
+    }
+    let callee = resolve_direct_call(program, ctx, source, call)?;
+    let TypeDesc::Struct { name, .. } = receiver_desc(program, ctx, source, call)? else {
+        return None;
+    };
+    let wrapper = program.types.class_type_id(&name)?;
+    (peel_wrapper_to_pointee(program, wrapper) != wrapper).then_some(CallRoot { callee, wrapper })
+}
+
+/// An overloaded `->`/`*` along a field path: the field index it precedes,
+/// the wrapper's type, and the pointee's.
+struct WrapperBoundary {
+    step: usize,
+    wrapper: trace_ir::TypeId,
+    pointee: trace_ir::TypeId,
+}
+
+/// Emit each wrapper crossing along a validated field path: the wrapper's
+/// value (the root itself, or the content of the cell the preceding fields
+/// reach) flows through `UnwrapPointer` into a pointee-typed receiver, where
+/// the rest of the path continues. Returns the last receiver (the root when
+/// there is no crossing) and the index of the first field after it. A
+/// receiver keeps PAG's type-keyed summary fallback, which connects it to
+/// raw-pointer accesses of the pointee. See `docs/ANALYSIS.md`,
+/// "Smart-pointer unwrap".
+fn emit_wrapper_boundaries(
+    program: &mut Program,
+    ctx: &LowerContext,
+    node: Node,
+    root: VarId,
+    field_ids: &[FieldId],
+    field_names: &[String],
+    boundaries: &[WrapperBoundary],
+) -> (VarId, usize) {
+    let mut current = root;
+    let mut start = 0;
+    for boundary in boundaries {
+        let prefix = start..boundary.step;
+        let cell = emit_gep_chain(
+            program,
+            ctx,
+            node,
+            current,
+            &field_ids[prefix.clone()],
+            &field_names[prefix],
+        );
+        // Only a root holding the wrapper by value is the wrapper itself. A
+        // reference or pointer root (`(*p)->` resolves to `p`), a member cell,
+        // or a previous receiver (`(*it)->`) holds it: load its content.
+        let by_value = cell == root
+            && !ctx.reference_bindings.contains(&root)
+            && !matches!(
+                program
+                    .types
+                    .get(program.symbols.variable(root).type_id)
+                    .desc
+                    .as_ref(),
+                TypeDesc::Ptr(_)
+            );
+        let wrapper_value = if by_value {
+            root
+        } else {
+            emit_load(program, ctx, node, cell, boundary.wrapper)
+        };
+        let receiver = alloc_recv_temp(program, ctx, node, boundary.pointee);
+        program.flow.push(FlowConstraint::UnwrapPointer {
+            dst: receiver,
+            src: wrapper_value,
+        });
+        current = receiver;
+        start = boundary.step;
+    }
+    (current, start)
+}
+
+/// GEPs along `field_ids` from `base`, returning the last field's cell
+/// (`base` itself for an empty path).
+fn emit_gep_chain(
+    program: &mut Program,
+    ctx: &LowerContext,
+    span_node: Node,
+    base: VarId,
+    field_ids: &[FieldId],
+    field_names: &[String],
+) -> VarId {
+    field_ids
+        .iter()
+        .zip(field_names)
+        .fold(base, |cell, (fid, name)| {
+            alloc_gep_temp(program, ctx, span_node, cell, *fid, name.clone())
+        })
+}
+
+/// A temporary typed `type_id` holding what `src` points to.
+fn emit_load(
+    program: &mut Program,
+    ctx: &LowerContext,
+    span_node: Node,
+    src: VarId,
+    type_id: trace_ir::TypeId,
+) -> VarId {
+    let loaded = alloc_load_temp(program, ctx, span_node, type_id);
+    program.flow.push(FlowConstraint::Load { dst: loaded, src });
+    loaded
 }
 
 /// `sp->f` on a smart pointer is `f` of the pointee, as `sp->m()` is the
@@ -10365,11 +10703,14 @@ fn addr_of_field_path(
     // &field_expression → direct field path
     if peeled.kind() == "field_expression" {
         let (base, field_ids, field_names) = decompose_field_path(program, ctx, source, peeled)?;
-        let mut current = base;
-        for (i, fid) in field_ids.iter().enumerate() {
-            current = alloc_gep_temp(program, ctx, peeled, current, *fid, field_names[i].clone());
-        }
-        return Some(current);
+        return Some(emit_gep_chain(
+            program,
+            ctx,
+            peeled,
+            base,
+            &field_ids,
+            &field_names,
+        ));
     }
     // &identifier → check for C++ implicit this->member
     if peeled.kind() == "identifier" {
@@ -10514,6 +10855,9 @@ fn expr_to_rhs_flow(
         "string_literal" | "concatenated_string" => string_literal_value(source, node)
             .map(|value| FlowConstraint::StringConst { dst, value }),
         "call_expression" => {
+            if let Some(src) = promoted_receiver_value(program, ctx, source, node) {
+                return Some(FlowConstraint::Copy { dst, src });
+            }
             if let Some(callee_name) = resolve_direct_call(program, ctx, source, node) {
                 emit_call_return(program, ctx, node, dst, callee_name);
             } else if let Some(callee_var) = resolve_callee_var(program, ctx, source, node) {
@@ -10529,16 +10873,8 @@ fn expr_to_rhs_flow(
                 return Some(FlowConstraint::Copy { dst, src });
             }
             let (base, field_ids, field_names) = decompose_field_path(program, ctx, source, node)?;
-            let mut current = base;
-            for (i, fid) in field_ids.iter().enumerate() {
-                if i + 1 == field_ids.len() {
-                    let tmp =
-                        alloc_gep_temp(program, ctx, node, current, *fid, field_names[i].clone());
-                    return Some(FlowConstraint::Load { dst, src: tmp });
-                }
-                current = alloc_gep_temp(program, ctx, node, current, *fid, field_names[i].clone());
-            }
-            None
+            let cell = emit_gep_chain(program, ctx, node, base, &field_ids, &field_names);
+            Some(FlowConstraint::Load { dst, src: cell })
         }
         "new_expression" if ctx.is_cpp => {
             if let Some(cls) = new_expression_class(program, ctx, source, node) {
@@ -11219,12 +11555,8 @@ fn resolve_callee_with_loads(
         let name = node_text(source, &node);
         let field_load = lookup_var(ctx, program, name).is_none().then(|| {
             resolve_implicit_this_member(program, ctx, source, node).map(|gep| {
-                let load_var = alloc_load_temp(program, ctx, node, program.types.int());
-                program.flow.push(FlowConstraint::Load {
-                    dst: load_var,
-                    src: gep,
-                });
-                load_var
+                let int = program.types.int();
+                emit_load(program, ctx, node, gep, int)
             })
         });
         result = Some(match field_load.flatten() {
@@ -11293,12 +11625,8 @@ fn load_table_element(
     span_node: Node,
     table: VarId,
 ) -> VarId {
-    let load_var = alloc_load_temp(program, ctx, span_node, program.types.int());
-    program.flow.push(FlowConstraint::Load {
-        dst: load_var,
-        src: table,
-    });
-    load_var
+    let int = program.types.int();
+    emit_load(program, ctx, span_node, table, int)
 }
 
 fn field_callee_text(source: &str, node: Node) -> String {
@@ -11345,23 +11673,14 @@ fn emit_field_fn_ptr_load(
         let field_type_id = program.types.get(type_id).layout.fields.get(fid)?.type_id;
         type_id = field_type_id;
         if i + 1 == field_ids.len() {
-            let load_var = alloc_load_temp(program, ctx, span_node, program.types.int());
-            program.flow.push(FlowConstraint::Load {
-                dst: load_var,
-                src: gep,
-            });
-            return Some(load_var);
+            let int = program.types.int();
+            return Some(emit_load(program, ctx, span_node, gep, int));
         }
         if matches!(
             program.types.get(field_type_id).desc.as_ref(),
             TypeDesc::Ptr(_)
         ) {
-            let load_var = alloc_load_temp(program, ctx, span_node, field_type_id);
-            program.flow.push(FlowConstraint::Load {
-                dst: load_var,
-                src: gep,
-            });
-            current = load_var;
+            current = emit_load(program, ctx, span_node, gep, field_type_id);
             type_id = program.types.resolve_type_id(
                 match program.types.get(field_type_id).desc.as_ref() {
                     TypeDesc::Ptr(inner) => inner,

@@ -57,6 +57,7 @@ Current kinds:
 - `CallReturnIndirect { dst, callee_var }`: Indirect/virtual call assignment (`dst = callee_var()`), callee resolved at analysis time from points-to sets.
 - `NewHeap { dst }`: Heap allocation (`new T(...)`), allocates fresh heap location so constructor's implicit `this` has concrete pointees.
 - `StringConst { dst, value }`: String literal constant interned as abstract location, enabling dynamic symbol lookup (`dlsym`, `GetProcAddress`).
+- `UnwrapPointer { dst, src }`: Step through a smart pointer's overloaded `->`/`*` (`sp->field`) into a pointee-typed receiver; the solver admits only pointee-compatible locations (see `docs/ANALYSIS.md`, "Smart-pointer unwrap").
 
 Return-value flow (`ReturnFlow` in `program.fn_returns`):
 - `AddrOfVar { src }`: `return &var`
@@ -144,6 +145,7 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 | Parse new C/C++ construct | `trace-parse/src/lower.rs` |
 | C++ virtual dispatch & hierarchy | `trace-ir/src/program.rs` (`inheritance`), `trace-parse/src/lower.rs` (`expand_virtual_overrides`) |
 | C++ smart pointer unwrapping | `trace-parse/src/lower.rs` (`ArrowReturn`), `symbol.rs` |
+| Smart-pointer value flow (`sp->field`, `wp.lock()`) | `trace-parse/src/lower.rs` (`decompose_field_path`, `emit_wrapper_boundaries`, `weak_promotion`, `promoted_receiver_value`), `trace-analysis/src/solver.rs` (`unwrap_admits`) → `docs/ANALYSIS.md` ("Smart-pointer unwrap", "Weak-pointer promotion") |
 | C++ class-template member return substitution | `trace-ir/src/program.rs` (`TemplateReturn`), `trace-parse/src/lower.rs` (`register_template_return`, `substituted_template_return`), `merge.rs` → `docs/ANALYSIS.md` |
 | Type of a call-expression receiver (`S::Get().Open()`) | `trace-parse/src/lower.rs` (`CallResult`, `call_result_shape`, `receiver_desc`) → `docs/ANALYSIS.md` |
 | C API functions / FFI bindings | `crates/trace-capi/src/`, `crates/trace-capi/include/trace.h`, `docs/CAPI.md`, `Doxyfile` |

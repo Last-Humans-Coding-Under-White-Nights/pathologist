@@ -78,6 +78,7 @@ pub enum TraceFlowKind {
     TraceFlowCallArg = 6,
     TraceFlowTerminates = 7,
     TraceFlowDlsym = 8,
+    TraceFlowUnwrap = 9,
     TraceFlowUnknown = -1,
 }
 

@@ -381,6 +381,7 @@ fn export_flow_graph(
             ConstraintKind::Store => "store",
             ConstraintKind::Gep => "gep",
             ConstraintKind::Dlsym => "dlsym",
+            ConstraintKind::UnwrapPointer => "unwrap",
         };
         edge_rows.push((c.src.0, c.dst.0, kind));
     }

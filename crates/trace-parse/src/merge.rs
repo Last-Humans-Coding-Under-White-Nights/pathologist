@@ -1120,6 +1120,7 @@ fn merge_unit(
                     | FlowConstraint::Copy { dst, src }
                     | FlowConstraint::Load { dst, src }
                     | FlowConstraint::AddrOfVar { dst, src }
+                    | FlowConstraint::UnwrapPointer { dst, src }
                         if file_scope_vars.contains(dst) && file_scope_vars.contains(src) =>
                     {
                         let has_dst = internal_init_vars.contains(dst);
@@ -1155,7 +1156,8 @@ fn merge_unit(
             FlowConstraint::Store { dst, src }
             | FlowConstraint::Copy { dst, src }
             | FlowConstraint::Load { dst, src }
-            | FlowConstraint::AddrOfVar { dst, src } => {
+            | FlowConstraint::AddrOfVar { dst, src }
+            | FlowConstraint::UnwrapPointer { dst, src } => {
                 internal_init_vars.contains(dst) && internal_init_vars.contains(src)
             }
             FlowConstraint::GepField { dst, base, .. } => {
@@ -1496,6 +1498,10 @@ fn remap_flow(
             dst: rv(*dst),
             value: value.clone(),
         },
+        FlowConstraint::UnwrapPointer { dst, src } => FlowConstraint::UnwrapPointer {
+            dst: rv(*dst),
+            src: rv(*src),
+        },
     }
 }
 
@@ -1536,6 +1542,25 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// Both ends of an unwrap are variables the merge renumbers.
+    #[test]
+    fn remap_flow_renumbers_both_unwrap_endpoints() {
+        let var_map: FxHashMap<VarId, VarId> = [(VarId(1), VarId(11)), (VarId(2), VarId(12))]
+            .into_iter()
+            .collect();
+        let flow = FlowConstraint::UnwrapPointer {
+            dst: VarId(1),
+            src: VarId(2),
+        };
+        assert_eq!(
+            remap_flow(&flow, &FxHashMap::default(), &var_map),
+            FlowConstraint::UnwrapPointer {
+                dst: VarId(11),
+                src: VarId(12),
+            }
+        );
     }
 
     /// The remap is indexed by the source id (#86), so it must line up with
