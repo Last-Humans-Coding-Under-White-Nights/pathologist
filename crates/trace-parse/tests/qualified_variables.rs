@@ -1290,12 +1290,17 @@ fn inherited_implicit_this_member_assignment() {
                 field_name,
                 dst,
                 ..
-            } if field_name == "base_val_" && program.symbols.variable(*base).name == "this" => {
+            } if field_name == "base_val_" => {
+                let base_var = program.symbols.variable(*base);
+                match program.types.get(base_var.type_id).desc.as_ref() {
+                    trace_ir::TypeDesc::Struct { name, .. } => assert_eq!(name, "Base"),
+                    other => panic!("expected Struct(Base), got {other:?}"),
+                }
                 Some(*dst)
             }
             _ => None,
         })
-        .expect("must emit GEP for this->base_val_ in Derived");
+        .expect("must emit GEP for base_val_ in Derived");
 
     let has_store = program.flow.iter().any(|f| match f {
         FlowConstraint::Store { dst, src } => {

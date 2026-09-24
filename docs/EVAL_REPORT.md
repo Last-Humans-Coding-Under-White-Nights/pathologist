@@ -26,11 +26,20 @@ referring to class member fields were dropped during AST lowering.
 
 ### Pinned Corpus Validation
 
-Evaluated with `python3 scripts/eval_check.py --skip-rev-check` on release build:
-- **Pass rate**: **94 checks, 0 failures** across hdf (`cdc75a2`), hiview (`92408e2`),
-  and camera (`8ffd69d`).
-- No regressions in call graph edges, indirect calls, IPC bridges, or arg flow edges.
-- Diagnostics and points-to fixpoints converge cleanly within budget.
+Evaluated with `python3 scripts/eval_check.py --bin target/release/trace --outdir /tmp/eval_check` on release build:
+- **Pass rate**: **94 checks, 0 failures** across hdf (`cdc75a2`), hiview (`92408e2`), and camera (`8ffd69d`).
+- Reconciled and re-captured metric movements from implicit `this` member variable and callback flow recovery:
+  - **hdf** (`drivers_hdf_core` @ `cdc75a20bb8f1a046cd22e189405a20d602d0521`):
+    - `edges_indirect`: 4,969 → 4,980 (+11 recovered callback and ops table indirect call edges)
+    - `arg_flow_edges` and `arg_flow_rows_per_call_edge`: 69,055 → 69,495 (+440 edges from recovered member callback argument flow)
+  - **hiview** (`hiviewdfx_hiview` @ `92408e2072bd6dc8fb0d980773e80b6ec898710c`):
+    - `edges_indirect`: 160 → 166 (+6 indirect call edges from member observer/handler callback stores)
+    - `edges_external`: 16,658 → 16,487 (-171 previously unresolved calls now reaching member and indirect targets)
+    - `arg_flow_edges`: 18,522 → 18,815 (+293 edges)
+  - **camera** (`multimedia_camera_framework` @ `8ffd69dcd47f533e70b4dba428439da9008b0cae`):
+    - `edges_indirect`: 286 → 305 (+19 indirect call edges across pipeline, stream manager, and session listener callbacks)
+    - `arg_flow_edges`: 41,629 → 43,306 (+1,677 argument flow edges)
+- Diagnostics and points-to fixpoints converge cleanly within budget. All other exact checks, IPC bridges, and dispatch site probes match bit-for-bit.
 
 ## Smart-pointer value flow — 2026-09-24 (#141)
 

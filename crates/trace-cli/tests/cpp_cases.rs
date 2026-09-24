@@ -8546,7 +8546,13 @@ void run() {
     )
     .unwrap();
     let program = build_program(root, &default_opts(root)).expect("build");
-    let (_pag, analysis) = trace_analysis::analyze(&program);
+    let (pag, analysis) = trace_analysis::analyze_with_options(
+        &program,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
 
     assert!(
         has_direct(&program, &analysis, "run", "Derived::SetTarget"),
@@ -8571,6 +8577,50 @@ void run() {
         _ => false,
     });
     assert!(has_store, "must emit Store of t into inner_.target_ptr");
+
+    let gep_node = pag.var_node.get(&gep_target_ptr).expect("GEP PAG node");
+    let gep_pts = analysis.points_to.get(gep_node).expect("GEP points-to");
+    assert!(
+        !gep_pts.is_empty(),
+        "GEP node must point to the field summary location"
+    );
+
+    let summary_loc = gep_pts
+        .iter()
+        .copied()
+        .find(|l| pag.locations[l.0 as usize].desc == "summary:Inner.target_ptr")
+        .expect("gep_target_ptr must point to summary:Inner.target_ptr");
+    assert_eq!(
+        pag.locations[summary_loc.0 as usize].desc,
+        "summary:Inner.target_ptr"
+    );
+
+    let g_target_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "g_target")
+        .expect("g_target variable")
+        .id;
+    let g_target_loc = pag
+        .var_location
+        .get(&g_target_var)
+        .copied()
+        .expect("g_target loc");
+
+    let t_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "t" && v.fn_id.is_some())
+        .expect("t variable")
+        .id;
+    let t_node = pag.var_node.get(&t_var).expect("t PAG node");
+    let t_pts = analysis.points_to.get(t_node).expect("t points-to");
+    assert!(
+        t_pts.contains(&g_target_loc),
+        "parameter t must point to g_target; pts = {t_pts:?}"
+    );
 }
 
 #[test]
@@ -8618,5 +8668,281 @@ void run() {
             .iter()
             .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn local_array_shadows_implicit_this_member_subscript() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+typedef void (*Callback)();
+void expected() {}
+void wrong() {}
+struct C {
+    Callback callbacks[1];
+    void run() {
+        callbacks[0] = wrong;
+        Callback callbacks[1] = { expected };
+        Callback f = callbacks[0];
+        f();
+    }
+};
+struct C2 {
+    Callback callbacks[1];
+    Callback get_member() {
+        return callbacks[0];
+    }
+    Callback get_shadowed() {
+        Callback callbacks[1] = { expected };
+        return callbacks[0];
+    }
+};
+void entry() {
+    C c;
+    c.run();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+
+    let has_expected = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run") && fn_name(&program, e.callee) == "expected"
+    });
+    let has_wrong = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run") && fn_name(&program, e.callee) == "wrong"
+    });
+    assert!(
+        has_expected,
+        "C::run must call expected via shadowed local array; call edges: {:?}",
+        analysis
+            .call_edges
+            .iter()
+            .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !has_wrong,
+        "C::run must not call wrong when local array shadows member"
+    );
+
+    // Verify return_flow_from_expr shadowing:
+    // C2::get_member should return a load from the implicit this member GEP.
+    let get_member_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.ends_with("get_member"))
+        .expect("get_member fn")
+        .id;
+    let get_member_returns = program
+        .fn_returns
+        .get(&get_member_fn)
+        .expect("get_member returns");
+    assert_eq!(get_member_returns.len(), 1);
+    let member_ret_src = match &get_member_returns[0] {
+        trace_ir::ReturnFlow::Copy { src } => *src,
+        other => panic!("expected ReturnFlow::Copy, got {other:?}"),
+    };
+    // The member load temp is loaded from a GEP on this
+    let loads_from_gep = program.flow.iter().any(|f| match f {
+        trace_ir::FlowConstraint::Load { dst, .. } => *dst == member_ret_src,
+        _ => false,
+    });
+    assert!(
+        loads_from_gep,
+        "get_member must load return value from implicit this member GEP"
+    );
+
+    // C2::get_shadowed should return the local array variable directly, not loading from GEP.
+    let get_shadowed_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.ends_with("get_shadowed"))
+        .expect("get_shadowed fn")
+        .id;
+    let get_shadowed_returns = program
+        .fn_returns
+        .get(&get_shadowed_fn)
+        .expect("get_shadowed returns");
+    assert_eq!(get_shadowed_returns.len(), 1);
+    let shadowed_ret_src = match &get_shadowed_returns[0] {
+        trace_ir::ReturnFlow::Copy { src } => *src,
+        other => panic!("expected ReturnFlow::Copy, got {other:?}"),
+    };
+    let shadowed_var = program.symbols.variable(shadowed_ret_src);
+    assert_eq!(shadowed_var.name, "callbacks");
+    assert_eq!(
+        shadowed_var.fn_id,
+        Some(get_shadowed_fn),
+        "shadowed return must reference local variable"
+    );
+}
+
+#[test]
+fn derived_static_function_hides_base_field_designator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+typedef void (*Callback)();
+struct Base { Callback foo; };
+struct Derived : Base {
+    static void foo() {}
+    void run() { Callback p = foo; p(); }
+};
+void entry() { Derived d; d.run(); }
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+
+    let has_derived_foo = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run") && fn_name(&program, e.callee).ends_with("foo")
+    });
+    assert!(
+        has_derived_foo,
+        "Derived::run must call Derived::foo; call edges: {:?}",
+        analysis
+            .call_edges
+            .iter()
+            .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn implicit_this_member_address_of() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct Target { int val; };
+class Container {
+    Target target_;
+public:
+    Target* get_ptr() {
+        return &target_;
+    }
+    void run() {
+        Target* p = &target_;
+        p->val = 42;
+    }
+};
+void entry() {
+    Container c;
+    c.run();
+    Target* ptr = c.get_ptr();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, _analysis) = trace_analysis::analyze(&program);
+
+    // Verify &target_ emits GepField on this->target_ and not an unresolved AddrOfFn
+    let gep_targets = program
+        .flow
+        .iter()
+        .filter_map(|f| match f {
+            trace_ir::FlowConstraint::GepField {
+                dst,
+                base,
+                field_name,
+                ..
+            } if field_name == "target_" && program.symbols.variable(*base).name == "this" => {
+                Some(*dst)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !gep_targets.is_empty(),
+        "must emit GepField for this->target_ in address-of expressions"
+    );
+
+    // Ensure pending function references did not treat target_ as a function
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "target_"),
+        "target_ member variable must not be registered as a function"
+    );
+}
+
+#[test]
+fn implicit_this_member_casted_and_parenthesized_call_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct Target { int x; };
+Target* make_target() { return nullptr; }
+typedef Target* (*FactoryFn)();
+
+class Holder {
+    Target* member_ = nullptr;
+    Target* member2_ = nullptr;
+public:
+    void test_direct() {
+        member_ = (Target*)make_target();
+        member2_ = (make_target());
+    }
+    void test_indirect(FactoryFn fn) {
+        member_ = (Target*)fn();
+        member2_ = (fn());
+    }
+};
+void run(FactoryFn fn) {
+    Holder h;
+    h.test_direct();
+    h.test_indirect(fn);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, _analysis) = trace_analysis::analyze(&program);
+
+    // Direct and indirect call stores
+    let stores = program
+        .flow
+        .iter()
+        .filter(|f| matches!(f, trace_ir::FlowConstraint::Store { .. }))
+        .count();
+    assert!(
+        stores >= 4,
+        "must emit Store constraints for member_ and member2_ across direct and indirect calls, found {stores}"
+    );
+
+    // Check that CallReturn constraints exist for make_target
+    let has_call_return = program.flow.iter().any(|f| match f {
+        trace_ir::FlowConstraint::CallReturn { callee_name, .. } => callee_name == "make_target",
+        _ => false,
+    });
+    assert!(
+        has_call_return,
+        "must emit CallReturn for make_target even when casted or parenthesized"
+    );
+
+    // Check that CallReturnIndirect constraints exist
+    let has_call_return_indirect = program
+        .flow
+        .iter()
+        .any(|f| matches!(f, trace_ir::FlowConstraint::CallReturnIndirect { .. }));
+    assert!(
+        has_call_return_indirect,
+        "must emit CallReturnIndirect for indirect call even when casted or parenthesized"
     );
 }
