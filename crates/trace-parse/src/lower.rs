@@ -10350,6 +10350,9 @@ fn decompose_field_path(
         // itself. Nothing to decompose, and nothing emitted.
         return None;
     }
+    field_names.reverse();
+    arrows.reverse();
+
     let mut is_implicit_this = false;
     let root = if ctx.is_cpp && cur.kind() == "call_expression" {
         PathRoot::Call(call_root(program, ctx, source, cur, &arrows)?)
@@ -10365,15 +10368,13 @@ fn decompose_field_path(
         let name = node_text(source, &ident);
         class_ctx_field(program, ctx, name)?;
         let this_var = ctx.locals.get("this").copied()?;
-        field_names.push(name.to_string());
-        arrows.push(true);
+        field_names.insert(0, name.to_string());
+        arrows.insert(0, true);
         is_implicit_this = true;
         PathRoot::Var(this_var)
     } else {
         return None;
     };
-    field_names.reverse();
-    arrows.reverse();
 
     let (mut raw_pointer, mut type_id) = match &root {
         // A wrapper value: the arrow is overloaded, never built in.
@@ -10839,7 +10840,7 @@ fn addr_of_field_path(
         ));
     }
     // &identifier → check for C++ implicit this->member
-    if peeled.kind() == "identifier" {
+    if peeled.kind() == "identifier" && lookup_var_node(program, ctx, source, peeled).is_none() {
         if let Some(gep) = resolve_implicit_this_member(program, ctx, source, peeled) {
             return Some(gep);
         }
@@ -10961,13 +10962,18 @@ fn expr_to_rhs_flow(
             let op = pointer_op(source, node);
             let arg = pointer_arg(node)?;
             if op.as_deref() == Some("&") {
-                if let Some(gep) = resolve_implicit_this_member(program, ctx, source, arg) {
-                    Some(FlowConstraint::Copy { dst, src: gep })
-                } else if let Some(callee) = resolve_fn_ref(program, ctx, source, arg) {
-                    Some(FlowConstraint::AddrOfFn { dst, callee })
+                let peeled = peel_expression(arg);
+                if let Some(src) = lookup_var_node(program, ctx, source, peeled) {
+                    Some(if names_reference_binding(ctx, peeled, src) {
+                        FlowConstraint::Copy { dst, src }
+                    } else {
+                        FlowConstraint::AddrOfVar { dst, src }
+                    })
                 } else if let Some(gep) = addr_of_field_path(program, ctx, source, arg) {
                     // The gep temp's pts-to is the field's own location.
                     Some(FlowConstraint::Copy { dst, src: gep })
+                } else if let Some(callee) = resolve_fn_ref(program, ctx, source, arg) {
+                    Some(FlowConstraint::AddrOfFn { dst, callee })
                 } else if let Some(src) = resolve_lvalue_var(program, ctx, source, arg) {
                     Some(if names_reference_binding(ctx, arg, src) {
                         FlowConstraint::Copy { dst, src }
@@ -10976,11 +10982,14 @@ fn expr_to_rhs_flow(
                     })
                 } else {
                     if arg.kind() == "identifier" {
-                        // Might be a function defined later in the unit.
-                        ctx.pending.borrow_mut().push(PendingFnRef::AddrOfIdent {
-                            dst,
-                            name: node_text(source, &arg).to_string(),
-                        });
+                        let name = node_text(source, &arg);
+                        if lookup_var_unless_hidden(ctx, program, name).is_none() {
+                            // Might be a function defined later in the unit.
+                            ctx.pending.borrow_mut().push(PendingFnRef::AddrOfIdent {
+                                dst,
+                                name: name.to_string(),
+                            });
+                        }
                     }
                     None
                 }
@@ -11145,16 +11154,21 @@ fn return_flow_from_expr(
             let op = pointer_op(source, node);
             let arg = pointer_arg(node)?;
             if op.as_deref() == Some("&") {
-                if let Some(gep) = resolve_implicit_this_member(program, ctx, source, arg) {
-                    return Some(ReturnFlow::Copy { src: gep });
-                }
-                if let Some(callee) = resolve_fn_ref(program, ctx, source, arg) {
-                    return Some(ReturnFlow::AddrOfFn { callee });
+                let peeled = peel_expression(arg);
+                if let Some(src) = lookup_var_node(program, ctx, source, peeled) {
+                    return Some(if names_reference_binding(ctx, peeled, src) {
+                        ReturnFlow::Copy { src }
+                    } else {
+                        ReturnFlow::AddrOfVar { src }
+                    });
                 }
                 // `&base.field` returns a pointer to the field subobject;
                 // carry it as a Copy of the gep temp's pts-to.
                 if let Some(gep) = addr_of_field_path(program, ctx, source, arg) {
                     return Some(ReturnFlow::Copy { src: gep });
+                }
+                if let Some(callee) = resolve_fn_ref(program, ctx, source, arg) {
+                    return Some(ReturnFlow::AddrOfFn { callee });
                 }
                 if let Some(src) = resolve_lvalue_var(program, ctx, source, arg) {
                     return Some(if names_reference_binding(ctx, arg, src) {
@@ -11164,10 +11178,13 @@ fn return_flow_from_expr(
                     });
                 }
                 if arg.kind() == "identifier" {
-                    ctx.pending.borrow_mut().push(PendingFnRef::ReturnAddrOf {
-                        owner: fn_id,
-                        name: node_text(source, &arg).to_string(),
-                    });
+                    let name = node_text(source, &arg);
+                    if lookup_var_unless_hidden(ctx, program, name).is_none() {
+                        ctx.pending.borrow_mut().push(PendingFnRef::ReturnAddrOf {
+                            owner: fn_id,
+                            name: name.to_string(),
+                        });
+                    }
                 }
                 return None;
             }

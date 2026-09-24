@@ -8946,3 +8946,159 @@ void run(FactoryFn fn) {
         "must emit CallReturnIndirect for indirect call even when casted or parenthesized"
     );
 }
+
+#[test]
+fn local_shadowing_inherited_member_address_of() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+typedef void (*Callback)();
+void expected() {}
+void wrong() {}
+struct Base { Callback cb; };
+struct Derived : Base {
+    void run() {
+        this->cb = wrong;
+        Callback cb = expected;
+        Callback *p = &cb;
+        (*p)();
+    }
+    Callback* get_cb() {
+        this->cb = wrong;
+        Callback cb = expected;
+        return &cb;
+    }
+    Callback* get_cb_param(Callback cb) {
+        this->cb = wrong;
+        return &cb;
+    }
+};
+void entry() {
+    Derived d;
+    d.run();
+    d.get_cb();
+    d.get_cb_param(expected);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+
+    let has_expected = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run")
+            && fn_name(&program, e.callee).ends_with("expected")
+    });
+    let has_wrong = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run")
+            && fn_name(&program, e.callee).ends_with("wrong")
+    });
+    assert!(
+        has_expected,
+        "Derived::run must call expected; call edges: {:?}",
+        analysis
+            .call_edges
+            .iter()
+            .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !has_wrong,
+        "Derived::run must not call wrong when local cb shadows Base::cb"
+    );
+
+    // Verify return address handling: return &cb must return the local variable's address,
+    // not the inherited field Base::cb
+    let get_cb_id = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.ends_with("get_cb"))
+        .map(|f| f.id)
+        .expect("get_cb function");
+    let returns = program
+        .fn_returns
+        .get(&get_cb_id)
+        .expect("returns for get_cb");
+    assert!(
+        returns.iter().any(|r| match r {
+            trace_ir::ReturnFlow::AddrOfVar { src } => {
+                let var = program.symbols.variable(*src);
+                var.name == "cb" && var.fn_id == Some(get_cb_id)
+            }
+            _ => false,
+        }),
+        "get_cb must return AddrOfVar for local cb, found returns: {:?}",
+        returns
+    );
+
+    // Verify return address handling with parameter shadowing: return &cb must return the
+    // parameter variable's address, not the inherited field Base::cb
+    let get_cb_param_id = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.ends_with("get_cb_param"))
+        .map(|f| f.id)
+        .expect("get_cb_param function");
+    let param_returns = program
+        .fn_returns
+        .get(&get_cb_param_id)
+        .expect("returns for get_cb_param");
+    assert!(
+        param_returns.iter().any(|r| match r {
+            trace_ir::ReturnFlow::AddrOfVar { src } => {
+                let var = program.symbols.variable(*src);
+                var.name == "cb" && var.fn_id == Some(get_cb_param_id)
+            }
+            _ => false,
+        }),
+        "get_cb_param must return AddrOfVar for parameter cb, found returns: {:?}",
+        param_returns
+    );
+}
+
+#[test]
+fn smart_pointer_call_root_mixed_arrow_dot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+namespace OHOS {
+template<class T> struct sptr { sptr(T*); T* operator->(); };
+}
+typedef void (*Callback)();
+void expected() {}
+struct Inner { Callback cb; };
+struct Payload { Inner inner; };
+Payload global;
+OHOS::sptr<Payload> GetSp() {
+    OHOS::sptr<Payload> r = &global;
+    return r;
+}
+void seed(Payload *p) { p->inner.cb = expected; }
+void run() { GetSp()->inner.cb(); }
+void entry() { seed(&global); run(); }
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+
+    let has_expected = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run")
+            && fn_name(&program, e.callee).ends_with("expected")
+    });
+    assert!(
+        has_expected,
+        "run must call expected via GetSp()->inner.cb(); call edges: {:?}",
+        analysis
+            .call_edges
+            .iter()
+            .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
+            .collect::<Vec<_>>()
+    );
+}
