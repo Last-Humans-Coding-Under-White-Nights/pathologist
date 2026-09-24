@@ -146,6 +146,52 @@ appears, and the method name is checked before the receiver is typed. Marking
 wrapper variables as pointers is one pass over the variables after merging,
 memoized per type.
 
+## Implicit member pointer field decomposition — 2026-09-24 (#146)
+
+Calling a function pointer through an implicit member pointer variable or field path in a member function body (e.g., `handler_->fn()`, `val_handler_.fn()`, `nested_->handler->fn()`) implicitly accesses fields of `this` (`this->handler_->fn()`). During AST lowering, `decompose_field_path` peeled the access down to the unqualified identifier `handler_`, but `resolve_lvalue_var` only searched local and parameter variables, failing to recognize instance fields on `this`. Consequently, field decomposition returned `None`, dropping the function-pointer load constraints and leaving `callee_var = None`, causing the call to be misclassified as a direct external call.
+
+With the fix, when `resolve_lvalue_var` returns `None` on an identifier in a C++ member function, `decompose_field_path` checks whether the identifier names an instance field on `this` (`class_ctx_field`), capturing the `FieldId` to avoid redundant layout lookups. It roots the access at `this` with arrow access (`this->handler_->fn`), generating the GEP and Load constraints that wire `callee_var` for indirect call resolution.
+
+Baseline: `master` at `58a81a8315bc8c5cf3aad384ae50af2572bb4e4e`. Candidate:
+branch `fix/issue-146-implicit-this-fn-ptr-call` at `e6f736cfbe3f392137bc32f3a873ad3a3696a6cd`.
+Both are release builds (`cargo build --release -p trace-cli`) run through
+`python3 scripts/eval_check.py --jobs 8` on the corpora pinned in `scripts/eval_expected.json`
+(`drivers_hdf_core` at `cdc75a20bb8f1a046cd22e189405a20d602d0521`,
+`hiviewdfx_hiview` at `92408e2072bd6dc8fb0d980773e80b6ec898710c`,
+`multimedia_camera_framework` at `8ffd69dcd47f9e8a7ea3dc690b240eefddac3218`), all clean.
+Evaluated on Linux x86_64 (kernel 6.6.87, 16 cores, 30 GB RAM, rustc `1.95.0`) and
+macOS arm64 (Apple M1 MacBook Air, 8 cores, 8 GB RAM, rustc `1.100.0-nightly`).
+
+### Corpus evaluation movement
+
+Comparing candidate against baseline on clean, pinned corpora:
+
+| Corpus | Metric | Baseline (`58a81a8`) | Candidate | Movement |
+|---|---|---:|---:|---|
+| hdf | `edges_indirect` (exact) | 4,969 | 4,972 | +3 recovered indirect callbacks |
+| hdf | `edges_total` (band) | 74,810 | 74,810 | Unchanged |
+| hdf | `arg_flow_edges` (band) | 69,123 | 69,123 | Unchanged |
+| hiview | (all 29 checks) | - | - | Unchanged (all 29 checks pass) |
+| camera | (all 36 checks) | - | - | Unchanged (all 36 checks pass) |
+
+The three recovered indirect callback edges in `drivers_hdf_core` (`cdc75a20bb8f1a046cd22e189405a20d602d0521`)
+occur at `HdfDeathNotifier::OnRemoteDied`, `adapter/uhdf2/ipc/src/hdf_remote_adapter.cpp:104`,
+through `recipient_->OnRemoteDied`:
+- `DevSvcManagerOnServiceDied`
+- `DevHostServiceProxyOnRemoteDied`
+- `DevSvcManagerProxyOnRemoteDied`
+
+All three are assigned to the recipient callback in the corpus, so these edges are genuine recoveries resulting from implicit member pointer field decomposition.
+
+### Validation
+- **Corpus Evaluation**: `python3 scripts/eval_check.py` passes all 94 checks with 0 failures on pinned OpenHarmony corpora (`hdf`, `hiview`, `multimedia_camera_framework`).
+- **Workspace Test Suite**: `cargo test --workspace` passes cleanly (1,132 unit, integration, and CLI tests passing).
+- **Regression Fixtures & Tests**:
+  - Reproducer fixture at `tests/fixtures/cpp_implicit_fn_ptr/main.cpp`.
+  - Integration tests in `crates/trace-cli/tests/cpp_cases.rs`: `cpp_implicit_member_pointer_fn_ptr_call_resolves_indirect` and `cpp_implicit_member_value_and_chained_fn_ptr_call`.
+  - CLI inspect test in `crates/trace-cli/tests/inspect_tests.rs`: `inspect_callgraph_up_for_implicit_member_pointer_fn_ptr`.
+  - Verified `is_direct = 0`, `callee_var` is set, indirect call edge `Dispatcher::Dispatch -> target_callback` is resolved, and `trace inspect callgraph --direction up` lists `Dispatcher::Dispatch` as caller.
+
 ## Qualified variables — 2026-09-23 (#133)
 
 The rules are defined in [Canonical variable identity](ANALYSIS.md#canonical-variable-identity)
