@@ -8136,21 +8136,49 @@ fn node_has_compound_body(node: Node) -> bool {
         .any(|c| c.kind() == "compound_statement")
 }
 
-fn class_has_data_field(program: &Program, cls: &str, field: &str) -> bool {
-    class_field_desc(program, cls, field).is_some()
+#[derive(Clone, Copy, Debug)]
+struct HierarchyField {
+    field_id: FieldId,
+    owner_type_id: trace_ir::TypeId,
+    type_id: trace_ir::TypeId,
 }
 
-/// Type of `field` on `cls` or a base (instance-insensitive layout).
-fn class_field_desc(program: &Program, cls: &str, field: &str) -> Option<TypeDesc> {
+/// Search `cls` and its base class hierarchy for an instance member field named `field_name`.
+/// If `ctx` is provided, a nearer function or static member variable declared on an intermediate
+/// class stops the search (preserving C++ name hiding).
+fn lookup_field_in_hierarchy(
+    program: &Program,
+    ctx: Option<&LowerContext>,
+    cls: &str,
+    field_name: &str,
+) -> Option<HierarchyField> {
+    if cls.is_empty() {
+        return None;
+    }
     let mut queue = std::collections::VecDeque::new();
     let mut seen = std::collections::BTreeSet::new();
     queue.push_back(cls.to_string());
     seen.insert(cls.to_string());
     while let Some(cur) = queue.pop_front() {
         if let Some(tid) = program.types.class_type_id(&cur) {
-            let info = program.types.get(tid);
-            if let Some((_, fl)) = info.layout.fields.iter().find(|(_, f)| f.name == field) {
-                return Some(program.types.get(fl.type_id).desc.as_ref().clone());
+            if let Some(fid) = program.types.field_id_by_name(tid, field_name) {
+                let fl = program.types.get(tid).layout.fields.get(&fid)?;
+                return Some(HierarchyField {
+                    field_id: fid,
+                    owner_type_id: tid,
+                    type_id: fl.type_id,
+                });
+            }
+        }
+        if let Some(ctx) = ctx {
+            let candidate = format!("{cur}::{field_name}");
+            if names_function(program, ctx, &candidate)
+                || program
+                    .symbols
+                    .variable_named_in_scope(&candidate, ctx.current_file)
+                    .is_some()
+            {
+                return None;
             }
         }
         for base in program.bases_of(&cur) {
@@ -8160,6 +8188,36 @@ fn class_field_desc(program: &Program, cls: &str, field: &str) -> Option<TypeDes
         }
     }
     None
+}
+
+fn field_in_hierarchy(
+    program: &Program,
+    ctx: Option<&LowerContext>,
+    type_id: trace_ir::TypeId,
+    fname: &str,
+) -> Option<HierarchyField> {
+    if let Some(fid) = program.types.field_id_by_name(type_id, fname) {
+        let fl = program.types.get(type_id).layout.fields.get(&fid)?;
+        return Some(HierarchyField {
+            field_id: fid,
+            owner_type_id: type_id,
+            type_id: fl.type_id,
+        });
+    }
+    let TypeDesc::Struct { name, .. } = program.types.get(type_id).desc.as_ref() else {
+        return None;
+    };
+    lookup_field_in_hierarchy(program, ctx, name, fname)
+}
+
+fn class_has_data_field(program: &Program, cls: &str, field: &str) -> bool {
+    class_field_desc(program, cls, field).is_some()
+}
+
+/// Type of `field` on `cls` or a base (instance-insensitive layout).
+fn class_field_desc(program: &Program, cls: &str, field: &str) -> Option<TypeDesc> {
+    let hf = lookup_field_in_hierarchy(program, None, cls, field)?;
+    Some(program.types.get(hf.type_id).desc.as_ref().clone())
 }
 
 fn class_field_static_class(program: &Program, cls: &str, field: &str) -> Option<String> {
@@ -9694,6 +9752,17 @@ fn extract_flow_from_expr(
             if let Some(flow) = expr_to_rhs_flow(program, ctx, source, rhs, dst) {
                 program.flow.push(flow);
             }
+        } else if ctx.is_cpp {
+            let target_ident = match lhs.kind() {
+                "identifier" => Some(lhs),
+                "subscript_expression" => subscript_table(lhs).filter(|n| n.kind() == "identifier"),
+                _ => None,
+            };
+            if let Some(ident) = target_ident {
+                if let Some(gep) = resolve_implicit_this_member(program, ctx, source, ident) {
+                    emit_store_to_location(program, ctx, source, node, gep, rhs);
+                }
+            }
         }
         return;
     }
@@ -10106,6 +10175,69 @@ fn emit_fn_name_store(
     }
 }
 
+fn emit_store_to_location(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    span_node: Node,
+    dst: VarId,
+    value_node: Node,
+) {
+    if let Some(src) = expr_to_store_src(program, ctx, source, value_node) {
+        program.flow.push(FlowConstraint::Store { dst, src });
+    } else {
+        let peeled_value = peel_casts(source, peel_expression(value_node));
+        if let Some(name) = fn_designator(source, peeled_value) {
+            emit_fn_name_store(program, ctx, source, span_node, dst, name);
+        } else if peeled_value.kind() == "lambda_expression" && ctx.is_cpp {
+            if let Some(callee) = lower_lambda_expression(program, ctx, source, peeled_value) {
+                let src_temp = alloc_ret_temp(program, ctx, span_node);
+                program.flow.push(FlowConstraint::AddrOfFn {
+                    dst: src_temp,
+                    callee,
+                });
+                program
+                    .flow
+                    .push(FlowConstraint::Store { dst, src: src_temp });
+            }
+        } else if let Some(src) = promoted_receiver_value(program, ctx, source, peeled_value) {
+            program.flow.push(FlowConstraint::Store { dst, src });
+        } else {
+            let ret_temp = alloc_ret_temp(program, ctx, span_node);
+            let emitted = if peeled_value.kind() == "call_expression" {
+                if let Some(callee_name) = resolve_direct_call(program, ctx, source, peeled_value) {
+                    emit_call_return(program, ctx, peeled_value, ret_temp, callee_name);
+                    true
+                } else if let Some(callee_var) =
+                    resolve_callee_var(program, ctx, source, peeled_value)
+                {
+                    program.flow.push(FlowConstraint::CallReturnIndirect {
+                        dst: ret_temp,
+                        callee_var,
+                    });
+                    ctx.call_return_dst
+                        .borrow_mut()
+                        .insert(peeled_value.id(), ret_temp);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                expr_to_rhs_flow(program, ctx, source, value_node, ret_temp)
+                    .map(|flow| {
+                        program.flow.push(flow);
+                    })
+                    .is_some()
+            };
+            if emitted {
+                program
+                    .flow
+                    .push(FlowConstraint::Store { dst, src: ret_temp });
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_field_value_store(
     program: &mut Program,
@@ -10136,54 +10268,7 @@ fn emit_field_value_store(
         last,
         field_names[prefix.len()].clone(),
     );
-    if let Some(src) = expr_to_store_src(program, ctx, source, value_node) {
-        program.flow.push(FlowConstraint::Store { dst: gep, src });
-    } else if let Some(name) = fn_designator(source, value_node) {
-        emit_fn_name_store(program, ctx, source, span_node, gep, name);
-    } else if value_node.kind() == "lambda_expression" && ctx.is_cpp {
-        if let Some(callee) = lower_lambda_expression(program, ctx, source, value_node) {
-            let src_temp = alloc_ret_temp(program, ctx, span_node);
-            program.flow.push(FlowConstraint::AddrOfFn {
-                dst: src_temp,
-                callee,
-            });
-            program.flow.push(FlowConstraint::Store {
-                dst: gep,
-                src: src_temp,
-            });
-        }
-    } else if let Some(src) = promoted_receiver_value(program, ctx, source, value_node) {
-        // The receiver value itself, as `*out = wp.lock()` stores it.
-        program.flow.push(FlowConstraint::Store { dst: gep, src });
-    } else {
-        let ret_temp = alloc_ret_temp(program, ctx, span_node);
-        let emitted = if value_node.kind() == "call_expression" {
-            if let Some(callee_name) = resolve_direct_call(program, ctx, source, value_node) {
-                emit_call_return(program, ctx, value_node, ret_temp, callee_name);
-                true
-            } else if let Some(callee_var) = resolve_callee_var(program, ctx, source, value_node) {
-                program.flow.push(FlowConstraint::CallReturnIndirect {
-                    dst: ret_temp,
-                    callee_var,
-                });
-                true
-            } else {
-                false
-            }
-        } else {
-            expr_to_rhs_flow(program, ctx, source, value_node, ret_temp)
-                .map(|flow| {
-                    program.flow.push(flow);
-                })
-                .is_some()
-        };
-        if emitted {
-            program.flow.push(FlowConstraint::Store {
-                dst: gep,
-                src: ret_temp,
-            });
-        }
-    }
+    emit_store_to_location(program, ctx, source, span_node, gep, value_node);
 }
 
 fn alloc_gep_temp(
@@ -10226,6 +10311,15 @@ fn field_name_from_node(source: &str, node: Node) -> Option<String> {
         .map(|n| node_text(source, &n).to_string())
 }
 
+fn field_id_in_hierarchy(
+    program: &Program,
+    ctx: Option<&LowerContext>,
+    type_id: trace_ir::TypeId,
+    fname: &str,
+) -> Option<HierarchyField> {
+    field_in_hierarchy(program, ctx, type_id, fname)
+}
+
 /// The field path `node` spells: its root (a variable, the last smart-pointer
 /// receiver, or a call's result) and the fields after it. `None`, with
 /// nothing emitted, when `node` has no field path or a field lookup fails,
@@ -10259,13 +10353,29 @@ fn decompose_field_path(
     field_names.reverse();
     arrows.reverse();
 
-    // The path's root: a variable, or the smart pointer a direct call returns
-    // (`GetSp()->field`), whose result is lowered only once the path validates.
+    let mut is_implicit_this = false;
     let root = if ctx.is_cpp && cur.kind() == "call_expression" {
         PathRoot::Call(call_root(program, ctx, source, cur, &arrows)?)
+    } else if let Some(base) = resolve_lvalue_var(program, ctx, source, cur) {
+        PathRoot::Var(base)
+    } else if ctx.is_cpp {
+        let root_node = if cur.kind() == "identifier" {
+            Some(cur)
+        } else {
+            subscript_table(cur).filter(|n| n.kind() == "identifier")
+        };
+        let ident = root_node?;
+        let name = node_text(source, &ident);
+        class_ctx_field(program, ctx, name)?;
+        let this_var = ctx.locals.get("this").copied()?;
+        field_names.insert(0, name.to_string());
+        arrows.insert(0, true);
+        is_implicit_this = true;
+        PathRoot::Var(this_var)
     } else {
-        PathRoot::Var(resolve_lvalue_var(program, ctx, source, cur)?)
+        return None;
     };
+
     let (mut raw_pointer, mut type_id) = match &root {
         // A wrapper value: the arrow is overloaded, never built in.
         PathRoot::Call(call) => (false, call.wrapper),
@@ -10276,7 +10386,7 @@ fn decompose_field_path(
             // referred-to value.
             let raw_pointer = ctx.is_cpp
                 && arrows.first() == Some(&true)
-                && if cur.kind() == "identifier" {
+                && if is_implicit_this || cur.kind() == "identifier" {
                     // The common case only needs a type tag, not a cloned layout.
                     match program
                         .types
@@ -10299,6 +10409,7 @@ fn decompose_field_path(
             (raw_pointer, struct_type_for_var(program, base)?)
         }
     };
+    let mut summary_receiver = None;
     let mut field_ids = Vec::new();
     // Validate the whole path before publishing anything: method names also
     // pass through decomposition, and a failed lookup must leave no
@@ -10356,10 +10467,13 @@ fn decompose_field_path(
                 type_id = pointee;
             }
         }
-        let fid = program.types.field_id_by_name(type_id, fname)?;
-        field_ids.push(fid);
-        let layout = program.types.get(type_id);
-        type_id = layout.layout.fields.get(&fid)?.type_id;
+        let hf = field_id_in_hierarchy(program, Some(ctx), type_id, fname)?;
+        if step == 0 && hf.owner_type_id != type_id {
+            summary_receiver = Some(hf.owner_type_id);
+        }
+        field_ids.push(hf.field_id);
+        let layout = program.types.get(hf.owner_type_id);
+        type_id = layout.layout.fields.get(&hf.field_id)?.type_id;
         raw_pointer = matches!(program.types.get(type_id).desc.as_ref(), TypeDesc::Ptr(_));
         type_id = peel_ptr_to_struct(program, type_id);
     }
@@ -10384,6 +10498,11 @@ fn decompose_field_path(
             emit_load(program, ctx, node, cell, wrapper)
         }
         None => base,
+    };
+    let base = if let Some(owner_tid) = summary_receiver {
+        alloc_recv_temp(program, ctx, node, owner_tid)
+    } else {
+        base
     };
     let (base, path_start) = emit_wrapper_boundaries(
         program,
@@ -10563,7 +10682,7 @@ fn peel_wrapper_to_pointee(program: &Program, type_id: trace_ir::TypeId) -> trac
 
 fn peel_ptr_to_struct(program: &mut Program, type_id: trace_ir::TypeId) -> trace_ir::TypeId {
     let inner = match program.types.get(type_id).desc.as_ref() {
-        TypeDesc::Ptr(inner) => Some((**inner).clone()),
+        TypeDesc::Ptr(inner) | TypeDesc::Array { elem: inner, .. } => Some((**inner).clone()),
         _ => None,
     };
     inner.map_or(type_id, |desc| program.types.intern(desc))
@@ -10657,30 +10776,38 @@ fn resolve_implicit_this_member(
     node: Node,
 ) -> Option<VarId> {
     let field_name = node_text(source, &node);
-    let field_id = class_ctx_field(program, ctx, field_name)?;
+    let (field_id, owner_tid) = class_ctx_field(program, ctx, field_name)?;
     // The body's `this`: a member's own, or the one a lambda captured. A
     // lambda's first parameter is no `this`, and one that captures none
     // reads no member.
     let this_var = *ctx.locals.get("this")?;
+    let base = if struct_type_for_var(program, this_var) == Some(owner_tid) {
+        this_var
+    } else {
+        alloc_recv_temp(program, ctx, node, owner_tid)
+    };
     Some(alloc_gep_temp(
         program,
         ctx,
         node,
-        this_var,
+        base,
         field_id,
         field_name.to_string(),
     ))
 }
 
 /// The instance field `name` of the C++ class whose member is being lowered.
-fn class_ctx_field(program: &Program, ctx: &LowerContext, name: &str) -> Option<trace_ir::FieldId> {
+fn class_ctx_field(
+    program: &Program,
+    ctx: &LowerContext,
+    name: &str,
+) -> Option<(trace_ir::FieldId, trace_ir::TypeId)> {
     if !ctx.is_cpp {
         return None;
     }
-    let cls = program
-        .types
-        .class_type_id(&ctx.class_ctx.as_ref()?.qual_name)?;
-    program.types.field_id_by_name(cls, name)
+    let root = &ctx.class_ctx.as_ref()?.qual_name;
+    let hf = lookup_field_in_hierarchy(program, Some(ctx), root, name)?;
+    Some((hf.field_id, hf.owner_type_id))
 }
 
 /// Lower `&base.f1.f2` into a gep-temp chain so the resulting pointer
@@ -10713,7 +10840,7 @@ fn addr_of_field_path(
         ));
     }
     // &identifier → check for C++ implicit this->member
-    if peeled.kind() == "identifier" {
+    if peeled.kind() == "identifier" && lookup_var_node(program, ctx, source, peeled).is_none() {
         if let Some(gep) = resolve_implicit_this_member(program, ctx, source, peeled) {
             return Some(gep);
         }
@@ -10780,10 +10907,25 @@ fn expr_to_rhs_flow(
         return None;
     }
     // `f = s.ops[i]` reads the field `ops`.
-    if let Some(table) = field_table(node) {
-        return expr_to_rhs_flow(program, ctx, source, table, dst);
+    if let Some(table) = subscript_table(node) {
+        if table.kind() == "field_expression" {
+            return expr_to_rhs_flow(program, ctx, source, table, dst);
+        } else if ctx.is_cpp && table.kind() == "identifier" {
+            let name = node_text(source, &table);
+            let found = lookup_var_unless_hidden(ctx, program, name);
+            if let Some(Some(src)) = found {
+                return Some(FlowConstraint::Copy { dst, src });
+            } else if let Some(gep) = resolve_implicit_this_member(program, ctx, source, table) {
+                return Some(FlowConstraint::Load { dst, src: gep });
+            }
+        }
     }
     match node.kind() {
+        "this" => ctx
+            .locals
+            .get("this")
+            .copied()
+            .map(|src| FlowConstraint::Copy { dst, src }),
         "identifier" => {
             let name = node_text(source, &node);
             // A declared name shadows a function of the same name, as in the
@@ -10820,11 +10962,18 @@ fn expr_to_rhs_flow(
             let op = pointer_op(source, node);
             let arg = pointer_arg(node)?;
             if op.as_deref() == Some("&") {
-                if let Some(callee) = resolve_fn_ref(program, ctx, source, arg) {
-                    Some(FlowConstraint::AddrOfFn { dst, callee })
+                let peeled = peel_expression(arg);
+                if let Some(src) = lookup_var_node(program, ctx, source, peeled) {
+                    Some(if names_reference_binding(ctx, peeled, src) {
+                        FlowConstraint::Copy { dst, src }
+                    } else {
+                        FlowConstraint::AddrOfVar { dst, src }
+                    })
                 } else if let Some(gep) = addr_of_field_path(program, ctx, source, arg) {
                     // The gep temp's pts-to is the field's own location.
                     Some(FlowConstraint::Copy { dst, src: gep })
+                } else if let Some(callee) = resolve_fn_ref(program, ctx, source, arg) {
+                    Some(FlowConstraint::AddrOfFn { dst, callee })
                 } else if let Some(src) = resolve_lvalue_var(program, ctx, source, arg) {
                     Some(if names_reference_binding(ctx, arg, src) {
                         FlowConstraint::Copy { dst, src }
@@ -10833,11 +10982,14 @@ fn expr_to_rhs_flow(
                     })
                 } else {
                     if arg.kind() == "identifier" {
-                        // Might be a function defined later in the unit.
-                        ctx.pending.borrow_mut().push(PendingFnRef::AddrOfIdent {
-                            dst,
-                            name: node_text(source, &arg).to_string(),
-                        });
+                        let name = node_text(source, &arg);
+                        if lookup_var_unless_hidden(ctx, program, name).is_none() {
+                            // Might be a function defined later in the unit.
+                            ctx.pending.borrow_mut().push(PendingFnRef::AddrOfIdent {
+                                dst,
+                                name: name.to_string(),
+                            });
+                        }
                     }
                     None
                 }
@@ -10974,18 +11126,49 @@ fn return_flow_from_expr(
     if node_is_from_ignored_macro(ctx, node) {
         return None;
     }
+    if let Some(table) = subscript_table(node) {
+        if table.kind() == "field_expression" {
+            return return_flow_from_expr(program, ctx, source, table, fn_id);
+        } else if ctx.is_cpp && table.kind() == "identifier" {
+            let name = node_text(source, &table);
+            let found = lookup_var_unless_hidden(ctx, program, name);
+            if let Some(Some(src)) = found {
+                return Some(ReturnFlow::Copy { src });
+            } else if let Some(gep) = resolve_implicit_this_member(program, ctx, source, table) {
+                let load_var = alloc_load_temp(program, ctx, node, program.types.int());
+                program.flow.push(FlowConstraint::Load {
+                    dst: load_var,
+                    src: gep,
+                });
+                return Some(ReturnFlow::Copy { src: load_var });
+            }
+        }
+    }
     match node.kind() {
+        "this" => ctx
+            .locals
+            .get("this")
+            .copied()
+            .map(|src| ReturnFlow::Copy { src }),
         "pointer_expression" => {
             let op = pointer_op(source, node);
             let arg = pointer_arg(node)?;
             if op.as_deref() == Some("&") {
-                if let Some(callee) = resolve_fn_ref(program, ctx, source, arg) {
-                    return Some(ReturnFlow::AddrOfFn { callee });
+                let peeled = peel_expression(arg);
+                if let Some(src) = lookup_var_node(program, ctx, source, peeled) {
+                    return Some(if names_reference_binding(ctx, peeled, src) {
+                        ReturnFlow::Copy { src }
+                    } else {
+                        ReturnFlow::AddrOfVar { src }
+                    });
                 }
                 // `&base.field` returns a pointer to the field subobject;
                 // carry it as a Copy of the gep temp's pts-to.
                 if let Some(gep) = addr_of_field_path(program, ctx, source, arg) {
                     return Some(ReturnFlow::Copy { src: gep });
+                }
+                if let Some(callee) = resolve_fn_ref(program, ctx, source, arg) {
+                    return Some(ReturnFlow::AddrOfFn { callee });
                 }
                 if let Some(src) = resolve_lvalue_var(program, ctx, source, arg) {
                     return Some(if names_reference_binding(ctx, arg, src) {
@@ -10995,10 +11178,13 @@ fn return_flow_from_expr(
                     });
                 }
                 if arg.kind() == "identifier" {
-                    ctx.pending.borrow_mut().push(PendingFnRef::ReturnAddrOf {
-                        owner: fn_id,
-                        name: node_text(source, &arg).to_string(),
-                    });
+                    let name = node_text(source, &arg);
+                    if lookup_var_unless_hidden(ctx, program, name).is_none() {
+                        ctx.pending.borrow_mut().push(PendingFnRef::ReturnAddrOf {
+                            owner: fn_id,
+                            name: name.to_string(),
+                        });
+                    }
                 }
                 return None;
             }
@@ -11006,15 +11192,20 @@ fn return_flow_from_expr(
         }
         "identifier" => {
             let name = node_text(source, &node);
-            // A declared name shadows a function of the same name, so the
-            // variable is asked first. Order matters now that this arm records
-            // `AddrOfFn` rather than merely suppressing a fact: resolving the
-            // function first would drop `return local;`'s real copy flow and
-            // invent a pointer to an unrelated function. A name a nearer field
-            // or function hides reads no variable, now or when deferred.
+            // A declared name shadows a function of the same name, as in the
+            // return arm: a variable first, then an instance field (read
+            // through `this`), then the function. A name a nearer field or
+            // function hides reads no variable.
             let found = lookup_var_unless_hidden(ctx, program, name);
             if let Some(Some(src)) = found {
                 Some(ReturnFlow::Copy { src })
+            } else if let Some(gep) = resolve_implicit_this_member(program, ctx, source, node) {
+                let load_var = alloc_load_temp(program, ctx, node, program.types.int());
+                program.flow.push(FlowConstraint::Load {
+                    dst: load_var,
+                    src: gep,
+                });
+                Some(ReturnFlow::Copy { src: load_var })
             } else if let Some(callee) = resolve_function_named(program, ctx, name) {
                 Some(ReturnFlow::AddrOfFn { callee })
             } else if found.is_some() {
@@ -11028,7 +11219,25 @@ fn return_flow_from_expr(
             }
         }
         "field_expression" => {
-            static_member_access(program, ctx, source, node).map(|src| ReturnFlow::Copy { src })
+            if let Some(src) = static_member_access(program, ctx, source, node) {
+                return Some(ReturnFlow::Copy { src });
+            }
+            let (base, field_ids, field_names) = decompose_field_path(program, ctx, source, node)?;
+            let mut current = base;
+            for (i, fid) in field_ids.iter().enumerate() {
+                if i + 1 == field_ids.len() {
+                    let gep =
+                        alloc_gep_temp(program, ctx, node, current, *fid, field_names[i].clone());
+                    let load_var = alloc_load_temp(program, ctx, node, program.types.int());
+                    program.flow.push(FlowConstraint::Load {
+                        dst: load_var,
+                        src: gep,
+                    });
+                    return Some(ReturnFlow::Copy { src: load_var });
+                }
+                current = alloc_gep_temp(program, ctx, node, current, *fid, field_names[i].clone());
+            }
+            None
         }
         "qualified_identifier" => {
             if let Some(src) = lookup_var_node(program, ctx, source, node) {
@@ -11194,6 +11403,7 @@ fn resolve_lvalue_var(
     node: Node,
 ) -> Option<VarId> {
     match node.kind() {
+        "this" => ctx.locals.get("this").copied(),
         "identifier" | "qualified_identifier" => lookup_var_node(program, ctx, source, node),
         "pointer_expression" => {
             let op = pointer_op(source, node);
@@ -11582,6 +11792,7 @@ fn resolve_callee_with_loads(
         if let Some(table) = subscript_table(node) {
             let table_var = if is_name(table) {
                 lookup_var_node(program, ctx, source, table)
+                    .or_else(|| resolve_implicit_this_member(program, ctx, source, table))
             } else {
                 static_member_access(program, ctx, source, table)
             };
@@ -11670,8 +11881,9 @@ fn emit_field_fn_ptr_load(
             *fid,
             field_names[i].clone(),
         );
-        let field_type_id = program.types.get(type_id).layout.fields.get(fid)?.type_id;
-        type_id = field_type_id;
+        let hf = field_id_in_hierarchy(program, Some(ctx), type_id, &field_names[i])?;
+        let field_type_id = hf.type_id;
+        type_id = peel_ptr_to_struct(program, field_type_id);
         if i + 1 == field_ids.len() {
             let int = program.types.int();
             return Some(emit_load(program, ctx, span_node, gep, int));
@@ -11792,6 +12004,7 @@ fn resolve_expr_var(
 ) -> Option<VarId> {
     let node = peel_casts(source, node);
     match node.kind() {
+        "this" => ctx.locals.get("this").copied(),
         "identifier" | "qualified_identifier" => lookup_var_node(program, ctx, source, node),
         "pointer_expression" => {
             let op = pointer_op(source, node);

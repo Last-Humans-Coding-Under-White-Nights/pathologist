@@ -8336,3 +8336,769 @@ fn smart_pointer_flow_path_rooted_at_a_call_result() {
         [["g_returned"], ["g_returned"]]
     );
 }
+
+#[test]
+fn implicit_this_member_assignment_flow_and_points_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct Target {
+    int val;
+};
+
+class Observer {
+    Target *target_ = nullptr;
+public:
+    void SetTarget(Target *t) {
+        target_ = t;
+    }
+    Target* GetTarget() {
+        return target_;
+    }
+};
+
+static Target g_target;
+
+void run() {
+    Observer obs;
+    obs.SetTarget(&g_target);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // Acceptance criterion 1: Running trace analyze on the reproducer emits a
+    // FlowConstraint::Store constraint storing `t` into `this->target_`.
+    let gep_target = program
+        .flow
+        .iter()
+        .find_map(|f| match f {
+            trace_ir::FlowConstraint::GepField {
+                dst,
+                base,
+                field_name,
+                ..
+            } if field_name == "target_" && program.symbols.variable(*base).name == "this" => {
+                Some(*dst)
+            }
+            _ => None,
+        })
+        .expect("must emit GepField for this->target_");
+
+    let has_store = program.flow.iter().any(|f| match f {
+        trace_ir::FlowConstraint::Store { dst, src } => {
+            *dst == gep_target && program.symbols.variable(*src).name == "t"
+        }
+        _ => false,
+    });
+    assert!(
+        has_store,
+        "must emit FlowConstraint::Store storing t into this->target_, got {:?}",
+        program.flow
+    );
+
+    // Acceptance criterion 2: Inspecting points-to sets demonstrates that
+    // `target_` contains `g_target`.
+    let (pag, analysis) = trace_analysis::analyze_with_options(
+        &program,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+
+    let gep_node = pag.var_node.get(&gep_target).expect("GEP PAG node");
+    let gep_pts = analysis.points_to.get(gep_node).expect("GEP points-to");
+    assert!(
+        !gep_pts.is_empty(),
+        "GEP node must point to the field summary location"
+    );
+
+    let summary_loc = gep_pts.iter().copied().next().unwrap();
+    assert_eq!(
+        pag.locations[summary_loc.0 as usize].desc,
+        "summary:Observer.target_"
+    );
+
+    let g_target_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "g_target")
+        .expect("g_target variable")
+        .id;
+    let g_target_loc = pag
+        .var_location
+        .get(&g_target_var)
+        .copied()
+        .expect("g_target loc");
+
+    let t_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "t" && v.fn_id.is_some())
+        .expect("t variable")
+        .id;
+    let t_node = pag.var_node.get(&t_var).expect("t PAG node");
+    let t_pts = analysis.points_to.get(t_node).expect("t points-to");
+    assert!(
+        t_pts.contains(&g_target_loc),
+        "parameter t must point to g_target; pts = {t_pts:?}"
+    );
+}
+
+#[test]
+fn memory_pressure_observer_implicit_this_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct epoll_data {
+    void *ptr;
+};
+struct epoll_event {
+    epoll_data data;
+};
+struct LevelHandler {};
+
+class MemoryPressureObserver {
+    struct LevelHandler *handlerInfo_ = nullptr;
+public:
+    void HandleEpollEvent(struct epoll_event *curEpollEvent) {
+        handlerInfo_ = (struct LevelHandler*)curEpollEvent->data.ptr;
+    }
+};
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // Acceptance criterion 3: In memory_pressure_observer.cpp,
+    // handlerInfo_ = (struct LevelHandler*)curEpollEvent->data.ptr; emits a Store to this->handlerInfo_.
+    let gep_handler = program
+        .flow
+        .iter()
+        .find_map(|f| match f {
+            trace_ir::FlowConstraint::GepField {
+                dst,
+                base,
+                field_name,
+                ..
+            } if field_name == "handlerInfo_" && program.symbols.variable(*base).name == "this" => {
+                Some(*dst)
+            }
+            _ => None,
+        })
+        .expect("must emit GepField for this->handlerInfo_");
+
+    let has_store = program.flow.iter().any(|f| match f {
+        trace_ir::FlowConstraint::Store { dst, src } => {
+            *dst == gep_handler && program.symbols.variable(*src).name == "curEpollEvent"
+        }
+        _ => false,
+    });
+    assert!(
+        has_store,
+        "must emit FlowConstraint::Store to this->handlerInfo_, got {:?}",
+        program.flow
+    );
+}
+
+#[test]
+fn inherited_and_nested_implicit_this_member_points_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct Target {
+    int val;
+};
+
+struct Inner {
+    Target *target_ptr = nullptr;
+};
+
+class Base {
+protected:
+    Inner inner_;
+};
+
+class Derived : public Base {
+public:
+    void SetTarget(Target *t) {
+        inner_.target_ptr = t;
+    }
+};
+
+static Target g_target;
+
+void run() {
+    Derived d;
+    d.SetTarget(&g_target);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (pag, analysis) = trace_analysis::analyze_with_options(
+        &program,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        has_direct(&program, &analysis, "run", "Derived::SetTarget"),
+        "direct call run -> Derived::SetTarget must be present"
+    );
+
+    let gep_target_ptr = program
+        .flow
+        .iter()
+        .find_map(|f| match f {
+            trace_ir::FlowConstraint::GepField {
+                dst, field_name, ..
+            } if field_name == "target_ptr" => Some(*dst),
+            _ => None,
+        })
+        .expect("must emit GEP for target_ptr");
+
+    let has_store = program.flow.iter().any(|f| match f {
+        trace_ir::FlowConstraint::Store { dst, src } => {
+            *dst == gep_target_ptr && program.symbols.variable(*src).name == "t"
+        }
+        _ => false,
+    });
+    assert!(has_store, "must emit Store of t into inner_.target_ptr");
+
+    let gep_node = pag.var_node.get(&gep_target_ptr).expect("GEP PAG node");
+    let gep_pts = analysis.points_to.get(gep_node).expect("GEP points-to");
+    assert!(
+        !gep_pts.is_empty(),
+        "GEP node must point to the field summary location"
+    );
+
+    let summary_loc = gep_pts
+        .iter()
+        .copied()
+        .find(|l| pag.locations[l.0 as usize].desc == "summary:Inner.target_ptr")
+        .expect("gep_target_ptr must point to summary:Inner.target_ptr");
+    assert_eq!(
+        pag.locations[summary_loc.0 as usize].desc,
+        "summary:Inner.target_ptr"
+    );
+
+    let g_target_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "g_target")
+        .expect("g_target variable")
+        .id;
+    let g_target_loc = pag
+        .var_location
+        .get(&g_target_var)
+        .copied()
+        .expect("g_target loc");
+
+    let t_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "t" && v.fn_id.is_some())
+        .expect("t variable")
+        .id;
+    let t_node = pag.var_node.get(&t_var).expect("t PAG node");
+    let t_pts = analysis.points_to.get(t_node).expect("t points-to");
+    assert!(
+        t_pts.contains(&g_target_loc),
+        "parameter t must point to g_target; pts = {t_pts:?}"
+    );
+}
+
+#[test]
+fn implicit_this_member_callback_flow_and_call_edge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+typedef void (*HandlerFn)();
+
+void my_handler() {}
+
+class Controller {
+    HandlerFn callback_ = nullptr;
+public:
+    void Init() {
+        callback_ = my_handler;
+    }
+    void Trigger() {
+        callback_();
+    }
+};
+
+void run() {
+    Controller c;
+    c.Init();
+    c.Trigger();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+
+    let has_call = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("Trigger")
+            && fn_name(&program, e.callee) == "my_handler"
+    });
+    assert!(
+        has_call,
+        "Controller::Trigger must resolve call to my_handler; call edges: {:?}",
+        analysis
+            .call_edges
+            .iter()
+            .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn local_array_shadows_implicit_this_member_subscript() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+typedef void (*Callback)();
+void expected() {}
+void wrong() {}
+struct C {
+    Callback callbacks[1];
+    void run() {
+        callbacks[0] = wrong;
+        Callback callbacks[1] = { expected };
+        Callback f = callbacks[0];
+        f();
+    }
+};
+struct C2 {
+    Callback callbacks[1];
+    Callback get_member() {
+        return callbacks[0];
+    }
+    Callback get_shadowed() {
+        Callback callbacks[1] = { expected };
+        return callbacks[0];
+    }
+};
+void entry() {
+    C c;
+    c.run();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+
+    let has_expected = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run") && fn_name(&program, e.callee) == "expected"
+    });
+    let has_wrong = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run") && fn_name(&program, e.callee) == "wrong"
+    });
+    assert!(
+        has_expected,
+        "C::run must call expected via shadowed local array; call edges: {:?}",
+        analysis
+            .call_edges
+            .iter()
+            .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !has_wrong,
+        "C::run must not call wrong when local array shadows member"
+    );
+
+    // Verify return_flow_from_expr shadowing:
+    // C2::get_member should return a load from the implicit this member GEP.
+    let get_member_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.ends_with("get_member"))
+        .expect("get_member fn")
+        .id;
+    let get_member_returns = program
+        .fn_returns
+        .get(&get_member_fn)
+        .expect("get_member returns");
+    assert_eq!(get_member_returns.len(), 1);
+    let member_ret_src = match &get_member_returns[0] {
+        trace_ir::ReturnFlow::Copy { src } => *src,
+        other => panic!("expected ReturnFlow::Copy, got {other:?}"),
+    };
+    // The member load temp is loaded from a GEP on this
+    let loads_from_gep = program.flow.iter().any(|f| match f {
+        trace_ir::FlowConstraint::Load { dst, .. } => *dst == member_ret_src,
+        _ => false,
+    });
+    assert!(
+        loads_from_gep,
+        "get_member must load return value from implicit this member GEP"
+    );
+
+    // C2::get_shadowed should return the local array variable directly, not loading from GEP.
+    let get_shadowed_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.ends_with("get_shadowed"))
+        .expect("get_shadowed fn")
+        .id;
+    let get_shadowed_returns = program
+        .fn_returns
+        .get(&get_shadowed_fn)
+        .expect("get_shadowed returns");
+    assert_eq!(get_shadowed_returns.len(), 1);
+    let shadowed_ret_src = match &get_shadowed_returns[0] {
+        trace_ir::ReturnFlow::Copy { src } => *src,
+        other => panic!("expected ReturnFlow::Copy, got {other:?}"),
+    };
+    let shadowed_var = program.symbols.variable(shadowed_ret_src);
+    assert_eq!(shadowed_var.name, "callbacks");
+    assert_eq!(
+        shadowed_var.fn_id,
+        Some(get_shadowed_fn),
+        "shadowed return must reference local variable"
+    );
+}
+
+#[test]
+fn derived_static_function_hides_base_field_designator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+typedef void (*Callback)();
+struct Base { Callback foo; };
+struct Derived : Base {
+    static void foo() {}
+    void run() { Callback p = foo; p(); }
+};
+void entry() { Derived d; d.run(); }
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+
+    let has_derived_foo = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run") && fn_name(&program, e.callee).ends_with("foo")
+    });
+    assert!(
+        has_derived_foo,
+        "Derived::run must call Derived::foo; call edges: {:?}",
+        analysis
+            .call_edges
+            .iter()
+            .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn implicit_this_member_address_of() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct Target { int val; };
+class Container {
+    Target target_;
+public:
+    Target* get_ptr() {
+        return &target_;
+    }
+    void run() {
+        Target* p = &target_;
+        p->val = 42;
+    }
+};
+void entry() {
+    Container c;
+    c.run();
+    Target* ptr = c.get_ptr();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, _analysis) = trace_analysis::analyze(&program);
+
+    // Verify &target_ emits GepField on this->target_ and not an unresolved AddrOfFn
+    let gep_targets = program
+        .flow
+        .iter()
+        .filter_map(|f| match f {
+            trace_ir::FlowConstraint::GepField {
+                dst,
+                base,
+                field_name,
+                ..
+            } if field_name == "target_" && program.symbols.variable(*base).name == "this" => {
+                Some(*dst)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !gep_targets.is_empty(),
+        "must emit GepField for this->target_ in address-of expressions"
+    );
+
+    // Ensure pending function references did not treat target_ as a function
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "target_"),
+        "target_ member variable must not be registered as a function"
+    );
+}
+
+#[test]
+fn implicit_this_member_casted_and_parenthesized_call_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct Target { int x; };
+Target* make_target() { return nullptr; }
+typedef Target* (*FactoryFn)();
+
+class Holder {
+    Target* member_ = nullptr;
+    Target* member2_ = nullptr;
+public:
+    void test_direct() {
+        member_ = (Target*)make_target();
+        member2_ = (make_target());
+    }
+    void test_indirect(FactoryFn fn) {
+        member_ = (Target*)fn();
+        member2_ = (fn());
+    }
+};
+void run(FactoryFn fn) {
+    Holder h;
+    h.test_direct();
+    h.test_indirect(fn);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, _analysis) = trace_analysis::analyze(&program);
+
+    // Direct and indirect call stores
+    let stores = program
+        .flow
+        .iter()
+        .filter(|f| matches!(f, trace_ir::FlowConstraint::Store { .. }))
+        .count();
+    assert!(
+        stores >= 4,
+        "must emit Store constraints for member_ and member2_ across direct and indirect calls, found {stores}"
+    );
+
+    // Check that CallReturn constraints exist for make_target
+    let has_call_return = program.flow.iter().any(|f| match f {
+        trace_ir::FlowConstraint::CallReturn { callee_name, .. } => callee_name == "make_target",
+        _ => false,
+    });
+    assert!(
+        has_call_return,
+        "must emit CallReturn for make_target even when casted or parenthesized"
+    );
+
+    // Check that CallReturnIndirect constraints exist
+    let has_call_return_indirect = program
+        .flow
+        .iter()
+        .any(|f| matches!(f, trace_ir::FlowConstraint::CallReturnIndirect { .. }));
+    assert!(
+        has_call_return_indirect,
+        "must emit CallReturnIndirect for indirect call even when casted or parenthesized"
+    );
+}
+
+#[test]
+fn local_shadowing_inherited_member_address_of() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+typedef void (*Callback)();
+void expected() {}
+void wrong() {}
+struct Base { Callback cb; };
+struct Derived : Base {
+    void run() {
+        this->cb = wrong;
+        Callback cb = expected;
+        Callback *p = &cb;
+        (*p)();
+    }
+    Callback* get_cb() {
+        this->cb = wrong;
+        Callback cb = expected;
+        return &cb;
+    }
+    Callback* get_cb_param(Callback cb) {
+        this->cb = wrong;
+        return &cb;
+    }
+};
+void entry() {
+    Derived d;
+    d.run();
+    d.get_cb();
+    d.get_cb_param(expected);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+
+    let has_expected = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run")
+            && fn_name(&program, e.callee).ends_with("expected")
+    });
+    let has_wrong = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run")
+            && fn_name(&program, e.callee).ends_with("wrong")
+    });
+    assert!(
+        has_expected,
+        "Derived::run must call expected; call edges: {:?}",
+        analysis
+            .call_edges
+            .iter()
+            .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !has_wrong,
+        "Derived::run must not call wrong when local cb shadows Base::cb"
+    );
+
+    // Verify return address handling: return &cb must return the local variable's address,
+    // not the inherited field Base::cb
+    let get_cb_id = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.ends_with("get_cb"))
+        .map(|f| f.id)
+        .expect("get_cb function");
+    let returns = program
+        .fn_returns
+        .get(&get_cb_id)
+        .expect("returns for get_cb");
+    assert!(
+        returns.iter().any(|r| match r {
+            trace_ir::ReturnFlow::AddrOfVar { src } => {
+                let var = program.symbols.variable(*src);
+                var.name == "cb" && var.fn_id == Some(get_cb_id)
+            }
+            _ => false,
+        }),
+        "get_cb must return AddrOfVar for local cb, found returns: {:?}",
+        returns
+    );
+
+    // Verify return address handling with parameter shadowing: return &cb must return the
+    // parameter variable's address, not the inherited field Base::cb
+    let get_cb_param_id = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.ends_with("get_cb_param"))
+        .map(|f| f.id)
+        .expect("get_cb_param function");
+    let param_returns = program
+        .fn_returns
+        .get(&get_cb_param_id)
+        .expect("returns for get_cb_param");
+    assert!(
+        param_returns.iter().any(|r| match r {
+            trace_ir::ReturnFlow::AddrOfVar { src } => {
+                let var = program.symbols.variable(*src);
+                var.name == "cb" && var.fn_id == Some(get_cb_param_id)
+            }
+            _ => false,
+        }),
+        "get_cb_param must return AddrOfVar for parameter cb, found returns: {:?}",
+        param_returns
+    );
+}
+
+#[test]
+fn smart_pointer_call_root_mixed_arrow_dot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+namespace OHOS {
+template<class T> struct sptr { sptr(T*); T* operator->(); };
+}
+typedef void (*Callback)();
+void expected() {}
+struct Inner { Callback cb; };
+struct Payload { Inner inner; };
+Payload global;
+OHOS::sptr<Payload> GetSp() {
+    OHOS::sptr<Payload> r = &global;
+    return r;
+}
+void seed(Payload *p) { p->inner.cb = expected; }
+void run() { GetSp()->inner.cb(); }
+void entry() { seed(&global); run(); }
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+
+    let has_expected = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run")
+            && fn_name(&program, e.callee).ends_with("expected")
+    });
+    assert!(
+        has_expected,
+        "run must call expected via GetSp()->inner.cb(); call edges: {:?}",
+        analysis
+            .call_edges
+            .iter()
+            .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
+            .collect::<Vec<_>>()
+    );
+}

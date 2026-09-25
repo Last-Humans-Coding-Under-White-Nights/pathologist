@@ -965,6 +965,37 @@ the member's type (`dev->service = &inst.service; ... service->Dispatch`
 resolves `Dispatch`, not same-index members of the outer struct). Arrays of
 structs peel to their element type for field resolution (`arr[i].field`).
 
+## Implicit this member variable access
+
+In C++ instance methods and member bodies, an unqualified identifier referring to a
+class instance field acts as an implicit member access on `this` (`member_ = val;` is
+semantically `this->member_ = val;`).
+
+Lowering resolves and models implicit `this` member accesses across all operations:
+- **`this` receiver binding**: `resolve_lvalue_var` and `resolve_expr_var` recognize
+  the AST node kind `"this"` from `ctx.locals["this"]`.
+- **Stores**: In `assignment_expression`, when the LHS is an unqualified identifier
+  or an array subscript (`table_[i] = rhs;`) that does not resolve to a local or
+  global variable, lowering checks `class_ctx_field`. If matched, it materializes
+  a GEP temp representing `this->member` via `resolve_implicit_this_member` and
+  routes to `emit_store_to_location` (which handles direct values, function pointer
+  designators, lambdas, and call returns).
+- **Inheritance hierarchy**: `class_ctx_field` traverses base classes using BFS over
+  `program.bases_of(cls)`, allowing derived class methods to access protected/public
+  fields declared in base classes.
+- **Nested field paths**: When peeling a field path (`inner_.val = p;` or `p = inner_.val;`),
+  if `resolve_lvalue_var` fails on the terminal receiver and the identifier matches a class
+  field on `this`, `decompose_field_path` binds `this` as the base variable and prepends
+  the member field to the path. `field_id_in_hierarchy` and `field_type_in_hierarchy`
+  resolve field layouts across base classes.
+- **Subscript and element access**: Array members peel through `TypeDesc::Array` in
+  `peel_ptr_to_struct`, and element accesses through implicit member arrays (`table_[i]`)
+  emit stores, loads, and callback call edges (`table_[i]()` via
+  `resolve_field_or_element_callee`).
+- **Loads and return flow**: `expr_to_rhs_flow` and `return_flow_from_expr` emit `Load`
+  and `Copy` constraints for bare member reads, array element reads, and field paths
+  returned from member functions (`return member_;`, `return inner_.val;`, `return table_[i];`).
+
 ## Indirect call resolution patterns
 
 Supported lowering patterns include:

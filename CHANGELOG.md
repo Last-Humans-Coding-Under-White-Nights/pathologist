@@ -4,6 +4,45 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Implicit this member variable access and assignments (#145)
+
+In C++, an unqualified variable access inside an instance member function can
+refer to a member field of `this` (e.g., `member_ = val;` is semantically
+`this->member_ = val;`). AST lowering previously checked only local variables
+and function parameters for unqualified LHS expressions in assignments. Class
+instance fields on `this` were not recognized, and the `"this"` keyword was
+also missing from lvalue and expression variable resolvers, silently dropping
+assignments to implicit and explicit `this` member variables and yielding zero
+flow constraints.
+
+- **Implicit and explicit `this` stores**: AST lowering now recognizes `"this"`
+  in `resolve_lvalue_var` and `resolve_expr_var`. In `assignment_expression`,
+  unqualified member identifiers and array subscripts (`member_ = val;`,
+  `table_[i] = val;`) resolve via `resolve_implicit_this_member`, routing through
+  a unified `emit_store_to_location` helper supporting values, function pointers,
+  lambdas, and direct/indirect call returns.
+- **Inherited member resolution**: `class_ctx_field` now traverses base class
+  hierarchies (`program.bases_of`), allowing derived class methods to assign to
+  or read inherited member fields.
+- **Nested member access paths**: `decompose_field_path` detects implicit `this`
+  members at the root of nested field expressions (`inner_.val = p;`), prepending
+  the member access with `this` as the base receiver. `field_id_in_hierarchy`
+  and `field_type_in_hierarchy` resolve field layouts across base classes.
+- **Member array subscripts and callee resolution**: `peel_ptr_to_struct` peels
+  array types (`TypeDesc::Array`) so array element fields participate in field
+  chains, and member array element callees (`table_[i]()`) resolve through
+  `resolve_field_or_element_callee`.
+- **Loads and return flows**: `expr_to_rhs_flow` and `return_flow_from_expr`
+  now emit `Load` and `Copy` constraints for implicit member reads, subscripts,
+  and field returns (`return member_;`, `return inner_.val;`, `return table_[i];`).
+
+In OpenHarmony `services/memmgrservice/src/event/memory_pressure_observer.cpp`
+(`resourceschedule_memmgr`), `handlerInfo_ = (struct LevelHandler*)curEpollEvent->data.ptr;`
+now emits a store into `this->handlerInfo_`, preserving pointer flow from the
+epoll event loop to the callback handler.
+See [docs/ANALYSIS.md](docs/ANALYSIS.md#implicit-this-member-variable-access)
+and [docs/EVAL_REPORT.md](docs/EVAL_REPORT.md#implicit-this-member-variable-access-and-assignments--2026-09-24-145).
+
 ### Noise macro filtering
 
 Repetitive logging and diagnostic macros (e.g., OpenHarmony `TAG_LOG*`, `HILOG_*`)

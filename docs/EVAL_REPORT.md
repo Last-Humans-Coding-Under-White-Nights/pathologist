@@ -1,5 +1,46 @@
 # Evaluation Report
 
+## Implicit this member variable access and assignments — 2026-09-24 (#145)
+
+The rules are defined in [Implicit this member variable access](ANALYSIS.md#implicit-this-member-variable-access).
+This change fixes a bug where unqualified variable accesses inside C++ instance methods
+referring to class member fields were dropped during AST lowering.
+
+### Problem & Fix
+
+- In C++, `member_ = val;` is semantically `this->member_ = val;`. Previously,
+  unqualified identifiers on the LHS of assignments only looked up locals and
+  parameters, and `"this"` was not recognized in `resolve_lvalue_var` or
+  `resolve_expr_var`. Assignments to implicit and explicit `this` member variables
+  were silently dropped.
+- In `trace-parse`, lowering now resolves implicit `this` member identifiers and
+  array subscripts via `resolve_implicit_this_member`, emits stores through
+  `emit_store_to_location`, searches base class hierarchies (`bases_of`), supports
+  nested member paths (`inner_.val = p;`) in `decompose_field_path`, and models
+  element subscripts, member callback calls (`table_[i]()`), and return flows.
+- Real-world impact: in OpenHarmony `resourceschedule_memmgr`
+  (`services/memmgrservice/src/event/memory_pressure_observer.cpp`),
+  `handlerInfo_ = (struct LevelHandler*)curEpollEvent->data.ptr;` now emits
+  a store into `this->handlerInfo_`, preserving pointer flow from the epoll
+  event loop to the callback handler.
+
+### Pinned Corpus Validation
+
+Evaluated with `python3 scripts/eval_check.py --bin target/release/trace --outdir /tmp/eval_check` on release build:
+- **Pass rate**: **94 checks, 0 failures** across hdf (`cdc75a2`), hiview (`92408e2`), and camera (`8ffd69d`).
+- Reconciled and re-captured metric movements from implicit `this` member variable and callback flow recovery:
+  - **hdf** (`drivers_hdf_core` @ `cdc75a20bb8f1a046cd22e189405a20d602d0521`):
+    - `edges_indirect`: 4,969 → 4,980 (+11 recovered callback and ops table indirect call edges)
+    - `arg_flow_edges` and `arg_flow_rows_per_call_edge`: 69,055 → 69,495 (+440 edges from recovered member callback argument flow)
+  - **hiview** (`hiviewdfx_hiview` @ `92408e2072bd6dc8fb0d980773e80b6ec898710c`):
+    - `edges_indirect`: 160 → 166 (+6 indirect call edges from member observer/handler callback stores)
+    - `edges_external`: 16,658 → 16,487 (-171 previously unresolved calls now reaching member and indirect targets)
+    - `arg_flow_edges`: 18,522 → 18,815 (+293 edges)
+  - **camera** (`multimedia_camera_framework` @ `8ffd69dcd47f533e70b4dba428439da9008b0cae`):
+    - `edges_indirect`: 286 → 305 (+19 indirect call edges across pipeline, stream manager, and session listener callbacks)
+    - `arg_flow_edges`: 41,629 → 43,306 (+1,677 argument flow edges)
+- Diagnostics and points-to fixpoints converge cleanly within budget. All other exact checks, IPC bridges, and dispatch site probes match bit-for-bit.
+
 ## Smart-pointer value flow — 2026-09-24 (#141)
 
 The rules are defined in [Smart-pointer unwrap](ANALYSIS.md#smart-pointer-unwrap)
