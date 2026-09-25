@@ -146,6 +146,15 @@ pub struct Function {
     /// arguments. C++ puts the defaults on the first declaration, so a merge
     /// keeps the larger count.
     pub default_args: u32,
+    /// Per parameter the declaration lists, by position and not counting a
+    /// member's implicit `this`, whether it binds a referent's address (`T &`,
+    /// `T &&`, named or not); empty where no declaration was read. A
+    /// `variadic` list ends with one more entry, for every position past the
+    /// others: `false` for `...`, the pack's own for a parameter pack. A
+    /// prototype records it as a definition does, so a call can tell a
+    /// reference parameter from a value one before any body is seen
+    /// (docs/ANALYSIS.md, "Dereferenced operands").
+    pub reference_params: Vec<bool>,
     /// Declared `virtual` (C++ methods). Virtual dispatch expansion treats a
     /// method as virtual if *any* entry with its qualified name carries this
     /// flag, so out-of-class definitions without the token still participate.
@@ -347,6 +356,16 @@ fn absorb_redeclaration(
         existing.param_type_ids = param_types
             .map(<[TypeId]>::to_vec)
             .unwrap_or_else(|| func.param_type_ids.clone());
+    }
+    // A reference list is one declaration's, whole: the first one read, or,
+    // while it has no tail entry, a variadic one's, whose list ends with the
+    // tail entry `variadic` needs.
+    let variadic_read = func.variadic && func.explicit_arity.is_some();
+    let has_tail = existing
+        .explicit_arity
+        .is_some_and(|declared| existing.reference_params.len() > declared as usize);
+    if existing.explicit_arity.is_none() || (variadic_read && !has_tail) {
+        existing.reference_params = func.reference_params.clone();
     }
     if existing.explicit_arity.is_none() {
         existing.explicit_arity = func.explicit_arity;
@@ -2455,6 +2474,7 @@ mod tests {
             param_type_ids: Vec::new(),
             explicit_arity: None,
             default_args: 0,
+            reference_params: Vec::new(),
             owner_unresolved: false,
             variadic: false,
             defaulted_in_class: false,
@@ -2799,6 +2819,44 @@ mod tests {
                 .add_function_with_param_types(on_control, Some(&[control]), Some(&p.types));
         assert_ne!(control_id, data_id, "distinct tags are distinct overloads");
         assert_eq!(p.symbols.externals_by_name["send"].len(), 2);
+    }
+
+    #[test]
+    fn a_variadic_redeclaration_brings_its_tail_entry() {
+        let mut s = SymbolTable::default();
+        let file = FileId(1);
+        let mut first = fake_function(s.alloc_fn_id(), "f", vec![], false, false, file, 1);
+        first.explicit_arity = Some(1);
+        first.reference_params = vec![true];
+        let mut variadic = fake_function(s.alloc_fn_id(), "f", vec![], false, false, file, 2);
+        variadic.explicit_arity = Some(1);
+        variadic.reference_params = vec![true, false];
+        variadic.variadic = true;
+        let id = s.add_function(first);
+        assert_eq!(s.add_function(variadic), id);
+        let merged = s.function(id);
+        assert!(merged.variadic);
+        assert_eq!(merged.reference_params, [true, false], "{merged:?}");
+    }
+
+    #[test]
+    fn a_declaration_less_variadic_entry_leaves_the_tail_to_a_declaration() {
+        let mut s = SymbolTable::default();
+        let file = FileId(1);
+        let mut first = fake_function(s.alloc_fn_id(), "f", vec![], false, false, file, 1);
+        first.explicit_arity = Some(1);
+        first.reference_params = vec![true];
+        let mut unread = fake_function(s.alloc_fn_id(), "f", vec![], false, false, file, 2);
+        unread.variadic = true;
+        let mut variadic = fake_function(s.alloc_fn_id(), "f", vec![], false, false, file, 3);
+        variadic.explicit_arity = Some(1);
+        variadic.reference_params = vec![true, false];
+        variadic.variadic = true;
+        let id = s.add_function(first);
+        assert_eq!(s.add_function(unread), id);
+        assert_eq!(s.add_function(variadic), id);
+        let merged = s.function(id);
+        assert_eq!(merged.reference_params, [true, false], "{merged:?}");
     }
 
     #[test]

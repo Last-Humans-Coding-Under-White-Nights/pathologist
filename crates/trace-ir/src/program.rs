@@ -67,6 +67,54 @@ pub struct TemplateBase {
     pub is_dependent: bool,
 }
 
+/// A C++ class template's parameters and the bases that mention them
+/// (`template<class I> class IRemoteStub : public I`,
+/// `template<class T> class Wrapper : public Layer<T>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClassTemplate {
+    /// Parameter names by position; `None` for an unnamed parameter.
+    pub parameters: Vec<Option<String>>,
+    /// Default arguments by position, qualified in the template's own scope
+    /// (`::ns::IDef`); `None` where a parameter has none.
+    pub defaults: Vec<Option<String>>,
+    /// The position of the parameter pack (`class... Is`), which binds every
+    /// argument from there on.
+    pub pack: Option<usize>,
+    /// Base spellings that mention a parameter, as recorded (`I`, `Layer<T>`), in declaration order.
+    pub dependent_bases: Vec<String>,
+}
+
+impl ClassTemplate {
+    /// Record `base` once, keeping declaration order.
+    pub fn add_dependent_base(&mut self, base: &str) {
+        if !self.dependent_bases.iter().any(|b| b == base) {
+            self.dependent_bases.push(base.to_owned());
+        }
+    }
+
+    /// Fold in another declaration of the same template. Bases spell the
+    /// definition's parameter names, so the first fact with bases names the
+    /// parameters; a default may be written on any one declaration, and
+    /// fills its position.
+    fn merge(&mut self, other: &ClassTemplate) {
+        if self.dependent_bases.is_empty() && !other.dependent_bases.is_empty() {
+            self.parameters.clone_from(&other.parameters);
+            self.pack = other.pack;
+        }
+        if self.defaults.len() < other.defaults.len() {
+            self.defaults.resize(other.defaults.len(), None);
+        }
+        for (mine, theirs) in self.defaults.iter_mut().zip(&other.defaults) {
+            if mine.is_none() {
+                mine.clone_from(theirs);
+            }
+        }
+        for base in &other.dependent_bases {
+            self.add_dependent_base(base);
+        }
+    }
+}
+
 type HeaderFunctions = FxHashMap<String, FxHashMap<Arc<str>, FnId>>;
 
 /// Call records at one site, grouped by [`CallSite::fact_fingerprint`].
@@ -259,6 +307,12 @@ pub struct Program {
     /// Class -> full member name -> return substitutions. Ordered keys keep
     /// header merges deterministic; lookups never scan unrelated functions.
     pub template_returns: BTreeMap<String, BTreeMap<String, Vec<TemplateReturn>>>,
+    /// Class template name -> its parameters and the bases that mention them.
+    /// Ordered keys keep header merges deterministic.
+    pub class_templates: BTreeMap<String, ClassTemplate>,
+    /// Class templates defined in an anonymous namespace, by the file whose
+    /// namespace it is: every file's `Impl` is another template.
+    pub anonymous_class_templates: BTreeMap<String, BTreeMap<FileId, ClassTemplate>>,
     /// Classes declared `final` — CHA does not walk into their subclasses.
     pub final_classes: Vec<String>,
     /// Classes defined in an anonymous namespace, with the files their
@@ -414,6 +468,46 @@ impl Program {
         if !self.template_base_set.contains(fact) {
             self.template_base_set.insert(fact.clone());
             self.template_bases.push(fact.clone());
+        }
+    }
+
+    /// Record class template `class`'s parameters, their defaults and the
+    /// bases that mention them, from its definition or a declaration that
+    /// writes a default; declarations merge by `ClassTemplate::merge`.
+    /// `anonymous_in` is the file whose anonymous namespace defines it. Every
+    /// unit re-adds a header's facts, so a repeat is a hit that clones
+    /// nothing.
+    pub fn add_class_template_fact(
+        &mut self,
+        class: &str,
+        anonymous_in: Option<FileId>,
+        fact: &ClassTemplate,
+    ) {
+        let has_default = fact.defaults.iter().any(Option::is_some);
+        if class.is_empty() || (fact.dependent_bases.is_empty() && !has_default) {
+            return;
+        }
+        let entry = match anonymous_in {
+            Some(file) => self
+                .anonymous_class_templates
+                .get_mut(class)
+                .and_then(|files| files.get_mut(&file)),
+            None => self.class_templates.get_mut(class),
+        };
+        if let Some(entry) = entry {
+            entry.merge(fact);
+            return;
+        }
+        match anonymous_in {
+            Some(file) => {
+                self.anonymous_class_templates
+                    .entry(class.to_owned())
+                    .or_default()
+                    .insert(file, fact.clone());
+            }
+            None => {
+                self.class_templates.insert(class.to_owned(), fact.clone());
+            }
         }
     }
 
@@ -748,6 +842,61 @@ mod tests {
         assert_eq!(program.subclass_closure("B"), ["B"]);
         program.add_inheritance("New", "B");
         assert_eq!(program.subclass_closure("B"), ["B", "New"]);
+    }
+
+    fn class_template(parameters: &[&str], bases: &[&str]) -> ClassTemplate {
+        let mut fact = ClassTemplate {
+            parameters: parameters.iter().map(|p| Some(p.to_string())).collect(),
+            ..ClassTemplate::default()
+        };
+        bases.iter().for_each(|base| fact.add_dependent_base(base));
+        fact
+    }
+
+    #[test]
+    fn class_template_bases_keep_order_and_deduplicate() {
+        let mut program = Program::default();
+        program.add_class_template_fact("Wrapper", None, &class_template(&["T"], &["Layer<T>"]));
+        program.add_class_template_fact(
+            "Wrapper",
+            None,
+            &class_template(&["T"], &["Layer<T>", "T"]),
+        );
+        program.add_class_template_fact("", None, &class_template(&["T"], &["T"]));
+        program.add_class_template_fact("Plain", None, &class_template(&["T"], &[]));
+        assert_eq!(
+            program.class_templates.get("Wrapper"),
+            Some(&class_template(&["T"], &["Layer<T>", "T"]))
+        );
+        assert_eq!(program.class_templates.len(), 1);
+    }
+
+    #[test]
+    fn class_template_facts_merge_keeping_order() {
+        let mut merged = Program::default();
+        merged.add_class_template_fact("Wrapper", None, &class_template(&["T"], &["T"]));
+        merged.add_class_template_fact("Wrapper", None, &class_template(&["U"], &["Layer<T>"]));
+        assert_eq!(
+            merged.class_templates["Wrapper"],
+            class_template(&["T"], &["T", "Layer<T>"]),
+            "the first fact keeps its parameters"
+        );
+    }
+
+    #[test]
+    fn class_template_defaults_merge_by_position_under_the_definitions_names() {
+        let mut merged = Program::default();
+        let forward = ClassTemplate {
+            parameters: vec![None, Some("X".to_string())],
+            defaults: vec![None, Some("::IDef".to_string())],
+            ..ClassTemplate::default()
+        };
+        merged.add_class_template_fact("Def", None, &forward);
+        merged.add_class_template_fact("Def", None, &class_template(&["I", "D"], &["I", "D"]));
+        let fact = &merged.class_templates["Def"];
+        assert_eq!(fact.parameters, class_template(&["I", "D"], &[]).parameters);
+        assert_eq!(fact.defaults, [None, Some("::IDef".to_string())]);
+        assert_eq!(fact.dependent_bases, ["I", "D"]);
     }
 
     /// Two stages can report the same text at the same position — a variant's

@@ -4,9 +4,41 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Dereferenced operands and template-parameter bases (#151, #150)
+
+A dereference `*x` used to read through `x`'s root variable, so `*h->pp`
+loaded from `h` rather than from the member's value, and a class deriving
+from an interface through a template parameter
+(`class S : public IRemoteStub<IFoo>`) was not a subclass of `IFoo`. Both
+now follow the C++ meaning, and the implicit-`this` handling of #145 and
+#151 is one rule.
+
+- **Dereferenced operands (#151)**: `*x` reads, stores through and passes the
+  value `x` holds (a member's loaded cell, an inner dereference, a recorded
+  call's result) rather than `x`'s root variable.
+- **Template-parameter bases (#150)**: a base reached through a template
+  parameter (`class S : public IRemoteStub<IFoo>` with
+  `template<class I> class IRemoteStub : public I`) is recorded as an ordinary
+  base, so virtual dispatch and smart-pointer unwrap see the subclass.
+- **One implicit-`this` rule**: the implicit member handling from #145 and
+  #151 now share one rule (`implicit_this`) and one lowering (`field_path`):
+  a local, parameter or body `using` hides a field; the field hides a
+  namespace or global variable. A member read (`y = h->f`, `y = m_f`,
+  `return h->f;`) loads the member's cell, and an array member is its cell
+  (`p = h->arr` holds the array's address). A bare field passed as a call
+  argument (`f(m_p)`) still passes the field's cell, and a same-named global
+  takes precedence there, as before (a known limit, to be followed up).
+- The Andersen solver's propagation was reworked to absorb the analyze-phase
+  cost the new facts add.
+
+See [docs/ANALYSIS.md](docs/ANALYSIS.md#dereferenced-operands),
+[Template-parameter bases](docs/ANALYSIS.md#template-parameter-bases) and
+[Implicit this member variable access](docs/ANALYSIS.md#implicit-this-member-variable-access),
+and [docs/EVAL_REPORT.md](docs/EVAL_REPORT.md#dereferenced-operands-and-template-parameter-bases--2026-09-25-151-150).
+
 ### Implicit member pointer field decomposition (#146)
 
-Calling a function pointer through an implicit member pointer or field path in a C++ member function (such as `handler_->fn()`) now correctly roots field decomposition at `this` (`this->handler_->fn`). During AST lowering, `decompose_field_path` detects when an unqualified identifier names an instance field on `this` (`class_ctx_field`), rooting field decomposition with arrow access. This generates the necessary GEP and Load constraints, wiring `callee_var` for indirect call resolution instead of misclassifying the call as a direct external call.
+Calling a function pointer through an implicit member pointer or field path in a C++ member function (such as `handler_->fn()`) now correctly roots field decomposition at `this` (`this->handler_->fn`). During AST lowering, the field path (`field_path`) is rooted at `this` with arrow access when an unqualified identifier names an instance field on `this` (`implicit_this`). This generates the necessary GEP and Load constraints, wiring `callee_var` for indirect call resolution instead of misclassifying the call as a direct external call.
 
 ### Implicit this member variable access and assignments (#145)
 
@@ -22,20 +54,21 @@ flow constraints.
 - **Implicit and explicit `this` stores**: AST lowering now recognizes `"this"`
   in `resolve_lvalue_var` and `resolve_expr_var`. In `assignment_expression`,
   unqualified member identifiers and array subscripts (`member_ = val;`,
-  `table_[i] = val;`) resolve via `resolve_implicit_this_member`, routing through
-  a unified `emit_store_to_location` helper supporting values, function pointers,
-  lambdas, and direct/indirect call returns.
+  `table_[i] = val;`) resolve as members of `this` (`implicit_this`, lowered by
+  `field_path`), routing through a unified `emit_store_to_location` helper
+  supporting values, function pointers, lambdas, and direct/indirect call
+  returns.
 - **Inherited member resolution**: `class_ctx_field` now traverses base class
   hierarchies (`program.bases_of`), allowing derived class methods to assign to
   or read inherited member fields.
 - **Nested member access paths**: `decompose_field_path` detects implicit `this`
   members at the root of nested field expressions (`inner_.val = p;`), prepending
-  the member access with `this` as the base receiver. `field_id_in_hierarchy`
-  and `field_type_in_hierarchy` resolve field layouts across base classes.
+  the member access with `this` as the base receiver. `field_in_hierarchy`
+  resolves field layouts across base classes.
 - **Member array subscripts and callee resolution**: `peel_ptr_to_struct` peels
   array types (`TypeDesc::Array`) so array element fields participate in field
-  chains, and member array element callees (`table_[i]()`) resolve through
-  `resolve_field_or_element_callee`.
+  chains, and member array element callees (`table_[i]()`) resolve as loads
+  from the table's cell.
 - **Loads and return flows**: `expr_to_rhs_flow` and `return_flow_from_expr`
   now emit `Load` and `Copy` constraints for implicit member reads, subscripts,
   and field returns (`return member_;`, `return inner_.val;`, `return table_[i];`).

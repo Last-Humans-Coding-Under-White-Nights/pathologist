@@ -93,6 +93,12 @@ struct LowerContext {
     /// Lazy LineMap file-index -> symbol file ID. Preserve first-encounter
     /// interning order while avoiding path comparisons/hashing per span.
     origin_file_ids: Vec<Cell<Option<trace_ir::FileId>>>,
+    /// This unit's canonical `#include` closure: the files whose file-local
+    /// templates it sees (docs/ANALYSIS.md, "Template-parameter bases").
+    included_headers: Arc<Vec<PathBuf>>,
+    /// `included_headers` and the unit's own file as sorted ids, resolved
+    /// on the first lookup that needs them.
+    unit_files: std::cell::OnceCell<Vec<trace_ir::FileId>>,
     /// Function references deferred to end-of-unit resolution.
     /// `RefCell` keeps `&LowerContext` receivers usable in expression
     /// helpers while still allowing deferred entries to be recorded.
@@ -156,6 +162,9 @@ struct LowerContext {
     /// Every variable declared as a reference, `auto&` included: it holds its
     /// referent's address, so `&r` is `r`'s value rather than a cell of r's.
     reference_bindings: HashSet<VarId>,
+    /// Functions whose declared return type is a reference: `return *p`
+    /// returns `p`'s value, the referent's address.
+    reference_returns: HashSet<FnId>,
     /// Every local registered in the C++ function being lowered, with the
     /// variable of that name it hid; a block unwinds its own on exit.
     local_scope_log: Vec<(String, Option<VarId>)>,
@@ -165,6 +174,9 @@ struct LowerContext {
     /// whose text has the keyword. Most units have none, and then no
     /// signature needs its ancestors.
     has_templates: bool,
+    /// How many `template_declaration`s enclose the node being lowered, so a
+    /// class asks for its ancestors only when one does.
+    template_depth: Cell<u32>,
     has_weak: bool,
     record_link_ownership: bool,
     /// The unit is a header indexed on its own: its own bodies are replayed
@@ -277,6 +289,13 @@ impl LowerContext {
 
     fn in_anonymous_namespace(&self) -> bool {
         self.ns_stack.iter().any(|level| level.is_none())
+    }
+
+    /// Step into (`+1`) or out of (`-1`) what a `template_declaration`
+    /// holds, counted in [`template_depth`](Self::template_depth).
+    fn step_template(&self, step: i32) {
+        self.template_depth
+            .set(self.template_depth.get().saturating_add_signed(step));
     }
 }
 
@@ -1138,6 +1157,8 @@ fn finalize_program(
     // member defined without its class in view only has afterwards.
     add_missing_this_params(program);
     bind_calls_past_this(program);
+    // Complete the class graph before CHA reads it.
+    crate::template_bases::expand_template_parameter_bases(program);
     expand_virtual_overrides(program);
     expand_internal_overload_refs(program);
     mark_wrapper_values(program);
@@ -1368,6 +1389,7 @@ fn finalize_extern_callees(program: &mut Program) {
             param_type_ids: Vec::new(),
             explicit_arity: None,
             default_args: 0,
+            reference_params: Vec::new(),
             owner_unresolved: false,
             variadic: false,
             defaulted_in_class: false,
@@ -1463,6 +1485,7 @@ fn finalize_target_extern_callees(program: &mut Program) {
             defaulted_in_class: false,
             declared_in_class: false,
             default_args: 0,
+            reference_params: Vec::new(),
             is_virtual: false,
             is_final: false,
             is_cpp: false,
@@ -2352,6 +2375,8 @@ fn lower_prepared_source(
         line_map: Some(std::sync::Arc::clone(&pre.line_map)),
         primary_path: self_canon,
         origin_file_ids: vec![Cell::new(None); pre.line_map.files.len()],
+        included_headers: Arc::clone(&pre.included_headers),
+        unit_files: std::cell::OnceCell::new(),
         pending: RefCell::new(Vec::new()),
         ns_stack: Vec::new(),
         using_nss: Vec::new(),
@@ -2369,9 +2394,11 @@ fn lower_prepared_source(
         ast_depth_warned: false,
         reference_vars: HashSet::default(),
         reference_bindings: HashSet::default(),
+        reference_returns: HashSet::default(),
         local_scope_log: Vec::new(),
         tree: parsed.tree.clone(),
         has_templates: is_cpp && parsed.source.contains("template"),
+        template_depth: Cell::new(0),
         has_weak: source_may_annotate_weak(&parsed.source) || program.symbols.has_weak_symbols(),
         record_link_ownership,
         header_unit,
@@ -2606,6 +2633,8 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
         template_bases: std::mem::take(&mut program.template_bases),
         arrow_returns: std::mem::take(&mut program.arrow_returns),
         template_returns: std::mem::take(&mut program.template_returns),
+        class_templates: std::mem::take(&mut program.class_templates),
+        anonymous_class_templates: std::mem::take(&mut program.anonymous_class_templates),
         final_classes: std::mem::take(&mut program.final_classes),
         anonymous_classes: std::mem::take(&mut program.anonymous_classes),
         anonymous_final_classes: std::mem::take(&mut program.anonymous_final_classes),
@@ -2807,6 +2836,7 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
         // instantiations; explicit specializations fold into the same entry
         // (documented imprecision). The inner definition carries everything.
         "template_declaration" => {
+            ctx.step_template(1);
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "template_parameter_list" {
@@ -2814,6 +2844,7 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
                 }
                 lower_tree(program, ctx, source, child);
             }
+            ctx.step_template(-1);
         }
         "type_definition" | "alias_declaration" => {
             lower_class_defined_in(program, ctx, source, node);
@@ -3196,6 +3227,45 @@ fn lower_struct_specifier(
                 None => program.mark_class_final(&derived),
             }
         }
+        // Only the primary template records its parameters: a partial or
+        // explicit specialization (`class W<T*>`) names them differently.
+        let is_primary_template = node
+            .child_by_field_name("name")
+            .is_some_and(|name| name.kind() != "template_type");
+        let has_bases = node
+            .children(&mut node.walk())
+            .any(|c| c.kind() == "base_class_clause");
+        // The enclosing templates, walked once: `ancestors` re-descends from
+        // the root, so only a class inside a template asks, and only one with
+        // bases or a forward declaration that may write a default.
+        let is_forward_declaration = !has_body
+            && is_primary_template
+            && source[node.end_byte()..].trim_start().starts_with(';');
+        let in_template = ctx.template_depth.get() > 0;
+        let path: Vec<Node> = if in_template && (has_bases || is_forward_declaration) {
+            ancestors(ctx, node).collect()
+        } else {
+            Vec::new()
+        };
+        let dependent = |spelling: &str| {
+            in_template
+                && mentions_template_parameter(
+                    source,
+                    path.iter().copied(),
+                    spelling,
+                    Spelling::Source,
+                )
+        };
+        // A class template's own parameters (`template<class I> class S : public I`):
+        // a base naming one is substituted per instantiation (docs/ANALYSIS.md,
+        // "Template-parameter bases"), never a class of its own.
+        let mut own_template = path
+            .last()
+            .filter(|p| p.kind() == "template_declaration")
+            .and_then(|t| t.child_by_field_name("parameters"))
+            .map(|params| class_template_parameters(program, ctx, source, params))
+            .unwrap_or_default();
+        let mut concrete_template_bases = Vec::new();
         for child in node.children(&mut node.walk()) {
             if child.kind() != "base_class_clause" {
                 continue;
@@ -3216,31 +3286,36 @@ fn lower_struct_specifier(
                         | "namespace_identifier"
                 ) {
                     let base_text = node_text(source, &base);
-                    let raw = normalize_qualified(base_text);
-                    let short = strip_template_args(&raw);
-                    // A base clause names a class, and names it through a
-                    // `using namespace` directive as readily as through the
-                    // enclosing scopes — which are asked first, as always.
-                    let through_directive = declared_class_in_scope(program, ctx, &short)
-                        .is_none()
-                        .then(|| class_seen_from(program, ctx, &short))
-                        .flatten();
-                    // Both inheritance and template substitution name the same
-                    // resolved class, including partially qualified spellings.
-                    let resolved_base = through_directive
-                        .unwrap_or_else(|| qualify_class_name(program, ctx, &short));
-                    let template_spelling = normalize_template_spelling(base_text);
-                    if let Some(at) = template_spelling.find('<') {
-                        let qualified = if template_tail(&template_spelling).is_empty() {
-                            format!("{resolved_base}{}", &template_spelling[at..])
-                        } else {
-                            // Outer<A>::Inner<B> has arguments on separate
-                            // classes; appending from the first '<' would
-                            // duplicate Inner and attach A to the wrong class.
-                            template_spelling
-                        };
-                        let is_dependent =
-                            spelling_is_dependent(ctx, source, base, base_text, Spelling::Source);
+                    let ClassSpelling {
+                        resolved: resolved_base,
+                        written: template_spelling,
+                        qualified,
+                    } = class_spelling(program, ctx, base_text);
+                    // `: public I` and `: public B<T>` name a template argument,
+                    // not a class `I` or `B`: a parameter of the class's own
+                    // template or of an enclosing one (`struct Inner : T` in
+                    // `Outer<T>`). Only the class name counts, since
+                    // `normalize_qualified` drops the arguments: `Layer<U>`
+                    // keeps its dependent `TemplateBase` and its edge, in a
+                    // partial specialization too.
+                    let names_parameter = dependent(&normalize_qualified(base_text));
+                    let mentions_own_parameter = own_template
+                        .parameters
+                        .iter()
+                        .flatten()
+                        .any(|p| spelling_mentions(&template_spelling, Spelling::Source, p));
+                    if mentions_own_parameter && is_primary_template {
+                        // A parameter is substituted as written, never qualified.
+                        own_template.add_dependent_base(match &qualified {
+                            Some(qualified) if !names_parameter => qualified,
+                            _ => &template_spelling,
+                        });
+                    }
+                    if names_parameter {
+                        continue;
+                    }
+                    if let Some(qualified) = &qualified {
+                        let is_dependent = dependent(base_text);
                         let declaration_scope = ctx
                             .type_scope
                             .borrow()
@@ -3249,16 +3324,59 @@ fn lower_struct_specifier(
                             .unwrap_or_else(|| ctx.namespace_scope());
                         program.add_template_base(
                             &derived,
-                            &qualified,
+                            qualified,
                             &declaration_scope,
                             is_dependent,
                         );
+                        if !is_dependent {
+                            concrete_template_bases.push((qualified.clone(), declaration_scope));
+                        }
                     }
                     if let Some(file) = anonymous_in {
                         program.add_anonymous_base(&derived, file, &resolved_base);
                     }
                     program.add_inheritance(&derived, &resolved_base);
                 }
+            }
+        }
+        if is_primary_template && !own_template.parameters.is_empty() {
+            // A forward declaration records the defaults it may write
+            // (`template <class I, class D = IDef> class Def;`).
+            let anonymous_in = ctx
+                .in_anonymous_namespace()
+                .then(|| node_span(program, ctx, node).file);
+            program.add_class_template_fact(&derived, anonymous_in, &own_template);
+        }
+        // What a concrete templated base reaches through its parameters is a
+        // base too, and member lookups in the rest of this unit see it. The
+        // class's file and unit say which file-local templates it sees.
+        if !concrete_template_bases.is_empty() {
+            let file = anonymous_in.unwrap_or_else(|| node_span(program, ctx, node).file);
+            let unit = if program.anonymous_class_templates.is_empty() {
+                &[][..]
+            } else {
+                ctx.unit_files.get_or_init(|| {
+                    let mut files: Vec<_> = std::iter::once(ctx.current_file)
+                        .chain(
+                            ctx.included_headers
+                                .iter()
+                                .filter_map(|h| program.symbols.file_by_path(h)),
+                        )
+                        .collect();
+                    files.sort_unstable();
+                    files.dedup();
+                    files
+                })
+            };
+            for (spelling, declaration_scope) in concrete_template_bases {
+                crate::template_bases::add_parameter_bases(
+                    program,
+                    &derived,
+                    &spelling,
+                    &declaration_scope,
+                    (file, unit),
+                    anonymous_in.is_some(),
+                );
             }
         }
     }
@@ -3307,7 +3425,9 @@ fn lower_struct_specifier(
                 }
                 "template_declaration" if is_cpp_class => {
                     if let Some(spec) = member_class_definition(child) {
+                        ctx.step_template(1);
                         lower_struct_specifier(program, ctx, source, spec);
+                        ctx.step_template(-1);
                     }
                 }
                 "type_definition" | "alias_declaration" if is_cpp_class => {
@@ -3508,10 +3628,37 @@ fn finish_initializer_capture(
 /// Record `var_id`, declared by `decl`, as a C++ reference when it is one:
 /// its value is its referent's address, and `&r` names the referent.
 fn mark_reference_binding(ctx: &mut LowerContext, decl: Node, var_id: VarId) {
-    if decl.kind() == "reference_declarator" {
+    if declares_reference(decl) {
         ctx.reference_vars.insert(var_id);
         ctx.reference_bindings.insert(var_id);
     }
+}
+
+/// Whether `declarator` binds its name, or an unnamed parameter, to a
+/// referent's address: its outermost declarator is `&` or `&&` (`T &r`,
+/// `T &`). `T *&r` is bound to the pointer's value, as initialization and
+/// argument passing bind it.
+fn declares_reference(declarator: Node) -> bool {
+    matches!(
+        declarator.kind(),
+        "reference_declarator" | "abstract_reference_declarator"
+    )
+}
+
+/// Whether a function definition or a lambda returns a reference: `S &f()`,
+/// or a trailing `-> S &`. `decltype(auto)` is taken to return by value.
+fn returns_reference(function: Node) -> bool {
+    function
+        .child_by_field_name("declarator")
+        .is_some_and(|declarator| {
+            declares_reference(declarator)
+                || declarator
+                    .children(&mut declarator.walk())
+                    .find(|child| child.kind() == "trailing_return_type")
+                    .and_then(|trailing| trailing.named_child(0))
+                    .and_then(|ty| ty.child_by_field_name("declarator"))
+                    .is_some_and(declares_reference)
+        })
 }
 
 /// Lower the member functions of a class body: prototypes first (so later
@@ -3606,7 +3753,10 @@ fn lower_class_definitions(
     for &m in &members {
         if let Some(spec) = member_class_definition(m) {
             if let Some(tag) = member_class_tag(ctx, source, spec) {
+                let template = i32::from(m.kind() == "template_declaration");
+                ctx.step_template(template);
                 lower_class_definitions(program, ctx, source, spec, &tag.spelling);
+                ctx.step_template(-template);
             }
         }
     }
@@ -3630,24 +3780,31 @@ fn lower_class_definitions(
     let signatures: Vec<_> = members
         .iter()
         .map(|&m| {
-            if m.kind() == "template_declaration" {
+            let template = i32::from(m.kind() == "template_declaration");
+            let member = if template == 1 {
                 template_member_decl(m).unwrap_or(m)
             } else {
                 m
-            }
+            };
+            (member, template)
         })
-        .filter(|&member| {
+        .filter(|&(member, _)| {
             member.kind() == "function_definition"
                 || (member.kind() == "field_declaration"
                     && member_decl_is_function(member)
                     && node_has_compound_body(member))
         })
-        .filter_map(|member| {
-            lower_function_signature(program, ctx, source, member).map(|sig| (member, sig))
+        .filter_map(|(member, template)| {
+            ctx.step_template(template);
+            let signature = lower_function_signature(program, ctx, source, member);
+            ctx.step_template(-template);
+            signature.map(|sig| (member, template, sig))
         })
         .collect();
-    for (member, signature) in signatures {
+    for (member, template, signature) in signatures {
+        ctx.step_template(template);
         lower_function_body(program, ctx, source, member, signature);
+        ctx.step_template(-template);
     }
     ctx.class_ctx = saved;
     ctx.type_scope.borrow_mut().pop();
@@ -4028,9 +4185,9 @@ fn register_member_prototype(
     // definitions, which supply the real param list. The count they declare
     // keeps overloads apart until then (`Get()` beside `Get(Mode&)`).
     let params: Vec<VarId> = Vec::new();
-    let (explicit_arity, shape) = find_params(node).map_or((0, ParamListShape::default()), |p| {
-        declared_param_counts(source, p)
-    });
+    let shape =
+        find_params(node).map_or_else(ParamListShape::default, |p| param_list_shape(source, p));
+    let explicit_arity = shape.declared();
     let span = node_span(program, ctx, node);
     let ret_type = node
         .child_by_field_name("type")
@@ -4057,6 +4214,7 @@ fn register_member_prototype(
         param_type_ids: Vec::new(),
         explicit_arity: Some(explicit_arity),
         default_args: shape.defaults,
+        reference_params: shape.references,
         owner_unresolved: false,
         variadic: shape.variadic,
         defaulted_in_class: false,
@@ -4357,6 +4515,7 @@ fn lower_function_signature(
         param_type_ids: Vec::new(),
         explicit_arity: Some((params.len() - usize::from(eff_class.is_some())) as u32),
         default_args: shape.defaults,
+        reference_params: shape.references,
         owner_unresolved,
         variadic: shape.variadic,
         // `A() = default;` in its class: not user-provided (C++17 aggregates).
@@ -4447,6 +4606,9 @@ fn lower_function_body(
         for segment in unopened.into_iter().flat_map(|rest| rest.split("::")) {
             ctx.ns_stack.push(Some(segment.to_owned()));
         }
+    }
+    if returns_reference(node) {
+        ctx.reference_returns.insert(fn_id);
     }
     ctx.current_fn = Some(fn_id);
     ctx.locals.clear();
@@ -4574,43 +4736,60 @@ fn is_parameter_node(kind: &str) -> bool {
     )
 }
 
-/// What a parameter list declares beyond the parameters themselves: how many
-/// carry a default argument, and whether it ends in `...` or a parameter pack,
-/// either of which takes any number of further arguments.
+/// What a parameter list declares beyond the parameters' names: whether
+/// each declared parameter is a reference, how many carry a default
+/// argument, and whether it ends in `...` or a parameter pack, either of
+/// which takes any number of further arguments. A variadic list's
+/// `references` end with one entry for those further arguments: `...`
+/// passes by value, a pack as its declarator says (`A... a`, `A &...a`).
 #[derive(Default)]
 struct ParamListShape {
+    references: Vec<bool>,
     defaults: u32,
     variadic: bool,
 }
 
 impl ParamListShape {
-    fn record(&mut self, param: Node) {
-        match param.kind() {
-            "optional_parameter_declaration" => self.defaults += 1,
-            "..." | "variadic_parameter_declaration" => self.variadic = true,
-            _ => {}
+    /// Record one child of a parameter list. A parameter is declared the way
+    /// `lower_parameter` lowers it: `(void)` declares none.
+    fn record(&mut self, source: &str, param: Node) {
+        let declarator = param.child_by_field_name("declarator");
+        let declares = match param.kind() {
+            // C's `...` parses as `variadic_parameter`. A pack followed by
+            // `...` is one tail, the pack's.
+            "..." | "variadic_parameter" | "variadic_parameter_declaration" => {
+                !std::mem::replace(&mut self.variadic, true)
+            }
+            kind => {
+                if kind == "optional_parameter_declaration" {
+                    self.defaults += 1;
+                }
+                let is_void = declarator.is_none()
+                    && param
+                        .child_by_field_name("type")
+                        .is_some_and(|t| node_text(source, &t) == "void");
+                is_parameter_node(kind) && !is_void
+            }
+        };
+        if declares {
+            self.references
+                .push(declarator.is_some_and(declares_reference));
         }
+    }
+
+    /// The parameters the list declares, its variadic tail aside.
+    fn declared(&self) -> u32 {
+        (self.references.len() - usize::from(self.variadic)) as u32
     }
 }
 
-/// The parameters a list declares, counted the way `lower_parameter` lowers
-/// them (`(void)` declares none), and its [`ParamListShape`].
-fn declared_param_counts(source: &str, params_node: Node) -> (u32, ParamListShape) {
-    let is_void = |param: Node| {
-        param.child_by_field_name("declarator").is_none()
-            && param
-                .child_by_field_name("type")
-                .is_some_and(|t| node_text(source, &t) == "void")
-    };
-    let mut declared = 0;
+/// A parameter list's [`ParamListShape`].
+fn param_list_shape(source: &str, params_node: Node) -> ParamListShape {
     let mut shape = ParamListShape::default();
     for param in params_node.children(&mut params_node.walk()) {
-        if is_parameter_node(param.kind()) && !is_void(param) {
-            declared += 1;
-        }
-        shape.record(param);
+        shape.record(source, param);
     }
-    (declared, shape)
+    shape
 }
 
 /// Lower the parameters `decl` lists onto `params`, after any `this` already
@@ -4628,7 +4807,7 @@ fn lower_parameters(
         return shape;
     };
     for param in params_node.children(&mut params_node.walk()) {
-        shape.record(param);
+        shape.record(source, param);
         if !is_parameter_node(param.kind()) {
             continue;
         }
@@ -5064,7 +5243,7 @@ fn substituted_parameter(
 }
 
 /// Resolve a stored base argument without consulting the caller's scope.
-fn held_class_in_declaration_scope(
+pub(crate) fn held_class_in_declaration_scope(
     program: &Program,
     declaration_scope: &str,
     arg: &str,
@@ -5311,21 +5490,6 @@ fn receiver_value(
             });
         }
     }
-    // `(*h->weak).lock()`: load through the pointer the operand's value
-    // holds. The general `*x` read resolves `x` to its root variable, which
-    // for a member path is the holder, not the member.
-    if let Some(pointer) =
-        pointer_arg(receiver).filter(|_| pointer_op(source, receiver).as_deref() == Some("*"))
-    {
-        if matches!(
-            receiver_desc(program, ctx, source, pointer),
-            Some(TypeDesc::Ptr(_))
-        ) {
-            let unknown = program.types.unknown();
-            let pointer = receiver_value(program, ctx, source, pointer, unknown)?;
-            return Some(emit_load(program, ctx, receiver, pointer, type_id));
-        }
-    }
     let value = alloc_load_temp(program, ctx, receiver, type_id);
     match expr_to_rhs_flow(program, ctx, source, receiver, value) {
         Some(flow) => program.flow.push(flow),
@@ -5430,6 +5594,89 @@ fn template_parameter_names<'s>(source: &'s str, params: Node) -> Vec<Option<&'s
             .filter(|name| !name.is_empty())
         })
         .collect()
+}
+
+/// A class template's parameters, as [`ClassTemplate`](trace_ir::ClassTemplate)
+/// records them: names by position, the pack's position, and each type
+/// parameter's default qualified here, in the template's own scope
+/// (`::ns::IDef`), so it names the same class wherever it is instantiated. A
+/// default that mentions another parameter is not recorded.
+fn class_template_parameters(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    params: Node,
+) -> trace_ir::ClassTemplate {
+    let names = template_parameter_names(source, params);
+    let mut cursor = params.walk();
+    let positions = params
+        .named_children(&mut cursor)
+        .filter(|p| p.kind() != "comment");
+    let mut template = trace_ir::ClassTemplate::default();
+    for (i, param) in positions.enumerate() {
+        if template.pack.is_none() && param.kind().starts_with("variadic_") {
+            template.pack = Some(i);
+        }
+        let default = param
+            .child_by_field_name("default_type")
+            .map(|ty| node_text(source, &ty))
+            .filter(|ty| {
+                !names
+                    .iter()
+                    .flatten()
+                    .any(|p| spelling_mentions(ty, Spelling::Source, p))
+            })
+            .map(|ty| {
+                let spelling = class_spelling(program, ctx, ty);
+                let name = spelling.qualified.unwrap_or(spelling.resolved);
+                format!("::{}", name.trim_start_matches("::"))
+            });
+        template.defaults.push(default);
+    }
+    template.parameters = names.into_iter().map(|n| n.map(str::to_owned)).collect();
+    template
+}
+
+/// A class named where it is written: a base clause, or a template
+/// parameter's default.
+struct ClassSpelling {
+    /// The class, qualified, without template arguments.
+    resolved: String,
+    /// As written, whitespace removed.
+    written: String,
+    /// `resolved` with the written arguments, for a templated spelling.
+    qualified: Option<String>,
+}
+
+fn class_spelling(program: &Program, ctx: &LowerContext, text: &str) -> ClassSpelling {
+    let raw = normalize_qualified(text);
+    let short = strip_template_args(&raw);
+    // A base clause names a class, and names it through a `using namespace`
+    // directive as readily as through the enclosing scopes — which are asked
+    // first, as always.
+    let through_directive = declared_class_in_scope(program, ctx, &short)
+        .is_none()
+        .then(|| class_seen_from(program, ctx, &short))
+        .flatten();
+    // Both inheritance and template substitution name the same resolved
+    // class, including partially qualified spellings.
+    let resolved = through_directive.unwrap_or_else(|| qualify_class_name(program, ctx, &short));
+    let written = normalize_template_spelling(text);
+    let qualified = written.find('<').map(|at| {
+        if template_tail(&written).is_empty() {
+            format!("{resolved}{}", &written[at..])
+        } else {
+            // Outer<A>::Inner<B> has arguments on separate classes; appending
+            // from the first '<' would duplicate Inner and attach A to the
+            // wrong class.
+            written.clone()
+        }
+    });
+    ClassSpelling {
+        resolved,
+        written,
+        qualified,
+    }
 }
 
 /// The identifier a declarator declares, through pointer, reference and
@@ -5617,7 +5864,7 @@ fn register_template_return(
                 .position(|p| *p == Some(spelling))
         })
         .flatten();
-    let arity = find_params(node).map_or(0, |p| declared_param_counts(source, p).0);
+    let arity = find_params(node).map_or(0, |p| param_list_shape(source, p).declared());
     let fact = trace_ir::TemplateReturn {
         arity,
         parameter,
@@ -5832,7 +6079,8 @@ fn lower_declaration(
                                             ctx,
                                             source,
                                             fdecl.child_by_field_name("parameters"),
-                                        );
+                                        )
+                                        .for_callee(program, None);
                                         let call_id = program.symbols.alloc_call_id();
                                         let expansion_span =
                                             node_expansion_span(program, ctx, node);
@@ -6090,11 +6338,7 @@ fn direct_init_argument(
         // `using Value = int;` makes `Worker make(Value);` a declaration.
         return None;
     }
-    if ctx
-        .class_ctx
-        .as_ref()
-        .is_some_and(|c| class_has_data_field(program, &c.qual_name, &name))
-    {
+    if this_field_named(program, ctx, &name).is_some() {
         // A data member is a value, so this defines an object:
         // `std::lock_guard<std::mutex> g(mu_);`. Its value is not a
         // variable here, and the position stays without an actual, as a
@@ -6688,6 +6932,7 @@ fn lower_function_decl(
         param_type_ids: Vec::new(),
         explicit_arity,
         default_args: shape.defaults,
+        reference_params: shape.references,
         owner_unresolved: false,
         variadic: shape.variadic,
         defaulted_in_class: false,
@@ -7262,6 +7507,7 @@ fn collect_call_at_node_inner(
     };
 
     if chosen.is_empty() {
+        let args = args.for_callee(program, None);
         let call_id = program.symbols.alloc_call_id();
         program.symbols.call_sites.push(CallSite {
             id: call_id,
@@ -7297,6 +7543,7 @@ fn collect_call_at_node_inner(
         } else {
             site_args
         };
+        let site_args = site_args.for_callee(program, Some(t));
         let call_id = program.symbols.alloc_call_id();
         program.symbols.call_sites.push(CallSite {
             id: call_id,
@@ -7336,6 +7583,7 @@ struct CallArgs {
     fn_args: Vec<(u32, FnId)>,
     addr_of_member_args: Vec<u32>,
     addr_of_args: Vec<u32>,
+    deref_args: Vec<DerefArg>,
     argc: u32,
     /// One slot per argument position (aligned with `argc`), holding the
     /// best-effort static type of the passed expression (literals, casts,
@@ -7354,6 +7602,9 @@ impl CallArgs {
             &mut self.addr_of_member_args,
             &mut self.addr_of_args,
         );
+        for deref in &mut self.deref_args {
+            deref.index += 1;
+        }
         if let Some(receiver) = receiver {
             self.var_args.insert(0, (0, receiver));
         }
@@ -7366,9 +7617,29 @@ impl CallArgs {
             fn_args: Vec::new(),
             addr_of_member_args: Vec::new(),
             addr_of_args: Vec::new(),
+            deref_args: Vec::new(),
             argc: 0,
             arg_desc: Vec::new(),
         }
+    }
+
+    /// The arguments for a site reaching `callee`, positions bound, or for
+    /// a site no callee is known at (`None`): each C++ `*x` passes what
+    /// [`DerefArg::passed`] gives the parameter it binds.
+    fn for_callee(mut self, program: &mut Program, callee: Option<FnId>) -> Self {
+        for deref in &self.deref_args {
+            // A position past the declared list takes the variadic tail's.
+            let reference = callee.and_then(|callee| {
+                let declared = program.symbols.function(callee);
+                let references = &declared.reference_params;
+                let tail = references.last().filter(|_| declared.variadic);
+                references.get(deref.param).or(tail).copied()
+            });
+            if let Some(arg) = self.var_args.iter_mut().find(|(i, _)| *i == deref.index) {
+                arg.1 = deref.passed(program, arg.1, reference);
+            }
+        }
+        self
     }
 
     /// One argument list for each of several sites emitted from one call: the
@@ -7379,6 +7650,55 @@ impl CallArgs {
         } else {
             self.clone()
         }
+    }
+}
+
+/// A C++ `*x` argument, collected with `x`'s value and bound per site
+/// ([`CallArgs::for_callee`]).
+#[derive(Clone)]
+struct DerefArg {
+    /// The position at the site, moved past `this` with the other arguments.
+    index: u32,
+    /// The position among the parameters the callee declares.
+    param: usize,
+    /// Where the temporaries are allocated: the calling function and the
+    /// argument.
+    owner: Option<FnId>,
+    span: Span,
+    /// The value read through `x`, and the value holding both `x`'s value
+    /// and the value read, once a site needs them. Clones share them.
+    read: std::rc::Rc<Cell<Option<VarId>>>,
+    either: std::rc::Rc<Cell<Option<VarId>>>,
+}
+
+impl DerefArg {
+    /// What `*x`, `x`'s value being `address`, passes a parameter: the
+    /// address to a reference, the value read to a by-value parameter, and,
+    /// to one no declaration describes (`reference` unknown), a temporary
+    /// holding both (docs/ANALYSIS.md, "Dereferenced operands"). Each
+    /// temporary is emitted once, by the first site that needs it.
+    fn passed(&self, program: &mut Program, address: VarId, reference: Option<bool>) -> VarId {
+        let cache = match reference {
+            Some(true) => return address,
+            Some(false) => &self.read,
+            None => &self.either,
+        };
+        if let Some(passed) = cache.get() {
+            return passed;
+        }
+        let passed = alloc_ret_temp_spanned(program, self.owner, self.span);
+        program.flow.push(FlowConstraint::Load {
+            dst: passed,
+            src: address,
+        });
+        if reference.is_none() {
+            program.flow.push(FlowConstraint::Copy {
+                dst: passed,
+                src: address,
+            });
+        }
+        cache.set(Some(passed));
+        passed
     }
 }
 
@@ -7431,6 +7751,7 @@ fn collect_call_args(
     let mut fn_args = Vec::new();
     let mut addr_of_member_args = Vec::new();
     let mut addr_of_args = Vec::new();
+    let mut deref_args = Vec::new();
     let mut arg_desc = Vec::new();
     let mut arg_index = 0u32;
     if let Some(args_node) = args_node {
@@ -7455,15 +7776,48 @@ fn collect_call_args(
                     arg_index += 1;
                     continue;
                 }
+                // `*x` passes the value it reads. In C++ a reference
+                // parameter takes `x`'s value instead, and so does one no
+                // declaration describes (docs/ANALYSIS.md, "Dereferenced
+                // operands"; [`CallArgs::for_callee`]). A function pointer
+                // is read in place: `*fp` passes `fp`.
+                let value = peel_casts(source, arg);
+                if let Some((x, in_place)) = deref_operand(source, value)
+                    .and_then(|_| Operand::resolve(program, ctx, source, value))
+                    .and_then(Operand::into_deref)
+                {
+                    let address = x.publish(program, ctx, source);
+                    let passed = if in_place {
+                        address
+                    } else if ctx.is_cpp {
+                        deref_args.push(DerefArg {
+                            index: arg_index,
+                            param: arg_index as usize,
+                            owner: ctx.current_fn,
+                            span: node_span(program, ctx, arg),
+                            read: Default::default(),
+                            either: Default::default(),
+                        });
+                        address
+                    } else {
+                        let read = alloc_ret_temp(program, ctx, arg);
+                        program.flow.push(FlowConstraint::Load {
+                            dst: read,
+                            src: address,
+                        });
+                        read
+                    };
+                    var_args.push((arg_index, passed));
+                    arg_desc.push(adesc);
+                    arg_index += 1;
+                    continue;
+                }
                 if let Some(v) = resolve_expr_var(program, ctx, source, arg) {
                     // A field/subscript argument passes the *value* stored in
                     // that memory (e.g. `take(g_h.h, 0)` passes the fn-ptr in
                     // `g_h.h`). `resolve_expr_var` yields the base object, so
                     // materialize a load temp and pass that instead.
-                    if matches!(
-                        peel_casts(source, arg).kind(),
-                        "field_expression" | "subscript_expression"
-                    ) {
+                    if matches!(value.kind(), "field_expression" | "subscript_expression") {
                         let temp = alloc_ret_temp(program, ctx, arg);
                         if let Some(flow) = expr_to_rhs_flow(program, ctx, source, arg, temp) {
                             program.flow.push(flow);
@@ -7502,6 +7856,7 @@ fn collect_call_args(
         fn_args,
         addr_of_member_args,
         addr_of_args,
+        deref_args,
         argc: arg_index,
         arg_desc,
     }
@@ -7932,9 +8287,10 @@ fn emit_unresolved_site(
         fn_args,
         addr_of_member_args,
         addr_of_args,
+        deref_args: _,
         argc: _,
         arg_desc: _,
-    } = args.bind_past_this(None);
+    } = args.bind_past_this(None).for_callee(program, None);
     let call_id = program.symbols.alloc_call_id();
     program.symbols.call_sites.push(CallSite {
         id: call_id,
@@ -8012,6 +8368,7 @@ fn emit_member_targets(
     if targets.is_empty() {
         // Unknown method: keep an unresolved site; the solver synthesizes
         // an external entry (mirrors plain-identifier C behavior).
+        let args = args.for_callee(program, None);
         let call_id = program.symbols.alloc_call_id();
         program.symbols.call_sites.push(CallSite {
             id: call_id,
@@ -8036,7 +8393,9 @@ fn emit_member_targets(
     }
     let last_index = targets.len() - 1;
     for (index, t) in targets.into_iter().enumerate() {
-        let site_args = args.take_for(index == last_index);
+        let site_args = args
+            .take_for(index == last_index)
+            .for_callee(program, Some(t));
         let (call_id, name) = {
             let id = program.symbols.alloc_call_id();
             let nm = program.symbols.function(t).name.clone();
@@ -8091,25 +8450,39 @@ fn lower_field_initializer_list(
             continue;
         };
         let fname = normalize_qualified(node_text(source, &name_node));
-        let target_cls: Option<String> = bases
+        // The class a base or member initializer constructs, and whether the
+        // member is an array of it, at any depth.
+        let target_cls: Option<(String, bool)> = bases
             .iter()
             .find(|b| last_segment_of(b) == fname)
-            .cloned()
+            .map(|b| (b.clone(), false))
             .or_else(|| {
                 let fid = cls_type?;
                 let info = program.types.get(fid);
                 let (_, fl) = info.layout.fields.iter().find(|(_, f)| f.name == fname)?;
-                match program.types.get(fl.type_id).desc.as_ref().clone() {
-                    TypeDesc::Struct { name, .. } => Some(name),
+                let mut desc = program.types.get(fl.type_id).desc.as_ref().clone();
+                let mut array = false;
+                while let TypeDesc::Array { elem, .. } = desc {
+                    desc = *elem;
+                    array = true;
+                }
+                match desc {
+                    TypeDesc::Struct { name, .. } => Some((name, array)),
                     _ => None,
                 }
             });
-        if let Some(target) = target_cls {
+        if let Some((target, array)) = target_cls {
             // `Base(a)` and `m_(a)` hold an argument list, `Base{a}` and
             // `m_{a}` an initializer list; either way `this` is not in it.
             let args = fi
                 .children(&mut fi.walk())
                 .find(|c| matches!(c.kind(), "argument_list" | "initializer_list"));
+            // A member array's list initializes its elements one by one: an
+            // empty one default-constructs them, and listed elements are
+            // expressions of their own, never one constructor's arguments.
+            if array && args.is_some_and(|list| list.named_child_count() > 0) {
+                continue;
+            }
             let span = node_call_span(program, ctx, fi);
             let expansion_span = node_expansion_span(program, ctx, fi);
             let call_args = collect_call_args(program, ctx, source, args);
@@ -8410,6 +8783,7 @@ fn lower_lambda_expression(
         program.symbols.call_sites.len(),
     );
     let mut params = Vec::new();
+    let mut shape = ParamListShape::default();
     if let Some(params_node) = node
         .children(&mut node.walk())
         .find(|c| c.kind() == "parameter_list" || c.kind() == "abstract_function_declarator")
@@ -8423,6 +8797,7 @@ fn lower_lambda_expression(
         })
     {
         for param in params_node.children(&mut params_node.walk()) {
+            shape.record(source, param);
             if is_parameter_node(param.kind()) {
                 if let Some(var) = lower_parameter(
                     program,
@@ -8454,8 +8829,9 @@ fn lower_lambda_expression(
         param_type_ids: Vec::new(),
         explicit_arity: Some(params.len() as u32),
         default_args: 0,
+        reference_params: shape.references,
         owner_unresolved: false,
-        variadic: false,
+        variadic: shape.variadic,
         defaulted_in_class: false,
         declared_in_class: false,
         is_virtual: false,
@@ -8588,6 +8964,9 @@ fn lower_lambda_expression(
         }
     }
 
+    if returns_reference(node) {
+        ctx.reference_returns.insert(fn_id);
+    }
     ctx.current_fn = Some(fn_id);
     ctx.locals = lambda_locals;
     if let Some(body) = node
@@ -8701,7 +9080,7 @@ fn declares_arrow(program: &Program, cls: &str) -> bool {
 /// Borrowed when the spelling already is that name, which is the common case
 /// on the member-call path: [`strip_template_args`] takes the same fast path
 /// but always allocates.
-fn receiver_lookup_name(name: &str) -> Cow<'_, str> {
+pub(crate) fn receiver_lookup_name(name: &str) -> Cow<'_, str> {
     let trimmed = name.trim_end();
     if trimmed.ends_with('>') {
         Cow::Owned(strip_template_args(trimmed))
@@ -8756,7 +9135,9 @@ fn resolve_operator_arrow_receiver(program: &Program, desc: TypeDesc) -> Option<
     let mut current = desc;
     let mut seen = HashSet::default();
     for _ in 0..=MAX_ARROW_DEPTH {
-        if let TypeDesc::Ptr(inner) = current {
+        // A built-in arrow, an array's included: `m_items->Run()` calls the
+        // first element's `Run`.
+        if let TypeDesc::Ptr(inner) | TypeDesc::Array { elem: inner, .. } = current {
             return class_spelling_of_desc(&inner).map(str::to_string);
         }
         let TypeDesc::Struct { ref name, .. } = current else {
@@ -8875,7 +9256,9 @@ fn member_receiver_class(
     resolve_operator_arrow(program, receiver_desc(program, ctx, source, recv)?)
 }
 
-/// What `*e` yields. A pointer dereferences to its pointee. A smart pointer
+/// What `*e` yields. A pointer dereferences to its pointee, an array to its
+/// first element, and a function
+/// pointer to the function, which designates itself. A smart pointer
 /// dereferences through its `operator->`: its `operator*` names the same
 /// pointee, so `(*sp).m()` looks `m` up where `sp->m()` does. Any other
 /// class value has an `operator*` this index does not follow — an iterator's
@@ -8884,7 +9267,10 @@ fn member_receiver_class(
 /// (`std::vector::iterator::GetCameras`).
 fn deref_desc(program: &Program, desc: TypeDesc) -> Option<TypeDesc> {
     match desc {
-        TypeDesc::Ptr(inner) => Some(*inner),
+        // An array's first element: `*h->objs` is `h->objs[0]`.
+        TypeDesc::Ptr(inner) | TypeDesc::Array { elem: inner, .. } => Some(*inner),
+        // A function designates itself: `*fp` and `**fp` are `fp`.
+        TypeDesc::FnPtr { .. } => Some(desc),
         TypeDesc::Struct { ref name, .. } => {
             let cls = strip_template_args(name);
             // A wrapper whose body is not in the tree unwraps on `*` as it
@@ -8938,14 +9324,12 @@ fn receiver_desc(
             fields: Vec::new(),
         }))),
         "identifier" => {
-            if let Some(v) = lookup_var_node(program, ctx, source, node) {
-                return Some(var_receiver_desc(program, ctx, v));
+            // An instance field outranks a namespace variable of its name,
+            // as it does for the value (`implicit_this`).
+            if let Some((_, field)) = implicit_this_field(program, ctx, source, node) {
+                return Some(program.types.get(field.type_id).desc.as_ref().clone());
             }
-            class_field_desc(
-                program,
-                &ctx.class_ctx.as_ref()?.qual_name,
-                node_text(source, &node),
-            )
+            lookup_var_node(program, ctx, source, node).map(|v| var_receiver_desc(program, ctx, v))
         }
         "qualified_identifier" => {
             lookup_var_node(program, ctx, source, node).map(|v| var_receiver_desc(program, ctx, v))
@@ -9088,7 +9472,7 @@ fn register_arrow_return(
 /// function type's own parameter list respected. Quoting is not tracked: a
 /// C++20 structural argument spelled as a string literal with a comma in it
 /// (`Tag<"a, b">`) would split there. No such spelling occurs in the corpora.
-fn template_arguments(raw: &str) -> Vec<String> {
+pub(crate) fn template_arguments(raw: &str) -> Vec<String> {
     let Some(start) = raw.find('<') else {
         return Vec::new();
     };
@@ -9127,7 +9511,7 @@ fn template_arguments(raw: &str) -> Vec<String> {
 /// What follows a spelling's first template argument list: `::Inner` for
 /// `Outer<A>::Inner`, empty for `Outer<A>`, for a spelling without
 /// arguments and for an unbalanced one.
-fn template_tail(raw: &str) -> &str {
+pub(crate) fn template_tail(raw: &str) -> &str {
     let Some(start) = raw.find('<') else {
         return "";
     };
@@ -9590,15 +9974,12 @@ fn infer_static_class(
     match node.kind() {
         "this" => ctx.class_ctx.as_ref().map(|c| c.qual_name.clone()),
         "identifier" => {
-            let name = node_text(source, &node);
-            if let Some(v) = lookup_var(ctx, program, name) {
-                return var_static_class(program, v);
-            }
             // Bare `plugin_->OnEvent()` inside a method is implicit
-            // `this->plugin_`; locals/params already lost, so look the
-            // name up as a data member of the enclosing class (and bases).
-            let cls = ctx.class_ctx.as_ref()?.qual_name.clone();
-            class_field_static_class(program, &cls, name)
+            // `this->plugin_` unless the body hides it (`implicit_this`).
+            if let Some((_, field)) = implicit_this_field(program, ctx, source, node) {
+                return class_name_of_desc(program.types.get(field.type_id).desc.as_ref());
+            }
+            var_static_class(program, lookup_var(ctx, program, node_text(source, &node))?)
         }
         "qualified_identifier" => {
             var_static_class(program, lookup_var_node(program, ctx, source, node)?)
@@ -9666,7 +10047,7 @@ fn class_name_of_desc(desc: &TypeDesc) -> Option<String> {
 fn class_spelling_of_desc(desc: &TypeDesc) -> Option<&str> {
     match desc {
         TypeDesc::Struct { name, .. } => Some(name),
-        TypeDesc::Ptr(inner) => class_spelling_of_desc(inner),
+        TypeDesc::Ptr(inner) | TypeDesc::Array { elem: inner, .. } => class_spelling_of_desc(inner),
         _ => None,
     }
 }
@@ -9716,52 +10097,52 @@ fn extract_flow_from_expr(
             return;
         }
         if is_deref_lhs(source, lhs) {
-            if let Some(arg) = deref_operand(lhs) {
-                if let Some(ptr) = resolve_lvalue_var(program, ctx, source, arg) {
-                    // `*out = (f())` stores the result as `*out = f()` does.
-                    let call = peel_expression(rhs);
-                    if let Some(src) = expr_to_store_src(program, ctx, source, rhs) {
-                        program.flow.push(FlowConstraint::Store { dst: ptr, src });
-                    } else if let Some(name) = fn_designator(source, rhs) {
-                        // `*out = handler`: a function designator stored
-                        // through a pointer.
-                        emit_fn_name_store(program, ctx, source, node, ptr, name);
-                    } else if call.kind() == "call_expression" {
-                        if let Some(src) = promoted_receiver_value(program, ctx, source, call) {
-                            program.flow.push(FlowConstraint::Store { dst: ptr, src });
-                        } else if let Some(callee_name) =
-                            resolve_direct_call(program, ctx, source, call)
-                        {
-                            let ret_temp = alloc_ret_temp(program, ctx, node);
-                            emit_call_return(program, ctx, call, ret_temp, callee_name);
-                            program.flow.push(FlowConstraint::Store {
-                                dst: ptr,
-                                src: ret_temp,
-                            });
-                        }
+            if let Some((target, _)) = deref_target(program, ctx, source, lhs) {
+                // The pointer is resolved first, with nothing emitted, and
+                // emitted only once there is a value to store through it:
+                // `*h->count = 0` loads no member, and `*(p + 1) = *h->pp`
+                // evaluates nothing.
+                let ptr = |program: &mut Program, ctx: &mut LowerContext| {
+                    target.publish(program, ctx, source)
+                };
+                // `*out = (f())` stores the result as `*out = f()` does.
+                let call = peel_expression(rhs);
+                if let Some(src) = expr_to_store_src(program, ctx, source, rhs) {
+                    let dst = ptr(program, ctx);
+                    program.flow.push(FlowConstraint::Store { dst, src });
+                } else if let Some(name) = fn_designator(source, rhs) {
+                    // `*out = handler`: a function designator stored
+                    // through a pointer.
+                    let dst = ptr(program, ctx);
+                    emit_fn_name_store(program, ctx, source, node, dst, name);
+                } else if call.kind() == "call_expression" {
+                    if let Some(src) = promoted_receiver_value(program, ctx, source, call) {
+                        let dst = ptr(program, ctx);
+                        program.flow.push(FlowConstraint::Store { dst, src });
+                    } else if let Some(callee_name) =
+                        resolve_direct_call(program, ctx, source, call)
+                    {
+                        let dst = ptr(program, ctx);
+                        let ret_temp = alloc_ret_temp(program, ctx, node);
+                        emit_call_return(program, ctx, call, ret_temp, callee_name);
+                        program
+                            .flow
+                            .push(FlowConstraint::Store { dst, src: ret_temp });
                     }
                 }
             }
-        } else if lhs.kind() == "field_expression" {
+        } else if lhs.kind() == "field_expression"
+            || implicit_this(program, ctx, source, lhs).is_some()
+        {
+            // `h->cb = v`, and `cb_ = v` as `this->cb_ = v`.
             emit_field_store(program, ctx, source, lhs, rhs);
-        } else if let Some(table) = field_table(lhs) {
+        } else if let Some(table) = field_table(program, ctx, source, lhs) {
             // `s.table[i] = v`: an element of a field array is the field's
             // cell, index-insensitively, as any array element is.
             emit_field_store(program, ctx, source, table, rhs);
         } else if let Some(dst) = resolve_lvalue_var(program, ctx, source, lhs) {
             if let Some(flow) = expr_to_rhs_flow(program, ctx, source, rhs, dst) {
                 program.flow.push(flow);
-            }
-        } else if ctx.is_cpp {
-            let target_ident = match lhs.kind() {
-                "identifier" => Some(lhs),
-                "subscript_expression" => subscript_table(lhs).filter(|n| n.kind() == "identifier"),
-                _ => None,
-            };
-            if let Some(ident) = target_ident {
-                if let Some(gep) = resolve_implicit_this_member(program, ctx, source, ident) {
-                    emit_store_to_location(program, ctx, source, node, gep, rhs);
-                }
             }
         }
         return;
@@ -10114,10 +10495,19 @@ fn subscript_table(node: Node) -> Option<Node> {
 }
 
 /// `s.table[i]` / `p->table[i]` / `s.matrix[i][j]`: the field expression
-/// naming the array. An element of a field array is the field's cell,
-/// index-insensitively, so every access through it reads or writes the field.
-fn field_table(node: Node) -> Option<Node> {
-    subscript_table(node).filter(|n| n.kind() == "field_expression")
+/// naming the array; in a member body, also a bare instance field
+/// (`table_[i]`, as `this->table_[i]`; [`implicit_this`]). An element of a
+/// field array is the field's cell, index-insensitively, so every access
+/// through it reads or writes the field.
+fn field_table<'t>(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node<'t>,
+) -> Option<Node<'t>> {
+    subscript_table(node).filter(|n| {
+        n.kind() == "field_expression" || implicit_this(program, ctx, source, *n).is_some()
+    })
 }
 
 /// A plain or qualified name (`x`, `ns::f`, `Cls::f`).
@@ -10311,25 +10701,31 @@ fn field_name_from_node(source: &str, node: Node) -> Option<String> {
         .map(|n| node_text(source, &n).to_string())
 }
 
-fn field_id_in_hierarchy(
-    program: &Program,
-    ctx: Option<&LowerContext>,
-    type_id: trace_ir::TypeId,
-    fname: &str,
-) -> Option<HierarchyField> {
-    field_in_hierarchy(program, ctx, type_id, fname)
-}
-
-/// The field path `node` spells: its root (a variable, the last smart-pointer
-/// receiver, or a call's result) and the fields after it. `None`, with
-/// nothing emitted, when `node` has no field path or a field lookup fails,
-/// so callers never see an empty path.
+/// The field path `node` spells, emitted: its root (a variable, the last
+/// smart-pointer receiver, a call's result, or the value a dereference
+/// reads) and the fields after it. `None`, with nothing emitted, when
+/// `node` has no field path or a field lookup fails, so callers never see
+/// an empty path.
 fn decompose_field_path(
     program: &mut Program,
-    ctx: &LowerContext,
+    ctx: &mut LowerContext,
     source: &str,
     node: Node,
 ) -> Option<(VarId, Vec<FieldId>, Vec<String>)> {
+    let path = field_path(program, ctx, source, node)?;
+    let (base, field_ids, field_names, _) = path.publish(program, ctx, source);
+    Some((base, field_ids, field_names))
+}
+
+/// The field path `node` spells, resolved and validated with nothing
+/// emitted ([`FieldPath`]). A bare instance field in a member body (`m_pp`,
+/// `m_in->pp`) is rooted at `this`, as `this->m_pp` is.
+fn field_path<'t>(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node<'t>,
+) -> Option<FieldPath<'t>> {
     let mut field_names = Vec::new();
     let mut arrows = Vec::new();
     let mut cur = peel_expression(node);
@@ -10345,6 +10741,16 @@ fn decompose_field_path(
         // `a`'s layout — the base `resolve_lvalue_var` peels down to anyway.
         cur = peel_expression(cur.child_by_field_name("argument")?);
     }
+    // A bare instance field at the root is `this`'s, an element of one
+    // (`table_[i].val`) included: an element is its table's cell.
+    let root_name = subscript_table(cur)
+        .filter(|_| !field_names.is_empty())
+        .unwrap_or(cur);
+    let this_field = implicit_this(program, ctx, source, root_name);
+    if this_field.is_some() {
+        field_names.push(node_text(source, &root_name).to_string());
+        arrows.push(true);
+    }
     if field_names.is_empty() {
         // No field path: `cur` is no field access, or the static member
         // itself. Nothing to decompose, and nothing emitted.
@@ -10353,102 +10759,107 @@ fn decompose_field_path(
     field_names.reverse();
     arrows.reverse();
 
-    let mut is_implicit_this = false;
-    let root = if ctx.is_cpp && cur.kind() == "call_expression" {
-        PathRoot::Call(call_root(program, ctx, source, cur, &arrows)?)
-    } else if let Some(base) = resolve_lvalue_var(program, ctx, source, cur) {
-        PathRoot::Var(base)
-    } else if ctx.is_cpp {
-        let root_node = if cur.kind() == "identifier" {
-            Some(cur)
-        } else {
-            subscript_table(cur).filter(|n| n.kind() == "identifier")
-        };
-        let ident = root_node?;
-        let name = node_text(source, &ident);
-        class_ctx_field(program, ctx, name)?;
-        let this_var = ctx.locals.get("this").copied()?;
-        field_names.insert(0, name.to_string());
-        arrows.insert(0, true);
-        is_implicit_this = true;
-        PathRoot::Var(this_var)
-    } else {
-        return None;
+    // The path's root: a variable, the smart pointer a direct call returns
+    // (`GetSp()->field`), or the class object a dereferenced member or
+    // dereference reads (`(*o->inner).pp`). A call or a dereference is
+    // lowered only once the path validates; one that is not a class object
+    // keeps the root variable (docs/ANALYSIS.md, "Dereferenced operands").
+    let operand = deref_operand(source, cur).map(peel_expression);
+    let operand_desc = operand.and_then(|operand| receiver_desc(program, ctx, source, operand));
+    let (pointee, is_pointer) = match operand_desc.clone().and_then(|d| deref_desc(program, d)) {
+        Some(TypeDesc::Ptr(inner)) => (Some(*inner), true),
+        desc => (desc, false),
     };
-
-    let (mut raw_pointer, mut type_id) = match &root {
+    let deref_class = match pointee {
+        Some(TypeDesc::Struct { name, .. }) => program.types.class_type_id(&name),
+        _ => None,
+    };
+    // An arrow on `*x` is built in unless `*x` is a smart pointer:
+    // `(*pp)->x` reads `x` through the pointer `*pp` holds. A field typed a
+    // pointer level short (`S **f` reads as `S *`) takes the arrow's word.
+    let arrow_root = deref_class.filter(|&class| {
+        arrows.first() == Some(&true)
+            && !matches!(operand_desc, Some(TypeDesc::Struct { .. }))
+            && (is_pointer || peel_wrapper_to_pointee(program, class) == class)
+    });
+    let deref_root = operand
+        // `*&x` is `x`: an address taken keeps the root variable. A bare
+        // instance field (`(*m_in).pp`) is read through `this`.
+        .filter(|operand| {
+            operand.kind() == "field_expression"
+                || deref_operand(source, *operand).is_some()
+                || implicit_this(program, ctx, source, *operand).is_some()
+        })
+        .zip(deref_class.filter(|_| !is_pointer));
+    let (root, mut raw_pointer, mut type_id) = if ctx.is_cpp && cur.kind() == "call_expression" {
         // A wrapper value: the arrow is overloaded, never built in.
-        PathRoot::Call(call) => (false, call.wrapper),
-        PathRoot::Var(base) => {
-            let base = *base;
-            // Keep the receiver's pointer provenance before layout lookup
-            // strips it. References and explicit dereferences denote the
-            // referred-to value.
-            let raw_pointer = ctx.is_cpp
-                && arrows.first() == Some(&true)
-                && if is_implicit_this || cur.kind() == "identifier" {
-                    // The common case only needs a type tag, not a cloned layout.
-                    match program
-                        .types
-                        .get(variable_type_id(program, base)?)
-                        .desc
-                        .as_ref()
-                    {
-                        TypeDesc::Ptr(inner) if ctx.reference_vars.contains(&base) => {
-                            matches!(**inner, TypeDesc::Ptr(_))
-                        }
-                        TypeDesc::Ptr(_) => true,
-                        _ => false,
+        let call = call_root(program, ctx, source, cur, &arrows)?;
+        let wrapper = call.wrapper;
+        (PathRoot::Call(cur, call), false, wrapper)
+    } else if let Some(class) = arrow_root {
+        // The pointer `*x` holds: its arrow is built in.
+        let value = Operand::resolve(program, ctx, source, cur)?;
+        (PathRoot::Deref(Box::new(value)), true, class)
+    } else if let Some((operand, class)) = deref_root {
+        // A class object: an arrow on it is overloaded, never built in.
+        let value = Operand::resolve(program, ctx, source, operand)?;
+        (PathRoot::Deref(Box::new(value)), false, class)
+    } else {
+        let base = this_field
+            .or_else(|| this_root(ctx, source, cur))
+            .or_else(|| resolve_lvalue_var(program, ctx, source, cur))?;
+        // Keep the receiver's pointer provenance before layout lookup
+        // strips it. References and explicit dereferences denote the
+        // referred-to value.
+        let raw_pointer = ctx.is_cpp
+            && arrows.first() == Some(&true)
+            && if this_field.is_some() || cur.kind() == "identifier" {
+                // The common case only needs a type tag, not a cloned layout.
+                match program
+                    .types
+                    .get(variable_type_id(program, base)?)
+                    .desc
+                    .as_ref()
+                {
+                    TypeDesc::Ptr(inner) if ctx.reference_vars.contains(&base) => {
+                        matches!(**inner, TypeDesc::Ptr(_))
                     }
-                } else {
-                    matches!(
-                        receiver_desc(program, ctx, source, cur),
-                        Some(TypeDesc::Ptr(_))
-                    )
-                };
-            (raw_pointer, struct_type_for_var(program, base)?)
-        }
+                    TypeDesc::Ptr(_) => true,
+                    _ => false,
+                }
+            } else {
+                matches!(
+                    receiver_desc(program, ctx, source, cur),
+                    Some(TypeDesc::Ptr(_))
+                )
+            };
+        // An implicit `this` is the member's own class, a union included,
+        // which `this`'s pointer type need not tag as one.
+        let type_id = match this_field {
+            Some(_) => program
+                .types
+                .class_type_id(&ctx.class_ctx.as_ref()?.qual_name)?,
+            None => struct_type_for_var(program, base)?,
+        };
+        (PathRoot::Var(base), raw_pointer, type_id)
     };
     let mut summary_receiver = None;
     let mut field_ids = Vec::new();
-    // Validate the whole path before publishing anything: method names also
-    // pass through decomposition, and a failed lookup must leave no
-    // receiver or fact behind.
+    let mut member_type = program.types.unknown();
     let mut boundaries = Vec::new();
-    // A dereferenced wrapper-valued member (`(*h.item).field`) and its
-    // wrapper type: the wrapper is the member's value, not the root
-    // `resolve_lvalue_var` reduced it to.
-    let mut deref_member = None;
     // `(*sp).field` crosses into the same separate object as `sp->field`.
     // Resolving the lvalue base alone retains `sp`'s layout. Only an
     // overloaded dereference needs a summary receiver; `(*raw).field`
     // keeps the raw pointer's existing points-to flow.
-    if ctx.is_cpp
-        && cur.kind() == "pointer_expression"
-        && pointer_op(source, cur).as_deref() == Some("*")
-    {
-        let operand_node = pointer_arg(cur)?;
-        if let Some(operand @ TypeDesc::Struct { .. }) =
-            receiver_desc(program, ctx, source, operand_node)
-        {
-            let wrapper = program.types.resolve_type_id(&operand);
-            let TypeDesc::Struct { name, .. } = deref_desc(program, operand)? else {
-                return None;
-            };
-            let pointee = program.types.class_type_id(&name)?;
-            boundaries.push(WrapperBoundary {
-                step: 0,
-                wrapper,
-                pointee,
-            });
-            type_id = pointee;
-            let member = peel_expression(operand_node);
-            if member.kind() == "field_expression"
-                && static_member_access(program, ctx, source, member).is_none()
-            {
-                deref_member = Some((member, wrapper));
-            }
-        }
+    if let Some(wrapper @ TypeDesc::Struct { .. }) = operand_desc.filter(|_| ctx.is_cpp) {
+        let wrapper = program.types.resolve_type_id(&wrapper);
+        let pointee = deref_class?;
+        boundaries.push(WrapperBoundary {
+            step: 0,
+            wrapper,
+            pointee,
+        });
+        type_id = pointee;
     }
     for (step, (fname, arrow)) in field_names.iter().zip(arrows).enumerate() {
         // `sp->f` is the pointee's `f`; `sp.f` stays the wrapper's own, so
@@ -10467,61 +10878,135 @@ fn decompose_field_path(
                 type_id = pointee;
             }
         }
-        let hf = field_id_in_hierarchy(program, Some(ctx), type_id, fname)?;
+        let hf = field_in_hierarchy(program, Some(ctx), type_id, fname)?;
+        // An inherited field at the root is read through a summary receiver
+        // of its declaring class (docs/ANALYSIS.md, "Implicit this member
+        // variable access").
         if step == 0 && hf.owner_type_id != type_id {
             summary_receiver = Some(hf.owner_type_id);
         }
         field_ids.push(hf.field_id);
-        let layout = program.types.get(hf.owner_type_id);
-        type_id = layout.layout.fields.get(&hf.field_id)?.type_id;
-        raw_pointer = matches!(program.types.get(type_id).desc.as_ref(), TypeDesc::Ptr(_));
-        type_id = peel_ptr_to_struct(program, type_id);
+        member_type = hf.type_id;
+        // An array member decays to a pointer to its element.
+        raw_pointer = matches!(
+            program.types.get(member_type).desc.as_ref(),
+            TypeDesc::Ptr(_) | TypeDesc::Array { .. }
+        );
+        type_id = peel_ptr_to_struct(program, member_type);
     }
-    // The path is a field chain: publish its wrapper crossings. Callers
-    // continue from the last receiver with the fields after it. Facts for a
-    // path whose caller then emits nothing stay sound (may-analysis). A
-    // dereferenced member roots the crossings at the member's loaded value;
-    // its own path decomposes (and validates) only now, so a failure above
-    // has published nothing.
-    let base = match root {
-        PathRoot::Var(base) => base,
-        PathRoot::Call(call) => {
-            let result = alloc_ret_temp(program, ctx, cur);
-            program.symbols.variable_mut(result).type_id = call.wrapper;
-            emit_call_return(program, ctx, cur, result, call.callee);
-            result
-        }
-    };
-    let base = match deref_member {
-        Some((member, wrapper)) => {
-            let cell = addr_of_field_path(program, ctx, source, member)?;
-            emit_load(program, ctx, node, cell, wrapper)
-        }
-        None => base,
-    };
-    let base = if let Some(owner_tid) = summary_receiver {
-        alloc_recv_temp(program, ctx, node, owner_tid)
-    } else {
-        base
-    };
-    let (base, path_start) = emit_wrapper_boundaries(
-        program,
-        ctx,
+    Some(FieldPath {
         node,
-        base,
-        &field_ids,
-        &field_names,
-        &boundaries,
-    );
-    field_ids.drain(..path_start);
-    field_names.drain(..path_start);
-    Some((base, field_ids, field_names))
+        root,
+        field_ids,
+        field_names,
+        member_type,
+        boundaries,
+        summary_receiver,
+    })
 }
 
-/// Where a field path starts.
-enum PathRoot {
+/// A field path resolved and validated, with nothing emitted yet: its node,
+/// root, fields, the last field's declared type, and its wrapper crossings.
+struct FieldPath<'t> {
+    node: Node<'t>,
+    root: PathRoot<'t>,
+    field_ids: Vec<FieldId>,
+    field_names: Vec<String>,
+    member_type: trace_ir::TypeId,
+    boundaries: Vec<WrapperBoundary>,
+    /// The declaring class of an inherited field at the root: the path is
+    /// read through a summary receiver of that class.
+    summary_receiver: Option<trace_ir::TypeId>,
+}
+
+impl FieldPath<'_> {
+    /// Emit the path's root and wrapper crossings: callers continue from the
+    /// last receiver with the fields after it, the last field's type
+    /// alongside. Facts for a path whose caller then emits nothing stay
+    /// sound (may-analysis).
+    fn publish(
+        self,
+        program: &mut Program,
+        ctx: &mut LowerContext,
+        source: &str,
+    ) -> (VarId, Vec<FieldId>, Vec<String>, trace_ir::TypeId) {
+        let Self {
+            node,
+            root,
+            mut field_ids,
+            mut field_names,
+            member_type,
+            boundaries,
+            summary_receiver,
+        } = self;
+        let base = match root {
+            PathRoot::Var(base) => base,
+            PathRoot::Call(call, root) => {
+                let result = alloc_ret_temp(program, ctx, call);
+                program.symbols.variable_mut(result).type_id = root.wrapper;
+                emit_call_return(program, ctx, call, result, root.callee);
+                result
+            }
+            PathRoot::Deref(value) => value.publish(program, ctx, source),
+        };
+        let base =
+            summary_receiver.map_or(base, |owner| alloc_recv_temp(program, ctx, node, owner));
+        let (base, path_start) = emit_wrapper_boundaries(
+            program,
+            ctx,
+            node,
+            base,
+            &field_ids,
+            &field_names,
+            &boundaries,
+        );
+        field_ids.drain(..path_start);
+        field_names.drain(..path_start);
+        (base, field_ids, field_names, member_type)
+    }
+
+    /// Emit the path and the cell holding the member's value, with the
+    /// type a load from it reads: none for an array member, which is its own
+    /// cell (its value is its address); an element's for an element of a
+    /// member table (`element`); else the member's declared type.
+    fn value_cell(
+        self,
+        program: &mut Program,
+        ctx: &mut LowerContext,
+        source: &str,
+        element: bool,
+    ) -> (VarId, Option<trace_ir::TypeId>) {
+        let (cell, member_type) = self.cell(program, ctx, source);
+        let loaded = match program.types.get(member_type).desc.as_ref().clone() {
+            TypeDesc::Array { .. } if !element => None,
+            TypeDesc::Array { elem, .. } => Some(program.types.intern(*elem)),
+            _ => Some(member_type),
+        };
+        (cell, loaded)
+    }
+
+    /// Emit the path and the cell its last field is, with that field's
+    /// declared type.
+    fn cell(
+        self,
+        program: &mut Program,
+        ctx: &mut LowerContext,
+        source: &str,
+    ) -> (VarId, trace_ir::TypeId) {
+        let node = self.node;
+        let (base, field_ids, field_names, member_type) = self.publish(program, ctx, source);
+        let cell = emit_gep_chain(program, ctx, node, base, &field_ids, &field_names);
+        (cell, member_type)
+    }
+}
+
+/// Where a field path starts: a variable, a smart pointer a direct call
+/// returns, or the value a class object's dereference reads, whose own
+/// root variable is another object.
+enum PathRoot<'t> {
     Var(VarId),
-    Call(CallRoot),
+    Call(Node<'t>, CallRoot),
+    Deref(Box<Operand<'t>>),
 }
 
 /// A direct call returning a smart pointer, as a field path's root.
@@ -10532,9 +11017,9 @@ struct CallRoot {
 
 /// `call` as a path root: a direct call by plain name, followed by `->`,
 /// returning a smart pointer; see `docs/ANALYSIS.md`, "Smart-pointer
-/// unwrap". Any other call root is left to the callers' own handling;
-/// evaluating an arbitrary root expression as a value is the direction #151
-/// proposes. The cheap syntactic checks run before the call is typed.
+/// unwrap". Any other call root, a qualified or member call among them, is
+/// left to the callers' own handling. The cheap syntactic checks run before
+/// the call is typed.
 fn call_root(
     program: &Program,
     ctx: &LowerContext,
@@ -10761,53 +11246,34 @@ fn is_deref_lhs(source: &str, node: Node) -> bool {
     pointer_op(source, node).as_deref() == Some("*")
 }
 
-fn deref_operand(node: Node) -> Option<Node> {
-    pointer_arg(node)
+/// The operand `x` of a dereference `*x`.
+fn deref_operand<'t>(source: &str, node: Node<'t>) -> Option<Node<'t>> {
+    pointer_arg(node).filter(|_| is_deref_lhs(source, node))
 }
 
-/// Inside a C++ class method, a bare identifier like `infImpl` that is a
-/// member of the enclosing class should be implicitly treated as
-/// `this->infImpl`.  Returns the GEP temp VarId representing the member
-/// address when the identifier matches a class field, `None` otherwise.
-fn resolve_implicit_this_member(
-    program: &mut Program,
-    ctx: &LowerContext,
-    source: &str,
-    node: Node,
-) -> Option<VarId> {
-    let field_name = node_text(source, &node);
-    let (field_id, owner_tid) = class_ctx_field(program, ctx, field_name)?;
-    // The body's `this`: a member's own, or the one a lambda captured. A
-    // lambda's first parameter is no `this`, and one that captures none
-    // reads no member.
-    let this_var = *ctx.locals.get("this")?;
-    let base = if struct_type_for_var(program, this_var) == Some(owner_tid) {
-        this_var
-    } else {
-        alloc_recv_temp(program, ctx, node, owner_tid)
-    };
-    Some(alloc_gep_temp(
-        program,
-        ctx,
-        node,
-        base,
-        field_id,
-        field_name.to_string(),
-    ))
-}
-
-/// The instance field `name` of the C++ class whose member is being lowered.
-fn class_ctx_field(
-    program: &Program,
-    ctx: &LowerContext,
-    name: &str,
-) -> Option<(trace_ir::FieldId, trace_ir::TypeId)> {
+/// The instance field `name` of the C++ class whose member is being lowered,
+/// or of a base it inherits one from, with its declaring class and its
+/// type. Whether a bare name in the body designates it is
+/// [`implicit_this`]'s rule.
+fn class_ctx_field(program: &Program, ctx: &LowerContext, name: &str) -> Option<HierarchyField> {
     if !ctx.is_cpp {
         return None;
     }
     let root = &ctx.class_ctx.as_ref()?.qual_name;
-    let hf = lookup_field_in_hierarchy(program, Some(ctx), root, name)?;
-    Some((hf.field_id, hf.owner_type_id))
+    lookup_field_in_hierarchy(program, Some(ctx), root, name)
+}
+
+/// The cell a member names and the member's declared type: a field path
+/// (`h->pp`), or a bare instance field in a member body (`m_pp`, as
+/// `this->m_pp`). `None`, with nothing emitted, for anything else.
+fn member_cell(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<(VarId, trace_ir::TypeId)> {
+    let path = field_path(program, ctx, source, node)?;
+    Some(path.cell(program, ctx, source))
 }
 
 /// Lower `&base.f1.f2` into a gep-temp chain so the resulting pointer
@@ -10815,7 +11281,7 @@ fn class_ctx_field(
 /// not the flattened outer instance. Returns the final temp var.
 fn addr_of_field_path(
     program: &mut Program,
-    ctx: &LowerContext,
+    ctx: &mut LowerContext,
     source: &str,
     arg: Node,
 ) -> Option<VarId> {
@@ -10827,23 +11293,10 @@ fn addr_of_field_path(
         }
         return Some(addr_of_temp(program, ctx, peeled, member));
     }
-    // &field_expression → direct field path
-    if peeled.kind() == "field_expression" {
-        let (base, field_ids, field_names) = decompose_field_path(program, ctx, source, peeled)?;
-        return Some(emit_gep_chain(
-            program,
-            ctx,
-            peeled,
-            base,
-            &field_ids,
-            &field_names,
-        ));
-    }
-    // &identifier → check for C++ implicit this->member
-    if peeled.kind() == "identifier" && lookup_var_node(program, ctx, source, peeled).is_none() {
-        if let Some(gep) = resolve_implicit_this_member(program, ctx, source, peeled) {
-            return Some(gep);
-        }
+    // &field_expression → direct field path; &identifier → check for C++
+    // implicit this->member
+    if let Some((cell, _)) = member_cell(program, ctx, source, peeled) {
+        return Some(cell);
     }
     // &ptr_expr → peel through pointer_expression with &
     if peeled.kind() == "pointer_expression" && pointer_op(source, peeled).as_deref() == Some("&") {
@@ -10871,7 +11324,7 @@ fn expr_to_store_src(
         return None;
     }
     // `t.a[i] = s.b[j]` stores the value read from the field `b`.
-    if let Some(table) = field_table(node) {
+    if let Some(table) = field_table(program, ctx, source, node) {
         let temp = alloc_ret_temp(program, ctx, node);
         let flow = expr_to_rhs_flow(program, ctx, source, table, temp)?;
         program.flow.push(flow);
@@ -10884,6 +11337,10 @@ fn expr_to_store_src(
             if op.as_deref() == Some("&") {
                 return addr_of_field_path(program, ctx, source, arg)
                     .or_else(|| resolve_lvalue_var(program, ctx, source, arg));
+            }
+            // `*out = *h->pp` stores the value `*h->pp` reads.
+            if op.as_deref() == Some("*") {
+                return operand_value(program, ctx, source, node);
             }
             None
         }
@@ -10906,19 +11363,14 @@ fn expr_to_rhs_flow(
     if node_is_from_ignored_macro(ctx, node) {
         return None;
     }
-    // `f = s.ops[i]` reads the field `ops`.
-    if let Some(table) = subscript_table(node) {
-        if table.kind() == "field_expression" {
-            return expr_to_rhs_flow(program, ctx, source, table, dst);
-        } else if ctx.is_cpp && table.kind() == "identifier" {
-            let name = node_text(source, &table);
-            let found = lookup_var_unless_hidden(ctx, program, name);
-            if let Some(Some(src)) = found {
-                return Some(FlowConstraint::Copy { dst, src });
-            } else if let Some(gep) = resolve_implicit_this_member(program, ctx, source, table) {
-                return Some(FlowConstraint::Load { dst, src: gep });
-            }
-        }
+    // `f = s.ops[i]` reads the field `ops`, as `f = ops_[i]` reads
+    // `this->ops_`: an element of a member table ([`Operand`]). A static
+    // member table is a variable of its own, read as its name is.
+    if let Some(table) = field_table(program, ctx, source, node) {
+        return match Operand::resolve(program, ctx, source, node) {
+            Some(element) => Some(element.read_into(program, ctx, source, dst)),
+            None => expr_to_rhs_flow(program, ctx, source, table, dst),
+        };
     }
     match node.kind() {
         "this" => ctx
@@ -10927,16 +11379,18 @@ fn expr_to_rhs_flow(
             .copied()
             .map(|src| FlowConstraint::Copy { dst, src }),
         "identifier" => {
-            let name = node_text(source, &node);
             // A declared name shadows a function of the same name, as in the
-            // return arm: a variable first, then an instance field (read
-            // through `this`), then the function. A name a nearer field or
-            // function hides reads no variable.
+            // return arm: an instance field unless the body hides it (its
+            // value, read through `this`; `implicit_this`), then a variable,
+            // then the function. A name a nearer field or function hides
+            // reads no variable.
+            if implicit_this(program, ctx, source, node).is_some() {
+                return operand_flow(program, ctx, source, node, dst);
+            }
+            let name = node_text(source, &node);
             let found = lookup_var_unless_hidden(ctx, program, name);
             if let Some(Some(src)) = found {
                 Some(FlowConstraint::Copy { dst, src })
-            } else if let Some(gep) = resolve_implicit_this_member(program, ctx, source, node) {
-                Some(FlowConstraint::Load { dst, src: gep })
             } else if let Some(callee) = resolve_function_named(program, ctx, name) {
                 Some(FlowConstraint::AddrOfFn { dst, callee })
             } else if found.is_some() {
@@ -10994,8 +11448,20 @@ fn expr_to_rhs_flow(
                     None
                 }
             } else if op.as_deref() == Some("*") {
-                let ptr = resolve_lvalue_var(program, ctx, source, arg)?;
-                Some(FlowConstraint::Load { dst, src: ptr })
+                let Some((value, in_place)) = deref_target(program, ctx, source, node) else {
+                    // A function designator is read in place: `*handler` is
+                    // `handler`, as a value names it.
+                    let operand = peel_expression(arg);
+                    return matches!(operand.kind(), "identifier" | "qualified_identifier")
+                        .then(|| expr_to_rhs_flow(program, ctx, source, operand, dst))
+                        .flatten();
+                };
+                let src = value.publish(program, ctx, source);
+                Some(if in_place {
+                    FlowConstraint::Copy { dst, src }
+                } else {
+                    FlowConstraint::Load { dst, src }
+                })
             } else {
                 None
             }
@@ -11020,14 +11486,9 @@ fn expr_to_rhs_flow(
             }
             None
         }
-        "field_expression" => {
-            if let Some(src) = static_member_access(program, ctx, source, node) {
-                return Some(FlowConstraint::Copy { dst, src });
-            }
-            let (base, field_ids, field_names) = decompose_field_path(program, ctx, source, node)?;
-            let cell = emit_gep_chain(program, ctx, node, base, &field_ids, &field_names);
-            Some(FlowConstraint::Load { dst, src: cell })
-        }
+        // `p = h->pp` reads the member's value, as any value position does
+        // ([`Operand`]); a static data member is its own variable.
+        "field_expression" => operand_flow(program, ctx, source, node, dst),
         "new_expression" if ctx.is_cpp => {
             if let Some(cls) = new_expression_class(program, ctx, source, node) {
                 // Allocate a temp representing the heap allocation result.
@@ -11077,7 +11538,7 @@ fn expr_to_rhs_flow(
 
 fn collect_return_statement(
     program: &mut Program,
-    ctx: &LowerContext,
+    ctx: &mut LowerContext,
     source: &str,
     node: Node,
     fn_id: FnId,
@@ -11102,7 +11563,7 @@ fn collect_return_statement(
 
 fn collect_return_flow(
     program: &mut Program,
-    ctx: &LowerContext,
+    ctx: &mut LowerContext,
     source: &str,
     node: Node,
     fn_id: FnId,
@@ -11114,7 +11575,7 @@ fn collect_return_flow(
 
 fn return_flow_from_expr(
     program: &mut Program,
-    ctx: &LowerContext,
+    ctx: &mut LowerContext,
     source: &str,
     node: Node,
     fn_id: FnId,
@@ -11126,22 +11587,15 @@ fn return_flow_from_expr(
     if node_is_from_ignored_macro(ctx, node) {
         return None;
     }
-    if let Some(table) = subscript_table(node) {
-        if table.kind() == "field_expression" {
-            return return_flow_from_expr(program, ctx, source, table, fn_id);
-        } else if ctx.is_cpp && table.kind() == "identifier" {
-            let name = node_text(source, &table);
-            let found = lookup_var_unless_hidden(ctx, program, name);
-            if let Some(Some(src)) = found {
-                return Some(ReturnFlow::Copy { src });
-            } else if let Some(gep) = resolve_implicit_this_member(program, ctx, source, table) {
-                let load_var = alloc_load_temp(program, ctx, node, program.types.int());
-                program.flow.push(FlowConstraint::Load {
-                    dst: load_var,
-                    src: gep,
-                });
-                return Some(ReturnFlow::Copy { src: load_var });
-            }
+    // `return s.ops[i];` / `return ops_[i];` returns the member's value,
+    // an element of a member table being its cell.
+    if field_table(program, ctx, source, node).is_some() {
+        return operand_value(program, ctx, source, node).map(|src| ReturnFlow::Copy { src });
+    }
+    // `return ops[i];` returns the table variable `ops`'s value.
+    if let Some(table) = subscript_table(node).filter(|t| ctx.is_cpp && t.kind() == "identifier") {
+        if let Some(src) = lookup_var(ctx, program, node_text(source, &table)) {
+            return Some(ReturnFlow::Copy { src });
         }
     }
     match node.kind() {
@@ -11188,24 +11642,31 @@ fn return_flow_from_expr(
                 }
                 return None;
             }
+            // `return *h->pp;` returns the value `*h->pp` reads. A function
+            // returning a reference returns the referent's address instead:
+            // `S &inst() { return *sp; }` returns `sp`'s value.
+            if op.as_deref() == Some("*") {
+                let returns_reference = ctx.reference_returns.contains(&fn_id);
+                let value = if returns_reference { arg } else { node };
+                return operand_value(program, ctx, source, value)
+                    .map(|src| ReturnFlow::Copy { src });
+            }
             None
         }
         "identifier" => {
+            // A declared name shadows a function of the same name: an
+            // instance field unless the body hides it (its value, read
+            // through `this`; `implicit_this`), then a variable, then the
+            // function. A name a nearer field or function hides reads no
+            // variable.
+            if implicit_this(program, ctx, source, node).is_some() {
+                return operand_value(program, ctx, source, node)
+                    .map(|src| ReturnFlow::Copy { src });
+            }
             let name = node_text(source, &node);
-            // A declared name shadows a function of the same name, as in the
-            // return arm: a variable first, then an instance field (read
-            // through `this`), then the function. A name a nearer field or
-            // function hides reads no variable.
             let found = lookup_var_unless_hidden(ctx, program, name);
             if let Some(Some(src)) = found {
                 Some(ReturnFlow::Copy { src })
-            } else if let Some(gep) = resolve_implicit_this_member(program, ctx, source, node) {
-                let load_var = alloc_load_temp(program, ctx, node, program.types.int());
-                program.flow.push(FlowConstraint::Load {
-                    dst: load_var,
-                    src: gep,
-                });
-                Some(ReturnFlow::Copy { src: load_var })
             } else if let Some(callee) = resolve_function_named(program, ctx, name) {
                 Some(ReturnFlow::AddrOfFn { callee })
             } else if found.is_some() {
@@ -11218,26 +11679,10 @@ fn return_flow_from_expr(
                 None
             }
         }
+        // `return h->pp;` returns the member's value, as any value position
+        // reads it ([`Operand`]); a static data member is its own variable.
         "field_expression" => {
-            if let Some(src) = static_member_access(program, ctx, source, node) {
-                return Some(ReturnFlow::Copy { src });
-            }
-            let (base, field_ids, field_names) = decompose_field_path(program, ctx, source, node)?;
-            let mut current = base;
-            for (i, fid) in field_ids.iter().enumerate() {
-                if i + 1 == field_ids.len() {
-                    let gep =
-                        alloc_gep_temp(program, ctx, node, current, *fid, field_names[i].clone());
-                    let load_var = alloc_load_temp(program, ctx, node, program.types.int());
-                    program.flow.push(FlowConstraint::Load {
-                        dst: load_var,
-                        src: gep,
-                    });
-                    return Some(ReturnFlow::Copy { src: load_var });
-                }
-                current = alloc_gep_temp(program, ctx, node, current, *fid, field_names[i].clone());
-            }
-            None
+            operand_value(program, ctx, source, node).map(|src| ReturnFlow::Copy { src })
         }
         "qualified_identifier" => {
             if let Some(src) = lookup_var_node(program, ctx, source, node) {
@@ -11394,6 +11839,297 @@ fn alloc_ret_temp_spanned(program: &mut Program, owner: Option<FnId>, span: Span
         is_pointer: true,
     });
     var_id
+}
+
+/// What a read `y = *x` or a store `*x = v` goes through, given `*x`: `x`'s
+/// value ([`Operand`]) and whether `*x` reads it in place, or, where it
+/// cannot be computed, `x`'s root variable, as these two did before
+/// (docs/ANALYSIS.md, "Dereferenced operands"). Other value positions take
+/// [`operand_value`] alone.
+fn deref_target<'t>(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    deref: Node<'t>,
+) -> Option<(Operand<'t>, bool)> {
+    let resolved = Operand::resolve(program, ctx, source, deref).and_then(Operand::into_deref);
+    resolved.or_else(|| {
+        let operand = peel_expression(deref_operand(source, deref)?);
+        let var = resolve_lvalue_var(program, ctx, source, operand)?;
+        let in_place = reads_in_place(program, ctx, source, operand);
+        Some((Operand::Var(operand, var), in_place))
+    })
+}
+
+/// The value `operand` holds, emitted ([`Operand`]); `None`, with nothing
+/// emitted, where it cannot be computed.
+fn operand_value(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    operand: Node,
+) -> Option<VarId> {
+    let value = Operand::resolve(program, ctx, source, operand)?;
+    Some(value.publish(program, ctx, source))
+}
+
+/// `dst = operand`: `operand`'s value ([`Operand`]) flows into `dst`
+/// directly, a member's without a temporary of its own; `None`, with
+/// nothing emitted, where it cannot be computed.
+fn operand_flow(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    operand: Node,
+    dst: VarId,
+) -> Option<FlowConstraint> {
+    let value = Operand::resolve(program, ctx, source, operand)?;
+    Some(value.read_into(program, ctx, source, dst))
+}
+
+/// A dereference operand's value, resolved and validated with nothing
+/// emitted, as a [`FieldPath`] is: a store resolves the pointer it stores
+/// through before its value, and emits it only once there is one.
+enum Operand<'t> {
+    /// A variable's own value, read through it when it names a reference.
+    Var(Node<'t>, VarId),
+    /// A member's value, from the cell its path reaches: the cell itself
+    /// for an array member, else loaded from it. `true` for an element of a
+    /// member table (`h->t[i]`), always loaded, as `field_table` reads one.
+    Member(FieldPath<'t>, bool),
+    /// What an inner dereference reads: in place for a function pointer.
+    Deref(Node<'t>, Box<Operand<'t>>, bool),
+    /// A recorded call's result, with the function-pointer member it calls
+    /// through, resolved once.
+    Call(Node<'t>, Option<FieldPath<'t>>),
+}
+
+impl<'t> Operand<'t> {
+    /// `operand`'s value where it can be computed: a variable's own, `this`
+    /// included; a member's (`h->pp`, a bare instance field `m_pp`, an
+    /// element of a member table `h->t[i]`); a recorded call's result; and
+    /// what an inner dereference reads (`*pp` in `**pp`). `None` for
+    /// anything else.
+    fn resolve(
+        program: &mut Program,
+        ctx: &LowerContext,
+        source: &str,
+        operand: Node<'t>,
+    ) -> Option<Self> {
+        let operand = peel_expression(operand);
+        // An instance field outranks a namespace variable of its name, which
+        // it hides even where its path does not resolve.
+        if implicit_this(program, ctx, source, operand).is_some() {
+            return field_path(program, ctx, source, operand).map(|path| Self::Member(path, false));
+        }
+        let var = match operand.kind() {
+            "identifier" | "qualified_identifier" => lookup_var_node(program, ctx, source, operand),
+            "field_expression" => static_member_access(program, ctx, source, operand),
+            "this" => this_root(ctx, source, operand),
+            _ => None,
+        };
+        if let Some(var) = var {
+            return Some(Self::Var(operand, var));
+        }
+        match operand.kind() {
+            "field_expression" => {
+                field_path(program, ctx, source, operand).map(|path| Self::Member(path, false))
+            }
+            // An element of a member table is the table's cell, as in
+            // `field_table`, so it holds the member's value.
+            "subscript_expression" => field_path(
+                program,
+                ctx,
+                source,
+                field_table(program, ctx, source, operand)?,
+            )
+            .map(|path| Self::Member(path, true)),
+            "pointer_expression" => {
+                let inner = deref_operand(source, operand)?;
+                let value = Self::resolve(program, ctx, source, inner)?;
+                // A member's type is the one its path resolved: a
+                // function-pointer member (`FnPtr`) is read in place.
+                let in_place = match &value {
+                    Self::Member(path, _) => matches!(
+                        program.types.get(path.member_type).desc.as_ref(),
+                        TypeDesc::FnPtr { .. }
+                    ),
+                    _ => reads_in_place(program, ctx, source, inner),
+                };
+                Some(Self::Deref(operand, Box::new(value), in_place))
+            }
+            // Only a call whose result is recorded: a direct callee's, or a
+            // function-pointer member's (`h->cb()`, `h.s_cb()`). A method's
+            // result is not, whatever its receiver, nor a class-typed
+            // member's `operator()`.
+            "call_expression" => {
+                if resolve_direct_call(program, ctx, source, operand).is_some() {
+                    return Some(Self::Call(operand, None));
+                }
+                let callee = operand
+                    .child_by_field_name("function")
+                    .map(peel_expression)
+                    .filter(|callee| callee.kind() == "field_expression")?;
+                if static_member_access(program, ctx, source, callee).is_some() {
+                    return Some(Self::Call(operand, None));
+                }
+                let path = field_path(program, ctx, source, callee)?;
+                matches!(
+                    program.types.get(path.member_type).desc.as_ref(),
+                    TypeDesc::FnPtr { .. }
+                )
+                .then_some(Self::Call(operand, Some(path)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Emit the value into `dst`: a member's is read off its cell, loaded
+    /// or, for an array member, copied; anything else is copied from the
+    /// variable [`Self::publish`] returns.
+    fn read_into(
+        self,
+        program: &mut Program,
+        ctx: &mut LowerContext,
+        source: &str,
+        dst: VarId,
+    ) -> FlowConstraint {
+        match self {
+            Self::Member(path, element) => match path.value_cell(program, ctx, source, element) {
+                (src, None) => FlowConstraint::Copy { dst, src },
+                (src, Some(_)) => FlowConstraint::Load { dst, src },
+            },
+            value => FlowConstraint::Copy {
+                dst,
+                src: value.publish(program, ctx, source),
+            },
+        }
+    }
+
+    /// A resolved `*x`: `x`'s value, and whether `*x` reads it in place.
+    fn into_deref(self) -> Option<(Self, bool)> {
+        match self {
+            Self::Deref(_, inner, in_place) => Some((*inner, in_place)),
+            _ => None,
+        }
+    }
+
+    /// Emit the value and return the variable holding it.
+    fn publish(self, program: &mut Program, ctx: &mut LowerContext, source: &str) -> VarId {
+        match self {
+            // A reference holds its referent's address.
+            Self::Var(node, var) if names_reference_binding(ctx, node, var) => {
+                let desc = var_receiver_desc(program, ctx, var);
+                let referent = program.types.resolve_type_id(&desc);
+                emit_load(program, ctx, node, var, referent)
+            }
+            Self::Var(_, var) => var,
+            Self::Member(path, element) => {
+                let node = path.node;
+                match path.value_cell(program, ctx, source, element) {
+                    (cell, None) => cell,
+                    (cell, Some(loaded)) => emit_load(program, ctx, node, cell, loaded),
+                }
+            }
+            Self::Deref(node, inner, in_place) => {
+                let value = inner.publish(program, ctx, source);
+                if in_place {
+                    return value;
+                }
+                let desc = program
+                    .types
+                    .get(program.symbols.variable(value).type_id)
+                    .desc
+                    .as_ref()
+                    .clone();
+                let pointee = deref_desc(program, desc).map_or_else(
+                    || program.types.unknown(),
+                    |d| program.types.resolve_type_id(&d),
+                );
+                emit_load(program, ctx, node, value, pointee)
+            }
+            // The call's result, received as any call's is.
+            Self::Call(call, path) => {
+                // The member's path was resolved here once: its function
+                // pointer is loaded where the call's lowering looks it up.
+                if let Some(path) = path {
+                    let callee = path.node;
+                    let (base, field_ids, field_names, _) = path.publish(program, ctx, source);
+                    let decomposed = (base, field_ids, field_names);
+                    if let Some(found) =
+                        field_fn_ptr_callee(program, ctx, source, callee, decomposed)
+                    {
+                        ctx.callee_load_cache
+                            .borrow_mut()
+                            .insert(callee.id(), found);
+                    }
+                }
+                let result = alloc_ret_temp(program, ctx, call);
+                if let Some(flow) = expr_to_rhs_flow(program, ctx, source, call, result) {
+                    program.flow.push(flow);
+                }
+                result
+            }
+        }
+    }
+}
+
+/// The body's `this` when `node` names an instance field through it. Class
+/// scope is asked before any namespace's, so only the body hides one: a
+/// local, a parameter, or a `using ns::name;` in the body.
+fn implicit_this(program: &Program, ctx: &LowerContext, source: &str, node: Node) -> Option<VarId> {
+    implicit_this_field(program, ctx, source, node).map(|(this, _)| this)
+}
+
+/// [`implicit_this`], with the field `node` names.
+fn implicit_this_field(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<(VarId, HierarchyField)> {
+    if node.kind() != "identifier" {
+        return None;
+    }
+    this_field_named(program, ctx, node_text(source, &node))
+}
+
+/// [`implicit_this_field`] for a name read off any node: `mu_` in
+/// `T g(mu_);`, which parses as a parameter's type.
+fn this_field_named(
+    program: &Program,
+    ctx: &LowerContext,
+    name: &str,
+) -> Option<(VarId, HierarchyField)> {
+    let this = ctx.locals.get("this").copied()?;
+    if ctx.locals.contains_key(name)
+        || variable_imported_by_declaration(ctx, program, name, &[ImportScope::Body]).is_some()
+    {
+        return None;
+    }
+    Some((this, class_ctx_field(program, ctx, name)?))
+}
+
+/// The body's `this` when `node` is the explicit `this`, or `*this`: a field
+/// path rooted there (`this->m_pp`, `(*this).m_pp`) starts where an instance
+/// field's implicit one does.
+fn this_root(ctx: &LowerContext, source: &str, node: Node) -> Option<VarId> {
+    let node = deref_operand(source, node).map_or(node, peel_expression);
+    ctx.locals
+        .get("this")
+        .copied()
+        .filter(|_| node.kind() == "this")
+}
+
+/// Whether `*operand` reads `operand`'s own value rather than through it: a
+/// function pointer dereferences to the function it designates (`*fp`); a
+/// pointer to one is loaded through (`*pfp`) as any `*p` is. An array's
+/// value is its own address, so `*arr` loads its cell as any `*p` does
+/// (docs/ANALYSIS.md, "Dereferenced operands").
+fn reads_in_place(program: &Program, ctx: &LowerContext, source: &str, operand: Node) -> bool {
+    receiver_desc(program, ctx, source, operand)
+        .and_then(|desc| deref_desc(program, desc))
+        .is_some_and(|desc| matches!(desc, TypeDesc::FnPtr { .. }))
 }
 
 fn resolve_lvalue_var(
@@ -11560,10 +12296,23 @@ fn type_desc_from_field_declaration(
         .map(|t| type_desc_from_node(program, ctx, source, t))
         .unwrap_or(TypeDesc::Int);
     let desc = if is_function_pointer_declarator(decl) {
-        TypeDesc::FnPtr {
+        // `void (**pcb)(void)` points to a function pointer: every pointer
+        // level past the first keeps its own layer.
+        let mut levels = 0;
+        let mut inner = decl.child_by_field_name("declarator");
+        while let Some(node) = inner {
+            levels += usize::from(node.kind() == "pointer_declarator");
+            inner = match node.kind() {
+                "parenthesized_declarator" => node.named_child(0),
+                "pointer_declarator" => node.child_by_field_name("declarator"),
+                _ => None,
+            };
+        }
+        let fn_ptr = TypeDesc::FnPtr {
             ret: Box::new(base),
             params: Vec::new(),
-        }
+        };
+        (1..levels).fold(fn_ptr, |desc, _| TypeDesc::Ptr(Box::new(desc)))
     } else if declarator_is_pointer_to_fn(decl) {
         // `struct T *(*Ref)(args)`: a pointer-wrapped function declarator.
         // Classifying it as a plain `Ptr(base)` loses the function-ness,
@@ -11578,6 +12327,27 @@ fn type_desc_from_field_declaration(
         TypeDesc::Ptr(Box::new(base))
     } else {
         base
+    };
+    // An array member keeps its array-ness, as its declarator nearest the
+    // name says (`int *arr[2]`, not `int (*p)[2]`): its value is its own
+    // cell, so `*h->arr` is `h->arr[0]` (docs/ANALYSIS.md, "Dereferenced
+    // operands"). Tables of functions stay function-pointer typed.
+    let mut innermost = decl;
+    while let Some(inner) = match innermost.kind() {
+        "parenthesized_declarator" => innermost.named_child(0),
+        _ => innermost.child_by_field_name("declarator"),
+    }
+    .filter(|inner| inner.kind().ends_with("_declarator"))
+    {
+        innermost = inner;
+    }
+    let desc = match desc {
+        TypeDesc::FnPtr { .. } => desc,
+        elem if innermost.kind() == "array_declarator" => TypeDesc::Array {
+            elem: Box::new(elem),
+            size: None,
+        },
+        desc => desc,
     };
     Some((fname, desc))
 }
@@ -11745,9 +12515,9 @@ fn resolve_callee_with_loads(
 ) -> CalleeRef {
     // `((cb_t)s.ops[i])()` calls the element as `s.ops[i]()` does.
     let node = peel_casts(source, node);
-    // Only a name the member's class declares as a field can be one.
-    let implicit_member = node.kind() == "identifier"
-        && class_ctx_field(program, ctx, node_text(source, &node)).is_some();
+    // Only a name the member's class declares as a field can be one, and
+    // only where the body does not hide it (`implicit_this`).
+    let implicit_member = implicit_this(program, ctx, source, node).is_some();
     if !implicit_member && !matches!(node.kind(), "field_expression" | "subscript_expression") {
         return resolve_callee(program, ctx, source, node);
     }
@@ -11760,30 +12530,21 @@ fn resolve_callee_with_loads(
     let mut result = None;
     if implicit_member {
         // `cb()` in a member body, `cb` an instance field: a load from
-        // `this->cb`, as `this->cb()` is. The field hides a function of its
-        // name outside the class; a variable in scope (a local) hides it.
-        let name = node_text(source, &node);
-        let field_load = lookup_var(ctx, program, name).is_none().then(|| {
-            resolve_implicit_this_member(program, ctx, source, node).map(|gep| {
-                let int = program.types.int();
-                emit_load(program, ctx, node, gep, int)
-            })
+        // `this->cb`, as `this->cb()` is. The field hides a function or a
+        // variable of its name outside the class; a local hides it. A field
+        // whose path does not resolve leaves the call unresolved, as its
+        // value is ([`Operand`]).
+        let field_load = member_cell(program, ctx, source, node).map(|(gep, _)| {
+            let int = program.types.int();
+            emit_load(program, ctx, node, gep, int)
         });
-        result = Some(match field_load.flatten() {
-            Some(load) => (name.to_string(), false, Some(load)),
-            None => resolve_callee(program, ctx, source, node),
-        });
-    } else if let Some((base, field_ids, field_names)) =
-        field_table(node).and_then(|table| decompose_field_path(program, ctx, source, table))
+        result = Some((node_text(source, &node).to_string(), false, field_load));
+    } else if let Some(decomposed) = field_table(program, ctx, source, node)
+        .and_then(|table| decompose_field_path(program, ctx, source, table))
     {
         // `s.table[i]()` / `p->table[i]()` calls an element of a field array:
         // a load from the field, where `s.table[i] = fn` stores.
-        let text = field_callee_text(source, node);
-        if let Some(load_var) =
-            emit_field_fn_ptr_load(program, ctx, source, node, base, &field_ids, &field_names)
-        {
-            result = Some((text, false, Some(load_var)));
-        }
+        result = field_fn_ptr_callee(program, ctx, source, node, decomposed);
     } else if node.kind() == "subscript_expression" {
         // `table[i]()` calls the element: a load from the table, which reads
         // what was stored in it and passes through the functions its
@@ -11792,7 +12553,6 @@ fn resolve_callee_with_loads(
         if let Some(table) = subscript_table(node) {
             let table_var = if is_name(table) {
                 lookup_var_node(program, ctx, source, table)
-                    .or_else(|| resolve_implicit_this_member(program, ctx, source, table))
             } else {
                 static_member_access(program, ctx, source, table)
             };
@@ -11802,15 +12562,8 @@ fn resolve_callee_with_loads(
                 result = Some((format!("{name}[...]"), false, Some(load_var)));
             }
         }
-    } else if let Some((base, field_ids, field_names)) =
-        decompose_field_path(program, ctx, source, node)
-    {
-        let text = field_callee_text(source, node);
-        if let Some(load_var) =
-            emit_field_fn_ptr_load(program, ctx, source, node, base, &field_ids, &field_names)
-        {
-            result = Some((text, false, Some(load_var)));
-        }
+    } else if let Some(decomposed) = decompose_field_path(program, ctx, source, node) {
+        result = field_fn_ptr_callee(program, ctx, source, node, decomposed);
     }
     let result = result.unwrap_or_else(|| resolve_callee(program, ctx, source, node));
     ctx.callee_load_cache
@@ -11858,6 +12611,19 @@ fn field_callee_text(source: &str, node: Node) -> String {
     }
 }
 
+/// A call through the function-pointer member a decomposed path reaches:
+/// the callee's spelling and the load of the pointer.
+fn field_fn_ptr_callee(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+    (base, field_ids, field_names): (VarId, Vec<FieldId>, Vec<String>),
+) -> Option<CalleeRef> {
+    let load = emit_field_fn_ptr_load(program, ctx, source, node, base, &field_ids, &field_names)?;
+    Some((field_callee_text(source, node), false, Some(load)))
+}
+
 fn emit_field_fn_ptr_load(
     program: &mut Program,
     ctx: &LowerContext,
@@ -11881,26 +12647,24 @@ fn emit_field_fn_ptr_load(
             *fid,
             field_names[i].clone(),
         );
-        let hf = field_id_in_hierarchy(program, Some(ctx), type_id, &field_names[i])?;
+        let hf = field_in_hierarchy(program, Some(ctx), type_id, &field_names[i])?;
         let field_type_id = hf.type_id;
         type_id = peel_ptr_to_struct(program, field_type_id);
         if i + 1 == field_ids.len() {
             let int = program.types.int();
             return Some(emit_load(program, ctx, span_node, gep, int));
         }
-        if matches!(
-            program.types.get(field_type_id).desc.as_ref(),
-            TypeDesc::Ptr(_)
-        ) {
-            current = emit_load(program, ctx, span_node, gep, field_type_id);
-            type_id = program.types.resolve_type_id(
-                match program.types.get(field_type_id).desc.as_ref() {
-                    TypeDesc::Ptr(inner) => inner,
-                    _ => unreachable!(),
-                },
-            );
-        } else {
-            current = gep;
+        match program.types.get(field_type_id).desc.as_ref().clone() {
+            TypeDesc::Ptr(inner) => {
+                current = emit_load(program, ctx, span_node, gep, field_type_id);
+                type_id = program.types.resolve_type_id(&inner);
+            }
+            // An array member's first element is in its own cell.
+            TypeDesc::Array { elem, .. } => {
+                current = gep;
+                type_id = program.types.resolve_type_id(&elem);
+            }
+            _ => current = gep,
         }
     }
     None
@@ -13043,7 +13807,7 @@ fn parse_declarator_name(source: &str, node: Node) -> (String, bool) {
 /// exactly the gaps a macro expansion introduces (`~ Cls`, `A :: b`). Between
 /// two words it is significant and collapses to a single space, so multi-word
 /// names keep their shape: `operator new`, `operator const char*`.
-fn normalize_qualified(text: &str) -> String {
+pub(crate) fn normalize_qualified(text: &str) -> String {
     fn is_word(c: char) -> bool {
         c.is_alphanumeric() || c == '_'
     }
@@ -13188,7 +13952,7 @@ fn qualify_type_name(ctx: &LowerContext, name: &str) -> String {
     }
 }
 
-fn sanitize_type_name(arg: &str) -> String {
+pub(crate) fn sanitize_type_name(arg: &str) -> String {
     let mut s = arg.trim();
     loop {
         let t = s.trim_start();
@@ -13412,6 +14176,161 @@ fn node_end_line(program: &Program, ctx: &LowerContext, node: Node, span: Span) 
 mod index_window_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn lower_cpp_snippet(source: &str) -> Program {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snippet.cpp");
+        std::fs::write(&path, source).unwrap();
+        let graph = IncludeGraph::build(dir.path(), std::slice::from_ref(&path), &[]);
+        let pre = PreprocessedSource {
+            text: source.into(),
+            line_map: Default::default(),
+            included_headers: Default::default(),
+            inlined_headers: Default::default(),
+            language: Language::Cpp,
+            replayed_variants: Default::default(),
+            diagnostics: Vec::new(),
+            conditionals: Vec::new(),
+        };
+        let mut program = Program::new(dir.path().to_path_buf());
+        lower_prepared_source(
+            &mut program,
+            &path,
+            &graph,
+            Arc::new(pre),
+            Language::Cpp,
+            false,
+            false,
+            None,
+            &[],
+        )
+        .unwrap();
+        program
+    }
+
+    #[test]
+    fn class_template_records_parameter_bases_and_no_parameter_edge() {
+        let program = lower_cpp_snippet(
+            "namespace OHOS { template <class I> class IRemoteStub : public I {}; }\n\
+             template <class T> class Wrapper : public OHOS::IRemoteStub<T> {};\n\
+             struct Base {};\ntemplate <class T> class Plain : public Base {};\n",
+        );
+        let stub = program
+            .class_templates
+            .get("OHOS::IRemoteStub")
+            .expect("recorded");
+        assert_eq!(stub.parameters, vec![Some("I".to_string())]);
+        assert_eq!(stub.dependent_bases, vec!["I".to_string()]);
+        let wrapper = program.class_templates.get("Wrapper").expect("recorded");
+        assert_eq!(
+            wrapper.dependent_bases,
+            vec!["OHOS::IRemoteStub<T>".to_string()]
+        );
+        assert!(
+            !program.class_templates.contains_key("Plain"),
+            "no base mentions a parameter"
+        );
+        assert!(
+            program.bases_of("OHOS::IRemoteStub").is_empty(),
+            "`I` is not a class"
+        );
+        assert_eq!(
+            program.bases_of("Wrapper"),
+            vec!["OHOS::IRemoteStub".to_string()]
+        );
+    }
+
+    #[test]
+    fn nested_classes_of_a_class_template_record_no_parameter_edge() {
+        let program = lower_cpp_snippet(
+            "template <class T> struct Outer {\n\
+             struct Inner : T {};\n\
+             template <class U> struct In : U {};\n\
+             };\n",
+        );
+        let inner: Vec<_> = program
+            .class_templates
+            .keys()
+            .filter(|name| name.ends_with("Inner"))
+            .collect();
+        assert!(inner.is_empty(), "{inner:?}: `Inner` is no template");
+        for name in ["Inner", "Outer::Inner", "In", "Outer::In"] {
+            assert!(
+                program.bases_of(name).is_empty(),
+                "{name}: `T`/`U` are no classes"
+            );
+        }
+        let (_, fact) = program
+            .class_templates
+            .iter()
+            .find(|(name, _)| name.ends_with("In"))
+            .expect("recorded");
+        assert_eq!(fact.parameters, vec![Some("U".to_string())]);
+        assert_eq!(fact.dependent_bases, vec!["U".to_string()]);
+    }
+
+    #[test]
+    fn classes_inside_any_template_take_no_parameter_edge() {
+        let program = lower_cpp_snippet(
+            "struct Host {\n\
+             template <class U> struct Member : U {};\n\
+             template <class V> void Method() { struct Local : V {}; }\n\
+             };\n\
+             template <class W> struct Outer { struct Inner { struct Deep : W {}; }; };\n\
+             template <class X> void Free() { struct InFn : X {}; }\n",
+        );
+        let parameter_edges: Vec<_> = program
+            .inheritance()
+            .iter()
+            .filter(|(_, base)| ["U", "V", "W", "X"].iter().any(|p| base.ends_with(p)))
+            .collect();
+        assert!(parameter_edges.is_empty(), "{parameter_edges:?}");
+    }
+
+    #[test]
+    fn class_template_specializations_record_no_parameter_bases() {
+        let program = lower_cpp_snippet(
+            "template <class T> struct Layer {};\n\
+             template <class T> class W : public T {};\n\
+             template <class U> class W<U*> : public Layer<U> {};\n\
+             template <class T> class V;\n\
+             template <class U> class V<U*> : public U {};\n",
+        );
+        let w = program.class_templates.get("W").expect("primary recorded");
+        assert_eq!(w.parameters, vec![Some("T".to_string())]);
+        assert_eq!(w.dependent_bases, vec!["T".to_string()]);
+        assert_eq!(
+            program.class_templates.len(),
+            1,
+            "specializations record nothing"
+        );
+    }
+
+    #[test]
+    fn partial_specialization_templated_bases_stay_template_bases() {
+        let program = lower_cpp_snippet(
+            "template <class T> struct Layer {};\n\
+             template <class T> class W : public T {};\n\
+             template <class U> class W<U*> : public Layer<U> {};\n\
+             template <template <class> class B, class T> class Wrap : public B<T> {};\n",
+        );
+        let facts: Vec<_> = program
+            .template_bases_of("W")
+            .into_iter()
+            .map(|f| (f.spelling.as_str(), f.is_dependent))
+            .collect();
+        assert_eq!(facts, [("Layer<U>", true)]);
+        assert!(
+            program.derives_from("W", "Layer"),
+            "{:?}",
+            program.bases_of("W")
+        );
+        assert!(
+            program.template_bases_of("Wrap").is_empty(),
+            "`B<T>` with a template template parameter `B` names no class"
+        );
+        assert!(!program.bases_of("Wrap").iter().any(|b| b == "B"));
+    }
 
     #[test]
     fn review_scoped_weak_attributes() {
@@ -14048,6 +14967,8 @@ mod qualified_variable_lookup_tests {
             line_map: None,
             primary_path: PathBuf::new(),
             origin_file_ids: Vec::new(),
+            included_headers: Arc::default(),
+            unit_files: std::cell::OnceCell::new(),
             pending: RefCell::new(Vec::new()),
             ns_stack,
             using_nss: Vec::new(),
@@ -14065,9 +14986,11 @@ mod qualified_variable_lookup_tests {
             ast_depth_warned: false,
             reference_vars: HashSet::default(),
             reference_bindings: HashSet::default(),
+            reference_returns: HashSet::default(),
             local_scope_log: Vec::new(),
             tree: parsed.tree,
             has_templates: false,
+            template_depth: Cell::new(0),
             has_weak: false,
             record_link_ownership: false,
             header_unit: false,

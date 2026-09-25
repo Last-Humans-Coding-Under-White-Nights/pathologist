@@ -1246,3 +1246,99 @@ fn inspect_callgraph_up_for_implicit_member_pointer_fn_ptr() {
         "inspect callgraph up should report Dispatcher::Dispatch as caller of target_callback, got:\n{stdout}"
     );
 }
+
+/// Issue #151 (docs/ANALYSIS.md, "Dereferenced operands"): what `dataflow`
+/// reports down from `func`'s locals `starts`, uncut, as value-flow
+/// `(from, to, label)` edges for [`common::flow_chain`].
+fn dataflow_down(
+    conn: &rusqlite::Connection,
+    func: &str,
+    starts: &[&str],
+) -> Vec<(i64, i64, String)> {
+    let starts: Vec<_> = starts
+        .iter()
+        .map(|name| symbol_in(conn, func, name))
+        .collect();
+    let graph = dataflow_graph(conn, &starts, Direction::Down, 12).unwrap();
+    assert!(!graph.truncated, "{func}: dataflow is cut off at depth 12");
+    (graph.edges.into_iter())
+        .map(|e| (e.from, e.to, e.label))
+        .collect()
+}
+
+/// The value-flow nodes of `func`'s local `name`.
+fn flow_nodes_of(conn: &rusqlite::Connection, func: &str, name: &str) -> Vec<i64> {
+    conn.prepare("SELECT id FROM flow_nodes WHERE var_id = ?1 AND kind = 'var'")
+        .unwrap()
+        .query_map([symbol_in(conn, func, name).var_id], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// Issue #151 guard: `dataflow` shows `o->inner->pp` reading through two
+/// field projections off `o`.
+#[test]
+fn dataflow_of_an_arrow_root_guard() {
+    let root = fixture("deref_member_reads");
+    for full_detail in [false, true] {
+        let db = export_tree_with(&root, "deref_member_reads", full_detail);
+        let conn = open_db(&db).unwrap();
+        let edges = dataflow_down(&conn, "read_arrow_root", &["o"]);
+        let o = flow_nodes_of(&conn, "read_arrow_root", "o");
+        let y = flow_nodes_of(&conn, "read_arrow_root", "arrow_y");
+        let mut read = common::flow_chain(&edges, &o, &["gep", "gep", "load"]);
+        read.extend(common::flow_chain(
+            &edges,
+            &o,
+            &["gep", "load", "gep", "load"],
+        ));
+        assert!(
+            y.iter().any(|n| read.contains(n)),
+            "full={full_detail}: {edges:?}"
+        );
+    }
+}
+
+/// Issue #151: `dataflow` shows `*h->pp` loading the `pp` member's value,
+/// then through it, with no load edge straight from `h`.
+#[test]
+fn dataflow_of_a_dereferenced_member_reads_the_member() {
+    let root = fixture("deref_member_reads");
+    for full_detail in [false, true] {
+        let db = export_tree_with(&root, "deref_member_reads", full_detail);
+        let conn = open_db(&db).unwrap();
+        for prefix in ["", "cpp_"] {
+            let func = format!("{prefix}read_member");
+            let edges = dataflow_down(&conn, &func, &["h"]);
+            let h = flow_nodes_of(&conn, &func, "h");
+            let y = flow_nodes_of(&conn, &func, &format!("{prefix}member_y"));
+            let loaded = common::flow_chain(&edges, &h, &["gep", "load", "load"]);
+            let what = format!("full={full_detail} {func}: {edges:?}");
+            assert!(y.iter().any(|n| loaded.contains(n)), "{what}");
+            let direct = |(from, to, label): &(i64, i64, String)| {
+                label == "load" && h.contains(from) && y.contains(to)
+            };
+            assert!(!edges.iter().any(direct), "{what}");
+        }
+    }
+}
+
+/// Issue #151: `dataflow` shows `*h->pp = v` storing through the `pp`
+/// member's value, not into `h`.
+#[test]
+fn dataflow_of_a_member_write_stores_through_the_member() {
+    let root = fixture("deref_member_reads");
+    for full_detail in [false, true] {
+        let db = export_tree_with(&root, "deref_member_reads", full_detail);
+        let conn = open_db(&db).unwrap();
+        let edges = dataflow_down(&conn, "write_member", &["h", "v"]);
+        let h = flow_nodes_of(&conn, "write_member", "h");
+        let v = flow_nodes_of(&conn, "write_member", "v");
+        let stored = common::flow_chain(&edges, &v, &["store"]);
+        let member_value = common::flow_chain(&edges, &h, &["gep", "load"]);
+        let what = format!("full={full_detail}: {edges:?}");
+        assert!(!stored.is_disjoint(&member_value), "{what}");
+        assert!(!h.iter().any(|n| stored.contains(n)), "{what}");
+    }
+}

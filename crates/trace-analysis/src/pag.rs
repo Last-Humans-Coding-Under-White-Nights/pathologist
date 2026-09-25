@@ -26,6 +26,11 @@ pub struct SolverIndices {
     pub copy_src: FxHashMap<PagNodeId, Vec<usize>>,
     pub addr_of_dst: FxHashMap<PagNodeId, Vec<usize>>,
     pub load_src: FxHashMap<PagNodeId, Vec<usize>>,
+    /// The nodes with a `load_src` entry, one bit per node id: the solver's
+    /// requeue of a hub location's loaders tests every holder, and a bit is
+    /// far cheaper to test than a map key. Kept in step with `load_src` by
+    /// [`SolverIndices::add_load`].
+    load_src_bits: Vec<u64>,
     pub store_dst: FxHashMap<PagNodeId, Vec<usize>>,
     pub store_src: FxHashMap<PagNodeId, Vec<usize>>,
     pub gep_src: FxHashMap<PagNodeId, Vec<usize>>,
@@ -34,6 +39,27 @@ pub struct SolverIndices {
     /// pointee declaration so propagation needs no further lookup.
     pub unwrap_src: FxHashMap<PagNodeId, Vec<(usize, trace_ir::TypeId)>>,
     pub indirect_by_target: FxHashMap<PagNodeId, Vec<trace_ir::CallSiteId>>,
+}
+
+impl SolverIndices {
+    /// Index Load constraint `idx` under its source `src`.
+    fn add_load(&mut self, src: PagNodeId, idx: usize) {
+        self.load_src.entry(src).or_default().push(idx);
+        let (word, bit) = (src.0 as usize / 64, src.0 % 64);
+        if word >= self.load_src_bits.len() {
+            self.load_src_bits.resize(word + 1, 0);
+        }
+        self.load_src_bits[word] |= 1u64 << bit;
+    }
+
+    /// Whether `node` is the source of a Load constraint (has a `load_src`
+    /// entry).
+    #[inline]
+    pub fn is_load_src(&self, node: PagNodeId) -> bool {
+        self.load_src_bits
+            .get(node.0 as usize / 64)
+            .is_some_and(|word| word & (1u64 << (node.0 % 64)) != 0)
+    }
 }
 
 /// Maximum nesting depth for instance-sensitive field locations. Deeper
@@ -222,7 +248,7 @@ impl Pag {
                     self.indices.addr_of_dst.entry(c.dst).or_default().push(i);
                 }
                 ConstraintKind::Load => {
-                    self.indices.load_src.entry(c.src).or_default().push(i);
+                    self.indices.add_load(c.src, i);
                 }
                 ConstraintKind::Store => {
                     self.indices.store_dst.entry(c.dst).or_default().push(i);
@@ -281,7 +307,7 @@ impl Pag {
                     srcs.push(c.src);
                 }
                 ConstraintKind::Load => {
-                    self.indices.load_src.entry(c.src).or_default().push(i);
+                    self.indices.add_load(c.src, i);
                     srcs.push(c.src);
                 }
                 ConstraintKind::Store => {
