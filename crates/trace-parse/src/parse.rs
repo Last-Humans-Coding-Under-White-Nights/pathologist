@@ -77,7 +77,7 @@ const MAX_PARSE_WALK_DEPTH: u32 = 512;
 /// have no declarator. Tree-sitter recovers by inserting a `(MISSING field_identifier)`
 /// immediately preceding the `bitfield_clause`.
 fn is_benign_parse_error(node: Node) -> bool {
-    if node.is_missing()
+    node.is_missing()
         && node.kind() == "field_identifier"
         && node
             .next_named_sibling()
@@ -85,10 +85,6 @@ fn is_benign_parse_error(node: Node) -> bool {
         && node
             .parent()
             .is_some_and(|p| p.kind() == "field_declaration")
-    {
-        return true;
-    }
-    false
 }
 
 /// Returns true if the parse tree contains genuine syntax errors.
