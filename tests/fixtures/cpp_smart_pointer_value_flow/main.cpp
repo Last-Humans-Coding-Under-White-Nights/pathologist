@@ -73,6 +73,16 @@ std::weak_ptr<Payload> get_weak() { return g_weak; }
 void promote_call_result() { auto call_promoted = get_weak().lock(); }
 struct WeakRef { std::weak_ptr<Payload> *weak; };
 void promote_deref_field(WeakRef *h) { auto deref_promoted = (*h->weak).lock(); }
+// A dereferenced call's result, and a dereferenced reference to a pointer,
+// which is bound to the pointer's value: one load reads the receiver.
+std::weak_ptr<Payload> *get_weak_ptr() { return &g_weak; }
+void promote_deref_call() { auto deref_call_promoted = (*get_weak_ptr()).lock(); }
+void promote_deref_ref(std::weak_ptr<Payload> *const &wr) { auto deref_ref_promoted = (*wr).lock(); }
+// A dereferenced method's result: nothing records it, so nothing is promoted.
+struct WeakSource { std::weak_ptr<Payload> *GetWeakPtr() { return &g_weak; } };
+void promote_deref_member_call(WeakSource *obj) {
+    auto deref_member_call_promoted = (*obj->GetWeakPtr()).lock();
+}
 void promote_into_deref_paren(std::weak_ptr<Payload> wp, std::shared_ptr<Payload> *out) {
     *out = (wp.lock());
 }

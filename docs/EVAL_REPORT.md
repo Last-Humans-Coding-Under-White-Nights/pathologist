@@ -1,5 +1,241 @@
 # Evaluation Report
 
+## Dereferenced operands and template-parameter bases — 2026-09-25 (#151, #150)
+
+The rules are defined in [Dereferenced operands](ANALYSIS.md#dereferenced-operands)
+(#151) and [Template-parameter bases](ANALYSIS.md#template-parameter-bases)
+(#150). This section records what the two changes moved. Both are measured
+together; each move is attributed to one of them by site, from SQL diffs of
+the baseline and candidate databases.
+
+Baseline: `master` at `6c924af` (#149), measured as a release build of
+`862b98e` (#148); #149 changes no file under `crates/*/src`, so the two are
+the same code. Candidate: a release build of this commit's code (the
+measured build predates two final cleanups, a dead-code removal and the
+scalar-array slot guard, which leave every call, argument-flow and flow-graph
+row of the three databases below unchanged).
+Both are release builds (`cargo build -p trace-cli --release`), rustc
+`1.100.0-nightly (bff8e12ff 2026-08-26)`, Apple M1 MacBook Air
+(`MacBookAir10,1`, 8 cores, 8 GB, macOS 26.6.2), `TRACE_SOLVE_BUDGET_POPS=800000`,
+`--jobs 8`, minimal export, on hdf `cdc75a2`, hiview `92408e2` and camera
+`8ffd69d`, all clean.
+
+### What moved
+
+`python3 scripts/eval_check.py` passes all 94 checks with the expectations
+below re-captured. Every metric not listed, including `files`,
+`functions_defined`, `edges_indirect`, `diagnostics`, `dlsym_edges`,
+`edges_ipc` (hdf 0, hiview 14, camera 2), every hiview metric and every
+dispatch-site and calibration probe, is identical to the baseline.
+
+| Corpus | Metric | `master` `6c924af` | Candidate | Change | Attribution |
+|---|---|---:|---:|---:|---|
+| hdf | `edges_total` | 74,821 | 74,823 | +2 | #150 |
+| hdf | `edges_direct` | 44,812 | 44,822 | +10 | #150 (+8 moved from external, +2 new) |
+| hdf | `edges_external` | 25,029 | 25,021 | −8 | #150 |
+| hdf | `arg_flow_edges` (and `arg_flow_rows_per_call_edge`) | 69,495 | 69,500 | +5 | #151 +3, #150 +2 |
+| hdf | `flow_graph_nodes` | 167,089 | 167,201 | +112 | #151 |
+| camera | `functions_total` | 23,512 | 23,511 | −1 | #150 |
+| camera | `functions_external` | 3,706 | 3,705 | −1 | #150 |
+| camera | `edges_total` | 102,104 | 102,102 | −2 | #150 |
+| camera | `edges_external` | 44,838 | 44,836 | −2 | #150 |
+| camera | `arg_flow_edges` | 43,306 | 43,311 | +5 | #151 |
+
+The arg-flow rows are compared keyed by call site (file, line, column,
+callee text), argument index, actual and formal, with numbered temporaries
+(`_ret12`, `_load7`) normalized. Beyond the net moves above, the same diff
+shows rows that change their actual without changing the count (#151): an
+argument `*x` used to name `x` and now names the temporary that holds the
+value loaded through it (`CopyFromUser(temp, arg, *size)` in hdf's
+`mipi_tx_dev.c:420`, `CameraDeviceToCJCameraDevice(*(cameraStatusInfo.cameraDevice))`
+in camera's cj `camera_utils.cpp:141`). That is 24 rows in hdf, 12 in hiview
+and 30 in camera. No call site loses an arg-flow row, and no call edge
+moves at a #151 site.
+
+**Already on `master`.** Before the rebase this section was measured
+against `10cec9a`. #148 and #146 (#149) have since produced several moves it
+credited to #151, so they are master's and are not claimed here:
+`recipient_->OnRemoteDied(recipient_, service_)` (hdf
+`hdf_remote_adapter.cpp:104`, +3 indirect edges and their 6 arg-flow rows;
+see the #146 section below); hiview's bare-field arguments rooted at `this`
+and its `*this` arguments (`StateProcess(it->second, *this)` in
+`native_leak_detector.cpp`, 31 rows on both sides); camera's bare-field
+arguments (`sink_filter.cpp:179`, `230`); and the camera phantom
+`metaDataCallback_` (`unified_pipeline_audio_capture_wrap.h:226`), which
+`master` no longer creates.
+
+**hdf.**
+
+- #151, +3 arg-flow rows where a dereferenced bare field feeds an argument
+  that had none: `WriteReserveData(messageParcel, *handle_)` and
+  `ReadReserveData(messageParcel, *handle_)` (`native_buffer.cpp:108`, `232`),
+  and `IsSpace(*bufferStart_)` (hc-gen `lexer.cpp:149`).
+- #150, 8 edges from external to direct. `DeviceManagerProxy` and
+  `ServiceManagerProxy` derive from `IProxyBroker<IDeviceManager>` and
+  `IProxyBroker<IServiceManager>`, and `IProxyBroker<INTERFACE>` derives from
+  `INTERFACE`. With those bases, the unqualified `GetDescriptor()` calls in
+  `idevmgr_client.cpp` (lines 67, 166, 219) and `iservmgr_client.cpp` (84,
+  109, 137, 182, 214) resolve to `I{Device,Service}Manager::GetDescriptor`
+  instead of the external stub `GetDescriptor`, which keeps 2 of its 10
+  edges.
+- #150, +2 direct edges and +2 arg-flow rows. `servmgr->GetService(...)`
+  (`idevmgr_client.cpp:254` in `IDeviceManager::Get`, and
+  `service_manager_hdi_test.cpp:1035`) keeps its edge to the declared
+  `IServiceManager::GetService` and gains the override
+  `ServiceManagerProxy::GetService`, now a known subclass.
+- #151, `flow_graph_nodes` +112: the temporaries that hold loaded operand
+  values (below).
+
+**hiview.** No eval metric moves. The only arg-flow change is #151's 12 rows
+whose actual is now the loaded value (`UpdatePluginStats(..., *timePtr)` in
+`event_dispatch_queue.cpp:47` and `plugin.cpp:70`, the `filter(*iter)` calls
+in `log_store_ex.cpp:102`, `LoadStringFromFd(*info.pipeFd, ...)` in
+`faultlog_cppcrash.cpp:217`). hiview gains no #150 edge.
+
+**camera.**
+
+- #151, +5 arg-flow rows. `*defaultTaskHandle_`, a dereferenced bare field,
+  now passes the loaded handle where `master` passed nothing: `task_manager.cpp`
+  lines 42 (`RegisterTaskGroup`'s last argument, spelled on line 51), 62, 120,
+  146 and 152.
+- #150, −1 function and −2 external edges. `template <typename T, ...> struct
+  MakeSharedHelper : public T` and `MakeUniqueHelper` (`dp_utils.h:90`, `103`)
+  used to give the helper a base `DeferredProcessing::T`, so the `T(...)` base
+  initializer resolved to a phantom external constructor `DeferredProcessing::T::T`.
+  A base that names a template parameter now gets no inheritance edge, and
+  the phantom and its two edges are gone.
+- Camera gains **no** #150 inheritance edge. The issue expected camera's IPC
+  stubs to gain their interfaces through `IRemoteStub<I> : public I`, but
+  `IRemoteStub` is defined in the ipc component, outside the camera tree, so
+  no `ClassTemplate` fact exists for it. That expectation holds only if the
+  ipc headers are indexed (for example with `--dep`).
+
+**Inheritance edges added by #150** (the export has no inheritance table;
+the call-edge moves above are consistent with them): hdf 2
+(`DeviceManagerProxy → IDeviceManager`, `ServiceManagerProxy →
+IServiceManager`, both through `IProxyBroker<INTERFACE>`), hiview 0 (its one
+such template, `EventPriorityQueue`, derives from `std::priority_queue<T, ...>`),
+camera 0.
+
+Flow facts (exported rows, jobs 8):
+
+| Corpus | `flow_nodes` rows | `flow_edges` rows | `flow_edges` moves by kind |
+|---|---:|---:|---|
+| hdf | 167,089 → 167,201 | 149,874 → 149,984 | `copy` +251, `gep` +7, `store` +3, `call_arg` −3, `load` −148 |
+| hiview | 74,886 → 74,957 | 46,422 → 46,536 | `copy` +77, `load` +37, `gep` +3, `unwrap` +1, `call_arg` −4 |
+| camera | 172,939 → 173,105 | 96,554 → 96,839 | `load` +139, `copy` +120, `gep` +24, `call_arg` +1, `store` +1 |
+
+All of it is #151 except two hdf `call_arg` edges, the #150 `GetService`
+rows above. Most of hdf's `load` → `copy` swap is array members read without
+`*`: an array member is its own cell, so `memcpy_s(..., info->devProp, ...)`
+in `hdf_hid_adapter.c`'s `GetInfoFromCache` copies the member's address
+where `master` loaded through it (20 edges in that function alone). The
+`call_arg` moves are arguments that now pass a loaded temporary instead of
+the root variable.
+
+Determinism: hdf analyzed by the candidate at `--jobs 1` and `--jobs 8`
+gives identical databases (every table except `analysis_run`, dumped in
+rowid order; both dumps hash to `00a62d8`).
+
+### Performance
+
+The `index` phase is unchanged. The measurements below were taken before the
+rebase, against `master` `10cec9a`, which did not yet resolve
+`recipient_->OnRemoteDied` (hdf `hdf_remote_adapter.cpp:104`); that call now
+resolves on `master` (#146). Wiring its three callees' parameters pulls about
+560 more variables, 292 of them `device` parameters, into HDF's hub of about
+420 locations. Total points-to grows 1.80M → 2.05M, and solver pops grow
+291k → 344k.
+
+The solver now answers the hub's repeated membership tests from bit mirrors
+and merges a load's new locations in one step
+([Membership mirrors and per-load merges](ANALYSIS.md#propagation-highlights)).
+The mirrors number a few thousand locations on HDF, against tens of thousands
+in all, so a mirror is a few hundred bytes.
+The exported database is byte-identical to the unoptimized branch on all three
+corpora, `points_to` debug rows and `--full-export` included.
+
+HDF solve time (`[solver] DONE`, `--jobs 8`, 5 interleaved runs, medians,
+before the rebase):
+
+| Binary | Solve |
+|---|---:|
+| master `10cec9a` | 0.77s |
+| branch before the solver change | 1.04s |
+| branch | 0.80s |
+
+**Performance gate (post-rebase).** Criterion: candidate wall AND CPU medians
+must each be ≤ +2% of baseline in every configuration (RSS is reported but
+not gating). Method: 5 rounds per configuration, alternating which binary
+runs first each round, `/usr/bin/time -l` for wall, user+sys CPU and peak
+RSS, a fresh output database deleted before every run,
+`TRACE_SOLVE_BUDGET_POPS=800000`, minimal export, on hdf, hiview and camera
+at `--jobs 1` and `--jobs 8` (6 configurations). Baseline:
+a release build of `862b98e`, code-identical to `master` `6c924af` (#149
+touches no file under `crates/*/src`). Candidate: a release build of the
+rebased branch, this commit's code before the two final cleanups named
+above, which change no exported row.
+
+| Corpus | Jobs | Wall s | CPU s | Peak RSS MB |
+|---|---:|---|---|---|
+| hdf | 1 | 7.80 → 7.53 (−3.5%) | 8.51 → 8.21 (−3.5%) | 435.77 → 429.80 (−1.4%) |
+| hdf | 8 | 4.22 → 3.90 (−7.6%) | 12.70 → 12.54 (−1.3%) | 469.88 → 504.52 (+7.4%) |
+| hiview | 1 | 3.14 → 3.18 (+1.3%) | 3.94 → 3.99 (+1.3%) | 265.59 → 274.14 (+3.2%) |
+| hiview | 8 | 1.53 → 1.54 (+0.7%) | 5.55 → 5.52 (−0.5%) | 303.98 → 320.59 (+5.5%) |
+| camera | 1 | 12.59 → 12.61 (+0.2%) | 13.62 → 13.64 (+0.1%) | 609.03 → 625.42 (+2.7%) |
+| camera | 8 | 5.62 → 5.57 (−0.9%) | 19.95 → 20.01 (+0.3%) | 685.48 → 694.56 (+1.3%) |
+
+All six configurations pass: candidate wall and CPU medians are within +2%
+of baseline in every case (several are faster). Peak RSS moves outside ±2%
+on four configurations (up to +7.4%, hdf `--jobs 8`); RSS is informational
+and not part of the gate, and is noisy at this sample size on this machine.
+
+## Implicit member pointer field decomposition — 2026-09-24 (#146)
+
+Calling a function pointer through an implicit member pointer variable or field path in a member function body (e.g., `handler_->fn()`, `val_handler_.fn()`, `nested_->handler->fn()`) implicitly accesses fields of `this` (`this->handler_->fn()`). During AST lowering, `decompose_field_path` peeled the access down to the unqualified identifier `handler_`, but `resolve_lvalue_var` only searched local and parameter variables, failing to recognize instance fields on `this`. Consequently, field decomposition returned `None`, dropping the function-pointer load constraints and leaving `callee_var = None`, causing the call to be misclassified as a direct external call.
+
+With the fix, when `resolve_lvalue_var` returns `None` on an identifier in a C++ member function, `decompose_field_path` checks whether the identifier names an instance field on `this` (`class_ctx_field`), capturing the `FieldId` to avoid redundant layout lookups. It roots the access at `this` with arrow access (`this->handler_->fn`), generating the GEP and Load constraints that wire `callee_var` for indirect call resolution.
+
+Baseline: `master` at `58a81a8315bc8c5cf3aad384ae50af2572bb4e4e`. Candidate:
+branch `fix/issue-146-implicit-this-fn-ptr-call` at `e6f736cfbe3f392137bc32f3a873ad3a3696a6cd`.
+Both are release builds (`cargo build --release -p trace-cli`) run through
+`python3 scripts/eval_check.py --jobs 8` on the corpora pinned in `scripts/eval_expected.json`
+(`drivers_hdf_core` at `cdc75a20bb8f1a046cd22e189405a20d602d0521`,
+`hiviewdfx_hiview` at `92408e2072bd6dc8fb0d980773e80b6ec898710c`,
+`multimedia_camera_framework` at `8ffd69dcd47f9e8a7ea3dc690b240eefddac3218`), all clean.
+Evaluated on Linux x86_64 (kernel 6.6.87, 16 cores, 30 GB RAM, rustc `1.95.0`) and
+macOS arm64 (Apple M1 MacBook Air, 8 cores, 8 GB RAM, rustc `1.100.0-nightly`).
+
+### Corpus evaluation movement
+
+Comparing candidate against baseline on clean, pinned corpora:
+
+| Corpus | Metric | Baseline (`58a81a8`) | Candidate | Movement |
+|---|---|---:|---:|---|
+| hdf | `edges_indirect` (exact) | 4,969 | 4,972 | +3 recovered indirect callbacks |
+| hdf | `edges_total` (band) | 74,810 | 74,810 | Unchanged |
+| hdf | `arg_flow_edges` (band) | 69,123 | 69,123 | Unchanged |
+| hiview | (all 29 checks) | - | - | Unchanged (all 29 checks pass) |
+| camera | (all 36 checks) | - | - | Unchanged (all 36 checks pass) |
+
+The three recovered indirect callback edges in `drivers_hdf_core` (`cdc75a20bb8f1a046cd22e189405a20d602d0521`)
+occur at `HdfDeathNotifier::OnRemoteDied`, `adapter/uhdf2/ipc/src/hdf_remote_adapter.cpp:104`,
+through `recipient_->OnRemoteDied`:
+- `DevSvcManagerOnServiceDied`
+- `DevHostServiceProxyOnRemoteDied`
+- `DevSvcManagerProxyOnRemoteDied`
+
+All three are assigned to the recipient callback in the corpus, so these edges are genuine recoveries resulting from implicit member pointer field decomposition.
+
+### Validation
+- **Corpus Evaluation**: `python3 scripts/eval_check.py` passes all 94 checks with 0 failures on pinned OpenHarmony corpora (`hdf`, `hiview`, `multimedia_camera_framework`).
+- **Workspace Test Suite**: `cargo test --workspace` passes cleanly (1,132 unit, integration, and CLI tests passing).
+- **Regression Fixtures & Tests**:
+  - Reproducer fixture at `tests/fixtures/cpp_implicit_fn_ptr/main.cpp`.
+  - Integration tests in `crates/trace-cli/tests/cpp_cases.rs`: `cpp_implicit_member_pointer_fn_ptr_call_resolves_indirect` and `cpp_implicit_member_value_and_chained_fn_ptr_call`.
+  - CLI inspect test in `crates/trace-cli/tests/inspect_tests.rs`: `inspect_callgraph_up_for_implicit_member_pointer_fn_ptr`.
+  - Verified `is_direct = 0`, `callee_var` is set, indirect call edge `Dispatcher::Dispatch -> target_callback` is resolved, and `trace inspect callgraph --direction up` lists `Dispatcher::Dispatch` as caller.
+
 ## Implicit this member variable access and assignments — 2026-09-24 (#145)
 
 The rules are defined in [Implicit this member variable access](ANALYSIS.md#implicit-this-member-variable-access).
@@ -145,52 +381,6 @@ lowering work runs only where a wrapper crossing or a `lock`/`promote` call
 appears, and the method name is checked before the receiver is typed. Marking
 wrapper variables as pointers is one pass over the variables after merging,
 memoized per type.
-
-## Implicit member pointer field decomposition — 2026-09-24 (#146)
-
-Calling a function pointer through an implicit member pointer variable or field path in a member function body (e.g., `handler_->fn()`, `val_handler_.fn()`, `nested_->handler->fn()`) implicitly accesses fields of `this` (`this->handler_->fn()`). During AST lowering, `decompose_field_path` peeled the access down to the unqualified identifier `handler_`, but `resolve_lvalue_var` only searched local and parameter variables, failing to recognize instance fields on `this`. Consequently, field decomposition returned `None`, dropping the function-pointer load constraints and leaving `callee_var = None`, causing the call to be misclassified as a direct external call.
-
-With the fix, when `resolve_lvalue_var` returns `None` on an identifier in a C++ member function, `decompose_field_path` checks whether the identifier names an instance field on `this` (`class_ctx_field`), capturing the `FieldId` to avoid redundant layout lookups. It roots the access at `this` with arrow access (`this->handler_->fn`), generating the GEP and Load constraints that wire `callee_var` for indirect call resolution.
-
-Baseline: `master` at `58a81a8315bc8c5cf3aad384ae50af2572bb4e4e`. Candidate:
-branch `fix/issue-146-implicit-this-fn-ptr-call` at `e6f736cfbe3f392137bc32f3a873ad3a3696a6cd`.
-Both are release builds (`cargo build --release -p trace-cli`) run through
-`python3 scripts/eval_check.py --jobs 8` on the corpora pinned in `scripts/eval_expected.json`
-(`drivers_hdf_core` at `cdc75a20bb8f1a046cd22e189405a20d602d0521`,
-`hiviewdfx_hiview` at `92408e2072bd6dc8fb0d980773e80b6ec898710c`,
-`multimedia_camera_framework` at `8ffd69dcd47f9e8a7ea3dc690b240eefddac3218`), all clean.
-Evaluated on Linux x86_64 (kernel 6.6.87, 16 cores, 30 GB RAM, rustc `1.95.0`) and
-macOS arm64 (Apple M1 MacBook Air, 8 cores, 8 GB RAM, rustc `1.100.0-nightly`).
-
-### Corpus evaluation movement
-
-Comparing candidate against baseline on clean, pinned corpora:
-
-| Corpus | Metric | Baseline (`58a81a8`) | Candidate | Movement |
-|---|---|---:|---:|---|
-| hdf | `edges_indirect` (exact) | 4,969 | 4,972 | +3 recovered indirect callbacks |
-| hdf | `edges_total` (band) | 74,810 | 74,810 | Unchanged |
-| hdf | `arg_flow_edges` (band) | 69,123 | 69,123 | Unchanged |
-| hiview | (all 29 checks) | - | - | Unchanged (all 29 checks pass) |
-| camera | (all 36 checks) | - | - | Unchanged (all 36 checks pass) |
-
-The three recovered indirect callback edges in `drivers_hdf_core` (`cdc75a20bb8f1a046cd22e189405a20d602d0521`)
-occur at `HdfDeathNotifier::OnRemoteDied`, `adapter/uhdf2/ipc/src/hdf_remote_adapter.cpp:104`,
-through `recipient_->OnRemoteDied`:
-- `DevSvcManagerOnServiceDied`
-- `DevHostServiceProxyOnRemoteDied`
-- `DevSvcManagerProxyOnRemoteDied`
-
-All three are assigned to the recipient callback in the corpus, so these edges are genuine recoveries resulting from implicit member pointer field decomposition.
-
-### Validation
-- **Corpus Evaluation**: `python3 scripts/eval_check.py` passes all 94 checks with 0 failures on pinned OpenHarmony corpora (`hdf`, `hiview`, `multimedia_camera_framework`).
-- **Workspace Test Suite**: `cargo test --workspace` passes cleanly (1,132 unit, integration, and CLI tests passing).
-- **Regression Fixtures & Tests**:
-  - Reproducer fixture at `tests/fixtures/cpp_implicit_fn_ptr/main.cpp`.
-  - Integration tests in `crates/trace-cli/tests/cpp_cases.rs`: `cpp_implicit_member_pointer_fn_ptr_call_resolves_indirect` and `cpp_implicit_member_value_and_chained_fn_ptr_call`.
-  - CLI inspect test in `crates/trace-cli/tests/inspect_tests.rs`: `inspect_callgraph_up_for_implicit_member_pointer_fn_ptr`.
-  - Verified `is_direct = 0`, `callee_var` is set, indirect call edge `Dispatcher::Dispatch -> target_callback` is resolved, and `trace inspect callgraph --direction up` lists `Dispatcher::Dispatch` as caller.
 
 ## Qualified variables — 2026-09-23 (#133)
 

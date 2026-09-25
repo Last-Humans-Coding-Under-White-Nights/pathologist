@@ -2999,3 +2999,349 @@ fn a_body_direct_init_with_an_unresolved_argument_defines_an_object() {
         .iter()
         .any(|e| fn_name(&program, e.callee).ends_with("log")));
 }
+
+/// Issue #151 (docs/ANALYSIS.md, "Dereferenced operands"): the
+/// `deref_member_reads` fixture, solved once with points-to retained.
+fn deref_member_reads() -> &'static (
+    trace_ir::Program,
+    trace_analysis::Pag,
+    trace_analysis::AnalysisResult,
+) {
+    static CACHE: std::sync::OnceLock<(
+        trace_ir::Program,
+        trace_analysis::Pag,
+        trace_analysis::AnalysisResult,
+    )> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let root = fixture("deref_member_reads");
+        let program = build_program(&root, &default_opts(&root)).expect("build");
+        let (pag, analysis) = analyze_with_pts(&program);
+        (program, pag, analysis)
+    })
+}
+
+/// Assert `var` points to `pointee`'s storage and to no other location of
+/// any kind: a wrong read shows as an extra pointee as often as a missing
+/// one. Checked for the C names and their `cpp_` mirrors.
+fn assert_deref_points_to_exactly(var: &str, pointee: &str) {
+    assert_deref_points_to_exactly_in(&["", "cpp_"], var, pointee);
+}
+
+/// [`assert_deref_points_to_exactly`] for the names under `prefixes` only.
+fn assert_deref_points_to_exactly_in(prefixes: &[&str], var: &str, pointee: &str) {
+    let (program, pag, analysis) = deref_member_reads();
+    for prefix in prefixes {
+        let name = format!("{prefix}{var}");
+        let id = only_variable(program, &name);
+        let target = pag.var_location[&only_variable(program, &format!("{prefix}{pointee}"))];
+        let node = pag.var_node.get(&id);
+        let pts: Vec<_> = (node.and_then(|n| analysis.points_to.get(n)).into_iter())
+            .flatten()
+            .copied()
+            .collect();
+        let names = points_to_names_of_var(program, pag, analysis, id);
+        assert_eq!(pts, [target], "{name} points to {names:?}");
+    }
+}
+
+/// Issue #151 guards: `o->inner->pp` and a plain `*p` already resolve.
+#[test]
+fn deref_member_reads_guards_point_to_exactly() {
+    assert_deref_points_to_exactly("arrow_y", "g_p");
+    assert_deref_points_to_exactly("plain_y", "g_x");
+}
+
+/// Issue #151: `*h->pp` points to what the `pp` member's value points to.
+#[test]
+fn deref_of_a_member_reads_the_member_value() {
+    assert_deref_points_to_exactly("member_y", "g_x");
+}
+
+/// Issue #151: `**ppp` points to what `*ppp` points to.
+#[test]
+fn deref_twice_reads_through_the_first_load() {
+    assert_deref_points_to_exactly("twice_y", "g_x");
+}
+
+/// Issue #151: `(*o->inner).pp` holds what its twin `o->inner->pp` holds.
+#[test]
+fn deref_root_reads_like_its_arrow_twin() {
+    assert_deref_points_to_exactly("root_y", "g_p");
+}
+
+/// Issue #151: `return *h->pp;` returns the member's value's pointee.
+#[test]
+fn deref_return_returns_the_value_read() {
+    assert_deref_points_to_exactly("ret_y", "g_x");
+}
+
+/// Issue #151: `*out = *h->pp` and `b->box_f = *h->pp` store the value read.
+#[test]
+fn deref_store_source_stores_the_value_read() {
+    assert_deref_points_to_exactly("g_out", "g_x");
+    assert_deref_points_to_exactly("box_y", "g_x");
+}
+
+/// Issue #151: `*t->tcells[1]` reads through the member table's element, and
+/// `*g_wt.wtcells[0] = v` stores through it.
+#[test]
+fn deref_of_a_member_element_reads_and_writes_through_it() {
+    assert_deref_points_to_exactly("sub_y", "g_x");
+    assert_deref_points_to_exactly("g_sub_slot", "g_y");
+}
+
+/// Issue #151: a member body's bare instance field is read and written
+/// through `this`, like `this->m_pp`.
+#[test]
+fn deref_of_an_implicit_this_member_reads_and_writes_through_it() {
+    assert_deref_points_to_exactly_in(&["cpp_"], "this_y", "g_x");
+    assert_deref_points_to_exactly_in(&["cpp_"], "g_this_slot", "g_y");
+}
+
+/// Issue #151: `int **&r = g_pp` binds `r` to the pointer's value, as
+/// initialization and argument passing do: `*r` is one load, and `&r` is
+/// `r`'s own address.
+#[test]
+fn deref_of_a_reference_to_a_pointer_reads_once() {
+    assert_deref_points_to_exactly_in(&["cpp_"], "ref_z", "g_x");
+    assert_deref_points_to_exactly_in(&["cpp_"], "ref_a", "ref_r");
+}
+
+/// Issue #151: an explicit `this->m_epp` reads and writes through the
+/// member's value, as the bare `m_rpp` / `m_wpp` do.
+#[test]
+fn deref_of_an_explicit_this_member_reads_and_writes_through_it() {
+    assert_deref_points_to_exactly_in(&["cpp_"], "ethis_y", "g_x");
+    assert_deref_points_to_exactly_in(&["cpp_"], "g_ethis_slot", "g_y");
+}
+
+/// Issue #151: only a function pointer is read in place. `*pfp`, for a
+/// pointer to one, loads the function pointer `g_fnp` that `pfp` points to,
+/// so the value read or passed points to `fnp_target` and nothing else.
+#[test]
+fn deref_of_a_pointer_to_a_function_pointer_reads_through_it() {
+    let (program, pag, analysis) = deref_member_reads();
+    let target = pag.fn_locations[&only_function(program, "fnp_target")];
+    for name in ["fnp_got", "fnp_passed"] {
+        let id = only_variable(program, name);
+        let pts: Vec<_> = (pag.var_node.get(&id))
+            .and_then(|n| analysis.points_to.get(n))
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        let names = points_to_names_of_var(program, pag, analysis, id);
+        assert_eq!(pts, [target], "{name} points to {names:?}");
+    }
+}
+
+/// A function designator is read in place: `*fn_designated`, read into an
+/// initializer or assigned, is `fn_designated` (docs/ANALYSIS.md,
+/// "Dereferenced operands").
+#[test]
+fn deref_of_a_function_designator_is_the_function() {
+    let (program, pag, analysis) = deref_member_reads();
+    for prefix in ["", "cpp_"] {
+        let target = pag.fn_locations[&only_function(program, &format!("{prefix}fn_designated"))];
+        for name in ["desig_got", "g_desig"] {
+            let id = only_variable(program, &format!("{prefix}{name}"));
+            let pts: Vec<_> = (pag.var_node.get(&id))
+                .and_then(|n| analysis.points_to.get(n))
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect();
+            let names = points_to_names_of_var(program, pag, analysis, id);
+            assert_eq!(pts, [target], "{prefix}{name} points to {names:?}");
+        }
+    }
+}
+
+/// Issue #151: `(*&g_h).pp` reads as its twin `g_h.pp` does.
+#[test]
+fn deref_of_an_address_root_reads_like_the_object() {
+    let (program, pag, analysis) = deref_member_reads();
+    let [read, twin] = ["addr_y", "addr_twin_y"]
+        .map(|name| points_to_names_of_var(program, pag, analysis, only_variable(program, name)));
+    assert!(!twin.is_empty(), "addr_twin_y points to nothing");
+    assert_eq!(read, twin, "addr_y reads as addr_twin_y does");
+}
+
+/// Issue #151: `(*this).m_dpp` is rooted at `this`, and reads as
+/// its twin `this->m_dpp` does.
+#[test]
+fn deref_of_a_dereferenced_this_member_reads_through_it() {
+    assert_deref_points_to_exactly_in(&["cpp_"], "dthis_y", "g_x");
+    let (program, pag, analysis) = deref_member_reads();
+    let [read, twin] = ["cpp_dthis_z", "cpp_dthis_w"]
+        .map(|name| points_to_names_of_var(program, pag, analysis, only_variable(program, name)));
+    assert!(
+        read.iter().any(|name| name == "cpp_g_p"),
+        "cpp_dthis_z points to {read:?}"
+    );
+    assert_eq!(read, twin, "cpp_dthis_z reads as cpp_dthis_w does");
+}
+
+/// Issue #151: a store through a longer path rooted at an instance
+/// field, bare (`*m_in->pp = q`) or through `this` (`*this->a->pp = q`),
+/// stores through the member's value.
+#[test]
+fn deref_store_through_an_instance_field_path_stores_through_it() {
+    assert_deref_points_to_exactly_in(&["cpp_"], "g_min_slot", "g_y");
+    assert_deref_points_to_exactly_in(&["cpp_"], "g_tin_slot", "g_y");
+}
+
+/// Issue #151: `(*pp)->ox` and `(*h->opp)->ox` read `ox` off the
+/// object the loaded pointer points to.
+#[test]
+fn deref_of_a_pointer_root_reads_through_its_arrow() {
+    assert_deref_points_to_exactly("out_y", "g_x");
+    assert_deref_points_to_exactly("out_member_y", "g_x");
+}
+
+/// Issue #151: `fp(*pp)` through a function pointer reaches a formal
+/// no declaration describes at the call, which gets the value read too.
+#[test]
+fn deref_argument_to_an_unknown_formal_passes_the_value_read_too() {
+    let (program, pag, analysis) = deref_member_reads();
+    let names = points_to_names_of_var(program, pag, analysis, only_variable(program, "cpp_ind_q"));
+    assert!(
+        names.iter().any(|name| name == "cpp_g_x"),
+        "cpp_ind_q points to {names:?}"
+    );
+}
+
+/// Issue #151: an array member's value is its cell: `*h->arr` reads
+/// what its twin `h->arr[0]` reads, and `*w->warr = v` stores into the
+/// element.
+#[test]
+fn deref_of_an_array_member_reads_and_writes_its_element() {
+    assert_deref_points_to_exactly("arr_twin_y", "g_x");
+    assert_deref_points_to_exactly("arr_y", "g_x");
+    assert_deref_points_to_exactly("warr_y", "g_y");
+}
+
+/// Issue #151: an array member's value is its cell in every value
+/// position. Read into a variable, bare in a member body (`p = varr`) or
+/// through a path (`p = h->varr`), or returned (`return varr;`,
+/// `return h->varr;`), it points to what `&h->varr` (`&varr` in the body)
+/// points to, the array member's own location among them, not only to what
+/// its elements hold.
+#[test]
+fn an_array_member_value_is_its_cell_in_every_position() {
+    let (program, pag, analysis) = deref_member_reads();
+    let pts = |name: &str| -> Vec<_> {
+        let id = only_variable(program, name);
+        (pag.var_node.get(&id))
+            .and_then(|n| analysis.points_to.get(n))
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect()
+    };
+    // The cell's address points to the member's own location (and, as any
+    // field address, to what it holds: docs/ANALYSIS.md, "Field
+    // sensitivity"); a load from it would point to the elements alone.
+    let member = |loc: &trace_ir::LocId| {
+        use trace_analysis::LocKind::{Field, FieldSummary};
+        matches!(pag.locations[loc.0 as usize].kind, Field | FieldSummary)
+    };
+    for (addr, reads) in [
+        (
+            "cpp_arrv_addr",
+            &["cpp_arrv_field", "cpp_arrv_assigned", "cpp_arrv_ret"][..],
+        ),
+        (
+            "cpp_arrv_bare_addr",
+            &["cpp_arrv_bare", "cpp_arrv_bare_assigned"][..],
+        ),
+    ] {
+        let cell = pts(addr);
+        assert!(cell.iter().any(member), "{addr} points to {cell:?}");
+        for name in reads {
+            let id = only_variable(program, name);
+            let names = points_to_names_of_var(program, pag, analysis, id);
+            assert_eq!(pts(name), cell, "{name} points to {names:?}");
+        }
+    }
+}
+
+/// Issue #151: `(*h->objs)->ox` reads `ox` off the object the
+/// array's first element points to; `h->sarr->cb()` calls what
+/// `h->sarr->cb = cb_target` stored.
+#[test]
+fn array_members_keep_their_element_paths() {
+    let (program, _, analysis) = deref_member_reads();
+    assert_deref_points_to_exactly("objs_y", "g_x");
+    let edge = |caller: &str, callee: &str| {
+        analysis
+            .call_edges
+            .iter()
+            .any(|e| fn_name(program, e.caller) == caller && fn_name(program, e.callee) == callee)
+    };
+    assert!(
+        edge("call_sarr", "cb_target"),
+        "h->sarr->cb() reaches cb_target"
+    );
+}
+
+/// Issue #151: `(*m_in).pp` in a member body is rooted at `this`, and
+/// reads as its arrow twin `m_in->pp` does.
+#[test]
+fn deref_of_a_bare_instance_field_root_reads_like_its_arrow_twin() {
+    let (program, pag, analysis) = deref_member_reads();
+    let [read, twin] = ["cpp_dm_y", "cpp_dm_twin_y"]
+        .map(|name| points_to_names_of_var(program, pag, analysis, only_variable(program, name)));
+    assert!(
+        twin.iter().any(|name| name == "cpp_g_p"),
+        "cpp_dm_twin_y points to {twin:?}"
+    );
+    assert_eq!(read, twin, "cpp_dm_y reads as cpp_dm_twin_y does");
+}
+
+/// Issue #151: `*h->pcb` on a pointer to a function-pointer member
+/// loads the function pointer, so `cb = *h->pcb; cb();` reaches
+/// `pcb_target`; and `*m_gpp` takes its type from the member it reads, not
+/// from a global function pointer of the same name.
+#[test]
+fn deref_types_come_from_the_operand_read() {
+    let (program, _, analysis) = deref_member_reads();
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(program, e.caller) == "call_pcb" && fn_name(program, e.callee) == "pcb_target"
+        }),
+        "cb = *h->pcb; cb(); reaches pcb_target"
+    );
+    assert_deref_points_to_exactly_in(&["cpp_"], "gpp_y", "g_x");
+    assert_deref_points_to_exactly_in(&["cpp_"], "gpp_z", "g_x");
+}
+
+/// Issue #151: `*h->pp = v` stores into the member's pointee `g_slot`, and
+/// nothing of the holder `g_w` (its storage, field cells or their field
+/// summaries) comes to point to `g_y`.
+#[test]
+fn deref_write_stores_into_the_members_pointee() {
+    let (program, pag, analysis) = deref_member_reads();
+    for prefix in ["", "cpp_"] {
+        let holder = only_variable(program, &format!("{prefix}g_w"));
+        let value = pag.var_location[&only_variable(program, &format!("{prefix}g_y"))];
+        let cells: Vec<_> = pag
+            .locations
+            .iter()
+            .filter(|loc| loc.var == Some(holder))
+            .map(|loc| loc.id)
+            .collect();
+        let summaries = cells.iter().filter_map(|c| pag.field_loc_to_summary.get(c));
+        let holder_nodes = (cells.iter().chain(summaries))
+            .filter_map(|loc| pag.loc_node.get(loc))
+            .chain(pag.var_node.get(&holder));
+        for node in holder_nodes {
+            let pts = analysis.points_to.get(node);
+            assert!(
+                !pts.is_some_and(|pts| pts.contains(&value)),
+                "{prefix}g_w's {node:?} points to {prefix}g_y: {pts:?}"
+            );
+        }
+    }
+    assert_deref_points_to_exactly("g_slot", "g_y");
+}

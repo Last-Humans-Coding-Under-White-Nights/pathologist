@@ -1,6 +1,7 @@
 //! Shared helpers for trace integration tests.
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use trace_analysis::{AnalysisResult, ResolutionKind};
 use trace_ir::Program;
@@ -366,4 +367,30 @@ pub fn assert_local_points_to(
         names.iter().any(|n| n == target),
         "{function}::{var} should point to {target}; points-to = {names:?}"
     );
+}
+
+/// Issue #151 (docs/ANALYSIS.md, "Dereferenced operands"): the nodes
+/// `start` reaches in value-flow `(from, to, label)` edges through one edge
+/// labelled with each of `hops`, in order, with any number of `copy` edges
+/// before, between and after them.
+pub fn flow_chain(edges: &[(i64, i64, String)], start: &[i64], hops: &[&str]) -> BTreeSet<i64> {
+    let step = |from: &BTreeSet<i64>, label: &str| {
+        edges
+            .iter()
+            .filter(|(src, _, l)| l == label && from.contains(src))
+            .map(|(_, dst, _)| *dst)
+            .collect::<Vec<_>>()
+    };
+    let with_copies = |mut set: BTreeSet<i64>| loop {
+        let before = set.len();
+        set.extend(step(&set, "copy"));
+        if set.len() == before {
+            return set;
+        }
+    };
+    let mut cur = with_copies(start.iter().copied().collect());
+    for hop in hops {
+        cur = with_copies(step(&cur, hop).into_iter().collect());
+    }
+    cur
 }

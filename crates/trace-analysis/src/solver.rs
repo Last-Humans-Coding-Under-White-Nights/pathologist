@@ -1,7 +1,7 @@
 use crate::constraints::{
     ArgFlowEdge, CallGraphEdge, Constraint, ConstraintKind, LocKind, ResolutionKind,
 };
-use crate::pag::{Pag, PagNodeKind};
+use crate::pag::{Pag, PagNodeKind, SolverIndices};
 use crate::summaries::{Effect, FnModelSet};
 use indexmap::{IndexMap, IndexSet};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
@@ -187,9 +187,10 @@ struct SolverState {
     /// Parameter count per function location (only when > 0; old-style `()`
     /// declarations stay unfiltered).
     fn_arity: FxHashMap<LocId, usize>,
-    /// Last-seen `memory_pts[loc]` size per `(dst, loc)` pair, used to skip
-    /// redundant merge iterations when memory hasn't grown.
-    merge_sizes: FxHashMap<(PagNodeId, LocId), usize>,
+    /// Last-seen `memory_pts[loc]` size per destination and cell, used to
+    /// skip redundant merge iterations when memory hasn't grown. Keyed by
+    /// destination first: a load merges many cells into one destination.
+    merge_sizes: FxHashMap<PagNodeId, FxHashMap<LocId, usize>>,
     /// Locations that are the source of an `AddrOf` constraint.
     addr_taken: FxHashSet<LocId>,
     /// Variable node → the memory cell kept in step with it, and back
@@ -201,6 +202,195 @@ struct SolverState {
     /// `(call site, parameter)` terminator events already recorded, so each
     /// is recorded once without scanning the event list.
     terminators_seen: FxHashSet<(CallSiteId, u32)>,
+    /// Membership bits mirroring the large `pts` and `memory_pts` sets
+    /// ([`LocBits`]): the sets stay the storage and the iteration order,
+    /// the bits only answer "already held" without hashing.
+    loc_bits: LocBits,
+    pts_bits: FxHashMap<PagNodeId, Vec<u64>>,
+    memory_bits: FxHashMap<LocId, Vec<u64>>,
+}
+
+/// Sets of at least this many locations get a [`LocBits`] mirror.
+const MIRROR_MIN: usize = 64;
+
+/// A dense numbering of the locations large sets hold, and bit-set
+/// membership over it.
+///
+/// Nearly every membership test the solver makes on a hub set is a hit: a
+/// memory merge re-checks each location a cell gained against a destination
+/// that usually holds it already, and a store re-inserts its whole source
+/// into cells that usually hold it already. A bit test answers those without
+/// hashing. The hub sets share a few thousand locations out of tens of
+/// thousands, so bits index a dense numbering of just those, which keeps a
+/// mirror a few hundred bytes instead of one bit per location.
+///
+/// A mirror only ever says "held": a location is numbered and its bit set
+/// only once its set holds it, and sets never shrink. A clear bit falls back
+/// to the set itself, so what the solver computes, and in which order, does
+/// not depend on the mirrors at all.
+#[derive(Default)]
+struct LocBits {
+    /// `LocId` → its dense number plus one; `0` for a location no mirror
+    /// holds.
+    number: Vec<u32>,
+    next: u32,
+}
+
+impl LocBits {
+    /// Whether `bits` has `loc`'s bit set.
+    #[inline]
+    fn test(&self, bits: &[u64], loc: LocId) -> bool {
+        match self.number.get(loc.0 as usize) {
+            Some(&n) if n != 0 => {
+                let n = n - 1;
+                bits.get(n as usize / 64)
+                    .is_some_and(|word| word >> (n % 64) & 1 != 0)
+            }
+            _ => false,
+        }
+    }
+
+    /// Set `loc`'s bit in `bits`, numbering `loc` first if it has none.
+    fn set(&mut self, bits: &mut Vec<u64>, loc: LocId) {
+        let i = loc.0 as usize;
+        if i >= self.number.len() {
+            self.number.resize(i + 1, 0);
+        }
+        if self.number[i] == 0 {
+            self.next += 1;
+            self.number[i] = self.next;
+        }
+        let n = (self.number[i] - 1) as usize;
+        if n / 64 >= bits.len() {
+            bits.resize(n / 64 + 1, 0);
+        }
+        bits[n / 64] |= 1u64 << (n % 64);
+    }
+
+    /// A mirror of `set`, whose elements are all held.
+    fn mirror<'a>(&mut self, set: impl IntoIterator<Item = &'a LocId>) -> Vec<u64> {
+        let mut bits = Vec::new();
+        for &loc in set {
+            self.set(&mut bits, loc);
+        }
+        bits
+    }
+}
+
+/// One destination's side of memory merges: its points-to set and its
+/// merged sizes, each looked up once and only on first need — a merge that
+/// finds nothing new creates neither, as a lone merge never did.
+struct MergeInto<'a> {
+    dst: PagNodeId,
+    /// The whole map until `held` is looked up in it.
+    pts: Option<&'a mut FxHashMap<PagNodeId, FxHashSet<LocId>>>,
+    held: Option<&'a mut FxHashSet<LocId>>,
+    /// The whole map until `sizes` is looked up in it.
+    merge_sizes: Option<&'a mut FxHashMap<PagNodeId, FxHashMap<LocId, usize>>>,
+    sizes: Option<&'a mut FxHashMap<LocId, usize>>,
+    /// `dst`'s mirror as it stood before this step; what the step adds is
+    /// found in `held`.
+    bits: Option<&'a [u64]>,
+    loc_bits: &'a LocBits,
+}
+
+impl MergeInto<'_> {
+    /// `pts[dst]`, created if missing.
+    fn held(&mut self) -> &mut FxHashSet<LocId> {
+        if let Some(pts) = self.pts.take() {
+            self.held = Some(pts.entry(self.dst).or_default());
+        }
+        self.held.as_deref_mut().expect("looked up above")
+    }
+
+    /// The sizes of `dst`'s merged cells, created if missing.
+    fn sizes(&mut self) -> &mut FxHashMap<LocId, usize> {
+        if let Some(merge_sizes) = self.merge_sizes.take() {
+            self.sizes = Some(merge_sizes.entry(self.dst).or_default());
+        }
+        self.sizes.as_deref_mut().expect("looked up above")
+    }
+
+    /// Add to `pts[dst]`, and append to `fresh`, what `memory_pts[mem_loc]`
+    /// gained since its last merge into `dst`.
+    fn merge(&mut self, pag: &Pag, memory: &Memory<'_>, mem_loc: LocId, fresh: &mut Vec<LocId>) {
+        let Some(mem) = memory.pts.get(&mem_loc) else {
+            return;
+        };
+        let cur_len = mem.len();
+        if cur_len == 0 {
+            return;
+        }
+        let prev_len = {
+            let seen = self.sizes().entry(mem_loc).or_insert(0);
+            if cur_len <= *seen {
+                return;
+            }
+            std::mem::replace(seen, cur_len)
+        };
+        // The cell's own filter is the same for every element it holds, so it
+        // is read once here rather than once per element.
+        let filter = FnFilter::of(memory.slot_guard.get(&mem_loc));
+        let (bits, loc_bits) = (self.bits, self.loc_bits);
+        let held = self.held();
+        let start = fresh.len();
+        // Collect first, insert second. Fusing the two — `pts.insert(loc)` in
+        // place of `!pts.contains(&loc)` — looks equivalent and saves a hash
+        // per added location, but it measurably reorders `pts` and changes the
+        // exported `points_to` rows on the HDF corpus. Whatever the mechanism,
+        // this pass is not the place to find out: keep the two passes.
+        for i in prev_len..cur_len {
+            let loc = mem[i];
+            if filter.admits(memory.fn_arity, pag, loc)
+                && !bits.is_some_and(|bits| loc_bits.test(bits, loc))
+                && !held.contains(&loc)
+            {
+                fresh.push(loc);
+            }
+        }
+        for &loc in &fresh[start..] {
+            held.insert(loc);
+        }
+    }
+}
+
+/// What a memory merge reads of the solver state besides the destination.
+struct Memory<'a> {
+    pts: &'a FxHashMap<LocId, IndexSet<LocId, FxBuildHasher>>,
+    slot_guard: &'a FxHashMap<LocId, SlotGuard>,
+    fn_arity: &'a FxHashMap<LocId, usize>,
+}
+
+/// Insert `locs`, in order, into `memory_pts[cell]` (created if missing):
+/// the one write path into cell memory. Returns whether the cell grew.
+fn write_memory(
+    memory_pts: &mut FxHashMap<LocId, IndexSet<LocId, FxBuildHasher>>,
+    memory_bits: &mut FxHashMap<LocId, Vec<u64>>,
+    loc_bits: &mut LocBits,
+    cell: LocId,
+    locs: impl IntoIterator<Item = LocId>,
+) -> bool {
+    let entry = memory_pts.entry(cell).or_default();
+    let before = entry.len();
+    match memory_bits.get_mut(&cell) {
+        Some(bits) => {
+            for loc in locs {
+                if !loc_bits.test(bits, loc) {
+                    entry.insert(loc);
+                    loc_bits.set(bits, loc);
+                }
+            }
+        }
+        None => {
+            for loc in locs {
+                entry.insert(loc);
+            }
+            if entry.len() >= MIRROR_MIN {
+                memory_bits.insert(cell, loc_bits.mirror(entry.iter()));
+            }
+        }
+    }
+    entry.len() > before
 }
 
 /// Buffers reused across propagation steps.
@@ -368,14 +558,14 @@ impl SolverState {
         &mut self,
         holders: &mut Vec<PagNodeId>,
         loc: LocId,
-        load_src: &FxHashMap<PagNodeId, Vec<usize>>,
+        indices: &SolverIndices,
     ) {
         // Collected into a scratch buffer in the set's own iteration order:
         // every write used to clone the whole holder set, which on hub
         // locations is thousands of nodes.
         holders.clear();
         if let Some(nodes) = self.loc_nodes.get(&loc) {
-            holders.extend(nodes.iter().copied().filter(|n| load_src.contains_key(n)));
+            holders.extend(nodes.iter().copied().filter(|&n| indices.is_load_src(n)));
         }
         for &n in holders.iter() {
             self.record_delta(n, &[loc]);
@@ -425,50 +615,95 @@ impl SolverState {
         dst: PagNodeId,
         mem_loc: LocId,
     ) {
-        let key = (dst, mem_loc);
-        let prev_len = self.merge_sizes.get(&key).copied().unwrap_or(0);
-        let Some(cur_len) = self.memory_pts.get(&mem_loc).map(IndexSet::len) else {
-            return;
-        };
-        if cur_len <= prev_len {
-            return;
-        }
-        // The cell's own filter is the same for every element it holds, so it
-        // is read once here rather than once per element.
-        let filter = FnFilter::of(self.slot_guard.get(&mem_loc));
         fresh.clear();
-        // Collect first, insert second. Fusing the two — `pts.insert(loc)` in
-        // place of `!pts.contains(&loc)` — looks equivalent and saves a hash
-        // per added location, but it measurably reorders `pts` and changes the
-        // exported `points_to` rows on the HDF corpus. Whatever the mechanism,
-        // this pass is not the place to find out: keep the two passes.
-        {
-            let Self {
-                memory_pts,
-                pts,
-                fn_arity,
-                ..
-            } = self;
-            let mem = memory_pts.get(&mem_loc).expect("memory checked above");
-            let pts = pts.entry(dst).or_default();
-            for i in prev_len..cur_len {
-                let loc = mem[i];
-                if filter.admits(fn_arity, pag, loc) && !pts.contains(&loc) {
+        let (mut into, memory) = self.merge_into(dst);
+        into.merge(pag, &memory, mem_loc, fresh);
+        self.finish_merge(dst, fresh);
+    }
+
+    /// A load `dst = *p` stepping over `locs`, the locations `p` newly holds,
+    /// in order: a function value is `dst`'s own, anything else contributes
+    /// its cell's memory ([`Self::merge_memory_into_if_grown`]). One call per
+    /// load rather than one per location, with the same effects in the same
+    /// order: nothing a merge reads is written by the commit it defers.
+    /// Returns the number of memory merges, for the `[solver]` stats line.
+    fn load_into(
+        &mut self,
+        pag: &Pag,
+        fresh: &mut Vec<LocId>,
+        dst: PagNodeId,
+        locs: &[LocId],
+    ) -> u64 {
+        fresh.clear();
+        let mut merges = 0;
+        let (mut into, memory) = self.merge_into(dst);
+        for &loc in locs {
+            if fn_for_loc(pag, loc).is_some() {
+                if into.held().insert(loc) {
                     fresh.push(loc);
                 }
+            } else {
+                merges += 1;
+                into.merge(pag, &memory, loc, fresh);
             }
         }
-        self.merge_sizes.insert(key, cur_len);
-        if fresh.is_empty() {
-            return;
+        self.finish_merge(dst, fresh);
+        merges
+    }
+
+    /// Split the state into `dst`'s side of a merge and what it reads.
+    fn merge_into(&mut self, dst: PagNodeId) -> (MergeInto<'_>, Memory<'_>) {
+        let Self {
+            pts,
+            pts_bits,
+            loc_bits,
+            memory_pts,
+            merge_sizes,
+            slot_guard,
+            fn_arity,
+            ..
+        } = self;
+        let into = MergeInto {
+            dst,
+            pts: Some(pts),
+            held: None,
+            merge_sizes: Some(merge_sizes),
+            sizes: None,
+            bits: pts_bits.get(&dst).map(Vec::as_slice),
+            loc_bits,
+        };
+        let memory = Memory {
+            pts: memory_pts,
+            slot_guard,
+            fn_arity,
+        };
+        (into, memory)
+    }
+
+    /// Mirror and commit what a merge added to `pts[dst]`.
+    fn finish_merge(&mut self, dst: PagNodeId, fresh: &[LocId]) {
+        if !fresh.is_empty() {
+            self.mirror_pts(dst, fresh);
+            self.commit_fresh(dst, fresh);
         }
-        {
-            let pts = self.pts.get_mut(&dst).expect("pts entry exists");
-            for &loc in fresh.iter() {
-                pts.insert(loc);
+    }
+
+    /// Keep `pts[dst]`'s [`LocBits`] mirror in step with the `added`
+    /// locations just inserted, creating it once the set is large.
+    fn mirror_pts(&mut self, dst: PagNodeId, added: &[LocId]) {
+        let Self {
+            pts,
+            pts_bits,
+            loc_bits,
+            ..
+        } = self;
+        if let Some(bits) = pts_bits.get_mut(&dst) {
+            for &loc in added {
+                loc_bits.set(bits, loc);
             }
+        } else if let Some(set) = pts.get(&dst).filter(|set| set.len() >= MIRROR_MIN) {
+            pts_bits.insert(dst, loc_bits.mirror(set));
         }
-        self.commit_fresh(dst, fresh);
     }
 
     /// Finish a step that just added `fresh` to `pts[dst]`: index the new
@@ -820,14 +1055,7 @@ fn solve(
         if let Some(idxs) = pag.indices.load_src.get(&node) {
             for &idx in idxs {
                 let dst = pag.constraints[idx].dst;
-                for &loc in delta.iter() {
-                    if fn_for_loc(pag, loc).is_some() {
-                        add_pts(&mut st, dst, loc);
-                    } else {
-                        w_load += 1;
-                        st.merge_memory_into_if_grown(pag, &mut scratch.fresh, dst, loc);
-                    }
-                }
+                w_load += st.load_into(pag, &mut scratch.fresh, dst, &delta);
             }
         }
 
@@ -1395,20 +1623,18 @@ fn propagate_locs(
     locs: impl IntoIterator<Item = LocId>,
 ) {
     fresh.clear();
-    {
-        let entry = st.pts.entry(dst).or_default();
-        for loc in locs {
-            if !entry.contains(&loc) {
-                fresh.push(loc);
-            }
+    // Two passes, as in `merge_memory_into_if_grown`, under one lookup.
+    let entry = st.pts.entry(dst).or_default();
+    let bits = st.pts_bits.get(&dst);
+    for loc in locs {
+        if !bits.is_some_and(|bits| st.loc_bits.test(bits, loc)) && !entry.contains(&loc) {
+            fresh.push(loc);
         }
     }
-    {
-        let entry = st.pts.get_mut(&dst).expect("entry just created");
-        for &loc in fresh.iter() {
-            entry.insert(loc);
-        }
+    for &loc in fresh.iter() {
+        entry.insert(loc);
     }
+    st.mirror_pts(dst, fresh);
     st.commit_fresh(dst, fresh);
 }
 
@@ -1533,15 +1759,13 @@ fn apply_store_to_targets(
         };
         {
             let view = views.view(filter, src, pag, &st.fn_arity);
-            let entry = st.memory_pts.entry(loc).or_default();
-            let before = entry.len();
-            for &l in view {
-                entry.insert(l);
-            }
-            if let Some(sl) = self_loc {
-                entry.insert(sl);
-            }
-            changed |= entry.len() > before;
+            changed |= write_memory(
+                &mut st.memory_pts,
+                &mut st.memory_bits,
+                &mut st.loc_bits,
+                loc,
+                view.iter().copied().chain(self_loc),
+            );
         }
         let summary_loc = pag.summary_for_field_loc(loc);
         if let Some(summary) = summary_loc {
@@ -1565,14 +1789,13 @@ fn apply_store_to_targets(
                     _ => FnFilter::Any,
                 };
                 let view = views.view(summary_filter, src, pag, &st.fn_arity);
-                let entry = st.memory_pts.entry(summary).or_default();
-                for &l in view {
-                    entry.insert(l);
-                }
-                if let Some(sl) = self_loc {
-                    entry.insert(sl);
-                }
-                changed |= entry.len() > before_summary;
+                changed |= write_memory(
+                    &mut st.memory_pts,
+                    &mut st.memory_bits,
+                    &mut st.loc_bits,
+                    summary,
+                    view.iter().copied().chain(self_loc),
+                );
             }
         }
         if changed {
@@ -1590,7 +1813,7 @@ fn apply_store_to_targets(
     for i in 0..scratch.store_requeues.len() {
         let loc = scratch.store_requeues[i];
         if scratch.requeued.insert(loc) {
-            st.touch_loc_holders(&mut scratch.holders, loc, &pag.indices.load_src);
+            st.touch_loc_holders(&mut scratch.holders, loc, &pag.indices);
             sync_cell_to_var(pag, st, &mut scratch.fresh, loc);
         }
     }
@@ -1640,15 +1863,10 @@ fn slot_guard_of(desc: &trace_ir::TypeDesc) -> Option<SlotGuard> {
         // `void *` / an unknown pointer is untyped storage: it may hold any
         // address, a function's included.
         TD::Ptr(inner) if matches!(inner.as_ref(), TD::Void | TD::Unknown) => return None,
-        // A table of function pointers, or of untyped pointers, holds what
-        // its elements hold; a multi-dimensional one, what its leaves hold.
-        TD::Array { elem, .. }
-            if matches!(elem.as_ref(), TD::FnPtr { .. } | TD::Array { .. })
-                || matches!(elem.as_ref(), TD::Ptr(f)
-                    if matches!(f.as_ref(), TD::FnPtr { .. } | TD::Void | TD::Unknown)) =>
-        {
-            return slot_guard_of(elem);
-        }
+        // An array guards as its element does: a table of function pointers
+        // takes their arity, a scalar array (`long v[4]`) is unguarded as a
+        // scalar is, and a multi-dimensional one guards as its leaves do.
+        TD::Array { elem, .. } => return slot_guard_of(elem),
         desc => desc,
     };
     match desc {
@@ -1779,20 +1997,23 @@ fn write_to_cell(
     let grew = {
         let SolverState {
             memory_pts,
+            memory_bits,
+            loc_bits,
             fn_arity,
             ..
         } = &mut *st;
-        let entry = memory_pts.entry(cell).or_default();
-        let before = entry.len();
-        for &l in locs {
-            if filter.admits(fn_arity, pag, l) {
-                entry.insert(l);
-            }
-        }
-        entry.len() > before
+        write_memory(
+            memory_pts,
+            memory_bits,
+            loc_bits,
+            cell,
+            locs.iter()
+                .copied()
+                .filter(|&l| filter.admits(fn_arity, pag, l)),
+        )
     };
     if grew {
-        st.touch_loc_holders(holders, cell, &pag.indices.load_src);
+        st.touch_loc_holders(holders, cell, &pag.indices);
     }
 }
 
@@ -1907,6 +2128,7 @@ fn add_pts(st: &mut SolverState, node: PagNodeId, loc: LocId) {
         entry.insert(loc)
     };
     if inserted {
+        st.mirror_pts(node, &[loc]);
         st.loc_nodes.entry(loc).or_default().insert(node);
         st.record_delta(node, &[loc]);
         st.push(node);
@@ -2217,6 +2439,152 @@ mod tests {
         assert_eq!(pts(&st, dst_b), [1, 2, 3]);
     }
 
+    /// A `LocBits` mirror says "held" only for what was set in it, under a
+    /// numbering shared by every mirror.
+    #[test]
+    fn loc_bits_answer_only_what_was_set() {
+        let mut numbering = LocBits::default();
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        assert!(!numbering.test(&a, LocId(7)));
+        numbering.set(&mut a, LocId(7));
+        numbering.set(&mut b, LocId(300));
+        numbering.set(&mut b, LocId(7));
+        assert!(numbering.test(&a, LocId(7)));
+        assert!(!numbering.test(&a, LocId(300)));
+        assert!(numbering.test(&b, LocId(300)) && numbering.test(&b, LocId(7)));
+        assert!(!numbering.test(&b, LocId(8)));
+        // Dense: two locations numbered, whatever their ids.
+        assert_eq!(numbering.next, 2);
+        let mirrored = numbering.mirror(&[LocId(8), LocId(7)]);
+        assert!(numbering.test(&mirrored, LocId(8)) && numbering.test(&mirrored, LocId(7)));
+        assert!(!numbering.test(&mirrored, LocId(300)));
+    }
+
+    /// A merge tests the destination's mirror as it stood before the step,
+    /// so what the step itself adds has a clear bit and is found in the set:
+    /// a location two cells share is added once, whether the destination is
+    /// mirrored from the start or crosses [`MIRROR_MIN`] during the step.
+    #[test]
+    fn a_clear_bit_falls_back_to_the_set_within_a_step() {
+        let mut pag = Pag::default();
+        for i in 0..300u32 {
+            pag.locations.push(loc(i, false));
+        }
+        let (cell_a, cell_b) = (LocId(0), LocId(1));
+        for (held_before, mirrored_before) in [(MIRROR_MIN as u32 - 1, false), (100, true)] {
+            let dst = PagNodeId(3);
+            let mut st = SolverState::default();
+            for l in 200..200 + held_before {
+                add_pts(&mut st, dst, LocId(l));
+            }
+            assert_eq!(st.pts_bits.contains_key(&dst), mirrored_before);
+            st.delta.clear();
+            st.delta_pending.clear();
+            {
+                let SolverState {
+                    memory_pts,
+                    memory_bits,
+                    loc_bits,
+                    ..
+                } = &mut st;
+                // Both cells hold 10..20 and a location `dst` already
+                // holds; `cell_b` also 20..40.
+                let a = (10..20).chain([200]).map(LocId);
+                let b = (10..40).chain([200]).map(LocId);
+                write_memory(memory_pts, memory_bits, loc_bits, cell_a, a);
+                write_memory(memory_pts, memory_bits, loc_bits, cell_b, b);
+            }
+            let mut fresh = Vec::new();
+            st.load_into(&pag, &mut fresh, dst, &[cell_a, cell_b]);
+            let added: Vec<u32> = fresh.iter().map(|l| l.0).collect();
+            assert_eq!(added, (10..40).collect::<Vec<_>>(), "added once each");
+            assert_eq!(st.delta[&dst], fresh);
+            assert_eq!(st.pts[&dst].len(), held_before as usize + 30);
+            let bits = &st.pts_bits[&dst];
+            assert!(
+                st.pts[&dst].iter().all(|&l| st.loc_bits.test(bits, l)),
+                "the mirror holds the whole set after the step"
+            );
+        }
+    }
+
+    /// `load_into` steps over a load's new locations in one call and must
+    /// leave exactly what one `add_pts` / `merge_memory_into_if_grown` per
+    /// location leaves: the same set in the same iteration order, the same
+    /// delta order, the same holders in the same order, and the same
+    /// worklist. Sets large enough to be mirrored are included, the cells
+    /// grow between the two steps, and `cell_b` is slot-guarded
+    /// (`NotFnPtr`), so the function values it holds are not lifted.
+    #[test]
+    fn load_into_matches_one_step_per_location() {
+        // Locations 0..3 are functions, the rest data.
+        let mut pag = Pag::default();
+        for i in 0..400u32 {
+            pag.locations.push(loc(i, i < 3));
+        }
+        let (cell_a, cell_b) = (LocId(3), LocId(4));
+        // Two loads share the cells, so each location has several holders.
+        let dsts = [PagNodeId(9), PagNodeId(5)];
+        let fill = |st: &mut SolverState, cell: LocId, range: std::ops::Range<u32>| {
+            let SolverState {
+                memory_pts,
+                memory_bits,
+                loc_bits,
+                ..
+            } = st;
+            write_memory(memory_pts, memory_bits, loc_bits, cell, range.map(LocId));
+        };
+        let (mut stepped, mut batched) = (SolverState::default(), SolverState::default());
+        for st in [&mut stepped, &mut batched] {
+            st.slot_guard.insert(cell_b, SlotGuard::NotFnPtr);
+        }
+        let mut fresh = Vec::new();
+        let delta = [LocId(0), cell_a, LocId(1), cell_b, LocId(0)];
+        for (grow_a, grow_b) in [(10..150, 100..220), (150..260, 0..30)] {
+            for st in [&mut stepped, &mut batched] {
+                fill(st, cell_a, grow_a.clone());
+                fill(st, cell_b, grow_b.clone());
+            }
+            for dst in dsts {
+                for &l in &delta {
+                    if fn_for_loc(&pag, l).is_some() {
+                        add_pts(&mut stepped, dst, l);
+                    } else {
+                        stepped.merge_memory_into_if_grown(&pag, &mut fresh, dst, l);
+                    }
+                }
+                let merges = batched.load_into(&pag, &mut fresh, dst, &delta);
+                assert_eq!(merges, 2);
+            }
+            for dst in dsts {
+                let order = |st: &SolverState| st.pts[&dst].iter().copied().collect::<Vec<_>>();
+                assert_eq!(order(&stepped), order(&batched));
+                assert_eq!(stepped.delta[&dst], batched.delta[&dst]);
+            }
+            assert_eq!(stepped.worklist, batched.worklist);
+            let holders =
+                |st: &SolverState, l: LocId| st.loc_nodes[&l].iter().copied().collect::<Vec<_>>();
+            for l in stepped.pts[&dsts[0]].iter().copied() {
+                assert_eq!(
+                    holders(&stepped, l),
+                    holders(&batched, l),
+                    "holders of {l:?}"
+                );
+                assert_eq!(holders(&batched, l).len(), 2, "holders of {l:?}");
+            }
+        }
+        for dst in dsts {
+            assert!(
+                batched.pts_bits.contains_key(&dst),
+                "the destination is mirrored"
+            );
+            // Functions 0 and 1, and data 3..260; the guarded cell's
+            // function 2 is not lifted.
+            assert_eq!(batched.pts[&dst].len(), 2 + 257);
+            assert!(!batched.pts[&dst].contains(&LocId(2)));
+        }
+    }
+
     /// Every `SlotGuard` maps to the filter that reproduces it, so the guard
     /// rule has one implementation rather than one per call site.
     #[test]
@@ -2238,6 +2606,50 @@ mod tests {
             FnFilter::Arity(9).guard_admits(&fn_arity, LocId(2)),
             "unknown arity passes"
         );
+    }
+
+    /// An array guards as its element does: a scalar array (`long v[4]`, a
+    /// struct's array field typed `Array { elem }`) is unguarded, as a scalar
+    /// is, so a function value cast into it is kept; a table of function
+    /// pointers keeps its arity guard and an array of structs stays
+    /// `NotFnPtr`.
+    #[test]
+    fn array_slots_guard_as_their_elements_do() {
+        use trace_ir::TypeDesc as TD;
+        let array = |elem: TD| TD::Array {
+            elem: Box::new(elem),
+            size: Some(4),
+        };
+        let fn_ptr = |arity: usize| TD::FnPtr {
+            ret: Box::new(TD::Void),
+            params: vec![TD::Int; arity],
+        };
+        for scalar in [TD::Char, TD::Long, TD::SizeT] {
+            let desc = array(scalar);
+            assert!(slot_guard_of(&desc).is_none(), "{desc:?}");
+            let nested = array(desc);
+            assert!(slot_guard_of(&nested).is_none(), "{nested:?}");
+        }
+        assert!(matches!(
+            slot_guard_of(&array(fn_ptr(2))),
+            Some(SlotGuard::FnParams(2))
+        ));
+        assert!(matches!(
+            slot_guard_of(&array(TD::Ptr(Box::new(fn_ptr(1))))),
+            Some(SlotGuard::FnParams(1))
+        ));
+        assert!(matches!(
+            slot_guard_of(&array(TD::Ptr(Box::new(TD::Int)))),
+            Some(SlotGuard::NotFnPtr)
+        ));
+        let s = TD::Struct {
+            name: "S".into(),
+            fields: Vec::new(),
+        };
+        assert!(matches!(
+            slot_guard_of(&array(s)),
+            Some(SlotGuard::NotFnPtr)
+        ));
     }
 
     /// Within one store a repeated filter reuses the view already built; a
@@ -2508,6 +2920,7 @@ mod tests {
                 param_type_ids: Vec::new(),
                 explicit_arity: None,
                 default_args: 0,
+                reference_params: Vec::new(),
                 owner_unresolved: false,
                 variadic: false,
                 defaulted_in_class: false,

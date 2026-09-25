@@ -403,6 +403,7 @@ mod tests {
             param_type_ids: Vec::new(),
             explicit_arity: None,
             default_args: 0,
+            reference_params: Vec::new(),
             owner_unresolved: false,
             variadic: false,
             defaulted_in_class: false,

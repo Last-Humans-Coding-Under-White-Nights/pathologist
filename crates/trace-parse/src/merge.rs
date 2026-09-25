@@ -40,6 +40,11 @@ pub struct UnitIndex {
     /// Per-unit declared `operator->` returns (C++), merged in every mode.
     pub arrow_returns: Vec<trace_ir::ArrowReturn>,
     pub template_returns: BTreeMap<String, BTreeMap<String, Vec<trace_ir::TemplateReturn>>>,
+    /// Per-unit class template parameters and dependent bases (C++).
+    pub class_templates: BTreeMap<String, trace_ir::ClassTemplate>,
+    /// Those this unit defines in an anonymous namespace, by unit-local file.
+    pub anonymous_class_templates:
+        BTreeMap<String, BTreeMap<trace_ir::FileId, trace_ir::ClassTemplate>>,
     /// Classes declared `final` in this unit.
     pub final_classes: Vec<String>,
     /// Classes this unit defines in an anonymous namespace, by unit-local file.
@@ -326,6 +331,9 @@ fn merge_unit(
     for fact in &unit.template_bases {
         program.add_template_base_fact(fact);
     }
+    for (class, fact) in &unit.class_templates {
+        program.add_class_template_fact(class, None, fact);
+    }
     for fact in &unit.arrow_returns {
         if !program.arrow_returns.contains(fact) {
             program.arrow_returns.push(fact.clone());
@@ -381,6 +389,11 @@ fn merge_unit(
     for (cls, bases) in &unit.anonymous_bases {
         for (file, base) in bases {
             program.add_anonymous_base(cls, map_file(*file), base);
+        }
+    }
+    for (class, files) in &unit.anonymous_class_templates {
+        for (&file, fact) in files {
+            program.add_class_template_fact(class, Some(map_file(file)), fact);
         }
     }
 
@@ -1778,6 +1791,7 @@ mod tests {
                 param_type_ids: Vec::new(),
                 explicit_arity: Some(1),
                 default_args: 0,
+                reference_params: Vec::new(),
                 owner_unresolved: false,
                 variadic: false,
                 defaulted_in_class: false,
@@ -1830,6 +1844,7 @@ mod tests {
             param_type_ids: Vec::new(),
             explicit_arity: Some(1),
             default_args: 0,
+            reference_params: Vec::new(),
             owner_unresolved: false,
             variadic: false,
             defaulted_in_class: false,

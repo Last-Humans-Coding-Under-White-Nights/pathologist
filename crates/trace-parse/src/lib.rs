@@ -12,6 +12,7 @@ mod lower;
 mod memory;
 mod merge;
 mod parse;
+mod template_bases;
 
 pub use deps::*;
 pub use explore::*;

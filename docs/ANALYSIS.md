@@ -265,11 +265,12 @@ entry before the global one: `using namespace A;` inside `Outer` asks
 what a directive brings in.
 
 In a value (`out = name;`) and a bare call (`name()`), a declared name
-shadows a function of the same name: a variable (local, parameter, or one the
-lookup above finds), then an instance field read through `this` in a member
-body, and only then the function, as a return already asks. `&name` asks
+shadows a function of the same name: a local, a parameter or a body `using`,
+then an instance field read through `this` in a member body, then a variable
+the lookup above finds, and only then the function, as a return already asks. `&name` asks
 the same way, so `&x` takes a variable's address even where a function `x`
-is visible.
+is visible. An instance field outranks a namespace or global variable of its
+name; see [Implicit this member variable access](#implicit-this-member-variable-access).
 
 A function named as a value resolves the way a call's name does
 (`resolve_function_named`): through the enclosing classes (their bases
@@ -348,16 +349,9 @@ The scope walk stops there (`scoped_variable_unless_hidden`), so `d.cb()`
 calls `D::cb`, not base `B`'s static callback. A hidden name reads no
 variable, now or in the deferred end-of-unit pass; an instance field it names
 is read through `this`, and a bare call through one in a member body
-(`cb()`) loads `this->cb`, as `this->cb()` does. Similarly, calling a function
-pointer through an implicit member pointer or member field path in a member
-body (`handler_->fn()`, `val_handler_.fn()`, `nested_->handler->fn()`) roots
-field decomposition at `this` (`this->handler_->fn`). When `decompose_field_path`
-peels down to an unqualified identifier that is not a local variable or
-parameter, it checks whether the identifier names an instance field on `this`
-(`class_ctx_field`); if so, the path is rooted at `this` with arrow access.
-This emits the corresponding GEP and Load constraints, setting `callee_var`
-for indirect call resolution rather than incorrectly treating the call as a
-direct external call (see [Implicit this member variable access](#implicit-this-member-variable-access)). A reference member is
+(`cb()`) loads `this->cb`, as `this->cb()` does, and a call through a path
+rooted at one (`handler_->fn()`) is an indirect call through
+`this->handler_->fn` (see [Implicit this member variable access](#implicit-this-member-variable-access)). A reference member is
 recorded as a reference binding, so `&H::ref` and `&h.ref` are the
 referent's address. A callable member called through an object (`h.fun()`)
 calls its class's `operator()`, as `H::fun()` does. Every declarator of one member declaration
@@ -589,7 +583,7 @@ Lowered from C during parse. Mapped to PAG in `Pag::build_flow_constraints`.
 | `Copy { dst, src }` | pointer assignment | `p = q` |
 | `AddrOfVar { dst, src }` | address of variable | `p = &x` |
 | `AddrOfFn { dst, callee }` | address of function | `p = handler` (fn ptr) |
-| `Load { dst, src }` | load through pointer | `y = *p` |
+| `Load { dst, src }` | load through pointer | `y = *p`; `y = *h->f` is `Load(y, Load(GEP(h, f)))` (see [Dereferenced operands](#dereferenced-operands)) |
 | `Store { dst, src }` | store through pointer | `*p = y`, `field = val` |
 | `GepField { dst, base, field }` | field address | `&obj.field`, `p->field` |
 | `ArrayFnMember { array, callee }` | fn-ptr array init member | `{ fn0, fn1 }` |
@@ -637,6 +631,104 @@ subDev.subDevOps->setConfig(subDev);
 
 **`StringConst`** intern a C string literal as an abstract location (`LocKind::StringLit`). Assignments (`const char *n = "foo"`), copies, and call arguments intern the same way, so a later `dlsym(h, n)` still sees `"foo"`. Concatenated literals (`"ta" "rget"`) are folded. No `sprintf` / buffer writes.
 
+### Dereferenced operands
+
+This section is the authoritative description of what `*x` reads, stores
+through and passes. `*x` goes through the value `x` holds, computed as a value
+(`Operand` in `lower.rs`):
+
+- A name is its own variable: `y = *p` is one `Load`, with no temporary. A
+  name bound to a reference is loaded through first. A reference is a
+  declaration whose outermost declarator is `&` or `&&` (`declares_reference`),
+  so `T *&r` and `T *const &r` are bound to the pointer's value, as
+  initialization and argument passing bind them.
+- A member path (`h->pp`, `this->a->pp`, `(*this).m`) is projected and its cell
+  loaded: `y = *h->f` is `Load(y, Load(GEP(h, f)))`, and `*h->f = v` stores
+  through the loaded value the same way. An array member is its own cell
+  (`*h->arr` reads `h->arr[0]`; a struct's array field is typed
+  `Array { elem }`); an element of a member table (`h->t[i]`) is loaded from
+  the table's cell.
+- An inner `*` is loaded: `**pp` loads twice.
+- A call's result, for a direct call by plain name (`*f()`) or a call through
+  a function-pointer data member (`*h->cb()`). A method's result is not
+  modeled, so `*obj->Get()` has no value.
+- `this` is its own value.
+- A function pointer is read in place (`*fp` is `fp`); a pointer to a
+  function pointer is loaded. A function designator is the function itself:
+  `y = *handler`, `T y = *handler` and `take(*handler)` take `handler`'s
+  address, as `y = handler` does.
+
+A bare instance field in a member body is a member path rooted at `this`
+(`m_pp` is `this->m_pp`, `(*m_in).pp` is `this->m_in->pp`); see
+[Implicit this member variable access](#implicit-this-member-variable-access)
+for when a name is one.
+
+Resolution emits nothing until the whole operand resolves, so an operand that
+fails leaves no temporaries behind.
+
+Positions:
+
+- A read `y = *x` and a store target `*x = v`: an operand that does not
+  resolve falls back to the root variable its lvalue names (`h` in `*h->f`
+  when neither `h`'s class nor a base declares `f`), loading or storing through it. This
+  over-approximates rather than drops the flow.
+- A store resolves its target first, then its value; a target that cannot be
+  lowered emits no value temporaries.
+- The value positions `return *x;` and the store source in `*out = *x` emit
+  nothing when the operand does not resolve. Arguments fall back instead
+  (below).
+- A member read without `*` is the same value: `y = h->f`, `y = m_f` and
+  `return h->f;` load the member's cell, and an array member is its cell
+  there too (`p = h->arr` and `return arr;` hold the array's address, not
+  what its elements hold).
+- `return *p;` in a function declared to return a reference (`S &f()`, or a
+  trailing `-> S &`; `returns_reference`) returns the address, `p`'s value.
+  `decltype(auto)` returns by value.
+
+Arguments `f(*x)`:
+
+- C passes the loaded value.
+- C++ passes by the callee's declared parameter kind,
+  `Function.reference_params`. It is recorded from declaration syntax, in-class
+  prototypes, unnamed parameters and lambdas included, with the outermost-
+  reference predicate above. A `...` tail is by value; a parameter pack takes
+  its own kind for every position past the others.
+  - A reference parameter takes the address, `x`'s value.
+  - A by-value parameter takes the loaded value. The load is emitted once per
+    argument and shared by every target of the site.
+  - Where the kind is unknown (no declaration read, an indirect call, an
+    unresolved callee), one temporary holds both the address and the loaded
+    value.
+- An operand that does not resolve passes its root variable, unloaded
+  (`resolve_expr_var`): `o` in `take(*o->absent)`, where no layout declares
+  `absent`, and `arr` in `take(*arr[i])`.
+
+Field-path roots:
+
+- `(*X).f` is rooted at `X`'s value: `(*h->in).f` projects `f` from the object
+  `h->in` points to, and `(*m_in).f` in a member body from the object the
+  instance field `m_in` points to.
+- `(*&x).f` is `x.f`.
+- `(*pp)->x` reads `x` through the pointer `*pp` loads.
+
+Limits:
+
+- A call lowering cannot name a callee for (a function-pointer call, a lambda
+  called through its closure variable) passes the combined temporary for `*x`.
+- `sp.get()` is not modeled, so `*sp.get()` passes nothing.
+- `*h->t[i]` on a member table of pointers reads one level short, as
+  `field_table` reads a table element.
+- Casts, pointer arithmetic (`*(p + 1)`) and elements of a local array
+  (`*arr[i]`) are not values: a read or store target and an argument keep
+  the root variable where the lvalue names one, and `return` or a store
+  source emits nothing.
+- `&*x` is not simplified: `&*h->f` takes `h`'s address.
+- A `T *&` out-parameter is bound by value, so assigning to it does not reach
+  the caller's pointer.
+- A reference return spelled through an alias (`Ref f()` with
+  `using Ref = S &;`) or deduced by `decltype(auto)` is taken as by value, so
+  `return *p;` there reads one level too deep.
+
 ### Smart-pointer unwrap
 
 `UnwrapPointer { dst, src }` is the step through a smart pointer's overloaded `operator->` or `operator*`. `src` holds the wrapper value (`sp`, or the loaded `h.item`); `dst` is the pointee-typed receiver temporary (`_recv`) that field accesses continue from. The receiver's type is the pointee class, and it is the only type the constraint consults, so merge remaps nothing but the two variables.
@@ -658,11 +750,11 @@ The unwrap adds no fallback of its own. The receiver's GEPs already fall back to
 
 A wrapper variable is a pointer to its pointee as far as the solver is concerned: after merging, `mark_wrapper_values` (`lower.rs`) sets `is_pointer` on every variable whose type `operator->` steps through. Its value and its storage are therefore kept in step ([Variable cells](#propagation-highlights)), so an object stored through `&sp` (`Fill(&sp)` writing `*out = &obj`) reaches `sp->f`, and `(*w)->f` sees `sp = x` copies; and a wrapper argument is wired to its parameter by a persistent copy, as a raw pointer is.
 
-A field path may also start at a call's result when it crosses a wrapper at its root (`GetSp()->cb()`, `GetSp()->value`): the path validates first, then the call's result is lowered into a temporary (`CallReturn`) that the unwrap reads. Only a direct call by plain name has a return flow to read; a qualified or member call (`Foo::GetInstance()->f`) is not decomposed, and a call returning a raw pointer keeps its previous handling. Evaluating any root expression as a value, which would lift both restrictions, is the direction [#151](https://github.com/Last-Humans-Coding-Under-White-Nights/pathologist/issues/151) proposes.
+A field path may also start at a call's result when it crosses a wrapper at its root (`GetSp()->cb()`, `GetSp()->value`): the path validates first, then the call's result is lowered into a temporary (`CallReturn`) that the unwrap reads. Only a direct call by plain name has a return flow to read; a qualified or member call (`Foo::GetInstance()->f`) is not decomposed, and a call returning a raw pointer keeps its previous handling. A dereferenced root is a value ([Dereferenced operands](#dereferenced-operands)): `(*h->sp).f` unwraps the value the member `h->sp` holds.
 
 Limits. Each leaves the receiver on the pointee's field summary, which is what every smart-pointer field access resolved through before `UnwrapPointer` existed:
 
-- **Subclasses are those the inheritance graph records.** A class deriving from the pointee through a template parameter (`class Foo : public IRemoteStub<IFoo>` with `template<class I> class IRemoteStub : public I`) is not known to derive from `IFoo`, so its objects are rejected, as virtual dispatch through the same graph would not see them either ([#150](https://github.com/Last-Humans-Coding-Under-White-Nights/pathologist/issues/150)).
+- **Subclasses are those the inheritance graph records.** A class deriving from the pointee through a template parameter is one only when the template's definition is in the tree ([Template-parameter bases](#template-parameter-bases)); otherwise its objects are rejected, as virtual dispatch through the same graph would not see them either.
 
 ### Weak-pointer promotion
 
@@ -673,7 +765,7 @@ Limits. Each leaves the receiver on the pointee's field summary, which is what e
 
 The result's type additionally needs a held class the call site can name; the value flow does not, so a promotion whose type stays unknown still carries its receiver's value.
 
-The receiver value is the variable for a plain name, and the object it names for a reference (`const wptr<T> &weak` is loaded through). Otherwise it is a temporary filled by ordinary expression lowering: `msg->weak.lock()` copies the loaded `weak` field, not `msg`; `get_weak().lock()` copies the call's return; `(*h->weak).lock()` loads through the `weak` member's value. The copy is emitted wherever a call result lands: an initializer or assignment to a local, and, as a direct store of the receiver value, a store into a field (`s->strong = wp.lock()`) or through a pointer (`*out = wp.lock()`, parenthesized or not). The call site itself is recorded as before, so the call edge to the external `lock`/`promote` remains.
+The receiver value is the variable for a plain name, and the object it names for a reference (`const wptr<T> &weak` is loaded through). Otherwise it is a temporary filled by ordinary expression lowering: `msg->weak.lock()` copies the loaded `weak` field, not `msg`; `get_weak().lock()` copies the call's return. A dereferenced receiver is read as any `*x` is ([Dereferenced operands](#dereferenced-operands)): `(*h->weak).lock()` loads through the `weak` member's value and `(*GetWeakPtr()).lock()` through the direct call's result, while a method call's result (`(*obj->GetWeak()).lock()`) has no value and nothing is copied. The copy is emitted wherever a call result lands: an initializer or assignment to a local, and, as a direct store of the receiver value, a store into a field (`s->strong = wp.lock()`) or through a pointer (`*out = wp.lock()`, parenthesized or not). The call site itself is recorded as before, so the call edge to the external `lock`/`promote` remains.
 
 This is a may-alias relation. Expiry, a null result, and ownership counts are not modeled. `return wp.lock();` records no return flow: `ReturnFlow` has no receiver form.
 
@@ -799,8 +891,8 @@ other store.
 
 Wrong-type pointer casts put unrelated objects into a pointer's points-to; a store through such a pointer would otherwise write callback addresses into alien layouts, where later field loads surface them as bogus indirect-call targets. The solver therefore filters **function values only** (all non-function flow stays unfiltered, preserving soundness):
 
-- A fn value may enter `memory_pts[cell]` / a summary cell only when the cell's declared type accepts it (`slot_guard_for`): `FnPtr` slots — a fn-pointer field (`FnPtr`) or variable (`Ptr(FnPtr)`) — require the same parameter count; a table of fn pointers or of untyped pointers (`void *ops[]`) takes its element's guard, a multi-dimensional one its leaf element's; other concrete non-fn-pointer cells (`struct`, array, scalar-pointer, union) reject all fn values; unknown/untyped cells, `void *` included, stay writable (a dlsym-style `GetSymbol(name, void **out)` stores a function there).
-- The same guard applies when `merge_memory_into` lifts cell contents into points-to sets — to **function values only**, exactly as on the store path: a load through a `NotFnPtr` cell (declared pointer, `struct`, `union`, array) returns every non-function value stored there. (Before #127 the load applied the guard to every value, so such cells yielded nothing — e.g. `viaload = *pp` with `int **pp` lost `&g`.) The guard also applies when a `Gep` passes fn values from the base node's set into the field node — except registered `array_fn_members` table members, which always pass (see "Arrays and function-pointer tables").
+- A fn value may enter `memory_pts[cell]` / a summary cell only when the cell's declared type accepts it (`slot_guard_for`): `FnPtr` slots — a fn-pointer field (`FnPtr`) or variable (`Ptr(FnPtr)`) — require the same parameter count; an array takes its element's guard, a multi-dimensional one its leaf element's: a table of fn pointers keeps their arity, a table of untyped pointers (`void *ops[]`) or of scalars (`long v[4]`) stays writable as its element does, and an array of structs or scalar pointers rejects fn values; other concrete non-fn-pointer cells (`struct`, scalar-pointer, union) reject all fn values; unknown/untyped cells, `void *` included, stay writable (a dlsym-style `GetSymbol(name, void **out)` stores a function there).
+- The same guard applies when `merge_memory_into` lifts cell contents into points-to sets — to **function values only**, exactly as on the store path: a load through a `NotFnPtr` cell (declared pointer, `struct`, `union`, an array of those) returns every non-function value stored there. (Before #127 the load applied the guard to every value, so such cells yielded nothing — e.g. `viaload = *pp` with `int **pp` lost `&g`.) The guard also applies when a `Gep` passes fn values from the base node's set into the field node — except registered `array_fn_members` table members, which always pass (see "Arrays and function-pointer tables").
 
 Consequence: callbacks stored through correctly-typed ops assignments resolve exactly as before, while cross-signature leaks (e.g. a 2-param `AddService` callback surfacing at 4-param `Dispatch` sites) are cut. Documented imprecision: old-style casts that stash fn pointers in `void *`-typed cells then call them through typed loads still work (unknown cells accept everything), but calls through cells whose declared type is structurally wrong for the stored fn are no longer reported.
 
@@ -859,10 +951,39 @@ database is byte-identical. Measurements are in the
 [evaluation report](EVAL_REPORT.md#analyze-phase-performance--2026-09-21-117).
 
 What is *not* done here: propagating only a store's newly-gained source
-locations instead of its whole source set, and bitset points-to sets. Both
+locations instead of its whole source set, and bitsets as the *storage* of
+points-to sets, which would fix their iteration order by bit position. Both
 would cut more, and both change the order locations enter cell memory, which
 changes the partial result the default pop budget stops at. That is a
-deliberate trade-off to make explicitly, not a free win.
+deliberate trade-off to make explicitly, not a free win. Bit mirrors that
+only answer membership, with the sets kept as the storage, are done (below).
+
+**Membership mirrors and per-load merges**
+
+Hub sets make most of the solver's set operations hits: a load merges each
+location a cell gained into a destination that usually holds it already, and
+a store re-inserts its whole source into cells that usually hold it already.
+The solver answers those without hashing, and still without changing the
+order of anything:
+
+- A points-to set or cell memory of at least `MIRROR_MIN` locations gets a
+  bit mirror (`LocBits`). Bits index a dense numbering of just the
+  locations mirrored sets hold, far fewer than all locations, so a mirror
+  stays small. The hash sets stay the storage and the iteration order. A mirror only ever says "held":
+  a bit is set once its set holds the location, sets never shrink, and a
+  clear bit falls back to the set. Every insert therefore happens as before,
+  in the same order.
+- A load steps over its source's new locations in one call per destination
+  (`load_into`) rather than one per location. The destination's set, mirror
+  and merged sizes are each looked up once. Only the destination's own
+  indexing, delta and requeue are deferred to the end of the step, and no
+  merge reads them, so they see the same sequence as before.
+- A holder's load-source test is a bit per node (`SolverIndices::is_load_src`)
+  instead of a map lookup, in the holder set's own iteration order.
+
+On HDF these recover what the larger hub of #150/#151 costs; the exported
+database, the `points_to` debug rows included, is byte-identical. Measurements
+are in the [evaluation report](EVAL_REPORT.md#dereferenced-operands-and-template-parameter-bases--2026-09-25-151-150).
 
 **Indirect calls**
 
@@ -917,7 +1038,10 @@ stub declaration namespace, independently of a qualified wrapper namespace;
 a relative qualified argument such as `api::IFoo` searches the declaration
 namespace and its enclosing namespaces, while only `::api::IFoo` forces global
 lookup. Bodyless methods are intentionally leaf targets when no implementation
-is indexed.
+is indexed. When the `IRemoteStub` definition itself is in the tree, the stub
+also has a real inheritance edge to `IFoo`
+([Template-parameter bases](#template-parameter-bases)); the argument
+recovery above covers the common case where it is not.
 The edge has resolution `ipc` and no source call site, and can be disabled
 with `--no-ipc`.
 Because v1 has no opcode or parcel-type information, overloaded handlers at
@@ -976,34 +1100,57 @@ structs peel to their element type for field resolution (`arr[i].field`).
 
 ## Implicit this member variable access
 
-In C++ instance methods and member bodies, an unqualified identifier referring to a
-class instance field acts as an implicit member access on `this` (`member_ = val;` is
-semantically `this->member_ = val;`).
+This section is the authoritative description of when a bare name in a C++
+member body designates an instance field of `this`. In an instance method or
+other member body, an unqualified identifier naming an instance field is a
+member access on `this`: `member_ = val;` is `this->member_ = val;`,
+`m_in->pp` is `this->m_in->pp`, and `*m_pp` is `*this->m_pp`.
 
-Lowering resolves and models implicit `this` member accesses across all operations:
-- **`this` receiver binding**: `resolve_lvalue_var` and `resolve_expr_var` recognize
-  the AST node kind `"this"` from `ctx.locals["this"]`.
-- **Stores**: In `assignment_expression`, when the LHS is an unqualified identifier
-  or an array subscript (`table_[i] = rhs;`) that does not resolve to a local or
-  global variable, lowering checks `class_ctx_field`. If matched, it materializes
-  a GEP temp representing `this->member` via `resolve_implicit_this_member` and
-  routes to `emit_store_to_location` (which handles direct values, function pointer
-  designators, lambdas, and call returns).
-- **Inheritance hierarchy**: `class_ctx_field` traverses base classes using BFS over
-  `program.bases_of(cls)`, allowing derived class methods to access protected/public
-  fields declared in base classes.
-- **Nested field paths**: When peeling a field path (`inner_.val = p;` or `p = inner_.val;`),
-  if `resolve_lvalue_var` fails on the terminal receiver and the identifier matches a class
-  field on `this`, `decompose_field_path` binds `this` as the base variable and prepends
-  the member field to the path. `field_id_in_hierarchy` and `field_type_in_hierarchy`
-  resolve field layouts across base classes.
-- **Subscript and element access**: Array members peel through `TypeDesc::Array` in
-  `peel_ptr_to_struct`, and element accesses through implicit member arrays (`table_[i]`)
-  emit stores, loads, and callback call edges (`table_[i]()` via
-  `resolve_field_or_element_callee`).
-- **Loads and return flow**: `expr_to_rhs_flow` and `return_flow_from_expr` emit `Load`
-  and `Copy` constraints for bare member reads, array element reads, and field paths
-  returned from member functions (`return member_;`, `return inner_.val;`, `return table_[i];`).
+One rule (`implicit_this` in `lower.rs`) decides it, in the order C++ lookup
+asks: a local, a parameter, or a `using ns::name;` in the body hides the
+field; the field, when the member's class or a base declares it, hides a
+namespace or global variable and a function of the same name. These
+positions ask it — values, stores, `&member_`, calls (`cb_()`), returns,
+the receiver of a member call (`plugin_.OnEvent()`), an argument of a direct
+initialization (`T g(mu_);`), and the root of a field path or dereference
+(including `f(*m_p)`) — and lower the field as the
+one-field path `this->member_` (`field_path`), so one mechanism emits the
+`GepField` in each of them. A bare field passed as a call argument
+(`f(m_p)`) does not; see Limits below. A call through a
+function pointer reached from one (`handler_->fn()`, `val_handler_.fn()`,
+`nested_->handler->fn()`) is therefore a load through
+`this->handler_->fn`, an indirect call with a `callee_var`, not a direct
+call to an external `fn` (#146). A call through a
+field whose path does not resolve stays unresolved, as the field's value
+does; it never falls back to a function the field hides.
+
+- **The field's class**: `class_ctx_field` searches the member's class, then
+  its bases breadth first (`program.bases_of`). A function or static data
+  member of the name declared on an intermediate class stops the search, as
+  C++ name hiding does. The member's own class is its type even where
+  `this`'s pointer type does not tag it as one (a union).
+- **Inherited fields**: a field a base declares, at the root of any field
+  path (`this->base_field_`, `d->base_field_`, `*d->get()`), is read through
+  a summary receiver of the declaring class (`_recv`), so the access reaches
+  the base's instance-insensitive field summary.
+- **Member tables**: an element of a member array (`table_[i]`, as
+  `this->table_[i]`) is the table's cell index-insensitively, as `s.table[i]`
+  is (`field_table`): stores, reads, returns and calls through it
+  (`table_[i]()`) go through that cell. Array types peel to their element in
+  `peel_ptr_to_struct`, so `table_[i].val` resolves `val` on the element.
+- **`this`**: the explicit `this` is its own value in values, returns and
+  lvalues (`ctx.locals["this"]`); a lambda's captured `this` is the body's.
+
+Limits:
+
+- A bare instance field passed as a call argument (`f(m_p)` in a member body)
+  passes the field's cell (`GEP(this, m_p)`), not its loaded value as
+  `f(this->m_p)` does, and a global of the same name takes precedence there
+  (`collect_call_args` asks `resolve_expr_var` before `addr_of_field_path`)
+  (follow-up).
+
+What a read, store or argument then does with the member's value is described
+in [Dereferenced operands](#dereferenced-operands).
 
 ## Indirect call resolution patterns
 
@@ -1037,6 +1184,7 @@ When a call edge is created (direct or indirect), actuals are connected to calle
 
 - **Pointer variables** → PAG `Copy` from actual var node to formal var node, persistent for pointers whose pointees can hold callbacks (`var_may_hold_pointee`: fn pointers, pointers to fn-pointer slots such as `cb_t *out` or a table row, and pointers to aggregates or unknown types)
 - **Function identifiers** passed as fn-ptr args → `add_pts(formal, fn_loc)`
+- **Dereferenced arguments** (`f(*x)`) pass what [Dereferenced operands](#dereferenced-operands) gives the parameter kind
 - **Address of a plain variable** (`f(&x)`, through parentheses and casts — C `(T)` and C++ `static_cast` / `reinterpret_cast` / `const_cast` / `dynamic_cast`, one peeling rule, `peel_casts`, at every value entry point: stored values, assignments and initializers, return values, arguments and callback arguments) → lowering materializes a temp with `AddrOfVar { dst: temp, src: x }` (`addr_of_temp`) and records the temp as the actual, so the formal points to `x` (the out-parameter idiom: `get_buf(&q)` gives `out -> q`). Before #127 the actual was `x` itself, which handed the callee `x`'s *pointees* instead of its address. The same temp carries a stored `&x` (`*p = &x`, `.f = &x`). `&base.member` / `&arr[i]` keep their base-variable handling (see "Documented imprecision" under function models; a stored `(void *)&s.f` is the member's field address, and a cast `memcpy((void *)&s.f, ..)` argument is still flagged as a member address), and so does `&r` for any C++ reference binding `r`, `auto &r` included (`reference_bindings`): the reference already holds its referent's address, so `&r` — as an argument, a stored value, `p = &r` or `return &r` — is `r`'s value (`names_reference_binding`). A qualified name (`&ns::var`, `&(ns::var)`) takes the same path once it resolves (see [Canonical variable identity](#canonical-variable-identity)), a qualified reference binding included. The position is recorded in `CallSite::addr_of_args`: consumers that report the argument's *object* rather than its value — arg-flow rows (`actual_var`), `clears` terminators, and the `alias` / `mem_copy` models (`model_copy_side`) — name `x` through `Pag::argument_var` / `Pag::addressed_var`, so `memcpy_s(&dst, .., &src, ..)` still copies between the objects.
 
 After fixpoint, `extract_arg_flow` records:
@@ -1365,7 +1513,13 @@ C++-aware only where it must be — everything else reuses the C machinery.
   and **virtual bases** (`class D : virtual B`) are recorded the same way as
   ordinary bases for CHA (diamond override sets include the most-derived
   override). When no ancestor declares the member, the call falls back to
-  the receiver's static-type subclass closure.
+  the receiver's static-type subclass closure. A base reached through a
+  template parameter (`class S : public IRemoteStub<IFoo>` with
+  `template<class I> class IRemoteStub : public I`) is recorded as an
+  ordinary base when the template's definition is in the analyzed tree; see
+  [Template-parameter bases](#template-parameter-bases).
+  A bare instance field in a member body is rooted at `this`
+  ([Implicit this member variable access](#implicit-this-member-variable-access)).
 - **Implicit `this->method()`**: a bare identifier call inside a method
   (`OnEvent()` from `OnEventProxy`) is rewritten as a member call on the
   enclosing class when that class (or a base) declares the method. This
@@ -1463,7 +1617,8 @@ C++-aware only where it must be — everything else reuses the C machinery.
   class, that class, followed on through a chain of up to eight links with
   cycles cut; for a raw pointer, its pointee, which ends the chain. `*sp` is
   the same pointee. A raw pointer receiver, `this` included, is the built-in
-  arrow. What each `operator->` returns is recorded as an `ArrowReturn` fact
+  arrow, and so is an array: `m_items->Run()` on an array member calls its
+  element class's `Run`. What each `operator->` returns is recorded as an `ArrowReturn` fact
   merged with a header's types, so a wrapper-typed field declared in a
   different header from the wrapper resolves too. Where the chain names no
   class — overloads that disagree, a dependent return the index cannot name
@@ -1674,7 +1829,11 @@ C++-aware only where it must be — everything else reuses the C machinery.
 - **Ctors / dtors**: emitted for `new Cls(...)`, destructor calls on
   `delete p`, explicit qualified dtor calls, constructor-declarations with
   an argument list, ctor-initializer lists (base + member targets, with
-  parentheses or braces). `Cls o{a};` is a constructor call when the class
+  parentheses or braces). A member that is an array of a class, nested arrays
+  included, constructs its elements: an empty list (`m_arr{}`) records the
+  element's default constructor, and a non-empty list initializes the
+  elements one by one, each listed expression lowered on its own rather than
+  as one constructor's arguments. `Cls o{a};` is a constructor call when the class
   declares a user-provided constructor; without one the braces initialize an
   aggregate's fields. A constructor declared `= default` or `= delete` in its
   class body is not user-provided (`Function::defaulted_in_class`), so
@@ -1797,6 +1956,8 @@ C++-aware only where it must be — everything else reuses the C machinery.
   resolve in the base declaration's lexical scope, not the caller's; dependent base spellings
   are recorded at lowering and excluded from concrete return substitution. Compound dependent
   returns and function templates remain unknown; no template bodies are instantiated.
+  A base that names a template parameter is substituted per concrete base
+  instead ([Template-parameter bases](#template-parameter-bases)).
 - **Lambda captures**: explicit (`[var]`, `[&var]`, `[this]`, `[*this]`), default (`[&]`, `[=]`), and init-captures (`[x = expr]`, `[&x = expr]`) bind the enclosing scope's variables, members, and `this` into the lowered lambda body.
 
 Known C++ imprecision (in addition to the general list below):
@@ -1929,6 +2090,128 @@ Known C++ imprecision (in addition to the general list below):
   missed but never wrongly added).
 
 Next slices (hiview-grounded): [docs/CPP_ROADMAP.md](CPP_ROADMAP.md).
+
+### Template-parameter bases
+
+This section is the authoritative description of subclasses reached through a
+class template's parameters (`template_bases.rs`). With
+`template<class I> class IRemoteStub : public I`, a
+`class S : public IRemoteStub<IFoo>` derives from `IFoo`.
+
+The fact. Lowering records a `ClassTemplate` (`Program.class_templates`) for a
+primary class template definition whose bases mention its parameters: the
+parameter names by position, the position of a parameter pack, each type
+parameter's default, and those base spellings (`I`, `Layer<T>`). A default is
+qualified in the template's own scope and recorded with a leading `::`, so it
+names the same class wherever the template is instantiated; a default that
+mentions another parameter is not recorded. C++ lets a default be written on
+one declaration only, often a forward declaration
+(`template <class I, class D = IDef> class Def;`), so such a declaration
+records its defaults too. A template defined in an anonymous namespace is
+file-local: it is recorded per file (`Program.anonymous_class_templates`), as
+anonymous-namespace classes are, since another file's template of the name is
+another template, and it is visible only within its translation unit (see
+Expansion). A partial or explicit specialization records nothing. A base whose class is a template parameter, of the class's own
+template or of an enclosing one (`struct Inner : T` in `Outer<T>`, or `B` in
+`: public B<T>` with a template template parameter `B`), is not a class and
+gets no inheritance edge. Lowering counts the `template_declaration`s it is
+inside, so only a class within one looks at its enclosing parameters.
+
+Expansion. For each concrete templated base a class spells (a `TemplateBase`
+that is not dependent), `parameter_bases` substitutes the written arguments
+into the template's recorded bases. A base whose class is a parameter yields
+the argument (instantiated, for a template template parameter: `B<T>` with
+`Layer, IC` yields `Layer<IC>`), looked up in the **derived class's declaration scope** (the scope
+IPC pairing resolves an `IRemoteStub<IFoo>` argument in), and becomes an
+ordinary `derived → base` inheritance edge; an anonymous-namespace derived
+class gets its file-scoped base as well. A substituted base that is itself a
+template instantiation is expanded the same way, breadth first, so each
+instantiation is expanded once, at the least depth it is reached, and nesting
+stops at depth 8. Expansion runs twice: while lowering the derived class, so
+member lookups later in the unit see the edge, and once after merge, before
+virtual-override expansion, for templates another unit defines. One lookup
+(`class_template`) serves both passes:
+
+- While lowering, a file-local template is visible to its whole
+  **translation unit**, as in C++. A template name resolves to the
+  file-local template of the deriving class's own file (the file its class
+  specifier is in); else to one defined in another file of the unit's
+  `#include` closure (the preprocessor's `included_headers`: a `.cpp`
+  deriving through an anonymous-namespace template of a header it
+  includes); else to the template with linkage (`Program.class_templates`).
+  The unit's program can also hold file-local templates of headers the
+  unit never includes (header facts reach it through the include graph,
+  which ignores `#if`); those are not seen. Well-formed C++ has at most one
+  file-local template of a name in a unit; where there are several, the
+  lowest `FileId` is taken. Where a file-local template and a linked one of
+  the name are both in view, which C++ would reject as ambiguous, the
+  file-local one wins. Nested bases resolve from the same file and unit.
+- After merge, only templates with linkage are consulted: a file-local
+  template was expanded while lowering its own file, and its name does not
+  say which file's template a class derives from, so it neither hides nor
+  replaces a linked template of the name.
+
+The post-merge pass walks `Program.template_bases` in order.
+
+Handled:
+
+- nesting: `BarImpl : Wrapper<IBar>`, `Wrapper<T> : Layer<T>`,
+  `Layer<I> : I` makes `BarImpl` derive from `IBar`;
+- packs: in `template<class T, class... Is> class Multi : public T,
+  public Is...`, `Is` binds each remaining argument, one base each; a pack
+  expanded inside a base's arguments (`Pack<Ts...> : B<Ts...>`,
+  `B<IC, Ts...>`, or through a pattern, `B<X<Ts>...>`) is one copy of the
+  expansion's pattern per remaining argument, comma-joined at its position
+  (nothing, with its separator, for an empty pack), so `B<X<Ts>...>` with
+  `IA, IB` is `B<X<IA>, X<IB>>`, and the result expands as any templated
+  base;
+- omitted arguments take the recorded default;
+- `Outer<A>::In<B>` binds `In`'s own (last) argument list;
+- template template parameters: `SvcC : Wrap<Layer, IC>` with
+  `Wrap<B, T> : B<T>` derives from `Layer`, and through it from `IC`;
+- anonymous-namespace derived classes, and file-local templates of one name
+  in several files.
+
+Merging (`add_class_template_fact`, per file for a file-local template).
+The first fact with bases names the
+parameters and the pack, since the bases spell the definition's names; a
+default fills its position from whichever declaration writes it; later facts
+add only bases not yet recorded.
+
+Templated dependent bases (`Layer<T>`) are recorded both in `ClassTemplate`
+and as a dependent `TemplateBase`. The two are not interchangeable:
+`TemplateBase` facts are keyed by the class name lowering gives, which a
+partial specialization shares with its primary template (`W<U*> : Layer<U>`
+is recorded under `W`), and include bases that mention only an enclosing
+template's parameters; `ClassTemplate` holds the primary definition's bases
+alone, spelled in its own parameter names.
+
+Member lookup. The written base's edge is recorded before the substituted
+one, and a hierarchy search is breadth first, so a member of the template
+hides its argument's member of the name: in a `FieldSvc :
+FieldStub<IField>` body, `x` is `FieldStub`'s own `x`, not `IField::x`.
+
+Effect. `derives_from` and `subclass_closure` see the subclass, so
+[smart-pointer unwrap](#smart-pointer-unwrap) admits its objects for the
+interface's pointee type and CHA virtual dispatch through the interface
+reaches its overrides.
+
+Limits:
+
+- The template's **definition** must be in the analyzed tree. OpenHarmony's
+  `IRemoteStub` is defined in the ipc component, so a stub in another
+  component (camera) gains no edge unless the ipc headers are indexed (for
+  example with `--dep`). IPC bridge pairing does not depend on it: IPC bridge
+  pairing recovers the interface from the `IRemoteStub<IFoo>` argument
+  ([OpenHarmony IPC bridges](#openharmony-ipc-bridges)).
+- Every argument resolves in the derived class's scope, including a
+  non-parameter name in a dependent base (`A<T, Helper>`) and the inner
+  arguments of a templated default.
+- A non-type parameter's default, and a type default that mentions another
+  parameter, are not recorded, so default filling stops at that position.
+- An exact global template name wins over the scoped lookup.
+- A base spelled with a partial specialization's arguments expands through
+  the primary template's bases.
 
 ## Dependency roots
 

@@ -8220,6 +8220,59 @@ fn smart_pointer_promotion_of_a_dereferenced_member_reads_the_member() {
     assert!(value_reaches(program, h, promoted));
 }
 
+/// Issue #151: `(*get_weak_ptr()).lock()` loads through the call's
+/// result, as the receiver it promotes.
+#[test]
+fn smart_pointer_promotion_of_a_dereferenced_call_reads_the_returned_pointer() {
+    use trace_ir::FlowConstraint::{CallReturn, Load};
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let func = "promote_deref_call";
+    let src = promotion_source(program, func, "deref_call_promoted");
+    let returned: Vec<_> = flows_in(program, func)
+        .filter_map(|flow| match flow {
+            CallReturn {
+                dst, callee_name, ..
+            } if callee_name == "get_weak_ptr" => Some(*dst),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        flows_in(program, func).any(
+            |flow| matches!(*flow, Load { dst, src: from } if dst == src && returned.contains(&from))
+        ),
+        "the receiver is loaded through get_weak_ptr()'s result"
+    );
+}
+
+/// Issue #151: `wr` in `(*wr).lock()` is a reference to a pointer,
+/// bound to the pointer's value as `f(gp)` binds it, so the receiver is one
+/// load through `wr`.
+#[test]
+fn smart_pointer_promotion_of_a_dereferenced_reference_reads_through_it_once() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let func = "promote_deref_ref";
+    let wr = common::local_variable(program, func, "wr");
+    let src = promotion_source(program, func, "deref_ref_promoted");
+    let loads: Vec<_> = flows_in(program, func)
+        .filter(|flow| matches!(flow, trace_ir::FlowConstraint::Load { .. }))
+        .collect();
+    assert!(
+        matches!(loads[..], [trace_ir::FlowConstraint::Load { dst, src: from }] if *dst == src && *from == wr),
+        "{func}: {loads:?}"
+    );
+}
+
+/// Issue #151: `GetWeakPtr` in `(*obj->GetWeakPtr()).lock()` is a
+/// method, whose result nothing records, so there is no receiver value to
+/// promote: no fact, where a temporary with no input used to be copied.
+#[test]
+fn smart_pointer_promotion_of_a_dereferenced_method_result_emits_nothing() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let func = "promote_deref_member_call";
+    let facts: Vec<_> = flows_in(program, func).collect();
+    assert!(facts.is_empty(), "{func}: {facts:?}");
+}
+
 #[test]
 fn smart_pointer_promotion_of_a_reference_reads_through_it() {
     let (program, _) = cpp_smart_pointer_value_flow();
@@ -9210,4 +9263,1115 @@ void run() {
         ),
         "Dispatcher::Dispatch should resolve indirect call to target_chain via nested_->handler->fn()"
     );
+}
+
+analyzed_fixture!(deref_member_reads);
+
+/// Issue #151 (docs/ANALYSIS.md, "Dereferenced operands"): `func`'s lowered
+/// facts in `deref_member_reads` as value-flow `(src, dst, label)` edges for
+/// [`common::flow_chain`]. A `Store` runs from the stored value to the
+/// pointer it goes through; a `GepField` is labelled `gep <field>`.
+fn deref_edges(func: &str) -> Vec<(i64, i64, String)> {
+    use trace_ir::FlowConstraint as F;
+    let (program, _) = deref_member_reads();
+    let edge = |src: &trace_ir::VarId, dst: &trace_ir::VarId, label: String| {
+        Some((i64::from(src.0), i64::from(dst.0), label))
+    };
+    flows_in(program, func)
+        .filter_map(|flow| match flow {
+            F::Copy { dst, src } => edge(src, dst, "copy".into()),
+            F::Load { dst, src } => edge(src, dst, "load".into()),
+            F::Store { dst, src } => edge(src, dst, "store".into()),
+            F::GepField {
+                dst,
+                base,
+                field_name,
+                ..
+            } => edge(base, dst, format!("gep {field_name}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `func`'s local `name` in `deref_member_reads`, as a flow-edge node.
+fn deref_local(func: &str, name: &str) -> i64 {
+    i64::from(common::local_variable(&deref_member_reads().0, func, name).0)
+}
+
+/// Assert `y` reads `pp` off `o`'s `inner` member (loading the `inner` cell
+/// or not), and never off a `pp` projection of `o` itself.
+fn assert_reads_pp_off_inner(func: &str, y: &str) {
+    let edges = deref_edges(func);
+    let (o, y) = ([deref_local(func, "o")], deref_local(func, y));
+    let mut read = common::flow_chain(&edges, &o, &["gep inner", "gep pp", "load"]);
+    read.extend(common::flow_chain(
+        &edges,
+        &o,
+        &["gep inner", "load", "gep pp", "load"],
+    ));
+    assert!(read.contains(&y), "{func}: {edges:?}");
+    let off_o = common::flow_chain(&edges, &o, &["gep pp", "load"]);
+    assert!(!off_o.contains(&y), "{func}: {edges:?}");
+}
+
+/// Issue #151 guards: `o->inner->pp` reads `pp` off the `inner` member, and
+/// a plain `*p` stays one `Load` with no temporary.
+#[test]
+fn deref_member_reads_guards_keep_their_lowering() {
+    use trace_ir::FlowConstraint::Load;
+    let (program, _) = deref_member_reads();
+    for prefix in ["", "cpp_"] {
+        assert_reads_pp_off_inner(
+            &format!("{prefix}read_arrow_root"),
+            &format!("{prefix}arrow_y"),
+        );
+        let func = format!("{prefix}read_plain");
+        let p = common::local_variable(program, &func, "p");
+        let y = common::local_variable(program, &func, &format!("{prefix}plain_y"));
+        let facts: Vec<_> = flows_in(program, &func).cloned().collect();
+        assert_eq!(facts, [Load { dst: y, src: p }], "{func}");
+        let fn_id = Some(common::only_function(program, &func));
+        let vars = program.symbols.variables.iter();
+        let locals: Vec<_> = vars.filter(|v| v.fn_id == fn_id).map(|v| v.id).collect();
+        assert_eq!(locals, [p, y], "{func} has no temporary");
+    }
+}
+
+/// Issue #151: `*h->pp` loads the `pp` member's value, then through it,
+/// and never loads straight off `h`.
+#[test]
+fn deref_of_a_member_loads_the_member_then_through_it() {
+    for prefix in ["", "cpp_"] {
+        let func = format!("{prefix}read_member");
+        let edges = deref_edges(&func);
+        let h = [deref_local(&func, "h")];
+        let y = deref_local(&func, &format!("{prefix}member_y"));
+        let loaded = common::flow_chain(&edges, &h, &["gep pp", "load", "load"]);
+        assert!(loaded.contains(&y), "{func}: {edges:?}");
+        let off_h = common::flow_chain(&edges, &h, &["load"]);
+        assert!(!off_h.contains(&y), "{func}: {edges:?}");
+    }
+}
+
+/// Issue #151: `**ppp` is two chained loads, not one.
+#[test]
+fn deref_twice_loads_through_the_first_loads_result() {
+    for prefix in ["", "cpp_"] {
+        let func = format!("{prefix}read_twice");
+        let edges = deref_edges(&func);
+        let ppp = [deref_local(&func, "ppp")];
+        let y = deref_local(&func, &format!("{prefix}twice_y"));
+        let twice = common::flow_chain(&edges, &ppp, &["load", "load"]);
+        assert!(twice.contains(&y), "{func}: {edges:?}");
+        let once = common::flow_chain(&edges, &ppp, &["load"]);
+        assert!(!once.contains(&y), "{func}: {edges:?}");
+    }
+}
+
+/// Issue #151: `(*o->inner).pp` reads `pp` off the `inner` member, like its
+/// arrow twin.
+#[test]
+fn deref_root_reads_the_member_off_the_dereferenced_root() {
+    for prefix in ["", "cpp_"] {
+        assert_reads_pp_off_inner(
+            &format!("{prefix}read_deref_root"),
+            &format!("{prefix}root_y"),
+        );
+    }
+}
+
+/// Issue #151: `*h->pp = v` stores `v` through the `pp` member's value,
+/// never into `h` or into the member's own cell.
+#[test]
+fn write_member_stores_through_the_loaded_member() {
+    for prefix in ["", "cpp_"] {
+        let func = format!("{prefix}write_member");
+        let edges = deref_edges(&func);
+        let (h, v) = ([deref_local(&func, "h")], [deref_local(&func, "v")]);
+        let stored = common::flow_chain(&edges, &v, &["store"]);
+        let member_value = common::flow_chain(&edges, &h, &["gep pp", "load"]);
+        assert!(!stored.is_disjoint(&member_value), "{func}: {edges:?}");
+        assert!(!stored.contains(&h[0]), "{func}: {edges:?}");
+        let cell = common::flow_chain(&edges, &h, &["gep pp"]);
+        assert!(stored.is_disjoint(&cell), "{func}: {edges:?}");
+    }
+}
+
+/// Assert `func`'s one call passes one explicit argument, reached from its
+/// local `root` through `hops` (see [`common::flow_chain`]).
+fn assert_passes(func: &str, root: &str, hops: &[&str]) {
+    let (program, _) = deref_member_reads();
+    let caller = common::only_function(program, func);
+    let sites: Vec<_> = (program.symbols.call_sites.iter())
+        .filter(|cs| cs.caller == caller)
+        .collect();
+    let [site] = sites[..] else {
+        panic!("{func}: {sites:?}");
+    };
+    let explicit = u32::from(site.args_bound_past_this);
+    let passed: Vec<_> = (site.var_args.iter())
+        .filter(|(i, _)| *i >= explicit)
+        .map(|(_, v)| i64::from(v.0))
+        .collect();
+    let edges = deref_edges(func);
+    let read = common::flow_chain(&edges, &[deref_local(func, root)], hops);
+    assert!(
+        matches!(passed[..], [arg] if read.contains(&arg)),
+        "{func} passes {passed:?}: {edges:?}"
+    );
+}
+
+/// Issue #151: `take_member(*h->pp)` passes the value read through the `pp`
+/// member's value, never the holder `h`; `take_plain(*p)` passes the value
+/// read through `p`, never `p` itself.
+#[test]
+fn deref_argument_passes_the_value_read() {
+    for prefix in ["", "cpp_"] {
+        assert_passes(
+            &format!("{prefix}pass_member"),
+            "h",
+            &["gep pp", "load", "load"],
+        );
+        assert_passes(&format!("{prefix}pass_plain"), "p", &["load"]);
+    }
+}
+
+/// Issue #151: `*p` passed to a reference parameter, free or member, passes
+/// `p` itself, the referent's address the reference holds, with no load; so
+/// does a parameter not yet known at the call (a member defined out of line
+/// after it). `*pp` passed to a known pointer parameter passes the value read
+/// through `pp`.
+#[test]
+fn deref_argument_to_a_reference_passes_the_address() {
+    assert_passes("cpp_call_ref", "p", &[]);
+    assert_passes("cpp_call_member_ref", "p", &[]);
+    assert_passes("cpp_call_out_of_line", "p", &[]);
+    assert_passes("cpp_call_ptr", "pp", &["load"]);
+    for func in ["cpp_call_ref", "cpp_call_out_of_line"] {
+        let edges = deref_edges(func);
+        let loads = common::flow_chain(&edges, &[deref_local(func, "p")], &["load"]);
+        assert!(loads.is_empty(), "{func} loads through p: {edges:?}");
+    }
+}
+
+/// Issue #151: reference-ness is the declaration's. A member's
+/// in-class prototype, defined only after the call, takes a pointer, so the
+/// value read is passed; an unnamed reference parameter takes the address.
+#[test]
+fn deref_argument_follows_the_declared_parameter() {
+    assert_passes("cpp_call_declared", "pp", &["load"]);
+    assert_passes("cpp_call_unnamed", "p", &[]);
+    let func = "cpp_call_unnamed";
+    let edges = deref_edges(func);
+    let loads = common::flow_chain(&edges, &[deref_local(func, "p")], &["load"]);
+    assert!(loads.is_empty(), "{func} loads through p: {edges:?}");
+}
+
+/// Issue #151: `*m_ppp` passed in a member body reads through the
+/// instance field, as `*this->m_ppp` does.
+#[test]
+fn deref_argument_of_an_implicit_this_member_passes_the_value_read() {
+    assert_passes("CppPasser::pass", "this", &["gep m_ppp", "load", "load"]);
+}
+
+/// Issue #151: one `*pp` passed to an override set is loaded once,
+/// and every target is passed that one value.
+#[test]
+fn deref_argument_loads_once_for_every_target() {
+    let (program, _) = deref_member_reads();
+    let func = "cpp_call_virtual";
+    let caller = common::only_function(program, func);
+    let sites: Vec<_> = (program.symbols.call_sites.iter())
+        .filter(|cs| cs.caller == caller)
+        .collect();
+    assert!(sites.len() >= 2, "{func}: {sites:?}");
+    let passed: std::collections::BTreeSet<_> = (sites.iter())
+        .flat_map(|cs| cs.var_args.iter().filter(|(i, _)| *i == 1).map(|(_, v)| *v))
+        .collect();
+    assert_eq!(passed.len(), 1, "{func}: {sites:?}");
+    let edges = deref_edges(func);
+    let pp = deref_local(func, "pp");
+    let loads = (edges.iter())
+        .filter(|(src, _, label)| *src == pp && label == "load")
+        .count();
+    assert_eq!(loads, 1, "{func}: {edges:?}");
+}
+
+/// Issue #151: a function pointer is read in place, so `take_fn(*fp)`
+/// passes `fp` itself and `take_fn(*o->op)` the `op` member's value.
+#[test]
+fn deref_argument_of_a_function_pointer_passes_it() {
+    let func = "pass_fn";
+    assert_passes(func, "fp", &[]);
+    let edges = deref_edges(func);
+    let loads = common::flow_chain(&edges, &[deref_local(func, "fp")], &["load"]);
+    assert!(loads.is_empty(), "{func} loads through fp: {edges:?}");
+    assert_passes("pass_member_fn", "o", &["gep op", "load"]);
+}
+
+/// Issue #151: `*(out + 1) = *h->pp` resolves no pointer to store
+/// through, nor do C's `*get_h()->pp = *h->pp` and `*&m_ap = *h->pp`, so
+/// the value is not evaluated: no fact and no temporary.
+#[test]
+fn deref_store_through_no_pointer_evaluates_no_value() {
+    let (program, _) = deref_member_reads();
+    for (func, params) in [
+        ("store_offset", &["h", "out"][..]),
+        ("store_call_root", &["h"][..]),
+        ("CppAddrOfMember::store", &["this", "h"][..]),
+    ] {
+        let facts: Vec<_> = flows_in(program, func).collect();
+        assert!(facts.is_empty(), "{func}: {facts:?}");
+        let fn_id = Some(common::only_function(program, func));
+        let vars = program.symbols.variables.iter();
+        let locals: Vec<_> = vars.filter(|v| v.fn_id == fn_id).map(|v| v.id).collect();
+        let params: Vec<_> = (params.iter())
+            .map(|name| common::local_variable(program, func, name))
+            .collect();
+        assert_eq!(locals, params, "{func} has no temporary");
+    }
+}
+
+/// Issue #151: `return *g_earr[0]`, `*out = *g_earr[0]` and
+/// `return *(int **)p` have no operand value to compute, so they emit
+/// nothing, as master did: no fact through the root one level short.
+#[test]
+fn deref_value_of_no_computable_operand_emits_nothing() {
+    let (program, _) = deref_member_reads();
+    for func in ["return_elem", "store_elem", "return_cast"] {
+        let facts: Vec<_> = flows_in(program, func).collect();
+        assert!(facts.is_empty(), "{func}: {facts:?}");
+        let returns = program
+            .fn_returns
+            .get(&common::only_function(program, func));
+        assert!(returns.is_none_or(|r| r.is_empty()), "{func}: {returns:?}");
+    }
+}
+
+/// Issue #151: `return *cpp_g_hp` from a function returning a
+/// reference returns the referent's address, `cpp_g_hp`'s value.
+#[test]
+fn deref_return_by_reference_returns_the_address() {
+    let (program, _) = deref_member_reads();
+    let returns = &program.fn_returns[&common::only_function(program, "cpp_inst")];
+    let src = common::only_variable(program, "cpp_g_hp");
+    assert_eq!(returns, &[trace_ir::ReturnFlow::Copy { src }]);
+}
+
+/// Issue #151: a function returning a reference, spelled `S &f()` or
+/// with a trailing `-> S &` (a lambda's included), returns `*cpp_g_hp` as
+/// `cpp_g_hp`'s value; `decltype(auto)` returns the value read.
+#[test]
+fn deref_return_by_reference_follows_the_declared_return() {
+    use trace_ir::{FlowConstraint::Load, ReturnFlow::Copy};
+    let (program, _) = deref_member_reads();
+    let hp = common::only_variable(program, "cpp_g_hp");
+    let lambda = (program.symbols.functions.iter())
+        .find(|f| f.name.starts_with("cpp_make_lambda::$lambda"))
+        .expect("the lambda")
+        .id;
+    let returns = |fid: FnId| program.fn_returns[&fid].clone();
+    for fid in [
+        common::only_function(program, "cpp_inst"),
+        common::only_function(program, "cpp_inst_trailing"),
+        lambda,
+    ] {
+        assert_eq!(returns(fid), [Copy { src: hp }], "{fid:?}");
+    }
+    let value = returns(common::only_function(program, "cpp_inst_value"));
+    let [Copy { src }] = value[..] else {
+        panic!("{value:?}");
+    };
+    assert!(
+        program
+            .flow
+            .iter()
+            .any(|flow| matches!(*flow, Load { dst, src: from } if dst == src && from == hp)),
+        "{value:?}"
+    );
+}
+
+/// Issue #151: a pack and a trailing `...` are one variadic tail, so
+/// `CppVariadic::vpack` declares no parameter; a lambda records which of its
+/// parameters are references, as a function does.
+#[test]
+fn param_lists_record_their_declared_shape() {
+    let (program, _) = deref_member_reads();
+    let vpack = program
+        .symbols
+        .function(common::only_function(program, "CppVariadic::vpack"));
+    assert_eq!(vpack.explicit_arity, Some(0), "{vpack:?}");
+    assert_eq!(vpack.reference_params, [false], "{vpack:?}");
+    let lambda = (program.symbols.functions.iter())
+        .find(|f| f.name.starts_with("cpp_lambda_params::$lambda"))
+        .expect("the lambda");
+    assert_eq!(lambda.reference_params, [false, true], "{lambda:?}");
+}
+
+/// Issue #151: a variadic list's extra positions and a by-value
+/// pack's elements take the value read, a reference pack's the address. A
+/// lambda is called through its closure variable, an indirect site no
+/// declaration describes, so `l(*pp)` keeps the address.
+#[test]
+fn deref_argument_past_the_declared_list_follows_the_tail() {
+    assert_passes("cpp_call_variadic", "pp", &["load"]);
+    assert_passes("cpp_call_pack", "pp", &["load"]);
+    assert_passes("cpp_call_ref_pack", "p", &[]);
+    assert_passes("cpp_call_lambda", "pp", &[]);
+}
+
+/// Issue #151: `&cache` in a member body takes the member's
+/// cell, `this->cache`, not the global of the same name.
+#[test]
+fn a_member_outranks_a_global_of_its_name() {
+    use trace_ir::FlowConstraint::{AddrOfVar, GepField};
+    let (program, _) = deref_member_reads();
+    let global = common::only_variable(program, "cache");
+    for func in ["CppCacheOwner::f", "CppCacheOwner::g"] {
+        let this = common::local_variable(program, func, "this");
+        let facts: Vec<_> = flows_in(program, func).collect();
+        let member = |flow: &&trace_ir::FlowConstraint| matches!(flow, GepField { base, field_name, .. } if *base == this && field_name == "cache");
+        assert!(facts.iter().any(member), "{func}: {facts:?}");
+        let global_address = |flow: &&trace_ir::FlowConstraint| matches!(flow, AddrOfVar { src, .. } if *src == global);
+        assert!(!facts.iter().any(global_address), "{func}: {facts:?}");
+    }
+}
+
+/// Issue #151: `(*pp)->ox` reads `ox` off the pointer `*pp` holds,
+/// loaded from `pp`, never off `pp` itself; `(*h->opp)->ox` off the pointer
+/// the `opp` member's value holds.
+#[test]
+fn deref_of_a_pointer_root_loads_the_pointer_first() {
+    for prefix in ["", "cpp_"] {
+        let func = format!("{prefix}read_out");
+        let edges = deref_edges(&func);
+        let pp = [deref_local(&func, "pp")];
+        let y = deref_local(&func, &format!("{prefix}out_y"));
+        let read = common::flow_chain(&edges, &pp, &["load", "gep ox", "load"]);
+        assert!(read.contains(&y), "{func}: {edges:?}");
+        let off_pp = common::flow_chain(&edges, &pp, &["gep ox"]);
+        assert!(off_pp.is_empty(), "{func}: {edges:?}");
+        let func = format!("{prefix}read_out_member");
+        let edges = deref_edges(&func);
+        let h = [deref_local(&func, "h")];
+        let y = deref_local(&func, &format!("{prefix}out_member_y"));
+        let hops = ["gep opp", "load", "load", "gep ox", "load"];
+        let read = common::flow_chain(&edges, &h, &hops);
+        assert!(read.contains(&y), "{func}: {edges:?}");
+    }
+}
+
+/// Issue #151: `*this` is an operand as any `*p` is. `return *this`
+/// from `CppChain &set(int *)` returns `this`; `cpp_chain_ref(*this)` passes
+/// `this` and `cpp_chain_val(*this)` the value read; `*this = *o` stores
+/// into the object.
+#[test]
+fn deref_of_this_follows_the_operand_rules() {
+    use trace_ir::FlowConstraint::{Load, Store};
+    let (program, _) = deref_member_reads();
+    let set = common::only_function(program, "CppChain::set");
+    let this = common::local_variable(program, "CppChain::set", "this");
+    assert_eq!(
+        program.fn_returns[&set],
+        [trace_ir::ReturnFlow::Copy { src: this }]
+    );
+    let pass = common::only_function(program, "CppChain::pass");
+    let this = common::local_variable(program, "CppChain::pass", "this");
+    let passed = |callee: &str| {
+        let site = (program.symbols.call_sites.iter())
+            .find(|cs| cs.caller == pass && cs.callee_name == callee)
+            .expect(callee);
+        site.var_args.iter().find(|(i, _)| *i == 0).map(|(_, v)| *v)
+    };
+    assert_eq!(passed("cpp_chain_ref"), Some(this));
+    let value = passed("cpp_chain_val").expect("passed");
+    assert!(
+        flows_in(program, "CppChain::pass")
+            .any(|flow| matches!(*flow, Load { dst, src } if dst == value && src == this)),
+        "the value read through `this`"
+    );
+    let this = common::local_variable(program, "CppChain::assign", "this");
+    assert!(
+        flows_in(program, "CppChain::assign")
+            .any(|flow| matches!(*flow, Store { dst, .. } if dst == this)),
+        "a store through `this`"
+    );
+}
+
+/// Issue #151: `m_arr{}` on a member array of `CppElem` constructs
+/// its elements, as a member of that class type is constructed.
+#[test]
+fn a_member_array_of_class_objects_is_constructed() {
+    let (program, _) = deref_member_reads();
+    let ctor = common::only_function(program, "CppArrOwner::CppArrOwner");
+    assert!(
+        program
+            .symbols
+            .call_sites
+            .iter()
+            .any(|cs| cs.caller == ctor && cs.callee_name == "CppElem::CppElem"),
+        "m_arr{{}} constructs its elements"
+    );
+}
+
+/// Issue #151: an arrow on an array member (`m_items->Run()`,
+/// `h->m_items->Run()`) calls its element's method, as on master.
+#[test]
+fn an_arrow_on_an_array_member_reaches_its_element_class() {
+    let (program, _) = deref_member_reads();
+    for func in ["CppRunHolder::a", "cpp_run_items"] {
+        let caller = common::only_function(program, func);
+        let callees: Vec<_> = (program.symbols.call_sites.iter())
+            .filter(|cs| cs.caller == caller)
+            .filter_map(|cs| cs.callee_fn_id)
+            .map(|f| program.symbols.function(f).name.clone())
+            .collect();
+        assert_eq!(callees, ["CppRunElem::Run"], "{func}");
+    }
+}
+
+/// Issue #151: a member array's brace list initializes its elements
+/// one by one. `m_arr{CppElemArgs(a), CppElemArgs(b)}` is no two-argument
+/// constructor call (its listed calls are their own sites), and the 2-D
+/// `m_grid{}` default-constructs its elements.
+#[test]
+fn a_member_array_brace_list_initializes_its_elements() {
+    let (program, _) = deref_member_reads();
+    let ctor = common::only_function(program, "CppArrOwner2::CppArrOwner2");
+    let sites: Vec<_> = (program.symbols.call_sites.iter())
+        .filter(|cs| cs.caller == ctor && cs.callee_name == "CppElemArgs::CppElemArgs")
+        .collect();
+    let (listed, default): (Vec<&&trace_ir::CallSite>, Vec<_>) =
+        sites.iter().partition(|cs| !cs.var_args.is_empty());
+    assert_eq!(listed.len(), 2, "{sites:?}");
+    let [default] = default[..] else {
+        panic!("{sites:?}");
+    };
+    let callee = program
+        .symbols
+        .function(default.callee_fn_id.expect("resolved"));
+    assert_eq!(callee.explicit_arity, Some(0), "{callee:?}");
+}
+
+/// Issue #151: an element of a member table (`*t->tcells[1]`) is read
+/// into a temporary typed as the element, not as the whole array.
+#[test]
+fn a_member_table_element_is_typed_as_the_element() {
+    use trace_ir::FlowConstraint::{GepField, Load};
+    let (program, _) = deref_member_reads();
+    let func = "cpp_read_subscript";
+    let cells: Vec<_> = flows_in(program, func)
+        .filter_map(|flow| match flow {
+            GepField {
+                dst, field_name, ..
+            } if field_name == "tcells" => Some(*dst),
+            _ => None,
+        })
+        .collect();
+    let elements: Vec<_> = flows_in(program, func)
+        .filter_map(|flow| match *flow {
+            Load { dst, src } if cells.contains(&src) => Some(dst),
+            _ => None,
+        })
+        .collect();
+    assert!(!elements.is_empty(), "{func}");
+    for element in elements {
+        let desc = program
+            .types
+            .get(program.symbols.variable(element).type_id)
+            .desc
+            .as_ref();
+        assert!(
+            !matches!(desc, trace_ir::TypeDesc::Array { .. }),
+            "{desc:?}"
+        );
+    }
+}
+
+/// Issue #151: `cb = *h->pcb` on a pointer to a function-pointer
+/// member loads the function pointer `h->pcb` points to: two loads off `h`'s
+/// `pcb` cell, not a copy of the member's value.
+#[test]
+fn deref_of_a_pointer_to_a_function_pointer_member_loads_it() {
+    let func = "call_pcb";
+    let edges = deref_edges(func);
+    let (h, cb) = ([deref_local(func, "h")], deref_local(func, "cb"));
+    let loaded = common::flow_chain(&edges, &h, &["gep pcb", "load", "load"]);
+    assert!(loaded.contains(&cb), "{func}: {edges:?}");
+    let in_place = common::flow_chain(&edges, &h, &["gep pcb", "load"]);
+    assert!(!in_place.contains(&cb), "{func}: {edges:?}");
+}
+
+/// Issue #151: `*cpp_make_noflow()->Get()` names a call whose result
+/// nothing records, so it is no operand value: no fact and no temporary.
+#[test]
+fn deref_of_an_unrecorded_call_result_emits_nothing() {
+    let (program, _) = deref_member_reads();
+    for (func, expected) in [
+        ("cpp_read_noflow", &["cpp_noflow_y"][..]),
+        ("cpp_read_noflow_var", &["cpp_noflow_var_y"][..]),
+        ("cpp_read_functor", &["h", "cpp_functor_y"][..]),
+    ] {
+        let facts: Vec<_> = flows_in(program, func).collect();
+        assert!(facts.is_empty(), "{func}: {facts:?}");
+        let fn_id = Some(common::only_function(program, func));
+        let vars = program.symbols.variables.iter();
+        let locals: Vec<_> = vars.filter(|v| v.fn_id == fn_id).map(|v| v.id).collect();
+        let expected: Vec<_> = (expected.iter())
+            .map(|name| common::local_variable(program, func, name))
+            .collect();
+        assert_eq!(locals, expected, "{func} has no temporary");
+    }
+}
+
+/// Issue #151: a member a base declares resolves through the base's layout
+/// (docs/ANALYSIS.md, "Implicit this member variable access"), so a
+/// dereference through it resolves: `*this->bpp = *h->pp` stores through
+/// `bpp`, and `*d->get()` reads the recorded result of a call through the
+/// inherited `get`.
+#[test]
+fn deref_through_an_inherited_member_resolves_it() {
+    use trace_ir::FlowConstraint as F;
+    let (program, _) = deref_member_reads();
+    let store: Vec<_> = flows_in(program, "CppDerivedHolder::store").collect();
+    assert!(
+        store
+            .iter()
+            .any(|f| matches!(f, F::GepField { field_name, .. } if field_name == "bpp")),
+        "{store:?}"
+    );
+    assert!(
+        store.iter().any(|f| matches!(f, F::Store { .. })),
+        "{store:?}"
+    );
+    let read: Vec<_> = flows_in(program, "cpp_read_inherited_get").collect();
+    assert!(
+        read.iter()
+            .any(|f| matches!(f, F::CallReturnIndirect { .. })),
+        "{read:?}"
+    );
+}
+
+/// Issue #151: a block-scope `using cpp_uns::ucache;` hides the member
+/// `ucache`, as a local does, so `&ucache` and a plain read agree on the
+/// namespace variable.
+#[test]
+fn a_body_using_hides_a_member() {
+    use trace_ir::FlowConstraint::{AddrOfVar, Copy, GepField};
+    let (program, _) = deref_member_reads();
+    let func = "CppUsingOwner::f";
+    let ucache = common::only_variable(program, "ucache");
+    let facts: Vec<_> = flows_in(program, func).collect();
+    let member = |flow: &&trace_ir::FlowConstraint| matches!(flow, GepField { field_name, .. } if field_name == "ucache");
+    assert!(!facts.iter().any(member), "{facts:?}");
+    let address =
+        |flow: &&trace_ir::FlowConstraint| matches!(flow, AddrOfVar { src, .. } if *src == ucache);
+    assert!(facts.iter().any(address), "{facts:?}");
+    let read =
+        |flow: &&trace_ir::FlowConstraint| matches!(flow, Copy { src, .. } if *src == ucache);
+    assert!(facts.iter().any(read), "{facts:?}");
+}
+
+/// Issue #151: a dereferenced root whose own path does not decompose
+/// (`o->absent`, a member no layout declares) reads no field off the holder,
+/// and emits nothing at all.
+#[test]
+fn deref_root_that_does_not_decompose_reads_nothing_off_the_holder() {
+    let func = "cpp_read_unresolved_root";
+    let edges = deref_edges(func);
+    let off_o = common::flow_chain(&edges, &[deref_local(func, "o")], &["gep pp"]);
+    assert!(off_o.is_empty(), "{func}: {edges:?}");
+    let (program, _) = deref_member_reads();
+    let facts: Vec<_> = flows_in(program, func).collect();
+    assert!(facts.is_empty(), "{func}: {facts:?}");
+}
+
+/// Issue #151: a returned member is its value, as any value
+/// position reads it. `return m_vpp;` returns a load from the member's cell
+/// typed as the member (`int **`); `return varr;`, an array member, returns
+/// the cell itself.
+#[test]
+fn a_returned_member_is_its_typed_value() {
+    use trace_ir::FlowConstraint::{GepField, Load};
+    let (program, _) = deref_member_reads();
+    let returned = |func: &str| {
+        let fn_id = common::only_function(program, func);
+        match program.fn_returns.get(&fn_id).map(Vec::as_slice) {
+            Some([trace_ir::ReturnFlow::Copy { src }]) => *src,
+            other => panic!("{func} returns {other:?}"),
+        }
+    };
+    let cell = |func: &str, member: &str| {
+        flows_in(program, func)
+            .find_map(|flow| match flow {
+                GepField {
+                    dst, field_name, ..
+                } if field_name == member => Some(*dst),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{func}: no cell of {member}"))
+    };
+
+    let value = returned("CppArrVal::ret_pp");
+    let m_vpp = cell("CppArrVal::ret_pp", "m_vpp");
+    assert!(
+        flows_in(program, "CppArrVal::ret_pp")
+            .any(|flow| matches!(flow, Load { dst, src } if *dst == value && *src == m_vpp)),
+        "ret_pp returns a load from m_vpp's cell"
+    );
+    let class = program.types.class_type_id("CppArrVal").expect("class");
+    let field = program
+        .types
+        .field_id_by_name(class, "m_vpp")
+        .expect("field");
+    let member_type = program.types.get(class).layout.fields[&field].type_id;
+    assert_eq!(
+        program.symbols.variable(value).type_id,
+        member_type,
+        "the value is typed as the member"
+    );
+
+    assert_eq!(
+        returned("CppArrVal::ret_arr"),
+        cell("CppArrVal::ret_arr", "varr"),
+        "an array member returns its cell"
+    );
+}
+
+/// Issue #151: `*c->count = 0` stores no pointer, so it resolves no
+/// pointer to store through: no fact and no temporary.
+#[test]
+fn deref_store_of_no_value_loads_no_member() {
+    let (program, _) = deref_member_reads();
+    for prefix in ["", "cpp_"] {
+        let func = format!("{prefix}zero_count");
+        let facts: Vec<_> = flows_in(program, &func).collect();
+        assert!(facts.is_empty(), "{func}: {facts:?}");
+        let fn_id = Some(common::only_function(program, &func));
+        let vars = program.symbols.variables.iter();
+        let locals: Vec<_> = vars.filter(|v| v.fn_id == fn_id).map(|v| v.id).collect();
+        let c = common::local_variable(program, &func, "c");
+        assert_eq!(locals, [c], "{func} has no temporary");
+    }
+}
+
+/// Pins the `copy`-tolerance in [`common::flow_chain`] that the #151 deref
+/// checks above rely on.
+#[test]
+fn flow_chain_tolerates_copies_around_and_between_hops() {
+    let edges = [
+        (0, 1, "copy".to_string()),
+        (1, 2, "gep pp".to_string()),
+        (2, 3, "copy".to_string()),
+        (3, 4, "load".to_string()),
+        (4, 5, "copy".to_string()),
+    ];
+    assert!(common::flow_chain(&edges, &[0], &["gep pp", "load"]).contains(&5));
+    let no_middle_copy: Vec<_> = edges
+        .iter()
+        .filter(|(s, d, _)| (s, d) != (&2, &3))
+        .cloned()
+        .collect();
+    assert!(!common::flow_chain(&no_middle_copy, &[0], &["gep pp", "load"]).contains(&5));
+    assert!(!common::flow_chain(&edges, &[0], &["load"]).contains(&5));
+}
+
+analyzed_fixture!(cpp_template_parameter_bases);
+
+/// Issue #150: a class inheriting through a template-parameter base
+/// (`class FooService : public OHOS::IRemoteStub<IFoo>`, with
+/// `template <class I> class IRemoteStub : public I`) derives from the
+/// argument `IFoo`, including through nested and scoped forms.
+#[test]
+fn template_parameter_base_derives_from_the_argument() {
+    let (program, _) = cpp_template_parameter_bases();
+    assert!(program.derives_from("FooService", "IFoo"));
+    assert!(
+        program.derives_from("BarImpl", "IBar"),
+        "through nested templates"
+    );
+    assert!(
+        program.derives_from("svc::Scoped", "svc::IFoo"),
+        "argument resolves where Scoped is declared"
+    );
+    assert!(
+        !program.derives_from("svc::Scoped", "IFoo"),
+        "not the same-named global"
+    );
+}
+
+/// Issue #150: the template base itself does not gain a spurious base named
+/// after its own type parameter.
+#[test]
+fn template_parameter_base_is_not_a_class_named_after_the_parameter() {
+    let (program, _) = cpp_template_parameter_bases();
+    assert!(
+        !program
+            .bases_of("OHOS::IRemoteStub")
+            .iter()
+            .any(|b| b == "OHOS::I"),
+        "{:?}",
+        program.bases_of("OHOS::IRemoteStub")
+    );
+    assert!(!program.bases_of("Layer").iter().any(|b| b == "I"));
+}
+
+/// Issue #150: virtual dispatch through the interface reaches overrides
+/// declared only through a template-parameter base.
+#[test]
+fn virtual_dispatch_reaches_overrides_through_template_parameter_bases() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(common::has_any_edge(
+        program,
+        analysis,
+        "Dispatch",
+        "FooService::Handle"
+    ));
+    assert!(common::has_any_edge(
+        program,
+        analysis,
+        "RunBar",
+        "BarImpl::Run"
+    ));
+}
+
+/// Issue #150: an anonymous-namespace class deriving through a
+/// template-parameter base keeps its file-scoped base, so dispatch from
+/// another file reaches its override.
+#[test]
+fn anonymous_class_reaches_overrides_through_template_parameter_bases() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(common::has_any_edge(
+        program,
+        analysis,
+        "DispatchAnon",
+        "Svc::Handle"
+    ));
+}
+
+/// Issue #150: a member lookup while lowering sees the parameter base, so a
+/// non-virtual member of the argument resolves on the derived class.
+#[test]
+fn member_lookup_sees_template_parameter_bases_while_lowering() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert_eq!(
+        direct_targets(program, analysis, "CallHelper"),
+        ["IHelp::Helper"]
+    );
+}
+
+/// Issue #150: a parameter-pack base binds every remaining argument.
+#[test]
+fn template_parameter_pack_bases_bind_every_argument() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(common::has_any_edge(program, analysis, "CallA", "Impl::A"));
+    assert!(common::has_any_edge(program, analysis, "CallB", "Impl::B"));
+}
+
+/// Issue #150: an omitted argument takes the parameter's default, which
+/// names a class in the template's scope.
+#[test]
+fn defaulted_template_parameter_bases_use_the_default() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(program.derives_from("WithDef", "tmpl::IDef"));
+    assert!(common::has_any_edge(
+        program,
+        analysis,
+        "CallD",
+        "WithDef::D"
+    ));
+}
+
+/// Issue #150: `Outer<A>::In<B>` binds `In`'s parameters to its own list.
+#[test]
+fn nested_template_bases_bind_their_own_arguments() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(program.derives_from("Nested", "IC"));
+    assert!(
+        !program.derives_from("Nested", "IA"),
+        "Outer's argument is not In's"
+    );
+    assert!(common::has_any_edge(
+        program,
+        analysis,
+        "CallC",
+        "Nested::C"
+    ));
+}
+
+/// Issue #150: a default written on a forward declaration of the template
+/// counts, since the definition may not repeat it.
+#[test]
+fn forward_declared_template_defaults_are_used() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(program.derives_from("WithFwdDef", "fwd::IFwd"));
+    assert!(common::has_any_edge(
+        program,
+        analysis,
+        "CallF",
+        "WithFwdDef::F"
+    ));
+}
+
+/// Issue #150: `: public B<T>` with a template template parameter `B` names
+/// no class `B`; an instantiation derives from the argument template.
+#[test]
+fn template_template_parameter_bases_name_the_argument_template() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(
+        !program.bases_of("Wrap").iter().any(|b| b == "B"),
+        "{:?}",
+        program.bases_of("Wrap")
+    );
+    assert!(program.derives_from("SvcC", "Layer"));
+    assert!(program.derives_from("SvcC", "IC"));
+    assert!(common::has_any_edge(program, analysis, "CallC", "SvcC::C"));
+}
+
+/// Issue #150: file-local (anonymous-namespace) templates of one name in
+/// two units are two templates; a class expands through its own unit's.
+#[test]
+fn file_local_class_templates_stay_apart() {
+    let (program, _) = cpp_template_parameter_bases();
+    assert!(program.derives_from("LocalA", "ILocal"));
+    assert!(
+        !program.derives_from("LocalA", "IExtra"),
+        "local_b.cpp's `Impl` is not local_a.cpp's"
+    );
+}
+
+/// Issue #150: a file-local template never hides or replaces a linked
+/// template of the same name, while lowering or once merged.
+#[test]
+fn file_local_class_templates_do_not_shadow_a_linked_template() {
+    let (program, _) = cpp_template_parameter_bases();
+    assert!(program.derives_from("ShadeA", "ILocal"));
+    assert!(
+        !program.derives_from("ShadeA", "IExtra"),
+        "{:?}",
+        program.bases_of("ShadeA")
+    );
+}
+
+/// Issue #150: a file-local template is visible from its own file only, so
+/// two headers' same-named templates each expand their own file's classes.
+#[test]
+fn file_local_class_templates_expand_their_own_files_classes() {
+    let (program, _) = cpp_template_parameter_bases();
+    assert!(program.derives_from("TwinOne", "ILocal"));
+    assert!(
+        !program.derives_from("TwinOne", "IExtra"),
+        "{:?}",
+        program.bases_of("TwinOne")
+    );
+    assert!(program.derives_from("TwinPair", "ILocal"));
+    assert!(program.derives_from("TwinPair", "IExtra"));
+}
+
+/// Issue #150: a file-local template is visible to its whole translation
+/// unit, so a class in a file including its header derives through it.
+#[test]
+fn file_local_class_templates_in_an_included_header_are_seen() {
+    let (program, _) = cpp_template_parameter_bases();
+    assert!(
+        program.derives_from("HdrUser", "ILocal"),
+        "{:?}",
+        program.bases_of("HdrUser")
+    );
+    assert!(
+        program.derives_from("HdrAnonUser", "IExtra"),
+        "{:?}",
+        program.bases_of("HdrAnonUser")
+    );
+}
+
+/// Issue #150: a pack forwarded inside a base's arguments (`B<Ts...>`,
+/// `B<IC, Ts...>`) substitutes the whole pack at that position.
+#[test]
+fn template_parameter_packs_forwarded_inside_arguments_expand() {
+    let (program, _) = cpp_template_parameter_bases();
+    assert!(
+        program.derives_from("S", "IA"),
+        "{:?}",
+        program.bases_of("S")
+    );
+    assert!(
+        program.derives_from("S", "IB"),
+        "{:?}",
+        program.bases_of("S")
+    );
+    assert!(program.derives_from("SMixed", "IC"));
+    assert!(program.derives_from("SMixed", "IA"));
+    assert!(!program.derives_from("SMixed", "IB"));
+}
+
+/// Issue #150: a pack expanded through a pattern (`B<Lift<Ts>...>`) copies
+/// the pattern once per element.
+#[test]
+fn template_parameter_pack_patterns_expand_per_element() {
+    let (program, _) = cpp_template_parameter_bases();
+    for base in ["IA", "IB"] {
+        assert!(
+            program.derives_from("SLifted", base),
+            "{:?}",
+            program.bases_of("SLifted")
+        );
+    }
+}
+
+/// Control: the base body itself stays a dispatch target, so this fixture
+/// shape does not lose the edges #150 does not touch. Kept in its own test
+/// so a red assertion elsewhere never masks it.
+#[test]
+fn virtual_dispatch_still_reaches_the_base_body() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(common::has_any_edge(
+        program,
+        analysis,
+        "Dispatch",
+        "IFoo::Handle"
+    ));
+}
+
+/// The `cpp_template_parameter_bases` fixture's points-to sets, solved once
+/// with `retain_points_to`.
+fn template_parameter_bases_points_to() -> &'static (trace_analysis::Pag, AnalysisResult) {
+    static CACHE: OnceLock<(trace_analysis::Pag, AnalysisResult)> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let (program, _) = cpp_template_parameter_bases();
+        trace_analysis::analyze_with_options(
+            program,
+            trace_analysis::AnalyzeOptions {
+                retain_points_to: true,
+                ..Default::default()
+            },
+        )
+    })
+}
+
+/// Class names of the heap locations each `UnwrapPointer` receiver in
+/// `func` points to, sorted. This is #150's actual claim: whether the
+/// `sptr<IFoo>` unwrap admits the concrete object's own class (`FooService`,
+/// `Direct`) into the receiver's points-to set, independent of any field the
+/// receiver's class happens to declare.
+fn receiver_heap_types(func: &str) -> Vec<String> {
+    let (program, _) = cpp_template_parameter_bases();
+    let (pag, analysis) = template_parameter_bases_points_to();
+    let mut names: Vec<String> = unwraps_in(program, func)
+        .into_iter()
+        .flat_map(|(_, receiver)| {
+            let pts = pag
+                .var_node
+                .get(&receiver)
+                .and_then(|n| analysis.points_to.get(n));
+            pts.into_iter().flatten().filter_map(|loc_id| {
+                let loc = &pag.locations[loc_id.0 as usize];
+                if loc.kind != trace_analysis::LocKind::Heap {
+                    return None;
+                }
+                match program.types.get(loc.type_id).desc.as_ref() {
+                    trace_ir::TypeDesc::Struct { name, .. } if !name.is_empty() => {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                }
+            })
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Issue #150: the smart-pointer unwrap admits a subclass reached only
+/// through a template-parameter base — the `FooService` heap object behind
+/// `sptr<IFoo>` in `Stub` reaches the receiver's points-to set.
+#[test]
+fn smart_pointer_unwrap_admits_a_subclass_through_a_template_parameter_base() {
+    assert!(
+        receiver_heap_types("Stub").contains(&"FooService".to_string()),
+        "{:?}",
+        receiver_heap_types("Stub")
+    );
+}
+
+/// Control: a direct subclass behind the same wrapper shape is recognized
+/// today. Kept in its own test so a red assertion elsewhere never masks it;
+/// if this one fails, the fixture is wrong, not #150.
+#[test]
+fn smart_pointer_unwrap_admits_a_direct_subclass() {
+    assert!(
+        receiver_heap_types("Plain").contains(&"Direct".to_string()),
+        "{:?}",
+        receiver_heap_types("Plain")
+    );
+}
+
+/// Issue #150: a bare name in a member body finds a member the
+/// template-parameter argument declares (`y`, `IField`'s), and a member of
+/// the template itself hides the argument's of its name (`x`, `FieldStub`'s):
+/// each is read through a receiver of its declaring class.
+#[test]
+fn template_parameter_base_members_resolve_with_the_template_nearer() {
+    let (program, _) = cpp_template_parameter_bases();
+    let owners: Vec<_> = flows_in(program, "FieldSvc::Set")
+        .filter_map(|flow| match flow {
+            trace_ir::FlowConstraint::GepField {
+                base, field_name, ..
+            } => {
+                let base_type = program.symbols.variable(*base).type_id;
+                match program.types.get(base_type).desc.as_ref() {
+                    trace_ir::TypeDesc::Struct { name, .. } => {
+                        Some((field_name.clone(), name.clone()))
+                    }
+                    desc => Some((field_name.clone(), format!("{desc:?}"))),
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        owners,
+        [
+            ("x".to_string(), "FieldStub".to_string()),
+            ("y".to_string(), "IField".to_string())
+        ],
+        "{owners:?}"
+    );
+}
+
+/// Issue #151: a direct-initialization argument asks one rule,
+/// `implicit_this`, whether a bare name is a member: a body `using` hides
+/// the member, so `Guard g(mu_)` passes the namespace variable, while
+/// without it the member is a value with no actual.
+#[test]
+fn direct_init_argument_member_is_hidden_by_a_body_using() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+namespace ns { int *mu_; }
+struct Guard { Guard(int *m); };
+struct GuardOwner {
+    int *mu_;
+    void imported() {
+        using ns::mu_;
+        Guard g(mu_);
+    }
+    void member() { Guard g(mu_); }
+};
+"#,
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let actuals = |func: &str| -> Vec<String> {
+        let caller = common::only_function(&program, func);
+        (program.symbols.call_sites.iter())
+            .filter(|cs| cs.caller == caller && cs.callee_name == "Guard::Guard")
+            .flat_map(|cs| cs.var_args.iter())
+            .filter(|(position, _)| *position > 0)
+            .map(|(_, var)| program.symbols.variable(*var).name.clone())
+            .collect()
+    };
+    assert_eq!(actuals("GuardOwner::imported"), ["mu_"]);
+    assert!(actuals("GuardOwner::member").is_empty());
 }

@@ -773,6 +773,7 @@ mod tests {
                 defaulted_in_class: false,
                 declared_in_class: false,
                 default_args: 0,
+                reference_params: Vec::new(),
                 is_virtual: false,
                 is_final: false,
                 is_cpp: false,
