@@ -8,7 +8,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use trace_parse::{
-    discover_source_files, parse_source_with_lang, IncludeGraph, IndexSourceCache, SourceLang,
+    discover_source_files, has_parse_errors, is_benign_parse_error, parse_source_with_lang,
+    IncludeGraph, IndexSourceCache, SourceLang,
 };
 use trace_preproc::PreprocessOptions;
 use tree_sitter::Node;
@@ -73,7 +74,7 @@ fn main() -> Result<(), String> {
         };
         let lang = index_lang(&canonical, &cpp_tus, &include_graph);
         let parsed = parse_source_with_lang(Arc::clone(&pre.text), lang)?;
-        if !parsed.tree.root_node().has_error() {
+        if !has_parse_errors(&parsed.tree) {
             continue;
         }
         let mut errors = Vec::new();
@@ -124,7 +125,7 @@ fn load_parse_failures_from_db(db: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn collect_errors(source: &str, node: Node, out: &mut Vec<(usize, usize, String, String)>) {
-    if !node.has_error() {
+    if !node.has_error() || is_benign_parse_error(node) {
         return;
     }
     let mut cursor = node.walk();

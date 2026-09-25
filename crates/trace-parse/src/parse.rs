@@ -65,6 +65,56 @@ pub fn node_text<'a>(source: &'a str, node: &Node) -> &'a str {
     &source[node.start_byte()..node.end_byte()]
 }
 
+/// Returns true if `node` represents a benign false-positive error produced by
+/// tree-sitter rather than a genuine syntax error in the source code.
+///
+/// Specifically: upstream tree-sitter C and C++ grammars mandate a declarator
+/// before a bitfield clause in field declarations (`_field_declaration_declarator`),
+/// but in standard C/C++ unnamed bitfields (e.g. `unsigned : 0;`, `int : 4;`)
+/// have no declarator. Tree-sitter recovers by inserting a `(MISSING field_identifier)`
+/// immediately preceding the `bitfield_clause`.
+pub fn is_benign_parse_error(node: Node) -> bool {
+    if node.is_missing()
+        && node.kind() == "field_identifier"
+        && node
+            .next_sibling()
+            .is_some_and(|s| s.kind() == "bitfield_clause")
+        && node
+            .parent()
+            .is_some_and(|p| p.kind() == "field_declaration")
+    {
+        return true;
+    }
+    false
+}
+
+/// Returns true if the parse tree contains genuine syntax errors.
+///
+/// False-positive error nodes caused by upstream grammar limitations (such as
+/// unnamed bitfields) are ignored.
 pub fn has_parse_errors(tree: &Tree) -> bool {
-    tree.root_node().has_error()
+    let root = tree.root_node();
+    if !root.has_error() {
+        return false;
+    }
+    has_unrecovered_parse_errors(root)
+}
+
+fn has_unrecovered_parse_errors(node: Node) -> bool {
+    if !node.has_error() {
+        return false;
+    }
+    if is_benign_parse_error(node) {
+        return false;
+    }
+    if node.is_error() || node.is_missing() {
+        return true;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.has_error() && has_unrecovered_parse_errors(child) {
+            return true;
+        }
+    }
+    false
 }
