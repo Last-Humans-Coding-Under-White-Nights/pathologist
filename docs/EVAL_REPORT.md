@@ -236,6 +236,52 @@ All three are assigned to the recipient callback in the corpus, so these edges a
   - CLI inspect test in `crates/trace-cli/tests/inspect_tests.rs`: `inspect_callgraph_up_for_implicit_member_pointer_fn_ptr`.
   - Verified `is_direct = 0`, `callee_var` is set, indirect call edge `Dispatcher::Dispatch -> target_callback` is resolved, and `trace inspect callgraph --direction up` lists `Dispatcher::Dispatch` as caller.
 
+## Function pointer member declarator classification and member call fallback — 2026-09-25 (#147)
+
+The rules are defined in [Member function pointer declarator classification](ANALYSIS.md#member-function-pointer-declarator-classification) and [Sound handling for unresolved member field calls](ANALYSIS.md#sound-handling-for-unresolved-member-field-calls).
+This change fixes a bug where struct function-pointer fields were misclassified as member functions in AST lowering and unresolved member field calls erroneously mutated into direct calls to same-named free functions.
+
+### Problem & Fix
+
+- In C++, struct function-pointer fields (e.g., `void (*handler)(int, uint32_t);` in `struct LevelHandler`) were misclassified as member functions because `member_decl_is_function` in `trace-parse/src/lower.rs` walked into the inner `function_declarator` without filtering out function-pointer declarators. This caused dummy function symbols (`"handler"`) to be registered in `program.symbols.functions`.
+- When an indirect member call (`obj->handler()`) failed field decomposition (e.g., due to casting from `void*`), AST lowering fell back to checking `resolve_function_named` with the bare field name (`"handler"`). It matched the dummy function symbol and flipped `is_direct` to `true`, producing an erroneous direct call edge. Furthermore, returning bare field names from `resolve_callee` caused `finalize_extern_callees` to synthesize bogus external functions.
+- In `trace-parse`, `member_decl_is_function` now filters out function pointer declarators via `is_function_pointer_declarator` and `declarator_is_pointer_to_fn` (including unwrapping `init_declarator`), ensuring function-pointer members are treated as pure data fields in struct layouts with `TypeDesc::FnPtr`.
+- In `collect_call_at_node_inner`, field expressions (`x->f()`, `x.f()`) and subscript expressions (`arr[i]()`) are explicitly excluded from mutating into direct free function calls. `resolve_callee` preserves full field paths (`field_callee_text`, e.g. `"h->handler"`), preventing erroneous synthesis of external symbols.
+- Real-world impact: in OpenHarmony `resourceschedule_memmgr` (`services/memmgrservice/src/event/memory_pressure_observer.cpp`), `handlerInfo_->handler(...)` resolves indirectly without generating a direct call to a placeholder `handler` function.
+
+### Pinned Corpus Validation
+
+Evaluated with `python3 scripts/eval_check.py --bin target/release/trace --outdir /tmp/eval_check` on release build:
+- **Pass rate**: **94 checks, 0 failures** across hdf (`cdc75a2`), hiview (`92408e2`), and camera (`8ffd69d`).
+- Re-captured metrics across the corpora reflecting the elimination of phantom member prototypes and spurious direct/external call edges:
+  - **hdf** (`drivers_hdf_core` @ `cdc75a20bb8f1a046cd22e189405a20d602d0521`):
+    - `functions_total`: 12,012 (unchanged)
+    - `functions_external`: 1,860 → 1,722 (-138 phantom prototypes from struct function-pointer fields eliminated)
+    - `edges_total`: 74,823 → 73,518 (-1,305 spurious external call edges removed)
+    - `edges_external`: 25,021 → 23,716 (-1,305)
+    - `edges_direct`: 44,822 (unchanged)
+    - `edges_indirect`: 4,980 (exact match)
+    - `arg_flow_edges` and `arg_flow_rows_per_call_edge`: 69,500 → 69,478 (-22)
+  - **hiview** (`hiviewdfx_hiview` @ `92408e2072bd6dc8fb0d980773e80b6ec898710c`):
+    - `functions_total`: 9,976 → 9,678 (-298 phantom prototypes from struct function-pointer fields eliminated)
+    - `functions_external`: 1,986 → 1,688 (-298)
+    - `edges_total`: 33,549 → 32,017 (-1,532 spurious edges eliminated)
+    - `edges_direct`: 16,726 → 16,734 (+8 legitimate direct calls)
+    - `edges_external`: 16,487 → 15,103 (-1,384)
+    - `edges_indirect`: 166 (exact match)
+    - `arg_flow_edges`: 18,815 (unchanged)
+  - **camera** (`multimedia_camera_framework` @ `8ffd69dcd47f533e70b4dba428439da9008b0cae`):
+    - `functions_total`: 23,511 → 23,194 (-317 phantom prototypes eliminated)
+    - `functions_defined`: 19,802 → 19,806 (+4 definitions)
+    - `functions_external`: 3,705 → 3,388 (-317)
+    - `edges_total`: 102,102 → 99,473 (-2,629 spurious edges eliminated)
+    - `edges_direct`: 56,772 → 56,403 (-369 direct edges from eliminated fallbacks to same-named functions)
+    - `edges_external`: 44,836 → 42,763 (-2,073)
+    - `edges_indirect`: 305 (exact match)
+    - `arg_flow_edges`: 43,311 → 43,157 (-154)
+    - `external-class template sites stay unresolved by design` probe: 1,183 → 1,338 (+155 sites properly retained as unresolved)
+- All correctness metrics, diagnostics, IPC bridges, and dispatch sites match bit-for-bit.
+
 ## Implicit this member variable access and assignments — 2026-09-24 (#145)
 
 The rules are defined in [Implicit this member variable access](ANALYSIS.md#implicit-this-member-variable-access).
