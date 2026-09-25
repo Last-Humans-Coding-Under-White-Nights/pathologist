@@ -9102,3 +9102,112 @@ void entry() { seed(&global); run(); }
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn cpp_implicit_member_pointer_fn_ptr_call_resolves_indirect() {
+    let root = fixture("cpp_implicit_fn_ptr");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let cs = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|c| c.callee_name.contains("fn"))
+        .expect("handler_->fn call site must exist");
+    assert!(
+        !cs.is_direct,
+        "handler_->fn() should be recorded as an indirect call site (is_direct = false)"
+    );
+    assert_eq!(cs.callee_name, "handler_->fn");
+    assert!(
+        cs.callee_var.is_some(),
+        "handler_->fn() should have callee_var set"
+    );
+
+    let (_pag, analysis) = analyze(&program);
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "Dispatcher::Dispatch",
+            "target_callback",
+            ResolutionKind::Indirect
+        ),
+        "Dispatcher::Dispatch should resolve indirect call to target_callback"
+    );
+}
+
+#[test]
+fn cpp_implicit_member_value_and_chained_fn_ptr_call() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_implicit_member_fn_ptr_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct Handler {
+    void (*fn)();
+};
+
+void target_val() {}
+void target_chain() {}
+
+struct Nested {
+    Handler *handler = nullptr;
+};
+
+class Dispatcher {
+    Handler val_handler_;
+    Nested *nested_ = nullptr;
+public:
+    void Init(Nested *n) {
+        val_handler_.fn = target_val;
+        // Unqualified member variable assignment produces zero flow constraints
+        // during lowering; this exercises Andersen field summary fallback until
+        // unqualified member assignments land.
+        nested_ = n;
+    }
+    void Dispatch() {
+        val_handler_.fn();
+        nested_->handler->fn();
+    }
+};
+
+static Handler g_chain_handler = { target_chain };
+static Nested g_nested = { &g_chain_handler };
+
+void run() {
+    Dispatcher d;
+    d.Init(&g_nested);
+    d.Dispatch();
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "Dispatcher::Dispatch",
+            "target_val",
+            ResolutionKind::Indirect
+        ),
+        "Dispatcher::Dispatch should resolve indirect call to target_val via val_handler_.fn()"
+    );
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "Dispatcher::Dispatch",
+            "target_chain",
+            ResolutionKind::Indirect
+        ),
+        "Dispatcher::Dispatch should resolve indirect call to target_chain via nested_->handler->fn()"
+    );
+}

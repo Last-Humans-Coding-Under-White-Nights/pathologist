@@ -4,6 +4,10 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Implicit member pointer field decomposition (#146)
+
+Calling a function pointer through an implicit member pointer or field path in a C++ member function (such as `handler_->fn()`) now correctly roots field decomposition at `this` (`this->handler_->fn`). During AST lowering, `decompose_field_path` detects when an unqualified identifier names an instance field on `this` (`class_ctx_field`), rooting field decomposition with arrow access. This generates the necessary GEP and Load constraints, wiring `callee_var` for indirect call resolution instead of misclassifying the call as a direct external call.
+
 ### Implicit this member variable access and assignments (#145)
 
 In C++, an unqualified variable access inside an instance member function can

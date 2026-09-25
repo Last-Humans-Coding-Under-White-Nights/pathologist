@@ -348,7 +348,16 @@ The scope walk stops there (`scoped_variable_unless_hidden`), so `d.cb()`
 calls `D::cb`, not base `B`'s static callback. A hidden name reads no
 variable, now or in the deferred end-of-unit pass; an instance field it names
 is read through `this`, and a bare call through one in a member body
-(`cb()`) loads `this->cb`, as `this->cb()` does. A reference member is
+(`cb()`) loads `this->cb`, as `this->cb()` does. Similarly, calling a function
+pointer through an implicit member pointer or member field path in a member
+body (`handler_->fn()`, `val_handler_.fn()`, `nested_->handler->fn()`) roots
+field decomposition at `this` (`this->handler_->fn`). When `decompose_field_path`
+peels down to an unqualified identifier that is not a local variable or
+parameter, it checks whether the identifier names an instance field on `this`
+(`class_ctx_field`); if so, the path is rooted at `this` with arrow access.
+This emits the corresponding GEP and Load constraints, setting `callee_var`
+for indirect call resolution rather than incorrectly treating the call as a
+direct external call (see [Implicit this member variable access](#implicit-this-member-variable-access)). A reference member is
 recorded as a reference binding, so `&H::ref` and `&h.ref` are the
 referent's address. A callable member called through an object (`h.fun()`)
 calls its class's `operator()`, as `H::fun()` does. Every declarator of one member declaration

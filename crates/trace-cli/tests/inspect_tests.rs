@@ -1200,3 +1200,49 @@ fn cli_reports_both_directions(export_flag: Option<&str>) {
         );
     }
 }
+
+#[test]
+fn inspect_callgraph_up_for_implicit_member_pointer_fn_ptr() {
+    let bin = env!("CARGO_BIN_EXE_trace");
+    let tmp = TempDb::new("trace_inspect_implicit_fn_ptr.db");
+    let out = Command::new(bin)
+        .args([
+            "analyze",
+            fixture("cpp_implicit_fn_ptr").to_str().unwrap(),
+            "--full-export",
+            "-o",
+            tmp.to_str().unwrap(),
+        ])
+        .output()
+        .expect("analyze runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(bin)
+        .args([
+            "inspect",
+            tmp.to_str().unwrap(),
+            "callgraph",
+            "--file",
+            "main.cpp",
+            "--line",
+            "5",
+            "--direction",
+            "up",
+        ])
+        .output()
+        .expect("inspect callgraph up runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Dispatcher::Dispatch"),
+        "inspect callgraph up should report Dispatcher::Dispatch as caller of target_callback, got:\n{stdout}"
+    );
+}
