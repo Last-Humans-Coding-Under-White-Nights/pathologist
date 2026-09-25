@@ -358,6 +358,24 @@ calls its class's `operator()`, as `H::fun()` does. Every declarator of one memb
 (`inline static CB a = f, b = g;`) is its own member with its own
 initializer.
 
+**Member function pointer declarator classification.** A struct or class
+member declared with a function pointer declarator (`void (*handler)(int, uint32_t);`,
+with or without an in-class initializer `= nullptr`, array dimensions, or multiple
+pointer levels) declares a data field, not a member function. `member_decl_is_function`
+in `trace-parse/src/lower.rs` rejects function pointer declarators
+(`is_function_pointer_declarator`, `declarator_is_pointer_to_fn`), preventing them
+from entering member prototype registration and `program.symbols.functions`.
+Instead, they are indexed into the struct's field layout with `TypeDesc::FnPtr`.
+This ensures that field stores and loads through function pointer fields are
+preserved in the PAG and analyzed via points-to flow. Declarator classification
+distinguishes nested callback types (e.g. pointers to functions returning function
+pointers, `void (*(*cb)(int))(double);`) from member functions returning function
+pointers (`void (*get_handler(int))(int);`) by examining the declarator binding nearest
+the declared identifier. For pointers to member functions (`void (S::*cb)(int);`),
+declarator classification traverses qualified identifiers with pointer-bearing names
+(`pointer_type_declarator`), identifying them as variable bindings while retaining
+ordinary qualified function names as terminals.
+
 A member declared in-class and defined out-of-class (`int *Holder::member;`
 or `int *Holder::member = &object;` at namespace scope) share one `VarId`:
 lowering an out-of-class variable definition recognizes a scope-qualified
@@ -1009,6 +1027,19 @@ with no `callee_var` and a bare callee name. The same `Program::callees_of`
 entry point resolves these through target-scoped candidate lookup. Lowering
 also registers pointer-returning prototypes (e.g. `T *f(void);`) as functions,
 so those declarations participate in lookup instead of creating phantom variables.
+
+**Sound handling for unresolved member field calls.** Only bare identifiers
+and qualified names may fall back to direct-call resolution or cross-TU name
+recovery. A member field call (`obj->fn()` or `obj.fn()`) or array subscript
+call (`arr[i]()`) whose field decomposition or receiver typing cannot be
+resolved represents an unresolved indirect call (`is_direct = false`). It must
+never fall back to matching an unrelated free function named `fn` in scope. AST
+lowering retains the field path (`field_callee_text`, e.g. `"obj->fn"`), which
+also prevents `finalize_extern_callees` from synthesizing bogus external
+function symbols for field names. When an identifier matches a local variable
+or parameter in the enclosing member method, local/parameter lookup takes
+precedence over implicit member resolution, ensuring that shadowing callbacks
+resolve their indirect call targets.
 
 ### Analyze options
 

@@ -10375,3 +10375,603 @@ struct GuardOwner {
     assert_eq!(actuals("GuardOwner::imported"), ["mu_"]);
     assert!(actuals("GuardOwner::member").is_empty());
 }
+
+#[test]
+fn cpp_member_call_and_fn_ptr_declarator_no_spurious_direct_call() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_spurious_direct_call_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct LevelHandler {
+    int data;
+    void (*handler)(int data, unsigned int events);
+};
+
+void target_handler(int data, unsigned int events) {}
+
+void invoke(LevelHandler *h) {
+    h->handler(h->data, 0);
+}
+
+static LevelHandler g_handler = { 1, target_handler };
+
+void test() {
+    invoke(&g_handler);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // Acceptance criterion 1: Struct function-pointer fields do not introduce extraneous
+    // function entries in program.symbols.functions.
+    let handler_func = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "handler" || f.name.ends_with("::handler"));
+    assert!(
+        handler_func.is_none(),
+        "function pointer member `handler` must not be registered as a function in program.symbols: {:?}",
+        handler_func
+    );
+
+    // Call site for h->handler must be indirect (is_direct = false)
+    let cs = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|c| c.callee_name.contains("handler"))
+        .expect("h->handler call site must exist");
+    assert_eq!(
+        cs.callee_name, "h->handler",
+        "h->handler call site must retain full receiver path"
+    );
+    assert!(
+        !cs.is_direct,
+        "h->handler call site must have is_direct = false, got callee_name={:?}, is_direct={}",
+        cs.callee_name, cs.is_direct
+    );
+
+    let (_pag, analysis) = analyze(&program);
+
+    // Acceptance criterion 3: invoke calls target_handler indirectly; no call edge to dummy handler.
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "invoke",
+            "target_handler",
+            ResolutionKind::Indirect
+        ),
+        "invoke should resolve indirect call to target_handler"
+    );
+    assert!(
+        !has_any_edge(&program, &analysis, "invoke", "handler"),
+        "invoke must not have any call edge to dummy function handler"
+    );
+}
+
+#[test]
+fn cpp_unresolved_member_call_does_not_fall_back_to_unrelated_free_function() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_unresolved_member_no_fallback_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct LevelHandler {
+    int data;
+    void (*handler)(int data, unsigned int events);
+};
+
+// Unrelated free function with the same name as the member
+void handler(int data, unsigned int events);
+
+void invoke(LevelHandler *h) {
+    // Member field call whose field loading cannot be resolved to any concrete target
+    h->handler(h->data, 0);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // Acceptance criterion 2: Member field calls obj->foo() whose field loading
+    // cannot be resolved remain is_direct = false with callee_var = None or field load,
+    // rather than mutating into direct calls to unrelated functions named foo.
+    let cs = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|c| c.callee_name.contains("handler"))
+        .expect("h->handler call site must exist");
+    assert_eq!(
+        cs.callee_name, "h->handler",
+        "h->handler call site must retain full receiver path"
+    );
+    assert!(
+        !cs.is_direct,
+        "h->handler call site must remain is_direct = false when field loading is unresolved"
+    );
+
+    let (_pag, analysis) = analyze(&program);
+
+    // invoke must NOT call free function handler
+    assert!(
+        !has_any_edge(&program, &analysis, "invoke", "handler"),
+        "invoke must not call unrelated free function handler"
+    );
+}
+
+#[test]
+fn cpp_member_call_edge_cases_and_declarator_variants() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_member_call_edge_cases_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct Ops {
+    int id;
+    void (*fn_ptr)(int);
+    void (*fn_init)(int) = nullptr;
+    void (*fn_arr[2])(int);
+    void (**fn_ptr_ptr)(int);
+
+    void real_method(int x) {}
+};
+
+void fn_ptr(int) {}
+void fn_init(int) {}
+void fn_arr(int) {}
+void fn_ptr_ptr(int) {}
+
+void test_edge_cases(Ops *ops_ptr, Ops ops_val) {
+    // 1. Real member call must resolve directly
+    ops_ptr->real_method(1);
+    ops_val.real_method(2);
+
+    // 2. Parenthesized member function pointer call
+    (ops_ptr->fn_ptr)(10);
+
+    // 3. Cast member function pointer call
+    ((void (*)(int))ops_ptr->fn_ptr)(20);
+
+    // 4. Dot access to member function pointer
+    ops_val.fn_ptr(30);
+
+    // 5. Initialized member function pointer
+    ops_ptr->fn_init(40);
+
+    // 6. Subscript expression on member function pointer array
+    ops_ptr->fn_arr[0](50);
+
+    // 7. Pointer-to-pointer-to-function member call with dereference
+    (*ops_ptr->fn_ptr_ptr)(60);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // Real method must be registered as a function
+    assert!(
+        program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "Ops::real_method"),
+        "Ops::real_method must be registered as a function"
+    );
+
+    // None of the function pointer fields should be registered as functions
+    for field_name in &["fn_ptr", "fn_init", "fn_arr", "fn_ptr_ptr"] {
+        assert!(
+            !program
+                .symbols
+                .functions
+                .iter()
+                .any(|f| f.name.ends_with(&format!("::{}", field_name))),
+            "{} must not be registered as a member function of Ops",
+            field_name
+        );
+    }
+
+    // Dot access must retain dot operator in callee_name
+    let cs_dot = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|c| c.callee_name.starts_with("ops_val.fn_ptr"))
+        .expect("ops_val.fn_ptr call site must exist");
+    assert_eq!(cs_dot.callee_name, "ops_val.fn_ptr");
+    assert!(!cs_dot.is_direct);
+
+    // Field layout type for initialized fn ptr must be TypeDesc::FnPtr
+    let ops_tid = program
+        .types
+        .class_type_id("Ops")
+        .expect("Ops type must exist");
+    let ops_layout = &program.types.get(ops_tid).layout;
+    let fn_init_field = ops_layout
+        .fields
+        .iter()
+        .find(|(_, f)| f.name == "fn_init")
+        .expect("fn_init field must exist");
+    let fn_init_desc = &program.types.get(fn_init_field.1.type_id).desc;
+    assert!(
+        matches!(fn_init_desc.as_ref(), trace_ir::TypeDesc::FnPtr { .. }),
+        "fn_init with in-class initializer must have TypeDesc::FnPtr, got {:?}",
+        fn_init_desc
+    );
+
+    let (_pag, analysis) = analyze(&program);
+
+    // Real method calls must resolve to Ops::real_method
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "test_edge_cases",
+            "Ops::real_method",
+            ResolutionKind::Direct
+        ),
+        "test_edge_cases should have direct calls to Ops::real_method"
+    );
+
+    // None of the member calls should fall back to free functions fn_ptr, fn_init, fn_arr, fn_ptr_ptr
+    for free_fn in &["fn_ptr", "fn_init", "fn_arr", "fn_ptr_ptr"] {
+        assert!(
+            !has_any_edge(&program, &analysis, "test_edge_cases", free_fn),
+            "test_edge_cases must not call unrelated free function {}",
+            free_fn
+        );
+    }
+}
+
+#[test]
+fn cpp_member_function_returning_fn_ptr_is_recognized_as_method() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_member_returning_fn_ptr_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct S {
+    int id;
+    void (*get_handler(int x))(int data);
+};
+
+void target_fn(int data) {}
+
+void (*S::get_handler(int x))(int data) {
+    return target_fn;
+}
+
+void test_call(S *s) {
+    s->get_handler(1)(42);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // S::get_handler must be registered as a member function, NOT a data field
+    let get_handler_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "S::get_handler" || f.name.ends_with("::get_handler"));
+    assert!(
+        get_handler_fn.is_some(),
+        "S::get_handler must be registered in program.symbols.functions"
+    );
+
+    let s_tid = program.types.class_type_id("S").expect("S type must exist");
+    let s_layout = &program.types.get(s_tid).layout;
+    assert!(
+        !s_layout.fields.iter().any(|(_, f)| f.name == "get_handler"),
+        "get_handler must NOT be a data field in struct S layout: {:?}",
+        s_layout.fields
+    );
+
+    let (_pag, analysis) = analyze(&program);
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "test_call",
+            "S::get_handler",
+            ResolutionKind::Direct
+        ),
+        "test_call must resolve call to S::get_handler"
+    );
+}
+
+#[test]
+fn cpp_implicit_member_fn_ptr_call_does_not_fall_back_to_free_function() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_implicit_member_no_fallback_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+void handler(int x);
+
+struct Worker {
+    void (*handler)(int x) = nullptr;
+
+    void process(int val) {
+        handler(val);
+    }
+};
+
+void run(Worker *w) {
+    w->process(10);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // The call site inside Worker::process must be this->handler, is_direct = false
+    let cs = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|c| c.callee_name.contains("handler"))
+        .expect("handler call site must exist");
+    assert_eq!(
+        cs.callee_name, "this->handler",
+        "implicit member call site callee_name must be this->handler"
+    );
+    assert!(
+        !cs.is_direct,
+        "implicit member call site must have is_direct = false"
+    );
+
+    let (_pag, analysis) = analyze(&program);
+
+    // Worker::process must NOT call free function handler
+    assert!(
+        !has_any_edge(&program, &analysis, "Worker::process", "handler"),
+        "Worker::process must not fall back to unrelated free function handler"
+    );
+}
+
+#[test]
+fn cpp_local_and_param_callback_shadows_member() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_callback_shadows_member_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+void target(int) {}
+struct Worker {
+    void (*handler)(int);
+    void parameter(void (*handler)(int)) { handler(1); }
+    void local() { void (*handler)(int) = target; handler(2); }
+};
+void entry(Worker *w) { w->parameter(target); w->local(); }
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "Worker::parameter",
+            "target",
+            ResolutionKind::Indirect
+        ),
+        "Worker::parameter must resolve indirect call to target via parameter callback"
+    );
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "Worker::local",
+            "target",
+            ResolutionKind::Indirect
+        ),
+        "Worker::local must resolve indirect call to target via local callback"
+    );
+}
+
+#[test]
+fn cpp_nested_callback_variable_flow() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_nested_callback_flow_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+void target(double) {}
+using Leaf = void (*)(double);
+Leaf factory(int) { return target; }
+void (*(*global_cb)(int))(double) = factory;
+void caller() { global_cb(2); }
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // global_cb must be registered as a variable, NOT as a function
+    assert!(
+        program
+            .symbols
+            .variables
+            .iter()
+            .any(|v| v.name == "global_cb"),
+        "global_cb must be registered in program.symbols.variables"
+    );
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "global_cb"),
+        "global_cb must NOT be registered as a function in program.symbols.functions"
+    );
+
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "caller",
+            "factory",
+            ResolutionKind::Indirect
+        ),
+        "caller must resolve indirect call to factory via global_cb"
+    );
+}
+
+#[test]
+fn cpp_pointer_to_member_function_variable() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_member_fn_ptr_var_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct S { void target(int) {} };
+void (S::*cb)(int) = &S::target;
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // S::*cb must be registered as a variable
+    let var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "S::*cb");
+    assert!(
+        var.is_some(),
+        "S::*cb must be registered as a variable in program.symbols.variables: {:?}",
+        program
+            .symbols
+            .variables
+            .iter()
+            .map(|v| &v.name)
+            .collect::<Vec<_>>()
+    );
+    let var = var.unwrap();
+
+    // S::*cb must NOT be registered as a function
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name.contains("S::*cb") || f.name == "cb"),
+        "S::*cb must NOT be registered as a function in program.symbols.functions: {:?}",
+        program
+            .symbols
+            .functions
+            .iter()
+            .map(|f| &f.name)
+            .collect::<Vec<_>>()
+    );
+
+    // Initializer flow must be emitted for the variable
+    let has_init_flow = program.flow.iter().any(|f| match f {
+        trace_ir::FlowConstraint::AddrOfFn { dst, .. } => *dst == var.id,
+        trace_ir::FlowConstraint::Copy { dst, .. } => *dst == var.id,
+        _ => false,
+    });
+    assert!(
+        has_init_flow,
+        "initializer flow must be emitted for variable S::*cb: {:?}",
+        program.flow
+    );
+
+    // Verify full export to SQLite: variable S::*cb exists, no function S::*cb, and two flow edges
+    let (pag, analysis) = analyze(&program);
+    let db_path = dir.path().join("out.db");
+    trace_db::export_to_sqlite(
+        &program,
+        &pag,
+        &analysis,
+        &trace_db::ExportOptions {
+            output: db_path.clone(),
+            trace_version: "test".into(),
+            include_points_to: false,
+            full_detail: true,
+            model_files: Vec::new(),
+        },
+    )
+    .expect("export");
+
+    let conn = trace_db::open_db(&db_path).expect("open db");
+    let var_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM variables WHERE name = 'S::*cb'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query var");
+    assert_eq!(var_count, 1, "S::*cb must be exported to variables table");
+
+    let fn_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM functions WHERE name LIKE '%S::*cb%' OR name = 'cb'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query fn");
+    assert_eq!(
+        fn_count, 0,
+        "S::*cb must NOT be exported to functions table"
+    );
+
+    let total_flow_edges: i64 = conn
+        .query_row("SELECT count(*) FROM flow_edges", [], |row| row.get(0))
+        .expect("query flow");
+    assert_eq!(
+        total_flow_edges, 2,
+        "two initializer flow edges must be exported for S::*cb"
+    );
+}

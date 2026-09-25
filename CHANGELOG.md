@@ -4,6 +4,25 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Function pointer member declarator classification and member call fallback (#147)
+
+- **Member function pointer declarator classification**: Struct function-pointer
+  fields (such as `void (*handler)(int, uint32_t);` in C++ `struct LevelHandler`)
+  are data fields, not member functions. `member_decl_is_function` in `trace-parse`
+  now checks `is_function_pointer_declarator` and `declarator_is_pointer_to_fn`
+  (including unwrapping `init_declarator`), preventing function-pointer fields from
+  being misclassified as member functions and registered in `program.symbols.functions`.
+  The fields are correctly indexed into the struct's field layout with `TypeDesc::FnPtr`.
+- **Sound indirect call handling for field expressions**: Member field calls (`obj->foo()`,
+  `obj.foo()`) whose field loading cannot be resolved remain unresolved indirect calls
+  (`is_direct = false`), rather than falling back to same-named free functions in scope
+  via `resolve_function_named`. `resolve_callee` preserves the field receiver path
+  (`field_callee_text`, e.g. `"h->handler"`), preventing `finalize_extern_callees` from
+  synthesizing bogus external function symbols for bare field names.
+- In OpenHarmony `services/memmgrservice/src/event/memory_pressure_observer.cpp`
+  (`resourceschedule_memmgr`), `handlerInfo_->handler(...)` resolves indirectly without
+  inventing a spurious direct call edge to a global dummy `handler` function.
+
 ### Dereferenced operands and template-parameter bases (#151, #150)
 
 A dereference `*x` used to read through `x`'s root variable, so `*h->pp`

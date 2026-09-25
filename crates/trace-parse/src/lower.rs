@@ -3058,6 +3058,16 @@ fn lower_using_declaration(ctx: &mut LowerContext, source: &str, node: Node) {
 /// parse through a `function_declarator` too but their name sits behind a
 /// parenthesized/pointer declarator — those are data.
 fn member_decl_is_function(node: Node) -> bool {
+    if let Some(decl) = node.child_by_field_name("declarator") {
+        let inner_decl = if decl.kind() == "init_declarator" {
+            decl.child_by_field_name("declarator").unwrap_or(decl)
+        } else {
+            decl
+        };
+        if is_function_pointer_declarator(inner_decl) || declarator_is_pointer_to_fn(inner_decl) {
+            return false;
+        }
+    }
     fn walk(n: Node) -> bool {
         match n.kind() {
             // Type position, not declarator position — see member_short_name.
@@ -3078,6 +3088,9 @@ fn member_decl_is_function(node: Node) -> bool {
             // opens is a conversion operator whatever it holds.
             "ERROR" if n.child(0).is_some_and(|k| k.kind() == "operator") => return true,
             "function_declarator" => {
+                if is_function_pointer_declarator(n) {
+                    return false;
+                }
                 if let Some(inner) = n.child_by_field_name("declarator") {
                     return matches!(
                         inner.kind(),
@@ -7438,7 +7451,20 @@ fn collect_call_at_node_inner(
     if callee_name.contains('"') {
         return;
     }
-    if !is_direct && callee_var.is_none() {
+    // Only bare identifiers and qualified names can fall back to direct calls.
+    // A field expression (x->f() or x.f()), subscript (arr[i]()), or implicit member
+    // whose decomposition failed is an unresolved indirect call, NEVER a direct call
+    // to an unrelated free function.
+    let peeled_func = peel_derefs_and_casts(source, func);
+    let is_implicit_member = ctx.is_cpp
+        && peeled_func.kind() == "identifier"
+        && !ctx.locals.contains_key(node_text(source, &peeled_func))
+        && class_ctx_field(program, ctx, node_text(source, &peeled_func)).is_some();
+    let is_field_or_element_call = matches!(
+        peeled_func.kind(),
+        "field_expression" | "subscript_expression"
+    ) || is_implicit_member;
+    if !is_direct && callee_var.is_none() && !is_field_or_element_call {
         is_direct =
             resolve_function_named(program, ctx, global_lookup_name(&callee_name)).is_some();
     }
@@ -7464,12 +7490,16 @@ fn collect_call_at_node_inner(
     // same-arity overloads survive, rank them by argument/parameter types so
     // `f(1)` picks `f(int)` rather than emitting every overload.
     let chosen: Vec<FnId> = if !ctx.is_cpp {
-        program
-            .symbols
-            .resolve_function_in_scope(&callee_name, Some(ctx.current_file))
-            .into_iter()
-            .collect()
-    } else if callee_var.is_none() {
+        if !is_direct || is_field_or_element_call {
+            Vec::new()
+        } else {
+            program
+                .symbols
+                .resolve_function_in_scope(&callee_name, Some(ctx.current_file))
+                .into_iter()
+                .collect()
+        }
+    } else if callee_var.is_none() && !is_field_or_element_call {
         let candidates = cpp_callee_candidates(program, ctx, func, &callee_name, &arg_desc);
         // A qualified method call (`Base::m(a)`, `Cls::Static(a)`) lands here
         // too: its `this` is not one of the arguments.
@@ -10358,6 +10388,21 @@ fn peel_casts<'t>(source: &str, mut node: Node<'t>) -> Node<'t> {
     node
 }
 
+/// Strip parentheses, casts, and pointer dereferences (`*x`).
+fn peel_derefs_and_casts<'t>(source: &str, mut node: Node<'t>) -> Node<'t> {
+    loop {
+        node = peel_casts(source, node);
+        if node.kind() == "pointer_expression" && pointer_op(source, node).as_deref() == Some("*") {
+            if let Some(inner) = pointer_arg(node) {
+                node = inner;
+                continue;
+            }
+        }
+        break;
+    }
+    node
+}
+
 /// `static_cast<T>(x)` and its siblings: a call of a named-cast template.
 fn is_named_cast(source: &str, call: Node) -> bool {
     call.child_by_field_name("function")
@@ -12287,7 +12332,12 @@ fn type_desc_from_field_declaration(
     node: Node,
 ) -> Option<(String, TypeDesc)> {
     let decl = node.child_by_field_name("declarator")?;
-    let (fname, _) = parse_declarator_name(source, decl);
+    let inner_decl = if decl.kind() == "init_declarator" {
+        decl.child_by_field_name("declarator").unwrap_or(decl)
+    } else {
+        decl
+    };
+    let (fname, _) = parse_declarator_name(source, inner_decl);
     if fname.is_empty() {
         return None;
     }
@@ -12295,11 +12345,11 @@ fn type_desc_from_field_declaration(
         .child_by_field_name("type")
         .map(|t| type_desc_from_node(program, ctx, source, t))
         .unwrap_or(TypeDesc::Int);
-    let desc = if is_function_pointer_declarator(decl) {
+    let desc = if is_function_pointer_declarator(inner_decl) {
         // `void (**pcb)(void)` points to a function pointer: every pointer
         // level past the first keeps its own layer.
         let mut levels = 0;
-        let mut inner = decl.child_by_field_name("declarator");
+        let mut inner = inner_decl.child_by_field_name("declarator");
         while let Some(node) = inner {
             levels += usize::from(node.kind() == "pointer_declarator");
             inner = match node.kind() {
@@ -12313,7 +12363,7 @@ fn type_desc_from_field_declaration(
             params: Vec::new(),
         };
         (1..levels).fold(fn_ptr, |desc, _| TypeDesc::Ptr(Box::new(desc)))
-    } else if declarator_is_pointer_to_fn(decl) {
+    } else if declarator_is_pointer_to_fn(inner_decl) {
         // `struct T *(*Ref)(args)`: a pointer-wrapped function declarator.
         // Classifying it as a plain `Ptr(base)` loses the function-ness,
         // and downstream typed-slot guards then reject every function
@@ -12323,7 +12373,7 @@ fn type_desc_from_field_declaration(
             ret: Box::new(base),
             params: Vec::new(),
         }
-    } else if declarator_is_pointer(decl) {
+    } else if declarator_is_pointer(inner_decl) {
         TypeDesc::Ptr(Box::new(base))
     } else {
         base
@@ -12514,7 +12564,8 @@ fn resolve_callee_with_loads(
     node: Node,
 ) -> CalleeRef {
     // `((cb_t)s.ops[i])()` calls the element as `s.ops[i]()` does.
-    let node = peel_casts(source, node);
+    // Also peel pointer dereferences so `(*obj->handler)()` loads the field.
+    let node = peel_derefs_and_casts(source, node);
     // Only a name the member's class declares as a field can be one, and
     // only where the body does not hide it (`implicit_this`).
     let implicit_member = implicit_this(program, ctx, source, node).is_some();
@@ -12538,7 +12589,9 @@ fn resolve_callee_with_loads(
             let int = program.types.int();
             emit_load(program, ctx, node, gep, int)
         });
-        result = Some((node_text(source, &node).to_string(), false, field_load));
+        let name = node_text(source, &node);
+        let callee_text = format!("this->{name}");
+        result = Some((callee_text, false, field_load));
     } else if let Some(decomposed) = field_table(program, ctx, source, node)
         .and_then(|table| decompose_field_path(program, ctx, source, table))
     {
@@ -12597,18 +12650,20 @@ fn field_callee_text(source: &str, node: Node) -> String {
     let mut parts = Vec::new();
     let mut cur = peel_expression(node);
     while cur.kind() == "field_expression" {
+        let op = if is_arrow_access(cur) { "->" } else { "." };
         if let Some(field) = cur.child_by_field_name("field") {
-            parts.push(node_text(source, &field).to_string());
+            parts.push((op, node_text(source, &field).to_string()));
         }
         cur = cur.child_by_field_name("argument").unwrap_or(cur);
     }
     parts.reverse();
     let base = node_text(source, &cur);
-    if parts.is_empty() {
-        base.to_string()
-    } else {
-        format!("{}->{}", base, parts.join("->"))
+    let mut result = base.to_string();
+    for (op, field) in parts {
+        result.push_str(op);
+        result.push_str(&field);
     }
+    result
 }
 
 /// A call through the function-pointer member a decomposed path reaches:
@@ -12741,13 +12796,14 @@ fn resolve_callee(
                 .unwrap_or_else(|| "field".into());
             let arg = node.child_by_field_name("argument").unwrap();
             if let Some(v) = resolve_lvalue_var(program, ctx, source, arg) {
+                let op = if is_arrow_access(node) { "->" } else { "." };
                 return (
-                    format!("{}->{}", node_text(source, &arg), field),
+                    format!("{}{}{}", node_text(source, &arg), op, field),
                     false,
                     Some(v),
                 );
             }
-            (field, false, None)
+            (field_callee_text(source, node), false, None)
         }
         "subscript_expression" => {
             let arr = node.child_by_field_name("argument").unwrap();
@@ -13045,10 +13101,104 @@ fn is_function_pointer_declarator(decl: Node) -> bool {
     if decl.kind() != "function_declarator" {
         return false;
     }
-    matches!(
-        decl.child_by_field_name("declarator").map(|n| n.kind()),
-        Some("parenthesized_declarator") | Some("pointer_declarator")
-    )
+    let inner = match decl.child_by_field_name("declarator") {
+        Some(d) => d,
+        None => return false,
+    };
+    if !matches!(
+        inner.kind(),
+        "parenthesized_declarator" | "pointer_declarator"
+    ) {
+        return false;
+    }
+    // Distinguish nested callback types from functions returning callbacks:
+    // the binding nearest to the declared identifier must not be a function_declarator.
+    innermost_binding_kind(decl) != Some("function_declarator")
+}
+
+fn innermost_binding_kind(decl: Node) -> Option<&'static str> {
+    let mut cur = decl;
+    let mut last_binding_kind = None;
+    loop {
+        match cur.kind() {
+            "parenthesized_declarator" => match cur.named_child(0) {
+                Some(inner) => cur = inner,
+                None => return last_binding_kind,
+            },
+            "pointer_declarator" | "pointer_type_declarator" => {
+                last_binding_kind = Some("pointer_declarator");
+                match cur
+                    .child_by_field_name("declarator")
+                    .or_else(|| cur.named_child(0))
+                {
+                    Some(inner) => cur = inner,
+                    None => return last_binding_kind,
+                }
+            }
+            "array_declarator" => {
+                last_binding_kind = Some("array_declarator");
+                match cur
+                    .child_by_field_name("declarator")
+                    .or_else(|| cur.named_child(0))
+                {
+                    Some(inner) => cur = inner,
+                    None => return last_binding_kind,
+                }
+            }
+            "reference_declarator" => {
+                last_binding_kind = Some("reference_declarator");
+                match cur
+                    .child_by_field_name("declarator")
+                    .or_else(|| cur.named_child(0))
+                {
+                    Some(inner) => cur = inner,
+                    None => return last_binding_kind,
+                }
+            }
+            "function_declarator" => {
+                last_binding_kind = Some("function_declarator");
+                match cur.child_by_field_name("declarator") {
+                    Some(inner) => cur = inner,
+                    None => return last_binding_kind,
+                }
+            }
+            "init_declarator" => match cur.child_by_field_name("declarator") {
+                Some(inner) => cur = inner,
+                None => return last_binding_kind,
+            },
+            "qualified_identifier" => {
+                if let Some(name) = cur.child_by_field_name("name") {
+                    if qualified_name_has_pointer(name) {
+                        cur = name;
+                        continue;
+                    }
+                }
+                return last_binding_kind;
+            }
+            "identifier" | "field_identifier" | "destructor_name" | "operator_name"
+            | "operator_cast" => return last_binding_kind,
+            _ => {
+                if let Some(inner) = cur.child_by_field_name("declarator") {
+                    cur = inner;
+                } else {
+                    return last_binding_kind;
+                }
+            }
+        }
+    }
+}
+
+fn qualified_name_has_pointer(mut node: Node) -> bool {
+    loop {
+        match node.kind() {
+            "qualified_identifier" => match node.child_by_field_name("name") {
+                Some(name) => node = name,
+                None => return false,
+            },
+            "pointer_type_declarator" | "pointer_declarator" => return true,
+            _ => return false,
+        }
+    }
 }
 
 /// If `decl` denotes a function whose declarator chain starts with one or more
