@@ -8,11 +8,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use trace_parse::{
-    discover_source_files, has_parse_errors, is_benign_parse_error, parse_source_with_lang,
-    IncludeGraph, IndexSourceCache, SourceLang,
+    collect_unrecovered_parse_errors, discover_source_files, has_parse_errors, node_text,
+    parse_source_with_lang, IncludeGraph, IndexSourceCache, SourceLang,
 };
 use trace_preproc::PreprocessOptions;
-use tree_sitter::Node;
 
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
@@ -77,9 +76,9 @@ fn main() -> Result<(), String> {
         if !has_parse_errors(&parsed.tree) {
             continue;
         }
-        let mut errors = Vec::new();
-        collect_errors(parsed.source.as_ref(), parsed.tree.root_node(), &mut errors);
-        if errors.is_empty() {
+        let mut error_nodes = Vec::new();
+        collect_unrecovered_parse_errors(parsed.tree.root_node(), &mut error_nodes);
+        if error_nodes.is_empty() {
             println!(
                 "FILE\t{}\tPARSE\t{} grammar; tree-sitter reported errors but no ERROR nodes found",
                 path.display(),
@@ -87,13 +86,25 @@ fn main() -> Result<(), String> {
             );
             continue;
         }
-        for (line, col, kind, snippet) in errors {
+        for node in error_nodes {
+            let pos = node.start_position();
+            let kind = if node.is_missing() {
+                format!("missing {}", node.kind())
+            } else {
+                node.kind().to_string()
+            };
+            let text = node_text(parsed.source.as_ref(), &node);
+            let snippet = if text.len() > 120 {
+                format!("{}…", &text[..120])
+            } else {
+                text.to_string()
+            };
             let snippet = snippet.replace(['\t', '\n'], " ");
             println!(
                 "FILE\t{}\tERROR\tline {} col {} ({}) {}",
                 path.display(),
-                line,
-                col,
+                pos.row + 1,
+                pos.column + 1,
                 kind,
                 snippet
             );
@@ -124,36 +135,6 @@ fn load_parse_failures_from_db(db: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-fn collect_errors(source: &str, node: Node, out: &mut Vec<(usize, usize, String, String)>) {
-    if !node.has_error() || is_benign_parse_error(node) {
-        return;
-    }
-    let mut cursor = node.walk();
-    let mut child_errors = false;
-    for child in node.children(&mut cursor) {
-        if child.has_error() {
-            child_errors = true;
-            collect_errors(source, child, out);
-        }
-    }
-    if child_errors {
-        return;
-    }
-    let pos = node.start_position();
-    let kind = if node.is_missing() {
-        format!("missing {}", node.kind())
-    } else {
-        node.kind().to_string()
-    };
-    let text = node_text(source, &node);
-    let snippet = if text.len() > 120 {
-        format!("{}…", &text[..120])
-    } else {
-        text.to_string()
-    };
-    out.push((pos.row + 1, pos.column + 1, kind, snippet));
-}
-
 fn index_lang(path: &Path, cpp_tus: &HashSet<PathBuf>, graph: &IncludeGraph) -> SourceLang {
     if trace_parse::is_cpp_path(path) || trace_parse::is_cpp_header_path(path) {
         return SourceLang::Cpp;
@@ -169,8 +150,4 @@ fn index_lang(path: &Path, cpp_tus: &HashSet<PathBuf>, graph: &IncludeGraph) -> 
         }
     }
     SourceLang::C
-}
-
-fn node_text<'a>(source: &'a str, node: &Node) -> &'a str {
-    &source[node.start_byte()..node.end_byte()]
 }
