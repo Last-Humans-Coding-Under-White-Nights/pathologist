@@ -162,6 +162,10 @@ struct LowerContext {
     /// Every variable declared as a reference, `auto&` included: it holds its
     /// referent's address, so `&r` is `r`'s value rather than a cell of r's.
     reference_bindings: HashSet<VarId>,
+    /// Reference parameters whose type lowering gave the referent's address
+    /// (`int &r`, `Value &v`; not `int *&p` or `VP &p`): the type of `&r` is
+    /// the type `r` is lowered with.
+    address_references: HashSet<VarId>,
     /// Functions whose declared return type is a reference: `return *p`
     /// returns `p`'s value, the referent's address.
     reference_returns: HashSet<FnId>,
@@ -1162,6 +1166,7 @@ fn finalize_program(
     expand_virtual_overrides(program);
     expand_internal_overload_refs(program);
     mark_wrapper_values(program);
+    program.symbols.index_overload_sites();
 }
 
 /// A smart pointer's value is its pointee's address, which is how
@@ -1266,7 +1271,16 @@ fn add_missing_this_params(program: &mut Program) {
         let (cls, span, target) = (cls.to_owned(), f.span, f.target);
         let this_id = add_this_param(program, &cls, fn_id, span);
         program.symbols.variable_mut(this_id).target = target;
-        let params = &mut program.symbols.functions[i].params;
+        let this_type = program.symbols.variable(this_id).type_id;
+        let function = &mut program.symbols.functions[i];
+        // A recorded signature is aligned with the parameters; it gains the
+        // `this` slot with them, or every explicit type reads one slot off.
+        if !function.param_type_ids.is_empty()
+            && function.param_type_ids.len() == function.params.len()
+        {
+            function.param_type_ids.insert(0, this_type);
+        }
+        let params = &mut function.params;
         params.insert(0, this_id);
         for &param in &params[1..] {
             let var = &mut program.symbols.variables[param.0 as usize];
@@ -1378,6 +1392,7 @@ fn finalize_extern_callees(program: &mut Program) {
             params: Vec::new(),
             locals: Vec::new(),
             is_cpp: false,
+            c_linkage: false,
             span: trace_ir::Span {
                 file: *file,
                 line: 0,
@@ -1489,6 +1504,7 @@ fn finalize_target_extern_callees(program: &mut Program) {
             is_virtual: false,
             is_final: false,
             is_cpp: false,
+            c_linkage: false,
             tu: None,
         });
         for i in sites {
@@ -1624,9 +1640,19 @@ fn expand_virtual_overrides(program: &mut Program) {
             });
             targets
         };
+        // An override of the overload the site was bound to, not of every
+        // overload its arity allows: ranking chose `On(int)` for `b->On(5)`,
+        // and `On(double)`'s overrides are not dispatched to.
         targets.retain(|&t| {
-            program.symbols.function(t).target == f.target
+            let target = program.symbols.function(t);
+            target.target == f.target
                 && arity_compatible(expected_arity, method_explicit_arity(program, t))
+                && program.symbols.explicit_params_alike(
+                    target,
+                    f,
+                    &program.types,
+                    trace_ir::SpellingTolerance::Override,
+                ) != Some(false)
         });
         for t in targets {
             let occurrence = cs.occurrence();
@@ -2394,6 +2420,7 @@ fn lower_prepared_source(
         ast_depth_warned: false,
         reference_vars: HashSet::default(),
         reference_bindings: HashSet::default(),
+        address_references: HashSet::default(),
         reference_returns: HashSet::default(),
         local_scope_log: Vec::new(),
         tree: parsed.tree.clone(),
@@ -2609,6 +2636,7 @@ fn resolve_pending_fn_refs(program: &mut Program, ctx: &LowerContext) {
 
 fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
     let inheritance = program.take_inheritance();
+    let template_bases = program.take_template_bases();
     UnitIndex {
         compilation_index: None,
         files: program
@@ -2630,7 +2658,7 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
         diagnostics: program.diagnostics,
         anon_type_counter: program.anon_type_counter,
         inheritance,
-        template_bases: std::mem::take(&mut program.template_bases),
+        template_bases,
         arrow_returns: std::mem::take(&mut program.arrow_returns),
         template_returns: std::mem::take(&mut program.template_returns),
         class_templates: std::mem::take(&mut program.class_templates),
@@ -2777,7 +2805,12 @@ fn using_alias(
         return None;
     }
     let base = type_desc_from_node(program, ctx, source, ty);
-    let desc = abstract_declarator_shape(base, ty.child_by_field_name("declarator"), true);
+    let desc = abstract_declarator_shape(
+        base,
+        ty.child_by_field_name("declarator"),
+        true,
+        ReferenceLayer::Pointer,
+    );
     Some((alias, desc))
 }
 
@@ -3340,6 +3373,7 @@ fn lower_struct_specifier(
                             qualified,
                             &declaration_scope,
                             is_dependent,
+                            anonymous_in,
                         );
                         if !is_dependent {
                             concrete_template_bases.push((qualified.clone(), declaration_scope));
@@ -3718,7 +3752,23 @@ fn register_class_prototypes(
     cls_qual: &str,
 ) {
     ctx.type_scope.borrow_mut().push(cls_qual.to_string());
-    for m in class_members(node) {
+    let members = class_members(node);
+    // Each member function's declaration and name, read once: the names
+    // tell which prototypes belong to an overload set.
+    let functions: Vec<Option<(Node, String)>> = members
+        .iter()
+        .map(|&m| member_function(source, m))
+        .collect();
+    // `using Base::f;` adds the base's `f` overloads to the class's own.
+    let using_names = using_member_names(source, node);
+    let overloaded = overloaded_names(
+        functions
+            .iter()
+            .flatten()
+            .map(|(_, name)| name.as_str())
+            .chain(using_names.iter().map(String::as_str)),
+    );
+    for (&m, function) in members.iter().zip(&functions) {
         // A member class registers its own members under its own spelling.
         if let Some(spec) = member_class_definition(m) {
             if let Some(tag) = member_class_tag(ctx, source, spec) {
@@ -3726,28 +3776,107 @@ fn register_class_prototypes(
             }
             continue;
         }
-        // A class-scope `template <typename T> T GetNumber() {...}` declares
-        // the member's primary; the template parameter list is not an
-        // argument — unwrap it and register the nested member like any other.
-        if m.kind() == "template_declaration" {
-            if let Some(inner) = template_member_decl(m) {
-                if member_decl_is_function(inner) {
-                    register_member_prototype(program, ctx, source, inner, cls_qual);
-                }
-            }
+        let Some((decl, name)) = function else {
             continue;
-        }
-        if m.kind() == "field_declaration" && member_decl_is_function(m) {
-            register_member_prototype(program, ctx, source, m, cls_qual);
-        }
-        // A ctor written `Cls(int);` inside the class parses as a plain
-        // declaration wrapping a function_declarator.
-        if m.kind() == "declaration" && member_decl_is_function(m) && !continues_previous_member(m)
-        {
-            register_member_prototype(program, ctx, source, m, cls_qual);
+        };
+        let prototype = match m.kind() {
+            // A class-scope `template <typename T> T GetNumber() {...}`
+            // declares the member's primary; the template parameter list is
+            // not an argument, so the nested member registers like any other.
+            "template_declaration" => member_decl_is_function(*decl),
+            "field_declaration" => true,
+            // A ctor written `Cls(int);` inside the class parses as a plain
+            // declaration wrapping a function_declarator.
+            "declaration" => !continues_previous_member(m),
+            _ => false,
+        };
+        if prototype {
+            let overload = overloaded.contains(name.as_str());
+            register_member_prototype(program, ctx, source, *decl, cls_qual, name, overload);
         }
     }
     ctx.type_scope.borrow_mut().pop();
+}
+
+/// A class member that declares or defines a member function: its
+/// declaration (a template's nested one) and name.
+fn member_function<'t>(source: &str, member: Node<'t>) -> Option<(Node<'t>, String)> {
+    let declaration = match member.kind() {
+        // A member class, alias or variable template declares no function.
+        "template_declaration" => template_member_decl(member).filter(|decl| {
+            decl.kind() == "function_definition" || member_decl_is_function(*decl)
+        })?,
+        "function_definition" => member,
+        _ if member_decl_is_function(member) => member,
+        _ => return None,
+    };
+    Some((declaration, member_short_name(source, declaration)?))
+}
+
+/// [`member_short_name`] read straight from the declarator for the common
+/// shape: an error-free member whose declarator is a function declarator
+/// naming a plain identifier, a destructor or an operator. A walk from the
+/// top would reach a name inside the return type first
+/// (`std::function<void(uint32_t handle)> GetExpiredFunc(uint32_t handle);`
+/// read as `handle`), and a pointer or reference return wraps the function
+/// declarator (`... *GetExpiredFunc(...)`). `None` for any other shape,
+/// which the walk reads.
+fn plain_declarator_name(source: &str, declaration: Node) -> Option<String> {
+    if declaration.has_error() {
+        return None;
+    }
+    let mut declarator = declaration.child_by_field_name("declarator")?;
+    while matches!(
+        declarator.kind(),
+        "pointer_declarator" | "reference_declarator"
+    ) {
+        declarator = declarator
+            .child_by_field_name("declarator")
+            .or_else(|| declarator.named_children(&mut declarator.walk()).last())?;
+    }
+    if declarator.kind() != "function_declarator" {
+        return None;
+    }
+    let name = declarator.child_by_field_name("declarator")?;
+    matches!(
+        name.kind(),
+        "field_identifier" | "identifier" | "destructor_name" | "operator_name"
+    )
+    .then(|| normalize_qualified(node_text(source, &name)))
+}
+
+/// The names a class body's `using Base::f;` declarations bring in.
+fn using_member_names(source: &str, class: Node) -> Vec<String> {
+    let Some(body) = class.child_by_field_name("body") else {
+        return Vec::new();
+    };
+    body.children(&mut body.walk())
+        .filter(|m| m.kind() == "using_declaration")
+        .filter_map(|m| {
+            let text = node_text(source, &m);
+            let named = text
+                .trim()
+                .strip_prefix("using")?
+                .trim()
+                .trim_end_matches(';');
+            let name = named.rsplit("::").next()?.trim();
+            (!name.is_empty() && !named.starts_with("namespace")).then(|| name.to_owned())
+        })
+        .collect()
+}
+
+/// The names more than one member function of a class body declares,
+/// defines or brings in with `using`: its overload sets. There a prototype's
+/// parameter types decide which entry it is and which overload a call ranks.
+fn overloaded_names<'n>(names: impl Iterator<Item = &'n str>) -> HashSet<&'n str> {
+    let mut counts: HashMap<&str, u32> = HashMap::default();
+    for name in names {
+        *counts.entry(name).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .filter_map(|(name, count)| (count > 1).then_some(name))
+        .collect()
 }
 
 /// The second pass of [`lower_class_members`]: in-class definitions. Member
@@ -3973,6 +4102,9 @@ fn template_member_decl(node: Node) -> Option<Node> {
 /// The bare name a member declares: method identifier, ctor class-name, or
 /// destructor spelling (`~Cls`).
 fn member_short_name(source: &str, node: Node) -> Option<String> {
+    if let Some(name) = plain_declarator_name(source, node) {
+        return Some(name);
+    }
     fn walk(source: &str, n: Node) -> Option<String> {
         match n.kind() {
             // A `decltype(...)` sits in the *type* position and holds an
@@ -4181,10 +4313,9 @@ fn register_member_prototype(
     source: &str,
     node: Node,
     cls_qual: &str,
+    short: &str,
+    overload: bool,
 ) {
-    let Some(short) = member_short_name(source, node) else {
-        return;
-    };
     if short.is_empty() || short == "operator" {
         return;
     }
@@ -4206,37 +4337,71 @@ fn register_member_prototype(
         .child_by_field_name("type")
         .map(|t| parse_type_node(program, ctx, source, t))
         .unwrap_or_else(|| program.types.void());
-    let ret_type = declared_return_type(program, ctx, source, node, ret_type, &full_name);
-    program.symbols.add_function(Function {
-        is_weak: false,
-        target: None,
-        id: provisional_id,
-        name: full_name,
-        linkage: if ctx.in_anonymous_namespace() {
-            Linkage::Internal
-        } else {
-            Linkage::External
+    // Types are read where they decide something: an overload set of the
+    // class, or a virtual member whose nearest declaring ancestor overloads
+    // the name, since a call ranked to another overload does not dispatch to
+    // it. A name declared once otherwise merges with its definition by name
+    // and arity (docs/ANALYSIS.md, "In-class prototypes" under C++ support).
+    let read_types = overload
+        || (flags.is_virtual
+            && declared_members_upward(
+                program,
+                cls_qual,
+                &trace_ir::MethodKind::Named(short.to_owned()),
+            )
+            .len()
+                > 1);
+    let param_type_ids = if ctx.is_cpp && read_types {
+        prototype_param_types(program, ctx, source, node)
+    } else {
+        Vec::new()
+    };
+    let ret_type = declared_return_type(
+        program,
+        ctx,
+        source,
+        node,
+        ret_type,
+        &full_name,
+        FactParams::Known(&param_type_ids),
+    );
+    program.symbols.add_function_with_param_types(
+        Function {
+            is_weak: false,
+            target: None,
+            id: provisional_id,
+            name: full_name,
+            linkage: if ctx.in_anonymous_namespace() {
+                Linkage::Internal
+            } else {
+                Linkage::External
+            },
+            return_type: ret_type,
+            params,
+            locals: Vec::new(),
+            span,
+            end_line: span.line,
+            file: ctx.current_file,
+            is_defined: false,
+            param_type_ids,
+            explicit_arity: Some(explicit_arity),
+            default_args: shape.defaults,
+            reference_params: shape.references,
+            owner_unresolved: false,
+            variadic: shape.variadic,
+            defaulted_in_class: false,
+            declared_in_class: true,
+            is_virtual: flags.is_virtual,
+            is_final: flags.is_final,
+            is_cpp: ctx.is_cpp,
+            c_linkage: false,
+            tu: Some(ctx.current_file),
         },
-        return_type: ret_type,
-        params,
-        locals: Vec::new(),
-        span,
-        end_line: span.line,
-        file: ctx.current_file,
-        is_defined: false,
-        param_type_ids: Vec::new(),
-        explicit_arity: Some(explicit_arity),
-        default_args: shape.defaults,
-        reference_params: shape.references,
-        owner_unresolved: false,
-        variadic: shape.variadic,
-        defaulted_in_class: false,
-        declared_in_class: true,
-        is_virtual: flags.is_virtual,
-        is_final: flags.is_final,
-        is_cpp: ctx.is_cpp,
-        tu: Some(ctx.current_file),
-    });
+        None,
+        // Shape, not id: a prototype meets a definition whose types it read
+        // in another scope (docs/ANALYSIS.md, "Templates").
+        Some(&program.types),
+    );
 }
 
 /// Whether a unit can carry a weak annotation at all, gating the per-declaration
@@ -4457,7 +4622,12 @@ fn lower_function_signature(
             None => program.types.int(),
         },
     };
-    let ret_type = declared_return_type(program, ctx, source, node, ret_type, &name);
+    let param_types = if ctx.class_ctx.is_some() {
+        FactParams::ReadInClass
+    } else {
+        FactParams::Unavailable
+    };
+    let ret_type = declared_return_type(program, ctx, source, node, ret_type, &name, param_types);
     let provisional_id = program.symbols.alloc_fn_id();
     let provisional_start = (
         program.symbols.variables.len(),
@@ -4483,6 +4653,13 @@ fn lower_function_signature(
         params.push(add_this_param(program, cls, provisional_id, span));
     }
     let shape = lower_parameters(program, ctx, source, decl, provisional_id, &mut params);
+    // Only a member meets an in-class prototype, the one kind of declaration
+    // that records an unresolved parameter as unknown.
+    let param_type_ids = if ctx.is_cpp && eff_class.is_some() {
+        definition_signature(program, ctx, source, node, &params)
+    } else {
+        Vec::new()
+    };
 
     // `static` on a member makes it a static member, not a function with
     // internal linkage. Registered internal, a static member template's body
@@ -4506,42 +4683,49 @@ fn lower_function_signature(
     } else {
         node_end_line(program, ctx, node, span)
     };
-    let fn_id = program.symbols.add_function(Function {
-        // Only an external symbol has linkage to weaken; GCC ignores the
-        // attribute on a `static` and lowering must not record it either.
-        is_weak: !is_static && ctx.has_weak && declaration_is_weak(source, node),
-        target: None,
-        id: provisional_id,
-        name: name.clone(),
-        linkage: if is_static {
-            Linkage::Internal
-        } else {
-            Linkage::External
+    let fn_id = program.symbols.add_function_with_param_types(
+        Function {
+            // Only an external symbol has linkage to weaken; GCC ignores the
+            // attribute on a `static` and lowering must not record it either.
+            is_weak: !is_static && ctx.has_weak && declaration_is_weak(source, node),
+            target: None,
+            id: provisional_id,
+            name: name.clone(),
+            linkage: if is_static {
+                Linkage::Internal
+            } else {
+                Linkage::External
+            },
+            return_type: ret_type,
+            params: params.clone(),
+            locals: Vec::new(),
+            span,
+            end_line,
+            file: ctx.current_file,
+            is_defined: !is_dep,
+            param_type_ids,
+            explicit_arity: Some((params.len() - usize::from(eff_class.is_some())) as u32),
+            default_args: shape.defaults,
+            reference_params: shape.references,
+            owner_unresolved,
+            variadic: shape.variadic,
+            // `A() = default;` in its class: not user-provided (C++17 aggregates).
+            defaulted_in_class: ctx.class_ctx.is_some()
+                && node
+                    .children(&mut node.walk())
+                    .any(|c| matches!(c.kind(), "default_method_clause" | "delete_method_clause")),
+            declared_in_class: ctx.class_ctx.is_some(),
+            is_virtual: flags.is_virtual,
+            is_final: flags.is_final,
+            is_cpp: ctx.is_cpp,
+            c_linkage: ctx.c_linkage && eff_class.is_none() && !is_static,
+            tu: Some(ctx.current_file),
         },
-        return_type: ret_type,
-        params: params.clone(),
-        locals: Vec::new(),
-        span,
-        end_line,
-        file: ctx.current_file,
-        is_defined: !is_dep,
-        param_type_ids: Vec::new(),
-        explicit_arity: Some((params.len() - usize::from(eff_class.is_some())) as u32),
-        default_args: shape.defaults,
-        reference_params: shape.references,
-        owner_unresolved,
-        variadic: shape.variadic,
-        // `A() = default;` in its class: not user-provided (C++17 aggregates).
-        defaulted_in_class: ctx.class_ctx.is_some()
-            && node
-                .children(&mut node.walk())
-                .any(|c| matches!(c.kind(), "default_method_clause" | "delete_method_clause")),
-        declared_in_class: ctx.class_ctx.is_some(),
-        is_virtual: flags.is_virtual,
-        is_final: flags.is_final,
-        is_cpp: ctx.is_cpp,
-        tu: Some(ctx.current_file),
-    });
+        None,
+        // Shape, not id: a prototype meets a definition whose types it read
+        // in another scope (docs/ANALYSIS.md, "Templates").
+        Some(&program.types),
+    );
     reassign_fn_id(program, provisional_id, fn_id, provisional_start);
     if scoped {
         ctx.type_scope.borrow_mut().pop();
@@ -4832,32 +5016,52 @@ fn lower_parameters(
     shape
 }
 
-fn lower_parameter(
+/// A parameter declaration read once: its type, and its declarator's name
+/// (empty when unnamed) and pointer flag.
+struct Parameter {
+    type_id: trace_ir::TypeId,
+    name: String,
+    is_ptr: bool,
+    /// A reference lowered as its referent's address (`int &r` is
+    /// `Ptr(Int)`); a reference to a pointer keeps the pointer's own type.
+    address: bool,
+}
+
+/// The parameter declaration `node` declares; `None` for the `void` of
+/// `f(void)`, which is zero arguments, not one unnamed `void` parameter.
+fn parameter_type(
     program: &mut Program,
-    ctx: &mut LowerContext,
+    ctx: &LowerContext,
     source: &str,
     node: Node,
-    fn_id: FnId,
-    index: u32,
-) -> Option<VarId> {
-    // Abstract / unnamed parameters (`void foo(int)`, `void foo(int *)`)
-    // still occupy an arity slot. Dropping them collapsed C++ overloads.
-    let (mut name, is_ptr) = match node.child_by_field_name("declarator") {
-        Some(decl) => parse_declarator_name(source, decl),
-        None => (String::new(), false),
-    };
-    let unnamed = name.is_empty();
+) -> Option<Parameter> {
     let declarator = node.child_by_field_name("declarator");
     let base_desc = node
         .child_by_field_name("type")
         .map(|t| type_desc_from_node(program, ctx, source, t))
         .unwrap_or(TypeDesc::Int);
-    // `void f(void)` is zero arguments, not one unnamed void param.
-    if unnamed && matches!(base_desc, TypeDesc::Void) && !is_ptr {
-        return None;
+    // An unnamed parameter's declarator (`const T &`, `void (*)(int)`,
+    // `const char *const []`) is an abstract one, shaped as any other.
+    if let Some(abstract_decl) = declarator.filter(|d| d.kind().starts_with("abstract_")) {
+        let type_desc = abstract_declarator_shape(
+            base_desc,
+            Some(abstract_decl),
+            true,
+            ReferenceLayer::Parameter,
+        );
+        let is_ptr = type_desc.is_pointer_like();
+        return Some(Parameter {
+            type_id: program.types.intern(type_desc),
+            name: String::new(),
+            is_ptr,
+            address: false,
+        });
     }
-    if unnamed {
-        name = format!("$arg{index}");
+    let (name, is_ptr) = declarator.map_or((String::new(), false), |decl| {
+        parse_declarator_name(source, decl)
+    });
+    if name.is_empty() && matches!(base_desc, TypeDesc::Void) && !is_ptr {
+        return None;
     }
     // `parse_declarator_name` reduces the declarator to a single pointer
     // bool, which would collapse `int **p` to `Ptr(Int)` and make `int**`
@@ -4868,15 +5072,167 @@ fn lower_parameter(
     let shape = declarator
         .map(|d| walk_declarator_shape(d, base_desc.clone()))
         .unwrap_or_else(|| base_desc.clone());
-    let type_desc = if is_ptr && !matches!(shape, TypeDesc::Ptr(_) | TypeDesc::Array { .. }) {
+    let address = is_ptr && !matches!(shape, TypeDesc::Ptr(_) | TypeDesc::Array { .. });
+    let type_desc = if address {
         TypeDesc::Ptr(Box::new(base_desc))
     } else {
         shape
     };
-    let type_id = program.types.intern(type_desc);
+    Some(Parameter {
+        type_id: program.types.intern(type_desc),
+        name,
+        is_ptr,
+        address,
+    })
+}
+
+/// The explicit parameter types an in-class prototype declares, `this`
+/// excluded. A prototype lowers no parameter variables, so these are what
+/// keep same-arity overloads (`Get(int)`, `Get(long)`) apart when they
+/// register and what ranks them at a call.
+fn prototype_param_types(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> Vec<trace_ir::TypeId> {
+    let Some(params_node) = find_params(node) else {
+        return Vec::new();
+    };
+    params_node
+        .children(&mut params_node.walk())
+        .filter(|param| is_parameter_node(param.kind()))
+        .filter_map(|param| {
+            let type_id = parameter_type(program, ctx, source, param)?.type_id;
+            Some(
+                match stand_in_parameter(program, ctx, source, param, type_id) {
+                    Some(unknown) => unknown,
+                    None => type_id,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The signature types a definition registers with, aligned with `params`
+/// (`this` first for a member), when they differ from its variables' types:
+/// a parameter whose class or enum lowering could not resolve is `Unknown`
+/// there, as its prototype records it, rather than the `int` its variable
+/// holds. Empty when the variables say it all.
+fn definition_signature(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+    params: &[VarId],
+) -> Vec<trace_ir::TypeId> {
+    // Only a parameter lowered as `int` can be a stand-in.
+    let int_typed = |&v: &VarId| {
+        matches!(
+            program
+                .types
+                .get(program.symbols.variable(v).type_id)
+                .desc
+                .innermost()
+                .0,
+            TypeDesc::Int
+        )
+    };
+    if !params.iter().any(int_typed) {
+        return Vec::new();
+    }
+    let Some(params_node) = find_params(node) else {
+        return Vec::new();
+    };
+    let declared: Vec<Node> = params_node
+        .children(&mut params_node.walk())
+        .filter(|param| is_parameter_node(param.kind()))
+        .collect();
+    let Some(skip) = params.len().checked_sub(declared.len()) else {
+        return Vec::new();
+    };
+    // Built only once a parameter turns out to be a stand-in, which most
+    // definitions have none of.
+    let mut signature: Vec<trace_ir::TypeId> = Vec::new();
+    for (i, &param) in declared.iter().enumerate() {
+        let type_id = program.symbols.variable(params[skip + i]).type_id;
+        if let Some(unknown) = stand_in_parameter(program, ctx, source, param, type_id) {
+            if signature.is_empty() {
+                signature = params
+                    .iter()
+                    .map(|&v| program.symbols.variable(v).type_id)
+                    .collect();
+            }
+            signature[skip + i] = unknown;
+        }
+    }
+    signature
+}
+
+/// `type_id` with its `int` replaced by `Unknown` when that `int` is only the
+/// stand-in lowering gives a class or enum name it could not resolve
+/// (`Mode`, `const Foo &`): a signature records what it does not know, so
+/// an overload set is not ranked on a guess. A real `int` (a keyword, a
+/// typedef of one, a known enum) is kept.
+fn stand_in_parameter(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    param: Node,
+    type_id: trace_ir::TypeId,
+) -> Option<trace_ir::TypeId> {
+    let type_node = param.child_by_field_name("type")?;
+    if !matches!(
+        type_node.kind(),
+        "type_identifier" | "qualified_identifier" | "template_type"
+    ) {
+        return None;
+    }
+    let (inner, layers) = program.types.get(type_id).desc.innermost();
+    if !matches!(inner, TypeDesc::Int) {
+        return None;
+    }
+    let spelled = normalize_qualified(node_text(source, &type_node));
+    // `uint32_t` or `size_t` with its header out of view, a class-scoped
+    // `using Id = int;`, a typedef or a known enum: an `int` of its own.
+    if is_fundamental_type_name(&spelled)
+        || local_alias(ctx, &spelled).is_some()
+        || scoped_type_desc(program, ctx, &spelled).is_some()
+        || program.types.resolve_alias(&spelled).is_some()
+    {
+        return None;
+    }
+    let unknown = (0..layers).fold(TypeDesc::Unknown, |desc, _| TypeDesc::Ptr(Box::new(desc)));
+    Some(program.types.intern(unknown))
+}
+
+fn lower_parameter(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+    fn_id: FnId,
+    index: u32,
+) -> Option<VarId> {
+    // Abstract / unnamed parameters (`void foo(int)`, `void foo(int *)`)
+    // still occupy an arity slot. Dropping them collapsed C++ overloads.
+    let Parameter {
+        type_id,
+        mut name,
+        is_ptr,
+        address,
+    } = parameter_type(program, ctx, source, node)?;
+    let unnamed = name.is_empty();
+    let declarator = node.child_by_field_name("declarator");
+    if unnamed {
+        name = format!("$arg{index}");
+    }
     let var_id = program.symbols.alloc_var_id();
     if let Some(declarator) = declarator {
         mark_reference_binding(ctx, declarator, var_id);
+        if address && ctx.reference_bindings.contains(&var_id) {
+            ctx.address_references.insert(var_id);
+        }
     }
     let span = node_span(program, ctx, node);
     program.symbols.add_variable(Variable {
@@ -4918,11 +5274,15 @@ fn auto_initializer_type(
                 candidates,
                 receiver,
             } => {
-                let args: Vec<TypeDesc> = call_arg_nodes(value)
-                    .into_iter()
-                    .map(|arg| arg_expr_type(program, ctx, source, arg))
+                let nodes = call_arg_nodes(value);
+                let args: Vec<TypeDesc> = nodes
+                    .iter()
+                    .map(|&arg| arg_expr_type(program, ctx, source, arg))
                     .collect();
-                call_result_among(program, ctx, source, value, candidates, receiver, &args)?
+                let nulls = null_constant_args(source, &nodes);
+                call_result_among(
+                    program, ctx, source, value, candidates, receiver, &args, &nulls,
+                )?
             }
         }
     } else {
@@ -4960,6 +5320,13 @@ fn auto_initializer_type(
 /// The argument expressions of a call, in the positions overload ranking
 /// counts them by. A comment is not an argument; [`collect_call_args`] reads
 /// the same list off the punctuation, for the arguments lowering emits.
+/// Which of a call's `args` are null pointer constants ([`is_null_constant`]).
+fn null_constant_args(source: &str, args: &[Node]) -> Vec<bool> {
+    args.iter()
+        .map(|&arg| is_null_constant(source, arg))
+        .collect()
+}
+
 fn call_arg_nodes(call: Node) -> Vec<Node> {
     match call.child_by_field_name("arguments") {
         Some(list) => list
@@ -5044,25 +5411,24 @@ fn call_result_shape(
             Spelling::Lowered,
         )));
     }
-    let mut receiver = None;
-    let candidates = if func.kind() == "field_expression" {
+    let (candidates, receiver) = if func.kind() == "field_expression" {
         let recv = func.child_by_field_name("argument")?;
         let field = normalize_qualified(node_text(source, &func.child_by_field_name("field")?));
         let arrow = is_arrow_access(func);
         let desc = receiver_desc(program, ctx, source, recv)?;
         // An arrow substitutes on its pointee, keeping template arguments
         // that member-name lookup deliberately strips.
-        receiver = Some(if arrow {
+        let receiver = if arrow {
             resolve_operator_arrow_receiver(program, desc)?
         } else {
             class_spelling_of_desc(&desc)?.to_string()
-        });
-        let cls = receiver_lookup_name(receiver.as_deref()?);
-        Overloads::Declared(declared_members_upward(
+        };
+        let members = declared_members_upward(
             program,
-            &cls,
+            &receiver_lookup_name(&receiver),
             &trace_ir::MethodKind::Named(strip_template_args(&field)),
-        ))
+        );
+        (Overloads::Declared(members), Some(receiver))
     } else {
         let (name, _, var) = resolve_callee(program, ctx, source, func);
         if var.is_some() {
@@ -5079,12 +5445,17 @@ fn call_result_shape(
             _ => Vec::new(),
         };
         if members.is_empty() {
-            Overloads::ByName(name)
+            if let Some(desc) = undefined_singleton_result(program, ctx, source, func) {
+                return Some(CallResult::Decided(Some(desc)));
+            }
+            // A static call's receiver is its scope, named once a candidate
+            // turns out to substitute ([`call_result_among`]).
+            (Overloads::ByName(name), None)
         } else {
             // `Get()` in a member body is `this->Get()`, so the enclosing
             // class is the receiver a base's substitution facts apply to.
-            receiver = ctx.class_ctx.as_ref().map(|cc| cc.qual_name.clone());
-            Overloads::Declared(members)
+            let receiver = ctx.class_ctx.as_ref().map(|cc| cc.qual_name.clone());
+            (Overloads::Declared(members), receiver)
         }
     };
     Some(CallResult::Overload {
@@ -5093,8 +5464,191 @@ fn call_result_shape(
     })
 }
 
+/// The scope a static call spells before its member, arguments included:
+/// `lib::Box<Svc>` for `lib::Box<Svc>::Get()`, `Svc` for `Svc::GetInstance()`.
+/// `None` for anything but a class-like scope, and for one that mentions a
+/// template parameter: `Box<T>` names no class until instantiation, even when
+/// a real class shares the parameter's spelling.
+struct StaticCallScope<'a> {
+    member: Node<'a>,
+    is_template_id: bool,
+    spelled: String,
+}
+
+fn static_call_scope<'a>(
+    ctx: &LowerContext,
+    source: &str,
+    func: Node<'a>,
+) -> Option<StaticCallScope<'a>> {
+    if func.kind() != "qualified_identifier" {
+        return None;
+    }
+    let inner = qualified_identifier_chain(func).last()?;
+    let scope = inner
+        .child_by_field_name("scope")
+        .filter(|scope| matches!(scope.kind(), "template_type" | "namespace_identifier"))?;
+    let spelled = normalize_spacing(&source[func.start_byte()..scope.end_byte()]);
+    if spelling_is_dependent(ctx, source, func, &spelled, Spelling::Source) {
+        return None;
+    }
+    Some(StaticCallScope {
+        member: inner.child_by_field_name("name")?,
+        is_template_id: scope.kind() == "template_type",
+        spelled,
+    })
+}
+
+/// The class a static call names as its receiver, with any arguments written
+/// there: `Box<Svc>::Get()` substitutes from `Box<Svc>`, and
+/// `Svc::GetInstance()` from the base of `Svc` that declares the accessor.
+fn static_call_receiver(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    func: Node,
+) -> Option<String> {
+    held_class(program, ctx, &static_call_scope(ctx, source, func)?.spelled)
+}
+
+/// What `DelayedSingleton<Svc>::GetInstance()` or `Singleton<Db>::GetInstance()`
+/// yields when the unit sees no definition of the template (c_utils lives
+/// outside the tree): `std::shared_ptr<Svc>` and `Db`, as c_utils declares them.
+/// `Svc::GetInstance()` yields the same when `Svc` inherits the accessor from
+/// such a base ([`inherited_singleton_result`]). Only these two templates with
+/// one class argument are recognised; a definition in view, from a dependency
+/// root too, decides instead (docs/ANALYSIS.md, "Undefined singleton
+/// templates" under "Templates").
+fn undefined_singleton_result(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    func: Node,
+) -> Option<TypeDesc> {
+    // Name checks first: the scope's dependency walk is the costly part.
+    if !node_text(source, &func).ends_with("GetInstance") {
+        return None;
+    }
+    let scope = static_call_scope(ctx, source, func)?;
+    if node_text(source, &scope.member) != "GetInstance" {
+        return None;
+    }
+    if !scope.is_template_id {
+        return inherited_singleton_result(program, ctx, &scope.spelled);
+    }
+    let singleton = c_utils_singleton(program, ctx, &scope.spelled)?;
+    // A template parameter names no class a shared pointer can hold.
+    if singleton.shared
+        && spelling_is_dependent(ctx, source, func, &singleton.argument, Spelling::Source)
+    {
+        return None;
+    }
+    Some(singleton.result(held_class(program, ctx, &singleton.argument)?))
+}
+
+/// [`undefined_singleton_result`] for `Cls::GetInstance()`, `Cls` spelled
+/// `scope`: the accessor of the nearest undefined c_utils base of `Cls` or an
+/// ancestor (`class AccessTokenDb : public DelayedSingleton<AccessTokenDb>`),
+/// its argument resolved where that base is written. A class declaring
+/// `GetInstance` on the way decides instead, as member lookup does.
+fn inherited_singleton_result(
+    program: &Program,
+    ctx: &LowerContext,
+    scope: &str,
+) -> Option<TypeDesc> {
+    let cls = class_seen_from(program, ctx, &receiver_lookup_name(scope))?;
+    let accessor = trace_ir::MethodKind::Named("GetInstance".to_owned());
+    if !declared_members_upward(program, &cls, &accessor).is_empty() {
+        return None;
+    }
+    // Breadth first: the nearest base decides, as member lookup finds it.
+    let mut pending = std::collections::VecDeque::from([cls]);
+    let mut seen = HashSet::default();
+    while let Some(class) = pending.pop_front() {
+        if !seen.insert(class.clone()) {
+            continue;
+        }
+        for fact in program.template_bases_of(&class) {
+            if fact.is_dependent {
+                continue;
+            }
+            let Some(singleton) = c_utils_singleton(program, ctx, &fact.spelling) else {
+                continue;
+            };
+            // An instance argument keeps its own arguments (`Holder<Svc>`),
+            // as the spelled accessor's does.
+            // An argument naming no class leaves this base, not the search.
+            let Some(held) = held_class_in_declaration_scope(
+                program,
+                &fact.declaration_scope,
+                &singleton.argument,
+            ) else {
+                continue;
+            };
+            return Some(singleton.result(held));
+        }
+        pending.extend(program.bases_of(&class));
+    }
+    None
+}
+
+/// A c_utils singleton template spelled `spelled` (`DelayedSingleton<Svc>`,
+/// `Singleton<Db>`) whose definition the unit does not see.
+struct CUtilsSingleton {
+    /// `DelayedSingleton`'s accessor returns `std::shared_ptr<T>`,
+    /// `Singleton`'s `T &`.
+    shared: bool,
+    /// Its one argument, sanitized (`class Svc` names `Svc`).
+    argument: String,
+}
+
+impl CUtilsSingleton {
+    /// What the accessor returns once its argument resolves to `held`,
+    /// however the accessor was spelled (`DelayedSingleton<Svc>::GetInstance`
+    /// or an inherited `Svc::GetInstance`).
+    fn result(&self, held: String) -> TypeDesc {
+        TypeDesc::Struct {
+            name: if self.shared {
+                format!("std::shared_ptr<{held}>")
+            } else {
+                held
+            },
+            fields: Vec::new(),
+        }
+    }
+}
+
+fn c_utils_singleton(
+    program: &Program,
+    ctx: &LowerContext,
+    spelled: &str,
+) -> Option<CUtilsSingleton> {
+    let template = strip_template_args(spelled);
+    // `Outer<A>::DelayedSingleton<Svc>` is a member of another template.
+    if template.contains('<') {
+        return None;
+    }
+    let shared = match last_type_segment(&template) {
+        "DelayedSingleton" => true,
+        "Singleton" => false,
+        _ => return None,
+    };
+    let defined = |cls: String| program.types.is_struct_defined(&cls);
+    if class_seen_from(program, ctx, &template).is_some_and(defined) {
+        return None;
+    }
+    let [argument]: [String; 1] = template_arguments(spelled).try_into().ok()?;
+    if !split_pointer_suffix(&argument).1.is_empty() {
+        return None;
+    }
+    Some(CUtilsSingleton {
+        shared,
+        argument: sanitize_type_name(&argument),
+    })
+}
+
 /// The second phase of [`CallResult`]: the one return type the candidates
 /// that take `args` agree on.
+#[allow(clippy::too_many_arguments)]
 fn call_result_among(
     program: &Program,
     ctx: &LowerContext,
@@ -5103,13 +5657,28 @@ fn call_result_among(
     candidates: Overloads,
     receiver: Option<String>,
     args: &[TypeDesc],
+    null_constants: &[bool],
 ) -> Option<TypeDesc> {
-    let candidates = match candidates {
-        Overloads::Declared(found) => found,
-        Overloads::ByName(name) => {
-            let func = value.child_by_field_name("function")?;
-            cpp_callee_candidates(program, ctx, func, &name, args)
-        }
+    let func = value.child_by_field_name("function")?;
+    let (candidates, by_name) = match candidates {
+        Overloads::Declared(found) => (found, false),
+        Overloads::ByName(name) => (
+            cpp_callee_candidates(program, ctx, source, func, &name, args),
+            true,
+        ),
+    };
+    // Looked up only for a candidate whose return is left to substitution.
+    let static_receiver = std::cell::OnceCell::new();
+    let receiver = || {
+        receiver.as_deref().or_else(|| {
+            static_receiver
+                .get_or_init(|| {
+                    by_name
+                        .then(|| static_call_receiver(program, ctx, source, func))
+                        .flatten()
+                })
+                .as_deref()
+        })
     };
     // A member of a template parameter -- the receiver's class (`T *t`), the
     // scope (`T::make()`) or a base (`struct M : Base`) -- has no declaration
@@ -5127,14 +5696,15 @@ fn call_result_among(
         }
     }
     let candidates = filter_targets_by_argc(program, candidates, args.len(), args, args.is_empty());
-    // Unknown arguments score as ties in call-edge ranking, so they rank
-    // nothing out. The candidates left must all take the arguments and agree
-    // on one return type; a partial match is no evidence for one of several.
-    let candidates = if args.contains(&TypeDesc::Unknown) {
-        candidates
-    } else {
-        rank_overloads(program, &candidates, args)
-    };
+    // The candidates left must all take the arguments and agree on one
+    // return type.
+    let candidates = narrow_overloads(
+        program,
+        candidates,
+        args,
+        null_constants,
+        OverloadChoice::Result,
+    );
     agreed(candidates.iter().map(|&f| {
         let function = program.symbols.function(f);
         let arity = method_explicit_arity(program, f)?;
@@ -5145,7 +5715,7 @@ fn call_result_among(
         if !matches!(desc, TypeDesc::Unknown) {
             return Some(desc.clone());
         }
-        substituted_template_return(program, ctx, receiver.as_deref()?, &function.name, arity)
+        substituted_template_return(program, ctx, receiver()?, f, arity)
     }))
 }
 
@@ -5161,9 +5731,9 @@ fn agreed<T: PartialEq>(mut candidates: impl Iterator<Item = Option<T>>) -> Opti
 
 /// What a class-template member declared to return a bare type parameter
 /// yields for a receiver that names its arguments: `Holder<Widget *>::Get`
-/// returns `Widget *`. Substitution facts are shared by same-name
-/// declarations (in-class prototypes carry no parameter types), so the
-/// same-arity ones must agree on one return.
+/// returns `Widget *`. Facts are looked up by member name and arity; those of
+/// the declaration `candidate` is (its parameter types plausibly agree) are
+/// preferred, and the ones left must agree on one return.
 ///
 /// The facts belong to the class that declares `member`, which a receiver
 /// inherits it from (`struct Adapter : Holder<Widget *>`) as readily as it
@@ -5173,18 +5743,41 @@ fn substituted_template_return(
     program: &Program,
     ctx: &LowerContext,
     receiver: &str,
-    member: &str,
+    candidate: FnId,
     arity: usize,
 ) -> Option<TypeDesc> {
+    let member = &program.symbols.function(candidate).name;
     let (owner, _) = member.rsplit_once("::")?;
     let facts = program.template_returns_of(owner, member)?;
     let (args, scope) = template_arguments_for(program, receiver, owner)?;
-    agreed(
-        facts
-            .iter()
-            .filter(|fact| fact.arity as usize == arity)
-            .map(|fact| substituted_parameter(program, ctx, &args, scope, fact)),
-    )
+    let same_arity = || facts.iter().filter(|fact| fact.arity as usize == arity);
+    let declared = program
+        .symbols
+        .explicit_params(program.symbols.function(candidate));
+    let its_own = |fact: &&trace_ir::TemplateReturn| {
+        declared.as_ref().is_some_and(|params| {
+            params.len() == fact.params.len()
+                && fact.params.iter().enumerate().all(|(i, desc)| {
+                    params.get(i).is_none_or(|ty| {
+                        trace_ir::spelled_alike(
+                            &program.types,
+                            program.types.get(ty).desc.as_ref(),
+                            desc,
+                            trace_ir::SpellingTolerance::Redeclaration,
+                        )
+                    })
+                })
+        })
+    };
+    let substitute = |fact: &trace_ir::TemplateReturn| {
+        substituted_parameter(program, ctx, owner, &args, scope, fact)
+    };
+    let own: Vec<&trace_ir::TemplateReturn> = same_arity().filter(its_own).collect();
+    if own.is_empty() {
+        agreed(same_arity().map(substitute))
+    } else {
+        agreed(own.into_iter().map(substitute))
+    }
 }
 
 /// The template arguments `receiver` gives `owner`: its own, when it spells
@@ -5232,6 +5825,7 @@ fn template_arguments_for<'a>(
 fn substituted_parameter(
     program: &Program,
     ctx: &LowerContext,
+    owner: &str,
     args: &[String],
     scope: Option<&str>,
     fact: &trace_ir::TemplateReturn,
@@ -5245,11 +5839,24 @@ fn substituted_parameter(
         None => held_class(program, ctx, &base),
     }
     .or_else(|| is_std_smart_ptr_name(&receiver_lookup_name(&base)).then(|| base.clone()))?;
+    let (name, arg_layers) = match &fact.wrapper {
+        None => (name, suffix.matches('*').count()),
+        // `sptr<Svc *>` is no receiver shape this names.
+        Some(_) if !suffix.is_empty() => return None,
+        // The wrapper as the class template's own scope names it, whatever
+        // the declaring unit could see (`sptr` in `OHOS` is `OHOS::sptr`).
+        Some(wrapper) => {
+            let template_scope = owner.rsplit_once("::").map_or("", |(scope, _)| scope);
+            let wrapper = held_class_in_declaration_scope(program, template_scope, wrapper)
+                .unwrap_or_else(|| wrapper.clone());
+            (format!("{wrapper}<{name}>"), 0)
+        }
+    };
     let mut desc = TypeDesc::Struct {
         name,
         fields: Vec::new(),
     };
-    for _ in 0..suffix.matches('*').count() + fact.pointer_depth {
+    for _ in 0..arg_layers + fact.pointer_depth {
         desc = TypeDesc::Ptr(Box::new(desc));
     }
     Some(desc)
@@ -5269,7 +5876,7 @@ pub(crate) fn held_class_in_declaration_scope(
         } else {
             format!("{scope}::{lookup}")
         };
-        if let Some(name) = declared_class_name(program, &candidate) {
+        if let Some(name) = program.types.declared_class(&candidate) {
             break name;
         }
         if scope.is_empty() || lookup.starts_with("::") {
@@ -5315,7 +5922,7 @@ fn receiver_type(program: &Program, ctx: &LowerContext, desc: TypeDesc) -> Optio
                 .first()
                 .map(|arg| receiver_lookup_name(arg.trim()).into_owned());
             let ambiguous = held.is_some_and(|held| {
-                declared_class_name(program, &held).is_none()
+                program.types.declared_class(&held).is_none()
                     && class_seen_from(program, ctx, &held).is_some_and(|seen| seen != held)
             });
             (!ambiguous).then_some(desc)
@@ -5357,7 +5964,7 @@ fn class_seen_from(program: &Program, ctx: &LowerContext, name: &str) -> Option<
             }
         }
         ctx.directive_namespaces()
-            .find_map(|ns| declared_class_name(program, &format!("{ns}::{bare}")))
+            .find_map(|ns| program.types.declared_class(&format!("{ns}::{bare}")))
     })
 }
 
@@ -5826,18 +6433,75 @@ fn type_is_dependent(ctx: &LowerContext, source: &str, node: Node, desc: &TypeDe
     }
 }
 
-/// Only a bare parameter of the owning class template can be substituted.
-/// Function templates and dependent compound types remain unknown. `path` is
-/// `node`'s ancestors and `pointer_depth` its declarator's pointer layers,
-/// both already computed by [`declared_return_type`].
+/// `desc` with every class's field list dropped: the shape a signature
+/// compares, the same in every unit whatever it had seen of the class.
+fn without_fields(desc: &TypeDesc) -> TypeDesc {
+    match desc {
+        TypeDesc::Struct { name, .. } => TypeDesc::Struct {
+            name: name.clone(),
+            fields: Vec::new(),
+        },
+        TypeDesc::Union { name, .. } => TypeDesc::Union {
+            name: name.clone(),
+            fields: Vec::new(),
+        },
+        TypeDesc::Ptr(inner) => TypeDesc::Ptr(Box::new(without_fields(inner))),
+        TypeDesc::Array { elem, size } => TypeDesc::Array {
+            elem: Box::new(without_fields(elem)),
+            size: *size,
+        },
+        TypeDesc::FnPtr { ret, params } => TypeDesc::FnPtr {
+            ret: Box::new(without_fields(ret)),
+            params: params.iter().map(without_fields).collect(),
+        },
+        other => other.clone(),
+    }
+}
+
+/// A member declaration whose return [`register_template_return`] reads.
+struct MemberDeclaration<'a, 't> {
+    /// `node`'s ancestors.
+    path: &'a [Node<'t>],
+    node: Node<'t>,
+    name: &'a str,
+    /// The declarator's pointer layers.
+    pointer_depth: usize,
+    /// Where its explicit parameter types come from.
+    param_types: FactParams<'a>,
+}
+
+/// The parameter types a template-return fact records for its declaration.
+#[derive(Clone, Copy)]
+enum FactParams<'a> {
+    /// A prototype's, already read.
+    Known(&'a [trace_ir::TypeId]),
+    /// An in-class definition's, read (only if a fact is recorded) in the
+    /// class scope it is written in, as its prototype would be.
+    ReadInClass,
+    /// An out-of-line definition's, which are read outside its class scope
+    /// here: none, so its fact matches any overload of its arity.
+    Unavailable,
+}
+
+/// Only a parameter of the owning class template can be substituted, bare
+/// (`T *`) or as the sole argument of a class template (`sptr<T>`), which
+/// the call site then treats as any receiver of that type. Function templates
+/// and other dependent compound types remain unknown. `path` is `node`'s
+/// ancestors and `pointer_depth` its declarator's pointer layers, both
+/// already computed by [`declared_return_type`].
 fn register_template_return(
     program: &mut Program,
+    ctx: &LowerContext,
     source: &str,
-    path: &[Node],
-    node: Node,
-    name: &str,
-    pointer_depth: usize,
+    declaration: MemberDeclaration,
 ) {
+    let MemberDeclaration {
+        path,
+        node,
+        name,
+        pointer_depth,
+        param_types,
+    } = declaration;
     let Some((owner, _)) = name.rsplit_once("::") else {
         return;
     };
@@ -5870,18 +6534,50 @@ fn register_template_return(
     };
     // Facts are shared by same-name/same-arity declarations. An unsupported
     // overload must block substitution, not borrow another overload's return.
+    // One argument list, closing the spelling: `Traits<T>::Ptr<U>` and
+    // `typename X<T>::type` name no wrapper of `T`.
+    let normalized = normalize_spacing(spelling);
+    let parameter_names = template_parameter_names(source, params);
+    let names_parameter = |name: &str| parameter_names.contains(&Some(name));
+    let (wrapper, returned) = match trace_ir::split_instance(&normalized) {
+        // One argument list, closing the spelling; not `typename X<T>::type`,
+        // nor a template template parameter (`Ptr<T>`), which is no class.
+        Some((head, args)) if args.len() == 1 && !head.contains(' ') && !names_parameter(head) => {
+            (Some(head.to_owned()), args[0].to_owned())
+        }
+        _ => (None, spelling.to_owned()),
+    };
     let parameter = (depth == 0)
         .then(|| {
-            template_parameter_names(source, params)
+            parameter_names
                 .iter()
-                .position(|p| *p == Some(spelling))
+                .position(|p| *p == Some(returned.as_str()))
         })
         .flatten();
     let arity = find_params(node).map_or(0, |p| param_list_shape(source, p).declared());
+    // Names and shapes only: a struct's fields differ with how complete it
+    // was in the declaring unit, and would split one fact into several.
+    let read;
+    let param_types: &[trace_ir::TypeId] = match param_types {
+        FactParams::Known(types) => types,
+        FactParams::ReadInClass => {
+            read = prototype_param_types(program, ctx, source, node);
+            &read
+        }
+        FactParams::Unavailable => &[],
+    };
+    let params = param_types
+        .iter()
+        .map(|&ty| without_fields(program.types.get(ty).desc.as_ref()))
+        .collect();
     let fact = trace_ir::TemplateReturn {
         arity,
         parameter,
         pointer_depth,
+        // As spelled: which class it names is read from the template's own
+        // scope where it is substituted, so every unit records one fact.
+        wrapper,
+        params,
     };
     program.add_template_return(owner, name, &fact);
 }
@@ -5893,6 +6589,7 @@ fn declared_return_type(
     node: Node,
     base: trace_ir::TypeId,
     name: &str,
+    param_types: FactParams,
 ) -> trace_ir::TypeId {
     let depth = node
         .child_by_field_name("declarator")
@@ -5907,7 +6604,14 @@ fn declared_return_type(
     let path: Vec<Node> = ancestors(ctx, node).collect();
     let dependent = return_is_dependent_under(source, &path, node);
     if dependent || matches!(program.types.get(base).desc.as_ref(), TypeDesc::Unknown) {
-        register_template_return(program, source, &path, node, name, depth);
+        let declaration = MemberDeclaration {
+            path: &path,
+            node,
+            name,
+            pointer_depth: depth,
+            param_types,
+        };
+        register_template_return(program, ctx, source, declaration);
     }
     if dependent {
         return program.types.unknown();
@@ -5954,7 +6658,7 @@ fn is_placeholder_type(ctx: &LowerContext, type_node: Node) -> bool {
 
 /// How many pointer layers `desc` has.
 fn pointer_depth(desc: &TypeDesc) -> usize {
-    std::iter::successors(Some(desc), |desc| desc.pointee()).count() - 1
+    desc.innermost().1
 }
 
 /// How many `*` a declarator puts in front of its name, through references
@@ -6953,6 +7657,7 @@ fn lower_function_decl(
         is_virtual: false,
         is_final: false,
         is_cpp: ctx.is_cpp,
+        c_linkage: ctx.c_linkage && !is_static,
         tu: Some(ctx.current_file),
     });
     reassign_fn_id(program, provisional_id, fn_id, provisional_start);
@@ -7475,6 +8180,7 @@ fn collect_call_at_node_inner(
     let argc = args.argc as usize;
     // Only ranking reads the types; the sites below need the positions.
     let arg_desc = std::mem::take(&mut args.arg_desc);
+    let null_constants = std::mem::take(&mut args.null_constants);
 
     // ---- Resolution ----
     // C preserves the exact legacy semantics: one scoped lookup, zero or
@@ -7500,15 +8206,17 @@ fn collect_call_at_node_inner(
                 .collect()
         }
     } else if callee_var.is_none() && !is_field_or_element_call {
-        let candidates = cpp_callee_candidates(program, ctx, func, &callee_name, &arg_desc);
+        let candidates = cpp_callee_candidates(program, ctx, source, func, &callee_name, &arg_desc);
         // A qualified method call (`Base::m(a)`, `Cls::Static(a)`) lands here
         // too: its `this` is not one of the arguments.
         let by_arity = filter_targets_by_argc(program, candidates, argc, &arg_desc, argc == 0);
-        let ranked = if by_arity.len() > 1 {
-            rank_overloads(program, &by_arity, &arg_desc)
-        } else {
-            by_arity
-        };
+        let ranked = narrow_overloads(
+            program,
+            by_arity,
+            &arg_desc,
+            &null_constants,
+            OverloadChoice::Edges,
+        );
         if ranked.len() > 1
             && ranked
                 .iter()
@@ -7619,6 +8327,9 @@ struct CallArgs {
     /// best-effort static type of the passed expression (literals, casts,
     /// variable types, pointer decay). Used to rank same-arity C++ overloads.
     arg_desc: Vec<TypeDesc>,
+    /// Aligned with `arg_desc`: the position holds a literal `0` (`NULL`
+    /// expanded), a null pointer constant as well as an `int`.
+    null_constants: Vec<bool>,
 }
 
 impl CallArgs {
@@ -7650,6 +8361,7 @@ impl CallArgs {
             deref_args: Vec::new(),
             argc: 0,
             arg_desc: Vec::new(),
+            null_constants: Vec::new(),
         }
     }
 
@@ -7783,11 +8495,13 @@ fn collect_call_args(
     let mut addr_of_args = Vec::new();
     let mut deref_args = Vec::new();
     let mut arg_desc = Vec::new();
+    let mut null_constants = Vec::new();
     let mut arg_index = 0u32;
     if let Some(args_node) = args_node {
         for arg in args_node.children(&mut args_node.walk()) {
             if !matches!(arg.kind(), "(" | ")" | "{" | "}" | ",") {
                 let adesc = arg_expr_type(program, ctx, source, arg);
+                null_constants.push(is_null_constant(source, arg));
                 // Parameter positions are syntactic: every argument slot
                 // advances the index even when the expression yields no IR
                 // variable (literals, sizeof, casts). Compressing indices
@@ -7889,6 +8603,7 @@ fn collect_call_args(
         deref_args,
         argc: arg_index,
         arg_desc,
+        null_constants,
     }
 }
 
@@ -7942,6 +8657,47 @@ fn known_arg_type(program: &Program, ctx: &LowerContext, source: &str, node: Nod
         "true" | "false" => TypeDesc::Bool,
         "string_literal" => TypeDesc::Ptr(Box::new(TypeDesc::Char)),
         "nullptr" => TypeDesc::Ptr(Box::new(TypeDesc::Unknown)),
+        // `&x` is a pointer to `x`'s type and `*p` its pointee's, not the
+        // variable's own type the operand names.
+        "pointer_expression" => {
+            let Some(operand) = node.child_by_field_name("argument") else {
+                return TypeDesc::Unknown;
+            };
+            let operand_type = known_arg_type(program, ctx, source, operand);
+            // `&(x)` is `&x`: the type is read through the parentheses, so is
+            // whether `x` is a reference.
+            let operand = peel_expression(operand);
+            let reference = (operand.kind() == "identifier")
+                .then(|| resolve_expr_var(program, ctx, source, operand))
+                .flatten()
+                .filter(|v| ctx.reference_vars.contains(v));
+            let operand_is_reference = reference.is_some();
+            // A reference parameter lowered as its referent's address has
+            // that address as `&r`, not one layer more. A local reference, or
+            // one to a pointer, holds the referent's own type, and `&r`
+            // points at it.
+            let lowered_as_address = reference.is_some_and(|v| ctx.address_references.contains(&v));
+            match node
+                .child_by_field_name("operator")
+                .map(|op| node_text(source, &op))
+            {
+                Some("&") if lowered_as_address => operand_type,
+                Some("&") if !matches!(operand_type, TypeDesc::Unknown) => {
+                    TypeDesc::Ptr(Box::new(operand_type))
+                }
+                // `*r` of a reference to a class calls its `operator*`
+                // (`*sp` for `const sptr<Foo> &sp`), whose result is not
+                // the referent.
+                Some("*") if operand_is_reference => match operand_type.pointee() {
+                    Some(TypeDesc::Struct { .. } | TypeDesc::Union { .. }) | None => {
+                        TypeDesc::Unknown
+                    }
+                    Some(pointee) => pointee.clone(),
+                },
+                Some("*") => operand_type.pointee().cloned().unwrap_or(TypeDesc::Unknown),
+                _ => TypeDesc::Unknown,
+            }
+        }
         _ => {
             if let Some(v) = resolve_expr_var(program, ctx, source, node) {
                 let tid = program.symbols.variable(v).type_id;
@@ -7980,9 +8736,89 @@ fn known_arg_type(program: &Program, ctx: &LowerContext, source: &str, node: Nod
                 }
                 return desc;
             }
-            TypeDesc::Unknown
+            enumerator_type(program, ctx, source, node).unwrap_or(TypeDesc::Unknown)
         }
     }
+}
+
+/// The type of `E::VALUE` when the type-cased `E` is neither a class nor a
+/// namespace the index knows: a value of `E`, most likely an enumerator. It is
+/// typed as an object of class-like type `E`, not as `int`: that is enough to
+/// rule out an overload taking an out-parameter pointer (`sptr<X> *`), yet
+/// ranks no overload exactly, since `E` may just as well be an out-of-tree
+/// class whose constant has any type (`Consts::DEFAULT_TAG`).
+fn enumerator_type(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<TypeDesc> {
+    if node.kind() != "qualified_identifier" {
+        return None;
+    }
+    let spelled = normalize_qualified(node_text(source, &node));
+    let (scope, member) = spelled.rsplit_once("::")?;
+    // Enum-shaped only: a type-cased scope and an ALL_CAPS value
+    // (`SceneMode::CAPTURE`). An out-of-tree namespace's constant
+    // (`ext::kFooPtr`, `std::cout`) keeps its unknown type.
+    let type_cased = last_type_segment(scope).starts_with(|c: char| c.is_ascii_uppercase());
+    let all_caps = member.chars().any(|c| c.is_ascii_uppercase())
+        && member
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    if !type_cased || !all_caps {
+        return None;
+    }
+    if class_seen_from(program, ctx, scope).is_some()
+        || find_in_scope(program, ctx, scope, |candidate, _| {
+            program.namespaces.contains(candidate).then_some(())
+        })
+        .is_some()
+    {
+        return None;
+    }
+    match scoped_type_desc(program, ctx, scope)
+        .or_else(|| program.types.resolve_alias(scope).cloned())
+    {
+        // An enum the index knows is lowered as `int`, and its values are.
+        Some(TypeDesc::Int) => Some(TypeDesc::Int),
+        None => Some(TypeDesc::Struct {
+            name: scope.to_owned(),
+            fields: Vec::new(),
+        }),
+        Some(_) => None,
+    }
+}
+
+/// Whether an argument is a literal zero, which converts to any pointer:
+/// `0`, `(0)`, or one negated (`-0`).
+fn is_null_constant(source: &str, arg: Node) -> bool {
+    let mut literal = peel_expression(arg);
+    while literal.kind() == "unary_expression"
+        && literal
+            .child_by_field_name("operator")
+            .is_some_and(|op| matches!(node_text(source, &op), "-" | "+"))
+    {
+        match literal.child_by_field_name("argument") {
+            Some(operand) => literal = peel_expression(operand),
+            None => return false,
+        }
+    }
+    literal.kind() == "number_literal" && is_literal_zero(node_text(source, &literal))
+}
+
+/// Whether an integer literal is zero in any base, suffix or digit grouping
+/// (`0`, `0L`, `0x0`, `00`, `0'0`).
+fn is_literal_zero(text: &str) -> bool {
+    let text = text.trim().replace('\'', "");
+    let digits = text.trim_end_matches(['u', 'U', 'l', 'L']);
+    let digits = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+        .or_else(|| digits.strip_prefix("0b"))
+        .or_else(|| digits.strip_prefix("0B"))
+        .unwrap_or(digits);
+    !digits.is_empty() && digits.chars().all(|c| c == '0')
 }
 
 fn number_literal_desc(text: &str) -> TypeDesc {
@@ -8002,30 +8838,313 @@ fn number_literal_desc(text: &str) -> TypeDesc {
     }
 }
 
+/// Member-call `targets` narrowed by their arguments. Overload selection
+/// happens on the class the call names (`cls`), among the members its lookup
+/// finds, as the compiler does; every other target (an override, or an
+/// overload only a subclass adds) is kept only when it may override one of
+/// the winners. `Derived::On(double)` is no target of `b->On(5)` once
+/// `Base::On(int)` won, and an overload only a subclass declares never
+/// displaces the base's.
+fn rank_per_class(
+    program: &Program,
+    cls: &str,
+    kind: &trace_ir::MethodKind,
+    targets: Vec<FnId>,
+    arg_desc: &[TypeDesc],
+    null_constants: &[bool],
+) -> Vec<FnId> {
+    if targets.len() <= 1 {
+        return targets;
+    }
+    let declared = declared_members_upward(program, cls, kind);
+    let own: Vec<FnId> = targets
+        .iter()
+        .copied()
+        .filter(|f| declared.contains(f))
+        .collect();
+    if own.len() == targets.len() {
+        return narrow_overloads(
+            program,
+            targets,
+            arg_desc,
+            null_constants,
+            OverloadChoice::Edges,
+        );
+    }
+    if own.is_empty() {
+        return targets;
+    }
+    let winners = narrow_overloads(
+        program,
+        own,
+        arg_desc,
+        null_constants,
+        OverloadChoice::Edges,
+    );
+    targets
+        .into_iter()
+        .filter(|&f| {
+            winners.contains(&f)
+                || (!declared.contains(&f)
+                    && winners.iter().any(|&winner| {
+                        program.symbols.explicit_params_alike(
+                            program.symbols.function(f),
+                            program.symbols.function(winner),
+                            &program.types,
+                            trace_ir::SpellingTolerance::Override,
+                        ) != Some(false)
+                    }))
+        })
+        .collect()
+}
+
+/// What an overload choice is for, which decides how far an argument of
+/// unknown type lets the known ones choose.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OverloadChoice {
+    /// A call's edges: the known arguments rank the candidates, an unknown
+    /// one ranking every candidate alike (`Write(GetFd(), "x")` binds
+    /// `Write(int, const char *)`).
+    Edges,
+    /// The type a call's result gives an `auto` local or a chained receiver:
+    /// with an argument of unknown type a better conversion elsewhere is no
+    /// evidence for one of several, so no ranking happens.
+    Result,
+}
+
+/// Same-arity `candidates` narrowed by the arguments: to those every known
+/// argument can bind, then to the uniquely exact one as `choice` allows.
+fn narrow_overloads(
+    program: &Program,
+    candidates: Vec<FnId>,
+    arg_desc: &[TypeDesc],
+    null_constants: &[bool],
+    choice: OverloadChoice,
+) -> Vec<FnId> {
+    if candidates.len() <= 1 {
+        return candidates;
+    }
+    let viable = viable_overloads(program, candidates, arg_desc, null_constants);
+    if choice == OverloadChoice::Result && arg_desc.contains(&TypeDesc::Unknown) {
+        viable
+    } else {
+        rank_overloads(program, &viable, arg_desc)
+    }
+}
+
+/// The candidates every known argument can bind. Converting constructors
+/// (`sptr<T>(T *)`) and conversion operators (`operator T *()`) let most
+/// mismatches through, so only one no conversion explains rules a candidate
+/// out: a value that is no pointer (a class object with no conversion
+/// operator, or a scalar such as an enum value, never a literal `0`) passed
+/// where a pointer to a class-template instance is taken (`sptr<X> *`), as
+/// an out-parameter overload takes it. All of them when none is viable.
+fn viable_overloads(
+    program: &Program,
+    candidates: Vec<FnId>,
+    arg_desc: &[TypeDesc],
+    null_constants: &[bool],
+) -> Vec<FnId> {
+    let class = TypeDesc::is_class_like;
+    // `T **` may be a decayed array (`const char *[]`), so only a pointer to
+    // a class-template instance is an out-parameter no conversion explains.
+    let out_parameter = |param: &TypeDesc| matches!(param.pointee(), Some(TypeDesc::Struct { name, .. }) if name.contains('<'));
+    let viable = |f: &FnId| {
+        let function = program.symbols.function(*f);
+        let Some(params) = program.symbols.explicit_params(function) else {
+            return true;
+        };
+        arg_desc.iter().enumerate().all(|(i, arg)| {
+            let Some(param) = params.get(i).map(|ty| program.types.get(ty).desc.as_ref()) else {
+                return true;
+            };
+            let reference = function.reference_params.get(i) == Some(&true);
+            // A scalar such as an enum value is no pointer, but a literal
+            // `0` converts to one; a class is a value only where it is
+            // declared with no conversion operator, its own or a base's
+            // (`operator sptr<Foo> *()`).
+            let value = || {
+                if class(arg) {
+                    !class_may_convert(program, arg)
+                } else {
+                    !arg.is_pointer_like()
+                        && !matches!(arg, TypeDesc::Unknown)
+                        && null_constants.get(i) != Some(&true)
+                }
+            };
+            reference || !out_parameter(param) || !value()
+        })
+    };
+    let kept: Vec<FnId> = candidates.iter().copied().filter(viable).collect();
+    if kept.is_empty() {
+        candidates
+    } else {
+        kept
+    }
+}
+
+/// Whether a class argument may convert to another type: it or a base
+/// declares a conversion operator (`X::operator T`). A class the index does
+/// not declare is most often an enumerator read as its enum (`E::VALUE`),
+/// and is taken as the value it reads as.
+fn class_may_convert(program: &Program, arg: &TypeDesc) -> bool {
+    let (TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. }) = arg else {
+        return false;
+    };
+    if !program.types.declares_class(name) {
+        return false;
+    }
+    let mut seen: HashSet<String> = HashSet::default();
+    let mut pending = vec![receiver_lookup_name(name).into_owned()];
+    let mut prefixes = Vec::new();
+    while let Some(cls) = pending.pop() {
+        if seen.insert(cls.clone()) {
+            pending.extend(program.bases_of(&cls));
+            prefixes.push(format!("{cls}::operator "));
+        }
+    }
+    program
+        .symbols
+        .functions
+        .iter()
+        .any(|f| prefixes.iter().any(|p| f.name.starts_with(p.as_str())))
+}
+
 /// Pick among same-arity C++ candidates using argument-type ranking. Exact
 /// matches (score 0) beat every conversion; a unique best winner is chosen.
 /// Any ambiguity (ties, no exact match, unresolvable args) keeps the whole
 /// arity-set — the may-approximation — rather than guessing.
 fn rank_overloads(program: &Program, candidates: &[FnId], arg_desc: &[TypeDesc]) -> Vec<FnId> {
-    let score = |f: FnId| -> usize {
-        let params = &program.symbols.function(f).params;
-        params
-            .iter()
-            .skip(usize::from(has_this_param(program, f)))
-            .enumerate()
-            .map(|(i, pv)| {
-                let pdesc = program
-                    .types
-                    .get(program.symbols.variable(*pv).type_id)
-                    .desc
-                    .as_ref()
-                    .clone();
-                let adesc = arg_desc.get(i).cloned().unwrap_or(TypeDesc::Unknown);
-                param_match_rank(&adesc, &pdesc)
+    let class = TypeDesc::is_class_like;
+    // Each candidate's explicit parameters, read once.
+    let signatures: Vec<_> = candidates
+        .iter()
+        .map(|&f| {
+            let function = program.symbols.function(f);
+            (function, program.symbols.explicit_params(function))
+        })
+        .collect();
+    let param_desc = |c: usize, i: usize| {
+        signatures[c]
+            .1
+            .as_ref()
+            .and_then(|params| params.get(i))
+            .map(|ty| program.types.get(ty).desc.as_ref())
+    };
+    // The class a reference parameter binds (`const Base &` reads as a
+    // pointer to `Base`); a pointer parameter (`Base *`) binds no class value.
+    let class_referent = |c: usize, i: usize| {
+        (signatures[c].0.reference_params.get(i) == Some(&true))
+            .then(|| param_desc(c, i)?.pointee().filter(|p| class(p)))
+            .flatten()
+    };
+    let class_reference = |c: usize, i: usize| {
+        signatures[c].0.reference_params.get(i) == Some(&true)
+            && param_desc(c, i)
+                .and_then(TypeDesc::pointee)
+                // A class lowering could not resolve reads as `int` here
+                // too: `const Foo &` with `Foo` out of view is `int &`.
+                .is_some_and(|pointee| class(pointee) || matches!(pointee, TypeDesc::Int))
+    };
+    // A class the index does not declare is a guess (an out-of-tree class,
+    // or the enum-shaped `E::VALUE`): it may convert to anything, so it
+    // decides nothing and leaves the other arguments to rank.
+    let guessed_class = |arg: &TypeDesc| match arg {
+        TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => {
+            !program.types.declares_class(name)
+        }
+        _ => false,
+    };
+    // A class argument meeting another class, by value or reference, may
+    // bind it through a base (`Take(const Base &)` for a `Derived`) or a
+    // converting constructor (`sptr<Impl>` for `const sptr<IListener> &`);
+    // two unrelated in-tree classes (`select(A)`, `select(B)`) cannot.
+    let converts_to_class = |arg: &TypeDesc, param: &TypeDesc| match (arg, param) {
+        (
+            TypeDesc::Struct { name: from, .. } | TypeDesc::Union { name: from, .. },
+            TypeDesc::Struct { name: to, .. } | TypeDesc::Union { name: to, .. },
+        ) => {
+            !trace_ir::spelled_alike(
+                &program.types,
+                arg,
+                param,
+                trace_ir::SpellingTolerance::Ranking,
+            ) && (!program.types.declares_class(from)
+                || !program.types.declares_class(to)
+                || (from.contains('<') && to.contains('<'))
+                || program.derives_from(&receiver_lookup_name(from), &receiver_lookup_name(to)))
+        }
+        _ => false,
+    };
+    // A position decides nothing where a guess could be the answer: a
+    // candidate records its type there as unknown (an unresolved class or
+    // enum, `SetMode(Mode)`); an `int` argument meets a reference to a class
+    // (it may be that class, unresolved: `Set(cfg)` for `Set(const Config &)`,
+    // and `Write(5)` must not fall to `Write(const std::string &)`); or a
+    // pointer argument meets that class by value (a reference variable reads
+    // one pointer layer deeper, so `f` in `Take(f)` may be a `Foo`).
+    let undecidable: Vec<bool> = arg_desc
+        .iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            // Whatever the candidates, a guessed class decides nothing.
+            let guessed = guessed_class(arg);
+            (0..candidates.len()).any(|c| {
+                let Some(param) = param_desc(c, i) else {
+                    return true;
+                };
+                guessed
+                    || matches!(param.innermost().0, TypeDesc::Unknown)
+                    || converts_to_class(arg, class_referent(c, i).unwrap_or(param))
+                    || (matches!(arg, TypeDesc::Int) && class_reference(c, i))
+                    || arg.pointee().is_some_and(|pointee| {
+                        class(pointee)
+                            && class(param)
+                            && trace_ir::spelled_alike(
+                                &program.types,
+                                pointee,
+                                param,
+                                trace_ir::SpellingTolerance::Ranking,
+                            )
+                    })
+            })
+        })
+        .collect();
+    let score = |c: usize| -> usize {
+        let (function, params) = &signatures[c];
+        let Some(params) = params else {
+            return 0;
+        };
+        (0..params.len())
+            .filter(|&i| !undecidable.get(i).copied().unwrap_or(false))
+            .map(|i| {
+                let pdesc = param_desc(c, i).unwrap_or(&TypeDesc::Unknown);
+                let adesc = arg_desc.get(i).unwrap_or(&TypeDesc::Unknown);
+                // A reference parameter is lowered one pointer layer deeper:
+                // a class argument binds `f(T &)` exactly.
+                let binds_reference = function.reference_params.get(i) == Some(&true)
+                    && class(adesc)
+                    && pdesc.pointee().is_some_and(|pointee| {
+                        trace_ir::spelled_alike(
+                            &program.types,
+                            adesc,
+                            pointee,
+                            trace_ir::SpellingTolerance::Ranking,
+                        )
+                    });
+                if binds_reference {
+                    0
+                } else {
+                    param_match_rank(adesc, pdesc)
+                }
             })
             .sum()
     };
-    let ranked: Vec<(FnId, usize)> = candidates.iter().copied().map(|f| (f, score(f))).collect();
+    let ranked: Vec<(FnId, usize)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(c, &f)| (f, score(c)))
+        .collect();
     let min = ranked.iter().map(|(_, s)| *s).min().unwrap_or(0);
     let second = ranked
         .iter()
@@ -8049,6 +9168,11 @@ fn param_match_rank(arg: &TypeDesc, param: &TypeDesc) -> usize {
     }
     match (arg, param) {
         (TypeDesc::Unknown, _) | (_, TypeDesc::Unknown) => 0,
+        // One class spelled with and without its qualifiers.
+        (
+            TypeDesc::Struct { .. } | TypeDesc::Union { .. },
+            TypeDesc::Struct { .. } | TypeDesc::Union { .. },
+        ) => usize::from(!trace_ir::may_name_same_type(arg, param)),
         (a, p) if a.is_pointer_like() || p.is_pointer_like() => {
             if a.is_pointer_like() && p.is_pointer_like() {
                 2
@@ -8090,6 +9214,15 @@ fn has_same_signature(program: &Program, a: FnId, b: FnId) -> bool {
     let a_params = &fa.params[a_skip..];
     let b_params = &fb.params[b_skip..];
     if a_params.is_empty() || b_params.is_empty() {
+        // A prototype's recorded types tell `Get(int)` from `Get(long)`.
+        if let Some(same) = program.symbols.explicit_params_alike(
+            fa,
+            fb,
+            &program.types,
+            trace_ir::SpellingTolerance::Redeclaration,
+        ) {
+            return same;
+        }
         let a_arity = fa.explicit_arity.or(Some(a_params.len() as u32));
         let b_arity = fb.explicit_arity.or(Some(b_params.len() as u32));
         return a_arity.zip(b_arity).is_none_or(|(ea, eb)| ea == eb);
@@ -8123,6 +9256,7 @@ fn has_same_signature(program: &Program, a: FnId, b: FnId) -> bool {
 fn cpp_callee_candidates(
     program: &Program,
     ctx: &LowerContext,
+    source: &str,
     func: Node,
     name: &str,
     arg_desc: &[TypeDesc],
@@ -8152,12 +9286,44 @@ fn cpp_callee_candidates(
                 ctx.directive_namespaces()
                     .find_map(|ns| lookup(&format!("{ns}::{name}")))
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| inherited_static_members(program, ctx, source, func, name))
     } else {
         program
             .symbols
             .resolve_function_candidates(global_lookup_name(name), Some(ctx.current_file))
     }
+}
+
+/// The members `Cls::m` names when `Cls` declares no `m` itself but inherits
+/// one: `Svc::GetInstance()` calls the `GetInstance` its base
+/// `DelayedSingleton<Svc>` declares. Lookup stops at the nearest declaring
+/// class, as member lookup on an object does.
+fn inherited_static_members(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    func: Node,
+    name: &str,
+) -> Vec<FnId> {
+    let Some((scope, member)) = name.rsplit_once("::") else {
+        return Vec::new();
+    };
+    // The class lookup first: most failed qualified lookups name a namespace
+    // or an out-of-tree function. A class it finds may be the target of an
+    // alias (`using Adaptor = Impl<...>`) and declare the member itself.
+    let Some(cls) = class_seen_from(program, ctx, &receiver_lookup_name(scope)) else {
+        return Vec::new();
+    };
+    // A scope mentioning a template parameter (`T::Get()`, `Wrap<T>::Get()`)
+    // names no class; `name` has lost the arguments, the source has not.
+    if func.kind() == "qualified_identifier" && static_call_scope(ctx, source, func).is_none() {
+        return Vec::new();
+    }
+    declared_members_upward(
+        program,
+        &cls,
+        &trace_ir::MethodKind::Named(member.to_owned()),
+    )
 }
 
 /// ADL (argument-dependent / Koenig) namespaces: the enclosing namespaces
@@ -8320,6 +9486,7 @@ fn emit_unresolved_site(
         deref_args: _,
         argc: _,
         arg_desc: _,
+        null_constants: _,
     } = args.bind_past_this(None).for_callee(program, None);
     let call_id = program.symbols.alloc_call_id();
     program.symbols.call_sites.push(CallSite {
@@ -8394,6 +9561,16 @@ fn emit_member_targets(
     let mut args = args.bind_past_this(receiver);
     let argc = args.argc;
     let targets = filter_targets_by_argc(program, targets, argc as usize, &args.arg_desc, true);
+    // Same-arity overloads the argument types tell apart (`Set(int)`,
+    // `Set(sptr<Base>)`) are one call, as a free function's are.
+    let targets = rank_per_class(
+        program,
+        cls,
+        kind,
+        targets,
+        &args.arg_desc,
+        &args.null_constants,
+    );
     let display = kind.name_on(cls);
     if targets.is_empty() {
         // Unknown method: keep an unresolved site; the solver synthesizes
@@ -8867,6 +10044,7 @@ fn lower_lambda_expression(
         is_virtual: false,
         is_final: false,
         is_cpp: true,
+        c_linkage: false,
         tu: Some(ctx.current_file),
     });
     reassign_fn_id(program, provisional_id, fn_id, provisional_start);
@@ -9085,7 +10263,7 @@ fn is_std_smart_ptr_name(cls: &str) -> bool {
 /// or only forward-declared -- and so a candidate for the argument guess
 /// (#86). A nested type of one (`Outer<A>::Inner`, an iterator) is a type
 /// of its own, not a wrapper around `A`.
-fn is_undefined_wrapper(program: &Program, name: &str, cls: &str) -> bool {
+pub(crate) fn is_undefined_wrapper(program: &Program, name: &str, cls: &str) -> bool {
     name.contains('<')
         && !program.types.is_struct_defined(cls)
         && template_tail(name).trim().is_empty()
@@ -9116,26 +10294,6 @@ pub(crate) fn receiver_lookup_name(name: &str) -> Cow<'_, str> {
         Cow::Owned(strip_template_args(trimmed))
     } else {
         Cow::Borrowed(trimmed)
-    }
-}
-
-/// `name` when the index declares a class by it, else the class a `typedef`
-/// spelled `name` stands for (typedefs register under their bare spelling).
-fn declared_class_name(program: &Program, name: &str) -> Option<String> {
-    // Tags are registered without the global-scope prefix.
-    let name = name.strip_prefix("::").unwrap_or(name);
-    if program.types.is_struct_declared(name) {
-        return Some(name.to_owned());
-    }
-    // A typedef is registered under its qualified name as well as its bare
-    // one, so the spelling is matched whole: `A::B::T` never lands on an
-    // unrelated namespace's `T`.
-    let alias = program.types.resolve_alias(name)?;
-    match alias {
-        TypeDesc::Struct { name, .. } if program.types.is_struct_declared(name) => {
-            Some(name.clone())
-        }
-        _ => None,
     }
 }
 
@@ -9191,7 +10349,7 @@ fn resolve_operator_arrow_receiver(program: &Program, desc: TypeDesc) -> Option<
             let [arg] = args.as_slice() else {
                 return None;
             };
-            let head = declared_class_name(program, &receiver_lookup_name(arg))?;
+            let head = program.types.declared_class(&receiver_lookup_name(arg))?;
             return Some(match arg.find('<') {
                 Some(at) => format!("{head}{}", &arg[at..]),
                 None => head,
@@ -9394,11 +10552,15 @@ fn receiver_desc(
                     candidates,
                     receiver,
                 }) => {
-                    let args: Vec<TypeDesc> = call_arg_nodes(node)
-                        .into_iter()
-                        .map(|arg| known_arg_type(program, ctx, source, arg))
+                    let nodes = call_arg_nodes(node);
+                    let args: Vec<TypeDesc> = nodes
+                        .iter()
+                        .map(|&arg| known_arg_type(program, ctx, source, arg))
                         .collect();
-                    call_result_among(program, ctx, source, node, candidates, receiver, &args)
+                    let nulls = null_constant_args(source, &nodes);
+                    call_result_among(
+                        program, ctx, source, node, candidates, receiver, &args, &nulls,
+                    )
                 }
                 None => None,
             };
@@ -9503,39 +10665,9 @@ fn register_arrow_return(
 /// C++20 structural argument spelled as a string literal with a comma in it
 /// (`Tag<"a, b">`) would split there. No such spelling occurs in the corpora.
 pub(crate) fn template_arguments(raw: &str) -> Vec<String> {
-    let Some(start) = raw.find('<') else {
-        return Vec::new();
-    };
-    let mut depth = 0;
-    let mut paren = 0;
-    let mut from = start + 1;
-    let mut args = Vec::new();
-    for (i, c) in raw.char_indices().skip_while(|(i, _)| *i <= start) {
-        match c {
-            // A function type's parameter list (`Callback<void(int, char)>`)
-            // has commas of its own.
-            '(' => paren += 1,
-            ')' if paren > 0 => paren -= 1,
-            _ if paren > 0 => {}
-            '<' => depth += 1,
-            '>' if depth > 0 => depth -= 1,
-            ',' | '>' if depth == 0 => {
-                let arg = raw[from..i].trim();
-                // `W<>` has no arguments. Pushing the empty slice would make
-                // it a one-argument spelling, which the wrapper rule then
-                // qualifies to a bare `ns::` and looks up as a class.
-                if !(arg.is_empty() && args.is_empty() && c == '>') {
-                    args.push(arg.to_owned());
-                }
-                from = i + 1;
-                if c == '>' {
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    args
+    trace_ir::template_argument_list(raw)
+        .map(|(args, _)| args.into_iter().map(str::to_owned).collect())
+        .unwrap_or_default()
 }
 
 /// What follows a spelling's first template argument list: `::Inner` for
@@ -9699,7 +10831,7 @@ fn declared_class_in_scope(program: &Program, ctx: &LowerContext, name: &str) ->
         return program.types.is_struct_declared(name).then(|| name.clone());
     }
     find_in_scope(program, ctx, name, |candidate, _| {
-        declared_class_name(program, candidate)
+        program.types.declared_class(candidate)
     })
 }
 
@@ -9736,7 +10868,7 @@ fn constructed_class_in_scope(program: &Program, ctx: &LowerContext, name: &str)
         if names_function(program, ctx, candidate) && !is_constructor {
             return Some(None);
         }
-        declared_class_name(program, candidate).map(Some)
+        program.types.declared_class(candidate).map(Some)
     })
     .flatten()
 }
@@ -13794,23 +14926,47 @@ fn conversion_target_type(
     op: Node,
 ) -> Option<trace_ir::TypeId> {
     let desc = type_desc_from_node(program, ctx, source, op.child_by_field_name("type")?);
-    let desc = abstract_declarator_shape(desc, op.child_by_field_name("declarator"), false);
+    let desc = abstract_declarator_shape(
+        desc,
+        op.child_by_field_name("declarator"),
+        false,
+        ReferenceLayer::Pointer,
+    );
     Some(program.types.intern(desc))
+}
+
+/// How [`abstract_declarator_shape`] reads a reference layer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReferenceLayer {
+    /// As a pointer layer of its own, as a cast or conversion target does.
+    Pointer,
+    /// As a parameter's reference: at most one pointer layer in all.
+    Parameter,
 }
 
 /// `desc` wrapped in the pointer, reference and function layers of an
 /// abstract declarator (`T *`, `void (*)(int)`). A function declarator with
 /// nothing nested is the function type itself when `bare_function_is_type`
 /// (`using F = void(int);`), and the declaring member's own parameter list
-/// otherwise (`operator T *()`).
+/// otherwise (`operator T *()`). With `references` [`ReferenceLayer::Parameter`]
+/// a reference layer follows the parameter convention a named declarator
+/// does: one pointer layer, added only to a type that is not one already
+/// (`Foo *&` is `Ptr(Foo)`).
 fn abstract_declarator_shape(
     mut desc: TypeDesc,
     declarator: Option<Node>,
     bare_function_is_type: bool,
+    references: ReferenceLayer,
 ) -> TypeDesc {
     let mut cur = declarator;
+    let mut reference = false;
     while let Some(n) = cur {
         cur = match n.kind() {
+            "abstract_reference_declarator" if references == ReferenceLayer::Parameter => {
+                reference = true;
+                n.child_by_field_name("declarator")
+                    .or_else(|| n.named_child(0))
+            }
             "abstract_pointer_declarator" | "abstract_reference_declarator" => {
                 desc = TypeDesc::Ptr(Box::new(desc));
                 n.child_by_field_name("declarator")
@@ -13857,6 +15013,9 @@ fn abstract_declarator_shape(
             _ => break,
         };
     }
+    if reference && !desc.is_pointer_like() {
+        desc = TypeDesc::Ptr(Box::new(desc));
+    }
     desc
 }
 
@@ -13889,6 +15048,11 @@ fn parse_declarator_name(source: &str, node: Node) -> (String, bool) {
                 (String::new(), true)
             }
         }
+        // An abstract declarator (`const T &`, `int *`) names nothing; its
+        // whole text would read as a parameter called `&`. Its shape is
+        // `abstract_declarator_shape`'s to read.
+        "abstract_reference_declarator" | "abstract_pointer_declarator" => (String::new(), true),
+        kind if kind.starts_with("abstract_") => (String::new(), false),
         // An out-of-class conversion operator (`Cls::operator T() const`)
         // hangs its `operator_cast` off the `name` field; the whole-node text
         // would glue the declarator's `()` and cv-qualifiers onto the name.
@@ -15136,6 +16300,7 @@ mod qualified_variable_lookup_tests {
             ast_depth_warned: false,
             reference_vars: HashSet::default(),
             reference_bindings: HashSet::default(),
+            address_references: HashSet::default(),
             reference_returns: HashSet::default(),
             local_scope_log: Vec::new(),
             tree: parsed.tree,
@@ -15294,5 +16459,26 @@ mod qualified_variable_lookup_tests {
         let ctx = test_ctx(file, None, Vec::new(), HashMap::default());
 
         assert_eq!(lookup_var(&ctx, &program, "missing::ptr"), None);
+    }
+}
+
+#[cfg(test)]
+mod member_function_tests {
+    use super::*;
+
+    #[test]
+    fn a_member_template_declaring_no_function_is_no_member_function() {
+        let source = "struct S {\n    template <class U> static constexpr bool Check = true;\n    \
+                      template <class U> struct Holder {};\n    template <class U> void Run(U u);\n};\n";
+        let parsed =
+            crate::parse::parse_source_with_lang(Arc::from(source), crate::parse::SourceLang::Cpp)
+                .unwrap();
+        let root = parsed.tree.root_node();
+        let class = root.named_child(0).unwrap();
+        let names: Vec<String> = class_members(class)
+            .into_iter()
+            .filter_map(|m| member_function(source, m).map(|(_, name)| name))
+            .collect();
+        assert_eq!(names, ["Run"]);
     }
 }

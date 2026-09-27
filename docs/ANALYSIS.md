@@ -526,7 +526,12 @@ Call-site resolution respects translation-unit boundaries:
   units.
 - A translation unit that does not define the function (seeing only declarations
   or prototypes) treats all matching definitions across the program as equal
-  candidates and resolves to them.
+  candidates and resolves to them. A call its unit ranked into one site per
+  overload (`SymbolTable::index_overload_sites`) does not count an overload a
+  sibling site binds as one: that is another function whose parameter types
+  merely read alike (constructors taking two enum classes). Definitions that
+  different units selected by `#if`, free or member, never share a call's
+  sites and stay candidates.
 
 **IPC bridges are the deliberate exception.** A Binder call crosses a process
 boundary, so a proxy and the stub it dispatches to are in *different* images by
@@ -1073,6 +1078,32 @@ is indexed. When the `IRemoteStub` definition itself is in the tree, the stub
 also has a real inheritance edge to `IFoo`
 ([Template-parameter bases](#template-parameter-bases)); the argument
 recovery above covers the common case where it is not.
+A proxy and a stub whose names pair are bridged only when their interfaces
+can be one. Each side's interfaces are the arguments of its `IRemoteProxy<I>`
+or `IRemoteStub<I>` bases, written on the class or on one of its bases, read
+as lowering reads a template argument: each candidate in the lookup order
+above that is a declared class, or a `typedef`/`using` alias of one. Every
+such reading counts, not only the nearest, because the merged index cannot
+tell which of two declared namesakes the class's unit sees. A bare spelling
+(`IRemoteProxy<IFoo>`) also reads as every declared class of that final name
+(`api::IFoo`), and as the class every alias of that final name stands for
+(`using IFoo = IReal` in an imported namespace), since a using-directive,
+which the index does not record, may import it. An explicitly global
+`IRemoteProxy<::IFoo>` names the global class only. A dependent
+base's argument (`template <class I> class ProxyBase : public IRemoteProxy<I>`)
+is a template parameter, not an interface. When both sides name an interface
+and no proxy reading is a stub reading or derives from or to one, the pair
+is two services that merely share a name stem, and no bridge is added. When
+either side's interface is unknown (an argument naming no declared class,
+such as one known only from an out-of-class method), pairing stays
+name-based as before: dropping a bridge takes more evidence than following
+one. The interface fallback above searches the stub's nearest candidate the
+IR represents, read as a declared class or alias when it is one, and walks a
+recovered interface like a base: its own `IRemoteStub<I>` spellings are
+followed too. The check is
+not link-target scoped, like pairing itself. A mock or test double
+implementing the same interface is not excluded: it stays a CHA target of
+calls through the interface.
 The edge has resolution `ipc` and no source call site, and can be disabled
 with `--no-ipc`.
 Because v1 has no opcode or parcel-type information, overloaded handlers at
@@ -1479,10 +1510,25 @@ C++-aware only where it must be — everything else reuses the C machinery.
   while distinct same-arity overloads still separate across TUs. The merge
   gate resolves the surviving entry's types through `Function::param_type_ids`
   (remapped into global type space at merge; unit-local VarIds are not
-  queryable mid-merge). A C `.c`
+  queryable mid-merge). Header entities merge by their position (file,
+  line, column), so overloads one macro declares on one line share its
+  expansion column and merge into one entry: a known limit, since neither a
+  unit's own types (a header prototype can be met twice in one unit, once
+  before its parameter type resolves) nor the signature (units spell one
+  prototype's types differently) tells those overloads from copies of one
+  function. A C `.c`
   body still merges with a C++-parsed `.h` prototype of the same arity —
   otherwise callers bind to the undefined prototype (HDF `GpioSetIrq` /
-  `gpio->func`). Calls resolve over the candidate set filtered by argument
+  `gpio->func`). A C++ prototype and definition of which one has C linkage
+  (`extern "C"`, not `static`; `Function::c_linkage`) meet when their
+  parameter types are spelled alike as a definition meets an in-class
+  prototype, an `int` standing in for a class or a function pointer: a
+  defining unit that does not see the header's typedefs reads `Callbacks*` or
+  a callback typedef `OnChange cb` as an `int` stand-in (camera's
+  `OH_CaptureSession_*` entry points). A C++ overload of another known type
+  (`void f(double)` beside `extern "C" void f(int)`) stays apart, and two
+  definitions never meet this way.
+  Calls resolve over the candidate set filtered by argument
   count; an empty arity-filtered set falls back to all candidates (varargs).
   The count a call must fit is a range: every declaration records its
   **explicit arity** (`Function::explicit_arity`, parameters without `this`)
@@ -1982,6 +2028,57 @@ C++-aware only where it must be — everything else reuses the C machinery.
   A concrete receiver substitutes its arguments before member lookup and
   virtual dispatch, through its pointer layers and through an instantiated
   class-template base it inherits the member from (`struct D : Holder<T *>`).
+  A static call that spells the class template with its arguments is such a
+  receiver too: `Box<Svc>::Get()->Run()` and
+  `Singleton<Db>::GetInstance().Open()` type their results as `Svc *` and
+  `Db`, and an `auto` local initialised from them keeps that type.
+  A static member named on a class that inherits it (`Svc::GetInstance()`
+  with `class Svc : public DelayedSingleton<Svc>`) is looked up through the
+  bases as member lookup on an object is, stopping at the nearest class
+  declaring it: the call's callee is the base template's
+  `DelayedSingleton::GetInstance`, never a name invented on `Svc`, and its
+  result substitutes the argument the base spells, resolved in that base
+  declaration's scope. A derived declaration of the name hides the base's.
+  **Undefined singleton templates.** When the unit being lowered sees no
+  definition of c_utils' `DelayedSingleton` or `Singleton` (absent from the
+  headers it includes, or only forward-declared there; lowering reads one
+  unit at a time, so a definition only another unit includes does not
+  count), `DelayedSingleton<Svc>::GetInstance()` is typed
+  `std::shared_ptr<Svc>` and `Singleton<Db>::GetInstance()` is typed `Db`,
+  as c_utils declares them; a template of that name nested in another
+  (`Outer<A>::DelayedSingleton<Svc>`) is not c_utils' and is not guessed.
+  This is a guess from a name, like the undeclared wrapper rule above
+  (#86): only `GetInstance` on these two templates, with
+  exactly one argument naming a declared class (not a pointer), is guessed.
+  The accessor itself stays the external declaration it is; no member is
+  synthesized. A definition in view, a dependency root's included, decides
+  instead, whatever it returns. An accessor inherited from such a base
+  (`AccessTokenDb::GetInstance()` with
+  `class AccessTokenDb : public DelayedSingleton<AccessTokenDb>` and no
+  template in the tree) is typed the same way from the nearest undefined
+  c_utils base of the class or an ancestor, its argument resolved where
+  that base is written; a class declaring `GetInstance` on the way decides
+  instead, as member lookup does.
+  A parameter returned as the sole argument of another class template
+  (`std::shared_ptr<T> GetInstance()`, `sptr<T> Get()`) substitutes inside
+  it: the result is typed `std::shared_ptr<Svc>`, and `->` then unwraps it
+  as it unwraps any receiver of that type ([Receiver typing through a
+  wrapper](#receiver-typing-through-a-wrapper)). The wrapper is named from
+  the template's scope when the tree declares it, else as spelled. A
+  non-pointer wrapper stays itself (`Pair<T> *` reaches `Pair`'s members,
+  never `T`'s), and a pointer argument inside a wrapper (`sptr<Svc *>`)
+  stays unknown, as do a template template parameter used as the wrapper
+  (`Ptr<T>`) and a spelling with more than one argument list
+  (`Traits<T>::Ptr<U>`).
+  In-class prototypes of an overload set record their explicit parameter
+  types (see below), so same-arity overloads (`T *Get(int)` beside
+  `Decoy *Get(long)`) are two entries, each with its own return, and
+  overload ranking picks between them; when the arguments cannot decide, the
+  candidates must agree on one type. Separate definitions keep their
+  parameter types, so overload ranking picks one and only its return
+  applies. A scope that mentions a
+  template parameter (`Box<T>::Get()`, `T::GetInstance()`) names no class
+  before instantiation, even when a real class shares the parameter's name.
   The argument is resolved from the scope it is spelled in, keeping its own
   template arguments so a nested `Holder<Holder<T>>` substitutes again. Inherited arguments
   resolve in the base declaration's lexical scope, not the caller's; dependent base spellings
@@ -2002,10 +2099,54 @@ Known C++ imprecision (in addition to the general list below):
   (`auto p = c ? a : b`). Cast arguments in a call-result receiver probe are
   conservatively unknown for overload ranking. `shared_ptr::get` and
   `unique_ptr::release` are not unwrapped to the held class.
-- In-class prototypes carry no parameter types, so same-arity overloads of a
-  member (`Worker *find(int)`, `Other *find(const char *)`) share one entry,
-  which keeps the first declaration's return type; an `auto` local takes it
-  whichever overload the call means.
+- In-class prototypes record no parameter variables. They record their
+  parameter types where those decide something: a name the class body
+  declares or defines more than once, or brings in again with
+  `using Base::f;`, and a virtual member whose nearest declaring ancestor
+  overloads the name (so a call ranked to another overload does not dispatch
+  to it). A name declared once merges with its definition by name and arity.
+  So same-arity overloads of a member (`Worker *find(int)`,
+  `Other *find(const char *)`, `Set(sptr<A>)` beside `Set(sptr<B>)`) are
+  separate entries. A definition joins the prototype whose types it spells
+  exactly; failing that, the one prototype whose types it spells alike
+  (`trace_ir::spelled_alike`: a class with and without its qualifiers, its
+  template arguments too; a class the index does not declare by its final
+  name, since lowering may have guessed its namespace; a class named bare in
+  its own body beside its instances; a name one side read as `int` because
+  it could not resolve it), preferring more exact then more alike types, and
+  none when two tie. A call reaches the overload its argument types rank
+  first. An argument of unknown type ranks every candidate alike, so the
+  known ones still choose the call's edges (`Write(GetFd(), "x")` binds
+  `Write(int, const char *)`); only a result's type (an `auto` local, a
+  chained receiver) is left to every overload a known argument can bind.
+  Member calls rank within each declaring class, and a virtual call
+  dispatches only to overrides of the overloads that won: a class's single
+  override of the name is kept only when its signature is one of theirs.
+  There an `int` parameter matches any integral one, since a standard
+  integer typedef whose header is not indexed (`size_t`, `uint32_t`) reads
+  as `int`: an override spelling `unsigned long` keeps the dispatch of a base
+  `On(size_t)`, at the cost of a dispatch to a hiding `On(long)` beside a
+  base `On(int)`. Converting constructors
+  and conversion operators explain most mismatches, so only a value that is
+  no pointer (a class object declared with no conversion operator of its own
+  or a base's, or a scalar such as an enum value, never a literal `0` or
+  `NULL`, a null pointer constant too, however spelled: `0x0`, `0'0`,
+  `-0`) passed where a
+  pointer to a class-template
+  instance is taken (an
+  out-parameter such as `sptr<X> *`; `T **` may be a decayed array) rules an
+  overload out. An `int` argument decides nothing where some overload takes
+  a reference to a class (or to `int`, which is how a class lowering cannot
+  see reads), since lowering reads such a class as `int`; ranking ignores
+  that position. An `auto` local initialised from the call is typed only
+  when the remaining overloads' returns agree. An argument `E::VALUE` whose
+  type-cased `E` is neither a class nor a namespace in the index is read as
+  a value of class-like type `E` (most likely an enumerator of an enum
+  outside the tree; one the index knows is `int`): it rules out
+  out-parameter overloads but ranks none exactly. An out-of-tree class's
+  `ALL_CAPS` constant of pointer type is misread the same way. One call bound to several
+  overloads keeps one site per overload through the merge. An unnamed reference or pointer parameter
+  (`const T &`) is one, like a named one.
 - A reference parameter is typed one pointer layer deeper than an explicit
   `T&` local, so overload ranking can prefer `take(T*)` over `take(T)` for
   it.
@@ -2227,13 +2368,50 @@ Effect. `derives_from` and `subclass_closure` see the subclass, so
 interface's pointee type and CHA virtual dispatch through the interface
 reaches its overrides.
 
+Undefined templates (#122). OpenHarmony's `IRemoteProxy` and `IRemoteStub`
+are defined in the ipc component, outside most trees, so a
+`class FooProxy : public IRemoteProxy<IFoo>` would reach no interface. After
+merge, a concrete templated base whose template the tree does not **define**
+(absent, or only forward-declared; a definition from a `--dep` root counts
+as one) derives the class from its sole template argument, a guess from the
+spelling like the [undeclared wrapper](#smart-pointer-unwrap) rule (#86):
+
+- only with exactly one argument, naming a class the index declares (a
+  scalar, a pointer, a reference, a cv-qualified type, a template instance
+  such as `Holder<IFoo>` or an unknown name gives nothing);
+- only when the class, or a class deriving from it, declares a member named
+  like a virtual member of the argument or of the argument's bases: a proxy
+  overrides its interface and a stub's service implements it, while
+  `Registry : Box<Handler>` or `CaseTest : testing::TestWithParam<Case>`
+  implements nothing of its argument. A marker interface without virtual
+  members is not guessed, which loses no dispatch;
+- never for a standard-library template (none derives from its argument),
+  or for a member of an instance (`Outer<IFoo>::Inner` and
+  `Outer<IFoo>::Inner<IBar>` are not `Outer`). A class in an anonymous
+  namespace keeps its guessed base in its file's view, as lowering keeps a
+  declared one;
+- never the class itself (`Svc : DelayedSingleton<Svc>` is CRTP, not
+  inheritance), and never an edge that closes a cycle. Guesses land after
+  every declared base, so a guess never displaces one (`A : W<B>` and
+  `B : W<A>` guessed add only the first);
+- never for a template the tree defines, whatever its bases: a visible
+  `template <class T> struct Plain {};` means `Plain<IFoo>` does not derive
+  from `IFoo`, and the declared rules above decide.
+
+It runs once, after merge, so a definition any unit (or dependency root)
+contributes is seen first; lowering makes no provisional guess.
+
 Limits:
 
-- The template's **definition** must be in the analyzed tree. OpenHarmony's
-  `IRemoteStub` is defined in the ipc component, so a stub in another
-  component (camera) gains no edge unless the ipc headers are indexed (for
-  example with `--dep`). IPC bridge pairing does not depend on it: IPC bridge
-  pairing recovers the interface from the `IRemoteStub<IFoo>` argument
+- The standard-library exclusion reads the spelling: `vector<Handler>`
+  after `using namespace std` is guessed like any undefined template when
+  the evidence rule holds. An alias template
+  (`template <class T> using Box = Holder<T>;`) is not lowered, so a base
+  spelled through one is guessed as if its template were undefined.
+- A template the tree defines must have its definition indexed to expand
+  (for example with `--dep`); only an undefined one is guessed. IPC bridge
+  pairing does not depend on either: it recovers the interface from the
+  `IRemoteStub<IFoo>` argument
   ([OpenHarmony IPC bridges](#openharmony-ipc-bridges)).
 - Every argument resolves in the derived class's scope, including a
   non-parameter name in a dependent base (`A<T, Helper>`) and the inner

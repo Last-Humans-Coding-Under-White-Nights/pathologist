@@ -4,6 +4,29 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Template singleton calls and undefined template bases (#121, #122)
+
+Calls through class-template singletons and proxies whose interface comes
+from an out-of-tree template now reach the classes they name.
+
+- **Template singleton calls (#121)**: `DelayedSingleton<Svc>::GetInstance()->Run()`,
+  `Svc::GetInstance()` inherited from such a base, and results returned
+  inside `std::shared_ptr<T>` / `sptr<T>` are typed by the template's
+  argument, including c_utils' `DelayedSingleton` and `Singleton` when their
+  definitions are outside the tree. Overloads are chosen by explicit
+  parameter types recorded for prototypes, and a virtual call dispatches to
+  overrides of the overloads that won. Rules: **Templates** in
+  [`docs/ANALYSIS.md`](docs/ANALYSIS.md#c-support-first-step).
+- **Undefined template bases (#122)**: `class FooProxy : public IRemoteProxy<IFoo>`
+  with the template outside the tree derives from `IFoo` when the class or a
+  subclass implements one of `IFoo`'s virtual members, so calls through the
+  interface reach the proxy. Rules: [Template-parameter bases](docs/ANALYSIS.md#template-parameter-bases).
+- **IPC interface consistency (#122)**: a proxy and a stub whose names pair
+  but whose `IRemoteProxy<I>` / `IRemoteStub<I>` arguments name two unrelated
+  declared interfaces are no longer bridged. Rules:
+  [OpenHarmony IPC bridges](docs/ANALYSIS.md#openharmony-ipc-bridges).
+- Measurements and corpus deltas: `docs/EVAL_REPORT.md`.
+
 ### Function pointer member declarator classification and member call fallback (#147)
 
 - **Member function pointer declarator classification**: Struct function-pointer

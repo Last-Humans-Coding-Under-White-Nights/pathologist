@@ -321,6 +321,23 @@ is full. A variant is named everywhere downstream by its **index** in that list:
 `PreprocessResult::replayed_variants` and `IncludeExpansion::nested_variants` record indices, and
 header units are lowered and merged per `(header, language, index)`.
 
+**Which variant a record names.** A unit merges only the header units its records name, so a
+record must name the variant that holds a header's declarations — the one the unit (or an entry's
+publisher) reached the header through first. An include replayed later under the header's guard
+matches a whitespace-only variant; the unit still records reaching it, but the earlier variant
+keeps standing for the header, both in the unit's own record and in the nested records of the
+entries it composes. An entry records every nested header it contains: those it replayed, those it
+skipped by their guard (the variant the run reached them through, or the one it expanded and
+published itself), and those it expanded live, whose own nested records it inherits. A
+whitespace-only expansion that includes nothing never stands for its header, and a variant a
+replayed entry's nested record carries in does not replace one the run expanded itself (it may be
+that empty one). A header without a guard can be expanded several times in one entry, differently
+each time (`#define NAME First`, `#include "decl.h"`, then `Second`): the record keeps one pair per
+expansion, not one per header. Without these rules a
+replayed entry could define a header's guard while naming no variant, or only the empty one, and
+the consumer lost the header's declarations (`PermissionDataBrief` in `security_access_token`,
+#121).
+
 **Why the order of publication matters.** Two things about a variant are decided by who publishes
 it first, not by the header and the fingerprint alone. Its index is its position, and a consumer
 takes the first match, so the order decides which of two overlapping variants a unit replays. And

@@ -238,6 +238,15 @@ singletons outside the tree stay unresolved.
 **Eval when done:** `hiview_service.cpp` `GetInstance().OpenTrace` is a
 direct edge to `TraceStateMachine::OpenTrace` when that class is in-tree.
 
+**Status: implemented for class-template singletons (#121).** Qualified
+static calls on a class template (`DelayedSingleton<Svc>::GetInstance()`),
+accessors inherited from one (`Svc::GetInstance()`), results returned
+inside a wrapper (`std::shared_ptr<T>`, `sptr<T>`) and c_utils' undefined
+`DelayedSingleton`/`Singleton` are typed, and calls on the result reach the
+class's members. The rules and their limits are the **Templates** bullet in
+[`docs/ANALYSIS.md`](ANALYSIS.md#c-support-first-step); measurements are in
+`docs/EVAL_REPORT.md`.
+
 ---
 
 ## C9 — Template member calls (`GetNumber<T>`)

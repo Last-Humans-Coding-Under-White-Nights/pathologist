@@ -168,6 +168,11 @@ pub struct Function {
     /// A C `.c` definition merging into a C++-parsed `.h` prototype clears
     /// this flag so a later TU merge does not treat the pair as overloads.
     pub is_cpp: bool,
+    /// Declared with C linkage (`extern "C"`, not `static`). No overload
+    /// shares a C function's symbol, so a prototype with C linkage meets its
+    /// definition where only an unresolved name read as `int` tells their
+    /// parameter types apart.
+    pub c_linkage: bool,
     /// Originating translation unit, recorded by merge. Absent before merge or
     /// on synthesized entries.
     pub tu: Option<crate::FileId>,
@@ -378,6 +383,189 @@ fn absorb_redeclaration(
     existing.is_final |= func.is_final;
 }
 
+/// A function's explicit parameter types (see
+/// [`SymbolTable::explicit_params`]), read in place without allocating.
+pub struct ExplicitParams<'a> {
+    table: &'a SymbolTable,
+    f: &'a Function,
+    /// A prototype's declared types, or a merge's remapped copy of `f`'s.
+    supplied: Option<&'a [TypeId]>,
+    /// Leading entries that are not explicit parameters (`this`).
+    skip: usize,
+    len: usize,
+}
+
+impl ExplicitParams<'_> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The type of explicit parameter `i`, when it is known.
+    pub fn get(&self, i: usize) -> Option<TypeId> {
+        if i >= self.len {
+            return None;
+        }
+        let at = self.skip + i;
+        if self.f.params.is_empty() {
+            return self.supplied?.get(at).copied();
+        }
+        self.supplied
+            .and_then(|ts| ts.get(at))
+            .or_else(|| self.f.param_type_ids.get(at))
+            .copied()
+            .or_else(|| self.table.param_type(self.f.params[at]))
+    }
+
+    /// Same length, and `same` holds for every pair of known types.
+    fn matches(&self, other: &Self, same: impl Fn(TypeId, TypeId) -> bool) -> bool {
+        self.len == other.len
+            && (0..self.len).all(|i| match (self.get(i), other.get(i)) {
+                (Some(x), Some(y)) => same(x, y),
+                _ => true,
+            })
+    }
+}
+
+/// How far [`spelled_alike`] reads two spellings as one type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpellingTolerance {
+    /// A definition looking for its prototype: every spelling lowering may
+    /// produce for one class, the `int` it reads an unresolved name as
+    /// included.
+    Registration,
+    /// Whether two entries already apart are one function: as
+    /// [`Self::Registration`], but no `int` stands in for a class, since
+    /// registration already weighed every pair that could explain.
+    Redeclaration,
+    /// Whether an argument binds a parameter exactly: only a class with and
+    /// without its qualifiers. A guess must not make one overload the only
+    /// callee.
+    Ranking,
+    /// Whether a derived member overrides a base one: as
+    /// [`Self::Registration`], and a template argument the index does not
+    /// know matches any, since a base declared in a class template spells its
+    /// parameter (`ProcessBuffer(std::unique_ptr<IN_TYPE>)`) where the
+    /// override spells the argument.
+    Override,
+    /// Whether a call bound to a declaration reaches a definition entry of
+    /// the same name that stayed apart: as [`Self::Redeclaration`], except
+    /// that an `int` stands in for a class the index does not declare
+    /// (`std::string` read as `int` under `using namespace std`), never for
+    /// an in-tree class (`Set(int)` is not `Set(Foo)`).
+    Redirect,
+}
+
+/// Whether two declarations' parameter types may be one type read in two
+/// scopes: [`crate::may_name_same_type`] (`sptr<Base>` and
+/// `OHOS::sptr<Base>`, not `ns1::Config` and `ns2::Config`), extended, as
+/// `tolerance` allows, to the spellings lowering produces for a class it
+/// could not see. A class the index does not declare may carry the namespace
+/// lowering guessed for it (`OHOS::HDI::sptr` for `OHOS::sptr`, or
+/// `OHOS::HiviewDFX::list` for `std::list` under `using namespace std`), so
+/// it is compared by final name; a class named bare inside its own body
+/// (`AutoPtr` for `AutoPtr<T>`) matches its instances.
+pub fn spelled_alike(
+    types: &crate::TypeTable,
+    a: &crate::TypeDesc,
+    b: &crate::TypeDesc,
+    tolerance: SpellingTolerance,
+) -> bool {
+    use crate::TypeDesc;
+    let (mut x, mut y) = (a, b);
+    while let (Some(px), Some(py)) = (x.pointee(), y.pointee()) {
+        (x, y) = (px, py);
+    }
+    let named = TypeDesc::is_class_like;
+    let int_against_class =
+        (matches!(x, TypeDesc::Int) && named(y)) || (matches!(y, TypeDesc::Int) && named(x));
+    let lenient = matches!(
+        tolerance,
+        SpellingTolerance::Registration | SpellingTolerance::Override
+    );
+    let undeclared_class = |t: &TypeDesc| match t {
+        TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => !types.declares_class(name),
+        _ => false,
+    };
+    let stand_in_for_undeclared =
+        tolerance == SpellingTolerance::Redirect && (undeclared_class(x) || undeclared_class(y));
+    if int_against_class && !lenient && !stand_in_for_undeclared {
+        return false;
+    }
+    // A type a signature records as unknown is a class or enum lowering could
+    // not resolve: it may be another spelling of a class, never a known
+    // scalar or pointer (`Set(Mode)` is not `Set(int)`).
+    let unknown_against_known = |u: &TypeDesc, k: &TypeDesc| {
+        matches!(u, TypeDesc::Unknown) && !named(k) && !matches!(k, TypeDesc::Unknown)
+    };
+    if !lenient && (unknown_against_known(x, y) || unknown_against_known(y, x)) {
+        return false;
+    }
+    if crate::may_name_same_type(a, b) {
+        return true;
+    }
+    // A standard integer typedef lowering could not resolve (`size_t`,
+    // `uint32_t` without their headers) reads as `int`, so an override's
+    // `int` may be the base's `unsigned long`: dropping its dispatch would
+    // lose a real target, where keeping it at worst adds one to a hiding
+    // function (`On(long)` beside a base `On(int)`).
+    let integral = |t: &TypeDesc| {
+        matches!(
+            t,
+            TypeDesc::Char
+                | TypeDesc::Short
+                | TypeDesc::Int
+                | TypeDesc::Long
+                | TypeDesc::LongLong
+                | TypeDesc::SizeT
+        )
+    };
+    if tolerance == SpellingTolerance::Override
+        && (matches!(x, TypeDesc::Int) || matches!(y, TypeDesc::Int))
+        && integral(x)
+        && integral(y)
+    {
+        return true;
+    }
+    match (x, y) {
+        (
+            TypeDesc::Struct { name: x, .. } | TypeDesc::Union { name: x, .. },
+            TypeDesc::Struct { name: y, .. } | TypeDesc::Union { name: y, .. },
+        ) if tolerance != SpellingTolerance::Ranking => {
+            class_names_alike(types, x, y, tolerance == SpellingTolerance::Override)
+        }
+        _ => false,
+    }
+}
+
+/// [`spelled_alike`] on two class spellings, a guessed namespace allowed;
+/// with `parameters_match`, a template argument the index does not know (a
+/// template parameter) matches any.
+fn class_names_alike(types: &crate::TypeTable, x: &str, y: &str, parameters_match: bool) -> bool {
+    fn split(name: &str) -> (&str, Vec<&str>) {
+        crate::types::split_instance(name).unwrap_or((name, Vec::new()))
+    }
+    fn final_segment(head: &str) -> &str {
+        head.rsplit("::").next().unwrap_or(head).trim()
+    }
+    let ((xh, xa), (yh, ya)) = (split(x), split(y));
+    let undeclared = !types.declares_class(xh) || !types.declares_class(yh);
+    let heads =
+        crate::types::same_head(xh, yh) || (undeclared && final_segment(xh) == final_segment(yh));
+    heads
+        && (xa.is_empty()
+            || ya.is_empty()
+            || (xa.len() == ya.len()
+                && xa.iter().zip(&ya).all(|(p, q)| {
+                    let unknown = |arg: &str| !arg.contains('<') && !types.declares_class(arg);
+                    (parameters_match && (unknown(p) || unknown(q)))
+                        || class_names_alike(types, p, q, parameters_match)
+                })))
+}
+
 /// Whether merging `a` and `b` joins a member's in-class prototype with a
 /// definition lowered without its `this`: a body defined under a qualifier its
 /// unit did not know (`owner_unresolved`). The prototype says it is a member
@@ -392,6 +580,28 @@ fn joins_member_missing_this(a: &Function, b: &Function) -> bool {
         && prototype.declared_in_class
         && body.is_defined
         && body.owner_unresolved
+}
+
+/// Whether `a` and `b` are a C++ prototype and definition of which one has
+/// C linkage. The defining unit may not see the header's typedefs and read a
+/// parameter as `int` where the prototype names a class; C linkage rules out
+/// an overload that such a difference could otherwise mean, while one of
+/// another known type (`f(double)` beside `extern "C" f(int)`) stays apart.
+fn c_linkage_pair(a: &Function, b: &Function) -> bool {
+    a.is_cpp && b.is_cpp && a.is_defined != b.is_defined && (a.c_linkage || b.c_linkage)
+}
+
+/// Whether one side is the `int` lowering reads an unresolved name as and
+/// the other a function pointer that name may be a typedef of (a callback
+/// parameter, `OnChange cb`, which lowers as a pointer to `FnPtr`).
+fn int_stands_for_fn_ptr(a: &crate::TypeDesc, b: &crate::TypeDesc) -> bool {
+    use crate::TypeDesc;
+    let (mut x, mut y) = (a, b);
+    while let (Some(px), Some(py)) = (x.pointee(), y.pointee()) {
+        (x, y) = (px, py);
+    }
+    let fn_ptr = |t: &TypeDesc| matches!(t.innermost().0, TypeDesc::FnPtr { .. });
+    (matches!(x, TypeDesc::Int) && fn_ptr(y)) || (matches!(y, TypeDesc::Int) && fn_ptr(x))
 }
 
 #[derive(Debug, Clone)]
@@ -487,6 +697,10 @@ pub struct SymbolTable {
     internal_members_by_name: FxHashMap<String, Vec<FnId>>,
     /// Lookup contexts retained by coalesced header call records.
     shared_call_tus: FxHashMap<CallSiteId, std::collections::BTreeSet<FileId>>,
+    /// For a site that is one of several a call was ranked into (one per
+    /// overload it may bind), the overloads its sibling sites bind. Built by
+    /// [`Self::index_overload_sites`] once merging is done.
+    overload_sites: FxHashMap<CallSiteId, Vec<FnId>>,
     /// Includers contributing each exact expanded header definition.
     shared_header_tus: FxHashMap<FnId, std::collections::BTreeSet<FileId>>,
     /// Headers whose entities were attributed to this TU during lowering
@@ -709,12 +923,38 @@ impl SymbolTable {
             let compatible = |existing_id: FnId, require_types: bool| {
                 self.redeclaration_compatible(&func, param_types, types, existing_id, require_types)
             };
-            // Only a mixed-language pair can answer the two passes
-            // differently -- it is the sole case that returns before
-            // consulting types -- so the fallback scan is restricted to those
-            // candidates rather than repeating identical work for a bucket of
-            let mixed_language =
-                |id: FnId| !(func.is_cpp && self.function_by_id(id).is_some_and(|e| e.is_cpp));
+            // Two kinds of pair answer the two passes differently: a
+            // mixed-language one (merged by arity alone) and a C++ prototype
+            // meeting a definition (compared by spelling instead of by exact
+            // type). The second pass takes the first kind by bucket order;
+            // the third weighs the second kind's candidates against each
+            // other, so neither repeats the strict pass over the whole bucket.
+            let mixed_language = |id: FnId| {
+                self.function_by_id(id)
+                    .is_none_or(|e| !(func.is_cpp && e.is_cpp) || c_linkage_pair(&func, e))
+            };
+            // A prototype meeting a definition: the two read their parameter
+            // types in different scopes (class body, out-of-line lookup), so a
+            // definition none of whose prototypes spells its types the same
+            // way (`sptr<Base>`, `OHOS::sptr<Base>`) joins one whose types
+            // plausibly agree.
+            //
+            // A merge never falls back between two entries of the same unit:
+            // lowering that unit already compared them with its own types
+            // and kept them apart, as `Set(int)` beside a `Set(Foo)` that met
+            // its definition.
+            //
+            // Nor does a prototype fall back onto a definition of its own unit:
+            // one written before its prototype is an inline member, another
+            // overload (`void Set(int v) { .. }` before `void Set(Foo);`).
+            let merging = param_types.is_some();
+            let prototype_meets_definition = |id: FnId| {
+                self.function_by_id(id).is_some_and(|e| {
+                    let same_unit = e.tu.is_some() && e.tu == func.tu;
+                    e.params.is_empty() != func.params.is_empty()
+                        && !(same_unit && (merging || func.params.is_empty()))
+                })
+            };
             let is_incompatible_def = |existing_id: FnId| -> bool {
                 if let Some(existing) = self.function_by_id(existing_id) {
                     if func.is_cpp && existing.is_cpp && func.is_defined && existing.is_defined {
@@ -736,6 +976,62 @@ impl SymbolTable {
                     candidates.iter().copied().find(|&id| {
                         mixed_language(id) && compatible(id, false) && !is_incompatible_def(id)
                     })
+                })
+                .or_else(|| {
+                    // Several prototypes may be read alike (`Set(int)` beside
+                    // `Set(sptr<Base>)`, for a definition spelling
+                    // `OHOS::sptr<Base>`): the one sharing the most exact
+                    // types, and only a unique one, is its declaration.
+                    let ours = self.explicit_params_with(&func, param_types);
+                    // Exact types first, then ones spelled alike without
+                    // an `int` standing in for a class.
+                    let exact = |id: FnId| {
+                        let theirs = self.explicit_params_with(self.function(id), None);
+                        theirs.zip(ours.as_ref()).map_or((0, 0), |(theirs, ours)| {
+                            let pairs =
+                                || (0..theirs.len()).filter_map(|i| theirs.get(i).zip(ours.get(i)));
+                            let exact = pairs()
+                                .filter(|&(x, y)| match types {
+                                    Some(types) => crate::same_param_type(types, x, y),
+                                    None => x == y,
+                                })
+                                .count();
+                            let alike = pairs()
+                                .filter(|&(x, y)| {
+                                    types.is_some_and(|types| {
+                                        spelled_alike(
+                                            types,
+                                            types.get(x).desc.as_ref(),
+                                            types.get(y).desc.as_ref(),
+                                            SpellingTolerance::Redeclaration,
+                                        )
+                                    })
+                                })
+                                .count();
+                            (exact, alike)
+                        })
+                    };
+                    // One pass: the best score, and whether another shares it.
+                    let mut best: Option<(FnId, (usize, usize))> = None;
+                    let mut tied = false;
+                    for &id in &candidates {
+                        if !(prototype_meets_definition(id)
+                            && compatible(id, false)
+                            && !is_incompatible_def(id))
+                        {
+                            continue;
+                        }
+                        let score = exact(id);
+                        match best {
+                            Some((_, top)) if score < top => {}
+                            Some((_, top)) if score == top => tied = true,
+                            _ => {
+                                best = Some((id, score));
+                                tied = false;
+                            }
+                        }
+                    }
+                    best.filter(|_| !tied).map(|(id, _)| id)
                 });
             if let Some(existing_id) = matched_id {
                 let mut missing_this = false;
@@ -773,6 +1069,7 @@ impl SymbolTable {
                     }
                     absorb_redeclaration(existing, &func, param_types, adopted_params);
                     existing.declared_in_class |= func.declared_in_class;
+                    existing.c_linkage |= func.c_linkage;
                     // A C definition merging into a C++-parsed header
                     // prototype must drop `is_cpp`. Otherwise a later
                     // TU merge sees both_cpp and refuses the body
@@ -1057,8 +1354,8 @@ impl SymbolTable {
     /// `push_indexed` is the only writer of `functions`, and it records the
     /// slot, so the map never lags the vector.
     fn function_mut_by_id(&mut self, id: FnId) -> Option<&mut Function> {
-        let slot = *self.fn_slots.get(&id)? as usize;
-        self.functions.get_mut(slot).filter(|f| f.id == id)
+        let slot = self.fn_slot(id)?;
+        Some(&mut self.functions[slot])
     }
 
     /// Whether `func` redeclares the entry `existing_id` rather than
@@ -1163,32 +1460,125 @@ impl SymbolTable {
                 // pair of definitions therefore keeps the exact id
                 // comparison.
                 let by_shape = types.filter(|_| !(existing.is_defined && func.is_defined));
+                let same = |ta: TypeId, tb: TypeId| match by_shape {
+                    Some(types) => crate::same_param_type(types, ta, tb),
+                    None => ta == tb,
+                };
+                if arity_ok && both_cpp && (existing.params.is_empty() || func.params.is_empty()) {
+                    // An in-class prototype lowers no parameter variables but
+                    // records its explicit types, so same-arity overloads
+                    // (`Get(int)`, `Get(long)`) stay two entries while a
+                    // prototype still meets its own definition.
+                    // The strict pass compares exact types, so two prototypes
+                    // whose types differ at all (`int`, `long`, `sptr<A>`,
+                    // `sptr<B>`) are two entries; the fallback pass reads a
+                    // definition's types as spelled alike
+                    // (docs/ANALYSIS.md, "Templates").
+                    let theirs = self.explicit_params_with(existing, None);
+                    let ours = self.explicit_params_with(func, param_types);
+                    return theirs.zip(ours).is_none_or(|(theirs, ours)| {
+                        theirs.matches(&ours, |x, y| match types {
+                            Some(types) if !require_types => spelled_alike(
+                                types,
+                                types.get(x).desc.as_ref(),
+                                types.get(y).desc.as_ref(),
+                                SpellingTolerance::Registration,
+                            ),
+                            _ => same(x, y),
+                        })
+                    });
+                }
+                if arity_ok && !require_types && c_linkage_pair(existing, func) {
+                    let theirs = self.explicit_params_with(existing, None);
+                    let ours = self.explicit_params_with(func, param_types);
+                    return theirs
+                        .zip(ours)
+                        .zip(types)
+                        .is_none_or(|((theirs, ours), types)| {
+                            theirs.matches(&ours, |x, y| {
+                                let (x, y) =
+                                    (types.get(x).desc.as_ref(), types.get(y).desc.as_ref());
+                                spelled_alike(types, x, y, SpellingTolerance::Registration)
+                                    || int_stands_for_fn_ptr(x, y)
+                            })
+                        });
+                }
                 arity_ok
                     && (existing.params.is_empty() || func.params.is_empty() || {
-                        let existing_t = |i: usize| {
-                            existing
-                                .param_type_ids
-                                .get(i)
-                                .copied()
-                                .or_else(|| self.param_type(existing.params[i]))
-                        };
-                        let ok = existing.params.iter().enumerate().all(|(i, _)| {
-                            let incoming_t = param_types
-                                .and_then(|ts| ts.get(i))
-                                .copied()
-                                .or_else(|| func.params.get(i).and_then(|&p| self.param_type(p)));
-                            match (existing_t(i), incoming_t) {
-                                (Some(ta), Some(tb)) => match by_shape {
-                                    Some(types) => crate::same_param_type(types, ta, tb),
-                                    None => ta == tb,
-                                },
-                                _ => true,
-                            }
-                        });
-                        ok
+                        let theirs = self.explicit_params_with(existing, None);
+                        let ours = self.explicit_params_with(func, param_types);
+                        theirs
+                            .zip(ours)
+                            .is_none_or(|(theirs, ours)| theirs.matches(&ours, same))
                     })
             })
             .unwrap_or(false)
+    }
+
+    /// `f`'s explicit parameter types, `this` excluded; `None` when they are
+    /// not known. The one reading of them every overload question shares:
+    /// redeclaration, ranking, and redirecting a call to an equal definition.
+    pub fn explicit_params<'a>(&'a self, f: &'a Function) -> Option<ExplicitParams<'a>> {
+        self.explicit_params_with(f, None)
+    }
+
+    /// [`Self::explicit_params`], with `supplied` standing in for the types
+    /// `f` carries: a merge's remapped copy, aligned as `f`'s own would be.
+    fn explicit_params_with<'a>(
+        &'a self,
+        f: &'a Function,
+        supplied: Option<&'a [TypeId]>,
+    ) -> Option<ExplicitParams<'a>> {
+        if f.params.is_empty() {
+            // A prototype: no variables, its declared types (possibly none).
+            let types = supplied.unwrap_or(&f.param_type_ids);
+            let arity = f.explicit_arity.map_or(types.len(), |a| a as usize);
+            return (types.len() == arity).then_some(ExplicitParams {
+                table: self,
+                f,
+                supplied: Some(types),
+                skip: 0,
+                len: arity,
+            });
+        }
+        let skip = match f.explicit_arity {
+            Some(arity) => f.params.len().checked_sub(arity as usize)?,
+            None => usize::from(
+                self.variable_by_id(f.params[0])
+                    .is_some_and(|v| v.name == "this"),
+            ),
+        };
+        Some(ExplicitParams {
+            table: self,
+            f,
+            supplied,
+            skip,
+            len: f.params.len() - skip,
+        })
+    }
+
+    /// Whether `a` and `b` declare explicit parameter types spelled alike as
+    /// `tolerance` reads them ([`spelled_alike`]); `None` when either side's
+    /// are not known. An override may override a base (`Override`) when only
+    /// a clear difference (`On(int)` against `On(double)`) would make it
+    /// another overload's; a call redirects to an equal definition
+    /// (`Redirect`) under the spellings its unit could not tell apart.
+    pub fn explicit_params_alike(
+        &self,
+        a: &Function,
+        b: &Function,
+        types: &crate::TypeTable,
+        tolerance: SpellingTolerance,
+    ) -> Option<bool> {
+        let (a, b) = (self.explicit_params(a)?, self.explicit_params(b)?);
+        Some(a.matches(&b, |x, y| {
+            spelled_alike(
+                types,
+                types.get(x).desc.as_ref(),
+                types.get(y).desc.as_ref(),
+                tolerance,
+            )
+        }))
     }
 
     /// Type of a parameter variable, for overload signature comparison.
@@ -1456,6 +1846,37 @@ impl SymbolTable {
         self.shared_call_tus.entry(id).or_default().insert(tu);
     }
 
+    /// Index the sites each call was ranked into, one per overload
+    /// (`overload_sites`): sites of one caller, occurrence and callee name
+    /// bound to different functions.
+    pub fn index_overload_sites(&mut self) {
+        // One call: its caller, occurrence and callee name.
+        type Call<'a> = (FnId, CallOccurrence, &'a str);
+        let mut calls: FxHashMap<Call, Vec<(CallSiteId, FnId)>> = FxHashMap::default();
+        for cs in &self.call_sites {
+            if let Some(callee) = cs.callee_fn_id {
+                calls
+                    .entry((cs.caller, cs.occurrence(), cs.callee_name.as_str()))
+                    .or_default()
+                    .push((cs.id, callee));
+            }
+        }
+        let mut overload_sites: FxHashMap<CallSiteId, Vec<FnId>> = FxHashMap::default();
+        for sites in calls.into_values() {
+            for &(id, own) in &sites {
+                let others: Vec<FnId> = sites
+                    .iter()
+                    .map(|&(_, callee)| callee)
+                    .filter(|&callee| callee != own)
+                    .collect();
+                if !others.is_empty() {
+                    overload_sites.insert(id, others);
+                }
+            }
+        }
+        self.overload_sites = overload_sites;
+    }
+
     pub fn is_shared_header_function(&self, id: FnId) -> bool {
         self.shared_header_tus.contains_key(&id)
     }
@@ -1635,6 +2056,10 @@ impl SymbolTable {
         // Both resolvers fall back to whole-program interpretation when
         // nothing is scoped, so one tail serves either mode.
         let target = self.caller_target(cs);
+        let siblings = self
+            .overload_sites
+            .get(&cs.id)
+            .map_or(&[][..], Vec::as_slice);
         let resolve_equal_defs = |fid: FnId| -> Vec<FnId> {
             let f = self.function(fid);
             if f.linkage != Linkage::External || self.defined_in_tu(fid, caller_tu) {
@@ -1655,6 +2080,14 @@ impl SymbolTable {
                     if !cand.is_defined || cand.variadic != f.variadic {
                         return false;
                     }
+                    // An overload the call's own unit ranked beside this one
+                    // is bound by a sibling site already, and is another
+                    // function: its types merely read alike (constructors
+                    // taking two enum classes). Definitions other units
+                    // chose by `#if` never share a call's sites.
+                    if siblings.contains(&id) {
+                        return false;
+                    }
                     let cand_skip = usize::from(self.has_this_param(id));
                     let cand_explicit_len = cand.params.len().saturating_sub(cand_skip);
                     let both_cpp = f.is_cpp && cand.is_cpp;
@@ -1662,29 +2095,48 @@ impl SymbolTable {
                         if !both_cpp {
                             return true;
                         }
+                        // A prototype names the definition its types agree
+                        // with (read in another scope, so plausibly), not
+                        // every same-arity overload (`Get(int)` is not
+                        // `Get(long)`). Registration already joined any pair
+                        // an `int` stand-in could explain, so none is read here.
+                        if let Some(same) = types.and_then(|types| {
+                            self.explicit_params_alike(
+                                f,
+                                cand,
+                                types,
+                                SpellingTolerance::Redeclaration,
+                            )
+                        }) {
+                            return same;
+                        }
                         let f_arity = f.explicit_arity.or(Some(f_explicit_len as u32));
                         let cand_arity = cand.explicit_arity.or(Some(cand_explicit_len as u32));
                         return f_arity.zip(cand_arity).is_none_or(|(a, b)| a == b);
                     }
-                    if cand_explicit_len != f_explicit_len {
+                    let (Some(ours), Some(theirs)) =
+                        (self.explicit_params(f), self.explicit_params(cand))
+                    else {
+                        return cand_explicit_len == f_explicit_len;
+                    };
+                    if ours.len() != theirs.len() {
                         return false;
                     }
-                    (0..cand_explicit_len).all(|i| {
-                        let p1 = cand.params[cand_skip + i];
-                        let p2 = f.params[f_skip + i];
-                        let t1 = self
-                            .param_type(p1)
-                            .or_else(|| cand.param_type_ids.get(cand_skip + i).copied());
-                        let t2 = self
-                            .param_type(p2)
-                            .or_else(|| f.param_type_ids.get(f_skip + i).copied());
-                        match (t1, t2) {
-                            (Some(a), Some(b)) => match types {
-                                Some(ty) => crate::same_param_type(ty, a, b),
-                                None => a == b,
-                            },
-                            _ => true,
+                    // A declaration and a definition its unit read in another
+                    // scope (`std::string` against `string` under `using
+                    // namespace std`, which lowering reads as `int`) are one
+                    // function (see `SpellingTolerance::Redirect`).
+                    ours.matches(&theirs, |a, b| match types {
+                        Some(ty) => {
+                            crate::same_param_type(ty, a, b)
+                                || spelled_alike(
+                                    ty,
+                                    ty.get(a).desc.as_ref(),
+                                    ty.get(b).desc.as_ref(),
+                                    SpellingTolerance::Redirect,
+                                )
                         }
+                        None => a == b,
                     })
                 })
                 .collect();
@@ -1960,9 +2412,17 @@ impl SymbolTable {
             .unwrap_or_default()
     }
 
+    /// `id`'s index in `functions`, when the entry there is still `id`'s.
+    fn fn_slot(&self, id: FnId) -> Option<usize> {
+        let slot = *self.fn_slots.get(&id)? as usize;
+        self.functions
+            .get(slot)
+            .is_some_and(|f| f.id == id)
+            .then_some(slot)
+    }
+
     pub fn function_by_id(&self, id: FnId) -> Option<&Function> {
-        let slot = *self.fn_slots.get(&id)?;
-        self.functions.get(slot as usize).filter(|f| f.id == id)
+        Some(&self.functions[self.fn_slot(id)?])
     }
 
     pub fn function(&self, id: FnId) -> &Function {
@@ -2482,6 +2942,7 @@ mod tests {
             is_virtual: false,
             is_final: false,
             is_cpp,
+            c_linkage: false,
             tu: None,
         }
     }
