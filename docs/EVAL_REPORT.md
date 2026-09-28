@@ -1,5 +1,53 @@
 # Evaluation Report
 
+## Solver string-literal memory cell exclusion and store requeue decoupling — 2026-09-28
+
+String literals (`LocKind::StringLit`) interned for dynamic symbol resolution (`dlsym`)
+represent immutable constants and cannot act as writable memory cells. Untyped stores
+through generic pointers or string buffers previously treated string literal locations
+as memory cells, accumulating thousands of abstract locations into interned strings
+(notably `""`, which was held by over 25,000 variables across 3,450 translation units in
+`ability_ability_runtime`). Each store touching a string literal requeued every variable
+holding the literal, leading to over 210 million load operations, worklist thrashing,
+and pop budget exhaustion. Furthermore, `apply_store_to_targets` coupled instance location
+and field summary growth into a single `changed` flag, triggering redundant holder
+requeues whenever either grew.
+
+The solver now:
+1. Skips `LocKind::StringLit` targets in `apply_store_to_targets` and `load_into`.
+2. Decouples `loc_changed` and `summary_changed` in `apply_store_to_targets`, ensuring
+   only memory cells that actually gained new locations requeue their holders.
+
+Rules: [Propagation highlights](ANALYSIS.md#propagation-highlights) and **`StringConst`**
+in `docs/ANALYSIS.md`.
+
+### Evaluation
+
+Release builds (`cargo build -p trace-cli --release --locked`), evaluated on
+`ability_ability_runtime` (commit `87e02b78de`, 3,450 TUs) and the pinned corpora
+(`python3 scripts/eval_check.py --jobs 8`: `drivers_hdf_core`, `hiviewdfx_hiview`,
+`multimedia_camera_framework`, all 94/94 checks passing cleanly with zero regressions).
+
+#### `ability_ability_runtime` Performance
+
+| Metric | Baseline | Candidate | Delta |
+|---|---:|---:|---:|
+| Solve pops | 2,847,032 (budget limit) | 490,198 | −82.8% (fixpoint reached) |
+| Solver time | 49.0s – 55.7s | 0.75s | ~75x faster |
+| Analyze phase total | 51.5s – 57.8s | 2.7s | ~20x faster |
+| Memory load operations | 210,728,119 | 264,062 | −99.87% (800x reduction) |
+| Indirect call edges | 952 | 1,068 | +116 edges recovered |
+| `solver_partial` | true | false | Full fixpoint converged |
+| Diagnostics / warnings | 1 (pop budget exceeded) | 0 | Clean |
+
+#### Pinned Corpora (`eval_check.py`)
+
+All 94 assertions across `drivers_hdf_core`, `hiviewdfx_hiview`, and
+`multimedia_camera_framework` pass with identical function counts, call graph edges,
+and argument flow counts. Because string literals are never intended to store
+pointer values or callbacks, excluding them as memory cells has zero adverse effect
+on valid call graph edges while completely eliminating pathological worklist thrashing.
+
 ## Template singleton calls and undefined template bases — 2026-09-27 (#121, #122)
 
 Calls chained on a class-template singleton accessor (`DelayedSingleton<Svc>::GetInstance()->Run()`,

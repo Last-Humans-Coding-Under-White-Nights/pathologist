@@ -642,6 +642,8 @@ impl SolverState {
                 if into.held().insert(loc) {
                     fresh.push(loc);
                 }
+            } else if pag.locations[loc.0 as usize].kind == LocKind::StringLit {
+                continue;
             } else {
                 merges += 1;
                 into.merge(pag, &memory, loc, fresh);
@@ -719,10 +721,6 @@ impl SolverState {
         self.record_delta(dst, fresh);
         self.push(dst);
     }
-}
-
-fn st_pts_stats_max(pts: &IndexMap<PagNodeId, FxHashSet<LocId>>) -> usize {
-    pts.values().map(|s| s.len()).max().unwrap_or(0)
 }
 
 /// Maximum distinct locations remembered per instance-insensitive summary
@@ -1399,14 +1397,8 @@ fn solve(
         eprintln!("[ipc] total bridges: {}", pag.ipc_bridges.len());
     }
 
-    let points_to = if retain_points_to {
-        st.pts.into_iter().collect()
-    } else {
-        IndexMap::new()
-    };
-
     if stats_enabled {
-        let biggest = st_pts_stats_max(&points_to);
+        let biggest = st.pts.values().map(|s| s.len()).max().unwrap_or(0);
         eprintln!(
             "[solver] DONE pops={} elapsed={:?} constraints={} max_pts={} resolved_sites={}",
             pops,
@@ -1423,6 +1415,12 @@ fn solve(
             );
         }
     }
+
+    let points_to = if retain_points_to {
+        st.pts.into_iter().collect()
+    } else {
+        IndexMap::new()
+    };
 
     let solve = SolveOutcome {
         converged,
@@ -1740,7 +1738,9 @@ fn apply_store_to_targets(
     scratch.store_requeues.clear();
 
     for &loc in target_slice {
-        if fn_for_loc(pag, loc).is_some() {
+        if fn_for_loc(pag, loc).is_some()
+            || pag.locations[loc.0 as usize].kind == LocKind::StringLit
+        {
             continue;
         }
 
@@ -1751,22 +1751,22 @@ fn apply_store_to_targets(
         // pointer writes callbacks into alien layouts, where later field
         // loads surface them as bogus indirect-call targets. Untyped cells
         // (`void *`, unknown layouts) stay writable — conservative.
-        let mut changed = false;
         let filter = if src_has_fns {
             FnFilter::of(st.slot_guard.get(&loc))
         } else {
             FnFilter::Any
         };
-        {
+        let loc_changed = {
             let view = views.view(filter, src, pag, &st.fn_arity);
-            changed |= write_memory(
+            write_memory(
                 &mut st.memory_pts,
                 &mut st.memory_bits,
                 &mut st.loc_bits,
                 loc,
                 view.iter().copied().chain(self_loc),
-            );
-        }
+            )
+        };
+        let mut summary_changed = false;
         let summary_loc = pag.summary_for_field_loc(loc);
         if let Some(summary) = summary_loc {
             let entry = st.memory_pts.entry(summary).or_default();
@@ -1789,7 +1789,7 @@ fn apply_store_to_targets(
                     _ => FnFilter::Any,
                 };
                 let view = views.view(summary_filter, src, pag, &st.fn_arity);
-                changed |= write_memory(
+                summary_changed = write_memory(
                     &mut st.memory_pts,
                     &mut st.memory_bits,
                     &mut st.loc_bits,
@@ -1798,8 +1798,10 @@ fn apply_store_to_targets(
                 );
             }
         }
-        if changed {
+        if loc_changed {
             scratch.store_requeues.push(loc);
+        }
+        if summary_changed {
             if let Some(summary) = summary_loc {
                 scratch.store_requeues.push(summary);
             }
@@ -3030,5 +3032,54 @@ mod tests {
             field_name: "value".into(),
         });
         assert_eq!(pointee_names(&fx.program, gep), ["summary:Payload.value"]);
+    }
+
+    #[test]
+    fn string_literals_do_not_act_as_memory_cells() {
+        let mut program = Program::default();
+        let int_type = program.types.int();
+        let ptr_type = program.types.ptr_to(trace_ir::TypeDesc::Int);
+        let str_ptr = add_var(&mut program, "str_ptr", ptr_type);
+        let target = add_var(&mut program, "target", int_type);
+        let target_ptr = add_var(&mut program, "target_ptr", ptr_type);
+        let read_back = add_var(&mut program, "read_back", ptr_type);
+
+        program.flow.extend([
+            trace_ir::FlowConstraint::StringConst {
+                dst: str_ptr,
+                value: "hello".into(),
+            },
+            trace_ir::FlowConstraint::AddrOfVar {
+                dst: target_ptr,
+                src: target,
+            },
+            trace_ir::FlowConstraint::Store {
+                dst: str_ptr,
+                src: target_ptr,
+            },
+            trace_ir::FlowConstraint::Load {
+                dst: read_back,
+                src: str_ptr,
+            },
+        ]);
+
+        let (pag, result) = analyze_with_options(
+            &program,
+            AnalyzeOptions {
+                retain_points_to: true,
+                ..Default::default()
+            },
+        );
+
+        let read_back_node = pag.var_node[&read_back];
+        let read_back_pts = result
+            .points_to
+            .get(&read_back_node)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            read_back_pts.is_empty(),
+            "string literal must not act as a writable memory cell or yield stored pointers on load: got {read_back_pts:?}"
+        );
     }
 }

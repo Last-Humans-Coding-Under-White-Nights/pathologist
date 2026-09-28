@@ -4,6 +4,24 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Solver string-literal memory cell exclusion and store requeue decoupling
+
+- **String literal memory cell exclusion**: `LocKind::StringLit` locations represent
+  immutable interned text constants for dynamic lookup (`dlsym`) and are not writable
+  memory cells. `apply_store_to_targets` and `load_into` in `trace-analysis` now skip
+  string literal locations. This prevents generic pointer stores through string buffers
+  from turning ubiquitous string literals (such as `""`, held by tens of thousands of
+  nodes) into massive memory hubs that thrash the solver worklist with hundreds of
+  millions of redundant load operations.
+- **Decoupled store requeuing**: `apply_store_to_targets` tracks `loc_changed` and
+  `summary_changed` independently, requeuing only the specific location or field summary
+  that actually gained new locations.
+- **Results**: On `ability_ability_runtime` (3,450 TUs), solve time dropped from ~50s
+  (exhausting the 3M pop budget with partial results) to 0.75s (full fixpoint reached in
+  490k pops, 75x speedup), load operations dropped from 210M to 264k (800x reduction),
+  and 116 missing indirect call edges were recovered. All 94 pinned corpus checks pass
+  cleanly.
+
 ### Cross-repository database merger and callgraph reconstruction (`trace-merge`)
 
 A dedicated workspace crate and CLI tool `trace-merge` that merges multiple per-repository SQLite databases produced by `trace analyze` into a unified database, reconstructing the global callgraph across repository boundaries without running static analysis or dataflow solvers during the merge phase.
