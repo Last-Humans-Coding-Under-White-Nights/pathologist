@@ -400,7 +400,14 @@ impl<'a> Parser<'a, '_> {
                     .map(|t| Self::string(&t.text, env))
                     .unwrap_or_default();
                 if value.known && value.strings.len() == 1 {
-                    if let Some(path) = self.reader.path(self.directory, &value.strings[0]) {
+                    // An in-tree import that is not on disk (generated during
+                    // the build, or optional) is unresolved like an
+                    // out-of-tree one: it must not discard the whole file.
+                    if let Some(path) = self
+                        .reader
+                        .path(self.directory, &value.strings[0])
+                        .filter(|path| path.is_file())
+                    {
                         let tokens = self.reader.import(&path);
                         self.reader.file(&path, tokens, env, self.depth + 1)?;
                         continue;
@@ -433,18 +440,32 @@ impl<'a> Parser<'a, '_> {
                     local.insert(key, Value::list());
                 }
                 self.block(&mut local, true, false)?;
-                let target_name = args
-                    .first()
-                    .filter(|t| t.quoted)
-                    .map(|t| Self::string(&t.text, env))
-                    .unwrap_or_default();
-                if !target_name.known || target_name.strings.len() != 1 {
-                    return Err("unresolved target name".into());
+                // The name may be a literal or a variable naming one
+                // (`shared_library(name) { ... }`), evaluated as any value is.
+                let target_name = Parser {
+                    tokens: args,
+                    pos: 0,
+                    reader: &mut *self.reader,
+                    directory: self.directory,
+                    depth: self.depth,
                 }
-                let label = self
-                    .reader
-                    .label(self.directory, &format!(":{}", target_name.strings[0]))
-                    .ok_or("invalid target label")?;
+                .expr(env);
+                let label =
+                    (target_name.known && !target_name.list && target_name.strings.len() == 1)
+                        .then(|| {
+                            self.reader
+                                .label(self.directory, &format!(":{}", target_name.strings[0]))
+                        })
+                        .flatten();
+                // One unnamed target leaves the rest of the file readable;
+                // the warning keeps resolution unscoped.
+                let Some(label) = label else {
+                    self.reader.warnings.insert(format!(
+                        "GN {}: unresolved {name} target name; ownership remains unscoped",
+                        self.directory.display()
+                    ));
+                    continue;
+                };
                 let sources = &local.vars["sources"];
                 let mut target = Target {
                     label,
@@ -631,10 +652,12 @@ pub(crate) fn infer_link_targets(root: &Path) -> LinkDatabase {
             }
         }
     }
+    // Incomplete targets are exported too, as observations: any of them
+    // leaves a warning, and a warning keeps resolution unscoped, so they never
+    // form an image. Only dependencies on known targets are recorded.
     let ids: BTreeMap<_, _> = reader
         .targets
         .iter()
-        .filter(|t| t.complete)
         .enumerate()
         .map(|(i, t)| (t.label.clone(), i))
         .collect();
@@ -645,7 +668,6 @@ pub(crate) fn infer_link_targets(root: &Path) -> LinkDatabase {
                 "GN {}: incomplete source/dependency evidence; ownership remains unscoped",
                 target.label
             ));
-            continue;
         }
         db.targets.push(LinkTargetSpec {
             output: root.join(".trace-gn").join(
@@ -657,7 +679,11 @@ pub(crate) fn infer_link_targets(root: &Path) -> LinkDatabase {
             ),
             name: target.label,
             sources: target.sources,
-            dependencies: target.deps.iter().map(|d| ids[d]).collect(),
+            dependencies: target
+                .deps
+                .iter()
+                .filter_map(|d| ids.get(d).copied())
+                .collect(),
             configurations: BTreeMap::new(),
         });
     }
@@ -760,7 +786,10 @@ mod tests {
             let build = format!("shared_library(\"app\") {{ {body} }}");
             let dir = tree(&[("BUILD.gn", &build), ("a.cpp", "")]);
             let db = infer_link_targets(dir.path());
-            assert!(db.targets.is_empty(), "{body}: {db:?}");
+            // Observed, never isolated: the target is exported but keeps
+            // whole-tree resolution.
+            assert!(db.unscoped_inference, "{body}: {db:?}");
+            assert_eq!(db.targets.len(), 1, "{body}: {db:?}");
             assert!(!db.warnings.is_empty());
         }
     }
@@ -777,6 +806,32 @@ mod tests {
             assert_eq!(db.targets.len(), 1, "{build}: {db:?}");
             assert_eq!(db.targets[0].sources.len(), 1, "{build}: {db:?}");
         }
+    }
+
+    #[test]
+    fn variable_target_names_resolve_and_unresolved_ones_keep_the_file() {
+        let dir = tree(&[
+            (
+                "BUILD.gn",
+                r#"name = "app"
+                shared_library(name) { sources = [ "a.cpp" ] }
+                static_library(target_name) { sources = [ "b.cpp" ] }
+                static_library("lib") { sources = [ "b.cpp" ] }"#,
+            ),
+            ("a.cpp", ""),
+            ("b.cpp", ""),
+        ]);
+        let db = infer_link_targets(dir.path());
+        let names: Vec<_> = db.targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["//:app", "//:lib"], "{:?}", db.warnings);
+        assert!(db.unscoped_inference);
+        assert!(
+            db.warnings
+                .iter()
+                .any(|w| w.contains("unresolved static_library target name")),
+            "{:?}",
+            db.warnings
+        );
     }
 
     #[test]
@@ -828,7 +883,7 @@ mod tests {
                 ("loop.gni", r#"import("loop.gni")"#),
             ]);
             let db = infer_link_targets(dir.path());
-            assert!(db.targets.is_empty(), "{db:?}");
+            assert!(db.unscoped_inference, "{build}: {db:?}");
             assert!(!db.warnings.is_empty(), "{build}");
         }
     }
@@ -860,8 +915,9 @@ mod tests {
                 .iter()
                 .map(|t| t.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["//a:same", "//b:same"]
+            vec!["//:app", "//a:same", "//b:same", "//lib:one"]
         );
+        assert!(db.unscoped_inference);
         assert_eq!(db.warnings.len(), 2);
     }
 
@@ -891,21 +947,24 @@ mod tests {
         ]);
         IMPORT_LOADS.with(|n| n.set(0));
         let db = infer_link_targets(dir.path());
-        // common.gni and missing.gni are each read once for five imports.
-        assert_eq!(IMPORT_LOADS.with(|n| n.get()), 2);
+        // common.gni is read once for three imports; the missing file is
+        // never read.
+        assert_eq!(IMPORT_LOADS.with(|n| n.get()), 1);
         let root = dir.path().canonicalize().unwrap();
-        assert_eq!(db.targets.len(), 1, "{:?}", db.warnings);
-        assert_eq!(db.targets[0].name, "//b:b");
+        let names: Vec<_> = db.targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["//a:a", "//b:b", "//c:c"], "{:?}", db.warnings);
         assert_eq!(
-            db.targets[0].sources,
+            db.targets[1].sources,
             vec![root.join("b/b.cpp"), root.join("b/shared.cpp")]
         );
-        // The unreadable import is still diagnosed at every importer.
-        for build in ["a/BUILD.gn", "c/BUILD.gn"] {
-            let prefix = format!("GN {}: ", root.join(build).display());
+        assert!(db.unscoped_inference);
+        // The missing import is diagnosed at every importer, without
+        // discarding the importing file's targets.
+        for dir in ["a", "c"] {
+            let prefix = format!("GN {}: unresolved import", root.join(dir).display());
             assert!(
                 db.warnings.iter().any(|w| w.starts_with(&prefix)),
-                "{build}: {:?}",
+                "{dir}: {:?}",
                 db.warnings
             );
         }
@@ -924,7 +983,12 @@ mod tests {
         ]);
         let db = infer_link_targets(dir.path());
         let names: Vec<_> = db.targets.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["//:ok"], "{:?}", db.warnings);
+        assert_eq!(names, vec!["//:app", "//:leaf", "//:mid", "//:ok"]);
+        assert!(db.unscoped_inference);
+        // The missing `:gone` dependency is not recorded; `:mid` keeps both
+        // known ones.
+        assert!(db.targets[1].dependencies.is_empty());
+        assert_eq!(db.targets[2].dependencies, vec![1, 3]);
         assert_eq!(db.warnings.len(), 3, "{:?}", db.warnings);
     }
     #[test]

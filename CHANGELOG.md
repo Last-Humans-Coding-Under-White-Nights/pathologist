@@ -20,7 +20,10 @@ in `docs/EVAL_REPORT.md`.
   and direct production-to-test edges drop from 88,969 to 0.
 - **Inferred GN targets**: without link commands or CMake metadata, target
   ownership is read from `BUILD.gn` files; imports are read once per run.
-  Incomplete inference keeps the whole-tree resolver.
+  Incomplete inference keeps the whole-tree resolver and exports every target
+  it read, incomplete ones included, as observations. A variable target name
+  resolves, and a missing import or an unresolved name no longer discards the
+  rest of its build file.
 - **Include order**: inferred tree directories are searched after every
   explicit `-I` / `-isystem` class.
 - **Performance**: cached tree-sitter grammar metadata, precomputed header

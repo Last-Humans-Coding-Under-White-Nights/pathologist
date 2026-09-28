@@ -2022,6 +2022,35 @@ impl SymbolTable {
                 .is_some_and(|headers| headers.contains(&other))
     }
 
+    /// [`SymbolTable::file_sees`] for a lookup file that may be a header
+    /// (an ordinary header body resolves from its own file). `headers_of` is
+    /// keyed by units only, so a header answers through its includers: some
+    /// unit including `file` is `other` or also includes it. The shorter of
+    /// the two includer sets is walked, as in `any_unit_sees`.
+    fn context_sees(&self, file: FileId, other: FileId) -> bool {
+        if self.file_sees(file, other) {
+            return true;
+        }
+        if self.headers_of.contains_key(&file) {
+            return false;
+        }
+        let Some(units) = self.includers_of.get(&file) else {
+            return false;
+        };
+        if units.contains(&other) {
+            return true;
+        }
+        let Some(others) = self.includers_of.get(&other) else {
+            return false;
+        };
+        let (small, large) = if units.len() <= others.len() {
+            (units, others)
+        } else {
+            (others, units)
+        };
+        small.iter().any(|tu| large.contains(tu))
+    }
+
     /// Cache the bare-tree fallback partition once after files are merged.
     pub fn set_inference_root(&mut self, root: &Path) {
         self.inference_root = Some(root.to_path_buf());
@@ -2188,7 +2217,7 @@ impl SymbolTable {
             || self.has_target_scopes
             || self.inferred_test_files.contains(&file)
             || !self.inferred_test_files.contains(&body)
-            || self.file_sees(file, body)
+            || self.context_sees(file, body)
     }
 
     fn callees_in_tu_unfiltered(
@@ -2536,7 +2565,9 @@ impl SymbolTable {
             // provenance is uncertainty, never evidence of invisibility.
             let visible = |id: FnId| {
                 self.member_declarations.get(&id).is_some_and(|origins| {
-                    origins.iter().any(|&origin| self.file_sees(file, origin))
+                    origins
+                        .iter()
+                        .any(|&origin| self.context_sees(file, origin))
                 })
             };
             self.retain_admitted(&mut candidates, file);
@@ -2545,10 +2576,13 @@ impl SymbolTable {
                     .iter()
                     .any(|&id| self.function(id).is_defined && visible(id))
             {
-                candidates.retain(|id| {
-                    !self.member_declarations.contains_key(id)
-                        || visible(*id)
-                        || self.defined_in_tu(*id, file)
+                // A header lookup file is no unit: its own bodies are the
+                // ones defined in it.
+                candidates.retain(|&id| {
+                    !self.member_declarations.contains_key(&id)
+                        || visible(id)
+                        || self.defined_in_tu(id, file)
+                        || (self.function(id).is_defined && self.function(id).file == file)
                 });
             }
         }
@@ -3161,6 +3195,45 @@ mod tests {
         symbols.share_header_function(caller, b);
         let result = symbols.return_flow_candidates(caller, "S::run");
         assert_eq!(result, vec![defs[1], defs[2], defs[0]]);
+    }
+
+    /// An ordinary header body resolves from its own file, which is no unit.
+    /// The test partition asks what that header's includers see.
+    #[test]
+    fn header_lookup_sees_test_bodies_through_its_includers() {
+        let mut symbols = SymbolTable::default();
+        let unit = symbols.add_file(PathBuf::from("/t/src/a.cpp"));
+        let header = symbols.add_file(PathBuf::from("/t/src/prod.h"));
+        let mock = symbols.add_file(PathBuf::from("/t/test/mock_svc.h"));
+        let real = symbols.add_file(PathBuf::from("/t/src/svc.cpp"));
+        let stray = symbols.add_file(PathBuf::from("/t/test/stray.h"));
+        symbols.set_inference_root(Path::new("/t"));
+        symbols.register_included_header(unit, header);
+        symbols.register_included_header(unit, mock);
+        let mut ids = Vec::new();
+        for (i, file) in [(0, real), (1, mock), (2, stray)] {
+            ids.push(symbols.add_function(fake_function(
+                FnId(i),
+                "Svc::Run",
+                vec![],
+                true,
+                true,
+                file,
+                1,
+            )));
+        }
+        let mut caller = fake_function(FnId(3), "Wrap", vec![], true, true, header, 1);
+        caller.tu = Some(unit);
+        let caller = symbols.add_function(caller);
+        assert!(symbols.has_inferred_test_partition());
+        // `a.cpp` includes the mock, so `prod.h` may bind it; nothing
+        // includes the stray test header alongside `prod.h`.
+        let result = symbols.return_flow_candidates(caller, "Svc::Run");
+        assert!(
+            result.contains(&ids[0]) && result.contains(&ids[1]),
+            "{result:?}"
+        );
+        assert!(!result.contains(&ids[2]), "{result:?}");
     }
 
     fn fake_function(

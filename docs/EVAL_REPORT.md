@@ -51,8 +51,12 @@ The GN reader skips scope literals (`sanitize = { ... }`) whole and accepts a
 `set_defaults` block that names no sources or deps. Before, a scope literal's
 closing brace ended the enclosing target and failed the file (7 HDF, 61
 hiview, 23 camera, 378 ability-runtime build files). Those files now report
-per target, which is why diagnostics rise while call edges stay identical:
-hiview exports 62 observed targets instead of 20.
+per target, which is why diagnostics rise while call edges stay identical.
+Every target read is exported as an observation, incomplete ones included:
+HDF 131, hiview 409 and camera 285 `link_targets` rows, with no symbol
+carrying a `target_id`. A missing in-tree import or an unresolved target
+name is diagnosed without discarding its build file; call edges and
+diagnostic counts are unchanged by either.
 
 Reproduce the corpus checks with:
 
@@ -68,8 +72,9 @@ The separate issue corpus is `ability_ability_runtime` at
 `origin/OpenHarmony-7.0-Release` revision), clean. The baseline has two
 `TaskHandlerWrap::SubmitTask` edges at `ability_manager_service.cpp:4028`;
 the candidate has exactly one, to `services/common/src/task_handler_wrap.cpp`.
-Both runs reach the solver fixpoint. The candidate exports 614 observed GN
-targets; incomplete ownership keeps the whole-tree resolver active.
+Both runs reach the solver fixpoint. The candidate exports 3,107 observed GN
+targets (every target read, incomplete ones included); incomplete ownership
+keeps the whole-tree resolver active, so no symbol carries a `target_id`.
 
 The acceptance audit enumerated call sites before joining edges, so a
 missing call in one image could not hide behind a correct call in another image.
@@ -96,7 +101,7 @@ fallback now taking the one production match beside mock copies:
 All SQLite analysis tables are identical at jobs 1 and 8, excluding only
 `analysis_run` metadata; their semantic SHA256 is
 `ebdd1bdb95e073c4aa8131821c47e7f4aa8e9b7bc6b6b6ddb396fca743744374`.
-The final workspace suite passes 1,486 tests, and corpus evaluation passes
+The final workspace suite passes 1,488 tests, and corpus evaluation passes
 94/94. Formatting, Clippy across all workspace targets, and whitespace checks
 pass.
 

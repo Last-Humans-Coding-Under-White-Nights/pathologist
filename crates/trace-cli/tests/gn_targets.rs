@@ -111,7 +111,18 @@ fn partial_gn_graph_cannot_hide_a_definition_from_unassigned_callers() {
     let targets: i64 = c
         .query_row("SELECT count(*) FROM link_targets", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(targets, 3, "known membership remains available as metadata");
+    assert_eq!(
+        targets, 4,
+        "every target read, the incomplete one included, remains available as metadata"
+    );
+    let scoped: i64 = c
+        .query_row(
+            "SELECT count(*) FROM functions WHERE target_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(scoped, 0, "observed targets must not scope symbols");
 }
 
 #[test]

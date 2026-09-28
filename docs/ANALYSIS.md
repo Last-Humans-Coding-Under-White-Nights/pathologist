@@ -144,7 +144,10 @@ basename fallback takes a production match only when it is the one
 production file of that name (`src/foo.h` beside `test/mock/foo.h` resolves to
 `src/foo.h`). Explicit include paths and relative includes still work.
 Production name lookup excludes test bodies unless the caller includes their
-defining file; when that exclusion removes the nearest entry, the
+defining file. An ordinary header body looks names up from its own header,
+which no unit indexes, so it asks its includers instead: the header sees
+another file when some unit including it includes that file too. The
+declaration-family rule below uses the same test. When that exclusion removes the nearest entry, the
 single-result lookup answers with the first remaining body, not a prototype
 registered ahead of it.
 Test callers retain production candidates. Authoritative link images override
@@ -497,10 +500,13 @@ labels use a real GN workspace root or an explicitly recorded OpenHarmony
 repository prefix from project metadata; arbitrary path suffixes are never
 used to guess ownership. A scope literal (`sanitize = { ... }`) is skipped as
 one unknown value, and `set_defaults` is ignored unless it names `sources`,
-`deps` or `public_deps`. Unknown expressions, templates, toolchains, or local
-dependencies produce diagnostics. When any part of the inferred graph is
-incomplete or any discovered translation unit has no inferred owner, known
-targets and source membership are exported as observations,
+`deps` or `public_deps`. A target name may be a literal or a variable holding
+one. An unresolved target name, or an import that is missing on disk, is a
+diagnostic that leaves the rest of the build file readable. Unknown
+expressions, templates, toolchains, or local dependencies produce diagnostics. When any part of the inferred graph is
+incomplete or any discovered translation unit has no inferred owner, every
+target read — incomplete ones included, with dependencies only on targets that
+were read — and its source membership are exported as observations,
 but symbol resolution stays unscoped for the whole tree: isolating just the
 known targets would hide their definitions from unassigned callers. External
 dependencies are not rebound to similarly named local targets. Incomplete

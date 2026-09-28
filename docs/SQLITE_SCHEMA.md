@@ -108,7 +108,11 @@ GN inference uses these same tables; origin and precedence rules are
 defined in [Link targets and weak symbols](ANALYSIS.md#link-targets-and-weak-symbols).
 
 Link metadata is exported in every detail mode. Without link-target metadata,
-these tables are empty and symbol `target_id` values are `NULL`.
+these tables are empty and symbol `target_id` values are `NULL`. Incomplete GN
+inference exports every target it read as an observation, complete or not,
+while symbols keep `target_id = NULL`: resolution stays whole-tree. A
+non-`NULL` `target_id` therefore means scoped resolution, and a populated
+`link_targets` alone does not.
 
 | Table | Columns | Meaning |
 |-------|---------|---------|

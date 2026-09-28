@@ -43,7 +43,7 @@ pub struct SolverIndices {
 
 impl SolverIndices {
     /// Index Load constraint `idx` under its source `src`.
-    fn add_load(&mut self, src: PagNodeId, idx: usize) {
+    pub(crate) fn add_load(&mut self, src: PagNodeId, idx: usize) {
         self.load_src.entry(src).or_default().push(idx);
         let (word, bit) = (src.0 as usize / 64, src.0 % 64);
         if word >= self.load_src_bits.len() {
