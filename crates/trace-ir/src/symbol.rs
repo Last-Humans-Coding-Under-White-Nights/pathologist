@@ -772,6 +772,11 @@ impl SymbolTable {
         self.files.get(file.0 as usize).is_some_and(|f| f.is_dep)
     }
 
+    /// Append a file. `path` must be spelled like every other interned path
+    /// and like the inference root: canonical, as the pipeline passes them.
+    /// Interning is keyed by exact spelling, and the test partition
+    /// ([`crate::is_test_path`]) compares lexically, so a symlinked or
+    /// relative spelling would be a separate, misclassified file.
     pub fn add_file(&mut self, path: PathBuf) -> FileId {
         let id = FileId(self.files.len() as u32);
         if self
@@ -2022,36 +2027,41 @@ impl SymbolTable {
                 .is_some_and(|headers| headers.contains(&other))
     }
 
-    /// [`SymbolTable::file_sees`] for a lookup file that may be a header
-    /// (an ordinary header body resolves from its own file). `headers_of` is
-    /// keyed by units only, so a header answers through its includers: some
-    /// unit including `file` is `other` or also includes it. The shorter of
-    /// the two includer sets is walked, as in `any_unit_sees`.
+    /// [`SymbolTable::file_sees`] widened by `file`'s includers: code in
+    /// `file` also sees what some unit including it is or includes. This is
+    /// how an ordinary header body, which resolves from its own file, sees
+    /// its includers' headers; `headers_of` is keyed by units only. No test
+    /// for unit-ness is needed: a file that is a unit and is also included
+    /// elsewhere (a header with its own compile command) gets both views, and
+    /// an unincluded unit has no includers to add. A production file widens
+    /// only through production units, so a test unit that happens to include
+    /// a production header lends it none of its own bodies or mocks. The
+    /// shorter of the two includer sets is walked, as in `any_unit_sees`.
     fn context_sees(&self, file: FileId, other: FileId) -> bool {
         if self.file_sees(file, other) {
             return true;
         }
-        if self.headers_of.contains_key(&file) {
-            return false;
-        }
         let Some(units) = self.includers_of.get(&file) else {
             return false;
         };
-        if units.contains(&other) {
+        let test_file = self.inferred_test_files.contains(&file);
+        let lends = |tu: &FileId| test_file || !self.inferred_test_files.contains(tu);
+        if units.contains(&other) && lends(&other) {
             return true;
         }
         let Some(others) = self.includers_of.get(&other) else {
             return false;
         };
-        let (small, large) = if units.len() <= others.len() {
-            (units, others)
+        if units.len() <= others.len() {
+            units.iter().any(|tu| lends(tu) && others.contains(tu))
         } else {
-            (others, units)
-        };
-        small.iter().any(|tu| large.contains(tu))
+            others.iter().any(|tu| lends(tu) && units.contains(tu))
+        }
     }
 
     /// Cache the bare-tree fallback partition once after files are merged.
+    /// `root` is spelled like the interned paths (canonical); see
+    /// [`SymbolTable::add_file`].
     pub fn set_inference_root(&mut self, root: &Path) {
         self.inference_root = Some(root.to_path_buf());
         self.inferred_test_files = self
@@ -3234,6 +3244,33 @@ mod tests {
             "{result:?}"
         );
         assert!(!result.contains(&ids[2]), "{result:?}");
+    }
+
+    /// A header with its own compile command is a unit and an included
+    /// header at once; it keeps its includers' view.
+    #[test]
+    fn header_unit_also_sees_through_its_includers() {
+        let mut symbols = SymbolTable::default();
+        let unit = symbols.add_file(PathBuf::from("/t/src/a.cpp"));
+        let header = symbols.add_file(PathBuf::from("/t/src/prod.h"));
+        let own = symbols.add_file(PathBuf::from("/t/src/own.h"));
+        let mock = symbols.add_file(PathBuf::from("/t/test/mock_svc.h"));
+        symbols.register_included_header(header, own);
+        symbols.register_included_header(unit, header);
+        symbols.register_included_header(unit, mock);
+        assert!(symbols.context_sees(header, own));
+        assert!(symbols.context_sees(header, mock));
+        assert!(!symbols.context_sees(own, unit));
+        assert!(!symbols.context_sees(unit, own));
+        // A test unit including the same header lends it nothing.
+        let test_unit = symbols.add_file(PathBuf::from("/t/test/b.cpp"));
+        let stray = symbols.add_file(PathBuf::from("/t/test/stray.h"));
+        symbols.set_inference_root(Path::new("/t"));
+        symbols.register_included_header(test_unit, header);
+        symbols.register_included_header(test_unit, stray);
+        assert!(!symbols.context_sees(header, test_unit));
+        assert!(!symbols.context_sees(header, stray));
+        assert!(symbols.context_sees(header, mock));
     }
 
     fn fake_function(

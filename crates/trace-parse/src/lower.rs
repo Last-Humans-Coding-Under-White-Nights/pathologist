@@ -1471,6 +1471,10 @@ fn finalize_target_extern_callees(program: &mut Program) {
     for (i, cs) in program.symbols.call_sites.iter().enumerate() {
         if cs.callee_var.is_some()
             || (!inferred && cs.callee_fn_id.is_some())
+            // A bare tree keeps the whole-program pass's classification: a
+            // direct site without a callee is left to name recovery there
+            // too. Sites with a callee are rechecked in context instead,
+            // since the partition may exclude every candidate they bind.
             || (inferred && cs.is_direct && cs.callee_fn_id.is_none())
             || !is_synthesizable_extern(&cs.callee_name)
             || (inferred && !program.callees_of(cs).is_empty())

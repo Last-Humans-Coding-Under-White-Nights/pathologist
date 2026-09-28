@@ -35,7 +35,12 @@ probes now exclude test classes: the two plugin `OnEvent` sites go from 24 to
 12 to 4, and `OnEventListeningCallback` from 8 to 6. The narrower
 `EventHandler::OnEvent` family probe goes from four to one because the three
 other implementations are test classes. Every removed target was checked by
-definition path; production dispatch targets remain.
+definition path; production dispatch targets remain. The declaration-only
+shadow probe rises from 22 to 24: two unrelated `TraceCollectorTest` fixtures
+(`unified_collection/utility/` and `unified_collection/client/`) both have
+`SetUp` and `TearDown`, declared only in the first and defined in the second.
+Declaration provenance now keeps the declared-only pair separate instead of
+merging it into the other fixture's definitions.
 
 Camera's two `Command::Do` probes each lose four test overrides (`TestCommand`
 and the three `VideoProcess*Fuzz` classes). Declaration provenance also keeps
@@ -101,7 +106,7 @@ fallback now taking the one production match beside mock copies:
 All SQLite analysis tables are identical at jobs 1 and 8, excluding only
 `analysis_run` metadata; their semantic SHA256 is
 `ebdd1bdb95e073c4aa8131821c47e7f4aa8e9b7bc6b6b6ddb396fca743744374`.
-The final workspace suite passes 1,488 tests, and corpus evaluation passes
+The final workspace suite passes 1,489 tests, and corpus evaluation passes
 94/94. Formatting, Clippy across all workspace targets, and whitespace checks
 pass.
 

@@ -146,7 +146,9 @@ production file of that name (`src/foo.h` beside `test/mock/foo.h` resolves to
 Production name lookup excludes test bodies unless the caller includes their
 defining file. An ordinary header body looks names up from its own header,
 which no unit indexes, so it asks its includers instead: the header sees
-another file when some unit including it includes that file too. The
+another file when some unit including it is or includes that file. A
+production header asks only production units, so a test unit that includes
+it lends it none of its own bodies or mocks. The
 declaration-family rule below uses the same test. When that exclusion removes the nearest entry, the
 single-result lookup answers with the first remaining body, not a prototype
 registered ahead of it.
