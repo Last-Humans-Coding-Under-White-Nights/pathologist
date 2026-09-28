@@ -2928,6 +2928,7 @@ mod tests {
                 is_virtual: false,
                 is_final: false,
                 is_cpp: true,
+                c_linkage: false,
                 tu: None,
             });
         fx.program

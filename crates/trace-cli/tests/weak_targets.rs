@@ -226,27 +226,77 @@ struct Ops configured_ops = { strong_only };
 /// that — scoping detection to one target silently removed the whole feature.
 #[test]
 fn ipc_bridges_span_link_targets() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    fs::write(
-        root.join("client.cpp"),
+    let bridges = two_image_bridges(
         "struct IRemote { virtual int SendRequest(int) = 0; };\n\
          struct FooProxy {\n\
            IRemote *remote;\n\
            int Run(int a) { return remote->SendRequest(a); }\n\
          };\n\
          int drive(FooProxy *p) { return p->Run(1); }\n",
-    )
-    .unwrap();
-    fs::write(
-        root.join("service.cpp"),
         "struct FooStub {\n\
            int Run(int a) { return a + 1; }\n\
            int OnRemoteRequest(int a) { return Run(a); }\n\
          };\n\
          int serve(FooStub *s) { return s->OnRemoteRequest(2); }\n",
-    )
-    .unwrap();
+    );
+    assert_eq!(
+        bridges,
+        vec![(
+            "FooProxy::Run".into(),
+            "FooStub::Run".into(),
+            "client".into(),
+            "service".into()
+        )],
+        "proxy and stub live in different images"
+    );
+}
+
+/// Interface identity is checked across images too: each side's
+/// `IRemoteProxy<I>` / `IRemoteStub<I>` base comes from its own unit.
+#[test]
+fn ipc_bridges_across_link_targets_match_interfaces() {
+    const HEADER: &str = "struct IRemote { virtual int SendRequest(int) = 0; };\n\
+         template <typename T> class IRemoteProxy;\n\
+         template <typename T> class IRemoteStub;\n\
+         struct IFoo { virtual int Run(int) = 0; };\n\
+         struct IBar { virtual int Run(int) = 0; };\n";
+    let bridges = two_image_bridges(
+        &format!(
+            "{HEADER}\
+             struct FooProxy : IRemoteProxy<IFoo> {{\n\
+               IRemote *remote;\n\
+               int Run(int a) {{ return remote->SendRequest(a); }}\n\
+             }};\n\
+             struct BarProxy : IRemoteProxy<IFoo> {{\n\
+               IRemote *remote;\n\
+               int Run(int a) {{ return remote->SendRequest(a); }}\n\
+             }};\n"
+        ),
+        &format!(
+            "{HEADER}\
+             struct FooStub : IRemoteStub<IFoo> {{ int Run(int a) {{ return a; }} }};\n\
+             struct BarStub : IRemoteStub<IBar> {{ int Run(int a) {{ return a; }} }};\n"
+        ),
+    );
+    assert_eq!(
+        bridges,
+        vec![(
+            "FooProxy::Run".into(),
+            "FooStub::Run".into(),
+            "client".into(),
+            "service".into()
+        )],
+        "BarProxy serves IFoo, BarStub IBar"
+    );
+}
+
+/// Analyze `client.cpp` and `service.cpp` linked into two images and return
+/// the IPC bridges as (caller, callee, caller image, callee image).
+fn two_image_bridges(client: &str, service: &str) -> Vec<(String, String, String, String)> {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("client.cpp"), client).unwrap();
+    fs::write(root.join("service.cpp"), service).unwrap();
     let commands: Vec<_> = ["client", "service"]
         .into_iter()
         .map(|name| {
@@ -279,24 +329,16 @@ fn ipc_bridges_span_link_targets() {
              JOIN functions callee ON callee.id = e.callee_fn_id
              JOIN link_targets ct ON ct.id = caller.target_id
              JOIN link_targets dt ON dt.id = callee.target_id
-             WHERE e.resolution = 'ipc'",
+             WHERE e.resolution = 'ipc'
+             ORDER BY caller.name, callee.name",
         )
         .unwrap();
-    let bridges: Vec<(String, String, String, String)> = stmt
+    let bridges = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    assert_eq!(
-        bridges,
-        vec![(
-            "FooProxy::Run".into(),
-            "FooStub::Run".into(),
-            "client".into(),
-            "service".into()
-        )],
-        "proxy and stub live in different images"
-    );
+    bridges
 }
 
 #[test]

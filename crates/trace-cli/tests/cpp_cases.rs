@@ -5,7 +5,7 @@ mod common;
 
 use std::sync::OnceLock;
 
-use common::{default_opts, fixture, fn_name, has_any_edge, must_not_have_edge};
+use common::{default_opts, fixture, fn_name, has_any_edge, has_edge, must_not_have_edge};
 use trace_analysis::{analyze, AnalysisResult, ResolutionKind};
 use trace_ir::{FnId, Linkage, Program};
 use trace_parse::build_program;
@@ -10974,4 +10974,2167 @@ void (S::*cb)(int) = &S::target;
         total_flow_edges, 2,
         "two initializer flow edges must be exported for S::*cb"
     );
+}
+
+analyzed_fixture!(cpp_singleton_calls);
+
+/// The resolutions of every `caller -> callee` edge.
+fn edge_resolutions(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    callee: &str,
+) -> Vec<ResolutionKind> {
+    analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == caller && fn_name(program, e.callee) == callee)
+        .map(|e| e.resolution)
+        .collect()
+}
+
+/// `(file name, line)` of the call sites behind `caller -> callee` edges.
+fn edge_site_locations(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    callee: &str,
+) -> Vec<(String, u32)> {
+    let mut locations: Vec<(String, u32)> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == caller && fn_name(program, e.callee) == callee)
+        .map(|e| {
+            let span = program.symbols.call_sites[e.call_site.0 as usize].span;
+            let path = &program.symbols.files[span.file.0 as usize].path;
+            let file = path.file_name().unwrap().to_string_lossy().into_owned();
+            (file, span.line)
+        })
+        .collect();
+    locations.sort();
+    locations.dedup();
+    locations
+}
+
+#[test]
+fn cpp_singleton_explicit_parameter_returns() {
+    let (p, a) = cpp_singleton_calls();
+    for (caller, accessor, target) in [
+        ("decl_ptr", "Box::Get", "DeclSvc::Run"),
+        ("decl_ref", "Singleton::GetInstance", "DeclDb::Open"),
+        ("decl_value", "Maker::Make", "DeclDb::Open"),
+        ("decl_auto", "Box::Get", "DeclSvc::Run"),
+        ("decl_auto_ref", "Singleton::GetInstance", "DeclDb::Open"),
+        ("decl_defined", "DefBox::Get", "DeclSvc::Run"),
+    ] {
+        assert_eq!(
+            edge_resolutions(p, a, caller, target),
+            [ResolutionKind::Direct],
+            "{caller} reaches {target}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        assert!(
+            has_any_edge(p, a, caller, accessor),
+            "{caller} calls {accessor}"
+        );
+    }
+    // A declared-only template member stays external; a defined one is direct.
+    assert_eq!(
+        edge_resolutions(p, a, "decl_ptr", "Box::Get"),
+        [ResolutionKind::External]
+    );
+    assert_eq!(
+        edge_resolutions(p, a, "decl_defined", "DefBox::Get"),
+        [ResolutionKind::Direct]
+    );
+}
+
+#[test]
+fn cpp_singleton_qualified_argument_scope() {
+    let (p, a) = cpp_singleton_calls();
+    for (caller, target, other, line) in [
+        (
+            "app::relative",
+            "app::ScopeSvc::Run",
+            "shade::ScopeSvc::Run",
+            9,
+        ),
+        ("rooted", "app::ScopeSvc::Run", "shade::ScopeSvc::Run", 12),
+        (
+            "namespaced_template",
+            "app::ScopeSvc::Run",
+            "shade::ScopeSvc::Run",
+            13,
+        ),
+        (
+            "shade::shadowed",
+            "shade::ScopeSvc::Run",
+            "app::ScopeSvc::Run",
+            21,
+        ),
+        (
+            "lib::template_relative",
+            "shade::ScopeSvc::Run",
+            "app::ScopeSvc::Run",
+            25,
+        ),
+    ] {
+        assert_eq!(
+            edge_site_locations(p, a, caller, target),
+            [("scope.cpp".to_string(), line)],
+            "{caller} reaches {target}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        assert!(
+            must_not_have_edge(p, a, caller, other),
+            "{caller} must not reach {other}"
+        );
+    }
+}
+
+#[test]
+fn cpp_singleton_wrapped_parameter_returns() {
+    let (p, a) = cpp_singleton_calls();
+    for (caller, accessor) in [
+        ("wrap_shared", "DelayedSingleton::GetInstance"),
+        ("wrap_unique", "UniqueHolder::Take"),
+        ("wrap_sptr", "SptrHolder::Get"),
+        ("wrap_shared_auto", "DelayedSingleton::GetInstance"),
+        ("wrap_sptr_auto", "SptrHolder::Get"),
+    ] {
+        assert_eq!(
+            edge_resolutions(p, a, caller, "WrapSvc::Run"),
+            [ResolutionKind::Direct],
+            "{caller} reaches WrapSvc::Run: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        assert!(
+            has_any_edge(p, a, caller, accessor),
+            "{caller} calls {accessor}"
+        );
+    }
+    // The wrapper keeps its own identity: no member is invented on it.
+    for phantom in [
+        "sptr::Run",
+        "shared_ptr::Run",
+        "std::shared_ptr::Run",
+        "unique_ptr::Run",
+    ] {
+        assert!(
+            !p.symbols.functions.iter().any(|f| f.name == phantom),
+            "phantom {phantom}"
+        );
+    }
+}
+
+#[test]
+fn cpp_singleton_conflicting_returns_stay_unknown() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        must_not_have_edge(p, a, "odd_pair", "OddSvc::Run"),
+        "Pair<T> is no wrapper of T: {:?}",
+        common::callees_of(p, a, "odd_pair")
+    );
+    assert!(
+        must_not_have_edge(p, a, "split_get", "OddSvc::Run"),
+        "a disagreeing overload lends no return: {:?}",
+        common::callees_of(p, a, "split_get")
+    );
+}
+
+/// A tree whose wrapper and accessor are declared in two headers, used by a
+/// unit named `user` and ordered first or last among the units by name.
+fn wrapped_return_tree(user: &str, dep: bool) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let headers = if dep {
+        tmp.path().join("dep")
+    } else {
+        tmp.path().to_path_buf()
+    };
+    std::fs::create_dir_all(&headers).unwrap();
+    std::fs::write(
+        headers.join("ref_ptr.h"),
+        "#pragma once\ntemplate <typename T> class sptr {\npublic:\n    T *operator->() const;\n};\n",
+    )
+    .unwrap();
+    std::fs::write(
+        headers.join("holder.h"),
+        "#pragma once\n#include \"ref_ptr.h\"\ntemplate <typename T> class Holder {\npublic:\n    static sptr<T> Get();\n    static std::shared_ptr<T> Shared();\n};\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(user),
+        "#include \"holder.h\"\nclass MergeSvc {\npublic:\n    void Run() {}\n};\nvoid use_sptr() { Holder<MergeSvc>::Get()->Run(); }\nvoid use_shared() { Holder<MergeSvc>::Shared()->Run(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("m_other.cpp"),
+        "#include \"holder.h\"\nvoid other() {}\n",
+    )
+    .unwrap();
+    tmp
+}
+
+#[test]
+fn cpp_singleton_return_facts_survive_header_merge() {
+    for dep in [false, true] {
+        for user in ["a_user.cpp", "z_user.cpp"] {
+            let tmp = wrapped_return_tree(user, dep);
+            let mut opts =
+                trace_preproc::PreprocessOptions::new().with_include(tmp.path().to_path_buf());
+            if dep {
+                opts = opts
+                    .with_include(tmp.path().join("dep"))
+                    .with_dep(tmp.path().join("dep"));
+            }
+            for jobs in [1, 8] {
+                let program =
+                    trace_parse::build_program_with_jobs(tmp.path(), &opts, jobs).expect("build");
+                let (_pag, analysis) = analyze(&program);
+                for caller in ["use_sptr", "use_shared"] {
+                    assert_eq!(
+                        edge_resolutions(&program, &analysis, caller, "MergeSvc::Run"),
+                        [ResolutionKind::Direct],
+                        "{caller} (user {user}, dep {dep}, jobs {jobs}): {:?}",
+                        common::callees_of(&program, &analysis, caller)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cpp_singleton_inherited_static_accessors() {
+    let (p, a) = cpp_singleton_calls();
+    for (caller, accessor, target) in [
+        ("inh_shared", "DelayedSingleton::GetInstance", "InhSvc::Run"),
+        ("inh_ref", "Singleton::GetInstance", "InhDb::Open"),
+        ("inh_mid", "DelayedSingleton::GetInstance", "InhMidSvc::Run"),
+        ("inh_auto", "DelayedSingleton::GetInstance", "InhSvc::Run"),
+        ("inh_hide", "InhHide::GetInstance", "InhOther::Run"),
+    ] {
+        assert_eq!(
+            edge_resolutions(p, a, caller, target),
+            [ResolutionKind::Direct],
+            "{caller} reaches {target}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        assert!(
+            has_any_edge(p, a, caller, accessor),
+            "{caller} calls {accessor}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    assert!(must_not_have_edge(p, a, "inh_hide", "InhHide::Run"));
+    assert!(must_not_have_edge(
+        p,
+        a,
+        "inh_hide",
+        "DelayedSingleton::GetInstance"
+    ));
+    // The accessor is the template's member: none is invented on a subclass.
+    for phantom in [
+        "InhSvc::GetInstance",
+        "InhDb::GetInstance",
+        "InhMidSvc::GetInstance",
+    ] {
+        assert!(
+            !p.symbols.functions.iter().any(|f| f.name == phantom),
+            "phantom {phantom}"
+        );
+    }
+    // CRTP names the subclass as an argument, never as its own base.
+    for cls in ["InhSvc", "InhDb", "InhHide"] {
+        assert!(!p.derives_from(cls, cls), "{cls} derives from itself");
+    }
+}
+
+analyzed_fixture!(cpp_singleton_issue121);
+
+#[test]
+fn cpp_singleton_issue121_fixture_reaches_every_target() {
+    let (p, a) = cpp_singleton_issue121();
+    for (caller, accessor, target) in [
+        ("f1", "DelayedSingleton::GetInstance", "Svc::Run"),
+        ("f2", "DelayedSingleton::GetInstance", "Svc::Run"),
+        ("f3", "Singleton::GetInstance", "Db::Open"),
+        ("f4", "Singleton::GetInstance", "Db::Open"),
+        ("f5", "DelayedSingleton::GetInstance", "Other::Go"),
+        ("f6", "DelayedSingleton::GetInstance", "Other::Go"),
+    ] {
+        assert!(
+            has_edge(p, a, caller, target, ResolutionKind::Direct)
+                && has_any_edge(p, a, caller, accessor),
+            "{caller} reaches {accessor} and {target}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    assert!(!p.derives_from("Svc", "Svc"));
+    assert!(!p.derives_from("Db", "Db"));
+}
+
+analyzed_fixture!(cpp_singleton_missing);
+
+#[test]
+fn cpp_singleton_missing_template_fallback() {
+    let (p, a) = cpp_singleton_missing();
+    for (caller, target) in [
+        ("miss_delayed", "MissSvc::Run"),
+        ("miss_singleton", "MissDb::Open"),
+        ("miss_qualified", "MissSvc::Run"),
+        ("miss_auto", "MissSvc::Run"),
+        ("miss_inherited", "MissInh::Run"),
+    ] {
+        assert_eq!(
+            edge_resolutions(p, a, caller, target),
+            [ResolutionKind::Direct],
+            "{caller} reaches {target}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    for caller in [
+        "miss_wrapper",
+        "miss_other_member",
+        "miss_unresolved",
+        "miss_multi",
+    ] {
+        let guessed: Vec<_> = common::callees_of(p, a, caller)
+            .into_iter()
+            .filter(|(callee, _)| callee.ends_with("::Run"))
+            .collect();
+        assert!(guessed.is_empty(), "{caller} guessed {guessed:?}");
+    }
+    assert!(!p.derives_from("MissInh", "MissInh"));
+    // No accessor is invented as a defined function.
+    assert!(
+        !p.symbols
+            .functions
+            .iter()
+            .any(|f| f.is_defined && f.name.contains("Singleton::")),
+        "defined singleton member invented"
+    );
+}
+
+/// A tree declaring `DelayedSingleton` with `accessor` as its whole body,
+/// in the tree or in a dependency root.
+fn declared_singleton_tree(accessor: &str, dep: bool) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let headers = if dep {
+        tmp.path().join("dep")
+    } else {
+        tmp.path().to_path_buf()
+    };
+    std::fs::create_dir_all(&headers).unwrap();
+    std::fs::write(
+        headers.join("singleton.h"),
+        format!(
+            "#pragma once\nclass Registry {{\npublic:\n    void Run();\n}};\ntemplate <typename T> class DelayedSingleton {{\npublic:\n    {accessor}\n}};\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.cpp"),
+        "#include \"singleton.h\"\nclass OvSvc {\npublic:\n    void Run() {}\n};\nvoid ov() { DelayedSingleton<OvSvc>::GetInstance()->Run(); }\n",
+    )
+    .unwrap();
+    tmp
+}
+
+#[test]
+fn cpp_singleton_declared_return_overrides_fallback() {
+    for dep in [false, true] {
+        for (accessor, expected) in [
+            ("static Registry *GetInstance();", Some("Registry::Run")),
+            ("static int GetInstance();", None),
+        ] {
+            let tmp = declared_singleton_tree(accessor, dep);
+            let mut opts =
+                trace_preproc::PreprocessOptions::new().with_include(tmp.path().to_path_buf());
+            if dep {
+                opts = opts
+                    .with_include(tmp.path().join("dep"))
+                    .with_dep(tmp.path().join("dep"));
+            }
+            let program = build_program(tmp.path(), &opts).expect("build");
+            let (_pag, analysis) = analyze(&program);
+            let callees = common::callees_of(&program, &analysis, "ov");
+            assert!(
+                !callees.iter().any(|(c, _)| c == "OvSvc::Run"),
+                "{accessor} (dep {dep}) wins over the heuristic: {callees:?}"
+            );
+            if let Some(target) = expected {
+                assert!(
+                    callees.iter().any(|(c, _)| c == target),
+                    "{accessor} (dep {dep}) reaches {target}: {callees:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cpp_singleton_ranked_definitions_keep_their_substitution() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(p, a, "ranked_get", "RankSvc::Run", ResolutionKind::Direct),
+        "{:?}",
+        common::callees_of(p, a, "ranked_get")
+    );
+    assert!(must_not_have_edge(p, a, "ranked_get", "Decoy::Run"));
+}
+
+#[test]
+fn cpp_singleton_concrete_first_prototype_lends_no_return() {
+    let (p, a) = cpp_singleton_calls();
+    let callees = common::callees_of(p, a, "concrete_first");
+    assert!(
+        !callees
+            .iter()
+            .any(|(c, _)| c == "Decoy::Run" || c == "FirstSvc::Run"),
+        "{callees:?}"
+    );
+}
+
+#[test]
+fn cpp_singleton_template_parameter_arguments_stay_dependent() {
+    let (p, a) = cpp_singleton_calls();
+    for (caller, target, accessor) in [
+        ("dep_box", "DepSvc::Run", None),
+        (
+            "dep_inherited",
+            "DepInh::Open",
+            Some("Singleton::GetInstance"),
+        ),
+    ] {
+        let callees = common::callees_of(p, a, caller);
+        assert!(
+            !callees.iter().any(|(c, _)| c == target),
+            "{caller}: {callees:?}"
+        );
+        if let Some(accessor) = accessor {
+            assert!(
+                !callees.iter().any(|(c, _)| c == accessor),
+                "{caller}: {callees:?}"
+            );
+        }
+    }
+    let (p, a) = cpp_singleton_missing();
+    let callees = common::callees_of(p, a, "miss_dependent");
+    assert!(
+        !callees.iter().any(|(c, _)| c == "MissSvc::Run"),
+        "miss_dependent: {callees:?}"
+    );
+}
+
+#[test]
+fn cpp_singleton_prototype_and_inline_definition_lend_no_return() {
+    let (p, a) = cpp_singleton_calls();
+    let callees = common::callees_of(p, a, "mixed_get");
+    assert!(
+        !callees
+            .iter()
+            .any(|(c, _)| c == "Decoy2::Run" || c == "MixSvc::Run"),
+        "{callees:?}"
+    );
+}
+
+#[test]
+fn cpp_singleton_plain_class_keeps_its_first_return() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(p, a, "plain_get", "Bar2::Foo", ResolutionKind::Direct),
+        "{:?}",
+        common::callees_of(p, a, "plain_get")
+    );
+    assert!(!p.has_template_returns("Plain"));
+}
+
+#[test]
+fn cpp_singleton_template_template_parameter_is_no_wrapper_class() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        must_not_have_edge(p, a, "tt_get", "Holder2::Run"),
+        "{:?}",
+        common::callees_of(p, a, "tt_get")
+    );
+}
+
+#[test]
+fn cpp_singleton_dependent_template_id_scope_looks_nothing_up() {
+    let (p, a) = cpp_singleton_calls();
+    let callees = common::callees_of(p, a, "wrap_dependent");
+    assert!(
+        !callees.iter().any(|(c, _)| c == "U::GetInstance"),
+        "{callees:?}"
+    );
+    assert!(must_not_have_edge(p, a, "wrap_dependent", "Decoy2::Run"));
+}
+
+#[test]
+fn cpp_singleton_nested_template_is_not_c_utils() {
+    let (p, a) = cpp_singleton_missing();
+    let nested = common::callees_of(p, a, "nested_singleton");
+    assert!(!nested.iter().any(|(c, _)| c == "NestA::Run"), "{nested:?}");
+}
+
+/// R2-9: two units see the wrapper's namespace differently; both record the
+/// same fact, so substitution still agrees.
+#[test]
+fn cpp_singleton_wrapper_fact_is_unit_independent() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("sptr.h"),
+        "#pragma once\nnamespace OHOS {\ntemplate <typename T> class sptr {\npublic:\n    T *operator->() const;\n};\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("holder.h"),
+        "#pragma once\nnamespace OHOS {\ntemplate <typename T> class Holder {\npublic:\n    static sptr<T> Get();\n};\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("a_sees.cpp"),
+        "#include \"sptr.h\"\n#include \"holder.h\"\nclass UnitSvc {\npublic:\n    void Run() {}\n};\nvoid use_holder() { OHOS::Holder<UnitSvc>::Get()->Run(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("b_blind.cpp"),
+        "#include \"holder.h\"\nvoid blind() {}\n",
+    )
+    .unwrap();
+    let opts = trace_preproc::PreprocessOptions::new().with_include(tmp.path().to_path_buf());
+    let program = build_program(tmp.path(), &opts).expect("build");
+    let facts = program
+        .template_returns_of("OHOS::Holder", "OHOS::Holder::Get")
+        .unwrap_or_default();
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "use_holder",
+        "UnitSvc::Run",
+        ResolutionKind::Direct
+    ));
+}
+
+#[test]
+fn cpp_singleton_specializations_keep_primary_substitution() {
+    let (p, a) = cpp_singleton_calls();
+    for caller in ["spec_member", "spec_class"] {
+        assert!(
+            has_edge(p, a, caller, "SpecSvc::Run", ResolutionKind::Direct),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        assert!(must_not_have_edge(p, a, caller, "SpecOther::Run"));
+    }
+}
+
+#[test]
+fn cpp_same_arity_prototype_overloads_keep_their_returns() {
+    let (p, a) = cpp_singleton_calls();
+    for (caller, target, other) in [
+        ("overloaded_int", "OvBaz::Foo", "OvBar::Foo"),
+        ("overloaded_long", "OvBar::Foo", "OvBaz::Foo"),
+    ] {
+        assert!(
+            has_edge(p, a, caller, target, ResolutionKind::Direct),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        assert!(must_not_have_edge(p, a, caller, other), "{caller}");
+    }
+    let overloads = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Overloaded::Get")
+        .count();
+    assert_eq!(overloads, 2, "Get(long) and Get(int) are two entries");
+}
+
+#[test]
+fn cpp_singleton_member_template_template_parameter_is_no_wrapper_class() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        must_not_have_edge(p, a, "member_template", "P::Run"),
+        "{:?}",
+        common::callees_of(p, a, "member_template")
+    );
+}
+
+#[test]
+fn cpp_enumerator_argument_ranks_the_value_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(
+            p,
+            a,
+            "cam::enum_arg",
+            "cam::EnumSession::BeginConfig",
+            ResolutionKind::Direct
+        ),
+        "{:?}",
+        common::callees_of(p, a, "cam::enum_arg")
+    );
+}
+
+#[test]
+fn cpp_member_alias_scope_reaches_the_aliased_static_member() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(
+            p,
+            a,
+            "AliasUser::Use",
+            "AliasImpl::Reg",
+            ResolutionKind::Direct
+        ),
+        "{:?}",
+        common::callees_of(p, a, "AliasUser::Use")
+    );
+}
+
+/// The definition lines of `name`'s callees from `caller`, one per edge.
+fn callee_lines(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    name: &str,
+) -> Vec<u32> {
+    let mut lines: Vec<u32> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == caller && fn_name(program, e.callee) == name)
+        .map(|e| program.symbols.function(e.callee).span.line)
+        .collect();
+    lines.sort_unstable();
+    lines
+}
+
+#[test]
+fn cpp_prototype_call_is_not_redirected_to_another_overloads_definition() {
+    let (p, a) = cpp_singleton_calls();
+    // `Get(int)` is declared on line 15, `Get(long)` defined on line 18.
+    assert_eq!(callee_lines(p, a, "r4_redirect", "R4Sel::Get"), [15]);
+}
+
+#[test]
+fn cpp_unknown_argument_keeps_every_same_arity_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(callee_lines(p, a, "r4_unknown", "R4Sel::Get"), [15, 18]);
+}
+
+#[test]
+fn cpp_out_of_tree_namespace_constant_is_no_enumerator() {
+    let (p, a) = cpp_singleton_calls();
+    let takes = common::callees_of(p, a, "r4_constant")
+        .into_iter()
+        .filter(|(c, _)| c == "R4Take")
+        .count();
+    assert_eq!(takes, 2, "{:?}", common::callees_of(p, a, "r4_constant"));
+}
+
+#[test]
+fn cpp_int_and_class_prototypes_stay_two_overloads() {
+    let (p, a) = cpp_singleton_calls();
+    let sets = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R4Setter::Set")
+        .count();
+    assert_eq!(sets, 2);
+    // `Set(5)` reaches the undefined `Set(int)` (line 31), not `Set(R4Foo)`.
+    assert_eq!(callee_lines(p, a, "r4_set_int", "R4Setter::Set"), [31]);
+}
+
+#[test]
+fn cpp_ranked_overload_substitutes_its_own_return() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(p, a, "r4_substitute", "R4Foo::Go", ResolutionKind::Direct),
+        "{:?}",
+        common::callees_of(p, a, "r4_substitute")
+    );
+}
+
+#[test]
+fn cpp_definition_joins_its_own_prototype_not_the_int_one() {
+    let (p, a) = cpp_singleton_calls();
+    // Prototypes on lines 16 (`int`) and 17 (`sptr<Base>`); definitions on
+    // 19 (`r5::sptr<Base>`) and 20 (`int`). Each call reaches its own body.
+    assert_eq!(callee_lines(p, a, "r5::set_ptr", "r5::Setter::Set"), [19]);
+    assert_eq!(callee_lines(p, a, "r5::set_int", "r5::Setter::Set"), [20]);
+}
+
+#[test]
+fn cpp_same_named_classes_in_two_namespaces_are_two_overloads() {
+    let (p, _) = cpp_singleton_calls();
+    let applies = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R5Cfg::Apply")
+        .count();
+    assert_eq!(applies, 2);
+}
+
+#[test]
+fn cpp_template_instance_parameter_is_not_every_type() {
+    let (p, _) = cpp_singleton_calls();
+    let gets = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R5Get::Get")
+        .count();
+    assert_eq!(gets, 2);
+}
+
+#[test]
+fn cpp_alias_template_return_is_what_it_aliases() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_any_edge(p, a, "r5_alias", "R5Svc::Run"),
+        "{:?}",
+        common::callees_of(p, a, "r5_alias")
+    );
+}
+
+#[test]
+fn cpp_unnamed_reference_parameter_meets_its_prototype() {
+    let (p, _) = cpp_singleton_calls();
+    let links: Vec<_> = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R5Link::Link")
+        .map(|f| f.is_defined)
+        .collect();
+    assert_eq!(links, [true], "one defined entry");
+    let unnamed = p
+        .symbols
+        .variables
+        .iter()
+        .any(|v| v.name == "&" || v.name == "&&");
+    assert!(
+        !unnamed,
+        "no parameter is named by its declarator punctuation"
+    );
+}
+
+#[test]
+fn cpp_known_argument_rules_out_an_overload_it_cannot_bind() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(
+            p,
+            a,
+            "r5_viable",
+            "R5Output::Commit",
+            ResolutionKind::Direct
+        ),
+        "{:?}",
+        common::callees_of(p, a, "r5_viable")
+    );
+}
+
+#[test]
+fn cpp_converting_constructor_keeps_an_overload_viable() {
+    let (p, a) = cpp_singleton_calls();
+    let sets: Vec<u32> = callee_lines(p, a, "r6_convert", "R6Conv::Set");
+    assert_eq!(sets, [15, 16], "both overloads stay candidates");
+}
+
+#[test]
+fn cpp_prototype_does_not_join_another_overloads_inline_definition() {
+    let (p, a) = cpp_singleton_calls();
+    // The inline `Set(int)` is on line 22; `Set(R6Foo)` is defined on line 26.
+    assert_eq!(callee_lines(p, a, "r6_inline", "R6Inline::Set"), [26]);
+}
+
+#[test]
+fn cpp_unnamed_pointer_parameters_keep_their_depth() {
+    let (p, _) = cpp_singleton_calls();
+    let gets = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R6Ptrs::Get" && f.is_defined)
+        .count();
+    assert_eq!(gets, 2, "`int *` and `int **` are two overloads");
+    assert!(
+        !p.symbols.variables.iter().any(|v| v.name == "const"),
+        "a qualifier names no parameter"
+    );
+}
+
+#[test]
+fn cpp_enumerator_shaped_constant_keeps_every_overload() {
+    let (p, a) = cpp_singleton_calls();
+    let logs = common::callees_of(p, a, "r7_constant")
+        .into_iter()
+        .filter(|(c, _)| c == "R7Log")
+        .count();
+    assert_eq!(logs, 2, "{:?}", common::callees_of(p, a, "r7_constant"));
+}
+
+#[test]
+fn cpp_int_stand_in_argument_keeps_the_reference_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(
+        callee_lines(p, a, "r7_standin", "R7Setter::Set"),
+        [11, 12],
+        "{:?}",
+        common::callees_of(p, a, "r7_standin")
+    );
+}
+
+#[test]
+fn cpp_same_final_name_in_unrelated_namespaces_is_no_exact_match() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(
+        callee_lines(p, a, "r7_other_namespace", "R7Apply::Apply"),
+        [21, 22],
+        "{:?}",
+        common::callees_of(p, a, "r7_other_namespace")
+    );
+}
+
+fn edge_count(p: &Program, a: &AnalysisResult, caller: &str, callee: &str) -> usize {
+    common::callees_of(p, a, caller)
+        .into_iter()
+        .filter(|(c, _)| c == callee)
+        .count()
+}
+
+#[test]
+fn cpp_literal_int_does_not_fall_to_a_class_reference_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(edge_count(p, a, "r8_literal", "R8Writer::Write"), 2);
+}
+
+#[test]
+fn cpp_enum_shaped_array_constant_keeps_the_pointer_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(edge_count(p, a, "r8_args", "R8Run"), 2);
+}
+
+/// A call's edges rank on the arguments whose types are known, an unknown
+/// one ranking every candidate alike: `Make(unknown, 5)` binds
+/// `Make(R8X, int)`, as `master` always has (review round 13 reversed R8-6).
+#[test]
+fn cpp_free_call_edges_rank_on_their_known_arguments() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(edge_count(p, a, "r8_unknown", "R8Make::Make"), 1);
+}
+
+/// R8-4: two overloads declared on one line of a header two units include
+/// stay two entries through the merge.
+#[test]
+fn cpp_same_line_overloads_survive_the_merge() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("line.h"),
+        "#pragma once\nstruct LineFoo { void Go() {} };\nstruct LineBar { void Go() {} };\nstruct Line { static LineFoo *Get(int k); static LineBar *Get(const char *k); };\n",
+    )
+    .unwrap();
+    for unit in ["a.cpp", "b.cpp"] {
+        std::fs::write(
+            tmp.path().join(unit),
+            format!(
+                "#include \"line.h\"\nvoid use_{}() {{ Line::Get(\"k\")->Go(); }}\n",
+                &unit[..1]
+            ),
+        )
+        .unwrap();
+    }
+    let opts = trace_preproc::PreprocessOptions::new().with_include(tmp.path().to_path_buf());
+    let program = build_program(tmp.path(), &opts).expect("build");
+    let gets = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Line::Get")
+        .count();
+    assert_eq!(gets, 2);
+    let (_pag, analysis) = analyze(&program);
+    for caller in ["use_a", "use_b"] {
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                caller,
+                "LineBar::Go",
+                ResolutionKind::Direct
+            ),
+            "{caller}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+}
+
+#[test]
+fn cpp_unnamed_function_pointer_and_array_parameters_meet_their_prototypes() {
+    let (p, a) = cpp_singleton_calls();
+    for name in ["R9Svc::E", "R9Svc::F"] {
+        let entries: Vec<bool> = p
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == name)
+            .map(|f| f.is_defined)
+            .collect();
+        assert_eq!(entries, [true], "{name}");
+    }
+    assert!(
+        has_any_edge(p, a, "R9Svc::E", "r9_handler"),
+        "{:?}",
+        common::callees_of(p, a, "R9Svc::E")
+    );
+}
+
+#[test]
+fn cpp_unresolved_class_reference_keeps_its_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(edge_count(p, a, "r9_unresolved", "R9Setter::Set"), 2);
+}
+
+#[test]
+fn cpp_header_call_keeps_a_site_per_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(edge_count(p, a, "R10Pick::Use", "R10Pick::Pick"), 2);
+}
+
+#[test]
+fn cpp_reference_argument_keeps_the_by_value_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(edge_count(p, a, "r10_reference", "R10Taker::Take"), 2);
+}
+
+#[test]
+fn cpp_unresolved_enum_parameter_is_no_exact_match() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(edge_count(p, a, "r10_enum", "R10Mode::SetMode"), 2);
+}
+
+#[test]
+fn cpp_unnamed_pointer_reference_meets_its_definition() {
+    let (p, _) = cpp_singleton_calls();
+    let entries: Vec<bool> = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R10Get::Get")
+        .map(|f| f.is_defined)
+        .collect();
+    assert_eq!(entries, [true]);
+}
+
+#[test]
+fn cpp_unresolved_parameter_definition_joins_its_own_prototype() {
+    let (p, _) = cpp_singleton_calls();
+    let mut entries: Vec<(u32, bool)> = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R11M::Get")
+        .map(|f| (f.span.line, f.is_defined))
+        .collect();
+    entries.sort();
+    // Each definition (lines 16 and 17) took its own prototype's entry.
+    assert_eq!(entries, [(16, true), (17, true)]);
+    let returns: Vec<String> = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R11M::Get" && f.span.line == 16)
+        .map(|f| format!("{:?}", p.types.get(f.return_type).desc))
+        .collect();
+    assert!(returns[0].contains("R11B"), "{returns:?}");
+}
+
+/// R11-3: one header function whose declaration starts at a different
+/// column in two configurations (`API` an attribute macro in one unit, empty
+/// in the other) is one entry.
+#[test]
+fn cpp_header_function_merges_across_configurations_that_move_its_column() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("api.h"),
+        "#pragma once\nAPI inline int Shared() { return 1; }\n",
+    )
+    .unwrap();
+    for unit in ["a.cpp", "b.cpp"] {
+        std::fs::write(
+            tmp.path().join(unit),
+            format!(
+                "#include \"api.h\"\nint use_{}() {{ return Shared(); }}\n",
+                &unit[..1]
+            ),
+        )
+        .unwrap();
+    }
+    let commands = serde_json::json!([
+        {"directory": tmp.path(), "file": "a.cpp", "arguments": ["c++", "-c", "a.cpp", "-DAPI=__attribute__((visibility(\"default\")))"]},
+        {"directory": tmp.path(), "file": "b.cpp", "arguments": ["c++", "-c", "b.cpp", "-DAPI="]}
+    ]);
+    std::fs::write(
+        tmp.path().join("compile_commands.json"),
+        serde_json::to_string(&commands).unwrap(),
+    )
+    .unwrap();
+    let opts = trace_preproc::PreprocessOptions::new().with_include(tmp.path().to_path_buf());
+    let program = build_program(tmp.path(), &opts).expect("build");
+    let shared = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Shared")
+        .count();
+    assert_eq!(shared, 1);
+}
+
+#[test]
+fn cpp_unknown_parameter_prototype_is_not_redirected_to_a_scalar_body() {
+    let (p, _) = cpp_singleton_calls();
+    let entry = |defined: bool| {
+        p.symbols
+            .functions
+            .iter()
+            .find(|f| f.name == "R11Redirect::Set" && f.is_defined == defined)
+            .expect("entry")
+    };
+    // `Set(Mode)` (declared, `Mode` unresolved) is not `Set(int)` (defined),
+    // so a call bound to the prototype is not redirected to that body.
+    assert_eq!(
+        p.symbols.explicit_params_alike(
+            entry(false),
+            entry(true),
+            &p.types,
+            trace_ir::SpellingTolerance::Redeclaration
+        ),
+        Some(false)
+    );
+}
+
+#[test]
+fn cpp_scalar_argument_does_not_bind_an_out_parameter_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(
+            p,
+            a,
+            "r11_enum_global",
+            "R11Session::Stop",
+            ResolutionKind::Direct
+        ),
+        "{:?}",
+        common::callees_of(p, a, "r11_enum_global")
+    );
+}
+
+#[test]
+fn cpp_virtual_call_dispatches_only_to_the_ranked_overloads_overrides() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        must_not_have_edge(p, a, "r13_dispatch", "R13Derived::On"),
+        "{:?}",
+        common::callees_of(p, a, "r13_dispatch")
+    );
+    assert_eq!(edge_count(p, a, "r13_dispatch", "R13Base::On"), 1);
+}
+
+#[test]
+fn cpp_address_argument_binds_the_out_parameter_overload() {
+    let (p, a) = cpp_singleton_calls();
+    let lines = callee_lines(p, a, "r13_address", "R13Create");
+    assert!(lines.contains(&71), "{lines:?}");
+}
+
+#[test]
+fn cpp_subclass_only_overload_does_not_displace_the_base() {
+    let (p, a) = cpp_singleton_calls();
+    let callees = common::callees_of(p, a, "r14_static");
+    assert!(
+        callees.iter().any(|(c, _)| c == "R14Base::On"),
+        "{callees:?}"
+    );
+}
+
+#[test]
+fn cpp_in_tree_class_is_no_int_stand_in_for_the_redirect() {
+    let (p, a) = cpp_singleton_calls();
+    // `R14Set(int)` is declared on line 16; `R14Set(R14Foo)` defined on 18.
+    assert_eq!(callee_lines(p, a, "r14_redirect", "R14Set"), [16]);
+}
+
+#[test]
+fn cpp_address_of_a_reference_is_the_referent_address() {
+    let (p, a) = cpp_singleton_calls();
+    // `R14F(R14Foo *)` is on line 22.
+    assert!(
+        callee_lines(p, a, "r14_address", "R14F").contains(&22),
+        "{:?}",
+        callee_lines(p, a, "r14_address", "R14F")
+    );
+}
+
+#[test]
+fn cpp_inline_template_overloads_substitute_their_own_returns() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(p, a, "r14_inline", "R14Svc::Run", ResolutionKind::Direct),
+        "{:?}",
+        common::callees_of(p, a, "r14_inline")
+    );
+}
+
+#[test]
+fn cpp_guessed_class_argument_leaves_the_others_to_rank() {
+    let (p, a) = cpp_singleton_calls();
+    // `SetParam(.., int)` is on line 5.
+    assert_eq!(callee_lines(p, a, "r15_guess", "R15Want::SetParam"), [5]);
+}
+
+#[test]
+fn cpp_address_of_an_element_through_a_reference_is_a_pointer() {
+    let (p, a) = cpp_singleton_calls();
+    // `R15Write(const int *, int)` is on line 11.
+    assert!(
+        callee_lines(p, a, "r15_subscript", "R15Write").contains(&11),
+        "{:?}",
+        callee_lines(p, a, "r15_subscript", "R15Write")
+    );
+}
+
+#[test]
+fn cpp_dereferenced_smart_pointer_reference_keeps_the_pointee_overload() {
+    let (p, a) = cpp_singleton_calls();
+    // `R16Use(R16Foo &)` is on line 9.
+    assert!(
+        callee_lines(p, a, "r16_deref", "R16Use").contains(&9),
+        "{:?}",
+        callee_lines(p, a, "r16_deref", "R16Use")
+    );
+}
+
+#[test]
+fn cpp_fixed_width_typedef_parameters_meet_their_definitions() {
+    let (p, _) = cpp_singleton_calls();
+    let writes: Vec<bool> = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R16Writer::Write")
+        .map(|f| f.is_defined)
+        .collect();
+    assert_eq!(writes, [true, true]);
+}
+
+#[test]
+fn cpp_derived_argument_keeps_the_base_reference_overload() {
+    let (p, a) = cpp_singleton_calls();
+    // `R17Take(const R17Base &)` is on line 5.
+    assert!(
+        callee_lines(p, a, "r17_derived", "R17Take").contains(&5),
+        "{:?}",
+        callee_lines(p, a, "r17_derived", "R17Take")
+    );
+}
+
+analyzed_fixture!(cpp_template_base_fallback);
+
+#[test]
+fn cpp_template_base_fallback_reaches_proxy() {
+    let (p, a) = cpp_template_base_fallback();
+    for target in ["FooProxy::Do", "FooStub::Do", "FooMock::Do"] {
+        assert!(
+            has_any_edge(p, a, "call", target),
+            "call reaches {target}: {:?}",
+            common::callees_of(p, a, "call")
+        );
+    }
+    assert!(has_any_edge(p, a, "callbar", "BarProxy::Go"));
+    assert!(
+        has_any_edge(p, a, "ns::callscoped", "ns::ScopedProxy::X"),
+        "{:?}",
+        common::callees_of(p, a, "ns::callscoped")
+    );
+}
+
+#[test]
+fn cpp_template_base_definition_disables_guess() {
+    let (p, a) = cpp_template_base_fallback();
+    for target in ["BazPlain::Run", "BazUnrelated::Run"] {
+        assert!(must_not_have_edge(p, a, "callbaz", target), "{target}");
+    }
+    assert!(!p.derives_from("BazPlain", "IBaz"));
+    assert!(!p.derives_from("BazUnrelated", "IBaz"));
+    // Another unit's definition of `Late` decides, too.
+    assert!(!p.derives_from("LateProxy", "IFoo"));
+    assert!(must_not_have_edge(p, a, "call", "LateProxy::Do"));
+}
+
+#[test]
+fn cpp_template_base_fallback_rejects_cycles() {
+    let (p, _) = cpp_template_base_fallback();
+    for cls in ["Crtp", "SSvc", "CycleA", "CycleB"] {
+        assert!(!p.derives_from(cls, cls), "{cls} derives from itself");
+    }
+    assert!(
+        !(p.derives_from("CycleA", "CycleB") && p.derives_from("CycleB", "CycleA")),
+        "a cycle"
+    );
+    assert!(p.bases_of("Prim").iter().all(|b| b != "int"));
+    assert!(!p.derives_from("Multi", "IFoo"));
+    assert!(!p.derives_from("Multi", "IBar"));
+}
+
+#[test]
+fn cpp_template_base_guess_needs_a_class_argument() {
+    let (p, _) = cpp_template_base_fallback();
+    assert!(!p.derives_from("PtrProxy", "IFoo"));
+    assert!(!p.derives_from("NestProxy", "Holder"));
+    assert!(!p.derives_from("NestProxy", "IFoo"));
+    assert!(!p.derives_from("RefProxy", "IFoo"));
+}
+
+#[test]
+fn cpp_template_base_guess_needs_an_override() {
+    let (p, _) = cpp_template_base_fallback();
+    assert!(!p.derives_from("Registry", "Handler"));
+    assert!(!p.derives_from("CaseTest", "Case"));
+}
+
+#[test]
+fn cpp_template_base_override_may_be_in_a_subclass() {
+    let (p, a) = cpp_template_base_fallback();
+    assert!(p.derives_from("TaskStub", "ITask"));
+    assert!(has_any_edge(p, a, "calltask", "TaskService::Perform"));
+}
+
+#[test]
+fn cpp_template_base_member_of_an_instance_is_not_guessed() {
+    let (p, _) = cpp_template_base_fallback();
+    assert!(!p.derives_from("TraitImpl", "IBaz"));
+    assert!(!p.derives_from("NestedImpl", "IBaz"));
+}
+
+#[test]
+fn cpp_template_base_argument_members_include_its_bases() {
+    let (p, a) = cpp_template_base_fallback();
+    assert!(p.derives_from("AllProxy", "IFoo"));
+    assert!(has_any_edge(p, a, "call", "AllProxy::Do"));
+}
+
+#[test]
+fn cpp_template_base_evidence_is_a_virtual_member() {
+    let (p, _) = cpp_template_base_fallback();
+    assert!(!p.derives_from("InfoList", "Info"), "std templates never");
+    assert!(!p.derives_from("PlainerBox", "Plainer"), "non-virtual name");
+}
+
+#[test]
+fn cpp_template_base_file_local_class_is_guessed_in_its_file() {
+    let (p, a) = cpp_template_base_fallback();
+    assert!(has_any_edge(p, a, "call", "AnonProxy::Do"));
+}
+
+#[test]
+fn cpp_template_base_merged_declared_base_is_seen_by_a_file_local_class() {
+    let (p, a) = cpp_template_base_fallback();
+    assert!(has_any_edge(p, a, "calllocal", "LocalImpl::Local"));
+}
+
+#[test]
+fn cpp_template_base_file_local_namesake_keeps_the_global_guess() {
+    let (p, a) = cpp_template_base_fallback();
+    assert!(p.derives_from("TwinProxy", "IFoo"));
+    assert!(has_any_edge(p, a, "call", "TwinProxy::Do"));
+}
+
+#[test]
+fn cpp_template_base_guess_defers_to_a_template_of_its_name() {
+    let (p, a) = cpp_template_base_fallback();
+    assert!(!p.derives_from("BazHidden", "IBaz"));
+    assert!(must_not_have_edge(p, a, "callbaz", "BazHidden::Run"));
+}
+
+#[test]
+fn cpp_template_base_declared_edge_precedes_a_guess() {
+    let (p, _) = cpp_template_base_fallback();
+    assert!(p.derives_from("PB", "PA"), "PDefined<PA> derives from PA");
+    assert!(!p.derives_from("PA", "PB"), "the guess would close a cycle");
+}
+
+/// A definition from a dependency root decides as an in-tree one does.
+#[test]
+fn cpp_template_base_dependency_definition_disables_guess() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dep = tmp.path().join("dep");
+    std::fs::create_dir(&dep).unwrap();
+    std::fs::write(
+        dep.join("wrap.h"),
+        "#pragma once\ntemplate <class T> class DepWrap {};\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.cpp"),
+        "#include \"wrap.h\"\nstruct IQux { virtual void Q() = 0; };\nclass QuxWrap : public DepWrap<IQux> { public: void Q() override {} };\n",
+    )
+    .unwrap();
+    let opts = trace_preproc::PreprocessOptions::new()
+        .with_include(dep.clone())
+        .with_dep(dep);
+    let program = build_program(tmp.path(), &opts).expect("build");
+    assert!(!program.derives_from("QuxWrap", "IQux"));
+}
+
+/// Both undefined singleton templates read their argument alike: an
+/// elaborated `class Svc` names `Svc` for `DelayedSingleton` as for
+/// `Singleton`.
+#[test]
+fn cpp_undefined_singletons_read_an_elaborated_argument() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct Svc { void Run() {} };\nstruct Db { void Put() {} };\n\
+             void a() { DelayedSingleton<class Svc>::GetInstance()->Run(); }\n\
+             void b() { Singleton<class Db>::GetInstance().Put(); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "a", "Svc::Run"));
+    assert!(has_any_edge(&program, &analysis, "b", "Db::Put"));
+}
+
+/// `size_t` is `unsigned long` on LP64 (and `unsigned int` on 32-bit
+/// targets): an override spelling the other keeps its dispatch.
+#[test]
+fn cpp_override_spelling_size_t_differently_keeps_dispatch() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct B { virtual void On(size_t n) = 0; };\n\
+             struct D : B { void On(unsigned long n) override {} };\n\
+             void go(B *b) { b->On(1); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(
+        has_any_edge(&program, &analysis, "go", "D::On"),
+        "{:?}",
+        common::callees_of(&program, &analysis, "go")
+    );
+}
+
+/// A parameter typed by a typedef of an anonymous struct is one type in
+/// every unit, however each unit names the anonymous struct: an override
+/// defined in another unit keeps its dispatch.
+#[test]
+fn cpp_override_of_an_anonymous_struct_parameter_keeps_dispatch() {
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "cb.h",
+                "#pragma once\nstruct Pad { int p; };\ntypedef struct { int v; } Info;\nstruct Callback { virtual void On(Info info) = 0; };\n",
+            ),
+            (
+                "a_session.cpp",
+                "#include \"cb.h\"\nvoid go(Callback *c) { Info i; c->On(i); }\n",
+            ),
+            (
+                "z_test.cpp",
+                "typedef struct { int u; } Other;\n#include \"cb.h\"\nstruct Recording : public Callback { void On(Info info) override {} };\n",
+            ),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(
+        has_any_edge(&program, &analysis, "go", "Recording::On"),
+        "{:?}",
+        common::callees_of(&program, &analysis, "go")
+    );
+}
+
+/// `Db::GetInstance()` inherits c_utils' accessor from an undefined
+/// `DelayedSingleton<Db>` / `Singleton<Db>` base, and the chain on its
+/// result reaches `Db`'s members (#121, `AccessTokenDb::GetInstance()->`).
+#[test]
+fn cpp_accessor_inherited_from_an_undefined_singleton_base_is_typed() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct TokenDb final : public DelayedSingleton<TokenDb> { int Modify(int x) { return x; } };\n\
+             struct Brief : public Singleton<Brief> { void Put() {} };\n\
+             namespace ns { struct Svc : public DelayedSingleton<Svc> { void Go() {} }; }\n\
+             struct Own : public DelayedSingleton<Own> { static Own &GetInstance(); void Run() {} };\n\
+             void a() { TokenDb::GetInstance()->Modify(1); }\n\
+             void b() { Brief::GetInstance().Put(); }\n\
+             void d() { ns::Svc::GetInstance()->Go(); }\n\
+             void e() { Own::GetInstance().Run(); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    for (caller, callee) in [
+        ("a", "TokenDb::Modify"),
+        ("b", "Brief::Put"),
+        ("d", "ns::Svc::Go"),
+        ("e", "Own::Run"),
+    ] {
+        assert!(
+            has_any_edge(&program, &analysis, caller, callee),
+            "{caller} -> {callee}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+}
+
+/// `&r` of a reference to a class is a pointer to the referent: it reaches
+/// `f(Value *)` (a pointer against a by-value class decides nothing, so
+/// `f(Value)` may stay too), and `&q` of a reference to a pointer binds
+/// `Take(int **)`.
+#[test]
+fn cpp_address_of_a_reference_binds_the_pointer_overload() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct Value { int v; };\n\
+             void by_value(int) {}\n\
+             void by_pointer(int) {}\n\
+             void f(Value v) { by_value(v.v); }\n\
+             void f(Value *p) { by_pointer(p->v); }\n\
+             void go(Value &arg) { Value &r = arg; f(&r); }\n\
+             void by_param(Value &arg) { f(&arg); }\n\
+             void Take(int *p) {}\n\
+             void Take(int **p) {}\n\
+             void by_pointer_ref(int *&pr) { int *&q = pr; Take(&q); Take(&pr); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let lines = |caller: &str, callee: &str| -> Vec<u32> {
+        analysis
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(&program, e.caller) == caller && fn_name(&program, e.callee) == callee
+            })
+            .map(|e| program.symbols.function(e.callee).span.line)
+            .collect()
+    };
+    assert!(
+        lines("go", "f").contains(&5),
+        "a local reference reaches f(Value *)"
+    );
+    assert!(
+        lines("by_param", "f").contains(&5),
+        "a reference parameter reaches f(Value *)"
+    );
+    let take = lines("by_pointer_ref", "Take");
+    assert!(
+        take.iter().all(|&l| l == 9) && !take.is_empty(),
+        "Take(int **) on line 9: {take:?}"
+    );
+}
+
+/// An inherited singleton accessor keeps its argument's own arguments:
+/// `Inherited : Singleton<Holder<Svc>>` yields `Holder<Svc>`.
+#[test]
+fn cpp_inherited_singleton_keeps_nested_template_arguments() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct Svc { void Run() {} };\n\
+             template <class T> struct Holder { T *Get() { return nullptr; } };\n\
+             struct Inherited : public Singleton<Holder<Svc>> {};\n\
+             void a() { Inherited::GetInstance().Get()->Run(); }\n\
+             void b() { Singleton<Holder<Svc>>::GetInstance().Get()->Run(); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    for caller in ["a", "b"] {
+        assert!(
+            has_any_edge(&program, &analysis, caller, "Svc::Run"),
+            "{caller}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+}
+
+/// A reference parameter lowered as its referent's address — a scalar
+/// (`int &r`) as much as a class — gives `&r` that address; one to a pointer
+/// typedef (`VP &p`, `VP = Value *`) is not, so `&p` is one layer more.
+#[test]
+fn cpp_address_of_a_reference_parameter_follows_its_lowering() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct Value { int v; };\n\
+             using VP = Value *;\n\
+             void Take(int *p) {}\n\
+             void Take(int **p) {}\n\
+             void Pick(Value *p) {}\n\
+             void Pick(Value **p) {}\n\
+             void scalar(int &r) { Take(&r); }\n\
+             void typedef_ref(VP &p) { Pick(&p); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let lines = |caller: &str, callee: &str| -> Vec<u32> {
+        analysis
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(&program, e.caller) == caller && fn_name(&program, e.callee) == callee
+            })
+            .map(|e| program.symbols.function(e.callee).span.line)
+            .collect()
+    };
+    assert_eq!(lines("scalar", "Take"), [3], "Take(int *) is line 3");
+    assert_eq!(
+        lines("typedef_ref", "Pick"),
+        [6],
+        "Pick(Value **) is line 6"
+    );
+}
+
+/// An override declared (never defined) in the tree reads its parameter
+/// types when its base overloads the name, so a call ranked to another
+/// overload does not dispatch to it.
+#[test]
+fn cpp_declared_override_of_another_overload_gets_no_dispatch() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct B { virtual void On(int n) {} virtual void On(double d) {} };\n\
+             struct D : B { void On(int n) override; };\n\
+             void go(B *b) { b->On(1.0); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "go", "B::On"));
+    assert!(
+        must_not_have_edge(&program, &analysis, "go", "D::On"),
+        "{:?}",
+        common::callees_of(&program, &analysis, "go")
+    );
+}
+
+/// `using B::f;` joins `B::f` to the class's own `f` overloads, so `D::f`'s
+/// prototype records its parameter types.
+#[test]
+fn cpp_using_declaration_makes_an_overload_set() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct B { void f(char *s) {} };\n\
+             struct D : B { using B::f; void f(int n); };\n\
+             void go(D *d) { char *s = 0; d->f(s); }\n",
+        )],
+        default_opts,
+    );
+    // Member lookup stops at `D`, which declares `f`, so the call's edges
+    // do not show it; the prototype's recorded types do.
+    let f = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "D::f" && !f.is_defined)
+        .expect("D::f prototype");
+    assert!(
+        program
+            .symbols
+            .explicit_params(f)
+            .is_some_and(|p| p.get(0).is_some()),
+        "D::f records its parameter type"
+    );
+}
+
+/// A singleton base whose argument names no class does not end the search
+/// for the accessor's result; a resolvable one further up still types it.
+#[test]
+fn cpp_inherited_singleton_search_passes_an_unresolved_base() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct Svc { void Run() {} };\n\
+             struct Base : public DelayedSingleton<Svc> {};\n\
+             struct Leaf : public Singleton<Missing>, public Base {};\n\
+             void go() { Leaf::GetInstance()->Run(); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(
+        has_any_edge(&program, &analysis, "go", "Svc::Run"),
+        "{:?}",
+        common::callees_of(&program, &analysis, "go")
+    );
+}
+
+/// Parentheses around a reference change nothing: `&(x)` of an `int &x`
+/// parameter is `x`'s address, as `&x` is.
+#[test]
+fn cpp_address_of_a_parenthesized_reference_parameter() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "void take(int *p) {}\n\
+             void take(int **p) {}\n\
+             void caller(int &x) { take(&(x)); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let lines: Vec<u32> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "caller" && fn_name(&program, e.callee) == "take"
+        })
+        .map(|e| program.symbols.function(e.callee).span.line)
+        .collect();
+    assert_eq!(lines, [1], "take(int *) is line 1");
+}
+
+/// A member returning a function type whose parameters are named is named
+/// by its own declarator, not by a parameter name inside the return type.
+#[test]
+fn cpp_member_named_by_its_declarator_not_its_return_type() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "namespace std { template <class F> class function; }\n\
+             class TimeBroker {\n\
+             public:\n\
+                 std::function<void(unsigned handle)> GetExpiredFunc(unsigned handle);\n\
+             };\n",
+        )],
+        default_opts,
+    );
+    let names: Vec<&str> = program
+        .symbols
+        .functions
+        .iter()
+        .map(|f| f.name.as_str())
+        .filter(|n| n.starts_with("TimeBroker::"))
+        .collect();
+    assert_eq!(names, ["TimeBroker::GetExpiredFunc"]);
+}
+
+/// A pointer or reference return wraps the member's function declarator;
+/// the member is still named by it, not by a parameter in the return type.
+#[test]
+fn cpp_member_returning_a_pointer_named_by_its_declarator() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "namespace std { template <class F> class function; }\n\
+             class TimeBroker {\n\
+             public:\n\
+                 std::function<void(unsigned handle)> *GetExpiredFunc(unsigned handle);\n\
+                 std::function<void(unsigned token)> &GetRenewFunc(unsigned token);\n\
+             };\n",
+        )],
+        default_opts,
+    );
+    let mut names: Vec<&str> = program
+        .symbols
+        .functions
+        .iter()
+        .map(|f| f.name.as_str())
+        .filter(|n| n.starts_with("TimeBroker::"))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["TimeBroker::GetExpiredFunc", "TimeBroker::GetRenewFunc"]
+    );
+}
+
+/// A free function defined where a parameter's type does not resolve (the
+/// header declaring it is not included there) still meets its prototype,
+/// which read the type: calls through the prototype reach the body.
+#[test]
+fn cpp_free_definition_with_an_unresolved_parameter_meets_its_prototype() {
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "api.h",
+                "typedef struct Callbacks { void (*on)(void); } Callbacks;\n\
+                 struct Session;\n\
+                 extern \"C\" int Register(struct Session *s, Callbacks *cb);\n",
+            ),
+            (
+                "impl.cpp",
+                "struct Session { int id; };\n\
+                 extern \"C\" int Register(struct Session *s, Callbacks *cb) { return s->id; }\n",
+            ),
+            (
+                "user.cpp",
+                "#include \"api.h\"\nint use(Session *s) { return Register(s, 0); }\n",
+            ),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let targets: Vec<bool> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "use" && fn_name(&program, e.callee) == "Register"
+        })
+        .map(|e| program.symbols.function(e.callee).is_defined)
+        .collect();
+    assert_eq!(targets, [true], "use reaches Register's body");
+}
+
+/// An `extern "C"` prototype meets its definition by arity only where a
+/// parameter's type may be an unresolved name read as `int`: a C++ overload
+/// of the name with another known type stays a separate function.
+#[test]
+fn cpp_c_linkage_prototype_keeps_apart_an_overload_of_another_type() {
+    let (_dir, program) = build_tree(
+        &[
+            ("api.h", "extern \"C\" void f(int v);\nvoid f(double d);\n"),
+            ("impl.cpp", "#include \"api.h\"\nvoid f(double d) { }\n"),
+            ("user.cpp", "#include \"api.h\"\nvoid use() { f(1); }\n"),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let targets: Vec<bool> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(&program, e.caller) == "use" && fn_name(&program, e.callee) == "f")
+        .map(|e| program.symbols.function(e.callee).is_defined)
+        .collect();
+    assert_eq!(
+        targets,
+        [false],
+        "f(1) binds the C prototype, not f(double)'s body"
+    );
+}
+
+/// A `static` function declared inside `extern "C"` still has internal
+/// linkage: each unit's copy stays its own.
+#[test]
+fn cpp_static_prototype_with_c_linkage_stays_in_its_unit() {
+    let unit = |ret: &str, caller: &str| {
+        format!(
+            "extern \"C\" {{ static int helper(int x); }}\n\
+             static int helper(int x) {{ return {ret}; }}\n\
+             int {caller}() {{ return helper(1); }}\n"
+        )
+    };
+    let (_dir, program) = build_tree(
+        &[
+            ("one.cpp", &unit("x", "a")),
+            ("two.cpp", &unit("x + 1", "b")),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let body_line_file = |caller: &str| -> Vec<String> {
+        analysis
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(&program, e.caller) == caller && fn_name(&program, e.callee) == "helper"
+            })
+            .map(|e| {
+                let f = program.symbols.function(e.callee);
+                format!(
+                    "{}:{}",
+                    program.symbols.files[f.file.0 as usize]
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy(),
+                    f.is_defined
+                )
+            })
+            .collect()
+    };
+    assert_eq!(body_line_file("a"), ["one.cpp:true"]);
+    assert_eq!(body_line_file("b"), ["two.cpp:true"]);
+}
+
+/// A header without a guard, included twice under different macros inside a
+/// cached header, contributes both expansions to a unit that replays it.
+#[test]
+fn cpp_repeated_unguarded_header_keeps_both_expansions_on_replay() {
+    let (_dir, program) = build_tree(
+        &[
+            ("decl.h", "struct NAME { void Run(); };\n"),
+            (
+                "both.h",
+                "#ifndef BOTH_H\n#define BOTH_H\n#define NAME First\n#include \"decl.h\"\n\
+                 #undef NAME\n#define NAME Second\n#include \"decl.h\"\n#undef NAME\n#endif\n",
+            ),
+            (
+                "a_impl.cpp",
+                "#include \"both.h\"\nvoid First::Run() {}\nvoid Second::Run() {}\n",
+            ),
+            (
+                "b_user.cpp",
+                "#include \"both.h\"\nvoid use(First *f, Second *s) { f->Run(); s->Run(); }\n",
+            ),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let mut callees: Vec<String> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(&program, e.caller) == "use")
+        .map(|e| fn_name(&program, e.callee))
+        .collect();
+    callees.sort();
+    assert_eq!(callees, ["First::Run", "Second::Run"]);
+}
+
+/// Copies of one header call in units that bound it differently — one to a
+/// declaration it saw, one to nothing — are one call site.
+#[test]
+fn cpp_header_call_bound_in_one_unit_only_is_one_site() {
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "h.h",
+                "#pragma once\n#ifdef WITH_S\nstruct S { void Run(); };\n#else\nstruct S;\n#endif\n\
+                 inline void f(S *s) { s->Run(); }\n",
+            ),
+            (
+                "a.cpp",
+                "#define WITH_S\n#include \"h.h\"\nvoid a(S *s) { f(s); }\n",
+            ),
+            ("b.cpp", "#include \"h.h\"\nvoid b(S *s) { f(s); }\n"),
+        ],
+        default_opts,
+    );
+    let sites: Vec<Option<String>> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|cs| cs.callee_name.ends_with("Run"))
+        .map(|cs| cs.callee_fn_id.map(|f| fn_name(&program, f)))
+        .collect();
+    for cs in &program.symbols.call_sites {
+        eprintln!(
+            "SITE {} {:?} caller={} callee={:?}",
+            cs.callee_name,
+            cs.span,
+            fn_name(&program, cs.caller),
+            cs.callee_fn_id.map(|f| fn_name(&program, f))
+        );
+    }
+    assert_eq!(sites.len(), 1, "one call to Run in h.h: {sites:?}");
+}
+
+/// A call ranked against overloads whose parameter types lowering cannot
+/// tell apart (enum classes) binds each of them once: an overload beside
+/// another in one class is not an equal definition of it.
+#[test]
+fn cpp_sibling_overloads_read_alike_are_not_equal_definitions() {
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "ret.h",
+                "#pragma once\nenum class A { X };\nenum class B { Y };\n\
+                 struct Ret {\n    explicit Ret(A a) {}\n    explicit Ret(B b) {}\n};\n",
+            ),
+            (
+                "use.cpp",
+                "#include \"ret.h\"\nvoid use() { Ret r(A::X); }\n",
+            ),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let mut edges: Vec<u32> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "use" && fn_name(&program, e.callee) == "Ret::Ret"
+        })
+        .map(|e| program.symbols.function(e.callee).span.line)
+        .collect();
+    edges.sort();
+    let distinct = {
+        let mut d = edges.clone();
+        d.dedup();
+        d
+    };
+    assert_eq!(edges, distinct, "each constructor once: {edges:?}");
+}
+
+fn overload_params_reached(
+    program: &trace_ir::Program,
+    analysis: &trace_analysis::AnalysisResult,
+    caller: &str,
+) -> Vec<String> {
+    let mut reached: Vec<String> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == caller)
+        .map(|e| {
+            let f = program.symbols.function(e.callee);
+            let params: Vec<String> = program
+                .symbols
+                .explicit_params(f)
+                .map(|p| {
+                    (0..p.len())
+                        .filter_map(|i| p.get(i))
+                        .map(|ty| format!("{:?}", program.types.get(ty).desc))
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!("{}({})", fn_name(program, e.callee), params.join(","))
+        })
+        .collect();
+    reached.sort();
+    reached.dedup();
+    reached
+}
+
+/// `NULL` (a literal `0`) converts to any pointer, so an out-parameter
+/// overload stays a callee of `Get(NULL)` beside one taking a class.
+#[test]
+fn cpp_null_argument_keeps_an_out_parameter_overload() {
+    let (_dir, program) = build_tree(
+        &[(
+            "use.cpp",
+            "#define NULL 0\ntemplate <class T> class sptr;\nstruct Foo {};\n\
+             struct Bar {};\nstruct S { int Get(Bar v); int Get(sptr<Foo> *out); };\n\
+             int use(S &s) { return s.Get(NULL); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let reached = overload_params_reached(&program, &analysis, "use");
+    assert!(
+        reached.iter().any(|r| r.contains("Ptr(")),
+        "Get(sptr<Foo> *) is reached: {reached:?}"
+    );
+}
+
+/// A negated or digit-grouped literal zero (`-0`, `0'0`) is a null pointer
+/// constant as `0` is, so it keeps the out-parameter overload too. Lowering
+/// types neither spelling yet, which keeps the overload on its own; this
+/// holds the rule once it does.
+#[test]
+fn cpp_spelled_zero_argument_keeps_an_out_parameter_overload() {
+    for zero in ["-0", "0'0", "(-(0))"] {
+        let (_dir, program) = build_tree(
+            &[(
+                "use.cpp",
+                &format!(
+                    "template <class T> class sptr;\nstruct Foo {{}};\n\
+                     struct Bar {{}};\nstruct S {{ int Get(Bar v); int Get(sptr<Foo> *out); }};\n\
+                     int use(S &s) {{ return s.Get({zero}); }}\n"
+                ),
+            )],
+            default_opts,
+        );
+        let (_, analysis) = analyze(&program);
+        let reached = overload_params_reached(&program, &analysis, "use");
+        assert!(
+            reached.iter().any(|r| r.contains("Ptr(")),
+            "Get({zero}) reaches Get(sptr<Foo> *): {reached:?}"
+        );
+    }
+}
+
+/// A result's type is chosen with the same null-constant rule as the edges:
+/// `Get(0)` may be either overload, so an `auto` local it initialises takes
+/// neither return type and no one method call is bound through it.
+#[test]
+fn cpp_null_argument_leaves_a_result_type_to_every_overload() {
+    let (_dir, program) = build_tree(
+        &[(
+            "use.cpp",
+            "template <class T> class sptr;\nstruct Foo {};\nstruct Bar {};\n\
+             struct A { void Run(); };\nstruct B { void Run(); };\n\
+             struct S { A *Get(Bar v); B *Get(sptr<Foo> *out); };\n\
+             void use(S &s) { auto p = s.Get(0); p->Run(); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(
+        must_not_have_edge(&program, &analysis, "use", "A::Run"),
+        "{:?}",
+        common::callees_of(&program, &analysis, "use")
+    );
+}
+
+/// A class value binds a reference to its base but never a pointer to it:
+/// `Take(Base *)` leaves `Take(Derived)` the exact match for a `Derived`.
+#[test]
+fn cpp_class_value_does_not_convert_to_a_pointer_to_its_base() {
+    let (_dir, program) = build_tree(
+        &[(
+            "use.cpp",
+            "struct Base {};\nstruct Derived : Base {};\n\
+             void Take(Base *b);\nvoid Take(Derived d);\n\
+             void use(Derived d) { Take(d); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let reached = overload_params_reached(&program, &analysis, "use");
+    assert_eq!(reached.len(), 1, "only Take(Derived): {reached:?}");
+    assert!(!reached[0].contains("Ptr("), "{reached:?}");
+}
+
+/// A class with a conversion operator may become the out-parameter's
+/// pointer; one without stays a value no pointer parameter takes.
+#[test]
+fn cpp_class_argument_with_a_conversion_keeps_a_pointer_overload() {
+    let (_dir, program) = build_tree(
+        &[(
+            "use.cpp",
+            "template <class T> class sptr;\nstruct Foo {};\n\
+             struct Source { operator sptr<Foo> *(); };\nstruct Plain {};\n\
+             void choose(sptr<Foo> *p);\nvoid choose(double d);\n\
+             void use(Source src) { choose(src); }\nvoid plain(Plain p) { choose(p); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let converted = overload_params_reached(&program, &analysis, "use");
+    assert_eq!(converted.len(), 2, "both choose overloads: {converted:?}");
+    let plain = overload_params_reached(&program, &analysis, "plain");
+    assert_eq!(plain.len(), 1, "only choose(double): {plain:?}");
+}
+
+/// The accessor inherited from the nearest undefined singleton base types
+/// the call: `Singleton<Svc>` one class up wins over a `DelayedSingleton`
+/// two classes up behind a later base.
+#[test]
+fn cpp_nearest_inherited_singleton_base_types_the_accessor() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct Svc;\nstruct Other { void Run() {} };\n\
+             struct Near : public Singleton<Svc> {};\n\
+             struct Mid : public DelayedSingleton<Other> {};\n\
+             struct Far : public Mid {};\n\
+             struct Svc : public Near, public Far { void Run() {} };\n\
+             void use() { Svc::GetInstance().Run(); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(
+        has_any_edge(&program, &analysis, "use", "Svc::Run"),
+        "{:?}",
+        common::callees_of(&program, &analysis, "use")
+    );
+    assert!(must_not_have_edge(&program, &analysis, "use", "Other::Run"));
+}
+
+/// A callback typedef the defining unit does not see reads as an `int`
+/// stand-in there; the `extern "C"` prototype naming it as a function
+/// pointer still meets that definition.
+#[test]
+fn cpp_c_linkage_prototype_meets_a_definition_missing_its_callback_typedef() {
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "api.h",
+                "struct Session;\ntypedef void (*OnChange)(struct Session *s, int v);\n\
+                 extern \"C\" int RegisterCb(struct Session *s, OnChange cb);\n",
+            ),
+            (
+                "impl.cpp",
+                "struct Session { int id; };\n\
+                 extern \"C\" int RegisterCb(struct Session *s, OnChange cb) { return s->id; }\n",
+            ),
+            (
+                "user.cpp",
+                "#include \"api.h\"\nint use(Session *s) { return RegisterCb(s, 0); }\n",
+            ),
+        ],
+        default_opts,
+    );
+    let entries = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "RegisterCb")
+        .map(|f| f.is_defined)
+        .collect::<Vec<_>>();
+    assert_eq!(entries, [true], "prototype and body are one entry");
+}
+
+/// Units that select different `#if` definitions of one function in a
+/// header leave a declaring unit's call reaching both: they are one
+/// function's definitions, not sibling overloads.
+#[test]
+fn cpp_alternate_header_definitions_stay_equal_candidates() {
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "choose.h",
+                "#ifdef FAST\nint choose() { return 1; }\n#else\nint choose() { return 2; }\n#endif\n",
+            ),
+            ("a.cpp", "#define FAST\n#include \"choose.h\"\nint a() { return choose(); }\n"),
+            ("b.cpp", "#include \"choose.h\"\nint b() { return choose(); }\n"),
+            ("c.cpp", "int choose();\nint c() { return choose(); }\n"),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let mut lines: Vec<u32> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(&program, e.caller) == "c" && fn_name(&program, e.callee) == "choose")
+        .map(|e| program.symbols.function(e.callee).span.line)
+        .collect();
+    lines.sort();
+    assert_eq!(lines, [2, 4], "both definitions");
+}
+
+/// As [`cpp_alternate_header_definitions_stay_equal_candidates`], for a
+/// member whose `#if` bodies units select inside its class.
+#[test]
+fn cpp_alternate_member_definitions_stay_equal_candidates() {
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "choose.h",
+                "struct C {\n#ifdef FAST\n    int choose() { return 1; }\n#else\n    int choose() { return 2; }\n#endif\n};\n",
+            ),
+            ("a.cpp", "#define FAST\n#include \"choose.h\"\nint a(C &c) { return c.choose(); }\n"),
+            ("b.cpp", "#include \"choose.h\"\nint b(C &c) { return c.choose(); }\n"),
+            ("c.cpp", "struct C { int choose(); };\nint c(C &c) { return c.choose(); }\n"),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let mut lines: Vec<u32> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "c" && fn_name(&program, e.callee) == "C::choose"
+        })
+        .map(|e| program.symbols.function(e.callee).span.line)
+        .collect();
+    lines.sort();
+    lines.dedup();
+    assert_eq!(lines, [3, 5], "both definitions");
 }

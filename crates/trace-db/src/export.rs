@@ -777,6 +777,7 @@ mod tests {
                 is_virtual: false,
                 is_final: false,
                 is_cpp: false,
+                c_linkage: false,
                 tu: None,
             });
             let id = program.symbols.alloc_var_id();

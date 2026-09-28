@@ -269,22 +269,22 @@ fn ipc_interface_fallback_prefers_defined_overrides() {
     let (program, pag, analysis) = build("ipc_interface_fallback");
 
     assert!(
-        program.template_bases.iter().any(|fact| {
+        program.template_bases().iter().any(|fact| {
             fact.derived == "svc::WrappedStub"
                 && fact.spelling == "OHOS::IRemoteStub<IWrapped>"
                 && fact.declaration_scope == "svc"
         }),
         "expected templated inheritance to survive lowering and merge, got: {:?}",
-        program.template_bases
+        program.template_bases()
     );
     assert!(
-        program.template_bases.iter().any(|fact| {
+        program.template_bases().iter().any(|fact| {
             fact.derived == "svc::RelativeStub"
                 && fact.spelling == "OHOS::IRemoteStub<api::IRelative>"
                 && fact.declaration_scope == "svc"
         }),
         "expected relative qualified template argument and scope, got: {:?}",
-        program.template_bases
+        program.template_bases()
     );
 
     let bridge_names: Vec<_> = pag
@@ -480,4 +480,172 @@ fn ipc_smart_ptr_reaches_the_stub_through_an_undeclared_wrapper() {
     }
 
     assert_eq!(pag.ipc_bridges.len(), 2);
+}
+
+#[test]
+fn cpp_singleton_ipc_chain_reaches_service() {
+    let (program, _pag, analysis) = build("cpp_singleton_ipc");
+    let has = |caller: &str, callee: &str| {
+        analysis
+            .call_edges
+            .iter()
+            .any(|e| fn_name(&program, e.caller) == caller && fn_name(&program, e.callee) == callee)
+    };
+    assert!(has("app", "DelayedSingleton::GetInstance"));
+    assert!(has("app", "FooClient::Launch"));
+    assert!(
+        has("FooClient::Launch", "FooProxy::Start"),
+        "the client reaches the proxy through IFoo"
+    );
+    assert!(has_bridge_edge(
+        &program,
+        &analysis,
+        "FooProxy::Start",
+        "FooService::Start"
+    ));
+}
+
+#[test]
+fn ipc_rejects_known_interface_mismatch() {
+    let (program, _pag, analysis) = build("ipc_interface_mismatch");
+    assert!(
+        !has_bridge_edge(&program, &analysis, "WidgetProxy::Ping", "WidgetStub::Ping"),
+        "IFoo's proxy is not IBar's stub"
+    );
+    assert!(has_bridge_edge(
+        &program,
+        &analysis,
+        "api::GoodProxy::Ping",
+        "api::GoodStub::Ping"
+    ));
+    assert!(
+        has_bridge_edge(&program, &analysis, "LegacyProxy::Ping", "LegacyStub::Ping"),
+        "unknown interfaces keep name-based pairing"
+    );
+    assert!(
+        !has_bridge_edge(&program, &analysis, "RelayProxy::Ping", "RelayStub::Ping"),
+        "RelayStub serves IBar through its middle base, so it is not IFoo's stub"
+    );
+    assert!(
+        has_bridge_edge(&program, &analysis, "ExtProxy::Ping", "ExtStub::Ping"),
+        "a derived interface serves its base's stub"
+    );
+    assert!(
+        has_bridge_edge(&program, &analysis, "OrphanProxy::Ping", "OrphanStub::Ping"),
+        "dropping a bridge takes a declared interface on both sides"
+    );
+    assert!(
+        has_bridge_edge(&program, &analysis, "TplProxy::Ping", "TplStub::Ping"),
+        "a template parameter is not an interface"
+    );
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "alias_ns::AliasProxy::Ping",
+            "alias_ns::AliasStub::Ping"
+        ),
+        "an alias names the class it aliases"
+    );
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "sh::cam::ShadowProxy::Ping",
+            "sh::cam::ShadowStub::Ping"
+        ),
+        "a shadowing reading does not drop the bridge"
+    );
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "client::UsedProxy::Ping",
+            "client::UsedStub::Ping"
+        ),
+        "a using-directive may import the interface a bare name spells"
+    );
+    assert!(
+        !has_bridge_edge(&program, &analysis, "GlobProxy::Ping", "GlobStub::Ping"),
+        "`::IGlob` is the global class, not gapi's namesake"
+    );
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "client2::AlProxy::Ping",
+            "client2::AlStub::Ping"
+        ),
+        "a bare spelling may name an imported alias"
+    );
+    assert!(
+        has_bridge_edge(&program, &analysis, "DeepProxy::Ping", "IDeep::Ping"),
+        "a recovered interface's own IRemoteStub base is followed"
+    );
+    assert!(
+        !has_bridge_edge(&program, &analysis, "DepProxy::Ping", "Iface2::Ping"),
+        "a template parameter is no fallback ancestor"
+    );
+    let reached: Vec<String> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(&program, e.caller) == "ping")
+        .map(|e| fn_name(&program, e.callee))
+        .collect();
+    for target in ["WidgetMock::Ping", "WidgetProxy::Ping"] {
+        assert!(reached.iter().any(|c| c == target), "{target}: {reached:?}");
+    }
+}
+
+#[test]
+fn no_ipc_flag_drops_only_the_bridges() {
+    type Edge = (String, String, String);
+    let edges = |extra: &[&str]| -> Vec<Edge> {
+        let db = common::TempDb::new("ipc.db");
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_trace"))
+            .arg("analyze")
+            .arg(fixture("ipc_basic"))
+            .args(["--include"])
+            .arg(fixture("include"))
+            .args(extra)
+            .arg("-o")
+            .arg(db.path())
+            .output()
+            .expect("run trace analyze");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let conn = trace_db::open_db(db.path()).expect("open exported database");
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM call_edges ce \
+                 WHERE ce.call_site_id IS NOT NULL \
+                 AND NOT EXISTS (SELECT 1 FROM call_sites cs WHERE cs.id = ce.call_site_id)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count edges without a call site row");
+        assert_eq!(orphans, 0, "a synthetic site was indexed as a call site");
+        let mut stmt = conn
+            .prepare(
+                "SELECT caller.name, callee.name, ce.resolution FROM call_edges ce \
+                 JOIN functions caller ON caller.id = ce.caller_fn_id \
+                 JOIN functions callee ON callee.id = ce.callee_fn_id \
+                 ORDER BY 1, 2, 3",
+            )
+            .expect("prepare edge query");
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query edges")
+            .collect::<Result<_, _>>()
+            .expect("read edges");
+        rows
+    };
+    let with = edges(&[]);
+    let without = edges(&["--no-ipc"]);
+    assert!(with.iter().any(|(_, _, resolution)| resolution == "ipc"));
+    let ordinary: Vec<&Edge> = with.iter().filter(|(_, _, r)| r != "ipc").collect();
+    assert_eq!(without.iter().collect::<Vec<_>>(), ordinary);
 }

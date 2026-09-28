@@ -65,6 +65,9 @@ pub struct TemplateBase {
     pub declaration_scope: String,
     /// The base spelling mentions an enclosing template parameter.
     pub is_dependent: bool,
+    /// The file whose anonymous namespace defines `derived`, whose bases
+    /// that file's view keeps apart (`Program::add_anonymous_base`).
+    pub anonymous_in: Option<FileId>,
 }
 
 /// A C++ class template's parameters and the bases that mention them
@@ -122,18 +125,41 @@ type HeaderFunctions = FxHashMap<String, FxHashMap<Arc<str>, FnId>>;
 /// A group holds every record whose fingerprint collided, so it is one entry
 /// deep except on a hash collision and the merge confirms each candidate.
 pub type CallFactBuckets = FxHashMap<u64, Vec<CallSiteId>>;
-/// Stable call-occurrence coordinates plus callee name. For macro member
-/// calls these coordinates and the chain fingerprint come from the
-/// replacement-list access operator, independently of the request position
-/// exported for the call.
-pub type CallSourceKey = (FileId, u32, u32, Option<(FileId, u32, u32)>, u64, String);
+/// A call site's source identity: its stable occurrence coordinates (for a
+/// macro member call, those of the replacement-list access operator and the
+/// chain fingerprint, independently of the request position exported for
+/// it), the callee name, and the merged entry it resolved to. One call bound
+/// to two same-arity overloads is two sites of one name, which the entry
+/// keeps apart; copies of a header's site in several units meet when they
+/// bound the one merged entry, as copies of a header's call to a header's
+/// function do, and stay apart where the units bound them differently.
+pub type CallSourceKey = (
+    FileId,
+    u32,
+    u32,
+    Option<(FileId, u32, u32)>,
+    u64,
+    String,
+    Option<FnId>,
+);
+
+/// A function merged at one `(file, line)`: its column, its entry, and the
+/// unit that met it last. Units merge one after another, so the last one is
+/// the current one exactly when this unit has met the entry already.
+#[derive(Debug, Clone, Copy)]
+pub struct FnKeyEntry {
+    pub col: u32,
+    pub id: FnId,
+    pub last_unit: FileId,
+}
 
 /// Cross-unit deduplication state used by the merge stage: entities whose
 /// origin (header file + position) was already merged map to the first copy.
 #[derive(Debug, Clone, Default)]
 pub struct MergeDedup {
-    /// `(file, line) → name → FnId` so a hit does not clone the function name.
-    pub fn_keys: FxHashMap<(FileId, u32), FxHashMap<String, FnId>>,
+    /// `(file, line) → name → entries` so a hit does not clone the function
+    /// name; see [`FnKeyEntry`].
+    pub fn_keys: FxHashMap<(FileId, u32), FxHashMap<String, Vec<FnKeyEntry>>>,
     /// Expanded definitions recorded by lowering or replayed from cached headers
     /// into a TU preamble; program_into_unit transfers these to UnitIndex.
     pub internal_definitions: FxHashMap<FnId, Arc<str>>,
@@ -180,18 +206,80 @@ impl MergeDedup {
             .insert(text, id);
     }
 
-    pub fn existing_fn(&self, file: FileId, name: &str, line: u32) -> Option<FnId> {
-        self.fn_keys
-            .get(&(file, line))
-            .and_then(|by_name| by_name.get(name))
-            .copied()
+    /// The entry a function declared at `(file, line, col)` named `name`
+    /// merges into, for the unit `unit`. The column tells two overloads on
+    /// one line apart, except those one macro declares on one line: they
+    /// share its expansion column and so one entry (a known limit,
+    /// docs/ANALYSIS.md, **Overloads**). A lone entry only other units recorded
+    /// matches whatever column this unit's configuration started the
+    /// declaration at (`API void Foo();` with `API` an attribute in one unit
+    /// and empty in another). Once this unit has met the entry at its own
+    /// column, or when it declares the name at more than one column of the
+    /// line (`unit_columns`), another column is another function (a second
+    /// overload the first unit's configuration never saw), whichever of its
+    /// declarations the unit merges first.
+    ///
+    /// A variant (`variant`) is another configuration of the family the entry
+    /// was recorded for (another configuration of one unit, or, with a
+    /// compilation database, any unit of the family merged after its first),
+    /// so for it a lone entry matches another column whoever met it.
+    ///
+    /// A hit here is taken as the same function without the signature check
+    /// `SymbolTable::register_function` makes: position and name are the
+    /// whole test, as they were when the key had no column. So a declaration
+    /// at a column only other units recorded, in a unit declaring the name
+    /// once on the line, joins their entry even if its parameters differ (an
+    /// overload one configuration adds where another spells a different one
+    /// at another column). docs/ANALYSIS.md, **Overloads**, records the
+    /// limit.
+    pub fn existing_fn(
+        &self,
+        file: FileId,
+        name: &str,
+        (line, col): (u32, u32),
+        unit: FileId,
+        unit_columns: usize,
+        variant: bool,
+    ) -> Option<FnId> {
+        let entries = self.fn_keys.get(&(file, line))?.get(name)?;
+        if let Some(hit) = entries.iter().find(|entry| entry.col == col) {
+            return Some(hit.id);
+        }
+        // Entries that all name one function (its columns in several
+        // configurations) are one lone function.
+        let lone = entries.first()?;
+        let met_here = entries.iter().any(|entry| entry.last_unit == unit);
+        (entries.iter().all(|entry| entry.id == lone.id)
+            && (variant || (!met_here && unit_columns <= 1)))
+            .then_some(lone.id)
     }
 
-    pub fn insert_fn(&mut self, file: FileId, name: String, line: u32, id: FnId) {
-        self.fn_keys
-            .entry((file, line))
-            .or_default()
-            .insert(name, id);
+    /// Record `id` at `(file, line, col)` under `name`, met by `unit`. A hit
+    /// updates the entry in place without cloning the name.
+    pub fn insert_fn(
+        &mut self,
+        file: FileId,
+        name: &str,
+        (line, col): (u32, u32),
+        id: FnId,
+        unit: FileId,
+    ) {
+        let by_name = self.fn_keys.entry((file, line)).or_default();
+        let entries = match by_name.get_mut(name) {
+            Some(entries) => entries,
+            None => by_name.entry(name.to_owned()).or_default(),
+        };
+        match entries.iter_mut().find(|entry| entry.col == col) {
+            Some(entry) => {
+                entry.id = id;
+                entry.last_unit = unit;
+            }
+            None => entries.push(FnKeyEntry {
+                col,
+                id,
+                last_unit: unit,
+            }),
+        }
     }
 
     /// Record a diagnostic's origin, returning whether it is the first of its
@@ -223,14 +311,24 @@ impl MergeDedup {
     }
 }
 
-/// A class-template member returning a bare type parameter. Kept with
-/// types across header-unit merges; looked up by class and member name.
+/// A class-template member returning a type parameter, bare (`T *Get()`) or
+/// as the sole argument of another class template (`sptr<T> Get()`). Kept
+/// with types across header-unit merges; looked up by class and member name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateReturn {
     pub arity: u32,
     /// None blocks inference for an unsupported same-arity return.
     pub parameter: Option<usize>,
     pub pointer_depth: usize,
+    /// The class template the parameter is returned inside, named from the
+    /// declaring template's scope (`std::shared_ptr` for
+    /// `std::shared_ptr<T>`); `None` for a bare parameter.
+    pub wrapper: Option<String>,
+    /// The declaration's explicit parameter types, so a call that ranking
+    /// narrowed to one same-arity overload substitutes that overload's
+    /// return. Kept as descriptors, like [`ArrowReturn::target`], so the fact
+    /// needs no remapping across unit merges.
+    pub params: Vec<crate::TypeDesc>,
 }
 
 /// What a C++ class's declared `operator->` returns, kept apart from the
@@ -297,10 +395,13 @@ pub struct Program {
     /// (for example, `IRemoteStub`), while consumers that understand a
     /// particular template can inspect the preserved spelling
     /// (`IRemoteStub<IFoo>`).
-    pub template_bases: Vec<TemplateBase>,
+    template_bases: Vec<TemplateBase>,
     /// `template_bases` as a set: a unit's facts are re-added by every unit
     /// merging it, and a scan of the list per fact was quadratic.
     template_base_set: rustc_hash::FxHashSet<TemplateBase>,
+    /// Positions in `template_bases` by derived class, so a lookup reads a
+    /// class's own facts (as `bases_by_class` does for inheritance).
+    template_bases_by_class: FxHashMap<String, Vec<usize>>,
     /// Declared C++ `operator->` returns, merged with a unit's types so a
     /// header's wrappers are followable from every unit that includes it.
     pub arrow_returns: Vec<ArrowReturn>,
@@ -446,6 +547,7 @@ impl Program {
         base: &str,
         declaration_scope: &str,
         is_dependent: bool,
+        anonymous_in: Option<FileId>,
     ) {
         if derived.is_empty() || base.is_empty() {
             return;
@@ -455,6 +557,7 @@ impl Program {
             spelling: base.to_string(),
             declaration_scope: declaration_scope.to_string(),
             is_dependent,
+            anonymous_in,
         });
     }
 
@@ -467,6 +570,11 @@ impl Program {
         }
         if !self.template_base_set.contains(fact) {
             self.template_base_set.insert(fact.clone());
+            push_edge_index(
+                &mut self.template_bases_by_class,
+                &fact.derived,
+                self.template_bases.len(),
+            );
             self.template_bases.push(fact.clone());
         }
     }
@@ -511,12 +619,27 @@ impl Program {
         }
     }
 
-    /// Templated base-class facts declared directly on `cls`.
+    /// Templated base-class facts declared directly on `cls`, in the order
+    /// they were recorded.
     pub fn template_bases_of(&self, cls: &str) -> Vec<&TemplateBase> {
-        self.template_bases
-            .iter()
-            .filter(|fact| fact.derived == cls)
+        self.template_bases_by_class
+            .get(cls)
+            .into_iter()
+            .flatten()
+            .map(|&i| &self.template_bases[i])
             .collect()
+    }
+
+    /// Every templated base-class fact, in the order they were recorded.
+    pub fn template_bases(&self) -> &[TemplateBase] {
+        &self.template_bases
+    }
+
+    /// Move the facts out, leaving none (and no index) behind.
+    pub fn take_template_bases(&mut self) -> Vec<TemplateBase> {
+        self.template_bases_by_class.clear();
+        self.template_base_set.clear();
+        std::mem::take(&mut self.template_bases)
     }
 
     /// Record that `member` of class template `owner` substitutes `fact`

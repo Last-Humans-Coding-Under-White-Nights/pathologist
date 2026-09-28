@@ -48,6 +48,21 @@ impl TypeDesc {
             _ => None,
         }
     }
+
+    /// A class or union: a type with members.
+    pub fn is_class_like(&self) -> bool {
+        matches!(self, TypeDesc::Struct { .. } | TypeDesc::Union { .. })
+    }
+
+    /// The type under every pointer layer, and how many layers there were.
+    pub fn innermost(&self) -> (&TypeDesc, usize) {
+        let (mut desc, mut layers) = (self, 0);
+        while let Some(pointee) = desc.pointee() {
+            desc = pointee;
+            layers += 1;
+        }
+        (desc, layers)
+    }
 }
 
 /// Numeric-category classification used by C++ overload-table construction
@@ -831,6 +846,36 @@ impl TypeTable {
         self.declared_structs.contains(name)
     }
 
+    /// Every class name the index declares, in no particular order.
+    pub fn declared_class_names(&self) -> impl Iterator<Item = &str> {
+        self.declared_structs.iter().map(|name| name.as_ref())
+    }
+
+    /// `name` when the index declares a class by it, else the class a
+    /// `typedef` or `using` alias spelled `name` stands for (aliases register
+    /// under their bare and qualified spellings, so a qualified name never
+    /// lands on an unrelated namespace's alias). A leading `::` aside. The one
+    /// reading of a lexical lookup candidate as a class.
+    pub fn declared_class(&self, name: &str) -> Option<String> {
+        // Tags are registered without the global-scope prefix.
+        let name = name.strip_prefix("::").unwrap_or(name);
+        if self.is_struct_declared(name) {
+            return Some(name.to_owned());
+        }
+        match self.resolve_alias(name)? {
+            TypeDesc::Struct { name, .. } if self.is_struct_declared(name) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether the index declares the class `name` spells, a template
+    /// instance by its template (`OHOS::sptr<Foo>` by `OHOS::sptr`), a
+    /// leading `::` aside. The one test of a class being out of view.
+    pub fn declares_class(&self, name: &str) -> bool {
+        let head = name.split('<').next().unwrap_or(name).trim();
+        self.is_struct_declared(head.trim_start_matches("::"))
+    }
+
     pub fn is_struct_defined(&self, name: &str) -> bool {
         self.defined_structs.contains(name)
     }
@@ -1048,7 +1093,7 @@ fn same_param_type_inner(
 /// non-pointer, or function pointers of different parameter lists are told
 /// apart.
 pub fn may_name_same_type(a: &TypeDesc, b: &TypeDesc) -> bool {
-    let named = |t: &TypeDesc| matches!(t, TypeDesc::Struct { .. } | TypeDesc::Union { .. });
+    let named = TypeDesc::is_class_like;
     match (a, b) {
         (TypeDesc::Unknown, _) | (_, TypeDesc::Unknown) => true,
         (TypeDesc::Int, other) | (other, TypeDesc::Int)
@@ -1061,6 +1106,14 @@ pub fn may_name_same_type(a: &TypeDesc, b: &TypeDesc) -> bool {
         | (TypeDesc::Array { elem: x, .. }, TypeDesc::Ptr(y))
         | (TypeDesc::Array { elem: x, .. }, TypeDesc::Array { elem: y, .. }) => {
             may_name_same_type(x, y)
+        }
+        // Units number an anonymous tag each their own way (`anon_4`,
+        // `anon_9`): its fields say whether two are one type.
+        (TypeDesc::Struct { name: x, .. }, TypeDesc::Struct { name: y, .. })
+        | (TypeDesc::Union { name: x, .. }, TypeDesc::Union { name: y, .. })
+            if is_anonymous_tag(x) || is_anonymous_tag(y) =>
+        {
+            same_type_shape(a, b, true)
         }
         (TypeDesc::Struct { name: x, .. }, TypeDesc::Struct { name: y, .. })
         | (TypeDesc::Union { name: x, .. }, TypeDesc::Union { name: y, .. }) => {
@@ -1078,14 +1131,75 @@ pub fn may_name_same_type(a: &TypeDesc, b: &TypeDesc) -> bool {
 }
 
 /// Whether one spelling is the other, or the other with namespace or class
-/// qualifiers in front of it: `ns::Obj` beside `Obj`.
+/// qualifiers in front of it: `ns::Obj` beside `Obj`. A template instance
+/// compares its class and each argument that way (`ns::sptr<ns::Base>`
+/// beside `ns::sptr<Base>`); a scope with arguments (`A<X>::B`) is compared
+/// as written.
 fn same_or_requalified(x: &str, y: &str) -> bool {
+    let (x, y) = (x.trim(), y.trim());
+    match (split_instance(x), split_instance(y)) {
+        (Some((xh, xa)), Some((yh, ya))) => {
+            same_head(xh, yh)
+                && xa.len() == ya.len()
+                && xa.iter().zip(&ya).all(|(a, b)| same_or_requalified(a, b))
+        }
+        // `Outer<A>::Inner<B>` does not split; read both whole.
+        _ => same_head(x, y),
+    }
+}
+
+/// [`same_or_requalified`] for spellings without template arguments.
+pub(crate) fn same_head(x: &str, y: &str) -> bool {
     let (x, y) = (x.trim_start_matches("::"), y.trim_start_matches("::"));
     let (long, short) = if x.len() >= y.len() { (x, y) } else { (y, x) };
     long == short
         || long
             .strip_suffix(short)
             .is_some_and(|qualifiers| qualifiers.ends_with("::"))
+}
+
+/// The top-level arguments of the first template-argument list in `raw`, and
+/// the byte offset just past its closing `>`; `None` when `raw` has none or
+/// the list never closes (`Map<K`, `A<B<C>`). A
+/// function type's parameter list (`Callback<void(int, char)>`) keeps its own
+/// commas, and `W<>` has no arguments. The one parser of argument lists, for
+/// lowering and signature comparison alike.
+pub fn template_argument_list(raw: &str) -> Option<(Vec<&str>, usize)> {
+    let start = raw.find('<')?;
+    let mut depth = 0;
+    let mut paren = 0;
+    let mut from = start + 1;
+    let mut args = Vec::new();
+    for (i, c) in raw.char_indices().skip_while(|(i, _)| *i <= start) {
+        match c {
+            '(' => paren += 1,
+            ')' if paren > 0 => paren -= 1,
+            _ if paren > 0 => {}
+            '<' => depth += 1,
+            '>' if depth > 0 => depth -= 1,
+            ',' | '>' if depth == 0 => {
+                let arg = raw[from..i].trim();
+                // `W<>` has no arguments; the empty slice is not one.
+                if !(arg.is_empty() && args.is_empty() && c == '>') {
+                    args.push(arg);
+                }
+                from = i + 1;
+                if c == '>' {
+                    return Some((args, i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `Head<A, B>` as its head and top-level arguments, when the spelling is one
+/// template instance whose argument list closes it (`A<X>::B<Y>` is not).
+pub fn split_instance(spelling: &str) -> Option<(&str, Vec<&str>)> {
+    let (args, end) = template_argument_list(spelling)?;
+    let open = spelling.find('<')?;
+    (end == spelling.len()).then(|| (&spelling[..open], args))
 }
 
 /// [`same_param_type`] on two descriptors: the parameter rule, so it can also
@@ -1841,6 +1955,24 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_tags_units_number_differently_may_name_one_type() {
+        // `typedef struct { float v; } Info;` is `anon_4` in one unit and
+        // `anon_9` in another: one type, compared by its fields.
+        let anon = |name: &str, field: &str| TypeDesc::Struct {
+            name: name.into(),
+            fields: vec![(field.into(), TypeDesc::Float)],
+        };
+        assert!(may_name_same_type(
+            &anon("ns::anon_4", "apertureValue"),
+            &anon("ns::anon_9", "apertureValue")
+        ));
+        assert!(!may_name_same_type(
+            &anon("ns::anon_4", "apertureValue"),
+            &anon("ns::anon_9", "zoom")
+        ));
+    }
+
+    #[test]
     fn anonymous_members_are_matched_on_their_type() {
         // Anonymous members all share the empty name, so name-only matching
         // would let the first one swallow every other one.
@@ -1880,5 +2012,21 @@ mod tests {
             2,
             "the identical anonymous member is shared, the differing one is added"
         );
+    }
+
+    /// A list that never closes is no list, so a spelling that ends in `>`
+    /// without closing its first list is no instance with no arguments.
+    #[test]
+    fn an_unclosed_template_argument_list_is_none() {
+        assert_eq!(template_argument_list("Map<K"), None);
+        assert_eq!(template_argument_list("A<B<C>"), None);
+        assert_eq!(split_instance("A<B<C>"), None);
+        assert_eq!(split_instance("Map<K"), None);
+        assert_eq!(
+            template_argument_list("A<B<C>>"),
+            Some((vec!["B<C>"], "A<B<C>>".len()))
+        );
+        assert_eq!(split_instance("A<B<C>>"), Some(("A", vec!["B<C>"])));
+        assert_eq!(split_instance("A<X>::B<Y>"), None);
     }
 }

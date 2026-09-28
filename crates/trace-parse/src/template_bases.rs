@@ -2,13 +2,13 @@
 //! "Template-parameter bases"): `class S : public IRemoteStub<IFoo>` with
 //! `template<class I> class IRemoteStub : public I` derives from `IFoo`.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use trace_ir::{ClassTemplate, FileId, Program};
+use trace_ir::{ClassTemplate, FileId, Program, TemplateBase};
 
 use crate::lower::{
-    held_class_in_declaration_scope, normalize_qualified, receiver_lookup_name, sanitize_type_name,
-    template_arguments, template_tail,
+    held_class_in_declaration_scope, is_undefined_wrapper, normalize_qualified,
+    receiver_lookup_name, sanitize_type_name, template_arguments, template_tail,
 };
 
 /// Nesting depth followed through dependent bases; deeper chains stop here.
@@ -153,21 +153,169 @@ pub(crate) fn add_parameter_bases(
 /// ever expanded while lowering its own file, so here none is consulted and
 /// none hides a linked template of its name.
 pub(crate) fn expand_template_parameter_bases(program: &mut Program) {
-    if program.class_templates.is_empty() {
-        return;
+    let mut declared = Vec::new();
+    let mut guessed = Vec::new();
+    for fact in program.template_bases().iter().filter(|f| !f.is_dependent) {
+        let edge = |base| Edge {
+            derived: fact.derived.clone(),
+            base,
+            anonymous_in: fact.anonymous_in,
+        };
+        if !program.class_templates.is_empty() {
+            let reached = parameter_bases(
+                program,
+                &fact.spelling,
+                &fact.declaration_scope,
+                Templates::Merged,
+            );
+            declared.extend(reached.into_iter().map(edge));
+        }
+        guessed.extend(undefined_template_base(program, fact).map(edge));
     }
-    let mut edges = Vec::new();
-    for fact in program.template_bases.iter().filter(|f| !f.is_dependent) {
-        let reached = parameter_bases(
-            program,
-            &fact.spelling,
-            &fact.declaration_scope,
-            Templates::Merged,
-        );
-        edges.extend(reached.into_iter().map(|base| (fact.derived.clone(), base)));
+    for edge in declared {
+        edge.add_to(program);
     }
-    for (derived, base) in edges {
-        program.add_inheritance(&derived, &base);
+    // Guesses land after every declared base, and each only when it closes
+    // no cycle: `A : W<B>` and `B : W<A>` add only the first
+    // (docs/ANALYSIS.md, "Template-parameter bases").
+    for guess in overriding(program, guessed) {
+        if !program.derives_from(&guess.base, &guess.derived) {
+            guess.add_to(program);
+        }
+    }
+}
+
+/// A base a merged templated base reaches for `derived`.
+struct Edge {
+    derived: String,
+    base: String,
+    anonymous_in: Option<FileId>,
+}
+
+impl Edge {
+    /// Add the edge; a file-local class keeps it apart in its file's view,
+    /// as lowering does.
+    fn add_to(&self, program: &mut Program) {
+        if let Some(file) = self.anonymous_in {
+            program.add_anonymous_base(&self.derived, file, &self.base);
+        }
+        program.add_inheritance(&self.derived, &self.base);
+    }
+}
+
+/// The class a base spelled with an undefined class template derives its
+/// class from: the template's sole argument, when it names a class the index
+/// declares (`FooProxy : IRemoteProxy<IFoo>` derives from `IFoo` while the
+/// ipc headers are out of the tree). Nothing for a template the tree defines
+/// (whatever its bases, the declared rules decide), a standard-library one
+/// (none derives from its argument), a member of an instance
+/// (`Outer<IFoo>::Inner`, `Outer<IFoo>::Inner<IBar>`), the derived class
+/// itself (CRTP), or several, pointer, reference, cv-qualified or non-class
+/// arguments.
+fn undefined_template_base(program: &Program, fact: &TemplateBase) -> Option<String> {
+    let spelling = fact.spelling.trim();
+    let template = receiver_lookup_name(spelling);
+    if !is_undefined_wrapper(program, spelling, &template)
+        || template.trim_start_matches("::").starts_with("std::")
+    {
+        return None;
+    }
+    // Defined under the name lookup reaches from the class's scope, or with
+    // a leading `::` the tag table does not spell.
+    let resolved = held_class_in_declaration_scope(program, &fact.declaration_scope, &template);
+    if resolved.is_some_and(|name| program.types.is_struct_defined(&name)) {
+        return None;
+    }
+    let [argument]: [String; 1] = template_arguments(spelling).try_into().ok()?;
+    if is_compound(&argument) {
+        return None;
+    }
+    let argument = sanitize_type_name(&argument);
+    let class = held_class_in_declaration_scope(program, &fact.declaration_scope, &argument)?;
+    let class = receiver_lookup_name(&class).into_owned();
+    (class != fact.derived && program.types.declares_class(&class)).then_some(class)
+}
+
+/// Whether a template argument is more than a class name: a pointer, a
+/// reference, a cv-qualified type or a template instance.
+fn is_compound(argument: &str) -> bool {
+    argument.contains(['*', '&', '<'])
+        || argument
+            .split_whitespace()
+            .any(|word| word == "const" || word == "volatile")
+}
+
+/// The guesses whose derived class, or a class deriving from it, declares a
+/// member named like a virtual member of the guessed base or its bases: a
+/// class implementing what it wraps (a stub's service implements its
+/// interface), not a container or test fixture of it
+/// (`Registry : Box<Handler>`).
+fn overriding(program: &Program, guesses: Vec<Edge>) -> Vec<Edge> {
+    if guesses.is_empty() {
+        return guesses;
+    }
+    let members = Members::new(program);
+    // Many classes wrap one interface; its virtual names are read once.
+    let mut virtuals: HashMap<String, HashSet<&str>> = HashMap::new();
+    guesses
+        .into_iter()
+        .filter(|guess| {
+            let virtuals = virtuals.entry(guess.base.clone()).or_insert_with(|| {
+                with_bases(program, &guess.base)
+                    .iter()
+                    .flat_map(|class| members.of(class, true))
+                    .collect()
+            });
+            !virtuals.is_empty()
+                && program
+                    .subclass_closure(&guess.derived)
+                    .iter()
+                    .any(|class| members.of(class, false).any(|name| virtuals.contains(name)))
+        })
+        .collect()
+}
+
+/// `class` and its transitive bases.
+fn with_bases(program: &Program, class: &str) -> Vec<String> {
+    let mut classes = vec![class.to_string()];
+    let mut seen: HashSet<String> = classes.iter().cloned().collect();
+    let mut index = 0;
+    while index < classes.len() {
+        for base in program.bases_of(&classes[index]) {
+            if seen.insert(base.clone()) {
+                classes.push(base);
+            }
+        }
+        index += 1;
+    }
+    classes
+}
+
+/// Member function names by owning class, with whether each is virtual.
+struct Members<'p>(HashMap<&'p str, Vec<(&'p str, bool)>>);
+
+impl<'p> Members<'p> {
+    fn new(program: &'p Program) -> Self {
+        let mut by_owner: HashMap<&str, Vec<(&str, bool)>> = HashMap::new();
+        for function in &program.symbols.functions {
+            if let Some((owner, member)) = function.name.rsplit_once("::") {
+                by_owner
+                    .entry(owner)
+                    .or_default()
+                    .push((member, function.is_virtual));
+            }
+        }
+        Self(by_owner)
+    }
+
+    /// The names `class` declares, only its virtual ones when `only_virtual`.
+    fn of(&self, class: &str, only_virtual: bool) -> impl Iterator<Item = &'p str> + '_ {
+        self.0
+            .get(class)
+            .into_iter()
+            .flatten()
+            .filter(move |(_, is_virtual)| *is_virtual || !only_virtual)
+            .map(|(name, _)| *name)
     }
 }
 
@@ -416,9 +564,9 @@ mod tests {
         add_template(&mut program, "OHOS::IRemoteStub", &["I"], &["I"]);
         add_template(&mut program, "Layer", &["I"], &["I"]);
         add_template(&mut program, "Wrapper", &["T"], &["Layer<T>"]);
-        program.add_template_base("BarImpl", "Wrapper<IBar>", "", false);
-        program.add_template_base("svc::Scoped", "OHOS::IRemoteStub<IFoo>", "svc", false);
-        program.add_template_base("Generic", "OHOS::IRemoteStub<T>", "", true);
+        program.add_template_base("BarImpl", "Wrapper<IBar>", "", false, None);
+        program.add_template_base("svc::Scoped", "OHOS::IRemoteStub<IFoo>", "svc", false, None);
+        program.add_template_base("Generic", "OHOS::IRemoteStub<T>", "", true, None);
 
         expand_template_parameter_bases(&mut program);
 
@@ -436,7 +584,7 @@ mod tests {
         let mut program = Program::default();
         program.types.define_struct("Loop");
         add_template(&mut program, "Loop", &["T"], &["Loop<T>"]);
-        program.add_template_base("User", "Loop<int>", "", false);
+        program.add_template_base("User", "Loop<int>", "", false, None);
         expand_template_parameter_bases(&mut program); // must terminate
         assert!(program.bases_of("User").is_empty());
     }
@@ -642,7 +790,7 @@ mod tests {
         add_parameter_bases(&mut program, "Own", "Twin<IA>", "", (FileId(1), &[]), false);
         assert_eq!(program.bases_of("Own"), ["IA"], "the file's own is nearer");
 
-        program.add_template_base("Merged", "Twin<IA>", "", false);
+        program.add_template_base("Merged", "Twin<IA>", "", false, None);
         expand_template_parameter_bases(&mut program);
         assert_eq!(
             program.bases_of("Merged"),

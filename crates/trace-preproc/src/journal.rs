@@ -255,13 +255,16 @@ impl ExpansionJournal {
 
     /// Keep `entry` back as a variant of `key`, if the list the run sees
     /// admits it.
+    /// Returns the handle a record of `entry` resolves through at commit:
+    /// its own, or that of the variant already holding its signature; `None`
+    /// when the list is full.
     pub(crate) fn publish(
         &mut self,
         key: ExpansionKey,
         cache: &ExpansionCache,
         ahead: &[Arc<ExpansionJournal>],
         entry: IncludeExpansion,
-    ) {
+    ) -> Option<usize> {
         let seen = Seen::of(&mut self.seen, &key, cache, ahead);
         let own = self.pending.entry(key).or_default();
         let signatures = seen
@@ -270,8 +273,19 @@ impl ExpansionJournal {
             .map(|v| v.signature)
             .chain(own.iter().map(|e| e.signature));
         if admits_variant(signatures, self.cap, entry.signature) {
+            let handle = provisional(entry.id);
             own.push(entry);
+            return Some(handle);
         }
+        if let Some(variant) = seen.view.iter().find(|v| v.signature == entry.signature) {
+            return Some(match variant.source {
+                Source::Stored(index) => index,
+                Source::Ahead { .. } => provisional(variant.id),
+            });
+        }
+        own.iter()
+            .find(|e| e.signature == entry.signature)
+            .map(|e| provisional(e.id))
     }
 
     /// Whether the cache already rules this run out. A run not ruled out can
@@ -691,5 +705,246 @@ mod tests {
         assert!(commit(&first, &cache).is_some());
         assert_eq!(commit(&second, &cache), Some(vec![(tree.header(), 0)]));
         assert_eq!(stored(&cache, &tree.header()).len(), 1);
+    }
+
+    #[test]
+    fn a_later_replay_keeps_the_variant_first_adopted() {
+        // `outer.h` records the full `b.h` as its nested variant, and its
+        // replay defines `B_H` without covering `b.h`, so a later
+        // `#include "b.h"` matches the stored guard-defined (empty) variant.
+        // The unit reached both: the full one first, which alone holds
+        // `b.h`'s declarations.
+        let tree = Tree::new(&[
+            (
+                "b.h",
+                "// b\n#ifndef B_H\n#define B_H\nint brief;\n#endif\n",
+            ),
+            (
+                "outer.h",
+                "#ifndef OUTER_H\n#define OUTER_H\n#include \"b.h\"\nint outer;\n#endif\n",
+            ),
+            ("w.c", "#include \"b.h\"\n"),
+            ("p.c", "#include \"outer.h\"\n"),
+            ("e.c", "#define B_H\n#include \"b.h\"\n"),
+            ("c.c", "#include \"outer.h\"\n#include \"b.h\"\n"),
+        ]);
+        let cache = new_cache();
+        for unit in ["w.c", "p.c", "e.c"] {
+            tree.run(unit, &cache, false);
+        }
+        let brief = tree.root.join("b.h");
+        let variants = stored(&cache, &brief);
+        let full = variants
+            .iter()
+            .position(|text| text.contains("brief"))
+            .expect("the full variant is stored");
+        assert!(
+            variants.iter().any(|text| !text.contains("brief")),
+            "a guard-defined variant is stored: {variants:?}"
+        );
+        let consumer = tree.run("c.c", &cache, false);
+        assert!(
+            consumer.replayed_variants.contains(&(brief.clone(), full)),
+            "{:?} lacks ({brief:?}, {full})",
+            consumer.replayed_variants
+        );
+    }
+
+    #[test]
+    fn an_entry_records_the_variant_its_publisher_expanded_itself() {
+        // `p.c` expands the guarded `b.h` live, publishing its full variant,
+        // then builds `outer.h`, whose `#include "b.h"` the guard skips. The
+        // entry takes `b.h`'s macro effects (its guard) and must also say
+        // which `b.h` it stands for, or a consumer replaying `outer.h` gets
+        // the guard without the declarations.
+        let tree = Tree::new(&[
+            ("b.h", "#ifndef B_H\n#define B_H\nint brief;\n#endif\n"),
+            (
+                "outer.h",
+                "#ifndef OUTER_H\n#define OUTER_H\n#include \"b.h\"\nint outer;\n#endif\n",
+            ),
+            ("p.c", "#include \"b.h\"\n#include \"outer.h\"\n"),
+            ("c.c", "#include \"outer.h\"\n#include \"b.h\"\n"),
+        ]);
+        let cache = new_cache();
+        tree.run("p.c", &cache, false);
+        let brief = tree.root.join("b.h");
+        let full = stored(&cache, &brief)
+            .iter()
+            .position(|text| text.contains("brief"))
+            .expect("the full variant is stored");
+        let consumer = tree.run("c.c", &cache, false);
+        assert!(
+            consumer.replayed_variants.contains(&(brief.clone(), full)),
+            "{:?} lacks ({brief:?}, {full})",
+            consumer.replayed_variants
+        );
+    }
+
+    #[test]
+    fn an_entry_records_the_nested_headers_it_expanded_live() {
+        // `outer.h` includes `mid.h`, which includes `b.h`; one run expands
+        // all three. `outer.h`'s entry holds the other two as nested
+        // includes and must record them as it records replayed ones, or a
+        // consumer replaying `outer.h` gets `b.h`'s guard without it.
+        let tree = Tree::new(&[
+            ("b.h", "#ifndef B_H\n#define B_H\nint brief;\n#endif\n"),
+            (
+                "mid.h",
+                "#ifndef MID_H\n#define MID_H\n#include \"b.h\"\n#endif\n",
+            ),
+            (
+                "outer.h",
+                "#ifndef OUTER_H\n#define OUTER_H\n#include \"mid.h\"\n#endif\n",
+            ),
+            ("p.c", "#include \"outer.h\"\n"),
+        ]);
+        let cache = new_cache();
+        tree.run("p.c", &cache, false);
+        let nested: Vec<PathBuf> = cache
+            .read()
+            .unwrap()
+            .get(&(tree.root.join("outer.h"), Language::C))
+            .and_then(|variants| variants.first())
+            .map(|entry| {
+                entry
+                    .nested_variants
+                    .iter()
+                    .map(|(p, _)| p.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            nested.contains(&tree.root.join("mid.h")) && nested.contains(&tree.root.join("b.h")),
+            "{nested:?}"
+        );
+    }
+
+    #[test]
+    fn a_replayed_empty_variant_does_not_stand_for_the_header_later() {
+        // `q.c` adopts the full `b.h` through `outer.h`, then replays the
+        // guard-defined (empty) `b.h` directly, then builds `later.h`, which
+        // includes `b.h` too. `later.h`'s entry must name the full `b.h`:
+        // naming the empty one hands consumers the guard without the
+        // declarations.
+        let tree = Tree::new(&[
+            (
+                "b.h",
+                "// b\n#ifndef B_H\n#define B_H\nint brief;\n#endif\n",
+            ),
+            (
+                "outer.h",
+                "#ifndef OUTER_H\n#define OUTER_H\n#include \"b.h\"\nint outer;\n#endif\n",
+            ),
+            (
+                "later.h",
+                "#ifndef LATER_H\n#define LATER_H\n#include \"b.h\"\nint later;\n#endif\n",
+            ),
+            ("w.c", "#include \"b.h\"\n"),
+            ("p.c", "#include \"outer.h\"\n"),
+            ("e.c", "#define B_H\n#include \"b.h\"\n"),
+            (
+                "q.c",
+                "#include \"outer.h\"\n#include \"b.h\"\n#include \"later.h\"\n",
+            ),
+        ]);
+        let cache = new_cache();
+        for unit in ["w.c", "p.c", "e.c", "q.c"] {
+            tree.run(unit, &cache, false);
+        }
+        let brief = tree.root.join("b.h");
+        let full = stored(&cache, &brief)
+            .iter()
+            .position(|text| text.contains("brief"))
+            .expect("the full variant is stored");
+        let recorded: Vec<(PathBuf, usize)> = cache
+            .read()
+            .unwrap()
+            .get(&(tree.root.join("later.h"), Language::C))
+            .and_then(|variants| variants.first())
+            .map(|entry| entry.nested_variants.iter().cloned().collect())
+            .unwrap_or_default();
+        assert_eq!(recorded, vec![(brief, full)]);
+    }
+
+    #[test]
+    fn an_entry_records_each_expansion_of_a_header_it_includes_twice() {
+        // `decl.h` has no guard and reads `NAME`; `both.h` includes it once
+        // per name. A consumer replaying `both.h` needs both expansions.
+        let tree = Tree::new(&[
+            ("decl.h", "int NAME;\n"),
+            (
+                "both.h",
+                "#ifndef BOTH_H\n#define BOTH_H\n#define NAME first\n#include \"decl.h\"\n\
+                 #undef NAME\n#define NAME second\n#include \"decl.h\"\n#undef NAME\n#endif\n",
+            ),
+            ("w.c", "#include \"both.h\"\n"),
+        ]);
+        let cache = new_cache();
+        tree.run("w.c", &cache, false);
+        let decl = tree.root.join("decl.h");
+        let variants = stored(&cache, &decl);
+        let at = |name: &str| {
+            variants
+                .iter()
+                .position(|text| text.contains(name))
+                .expect("each expansion is stored")
+        };
+        let recorded: Vec<(PathBuf, usize)> = cache
+            .read()
+            .unwrap()
+            .get(&(tree.root.join("both.h"), Language::C))
+            .and_then(|variants| variants.first())
+            .map(|entry| entry.nested_variants.iter().cloned().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            recorded,
+            vec![(decl.clone(), at("first")), (decl, at("second"))]
+        );
+    }
+
+    #[test]
+    fn an_adopted_empty_variant_does_not_displace_the_one_expanded_here() {
+        // `f.c` stores an `x.h` that replayed the guard-defined (empty)
+        // `b.h`. `q.c` expands `b.h` itself, then replays that `x.h`, then
+        // builds `later.h`: `later.h` must name the `b.h` `q.c` expanded,
+        // not the empty one `x.h`'s record carried in.
+        let tree = Tree::new(&[
+            (
+                "b.h",
+                "// b\n#ifndef B_H\n#define B_H\nint brief;\n#endif\n",
+            ),
+            (
+                "x.h",
+                "#ifndef X_H\n#define X_H\n#include \"b.h\"\nint x;\n#endif\n",
+            ),
+            (
+                "later.h",
+                "#ifndef LATER_H\n#define LATER_H\n#include \"b.h\"\nint later;\n#endif\n",
+            ),
+            ("e.c", "#define B_H\n#include \"b.h\"\n"),
+            ("f.c", "#define B_H\n#include \"x.h\"\n"),
+            (
+                "q.c",
+                "#include \"b.h\"\n#include \"x.h\"\n#include \"later.h\"\n",
+            ),
+        ]);
+        let cache = new_cache();
+        for unit in ["e.c", "f.c", "q.c"] {
+            tree.run(unit, &cache, false);
+        }
+        let brief = tree.root.join("b.h");
+        let full = stored(&cache, &brief)
+            .iter()
+            .position(|text| text.contains("brief"))
+            .expect("the full variant is stored");
+        let recorded: Vec<(PathBuf, usize)> = cache
+            .read()
+            .unwrap()
+            .get(&(tree.root.join("later.h"), Language::C))
+            .and_then(|variants| variants.first())
+            .map(|entry| entry.nested_variants.iter().cloned().collect())
+            .unwrap_or_default();
+        assert_eq!(recorded, vec![(brief, full)]);
     }
 }

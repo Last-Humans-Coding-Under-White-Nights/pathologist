@@ -272,10 +272,14 @@ fn base_definitions(
             .get(func.span.file.0 as usize)
             .copied()
             .unwrap_or(primary_file_id);
-        let Some(id) = program
-            .dedup
-            .existing_fn(span_file, &func.name, func.span.line)
-        else {
+        let Some(id) = program.dedup.existing_fn(
+            span_file,
+            &func.name,
+            (func.span.line, func.span.col),
+            primary_file_id,
+            1,
+            false,
+        ) else {
             continue;
         };
         // The unit's own entry can have merged into a declaration that another
@@ -328,9 +332,6 @@ fn merge_unit(
     for (derived, base) in &unit.inheritance {
         program.add_inheritance(derived, base);
     }
-    for fact in &unit.template_bases {
-        program.add_template_base_fact(fact);
-    }
     for (class, fact) in &unit.class_templates {
         program.add_class_template_fact(class, None, fact);
     }
@@ -376,6 +377,15 @@ fn merge_unit(
             .copied()
             .unwrap_or(primary_file_id)
     };
+    for fact in &unit.template_bases {
+        match fact.anonymous_in {
+            None => program.add_template_base_fact(fact),
+            Some(file) => program.add_template_base_fact(&TemplateBase {
+                anonymous_in: Some(map_file(file)),
+                ..fact.clone()
+            }),
+        }
+    }
     for (cls, files) in &unit.anonymous_classes {
         for &file in files {
             program.mark_class_anonymous(cls, map_file(file));
@@ -459,6 +469,17 @@ fn merge_unit(
     }
 
     let respelled = respelled_declarations(unit, &unit_param_types, &program.types);
+    // The columns this unit declares each name at on each line: two are two
+    // functions, whatever other units recorded there.
+    let mut unit_columns: FxHashMap<(trace_ir::FileId, u32, &str), Vec<u32>> = FxHashMap::default();
+    for func in &unit.functions {
+        let columns = unit_columns
+            .entry((func.span.file, func.span.line, func.name.as_str()))
+            .or_default();
+        if !columns.contains(&func.span.col) {
+            columns.push(func.span.col);
+        }
+    }
     for func in &unit.functions {
         let old_id = func.id;
         if respelled.contains_key(&old_id) {
@@ -485,9 +506,16 @@ fn merge_unit(
             .and_then(|text| program.dedup.existing_header_fn(origin, &func.name, text));
         let mut canonical = shared;
         if canonical.is_none() && !internal_cpp {
-            canonical = program
-                .dedup
-                .existing_fn(span_file, &func.name, func.span.line);
+            canonical = program.dedup.existing_fn(
+                span_file,
+                &func.name,
+                (func.span.line, func.span.col),
+                primary_file_id,
+                unit_columns
+                    .get(&(func.span.file, func.span.line, func.name.as_str()))
+                    .map_or(1, Vec::len),
+                matches!(mode, MergeMode::Variant),
+            );
         }
         if canonical.is_none() && matches!(mode, MergeMode::Variant) && func.is_defined {
             // The two arms of an `#ifdef X / #else` pair put one function's
@@ -562,6 +590,17 @@ fn merge_unit(
         }
         if let Some(canonical) = canonical {
             fn_map.insert(old_id, canonical);
+            // This unit has now met the entry at its own column too (see
+            // `MergeDedup::existing_fn`).
+            if !internal_cpp {
+                program.dedup.insert_fn(
+                    span_file,
+                    &func.name,
+                    (func.span.line, func.span.col),
+                    canonical,
+                    primary_file_id,
+                );
+            }
             if shared.is_some() {
                 program
                     .symbols
@@ -626,23 +665,34 @@ fn merge_unit(
         // whose ids collide, breaking C++ prototype + definition merges. Map
         // them through the unit's own variables + this unit's type_map so the
         // overload signature check sees real, remapped types.
-        let incoming_param_types: Vec<trace_ir::TypeId> = f
-            .params
-            .iter()
-            .map(|old| {
-                // `Unknown`, not `TypeId(0)`. Zero is the first descriptor the
-                // prelude interns, `Void`, and no parameter has that type, so
-                // a parameter whose variable did not lower used to guarantee a
-                // signature mismatch and block a merge the rest of the
-                // signature agreed on. `Unknown` is what the comparison
-                // already documents for a type neither side can resolve: it
-                // matches anything, leaving arity to decide.
-                unit_param_types
-                    .get(old)
-                    .copied()
-                    .unwrap_or_else(|| program.types.unknown())
-            })
-            .collect();
+        // A prototype has no parameter variables; the explicit types it
+        // recorded are its signature, remapped like any other type.
+        for ty in &mut f.param_type_ids {
+            *ty = remap_type(*ty, &type_map);
+        }
+        // A prototype's recorded types, or a definition's when they differ
+        // from its variables' (a parameter it could not resolve is unknown).
+        let incoming_param_types: Vec<trace_ir::TypeId> =
+            if f.params.is_empty() || f.param_type_ids.len() == f.params.len() {
+                f.param_type_ids.clone()
+            } else {
+                f.params
+                    .iter()
+                    .map(|old| {
+                        // `Unknown`, not `TypeId(0)`. Zero is the first descriptor the
+                        // prelude interns, `Void`, and no parameter has that type, so
+                        // a parameter whose variable did not lower used to guarantee a
+                        // signature mismatch and block a merge the rest of the
+                        // signature agreed on. `Unknown` is what the comparison
+                        // already documents for a type neither side can resolve: it
+                        // matches anything, leaving arity to decide.
+                        unit_param_types
+                            .get(old)
+                            .copied()
+                            .unwrap_or_else(|| program.types.unknown())
+                    })
+                    .collect()
+            };
         let registered =
             program
                 .symbols
@@ -680,9 +730,13 @@ fn merge_unit(
             unit_shares_headers = true;
         }
         if !internal_cpp {
-            program
-                .dedup
-                .insert_fn(span_file, func.name.clone(), func.span.line, merged);
+            program.dedup.insert_fn(
+                span_file,
+                &func.name,
+                (func.span.line, func.span.col),
+                merged,
+                primary_file_id,
+            );
         }
     }
 
@@ -705,9 +759,13 @@ fn merge_unit(
             file_of(declaration) == file_of(definition),
         ) {
             let span_file = map_file(func.span.file);
-            program
-                .dedup
-                .insert_fn(span_file, func.name.clone(), func.span.line, merged);
+            program.dedup.insert_fn(
+                span_file,
+                &func.name,
+                (func.span.line, func.span.col),
+                merged,
+                primary_file_id,
+            );
         }
     }
 
@@ -937,14 +995,6 @@ fn merge_unit(
         if program.is_dep_file(ownership_file) {
             continue;
         }
-        let key: SiteKey = (
-            occurrence_file,
-            occurrence.span.line,
-            occurrence.span.col,
-            occurrence_expansion,
-            occurrence.expansion_id,
-            cs.callee_name.clone(),
-        );
         let is_internal_caller = program
             .symbols
             .function_by_id(mapped_caller)
@@ -956,6 +1006,15 @@ fn merge_unit(
         if matches!(mode, MergeMode::SymbolsOnly) && !is_internal_caller {
             continue;
         }
+        let key: SiteKey = (
+            occurrence_file,
+            occurrence.span.line,
+            occurrence.span.col,
+            occurrence_expansion,
+            occurrence.expansion_id,
+            cs.callee_name.clone(),
+            cs.callee_fn_id.and_then(|f| fn_map.get(&f).copied()),
+        );
         if !matches!(mode, MergeMode::Variant) && !is_internal_caller {
             if let Some(&existing) = program.dedup.site_keys.get(&key) {
                 call_map.insert(cs.id, existing);
@@ -1799,6 +1858,7 @@ mod tests {
                 is_virtual: false,
                 is_final: false,
                 is_cpp: true,
+                c_linkage: false,
                 tu: None,
             }],
             variables: vec![Variable {
@@ -1852,6 +1912,7 @@ mod tests {
             is_virtual: false,
             is_final: false,
             is_cpp: true,
+            c_linkage: false,
             tu: None,
         };
         let var = |id: u32, name: String, owner: u32, param: bool| Variable {
@@ -1923,6 +1984,183 @@ mod tests {
             .count();
         assert_eq!(program.symbols.functions.len(), 1, "one function");
         assert_eq!(records, 1, "one record for the one call");
+    }
+
+    /// Copies of one call in one definition's body that units bound
+    /// differently -- one to a declaration it saw, one to nothing, or each to
+    /// its own definition -- are one call site: the body merges once, and the
+    /// later unit's copy of it is dropped with its calls. Here one source file
+    /// is two units (two link targets).
+    #[test]
+    fn a_call_bound_differently_by_two_units_is_one_site() {
+        assert_eq!(sites_of_a_call_bound_differently(false), [1, 1, 1]);
+    }
+
+    /// In a shared header body (`static inline`), each unit's copy of the
+    /// call stays its own site where the units bound it differently
+    /// ([`trace_ir::CallSourceKey`]): each unit's copy reaches the callee
+    /// that unit sees.
+    #[test]
+    fn a_shared_header_call_bound_differently_by_two_units_stays_apart() {
+        assert_eq!(sites_of_a_call_bound_differently(true), [2, 2, 2]);
+    }
+
+    /// Call records of `f`'s call to `g` after merging two units that bind it
+    /// differently: bound in one unit only, either way round, and bound to
+    /// two units' own definitions of `g`. `shared` puts `f` in a header as a
+    /// `static inline` body.
+    fn sites_of_a_call_bound_differently(shared: bool) -> [usize; 3] {
+        let source = trace_ir::FileId(u32::from(shared));
+        let function = |id: u32, name: &str, file, line, defined| Function {
+            is_weak: false,
+            target: None,
+            id: FnId(id),
+            name: name.into(),
+            linkage: trace_ir::Linkage::External,
+            return_type: TypeId(0),
+            params: Vec::new(),
+            locals: Vec::new(),
+            span: trace_ir::Span::new(file, line, 1),
+            end_line: line + 2,
+            file,
+            is_defined: defined,
+            param_type_ids: Vec::new(),
+            explicit_arity: Some(0),
+            default_args: 0,
+            reference_params: Vec::new(),
+            owner_unresolved: false,
+            variadic: false,
+            defaulted_in_class: false,
+            declared_in_class: false,
+            is_virtual: false,
+            is_final: false,
+            is_cpp: true,
+            c_linkage: false,
+            tu: None,
+        };
+        let unit = |path: &str, bound: Option<&str>| {
+            let mut functions = vec![function(0, "f", source, 5, true)];
+            if let Some(file) = bound {
+                functions.push(function(1, "g", trace_ir::FileId(2), 1, true));
+                return (functions, file.to_string(), path.to_string());
+            }
+            (functions, String::new(), path.to_string())
+        };
+        let unit = |path: &str, bound: Option<&str>| {
+            let (functions, g_file, path) = unit(path, bound);
+            let bound = bound.is_some();
+            let mut index = UnitIndex {
+                path: PathBuf::from(&path),
+                files: vec![
+                    PathBuf::from(&path),
+                    PathBuf::from("h.h"),
+                    PathBuf::from(if g_file.is_empty() {
+                        "none.cpp"
+                    } else {
+                        &g_file
+                    }),
+                ],
+                functions,
+                call_sites: vec![CallSite {
+                    id: trace_ir::CallSiteId(0),
+                    caller: FnId(0),
+                    callee_name: "g".into(),
+                    callee_var: None,
+                    callee_fn_id: bound.then_some(FnId(1)),
+                    var_args: Vec::new(),
+                    fn_args: Vec::new(),
+                    addr_of_member_args: Vec::new(),
+                    addr_of_args: Vec::new(),
+                    args_bound_past_this: false,
+                    span: trace_ir::Span::new(source, 6, 10),
+                    expansion_span: None,
+                    occurrence: None,
+                    is_direct: true,
+                    receiver_class: None,
+                    return_dst: None,
+                    tu: None,
+                }],
+                ..Default::default()
+            };
+            if shared {
+                index.functions[0].linkage = trace_ir::Linkage::Internal;
+                index
+                    .internal_definitions
+                    .insert(FnId(0), Arc::from("static inline void f() { g(); }"));
+            }
+            index
+        };
+        [
+            [Some("g1.cpp"), None],
+            [None, Some("g1.cpp")],
+            [Some("g1.cpp"), Some("g2.cpp")],
+        ]
+        .map(|order| {
+            let mut program = Program::new(PathBuf::from("root"));
+            merge_unit_index(&mut program, &unit("a.cpp", order[0]));
+            merge_unit_index(&mut program, &unit("a.cpp", order[1]));
+            program
+                .symbols
+                .call_sites
+                .iter()
+                .filter(|cs| cs.callee_name == "g")
+                .count()
+        })
+    }
+
+    /// A unit that declares a name at two columns of one line declares two
+    /// functions there: a column only other units recorded is not its own
+    /// configuration of theirs, whichever of its two it merges first.
+    #[test]
+    fn a_second_overload_on_one_line_stays_apart_whatever_the_order() {
+        let header = trace_ir::FileId(1);
+        let prototype = |id: u32, col: u32, arity: u32| Function {
+            is_weak: false,
+            target: None,
+            id: FnId(id),
+            name: "F".into(),
+            linkage: trace_ir::Linkage::External,
+            return_type: TypeId(0),
+            params: Vec::new(),
+            locals: Vec::new(),
+            span: trace_ir::Span::new(header, 10, col),
+            end_line: 10,
+            file: header,
+            is_defined: false,
+            param_type_ids: Vec::new(),
+            explicit_arity: Some(arity),
+            default_args: 0,
+            reference_params: Vec::new(),
+            owner_unresolved: false,
+            variadic: false,
+            defaulted_in_class: false,
+            declared_in_class: false,
+            is_virtual: false,
+            is_final: false,
+            is_cpp: true,
+            c_linkage: false,
+            tu: None,
+        };
+        let unit = |path: &str, functions: Vec<Function>| UnitIndex {
+            path: PathBuf::from(path),
+            files: vec![PathBuf::from(path), PathBuf::from("h.h")],
+            functions,
+            ..Default::default()
+        };
+        let mut program = Program::new(PathBuf::from("root"));
+        merge_unit_index(&mut program, &unit("a.cpp", vec![prototype(0, 1, 1)]));
+        merge_unit_index(
+            &mut program,
+            &unit("b.cpp", vec![prototype(0, 14, 2), prototype(1, 1, 1)]),
+        );
+        let arities: Vec<Option<u32>> = program
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == "F")
+            .map(|f| f.explicit_arity)
+            .collect();
+        assert_eq!(arities.len(), 2, "two overloads: {arities:?}");
     }
 
     #[test]

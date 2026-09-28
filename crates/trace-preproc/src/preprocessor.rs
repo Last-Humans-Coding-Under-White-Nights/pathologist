@@ -114,6 +114,12 @@ struct PreprocessorState {
     /// site records on an enclosing frame, and what
     /// `IncludeExpansion::nested_variants` inherits.
     variant_used: FxHashMap<PathBuf, usize>,
+    /// The variant each header this run expanded itself was published as (or
+    /// matched by signature). A guard-skipped `#include` inside an entry being
+    /// composed records it when the run replayed no variant of that header:
+    /// the entry takes the header's macro effects, its guard among them, and
+    /// must also name the expansion holding its declarations.
+    variant_composed: FxHashMap<PathBuf, usize>,
     /// Every `(path, variant)` this run replayed at an `#include` of that
     /// path itself, for `PreprocessResult::replayed_variants`. Distinct from
     /// `variant_used` because a header included twice under different macros
@@ -283,6 +289,7 @@ impl PreprocessorState {
             inlined_files: FxHashSet::default(),
             entry_used: FxHashMap::default(),
             variant_used: FxHashMap::default(),
+            variant_composed: FxHashMap::default(),
             direct_variants: FxHashSet::default(),
             conditional_stack: Vec::new(),
             cond_base: 0,
@@ -1199,16 +1206,41 @@ impl PreprocessorState {
         };
         self.entry_used
             .insert(canonical.to_path_buf(), entry.clone());
-        self.variant_used.insert(canonical.to_path_buf(), at);
+        // A variant this run adopted earlier — from an enclosing entry's
+        // nested record, or an earlier replay — is still one it reached; the
+        // first inclusion is the one holding the header's declarations. A
+        // later replay of an empty variant (its guard defined by a replayed
+        // entry that did not cover the header) is recorded as reached, but
+        // the earlier variant keeps standing for the header, in this run's
+        // record and in the entries it composes.
+        let empty = entry.text.trim().is_empty() && entry.nested_variants.is_empty();
+        let stands_for = match self.variant_used.get(canonical).copied() {
+            Some(earlier) if empty => earlier,
+            None if empty => self.variant_composed.get(canonical).copied().unwrap_or(at),
+            Some(earlier) => {
+                if earlier != at {
+                    self.direct_variants
+                        .insert((canonical.to_path_buf(), earlier));
+                }
+                at
+            }
+            None => at,
+        };
+        self.variant_used
+            .insert(canonical.to_path_buf(), stands_for);
         self.direct_variants.insert((canonical.to_path_buf(), at));
         if let Some(frame) = self.cache_frames.last_mut() {
-            frame.replayed.push((canonical.to_path_buf(), at));
+            frame.replayed.push((canonical.to_path_buf(), stands_for));
         }
         // Replaying an entry adopts its nested choices too: those headers
         // are never visited here, and without this the consumer has no
         // record for them and has to merge every stored expansion of each.
+        // A header this run expanded itself keeps that expansion: the
+        // entry's may be the empty one its guard left.
         for (path, at) in entry.nested_variants.iter() {
-            self.variant_used.entry(path.clone()).or_insert(*at);
+            if !self.variant_composed.contains_key(path) {
+                self.variant_used.entry(path.clone()).or_insert(*at);
+            }
         }
         self.merge_recorded_deps(&entry.deps);
         // The consumer never visits the headers this entry covers, so the
@@ -1283,23 +1315,26 @@ impl PreprocessorState {
     /// already handed out valid. Past the cap nothing is stored and later
     /// consumers expand the header themselves, which costs time and changes
     /// no output. Under `defer_expansion_publish` the journal keeps it back.
-    fn publish_variant(&mut self, canonical: PathBuf, entry: crate::IncludeExpansion) {
+    /// Store `entry` as a variant of `canonical`, returning the handle a
+    /// record of it names: its index (provisional under a journal), or that
+    /// of the stored variant with its signature; `None` when it is not
+    /// stored.
+    fn publish_variant(
+        &mut self,
+        canonical: PathBuf,
+        entry: crate::IncludeExpansion,
+    ) -> Option<usize> {
         // Keep incompatible expansions only in entry_used for this run's
         // text composition; they cannot serve any consumer or use a slot.
         if entry.deps.incompatible {
-            return;
+            return None;
         }
-        let Some(cache) = self.opts.include_expansion_cache.as_ref() else {
-            return;
-        };
+        let cache = self.opts.include_expansion_cache.as_ref()?;
         let key = (canonical, self.language);
         if let Some(journal) = self.journal.as_mut() {
-            journal.publish(key, cache, &self.opts.expansion_journals_ahead, entry);
-            return;
+            return journal.publish(key, cache, &self.opts.expansion_journals_ahead, entry);
         }
-        let Ok(mut guard) = cache.write() else {
-            return;
-        };
+        let mut guard = cache.write().ok()?;
         let variants = guard.entry(key).or_default();
         let signatures = variants.iter().map(|v| v.signature);
         if crate::options::admits_variant(
@@ -1308,7 +1343,9 @@ impl PreprocessorState {
             entry.signature,
         ) {
             variants.push(entry);
+            return Some(variants.len() - 1);
         }
+        variants.iter().position(|v| v.signature == entry.signature)
     }
 
     /// The stored expansion of `canonical` whose fingerprint this run's
@@ -1443,7 +1480,11 @@ impl PreprocessorState {
                 {
                     self.merge_guards(&guards);
                 }
-                let replayed_as = self.variant_used.get(&canonical).copied();
+                let replayed_as = self
+                    .variant_used
+                    .get(&canonical)
+                    .or_else(|| self.variant_composed.get(&canonical))
+                    .copied();
                 if let Some(frame) = self.cache_frames.last_mut() {
                     frame.skips.push((self.output.len(), canonical.clone()));
                     // The body is skipped here, but this header still needs
@@ -1710,8 +1751,11 @@ impl PreprocessorState {
                     // whole subtree: entries are built bottom-up, so each
                     // one this replayed is already closed, and unioning
                     // their records keeps the property.
+                    // A header without a guard may be expanded more than
+                    // once here, differently each time, so a record is one
+                    // per expansion, not per header.
                     let mut nested_variants: Vec<(PathBuf, usize)> = Vec::new();
-                    let mut seen: FxHashSet<PathBuf> = FxHashSet::default();
+                    let mut seen: FxHashSet<(PathBuf, usize)> = FxHashSet::default();
                     for (nested_path, nested_at) in replayed {
                         if let Some(deeper) = self
                             .entry_used
@@ -1719,12 +1763,12 @@ impl PreprocessorState {
                             .map(|e| Arc::clone(&e.nested_variants))
                         {
                             for (p, v) in deeper.iter() {
-                                if seen.insert(p.clone()) {
+                                if seen.insert((p.clone(), *v)) {
                                     nested_variants.push((p.clone(), *v));
                                 }
                             }
                         }
-                        if seen.insert(nested_path.clone()) {
+                        if seen.insert((nested_path.clone(), nested_at)) {
                             nested_variants.push((nested_path, nested_at));
                         }
                     }
@@ -1742,7 +1786,24 @@ impl PreprocessorState {
                         id: crate::journal::next_expansion_id(),
                     };
                     self.entry_used.insert(canonical.clone(), entry.clone());
-                    self.publish_variant(canonical, entry);
+                    // A whitespace-only expansion that includes nothing (the
+                    // header's guard was already defined) holds none of its
+                    // declarations, so it never stands for the header in a
+                    // record.
+                    let declares =
+                        !entry.text.trim().is_empty() || !entry.nested_variants.is_empty();
+                    if let Some(handle) = self.publish_variant(canonical.clone(), entry) {
+                        if declares {
+                            // An enclosing entry being composed holds this
+                            // expansion as a nested include and records it
+                            // as a replay would, its own nested records with
+                            // it.
+                            if let Some(frame) = self.cache_frames.last_mut() {
+                                frame.replayed.push((canonical.clone(), handle));
+                            }
+                            self.variant_composed.insert(canonical, handle);
+                        }
+                    }
                 }
             }
             // The log only feeds open frames; once the outermost cached

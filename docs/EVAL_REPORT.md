@@ -1,5 +1,197 @@
 # Evaluation Report
 
+## Template singleton calls and undefined template bases — 2026-09-27 (#121, #122)
+
+Calls chained on a class-template singleton accessor (`DelayedSingleton<Svc>::GetInstance()->Run()`,
+`Svc::GetInstance()` inherited from such a base, results returned inside `std::shared_ptr<T>` /
+`sptr<T>`) are typed by the template's argument, including c_utils' templates when their
+definitions are outside the tree (#121). A class deriving from an undefined class template's sole
+argument (`FooProxy : IRemoteProxy<IFoo>`) derives from it when it implements one of its virtual
+members, and a name-paired proxy and stub whose interfaces are declared and unrelated are no
+longer bridged (#122). A cached header expansion records the variant that holds its
+declarations, so a unit that replays a header another unit expanded first still sees its classes,
+and a C++ prototype with C linkage meets its definition by arity. Rules: **Templates** and
+[Template-parameter bases](ANALYSIS.md#template-parameter-bases) in `docs/ANALYSIS.md`,
+[OpenHarmony IPC bridges](ANALYSIS.md#openharmony-ipc-bridges), and "Which variant a record
+names" in `docs/PREPROCESSOR.md`.
+
+Baseline: `master` at `c4a2424b61a8ea5a91aa490f7354ae323d4b0540`. Candidate: branch
+`fix/issues-121-122-template-calls` as merged (the measured candidate; see Performance).
+Release builds (`cargo build -p trace-cli --release --locked`), `python3 scripts/eval_check.py
+--jobs 8` on the pinned corpora (`drivers_hdf_core` `cdc75a2`, `hiviewdfx_hiview` `92408e2`,
+`multimedia_camera_framework` `8ffd69d`, all clean). The issue corpora are OpenHarmony
+`OpenHarmony-v7.0-Release` checkouts: `security_access_token` `a99aa14`,
+`ability_ability_runtime` `299f916`, analyzed bare (no `--dep`, no compilation database) with
+`--full-export --jobs 8`. macOS arm64 (Apple M1, 8 cores, 8 GB), rustc `1.100.0-nightly`.
+
+### What moved
+
+| Corpus | Metric | Baseline | Candidate |
+|---|---|---:|---:|
+| hdf | `functions_total` / `functions_external` | 12,012 / 1,722 | 11,997 / 1,707 |
+| hdf | `edges_total` / `edges_direct` | 73,518 / 44,822 | 76,502 / 47,845 |
+| hdf | `edges_external` / `arg_flow_edges` | 23,716 / 69,478 | 23,677 / 69,985 |
+| hiview | `functions_total` / `functions_external` | 9,678 / 1,688 | 9,599 / 1,609 |
+| hiview | `edges_total` / `edges_direct` | 32,017 / 16,734 | 32,649 / 18,033 |
+| hiview | `edges_external` / `edges_indirect` | 15,103 / 166 | 14,426 / 176 |
+| hiview | `arg_flow_edges` | 18,815 | 20,141 |
+| camera | `functions_total` / `functions_external` | 23,194 / 3,388 | 22,796 / 2,990 |
+| camera | `edges_total` / `edges_direct` | 99,473 / 56,403 | 103,000 / 62,704 |
+| camera | `edges_external` / `arg_flow_edges` | 42,763 / 43,157 | 39,989 / 48,818 |
+| camera | declaration-only shadows (#83 probe) | 52 | 15 |
+
+Attribution, by callee:
+
+- **Overloads kept per site.** A call whose argument types rank several overloads keeps one
+  site per overload through the merge (the call-site key carries the merged callee). hdf's
+  +3,023 direct edges are 2,923 `StringBuilder::Append` / `AppendFormat` overload edges, the
+  other 100 spread over `Options` and `AstObject` members;
+  camera's largest additions are `CameraManager::CreateCameraInput` (+775),
+  `CameraNapiParamParser` constructors (+379) and `AddOrUpdateMetadata` (+352); hiview's
+  are `TraceRet` constructors (+456) and `XperfEventBuilder::Param` (+198).
+- **Prototypes join their definitions by parameter types.** hiview's `StringUtil::*` and
+  `FileUtil::ForceCreateDirectory` calls moved from external to direct (hiview external −245).
+  Argument flow now reaches those bodies, which accounts for hiview's +10 indirect edges
+  (existing indirect calls inside `ForceCreateDirectory` and `TrimStr`).
+- **Real overload sets kept apart.** A class's same-arity overloads used to
+  merge on arity alone; prototypes of an overload set now record their
+  parameter types and stay apart, so a declared-only overload beside a
+  defined one counts in the #83 probe: `CameraManager::CreatePhotoOutput` /
+  `CreateVideoOutput`, `CameraInput::CameraInput`, `CaptureSession::SetParameters`
+  and `PhotoOutput::SetCallback` join it.
+- **Header variants that hold their declarations.** A unit that replays a header expanded
+  first by another unit, or reaches it only through a header it replays, used to record no
+  variant, or an empty include-guard variant, and merged declarations from the wrong one or
+  none. With the variant recorded, calls through classes those headers declare resolve:
+  hiview's `FileUtil::*` calls move from external to direct (external −432), and camera's
+  session subclasses become visible to virtual dispatch (`CinematicVideoSession::AddOutput`
+  +589, `ScanSession::AddOutput` +526, the `*Session::CommitConfig` overrides +378 each),
+  and calls to `CameraNapiUtils::CheckError` / `ThrowError` / `GetUndefinedValue` are no longer
+  external (−437). Ten camera constructor calls now reach the
+  constructed class instead of its base (`AudioBufferWrapper` over `BufferWrapperBase`,
+  `CaptureSessionForSys` over `CaptureSession`).
+- **`extern "C"` prototypes meet their definitions.** A defining unit that does not include the
+  header's callback typedefs reads such a parameter as an `int` stand-in, so the signature kept
+  camera's `OH_*` C API prototypes apart from their bodies. Those 42 names leave the #83 probe
+  (57 → 15), and calls to them are direct (`OH_CameraManager_CreateCaptureSession` −198
+  external).
+- **One edge per overload a call binds.** A site bound to one overload used to reach every
+  definition whose parameters read alike, sibling overloads included, so a call ranked against
+  N overloads read as N sites with N edges each (hiview's `TraceRet(TraceStateCode)` /
+  `TraceRet(TraceFlowCode)`, camera's `MovieFileOutput::Release`, both already so on
+  `master`). A site now leaves out the overloads its sibling sites bind: camera's groups of
+  same-position sites reaching identical targets fall from 626 (`master`: 625) to 15, and
+  the per-overload additions above were counted before it. `#if` alternatives of one function that
+  different units selected still reach each other.
+- **Qualified and inherited static calls (#121).** `PhotoJobRepository::Create` and 125 other
+  name-only externals now resolve to the inherited accessor (`EnableSharedCreateInit::Create`),
+  an aliased class (`CameraNapiAdaptor::SetArg`) or a base (`CameraNapiEventEmitter::GetEventLoop`).
+
+Master comparison by distinct caller → callee pair: 32 (hdf), 369 (hiview) and 2,536 (camera)
+pairs disappear against 110, 562 and 5,442 added. All but ten are the same caller now reaching a
+same-named callee under its real class or overload; one of those is a correct narrowing, hiview
+`FaultloggerBase::ProcessFaultLogEvent → FaultLogEventIpc::AddFaultLog` (the call passes
+`std::shared_ptr<Event> &`, and that overload takes `FaultLogInfo`). The ten are the camera
+constructor calls above, now reaching the derived class's constructor.
+
+### Performance
+
+Paired runs, the branch against baseline `c4a2424`, release builds with `--locked`,
+`--solve-budget-pops 800000`, fresh output database per run, one warm-up per binary and
+configuration, then nine alternating base/candidate pairs; `/usr/bin/time -l`. No run was
+truncated, and each configuration's edge count was identical across its runs. Medians:
+
+| Configuration | Wall, baseline → candidate (s) | Wall | CPU (user+sys) | Instructions |
+|---|---|---:|---:|---:|
+| hdf minimal, jobs 1 | 7.34 → 7.75 | +5.59% | +3.80% | +1.23% |
+| hdf minimal, jobs 8 | 4.03 → 3.97 | −1.49% | −0.07% | +1.16% |
+| hiview minimal, jobs 1 | 3.06 → 3.28 | +7.19% | +5.93% | +6.15% |
+| hiview minimal, jobs 8 | 1.52 → 1.63 | +7.24% | +7.43% | +5.88% |
+| camera minimal, jobs 1 | 11.89 → 13.01 | +9.42% | +8.24% | +8.38% |
+| camera minimal, jobs 8 | 5.52 → 5.92 | +7.25% | +10.05% | +7.91% |
+| camera full + points-to, jobs 1 | 11.94 → 13.06 | +9.38% | +8.06% | +8.34% |
+| camera full + points-to, jobs 8 | 5.45 → 5.97 | +9.54% | +10.61% | +7.95% |
+
+Wall and CPU on hdf moved with machine load (instructions retired, the nearly load-independent
+measure, are within +1.3% there).
+
+Peak RSS varied by up to 25% between identical runs of one binary (an 8 GB machine compressing
+memory), so memory is measured as peak live heap bytes, counted by a global allocator in scratch
+builds of both commits (not part of the product). At jobs 1 it is identical from run to run:
+
+| Configuration | Baseline (MB) | Candidate (MB) | Change |
+|---|---:|---:|---:|
+| hdf minimal, jobs 1 / 8 | 243.8 / 249.2 | 245.6 / 251.1 | +0.74% / +0.76% |
+| hiview minimal, jobs 1 / 8 | 163.2 / 163.2 | 178.4 / 178.4 | +9.29% / +9.29% |
+| camera minimal, jobs 1 / 8 | 556.1 / 573.7 | 648.4 / 677.7 | +16.60% / +18.13% |
+| camera full + points-to, jobs 1 / 8 | 556.1 / 573.8 | 648.4 / 677.2 | +16.60% / +18.03% |
+
+**Accepted over the 2% gate.** Before the header-variant records, every configuration was within
++1.8% on time and heap. Most of the cost is the header variants units now record: they are
+lowered and merged where before a unit took the wrong variant or none. Camera lowers 1,651 header
+expansions instead of 1,321, and that pass takes 1.8 s instead of 1.2 s at jobs 1; the added
+edges (camera +5,081 direct before the duplicate-edge fix) are the return. The review fixes
+that followed add about 1.5 points of instructions on camera and none on heap. Lowering once per
+group of identical expansions does not recover the header cost: variants with equal text almost
+always differ in their replayed diagnostics or nested records (11 of 1,651 group), and merging
+one unit where a unit had merged two identical ones changes the output (duplicate variables and
+diagnostics collapse).
+
+Earlier, the first measured candidate was 2–5% slower on hiview and camera: every in-class
+prototype read its parameter types in every unit including its header. Prototypes now read them
+only where they decide something (an overload set, or a virtual member whose base overloads the
+name), member names are read from the declarator directly, and a definition's signature is not
+rebuilt when no parameter lowered as `int`.
+
+### Issue acceptance
+
+#121, `security_access_token` / `ability_ability_runtime`, counting lowered member calls chained
+on `X::GetInstance()` in the source (a line whose `GetInstance` call has a site, with `->m(` or
+`.m(` after it) and whether a direct or indirect edge on that line reaches a qualified member:
+
+| Corpus | Chained calls | Resolved, baseline | Resolved, candidate |
+|---|---:|---:|---:|
+| security_access_token | 2,292 | 1,814 | 2,111 |
+| ability_ability_runtime | 6,376 | 4,298 | 6,045 |
+
+`AccessTokenDb::GetInstance()->` chains (119 unresolved at baseline) all resolve. The issue's
+original measure (sites whose callee is an unqualified external on a `::GetInstance` line) is
+38 in `security_access_token` at both baseline and candidate: #153 already drops untyped chained
+sites, so the chain count above replaces it. No `DelayedSingleton::*` member is invented
+(`DelayedSingleton::GetInstance` and `DestroyInstance` are the accessors the tree's mock and
+calls name).
+
+Remaining unresolved chains, investigated:
+
+- `DelayedSingleton<AccessTokenManagerService|PrivacyManagerService>::GetInstance()->OnRemoteRequest`
+  (120, fuzz tests): `OnRemoteRequest` belongs to IDL-generated stubs outside the tree (#123).
+- `PermissionDataBrief::GetInstance().` chains, which `master` left unresolved, now all resolve:
+  of the 96 such source lines, 93 carry an edge to a `PermissionDataBrief` member. The other three
+  are two lines under an unset `#ifdef SUPPORT_SANDBOX_APP` and one call written across lines
+  (its site is on the next line). The units that call them replay `permission_data_brief.h`
+  from the expansion cache and used to record no variant of it, so the class was never merged
+  into them, and the call bound a global `PermissionDataBrief::GetInstance` stand-in.
+- `ability_ability_runtime`'s `DelayedSingleton<AbilityManagerService>::GetInstance()->GetTaskHandler()`
+  and similar (87; 443 before the variant records): without a compilation database `#include "singleton.h"` resolves by basename
+  to the tree's only `singleton.h`, a test mock whose `DECLARE_DELAYED_SINGLETON` expands without
+  a semicolon, and the class body after it parses in error recovery. A configuration artifact;
+  `master` behaves the same.
+
+#122, `ability_ability_runtime`: `*Proxy` classes without a declared ancestor fall from 92 to 21,
+and `security_access_token`'s from 10 to 0. The 21 are 12 classes with no base in their source
+(JS/ETS/NAPI wrappers and a C mock, the same 12 as at baseline), 3 test mocks of interfaces from
+the bundle framework (not in the tree), 4 classes deriving from out-of-tree classes, and the two
+`AbilityTokenProxy` classes, whose `IAbilityToken` declares no virtual member (no dispatch is
+lost). `AbilityManagerClient::StartAbility` now reaches `AbilityManagerProxy::StartAbility`
+(direct), and its bridge reaches `AbilityManagerService::StartAbility` besides the stub-derived
+test doubles. IPC bridges are unchanged: 1,059 and 26 edges.
+
+Probe definitions: the #122 counts walk each defined `*Proxy` / `*Stub` class's bases for a class
+the index declares (`TypeTable::is_struct_declared`); the #121 chain count reads each source line
+matching `(\w+)(<…>)?::GetInstance\(\)\s*(->|\.)\s*\w+\s*\(` whose `GetInstance` call has a
+`call_sites` row, and joins `call_edges` (`resolution IN ('direct','indirect')`, callee name
+containing `::`) on file and line.
+
 ## Dereferenced operands and template-parameter bases — 2026-09-25 (#151, #150)
 
 The rules are defined in [Dereferenced operands](ANALYSIS.md#dereferenced-operands)

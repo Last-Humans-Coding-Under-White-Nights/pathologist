@@ -418,6 +418,13 @@ before `::api::IFoo`; a leading `::` is required to force the latter.
 Using recorded inheritance rather than namespace/name similarity prevents
 unrelated same-namespace declarations from becoming bridge targets.
 
+A proxy and a stub whose names pair are not bridged when their
+`IRemoteProxy<I>` / `IRemoteStub<I>` arguments name two unrelated declared
+interfaces, and a proxy deriving from an out-of-tree `IRemoteProxy<IFoo>`
+is a subclass of `IFoo` (#122). Both rules and their limits are in
+[`docs/ANALYSIS.md`](ANALYSIS.md#openharmony-ipc-bridges) and
+[Template-parameter bases](ANALYSIS.md#template-parameter-bases).
+
 #### IR structures
 
 Lowering preserves templated inheritance in
