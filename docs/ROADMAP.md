@@ -4,7 +4,7 @@
 
 ### M0 — Skeleton & docs ✅
 
-- Cargo workspace (initially 6 crates, now 7 with `trace-capi`)
+- Cargo workspace (initially 6 crates, now 8 with `trace-capi` and `trace-merge`)
 - README, AGENTS.md, docs/
 - Fixture: `tests/fixtures/direct_call/`
 
@@ -102,6 +102,16 @@
   `is_weak` / `target_id` columns on `functions` and `variables`.
 - IPC proxy→stub bridges deliberately remain cross-image, being the one edge
   kind that models a process boundary.
+
+### M13 — Cross-repository database merger & callgraph reconstruction (`trace-merge`) ✅
+
+- Dedicated crate and CLI binary `crates/trace-merge` for merging multiple per-repository SQLite databases.
+- External call re-linking across repositories (`resolution = 'external'` -> `'direct'` / `'ambiguous'`).
+- Separation of concerns: intra-repo dataflow remains in individual databases; no static analysis or dataflow solvers during the merge phase.
+- ELF linker semantics: internal linkage (`static`) stays file-local, strong definitions override weak symbols across repositories.
+- Disambiguation of C++ overloads via concrete `functions.signature` (`name(type1, type2)`).
+- Collision detection (`MultipleDefinitions`), unresolved external reporting, and weak override diagnostics (`stage = 'merge'`).
+- Transactional integrity verified with `PRAGMA foreign_key_check`.
 
 ## In progress / next
 

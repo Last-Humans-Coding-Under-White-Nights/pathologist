@@ -788,6 +788,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "trace-merge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rusqlite",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "trace-db",
+]
+
+[[package]]
 name = "trace-parse"
 version = "0.1.0"
 dependencies = [

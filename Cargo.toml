@@ -8,6 +8,7 @@ members = [
     "crates/trace-db",
     "crates/trace-capi",
     "crates/trace-cli",
+    "crates/trace-merge",
 ]
 
 [workspace.package]

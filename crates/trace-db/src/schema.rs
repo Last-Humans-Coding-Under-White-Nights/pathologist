@@ -5,8 +5,8 @@ pub const SCHEMA_VERSION: i64 = 6;
 macro_rules! define_schema {
     ($tables:literal, $indexes:literal) => {
         pub const SCHEMA_V6: &str = concat!($tables, $indexes);
-        pub(crate) const TABLES_V6: &str = $tables;
-        pub(crate) const INDEXES_V6: &str = $indexes;
+        pub const TABLES_V6: &str = $tables;
+        pub const INDEXES_V6: &str = $indexes;
     };
 }
 

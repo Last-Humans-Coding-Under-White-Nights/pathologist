@@ -13,6 +13,7 @@ This file is for AI agents and human contributors working on the trace codebase.
 | `trace-db` | SQLite schema and export (minimal/full/debug) |
 | `trace-capi` | C ABI wrapper library (`libtrace_capi`), C header (`crates/trace-capi/include/trace.h`), FFI indexing and inspect API |
 | `trace-cli` | CLI entry point (`analyze`, `inspect`, reporting examples) |
+| `trace-merge` | Cross-repository database merger & callgraph reconstruction (`trace-merge`) |
 
 ## Pipeline (do not reorder casually)
 
