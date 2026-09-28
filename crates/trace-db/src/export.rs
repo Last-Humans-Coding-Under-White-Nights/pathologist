@@ -508,6 +508,37 @@ fn export_one_variable(stmt: &mut rusqlite::Statement<'_>, var: &trace_ir::Varia
     Ok(())
 }
 
+fn param_type_name(desc: &TypeDesc) -> String {
+    match desc {
+        TypeDesc::Array { elem, .. } => format!("{}*", type_name(elem)),
+        other => type_name(other),
+    }
+}
+
+fn function_signature(func: &trace_ir::Function, program: &Program) -> String {
+    if let Some(params) = program.symbols.explicit_params(func) {
+        let mut parts = Vec::new();
+        for i in 0..params.len() {
+            if let Some(ty_id) = params.get(i) {
+                if (ty_id.0 as usize) < program.types.all().len() {
+                    let ty = program.types.get(ty_id);
+                    parts.push(param_type_name(&ty.desc));
+                } else {
+                    parts.push("unknown".to_string());
+                }
+            } else {
+                parts.push("unknown".to_string());
+            }
+        }
+        if func.variadic {
+            parts.push("...".to_string());
+        }
+        format!("{}({})", func.name, parts.join(", "))
+    } else {
+        format!("{}(...)", func.name)
+    }
+}
+
 fn export_functions(conn: &Connection, program: &Program) -> Result<()> {
     let mut stmt = conn.prepare_cached(
         "INSERT INTO functions (id, name, file_id, line_start, line_end, linkage, signature, is_defined, is_dep, is_weak, target_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -518,6 +549,7 @@ fn export_functions(conn: &Connection, program: &Program) -> Result<()> {
             Linkage::Internal => "internal",
             Linkage::None => "none",
         };
+        let signature = function_signature(func, program);
         stmt.execute(params![
             func.id.0,
             func.name,
@@ -525,7 +557,7 @@ fn export_functions(conn: &Connection, program: &Program) -> Result<()> {
             func.span.line,
             func.end_line.max(func.span.line),
             linkage,
-            format!("fn_{}", func.name),
+            signature,
             func.is_defined as i32,
             program.is_dep_file(func.file) as i32,
             func.is_weak,

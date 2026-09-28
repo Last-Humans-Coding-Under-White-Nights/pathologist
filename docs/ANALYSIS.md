@@ -572,6 +572,40 @@ the same facts at N times the cost — and a diagnostic names the ignored
 configurations. Missing metadata cannot establish which independently built
 image a symbol belongs to.
 
+## Cross-repository callgraph reconstruction (`trace-merge`)
+
+Large multi-repository software systems (such as OpenHarmony or Android subsystems) are organized and built as distinct repositories with separate build configurations, include paths, dependencies, and git trees. Running whole-program static analysis across multiple separate repositories simultaneously is intractable due to incompatible build roots, header namespace collisions, and massive memory footprints.
+
+Instead, `trace` decouples intra-repository static analysis from cross-repository linking via the `trace-merge` tool:
+
+1. **Intra-repository analysis**: Each repository is analyzed separately using `trace analyze`, producing a standalone SQLite database containing its callgraph, internal/external function definitions, call sites, and intra-repo points-to/dataflow facts.
+2. **Cross-repository merge (`trace-merge`)**: Merges multiple per-repository SQLite databases into a unified database, reconstructing the cross-repository callgraph without running static analysis or dataflow solvers during the merge phase.
+
+### Invariants and linking rules
+
+- **No analysis during merge**: Andersen pointer analysis, PAG construction, and interprocedural dataflow solvers do **not** run during the merge stage. Intra-repository dataflow facts (`flow_nodes`, `flow_edges`, `arg_flow_edges`) remain strictly within their original repository databases. The merge stage is purely a deterministic linker that reconnects external call edges across repositories.
+- **External call re-linking and may-analysis over-approximation**:
+  - In individual repositories, calls to functions declared but not defined in that repository are emitted with `resolution = 'external'` (or point to `is_defined = 0` declarations). `trace-merge` matches these calls against exported strong definitions (`is_defined = 1`, `linkage = 'external'`) from other repositories, updating `call_edges.callee_fn_id` to the survivor's unified ID and retargeting `resolution` to `'direct'` (or `'ambiguous'` if conflicting definitions exist), while preserving original non-direct resolutions (`indirect` and `ipc`). Unresolved external calls retain their original resolution.
+  - When multiple strong definitions exist across different repositories (or multiple weak definitions), `trace-merge` emits an ambiguous edge (`resolution = 'ambiguous'`) to **every candidate definition**, satisfying the may-analysis invariant (AGENTS.md §2). This ensures downstream path queries such as `trace inspect callchain` do not miss valid paths.
+  - Edges are deduplicated per call site on `(call_site_id, callee_fn_id)`, eliminating duplicate edges when an intra-repo direct or indirect edge and a re-linked external edge reach the same callee.
+- **ELF linker semantics**:
+  - `static` / internal-linkage functions are strictly kept file-local and are never exported for cross-repository resolution.
+  - Strong definitions (`is_weak = 0`) supersede weak definitions (`is_weak = 1`) across repositories. If an external call in Repo A binds to a weak fallback in Repo A, but Repo B supplies a strong definition for the same symbol and signature, the caller in Repo A is retargeted to Repo B's strong definition.
+- **Header deduplication and dependency tracking**:
+  - Shared header files and header-declared functions/prototypes are deduplicated across repositories using `(file_id, line, name, signature)`. If any merged repository analyzes the header as non-dependency code (`is_dep = 0`, e.g. the owning repository), the unified function is updated to `is_dep = 0` so downstream queries filtering dependencies (`--exclude-deps`) retain project functions.
+- **Signature-aware C++ overload disambiguation and normalized matching**:
+  - `trace-db` exports normalized parameter signatures in `functions.signature` (e.g. `process(int)`, `process(double)`). Top-level array parameters decay to pointers (`int[]` -> `int*`), while qualifiers (`const`, `volatile`) and signedness are dropped.
+  - `trace-merge` groups exported definitions by `(name, signature)` before collision detection. Valid C++ overloads do not trigger false `MultipleDefinitions` warnings.
+  - Calls to overloaded external functions first match candidates by exact signature (`orig_callee.signature == candidate.signature`). If no candidate matches by exact signature, `trace-merge` over-approximates by falling back to every same-name candidate rather than dropping the call, preventing lossy spelling discrepancies from stranding calls as unresolved.
+  - When candidates originate from the same-name fallback rather than an exact signature match and multiple candidate definitions exist, `trace-merge` emits ambiguous edges to all candidates rather than applying same-database/same-target direct preference (which applies only to conflicting definitions of the same overload).
+- **Problem detection and diagnostic reporting**:
+  - `MultipleDefinitions`: Multiple strong definitions with the same signature found across different repositories. Reported as a collision warning and recorded with `stage = 'merge'`.
+  - `UnresolvedExternal`: External function references that have no matching definition in any merged database.
+  - `WeakOverride`: Diagnostic informing that a weak definition in one repository was overridden by a strong definition from another repository. Intra-repository weak overrides do not trigger warnings.
+- **Referential integrity and safety**:
+  - Staging inserts and remapping are verified using `PRAGMA foreign_key_check` before transaction commit, ensuring zero orphaned foreign keys in `call_sites`, `call_edges`, or `target_sources`.
+  - Rejects attempts to write output to any path matching an active input database.
+
 ## Type storage
 
 Type tables share immutable `Arc<TypeDesc>` descriptors and typedef alias

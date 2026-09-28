@@ -50,6 +50,7 @@ The pipeline is also exposed programmatically via `trace-capi` (`libtrace_capi`)
 
 ```mermaid
 flowchart BT
+  Merge[trace-merge]
   CLI[trace-cli]
   CAPI[trace-capi]
   DB[trace-db]
@@ -58,6 +59,7 @@ flowchart BT
   Preproc[trace-preproc]
   IR[trace-ir]
 
+  Merge --> DB
   CLI --> DB
   CLI --> Analysis
   CLI --> Parse
@@ -83,6 +85,7 @@ flowchart BT
 | `trace-db` | SQLite schema, minimal/full export |
 | `trace-capi` | C ABI library (`libtrace_capi`), C header (`trace.h`), indexing and inspect FFI |
 | `trace-cli` | `analyze`, `inspect`, reporting examples |
+| `trace-merge` | Cross-repository database merger & callgraph reconstruction (`trace-merge`) |
 
 ## Program IR (`trace-ir`)
 
@@ -145,6 +148,25 @@ Spans are resolved through the preprocessor `LineMap`: **all** entities use orig
 - A failed TU is recorded; the run continues if other TUs succeed.
 - A preprocessor stop inside a file keeps the output produced so far (no raw-source fallback); every preprocessor diagnostic is forwarded to the export as a `stage = 'preprocess'` row, attributed to the file it occurred in and deduplicated across translation units.
 
+## Cross-repository merging (`trace-merge`)
+
+When analyzing multi-repository architectures, each repository is first analyzed independently via `trace analyze`, producing individual SQLite databases. `trace-merge` then combines these databases:
+
+```mermaid
+flowchart TD
+  RepoA[Repo A: trace analyze] --> DbA[(repo_a.db)]
+  RepoB[Repo B: trace analyze] --> DbB[(repo_b.db)]
+  RepoC[Repo C: trace analyze] --> DbC[(repo_c.db)]
+  DbA --> Merge[trace-merge]
+  DbB --> Merge
+  DbC --> Merge
+  Merge --> Unified[(unified.db)]
+```
+
+- **Callgraph reconstruction without analysis**: Andersen pointer analysis and PAG dataflow are intentionally not executed during the merge stage; value-flow graphs stay intra-repository within individual databases. The merger's focus is re-linking unresolved external calls across repositories.
+- **Linker semantics & signature matching**: Re-links external call edges against matching exported definitions using concrete function signatures (`name(param_types)`), respecting internal linkage (`static` functions stay local) and weak symbol overrides (`is_weak = 0` wins over `is_weak = 1`).
+- **Conflict detection**: Flags multiple strong definitions with identical signatures across repositories, detects unresolvable externals, and exports merge-stage diagnostics into the output database.
+
 ## Extension points
 
 | Change | Where |
@@ -156,6 +178,7 @@ Spans are resolved through the preprocessor `LineMap`: **all** entities use orig
 | Libc summary / function model | `trace-analysis/src/summaries.rs` |
 | SQLite column/table | `trace-db/src/schema.rs`, `export.rs`, `docs/SQLITE_SCHEMA.md` |
 | C API functions / FFI exports | `crates/trace-capi/src/`, `crates/trace-capi/include/trace.h`, `docs/CAPI.md` |
+| Cross-repository callgraph merge | `crates/trace-merge/src/lib.rs`, `trace-merge` |
 | Compilation database support | `trace-parse/src/compile_commands.rs`, `configured.rs` |
 | Dependency root handling | `trace-parse/src/lib.rs`, `configured.rs`, `merge.rs`, `trace-db/src/inspect.rs` |
 
