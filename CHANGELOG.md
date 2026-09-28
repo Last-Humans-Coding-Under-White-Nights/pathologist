@@ -4,6 +4,14 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Configurable bare-tree test partition (#161)
+
+Added `--no-test-partition` and repeatable `--test-dir NAME` options, with
+equivalent C API settings, for trees that ship production code under test or
+mock directories. Defaults remain unchanged. See
+[Declaring-header eligibility](docs/ANALYSIS.md#declaring-header-eligibility)
+for the policy and examples.
+
 ### Mock isolation and inferred GN targets (#120)
 
 Production code in a bare tree no longer binds to test doubles that redefine

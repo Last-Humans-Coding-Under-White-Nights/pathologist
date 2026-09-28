@@ -785,6 +785,9 @@ mod tests {
             n_models: 0,
             ignore_macros: ptr::null(),
             n_ignore_macros: 0,
+            no_test_partition: 0,
+            test_dirs: ptr::null(),
+            n_test_dirs: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,
@@ -1158,6 +1161,9 @@ mod tests {
             n_models: 0,
             ignore_macros: ptr::null(),
             n_ignore_macros: 0,
+            no_test_partition: 0,
+            test_dirs: ptr::null(),
+            n_test_dirs: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,
@@ -1202,6 +1208,9 @@ mod tests {
             n_models: 1,
             ignore_macros: ptr::null(),
             n_ignore_macros: 0,
+            no_test_partition: 0,
+            test_dirs: ptr::null(),
+            n_test_dirs: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,
@@ -1248,6 +1257,9 @@ mod tests {
             n_models: 0,
             ignore_macros: ptr::null(),
             n_ignore_macros: 0,
+            no_test_partition: 0,
+            test_dirs: ptr::null(),
+            n_test_dirs: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,
@@ -1297,6 +1309,9 @@ mod tests {
             n_models: 0,
             ignore_macros: ptr::null(),
             n_ignore_macros: 0,
+            no_test_partition: 0,
+            test_dirs: ptr::null(),
+            n_test_dirs: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,
@@ -1348,6 +1363,9 @@ mod tests {
             n_models: 0,
             ignore_macros: ptr::null(),
             n_ignore_macros: 0,
+            no_test_partition: 0,
+            test_dirs: ptr::null(),
+            n_test_dirs: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,
@@ -1399,6 +1417,9 @@ mod tests {
             n_models: 0,
             ignore_macros: ptr::null(),
             n_ignore_macros: 0,
+            no_test_partition: 0,
+            test_dirs: ptr::null(),
+            n_test_dirs: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,
@@ -1823,6 +1844,9 @@ void test_fn(void) {
             n_models: 0,
             ignore_macros: ignore_macros.as_ptr(),
             n_ignore_macros: 1,
+            no_test_partition: 0,
+            test_dirs: ptr::null(),
+            n_test_dirs: 0,
         };
         let mut result = TraceIndexResult {
             files: 0,

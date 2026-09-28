@@ -640,6 +640,7 @@ pub struct SymbolTable {
     has_target_scopes: bool,
     inferred_test_files: FxHashSet<FileId>,
     inference_root: Option<PathBuf>,
+    test_partition: crate::TestPartition,
     resolved_external_functions: FxHashSet<FnId>,
     /// Monotonic cache: avoids scanning imported symbols in each translation unit.
     has_weak_symbols: bool,
@@ -782,7 +783,7 @@ impl SymbolTable {
         if self
             .inference_root
             .as_ref()
-            .is_some_and(|root| crate::is_test_path(root, &path))
+            .is_some_and(|root| crate::is_test_path(root, &path, &self.test_partition))
         {
             self.inferred_test_files.insert(id);
         }
@@ -2062,14 +2063,22 @@ impl SymbolTable {
     /// Cache the bare-tree fallback partition once after files are merged.
     /// `root` is spelled like the interned paths (canonical); see
     /// [`SymbolTable::add_file`].
-    pub fn set_inference_root(&mut self, root: &Path) {
+    /// `policy` selects the directory names below `root` used to populate
+    /// `inferred_test_files`; a disabled policy leaves that set empty.
+    /// See docs/ANALYSIS.md, "Declaring-header eligibility".
+    pub fn set_inference_root(&mut self, root: &Path, policy: crate::TestPartition) {
+        self.test_partition = policy;
         self.inference_root = Some(root.to_path_buf());
         self.inferred_test_files = self
             .files
             .iter()
-            .filter(|f| crate::is_test_path(root, &f.path))
+            .filter(|f| crate::is_test_path(root, &f.path, &self.test_partition))
             .map(|f| f.id)
             .collect();
+    }
+
+    pub fn test_partition(&self) -> &crate::TestPartition {
+        &self.test_partition
     }
 
     pub fn has_inferred_test_partition(&self) -> bool {
@@ -3217,7 +3226,7 @@ mod tests {
         let mock = symbols.add_file(PathBuf::from("/t/test/mock_svc.h"));
         let real = symbols.add_file(PathBuf::from("/t/src/svc.cpp"));
         let stray = symbols.add_file(PathBuf::from("/t/test/stray.h"));
-        symbols.set_inference_root(Path::new("/t"));
+        symbols.set_inference_root(Path::new("/t"), crate::TestPartition::default());
         symbols.register_included_header(unit, header);
         symbols.register_included_header(unit, mock);
         let mut ids = Vec::new();
@@ -3265,7 +3274,7 @@ mod tests {
         // A test unit including the same header lends it nothing.
         let test_unit = symbols.add_file(PathBuf::from("/t/test/b.cpp"));
         let stray = symbols.add_file(PathBuf::from("/t/test/stray.h"));
-        symbols.set_inference_root(Path::new("/t"));
+        symbols.set_inference_root(Path::new("/t"), crate::TestPartition::default());
         symbols.register_included_header(test_unit, header);
         symbols.register_included_header(test_unit, stray);
         assert!(!symbols.context_sees(header, test_unit));

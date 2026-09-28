@@ -133,10 +133,10 @@ after indexing and before analysis, releasing these merge-only tables in both
 scoped and unscoped runs. Rust callers that will merge more units retain the
 state until their final merge is complete.
 
-**Declaring-header eligibility (#120)**
+### Declaring-header eligibility
 
-For bare-tree inference, a file below a `test`, `tests`, `mock`, or `mocks`
-directory relative to the analysis root belongs to the test partition
+By default, bare-tree inference puts files below a `test`, `tests`, `mock`,
+or `mocks` directory relative to the analysis root in the test partition
 (`trace_ir::is_test_path`, a lexical test on canonical paths). This
 fallback convention never removes translation units. Production includes do
 not search inferred test directories or select test headers by basename: the
@@ -155,6 +155,41 @@ registered ahead of it.
 Test callers retain production candidates. Authoritative link images override
 this convention. The preprocessor and resolver share this path classification;
 a missing external dependency remains unresolved instead of acquiring a mock.
+
+The default directory names can be replaced with repeated `--test-dir NAME`
+options, for example `--test-dir test --test-dir mocks` or `--test-dir fakes`.
+Names are literal, case-sensitive directory components, not glob patterns.
+Empty names, `.`, `..`, path separators (`/` or `\`), and NUL are invalid;
+repeated names are deduplicated in first-seen order.
+`--no-test-partition` disables this convention entirely; it conflicts with
+`--test-dir`. Use the opt-out for production shims under `mock/` or shipped
+headers under `tests/`. Neither setting changes explicit include or link
+ownership rules. `trace_ir::TestPartition` owns the effective name list (an
+empty list disables it); `is_test_path` applies it consistently in include
+discovery, preprocessing, and symbol lookup through the inference-root
+configuration. Shared include-search caches distinguish policies.
+The configured policy is
+recorded in [`analysis_run.options_json.test_partition`](SQLITE_SCHEMA.md#analysis_run),
+even when authoritative build metadata takes precedence.
+The C API exposes the same settings through `trace_index_options` (see
+[the C API](CAPI.md)).
+
+For example, a simulator build may ship this implementation under `mock/`:
+
+```cpp
+// src/net/client.cpp
+int SocketOpen(const char *host);
+int Connect() { return SocketOpen("a"); }
+
+// src/net/mock/socket_shim.cpp
+int SocketOpen(const char *) { return 1; }
+```
+
+In a bare tree, the default run leaves `Connect`'s call external. Running
+`trace analyze <root> --no-test-partition` instead produces a direct edge to
+`socket_shim.cpp`. The same option allows a production `#include "foo_util.h"`
+to find a shipped header under `third_party/foo/tests/` through inferred
+search paths or basename fallback.
 
 An excluded definition must not erase its caller's external edge. External
 synthesis uses the shared resolver across all contributing translation units,

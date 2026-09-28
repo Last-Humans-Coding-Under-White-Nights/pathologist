@@ -179,6 +179,9 @@ typedef struct trace_index_options {
     size_t                 n_models;        /**< Number of model files in @p models. */
     const char *const     *ignore_macros;   /**< Array of macro names/patterns to ignore during lowering, or NULL if none. */
     size_t                 n_ignore_macros; /**< Number of patterns in @p ignore_macros. */
+    int32_t                no_test_partition; /**< Nonzero disables the bare-tree test partition; conflicts with @p n_test_dirs > 0. */
+    const char *const     *test_dirs;         /**< Literal directory names replacing defaults; NULL when @p n_test_dirs is 0. */
+    size_t                 n_test_dirs;       /**< Number of @p test_dirs; 0 keeps defaults unless @p no_test_partition is set. */
 } trace_index_options;
 
 /**

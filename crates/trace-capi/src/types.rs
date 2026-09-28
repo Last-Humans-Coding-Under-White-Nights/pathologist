@@ -219,6 +219,9 @@ pub struct TraceIndexOptions {
     pub n_models: usize,
     pub ignore_macros: *const *const c_char,
     pub n_ignore_macros: usize,
+    pub no_test_partition: i32,
+    pub test_dirs: *const *const c_char,
+    pub n_test_dirs: usize,
 }
 
 /// Summary counters filled by `trace_index` on success.

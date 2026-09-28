@@ -50,6 +50,12 @@ enum Commands {
         /// Link commands database path (default: auto-discovery).
         #[arg(long)]
         link_commands: Option<PathBuf>,
+        /// Disable the bare-tree test/mock directory partition.
+        #[arg(long, conflicts_with = "test_dirs")]
+        no_test_partition: bool,
+        /// Replace the default test, tests, mock, mocks directory names (repeatable).
+        #[arg(long = "test-dir")]
+        test_dirs: Vec<String>,
         /// Number of parallel jobs for indexing (parse/lower).
         #[arg(long)]
         jobs: Option<usize>,
@@ -248,6 +254,8 @@ fn main() -> Result<()> {
             defines,
             compile_commands,
             link_commands,
+            no_test_partition,
+            test_dirs,
             jobs,
             timeout_secs,
             debug_points_to,
@@ -268,6 +276,8 @@ fn main() -> Result<()> {
             defines,
             compile_commands,
             link_commands,
+            no_test_partition,
+            test_dirs,
             jobs,
             timeout_secs,
             debug_points_to,
@@ -306,6 +316,8 @@ fn run_analyze(
     defines: Vec<String>,
     compile_commands: Option<PathBuf>,
     link_commands: Option<PathBuf>,
+    no_test_partition: bool,
+    test_dirs: Vec<String>,
     jobs: Option<usize>,
     timeout_secs: Option<u64>,
     debug_points_to: bool,
@@ -355,6 +367,8 @@ fn run_analyze(
         );
     }
     let mut opts = PreprocessOptions::new();
+    opts.test_partition = trace_ir::TestPartition::from_options(no_test_partition, test_dirs)
+        .map_err(anyhow::Error::msg)?;
     // An explicitly named database that is not there is a mistyped flag. Auto
     // discovery stays silent, but failing here beats returning a plausible
     // index built from the inferred configuration the flag meant to replace.

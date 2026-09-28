@@ -1,5 +1,50 @@
 # Evaluation Report
 
+## Configurable test partition — 2026-09-28 (#161)
+
+The options and their precedence are specified in
+[Declaring-header eligibility](ANALYSIS.md#declaring-header-eligibility).
+Compared the default policy against parent `ae2dab2`, using release builds
+(`cargo build -p trace-cli --release`), eight jobs, minimal export, and the
+same clean pinned HDF, hiview, camera, and ability-runtime checkouts as #120
+below. Solver budgets were 800,000 pops for the three eval corpora and
+unlimited for ability-runtime. No eval expectations were changed.
+
+Both versions pass `scripts/eval_check.py` **94/94**. All 15 analysis-data
+tables match exactly on all four corpora (SHA-256 of rows ordered by every
+column); only `analysis_run` metadata differs, including the new effective
+policy. The two ability-runtime acceptance queries below still return the
+single production `TaskHandlerWrap::SubmitTask` body and zero production
+source calls to test bodies.
+
+Three sequential runs per version and corpus, alternating baseline/candidate
+order, with no concurrent builds, tests, or analyses. End-to-end time uses a
+monotonic clock around each fresh process; peak RSS uses `/usr/bin/time -l`.
+Values are median (minimum–maximum). The initial HDF candidate process took
+4.694 s despite its logged phases totaling 3.8 s; it is retained in the range.
+
+| Corpus | Baseline wall seconds | Candidate wall seconds | Median change |
+|---|---:|---:|---:|
+| HDF | 3.996 (3.864–4.099) | 3.964 (3.913–4.694) | −0.8% |
+| hiview | 1.651 (1.606–1.722) | 1.678 (1.599–1.683) | +1.6% |
+| camera | 6.052 (6.022–6.266) | 6.097 (5.865–6.150) | +0.7% |
+| ability-runtime | 53.659 (49.795–54.602) | 53.758 (52.006–54.345) | +0.2% |
+
+| Corpus | Baseline peak RSS MiB | Candidate peak RSS MiB |
+|---|---:|---:|
+| HDF | 584.0 (504.8–588.9) | 583.9 (575.7–586.3) |
+| hiview | 351.8 (351.5–351.8) | 342.9 (338.2–352.9) |
+| camera | 1013.2 (947.3–1077.9) | 1025.4 (920.6–1072.8) |
+| ability-runtime | 1861.2 (1842.6–1924.4) | 1827.2 (1663.7–1915.4) |
+
+No reproducible runtime or memory regression was observed: all ranges overlap,
+with median runtime changes below 2%. These measurements cover the default
+policy; disabling the partition admits additional code and may increase work.
+Validation also passes `cargo test --workspace` (1,495 tests), workspace Clippy
+with warnings denied, formatting, and the C example's header syntax check.
+Regression tests exercise both issue examples, custom names replacing defaults,
+include-search cache isolation, invalid CLI/C API options, and policy metadata.
+
 ## Mock isolation and inferred GN targets — 2026-09-28 (#120)
 
 Rules are maintained in [Shared header functions](ANALYSIS.md#shared-header-functions)

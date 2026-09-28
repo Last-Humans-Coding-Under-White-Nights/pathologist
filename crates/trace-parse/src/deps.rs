@@ -9,6 +9,7 @@ use walkdir::WalkDir;
 #[derive(Debug, Clone, Default)]
 pub struct IncludeGraph {
     pub root: PathBuf,
+    pub test_partition: trace_ir::TestPartition,
     /// Canonical roots whose entities contribute declarations only.
     pub dep_roots: Vec<PathBuf>,
     /// All `.c` / `.h` files under the analyzed root (canonical).
@@ -52,6 +53,24 @@ impl IncludeGraph {
         dep_roots: &[PathBuf],
         dep_headers: &[PathBuf],
     ) -> Self {
+        Self::build_with_partition(
+            root,
+            c_files,
+            h_files,
+            dep_roots,
+            dep_headers,
+            &trace_ir::TestPartition::default(),
+        )
+    }
+
+    pub fn build_with_partition(
+        root: &Path,
+        c_files: &[PathBuf],
+        h_files: &[PathBuf],
+        dep_roots: &[PathBuf],
+        dep_headers: &[PathBuf],
+        test_partition: &trace_ir::TestPartition,
+    ) -> Self {
         let root = trace_ir::canonicalize(root);
         let mut project_files: HashSet<PathBuf> = HashSet::default();
         for p in c_files
@@ -75,10 +94,11 @@ impl IncludeGraph {
                     return None;
                 };
                 let mut deps = Vec::new();
-                let from_is_test = trace_ir::is_test_path(&root, path);
+                let from_is_test = trace_ir::is_test_path(&root, path, test_partition);
                 for inc in scan_includes(&content) {
                     if let Some(resolved) = resolve_include(
                         &root,
+                        test_partition,
                         path,
                         from_is_test,
                         &inc,
@@ -110,6 +130,7 @@ impl IncludeGraph {
 
         Self {
             root,
+            test_partition: test_partition.clone(),
             dep_roots: dep_roots.iter().map(|p| canonicalize(p)).collect(),
             project_files,
             edges,
@@ -448,6 +469,7 @@ fn build_basename_index(project_files: &HashSet<PathBuf>) -> FxHashMap<String, V
 
 fn resolve_include(
     root: &Path,
+    test_partition: &trace_ir::TestPartition,
     from: &Path,
     from_is_test: bool,
     inc: &IncludeRef,
@@ -476,7 +498,7 @@ fn resolve_include(
     }
     // A production includer never takes a test/mock candidate from the
     // inferred search (docs/ANALYSIS.md, "Declaring-header eligibility").
-    let admits = |p: &Path| from_is_test || !trace_ir::is_test_path(root, p);
+    let admits = |p: &Path| from_is_test || !trace_ir::is_test_path(root, p, test_partition);
     for dir in include_dirs {
         let cand = dir.join(&inc.path);
         if trace_ir::is_file_cached(&cand) && admits(&cand) {
@@ -621,13 +643,22 @@ mod tests {
         );
         let resolve = |from: &str, spelled: &str| {
             let from = root_dir.join(from);
-            let from_is_test = trace_ir::is_test_path(root_dir, &from);
+            let from_is_test =
+                trace_ir::is_test_path(root_dir, &from, &trace_ir::TestPartition::default());
             let inc = IncludeRef {
                 kind: IncludeKind::System,
                 path: spelled.to_string(),
             };
-            resolve_include(root_dir, &from, from_is_test, &inc, &dirs, &index)
-                .map(|p| p.strip_prefix(root_dir).unwrap().to_path_buf())
+            resolve_include(
+                root_dir,
+                &trace_ir::TestPartition::default(),
+                &from,
+                from_is_test,
+                &inc,
+                &dirs,
+                &index,
+            )
+            .map(|p| p.strip_prefix(root_dir).unwrap().to_path_buf())
         };
         // A later production directory wins over an earlier mock one...
         assert_eq!(resolve("app/u.c", "a.h"), Some("zsrc/a.h".into()));

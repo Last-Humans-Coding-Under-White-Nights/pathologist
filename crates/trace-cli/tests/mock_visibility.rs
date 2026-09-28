@@ -4,6 +4,124 @@ use rusqlite::Connection;
 use std::{path::Path, process::Command};
 
 #[test]
+fn configurable_test_partition_controls_includes_and_calls() {
+    for (args, shim, fake, header, names) in [
+        (vec!["--no-test-partition"], true, true, true, vec![]),
+        (
+            vec![],
+            false,
+            true,
+            false,
+            vec!["test", "tests", "mock", "mocks"],
+        ),
+        (
+            vec!["--test-dir", "fakes"],
+            true,
+            false,
+            true,
+            vec!["fakes"],
+        ),
+        (
+            vec!["--test-dir", "fakes", "--test-dir", "mock"],
+            false,
+            false,
+            true,
+            vec!["fakes", "mock"],
+        ),
+        (
+            vec![
+                "--test-dir",
+                "mock",
+                "--test-dir",
+                "mock",
+                "--test-dir",
+                "fakes",
+                "--test-dir",
+                "mock",
+                "--test-dir",
+                "fakes",
+            ],
+            false,
+            false,
+            true,
+            vec!["mock", "fakes"],
+        ),
+    ] {
+        let db = TempDb::new("partition.db");
+        let result = Command::new(env!("CARGO_BIN_EXE_trace"))
+            .arg("analyze")
+            .arg(common::fixture("test_partition"))
+            .args(&args)
+            .arg("-o")
+            .arg(db.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let conn = Connection::open(db.path()).unwrap();
+        for (caller, callee, suffix, admitted) in [
+            (
+                "Connect",
+                "SocketOpen",
+                "src/net/mock/socket_shim.cpp",
+                shim,
+            ),
+            ("ConnectFake", "FakeOpen", "fakes/socket.cpp", fake),
+            (
+                "UseFoo",
+                "FooUtil",
+                "third_party/foo/tests/foo_util.h",
+                header,
+            ),
+            (
+                "UseFooFallback",
+                "FooUtil",
+                "third_party/foo/tests/foo_util.h",
+                header,
+            ),
+        ] {
+            let edges: i64 = conn.query_row("SELECT count(*) FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id JOIN functions callee ON callee.id=e.callee_fn_id JOIN files f ON f.id=callee.file_id WHERE caller.name=?1 AND callee.name=?2 AND callee.is_defined=1 AND e.resolution='direct' AND f.path LIKE '%' || ?3", [caller, callee, suffix], |r| r.get(0)).unwrap();
+            assert_eq!(edges, i64::from(admitted), "{args:?}: {caller} -> {callee}");
+        }
+        let options: String = conn
+            .query_row("SELECT options_json FROM analysis_run", [], |r| r.get(0))
+            .unwrap();
+        let options: serde_json::Value = serde_json::from_str(&options).unwrap();
+        assert_eq!(
+            options["test_partition"],
+            serde_json::json!({"enabled": !names.is_empty(), "directories": names})
+        );
+    }
+}
+
+#[test]
+fn invalid_test_partition_options_are_rejected() {
+    for args in [
+        vec!["--no-test-partition", "--test-dir", "fakes"],
+        vec!["--test-dir", ""],
+        vec!["--test-dir", "a/b"],
+        vec!["--test-dir", ".."],
+        vec!["--test-dir", "."],
+        vec!["--test-dir", "a\\b"],
+    ] {
+        let db = TempDb::new("invalid.db");
+        let result = Command::new(env!("CARGO_BIN_EXE_trace"))
+            .arg("analyze")
+            .arg(common::fixture("test_partition"))
+            .args(&args)
+            .arg("-o")
+            .arg(db.path())
+            .output()
+            .unwrap();
+        assert!(!result.status.success(), "{args:?}");
+        assert!(!db.path().exists());
+    }
+}
+
+#[test]
 fn excluded_overload_remains_external_beside_a_production_overload() {
     let tree = tempfile::tempdir().unwrap();
     for (file, text) in [

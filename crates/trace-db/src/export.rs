@@ -56,6 +56,10 @@ pub fn export_to_sqlite(
         conn.execute_batch(TABLES_V6)?;
 
         let options_json = serde_json::json!({
+            "test_partition": {
+                "enabled": program.symbols.test_partition().enabled(),
+                "directories": program.symbols.test_partition().directories(),
+            },
             "include_paths": program.include_paths,
             "defines": program.defines,
             "dep_roots": program.dep_roots(),

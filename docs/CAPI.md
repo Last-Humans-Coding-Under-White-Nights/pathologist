@@ -157,6 +157,15 @@ string `Vec` moves the `CString` values but not the buffers they own.
   buffer across calls can never observe a stale (already-freed) pointer; the
   rule is: check the status, then `if (*out_err) { free it }`.
 
+The trailing `trace_index_options` fields map to the CLI partition options:
+nonzero `no_test_partition` requests `--no-test-partition`; the `test_dirs`
+array, with length `n_test_dirs`, supplies repeated `--test-dir` values.
+Zero initialization selects the default policy. Defaults, valid names,
+conflicts, and precedence are defined in
+[Declaring-header eligibility](ANALYSIS.md#declaring-header-eligibility);
+invalid settings return `TRACE_ERR_INVALID_ARG`. Recompile consumers with the
+updated header; the existing size guard rejects older, shorter option structs.
+
 ## Status codes
 
 `TRACE_OK` (0) on success. Errors: `TRACE_ERR_INVALID_ARG`,

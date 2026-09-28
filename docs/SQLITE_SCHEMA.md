@@ -72,7 +72,12 @@ diagnostics
 | `schema_version` | INTEGER | Database layout version (currently `5`) |
 | `target_root` | TEXT | Analyzed directory |
 | `created_at` | TEXT | Unix timestamp (seconds) |
-| `options_json` | TEXT | JSON: `include_paths`, `defines`, `dep_roots`, `ignored_macros`, `include_points_to`, `full_detail`, `model_files`, `explore`, `explore_budget`, `variants_merged`, `solver_partial`, `solver_pops`, `solve_budget_pops`, `solve_budget_secs` |
+| `options_json` | TEXT | JSON: `test_partition`, `include_paths`, `defines`, `dep_roots`, `ignored_macros`, `include_points_to`, `full_detail`, `model_files`, `explore`, `explore_budget`, `variants_merged`, `solver_partial`, `solver_pops`, `solve_budget_pops`, `solve_budget_secs` |
+
+`test_partition` is an object with `enabled` (boolean) and `directories`
+(array of strings), recording the effective configured name list. Disabled runs
+store `false` and an empty array. Defaults, validation, and precedence are defined in
+[Declaring-header eligibility](ANALYSIS.md#declaring-header-eligibility).
 
 `explore` and `explore_budget` record what the run *requested*; `variants_merged`
 records how many variant units it actually merged. They come apart: a run can ask
