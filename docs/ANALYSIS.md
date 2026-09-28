@@ -686,7 +686,7 @@ subDev.subDevOps->setConfig(subDev);
 
 **`NewHeap`** represents C++ `new T(...)` allocations. The PAG allocates a heap location typed to the allocated struct and adds an `AddrOf` edge from `dst` to the heap location. The solver then propagates into the struct's fields, enabling resolution of function pointers stored by constructors (e.g., `MParcelImplInterfaceAssign` writing into `HdfSBufImpl.readBuffer`).
 
-**`StringConst`** intern a C string literal as an abstract location (`LocKind::StringLit`). Assignments (`const char *n = "foo"`), copies, and call arguments intern the same way, so a later `dlsym(h, n)` still sees `"foo"`. Concatenated literals (`"ta" "rget"`) are folded. No `sprintf` / buffer writes.
+**`StringConst`** intern a C string literal as an abstract location (`LocKind::StringLit`). Assignments (`const char *n = "foo"`), copies, and call arguments intern the same way, so a later `dlsym(h, n)` still sees `"foo"`. Concatenated literals (`"ta" "rget"`) are folded. String literals represent immutable constants and are excluded from being writable memory cells: stores through untyped or cast pointers do not write into string literal locations, and dereferences of pointers holding string literals do not merge cell memory (see [Propagation highlights](#propagation-highlights)). No `sprintf` / buffer writes.
 
 ### Dereferenced operands
 
@@ -1041,6 +1041,15 @@ order of anything:
 On HDF these recover what the larger hub of #150/#151 costs; the exported
 database, the `points_to` debug rows included, is byte-identical. Measurements
 are in the [evaluation report](EVAL_REPORT.md#dereferenced-operands-and-template-parameter-bases--2026-09-25-151-150).
+
+**String-literal memory cell exclusion and precise store requeuing**
+
+String literals (`LocKind::StringLit`) interned for dynamic lookup (`dlsym`) represent immutable constants, never writable memory cells:
+- `apply_store_to_targets` skips `LocKind::StringLit` targets, preventing stores through generic/cast pointer buffers or strings from treating constant string literals as memory cells.
+- `load_into` skips `LocKind::StringLit` locations during cell merges, preventing dereferences of pointers holding string literals from attempting to read memory cells.
+- In `apply_store_to_targets`, requeuing of instance field locations and field summaries is decoupled (`loc_changed` vs `summary_changed`). When an instance field grows without growing the summary (e.g. because the summary already holds the locations or hit `SUMMARY_MEM_CAP`), the summary's holders are not re-walked. Conversely, when only the summary grows, the instance field is not needlessly requeued.
+
+Without this, ubiquitous string constants (such as `""` held by tens of thousands of variables across translation units) accumulated abstract locations, turning into massive false memory hubs whose stores re-triggered hundreds of millions of redundant loads across the entire program. Measurements are in the [evaluation report](EVAL_REPORT.md#solver-string-literal-memory-cell-exclusion-and-store-requeue-decoupling--2026-09-28).
 
 **Indirect calls**
 
