@@ -4,6 +4,33 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Mock isolation and inferred GN targets (#120)
+
+Production code in a bare tree no longer binds to test doubles that redefine
+production classes, and indexing is faster. Rules: **Declaring-header
+eligibility** and **Inferred GN targets** in `docs/ANALYSIS.md`; measurements
+in `docs/EVAL_REPORT.md`.
+
+- **Test partition**: files below a `test`, `tests`, `mock` or `mocks`
+  directory form a partition. Production includes skip test headers
+  (the basename fallback takes the one production match beside mock copies),
+  and production calls skip test bodies unless the caller includes their file.
+  On `ability_ability_runtime`, `ability_manager_service.cpp:4028`
+  (`SubmitTask`) now reaches only `services/common/src/task_handler_wrap.cpp`,
+  and direct production-to-test edges drop from 88,969 to 0.
+- **Inferred GN targets**: without link commands or CMake metadata, target
+  ownership is read from `BUILD.gn` files; imports are read once per run.
+  Incomplete inference keeps the whole-tree resolver and exports every target
+  it read, incomplete ones included, as observations. A variable target name
+  resolves, and a missing import or an unresolved name no longer discards the
+  rest of its build file.
+- **Include order**: inferred tree directories are searched after every
+  explicit `-I` / `-isystem` class.
+- **Performance**: cached tree-sitter grammar metadata, precomputed header
+  ranks, all indexing workers available to parsing, cached solver loader
+  lists, and no test-path walks per include-search candidate. Release builds
+  use ThinLTO and one codegen unit.
+
 ### Solver string-literal memory cell exclusion and store requeue decoupling
 
 - **String literal memory cell exclusion**: `LocKind::StringLit` locations represent

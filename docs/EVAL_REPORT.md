@@ -1,5 +1,234 @@
 # Evaluation Report
 
+## Mock isolation and inferred GN targets — 2026-09-28 (#120)
+
+Rules are maintained in [Shared header functions](ANALYSIS.md#shared-header-functions)
+and [Link targets and weak symbols](ANALYSIS.md#link-targets-and-weak-symbols).
+The local branch is `fix/issue-120-mock-target-isolation`, based on
+`0120768025acaf5768116fcda47d54d049eaa630`. Both versions use the same pinned,
+clean HDF (`cdc75a2`), hiview (`92408e2`), and camera (`8ffd69d`) corpora from
+`scripts/eval_expected.json`, release builds, eight jobs, and the existing eval
+solver settings. Baseline checks passed 94/94 before changes.
+
+| Corpus | Metric | Baseline | Candidate |
+|---|---|---:|---:|
+| HDF | direct / indirect / external edges | 47,845 / 4,980 / 23,677 | unchanged |
+| HDF | functions / external functions | 11,997 / 1,707 | 11,989 / 1,699 |
+| HDF | diagnostics | 1,659 | 1,882 |
+| hiview | direct / indirect / external edges | 18,033 / 176 / 14,426 | 17,409 / 176 / 14,426 |
+| hiview | functions / argument-flow edges | 9,599 / 20,141 | 9,604 / 19,648 |
+| hiview | diagnostics | 3,010 | 3,597 |
+| camera | direct / indirect / external edges | 62,704 / 305 / 39,989 | 62,173 / 305 / 40,645 |
+| camera | functions / external functions | 22,796 / 2,990 | 22,954 / 3,148 |
+| camera | argument-flow edges / diagnostics | 48,818 / 4,882 | 48,352 / 5,350 |
+
+HDF's semantic call-edge multiset is identical: caller name/file/line,
+call position, callee name/file/line, and resolution. A synthesized external
+has no declaration location (line zero), so its arbitrary placeholder file
+is excluded from that comparison. Context-aware external synthesis removes
+eight unused duplicate external entries and chooses different placeholder
+files for five external names; neither change moves a call to another body.
+
+Hiview loses exactly 624 direct edges, all to test/mock bodies. Its dispatch
+probes now exclude test classes: the two plugin `OnEvent` sites go from 24 to
+13 targets, `EventHandler::OnEventProxy` from 28 to 14, `CanProcessEvent` from
+12 to 4, and `OnEventListeningCallback` from 8 to 6. The narrower
+`EventHandler::OnEvent` family probe goes from four to one because the three
+other implementations are test classes. Every removed target was checked by
+definition path; production dispatch targets remain. The declaration-only
+shadow probe rises from 22 to 24: two unrelated `TraceCollectorTest` fixtures
+(`unified_collection/utility/` and `unified_collection/client/`) both have
+`SetUp` and `TearDown`, declared only in the first and defined in the second.
+Declaration provenance now keeps the declared-only pair separate instead of
+merging it into the other fixture's definitions.
+
+Camera's two `Command::Do` probes each lose four test overrides (`TestCommand`
+and the three `VideoProcess*Fuzz` classes). Declaration provenance also keeps
+unrelated mock header families apart instead of merging solely by member
+name. The declaration/definition-name overlap probe rises from 15 to 60:
+distinct `CameraServerPhotoProxy`, `PhotoAssetAdapter`, and `CameraXmlNode`
+headers and separate mock callback declarations explain the additional
+entries. These declarations produce external edges rather than borrowing a
+different header family's body. Correctness tolerances were not widened.
+GN uncertainty diagnostics account for new metadata warnings; missing mock
+headers are reported as unresolved includes. No translation units are removed.
+The GN reader skips scope literals (`sanitize = { ... }`) whole and accepts a
+`set_defaults` block that names no sources or deps. Before, a scope literal's
+closing brace ended the enclosing target and failed the file (7 HDF, 61
+hiview, 23 camera, 378 ability-runtime build files). Those files now report
+per target, which is why diagnostics rise while call edges stay identical.
+Every target read is exported as an observation, incomplete ones included:
+HDF 131, hiview 409 and camera 285 `link_targets` rows, with no symbol
+carrying a `target_id`. A missing in-tree import or an unresolved target
+name is diagnosed without discarding its build file; call edges and
+diagnostic counts are unchanged by either.
+
+Reproduce the corpus checks with:
+
+```sh
+cargo build -p trace-cli --release
+python3 scripts/eval_check.py --bin target/release/trace --outdir /tmp/issue120-eval hdf hiview camera
+```
+
+### Ability-runtime acceptance and performance
+
+The separate issue corpus is `ability_ability_runtime` at
+`6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8` (the local
+`origin/OpenHarmony-7.0-Release` revision), clean. The baseline has two
+`TaskHandlerWrap::SubmitTask` edges at `ability_manager_service.cpp:4028`;
+the candidate has exactly one, to `services/common/src/task_handler_wrap.cpp`.
+Both runs reach the solver fixpoint. The candidate exports 3,107 observed GN
+targets (every target read, incomplete ones included); incomplete ownership
+keeps the whole-tree resolver active, so no symbol carries a `target_id`.
+
+The acceptance audit enumerated call sites before joining edges, so a
+missing call in one image could not hide behind a correct call in another image.
+It checked header-origin mock edges in their actual contributing translation
+units. This distinguishes a production source call from a shared header
+body used by a test. The final audit reports 3,127 retained header-origin edges
+(859 grouped rows, 10,633 contributing context entries), all from test
+translation units. There are zero unexplained production contexts and zero
+direct production-source-to-test edges. A file-path-only report also counted
+33 calls under `tools/ohos-aa/tests/` as production; the final audit used
+the same four directory components as the resolver. Legitimate test-context
+uses of shared headers remain, together with explicitly included utilities.
+External synthesis uses the same contextual resolver as analysis: four
+`DlpUtils::CheckCallerIsDlpManager` calls to internal header helpers remain
+direct (two each to `CovertFileName` and `GetTagInfoFromDomainId`). These are
+positive acceptance probes, alongside the excluded-mock checks. The final
+candidate has 81,356 functions and 633,464 call edges: 310,012 direct, 920
+indirect, 321,477 external, and 1,055 IPC, with 316,879 argument-flow edges.
+The three direct edges over the timed candidate come from the basename
+fallback now taking the one production match beside mock copies:
+`ability_event_util.cpp` reaches the `BundleMgrHelper` bodies of
+`GetSignatureInfoByBundleName`, `GetApplicationInfoWithAppIndex`, and
+`SetBundleFirstLaunch`.
+All SQLite analysis tables are identical at jobs 1 and 8, excluding only
+`analysis_run` metadata; their semantic SHA256 is
+`ebdd1bdb95e073c4aa8131821c47e7f4aa8e9b7bc6b6b6ddb396fca743744374`.
+The final workspace suite passes 1,489 tests, and corpus evaluation passes
+94/94. Formatting, Clippy across all workspace targets, and whitespace checks
+pass.
+
+The two acceptance queries run against the exported database. The first must
+return one row, the production `task_handler_wrap.cpp` body (master also returns
+the `test/new_test/mock/` header). The second must return zero (master: 88,969).
+Indirect edges are excluded because the whole-program points-to analysis
+still carries callbacks that tests store into production objects.
+
+```sql
+SELECT cs.line, callee.name, cf.path
+FROM call_sites cs
+JOIN files sf ON sf.id = cs.file_id
+JOIN call_edges e ON e.call_site_id = cs.id
+JOIN functions callee ON callee.id = e.callee_fn_id
+JOIN files cf ON cf.id = callee.file_id
+WHERE sf.path LIKE '%/services/abilitymgr/src/ability_manager_service.cpp'
+  AND cs.line = 4028 AND callee.name LIKE '%SubmitTask';
+
+WITH t(pattern) AS (VALUES ('%/test/%'), ('%/tests/%'), ('%/mock/%'), ('%/mocks/%'))
+SELECT COUNT(*)
+FROM call_edges e
+JOIN call_sites cs ON cs.id = e.call_site_id
+JOIN files sf ON sf.id = cs.file_id
+JOIN functions callee ON callee.id = e.callee_fn_id
+JOIN files cf ON cf.id = callee.file_id
+WHERE (sf.path LIKE '%.c' OR sf.path LIKE '%.cc' OR sf.path LIKE '%.cpp')
+  AND NOT EXISTS (SELECT 1 FROM t WHERE sf.path LIKE t.pattern)
+  AND EXISTS (SELECT 1 FROM t WHERE cf.path LIKE t.pattern)
+  AND callee.is_defined = 1 AND e.resolution = 'direct';
+```
+
+Measurements used the pinned clean corpus, fresh processes and SQLite
+databases, eight jobs, default minimal export, and unlimited solver budgets.
+Elapsed wall time was measured with Python’s monotonic clock around the
+complete analyzer subprocess. Builds and verification queries are outside the
+timer. Measurements use the existing `--features mimalloc,mimalloc/override`
+options for both baseline and candidate, including native parser allocations.
+The acceptance condition is an otherwise idle machine (Apple M1, eight logical
+CPUs, 8 GB RAM, macOS 26.6.2 arm64; rustc 1.100.0-nightly, bff8e12ff).
+The final builds also use ThinLTO and one codegen unit. The workspace
+`[profile.release]` now sets both, so a plain release build matches; a
+master baseline, which predates that profile, needs
+`CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`:
+
+```sh
+cargo build -p trace-cli --release --features mimalloc,mimalloc/override \
+  --target-dir target/issue120-candidate
+target/issue120-candidate/release/trace analyze /path/to/ability_ability_runtime \
+  --jobs 8 --solve-budget-pops 0 --solve-budget-secs 0 \
+  -o /path/to/fresh-output.db
+```
+
+Build master from a clean checkout of the recorded revision with the same
+options and a separate target directory. Sharing workspace build artifacts
+between revisions can reuse stale Cargo outputs; only isolated builds are
+accepted for this comparison. Record the source revision for each binary.
+
+One warm-up precedes three measured runs; every measured run must
+complete within 60 seconds and pass both acceptance queries. Reports include binary
+and source fingerprints, machine/toolchain, commands, times, solve status, and
+a semantic SQLite digest excluding `analysis_run` metadata.
+
+**The candidate passes the gate.** All three runs reach the solver fixpoint,
+pass both acceptance queries, and match that revision's semantic digest,
+`db0c5812a4aa160fa70473b50388ab3a0ff51b3f7ee19f187a02a27c85bee402`. The
+timings below predate the final review fixes (basename fallback, resolver fast
+path, include-graph and GN inference costs); those fixes were verified on a
+busy machine only and still need an idle three-run series. Rebased onto the
+string-literal solver fix (#159), the analysis data is unchanged (same digest)
+and the analyze phase falls from about 8.5 s to 1.0 s (busy machine).
+Other user work was paused; normal desktop background processes remained open.
+
+| Complete process | Warm-up | Run 1 | Run 2 | Run 3 | Median | Maximum |
+|---|---:|---:|---:|---:|---:|---:|
+| Master | 68.296 s | 70.239 s | 73.604 s | 75.907 s | 73.604 s | 75.907 s |
+| Candidate | 54.608 s | 57.209 s | 57.454 s | 58.888 s | 57.454 s | 58.888 s |
+
+The median is 21.9% lower than master. Master also completes every solve and
+produces identical analysis data across its three runs, but retains the second
+`SubmitTask` target and fails the new mock-isolation probes as expected. This
+isolated baseline has 77,192 functions and 821,853 call edges; its semantic SHA256 is
+`5cfaa3e6cd25ec22bcfebf6d926fc5b5651bd0f6ae14259a6dda62b7394d6742`.
+Its binary SHA256 is
+`608783e3ae0ed6fe25711a94d68ede0e1e7541cd6799ea983a0f76711cd6ea6e`.
+The candidate binary SHA256 is
+`20ff5346954729902a21a7980ee317898ef5f14b432567605d719e2ae211f82c`.
+
+| Candidate phase | Run 1 | Run 2 | Run 3 |
+|---|---:|---:|---:|
+| Index | 45.2 s | 45.4 s | 46.5 s |
+| Analyze | 8.6 s | 8.6 s | 8.8 s |
+| Export | 3.3 s | 3.3 s | 3.4 s |
+
+The process clock additionally includes startup and teardown; phase logs round
+to tenths of a second. Optimizations preserve the same analysis data: header
+order ranks are prepared once, the merge coordinator leaves every indexing
+worker available, unchanged location-holder membership reuses its ordered
+loader view, and C/C++ grammar metadata avoids repeated node-name decoding and
+field-name searches. Grammar selection follows each node's actual language,
+including workers switching between C and C++; recovery nodes retain the
+tree-sitter fallback. Instrumented regressions protect the avoided work and
+existing ordering, alongside the semantic digest and corpus checks.
+
+Most of the gain comes from mock isolation doing less work, not from these
+optimizations. Excluding test and mock headers and bodies cuts the include
+graph from 21,315 to 19,334 edges, flow constraints from 237,954 to 220,522,
+and call edges from 821,853 to 633,461. Preprocessing (about 21 to 14 s)
+and analysis (13.5 to 8.3 s) shrink with them. On corpora the isolation barely
+changes, the optimizations alone are within noise: camera 4.8–5.1 s on both
+revisions, HDF 3.35–3.40 s against 3.23–3.29 s (default release profile,
+mimalloc, eight jobs, interleaved runs on a non-idle machine).
+
+Earlier attempts remain failures: before grammar metadata caching, the idle
+series took 63.316, 65.781, and 65.801 seconds. The first final-binary series
+took 57.133, 64.608, and 61.386 seconds while editor activity resumed. Isolated
+sub-minute runs were not accepted in place of the three-run gate. Earlier
+master measurements that reused a shared Cargo target directory were discarded.
+Relative improvement is context, not the acceptance gate. These measurements
+establish the limit for the documented source build on this machine; they do not claim the default system-allocator
+release artifact meets the same limit.
+
 ## Solver string-literal memory cell exclusion and store requeue decoupling — 2026-09-28
 
 String literals (`LocKind::StringLit`) interned for dynamic symbol resolution (`dlsym`)

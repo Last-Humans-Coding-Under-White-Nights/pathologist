@@ -148,6 +148,10 @@ struct PreprocessorState {
     /// retain its first occurrence rather than multiplying it by cache path.
     diagnostic_keys: FxHashSet<(Option<PathBuf>, u32, String)>,
     current_file: PathBuf,
+    /// Whether `current_file` is in the bare-tree test partition (always
+    /// true without an inference root). Kept by `set_current_file` so an
+    /// include lookup does not walk the path each time.
+    current_file_is_test: bool,
     current_line: u32,
     /// Bytes each processed file contributed to `output`. Files whose
     /// expansion was fully skipped (e.g. by an already-defined include
@@ -204,7 +208,7 @@ struct PreprocessorState {
     /// the run, so only the including file's own directory varies, and that
     /// is checked separately before this cache is consulted. A hit here costs
     /// no lock; a miss falls through to the shared map below.
-    include_search_cache: RefCell<FxHashMap<(String, bool), Option<PathBuf>>>,
+    include_search_cache: RefCell<FxHashMap<(String, bool, bool), Option<PathBuf>>>,
     /// The directory walk's results shared with every other run over the
     /// same `SourceCache` and search lists (`SourceCache::directory_results`).
     /// `None` when no source cache was supplied.
@@ -297,6 +301,7 @@ impl PreprocessorState {
             line_map: LineMap::new(),
             diagnostics: Vec::new(),
             diagnostic_keys: FxHashSet::default(),
+            current_file_is_test: false,
             current_file: file,
             current_line: 1,
             emitted_bytes: FxHashMap::default(),
@@ -318,6 +323,8 @@ impl PreprocessorState {
             forced_include_depth: 0,
             journal: None,
         };
+        let file = std::mem::take(&mut state.current_file);
+        state.set_current_file(file);
         if state.opts.defer_expansion_publish
             && !state.opts.frozen_expansion_cache
             && state.opts.include_expansion_cache.is_some()
@@ -1648,7 +1655,7 @@ impl PreprocessorState {
         }
 
         let prev_file = self.current_file.clone();
-        self.current_file = path.to_path_buf();
+        self.set_current_file(path.to_path_buf());
         self.include_stack.push(path.to_path_buf());
 
         let tokens = Lexer::new(&content, self.language).tokenize();
@@ -1663,7 +1670,7 @@ impl PreprocessorState {
         }
 
         self.include_stack.pop();
-        self.current_file = prev_file;
+        self.set_current_file(prev_file);
 
         let emitted = self.output.len() - output_start;
         self.emitted_bytes.insert(canonical.clone(), emitted);
@@ -2452,7 +2459,7 @@ impl PreprocessorState {
         // Everything below depends only on the header spelling and the fixed
         // search lists, so a guarded header re-included by many files, and
         // every file that includes it, share one directory walk.
-        let key = (path.to_string(), quoted);
+        let key = (path.to_string(), quoted, self.current_file_is_test);
         if let Some(hit) = self.include_search_cache.borrow().get(&key) {
             return hit.clone().ok_or_else(|| PreprocessError::Message {
                 message: format!("include file not found: {path}"),
@@ -2465,6 +2472,15 @@ impl PreprocessorState {
         found.ok_or_else(|| PreprocessError::Message {
             message: format!("include file not found: {path}"),
         })
+    }
+
+    fn set_current_file(&mut self, file: PathBuf) {
+        self.current_file_is_test = self
+            .opts
+            .inference_root
+            .as_ref()
+            .is_none_or(|root| trace_ir::is_test_path(root, &file));
+        self.current_file = file;
     }
 
     /// Whether `path` names a header this run can read: a file on disk, or an
@@ -2497,12 +2513,25 @@ impl PreprocessorState {
     }
 
     /// The include search proper, excluding the including file's own
-    /// directory, for `key` = (spelling, quoted). The directory walk is
-    /// shared with every run over the same `SourceCache` and search lists
-    /// (hits and misses alike); the basename fallback is not, because it
+    /// directory, for `key` = (spelling, quoted, test context). The directory
+    /// walk is shared with every run over the same `SourceCache` and search
+    /// lists (hits and misses alike); the basename fallback is not, because it
     /// depends on the caller's own index and strictness.
-    fn search_include_dirs(&self, key: &(String, bool)) -> Option<PathBuf> {
+    ///
+    /// A production includer never takes an inferred test/mock candidate, and
+    /// its basename fallback takes the one production match when exactly one
+    /// exists (docs/ANALYSIS.md, "Declaring-header eligibility"). The
+    /// partition is checked only on candidates that exist.
+    fn search_include_dirs(&self, key: &(String, bool, bool)) -> Option<PathBuf> {
         let (path, quoted) = (key.0.as_str(), key.1);
+        let admits = |p: &Path| {
+            key.2
+                || self
+                    .opts
+                    .inference_root
+                    .as_ref()
+                    .is_none_or(|root| !trace_ir::is_test_path(root, p))
+        };
         let cached = self.shared_directory_results.as_ref().and_then(|cache| {
             cache
                 .read()
@@ -2515,7 +2544,14 @@ impl PreprocessorState {
                 .chain(&self.opts.include_paths)
                 .chain(&self.opts.system_include_paths)
                 .map(|inc| inc.join(path))
-                .find(|p| self.include_exists(p));
+                .find(|p| self.include_exists(p))
+                .or_else(|| {
+                    self.opts
+                        .inferred_include_paths
+                        .iter()
+                        .map(|inc| inc.join(path))
+                        .find(|p| self.include_exists(p) && admits(p))
+                });
             if let Some(cache) = &self.shared_directory_results {
                 if let Ok(mut results) = cache.write() {
                     results.insert(key.clone(), found.clone());
@@ -2534,8 +2570,9 @@ impl PreprocessorState {
         {
             if let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str()) {
                 if let Some(matches) = index.get(name) {
-                    if matches.len() == 1 {
-                        return Some(matches[0].clone());
+                    let mut admitted = matches.iter().filter(|p| admits(p));
+                    if let (Some(only), None) = (admitted.next(), admitted.next()) {
+                        return Some(only.clone());
                     }
                 }
             }
@@ -2564,13 +2601,13 @@ impl PreprocessorState {
         for include in self.opts.forced_includes.clone() {
             let name = include.to_string_lossy().into_owned();
             if let Some(directory) = &search_from {
-                self.current_file = directory.clone();
+                self.set_current_file(directory.clone());
             }
             let resolved = self.resolve_include(&name, true);
             // Warn as the source, never as the synthetic `<command-line>`:
             // a diagnostic's file is interned into the program, and that
             // path does not exist.
-            self.current_file = source.clone();
+            self.set_current_file(source.clone());
             match resolved {
                 Ok(path) => {
                     if let Err(e) = self.process_file(&path) {
@@ -2584,7 +2621,7 @@ impl PreprocessorState {
             }
         }
         self.forced_include_depth -= 1;
-        self.current_file = source;
+        self.set_current_file(source);
     }
 
     fn handle_define(&mut self, tokens: &[Token], mut i: usize) -> Result<usize, PreprocessError> {
@@ -5321,7 +5358,9 @@ mod tests {
         let shared = |opts: &PreprocessOptions, quoted: bool| {
             let cache = opts.source_cache.as_ref().unwrap().directory_results(opts);
             let results = cache.read().unwrap();
-            results.get(&("shared.h".to_string(), quoted)).cloned()
+            results
+                .get(&("shared.h".to_string(), quoted, true))
+                .cloned()
         };
         assert_eq!(shared(&opts, false), Some(Some(a.join("shared.h"))));
         // Warm the same quoted key that the local candidate must override.

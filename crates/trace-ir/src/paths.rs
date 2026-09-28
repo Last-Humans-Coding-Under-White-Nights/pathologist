@@ -234,9 +234,71 @@ pub fn resolve_against(directory: &Path, path: &Path) -> PathBuf {
     canonicalize(&normalized)
 }
 
+/// Bare-tree fallback partition; explicit include/link evidence takes precedence.
+/// See docs/ANALYSIS.md, "Declaring-header eligibility".
+///
+/// True when a directory component of `path` below `root` is `test`, `tests`,
+/// `mock` or `mocks` (the file name itself does not count).
+///
+/// Precondition: `root` and `path` are spelled the same way -- both
+/// canonical, as every pipeline stage passes them. The test is lexical: a
+/// symlinked prefix or a `root` spelled differently from `path`'s prefix
+/// yields `false`, and so does a path not under `root`. A `..` component below
+/// `root` is folded lexically (`root/test/../src/a.h` is production); one that
+/// climbs out of `root` yields `false`. Only that rare spelling allocates.
+pub fn is_test_path(root: &Path, path: &Path) -> bool {
+    let Some(parent) = path.strip_prefix(root).ok().and_then(Path::parent) else {
+        return false;
+    };
+    let mut test = false;
+    for part in parent.components() {
+        match part {
+            Component::Normal(name) => test |= is_test_dir_name(name),
+            Component::ParentDir => return is_test_dir_folded(parent),
+            _ => {}
+        }
+    }
+    test
+}
+
+fn is_test_dir_name(name: &std::ffi::OsStr) -> bool {
+    matches!(name.to_str(), Some("test" | "tests" | "mock" | "mocks"))
+}
+
+/// [`is_test_path`] for a relative directory spelled with `..`.
+fn is_test_dir_folded(relative: &Path) -> bool {
+    let mut dirs = Vec::new();
+    for part in relative.components() {
+        match part {
+            Component::Normal(name) => dirs.push(name),
+            Component::ParentDir if dirs.pop().is_none() => return false,
+            _ => {}
+        }
+    }
+    dirs.into_iter().any(is_test_dir_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_partition_reads_directories_below_the_root() {
+        let root = Path::new("/r");
+        for (path, expected) in [
+            ("/r/src/a.h", false),
+            ("/r/test/a.h", true),
+            ("/r/src/mocks/deep/a.cpp", true),
+            ("/r/test.h", false),
+            ("/r/src/test", false),
+            ("/elsewhere/test/a.h", false),
+            ("/r/test/../src/a.h", false),
+            ("/r/src/../mock/a.h", true),
+            ("/r/../test/a.h", false),
+        ] {
+            assert_eq!(is_test_path(root, Path::new(path)), expected, "{path}");
+        }
+    }
 
     #[test]
     fn review_relative_parents_survive_normalization() {

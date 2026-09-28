@@ -6,11 +6,13 @@ mod discover;
 mod expansion_discovery;
 pub mod explore;
 pub mod gn_defines;
+mod gn_targets;
 mod index_cache;
 mod link_commands;
 mod lower;
 mod memory;
 mod merge;
+mod node_metadata;
 mod parse;
 mod template_bases;
 

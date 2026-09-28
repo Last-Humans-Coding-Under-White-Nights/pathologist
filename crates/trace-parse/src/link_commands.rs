@@ -13,6 +13,10 @@ use trace_ir::resolve_against;
 pub(crate) struct LinkDatabase {
     pub targets: Vec<LinkTargetSpec>,
     pub warnings: Vec<String>,
+    /// Partial inferred graphs describe membership but cannot isolate symbols:
+    /// unassigned callers may need definitions from the known targets.
+    pub unscoped_inference: bool,
+    pub inferred: bool,
 }
 #[derive(Debug)]
 pub(crate) struct LinkTargetSpec {
@@ -51,6 +55,11 @@ impl LinkDatabase {
         };
         let mut db = Self::default();
         let database = compilation.path.as_ref().and_then(|p| p.parent());
+        // Presence, not successful parsing, determines authority. A broken
+        // explicit database must retain its diagnostics and fallback behavior.
+        if !metadata_exists(root, database, links) && compilation.link_entries.is_empty() {
+            return Ok(crate::gn_targets::infer_link_targets(root));
+        }
         let link_path = database_path(root, database, links, "link_commands.json")?;
         let mut batches = Vec::new();
         if let Some(path) = &compilation.path {
@@ -823,6 +832,39 @@ mod tests {
             let db = load(dir.path(), None, None).unwrap();
             assert!(db.warnings.is_empty(), "{:?}", db.warnings);
             assert_eq!(db.targets[2].dependencies, vec![0]);
+        }
+    }
+
+    #[test]
+    fn gn_is_lower_priority_than_commands_and_cmake() {
+        for kind in ["links", "compile", "cmake"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.c"), "void a(void) {}\n").unwrap();
+            std::fs::write(
+                dir.path().join("BUILD.gn"),
+                r#"shared_library("inferred") { sources = [ "a.c" ] }"#,
+            )
+            .unwrap();
+            match kind {
+                "links" => write(
+                    dir.path(),
+                    "link_commands.json",
+                    json!([
+                        {"directory":".","arguments":["cc","a.c","-o","authoritative"]}
+                    ]),
+                ),
+                "compile" => write(
+                    dir.path(),
+                    "compile_commands.json",
+                    json!([
+                        {"directory":".","arguments":["cc","a.c","-o","authoritative"]}
+                    ]),
+                ),
+                _ => review_cmake_reply(dir.path(), "build/.cmake/api/v1/reply", json!([])),
+            }
+            let db = load(dir.path(), None, None).unwrap();
+            assert_eq!(db.targets.len(), 1, "{kind}: {db:?}");
+            assert!(!db.targets[0].name.contains("inferred"));
         }
     }
 

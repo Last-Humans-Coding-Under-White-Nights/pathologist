@@ -4,12 +4,13 @@ use crate::link_commands::LinkDatabase;
 use trace_ir::{LinkTarget, SymbolTable, TargetId};
 
 pub(crate) fn merge_linked_units(program: &mut Program, units: &[UnitIndex], links: &LinkDatabase) {
+    record_link_targets(program, links);
     let mut by_source: FxHashMap<&Path, Vec<usize>> = FxHashMap::default();
     for (i, unit) in units.iter().enumerate() {
         by_source.entry(&unit.path).or_default().push(i);
     }
     let mut assigned: FxHashSet<usize> = FxHashSet::default();
-    for (index, spec) in links.targets.iter().enumerate() {
+    for index in 0..links.targets.len() {
         let id = TargetId(index as u32);
         let mut visited = BTreeSet::new();
         let mut pending = vec![index];
@@ -34,21 +35,6 @@ pub(crate) fn merge_linked_units(program: &mut Program, units: &[UnitIndex], lin
             }
         }
         assigned.extend(members.iter().copied());
-        program.link_targets.push(LinkTarget {
-            id,
-            name: spec.name.clone(),
-            output: spec.output.clone(),
-            sources: spec
-                .sources
-                .iter()
-                .map(|p| program.symbols.add_file_interned(p))
-                .collect(),
-            dependencies: spec
-                .dependencies
-                .iter()
-                .map(|i| TargetId(*i as u32))
-                .collect(),
-        });
         // Deduplication is local to a link image, including header-origin
         // entities. Diagnostic keys are program-wide and deliberately survive.
         program.dedup.clear_entities();
@@ -70,6 +56,28 @@ pub(crate) fn merge_linked_units(program: &mut Program, units: &[UnitIndex], lin
         for unit in variants {
             merge.push(program, unit);
         }
+    }
+}
+
+/// Export observed membership even when inference cannot establish isolation.
+pub(crate) fn record_link_targets(program: &mut Program, links: &LinkDatabase) {
+    for (index, spec) in links.targets.iter().enumerate() {
+        let id = TargetId(index as u32);
+        program.link_targets.push(LinkTarget {
+            id,
+            name: spec.name.clone(),
+            output: spec.output.clone(),
+            sources: spec
+                .sources
+                .iter()
+                .map(|p| program.symbols.add_file_interned(p))
+                .collect(),
+            dependencies: spec
+                .dependencies
+                .iter()
+                .map(|i| TargetId(*i as u32))
+                .collect(),
+        });
     }
 }
 
@@ -257,6 +265,20 @@ fn suppressed_weak_bodies(
         })
         .collect();
     let mut selector = SymbolTable::default();
+    let selector_files: Vec<Vec<_>> = units
+        .iter()
+        .zip(&contributing)
+        .map(|(unit, wanted)| {
+            if *wanted {
+                unit.files
+                    .iter()
+                    .map(|path| selector.add_file_interned(path))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
     let mut origins: FxHashMap<FnId, (&Path, bool)> = FxHashMap::default();
     for weak in [false, true] {
         for (i, unit) in units.iter().enumerate() {
@@ -272,6 +294,17 @@ fn suppressed_weak_bodies(
                 let mut candidate = f.clone();
                 candidate.id = selector.alloc_fn_id();
                 candidate.target = Some(target);
+                candidate.file = selector_files[i][candidate.file.0 as usize];
+                candidate.span.file = selector_files[i][candidate.span.file.0 as usize];
+                candidate.tu = candidate.tu.map(|file| selector_files[i][file.0 as usize]);
+                if let Some(declarations) = unit.member_declarations.get(&f.id) {
+                    selector.record_member_declarations(
+                        candidate.id,
+                        declarations
+                            .iter()
+                            .map(|file| selector_files[i][file.0 as usize]),
+                    );
+                }
                 // Reached only for a contributing unit, so `indexed[i]` is set;
                 // an unknown type stands in for a parameter with no recorded type.
                 let unit_types = indexed[i].as_ref();

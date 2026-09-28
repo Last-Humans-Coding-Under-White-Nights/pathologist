@@ -638,6 +638,9 @@ enum TargetScope {
 #[derive(Debug, Clone, Default)]
 pub struct SymbolTable {
     has_target_scopes: bool,
+    inferred_test_files: FxHashSet<FileId>,
+    inference_root: Option<PathBuf>,
+    resolved_external_functions: FxHashSet<FnId>,
     /// Monotonic cache: avoids scanning imported symbols in each translation unit.
     has_weak_symbols: bool,
     pub files: Vec<FileInfo>,
@@ -725,12 +728,20 @@ pub struct SymbolTable {
     /// unresolved) merged with the class's in-class prototype. Recorded at
     /// that merge, the only point where both halves are in view.
     members_missing_this: std::collections::BTreeSet<FnId>,
+    /// Exact class-member declaration origins; see docs/ANALYSIS.md.
+    member_declarations: FxHashMap<FnId, Vec<FileId>>,
     next_fn: u32,
     next_var: u32,
     next_call: u32,
 }
 
 impl SymbolTable {
+    /// Whether symbols actually carry image ownership. Observed build metadata
+    /// alone may be incomplete and must not change resolution semantics.
+    pub fn has_target_scopes(&self) -> bool {
+        self.has_target_scopes
+    }
+
     /// Declare the dependency roots (canonical) that classify files as they
     /// are interned. Call before any file is added, so every entry is
     /// classified under the same roots.
@@ -761,8 +772,20 @@ impl SymbolTable {
         self.files.get(file.0 as usize).is_some_and(|f| f.is_dep)
     }
 
+    /// Append a file. `path` must be spelled like every other interned path
+    /// and like the inference root: canonical, as the pipeline passes them.
+    /// Interning is keyed by exact spelling, and the test partition
+    /// ([`crate::is_test_path`]) compares lexically, so a symlinked or
+    /// relative spelling would be a separate, misclassified file.
     pub fn add_file(&mut self, path: PathBuf) -> FileId {
         let id = FileId(self.files.len() as u32);
+        if self
+            .inference_root
+            .as_ref()
+            .is_some_and(|root| crate::is_test_path(root, &path))
+        {
+            self.inferred_test_files.insert(id);
+        }
         let is_dep = self.path_is_dep(&path);
         self.files.push(FileInfo { id, path, is_dep });
         id
@@ -847,6 +870,46 @@ impl SymbolTable {
     /// parameters (#83). `merge_unit` needs the answer because an adopted list
     /// is still unit-local and has to be remapped.
     pub fn register_function(
+        &mut self,
+        func: Function,
+        param_types: Option<&[TypeId]>,
+        types: Option<&crate::TypeTable>,
+    ) -> FnRegistration {
+        let incoming = func.id;
+        if func.is_cpp && func.declared_in_class {
+            self.member_declarations
+                .entry(incoming)
+                .or_insert_with(|| vec![func.span.file]);
+        }
+        let result = self.register_function_inner(func, param_types, types);
+        if result.id != incoming {
+            if let Some(origins) = self.member_declarations.remove(&incoming) {
+                self.record_member_declarations(result.id, origins);
+            }
+        }
+        result
+    }
+
+    /// Carry exact declaration origins through unit/global identity remapping.
+    pub fn record_member_declarations(
+        &mut self,
+        id: FnId,
+        origins: impl IntoIterator<Item = FileId>,
+    ) {
+        let origins = origins.into_iter();
+        for file in origins {
+            let files = self.member_declarations.entry(id).or_default();
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+    }
+
+    pub fn take_member_declarations(&mut self) -> FxHashMap<FnId, Vec<FileId>> {
+        std::mem::take(&mut self.member_declarations)
+    }
+
+    fn register_function_inner(
         &mut self,
         func: Function,
         param_types: Option<&[TypeId]>,
@@ -957,6 +1020,15 @@ impl SymbolTable {
             };
             let is_incompatible_def = |existing_id: FnId| -> bool {
                 if let Some(existing) = self.function_by_id(existing_id) {
+                    if func.target.is_none()
+                        && existing.target.is_none()
+                        && func.is_defined
+                        && existing.is_defined
+                        && self.inferred_test_files.contains(&func.span.file)
+                            != self.inferred_test_files.contains(&existing.span.file)
+                    {
+                        return true;
+                    }
                     if func.is_cpp && existing.is_cpp && func.is_defined && existing.is_defined {
                         let is_same_def =
                             existing.file == func.file && existing.span.line == func.span.line;
@@ -1306,12 +1378,18 @@ impl SymbolTable {
     /// real definitions. Only the id index is maintained.
     pub fn push_synthetic_function(&mut self, func: Function) -> FnId {
         debug_assert!(
-            self.externals_by_name.get(&func.name).is_none_or(|ids| ids
-                .iter()
-                .all(|id| self.function(*id).target != func.target)),
-            "synthetic function must not shadow a registered name in its target"
+            !self.fn_slots.contains_key(&func.id),
+            "synthetic function ID must be fresh"
         );
         self.push_indexed(func)
+    }
+
+    /// An external selected after context-specific lookup must retain that
+    /// result, even beside another overload's production definition.
+    pub fn push_context_external_function(&mut self, func: Function) -> FnId {
+        debug_assert!(!func.is_defined);
+        self.resolved_external_functions.insert(func.id);
+        self.push_synthetic_function(func)
     }
 
     fn push_indexed(&mut self, func: Function) -> FnId {
@@ -1387,6 +1465,18 @@ impl SymbolTable {
             .map(|existing| {
                 if existing.target != func.target {
                     return false;
+                }
+                // Known distinct class declarations are not redeclarations merely
+                // because their member names and signatures agree.
+                if both_cpp {
+                    if let (Some(ours), Some(theirs)) = (
+                        self.member_declarations.get(&func.id),
+                        self.member_declarations.get(&existing_id),
+                    ) {
+                        if !ours.iter().any(|f| theirs.contains(f)) {
+                            return false;
+                        }
+                    }
                 }
                 if !func.is_cpp && !existing.is_cpp {
                     // Pure C: prototype + definition always collapse.
@@ -1604,6 +1694,7 @@ impl SymbolTable {
     }
 
     pub fn add_variable(&mut self, var: Variable) -> VarId {
+        self.has_target_scopes |= var.target.is_some();
         self.has_weak_symbols |= var.is_weak;
         if let Some(qualified) = &var.qualified_name {
             let leaf = qualified.rsplit("::").next().unwrap_or(qualified);
@@ -1936,6 +2027,55 @@ impl SymbolTable {
                 .is_some_and(|headers| headers.contains(&other))
     }
 
+    /// [`SymbolTable::file_sees`] widened by `file`'s includers: code in
+    /// `file` also sees what some unit including it is or includes. This is
+    /// how an ordinary header body, which resolves from its own file, sees
+    /// its includers' headers; `headers_of` is keyed by units only. No test
+    /// for unit-ness is needed: a file that is a unit and is also included
+    /// elsewhere (a header with its own compile command) gets both views, and
+    /// an unincluded unit has no includers to add. A production file widens
+    /// only through production units, so a test unit that happens to include
+    /// a production header lends it none of its own bodies or mocks. The
+    /// shorter of the two includer sets is walked, as in `any_unit_sees`.
+    fn context_sees(&self, file: FileId, other: FileId) -> bool {
+        if self.file_sees(file, other) {
+            return true;
+        }
+        let Some(units) = self.includers_of.get(&file) else {
+            return false;
+        };
+        let test_file = self.inferred_test_files.contains(&file);
+        let lends = |tu: &FileId| test_file || !self.inferred_test_files.contains(tu);
+        if units.contains(&other) && lends(&other) {
+            return true;
+        }
+        let Some(others) = self.includers_of.get(&other) else {
+            return false;
+        };
+        if units.len() <= others.len() {
+            units.iter().any(|tu| lends(tu) && others.contains(tu))
+        } else {
+            others.iter().any(|tu| lends(tu) && units.contains(tu))
+        }
+    }
+
+    /// Cache the bare-tree fallback partition once after files are merged.
+    /// `root` is spelled like the interned paths (canonical); see
+    /// [`SymbolTable::add_file`].
+    pub fn set_inference_root(&mut self, root: &Path) {
+        self.inference_root = Some(root.to_path_buf());
+        self.inferred_test_files = self
+            .files
+            .iter()
+            .filter(|f| crate::is_test_path(root, &f.path))
+            .map(|f| f.id)
+            .collect();
+    }
+
+    pub fn has_inferred_test_partition(&self) -> bool {
+        !self.has_target_scopes && !self.inferred_test_files.is_empty()
+    }
+
     /// The TUs a function stands for: every includer of a shared header body,
     /// otherwise the one unit that lowered it.
     fn contributing_tus(&self, id: FnId) -> impl Iterator<Item = FileId> + '_ {
@@ -2028,26 +2168,69 @@ impl SymbolTable {
         self.callees_of_with_types(cs, None)
     }
 
+    /// Translation-unit contexts represented by a source call, including all
+    /// contributors of a shared header body. Useful when auditing source-only
+    /// reports, which otherwise mistake test uses of shared headers for
+    /// production calls.
+    pub fn call_translation_units(&self, cs: &CallSite) -> impl Iterator<Item = FileId> + '_ {
+        let shared = self.shared_call_tus.get(&cs.id);
+        let own = shared.is_none().then(|| {
+            cs.tu
+                .or_else(|| self.function_by_id(cs.caller).and_then(|f| f.tu))
+                .unwrap_or_else(|| cs.scope_file())
+        });
+        shared.into_iter().flatten().copied().chain(own)
+    }
+
     pub fn callees_of_with_types(
         &self,
         cs: &CallSite,
         types: Option<&crate::TypeTable>,
     ) -> Vec<FnId> {
-        if let Some(tus) = self.shared_call_tus.get(&cs.id) {
-            let mut result = Vec::new();
-            for &tu in tus {
-                push_unique(&mut result, self.callees_in_tu(cs, types, tu));
-            }
-            return result;
+        let mut contexts = self.call_translation_units(cs);
+        let Some(first) = contexts.next() else {
+            return Vec::new();
+        };
+        let mut result = self.callees_in_tu(cs, types, first);
+        for tu in contexts {
+            push_unique(&mut result, self.callees_in_tu(cs, types, tu));
         }
-        let caller_tu = cs
-            .tu
-            .or_else(|| self.function_by_id(cs.caller).and_then(|f| f.tu))
-            .unwrap_or_else(|| cs.scope_file());
-        self.callees_in_tu(cs, types, caller_tu)
+        result
     }
 
-    fn callees_in_tu(
+    /// Resolve one of [`Self::call_translation_units`]' contexts. The usual
+    /// call graph unions these results; audits can retain their TU evidence.
+    pub fn callees_in_tu(
+        &self,
+        cs: &CallSite,
+        types: Option<&crate::TypeTable>,
+        caller_tu: FileId,
+    ) -> Vec<FnId> {
+        let mut candidates = self.callees_in_tu_unfiltered(cs, types, caller_tu);
+        self.retain_admitted(&mut candidates, caller_tu);
+        candidates
+    }
+
+    /// Drop the candidates code in `file` may not bind under the bare-tree
+    /// test partition ([`Self::fallback_admits`]). Nothing to do without a
+    /// partition, or for a test file, which sees every candidate.
+    fn retain_admitted(&self, candidates: &mut Vec<FnId>, file: FileId) {
+        if self.has_inferred_test_partition() && !self.inferred_test_files.contains(&file) {
+            candidates.retain(|&id| self.fallback_admits(id, file));
+        }
+    }
+
+    fn fallback_admits(&self, id: FnId, file: FileId) -> bool {
+        let function = self.function(id);
+        let body = function.span.file;
+        !function.is_defined
+            || self.has_target_scopes
+            || self.inferred_test_files.contains(&file)
+            || !self.inferred_test_files.contains(&body)
+            || self.context_sees(file, body)
+    }
+
+    fn callees_in_tu_unfiltered(
         &self,
         cs: &CallSite,
         types: Option<&crate::TypeTable>,
@@ -2062,7 +2245,13 @@ impl SymbolTable {
             .map_or(&[][..], Vec::as_slice);
         let resolve_equal_defs = |fid: FnId| -> Vec<FnId> {
             let f = self.function(fid);
-            if f.linkage != Linkage::External || self.defined_in_tu(fid, caller_tu) {
+            // Synthesized externals already represent a failed lookup in this
+            // call's context. A same-name production overload is not evidence
+            // for replacing their deliberately unknown signature.
+            if self.resolved_external_functions.contains(&fid)
+                || f.linkage != Linkage::External
+                || self.defined_in_tu(fid, caller_tu)
+            {
                 return vec![fid];
             }
             // Nothing else can be named, so nothing else can be an equal
@@ -2229,6 +2418,34 @@ impl SymbolTable {
     }
 
     fn first_in_image(&self, name: &str, file: Option<FileId>, scope: TargetScope) -> Option<FnId> {
+        let hit = self.first_in_image_unpartitioned(name, file, scope)?;
+        let Some(file) = file.filter(|_| self.has_inferred_test_partition()) else {
+            return Some(hit);
+        };
+        if self.fallback_admits(hit, file) {
+            return Some(hit);
+        }
+        // The nearest entry is a test body production code may not bind
+        // (docs/ANALYSIS.md, "Declaring-header eligibility"). Rare, so the
+        // filtered candidate list is affordable here; like the primary slot,
+        // it prefers a body over a prototype registered ahead of it.
+        let candidates = self.candidates_in_image(name, Some(file), scope);
+        candidates
+            .iter()
+            .copied()
+            .find(|&id| self.function(id).is_defined)
+            .or_else(|| candidates.first().copied())
+    }
+
+    /// [`first_in_image`](Self::first_in_image) without the bare-tree test
+    /// partition: the nearest visible scope entry, else the body-preferring
+    /// primary slot, else (inside an image) the image's first body.
+    fn first_in_image_unpartitioned(
+        &self,
+        name: &str,
+        file: Option<FileId>,
+        scope: TargetScope,
+    ) -> Option<FnId> {
         if let Some(file) = file {
             let entries = self.fn_by_scope.get(name).map(Vec::as_slice);
             if let Some(id) = self.first_in_scope(file, entries, |id| {
@@ -2352,7 +2569,34 @@ impl SymbolTable {
                 }
             }
         }
-        out.into_vec()
+        let mut candidates = out.into_vec();
+        if let Some(file) = file {
+            // A visible declaration family supplies positive evidence; missing
+            // provenance is uncertainty, never evidence of invisibility.
+            let visible = |id: FnId| {
+                self.member_declarations.get(&id).is_some_and(|origins| {
+                    origins
+                        .iter()
+                        .any(|&origin| self.context_sees(file, origin))
+                })
+            };
+            self.retain_admitted(&mut candidates, file);
+            if candidates.len() >= 2
+                && candidates
+                    .iter()
+                    .any(|&id| self.function(id).is_defined && visible(id))
+            {
+                // A header lookup file is no unit: its own bodies are the
+                // ones defined in it.
+                candidates.retain(|&id| {
+                    !self.member_declarations.contains_key(&id)
+                        || visible(id)
+                        || self.defined_in_tu(id, file)
+                        || (self.function(id).is_defined && self.function(id).file == file)
+                });
+            }
+        }
+        candidates
     }
 
     /// Every external entry declared or defined under `name` (overloads
@@ -2907,6 +3151,126 @@ mod tests {
         });
         assert_eq!(plain.global_named(Some(target), "x"), Some(VarId(0)));
         assert_eq!(plain.global_named(Some(target), "ns::x"), None);
+    }
+
+    #[test]
+    fn image_owned_variables_activate_target_scopes_without_functions() {
+        let mut symbols = SymbolTable::default();
+        let mut var = fake_variable(VarId(0), "global", StorageClass::Global, FileId(0), 1);
+        var.target = Some(crate::TargetId(0));
+        symbols.add_variable(var);
+        assert!(symbols.has_target_scopes());
+    }
+
+    #[test]
+    fn member_origin_is_the_spelling_file_not_the_lowering_unit() {
+        let mut symbols = SymbolTable::default();
+        let mut f = fake_function(FnId(0), "S::run", vec![], false, true, FileId(0), 1);
+        f.declared_in_class = true;
+        f.span.file = FileId(1);
+        let id = symbols.add_function(f);
+        assert_eq!(symbols.member_declarations[&id], vec![FileId(1)]);
+    }
+
+    #[test]
+    fn member_provenance_retains_unknowns_and_unions_shared_contexts() {
+        let mut symbols = SymbolTable::default();
+        let a = FileId(0);
+        let b = FileId(1);
+        let caller_file = FileId(2);
+        let other_file = FileId(3);
+        let mut defs = Vec::new();
+        for (i, file, known) in [(0, a, true), (1, b, true), (2, other_file, false)] {
+            let id = FnId(i);
+            let mut f = fake_function(id, "S::run", vec![], true, true, file, 1);
+            f.tu = Some(file);
+            f.declared_in_class = known;
+            defs.push(symbols.add_function(f));
+        }
+        symbols.register_included_header(caller_file, a);
+        assert_eq!(
+            symbols.resolve_function_candidates_in_target("S::run", Some(caller_file), None),
+            vec![defs[2], defs[0]]
+        );
+        assert_eq!(
+            symbols
+                .resolve_function_candidates_in_target("S::run", Some(FileId(10)), None)
+                .len(),
+            3
+        );
+        let mut caller = fake_function(FnId(3), "shared", vec![], true, true, FileId(4), 1);
+        caller.tu = Some(caller_file);
+        let caller = symbols.add_function(caller);
+        symbols.share_header_function(caller, caller_file);
+        symbols.share_header_function(caller, b);
+        let result = symbols.return_flow_candidates(caller, "S::run");
+        assert_eq!(result, vec![defs[1], defs[2], defs[0]]);
+    }
+
+    /// An ordinary header body resolves from its own file, which is no unit.
+    /// The test partition asks what that header's includers see.
+    #[test]
+    fn header_lookup_sees_test_bodies_through_its_includers() {
+        let mut symbols = SymbolTable::default();
+        let unit = symbols.add_file(PathBuf::from("/t/src/a.cpp"));
+        let header = symbols.add_file(PathBuf::from("/t/src/prod.h"));
+        let mock = symbols.add_file(PathBuf::from("/t/test/mock_svc.h"));
+        let real = symbols.add_file(PathBuf::from("/t/src/svc.cpp"));
+        let stray = symbols.add_file(PathBuf::from("/t/test/stray.h"));
+        symbols.set_inference_root(Path::new("/t"));
+        symbols.register_included_header(unit, header);
+        symbols.register_included_header(unit, mock);
+        let mut ids = Vec::new();
+        for (i, file) in [(0, real), (1, mock), (2, stray)] {
+            ids.push(symbols.add_function(fake_function(
+                FnId(i),
+                "Svc::Run",
+                vec![],
+                true,
+                true,
+                file,
+                1,
+            )));
+        }
+        let mut caller = fake_function(FnId(3), "Wrap", vec![], true, true, header, 1);
+        caller.tu = Some(unit);
+        let caller = symbols.add_function(caller);
+        assert!(symbols.has_inferred_test_partition());
+        // `a.cpp` includes the mock, so `prod.h` may bind it; nothing
+        // includes the stray test header alongside `prod.h`.
+        let result = symbols.return_flow_candidates(caller, "Svc::Run");
+        assert!(
+            result.contains(&ids[0]) && result.contains(&ids[1]),
+            "{result:?}"
+        );
+        assert!(!result.contains(&ids[2]), "{result:?}");
+    }
+
+    /// A header with its own compile command is a unit and an included
+    /// header at once; it keeps its includers' view.
+    #[test]
+    fn header_unit_also_sees_through_its_includers() {
+        let mut symbols = SymbolTable::default();
+        let unit = symbols.add_file(PathBuf::from("/t/src/a.cpp"));
+        let header = symbols.add_file(PathBuf::from("/t/src/prod.h"));
+        let own = symbols.add_file(PathBuf::from("/t/src/own.h"));
+        let mock = symbols.add_file(PathBuf::from("/t/test/mock_svc.h"));
+        symbols.register_included_header(header, own);
+        symbols.register_included_header(unit, header);
+        symbols.register_included_header(unit, mock);
+        assert!(symbols.context_sees(header, own));
+        assert!(symbols.context_sees(header, mock));
+        assert!(!symbols.context_sees(own, unit));
+        assert!(!symbols.context_sees(unit, own));
+        // A test unit including the same header lends it nothing.
+        let test_unit = symbols.add_file(PathBuf::from("/t/test/b.cpp"));
+        let stray = symbols.add_file(PathBuf::from("/t/test/stray.h"));
+        symbols.set_inference_root(Path::new("/t"));
+        symbols.register_included_header(test_unit, header);
+        symbols.register_included_header(test_unit, stray);
+        assert!(!symbols.context_sees(header, test_unit));
+        assert!(!symbols.context_sees(header, stray));
+        assert!(symbols.context_sees(header, mock));
     }
 
     fn fake_function(

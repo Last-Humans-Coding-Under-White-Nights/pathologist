@@ -43,7 +43,7 @@ pub struct SolverIndices {
 
 impl SolverIndices {
     /// Index Load constraint `idx` under its source `src`.
-    fn add_load(&mut self, src: PagNodeId, idx: usize) {
+    pub(crate) fn add_load(&mut self, src: PagNodeId, idx: usize) {
         self.load_src.entry(src).or_default().push(idx);
         let (word, bit) = (src.0 as usize / 64, src.0 % 64);
         if word >= self.load_src_bits.len() {
@@ -349,7 +349,7 @@ impl Pag {
         // for a variable whose target the symbol table already knows — and a
         // heap location stamped `None` shares its field summaries with every
         // other image.
-        if program.link_targets.is_empty() {
+        if !program.symbols.has_target_scopes() {
             return None;
         }
         match self.nodes[node.0 as usize].kind {
@@ -1110,7 +1110,7 @@ fn struct_type_from_type_id(
 /// call-target node. Without link metadata the historical whole-program
 /// lookup is kept exactly.
 fn callee_name_is_a_function(program: &Program, cs: &trace_ir::CallSite) -> bool {
-    if program.link_targets.is_empty() {
+    if !program.symbols.has_target_scopes() {
         return program.symbols.resolve_function(&cs.callee_name).is_some();
     }
     program

@@ -4,7 +4,7 @@
 
 use super::{
     finalize_program, index_language, index_pool, index_progress, index_source_file,
-    index_source_file_with_variants, project_preprocess_opts,
+    index_source_file_with_variants, project_preprocess_opts, HeaderOrder,
 };
 use crate::compile_commands::CompilationDatabase;
 use crate::merge::{merge_unit_index, merge_unit_variants, UnitIndex};
@@ -98,7 +98,7 @@ pub(super) fn build(
                         &config,
                         &cache,
                         None,
-                        &[],
+                        &HeaderOrder::default(),
                         candidates.as_ref(),
                         &defines,
                         budget,
@@ -137,10 +137,13 @@ pub(super) fn build(
     // Merge the complete configuration family together. A shared header can
     // vary between different source files as well as between commands for one
     // source; ordinary TU deduplication would drop its second body.
-    if !links.targets.is_empty() {
+    if !links.targets.is_empty() && !links.unscoped_inference {
         crate::merge::merge_linked_units(&mut program, &units, &links);
     } else if let Some((base, variants)) = units.split_first() {
         merge_unit_variants(&mut program, base, variants);
+    }
+    if links.unscoped_inference {
+        crate::merge::record_link_targets(&mut program, &links);
     }
     // `merge_unit_variants` counts variants across the whole family; this field
     // means variants per source, so the per-file tally replaces it.
@@ -172,7 +175,15 @@ pub(super) fn build(
                 no_c_units,
                 opts.language,
             ));
-            let unit = index_source_file(path, root, &graph, &config, &cache, None, &[]);
+            let unit = index_source_file(
+                path,
+                root,
+                &graph,
+                &config,
+                &cache,
+                None,
+                &HeaderOrder::default(),
+            );
             merge_unit_index(&mut program, &unit);
         }
     } else {
@@ -187,7 +198,15 @@ pub(super) fn build(
                         no_c_units,
                         opts.language,
                     ));
-                    index_source_file(path, root, &graph, &config, &cache, None, &[])
+                    index_source_file(
+                        path,
+                        root,
+                        &graph,
+                        &config,
+                        &cache,
+                        None,
+                        &HeaderOrder::default(),
+                    )
                 })
                 .collect()
         });
@@ -209,6 +228,7 @@ pub(super) fn build(
                 .iter()
                 .chain(&config.include_paths)
                 .chain(&config.system_include_paths)
+                .chain(&config.inferred_include_paths)
         })
         .cloned()
         .collect();

@@ -155,6 +155,43 @@ pub fn analyze_with_options(program: &Program, opts: AnalyzeOptions) -> (Pag, An
     (pag, result)
 }
 
+/// All holders stay in their original set; the filtered traversal must use
+/// that set's order, including reordering caused by non-loader insertions.
+/// The filter is always `SolverIndices::is_load_src`, so the cached view is
+/// keyed on holder membership and the load-source count alone.
+#[derive(Default)]
+struct LocationHolders {
+    nodes: FxHashSet<PagNodeId>,
+    loaders: Vec<PagNodeId>,
+    cached_load_sources: Option<usize>,
+}
+
+impl LocationHolders {
+    fn insert(&mut self, node: PagNodeId) {
+        if self.nodes.insert(node) {
+            self.cached_load_sources = None;
+        }
+    }
+
+    /// The holders that are load sources, in set order. Load membership is
+    /// monotonic, so a new source invalidates the view even when holder
+    /// membership has not changed.
+    fn loading(&mut self, indices: &SolverIndices) -> &[PagNodeId] {
+        let load_sources = indices.load_src.len();
+        if self.cached_load_sources != Some(load_sources) {
+            self.loaders.clear();
+            self.loaders.extend(
+                self.nodes
+                    .iter()
+                    .copied()
+                    .filter(|&node| indices.is_load_src(node)),
+            );
+            self.cached_load_sources = Some(load_sources);
+        }
+        &self.loaders
+    }
+}
+
 #[derive(Default)]
 struct SolverState {
     pts: FxHashMap<PagNodeId, FxHashSet<LocId>>,
@@ -169,7 +206,7 @@ struct SolverState {
     /// cycle instead of unboundedly inflating delta vectors.
     delta_pending: FxHashSet<(PagNodeId, LocId)>,
     memory_pts: FxHashMap<LocId, IndexSet<LocId, FxBuildHasher>>,
-    loc_nodes: FxHashMap<LocId, FxHashSet<PagNodeId>>,
+    loc_nodes: FxHashMap<LocId, LocationHolders>,
     worklist: Vec<PagNodeId>,
     queued: FxHashSet<PagNodeId>,
     /// Nodes whose one-time, points-to-independent constraint effects
@@ -564,8 +601,8 @@ impl SolverState {
         // every write used to clone the whole holder set, which on hub
         // locations is thousands of nodes.
         holders.clear();
-        if let Some(nodes) = self.loc_nodes.get(&loc) {
-            holders.extend(nodes.iter().copied().filter(|&n| indices.is_load_src(n)));
+        if let Some(nodes) = self.loc_nodes.get_mut(&loc) {
+            holders.extend(nodes.loading(indices));
         }
         for &n in holders.iter() {
             self.record_delta(n, &[loc]);
@@ -2251,7 +2288,7 @@ fn reached_definitions(
     caller_target: Option<TargetId>,
 ) -> Vec<FnId> {
     let callee = program.symbols.function(fn_id);
-    let scoped = !program.link_targets.is_empty();
+    let scoped = program.symbols.has_target_scopes();
     if scoped && callee.target != caller_target {
         return Vec::new();
     }
@@ -2334,6 +2371,52 @@ mod tests {
     use super::*;
     use crate::constraints::AbstractLocation;
     use trace_ir::{FlowConstraint, LocId, TypeDesc, TypeId};
+
+    #[test]
+    fn holder_filter_reuses_stable_membership_and_preserves_order_after_growth() {
+        let mut indices = SolverIndices::default();
+        for i in (0..512).step_by(7) {
+            indices.add_load(PagNodeId(i), 0);
+        }
+        let mut holders = LocationHolders::default();
+        for i in 0..64 {
+            holders.insert(PagNodeId(i));
+        }
+        let loaders = |holders: &LocationHolders, indices: &SolverIndices| {
+            holders
+                .nodes
+                .iter()
+                .copied()
+                .filter(|&node| indices.is_load_src(node))
+                .collect::<Vec<_>>()
+        };
+        let expected = loaders(&holders, &indices);
+        assert_eq!(holders.loading(&indices), expected);
+        assert_eq!(holders.cached_load_sources, Some(indices.load_src.len()));
+        // Unchanged membership must not be rescanned: a marker left in the
+        // cached view survives the next read.
+        holders.loaders.push(PagNodeId(u32::MAX));
+        assert_eq!(holders.loading(&indices).last(), Some(&PagNodeId(u32::MAX)));
+        // Non-load holders can resize the set and reorder existing loaders.
+        for i in 64..512 {
+            if i % 7 != 0 {
+                holders.insert(PagNodeId(i));
+            }
+        }
+        assert_eq!(holders.cached_load_sources, None);
+        let expected = loaders(&holders, &indices);
+        assert_eq!(holders.loading(&indices), expected);
+        // A new load source must also invalidate the cached view.
+        indices.add_load(PagNodeId(1), 0);
+        let expected = loaders(&holders, &indices);
+        assert!(expected.contains(&PagNodeId(1)));
+        assert_eq!(holders.loading(&indices), expected);
+        let mut empty = LocationHolders::default();
+        empty.insert(PagNodeId(3));
+        assert!(empty.loading(&indices).is_empty());
+        empty.insert(PagNodeId(7));
+        assert_eq!(empty.loading(&indices), [PagNodeId(7)]);
+    }
 
     fn loc(id: u32, is_fn: bool) -> AbstractLocation {
         AbstractLocation {
@@ -2564,8 +2647,9 @@ mod tests {
                 assert_eq!(stepped.delta[&dst], batched.delta[&dst]);
             }
             assert_eq!(stepped.worklist, batched.worklist);
-            let holders =
-                |st: &SolverState, l: LocId| st.loc_nodes[&l].iter().copied().collect::<Vec<_>>();
+            let holders = |st: &SolverState, l: LocId| {
+                st.loc_nodes[&l].nodes.iter().copied().collect::<Vec<_>>()
+            };
             for l in stepped.pts[&dsts[0]].iter().copied() {
                 assert_eq!(
                     holders(&stepped, l),
