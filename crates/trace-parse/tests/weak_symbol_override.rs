@@ -249,6 +249,60 @@ fn a_strong_cpp_overload_overrides_the_weak_definition_of_its_signature() {
     );
 }
 
+/// Declaration provenance used by weak selection must be remapped just like
+/// the final merge: an included fallback body and an out-of-line strong body
+/// share their declaring header despite different unit-local file IDs.
+#[test]
+fn member_weak_selection_preserves_declaring_header_identity() {
+    for (weak, strong) in [("a_weak", "b_strong"), ("b_weak", "a_strong")] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("holder.h"),
+            "struct Holder { static void hook(); };\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("padding.h"), "struct Padding {};\n").unwrap();
+        fs::write(
+            dir.path().join("weak_impl.h"),
+            "__attribute__((weak)) void Holder::hook() { weak_body(); }\n",
+        )
+        .unwrap();
+        let program = linked_program(
+            dir.path(),
+            "cpp",
+            &[
+                (
+                    weak,
+                    "#include \"holder.h\"\nvoid weak_body() {}\n#include \"weak_impl.h\"\n",
+                ),
+                (
+                    strong,
+                    "#include \"padding.h\"\n#include \"holder.h\"\nvoid strong_body() {}\nvoid Holder::hook() { strong_body(); }\n",
+                ),
+                (
+                    "caller",
+                    "#include \"holder.h\"\nvoid caller() { Holder::hook(); }\n",
+                ),
+            ],
+            &[("app", &[weak, strong, "caller"])],
+        );
+        let hook = defined(&program, "Holder::hook");
+        assert!(!program.symbols.function(hook).is_weak);
+        let bodies: Vec<_> = program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|site| site.caller == hook)
+            .map(|site| site.callee_name.as_str())
+            .collect();
+        assert_eq!(
+            bodies,
+            ["strong_body"],
+            "{weak} first: the overridden member body must contribute no calls"
+        );
+    }
+}
+
 /// A namespaced global must not occupy the image's binding for its unqualified
 /// name, or an unrelated C global of that name unifies with it.
 #[test]

@@ -133,6 +133,49 @@ after indexing and before analysis, releasing these merge-only tables in both
 scoped and unscoped runs. Rust callers that will merge more units retain the
 state until their final merge is complete.
 
+**Declaring-header eligibility (#120)**
+
+For bare-tree inference, a file below a `test`, `tests`, `mock`, or `mocks`
+directory relative to the analysis root belongs to the test partition
+(`trace_ir::is_test_path`, a lexical test on canonical paths). This
+fallback convention never removes translation units. Production includes do
+not search inferred test directories or select test headers by basename: the
+basename fallback takes a production match only when it is the one
+production file of that name (`src/foo.h` beside `test/mock/foo.h` resolves to
+`src/foo.h`). Explicit include paths and relative includes still work.
+Production name lookup excludes test bodies unless the caller includes their
+defining file; when that exclusion removes the nearest entry, the
+single-result lookup answers with the first remaining body, not a prototype
+registered ahead of it.
+Test callers retain production candidates. Authoritative link images override
+this convention. The preprocessor and resolver share this path classification;
+a missing external dependency remains unresolved instead of acquiring a mock.
+
+An excluded definition must not erase its caller's external edge. External
+synthesis uses the shared resolver across all contributing translation units,
+including internal callees reached from header macros. An external synthesized
+after that lookup retains its result; it does not expand again by name into
+a different production overload.
+Unscoped C definitions in different inferred partitions also retain separate
+identities, so a later test body cannot overwrite the production candidate.
+
+For an ambiguous C++ member name, declaration provenance belongs to the exact
+function identity, including its overload, and survives prototype/definition
+merging. A definition's source file is not its declaring header. After target
+scope and caller-TU ownership are respected, a caller with positive evidence
+of a visible declaration family with a definition prefers that family over
+known unrelated families. A visible prototype alone does not justify dropping
+otherwise compatible definitions. Unknown provenance retains the existing conservative fallback;
+when no family is visible, all otherwise eligible candidates remain. This
+declaration-family rule does not itself filter C external functions or remove
+competing definitions that share the same declaring header. The separate
+bare-tree partition rule above still applies to those candidates.
+
+The shared resolver applies this eligibility to direct calls, expansion of
+same-signature definitions, and name-based return flows. Expansion preserves
+the call's overload selection. Shared header calls union the results of their
+individual contributing TU contexts, rather than widening each context.
+
 **Lookup order in name buckets**
 
 Internal-function and file-`static` variable name buckets are kept sorted by
@@ -433,6 +476,42 @@ names sort newest-last — and its referenced `codemodel-v2` objects in those
 same three directories. The first candidate build root that supplies targets
 is used; additional build roots are not combined, avoiding duplicate target
 scopes. Stale, unreferenced target JSON files are ignored.
+
+**Inferred GN targets (#120)**
+
+When link commands (including compilation-database link entries) and CMake
+metadata are absent, sorted `BUILD.gn` discovery infers targets from literal
+source and dependency lists. Authoritative metadata takes precedence even
+when malformed: its diagnostics must not silently trigger inferred ownership.
+The reader recognizes OpenHarmony library, executable, unit-test, fuzz-test,
+and module-test target forms and standard GN equivalents. `source_set` and
+`group` contribute dependency membership; config, action, and `data_deps`
+entries do not supply linked symbols.
+
+GN is parsed as data. Local imports and literal variables are evaluated with
+bounded recursion; enumerable conditional alternatives are conservatively
+unioned. Each imported file is read and lexed once per run but evaluated at
+every import, in the importing scope; build files are read in parallel and
+evaluated in sorted discovery order. Relative paths are resolved at their declaring build file. `//`
+labels use a real GN workspace root or an explicitly recorded OpenHarmony
+repository prefix from project metadata; arbitrary path suffixes are never
+used to guess ownership. A scope literal (`sanitize = { ... }`) is skipped as
+one unknown value, and `set_defaults` is ignored unless it names `sources`,
+`deps` or `public_deps`. Unknown expressions, templates, toolchains, or local
+dependencies produce diagnostics. When any part of the inferred graph is
+incomplete or any discovered translation unit has no inferred owner, known
+targets and source membership are exported as observations,
+but symbol resolution stays unscoped for the whole tree: isolating just the
+known targets would hide their definitions from unassigned callers. External
+dependencies are not rebound to similarly named local targets. Incomplete
+inference must not discard valid calls by pretending a partial image is a
+complete one.
+
+Known source/dependency membership feeds the existing target merge and
+`link_targets` / `target_sources` export; inferred outputs are stable synthetic
+identities, not claims that an artifact has been built. A source shared by
+several targets receives separate image instances. Unassigned code remains
+unscoped. The IPC process-boundary exception below applies unchanged.
 
 Compilation object outputs (`output` or `-o`) identify both the source and
 its compiler configuration. The same source built with different macros for
@@ -1035,8 +1114,12 @@ order of anything:
   and merged sizes are each looked up once. Only the destination's own
   indexing, delta and requeue are deferred to the end of the step, and no
   merge reads them, so they see the same sequence as before.
-- A holder's load-source test is a bit per node (`SolverIndices::is_load_src`)
-  instead of a map lookup, in the holder set's own iteration order.
+- A holder's load-source test is a bit per node (`SolverIndices::is_load_src`).
+  Each location caches the filtered holders in the full holder set's own
+  iteration order. Every successful holder insertion invalidates the cache,
+  including non-load holders: a set resize can reorder the existing loaders.
+  Growth of the load-source index also invalidates it. Empty results are
+  cached, and the scratch-copy and requeue order remain unchanged.
 
 On HDF these recover what the larger hub of #150/#151 costs; the exported
 database, the `points_to` debug rows included, is byte-identical. Measurements
@@ -2288,7 +2371,8 @@ Known C++ imprecision (in addition to the general list below):
 - Virtual expansion is CHA from the static receiver type (not points-to).
   Multiple bases resolve; nearest declarer wins when walking up.
   `override` implies virtual. `final` on a class or method stops further
-  subclass targets. Virtual inheritance is recorded as a normal base edge.
+  subclass targets. Flags belong to the declaration, not to local classes
+  nested inside its body. Virtual inheritance is recorded as a normal base edge.
 - Headers shared between `.c` and `.cpp` TUs parse under whichever
   grammar reaches them first at merge time.
 - **`using namespace` in headers**: ANALYSIS.md says file-scope directives
@@ -2531,6 +2615,9 @@ caller or callee is a dependency function.
 
 ## Compilation databases (#62)
 
+Inferred target ownership and authoritative metadata precedence are defined
+in [Link targets and weak symbols](#link-targets-and-weak-symbols).
+
 Indexing opportunistically reads `compile_commands.json` at the analysis root,
 then `build/compile_commands.json`. `--compile-commands PATH` selects another file;
 the library equivalent is `PreprocessOptions::compilation_database`. The first
@@ -2579,7 +2666,10 @@ directories, ordered `-I` directories, ordered `-isystem` directories and finall
 the `-idirafter` chain. Angle includes skip the first two classes. A directory
 also marked `-isystem` keeps its system position. Explicit CLI include paths precede database `-I` paths; CLI
 defines override command macros. Configured units do not use inferred include
-directories or basename guessing. Forced includes first search the command's
+directories or basename guessing. A bare-tree unit searches its inferred tree
+directories after every explicit class, so a CLI `-I` or `-isystem` directory
+wins over a same-named header elsewhere in the tree (before #120 the inferred
+directories were ordinary `-I` entries and preceded system directories). Forced includes first search the command's
 working directory and preserve their own source locations; a header they cannot
 find is reported against the source, never against the synthetic search path.
 

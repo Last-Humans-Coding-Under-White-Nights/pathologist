@@ -113,3 +113,52 @@ fn header_reclassified_by_a_macro_include_is_preprocessed_in_its_parse_language(
         );
     }
 }
+
+#[test]
+fn inferred_test_partition_preserves_translation_unit_local_header_callees() {
+    let tree = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(fixture("mixed_lang_late")).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), tree.path().join(entry.file_name())).unwrap();
+    }
+    std::fs::create_dir(tree.path().join("test")).unwrap();
+    std::fs::write(tree.path().join("test/marker.cpp"), "void test_marker() {}").unwrap();
+    let program = build_program(tree.path(), &default_opts(tree.path())).unwrap();
+    let (_, analysis) = analyze(&program);
+    for caller in ["c_user", "cpp_user"] {
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                caller,
+                "late_raw",
+                ResolutionKind::Direct
+            ),
+            "{caller} must retain the translation-unit-local header definition"
+        );
+    }
+}
+
+#[test]
+fn inferred_test_partition_preserves_qualified_internal_macro_callees() {
+    let tree = tempfile::tempdir().unwrap();
+    for (name, text) in [
+        ("helpers.h", "#pragma once\nnamespace N { static int helper(int x) { return x; } }\n#define INVOKE() N::helper(1)\n"),
+        ("caller.h", "#pragma once\n#include \"helpers.h\"\nnamespace N { namespace Inner { static int use() { return INVOKE(); } } }"),
+        ("prod.cpp", "#include \"caller.h\"\nint prod() { return N::Inner::use(); }"),
+        ("other.cpp", "#include \"caller.h\"\nint other() { return N::Inner::use(); }"),
+    ] {
+        std::fs::write(tree.path().join(name), text).unwrap();
+    }
+    std::fs::create_dir(tree.path().join("test")).unwrap();
+    std::fs::write(tree.path().join("test/marker.cpp"), "void test_marker() {}").unwrap();
+    let program = build_program(tree.path(), &default_opts(tree.path())).unwrap();
+    let (_, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "N::Inner::use",
+        "N::helper",
+        ResolutionKind::Direct
+    ));
+}

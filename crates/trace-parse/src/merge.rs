@@ -4,7 +4,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-pub(crate) use target_merge::merge_linked_units;
+pub(crate) use target_merge::{merge_linked_units, record_link_targets};
 use trace_ir::{
     same_param_type_or_unresolved, CallSite, CallSiteId, FlowConstraint, FnId, Function, Program,
     ReturnFlow, TemplateBase, TypeDesc, TypeId, VarId, Variable,
@@ -22,6 +22,7 @@ pub struct UnitIndex {
     pub files: Vec<PathBuf>,
     pub types: trace_ir::TypeTable,
     pub functions: Vec<Function>,
+    pub member_declarations: FxHashMap<FnId, Vec<trace_ir::FileId>>,
     /// Exact expanded C++ internal definitions, independent of TU-local IDs.
     pub internal_definitions: FxHashMap<FnId, Arc<str>>,
     pub variables: Vec<Variable>,
@@ -588,7 +589,17 @@ fn merge_unit(
             // merge path in that case instead of choosing by insertion order.
             canonical = matching.next().filter(|_| matching.next().is_none());
         }
+        let declaration_files: Vec<_> = unit
+            .member_declarations
+            .get(&old_id)
+            .into_iter()
+            .flatten()
+            .map(|file| file_map[file.0 as usize])
+            .collect();
         if let Some(canonical) = canonical {
+            program
+                .symbols
+                .record_member_declarations(canonical, declaration_files);
             fn_map.insert(old_id, canonical);
             // This unit has now met the entry at its own column too (see
             // `MergeDedup::existing_fn`).
@@ -647,6 +658,9 @@ fn merge_unit(
             continue;
         }
         let new_id = program.symbols.alloc_fn_id();
+        program
+            .symbols
+            .record_member_declarations(new_id, declaration_files);
         let mut f = func.clone();
         f.id = new_id;
         f.span.file = span_file;

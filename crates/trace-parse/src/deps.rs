@@ -75,10 +75,16 @@ impl IncludeGraph {
                     return None;
                 };
                 let mut deps = Vec::new();
+                let from_is_test = trace_ir::is_test_path(&root, path);
                 for inc in scan_includes(&content) {
-                    if let Some(resolved) =
-                        resolve_include(path, &inc, &include_dirs, &basename_index)
-                    {
+                    if let Some(resolved) = resolve_include(
+                        &root,
+                        path,
+                        from_is_test,
+                        &inc,
+                        &include_dirs,
+                        &basename_index,
+                    ) {
                         let canon = canonicalize(&resolved);
                         if project_files.contains(&canon) {
                             deps.push(canon);
@@ -441,7 +447,9 @@ fn build_basename_index(project_files: &HashSet<PathBuf>) -> FxHashMap<String, V
 }
 
 fn resolve_include(
+    root: &Path,
     from: &Path,
+    from_is_test: bool,
     inc: &IncludeRef,
     include_dirs: &[PathBuf],
     basename_index: &FxHashMap<String, Vec<PathBuf>>,
@@ -455,30 +463,34 @@ fn resolve_include(
     // project file (`<string>`, `<vector>`) walks the whole list, and every
     // file that spells it walked it again with a `stat` per candidate --
     // ten seconds of kernel time on camera, at any job count.
+    // The test partition is checked only on a candidate that exists: a path
+    // walk per search directory cost more than the memoized probe itself.
     let local_first = match inc.kind {
         IncludeKind::Local => from.parent(),
         IncludeKind::System => None,
     };
-    let candidates = local_first
-        .map(|parent| parent.join(&inc.path))
-        .into_iter()
-        .chain(include_dirs.iter().map(|dir| dir.join(&inc.path)));
-
-    for cand in candidates {
+    if let Some(cand) = local_first.map(|parent| parent.join(&inc.path)) {
         if trace_ir::is_file_cached(&cand) {
             return Some(cand);
         }
     }
-
-    // Last resort: unique match under project by filename.
-    if let Some(name) = Path::new(&inc.path).file_name().and_then(|n| n.to_str()) {
-        if let Some(matches) = basename_index.get(name) {
-            if matches.len() == 1 {
-                return Some(matches[0].clone());
-            }
+    // A production includer never takes a test/mock candidate from the
+    // inferred search (docs/ANALYSIS.md, "Declaring-header eligibility").
+    let admits = |p: &Path| from_is_test || !trace_ir::is_test_path(root, p);
+    for dir in include_dirs {
+        let cand = dir.join(&inc.path);
+        if trace_ir::is_file_cached(&cand) && admits(&cand) {
+            return Some(cand);
         }
     }
-    None
+
+    // Last resort: the unique admitted match under project by filename.
+    let name = Path::new(&inc.path).file_name().and_then(|n| n.to_str())?;
+    let mut admitted = basename_index.get(name)?.iter().filter(|p| admits(p));
+    match (admitted.next(), admitted.next()) {
+        (Some(only), None) => Some(only.clone()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -574,5 +586,60 @@ mod tests {
                 .all(|w| w.iter().all(|f| !leftover.contains(f))),
             "leftover files must not also appear in a parallel wave"
         );
+    }
+
+    #[test]
+    fn production_includers_never_take_test_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_dir = dir.path();
+        for file in [
+            "mock/a.h",
+            "zsrc/a.h",
+            "test/only.h",
+            "src/b.h",
+            "test/mock/b.h",
+        ] {
+            let path = root_dir.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        let dirs: Vec<PathBuf> = ["mock", "test", "zsrc"]
+            .iter()
+            .map(|d| root_dir.join(d))
+            .collect();
+        let index = build_basename_index(
+            &[
+                "src/b.h",
+                "test/mock/b.h",
+                "test/only.h",
+                "mock/a.h",
+                "zsrc/a.h",
+            ]
+            .iter()
+            .map(|f| root_dir.join(f))
+            .collect(),
+        );
+        let resolve = |from: &str, spelled: &str| {
+            let from = root_dir.join(from);
+            let from_is_test = trace_ir::is_test_path(root_dir, &from);
+            let inc = IncludeRef {
+                kind: IncludeKind::System,
+                path: spelled.to_string(),
+            };
+            resolve_include(root_dir, &from, from_is_test, &inc, &dirs, &index)
+                .map(|p| p.strip_prefix(root_dir).unwrap().to_path_buf())
+        };
+        // A later production directory wins over an earlier mock one...
+        assert_eq!(resolve("app/u.c", "a.h"), Some("zsrc/a.h".into()));
+        // ...but test code keeps the search order.
+        assert_eq!(resolve("test/u.c", "a.h"), Some("mock/a.h".into()));
+        // A header only under a test directory stays unresolved for
+        // production code, by search or by basename.
+        assert_eq!(resolve("app/u.c", "only.h"), None);
+        assert_eq!(resolve("test/u.c", "only.h"), Some("test/only.h".into()));
+        // Basename fallback: the one production match is taken; test code
+        // sees two matches and takes neither.
+        assert_eq!(resolve("app/u.c", "gone/b.h"), Some("src/b.h".into()));
+        assert_eq!(resolve("test/u.c", "gone/b.h"), None);
     }
 }

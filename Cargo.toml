@@ -42,3 +42,9 @@ tree-sitter-c = "0.24"
 walkdir = "2"
 rayon = "1"
 tempfile = "3"
+
+# ThinLTO and a single codegen unit: the configuration docs/EVAL_REPORT.md
+# measures. Slower release compiles for a faster analyzer.
+[profile.release]
+lto = "thin"
+codegen-units = 1

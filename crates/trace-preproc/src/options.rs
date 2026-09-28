@@ -156,7 +156,7 @@ pub struct SourceCache {
     directory_searches: RwLock<DirectorySearches>,
 }
 
-pub(crate) type DirectoryResults = Arc<RwLock<FxHashMap<(String, bool), Option<PathBuf>>>>;
+pub(crate) type DirectoryResults = Arc<RwLock<FxHashMap<(String, bool, bool), Option<PathBuf>>>>;
 
 #[derive(Debug, Default)]
 struct DirectorySearches {
@@ -169,6 +169,8 @@ struct SearchPaths {
     quote: Vec<PathBuf>,
     include: Vec<PathBuf>,
     system: Vec<PathBuf>,
+    inferred: Vec<PathBuf>,
+    root: Option<PathBuf>,
 }
 
 impl SourceCache {
@@ -191,6 +193,8 @@ impl SourceCache {
             quote: opts.quote_include_paths.clone(),
             include: opts.include_paths.clone(),
             system: opts.system_include_paths.clone(),
+            inferred: opts.inferred_include_paths.clone(),
+            root: opts.inference_root.clone(),
         };
         if let Ok(searches) = self.directory_searches.read() {
             if searches.epoch == epoch {
@@ -332,6 +336,10 @@ pub struct PreprocessOptions {
     /// Indexing-only: retain weak body/initializer ownership for link selection.
     pub record_link_ownership: bool,
     pub include_paths: Vec<PathBuf>,
+    /// Bare-tree search paths, lower priority than explicit paths.
+    pub inferred_include_paths: Vec<PathBuf>,
+    /// Root for the shared production/test fallback convention.
+    pub inference_root: Option<PathBuf>,
     /// Quoted includes search these before `include_paths`.
     pub quote_include_paths: Vec<PathBuf>,
     /// System directories follow `include_paths`, in supplied order.
@@ -435,6 +443,8 @@ impl Default for PreprocessOptions {
             link_commands: None,
             record_link_ownership: false,
             include_paths: Vec::new(),
+            inferred_include_paths: Vec::new(),
+            inference_root: None,
             quote_include_paths: Vec::new(),
             system_include_paths: Vec::new(),
             strict_include_search: false,
@@ -474,6 +484,7 @@ impl PreprocessOptions {
     pub fn configures_preprocessing(&self) -> bool {
         !self.defines.is_empty()
             || !self.include_paths.is_empty()
+            || !self.inferred_include_paths.is_empty()
             || !self.command_macros.is_empty()
             || !self.forced_includes.is_empty()
             || !self.quote_include_paths.is_empty()

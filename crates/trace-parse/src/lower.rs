@@ -10,6 +10,7 @@ use crate::merge::{
     merge_unit_header_preamble, merge_unit_index, merge_unit_symbols, merge_unit_types,
     merge_unit_variants, UnitIndex,
 };
+use crate::node_metadata::NodeMetadata;
 use crate::parse::node_text;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -347,6 +348,9 @@ fn build_program_inner(
     // this process saw.
     trace_ir::start_file_probe_epoch();
     let mut program = Program::new(root.to_path_buf());
+    program
+        .symbols
+        .set_inference_root(&trace_ir::canonicalize(root));
     program.include_paths = opts.include_paths.clone();
     // Set before any path is interned: `SymbolTable` decides `FileInfo::is_dep`
     // as it interns, so every later dep question is an O(1) file lookup (#60).
@@ -419,8 +423,22 @@ fn build_program_inner(
 
     let mut include_graph =
         IncludeGraph::build_with_deps(root, &files, &headers, &dep_roots, &dep_headers);
-    let links =
+    let mut links =
         crate::link_commands::LinkDatabase::load(root, &database, opts.link_commands.as_deref())?;
+    if links.inferred && !links.unscoped_inference && !links.targets.is_empty() {
+        let assigned: HashSet<_> = links
+            .targets
+            .iter()
+            .flat_map(|t| t.sources.iter())
+            .collect();
+        if files.iter().any(|file| !assigned.contains(file)) {
+            links.unscoped_inference = true;
+            links.warnings.push(
+                "GN: sources without inferred ownership; retaining whole-tree symbol resolution"
+                    .into(),
+            );
+        }
+    }
     for message in &links.warnings {
         program.add_diagnostic(Diagnostic {
             severity: DiagnosticSeverity::Warning,
@@ -430,7 +448,7 @@ fn build_program_inner(
             stage: "link_commands".into(),
         });
     }
-    if !database.commands.is_empty() || !links.targets.is_empty() {
+    if !database.commands.is_empty() || (!links.targets.is_empty() && !links.unscoped_inference) {
         return configured::build(
             program,
             root,
@@ -810,6 +828,7 @@ fn build_program_inner(
     pch_headers.dedup();
     pch_headers.retain(|p| !skip_headers.contains(p));
     let pch_order = Arc::new(include_graph.index_order(&pch_headers));
+    let header_order = HeaderOrder::new(&pch_order);
     let pch_set: HashSet<PathBuf> = pch_headers.iter().cloned().collect();
     // Orphans get the same treatment: indexing a header standalone that every
     // unit already expanded for itself would reintroduce the configuration
@@ -900,7 +919,7 @@ fn build_program_inner(
                     &include_expansion_cache,
                     index_language(path, &cpp_parse, no_c_units, forced_language),
                     Some(&header_ir_map),
-                    pch_order.as_ref(),
+                    &header_order,
                     &opts.ignored_macros,
                 );
                 push_header_ir(
@@ -931,7 +950,7 @@ fn build_program_inner(
                                 &include_expansion_cache,
                                 index_language(path, &cpp_parse, no_c_units, forced_language),
                                 Some(snapshot),
-                                pch_order.as_ref(),
+                                &header_order,
                                 &opts.ignored_macros,
                             ),
                         )
@@ -967,7 +986,7 @@ fn build_program_inner(
                 &include_expansion_cache,
                 index_language(&path, &cpp_parse, no_c_units, forced_language),
                 Some(&header_ir_map),
-                pch_order.as_ref(),
+                &header_order,
                 &opts.ignored_macros,
             );
             push_header_ir(
@@ -1003,8 +1022,8 @@ fn build_program_inner(
     }
     program.types.complete_nested_tags();
 
-    pool.install(|| {
-        if jobs == 1 {
+    if jobs == 1 {
+        pool.install(|| {
             for (i, path) in orphan_headers.iter().enumerate() {
                 let t = Instant::now();
                 index_item_progress(
@@ -1026,7 +1045,7 @@ fn build_program_inner(
                         &index_opts[&index_language(path, &cpp_parse, no_c_units, forced_language)],
                         &source_cache,
                         Some(&header_ir),
-                        pch_order.as_ref(),
+                        &header_order,
                     ),
                 );
                 source_cache.evict(path, &include_graph);
@@ -1041,30 +1060,31 @@ fn build_program_inner(
                     ),
                 );
             }
-        } else {
-            index_in_window(
-                &orphan_headers,
-                jobs,
-                |path| {
-                    let unit = index_source_file(
-                        path,
-                        root,
-                        &include_graph,
-                        &index_opts[&index_language(path, &cpp_parse, no_c_units, forced_language)],
-                        &source_cache,
-                        Some(&header_ir),
-                        pch_order.as_ref(),
-                    );
-                    source_cache.evict(path, &include_graph);
-                    unit
-                },
-                |unit| merge_unit_index(&mut program, &unit),
-            );
-        }
-    });
+        });
+    } else {
+        index_in_window(
+            &pool,
+            &orphan_headers,
+            jobs,
+            |path| {
+                let unit = index_source_file(
+                    path,
+                    root,
+                    &include_graph,
+                    &index_opts[&index_language(path, &cpp_parse, no_c_units, forced_language)],
+                    &source_cache,
+                    Some(&header_ir),
+                    &header_order,
+                );
+                source_cache.evict(path, &include_graph);
+                unit
+            },
+            |unit| merge_unit_index(&mut program, &unit),
+        );
+    }
 
-    pool.install(|| {
-        if jobs == 1 {
+    if jobs == 1 {
+        pool.install(|| {
             for (i, path) in file_order.iter().enumerate() {
                 let t = Instant::now();
                 index_item_progress(
@@ -1080,7 +1100,7 @@ fn build_program_inner(
                     &index_opts[&lang],
                     &source_cache,
                     Some(&header_ir),
-                    pch_order.as_ref(),
+                    &header_order,
                     gn_candidates.as_ref(),
                     &base_defines,
                     opts.explore_budget,
@@ -1098,33 +1118,34 @@ fn build_program_inner(
                     ),
                 );
             }
-        } else {
-            index_in_window(
-                &file_order,
-                jobs,
-                |path| {
-                    let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
-                    let units = index_source_file_with_variants(
-                        path,
-                        root,
-                        &include_graph,
-                        &index_opts[&lang],
-                        &source_cache,
-                        Some(&header_ir),
-                        pch_order.as_ref(),
-                        gn_candidates.as_ref(),
-                        &base_defines,
-                        opts.explore_budget,
-                    );
-                    // Header provenance and PCH construction are complete.
-                    // Keep the source through variant generation, then release it.
-                    source_cache.evict(path, &include_graph);
-                    units
-                },
-                |(base_unit, var_units)| merge_unit_variants(&mut program, &base_unit, &var_units),
-            );
-        }
-    });
+        });
+    } else {
+        index_in_window(
+            &pool,
+            &file_order,
+            jobs,
+            |path| {
+                let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
+                let units = index_source_file_with_variants(
+                    path,
+                    root,
+                    &include_graph,
+                    &index_opts[&lang],
+                    &source_cache,
+                    Some(&header_ir),
+                    &header_order,
+                    gn_candidates.as_ref(),
+                    &base_defines,
+                    opts.explore_budget,
+                );
+                // Header provenance and PCH construction are complete.
+                // Keep the source through variant generation, then release it.
+                source_cache.evict(path, &include_graph);
+                units
+            },
+            |(base_unit, var_units)| merge_unit_variants(&mut program, &base_unit, &var_units),
+        );
+    }
 
     program.types.complete_nested_tags();
     // After the merges, so the headers involved already hold their ids
@@ -1134,6 +1155,9 @@ fn build_program_inner(
             .symbols
             .add_file_interned(include_graph.intern_path(&path));
         add_preprocess_diagnostics(&mut program, &include_graph, unit_file, &diagnostics);
+    }
+    if links.unscoped_inference {
+        crate::merge::record_link_targets(&mut program, &links);
     }
     let inferred_dirs = include_graph.include_dirs.clone();
     source_cache.check_load_errors()?;
@@ -1149,6 +1173,7 @@ fn finalize_program(
     graph: &IncludeGraph,
     extra_dirs: impl IntoIterator<Item = PathBuf>,
 ) {
+    program.symbols.set_inference_root(&graph.root);
     program.include_deps = graph.edge_list();
     let mut seen: HashSet<PathBuf> = program.include_paths.iter().cloned().collect();
     for dir in extra_dirs {
@@ -1335,7 +1360,7 @@ fn bind_calls_past_this(program: &mut Program) {
 /// pushed directly (not via `add_function`) so they stay out of the name
 /// resolution maps and cannot shadow real definitions or feed param wiring.
 fn finalize_extern_callees(program: &mut Program) {
-    if !program.link_targets.is_empty() {
+    if program.symbols.has_target_scopes() || program.symbols.has_inferred_test_partition() {
         finalize_target_extern_callees(program);
         return;
     }
@@ -1435,15 +1460,20 @@ fn is_plain_ident(name: &str) -> bool {
 /// An unresolved external belongs to the same image as its caller. A name
 /// present only in another image must not prevent synthesizing this declaration.
 fn finalize_target_extern_callees(program: &mut Program) {
+    let inferred = program.symbols.has_inferred_test_partition();
     // Group first, resolve once per group. Resolving per site re-walks the
     // scope table for every call — the cost the whole-program pass above was
-    // restructured to avoid (#108).
+    // restructured to avoid (#108). The inferred partition is the exception:
+    // shared header sites bind per contributing translation unit, so each
+    // remaining site is resolved once, after the cheap filters.
     let mut grouped: std::collections::BTreeMap<(&str, Option<trace_ir::TargetId>), Vec<usize>> =
         std::collections::BTreeMap::new();
     for (i, cs) in program.symbols.call_sites.iter().enumerate() {
         if cs.callee_var.is_some()
-            || cs.callee_fn_id.is_some()
+            || (!inferred && cs.callee_fn_id.is_some())
+            || (inferred && cs.is_direct && cs.callee_fn_id.is_none())
             || !is_synthesizable_extern(&cs.callee_name)
+            || (inferred && !program.callees_of(cs).is_empty())
         {
             continue;
         }
@@ -1456,17 +1486,22 @@ fn finalize_target_extern_callees(program: &mut Program) {
     let missing: std::collections::BTreeMap<(String, Option<trace_ir::TargetId>), Vec<usize>> =
         grouped
             .into_iter()
-            .filter(|((name, target), _)| {
+            .filter_map(|((name, target), sites)| {
+                if inferred {
+                    // Every site was already checked against the contextual
+                    // resolver analysis uses.
+                    return Some(((name.to_owned(), target), sites));
+                }
                 // Unscoped by file: the group spans call sites in many files,
                 // and a file-`static` visible from just one of them must not
                 // decide for the rest. Matches the whole-program pass, which
                 // asks `resolve_function` without a file.
                 program
                     .symbols
-                    .resolve_function_candidates_in_target(name, None, *target)
+                    .resolve_function_candidates_in_target(name, None, target)
                     .is_empty()
+                    .then(|| ((name.to_owned(), target), sites))
             })
-            .map(|((name, target), sites)| ((name.to_owned(), target), sites))
             .collect();
     for ((name, target), sites) in missing {
         // Synthesized externals were never declared in the tree, so they have
@@ -1480,7 +1515,7 @@ fn finalize_target_extern_callees(program: &mut Program) {
             col: 0,
         };
         let id = program.symbols.alloc_fn_id();
-        program.symbols.push_synthetic_function(Function {
+        let function = Function {
             id,
             name,
             target,
@@ -1506,7 +1541,12 @@ fn finalize_target_extern_callees(program: &mut Program) {
             is_cpp: false,
             c_linkage: false,
             tu: None,
-        });
+        };
+        if inferred {
+            program.symbols.push_context_external_function(function);
+        } else {
+            program.symbols.push_synthetic_function(function);
+        }
         for i in sites {
             let cs = &mut program.symbols.call_sites[i];
             cs.callee_fn_id = Some(id);
@@ -1733,7 +1773,8 @@ fn index_window(jobs: usize) -> usize {
         .clamp(INDEX_WINDOW_MIN, INDEX_WINDOW_MAX)
 }
 
-/// Index `items` on `jobs` workers and merge them in the order given.
+/// Index `items` on `jobs` workers and merge them in order on the caller.
+/// Call outside the pool so waiting for a unit does not occupy a worker.
 ///
 /// Workers take units in order and park a finished unit until the merge
 /// reaches it; the merge runs on this thread while the workers go on. A
@@ -1747,6 +1788,7 @@ fn index_window(jobs: usize) -> usize {
 /// out and wakes every waiter, so no thread waits for a result that will
 /// never come, and the scope re-raises the panic once the rest have left.
 fn index_in_window<T: Send>(
+    pool: &rayon::ThreadPool,
     items: &[PathBuf],
     jobs: usize,
     index: impl Fn(&PathBuf) -> T + Sync,
@@ -1803,7 +1845,7 @@ fn index_in_window<T: Send>(
     // lock poisoned by a panic elsewhere holds a consistent window; the
     // cancellation flag is what stops the run.
     let lock = || state.lock().unwrap_or_else(|e| e.into_inner());
-    rayon::scope(|scope| {
+    pool.in_place_scope(|scope| {
         for _ in 0..jobs {
             scope.spawn(move |_| {
                 let _cancel = CancelOnPanic { state, signals };
@@ -1871,9 +1913,10 @@ fn project_preprocess_opts(
     graph: &IncludeGraph,
 ) -> PreprocessOptions {
     let mut eff = opts.clone();
+    eff.inference_root = Some(graph.root.clone());
     for dir in &graph.include_dirs {
         if !eff.include_paths.iter().any(|p| p == dir) {
-            eff.include_paths.push(dir.clone());
+            eff.inferred_include_paths.push(dir.clone());
         }
     }
     if eff.source_cache.is_none() && !graph.source_cache.is_empty() {
@@ -1893,6 +1936,22 @@ pub(crate) fn is_index_header(path: &Path) -> bool {
     })
 }
 
+/// Global header order, computed once and queried only for needed headers.
+#[derive(Default)]
+struct HeaderOrder {
+    ranks: HashMap<PathBuf, usize>,
+}
+
+impl HeaderOrder {
+    fn new(paths: &[PathBuf]) -> Self {
+        let mut ranks = HashMap::default();
+        for (rank, path) in paths.iter().enumerate() {
+            ranks.entry(path.clone()).or_insert(rank);
+        }
+        Self { ranks }
+    }
+}
+
 /// Headers whose IR must be visible before lowering `self_canon`.
 ///
 /// PCH (`types_only`): direct include-graph edges plus this file's preprocess
@@ -1907,7 +1966,7 @@ pub(crate) fn is_index_header(path: &Path) -> bool {
 /// `index_order`, which would redo Kahn's algorithm for every TU.
 fn headers_to_merge<'a>(
     graph: &'a IncludeGraph,
-    pch_order: &'a [PathBuf],
+    pch_order: &HeaderOrder,
     self_canon: &'a Path,
     included_headers: &'a [PathBuf],
     types_only: bool,
@@ -1933,15 +1992,15 @@ fn headers_to_merge<'a>(
             wanted.insert(h.as_path());
         }
     }
-    let mut out = Vec::with_capacity(wanted.len());
-    for h in pch_order {
-        if wanted.remove(h.as_path()) {
-            out.push(h.as_path());
-        }
-    }
-    let mut rest: Vec<&Path> = wanted.into_iter().collect();
-    rest.sort();
-    out.extend(rest);
+    let mut out: Vec<&Path> = wanted.into_iter().collect();
+    // Cache ranks once per wanted path, not once per comparison. Unknown
+    // cached-expansion paths retain the old lexical tail order.
+    out.sort_by_cached_key(|path| {
+        (
+            pch_order.ranks.get(*path).copied().unwrap_or(usize::MAX),
+            *path,
+        )
+    });
     out
 }
 
@@ -2060,7 +2119,7 @@ fn index_header_variant(
     cache: &trace_preproc::ExpansionCache,
     language: Language,
     header_ir: Option<&HeaderIr>,
-    pch_order: &[PathBuf],
+    pch_order: &HeaderOrder,
     ignored_macros: &[String],
 ) -> UnitIndex {
     let expansion = cache.read().ok().and_then(|guard| {
@@ -2143,7 +2202,7 @@ fn index_source_file(
     index_opts: &PreprocessOptions,
     source_cache: &IndexSourceCache,
     header_ir: Option<&HeaderIr>,
-    pch_order: &[PathBuf],
+    pch_order: &HeaderOrder,
 ) -> UnitIndex {
     let mut program = Program::new(root.to_path_buf());
     program.ignored_macros = index_opts.ignored_macros.clone();
@@ -2201,7 +2260,7 @@ fn index_source_file_with_variants(
     index_opts: &PreprocessOptions,
     source_cache: &IndexSourceCache,
     header_ir: Option<&HeaderIr>,
-    pch_order: &[PathBuf],
+    pch_order: &HeaderOrder,
     gn_candidates: Option<&std::collections::HashMap<String, Vec<Candidate>>>,
     base_defines: &BTreeMap<String, String>,
     explore_budget: usize,
@@ -2297,7 +2356,7 @@ fn process_indexed_file(
     index_opts: &PreprocessOptions,
     source_cache: &IndexSourceCache,
     header_ir: Option<&HeaderIr>,
-    pch_order: &[PathBuf],
+    pch_order: &HeaderOrder,
 ) -> Result<(), String> {
     let pre = source_cache.get_or_preprocess(path, graph, index_opts)?;
     // `index_opts` was chosen by `index_language`, so its language is the
@@ -2334,7 +2393,7 @@ fn lower_prepared_source(
     record_link_ownership: bool,
     header_unit: bool,
     header_ir: Option<&HeaderIr>,
-    pch_order: &[PathBuf],
+    pch_order: &HeaderOrder,
 ) -> Result<(), String> {
     program.symbols.set_dep_roots(graph.dep_roots.clone());
     let self_canon = graph.intern_path(path);
@@ -2647,6 +2706,7 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
             .collect(),
         path,
         types: program.types,
+        member_declarations: program.symbols.take_member_declarations(),
         functions: program.symbols.functions,
         internal_definitions: program.dedup.internal_definitions,
         variables: program.symbols.variables,
@@ -2696,7 +2756,7 @@ fn register_typedef_alias(
     if ctx.is_cpp
         && node
             .parent()
-            .is_some_and(|p| p.kind() == "field_declaration_list")
+            .is_some_and(|p| p.cached_kind() == "field_declaration_list")
     {
         if let Some(cls) = ctx.type_scope.borrow().last() {
             program
@@ -2729,7 +2789,7 @@ fn declared_alias(
     source: &str,
     node: Node,
 ) -> Option<(String, TypeDesc)> {
-    match node.kind() {
+    match node.cached_kind() {
         "type_definition" => typedef_alias(program, ctx, source, node),
         "alias_declaration" => using_alias(program, ctx, source, node),
         _ => None,
@@ -2743,18 +2803,19 @@ fn typedef_alias(
     source: &str,
     node: Node,
 ) -> Option<(String, TypeDesc)> {
-    let decl = node.child_by_field_name("declarator")?;
+    let decl = node.cached_field("declarator")?;
     let (alias, _) = parse_declarator_name(source, decl);
-    let type_node = node.child_by_field_name("type")?;
+    let type_node = node.cached_field("type")?;
     if alias.is_empty() {
         return None;
     }
-    if type_node.kind() == "struct_specifier" || type_node.kind() == "union_specifier" {
+    if type_node.cached_kind() == "struct_specifier" || type_node.cached_kind() == "union_specifier"
+    {
         let tag = lower_struct_specifier(program, ctx, source, type_node);
         if tag.is_empty() {
             return None;
         }
-        let kind = if type_node.kind() == "union_specifier" {
+        let kind = if type_node.cached_kind() == "union_specifier" {
             TypeDesc::Union {
                 name: tag.clone(),
                 fields: Vec::new(),
@@ -2794,12 +2855,12 @@ fn using_alias(
 ) -> Option<(String, TypeDesc)> {
     if node
         .parent()
-        .is_some_and(|p| p.kind() == "template_declaration")
+        .is_some_and(|p| p.cached_kind() == "template_declaration")
     {
         return None;
     }
-    let name = node.child_by_field_name("name")?;
-    let ty = node.child_by_field_name("type")?;
+    let name = node.cached_field("name")?;
+    let ty = node.cached_field("type")?;
     let alias = normalize_qualified(node_text(source, &name));
     if alias.is_empty() {
         return None;
@@ -2807,7 +2868,7 @@ fn using_alias(
     let base = type_desc_from_node(program, ctx, source, ty);
     let desc = abstract_declarator_shape(
         base,
-        ty.child_by_field_name("declarator"),
+        ty.cached_field("declarator"),
         true,
         ReferenceLayer::Pointer,
     );
@@ -2841,7 +2902,7 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
         return;
     }
     ctx.ast_depth += 1;
-    match node.kind() {
+    match node.cached_kind() {
         "function_definition" => lower_function(program, ctx, source, node),
         "declaration" => {
             lower_class_defined_in(program, ctx, source, node);
@@ -2857,7 +2918,7 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
         "linkage_specification" => {
             let outer = ctx.c_linkage;
             ctx.c_linkage = node
-                .child_by_field_name("value")
+                .cached_field("value")
                 .is_some_and(|v| node_text(source, &v) == "\"C\"");
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -2872,7 +2933,7 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
             ctx.step_template(1);
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                if child.kind() == "template_parameter_list" {
+                if child.cached_kind() == "template_parameter_list" {
                     continue;
                 }
                 lower_tree(program, ctx, source, child);
@@ -2898,7 +2959,7 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
 /// member functions and static data members.
 fn lower_class_specifier(program: &mut Program, ctx: &mut LowerContext, source: &str, node: Node) {
     let tag = lower_struct_specifier(program, ctx, source, node);
-    if node.kind() == "class_specifier" || ctx.is_cpp {
+    if node.cached_kind() == "class_specifier" || ctx.is_cpp {
         lower_class_members(program, ctx, source, node, &tag);
     }
 }
@@ -2912,7 +2973,7 @@ fn lower_class_defined_in(program: &mut Program, ctx: &mut LowerContext, source:
         return;
     }
     if let Some(spec) = node
-        .child_by_field_name("type")
+        .cached_field("type")
         .filter(|t| is_named_class_definition(*t))
     {
         lower_class_specifier(program, ctx, source, spec);
@@ -2926,11 +2987,11 @@ fn lower_namespace(program: &mut Program, ctx: &mut LowerContext, source: &str, 
     // bare name and with internal linkage.
     let levels: Vec<Option<String>> = match node.children(&mut node.walk()).find(|c| {
         matches!(
-            c.kind(),
+            c.cached_kind(),
             "namespace_identifier" | "nested_namespace_specifier"
         )
     }) {
-        Some(c) if c.kind() == "nested_namespace_specifier" => {
+        Some(c) if c.cached_kind() == "nested_namespace_specifier" => {
             // `namespace A::inline B {` (C++20) keeps the keyword inside
             // the segment; the scope is named `B`.
             normalize_qualified(node_text(source, &c))
@@ -2963,7 +3024,7 @@ fn lower_namespace(program: &mut Program, ctx: &mut LowerContext, source: &str, 
     let using_imports_len = ctx.using_name_imports.len();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "declaration_list" {
+        if child.cached_kind() == "declaration_list" {
             let mut inner = child.walk();
             for decl in child.children(&mut inner) {
                 lower_tree(program, ctx, source, decl);
@@ -3046,7 +3107,7 @@ fn lower_using_declaration(ctx: &mut LowerContext, source: &str, node: Node) {
     let mut is_ns_using = false;
     let mut target: Option<String> = None;
     for child in node.children(&mut node.walk()) {
-        match child.kind() {
+        match child.cached_kind() {
             "namespace" => is_ns_using = true,
             "identifier" | "qualified_identifier" | "namespace_identifier" => {
                 target = Some(normalize_qualified(node_text(source, &child)));
@@ -3091,9 +3152,9 @@ fn lower_using_declaration(ctx: &mut LowerContext, source: &str, node: Node) {
 /// parse through a `function_declarator` too but their name sits behind a
 /// parenthesized/pointer declarator — those are data.
 fn member_decl_is_function(node: Node) -> bool {
-    if let Some(decl) = node.child_by_field_name("declarator") {
-        let inner_decl = if decl.kind() == "init_declarator" {
-            decl.child_by_field_name("declarator").unwrap_or(decl)
+    if let Some(decl) = node.cached_field("declarator") {
+        let inner_decl = if decl.cached_kind() == "init_declarator" {
+            decl.cached_field("declarator").unwrap_or(decl)
         } else {
             decl
         };
@@ -3102,7 +3163,7 @@ fn member_decl_is_function(node: Node) -> bool {
         }
     }
     fn walk(n: Node) -> bool {
-        match n.kind() {
+        match n.cached_kind() {
             // Type position, not declarator position — see member_short_name.
             "decltype" => return false,
             // A nested class's body: its members are its own (#92). Walking
@@ -3119,14 +3180,14 @@ fn member_decl_is_function(node: Node) -> bool {
             // anywhere for the test below to find, so the member was read as a
             // data field and dropped from the index. An `ERROR` the keyword
             // opens is a conversion operator whatever it holds.
-            "ERROR" if n.child(0).is_some_and(|k| k.kind() == "operator") => return true,
+            "ERROR" if n.child(0).is_some_and(|k| k.cached_kind() == "operator") => return true,
             "function_declarator" => {
                 if is_function_pointer_declarator(n) {
                     return false;
                 }
-                if let Some(inner) = n.child_by_field_name("declarator") {
+                if let Some(inner) = n.cached_field("declarator") {
                     return matches!(
-                        inner.kind(),
+                        inner.cached_kind(),
                         "field_identifier"
                             | "identifier"
                             | "qualified_identifier"
@@ -3164,8 +3225,13 @@ fn virtual_flags(source: &str, node: Node) -> VirtualFlags {
     let mut is_final = false;
     fn walk(source: &str, n: Node, is_virtual: &mut bool, is_final: &mut bool) {
         for child in n.children(&mut n.walk()) {
-            match child.kind() {
+            match child.cached_kind() {
                 "virtual" => *is_virtual = true,
+                // A function body may contain local classes with unrelated
+                // virtual members. Its statements carry no flags for this
+                // declaration, and walking them repeats lowering's work.
+                // A nested class body is likewise someone else's members.
+                "compound_statement" | "field_declaration_list" => {}
                 "virtual_specifier" => {
                     *is_virtual = true;
                     if node_text(source, &child).contains("final") {
@@ -3185,7 +3251,7 @@ fn virtual_flags(source: &str, node: Node) -> VirtualFlags {
 
 fn class_specifier_is_final(source: &str, node: Node) -> bool {
     node.children(&mut node.walk())
-        .any(|c| c.kind() == "virtual_specifier" && node_text(source, &c).contains("final"))
+        .any(|c| c.cached_kind() == "virtual_specifier" && node_text(source, &c).contains("final"))
 }
 
 fn lower_struct_specifier(
@@ -3194,12 +3260,12 @@ fn lower_struct_specifier(
     source: &str,
     node: Node,
 ) -> String {
-    let is_union = node.kind() == "union_specifier";
-    let name_node = node.child_by_field_name("name");
+    let is_union = node.cached_kind() == "union_specifier";
+    let name_node = node.cached_field("name");
     let mut name = name_node
         .map(|n| {
             let raw = node_text(source, &n).to_string();
-            if n.kind() == "template_type" || raw.contains('<') {
+            if n.cached_kind() == "template_type" || raw.contains('<') {
                 // `Box<int>` specializations register under the bare template
                 // tag; members merge with the primary template's.
                 strip_template_args(&normalize_qualified(&raw))
@@ -3221,7 +3287,7 @@ fn lower_struct_specifier(
     // owner-class derivation and member resolution all agree on one name.
     let is_cpp_class = ctx.is_cpp
         && matches!(
-            node.kind(),
+            node.cached_kind(),
             "class_specifier" | "struct_specifier" | "union_specifier"
         );
     let member_tag = member_class_tag(ctx, source, node);
@@ -3255,7 +3321,7 @@ fn lower_struct_specifier(
     // namespace scope (usings ignored here; documented imprecision).
     // `struct D : B` is the same relationship (only default access differs).
     if is_cpp_class {
-        let has_body = node.child_by_field_name("body").is_some();
+        let has_body = node.cached_field("body").is_some();
         if has_body {
             program.types.define_struct(&reg_name);
         } else {
@@ -3276,11 +3342,11 @@ fn lower_struct_specifier(
         // Only the primary template records its parameters: a partial or
         // explicit specialization (`class W<T*>`) names them differently.
         let is_primary_template = node
-            .child_by_field_name("name")
-            .is_some_and(|name| name.kind() != "template_type");
+            .cached_field("name")
+            .is_some_and(|name| name.cached_kind() != "template_type");
         let has_bases = node
             .children(&mut node.walk())
-            .any(|c| c.kind() == "base_class_clause");
+            .any(|c| c.cached_kind() == "base_class_clause");
         // The enclosing templates, walked once: `ancestors` re-descends from
         // the root, so only a class inside a template asks, and only one with
         // bases or a forward declaration that may write a default.
@@ -3307,13 +3373,13 @@ fn lower_struct_specifier(
         // "Template-parameter bases"), never a class of its own.
         let mut own_template = path
             .last()
-            .filter(|p| p.kind() == "template_declaration")
-            .and_then(|t| t.child_by_field_name("parameters"))
+            .filter(|p| p.cached_kind() == "template_declaration")
+            .and_then(|t| t.cached_field("parameters"))
             .map(|params| class_template_parameters(program, ctx, source, params))
             .unwrap_or_default();
         let mut concrete_template_bases = Vec::new();
         for child in node.children(&mut node.walk()) {
-            if child.kind() != "base_class_clause" {
+            if child.cached_kind() != "base_class_clause" {
                 continue;
             }
             // `class D : virtual public B, public C` — `virtual` is an
@@ -3321,11 +3387,11 @@ fn lower_struct_specifier(
             // (CHA treats virtual and non-virtual bases the same for
             // override sets; diamond sharing is a layout concern).
             for base in child.children(&mut child.walk()) {
-                if !base.is_named() && base.kind() != "qualified_identifier" {
+                if !base.is_named() && base.cached_kind() != "qualified_identifier" {
                     continue;
                 }
                 if matches!(
-                    base.kind(),
+                    base.cached_kind(),
                     "type_identifier"
                         | "qualified_identifier"
                         | "template_type"
@@ -3429,7 +3495,7 @@ fn lower_struct_specifier(
     }
 
     let mut fields = Vec::new();
-    if let Some(body) = node.child_by_field_name("body") {
+    if let Some(body) = node.cached_field("body") {
         // Field types, member classes and member aliases are looked up in
         // the class's own scope first.
         if is_cpp_class {
@@ -3440,13 +3506,13 @@ fn lower_struct_specifier(
         }
         let mut cursor = body.walk();
         for child in body.children(&mut cursor) {
-            match child.kind() {
+            match child.cached_kind() {
                 "field_declaration" if !member_decl_is_function(child) => {
                     // `class Inner { ... };` and `class Inner;` declare a
                     // type and no field.
-                    if is_cpp_class && child.child_by_field_name("declarator").is_none() {
+                    if is_cpp_class && child.cached_field("declarator").is_none() {
                         if let Some(spec) = child
-                            .child_by_field_name("type")
+                            .cached_field("type")
                             .filter(|t| is_named_class_specifier(*t))
                         {
                             lower_struct_specifier(program, ctx, source, spec);
@@ -3494,7 +3560,7 @@ fn lower_struct_specifier(
     // C++ classes always intern a layout entry; C++ structs do too — a
     // method-only body (`struct Ctor { Ctor(); };`) must still resolve as
     // a class type for member-initializer and receiver inference.
-    if !fields.is_empty() || node.kind() == "class_specifier" || ctx.is_cpp {
+    if !fields.is_empty() || node.cached_kind() == "class_specifier" || ctx.is_cpp {
         if is_union {
             program.types.compute_union_layout(reg_name.clone(), fields);
         } else {
@@ -3530,7 +3596,7 @@ fn register_static_data_member(
     field: Node,
     cls_qual: &str,
 ) {
-    let Some(type_node) = field.child_by_field_name("type") else {
+    let Some(type_node) = field.cached_field("type") else {
         return;
     };
     let base_type_id = parse_type_node(program, ctx, source, type_node);
@@ -3687,7 +3753,7 @@ fn mark_reference_binding(ctx: &mut LowerContext, decl: Node, var_id: VarId) {
 /// argument passing bind it.
 fn declares_reference(declarator: Node) -> bool {
     matches!(
-        declarator.kind(),
+        declarator.cached_kind(),
         "reference_declarator" | "abstract_reference_declarator"
     )
 }
@@ -3696,14 +3762,14 @@ fn declares_reference(declarator: Node) -> bool {
 /// or a trailing `-> S &`. `decltype(auto)` is taken to return by value.
 fn returns_reference(function: Node) -> bool {
     function
-        .child_by_field_name("declarator")
+        .cached_field("declarator")
         .is_some_and(|declarator| {
             declares_reference(declarator)
                 || declarator
                     .children(&mut declarator.walk())
-                    .find(|child| child.kind() == "trailing_return_type")
+                    .find(|child| child.cached_kind() == "trailing_return_type")
                     .and_then(|trailing| trailing.named_child(0))
-                    .and_then(|ty| ty.child_by_field_name("declarator"))
+                    .and_then(|ty| ty.cached_field("declarator"))
                     .is_some_and(declares_reference)
         })
 }
@@ -3727,13 +3793,13 @@ fn lower_class_members(
 
 /// The members of a class body the two member passes look at.
 fn class_members(node: Node) -> Vec<Node> {
-    let Some(body) = node.child_by_field_name("body") else {
+    let Some(body) = node.cached_field("body") else {
         return Vec::new();
     };
     body.children(&mut body.walk())
         .filter(|m| {
             matches!(
-                m.kind(),
+                m.cached_kind(),
                 "function_definition"
                     | "field_declaration"
                     | "declaration"
@@ -3779,7 +3845,7 @@ fn register_class_prototypes(
         let Some((decl, name)) = function else {
             continue;
         };
-        let prototype = match m.kind() {
+        let prototype = match m.cached_kind() {
             // A class-scope `template <typename T> T GetNumber() {...}`
             // declares the member's primary; the template parameter list is
             // not an argument, so the nested member registers like any other.
@@ -3801,10 +3867,10 @@ fn register_class_prototypes(
 /// A class member that declares or defines a member function: its
 /// declaration (a template's nested one) and name.
 fn member_function<'t>(source: &str, member: Node<'t>) -> Option<(Node<'t>, String)> {
-    let declaration = match member.kind() {
+    let declaration = match member.cached_kind() {
         // A member class, alias or variable template declares no function.
         "template_declaration" => template_member_decl(member).filter(|decl| {
-            decl.kind() == "function_definition" || member_decl_is_function(*decl)
+            decl.cached_kind() == "function_definition" || member_decl_is_function(*decl)
         })?,
         "function_definition" => member,
         _ if member_decl_is_function(member) => member,
@@ -3825,21 +3891,21 @@ fn plain_declarator_name(source: &str, declaration: Node) -> Option<String> {
     if declaration.has_error() {
         return None;
     }
-    let mut declarator = declaration.child_by_field_name("declarator")?;
+    let mut declarator = declaration.cached_field("declarator")?;
     while matches!(
-        declarator.kind(),
+        declarator.cached_kind(),
         "pointer_declarator" | "reference_declarator"
     ) {
         declarator = declarator
-            .child_by_field_name("declarator")
+            .cached_field("declarator")
             .or_else(|| declarator.named_children(&mut declarator.walk()).last())?;
     }
-    if declarator.kind() != "function_declarator" {
+    if declarator.cached_kind() != "function_declarator" {
         return None;
     }
-    let name = declarator.child_by_field_name("declarator")?;
+    let name = declarator.cached_field("declarator")?;
     matches!(
-        name.kind(),
+        name.cached_kind(),
         "field_identifier" | "identifier" | "destructor_name" | "operator_name"
     )
     .then(|| normalize_qualified(node_text(source, &name)))
@@ -3847,11 +3913,11 @@ fn plain_declarator_name(source: &str, declaration: Node) -> Option<String> {
 
 /// The names a class body's `using Base::f;` declarations bring in.
 fn using_member_names(source: &str, class: Node) -> Vec<String> {
-    let Some(body) = class.child_by_field_name("body") else {
+    let Some(body) = class.cached_field("body") else {
         return Vec::new();
     };
     body.children(&mut body.walk())
-        .filter(|m| m.kind() == "using_declaration")
+        .filter(|m| m.cached_kind() == "using_declaration")
         .filter_map(|m| {
             let text = node_text(source, &m);
             let named = text
@@ -3895,7 +3961,7 @@ fn lower_class_definitions(
     for &m in &members {
         if let Some(spec) = member_class_definition(m) {
             if let Some(tag) = member_class_tag(ctx, source, spec) {
-                let template = i32::from(m.kind() == "template_declaration");
+                let template = i32::from(m.cached_kind() == "template_declaration");
                 ctx.step_template(template);
                 lower_class_definitions(program, ctx, source, spec, &tag.spelling);
                 ctx.step_template(-template);
@@ -3912,7 +3978,7 @@ fn lower_class_definitions(
     // initializer needs the mutable context this pass carries, so it is
     // lowered here rather than there.
     for &m in &members {
-        if m.kind() == "field_declaration"
+        if m.cached_kind() == "field_declaration"
             && !member_decl_is_function(m)
             && declaration_is_static(m)
         {
@@ -3922,7 +3988,7 @@ fn lower_class_definitions(
     let signatures: Vec<_> = members
         .iter()
         .map(|&m| {
-            let template = i32::from(m.kind() == "template_declaration");
+            let template = i32::from(m.cached_kind() == "template_declaration");
             let member = if template == 1 {
                 template_member_decl(m).unwrap_or(m)
             } else {
@@ -3931,8 +3997,8 @@ fn lower_class_definitions(
             (member, template)
         })
         .filter(|&(member, _)| {
-            member.kind() == "function_definition"
-                || (member.kind() == "field_declaration"
+            member.cached_kind() == "function_definition"
+                || (member.cached_kind() == "field_declaration"
                     && member_decl_is_function(member)
                     && node_has_compound_body(member))
         })
@@ -3955,32 +4021,32 @@ fn lower_class_definitions(
 /// A `class` / `struct` / `union` specifier with a name.
 fn is_named_class_specifier(node: Node) -> bool {
     matches!(
-        node.kind(),
+        node.cached_kind(),
         "class_specifier" | "struct_specifier" | "union_specifier"
-    ) && node.child_by_field_name("name").is_some()
+    ) && node.cached_field("name").is_some()
 }
 
 /// A `class` / `struct` specifier with a name and a body.
 fn is_named_class_definition(node: Node) -> bool {
-    is_named_class_specifier(node) && node.child_by_field_name("body").is_some()
+    is_named_class_specifier(node) && node.cached_field("body").is_some()
 }
 
 /// A body-less specifier inside a declaration of something else
 /// (`struct Node *next;`, `void f(class Impl *p)`): it refers to a class
 /// rather than declaring one, as a standalone `class Impl;` does.
 fn is_class_reference(spec: Node) -> bool {
-    spec.child_by_field_name("body").is_none()
+    spec.cached_field("body").is_none()
         && spec
             .parent()
-            .is_some_and(|p| p.child_by_field_name("declarator").is_some())
+            .is_some_and(|p| p.cached_field("declarator").is_some())
 }
 
 /// The class a member declaration defines: `class Inner { ... };`, with or
 /// without a declarator, or `template<...> class Inner { ... };`.
 fn member_class_definition(member: Node) -> Option<Node> {
-    match member.kind() {
+    match member.cached_kind() {
         "field_declaration" => member
-            .child_by_field_name("type")
+            .cached_field("type")
             .filter(|t| is_named_class_definition(*t)),
         "template_declaration" => member
             .named_children(&mut member.walk())
@@ -4017,7 +4083,7 @@ fn member_class_tag(ctx: &LowerContext, source: &str, spec: Node) -> Option<Memb
     }
     let nests =
         std::iter::successors(Some(spec), |c| enclosing_member_class(*c)).any(is_cpp_only_class);
-    let raw = node_text(source, &spec.child_by_field_name("name")?);
+    let raw = node_text(source, &spec.cached_field("name")?);
     let name = strip_template_args(&normalize_qualified(raw));
     if name.contains("::") {
         return None;
@@ -4032,15 +4098,18 @@ fn member_class_tag(ctx: &LowerContext, source: &str, spec: Node) -> Option<Memb
 /// The class specifier whose body declares `spec` as a member.
 fn enclosing_member_class(spec: Node) -> Option<Node> {
     let member = spec.parent()?;
-    if !matches!(member.kind(), "field_declaration" | "template_declaration") {
+    if !matches!(
+        member.cached_kind(),
+        "field_declaration" | "template_declaration"
+    ) {
         return None;
     }
     let body = member
         .parent()
-        .filter(|b| b.kind() == "field_declaration_list")?;
+        .filter(|b| b.cached_kind() == "field_declaration_list")?;
     body.parent().filter(|o| {
         matches!(
-            o.kind(),
+            o.cached_kind(),
             "class_specifier" | "struct_specifier" | "union_specifier"
         )
     })
@@ -4050,24 +4119,24 @@ fn enclosing_member_class(spec: Node) -> Option<Node> {
 /// keyword, a template head, bases, or members other than instance data
 /// fields (a `static` data member is C++-only).
 fn is_cpp_only_class(spec: Node) -> bool {
-    if spec.kind() == "class_specifier"
+    if spec.cached_kind() == "class_specifier"
         || spec
             .parent()
-            .is_some_and(|p| p.kind() == "template_declaration")
+            .is_some_and(|p| p.cached_kind() == "template_declaration")
     {
         return true;
     }
     if spec
         .children(&mut spec.walk())
-        .any(|c| c.kind() == "base_class_clause")
+        .any(|c| c.cached_kind() == "base_class_clause")
     {
         return true;
     }
-    let Some(body) = spec.child_by_field_name("body") else {
+    let Some(body) = spec.cached_field("body") else {
         return false;
     };
     body.named_children(&mut body.walk())
-        .any(|m| match m.kind() {
+        .any(|m| match m.cached_kind() {
             "field_declaration" => member_decl_is_function(m) || declaration_is_static(m),
             kind => matches!(
                 kind,
@@ -4089,10 +4158,10 @@ fn is_cpp_only_class(spec: Node) -> bool {
 fn template_member_decl(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
     node.children(&mut cursor)
-        .filter(|c| !matches!(c.kind(), "template_parameter_list" | "template"))
+        .filter(|c| !matches!(c.cached_kind(), "template_parameter_list" | "template"))
         .filter(|c| {
             matches!(
-                c.kind(),
+                c.cached_kind(),
                 "function_definition" | "field_declaration" | "declaration"
             )
         })
@@ -4106,7 +4175,7 @@ fn member_short_name(source: &str, node: Node) -> Option<String> {
         return Some(name);
     }
     fn walk(source: &str, n: Node) -> Option<String> {
-        match n.kind() {
+        match n.cached_kind() {
             // A `decltype(...)` sits in the *type* position and holds an
             // expression, not a declarator. Walking into it takes the first
             // `identifier` of that expression as the member's name, so
@@ -4136,7 +4205,7 @@ fn member_short_name(source: &str, node: Node) -> Option<String> {
             "ERROR" => {
                 return n
                     .children(&mut n.walk())
-                    .filter(|c| c.kind().ends_with("_declarator"))
+                    .filter(|c| c.cached_kind().ends_with("_declarator"))
                     .find_map(|c| walk(source, c));
             }
             // A C++11 attribute (`[[nodiscard]]`, `[[gnu::pure]]`) or a GNU
@@ -4152,7 +4221,7 @@ fn member_short_name(source: &str, node: Node) -> Option<String> {
             "operator_name" => return Some(normalize_qualified(node_text(source, &n))),
             "operator_cast" => return Some(conversion_operator_name(source, n)),
             "function_declarator" => {
-                if let Some(inner) = n.child_by_field_name("declarator") {
+                if let Some(inner) = n.cached_field("declarator") {
                     return walk(source, inner);
                 }
                 return None;
@@ -4168,7 +4237,7 @@ fn member_short_name(source: &str, node: Node) -> Option<String> {
         // expanded over an override set missing it.
         if let Some(err) = n
             .children(&mut n.walk())
-            .find(|c| c.kind() == "ERROR" && node_text(source, c).trim_end() == "~")
+            .find(|c| c.cached_kind() == "ERROR" && node_text(source, c).trim_end() == "~")
         {
             let rest = n
                 .children(&mut n.walk())
@@ -4224,19 +4293,19 @@ fn member_short_name(source: &str, node: Node) -> Option<String> {
             let tail = &source[keyword_end..err.end_byte()];
             let own_declarator = err
                 .children(&mut err.walk())
-                .filter(|c| c.kind().ends_with("_declarator"))
+                .filter(|c| c.cached_kind().ends_with("_declarator"))
                 .last()
                 .or_else(|| {
                     if tail.contains('(') {
                         return None;
                     }
                     n.children(&mut n.walk()).find(|c| {
-                        c.start_byte() >= err.end_byte() && c.kind().ends_with("_declarator")
+                        c.start_byte() >= err.end_byte() && c.cached_kind().ends_with("_declarator")
                     })
                 });
             if let Some(decl) = own_declarator {
                 let end = decl
-                    .child_by_field_name("declarator")
+                    .cached_field("declarator")
                     .map_or_else(|| decl.start_byte(), |d| d.end_byte());
                 let target = normalize_spacing(&source[keyword_end..end]);
                 return Some(format!("operator {}", target.trim_start()));
@@ -4304,7 +4373,7 @@ fn continues_previous_member(node: Node) -> bool {
     prev.child_count()
         .checked_sub(1)
         .and_then(|last| prev.child(last))
-        .is_some_and(|c| c.is_missing() && c.kind() == ";")
+        .is_some_and(|c| c.is_missing() && c.cached_kind() == ";")
 }
 
 fn register_member_prototype(
@@ -4334,7 +4403,7 @@ fn register_member_prototype(
     let explicit_arity = shape.declared();
     let span = node_span(program, ctx, node);
     let ret_type = node
-        .child_by_field_name("type")
+        .cached_field("type")
         .map(|t| parse_type_node(program, ctx, source, t))
         .unwrap_or_else(|| program.types.void());
     // Types are read where they decide something: an overload set of the
@@ -4483,7 +4552,7 @@ fn declaration_is_weak(source: &str, node: Node) -> bool {
     let own = own_declarator(decl, node);
     fn visit(source: &str, node: Node) -> bool {
         if matches!(
-            node.kind(),
+            node.cached_kind(),
             "compound_statement"
                 | "parameter_list"
                 | "initializer_list"
@@ -4492,20 +4561,23 @@ fn declaration_is_weak(source: &str, node: Node) -> bool {
         ) {
             return false;
         }
-        if matches!(node.kind(), "attribute_specifier" | "attribute_declaration") {
+        if matches!(
+            node.cached_kind(),
+            "attribute_specifier" | "attribute_declaration"
+        ) {
             let mut cursor = node.walk();
             return node.named_children(&mut cursor).any(|args| {
                 let mut cursor = args.walk();
                 // Bound, not returned directly: the iterator borrows `cursor`,
                 // so the temporary has to drop before it does.
                 let found = args.named_children(&mut cursor).any(|arg| {
-                    arg.kind() == "identifier"
+                    arg.cached_kind() == "identifier"
                         && matches!(node_text(source, &arg), "weak" | "__weak__")
                 });
                 found
             });
         }
-        let value = node.child_by_field_name("value");
+        let value = node.cached_field("value");
         let mut cursor = node.walk();
         let found = node
             .named_children(&mut cursor)
@@ -4514,7 +4586,7 @@ fn declaration_is_weak(source: &str, node: Node) -> bool {
     }
     // One scan for both shapes: with a single declarator nothing is excluded,
     // so the multi-declarator case is the same walk with siblings filtered out.
-    let value = decl.child_by_field_name("value");
+    let value = decl.cached_field("value");
     let mut cursor = decl.walk();
     let mut found = false;
     if cursor.goto_first_child() {
@@ -4573,7 +4645,7 @@ fn lower_function_signature(
     node: Node,
 ) -> Option<FunctionSignature> {
     let decl = error_parked_declarator(node)
-        .or_else(|| node.child_by_field_name("declarator"))
+        .or_else(|| node.cached_field("declarator"))
         .or_else(|| find_function_declarator(node))?;
     // An in-class conversion operator behind a leading macro keeps a
     // declarator, but that declarator names the type it converts *to*; only
@@ -4611,7 +4683,7 @@ fn lower_function_signature(
         let cls = eff_class.clone().unwrap_or_else(|| prefix.to_owned());
         register_arrow_return(program, ctx, source, node, &cls);
     }
-    let ret_type = match node.child_by_field_name("type") {
+    let ret_type = match node.cached_field("type") {
         Some(t) => parse_type_node(program, ctx, source, t),
         // A conversion operator has no `type` field: what it returns is the
         // type it converts to, which lives inside its `operator_cast`.
@@ -4711,9 +4783,12 @@ fn lower_function_signature(
             variadic: shape.variadic,
             // `A() = default;` in its class: not user-provided (C++17 aggregates).
             defaulted_in_class: ctx.class_ctx.is_some()
-                && node
-                    .children(&mut node.walk())
-                    .any(|c| matches!(c.kind(), "default_method_clause" | "delete_method_clause")),
+                && node.children(&mut node.walk()).any(|c| {
+                    matches!(
+                        c.cached_kind(),
+                        "default_method_clause" | "delete_method_clause"
+                    )
+                }),
             declared_in_class: ctx.class_ctx.is_some(),
             is_virtual: flags.is_virtual,
             is_final: flags.is_final,
@@ -4840,7 +4915,7 @@ fn lower_function_body(
     let using_imports_len = ctx.using_name_imports.len();
     let local_aliases_len = ctx.local_aliases.len();
 
-    if let Some(body_node) = node.child_by_field_name("body") {
+    if let Some(body_node) = node.cached_field("body") {
         walk_function_body(program, ctx, source, body_node, fn_id);
     }
     // Constructor-initializer lists are siblings of the body on
@@ -4848,7 +4923,7 @@ fn lower_function_body(
     if ctx.is_cpp {
         let init_lists: Vec<_> = node
             .children(&mut node.walk())
-            .filter(|c| c.kind() == "field_initializer_list")
+            .filter(|c| c.cached_kind() == "field_initializer_list")
             .collect();
         for il in init_lists {
             walk_function_body(program, ctx, source, il, fn_id);
@@ -4950,8 +5025,8 @@ impl ParamListShape {
     /// Record one child of a parameter list. A parameter is declared the way
     /// `lower_parameter` lowers it: `(void)` declares none.
     fn record(&mut self, source: &str, param: Node) {
-        let declarator = param.child_by_field_name("declarator");
-        let declares = match param.kind() {
+        let declarator = param.cached_field("declarator");
+        let declares = match param.cached_kind() {
             // C's `...` parses as `variadic_parameter`. A pack followed by
             // `...` is one tail, the pack's.
             "..." | "variadic_parameter" | "variadic_parameter_declaration" => {
@@ -4963,7 +5038,7 @@ impl ParamListShape {
                 }
                 let is_void = declarator.is_none()
                     && param
-                        .child_by_field_name("type")
+                        .cached_field("type")
                         .is_some_and(|t| node_text(source, &t) == "void");
                 is_parameter_node(kind) && !is_void
             }
@@ -5005,7 +5080,7 @@ fn lower_parameters(
     };
     for param in params_node.children(&mut params_node.walk()) {
         shape.record(source, param);
-        if !is_parameter_node(param.kind()) {
+        if !is_parameter_node(param.cached_kind()) {
             continue;
         }
         let index = params.len() as u32;
@@ -5035,14 +5110,14 @@ fn parameter_type(
     source: &str,
     node: Node,
 ) -> Option<Parameter> {
-    let declarator = node.child_by_field_name("declarator");
+    let declarator = node.cached_field("declarator");
     let base_desc = node
-        .child_by_field_name("type")
+        .cached_field("type")
         .map(|t| type_desc_from_node(program, ctx, source, t))
         .unwrap_or(TypeDesc::Int);
     // An unnamed parameter's declarator (`const T &`, `void (*)(int)`,
     // `const char *const []`) is an abstract one, shaped as any other.
-    if let Some(abstract_decl) = declarator.filter(|d| d.kind().starts_with("abstract_")) {
+    if let Some(abstract_decl) = declarator.filter(|d| d.cached_kind().starts_with("abstract_")) {
         let type_desc = abstract_declarator_shape(
             base_desc,
             Some(abstract_decl),
@@ -5101,7 +5176,7 @@ fn prototype_param_types(
     };
     params_node
         .children(&mut params_node.walk())
-        .filter(|param| is_parameter_node(param.kind()))
+        .filter(|param| is_parameter_node(param.cached_kind()))
         .filter_map(|param| {
             let type_id = parameter_type(program, ctx, source, param)?.type_id;
             Some(
@@ -5146,7 +5221,7 @@ fn definition_signature(
     };
     let declared: Vec<Node> = params_node
         .children(&mut params_node.walk())
-        .filter(|param| is_parameter_node(param.kind()))
+        .filter(|param| is_parameter_node(param.cached_kind()))
         .collect();
     let Some(skip) = params.len().checked_sub(declared.len()) else {
         return Vec::new();
@@ -5181,9 +5256,9 @@ fn stand_in_parameter(
     param: Node,
     type_id: trace_ir::TypeId,
 ) -> Option<trace_ir::TypeId> {
-    let type_node = param.child_by_field_name("type")?;
+    let type_node = param.cached_field("type")?;
     if !matches!(
-        type_node.kind(),
+        type_node.cached_kind(),
         "type_identifier" | "qualified_identifier" | "template_type"
     ) {
         return None;
@@ -5223,7 +5298,7 @@ fn lower_parameter(
         address,
     } = parameter_type(program, ctx, source, node)?;
     let unnamed = name.is_empty();
-    let declarator = node.child_by_field_name("declarator");
+    let declarator = node.cached_field("declarator");
     if unnamed {
         name = format!("$arg{index}");
     }
@@ -5267,7 +5342,7 @@ fn auto_initializer_type(
     value: Node,
 ) -> Option<TypeDesc> {
     let value = peel_expression(value);
-    let desc = if value.kind() == "call_expression" {
+    let desc = if value.cached_kind() == "call_expression" {
         match call_result_shape(program, ctx, source, value)? {
             CallResult::Decided(desc) => desc?,
             CallResult::Overload {
@@ -5289,12 +5364,12 @@ fn auto_initializer_type(
         // A cast or `new` spells its type in the source; any other expression
         // has the type lowering gave its variable or field.
         let spelled_dependent = |ctx: &LowerContext| {
-            value.child_by_field_name("type").is_some_and(|ty| {
+            value.cached_field("type").is_some_and(|ty| {
                 let spelling = node_text(source, &ty);
                 spelling_is_dependent(ctx, source, value, spelling, Spelling::Source)
             })
         };
-        let (desc, dependent) = match value.kind() {
+        let (desc, dependent) = match value.cached_kind() {
             "cast_expression" => (
                 arg_expr_type(program, ctx, source, value),
                 spelled_dependent(ctx),
@@ -5328,10 +5403,10 @@ fn null_constant_args(source: &str, args: &[Node]) -> Vec<bool> {
 }
 
 fn call_arg_nodes(call: Node) -> Vec<Node> {
-    match call.child_by_field_name("arguments") {
+    match call.cached_field("arguments") {
         Some(list) => list
             .named_children(&mut list.walk())
-            .filter(|n| n.kind() != "comment")
+            .filter(|n| n.cached_kind() != "comment")
             .collect(),
         None => Vec::new(),
     }
@@ -5372,7 +5447,7 @@ fn call_result_shape(
 ) -> Option<CallResult> {
     // Kinds are read off the callee as written, as collect_call_at_node reads
     // them: a parenthesized name is not a bare name.
-    let func = value.child_by_field_name("function")?;
+    let func = value.cached_field("function")?;
     let raw = normalize_spacing(node_text(source, &func));
     let name = strip_template_args(&raw);
     if let Some(wrapper) = smart_ptr_factory(ctx, &name) {
@@ -5386,7 +5461,7 @@ fn call_result_shape(
             Spelling::Source,
         )));
     }
-    if matches!(func.kind(), "identifier" | "qualified_identifier") {
+    if matches!(func.cached_kind(), "identifier" | "qualified_identifier") {
         let spelled = normalize_qualified(node_text(source, &func));
         if lookup_var_node(program, ctx, source, func).is_none() {
             // `T(args)` constructs a `T`, as the call site reads it.
@@ -5411,9 +5486,9 @@ fn call_result_shape(
             Spelling::Lowered,
         )));
     }
-    let (candidates, receiver) = if func.kind() == "field_expression" {
-        let recv = func.child_by_field_name("argument")?;
-        let field = normalize_qualified(node_text(source, &func.child_by_field_name("field")?));
+    let (candidates, receiver) = if func.cached_kind() == "field_expression" {
+        let recv = func.cached_field("argument")?;
+        let field = normalize_qualified(node_text(source, &func.cached_field("field")?));
         let arrow = is_arrow_access(func);
         let desc = receiver_desc(program, ctx, source, recv)?;
         // An arrow substitutes on its pointee, keeping template arguments
@@ -5480,20 +5555,23 @@ fn static_call_scope<'a>(
     source: &str,
     func: Node<'a>,
 ) -> Option<StaticCallScope<'a>> {
-    if func.kind() != "qualified_identifier" {
+    if func.cached_kind() != "qualified_identifier" {
         return None;
     }
     let inner = qualified_identifier_chain(func).last()?;
-    let scope = inner
-        .child_by_field_name("scope")
-        .filter(|scope| matches!(scope.kind(), "template_type" | "namespace_identifier"))?;
+    let scope = inner.cached_field("scope").filter(|scope| {
+        matches!(
+            scope.cached_kind(),
+            "template_type" | "namespace_identifier"
+        )
+    })?;
     let spelled = normalize_spacing(&source[func.start_byte()..scope.end_byte()]);
     if spelling_is_dependent(ctx, source, func, &spelled, Spelling::Source) {
         return None;
     }
     Some(StaticCallScope {
-        member: inner.child_by_field_name("name")?,
-        is_template_id: scope.kind() == "template_type",
+        member: inner.cached_field("name")?,
+        is_template_id: scope.cached_kind() == "template_type",
         spelled,
     })
 }
@@ -5659,7 +5737,7 @@ fn call_result_among(
     args: &[TypeDesc],
     null_constants: &[bool],
 ) -> Option<TypeDesc> {
-    let func = value.child_by_field_name("function")?;
+    let func = value.cached_field("function")?;
     let (candidates, by_name) = match candidates {
         Overloads::Declared(found) => (found, false),
         Overloads::ByName(name) => (
@@ -6041,16 +6119,16 @@ fn weak_promotion<'t>(
 ) -> Option<WeakPromotion<'t>> {
     // `(wp.lock())` is the same promotion at every call-result site.
     let call = peel_expression(call);
-    if call.kind() != "call_expression" {
+    if call.cached_kind() != "call_expression" {
         return None;
     }
-    let func = call.child_by_field_name("function")?;
-    if func.kind() != "field_expression" {
+    let func = call.cached_field("function")?;
+    if func.cached_kind() != "field_expression" {
         return None;
     }
     // The method name settles almost every call before anything allocates
     // or the receiver is typed.
-    let method = node_text(source, &func.child_by_field_name("field")?);
+    let method = node_text(source, &func.cached_field("field")?);
     if !WEAK_PTR_UPGRADES
         .iter()
         .any(|&(_, upgrade, _)| upgrade == method)
@@ -6059,7 +6137,7 @@ fn weak_promotion<'t>(
     {
         return None;
     }
-    let receiver = func.child_by_field_name("argument")?;
+    let receiver = func.cached_field("argument")?;
     let TypeDesc::Struct { name: weak, .. } = receiver_desc(program, ctx, source, receiver)? else {
         return None;
     };
@@ -6100,7 +6178,7 @@ fn receiver_value(
     type_id: trace_ir::TypeId,
 ) -> Option<VarId> {
     let receiver = peel_expression(receiver);
-    if receiver.kind() == "identifier" {
+    if receiver.cached_kind() == "identifier" {
         if let Some(var) = lookup_var(ctx, program, node_text(source, &receiver)) {
             // `const wptr<T> &weak` holds the weak pointer's address.
             return Some(if ctx.reference_bindings.contains(&var) {
@@ -6168,8 +6246,8 @@ fn mentions_template_parameter<'t>(
     from: Spelling,
 ) -> bool {
     path.into_iter()
-        .filter(|n| n.kind() == "template_declaration")
-        .filter_map(|n| n.child_by_field_name("parameters"))
+        .filter(|n| n.cached_kind() == "template_declaration")
+        .filter_map(|n| n.cached_field("parameters"))
         .any(|params| {
             template_parameter_names(source, params)
                 .into_iter()
@@ -6186,25 +6264,25 @@ fn mentions_template_parameter<'t>(
 fn template_parameter_names<'s>(source: &'s str, params: Node) -> Vec<Option<&'s str>> {
     fn type_identifier(node: Node) -> Option<Node> {
         node.named_children(&mut node.walk())
-            .find(|n| n.kind() == "type_identifier")
+            .find(|n| n.cached_kind() == "type_identifier")
     }
     params
         .named_children(&mut params.walk())
-        .filter(|p| p.kind() != "comment")
+        .filter(|p| p.cached_kind() != "comment")
         .map(|param| {
-            match param.kind() {
+            match param.cached_kind() {
                 "type_parameter_declaration" | "variadic_type_parameter_declaration" => {
                     type_identifier(param)
                 }
-                "optional_type_parameter_declaration" => param.child_by_field_name("name"),
+                "optional_type_parameter_declaration" => param.cached_field("name"),
                 "template_template_parameter_declaration" => param
                     .named_children(&mut param.walk())
-                    .find(|n| n.kind() != "template_parameter_list")
+                    .find(|n| n.cached_kind() != "template_parameter_list")
                     .and_then(type_identifier),
                 "parameter_declaration"
                 | "optional_parameter_declaration"
                 | "variadic_parameter_declaration" => param
-                    .child_by_field_name("declarator")
+                    .cached_field("declarator")
                     .and_then(declarator_identifier),
                 _ => None,
             }
@@ -6231,14 +6309,14 @@ fn class_template_parameters(
     let mut cursor = params.walk();
     let positions = params
         .named_children(&mut cursor)
-        .filter(|p| p.kind() != "comment");
+        .filter(|p| p.cached_kind() != "comment");
     let mut template = trace_ir::ClassTemplate::default();
     for (i, param) in positions.enumerate() {
-        if template.pack.is_none() && param.kind().starts_with("variadic_") {
+        if template.pack.is_none() && param.cached_kind().starts_with("variadic_") {
             template.pack = Some(i);
         }
         let default = param
-            .child_by_field_name("default_type")
+            .cached_field("default_type")
             .map(|ty| node_text(source, &ty))
             .filter(|ty| {
                 !names
@@ -6302,13 +6380,14 @@ fn class_spelling(program: &Program, ctx: &LowerContext, text: &str) -> ClassSpe
 /// The identifier a declarator declares, through pointer, reference and
 /// pack layers; `None` for an abstract declarator.
 fn declarator_identifier(node: Node) -> Option<Node> {
-    if node.kind() == "identifier" {
+    if node.cached_kind() == "identifier" {
         return Some(node);
     }
-    node.child_by_field_name("declarator")
+    node.cached_field("declarator")
         .or_else(|| {
-            node.named_children(&mut node.walk())
-                .find(|n| n.kind() == "identifier" || n.kind().ends_with("_declarator"))
+            node.named_children(&mut node.walk()).find(|n| {
+                n.cached_kind() == "identifier" || n.cached_kind().ends_with("_declarator")
+            })
         })
         .and_then(declarator_identifier)
 }
@@ -6349,19 +6428,17 @@ fn return_is_dependent(ctx: &LowerContext, source: &str, node: Node) -> bool {
 fn return_is_dependent_under(source: &str, path: &[Node], node: Node) -> bool {
     // The declaration whose `type` is the return type: `node` itself, or the
     // nearest ancestor with one (a prototype's declarator sits under it).
-    let Some((enclosing, ty)) = node
-        .child_by_field_name("type")
-        .map(|ty| (path, ty))
-        .or_else(|| {
-            path.iter()
-                .enumerate()
-                .rev()
-                .find_map(|(i, n)| Some((&path[..i], n.child_by_field_name("type")?)))
-        })
-    else {
+    let Some((enclosing, ty)) = node.cached_field("type").map(|ty| (path, ty)).or_else(|| {
+        path.iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, n)| Some((&path[..i], n.cached_field("type")?)))
+    }) else {
         return false;
     };
-    enclosing.iter().any(|n| n.kind() == "template_declaration")
+    enclosing
+        .iter()
+        .any(|n| n.cached_kind() == "template_declaration")
         && spelling_names_dependent_type(source, enclosing, node_text(source, &ty), 0)
 }
 
@@ -6383,7 +6460,7 @@ fn spelling_names_dependent_type(
     ) || depth < MAX_ALIAS_DEPTH
         && enclosing
             .iter()
-            .filter(|n| n.kind() == "field_declaration_list")
+            .filter(|n| n.cached_kind() == "field_declaration_list")
             .flat_map(|body| body.named_children(&mut body.walk()).collect::<Vec<_>>())
             .filter_map(|member| member_alias(source, member))
             .any(|(name, aliased)| {
@@ -6395,16 +6472,16 @@ fn spelling_names_dependent_type(
 /// The name a member `using` alias or `typedef` declares, and the text of the
 /// type it stands for.
 fn member_alias<'s>(source: &'s str, member: Node) -> Option<(&'s str, &'s str)> {
-    match member.kind() {
+    match member.cached_kind() {
         "alias_declaration" => Some((
-            node_text(source, &member.child_by_field_name("name")?),
-            node_text(source, &member.child_by_field_name("type")?),
+            node_text(source, &member.cached_field("name")?),
+            node_text(source, &member.cached_field("type")?),
         )),
         "type_definition" => {
-            let name = std::iter::successors(member.child_by_field_name("declarator"), |d| {
-                d.child_by_field_name("declarator")
+            let name = std::iter::successors(member.cached_field("declarator"), |d| {
+                d.cached_field("declarator")
             })
-            .find(|d| d.kind() == "type_identifier")?;
+            .find(|d| d.cached_kind() == "type_identifier")?;
             Some((node_text(source, &name), node_text(source, &member)))
         }
         _ => None,
@@ -6505,31 +6582,31 @@ fn register_template_return(
     let Some((owner, _)) = name.rsplit_once("::") else {
         return;
     };
-    let Some(ty) = node.child_by_field_name("type") else {
+    let Some(ty) = node.cached_field("type") else {
         return;
     };
     let spelling = node_text(source, &ty).trim();
     let Some((depth, template, class)) = path
         .iter()
         .rev()
-        .filter(|n| n.kind() == "template_declaration")
+        .filter(|n| n.cached_kind() == "template_declaration")
         .enumerate()
         .find_map(|(depth, template)| {
             let class = template
                 .named_children(&mut template.walk())
-                .find(|n| matches!(n.kind(), "class_specifier" | "struct_specifier"))?;
+                .find(|n| matches!(n.cached_kind(), "class_specifier" | "struct_specifier"))?;
             Some((depth, *template, class))
         })
     else {
         return;
     };
-    let Some(class_name) = class.child_by_field_name("name") else {
+    let Some(class_name) = class.cached_field("name") else {
         return;
     };
     if node_text(source, &class_name) != last_type_segment(owner) {
         return;
     }
-    let Some(params) = template.child_by_field_name("parameters") else {
+    let Some(params) = template.cached_field("parameters") else {
         return;
     };
     // Facts are shared by same-name/same-arity declarations. An unsupported
@@ -6592,7 +6669,7 @@ fn declared_return_type(
     param_types: FactParams,
 ) -> trace_ir::TypeId {
     let depth = node
-        .child_by_field_name("declarator")
+        .cached_field("declarator")
         .and_then(fn_decl_under_pointer)
         .map_or(0, |(_, depth, _)| depth);
     if !ctx.has_templates {
@@ -6653,7 +6730,7 @@ fn local_type(
 
 /// A C++ `auto` type specifier.
 fn is_placeholder_type(ctx: &LowerContext, type_node: Node) -> bool {
-    ctx.is_cpp && type_node.kind() == "placeholder_type_specifier"
+    ctx.is_cpp && type_node.cached_kind() == "placeholder_type_specifier"
 }
 
 /// How many pointer layers `desc` has.
@@ -6665,16 +6742,16 @@ fn pointer_depth(desc: &TypeDesc) -> usize {
 /// and parentheses (`**p`, `*&p`).
 fn declarator_pointer_depth(decl: Node) -> usize {
     std::iter::successors(Some(decl), |d| {
-        d.child_by_field_name("declarator").or_else(|| {
+        d.cached_field("declarator").or_else(|| {
             matches!(
-                d.kind(),
+                d.cached_kind(),
                 "reference_declarator" | "parenthesized_declarator"
             )
             .then(|| d.named_child(0))
             .flatten()
         })
     })
-    .filter(|d| d.kind() == "pointer_declarator")
+    .filter(|d| d.cached_kind() == "pointer_declarator")
     .count()
 }
 
@@ -6688,7 +6765,7 @@ fn lower_declaration(
     if node_is_from_ignored_macro(ctx, node) {
         return;
     }
-    let type_node = match node.child_by_field_name("type") {
+    let type_node = match node.cached_field("type") {
         Some(t) => t,
         None => return,
     };
@@ -6726,26 +6803,18 @@ fn lower_declaration(
     // A condition declaration (`if (auto p = f())`) stores its initializer
     // directly on the declaration, without an init_declarator child. Its
     // variable starts at the declarator, as an init_declarator's does.
-    if let (Some(decl), Some(value)) = (
-        node.child_by_field_name("declarator"),
-        node.child_by_field_name("value"),
-    ) {
+    if let (Some(decl), Some(value)) = (node.cached_field("declarator"), node.cached_field("value"))
+    {
         lower_initialized(program, ctx, decl, decl, Some(value));
         return;
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        match child.kind() {
+        match child.cached_kind() {
             "init_declarator" => {
-                let decl = child.child_by_field_name("declarator").unwrap_or(child);
-                lower_initialized(
-                    program,
-                    ctx,
-                    child,
-                    decl,
-                    child.child_by_field_name("value"),
-                );
+                let decl = child.cached_field("declarator").unwrap_or(child);
+                lower_initialized(program, ctx, child, decl, child.cached_field("value"));
             }
             // Inside a body, `cb && cb();` parses as a reference-returning
             // prototype; a real one is declared at namespace scope.
@@ -6754,7 +6823,7 @@ fn lower_declaration(
             | "reference_declarator"
             | "function_declarator"
             | "array_declarator"
-                if child.kind() != "reference_declarator" || ctx.current_fn.is_none() =>
+                if child.cached_kind() != "reference_declarator" || ctx.current_fn.is_none() =>
             {
                 // A pointer-returning function declaration (`T *f(void);`) is a
                 // `pointer_declarator` wrapping a `function_declarator`; it must
@@ -6778,8 +6847,8 @@ fn lower_declaration(
                         ),
                         None => {
                             if let Some(caller) = ctx.current_fn {
-                                if let Some(inner) = fdecl.child_by_field_name("declarator") {
-                                    if inner.kind() == "structured_binding_declarator" {
+                                if let Some(inner) = fdecl.cached_field("declarator") {
+                                    if inner.cached_kind() == "structured_binding_declarator" {
                                         // `ns::table[i]();` parses as a declaration
                                         // of a structured binding: a call through
                                         // the table's element.
@@ -6795,7 +6864,7 @@ fn lower_declaration(
                                             program,
                                             ctx,
                                             source,
-                                            fdecl.child_by_field_name("parameters"),
+                                            fdecl.cached_field("parameters"),
                                         )
                                         .for_callee(program, None);
                                         let call_id = program.symbols.alloc_call_id();
@@ -6850,7 +6919,7 @@ fn lower_declaration(
             // type, which may be spelled qualified too).
             "qualified_identifier"
                 if ctx.current_fn.is_none()
-                    && node.child_by_field_name("type").map(|t| t.id()) != Some(child.id()) =>
+                    && node.cached_field("type").map(|t| t.id()) != Some(child.id()) =>
             {
                 lower_one_declarator(
                     program,
@@ -6921,12 +6990,12 @@ fn direct_init_arguments(
     source: &str,
     decl: Node,
 ) -> Option<CallArgs> {
-    if !ctx.is_cpp || decl.kind() != "function_declarator" {
+    if !ctx.is_cpp || decl.cached_kind() != "function_declarator" {
         return None;
     }
-    let declared = decl.child_by_field_name("declarator")?;
-    let params = decl.child_by_field_name("parameters")?;
-    let args = match declared.kind() {
+    let declared = decl.cached_field("declarator")?;
+    let params = decl.cached_field("parameters")?;
+    let args = match declared.cached_kind() {
         // In a body, a name lowering cannot resolve and that names no type
         // is a value (an enumerator, a macro constant), so `T w(E::kind);`
         // defines `w`: C++ reads it as a declaration only when the name is a
@@ -7002,7 +7071,7 @@ fn direct_init_call_args(
 ) -> Option<CallArgs> {
     let mut args = CallArgs::empty();
     for param in params.named_children(&mut params.walk()) {
-        if param.kind() == "comment" {
+        if param.cached_kind() == "comment" {
             continue;
         }
         let index = args.argc;
@@ -7038,12 +7107,15 @@ fn direct_init_argument(
     source: &str,
     param: Node,
 ) -> Option<DirectInitArg> {
-    if param.kind() != "parameter_declaration" || param.child_by_field_name("declarator").is_some()
+    if param.cached_kind() != "parameter_declaration" || param.cached_field("declarator").is_some()
     {
         return None;
     }
-    let name_node = param.child_by_field_name("type")?;
-    if !matches!(name_node.kind(), "type_identifier" | "qualified_identifier") {
+    let name_node = param.cached_field("type")?;
+    if !matches!(
+        name_node.cached_kind(),
+        "type_identifier" | "qualified_identifier"
+    ) {
         return None;
     }
     let name = normalize_qualified(node_text(source, &name_node));
@@ -7086,7 +7158,7 @@ fn lower_direct_init(
     storage_override: Option<StorageClass>,
     args: CallArgs,
 ) {
-    let Some(name_node) = decl.child_by_field_name("declarator") else {
+    let Some(name_node) = decl.cached_field("declarator") else {
         return;
     };
     let capture = start_initializer_capture(program, ctx);
@@ -7183,7 +7255,7 @@ fn lower_one_declarator(
     if node_is_from_ignored_macro(ctx, decl) || node_is_from_ignored_macro(ctx, span_node) {
         return None;
     }
-    if decl.kind() == "function_declarator" && !is_function_pointer_declarator(decl) {
+    if decl.cached_kind() == "function_declarator" && !is_function_pointer_declarator(decl) {
         lower_function_decl(program, ctx, source, decl, type_id, is_static);
         return None;
     }
@@ -7274,19 +7346,19 @@ fn lower_one_declarator(
     // calls a constructor too when the class declares a user-provided one; a
     // class without one is an aggregate, whose braces initialize its fields.
     let mut braced_ctor = false;
-    if ctx.is_cpp && span_node.kind() == "init_declarator" && ctx.current_fn.is_some() {
+    if ctx.is_cpp && span_node.cached_kind() == "init_declarator" && ctx.current_fn.is_some() {
         if let Some(cls) = named_class(program, type_id) {
             // A constructor defaulted or deleted in its class is not
             // user-provided and leaves the class an aggregate (C++17).
-            braced_ctor = init_expr.is_some_and(|n| n.kind() == "initializer_list")
+            braced_ctor = init_expr.is_some_and(|n| n.cached_kind() == "initializer_list")
                 && declared_members_upward(program, &cls, &trace_ir::MethodKind::Ctor)
                     .iter()
                     .any(|&ctor| !program.symbols.function(ctor).defaulted_in_class);
             let ctor_args: Option<Node> = match init_expr {
-                Some(n) if n.kind() == "argument_list" || braced_ctor => Some(n),
+                Some(n) if n.cached_kind() == "argument_list" || braced_ctor => Some(n),
                 _ => span_node
                     .children(&mut span_node.walk())
-                    .find(|c| c.kind() == "argument_list"),
+                    .find(|c| c.cached_kind() == "argument_list"),
             };
             if ctor_args.is_some() {
                 let span = node_call_span(program, ctx, span_node);
@@ -7307,7 +7379,7 @@ fn lower_one_declarator(
         }
     }
     if let Some(init) = init_expr {
-        if init.kind() != "argument_list" && !braced_ctor {
+        if init.cached_kind() != "argument_list" && !braced_ctor {
             // A ctor argument list is not a value flowing into the object.
             lower_var_initializer(program, ctx, source, var_id, type_id, decl, init);
         }
@@ -7488,7 +7560,7 @@ fn lower_var_initializer(
     {
         return;
     }
-    if init.kind() == "initializer_list"
+    if init.cached_kind() == "initializer_list"
         && (is_array_type(program, type_id) || declarator_is_array(decl))
     {
         lower_fn_ptr_array_init(program, ctx, source, var_id, init);
@@ -7508,7 +7580,7 @@ fn is_array_type(program: &Program, type_id: trace_ir::TypeId) -> bool {
 }
 
 fn declarator_is_array(decl: Node) -> bool {
-    if decl.kind() == "array_declarator" {
+    if decl.cached_kind() == "array_declarator" {
         return true;
     }
     let mut found = false;
@@ -7531,23 +7603,25 @@ fn lower_fn_ptr_array_init(
 ) {
     let mut cursor = init.walk();
     for child in init.children(&mut cursor) {
-        if matches!(child.kind(), "(" | ")" | ",") {
+        if matches!(child.cached_kind(), "(" | ")" | ",") {
             continue;
         }
         // Arrays of structs: `{ {TYPE, Fn}, ... }` or `{ {.init = Fn}, ... }`.
         // Recurse so element expressions nested in inner lists are visited.
-        if child.kind() == "initializer_list" {
+        if child.cached_kind() == "initializer_list" {
             lower_fn_ptr_array_init(program, ctx, source, array, child);
             continue;
         }
-        if child.kind() == "initializer_pair" || child.kind() == "designated_initializer" {
+        if child.cached_kind() == "initializer_pair"
+            || child.cached_kind() == "designated_initializer"
+        {
             if let Some(value) = init_pair_value_node(child) {
                 // `[i] = { ... }` with a nested *positional* element list has
                 // no field info — park members via ArrayFnMember (sound blob).
                 // Lists carrying field designators are handled precisely by
                 // `lower_designated_initializer` (via `extract_flow_from_expr`)
                 // so members stay bound to their own field.
-                if value.kind() == "initializer_list" {
+                if value.cached_kind() == "initializer_list" {
                     if !list_has_field_designators(value) {
                         lower_fn_ptr_array_init(program, ctx, source, array, value);
                     }
@@ -7564,7 +7638,7 @@ fn lower_fn_ptr_array_init(
 fn init_pair_value_node(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
     node.children(&mut cursor)
-        .filter(|c| c.is_named() && c.kind() != "field_designator")
+        .filter(|c| c.is_named() && c.cached_kind() != "field_designator")
         .last()
 }
 
@@ -7574,12 +7648,12 @@ fn init_pair_value_node(node: Node) -> Option<Node> {
 fn list_has_field_designators(list: Node) -> bool {
     let mut cursor = list.walk();
     for c in list.children(&mut cursor) {
-        if c.kind() != "initializer_pair" && c.kind() != "designated_initializer" {
+        if c.cached_kind() != "initializer_pair" && c.cached_kind() != "designated_initializer" {
             continue;
         }
         let mut inner = c.walk();
         for g in c.children(&mut inner) {
-            if g.kind() == "field_designator" {
+            if g.cached_kind() == "field_designator" {
                 return true;
             }
         }
@@ -7715,7 +7789,7 @@ fn walk_function_body(
         return;
     }
     ctx.ast_depth += 1;
-    match node.kind() {
+    match node.cached_kind() {
         "declaration" => lower_declaration(program, ctx, source, node, None),
         // `using namespace X;` / `using X::f;` scoped to a function body.
         // Collected into `ctx` for the duration of the body walk only —
@@ -7733,7 +7807,7 @@ fn walk_function_body(
             if !node_is_from_ignored_macro(ctx, node)
                 && node
                     .parent()
-                    .is_none_or(|p| p.kind() != "field_declaration_list") =>
+                    .is_none_or(|p| p.cached_kind() != "field_declaration_list") =>
         {
             if let Some(alias) = declared_alias(program, ctx, source, node) {
                 ctx.local_aliases.push(alias);
@@ -7763,7 +7837,7 @@ fn walk_function_body(
                 if let Some(cls) = new_expression_class(program, ctx, source, node) {
                     let args = node
                         .children(&mut node.walk())
-                        .find(|c| c.kind() == "argument_list");
+                        .find(|c| c.cached_kind() == "argument_list");
                     let span = node_call_span(program, ctx, node);
                     let expansion_span = node_expansion_span(program, ctx, node);
                     let call_args = collect_call_args(program, ctx, source, args);
@@ -7818,7 +7892,7 @@ fn walk_function_body(
     // on exit so a nested directive never leaks to sibling blocks or the rest
     // of the function (a leak could let the ranking collapse away the correct
     // in-scope edge: an under-approximation).
-    let is_block = node.kind() == "compound_statement";
+    let is_block = node.cached_kind() == "compound_statement";
     let using_nss_len = ctx.using_nss.len();
     let using_imports_len = ctx.using_name_imports.len();
     let local_aliases_len = ctx.local_aliases.len();
@@ -7829,7 +7903,7 @@ fn walk_function_body(
     let is_local_scope = ctx.is_cpp
         && (is_block
             || matches!(
-                node.kind(),
+                node.cached_kind(),
                 "if_statement"
                     | "for_statement"
                     | "for_range_loop"
@@ -7869,8 +7943,8 @@ fn collect_call_at_node(
         return;
     }
     let occurrence_node = node
-        .child_by_field_name("function")
-        .filter(|func| func.kind() == "field_expression")
+        .cached_field("function")
+        .filter(|func| func.cached_kind() == "field_expression")
         .and_then(member_access_token)
         .filter(|token| node_has_expansion_location(ctx, *token));
     let first_site = program.symbols.call_sites.len();
@@ -7895,7 +7969,7 @@ fn collect_call_at_node_inner(
     node: Node,
     caller: FnId,
 ) {
-    let func = match node.child_by_field_name("function") {
+    let func = match node.cached_field("function") {
         Some(f) => f,
         None => return,
     };
@@ -7903,8 +7977,8 @@ fn collect_call_at_node_inner(
     // a replacement list, display that token so a macro-argument receiver
     // cannot hide its provenance. `CallSite::occurrence` independently keeps
     // repeated calls distinct when this token came from a shared argument.
-    let source_node = if func.kind() == "field_expression" {
-        let field = func.child_by_field_name("field").unwrap_or(func);
+    let source_node = if func.cached_kind() == "field_expression" {
+        let field = func.cached_field("field").unwrap_or(func);
         if node_has_expansion_location(ctx, field) {
             field
         } else {
@@ -7929,22 +8003,20 @@ fn collect_call_at_node_inner(
     // fall through to the generic indirect handling below (vtable-slot
     // style flow resolution), preserving soundness. So does a static
     // callback member (`h.cb()`), which is called through its variable.
-    let static_member = (ctx.is_cpp && func.kind() == "field_expression")
+    let static_member = (ctx.is_cpp && func.cached_kind() == "field_expression")
         .then(|| static_member_access(program, ctx, source, func))
         .flatten();
-    if ctx.is_cpp && func.kind() == "field_expression" && static_member.is_none() {
+    if ctx.is_cpp && func.cached_kind() == "field_expression" && static_member.is_none() {
         let (op_is_member_access, op_is_arrow) = member_access_op(func);
         if op_is_member_access {
-            if let Some(field) = func.child_by_field_name("field") {
+            if let Some(field) = func.cached_field("field") {
                 if matches!(
-                    field.kind(),
+                    field.cached_kind(),
                     "field_identifier" | "destructor_name" | "template_type" | "template_method"
                 ) {
-                    if let Some((recv, recv_cls)) =
-                        func.child_by_field_name("argument").and_then(|recv| {
-                            infer_static_class(program, ctx, source, recv).map(|c| (recv, c))
-                        })
-                    {
+                    if let Some((recv, recv_cls)) = func.cached_field("argument").and_then(|recv| {
+                        infer_static_class(program, ctx, source, recv).map(|c| (recv, c))
+                    }) {
                         // `p->m()` looks `m` up on what `p`'s `operator->`
                         // yields, not on `p`'s own class (#64). `r.m()` looks
                         // it up on `r`'s own class, which is already in hand.
@@ -7958,7 +8030,7 @@ fn collect_call_at_node_inner(
                                     program,
                                     ctx,
                                     source,
-                                    node.child_by_field_name("arguments"),
+                                    node.cached_field("arguments"),
                                 );
                                 emit_unresolved_site(
                                     program,
@@ -7980,7 +8052,7 @@ fn collect_call_at_node_inner(
                         // template with substitution facts keeps — would
                         // otherwise miss every member it declares.
                         let cls = receiver_lookup_name(&cls).into_owned();
-                        let kind = if field.kind() == "destructor_name" {
+                        let kind = if field.cached_kind() == "destructor_name" {
                             trace_ir::MethodKind::Dtor
                         } else {
                             trace_ir::MethodKind::Named(strip_template_args(&normalize_qualified(
@@ -7993,7 +8065,7 @@ fn collect_call_at_node_inner(
                                 program,
                                 ctx,
                                 source,
-                                node.child_by_field_name("arguments"),
+                                node.cached_field("arguments"),
                             );
                             emit_member_targets(
                                 program,
@@ -8019,7 +8091,7 @@ fn collect_call_at_node_inner(
                                     program,
                                     ctx,
                                     source,
-                                    node.child_by_field_name("arguments"),
+                                    node.cached_field("arguments"),
                                 );
                                 emit_member_targets(
                                     program,
@@ -8048,7 +8120,7 @@ fn collect_call_at_node_inner(
                                 program,
                                 ctx,
                                 source,
-                                node.child_by_field_name("arguments"),
+                                node.cached_field("arguments"),
                             );
                             emit_unresolved_site(
                                 program,
@@ -8070,7 +8142,7 @@ fn collect_call_at_node_inner(
     // Bare `method(args)` inside a C++ method is implicit `this->method`.
     // Must run before name lookup, which would otherwise synthesize an
     // unqualified external stub (`OnEvent` vs `Plugin::OnEvent`).
-    if ctx.is_cpp && func.kind() == "identifier" {
+    if ctx.is_cpp && func.cached_kind() == "identifier" {
         if let Some(cls) = ctx.class_ctx.as_ref().map(|c| c.qual_name.clone()) {
             let cls = receiver_lookup_name(&cls).into_owned();
             let short = strip_template_args(&normalize_qualified(node_text(source, &func)));
@@ -8078,12 +8150,8 @@ fn collect_call_at_node_inner(
                 let kind = trace_ir::MethodKind::Named(short);
                 let targets = member_targets_upward(program, &cls, &kind);
                 if !targets.is_empty() {
-                    let call_args = collect_call_args(
-                        program,
-                        ctx,
-                        source,
-                        node.child_by_field_name("arguments"),
-                    );
+                    let call_args =
+                        collect_call_args(program, ctx, source, node.cached_field("arguments"));
                     emit_member_targets(
                         program,
                         caller,
@@ -8102,8 +8170,7 @@ fn collect_call_at_node_inner(
     }
     // A static callable member called through an object (`h.fun()`).
     if let Some((cls, kind)) = static_member.and_then(|v| callable_operator(program, v)) {
-        let call_args =
-            collect_call_args(program, ctx, source, node.child_by_field_name("arguments"));
+        let call_args = collect_call_args(program, ctx, source, node.cached_field("arguments"));
         emit_member_sites(
             program,
             caller,
@@ -8116,7 +8183,7 @@ fn collect_call_at_node_inner(
         );
         return;
     }
-    if ctx.is_cpp && matches!(func.kind(), "identifier" | "qualified_identifier") {
+    if ctx.is_cpp && matches!(func.cached_kind(), "identifier" | "qualified_identifier") {
         let spelled = normalize_qualified(node_text(source, &func));
         let target = match lookup_var_node(program, ctx, source, func) {
             // `T(args)` where `T` names a class with a declared constructor
@@ -8130,8 +8197,7 @@ fn collect_call_at_node_inner(
             Some(v) => callable_operator(program, v),
         };
         if let Some((cls, kind)) = target {
-            let call_args =
-                collect_call_args(program, ctx, source, node.child_by_field_name("arguments"));
+            let call_args = collect_call_args(program, ctx, source, node.cached_field("arguments"));
             emit_member_sites(
                 program,
                 caller,
@@ -8162,11 +8228,11 @@ fn collect_call_at_node_inner(
     // to an unrelated free function.
     let peeled_func = peel_derefs_and_casts(source, func);
     let is_implicit_member = ctx.is_cpp
-        && peeled_func.kind() == "identifier"
+        && peeled_func.cached_kind() == "identifier"
         && !ctx.locals.contains_key(node_text(source, &peeled_func))
         && class_ctx_field(program, ctx, node_text(source, &peeled_func)).is_some();
     let is_field_or_element_call = matches!(
-        peeled_func.kind(),
+        peeled_func.cached_kind(),
         "field_expression" | "subscript_expression"
     ) || is_implicit_member;
     if !is_direct && callee_var.is_none() && !is_field_or_element_call {
@@ -8176,7 +8242,7 @@ fn collect_call_at_node_inner(
     if !is_direct && is_likely_macro_callee(&callee_name) {
         return;
     }
-    let mut args = collect_call_args(program, ctx, source, node.child_by_field_name("arguments"));
+    let mut args = collect_call_args(program, ctx, source, node.cached_field("arguments"));
     let argc = args.argc as usize;
     // Only ranking reads the types; the sites below need the positions.
     let arg_desc = std::mem::take(&mut args.arg_desc);
@@ -8499,7 +8565,7 @@ fn collect_call_args(
     let mut arg_index = 0u32;
     if let Some(args_node) = args_node {
         for arg in args_node.children(&mut args_node.walk()) {
-            if !matches!(arg.kind(), "(" | ")" | "{" | "}" | ",") {
+            if !matches!(arg.cached_kind(), "(" | ")" | "{" | "}" | ",") {
                 let adesc = arg_expr_type(program, ctx, source, arg);
                 null_constants.push(is_null_constant(source, arg));
                 // Parameter positions are syntactic: every argument slot
@@ -8561,7 +8627,10 @@ fn collect_call_args(
                     // that memory (e.g. `take(g_h.h, 0)` passes the fn-ptr in
                     // `g_h.h`). `resolve_expr_var` yields the base object, so
                     // materialize a load temp and pass that instead.
-                    if matches!(value.kind(), "field_expression" | "subscript_expression") {
+                    if matches!(
+                        value.cached_kind(),
+                        "field_expression" | "subscript_expression"
+                    ) {
                         let temp = alloc_ret_temp(program, ctx, arg);
                         if let Some(flow) = expr_to_rhs_flow(program, ctx, source, arg, temp) {
                             program.flow.push(flow);
@@ -8619,9 +8688,9 @@ fn arg_expr_type(
     // `known_arg_type` peels before it answers. Reading the kind off the
     // unpeeled node ranked `f((T)x)` and `f(((T)x))` differently.
     let node = peel_expression(node);
-    match node.kind() {
+    match node.cached_kind() {
         "cast_expression" => {
-            if let Some(ty) = node.child_by_field_name("type") {
+            if let Some(ty) = node.cached_field("type") {
                 // `type_desc_from_node` reads scalar text with `contains`,
                 // so a pointer cast would classify the value as a scalar and
                 // exactly match the wrong overload (`(float*)p` -> $f(float)$).
@@ -8648,7 +8717,7 @@ fn arg_expr_type(
 
 fn known_arg_type(program: &Program, ctx: &LowerContext, source: &str, node: Node) -> TypeDesc {
     let node = peel_expression(node);
-    match node.kind() {
+    match node.cached_kind() {
         // A cast's operand type is not the type of the expression. Probing
         // a receiver cannot register a new type, so keep it unknown.
         "cast_expression" => TypeDesc::Unknown,
@@ -8660,14 +8729,14 @@ fn known_arg_type(program: &Program, ctx: &LowerContext, source: &str, node: Nod
         // `&x` is a pointer to `x`'s type and `*p` its pointee's, not the
         // variable's own type the operand names.
         "pointer_expression" => {
-            let Some(operand) = node.child_by_field_name("argument") else {
+            let Some(operand) = node.cached_field("argument") else {
                 return TypeDesc::Unknown;
             };
             let operand_type = known_arg_type(program, ctx, source, operand);
             // `&(x)` is `&x`: the type is read through the parentheses, so is
             // whether `x` is a reference.
             let operand = peel_expression(operand);
-            let reference = (operand.kind() == "identifier")
+            let reference = (operand.cached_kind() == "identifier")
                 .then(|| resolve_expr_var(program, ctx, source, operand))
                 .flatten()
                 .filter(|v| ctx.reference_vars.contains(v));
@@ -8678,7 +8747,7 @@ fn known_arg_type(program: &Program, ctx: &LowerContext, source: &str, node: Nod
             // points at it.
             let lowered_as_address = reference.is_some_and(|v| ctx.address_references.contains(&v));
             match node
-                .child_by_field_name("operator")
+                .cached_field("operator")
                 .map(|op| node_text(source, &op))
             {
                 Some("&") if lowered_as_address => operand_type,
@@ -8705,9 +8774,12 @@ fn known_arg_type(program: &Program, ctx: &LowerContext, source: &str, node: Nod
                 // Field/subscript args pass the *stored value*: a pointer
                 // member is passed as its pointee (array decay), and a
                 // struct-by-value member as the struct.
-                if matches!(node.kind(), "field_expression" | "subscript_expression") {
+                if matches!(
+                    node.cached_kind(),
+                    "field_expression" | "subscript_expression"
+                ) {
                     match &desc {
-                        TypeDesc::Ptr(inner) if node.kind() == "subscript_expression" => {
+                        TypeDesc::Ptr(inner) if node.cached_kind() == "subscript_expression" => {
                             // `arr[i]`: the element value is the pointee.
                             return (**inner).clone();
                         }
@@ -8753,7 +8825,7 @@ fn enumerator_type(
     source: &str,
     node: Node,
 ) -> Option<TypeDesc> {
-    if node.kind() != "qualified_identifier" {
+    if node.cached_kind() != "qualified_identifier" {
         return None;
     }
     let spelled = normalize_qualified(node_text(source, &node));
@@ -8794,17 +8866,17 @@ fn enumerator_type(
 /// `0`, `(0)`, or one negated (`-0`).
 fn is_null_constant(source: &str, arg: Node) -> bool {
     let mut literal = peel_expression(arg);
-    while literal.kind() == "unary_expression"
+    while literal.cached_kind() == "unary_expression"
         && literal
-            .child_by_field_name("operator")
+            .cached_field("operator")
             .is_some_and(|op| matches!(node_text(source, &op), "-" | "+"))
     {
-        match literal.child_by_field_name("argument") {
+        match literal.cached_field("argument") {
             Some(operand) => literal = peel_expression(operand),
             None => return false,
         }
     }
-    literal.kind() == "number_literal" && is_literal_zero(node_text(source, &literal))
+    literal.cached_kind() == "number_literal" && is_literal_zero(node_text(source, &literal))
 }
 
 /// Whether an integer literal is zero in any base, suffix or digit grouping
@@ -9200,7 +9272,7 @@ fn param_match_rank(arg: &TypeDesc, param: &TypeDesc) -> usize {
 /// not `GetNumber<int>`), which correctly indexes into the `base_by_name`
 /// bucket.
 fn is_bare_callee_node(func: Node, name: &str) -> bool {
-    matches!(func.kind(), "identifier" | "template_function") && !name.contains("::")
+    matches!(func.cached_kind(), "identifier" | "template_function") && !name.contains("::")
 }
 
 fn has_same_signature(program: &Program, a: FnId, b: FnId) -> bool {
@@ -9263,7 +9335,9 @@ fn cpp_callee_candidates(
 ) -> Vec<FnId> {
     if is_bare_callee_node(func, name) {
         resolve_cpp_name_candidates(program, ctx, name, arg_desc)
-    } else if func.kind() == "qualified_identifier" || func.kind() == "template_function" {
+    } else if func.cached_kind() == "qualified_identifier"
+        || func.cached_kind() == "template_function"
+    {
         let lookup = |candidate: &str| {
             let found = program
                 .symbols
@@ -9316,7 +9390,9 @@ fn inherited_static_members(
     };
     // A scope mentioning a template parameter (`T::Get()`, `Wrap<T>::Get()`)
     // names no class; `name` has lost the arguments, the source has not.
-    if func.kind() == "qualified_identifier" && static_call_scope(ctx, source, func).is_none() {
+    if func.cached_kind() == "qualified_identifier"
+        && static_call_scope(ctx, source, func).is_none()
+    {
         return Vec::new();
     }
     declared_members_upward(
@@ -9647,12 +9723,12 @@ fn lower_field_initializer_list(
     let bases = program.bases_of(&cls);
     let cls_type = program.types.class_type_id(&cls);
     for fi in node.children(&mut node.walk()) {
-        if fi.kind() != "field_initializer" {
+        if fi.cached_kind() != "field_initializer" {
             continue;
         }
         let Some(name_node) = fi
             .children(&mut fi.walk())
-            .find(|c| matches!(c.kind(), "field_identifier" | "identifier"))
+            .find(|c| matches!(c.cached_kind(), "field_identifier" | "identifier"))
         else {
             continue;
         };
@@ -9683,7 +9759,7 @@ fn lower_field_initializer_list(
             // `m_{a}` an initializer list; either way `this` is not in it.
             let args = fi
                 .children(&mut fi.walk())
-                .find(|c| matches!(c.kind(), "argument_list" | "initializer_list"));
+                .find(|c| matches!(c.cached_kind(), "argument_list" | "initializer_list"));
             // A member array's list initializes its elements one by one: an
             // empty one default-constructs them, and listed elements are
             // expressions of their own, never one constructor's arguments.
@@ -9713,7 +9789,7 @@ fn last_segment_of(name: &str) -> &str {
 
 fn node_has_compound_body(node: Node) -> bool {
     node.children(&mut node.walk())
-        .any(|c| c.kind() == "compound_statement")
+        .any(|c| c.cached_kind() == "compound_statement")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -9993,19 +10069,21 @@ fn lower_lambda_expression(
     let mut shape = ParamListShape::default();
     if let Some(params_node) = node
         .children(&mut node.walk())
-        .find(|c| c.kind() == "parameter_list" || c.kind() == "abstract_function_declarator")
+        .find(|c| {
+            c.cached_kind() == "parameter_list" || c.cached_kind() == "abstract_function_declarator"
+        })
         .and_then(|n| {
-            if n.kind() == "parameter_list" {
+            if n.cached_kind() == "parameter_list" {
                 Some(n)
             } else {
                 n.children(&mut n.walk())
-                    .find(|c| c.kind() == "parameter_list")
+                    .find(|c| c.cached_kind() == "parameter_list")
             }
         })
     {
         for param in params_node.children(&mut params_node.walk()) {
             shape.record(source, param);
-            if is_parameter_node(param.kind()) {
+            if is_parameter_node(param.cached_kind()) {
                 if let Some(var) = lower_parameter(
                     program,
                     ctx,
@@ -10065,10 +10143,10 @@ fn lower_lambda_expression(
 
     if let Some(cap_node) = node
         .children(&mut node.walk())
-        .find(|c| c.kind() == "lambda_capture_specifier")
+        .find(|c| c.cached_kind() == "lambda_capture_specifier")
     {
         for child in cap_node.children(&mut cap_node.walk()) {
-            match child.kind() {
+            match child.cached_kind() {
                 "this" => captures_this = true,
                 "lambda_default_capture" => {
                     default_capture_all = true;
@@ -10081,10 +10159,9 @@ fn lower_lambda_expression(
                     captured_vars.push(name);
                 }
                 "lambda_capture_initializer" => {
-                    if let (Some(left), Some(right)) = (
-                        child.child_by_field_name("left"),
-                        child.child_by_field_name("right"),
-                    ) {
+                    if let (Some(left), Some(right)) =
+                        (child.cached_field("left"), child.cached_field("right"))
+                    {
                         let is_ref = node_text(source, &child).trim_start().starts_with('&');
                         let name = node_text(source, &left).trim().to_string();
                         init_captures.push((name, is_ref, left, right));
@@ -10116,7 +10193,7 @@ fn lower_lambda_expression(
             walk_function_body(program, ctx, source, right, caller);
         }
         let right_text = node_text(source, &right).trim();
-        if is_ref && right.kind() == "identifier" {
+        if is_ref && right.cached_kind() == "identifier" {
             let orig_var = saved_locals
                 .get(right_text)
                 .copied()
@@ -10179,7 +10256,7 @@ fn lower_lambda_expression(
     ctx.locals = lambda_locals;
     if let Some(body) = node
         .children(&mut node.walk())
-        .find(|c| c.kind() == "compound_statement")
+        .find(|c| c.cached_kind() == "compound_statement")
     {
         walk_function_body(program, ctx, source, body, fn_id);
     }
@@ -10506,7 +10583,7 @@ fn receiver_desc(
     node: Node,
 ) -> Option<TypeDesc> {
     let node = peel_expression(node);
-    match node.kind() {
+    match node.cached_kind() {
         "this" => Some(TypeDesc::Ptr(Box::new(TypeDesc::Struct {
             name: ctx.class_ctx.as_ref()?.qual_name.clone(),
             fields: Vec::new(),
@@ -10526,12 +10603,12 @@ fn receiver_desc(
             if let Some(member) = static_member_access(program, ctx, source, node) {
                 return Some(var_receiver_desc(program, ctx, member));
             }
-            let base = node.child_by_field_name("argument")?;
+            let base = node.cached_field("argument")?;
             let cls = member_receiver_class(program, ctx, source, base, is_arrow_access(node))?;
             class_field_desc(
                 program,
                 &cls,
-                node_text(source, &node.child_by_field_name("field")?),
+                node_text(source, &node.cached_field("field")?),
             )
         }
         "pointer_expression" => {
@@ -10605,7 +10682,7 @@ fn register_arrow_return(
 ) {
     // An out-of-line operator also proves that this is a defined wrapper.
     program.types.define_struct(cls);
-    let Some(t) = node.child_by_field_name("type") else {
+    let Some(t) = node.cached_field("type") else {
         return;
     };
     let spelling = node_text(source, &t).trim();
@@ -10613,8 +10690,8 @@ fn register_arrow_return(
     let mut parameter = None;
     let mut dependent = false;
     while let Some(parent) = ancestor {
-        if parent.kind() == "template_declaration" {
-            if let Some(params) = parent.child_by_field_name("parameters") {
+        if parent.cached_kind() == "template_declaration" {
+            if let Some(params) = parent.cached_field("parameters") {
                 // Positions must line up with the instantiation's argument
                 // list, which template_parameter_names keeps comments out of.
                 for (i, name) in template_parameter_names(source, params)
@@ -10638,8 +10715,8 @@ fn register_arrow_return(
         type_desc_from_node(program, ctx, source, t)
     };
     let pointer = node
-        .child_by_field_name("declarator")
-        .is_some_and(|d| d.kind() == "pointer_declarator");
+        .cached_field("declarator")
+        .is_some_and(|d| d.cached_kind() == "pointer_declarator");
     // A named pointer typedef already includes its terminating pointer layer.
     let pointer = if let TypeDesc::Ptr(inner) = target {
         target = *inner;
@@ -11107,7 +11184,7 @@ fn member_access_op(node: Node) -> (bool, bool) {
     let mut arrow = false;
     let mut dot = false;
     for child in node.children(&mut node.walk()) {
-        match child.kind() {
+        match child.cached_kind() {
             "->" => arrow = true,
             "." => dot = true,
             _ => {}
@@ -11121,7 +11198,7 @@ fn member_access_op(node: Node) -> (bool, bool) {
 /// one syntactic call occurrence.
 fn member_access_token(node: Node) -> Option<Node> {
     node.children(&mut node.walk())
-        .find(|child| matches!(child.kind(), "." | "->"))
+        .find(|child| matches!(child.cached_kind(), "." | "->"))
 }
 
 /// Static class of a receiver expression, when inferable from declared
@@ -11133,7 +11210,7 @@ fn infer_static_class(
     node: Node,
 ) -> Option<String> {
     let node = peel_expression(node);
-    match node.kind() {
+    match node.cached_kind() {
         "this" => ctx.class_ctx.as_ref().map(|c| c.qual_name.clone()),
         "identifier" => {
             // Bare `plugin_->OnEvent()` inside a method is implicit
@@ -11163,8 +11240,8 @@ fn infer_static_class(
             if let Some(member) = static_member_access(program, ctx, source, node) {
                 return var_static_class(program, member);
             }
-            let base = node.child_by_field_name("argument")?;
-            let field = node.child_by_field_name("field")?;
+            let base = node.cached_field("argument")?;
+            let field = node.cached_field("field")?;
             let base_cls = infer_static_class(program, ctx, source, base)?;
             // `w->f` reads `f` off what `w`'s `operator->` yields (#64).
             let base_cls = if ctx.is_cpp && is_arrow_access(node) {
@@ -11177,8 +11254,8 @@ fn infer_static_class(
         }
         "cast_expression" => {
             // `(T *)p` names `T`; the descriptor's declarator is not part of it.
-            let descriptor = node.child_by_field_name("type")?;
-            let type_node = descriptor.child_by_field_name("type").unwrap_or(descriptor);
+            let descriptor = node.cached_field("type")?;
+            let type_node = descriptor.cached_field("type").unwrap_or(descriptor);
             let raw = normalize_qualified(node_text(source, &type_node));
             let qualified = qualify_class_name(program, ctx, &strip_template_args(&raw));
             if program.types.class_type_id(&qualified).is_some() {
@@ -11222,7 +11299,7 @@ fn new_expression_class(
     node: Node,
 ) -> Option<String> {
     for child in node.children(&mut node.walk()) {
-        match child.kind() {
+        match child.cached_kind() {
             "qualified_identifier" | "type_identifier" | "template_type" => {
                 let raw = normalize_qualified(node_text(source, &child));
                 return Some(qualify_class_name(program, ctx, &strip_template_args(&raw)));
@@ -11243,14 +11320,14 @@ fn extract_flow_from_expr(
     if node_is_from_ignored_macro(ctx, node) {
         return;
     }
-    if node.kind() == "assignment_expression" {
+    if node.cached_kind() == "assignment_expression" {
         let lhs = peel_expression(
-            node.child_by_field_name("left")
+            node.cached_field("left")
                 .or_else(|| node.named_child(0))
                 .unwrap(),
         );
         let rhs = node
-            .child_by_field_name("right")
+            .cached_field("right")
             .or_else(|| node.named_child(1))
             .unwrap();
         if node_is_from_ignored_macro(ctx, rhs)
@@ -11277,7 +11354,7 @@ fn extract_flow_from_expr(
                     // through a pointer.
                     let dst = ptr(program, ctx);
                     emit_fn_name_store(program, ctx, source, node, dst, name);
-                } else if call.kind() == "call_expression" {
+                } else if call.cached_kind() == "call_expression" {
                     if let Some(src) = promoted_receiver_value(program, ctx, source, call) {
                         let dst = ptr(program, ctx);
                         program.flow.push(FlowConstraint::Store { dst, src });
@@ -11293,7 +11370,7 @@ fn extract_flow_from_expr(
                     }
                 }
             }
-        } else if lhs.kind() == "field_expression"
+        } else if lhs.cached_kind() == "field_expression"
             || implicit_this(program, ctx, source, lhs).is_some()
         {
             // `h->cb = v`, and `cb_ = v` as `this->cb_ = v`.
@@ -11310,7 +11387,7 @@ fn extract_flow_from_expr(
         return;
     }
 
-    if node.kind() == "initializer_list" {
+    if node.cached_kind() == "initializer_list" {
         if let Some(base) = assign_target {
             lower_initializer_list(program, ctx, source, node, base);
             return;
@@ -11344,7 +11421,7 @@ fn lower_initializer_list(
     let mut pos = 0usize;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        match child.kind() {
+        match child.cached_kind() {
             "designated_initializer" | "initializer_pair" => {
                 lower_designated_initializer(program, ctx, source, child, base);
             }
@@ -11419,11 +11496,11 @@ fn lower_designated_initializer(
     let mut value = None;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        match child.kind() {
+        match child.cached_kind() {
             "field_designator" => {
                 let mut inner = child.walk();
                 for c in child.children(&mut inner) {
-                    if c.kind() == "field_identifier" {
+                    if c.cached_kind() == "field_identifier" {
                         field_names.push(node_text(source, &c).to_string());
                     }
                 }
@@ -11432,7 +11509,10 @@ fn lower_designated_initializer(
             // index-insensitive in this IR, so the subscript itself carries no
             // information — just don't mistake it for the value.
             "subscript_designator" | "=" => {}
-            _ if value.is_none() && child.is_named() && child.kind() != "field_designator" => {
+            _ if value.is_none()
+                && child.is_named()
+                && child.cached_kind() != "field_designator" =>
+            {
                 value = Some(child)
             }
             _ => {}
@@ -11445,7 +11525,7 @@ fn lower_designated_initializer(
         Some(t) => t,
         None => return,
     };
-    if value_node.kind() == "initializer_list" {
+    if value_node.cached_kind() == "initializer_list" {
         // `[i] = { .f = v }` or `.s = { .g = v }`: descend into the nested
         // list against the same base (array elements are index-insensitive),
         // chaining GEPs for any field designators seen so far.
@@ -11487,7 +11567,7 @@ fn lower_designated_initializer(
 }
 
 fn peel_expression(mut node: Node) -> Node {
-    while node.kind() == "parenthesized_expression" {
+    while node.cached_kind() == "parenthesized_expression" {
         match node.named_child(0) {
             Some(inner) => node = inner,
             None => break,
@@ -11502,13 +11582,13 @@ fn peel_expression(mut node: Node) -> Node {
 fn peel_casts<'t>(source: &str, mut node: Node<'t>) -> Node<'t> {
     loop {
         node = peel_expression(node);
-        let inner = match node.kind() {
+        let inner = match node.cached_kind() {
             "cast_expression" => node
-                .child_by_field_name("value")
-                .or_else(|| node.child_by_field_name("expression"))
+                .cached_field("value")
+                .or_else(|| node.cached_field("expression"))
                 .or_else(|| node.named_child(1)),
             "call_expression" if is_named_cast(source, node) => node
-                .child_by_field_name("arguments")
+                .cached_field("arguments")
                 .and_then(|args| args.named_child(0)),
             _ => None,
         };
@@ -11524,7 +11604,9 @@ fn peel_casts<'t>(source: &str, mut node: Node<'t>) -> Node<'t> {
 fn peel_derefs_and_casts<'t>(source: &str, mut node: Node<'t>) -> Node<'t> {
     loop {
         node = peel_casts(source, node);
-        if node.kind() == "pointer_expression" && pointer_op(source, node).as_deref() == Some("*") {
+        if node.cached_kind() == "pointer_expression"
+            && pointer_op(source, node).as_deref() == Some("*")
+        {
             if let Some(inner) = pointer_arg(node) {
                 node = inner;
                 continue;
@@ -11537,9 +11619,9 @@ fn peel_derefs_and_casts<'t>(source: &str, mut node: Node<'t>) -> Node<'t> {
 
 /// `static_cast<T>(x)` and its siblings: a call of a named-cast template.
 fn is_named_cast(source: &str, call: Node) -> bool {
-    call.child_by_field_name("function")
-        .filter(|f| f.kind() == "template_function")
-        .and_then(|f| f.child_by_field_name("name"))
+    call.cached_field("function")
+        .filter(|f| f.cached_kind() == "template_function")
+        .and_then(|f| f.cached_field("name"))
         .is_some_and(|name| {
             matches!(
                 node_text(source, &name),
@@ -11573,13 +11655,13 @@ fn is_symbol_lookup_callee(name: &str) -> bool {
 /// Decode a C/C++ string literal or concatenated string into its contents.
 fn string_literal_value(source: &str, node: Node) -> Option<String> {
     let node = peel_casts(source, node);
-    match node.kind() {
+    match node.cached_kind() {
         "string_literal" => decode_c_string_literal(node_text(source, &node)),
         "concatenated_string" => {
             let mut out = String::new();
             let mut any = false;
             for child in node.children(&mut node.walk()) {
-                if child.kind() == "string_literal" {
+                if child.cached_kind() == "string_literal" {
                     out.push_str(&decode_c_string_literal(node_text(source, &child))?);
                     any = true;
                 }
@@ -11662,11 +11744,11 @@ fn emit_field_store(
 /// `s.t[i]`. `None` when `node` is not a subscript.
 fn subscript_table(node: Node) -> Option<Node> {
     let mut node = peel_expression(node);
-    if node.kind() != "subscript_expression" {
+    if node.cached_kind() != "subscript_expression" {
         return None;
     }
-    while node.kind() == "subscript_expression" {
-        node = peel_expression(node.child_by_field_name("argument")?);
+    while node.cached_kind() == "subscript_expression" {
+        node = peel_expression(node.cached_field("argument")?);
     }
     Some(node)
 }
@@ -11683,13 +11765,13 @@ fn field_table<'t>(
     node: Node<'t>,
 ) -> Option<Node<'t>> {
     subscript_table(node).filter(|n| {
-        n.kind() == "field_expression" || implicit_this(program, ctx, source, *n).is_some()
+        n.cached_kind() == "field_expression" || implicit_this(program, ctx, source, *n).is_some()
     })
 }
 
 /// A plain or qualified name (`x`, `ns::f`, `Cls::f`).
 fn is_name(node: Node) -> bool {
-    matches!(node.kind(), "identifier" | "qualified_identifier")
+    matches!(node.cached_kind(), "identifier" | "qualified_identifier")
 }
 
 /// `&name` through parentheses and casts: the name whose address is taken.
@@ -11756,7 +11838,7 @@ fn emit_store_to_location(
         let peeled_value = peel_casts(source, peel_expression(value_node));
         if let Some(name) = fn_designator(source, peeled_value) {
             emit_fn_name_store(program, ctx, source, span_node, dst, name);
-        } else if peeled_value.kind() == "lambda_expression" && ctx.is_cpp {
+        } else if peeled_value.cached_kind() == "lambda_expression" && ctx.is_cpp {
             if let Some(callee) = lower_lambda_expression(program, ctx, source, peeled_value) {
                 let src_temp = alloc_ret_temp(program, ctx, span_node);
                 program.flow.push(FlowConstraint::AddrOfFn {
@@ -11771,7 +11853,7 @@ fn emit_store_to_location(
             program.flow.push(FlowConstraint::Store { dst, src });
         } else {
             let ret_temp = alloc_ret_temp(program, ctx, span_node);
-            let emitted = if peeled_value.kind() == "call_expression" {
+            let emitted = if peeled_value.cached_kind() == "call_expression" {
                 if let Some(callee_name) = resolve_direct_call(program, ctx, source, peeled_value) {
                     emit_call_return(program, ctx, peeled_value, ret_temp, callee_name);
                     true
@@ -11874,7 +11956,7 @@ fn alloc_gep_temp(
 }
 
 fn field_name_from_node(source: &str, node: Node) -> Option<String> {
-    node.child_by_field_name("field")
+    node.cached_field("field")
         .map(|n| node_text(source, &n).to_string())
 }
 
@@ -11908,7 +11990,7 @@ fn field_path<'t>(
     let mut cur = peel_expression(node);
     // A static data member along the chain (`h.obj` in `h.obj.cb`) is an
     // object of its own, not a field: the path is rooted at its variable.
-    while cur.kind() == "field_expression"
+    while cur.cached_kind() == "field_expression"
         && static_member_access(program, ctx, source, cur).is_none()
     {
         field_names.push(field_name_from_node(source, cur)?);
@@ -11916,7 +11998,7 @@ fn field_path<'t>(
         // Peel inside the walk, not only at the root: `(a->b)->c` is one
         // chain, and stopping at the parentheses would resolve `c` against
         // `a`'s layout — the base `resolve_lvalue_var` peels down to anyway.
-        cur = peel_expression(cur.child_by_field_name("argument")?);
+        cur = peel_expression(cur.cached_field("argument")?);
     }
     // A bare instance field at the root is `this`'s, an element of one
     // (`table_[i].val`) included: an element is its table's cell.
@@ -11963,63 +12045,64 @@ fn field_path<'t>(
         // `*&x` is `x`: an address taken keeps the root variable. A bare
         // instance field (`(*m_in).pp`) is read through `this`.
         .filter(|operand| {
-            operand.kind() == "field_expression"
+            operand.cached_kind() == "field_expression"
                 || deref_operand(source, *operand).is_some()
                 || implicit_this(program, ctx, source, *operand).is_some()
         })
         .zip(deref_class.filter(|_| !is_pointer));
-    let (root, mut raw_pointer, mut type_id) = if ctx.is_cpp && cur.kind() == "call_expression" {
-        // A wrapper value: the arrow is overloaded, never built in.
-        let call = call_root(program, ctx, source, cur, &arrows)?;
-        let wrapper = call.wrapper;
-        (PathRoot::Call(cur, call), false, wrapper)
-    } else if let Some(class) = arrow_root {
-        // The pointer `*x` holds: its arrow is built in.
-        let value = Operand::resolve(program, ctx, source, cur)?;
-        (PathRoot::Deref(Box::new(value)), true, class)
-    } else if let Some((operand, class)) = deref_root {
-        // A class object: an arrow on it is overloaded, never built in.
-        let value = Operand::resolve(program, ctx, source, operand)?;
-        (PathRoot::Deref(Box::new(value)), false, class)
-    } else {
-        let base = this_field
-            .or_else(|| this_root(ctx, source, cur))
-            .or_else(|| resolve_lvalue_var(program, ctx, source, cur))?;
-        // Keep the receiver's pointer provenance before layout lookup
-        // strips it. References and explicit dereferences denote the
-        // referred-to value.
-        let raw_pointer = ctx.is_cpp
-            && arrows.first() == Some(&true)
-            && if this_field.is_some() || cur.kind() == "identifier" {
-                // The common case only needs a type tag, not a cloned layout.
-                match program
-                    .types
-                    .get(variable_type_id(program, base)?)
-                    .desc
-                    .as_ref()
-                {
-                    TypeDesc::Ptr(inner) if ctx.reference_vars.contains(&base) => {
-                        matches!(**inner, TypeDesc::Ptr(_))
+    let (root, mut raw_pointer, mut type_id) =
+        if ctx.is_cpp && cur.cached_kind() == "call_expression" {
+            // A wrapper value: the arrow is overloaded, never built in.
+            let call = call_root(program, ctx, source, cur, &arrows)?;
+            let wrapper = call.wrapper;
+            (PathRoot::Call(cur, call), false, wrapper)
+        } else if let Some(class) = arrow_root {
+            // The pointer `*x` holds: its arrow is built in.
+            let value = Operand::resolve(program, ctx, source, cur)?;
+            (PathRoot::Deref(Box::new(value)), true, class)
+        } else if let Some((operand, class)) = deref_root {
+            // A class object: an arrow on it is overloaded, never built in.
+            let value = Operand::resolve(program, ctx, source, operand)?;
+            (PathRoot::Deref(Box::new(value)), false, class)
+        } else {
+            let base = this_field
+                .or_else(|| this_root(ctx, source, cur))
+                .or_else(|| resolve_lvalue_var(program, ctx, source, cur))?;
+            // Keep the receiver's pointer provenance before layout lookup
+            // strips it. References and explicit dereferences denote the
+            // referred-to value.
+            let raw_pointer = ctx.is_cpp
+                && arrows.first() == Some(&true)
+                && if this_field.is_some() || cur.cached_kind() == "identifier" {
+                    // The common case only needs a type tag, not a cloned layout.
+                    match program
+                        .types
+                        .get(variable_type_id(program, base)?)
+                        .desc
+                        .as_ref()
+                    {
+                        TypeDesc::Ptr(inner) if ctx.reference_vars.contains(&base) => {
+                            matches!(**inner, TypeDesc::Ptr(_))
+                        }
+                        TypeDesc::Ptr(_) => true,
+                        _ => false,
                     }
-                    TypeDesc::Ptr(_) => true,
-                    _ => false,
-                }
-            } else {
-                matches!(
-                    receiver_desc(program, ctx, source, cur),
-                    Some(TypeDesc::Ptr(_))
-                )
+                } else {
+                    matches!(
+                        receiver_desc(program, ctx, source, cur),
+                        Some(TypeDesc::Ptr(_))
+                    )
+                };
+            // An implicit `this` is the member's own class, a union included,
+            // which `this`'s pointer type need not tag as one.
+            let type_id = match this_field {
+                Some(_) => program
+                    .types
+                    .class_type_id(&ctx.class_ctx.as_ref()?.qual_name)?,
+                None => struct_type_for_var(program, base)?,
             };
-        // An implicit `this` is the member's own class, a union included,
-        // which `this`'s pointer type need not tag as one.
-        let type_id = match this_field {
-            Some(_) => program
-                .types
-                .class_type_id(&ctx.class_ctx.as_ref()?.qual_name)?,
-            None => struct_type_for_var(program, base)?,
+            (PathRoot::Var(base), raw_pointer, type_id)
         };
-        (PathRoot::Var(base), raw_pointer, type_id)
-    };
     let mut summary_receiver = None;
     let mut field_ids = Vec::new();
     let mut member_type = program.types.unknown();
@@ -12403,19 +12486,19 @@ fn variable_type_id(program: &Program, var: VarId) -> Option<trace_ir::TypeId> {
 }
 
 fn pointer_op(source: &str, node: Node) -> Option<String> {
-    if node.kind() != "pointer_expression" {
+    if node.cached_kind() != "pointer_expression" {
         return None;
     }
-    node.child_by_field_name("operator")
+    node.cached_field("operator")
         .map(|n| node_text(source, &n).to_string())
         .or_else(|| node.child(0).map(|n| node_text(source, &n).to_string()))
 }
 
 fn pointer_arg(node: Node) -> Option<Node> {
-    if node.kind() != "pointer_expression" {
+    if node.cached_kind() != "pointer_expression" {
         return None;
     }
-    node.child_by_field_name("argument")
+    node.cached_field("argument")
         .or_else(|| node.named_child(0))
 }
 
@@ -12476,7 +12559,9 @@ fn addr_of_field_path(
         return Some(cell);
     }
     // &ptr_expr → peel through pointer_expression with &
-    if peeled.kind() == "pointer_expression" && pointer_op(source, peeled).as_deref() == Some("&") {
+    if peeled.cached_kind() == "pointer_expression"
+        && pointer_op(source, peeled).as_deref() == Some("&")
+    {
         if let Some(inner) = pointer_arg(peeled) {
             return addr_of_field_path(program, ctx, source, inner);
         }
@@ -12507,7 +12592,7 @@ fn expr_to_store_src(
         program.flow.push(flow);
         return Some(temp);
     }
-    match node.kind() {
+    match node.cached_kind() {
         "pointer_expression" => {
             let op = pointer_op(source, node);
             let arg = pointer_arg(node)?;
@@ -12549,7 +12634,7 @@ fn expr_to_rhs_flow(
             None => expr_to_rhs_flow(program, ctx, source, table, dst),
         };
     }
-    match node.kind() {
+    match node.cached_kind() {
         "this" => ctx
             .locals
             .get("this")
@@ -12612,7 +12697,7 @@ fn expr_to_rhs_flow(
                         FlowConstraint::AddrOfVar { dst, src }
                     })
                 } else {
-                    if arg.kind() == "identifier" {
+                    if arg.cached_kind() == "identifier" {
                         let name = node_text(source, &arg);
                         if lookup_var_unless_hidden(ctx, program, name).is_none() {
                             // Might be a function defined later in the unit.
@@ -12629,7 +12714,7 @@ fn expr_to_rhs_flow(
                     // A function designator is read in place: `*handler` is
                     // `handler`, as a value names it.
                     let operand = peel_expression(arg);
-                    return matches!(operand.kind(), "identifier" | "qualified_identifier")
+                    return matches!(operand.cached_kind(), "identifier" | "qualified_identifier")
                         .then(|| expr_to_rhs_flow(program, ctx, source, operand, dst))
                         .flatten();
                 };
@@ -12679,7 +12764,7 @@ fn expr_to_rhs_flow(
                 }
                 let args = node
                     .children(&mut node.walk())
-                    .find(|c| c.kind() == "argument_list");
+                    .find(|c| c.cached_kind() == "argument_list");
                 let span = node_call_span(program, ctx, node);
                 let expansion_span = node_expansion_span(program, ctx, node);
                 let call_args = collect_call_args(program, ctx, source, args);
@@ -12723,13 +12808,11 @@ fn collect_return_statement(
     if node_is_from_ignored_macro(ctx, node) {
         return;
     }
-    let value = node
-        .child_by_field_name("value")
-        .or_else(|| node.named_child(0));
+    let value = node.cached_field("value").or_else(|| node.named_child(0));
     let Some(value) = value else {
         return;
     };
-    if value.kind() == ";"
+    if value.cached_kind() == ";"
         || node_is_from_ignored_macro(ctx, value)
         || node_is_from_ignored_macro(ctx, peel_casts(source, value))
     {
@@ -12770,12 +12853,14 @@ fn return_flow_from_expr(
         return operand_value(program, ctx, source, node).map(|src| ReturnFlow::Copy { src });
     }
     // `return ops[i];` returns the table variable `ops`'s value.
-    if let Some(table) = subscript_table(node).filter(|t| ctx.is_cpp && t.kind() == "identifier") {
+    if let Some(table) =
+        subscript_table(node).filter(|t| ctx.is_cpp && t.cached_kind() == "identifier")
+    {
         if let Some(src) = lookup_var(ctx, program, node_text(source, &table)) {
             return Some(ReturnFlow::Copy { src });
         }
     }
-    match node.kind() {
+    match node.cached_kind() {
         "this" => ctx
             .locals
             .get("this")
@@ -12808,7 +12893,7 @@ fn return_flow_from_expr(
                         ReturnFlow::AddrOfVar { src }
                     });
                 }
-                if arg.kind() == "identifier" {
+                if arg.cached_kind() == "identifier" {
                     let name = node_text(source, &arg);
                     if lookup_var_unless_hidden(ctx, program, name).is_none() {
                         ctx.pending.borrow_mut().push(PendingFnRef::ReturnAddrOf {
@@ -12888,9 +12973,9 @@ fn return_flow_from_expr(
 }
 
 fn resolve_direct_call_name(source: &str, node: Node) -> Option<String> {
-    let func = node.child_by_field_name("function")?;
+    let func = node.cached_field("function")?;
     let func = peel_expression(func);
-    match func.kind() {
+    match func.cached_kind() {
         "identifier" => Some(node_text(source, &func).to_string()),
         "pointer_expression" | "parenthesized_expression" => func
             .named_child(0)
@@ -13099,7 +13184,7 @@ impl<'t> Operand<'t> {
         if implicit_this(program, ctx, source, operand).is_some() {
             return field_path(program, ctx, source, operand).map(|path| Self::Member(path, false));
         }
-        let var = match operand.kind() {
+        let var = match operand.cached_kind() {
             "identifier" | "qualified_identifier" => lookup_var_node(program, ctx, source, operand),
             "field_expression" => static_member_access(program, ctx, source, operand),
             "this" => this_root(ctx, source, operand),
@@ -13108,7 +13193,7 @@ impl<'t> Operand<'t> {
         if let Some(var) = var {
             return Some(Self::Var(operand, var));
         }
-        match operand.kind() {
+        match operand.cached_kind() {
             "field_expression" => {
                 field_path(program, ctx, source, operand).map(|path| Self::Member(path, false))
             }
@@ -13144,9 +13229,9 @@ impl<'t> Operand<'t> {
                     return Some(Self::Call(operand, None));
                 }
                 let callee = operand
-                    .child_by_field_name("function")
+                    .cached_field("function")
                     .map(peel_expression)
-                    .filter(|callee| callee.kind() == "field_expression")?;
+                    .filter(|callee| callee.cached_kind() == "field_expression")?;
                 if static_member_access(program, ctx, source, callee).is_some() {
                     return Some(Self::Call(operand, None));
                 }
@@ -13265,7 +13350,7 @@ fn implicit_this_field(
     source: &str,
     node: Node,
 ) -> Option<(VarId, HierarchyField)> {
-    if node.kind() != "identifier" {
+    if node.cached_kind() != "identifier" {
         return None;
     }
     this_field_named(program, ctx, node_text(source, &node))
@@ -13295,7 +13380,7 @@ fn this_root(ctx: &LowerContext, source: &str, node: Node) -> Option<VarId> {
     ctx.locals
         .get("this")
         .copied()
-        .filter(|_| node.kind() == "this")
+        .filter(|_| node.cached_kind() == "this")
 }
 
 /// Whether `*operand` reads `operand`'s own value rather than through it: a
@@ -13315,7 +13400,7 @@ fn resolve_lvalue_var(
     source: &str,
     node: Node,
 ) -> Option<VarId> {
-    match node.kind() {
+    match node.cached_kind() {
         "this" => ctx.locals.get("this").copied(),
         "identifier" | "qualified_identifier" => lookup_var_node(program, ctx, source, node),
         "pointer_expression" => {
@@ -13328,7 +13413,7 @@ fn resolve_lvalue_var(
         }
         "field_expression" | "subscript_expression" => {
             static_member_access(program, ctx, source, node).or_else(|| {
-                node.child_by_field_name("argument")
+                node.cached_field("argument")
                     .and_then(|n| resolve_lvalue_var(program, ctx, source, n))
             })
         }
@@ -13336,7 +13421,7 @@ fn resolve_lvalue_var(
             .named_child(0)
             .and_then(|n| resolve_lvalue_var(program, ctx, source, n)),
         "cast_expression" => node
-            .child_by_field_name("expression")
+            .cached_field("expression")
             .or_else(|| node.named_child(1))
             .and_then(|n| resolve_lvalue_var(program, ctx, source, n)),
         _ => None,
@@ -13393,7 +13478,12 @@ fn is_addr_of_member(source: &str, node: Node) -> bool {
     }
     pointer_arg(node)
         .map(|inner| peel_casts(source, inner))
-        .is_some_and(|inner| matches!(inner.kind(), "field_expression" | "subscript_expression"))
+        .is_some_and(|inner| {
+            matches!(
+                inner.cached_kind(),
+                "field_expression" | "subscript_expression"
+            )
+        })
 }
 
 /// The real declarator of a definition whose `declarator` field is nothing
@@ -13414,17 +13504,18 @@ fn is_addr_of_member(source: &str, node: Node) -> bool {
 /// ordinary trailing-macro leftover of a declaration that parsed fine.
 fn error_parked_declarator(node: Node) -> Option<Node> {
     fn parked_at(n: Node) -> Option<Node> {
-        let decl_start = n.child_by_field_name("declarator")?.start_byte();
+        let decl_start = n.cached_field("declarator")?.start_byte();
         let err = n
             .children(&mut n.walk())
-            .find(|c| c.kind() == "ERROR" && c.end_byte() <= decl_start)?;
-        err.children(&mut err.walk()).find_map(|c| match c.kind() {
-            "function_declarator" => Some(c),
-            // `C::M()` read as a call: the name is the callee, and the empty
-            // argument list is the parameter list it stands in for.
-            "init_declarator" => c.child_by_field_name("declarator"),
-            _ => None,
-        })
+            .find(|c| c.cached_kind() == "ERROR" && c.end_byte() <= decl_start)?;
+        err.children(&mut err.walk())
+            .find_map(|c| match c.cached_kind() {
+                "function_declarator" => Some(c),
+                // `C::M()` read as a call: the name is the callee, and the empty
+                // argument list is the parameter list it stands in for.
+                "init_declarator" => c.cached_field("declarator"),
+                _ => None,
+            })
     }
     // A pointer- or reference-returning member wraps its declarator, and the
     // repair is parked one level down per layer: `void *C::P() OVERRIDE {}`
@@ -13436,8 +13527,11 @@ fn error_parked_declarator(node: Node) -> Option<Node> {
         if let Some(found) = parked_at(level) {
             return Some(found);
         }
-        let next = level.child_by_field_name("declarator")?;
-        if !matches!(next.kind(), "pointer_declarator" | "reference_declarator") {
+        let next = level.cached_field("declarator")?;
+        if !matches!(
+            next.cached_kind(),
+            "pointer_declarator" | "reference_declarator"
+        ) {
             return None;
         }
         level = next;
@@ -13445,7 +13539,7 @@ fn error_parked_declarator(node: Node) -> Option<Node> {
 }
 
 fn find_function_declarator(node: Node) -> Option<Node> {
-    if node.kind() == "function_declarator" {
+    if node.cached_kind() == "function_declarator" {
         return Some(node);
     }
     let mut cursor = node.walk();
@@ -13463,9 +13557,9 @@ fn type_desc_from_field_declaration(
     source: &str,
     node: Node,
 ) -> Option<(String, TypeDesc)> {
-    let decl = node.child_by_field_name("declarator")?;
-    let inner_decl = if decl.kind() == "init_declarator" {
-        decl.child_by_field_name("declarator").unwrap_or(decl)
+    let decl = node.cached_field("declarator")?;
+    let inner_decl = if decl.cached_kind() == "init_declarator" {
+        decl.cached_field("declarator").unwrap_or(decl)
     } else {
         decl
     };
@@ -13474,19 +13568,19 @@ fn type_desc_from_field_declaration(
         return None;
     }
     let base = node
-        .child_by_field_name("type")
+        .cached_field("type")
         .map(|t| type_desc_from_node(program, ctx, source, t))
         .unwrap_or(TypeDesc::Int);
     let desc = if is_function_pointer_declarator(inner_decl) {
         // `void (**pcb)(void)` points to a function pointer: every pointer
         // level past the first keeps its own layer.
         let mut levels = 0;
-        let mut inner = inner_decl.child_by_field_name("declarator");
+        let mut inner = inner_decl.cached_field("declarator");
         while let Some(node) = inner {
-            levels += usize::from(node.kind() == "pointer_declarator");
-            inner = match node.kind() {
+            levels += usize::from(node.cached_kind() == "pointer_declarator");
+            inner = match node.cached_kind() {
                 "parenthesized_declarator" => node.named_child(0),
-                "pointer_declarator" => node.child_by_field_name("declarator"),
+                "pointer_declarator" => node.cached_field("declarator"),
                 _ => None,
             };
         }
@@ -13515,17 +13609,17 @@ fn type_desc_from_field_declaration(
     // cell, so `*h->arr` is `h->arr[0]` (docs/ANALYSIS.md, "Dereferenced
     // operands"). Tables of functions stay function-pointer typed.
     let mut innermost = decl;
-    while let Some(inner) = match innermost.kind() {
+    while let Some(inner) = match innermost.cached_kind() {
         "parenthesized_declarator" => innermost.named_child(0),
-        _ => innermost.child_by_field_name("declarator"),
+        _ => innermost.cached_field("declarator"),
     }
-    .filter(|inner| inner.kind().ends_with("_declarator"))
+    .filter(|inner| inner.cached_kind().ends_with("_declarator"))
     {
         innermost = inner;
     }
     let desc = match desc {
         TypeDesc::FnPtr { .. } => desc,
-        elem if innermost.kind() == "array_declarator" => TypeDesc::Array {
+        elem if innermost.cached_kind() == "array_declarator" => TypeDesc::Array {
             elem: Box::new(elem),
             size: None,
         },
@@ -13540,11 +13634,11 @@ fn type_desc_from_field_declaration(
 fn declarator_is_pointer_to_fn(decl: Node) -> bool {
     let mut cur = decl;
     while matches!(
-        cur.kind(),
+        cur.cached_kind(),
         "pointer_declarator" | "parenthesized_declarator"
     ) {
         cur = match cur
-            .child_by_field_name("declarator")
+            .cached_field("declarator")
             .or_else(|| cur.named_child(0))
         {
             Some(c) => c,
@@ -13555,10 +13649,10 @@ fn declarator_is_pointer_to_fn(decl: Node) -> bool {
 }
 
 fn declarator_is_pointer(decl: Node) -> bool {
-    match decl.kind() {
+    match decl.cached_kind() {
         "pointer_declarator" => true,
         "function_declarator" | "parenthesized_declarator" | "array_declarator" => decl
-            .child_by_field_name("declarator")
+            .cached_field("declarator")
             .is_some_and(declarator_is_pointer),
         _ => false,
     }
@@ -13574,13 +13668,13 @@ fn resolve_call_fn_arg(
     // spelling that keeps a direct initialization from reading as a
     // declaration; `reg((cb_t)fn)` passes it under a cast.
     let node = peel_casts(source, node);
-    if ctx.is_cpp && node.kind() == "lambda_expression" {
+    if ctx.is_cpp && node.cached_kind() == "lambda_expression" {
         return lower_lambda_expression(program, ctx, source, node);
     }
     if let Some(fn_id) = resolve_fn_ref(program, ctx, source, node) {
         return Some(fn_id);
     }
-    if node.kind() == "pointer_expression" {
+    if node.cached_kind() == "pointer_expression" {
         if let Some(inner) = pointer_arg(node) {
             return resolve_call_fn_arg(program, ctx, source, inner);
         }
@@ -13660,7 +13754,7 @@ fn resolve_fn_ref(program: &Program, ctx: &LowerContext, source: &str, node: Nod
     if lookup_var_node(program, ctx, source, node).is_some() {
         return None;
     }
-    match node.kind() {
+    match node.cached_kind() {
         "identifier" => resolve_function_named(program, ctx, node_text(source, &node)),
         "qualified_identifier" => resolve_qualified_fn(program, ctx, source, node),
         _ => None,
@@ -13684,7 +13778,7 @@ fn resolve_callee_var(
     source: &str,
     node: Node,
 ) -> Option<VarId> {
-    let func = node.child_by_field_name("function")?;
+    let func = node.cached_field("function")?;
     let (_, _, var) = resolve_callee_with_loads(program, ctx, source, func);
     var
 }
@@ -13701,7 +13795,12 @@ fn resolve_callee_with_loads(
     // Only a name the member's class declares as a field can be one, and
     // only where the body does not hide it (`implicit_this`).
     let implicit_member = implicit_this(program, ctx, source, node).is_some();
-    if !implicit_member && !matches!(node.kind(), "field_expression" | "subscript_expression") {
+    if !implicit_member
+        && !matches!(
+            node.cached_kind(),
+            "field_expression" | "subscript_expression"
+        )
+    {
         return resolve_callee(program, ctx, source, node);
     }
     // Answer before decomposition: it emits loads and allocates a summary
@@ -13730,7 +13829,7 @@ fn resolve_callee_with_loads(
         // `s.table[i]()` / `p->table[i]()` calls an element of a field array:
         // a load from the field, where `s.table[i] = fn` stores.
         result = field_fn_ptr_callee(program, ctx, source, node, decomposed);
-    } else if node.kind() == "subscript_expression" {
+    } else if node.cached_kind() == "subscript_expression" {
         // `table[i]()` calls the element: a load from the table, which reads
         // what was stored in it and passes through the functions its
         // initializer placed (`ArrayFnMember`). So does `h.table[i]()` on a
@@ -13781,12 +13880,12 @@ fn load_table_element(
 fn field_callee_text(source: &str, node: Node) -> String {
     let mut parts = Vec::new();
     let mut cur = peel_expression(node);
-    while cur.kind() == "field_expression" {
+    while cur.cached_kind() == "field_expression" {
         let op = if is_arrow_access(cur) { "->" } else { "." };
-        if let Some(field) = cur.child_by_field_name("field") {
+        if let Some(field) = cur.cached_field("field") {
             parts.push((op, node_text(source, &field).to_string()));
         }
-        cur = cur.child_by_field_name("argument").unwrap_or(cur);
+        cur = cur.cached_field("argument").unwrap_or(cur);
     }
     parts.reverse();
     let base = node_text(source, &cur);
@@ -13881,7 +13980,7 @@ fn resolve_callee(
     node: Node,
 ) -> (String, bool, Option<VarId>) {
     let node = peel_expression(node);
-    match node.kind() {
+    match node.cached_kind() {
         "identifier" => {
             let name = node_text(source, &node).to_string();
             if let Some(v) = lookup_var(ctx, program, &name) {
@@ -13913,8 +14012,8 @@ fn resolve_callee(
             .map(|inner| resolve_callee(program, ctx, source, inner))
             .unwrap_or(("<indirect>".into(), false, None)),
         "cast_expression" => node
-            .child_by_field_name("value")
-            .or_else(|| node.child_by_field_name("expression"))
+            .cached_field("value")
+            .or_else(|| node.cached_field("expression"))
             .or_else(|| node.named_child(1))
             .map(|inner| resolve_callee(program, ctx, source, inner))
             .unwrap_or(("<indirect>".into(), false, None)),
@@ -13923,10 +14022,10 @@ fn resolve_callee(
                 return (field_callee_text(source, node), false, Some(member));
             }
             let field = node
-                .child_by_field_name("field")
+                .cached_field("field")
                 .map(|n| node_text(source, &n).to_string())
                 .unwrap_or_else(|| "field".into());
-            let arg = node.child_by_field_name("argument").unwrap();
+            let arg = node.cached_field("argument").unwrap();
             if let Some(v) = resolve_lvalue_var(program, ctx, source, arg) {
                 let op = if is_arrow_access(node) { "->" } else { "." };
                 return (
@@ -13938,7 +14037,7 @@ fn resolve_callee(
             (field_callee_text(source, node), false, None)
         }
         "subscript_expression" => {
-            let arr = node.child_by_field_name("argument").unwrap();
+            let arr = node.cached_field("argument").unwrap();
             if let Some(v) = resolve_lvalue_var(program, ctx, source, arr) {
                 return (format!("{}[...]", node_text(source, &arr)), false, Some(v));
             }
@@ -13955,7 +14054,7 @@ fn resolve_expr_var(
     node: Node,
 ) -> Option<VarId> {
     let node = peel_casts(source, node);
-    match node.kind() {
+    match node.cached_kind() {
         "this" => ctx.locals.get("this").copied(),
         "identifier" | "qualified_identifier" => lookup_var_node(program, ctx, source, node),
         "pointer_expression" => {
@@ -13968,7 +14067,7 @@ fn resolve_expr_var(
         }
         "field_expression" | "subscript_expression" => {
             static_member_access(program, ctx, source, node).or_else(|| {
-                node.child_by_field_name("argument")
+                node.cached_field("argument")
                     .and_then(|n| resolve_expr_var(program, ctx, source, n))
             })
         }
@@ -14117,7 +14216,7 @@ fn lookup_var_node(
     node: Node,
 ) -> Option<VarId> {
     let text = node_text(source, &node);
-    match node.kind() {
+    match node.cached_kind() {
         "identifier" => lookup_var(ctx, program, text),
         // Only a spelling with whitespace (`a :: b`, from a macro) needs
         // normalizing; `lookup_var`'s leaf pre-filter answers the rest.
@@ -14142,14 +14241,14 @@ fn static_member_access(
     source: &str,
     node: Node,
 ) -> Option<VarId> {
-    if node.kind() != "field_expression" {
+    if node.cached_kind() != "field_expression" {
         return None;
     }
-    let field = node_text(source, &node.child_by_field_name("field")?);
+    let field = node_text(source, &node.cached_field("field")?);
     if !program.symbols.has_scoped_variable_leaf(field) {
         return None;
     }
-    let recv = node.child_by_field_name("argument")?;
+    let recv = node.cached_field("argument")?;
     let cls = member_receiver_class(program, ctx, source, recv, is_arrow_access(node))?;
     find_in_class_or_bases(program, &cls, |cls| {
         scoped_variable_unless_hidden(program, ctx, &format!("{cls}::{field}"))
@@ -14191,7 +14290,7 @@ fn declaration_is_extern(source: &str, node: Node) -> bool {
         has_storage_specifier(source, decl, "extern")
             // `extern "C" T x;`, a linkage specification's one declaration
             // without braces, is `extern` too.
-            || decl.parent().is_some_and(|p| p.kind() == "linkage_specification")
+            || decl.parent().is_some_and(|p| p.cached_kind() == "linkage_specification")
     })
 }
 
@@ -14200,14 +14299,14 @@ fn declaration_is_extern(source: &str, node: Node) -> bool {
 fn has_storage_specifier(source: &str, decl: Node, keyword: &str) -> bool {
     let mut cursor = decl.walk();
     let found = decl.named_children(&mut cursor).any(|child| {
-        child.kind() == "storage_class_specifier" && node_text(source, &child) == keyword
+        child.cached_kind() == "storage_class_specifier" && node_text(source, &child) == keyword
     });
     found
 }
 
 /// Climb to the enclosing declaration node of one of `kinds`.
 fn enclosing_decl<'t>(mut node: Node<'t>, kinds: &[&str]) -> Option<Node<'t>> {
-    while !kinds.contains(&node.kind()) {
+    while !kinds.contains(&node.cached_kind()) {
         node = node.parent()?;
     }
     Some(node)
@@ -14216,12 +14315,12 @@ fn enclosing_decl<'t>(mut node: Node<'t>, kinds: &[&str]) -> Option<Node<'t>> {
 fn declaration_is_static(node: Node) -> bool {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() != "storage_class_specifier" {
+        if child.cached_kind() != "storage_class_specifier" {
             continue;
         }
         let mut inner = child.walk();
         for token in child.children(&mut inner) {
-            if token.kind() == "static" {
+            if token.cached_kind() == "static" {
                 return true;
             }
         }
@@ -14230,15 +14329,15 @@ fn declaration_is_static(node: Node) -> bool {
 }
 
 fn is_function_pointer_declarator(decl: Node) -> bool {
-    if decl.kind() != "function_declarator" {
+    if decl.cached_kind() != "function_declarator" {
         return false;
     }
-    let inner = match decl.child_by_field_name("declarator") {
+    let inner = match decl.cached_field("declarator") {
         Some(d) => d,
         None => return false,
     };
     if !matches!(
-        inner.kind(),
+        inner.cached_kind(),
         "parenthesized_declarator" | "pointer_declarator"
     ) {
         return false;
@@ -14252,7 +14351,7 @@ fn innermost_binding_kind(decl: Node) -> Option<&'static str> {
     let mut cur = decl;
     let mut last_binding_kind = None;
     loop {
-        match cur.kind() {
+        match cur.cached_kind() {
             "parenthesized_declarator" => match cur.named_child(0) {
                 Some(inner) => cur = inner,
                 None => return last_binding_kind,
@@ -14260,7 +14359,7 @@ fn innermost_binding_kind(decl: Node) -> Option<&'static str> {
             "pointer_declarator" | "pointer_type_declarator" => {
                 last_binding_kind = Some("pointer_declarator");
                 match cur
-                    .child_by_field_name("declarator")
+                    .cached_field("declarator")
                     .or_else(|| cur.named_child(0))
                 {
                     Some(inner) => cur = inner,
@@ -14270,7 +14369,7 @@ fn innermost_binding_kind(decl: Node) -> Option<&'static str> {
             "array_declarator" => {
                 last_binding_kind = Some("array_declarator");
                 match cur
-                    .child_by_field_name("declarator")
+                    .cached_field("declarator")
                     .or_else(|| cur.named_child(0))
                 {
                     Some(inner) => cur = inner,
@@ -14280,7 +14379,7 @@ fn innermost_binding_kind(decl: Node) -> Option<&'static str> {
             "reference_declarator" => {
                 last_binding_kind = Some("reference_declarator");
                 match cur
-                    .child_by_field_name("declarator")
+                    .cached_field("declarator")
                     .or_else(|| cur.named_child(0))
                 {
                     Some(inner) => cur = inner,
@@ -14289,17 +14388,17 @@ fn innermost_binding_kind(decl: Node) -> Option<&'static str> {
             }
             "function_declarator" => {
                 last_binding_kind = Some("function_declarator");
-                match cur.child_by_field_name("declarator") {
+                match cur.cached_field("declarator") {
                     Some(inner) => cur = inner,
                     None => return last_binding_kind,
                 }
             }
-            "init_declarator" => match cur.child_by_field_name("declarator") {
+            "init_declarator" => match cur.cached_field("declarator") {
                 Some(inner) => cur = inner,
                 None => return last_binding_kind,
             },
             "qualified_identifier" => {
-                if let Some(name) = cur.child_by_field_name("name") {
+                if let Some(name) = cur.cached_field("name") {
                     if qualified_name_has_pointer(name) {
                         cur = name;
                         continue;
@@ -14310,7 +14409,7 @@ fn innermost_binding_kind(decl: Node) -> Option<&'static str> {
             "identifier" | "field_identifier" | "destructor_name" | "operator_name"
             | "operator_cast" => return last_binding_kind,
             _ => {
-                if let Some(inner) = cur.child_by_field_name("declarator") {
+                if let Some(inner) = cur.cached_field("declarator") {
                     cur = inner;
                 } else {
                     return last_binding_kind;
@@ -14322,8 +14421,8 @@ fn innermost_binding_kind(decl: Node) -> Option<&'static str> {
 
 fn qualified_name_has_pointer(mut node: Node) -> bool {
     loop {
-        match node.kind() {
-            "qualified_identifier" => match node.child_by_field_name("name") {
+        match node.cached_kind() {
+            "qualified_identifier" => match node.cached_field("name") {
                 Some(name) => node = name,
                 None => return false,
             },
@@ -14343,15 +14442,15 @@ fn fn_decl_under_pointer(decl: Node) -> Option<(Node, usize, bool)> {
     let mut depth = 0usize;
     let mut reference = false;
     loop {
-        match cur.kind() {
+        match cur.cached_kind() {
             "pointer_declarator" => {
                 depth += 1;
                 cur = cur
-                    .child_by_field_name("declarator")
+                    .cached_field("declarator")
                     .or_else(|| cur.named_child(0))?;
             }
             "parenthesized_declarator" | "reference_declarator" => {
-                reference |= cur.kind() == "reference_declarator";
+                reference |= cur.cached_kind() == "reference_declarator";
                 cur = cur.named_child(0)?;
             }
             "function_declarator" => {
@@ -14389,9 +14488,9 @@ fn type_desc_from_node(
     node: Node,
 ) -> TypeDesc {
     let node = peel_cpp_type_node(node);
-    if node.kind() == "struct_specifier" || node.kind() == "union_specifier" {
+    if node.cached_kind() == "struct_specifier" || node.cached_kind() == "union_specifier" {
         let name = lower_struct_specifier(program, ctx, source, node);
-        if node.kind() == "union_specifier" {
+        if node.cached_kind() == "union_specifier" {
             return TypeDesc::Union {
                 name,
                 fields: Vec::new(),
@@ -14402,7 +14501,7 @@ fn type_desc_from_node(
             fields: Vec::new(),
         };
     }
-    if node.kind() == "class_specifier" {
+    if node.cached_kind() == "class_specifier" {
         let name = lower_struct_specifier(program, ctx, source, node);
         return TypeDesc::Struct {
             name,
@@ -14410,12 +14509,12 @@ fn type_desc_from_node(
         };
     }
     if matches!(
-        node.kind(),
+        node.cached_kind(),
         "qualified_identifier" | "type_identifier" | "template_type" | "placeholder_type_specifier"
     ) {
         let text = node_text(source, &node);
         let raw = normalize_qualified(text);
-        if node.kind() == "placeholder_type_specifier" {
+        if node.cached_kind() == "placeholder_type_specifier" {
             // `auto`: unknown until the initializer is examined; callers
             // refine supported initializers separately.
             return TypeDesc::Unknown;
@@ -14570,9 +14669,9 @@ fn primitive_scalar_desc(text: &str) -> Option<TypeDesc> {
 }
 
 fn peel_cpp_type_node(node: Node) -> Node {
-    match node.kind() {
+    match node.cached_kind() {
         "type_descriptor" => node
-            .child_by_field_name("type")
+            .cached_field("type")
             .map(peel_cpp_type_node)
             .unwrap_or(node),
         "qualified_identifier"
@@ -14587,7 +14686,7 @@ fn peel_cpp_type_node(node: Node) -> Node {
             for i in 0..node.named_child_count() {
                 if let Some(c) = node.named_child(i) {
                     if matches!(
-                        c.kind(),
+                        c.cached_kind(),
                         "qualified_identifier" | "template_type" | "type_identifier"
                     ) {
                         return peel_cpp_type_node(c);
@@ -14608,8 +14707,8 @@ fn typedef_underlying_desc(
     source: &str,
     node: Node,
 ) -> Option<TypeDesc> {
-    let type_node = node.child_by_field_name("type")?;
-    let decl_node = node.child_by_field_name("declarator")?;
+    let type_node = node.cached_field("type")?;
+    let decl_node = node.cached_field("declarator")?;
     let base = type_desc_from_node(program, ctx, source, type_node);
     Some(walk_declarator_shape(decl_node, base))
 }
@@ -14620,20 +14719,20 @@ fn walk_declarator_shape(node: Node, base: TypeDesc) -> TypeDesc {
     // identifier. `int *t[4]` is an array of pointers, `void (*h[4])(void)` an
     // array of function pointers, `typedef void (*Name)(..)` a pointer to a
     // function and `typedef int f_t(int)` a bare function type.
-    let (inner, shaped) = match node.kind() {
+    let (inner, shaped) = match node.cached_kind() {
         "pointer_declarator" => (
-            node.child_by_field_name("declarator"),
+            node.cached_field("declarator"),
             TypeDesc::Ptr(Box::new(base)),
         ),
         "array_declarator" => (
-            node.child_by_field_name("declarator"),
+            node.cached_field("declarator"),
             TypeDesc::Array {
                 elem: Box::new(base),
                 size: None,
             },
         ),
         "function_declarator" => (
-            node.child_by_field_name("declarator"),
+            node.cached_field("declarator"),
             TypeDesc::FnPtr {
                 ret: Box::new(base),
                 params: Vec::new(),
@@ -14706,13 +14805,13 @@ fn conversion_operator_name(source: &str, node: Node) -> String {
     /// `operator void (*)() const` would name the member `operator void`,
     /// colliding with a real conversion to `void`.
     fn own_parameters(node: Node) -> Option<Node> {
-        let mut cur = node.child_by_field_name("declarator")?;
-        while cur.kind() != "abstract_function_declarator" {
+        let mut cur = node.cached_field("declarator")?;
+        while cur.cached_kind() != "abstract_function_declarator" {
             cur = cur
-                .child_by_field_name("declarator")
+                .cached_field("declarator")
                 .or_else(|| cur.named_child(0))?;
         }
-        cur.child_by_field_name("parameters").or(Some(cur))
+        cur.cached_field("parameters").or(Some(cur))
     }
     let end = own_parameters(node).map_or_else(|| node.end_byte(), |p| p.start_byte());
     // `normalize_spacing`, not `normalize_qualified`: the target's template
@@ -14852,9 +14951,9 @@ fn strip_own_scopes(text: &str, prefixes: &[String]) -> String {
 fn fabricated_qualified_name(node: Node) -> Option<usize> {
     fn repaired_at(n: Node) -> Option<usize> {
         if n.children(&mut n.walk())
-            .any(|c| c.kind() == "::" && c.is_missing())
+            .any(|c| c.cached_kind() == "::" && c.is_missing())
         {
-            return n.child_by_field_name("name").map(|x| x.start_byte());
+            return n.cached_field("name").map(|x| x.start_byte());
         }
         // Only an `ERROR` standing where the recovery puts it: between the
         // leftover type and the `::` that joins them, which is the one thing
@@ -14863,13 +14962,15 @@ fn fabricated_qualified_name(node: Node) -> Option<usize> {
         // `EXPORT C::operator int()` parks the `operator` keyword there (see
         // `conversion_keyword_error`), and taking it would cut the class off
         // the front of the name and send the definition to global scope.
-        let scope_end = n.child_by_field_name("scope")?.end_byte();
+        let scope_end = n.cached_field("scope")?.end_byte();
         let sep = n
             .children(&mut n.walk())
-            .find(|c| c.kind() == "::")?
+            .find(|c| c.cached_kind() == "::")?
             .start_byte();
         n.children(&mut n.walk())
-            .find(|c| c.kind() == "ERROR" && c.start_byte() >= scope_end && c.start_byte() < sep)
+            .find(|c| {
+                c.cached_kind() == "ERROR" && c.start_byte() >= scope_end && c.start_byte() < sep
+            })
             .map(|c| c.start_byte())
     }
     qualified_identifier_chain(node).find_map(repaired_at)
@@ -14884,8 +14985,8 @@ fn fabricated_qualified_name(node: Node) -> Option<usize> {
 /// `EXPORT ns::C::operator ns::S()` its stranded keyword two.
 fn qualified_identifier_chain<'a>(node: Node<'a>) -> impl Iterator<Item = Node<'a>> {
     std::iter::successors(Some(node), |n| {
-        n.child_by_field_name("name")
-            .filter(|c| c.kind() == "qualified_identifier")
+        n.cached_field("name")
+            .filter(|c| c.cached_kind() == "qualified_identifier")
     })
 }
 
@@ -14901,18 +15002,19 @@ fn qualified_identifier_chain<'a>(node: Node<'a>) -> impl Iterator<Item = Node<'
 /// A pointer target needs none of this: `MACRO operator int *() const;` keeps
 /// a real `operator_name` and only nests an `ERROR` inside it.
 fn conversion_keyword_error(node: Node) -> Option<Node> {
-    node.children(&mut node.walk())
-        .find(|c| c.kind() == "ERROR" && c.child(0).is_some_and(|k| k.kind() == "operator"))
+    node.children(&mut node.walk()).find(|c| {
+        c.cached_kind() == "ERROR" && c.child(0).is_some_and(|k| k.cached_kind() == "operator")
+    })
 }
 
 /// The `operator_cast` a declarator is, or ends in: `operator T` for an
 /// in-class definition, `A::B::operator T` for an out-of-class one.
 fn declarator_operator_cast(node: Node) -> Option<Node> {
     let mut cur = node;
-    while cur.kind() == "qualified_identifier" {
-        cur = cur.child_by_field_name("name")?;
+    while cur.cached_kind() == "qualified_identifier" {
+        cur = cur.cached_field("name")?;
     }
-    (cur.kind() == "operator_cast").then_some(cur)
+    (cur.cached_kind() == "operator_cast").then_some(cur)
 }
 
 /// The type a conversion operator converts to — its `operator_cast`'s `type`
@@ -14925,10 +15027,10 @@ fn conversion_target_type(
     source: &str,
     op: Node,
 ) -> Option<trace_ir::TypeId> {
-    let desc = type_desc_from_node(program, ctx, source, op.child_by_field_name("type")?);
+    let desc = type_desc_from_node(program, ctx, source, op.cached_field("type")?);
     let desc = abstract_declarator_shape(
         desc,
-        op.child_by_field_name("declarator"),
+        op.cached_field("declarator"),
         false,
         ReferenceLayer::Pointer,
     );
@@ -14961,16 +15063,14 @@ fn abstract_declarator_shape(
     let mut cur = declarator;
     let mut reference = false;
     while let Some(n) = cur {
-        cur = match n.kind() {
+        cur = match n.cached_kind() {
             "abstract_reference_declarator" if references == ReferenceLayer::Parameter => {
                 reference = true;
-                n.child_by_field_name("declarator")
-                    .or_else(|| n.named_child(0))
+                n.cached_field("declarator").or_else(|| n.named_child(0))
             }
             "abstract_pointer_declarator" | "abstract_reference_declarator" => {
                 desc = TypeDesc::Ptr(Box::new(desc));
-                n.child_by_field_name("declarator")
-                    .or_else(|| n.named_child(0))
+                n.cached_field("declarator").or_else(|| n.named_child(0))
             }
             "abstract_parenthesized_declarator" => n.named_child(0),
             "abstract_array_declarator" => {
@@ -14978,9 +15078,9 @@ fn abstract_declarator_shape(
                     elem: Box::new(desc),
                     size: None,
                 };
-                n.child_by_field_name("declarator")
+                n.cached_field("declarator")
             }
-            "abstract_function_declarator" => match n.child_by_field_name("declarator") {
+            "abstract_function_declarator" => match n.cached_field("declarator") {
                 // `operator void (*)()` — a declarator nested inside this
                 // one means the `(...)` belongs to the *target*, which is
                 // therefore a function type; the `(*)` that makes it
@@ -15020,11 +15120,11 @@ fn abstract_declarator_shape(
 }
 
 fn parse_declarator_name(source: &str, node: Node) -> (String, bool) {
-    match node.kind() {
+    match node.cached_kind() {
         "identifier" => (node_text(source, &node).to_string(), false),
         "pointer_declarator" => {
             if let Some(inner) = node
-                .child_by_field_name("declarator")
+                .cached_field("declarator")
                 .or_else(|| node.named_child(0))
             {
                 let (name, _) = parse_declarator_name(source, inner);
@@ -15039,7 +15139,7 @@ fn parse_declarator_name(source: &str, node: Node) -> (String, bool) {
         // child, not a `declarator` field (`&p` / `&&p`).
         "reference_declarator" => {
             if let Some(inner) = node
-                .child_by_field_name("declarator")
+                .cached_field("declarator")
                 .or_else(|| node.named_child(0))
             {
                 let (name, _) = parse_declarator_name(source, inner);
@@ -15088,7 +15188,7 @@ fn parse_declarator_name(source: &str, node: Node) -> (String, bool) {
         "operator_name" => (normalize_qualified(node_text(source, &node)), false),
         "operator_cast" => (conversion_operator_name(source, node), false),
         "function_declarator" => {
-            if let Some(inner) = node.child_by_field_name("declarator") {
+            if let Some(inner) = node.cached_field("declarator") {
                 parse_declarator_name(source, inner)
             } else {
                 (String::new(), false)
@@ -15099,11 +15199,11 @@ fn parse_declarator_name(source: &str, node: Node) -> (String, bool) {
             .map(|n| parse_declarator_name(source, n))
             .unwrap_or((String::new(), false)),
         "array_declarator" => node
-            .child_by_field_name("declarator")
+            .cached_field("declarator")
             .map(|n| parse_declarator_name(source, n))
             .unwrap_or((String::new(), false)),
         _ => {
-            if let Some(inner) = node.child_by_field_name("declarator") {
+            if let Some(inner) = node.cached_field("declarator") {
                 parse_declarator_name(source, inner)
             } else {
                 (node_text(source, &node).to_string(), false)
@@ -15287,8 +15387,8 @@ pub(crate) fn sanitize_type_name(arg: &str) -> String {
 }
 
 fn find_params(decl: Node) -> Option<Node> {
-    if decl.kind() == "function_declarator" {
-        return decl.child_by_field_name("parameters");
+    if decl.cached_kind() == "function_declarator" {
+        return decl.cached_field("parameters");
     }
     for i in 0..decl.child_count() {
         if let Some(child) = decl.child(i) {
@@ -15516,7 +15616,7 @@ mod index_window_tests {
             false,
             false,
             None,
-            &[],
+            &HeaderOrder::default(),
         )
         .unwrap();
         program
@@ -15689,7 +15789,7 @@ mod index_window_tests {
             false,
             false,
             None,
-            &[],
+            &HeaderOrder::default(),
         )
         .unwrap();
         assert!(
@@ -15738,7 +15838,7 @@ mod index_window_tests {
                 },
                 &IndexSourceCache::new(),
                 None,
-                &[],
+                &HeaderOrder::default(),
             );
             let global = unit
                 .variables
@@ -15774,7 +15874,7 @@ mod index_window_tests {
             &PreprocessOptions::new().with_include(dir.path().to_path_buf()),
             &IndexSourceCache::new(),
             None,
-            &[],
+            &HeaderOrder::default(),
         );
         assert!(ordinary.global_initializer_ranges.is_empty());
         assert!(ordinary.function_flow_ranges.is_empty());
@@ -15792,7 +15892,7 @@ mod index_window_tests {
             },
             &IndexSourceCache::new(),
             None,
-            &[],
+            &HeaderOrder::default(),
         );
         let global = unit
             .variables
@@ -15854,7 +15954,7 @@ mod index_window_tests {
                 },
                 &IndexSourceCache::new(),
                 None,
-                &[],
+                &HeaderOrder::default(),
             );
             let owner = unit
                 .functions
@@ -15890,6 +15990,69 @@ mod index_window_tests {
     }
 
     #[test]
+    fn header_merge_order_keeps_topology_then_unknown_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let mut graph = IncludeGraph::build(root.path(), &[], &[]);
+        let source = graph.root.join("unit.cpp");
+        let a = graph.root.join("a.h");
+        let b = graph.root.join("b.h");
+        let z = graph.root.join("z.h");
+        let c = graph.root.join("c.h");
+        let unknown = graph.root.join("unknown.h");
+        graph
+            .project_files
+            .extend([source.clone(), a.clone(), b.clone(), c.clone()]);
+        graph.add_preprocess_includes(&source, &[a.clone(), b.clone()]);
+        graph.add_preprocess_includes(&a, std::slice::from_ref(&c));
+        let order = HeaderOrder::new(&[c.clone(), b.clone(), a.clone()]);
+        let included = vec![z.clone(), a.clone(), unknown.clone(), source.clone()];
+        for types_only in [false, true] {
+            let actual = headers_to_merge(&graph, &order, &source, &included, types_only);
+            let expected = if types_only {
+                vec![b.as_path(), a.as_path(), unknown.as_path(), z.as_path()]
+            } else {
+                vec![
+                    c.as_path(),
+                    b.as_path(),
+                    a.as_path(),
+                    unknown.as_path(),
+                    z.as_path(),
+                ]
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn ordered_merge_does_not_reserve_an_indexing_worker() {
+        let jobs = 2;
+        let pool = index_pool(jobs).unwrap();
+        let items = [PathBuf::from("a.cpp"), PathBuf::from("b.cpp")];
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        index_in_window(
+            &pool,
+            &items,
+            jobs,
+            |_| {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                let deadline = Instant::now() + std::time::Duration::from_secs(1);
+                while peak.load(Ordering::SeqCst) < jobs && Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+            },
+            |_| {},
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            jobs,
+            "the waiting merge coordinator must not consume an indexing worker"
+        );
+    }
+
+    #[test]
     fn units_merge_in_order_while_workers_run_ahead_within_the_window() {
         let jobs = 4;
         let items: Vec<PathBuf> = (0..40).map(|i| PathBuf::from(format!("/u{i}.c"))).collect();
@@ -15898,32 +16061,31 @@ mod index_window_tests {
         let peak = AtomicUsize::new(0);
         let merged_count = AtomicUsize::new(0);
         let mut merged: Vec<usize> = Vec::new();
-        pool.install(|| {
-            index_in_window(
-                &items,
-                jobs,
-                |path| {
-                    let i: usize = path.to_str().unwrap()[2..]
-                        .trim_end_matches(".c")
-                        .parse()
-                        .unwrap();
-                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(now, Ordering::SeqCst);
-                    // The first unit is the straggler: everyone else finishes
-                    // long before it, and must not wait for it to be taken.
-                    let delay = if i == 0 { 40 } else { 1 };
-                    std::thread::sleep(std::time::Duration::from_millis(delay));
-                    // A worker can only be this far past the merge.
-                    assert!(i < merged_count.load(Ordering::SeqCst) + index_window(jobs));
-                    in_flight.fetch_sub(1, Ordering::SeqCst);
-                    i
-                },
-                |i| {
-                    merged.push(i);
-                    merged_count.fetch_add(1, Ordering::SeqCst);
-                },
-            )
-        });
+        index_in_window(
+            &pool,
+            &items,
+            jobs,
+            |path| {
+                let i: usize = path.to_str().unwrap()[2..]
+                    .trim_end_matches(".c")
+                    .parse()
+                    .unwrap();
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                // The first unit is the straggler: everyone else finishes
+                // long before it, and must not wait for it to be taken.
+                let delay = if i == 0 { 40 } else { 1 };
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                // A worker can only be this far past the merge.
+                assert!(i < merged_count.load(Ordering::SeqCst) + index_window(jobs));
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                i
+            },
+            |i| {
+                merged.push(i);
+                merged_count.fetch_add(1, Ordering::SeqCst);
+            },
+        );
         assert_eq!(merged, (0..40).collect::<Vec<_>>());
         assert!(
             peak.load(Ordering::SeqCst) >= 2,
@@ -15953,56 +16115,53 @@ mod index_window_tests {
         // A worker panics while the merge waits for its unit and the other
         // workers wait on the window.
         let worker = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pool.install(|| {
-                index_in_window(
-                    &items,
-                    jobs,
-                    |path| {
-                        let i = unit_of(path);
-                        assert!(i != 7, "unit 7 fails to index");
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                        i
-                    },
-                    |_| {},
-                )
-            })
+            index_in_window(
+                &pool,
+                &items,
+                jobs,
+                |path| {
+                    let i = unit_of(path);
+                    assert!(i != 7, "unit 7 fails to index");
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    i
+                },
+                |_| {},
+            )
         }));
         let message = panic_message(worker.unwrap_err());
         assert!(message.contains("unit 7 fails to index"), "{message}");
         // The merge panics while workers wait on the window ahead of it.
         let merge = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pool.install(|| {
-                index_in_window(
-                    &items,
-                    jobs,
-                    |path| unit_of(path),
-                    |i| assert!(i != 2, "unit 2 fails to merge"),
-                )
-            })
+            index_in_window(
+                &pool,
+                &items,
+                jobs,
+                |path| unit_of(path),
+                |i| assert!(i != 2, "unit 2 fails to merge"),
+            )
         }));
         let message = panic_message(merge.unwrap_err());
         assert!(message.contains("unit 2 fails to merge"), "{message}");
         // The pool is still usable afterwards.
         let mut merged = Vec::new();
-        pool.install(|| index_in_window(&items[..5], jobs, unit_of, |i| merged.push(i)));
+        index_in_window(&pool, &items[..5], jobs, unit_of, |i| merged.push(i));
         assert_eq!(merged, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
     fn empty_and_single_worker_inputs_complete() {
-        let pool = index_pool(2).unwrap();
+        let pool = index_pool(1).unwrap();
         let mut seen = Vec::new();
-        pool.install(|| index_in_window(&[], 2, |_| 0usize, |i| seen.push(i)));
+        index_in_window(&pool, &[], 2, |_| 0usize, |i| seen.push(i));
         assert!(seen.is_empty());
         let items = [PathBuf::from("/a.c"), PathBuf::from("/b.c")];
-        pool.install(|| {
-            index_in_window(
-                &items,
-                1,
-                |p| p.clone(),
-                |p| seen.push(p.to_str().unwrap().len()),
-            )
-        });
+        index_in_window(
+            &pool,
+            &items,
+            1,
+            |p| p.clone(),
+            |p| seen.push(p.to_str().unwrap().len()),
+        );
         assert_eq!(seen, vec![4, 4]);
     }
 }

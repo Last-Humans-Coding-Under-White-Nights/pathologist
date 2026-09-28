@@ -104,6 +104,9 @@ Databases exported before this feature have none of the four keys.
 
 ### Link targets
 
+GN inference uses these same tables; origin and precedence rules are
+defined in [Link targets and weak symbols](ANALYSIS.md#link-targets-and-weak-symbols).
+
 Link metadata is exported in every detail mode. Without link-target metadata,
 these tables are empty and symbol `target_id` values are `NULL`.
 
