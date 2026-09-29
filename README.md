@@ -119,14 +119,19 @@ analysis complete: 11442 functions, 25478 call edges, 25803 arg-flow edges -> tr
 SQLite export builds secondary indexes after loading rows, before committing
 and publishing the database, to reduce bulk insertion work.
 
-Normal indexing spills large preprocessed source text and LineMaps to temporary
-files and loads them as parsing needs them. Parsing workers run at most two
-units per worker (between 4 and 32 in total) ahead of the ordered merge, which
-limits queued IR without making a batch wait for its slowest unit. Temporary files are cleaned
-automatically; cached header expansions and the final merged program remain in
-memory. Type tables share immutable descriptors across cached headers and TUs
-while retaining local IDs and layouts. On Linux/glibc, indexing returns freed
-heap pages at phase boundaries. See [memory measurements](docs/MEMORY_PROFILE.md).
+Without build metadata, indexing spills large preprocessed source text
+and LineMaps to automatically cleaned temporary files and loads them for
+parsing. Discovery drops payloads that the settle pass must rebuild. After
+header lowering, settled TUs can release frozen header expansions and raw
+source copies before the ordered merge. Parsing workers run at most two units
+per worker (between 4 and 32 in total) ahead of that merge, limiting queued
+IR without making a batch wait for its slowest unit. Cached header type tables
+discard lowering-only indexes and layouts once their merge descriptors are
+ready. Type tables share immutable descriptors across headers and TUs while
+retaining local IDs. On Linux/glibc, indexing returns freed heap pages at phase
+boundaries and between ordered TU merge batches. See
+[memory measurements](docs/EVAL_REPORT.md#compacting-cached-header-type-tables--2026-09-28)
+and the [memory investigation](docs/MEMORY_PROFILE.md).
 
 **Examples**
 

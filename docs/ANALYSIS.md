@@ -707,11 +707,20 @@ values and exported data are unchanged. See [memory measurements](MEMORY_PROFILE
 Sharing also makes re-interning cheap: a table answers `intern_arc` for an
 allocation it already holds by address, without hashing the descriptor tree,
 and a header unit carries the descriptor each of its types merges as
-(`UnitIndex::merge_descs`), computed once rather than by every consumer. A
-descriptor that tag completion may rewrite (`Ptr(Struct { name, fields: [] })`)
-is answered from a small cache keyed by that spelling and validated against
-the tag's current id, its descriptor allocation and the aggregate-union count,
-so the answer changes exactly when the layout it names does. Internal-linkage
+(`UnitIndex::merge_descs`), computed once rather than by every consumer.
+
+After an unconfigured header unit prepares `merge_descs`, its type table is
+retained only for merging: it drops interning, pointer, canonicalization and
+tag indexes, plus field layouts. Consumers use the prepared descriptors, type
+IDs, aliases and class declaration sets; they must not intern into the
+compacted table or read its layouts. Header flow-ownership maps are also
+discarded on this path. Ordinary TU and configured-build tables remain mutable.
+
+For mutable tables, a descriptor that tag completion may rewrite
+(`Ptr(Struct { name, fields: [] })`) is answered from a small cache keyed by
+that spelling and validated against the tag's current id, its descriptor
+allocation and the aggregate-union count, so the answer changes exactly when
+the layout it names does. Internal-linkage
 function and file-static lookups are indexed by name and filtered by the
 asking file's scope, rather than walking every header of the scope per name.
 See the [Clang benchmark](PERFORMANCE_REVIEW.md#clang-source-benchmark-header-import-and-lowering).

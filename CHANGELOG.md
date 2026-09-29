@@ -31,6 +31,23 @@ in `docs/EVAL_REPORT.md`.
   lists, and no test-path walks per include-search candidate. Release builds
   use ThinLTO and one codegen unit.
 
+### Lower peak memory during unconfigured indexing
+
+- Discovery releases the text and `LineMap` of TUs that must be settled, and
+  indexing drops frozen header expansions and raw source copies once every TU
+  has a reusable payload and no exploration variant needs them.
+- Cached header type tables discard lowering-only indexes, tag caches, field
+  layouts, and flow ownership maps after preparing the descriptors used by
+  later merges. Ordered TU merge batches return freed glibc pages between
+  batches and at earlier phase boundaries. Job count and allocator selection
+  are unchanged.
+- On `ability_ability_runtime` with eight jobs and the standard Linux/glibc
+  allocator, the measured build based on `efcdba7` reduced process peak RSS
+  from 3,111 MiB to 1,811–1,826 MiB (41.3–41.8%). All 15 non-metadata SQLite
+  tables matched in the measured comparisons. Wall-time variation did not
+  establish a runtime change.
+  Conditions and intermediate measurements: [EVAL_REPORT.md](docs/EVAL_REPORT.md#compacting-cached-header-type-tables--2026-09-28).
+
 ### Solver string-literal memory cell exclusion and store requeue decoupling
 
 - **String literal memory cell exclusion**: `LocKind::StringLit` locations represent

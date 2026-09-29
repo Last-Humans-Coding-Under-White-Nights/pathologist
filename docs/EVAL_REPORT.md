@@ -229,6 +229,134 @@ Relative improvement is context, not the acceptance gate. These measurements
 establish the limit for the documented source build on this machine; they do not claim the default system-allocator
 release artifact meets the same limit.
 
+## Compacting cached header type tables — 2026-09-28
+
+This section and the following three memory sections record experiments on a
+build based on `efcdba7`, using `ability_ability_runtime` at `87e02b78de`.
+The figures compare successive memory changes to that build and corpus.
+
+The unconfigured indexing path retains 5,646 lowered header variants while
+merging translation units on `ability_ability_runtime`. Together they held
+702,558 type entries. A header's type table previously retained its mutable
+interning indexes, tag lookup tables, canonicalization cache, and completed
+field layouts through the entire TU merge. Once `merge_descs` has captured the
+descriptors needed for later merges, that path reads only type order, aliases,
+and class declaration sets from each header table. It now discards the
+lowering-only structures and the header's flow ownership range maps. Normal
+TU and configured-build type tables are unchanged. The consumer contract for
+compacted cached headers is in [Type storage](ANALYSIS.md#type-storage).
+
+Release build, standard Linux/glibc allocator, `--jobs 8`, minimal export,
+same corpus checkout and settings. `ru_maxrss` is the child process peak;
+phase RSS was sampled every 100 ms. Each row is a separate run:
+
+| Version | PCH phase peak | TU merge phase peak | Process peak RSS | Wall time |
+|---|---:|---:|---:|---:|
+| Before header compaction | 1,877 MiB | 2,156 MiB | 2,156 MiB | 138.4 s |
+| Compact cached header types, run 1 | 1,629 MiB | 1,810 MiB | 1,811 MiB | 130.2 s |
+| Compact cached header types, run 2 | 1,636 MiB | 1,826 MiB | 1,826 MiB | 142.1 s |
+
+Peak RSS fell 330–345 MiB (15.3–16.0%) against the measured baseline.
+The first changed run's output matched all 15 non-metadata SQLite tables by
+row count and SHA-256 of rows in rowid order; the second run matched the first.
+`cargo test --workspace --locked` passed. Wall time varied by 12 seconds
+between the two changed runs, so these samples do not establish a runtime
+change. Against the original 3,111 MiB baseline below, the combined peak
+reduction is 1,285–1,300 MiB (41.3–41.8%).
+
+## Releasing phase allocations and raw source copies — 2026-09-28
+
+The include-graph scan and sequential header warming leave temporary glibc
+pages behind. Trimming at those phase boundaries returns them before
+preprocessing grows the heap. After PCH and orphan headers are lowered, a run
+whose TUs all have settled cached sources can also release the include graph's
+raw source cache and the option sets retaining it. A caller-supplied source
+cache is preserved.
+
+Release build, standard Linux/glibc allocator, `--jobs 8`, same corpus. The
+first row is the 512-TU batch version in the section below:
+
+| Version | Process peak RSS | Wall time |
+|---|---:|---:|
+| 512-TU merge batches | 2,335–2,342 MiB | 117.2–119.6 s |
+| Also trim after graph scan and header warming | 2,208 MiB | 116.9 s |
+| Also release raw source copies | 2,164 MiB | 115.4 s |
+
+Together these changes saved another 171–178 MiB (7.3–7.6%) versus the
+batched version, with no slowdown observed in these runs. All 15 non-metadata
+SQLite tables matched between the latter two runs.
+
+## Returning worker pages between TU merge batches — 2026-09-28
+
+After releasing the frozen expansion cache (section below), peak RSS on
+`ability_ability_runtime` moved to the late translation-unit merge. The
+normal Linux/glibc run held about 2.59 GiB at that point. Header IR contained
+5,646 lowered variants with 702,558 type entries; the merged Program held
+1,490,449 variables and 713,526 call sites. The merge now processes TUs in
+ordered groups of 512 and calls `malloc_trim(0)` after each group, when all
+index workers are idle. This returns released AST and temporary IR pages before
+later groups grow the Program. Merge order and facts are unchanged.
+
+Release build, `analyze /home/sergei/ability_ability_runtime --jobs 8` on the
+same `87e02b78de` checkout as below; `ru_maxrss` from the child process and
+100 ms phase RSS samples. Two independent runs of the new version:
+
+| Version | Preprocess peak | TU merge peak | Process peak RSS | Wall time |
+|---|---:|---:|---:|---:|
+| Before batching | 2,333–2,340 MiB | 2,591–2,593 MiB | 2,591–2,593 MiB | 117.2–120.7 s |
+| 512-TU batches with trim | 2,334–2,342 MiB | 2,204–2,205 MiB | 2,335–2,342 MiB | 117.2–119.6 s |
+
+The additional process-peak reduction is 251–258 MiB (9.7–10.0%). The peak is
+now in preprocessing, so smaller merge batches cannot lower overall RSS on
+this corpus. Against the original 3,111 MiB baseline below, the combined
+reduction is 769–776 MiB (24.7–24.9%). All 15 non-metadata SQLite tables in
+both batched runs matched the previous version by row count and SHA-256 of
+rows in rowid order; `cargo test --workspace --locked` passed.
+
+An optional glibc allocator setting can lower RSS further for this workload:
+`MALLOC_ARENA_MAX=8` with `--jobs 8` measured 2,120 MiB peak and 131.4 seconds
+wall time, versus 2,335–2,342 MiB and 117.2–119.6 seconds with the default
+allocator. All 15 non-metadata tables still matched. This trades about 9% less
+memory for roughly 10% more time, so it is not set automatically. A cap of two
+arenas was much slower: discovery plus settle rose from about 30 seconds to
+107.4 seconds, and merging was still running after five minutes. That run was
+stopped before completion.
+
+## Releasing discarded source payloads and frozen header expansions — 2026-09-28
+
+On `ability_ability_runtime` at `87e02b78de` (3,450 TUs), the discovery pass
+retained the text and `LineMap` of every committed TU until the pass ended. The 1,909 TUs that
+expanded headers were then evicted and preprocessed again during settling; their
+first payloads were never parsed. Discovery now keeps only their include and
+variant provenance at commit. After PCH and orphan headers have been lowered,
+the frozen header-expansion cache is released before TU merging when every TU
+has a reusable settled payload and exploration will not re-preprocess it.
+The cache remains available when either condition is false. The source-lifetime
+rules are in [PREPROCESSOR.md](PREPROCESSOR.md#linemap).
+
+Release build, `analyze /home/sergei/ability_ability_runtime --jobs 8` with
+minimal export on this Linux x86-64 host. Peak RSS was sampled from
+`/proc/<pid>/status` every 100 ms by phase; the baseline process peak is also
+from `/usr/bin/time -v`. Each row is a separate run on the same checkout and
+machine; phase peaks need not occur at the process peak.
+
+| Version | Preprocess phase peak | TU merge phase peak | Process peak RSS | Wall time |
+|---|---:|---:|---:|---:|
+| Baseline | 3,011 MiB (sampled in a second baseline run) | — | 3,111 MiB (`time -v`) | 119.4 s |
+| Release discarded TU payloads | 2,325 MiB | 2,968 MiB | 2,968 MiB sampled | 109.8 s |
+| Also release frozen expansion cache, two runs | 2,333–2,340 MiB | 2,591–2,593 MiB | 2,591–2,593 MiB (second run: `ru_maxrss`) | 117.2–120.7 s |
+
+The discarded-payload change reduces the preprocessing peak by 686 MiB
+(22.8%). Releasing the expansion cache then reduces the process peak by a
+further 375–378 MiB (12.6–12.7%). The combined change reduces measured process
+peak by 518–520 MiB (16.6–16.7%) against baseline. Preprocessing and total runtime vary
+with discovery scheduling and disk cache state, so these runs establish memory
+impact rather than a runtime speedup. All 15 non-metadata SQLite tables were
+identical between baseline and each changed run, including the repeated final
+run (row count and SHA-256 of rows in rowid order); function, flow, edge, and
+arg-flow counts were unchanged.
+`cargo test --workspace --locked` and `cargo fmt --all --check` passed.
+
 ## Solver string-literal memory cell exclusion and store requeue decoupling — 2026-09-28
 
 String literals (`LocKind::StringLit`) interned for dynamic symbol resolution (`dlsym`)

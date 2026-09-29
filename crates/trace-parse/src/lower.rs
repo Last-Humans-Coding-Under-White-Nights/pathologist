@@ -466,6 +466,9 @@ fn build_program_inner(
         include_graph.project_files.len(),
         include_graph.edges.values().map(|v| v.len()).sum::<usize>()
     ));
+    // Graph discovery has finished its parallel source scans. Return their
+    // temporary allocations before retaining header and TU expansions.
+    crate::memory::reclaim_unused_pages();
     let file_order = include_graph.index_order(&files);
 
     let basename_index = Arc::new(include_graph.basename_index.clone());
@@ -674,6 +677,9 @@ fn build_program_inner(
         }
     }
 
+    // Header warming is sequential; its temporary preprocess allocations
+    // are no longer needed when the parallel TU discovery starts.
+    crate::memory::reclaim_unused_pages();
     let reachable_from_c = include_graph.reachable_from(&c_sources);
     let cpp_parse: Arc<HashSet<PathBuf>> = Arc::new(include_graph.reachable_from(&cpp_tus));
     // See `index_language`: with no C translation unit in the tree, a `.h`
@@ -695,7 +701,7 @@ fn build_program_inner(
     // therefore expands the header into its own text — so discovery writes
     // the cache and its texts are thrown away, and every text that reaches
     // the parser comes from the frozen pass below.
-    let index_opts: HashMap<Language, PreprocessOptions> = [Language::C, Language::Cpp]
+    let mut index_opts: HashMap<Language, PreprocessOptions> = [Language::C, Language::Cpp]
         .into_iter()
         .map(|l| {
             let o = eff_opts
@@ -752,9 +758,9 @@ fn build_program_inner(
     // which is what turns an inlined body back into a shared one.
     let dirty: HashSet<PathBuf> = source_cache.units_that_inlined(&tu_paths);
     source_cache.evict_all(&dirty);
-    // Discovery keeps every text resident until the pass is over. The units
-    // that stand are spilled here, in parallel; the dirty ones are spilled by
-    // the settle pass that rebuilds them, so nothing is written twice.
+    // Discovery already released text for units that expanded headers: their
+    // runs must be settled and will never be parsed. Spill the standing runs
+    // here; the settle pass spills the rebuilt dirty units.
     pool.install(|| {
         file_order
             .par_iter()
@@ -1083,6 +1089,30 @@ fn build_program_inner(
         );
     }
 
+    // Every expansion needed by a header has been lowered, and orphan
+    // headers have finished. Ordinary TUs now read their settled payloads
+    // from `source_cache`, so keeping every header expansion beside the
+    // growing merged Program only raises the peak. Keep the cache if a TU
+    // must still preprocess or exploration may generate new variants.
+    if gn_candidates.is_none() && source_cache.has_indexable_sources(&file_order, &include_graph) {
+        include_expansion_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        if opts.source_cache.is_none() {
+            // Graph discovery kept raw copies of every source for fast
+            // preprocessing. The headers have been lowered and every TU has
+            // a settled payload, so none of the remaining work reads them.
+            for config in index_opts.values_mut() {
+                config.source_cache = None;
+            }
+            drop(discover_opts);
+            drop(eff_opts);
+            include_graph.source_cache.clear();
+        }
+        crate::memory::reclaim_unused_pages();
+    }
+
     if jobs == 1 {
         pool.install(|| {
             for (i, path) in file_order.iter().enumerate() {
@@ -1120,31 +1150,37 @@ fn build_program_inner(
             }
         });
     } else {
-        index_in_window(
-            &pool,
-            &file_order,
-            jobs,
-            |path| {
-                let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
-                let units = index_source_file_with_variants(
-                    path,
-                    root,
-                    &include_graph,
-                    &index_opts[&lang],
-                    &source_cache,
-                    Some(&header_ir),
-                    &header_order,
-                    gn_candidates.as_ref(),
-                    &base_defines,
-                    opts.explore_budget,
-                );
-                // Header provenance and PCH construction are complete.
-                // Keep the source through variant generation, then release it.
-                source_cache.evict(path, &include_graph);
-                units
-            },
-            |(base_unit, var_units)| merge_unit_variants(&mut program, &base_unit, &var_units),
-        );
+        for batch in file_order.chunks(512) {
+            index_in_window(
+                &pool,
+                batch,
+                jobs,
+                |path| {
+                    let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
+                    let units = index_source_file_with_variants(
+                        path,
+                        root,
+                        &include_graph,
+                        &index_opts[&lang],
+                        &source_cache,
+                        Some(&header_ir),
+                        &header_order,
+                        gn_candidates.as_ref(),
+                        &base_defines,
+                        opts.explore_budget,
+                    );
+                    // Header provenance and PCH construction are complete.
+                    // Keep the source through variant generation, then release it.
+                    source_cache.evict(path, &include_graph);
+                    units
+                },
+                |(base_unit, var_units)| merge_unit_variants(&mut program, &base_unit, &var_units),
+            );
+            // All workers finished this batch. Return their released AST
+            // and temporary-IR pages before the next batch grows the
+            // merged Program further.
+            crate::memory::reclaim_unused_pages();
+        }
     }
 
     program.types.complete_nested_tags();
@@ -2157,6 +2193,13 @@ fn index_header_variant(
             // A header's unit is merged into every unit below it; a TU's
             // once, which the precomputation would not pay for.
             unit.merge_descs = crate::merge::merge_descs_of(&unit.types);
+            // Subsequent PCH waves and TUs only read these merge descriptors,
+            // type IDs, aliases and declaration sets from a cached header.
+            unit.types.compact_for_header_merge();
+            // Flow ownership ranges are used by link-target selection, not
+            // by the unconfigured header preamble merge.
+            unit.function_flow_ranges = HashMap::default();
+            unit.global_initializer_ranges = HashMap::default();
             unit
         }
         Err(e) => UnitIndex {

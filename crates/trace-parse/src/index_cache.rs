@@ -327,6 +327,21 @@ impl IndexSourceCache {
         }
     }
 
+    /// Whether every translation unit can be lowered from its already
+    /// preprocessed payload, without consulting the expansion cache again.
+    pub(crate) fn has_indexable_sources(&self, paths: &[PathBuf], graph: &IncludeGraph) -> bool {
+        let canonical: Vec<_> = paths.iter().map(|path| graph.intern_path(path)).collect();
+        let Ok(guard) = self.inner.read() else {
+            return false;
+        };
+        canonical.iter().all(|path| {
+            matches!(
+                guard.get(path),
+                Some(CachedSource::Resident(_) | CachedSource::Spilled(_))
+            )
+        })
+    }
+
     /// Preprocess `path` without storing the result here, for the side
     /// effects carried by `eff_opts` (include-expansion cache, shared macro
     /// table) and for what the run reported. The warm pass uses it for the

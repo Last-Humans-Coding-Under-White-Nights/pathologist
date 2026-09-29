@@ -635,6 +635,22 @@ impl TypeTable {
         &self.types
     }
 
+    /// Shed indexes and layouts after a header has finished lowering and its
+    /// merge descriptors have been prepared. A cached header is subsequently
+    /// only read by `merge_types`: it needs descriptor order, aliases, and
+    /// class declaration sets, but never interns into this table or examines
+    /// its layouts again. The ordinary `TypeTable` in a Program stays mutable.
+    pub fn compact_for_header_merge(&mut self) {
+        self.intern = IndexMap::default();
+        self.by_ptr = ByAddress::default();
+        self.canonical = CanonicalCache::default();
+        self.struct_tags = FxHashMap::default();
+        self.union_tags = FxHashMap::default();
+        for info in &mut self.types {
+            info.layout.fields = IndexMap::new();
+        }
+    }
+
     pub fn compute_struct_layout(
         &mut self,
         name: String,
