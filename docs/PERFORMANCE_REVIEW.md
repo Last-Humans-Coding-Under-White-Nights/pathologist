@@ -1,5 +1,9 @@
 # Performance and memory review
 
+This is a historical review of the 2026-09-15 implementation. The current
+parallel discovery protocol is described in [PREPROCESSOR.md](PREPROCESSOR.md#parallel-discovery-88),
+and later large-corpus memory measurements are in [EVAL_REPORT.md](EVAL_REPORT.md#compacting-cached-header-type-tables--2026-09-28).
+
 For measured ownership, allocator retention, and the largest remaining memory
 targets, see [Memory ownership investigation](MEMORY_PROFILE.md).
 

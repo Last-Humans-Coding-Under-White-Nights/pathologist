@@ -221,15 +221,23 @@ Semantics — a fallback is a definition of last resort, never an answer to
 The normal indexing path stores preprocessed source payloads larger than 512 KiB
 (text plus allocated LineMap entry storage) in automatically cleaned temporary
 files once discovery and settling are done, and only for sources that are read
-back: a unit the settle pass rebuilds is spilled by the settle pass alone, and
-a warmed header that is not indexed on its own drops its text without a file.
+back. Discovery immediately drops the text and LineMap of a unit that expanded
+a header: settling must rebuild that unit, so the discovery payload is never
+parsed. The settle pass spills the rebuilt payload alone, and a warmed header
+that is not indexed on its own drops its text without a file.
 Include provenance, variants, conditionals,
 diagnostics, and original paths remain in memory. Parsing loads the original
-payload without rerunning preprocessing; cached header expansions are unchanged.
+payload without rerunning preprocessing; cache hits retain the same expansion
+contents and source mappings.
 Temporary storage uses the OS temporary directory and may reside on a tmpfs.
 Spill/load errors fail indexing with a diagnostic rather than changing source
-contents. This limits retained source payloads, not the final IR or expansion
-cache, and trades temporary-file I/O for lower process RSS.
+contents. Once header and orphan units have been lowered, the frozen expansion
+cache is released before translation-unit merging when every TU has a usable
+settled payload and no exploration variant will re-preprocess it. The include
+graph's raw source copies are also released then when indexing owns that cache;
+a caller-supplied source cache remains available. This limits
+retained source and expansion payloads, not the final IR, and trades
+temporary-file I/O for lower process RSS.
 
 Cache composition appends origin mappings only within each live output chunk's
 half-open byte interval. Both interval endpoints are found by binary search;
@@ -308,8 +316,8 @@ Before any text reaches the parser, every translation unit is preprocessed once 
 **writable** expansion cache (the discovery pass), so that the macro environments the tree
 actually presents at each `#include` end up stored and shared; units that expanded a header
 themselves are then re-run against the frozen result (the settle pass). Discovery used to run one
-unit at a time on the main thread. It now runs on the worker pool and leaves the cache, and every
-unit's text, byte-for-byte as the one-at-a-time pass in `index_order` does.
+unit at a time on the main thread. It now runs on the worker pool and produces the same cache and
+unit text as the one-at-a-time pass in `index_order`; discarded unit text is released after commit.
 
 **The cache key.** The cache maps `(canonical path, language)` to that header's **variants**: the
 expansions stored so far, in publication order, at most `max_expansion_variants` of them. A variant

@@ -42,8 +42,8 @@ The pipeline is also exposed programmatically via `trace-capi` (`libtrace_capi`)
 ## Translation units and headers
 
 - **Indexed TUs**: `*.c` and `*.cpp`-family files under `<TARGET>`. Each TU selects the tree-sitter C or C++ grammar by extension.
-- **Headers**: discovered for the include graph but **not** lowered as standalone TUs. Their declarations appear in preprocessed `.c` output.
-- **Orphan headers** (never `#include`d by any project `.c`) are skipped — they contribute no reachable code.
+- **Headers**: discovered for the include graph and lowered into cached header units for expansion variants consumed by TUs. Their declarations are merged into each receiving TU before its own source is lowered.
+- **Orphan headers** (not reached by a project TU) are lowered separately and merged into the program.
 - **Cross-TU linking**: external symbols merged by name in `merge_unit_index` (`fn_by_name`), or per link image in `merge_linked_units` when build metadata is available (see [ANALYSIS.md](ANALYSIS.md#link-targets-and-weak-symbols)). **`static` / internal-linkage** functions remain **per-file** and are resolved with `resolve_function_in_scope(name, file)` at analysis time; file-scope `static` variables are looked up with `SymbolTable::file_static_named`, in the file and the headers it includes.
 
 ## Crate dependencies
@@ -131,9 +131,9 @@ Indirect call sites **without** resolved edges are still exported in `call_sites
 
 | Phase | Parallelism |
 |-------|-------------|
-| Preprocess: discovery | **Serial**, deliberately: the one pass that writes the shared expansion cache while reading it, so whichever unit reaches a header first decides that entry's content and ordering the writes is what makes the result reproducible (#83) |
+| Preprocess: discovery | `--jobs N` workers; cache journals publish in deterministic TU order, independent of worker completion order ([details](PREPROCESSOR.md#parallel-discovery-88)) |
 | Preprocess: settle | `--jobs N` (rayon) against the frozen cache; re-runs only the units that expanded something |
-| Parse + lower | `--jobs N` per-TU indexing, deterministic merge order |
+| Parse + lower | Parallel header waves and `--jobs N` per-TU indexing; deterministic merge order |
 | Analysis + export | Single-threaded whole-program |
 
 Default job count: logical CPU count.

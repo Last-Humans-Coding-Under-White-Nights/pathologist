@@ -301,13 +301,28 @@ impl Board<'_> {
 }
 
 impl Discovery<'_> {
+    /// A unit that expanded a header must be settled against the frozen
+    /// expansion cache. Its discovery text is never parsed, so retain only
+    /// the provenance needed to identify and settle it.
+    fn store_committed(&self, path: &Path, src: PreprocessedSource) {
+        let needs_settle = !src.inlined_headers.is_empty();
+        self.sources.insert(path, self.graph, src);
+        if needs_settle {
+            self.sources.release_text(path, self.graph);
+        }
+    }
+
     pub(crate) fn run(&self, pool: &rayon::ThreadPool, jobs: usize) -> DiscoveryStats {
         let n = self.units.len();
         if jobs == 1 || n <= 1 {
             // The serial pass itself: there is nothing to schedule.
             for path in self.units {
                 let opts = &self.opts[&(self.language)(path)];
-                let _ = self.sources.get_or_preprocess(path, self.graph, opts);
+                if let Ok(src) = self.sources.get_or_preprocess(path, self.graph, opts) {
+                    if !src.inlined_headers.is_empty() {
+                        self.sources.release_text(path, self.graph);
+                    }
+                }
             }
             return DiscoveryStats {
                 discarded: 0,
@@ -447,9 +462,7 @@ impl Pass<'_> {
                     .as_ref()
                     .is_none_or(|j| src.commit(j, discovery.expansions))
                 {
-                    discovery
-                        .sources
-                        .insert(&discovery.units[unit], discovery.graph, src);
+                    discovery.store_committed(&discovery.units[unit], src);
                     (Some(run), None)
                 } else {
                     self.update(|board| {
@@ -485,7 +498,7 @@ impl Pass<'_> {
                 "a run shown nothing ahead commits against a cache only this thread writes"
             );
         }
-        discovery.sources.insert(path, discovery.graph, src);
+        discovery.store_committed(path, src);
         journal
     }
 }

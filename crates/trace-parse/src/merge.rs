@@ -1776,6 +1776,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compact_header_types_keep_completed_layouts_for_merge() {
+        let mut header = trace_ir::TypeTable::new();
+        let outer = header.intern(tag(
+            "Outer",
+            vec![("inner".into(), tag("Inner", Vec::new()))],
+        ));
+        header.intern(tag("Inner", vec![int_field("x")]));
+        header.register_alias("OuterAlias", tag("Outer", Vec::new()));
+        header.complete_nested_tags();
+
+        let mut full = trace_ir::TypeTable::new();
+        let full_map = merge_types(&mut full, &header, false, None);
+        let merge_descs = merge_descs_of(&header);
+        header.compact_for_header_merge();
+
+        let mut compact = trace_ir::TypeTable::new();
+        let compact_map = merge_types(&mut compact, &header, false, Some(&merge_descs));
+        assert_eq!(compact_map, full_map);
+        assert_eq!(format!("{:?}", compact.all()), format!("{:?}", full.all()));
+        assert_eq!(
+            compact.resolve_alias("OuterAlias"),
+            full.resolve_alias("OuterAlias")
+        );
+        assert_eq!(
+            compact.get(remap_type(outer, &compact_map)).desc.as_ref(),
+            &tag(
+                "Outer",
+                vec![("inner".into(), tag("Inner", vec![int_field("x")]))]
+            )
+        );
+    }
+
     /// A struct spelled with other fields under the same name is a different
     /// type, shortcut or not.
     #[test]
