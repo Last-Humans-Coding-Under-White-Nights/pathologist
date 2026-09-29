@@ -169,6 +169,7 @@ struct SearchPaths {
     quote: Vec<PathBuf>,
     include: Vec<PathBuf>,
     system: Vec<PathBuf>,
+    after: Vec<PathBuf>,
     inferred: Vec<PathBuf>,
     root: Option<PathBuf>,
     test_partition: trace_ir::TestPartition,
@@ -194,6 +195,7 @@ impl SourceCache {
             quote: opts.quote_include_paths.clone(),
             include: opts.include_paths.clone(),
             system: opts.system_include_paths.clone(),
+            after: opts.after_include_paths.clone(),
             inferred: opts.inferred_include_paths.clone(),
             root: opts.inference_root.clone(),
             test_partition: opts.test_partition.clone(),
@@ -333,6 +335,9 @@ pub struct PreprocessOptions {
     /// Explicit compilation database path; otherwise indexing checks the
     /// analysis root, then its `build` directory.
     pub compilation_database: Option<PathBuf>,
+    /// Query a compiler for its effective system header search paths during
+    /// indexing. Off by default; explicit system paths remain available.
+    pub system_includes: bool,
     /// Link database path; otherwise indexing discovers root/build metadata.
     pub link_commands: Option<PathBuf>,
     /// Indexing-only: retain weak body/initializer ownership for link selection.
@@ -348,6 +353,11 @@ pub struct PreprocessOptions {
     pub quote_include_paths: Vec<PathBuf>,
     /// System directories follow `include_paths`, in supplied order.
     pub system_include_paths: Vec<PathBuf>,
+    /// Selected target/hosted macros reported by the compiler include probe.
+    /// Command macro operations and explicit `defines` may override these.
+    pub compiler_defines: indexmap::IndexMap<String, String>,
+    /// `-idirafter` directories follow compiler and explicit system paths.
+    pub after_include_paths: Vec<PathBuf>,
     /// Use compiler include semantics, without inferred basename fallback.
     pub strict_include_search: bool,
     /// Database macro operations, applied after predefines and before `defines`.
@@ -364,6 +374,9 @@ pub struct PreprocessOptions {
     /// Shared cache of expanded `#include` bodies keyed by canonical path
     /// and lexing language (see [`ExpansionKey`]).
     pub include_expansion_cache: Option<ExpansionCache>,
+    /// Headers eligible for separate cached units when include bodies are not
+    /// inlined. Other headers remain in their including unit's text.
+    pub separate_header_paths: Option<Arc<FxHashSet<PathBuf>>>,
     /// Basename → project paths for fast include resolution.
     pub basename_index: Option<Arc<FxHashMap<String, Vec<PathBuf>>>>,
     /// Shared macro table populated during header warm-up; inherited by translation units.
@@ -444,6 +457,7 @@ impl Default for PreprocessOptions {
     fn default() -> Self {
         Self {
             compilation_database: None,
+            system_includes: false,
             link_commands: None,
             record_link_ownership: false,
             include_paths: Vec::new(),
@@ -452,6 +466,8 @@ impl Default for PreprocessOptions {
             test_partition: trace_ir::TestPartition::default(),
             quote_include_paths: Vec::new(),
             system_include_paths: Vec::new(),
+            compiler_defines: indexmap::IndexMap::new(),
+            after_include_paths: Vec::new(),
             strict_include_search: false,
             command_macros: Vec::new(),
             forced_includes: Vec::new(),
@@ -459,6 +475,7 @@ impl Default for PreprocessOptions {
             defines: indexmap::IndexMap::new(),
             source_cache: None,
             include_expansion_cache: None,
+            separate_header_paths: None,
             basename_index: None,
             shared_macros: None,
             accumulate_macros: false,
@@ -494,6 +511,9 @@ impl PreprocessOptions {
             || !self.forced_includes.is_empty()
             || !self.quote_include_paths.is_empty()
             || !self.system_include_paths.is_empty()
+            || !self.compiler_defines.is_empty()
+            || !self.after_include_paths.is_empty()
+            || self.system_includes
             || self.strict_include_search
     }
 
@@ -568,6 +588,13 @@ impl PreprocessOptions {
     #[must_use]
     pub fn with_compilation_database(mut self, path: impl Into<PathBuf>) -> Self {
         self.compilation_database = Some(path.into());
+        self
+    }
+
+    /// Enable or disable compiler system-header search path discovery.
+    #[must_use]
+    pub fn with_system_includes(mut self, enabled: bool) -> Self {
+        self.system_includes = enabled;
         self
     }
 

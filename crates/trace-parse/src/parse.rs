@@ -1,5 +1,7 @@
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use trace_preproc::LineMap;
 use tree_sitter::{Node, Parser, Tree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +61,158 @@ pub fn parse_source_with_lang(
 
 pub fn parse_c_source(source: impl Into<Arc<str>>) -> Result<ParseResult, String> {
     parse_source_with_lang(source, SourceLang::C)
+}
+
+/// Rewrite only syntax in declaration-only C++ dependencies that tree-sitter
+/// does not recognize. The input is for parsing; preprocessing and its LineMap
+/// retain the original text. Every edit replaces bytes in place so node offsets
+/// continue to identify the original source location.
+pub(crate) fn normalize_dependency_cpp_syntax(
+    source: &Arc<str>,
+    line_map: &LineMap,
+    dep_roots: &[PathBuf],
+    primary_path: &Path,
+) -> Arc<str> {
+    if dep_roots.is_empty() {
+        return Arc::clone(source);
+    }
+    let bytes = source.as_bytes();
+    let mut changed: Option<Vec<u8>> = None;
+    let is_dep_at = |offset: usize| {
+        let path = if line_map.entries.is_empty() {
+            primary_path
+        } else {
+            let Some(entry) = line_map.lookup(offset) else {
+                return false;
+            };
+            if line_map
+                .expansion_path_of(entry)
+                .is_some_and(|path| !dep_roots.iter().any(|root| path.starts_with(root)))
+            {
+                return false;
+            }
+            line_map.path_of(entry)
+        };
+        dep_roots.iter().any(|root| path.starts_with(root))
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        // The preprocessor normally removes comments, but raw sources and
+        // literals can still contain the same byte sequences as C++ syntax.
+        if bytes[i..].starts_with(b"//") {
+            i = line_comment_end(bytes, i);
+            continue;
+        }
+        if bytes[i..].starts_with(b"/*") {
+            i = bytes[i + 2..]
+                .windows(2)
+                .position(|window| window == b"*/")
+                .map_or(bytes.len(), |n| i + n + 4);
+            continue;
+        }
+        if bytes[i..].starts_with(b"R\"") {
+            if let Some(end) = raw_string_end(bytes, i) {
+                i = end;
+                continue;
+            }
+        }
+        if bytes[i] == b'\'' && is_digit_separator(bytes, i) {
+            i += 1;
+            continue;
+        }
+        if matches!(bytes[i], b'\'' | b'"') {
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(bytes.len());
+                } else if bytes[i] == quote {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"::*") {
+            let mut start = i;
+            while start > 0 && is_cpp_ident(bytes[start - 1]) {
+                start -= 1;
+            }
+            // Qualified/template class names need a separate treatment.
+            if start < i
+                && (bytes[start].is_ascii_alphabetic() || bytes[start] == b'_')
+                && !bytes[..start].ends_with(b"::")
+                && is_dep_at(start)
+                && is_dep_at(i + 2)
+            {
+                let output = changed.get_or_insert_with(|| bytes.to_vec());
+                output[start..i + 2].fill(b' ');
+                output[i + 2] = b'*';
+                i += 3;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    changed.map_or_else(
+        || Arc::clone(source),
+        |bytes| Arc::from(String::from_utf8(bytes).expect("ASCII-only syntax edits")),
+    )
+}
+
+fn is_cpp_ident(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_digit_separator(bytes: &[u8], at: usize) -> bool {
+    if at == 0 || at + 1 == bytes.len() || !bytes[at + 1].is_ascii_alphanumeric() {
+        return false;
+    }
+    let mut start = at;
+    while start > 0 && (is_cpp_ident(bytes[start - 1]) || bytes[start - 1] == b'\'') {
+        start -= 1;
+    }
+    bytes[start].is_ascii_digit()
+}
+
+fn line_comment_end(bytes: &[u8], mut at: usize) -> usize {
+    while let Some(relative) = bytes[at..].iter().position(|&byte| byte == b'\n') {
+        let newline = at + relative;
+        let before_newline = if newline > 0 && bytes[newline - 1] == b'\r' {
+            newline - 1
+        } else {
+            newline
+        };
+        if before_newline > 0 && bytes[before_newline - 1] == b'\\' {
+            at = newline + 1;
+        } else {
+            return newline;
+        }
+    }
+    bytes.len()
+}
+
+fn raw_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let open = bytes[start + 2..]
+        .iter()
+        .take(17)
+        .position(|&b| b == b'(')?
+        + start
+        + 2;
+    let delimiter = &bytes[start + 2..open];
+    let mut pos = open + 1;
+    while pos + delimiter.len() + 1 < bytes.len() {
+        if bytes[pos] == b')'
+            && bytes[pos + 1..].starts_with(delimiter)
+            && bytes[pos + 1 + delimiter.len()] == b'"'
+        {
+            return Some(pos + delimiter.len() + 2);
+        }
+        pos += 1;
+    }
+    None
 }
 
 pub fn node_text<'a>(source: &'a str, node: &Node) -> &'a str {
@@ -152,5 +306,98 @@ fn collect_unrecovered_parse_errors_depth<'a>(node: Node<'a>, out: &mut Vec<Node
     }
     if out.len() == initial_len && (node.is_error() || node.is_missing()) {
         out.push(node);
+    }
+}
+
+#[cfg(test)]
+mod dependency_cpp_tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_only_dependency_syntax_without_moving_locations() {
+        let project = PathBuf::from("/project/main.cpp");
+        let dep = PathBuf::from("/external/headers/member.hpp");
+        let input: Arc<str> = Arc::from(
+            "struct Project { using Member = int C::*; };\n\
+             struct Dependency { using Member = int C::*; [[__nodiscard__]] friend bool operator==(Dependency, Dependency) { return true; } };\n\
+             const char* dep_text = \"C::*\";\n\
+             const char* dep_raw = R\"tag(C::*)tag\";\n\
+             const char* text = \"C::* [[__nodiscard__]]\";\n\
+             const char* raw = R\"tag(C::* [[nodiscard]])tag\";\n",
+        );
+        let mut map = LineMap::new();
+        let project_id = map.intern_file(&project);
+        let dep_id = map.intern_file(&dep);
+        map.push(0, project_id, 1, 1);
+        let dep_start = input.find("struct Dependency").unwrap();
+        map.push(dep_start, dep_id, 1, 1);
+        let project_start = input.find("const char* text").unwrap();
+        map.push(project_start, project_id, 5, 1);
+        let output = normalize_dependency_cpp_syntax(
+            &input,
+            &map,
+            &[PathBuf::from("/external/headers")],
+            &project,
+        );
+        assert_eq!(input.len(), output.len());
+        assert_eq!(input.matches('\n').count(), output.matches('\n').count());
+        assert!(output.contains("using Member = int C::*; };"));
+        assert!(output.contains("using Member = int    *;"));
+        assert!(output.contains("[[__nodiscard__]] friend"));
+        assert!(output.contains("dep_text = \"C::*\""));
+        assert!(output.contains("dep_raw = R\"tag(C::*)tag\""));
+        assert!(output.contains("\"C::* [[__nodiscard__]]\""));
+        assert!(output.contains("R\"tag(C::* [[nodiscard]])tag\""));
+        assert_eq!(map.lookup(dep_start).unwrap().file, dep_id);
+    }
+
+    #[test]
+    fn dependency_member_pointer_approximation_recovers_declarations() {
+        let source: Arc<str> =
+            Arc::from("template<class T, class C> struct Traits { using Member = T C::*; };\n");
+        let raw = parse_source_with_lang(Arc::clone(&source), SourceLang::Cpp).unwrap();
+        assert!(has_parse_errors(&raw.tree));
+        let normalized = normalize_dependency_cpp_syntax(
+            &source,
+            &LineMap::new(),
+            &[PathBuf::from("/external")],
+            Path::new("/external/member.hpp"),
+        );
+        let parsed = parse_source_with_lang(normalized, SourceLang::Cpp).unwrap();
+        assert!(!has_parse_errors(&parsed.tree));
+    }
+
+    #[test]
+    fn digit_separators_do_not_hide_later_dependency_syntax() {
+        let source: Arc<str> = Arc::from(
+            "constexpr int number = 1'000; using First = int C::*; \
+             constexpr int hex = 0xAB'CD; using Second = int C::*; \
+             char letter = 'x'; using Third = int C::*;",
+        );
+        let normalized = normalize_dependency_cpp_syntax(
+            &source,
+            &LineMap::new(),
+            &[PathBuf::from("/external")],
+            Path::new("/external/member.hpp"),
+        );
+        assert!(normalized.contains("1'000; using First = int    *;"));
+        assert!(normalized.contains("0xAB'CD; using Second = int    *;"));
+        assert!(normalized.contains("'x'; using Third = int    *;"));
+    }
+
+    #[test]
+    fn spliced_line_comment_does_not_rewrite_its_continuation() {
+        let source: Arc<str> = Arc::from(concat!(
+            "// commented C::* \\\n",
+            "still commented C::*\nusing Real = int C::*;\n"
+        ));
+        let normalized = normalize_dependency_cpp_syntax(
+            &source,
+            &LineMap::new(),
+            &[PathBuf::from("/external")],
+            Path::new("/external/member.hpp"),
+        );
+        assert!(normalized.contains("still commented C::*"));
+        assert!(normalized.contains("using Real = int    *;"));
     }
 }

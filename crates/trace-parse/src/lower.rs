@@ -372,11 +372,62 @@ fn build_program_inner(
     // A dependency root contributes headers only: its sources are never
     // translation units, even when the root sits inside the analyzed tree,
     // and its headers are discovered separately (#60).
-    let dep_roots: Vec<PathBuf> = program.dep_roots().to_vec();
+    let dep_roots: Vec<PathBuf> = opts
+        .dep_roots
+        .iter()
+        .map(|d| trace_ir::canonicalize(d))
+        .collect();
     let under_dep = |p: &PathBuf| dep_roots.iter().any(|dep| p.starts_with(dep));
     let (files, headers) = discover_source_files(root);
     let mut files = normalize_discovered_paths(files);
     let database = crate::compile_commands::CompilationDatabase::load(root, opts)?;
+    // Sources without a database entry and orphan project headers use the
+    // shared fallback configuration and need compiler default headers.
+    let needs_fallback = files
+        .iter()
+        .any(|file| !under_dep(file) && !database.commands.contains_key(file))
+        || headers.iter().any(|header| !under_dep(header));
+    let needs_project_probe = opts.system_includes && (database.path.is_none() || needs_fallback);
+    let project_compiler_paths = if needs_project_probe {
+        let directory = if root.is_file() {
+            root.parent().unwrap_or(root)
+        } else {
+            root
+        };
+        crate::compiler_includes::CompilerIncludes::default().for_project(
+            &trace_ir::canonicalize(directory),
+            &opts.system_include_paths,
+        )
+    } else {
+        None
+    };
+    // Compiler-owned headers have declaration ownership like explicit
+    // dependency headers. Do not feed these roots to file discovery: walking
+    // every installed system header would turn them into project files.
+    let root_canonical = trace_ir::canonicalize(root);
+    let mut classification_roots = dep_roots.clone();
+    let mut system_roots: Vec<PathBuf> = opts
+        .system_include_paths
+        .iter()
+        .chain(&opts.after_include_paths)
+        .map(|path| trace_ir::canonicalize(path))
+        .collect();
+    system_roots.extend(database.commands.values().flatten().flat_map(|config| {
+        config
+            .system_include_paths
+            .iter()
+            .chain(&config.after_include_paths)
+            .cloned()
+    }));
+    if let Some((c, cpp)) = &project_compiler_paths {
+        system_roots.extend(c.paths.iter().chain(&cpp.paths).cloned());
+    }
+    for path in system_roots {
+        if !path.starts_with(&root_canonical) && !classification_roots.contains(&path) {
+            classification_roots.push(path);
+        }
+    }
+    program.symbols.set_dep_roots(classification_roots.clone());
     files.extend(database.commands.keys().cloned());
     files.sort();
     files.dedup();
@@ -429,6 +480,7 @@ fn build_program_inner(
         &dep_headers,
         &opts.test_partition,
     );
+    include_graph.dep_roots = classification_roots;
     let mut links =
         crate::link_commands::LinkDatabase::load(root, &database, opts.link_commands.as_deref())?;
     if links.inferred && !links.unscoped_inference && !links.targets.is_empty() {
@@ -465,6 +517,7 @@ fn build_program_inner(
             include_graph,
             database,
             links,
+            project_compiler_paths,
         );
     }
     index_progress(format!(
@@ -480,11 +533,12 @@ fn build_program_inner(
     let basename_index = Arc::new(include_graph.basename_index.clone());
     let include_expansion_cache =
         Arc::new(std::sync::RwLock::new(rustc_hash::FxHashMap::default()));
-    let eff_opts = project_preprocess_opts(root, opts, &include_graph)
+    let mut eff_opts = project_preprocess_opts(root, opts, &include_graph)
         .for_indexing()
         .with_include_expansion_cache(Arc::clone(&include_expansion_cache))
         .with_basename_index(basename_index)
         .with_inline_include_bodies(false);
+    eff_opts.separate_header_paths = Some(Arc::new(include_graph.project_files.clone()));
     let eff_opts = eff_opts.with_record_conditionals(opts.explore || opts.record_conditionals);
 
     let gn_candidates = if opts.explore && opts.explore_budget > 0 {
@@ -632,14 +686,25 @@ fn build_program_inner(
             let mut failed = false;
             let mut warmed: Vec<(Language, Arc<std::sync::RwLock<MacroTable>>)> = Vec::new();
             for (k, language) in languages.iter().copied().enumerate() {
+                let mut seed_defines = opts.compiler_defines.clone();
+                if let Some((c, cpp)) = &project_compiler_paths {
+                    let search = if language == Language::C { c } else { cpp };
+                    seed_defines.extend(search.target_defines.iter().cloned());
+                }
+                seed_defines.extend(opts.defines.iter().map(|(k, v)| (k.clone(), v.clone())));
                 let header_macros: Arc<std::sync::RwLock<MacroTable>> = Arc::new(
-                    std::sync::RwLock::new(macro_table_from_defines(&opts.defines, language)),
+                    std::sync::RwLock::new(macro_table_from_defines(&seed_defines, language)),
                 );
                 let header_prep_opts = eff_opts
                     .clone()
                     .with_shared_macros(Arc::clone(&header_macros))
                     .with_accumulate_macros(true)
                     .with_language(language);
+                let header_prep_opts = with_project_system_paths(
+                    header_prep_opts,
+                    language,
+                    project_compiler_paths.as_ref(),
+                );
                 let result = if k == 0 {
                     source_cache
                         .get_or_preprocess(path, &include_graph, &header_prep_opts)
@@ -714,12 +779,21 @@ fn build_program_inner(
                 .clone()
                 .with_frozen_expansion_cache(true)
                 .with_language(l);
-            (l, o)
+            (
+                l,
+                with_project_system_paths(o, l, project_compiler_paths.as_ref()),
+            )
         })
         .collect();
     let discover_opts: HashMap<Language, PreprocessOptions> = [Language::C, Language::Cpp]
         .into_iter()
-        .map(|l| (l, eff_opts.clone().with_language(l)))
+        .map(|l| {
+            let o = eff_opts.clone().with_language(l);
+            (
+                l,
+                with_project_system_paths(o, l, project_compiler_paths.as_ref()),
+            )
+        })
         .collect();
 
     let pool = index_pool(jobs)?;
@@ -1976,6 +2050,28 @@ fn project_preprocess_opts(
     eff
 }
 
+fn with_project_system_paths(
+    mut opts: PreprocessOptions,
+    language: Language,
+    paths: Option<&(
+        crate::compiler_includes::CompilerSearch,
+        crate::compiler_includes::CompilerSearch,
+    )>,
+) -> PreprocessOptions {
+    if let Some((c, cpp)) = paths {
+        let searched = if language == Language::C { c } else { cpp };
+        if !searched.paths.is_empty() {
+            opts.system_include_paths.clone_from(&searched.paths);
+            for (name, value) in &searched.target_defines {
+                opts.compiler_defines
+                    .entry(name.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+    }
+    opts
+}
+
 pub(crate) fn is_index_header(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
         crate::discover::HEADER_EXTENSIONS
@@ -2496,7 +2592,17 @@ fn lower_prepared_source(
         let _ = std::fs::write(std::path::Path::new(&dir).join(fname), pre.text.as_ref());
     }
     let lang = source_lang(language);
-    let parsed = crate::parse::parse_source_with_lang(Arc::clone(&pre.text), lang)?;
+    let parse_text = if lang == crate::parse::SourceLang::Cpp {
+        crate::parse::normalize_dependency_cpp_syntax(
+            &pre.text,
+            &pre.line_map,
+            &graph.dep_roots,
+            &self_canon,
+        )
+    } else {
+        Arc::clone(&pre.text)
+    };
+    let parsed = crate::parse::parse_source_with_lang(parse_text, lang)?;
     if crate::parse::has_parse_errors(&parsed.tree) {
         program.add_diagnostic(Diagnostic {
             severity: DiagnosticSeverity::Warning,

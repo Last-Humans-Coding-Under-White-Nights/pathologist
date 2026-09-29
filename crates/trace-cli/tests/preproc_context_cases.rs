@@ -10,6 +10,21 @@ use common::*;
 use trace_analysis::analyze;
 use trace_parse::build_program;
 
+#[test]
+fn argument_prescan_keeps_active_macro_suppressed_during_rescan() {
+    let root = fixture("preproc/macro_prescan_hide");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "caller", "f"));
+    for name in ["expected_if", "expected_elif"] {
+        assert!(program.symbols.resolve_function(name).is_some(), "{name}");
+    }
+    for name in ["wrong_if", "wrong_first_arm", "wrong_elif"] {
+        assert!(program.symbols.resolve_function(name).is_none(), "{name}");
+    }
+    assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+}
+
 /// One TU defining `USE_FAST` before including the header must see the
 /// header's `#ifdef USE_FAST` arm. The `#else` arm belongs to a
 /// configuration no TU in this tree presents, so it must not be lowered at

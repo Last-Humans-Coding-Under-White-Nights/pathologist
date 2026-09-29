@@ -349,11 +349,13 @@ impl PreprocessorState {
             // table binds neither name — so the CLI defines go first and
             // `-D __cplusplus=…` wins there too, as on the path below.
             state.init_cli_defines_missing_only();
+            state.init_compiler_defines(true);
             state.init_predefined_macros(true);
         } else {
             // Predefines first: a `-D __cplusplus=…` overrides the
             // language's own value.
             state.init_predefined_macros(false);
+            state.init_compiler_defines(false);
             state.init_cli_defines();
         }
         // Builtins are local to each preprocess so they apply even when
@@ -604,6 +606,24 @@ impl PreprocessorState {
                 name.to_string(),
                 MacroDef::Object {
                     replacement: lex_macro_body(val, self.language).into(),
+                },
+            );
+        }
+    }
+
+    fn init_compiler_defines(&mut self, missing_only: bool) {
+        let defines: Vec<_> = self
+            .opts
+            .compiler_defines
+            .iter()
+            .filter(|(name, _)| !missing_only || !self.macros.contains_key(name.as_str()))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        for (name, value) in defines {
+            self.insert_macro(
+                name,
+                MacroDef::Object {
+                    replacement: lex_macro_body(&value, self.language).into(),
                 },
             );
         }
@@ -1377,11 +1397,15 @@ impl PreprocessorState {
         Some((at, variants[at].clone()))
     }
 
-    fn is_cacheable_header(path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-            matches!(e, "h" | "H" | "hpp" | "hh" | "hxx" | "inl" | "ipp")
-                || e.eq_ignore_ascii_case("h")
-        })
+    fn is_cacheable_header(&self, path: &Path) -> bool {
+        self.opts
+            .separate_header_paths
+            .as_ref()
+            .is_none_or(|paths| paths.contains(path))
+            && path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                matches!(e, "h" | "H" | "hpp" | "hh" | "hxx" | "inl" | "ipp")
+                    || e.eq_ignore_ascii_case("h")
+            })
     }
 
     /// Self-contained cache blob: live unique text plus nested expansions
@@ -1586,7 +1610,7 @@ impl PreprocessorState {
         // run. `include_stack` holds only the root at this point (see
         // `Preprocessor::new`); nested includes push on top of it.
         let is_root = self.include_stack.len() == 1 && self.forced_include_depth == 0;
-        if !is_root && self.splice_cached(&canonical) {
+        if !is_root && self.is_cacheable_header(&canonical) && self.splice_cached(&canonical) {
             return Ok(());
         }
 
@@ -1597,7 +1621,7 @@ impl PreprocessorState {
         }
 
         let cache_header =
-            self.opts.include_expansion_cache.is_some() && Self::is_cacheable_header(&canonical);
+            self.opts.include_expansion_cache.is_some() && self.is_cacheable_header(&canonical);
 
         let guard_snapshot = if cache_header {
             self.included_files.clone()
@@ -2260,6 +2284,17 @@ impl PreprocessorState {
             // well would eat the newline AND the whole following line
             // (e.g. `#pragma pack(push, 4)` swallowing the struct after it).
             "line" => {}
+            "error" | "warning" if self.is_active() => {
+                let message = spell_condition(directive_rest(tokens, i));
+                let message = format!("#{directive} {}", message.trim());
+                let severity = if directive == "error" {
+                    DiagnosticSeverity::Error
+                } else {
+                    DiagnosticSeverity::Warning
+                };
+                self.report(severity, line, message.trim_end().to_string());
+            }
+            "error" | "warning" => {}
             "pragma" => {
                 // `#pragma once` is the file's own statement that one
                 // expansion per translation unit is enough. Weak pragmas are
@@ -2295,12 +2330,13 @@ impl PreprocessorState {
                 let name = self.read_directive_ident(tokens, &mut i)?;
                 self.remove_macro(&name);
             }
-            _ => {
+            _ if self.is_active() => {
                 self.warn(
                     tokens[i.saturating_sub(1)].line,
                     format!("unknown directive #{directive}"),
                 );
             }
+            _ => {}
         }
         i = Self::skip_to_newline(tokens, i);
         Ok(i)
@@ -2337,6 +2373,10 @@ impl PreprocessorState {
             self.warn(line, format!("include file not found, skipping: {path}"));
             return Ok(i);
         };
+        // Processing keeps the spelling: a symlinked header resolves its
+        // nested quoted includes relative to the directory used to reach it.
+        // Cache membership and skip records use the canonical identity.
+        let canonical_include = trace_ir::canonicalize(&include_path);
         let live_at = self.output.len();
         if let Err(e) = self.process_file(&include_path) {
             // The include is already in `included_files` and contributed
@@ -2354,14 +2394,12 @@ impl PreprocessorState {
         // every consumer.
         if !self.opts.inline_include_bodies
             && !self.opts.frozen_expansion_cache
-            && Self::is_cacheable_header(&include_path)
+            && self.is_cacheable_header(&canonical_include)
         {
             self.output.truncate(live_at);
             self.line_map.truncate_at(live_at);
             if let Some(frame) = self.cache_frames.last_mut() {
-                frame
-                    .skips
-                    .push((live_at, trace_ir::canonicalize(&include_path)));
+                frame.skips.push((live_at, canonical_include));
             }
         }
         Ok(i)
@@ -2542,6 +2580,7 @@ impl PreprocessorState {
             let found = quote_dirs
                 .chain(&self.opts.include_paths)
                 .chain(&self.opts.system_include_paths)
+                .chain(&self.opts.after_include_paths)
                 .map(|inc| inc.join(path))
                 .find(|p| self.include_exists(p))
                 .or_else(|| {
@@ -2978,6 +3017,7 @@ impl PreprocessorState {
                                     replacement,
                                     params,
                                     &args,
+                                    None,
                                     *variadic,
                                 ));
                                 work.splice(i..next, substituted);
@@ -3507,13 +3547,52 @@ impl PreprocessorState {
                 replacement,
                 variadic,
             } => {
+                let mut prescan = vec![false; params.len()];
+                for (i, token) in replacement.iter().enumerate() {
+                    if let TokenKind::Identifier(name) = &token.kind {
+                        if !parameter_is_pasted_or_stringized(replacement, i) {
+                            if let Some(param) = params.iter().position(|p| p == name) {
+                                prescan[param] = true;
+                            }
+                        }
+                    }
+                }
+                let expanded_args_storage;
+                let expanded_args = if prescan.iter().any(|needed| *needed) {
+                    let mut expanded = Vec::with_capacity(args.args.len());
+                    for (i, arg) in args.args.iter().enumerate() {
+                        let param = if *variadic {
+                            i.min(params.len().saturating_sub(1))
+                        } else {
+                            i
+                        };
+                        if prescan.get(param).copied().unwrap_or(false) {
+                            expanded.push(self.expand_operand_tokens(arg)?);
+                        } else {
+                            expanded.push(arg.clone());
+                        }
+                    }
+                    expanded_args_storage = MacroArgs {
+                        args: expanded,
+                        separators: args.separators.clone(),
+                    };
+                    &expanded_args_storage
+                } else {
+                    args
+                };
                 // Bound what this is about to allocate before allocating it
                 // (#30). The rescan charges the result again as it walks
                 // it, which is the pre-existing accounting; this charge is
                 // what makes a wide argument fail before it is copied once
                 // per parameter occurrence.
                 self.charge_tokens(
-                    projected_substitution_len(replacement, params, args, *variadic),
+                    projected_substitution_len_with_prescan(
+                        replacement,
+                        params,
+                        args,
+                        expanded_args,
+                        *variadic,
+                    ),
                     origin.line,
                 )?;
                 apply_concatenation(substitute_macro(
@@ -3522,6 +3601,7 @@ impl PreprocessorState {
                     replacement,
                     params,
                     args,
+                    Some(expanded_args),
                     *variadic,
                 ))
             }
@@ -4060,12 +4140,54 @@ fn projected_substitution_len(
     n
 }
 
+fn projected_substitution_len_with_prescan(
+    body: &[Token],
+    params: &[String],
+    raw: &MacroArgs,
+    expanded: &MacroArgs,
+    variadic: bool,
+) -> u64 {
+    let mut total = 0_u64;
+    for (i, token) in body.iter().enumerate() {
+        let width = match &token.kind {
+            TokenKind::Identifier(name) => match params.iter().position(|p| p == name) {
+                Some(idx) => {
+                    let args = if parameter_is_pasted_or_stringized(body, i) {
+                        raw
+                    } else {
+                        expanded
+                    };
+                    if is_variadic_tail(params, variadic, idx) {
+                        args.variadic_len(idx)
+                    } else {
+                        args.args.get(idx).map_or(0, Vec::len)
+                    }
+                }
+                None => 1,
+            },
+            _ => 1,
+        };
+        total = total.saturating_add(width as u64);
+    }
+    total
+}
+
+fn parameter_is_pasted_or_stringized(body: &[Token], i: usize) -> bool {
+    i.checked_sub(1).is_some_and(|before| {
+        matches!(body[before].kind, TokenKind::Hash) || concat_width_at(body, before) > 0
+    }) || i
+        .checked_sub(2)
+        .is_some_and(|before| concat_width_at(body, before) == 2)
+        || concat_width_after(body, i) > 0
+}
+
 fn substitute_macro(
     macro_name: &str,
     origin: &Token,
     body: &[Token],
     params: &[String],
     args: &MacroArgs,
+    expanded_args: Option<&MacroArgs>,
     variadic: bool,
 ) -> Vec<Token> {
     debug_assert!(
@@ -4073,6 +4195,14 @@ fn substitute_macro(
         "a variadic MacroDef must name its tail parameter \
          (\"__VA_ARGS__\" for the anonymous form; see parse_macro_param_list)"
     );
+    // Conditional expressions pass None because they rescan raw arguments;
+    // emitted-source expansion passes its prescan result.
+    let active_hidden = expanded_args.map(|_| {
+        let mut hidden = origin.hidden.as_deref().cloned().unwrap_or_default();
+        hidden.insert(macro_name.to_string());
+        Arc::new(hidden)
+    });
+    let expanded_args = expanded_args.unwrap_or(args);
     let mut out: Vec<Token> = Vec::new();
     // Whitespace owed to the next token emitted: a parameter that had
     // whitespace before it and expanded to nothing leaves that whitespace
@@ -4159,14 +4289,29 @@ fn substitute_macro(
             // stray `__VA_ARGS__` in a named-variadic body to the tail
             // param, so plain position lookup covers both variadic styles.
             if let Some(idx) = params.iter().position(|p| p == name) {
+                let substituted = if parameter_is_pasted_or_stringized(body, i) {
+                    args
+                } else {
+                    expanded_args
+                };
                 let first = out.len();
                 if is_variadic_tail(params, variadic, idx) {
-                    out.extend(args.variadic_tokens(idx).into_iter().map(|token| {
-                        token.with_substitution_provenance(origin, macro_name, &body[i])
+                    out.extend(substituted.variadic_tokens(idx).into_iter().map(|token| {
+                        token.with_substitution_provenance(
+                            origin,
+                            macro_name,
+                            &body[i],
+                            active_hidden.as_ref(),
+                        )
                     }));
-                } else if let Some(arg) = args.args.get(idx) {
+                } else if let Some(arg) = substituted.args.get(idx) {
                     out.extend(arg.iter().map(|token| {
-                        token.with_substitution_provenance(origin, macro_name, &body[i])
+                        token.with_substitution_provenance(
+                            origin,
+                            macro_name,
+                            &body[i],
+                            active_hidden.as_ref(),
+                        )
                     }));
                 }
                 // Whether the argument touches what precedes it in the
@@ -5535,6 +5680,31 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_macro_prescans_argument_before_nested_paste() {
+        let src = "#define CAT(a,b) a##b\n\
+                   #define NAME(n,s) n##s\n\
+                   #define WRAP(f) CAT(attr_, f)\n\
+                   #define attr_cos int\n\
+                   WRAP(NAME(cos,)) value;\n";
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(result.output.contains("int value"), "{}", result.output);
+        assert!(!result.output.contains("attr_NAME"), "{}", result.output);
+    }
+
+    #[test]
+    fn argument_prescan_keeps_the_invoking_macro_hidden_on_rescan() {
+        let src = include_str!("../../../tests/fixtures/preproc/macro_prescan_hide/main.c");
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.output.contains("f(1)"), "{}", result.output);
+        assert!(!result.output.contains("{ 1; }"), "{}", result.output);
+        assert!(result.output.contains("expected_if"), "{}", result.output);
+        assert!(result.output.contains("expected_elif"), "{}", result.output);
+        assert!(!result.output.contains("wrong_if"), "{}", result.output);
+        assert!(!result.output.contains("wrong_elif"), "{}", result.output);
+    }
+
+    #[test]
     fn expands_chained_token_paste() {
         let src = "#define CAT3(a,b,c) a ## b ## c\nint CAT3(x, y, z);\n";
         let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
@@ -5655,6 +5825,19 @@ mod tests {
             "{:?}",
             result.diagnostics
         );
+    }
+
+    #[test]
+    fn inactive_diagnostics_are_ignored_and_active_ones_keep_processing() {
+        let src = "#if 0\n#error dead error\n#warning dead warning\n#unknown dead\n#endif\n\
+                   #warning live warning\n#error live error\nint kept;\n";
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(result.output.contains("kept"), "{}", result.output);
+        assert_eq!(result.diagnostics.len(), 2, "{:?}", result.diagnostics);
+        assert_eq!(result.diagnostics[0].severity, DiagnosticSeverity::Warning);
+        assert!(result.diagnostics[0].message.contains("live warning"));
+        assert_eq!(result.diagnostics[1].severity, DiagnosticSeverity::Error);
+        assert!(result.diagnostics[1].message.contains("live error"));
     }
 
     #[test]
@@ -7837,6 +8020,65 @@ int x = A;
     }
 
     #[test]
+    fn relative_parent_include_has_identical_cold_and_warm_separate_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let header = dir.path().join("h.h");
+        let source = sub.join("a.c");
+        fs::write(&header, "int in_header;\n").unwrap();
+        fs::write(&source, "#include \"../h.h\"\nint in_source;\n").unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let mut opts = PreprocessOptions::new()
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_inline_include_bodies(false);
+        opts.separate_header_paths =
+            Some(Arc::new(FxHashSet::from_iter([trace_ir::canonicalize(
+                &header,
+            )])));
+        let cold = preprocess_file(&source, &opts).unwrap();
+        let warm = preprocess_file(&source, &opts).unwrap();
+        for result in [&cold, &warm] {
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+            assert!(result.output.contains("in_source"), "{}", result.output);
+            assert!(!result.output.contains("in_header"), "{}", result.output);
+        }
+        assert_eq!(cold.output, warm.output);
+        assert!(sole_variant(&cache, trace_ir::canonicalize(&header), Language::C).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_header_keeps_lexical_parent_for_nested_quoted_include() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let real = dir.path().join("real");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("header.h"), "#include \"choice.h\"\n").unwrap();
+        fs::write(real.join("choice.h"), "#define PICK 2\n").unwrap();
+        fs::write(project.join("choice.h"), "#define PICK 1\n").unwrap();
+        symlink("../real/header.h", project.join("alias.h")).unwrap();
+        let source = project.join("main.c");
+        fs::write(
+            &source,
+            "#include \"alias.h\"\n#if PICK == 1\nint selected;\n#else\nint wrong;\n#endif\n",
+        )
+        .unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = PreprocessOptions::new()
+            .with_include_expansion_cache(cache)
+            .with_inline_include_bodies(false);
+        for _ in 0..2 {
+            let result = preprocess_file(&source, &opts).unwrap();
+            assert!(result.output.contains("selected"), "{}", result.output);
+            assert!(!result.output.contains("wrong"), "{}", result.output);
+        }
+    }
+
+    #[test]
     fn root_file_is_emitted_even_when_the_cache_already_holds_it() {
         // via.h includes late.h through a macro, so an indexer's raw include
         // scanner cannot order late.h before via.h; preprocessing via.h
@@ -8354,16 +8596,18 @@ int from_late;
     }
 
     /// The operand of `#` is the argument as written, never expanded.
-    /// (The two-level `XSTR(x) STR(x)` idiom that expands first needs C11
-    /// argument prescan, which docs/PREPROCESSOR.md lists as unsupported.)
+    /// A two-level `XSTR(x) STR(x)` invocation expands `x` in the outer
+    /// macro, while direct `STR(x)` stringizes its unexpanded spelling.
     #[test]
     fn stringize_uses_unexpanded_argument() {
         let src = "#define STR(x) #x\n\
+                   #define XSTR(x) STR(x)\n\
                    #define VALUE 42\n\
-                   const char *d = STR(VALUE);\n";
+                   const char *d = STR(VALUE);\n\
+                   const char *e = XSTR(VALUE);\n";
         let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
         assert!(result.output.contains("\"VALUE\""), "{}", result.output);
-        assert!(!result.output.contains("42"), "{}", result.output);
+        assert!(result.output.contains("\"42\""), "{}", result.output);
     }
 
     /// `"` and `\` inside string and character literals in the argument are
@@ -10154,6 +10398,22 @@ int from_late;
         .output;
         assert!(out.contains("cxx98_arm"), "{out}");
         assert!(!out.contains("cxx11_arm"), "{out}");
+    }
+
+    #[test]
+    fn command_and_cli_macros_override_compiler_target_macros() {
+        let mut opts = PreprocessOptions::new();
+        opts.compiler_defines.insert("TARGET".into(), "1".into());
+        opts.command_macros
+            .push(crate::CommandMacro::Define("TARGET".into(), "2".into()));
+        let command = preprocess_string("int selected = TARGET;\n", Path::new("t.c"), &opts);
+        assert!(command.output.contains("selected= 2"), "{}", command.output);
+        let cli = preprocess_string(
+            "int selected = TARGET;\n",
+            Path::new("t.c"),
+            &opts.with_define("TARGET", "3"),
+        );
+        assert!(cli.output.contains("selected= 3"), "{}", cli.output);
     }
 
     /// `__STDC__` is predefined for both languages (g++ defines it too);

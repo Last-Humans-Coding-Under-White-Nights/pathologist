@@ -86,6 +86,14 @@ impl CompilationDatabase {
             overrides.link_commands.as_deref(),
         ) || entries.iter().any(crate::link_commands::is_link_only_entry);
         db.path = Some(path.clone());
+        let mut compiler_includes = crate::compiler_includes::CompilerIncludes::default();
+        let cli_include_paths: BTreeSet<PathBuf> = overrides
+            .include_paths
+            .iter()
+            .map(|path| trace_ir::canonicalize(path))
+            .collect();
+        let cpath = std::env::var_os("CPATH");
+        let mut cpath_by_directory: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
         for (i, entry) in entries.into_iter().enumerate() {
             // Link-only records in mixed databases are handled by the target
             // reader; they do not supply a preprocessing configuration.
@@ -109,8 +117,49 @@ impl CompilationDatabase {
             if !in_root || dep_roots.iter().any(|dep| file.starts_with(dep)) {
                 continue;
             }
-            match entry.options(directory, &file, overrides, wants_objects) {
-                Ok((opts, output)) => {
+            match entry.options(directory.clone(), &file, overrides, wants_objects) {
+                Ok((mut opts, output, args)) => {
+                    if overrides.system_includes {
+                        let language = opts.language.unwrap_or_else(|| Language::from_path(&file));
+                        let search = compiler_includes.for_command(
+                            &args,
+                            &directory,
+                            language,
+                            &opts.system_include_paths,
+                        );
+                        if !search.paths.is_empty() {
+                            // The probe includes explicit -isystem directories
+                            // in their actual position relative to CPATH and
+                            // the compiler's builtins. GCC ignores a command
+                            // -I that names a system directory, so remove
+                            // those duplicates from the earlier -I class.
+                            // CPATH acts like -I, though, and a repeated
+                            // CPATH directory must keep its early position.
+                            // A CLI --include is an explicit trace override.
+                            let cpath_dirs = cpath_by_directory
+                                .entry(directory.clone())
+                                .or_insert_with(|| {
+                                    cpath
+                                        .as_ref()
+                                        .map(|value| {
+                                            std::env::split_paths(value)
+                                                .map(|path| {
+                                                    trace_ir::canonicalize(&directory.join(path))
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default()
+                                });
+                            opts.include_paths.retain(|path| {
+                                cli_include_paths.contains(path)
+                                    || !search.paths.contains(path)
+                                    || (cpath_dirs.contains(path)
+                                        && !opts.system_include_paths.contains(path))
+                            });
+                            opts.system_include_paths = search.paths;
+                            opts.compiler_defines.extend(search.target_defines);
+                        }
+                    }
                     let ordinal = db.commands.get(&file).map_or(0, Vec::len);
                     if let Some(output) = output {
                         db.objects
@@ -154,7 +203,7 @@ impl Entry {
         file: &Path,
         overrides: &PreprocessOptions,
         wants_output: bool,
-    ) -> Result<(PreprocessOptions, Option<PathBuf>), String> {
+    ) -> Result<(PreprocessOptions, Option<PathBuf>, Vec<String>), String> {
         if !file.is_file() {
             return Err(format!("source does not exist: {}", file.display()));
         }
@@ -199,6 +248,11 @@ impl Entry {
         let mut updated_cplusplus = !binary_stem(&args[driver_idx]).eq_ignore_ascii_case("cl");
         let mut macros = Vec::new();
         let mut standard = None;
+        let args_for_probe = if overrides.system_includes {
+            args.clone()
+        } else {
+            Vec::new()
+        };
         let mut args = args.iter().skip(driver_idx + 1);
         while let Some(arg) = args.next() {
             // Check the actual input before slash options: an absolute Unix
@@ -483,11 +537,12 @@ impl Entry {
             }
         }
         opts.command_macros.extend(macros);
-        opts.system_include_paths.extend(after_include_paths);
+        opts.after_include_paths.extend(after_include_paths);
         for paths in [
             &mut opts.include_paths,
             &mut opts.quote_include_paths,
             &mut opts.system_include_paths,
+            &mut opts.after_include_paths,
         ] {
             for path in paths.iter_mut() {
                 *path = trace_ir::canonicalize(path);
@@ -495,16 +550,16 @@ impl Entry {
             let mut seen = std::collections::HashSet::new();
             paths.retain(|path| seen.insert(path.clone()));
         }
-        // A directory supplied as both -I and -isystem belongs in the system
-        // class, as in GCC/Clang. Keep order within each class.
+        // A directory supplied as both -I and a later system/after directory
+        // belongs in that later class, as in GCC/Clang. Keep class order.
         let systems: std::collections::HashSet<PathBuf> = opts
             .system_include_paths
             .iter()
-            .map(|p| trace_ir::canonicalize(p))
+            .chain(opts.after_include_paths.iter())
+            .cloned()
             .collect();
-        opts.include_paths
-            .retain(|p| !systems.contains(&trace_ir::canonicalize(p)));
-        Ok((opts, output))
+        opts.include_paths.retain(|p| !systems.contains(p));
+        Ok((opts, output, args_for_probe))
     }
 }
 
@@ -707,7 +762,7 @@ mod review_tests {
             &PreprocessOptions::new(),
             true,
         )
-        .map(|(options, _)| options)
+        .map(|(options, _, _)| options)
     }
 
     #[test]

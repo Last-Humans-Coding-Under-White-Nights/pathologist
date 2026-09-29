@@ -278,6 +278,318 @@ fn cli_accepts_an_external_database_path() {
     assert_eq!(count, 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn relative_cpath_precedes_explicit_isystem_from_command_directory() {
+    if std::process::Command::new("gcc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let build = root.join("build");
+    let cpath = dir.path().join("relative_cpath");
+    let system = dir.path().join("system");
+    let source = root.join("src");
+    for path in [&build, &cpath, &system, &source] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    std::fs::write(cpath.join("choice.h"), "void cpath_choice(void);\n").unwrap();
+    std::fs::write(system.join("choice.h"), "void system_choice(void);\n").unwrap();
+    std::fs::write(source.join("main.c"), "#include <choice.h>\n").unwrap();
+    std::fs::write(
+        root.join("compile_commands.json"),
+        json!([{
+            "directory": build,
+            "file": "../src/main.c",
+        "arguments": ["gcc", "-isystem", "../../system", "-c", "../src/main.c"]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let output = dir.path().join("result.db");
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_trace"))
+        .arg("analyze")
+        .arg(&root)
+        .arg("--system-includes")
+        .arg("-o")
+        .arg(&output)
+        .env("CPATH", "../../relative_cpath")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let conn = rusqlite::Connection::open(output).unwrap();
+    for (name, expected) in [("cpath_choice", 1), ("system_choice", 0)] {
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM functions WHERE name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, expected, "{name}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn partial_database_fallback_uses_compiler_system_headers() {
+    if ["gcc", "clang"].iter().all(|compiler| {
+        std::process::Command::new(compiler)
+            .arg("--version")
+            .output()
+            .is_err()
+    }) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("configured.c"), "void configured(void) {}\n").unwrap();
+    std::fs::write(
+        root.join("fallback.c"),
+        "#include <stddef.h>\nvoid fallback_uses_size_t(size_t *value) { (void)value; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("compile_commands.json"),
+        json!([{
+            "directory": root,
+            "file": "configured.c",
+            "arguments": ["gcc", "-c", "configured.c"]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let output = root.join("result.db");
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_trace"))
+        .arg("analyze")
+        .arg(root)
+        .arg("--system-includes")
+        .arg("--jobs")
+        .arg("1")
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let conn = rusqlite::Connection::open(output).unwrap();
+    let missing: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM diagnostics WHERE message LIKE '%include file not found%stddef.h%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(missing, 0, "fallback TU lost compiler default headers");
+    let found: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM files WHERE path LIKE '%/stddef.h' AND is_dep=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(found > 0, "stddef.h was not indexed as a dependency");
+}
+
+#[cfg(unix)]
+#[test]
+fn orphan_header_uses_compiler_paths_with_complete_database() {
+    if ["gcc", "clang"].iter().all(|compiler| {
+        std::process::Command::new(compiler)
+            .arg("--version")
+            .output()
+            .is_err()
+    }) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("main.c"), "void configured(void) {}\n").unwrap();
+    std::fs::write(
+        root.join("orphan.h"),
+        "#include <stddef.h>\nvoid orphan_uses_size_t(size_t *value);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("compile_commands.json"),
+        json!([{
+            "directory": root,
+            "file": "main.c",
+            "arguments": ["gcc", "-c", "main.c"]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let output = root.join("result.db");
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_trace"))
+        .arg("analyze")
+        .arg(root)
+        .arg("--system-includes")
+        .arg("--jobs")
+        .arg("1")
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let conn = rusqlite::Connection::open(output).unwrap();
+    let missing: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM diagnostics WHERE message LIKE '%include file not found%stddef.h%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(missing, 0, "orphan header lost compiler default headers");
+    let found: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM functions WHERE name='orphan_uses_size_t'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(found, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn gcc_builtin_duplicate_i_keeps_cpath_precedence() {
+    let builtin = match std::process::Command::new("gcc")
+        .arg("-print-file-name=include")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+        }
+        _ => return,
+    };
+    if !builtin.join("stddef.h").is_file() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let cpath = dir.path().join("cpath");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&cpath).unwrap();
+    std::fs::write(cpath.join("stddef.h"), "void from_cpath(void);\n").unwrap();
+    std::fs::write(
+        root.join("main.c"),
+        "#include <stddef.h>\nvoid chosen(void) { from_cpath(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("compile_commands.json"),
+        json!([{
+            "directory": root,
+            "file": "main.c",
+            "arguments": ["gcc", "-I", builtin, "-c", "main.c"]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let output = dir.path().join("result.db");
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_trace"))
+        .arg("analyze")
+        .arg(&root)
+        .arg("--system-includes")
+        .arg("--jobs")
+        .arg("1")
+        .arg("-o")
+        .arg(&output)
+        .env("CPATH", &cpath)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let conn = rusqlite::Connection::open(output).unwrap();
+    let expected_path = trace_ir::canonicalize(&cpath.join("stddef.h"));
+    let from_cpath: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM functions AS f JOIN files AS source ON source.id=f.file_id WHERE f.name='from_cpath' AND f.is_dep=1 AND source.path=?1",
+            [expected_path.to_string_lossy().as_ref()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(from_cpath, 1, "compiler ignored -I builtin, trace must too");
+}
+
+#[cfg(unix)]
+#[test]
+fn duplicate_i_for_cpath_stays_before_other_i_directories() {
+    if std::process::Command::new("gcc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let cpath = dir.path().join("cpath");
+    let other = dir.path().join("other");
+    for path in [&root, &cpath, &other] {
+        std::fs::create_dir(path).unwrap();
+    }
+    std::fs::write(cpath.join("choice.h"), "void from_cpath(void);\n").unwrap();
+    std::fs::write(other.join("choice.h"), "void from_other(void);\n").unwrap();
+    std::fs::write(root.join("main.c"), "#include <choice.h>\n").unwrap();
+    std::fs::write(
+        root.join("compile_commands.json"),
+        json!([{
+            "directory": root,
+            "file": "main.c",
+            "arguments": ["gcc", "-I", cpath, "-I", other, "-c", "main.c"]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let output = dir.path().join("result.db");
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_trace"))
+        .arg("analyze")
+        .arg(&root)
+        .arg("--system-includes")
+        .arg("--jobs")
+        .arg("1")
+        .arg("-o")
+        .arg(&output)
+        .env("CPATH", &cpath)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let conn = rusqlite::Connection::open(output).unwrap();
+    let found: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM functions WHERE name='from_cpath'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(found, 1, "CPATH -I was incorrectly removed");
+}
+
 #[test]
 fn database_preserves_cpp_inference_for_orphan_headers() {
     let dir = tempfile::tempdir().unwrap();
@@ -448,6 +760,87 @@ void wrong_configuration(void) {}
         .symbols
         .resolve_function("wrong_configuration")
         .is_none());
+}
+
+#[test]
+fn duplicate_i_directory_moves_to_after_search_class() {
+    for (case, first, after_flags) in [
+        ("idirafter", "a", vec!["-idirafter", "a"]),
+        (
+            "iwithprefix",
+            "pre/a",
+            vec!["-iprefix", "pre/", "-iwithprefix", "a"],
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(case);
+        std::fs::create_dir_all(root.join(first)).unwrap();
+        std::fs::create_dir(root.join("b")).unwrap();
+        std::fs::write(root.join(first).join("choice.h"), "#define PICK 1\n").unwrap();
+        std::fs::write(root.join("b/choice.h"), "#define PICK 2\n").unwrap();
+        std::fs::write(
+            root.join("main.c"),
+            "#include <choice.h>\n#if PICK == 2\nvoid selected(void) {}\n#else\nvoid wrong(void) {}\n#endif\n",
+        )
+        .unwrap();
+        let mut arguments = vec!["cc", "-I", first, "-I", "b"];
+        arguments.extend(after_flags);
+        arguments.extend(["-c", "main.c"]);
+        std::fs::write(
+            root.join("compile_commands.json"),
+            json!([{
+                "directory": root,
+                "file": "main.c",
+                "arguments": arguments
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let program = build_program_with_jobs(&root, &PreprocessOptions::new(), 1).unwrap();
+        assert!(
+            program.symbols.resolve_function("selected").is_some(),
+            "{case}"
+        );
+        assert!(
+            program.symbols.resolve_function("wrong").is_none(),
+            "{case}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_header_uses_lexical_parent_for_nested_quoted_include() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let real = dir.path().join("real");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("header.h"), "#include \"choice.h\"\n").unwrap();
+    std::fs::write(real.join("choice.h"), "#define PICK 2\n").unwrap();
+    std::fs::write(project.join("choice.h"), "#define PICK 1\n").unwrap();
+    symlink("../real/header.h", project.join("alias.h")).unwrap();
+    std::fs::write(
+        project.join("main.c"),
+        "#include \"alias.h\"\n#if PICK == 1\nvoid selected(void) {}\n#else\nvoid wrong(void) {}\n#endif\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("compile_commands.json"),
+        json!([{
+            "directory": project,
+            "file": "main.c",
+            "arguments": ["cc", "-c", "main.c"]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let program = build_program_with_jobs(&project, &PreprocessOptions::new(), 1).unwrap();
+    assert!(program.symbols.resolve_function("selected").is_some());
+    assert!(program.symbols.resolve_function("wrong").is_none());
+    assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
 }
 
 #[test]

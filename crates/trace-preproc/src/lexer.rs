@@ -156,8 +156,24 @@ impl Token {
         origin: &Token,
         macro_name: &str,
         parameter: &Token,
+        active_hidden: Option<&Arc<FxHashSet<String>>>,
     ) -> Token {
         let mut token = self.clone();
+        // Argument prescan must see same-name macros normally. Only after
+        // substitution does the active invocation become unavailable during
+        // emitted-source rescan. Conditional expressions rescan raw arguments
+        // and retain their original hide state.
+        if let Some(active_hidden) = active_hidden {
+            token.hidden = Some(match &self.hidden {
+                None => Arc::clone(active_hidden),
+                Some(previous) if previous.is_subset(active_hidden) => Arc::clone(active_hidden),
+                Some(previous) => {
+                    let mut combined = (**active_hidden).clone();
+                    combined.extend(previous.iter().cloned());
+                    Arc::new(combined)
+                }
+            });
+        }
         token.expansion_id =
             expansion_fingerprint(origin, macro_name, Some(parameter), self.expansion_id);
         token.expansion_macro = origin

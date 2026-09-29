@@ -1,5 +1,48 @@
 # Evaluation Report
 
+## Installed system-header sample — 2026-09-29
+
+Measured with the current debug `trace` binary and `--system-includes --jobs 1`
+on Ubuntu's GCC 13.3 headers. Each header was the sole `#include` in a separate
+translation unit. C headers: `stdio.h`, `stdlib.h`, `string.h`, `stdint.h`,
+`stddef.h`, `limits.h`, `math.h`, `time.h`, `errno.h`, `assert.h`, `unistd.h`.
+C++ headers: `vector`, `string`, `memory`, `type_traits`, `algorithm`, `map`,
+`utility`, `iostream`, `optional`, `cstdint`, `array`. All 22 runs completed.
+This is a convenience sample, not a corpus-wide success estimate.
+
+| Outcome | Before preprocessing fixes | After |
+|---|---:|---:|
+| Top-level header found | 22/22 | 22/22 |
+| No missing nested include | 3/22 | 22/22 |
+| No parse-error diagnostic | 11/22 (C 10, C++ 1) | 12/22 (C 11, C++ 1) |
+| No preprocessing or parse diagnostic | 1/22 | 10/22 |
+
+The recurring `gnu/stubs-32.h` miss came from glibc taking the wrong branch
+without the compiler's `__x86_64__` macro. `<math.h>` parse errors came from
+an ordinary macro argument reaching a nested `##` paste without prescan.
+Inactive `#error` and `#warning` directives generated most of the initial
+preprocessing warnings. Ten of the eleven C++ headers still report parse
+errors after the fixes; analysis completes and retains declarations from them,
+but their syntax is not fully represented by the current parser.
+
+### C++ dependency parse normalization follow-up — 2026-09-29
+
+The same 11 C++ headers were reparsed after the declaration-only
+pointer-to-member approximation described in
+[Compilation databases](ANALYSIS.md#compilation-databases-62). Innermost
+unrecovered tree-sitter error nodes fell from **1,090 to 636**. `<vector>` fell
+from 186 to 89 and `<memory>` from 173 to 76. The parse-diagnostic outcome
+remains **1/11 clean** (`<cstdint>`), because other declaration grammar gaps
+remain. GCC's default C++ mode in this environment already reports
+`__cplusplus=201703L`; concepts and coroutines did not explain these errors.
+
+The `<vector>` export went from 1,132 to 1,121 functions. Comparing names and
+origin files found that the 11 removed entries were malformed parser artifacts
+from member-pointer declarations (for example `std::>:` and `_Ret`); no real
+declaration disappeared. An earlier experiment that blanked `nodiscard`
+attributes removed 14 real operators from `<vector>`, so that edit was
+discarded. This sample does not establish a corpus-wide parse success rate.
+
 ## Configurable test partition — 2026-09-28 (#161)
 
 The options and their precedence are specified in
