@@ -171,6 +171,7 @@ struct SearchPaths {
     system: Vec<PathBuf>,
     inferred: Vec<PathBuf>,
     root: Option<PathBuf>,
+    test_partition: trace_ir::TestPartition,
 }
 
 impl SourceCache {
@@ -195,6 +196,7 @@ impl SourceCache {
             system: opts.system_include_paths.clone(),
             inferred: opts.inferred_include_paths.clone(),
             root: opts.inference_root.clone(),
+            test_partition: opts.test_partition.clone(),
         };
         if let Ok(searches) = self.directory_searches.read() {
             if searches.epoch == epoch {
@@ -340,6 +342,8 @@ pub struct PreprocessOptions {
     pub inferred_include_paths: Vec<PathBuf>,
     /// Root for the shared production/test fallback convention.
     pub inference_root: Option<PathBuf>,
+    /// Directory-name policy shared by include inference and symbol lookup.
+    pub test_partition: trace_ir::TestPartition,
     /// Quoted includes search these before `include_paths`.
     pub quote_include_paths: Vec<PathBuf>,
     /// System directories follow `include_paths`, in supplied order.
@@ -445,6 +449,7 @@ impl Default for PreprocessOptions {
             include_paths: Vec::new(),
             inferred_include_paths: Vec::new(),
             inference_root: None,
+            test_partition: trace_ir::TestPartition::default(),
             quote_include_paths: Vec::new(),
             system_include_paths: Vec::new(),
             strict_include_search: false,

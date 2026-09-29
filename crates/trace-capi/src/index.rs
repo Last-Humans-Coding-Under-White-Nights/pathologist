@@ -24,6 +24,7 @@ struct IndexConfig {
     debug_points_to: bool,
     models: Vec<PathBuf>,
     ignore_macros: Vec<String>,
+    test_partition: trace_ir::TestPartition,
 }
 
 unsafe fn read_config(opts: &TraceIndexOptions) -> Result<IndexConfig, ApiError> {
@@ -47,6 +48,11 @@ unsafe fn read_config(opts: &TraceIndexOptions) -> Result<IndexConfig, ApiError>
         .map(PathBuf::from)
         .collect();
     let ignore_macros = crate::util::str_array(opts.ignore_macros, opts.n_ignore_macros)?;
+    let test_partition = trace_ir::TestPartition::from_options(
+        opts.no_test_partition != 0,
+        crate::util::str_array(opts.test_dirs, opts.n_test_dirs)?,
+    )
+    .map_err(ApiError::InvalidArg)?;
     let jobs = if opts.jobs <= 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -66,6 +72,7 @@ unsafe fn read_config(opts: &TraceIndexOptions) -> Result<IndexConfig, ApiError>
         debug_points_to: opts.debug_points_to != 0,
         models,
         ignore_macros,
+        test_partition,
     })
 }
 
@@ -182,6 +189,7 @@ fn run_index(cfg: &IndexConfig) -> Result<(TraceIndexResult, String), ApiError> 
     let models = Arc::new(models);
 
     let mut popts = PreprocessOptions::new();
+    popts.test_partition = cfg.test_partition.clone();
     for inc in &cfg.includes {
         popts.include_paths.push(inc.clone());
     }
@@ -332,6 +340,103 @@ unsafe fn trace_index_impl(
         Err(err) => {
             unsafe { set_error(out_err, err.message()) };
             err.status()
+        }
+    }
+}
+
+#[cfg(test)]
+mod partition_tests {
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn c_api_rejects_invalid_partition_options_before_indexing() {
+        let root = CString::new(".").unwrap();
+        for (disabled, name, null_array) in [
+            (1, "fakes", false),
+            (0, "", false),
+            (0, ".", false),
+            (0, "..", false),
+            (0, "a/b", false),
+            (0, "a\\b", false),
+            (0, "fakes", true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let output = dir.path().join("out.db");
+            let output_c = CString::new(output.to_str().unwrap()).unwrap();
+            let name = CString::new(name).unwrap();
+            let names = [name.as_ptr()];
+            let mut opts: TraceIndexOptions = unsafe { std::mem::zeroed() };
+            opts.size = std::mem::size_of::<TraceIndexOptions>();
+            opts.root = root.as_ptr();
+            opts.output_db = output_c.as_ptr();
+            opts.no_test_partition = disabled;
+            opts.test_dirs = if null_array {
+                ptr::null()
+            } else {
+                names.as_ptr()
+            };
+            opts.n_test_dirs = 1;
+            let mut result: TraceIndexResult = unsafe { std::mem::zeroed() };
+            let mut error = ptr::null_mut();
+            assert_eq!(
+                unsafe { trace_index(&opts, &mut result, &mut error) },
+                TraceStatus::TraceErrInvalidArg as i32
+            );
+            assert!(!error.is_null());
+            unsafe { crate::util::trace_string_free(error) };
+            assert!(!output.exists());
+        }
+    }
+
+    #[test]
+    fn c_api_test_partition_controls_calls_and_records_policy() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/test_partition");
+        let root = CString::new(root.to_str().unwrap()).unwrap();
+        let fake = CString::new("fakes").unwrap();
+        let names = [fake.as_ptr()];
+        for (disabled, custom, shim, fake_edge, expected_names) in [
+            (1, false, 1, 1, vec![]),
+            (0, true, 1, 0, vec!["fakes"]),
+            (0, false, 0, 1, vec!["test", "tests", "mock", "mocks"]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let output = dir.path().join("out.db");
+            let output_c = CString::new(output.to_str().unwrap()).unwrap();
+            let mut opts: TraceIndexOptions = unsafe { std::mem::zeroed() };
+            opts.size = std::mem::size_of::<TraceIndexOptions>();
+            opts.root = root.as_ptr();
+            opts.output_db = output_c.as_ptr();
+            opts.jobs = 1;
+            opts.no_test_partition = disabled;
+            if custom {
+                opts.test_dirs = names.as_ptr();
+                opts.n_test_dirs = 1;
+            }
+            let mut result: TraceIndexResult = unsafe { std::mem::zeroed() };
+            let mut error = ptr::null_mut();
+            assert_eq!(
+                unsafe { trace_index(&opts, &mut result, &mut error) },
+                TraceStatus::TraceOk as i32
+            );
+            assert!(error.is_null());
+            let conn = rusqlite::Connection::open(output).unwrap();
+            for (caller, callee, expected) in [
+                ("Connect", "SocketOpen", shim),
+                ("ConnectFake", "FakeOpen", fake_edge),
+                ("UseFoo", "FooUtil", shim),
+            ] {
+                let count: i64 = conn.query_row("SELECT count(*) FROM call_edges e JOIN functions a ON a.id=e.caller_fn_id JOIN functions b ON b.id=e.callee_fn_id WHERE a.name=?1 AND b.name=?2 AND b.is_defined=1 AND e.resolution='direct'", [caller, callee], |r| r.get(0)).unwrap();
+                assert_eq!(
+                    count, expected,
+                    "disabled={disabled} custom={custom} {caller}"
+                );
+            }
+            let enabled: bool = conn.query_row("SELECT json_extract(options_json, '$.test_partition.enabled') FROM analysis_run", [], |r| r.get(0)).unwrap();
+            let directories: String = conn.query_row("SELECT coalesce(group_concat(value, ','), '') FROM analysis_run, json_each(options_json, '$.test_partition.directories')", [], |r| r.get(0)).unwrap();
+            assert_eq!(enabled, disabled == 0);
+            assert_eq!(directories, expected_names.join(","));
         }
     }
 }

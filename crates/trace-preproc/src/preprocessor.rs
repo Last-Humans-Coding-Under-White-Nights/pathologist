@@ -2479,7 +2479,7 @@ impl PreprocessorState {
             .opts
             .inference_root
             .as_ref()
-            .is_none_or(|root| trace_ir::is_test_path(root, &file));
+            .is_none_or(|root| trace_ir::is_test_path(root, &file, &self.opts.test_partition));
         self.current_file = file;
     }
 
@@ -2524,14 +2524,13 @@ impl PreprocessorState {
     /// partition is checked only on candidates that exist.
     fn search_include_dirs(&self, key: &(String, bool, bool)) -> Option<PathBuf> {
         let (path, quoted) = (key.0.as_str(), key.1);
-        let admits = |p: &Path| {
-            key.2
-                || self
-                    .opts
-                    .inference_root
-                    .as_ref()
-                    .is_none_or(|root| !trace_ir::is_test_path(root, p))
-        };
+        let admits =
+            |p: &Path| {
+                key.2
+                    || self.opts.inference_root.as_ref().is_none_or(|root| {
+                        !trace_ir::is_test_path(root, p, &self.opts.test_partition)
+                    })
+            };
         let cached = self.shared_directory_results.as_ref().and_then(|cache| {
             cache
                 .read()
@@ -5388,6 +5387,36 @@ mod tests {
             vec![a.join("shared.h")],
         )])));
         check(&source, "#include <shared.h>\n", &opts, "from_a");
+    }
+
+    #[test]
+    fn shared_directory_search_distinguishes_test_partition_policies() {
+        let _guard = PROBE_EPOCH_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut opts = PreprocessOptions::new();
+        opts.inference_root = Some(root.to_path_buf());
+        opts.inferred_include_paths = vec![root.join("mock"), root.join("fakes")];
+        opts.source_cache = Some(Arc::new(crate::SourceCache::new(FxHashMap::from_iter([
+            (
+                root.join("mock/shared.h"),
+                Arc::<str>::from("int from_mock;\n"),
+            ),
+            (
+                root.join("fakes/shared.h"),
+                Arc::<str>::from("int from_fake;\n"),
+            ),
+        ]))));
+        for (disabled, names, expected) in [
+            (false, vec![], "from_fake"),
+            (true, vec![], "from_mock"),
+            (false, vec!["fakes".into()], "from_mock"),
+            (false, vec![], "from_fake"),
+        ] {
+            opts.test_partition = trace_ir::TestPartition::from_options(disabled, names).unwrap();
+            let result = preprocess_string("#include <shared.h>\n", &root.join("main.c"), &opts);
+            assert!(result.output.contains(expected), "{}", result.output);
+        }
     }
 
     #[test]

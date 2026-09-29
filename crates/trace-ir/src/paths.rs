@@ -234,11 +234,85 @@ pub fn resolve_against(directory: &Path, path: &Path) -> PathBuf {
     canonicalize(&normalized)
 }
 
+/// Directory-name policy for bare-tree production/test inference.
+/// An empty effective list disables the partition. See docs/ANALYSIS.md,
+/// "Declaring-header eligibility".
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TestPartition {
+    directories: Vec<String>,
+}
+
+impl Default for TestPartition {
+    fn default() -> Self {
+        Self {
+            directories: ["test", "tests", "mock", "mocks"]
+                .map(str::to_owned)
+                .to_vec(),
+        }
+    }
+}
+
+impl TestPartition {
+    /// Interpret CLI/C API options: no names keeps defaults; supplied names
+    /// replace them. Disabling and supplying names are mutually exclusive.
+    pub fn from_options(disabled: bool, mut names: Vec<String>) -> Result<Self, String> {
+        if disabled {
+            return if names.is_empty() {
+                Ok(Self {
+                    directories: Vec::new(),
+                })
+            } else {
+                Err(
+                    "disabling the test partition conflicts with specifying custom test directories"
+                        .into(),
+                )
+            };
+        }
+        if names.is_empty() {
+            return Ok(Self::default());
+        }
+        for name in &names {
+            if name.is_empty()
+                || matches!(name.as_str(), "." | "..")
+                || name.contains(['/', '\\', '\0'])
+            {
+                return Err(format!(
+                    "test directory name must be a single literal directory component: {name:?}"
+                ));
+            }
+        }
+        // Stable deduplication also keeps the recorded effective list concise.
+        // Record decisions before mutating names so the set can borrow strings.
+        let mut seen = FxHashSet::default();
+        let keep: Vec<bool> = names
+            .iter()
+            .map(|name| seen.insert(name.as_str()))
+            .collect();
+        let mut keep = keep.into_iter();
+        names.retain(|_| keep.next().unwrap());
+        Ok(Self { directories: names })
+    }
+
+    pub fn directories(&self) -> &[String] {
+        &self.directories
+    }
+
+    pub fn enabled(&self) -> bool {
+        !self.directories.is_empty()
+    }
+
+    fn matches(&self, name: &std::ffi::OsStr) -> bool {
+        self.directories
+            .iter()
+            .any(|dir| name == std::ffi::OsStr::new(dir))
+    }
+}
+
 /// Bare-tree fallback partition; explicit include/link evidence takes precedence.
 /// See docs/ANALYSIS.md, "Declaring-header eligibility".
 ///
-/// True when a directory component of `path` below `root` is `test`, `tests`,
-/// `mock` or `mocks` (the file name itself does not count).
+/// True when a directory component of `path` below `root` matches the
+/// configured policy (the file name itself does not count).
 ///
 /// Precondition: `root` and `path` are spelled the same way -- both
 /// canonical, as every pipeline stage passes them. The test is lexical: a
@@ -246,27 +320,26 @@ pub fn resolve_against(directory: &Path, path: &Path) -> PathBuf {
 /// yields `false`, and so does a path not under `root`. A `..` component below
 /// `root` is folded lexically (`root/test/../src/a.h` is production); one that
 /// climbs out of `root` yields `false`. Only that rare spelling allocates.
-pub fn is_test_path(root: &Path, path: &Path) -> bool {
+pub fn is_test_path(root: &Path, path: &Path, policy: &TestPartition) -> bool {
+    if !policy.enabled() {
+        return false;
+    }
     let Some(parent) = path.strip_prefix(root).ok().and_then(Path::parent) else {
         return false;
     };
     let mut test = false;
     for part in parent.components() {
         match part {
-            Component::Normal(name) => test |= is_test_dir_name(name),
-            Component::ParentDir => return is_test_dir_folded(parent),
+            Component::Normal(name) => test |= policy.matches(name),
+            Component::ParentDir => return is_test_dir_folded(parent, policy),
             _ => {}
         }
     }
     test
 }
 
-fn is_test_dir_name(name: &std::ffi::OsStr) -> bool {
-    matches!(name.to_str(), Some("test" | "tests" | "mock" | "mocks"))
-}
-
 /// [`is_test_path`] for a relative directory spelled with `..`.
-fn is_test_dir_folded(relative: &Path) -> bool {
+fn is_test_dir_folded(relative: &Path, policy: &TestPartition) -> bool {
     let mut dirs = Vec::new();
     for part in relative.components() {
         match part {
@@ -275,7 +348,7 @@ fn is_test_dir_folded(relative: &Path) -> bool {
             _ => {}
         }
     }
-    dirs.into_iter().any(is_test_dir_name)
+    dirs.into_iter().any(|name| policy.matches(name))
 }
 
 #[cfg(test)]
@@ -296,7 +369,37 @@ mod tests {
             ("/r/src/../mock/a.h", true),
             ("/r/../test/a.h", false),
         ] {
-            assert_eq!(is_test_path(root, Path::new(path)), expected, "{path}");
+            assert_eq!(
+                is_test_path(root, Path::new(path), &TestPartition::default()),
+                expected,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_partition_names_preserve_path_boundaries() {
+        let policy = TestPartition::from_options(false, vec!["fakes".into()]).unwrap();
+        let disabled = TestPartition::from_options(true, vec![]).unwrap();
+        // The root's own name never classifies its contents as tests.
+        let root = Path::new("/fakes");
+        for (path, expected) in [
+            ("/fakes/src/a.h", false),
+            ("/fakes/mock/a.h", false),
+            ("/fakes/fakes/a.h", true),
+            ("/fakes/Fakes/a.h", false),
+            ("/fakes/src/fakes", false),
+            ("/fakes/fakes/../src/a.h", false),
+            ("/fakes/src/../fakes/a.h", true),
+            ("/fakes/../fakes/a.h", false),
+            ("/elsewhere/fakes/a.h", false),
+        ] {
+            assert_eq!(
+                is_test_path(root, Path::new(path), &policy),
+                expected,
+                "{path}"
+            );
+            assert!(!is_test_path(root, Path::new(path), &disabled), "{path}");
         }
     }
 

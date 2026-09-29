@@ -350,7 +350,7 @@ fn build_program_inner(
     let mut program = Program::new(root.to_path_buf());
     program
         .symbols
-        .set_inference_root(&trace_ir::canonicalize(root));
+        .set_inference_root(&trace_ir::canonicalize(root), opts.test_partition.clone());
     program.include_paths = opts.include_paths.clone();
     // Set before any path is interned: `SymbolTable` decides `FileInfo::is_dep`
     // as it interns, so every later dep question is an O(1) file lookup (#60).
@@ -421,8 +421,14 @@ fn build_program_inner(
         ));
     }
 
-    let mut include_graph =
-        IncludeGraph::build_with_deps(root, &files, &headers, &dep_roots, &dep_headers);
+    let mut include_graph = IncludeGraph::build_with_partition(
+        root,
+        &files,
+        &headers,
+        &dep_roots,
+        &dep_headers,
+        &opts.test_partition,
+    );
     let mut links =
         crate::link_commands::LinkDatabase::load(root, &database, opts.link_commands.as_deref())?;
     if links.inferred && !links.unscoped_inference && !links.targets.is_empty() {
@@ -1173,7 +1179,9 @@ fn finalize_program(
     graph: &IncludeGraph,
     extra_dirs: impl IntoIterator<Item = PathBuf>,
 ) {
-    program.symbols.set_inference_root(&graph.root);
+    program
+        .symbols
+        .set_inference_root(&graph.root, graph.test_partition.clone());
     program.include_deps = graph.edge_list();
     let mut seen: HashSet<PathBuf> = program.include_paths.iter().cloned().collect();
     for dir in extra_dirs {
