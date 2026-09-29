@@ -124,6 +124,16 @@ a shared helper can propagate values from any of its includers, while no
 contributing binding is discarded. Internal definitions without expansion
 metadata retain their existing merge behavior.
 
+A header lowered as a unit of its own, from a stored expansion, holds its
+internal-linkage definitions itself: their unit is the header, not an
+includer, and every file that includes the header sees them. A unit that
+replays the expansion has no copy of its own, and its call to the header's
+`static` function binds to the header's. The same holds for a header whose
+expansion could not be stored and whose text another header's entry holds
+(`docs/PREPROCESSOR.md`, "An expansion that cannot be stored"): what it
+defines is its own, never a body the holder shares, so a file sees it by
+including the header, whichever entry holds the text.
+
 Expanded definition text travels through `UnitIndex::internal_definitions`.
 Cached-header replay retains it in the temporary TU preamble so
 `program_into_unit` can transfer it to the unit. The final merge keeps the
@@ -1288,6 +1298,16 @@ Because v1 has no opcode or parcel-type information, overloaded handlers at
 the selected naming tier are all retained as a may-analysis result. With `m`
 proxy overloads and `n` handler overloads this deliberately emits the full
 `m × n` cross-product, so IPC edge counts can grow for overloaded interfaces.
+
+A proxy and stub synthesized from an `.idl` file
+([IDL-generated interfaces](#idl-generated-interfaces)) are registered from
+`Program::idl_interfaces` instead: the proxy's IDL methods count as IPC sends
+without a `SendRequest` call, the stub has no handlers so the interface
+fallback above selects the service's overrides, and the bridge carries the
+IDL descriptor. So does the bridge of any other sender that pairs with that
+stub, a hand-written `AtmClient` beside the generated `AtmProxy`: the
+descriptor is the stub's interface's. `ipccode` is recorded but not used for
+matching yet.
 
 This is deliberately name-based and does not interpret transaction opcodes or
 control flow in `OnRemoteRequest`. Synthetic IPC edges are appended after the
@@ -2600,6 +2620,134 @@ Limits:
 - An exact global template name wins over the scoped lookup.
 - A base spelled with a partial specialization's arguments expands through
   the primary template's bases.
+
+## IDL-generated interfaces
+
+OpenHarmony services declare their IPC interfaces in `.idl` files; the build
+runs idl-tool to generate the interface header, the proxy and the stub, and
+none of the three is in the source tree. For every `.idl` file under the
+analysis root or a dependency root, indexing synthesizes the declarations
+idl-tool would generate and serves them from memory at
+`<root>/.trace-idl-generated/<header>`. That directory is a dependency root
+([Dependency roots](#dependency-roots)): the headers resolve `#include` like
+any other, carry `is_dep = 1`, and contribute declarations only. The headers
+of an IDL file in the test partition
+([Declaring-header eligibility](#declaring-header-eligibility)) are served
+one directory down, named after the file's test directory
+(`.trace-idl-generated/test/<header>`), so they stay in the partition:
+test code includes them and production code does not. A test directory is
+one below the analysis root or below the dependency root the file is under,
+so `<dep>/mock/IAtm.idl` is test IDL as `<root>/mock/IAtm.idl` is. The
+include guard of a header names its directory with its file
+(`TRACE_IDL_IATM_H`, `TRACE_IDL_TEST_IATM_H`): a unit that includes a
+production header and the header of that name in the partition gets both.
+
+| IDL | Synthesized |
+|-----|-------------|
+| `interface OHOS.Security.IAtm` (or `package OHOS.Security;` + `interface IAtm`) | `namespace OHOS { namespace Security { … } }` |
+| interface `IAtm` | `iatm.h`: `class IAtm : public OHOS::IRemoteBroker` with one pure-virtual method per IDL method |
+| `interface IFoo extends IBase` | `class IFoo : public a::IBase` (a bare base name is in the file's package); `ifoo.h` includes `ibase.h` when that header is synthesized too or is on disk |
+| proxy | `atm_proxy.h`: `class AtmProxy : public IRemoteProxy<IAtm>`, every method `override`: the interface's own, then those it inherits through `extends`, nearest base first and each name once, a nearer base's declaration standing for those further up, as far as the bases are declared in the tree's IDL files. A production interface inherits from production IDL only; one in the test partition from its own test directory's IDL, then from production IDL |
+| stub | `atm_stub.h`: `class AtmStub : public IRemoteStub<IAtm>` declaring `OnRemoteRequest` |
+| descriptor | the dotted name as written, `OHOS.Security.IAtm`, or what the file's `interface_token a.b.c;` declares |
+
+Names follow idl-tool: a leading `I` followed by an uppercase letter is
+stripped to form the base (`IAtm` → `Atm`). A file is named after its class
+in lower case, with an underscore before every capital past the second
+character (the generators' `CodeEmitter::FileName`):
+`IAccessTokenManager` → `iaccess_token_manager.h`,
+`AccessTokenManagerProxy` → `access_token_manager_proxy.h`, and a run of
+capitals splits at each one (`IHDIFoo` → `ih_d_i_foo.h`). A name without
+the `I` prefix is its own base (`El5FilekeyManagerInterface` →
+`el5_filekey_manager_interface.h`, `El5FilekeyManagerInterfaceProxy`).
+
+Every method returns `int32_t` (idl-tool's `ErrCode`); a non-`void` IDL
+return becomes a trailing `T& funcResult` parameter. Parameters:
+
+| IDL | `[in]` | `[out]` / `[inout]` |
+|-----|--------|---------------------|
+| `boolean byte short int long float double char`, `unsigned …`, an IDL `enum`, `FileDescriptor` | `T name` | `T& name` |
+| `String` → `std::string`, `List<T>` / `T[]` → `std::vector<T>`, `Map<K,V>` → `std::unordered_map<K, V>`, a `sequenceable a.b.S` → `a::b::S` | `const T& name` | `T& name` |
+| `IRemoteObject`, an IDL `interface` → `sptr<…>` | `const sptr<…>& name` | `sptr<…>& name` |
+
+Primitive spellings: `boolean` → `bool`, `byte` → `int8_t`, `short` →
+`int16_t`, `int` → `int32_t`, `long` → `int64_t`, `unsigned char/short/int/long`
+→ `uint8_t/uint16_t/uint32_t/uint64_t`, `FileDescriptor` → `int`. The C++
+spellings `bool`, `int8_t` … `int64_t` and `uint8_t` … `uint64_t`, which some
+IDL files use directly, map to themselves and are passed by value too.
+
+The synthesized headers include nothing but each other: `IRemoteBroker`,
+`IRemoteProxy`, `IRemoteStub`, `sptr` and the standard types stay whatever
+the tree declares. Where it declares `IRemoteBroker`, a call such as
+`proxy_->AsObject()` binds to the broker's member. When the IPC framework
+is not in the tree the undefined-template base
+rule ([Template-parameter bases](#template-parameter-bases)) makes the proxy
+and the stub subclasses of the interface, so a call through `sptr<IAtm>`
+reaches `AtmProxy`. That edge has resolution `external`, as every edge to a
+function declared without a body has: the proxy's body is generated, not in
+the tree.
+
+Precedence and failures:
+
+- A header already on disk with the same file name wins; that one header is
+  not synthesized. On disk means among the headers of the analysis root and
+  the dependency roots, or in a directory named by `--include`. For a
+  production interface a header in the test partition does not count: a
+  production includer cannot take a mock `iatm.h`, so the generated one is
+  still synthesized. Whether a header is in the partition is decided as
+  include resolution decides it, relative to the analysis root. This is
+  deliberately not the rule for IDL files, which have a test directory below
+  a dependency root as well: include resolution finds `<dep>/mock/iatm.h`
+  for a production includer, so that header counts as on disk for a
+  production interface and stands in for the generated one, while
+  `<dep>/mock/IAtm.idl` renders where production code does not look. The
+  asymmetry ends when the partition reaches dependency roots in include
+  resolution and symbol lookup.
+- Production IDL files are processed before those of the test partition,
+  each group in sorted path order; when two render the same header into the
+  same directory the first keeps it and a warning names both. An interface that
+  lost its proxy or stub header this way, or whose proxy or stub class an
+  earlier interface already names, records no fact on
+  `Program::idl_interfaces`: the classes declared are the earlier
+  interface's. One that lost its interface header (`IFoo` and `Ifoo` are
+  both `ifoo.h`) is not declared at all: its proxy and stub are not rendered
+  either, since they would include a header declaring another class, and an
+  interface extending it includes nothing for it and inherits nothing from
+  it.
+- A file that does not parse is skipped with one warning
+  (`stage = idl`, `<path>:<line>: <message>`). `enum`, `struct`, `union`,
+  `import`, `option_*` declarations (`option_stub_hooks on;`) and
+  interface-level attributes are skipped; `sequenceable`, `rawdata` and
+  forward `interface` declarations only inform the parameter mapping
+  (a `rawdata` type maps as a `sequenceable` does). Each of the three may
+  name the header declaring the type before `..`
+  (`interface CallbackHeader..a.ICallback;`); the name is what follows it,
+  and a `.` right after the separator (`interface IncludeDir...ICallback;`)
+  puts it in the global namespace rather than the file's package.
+  An attribute's value is read only when it is a number (`ipccode 1`); any
+  other (`customMsgOption flags=MessageOption::TF_IMAGE`) is skipped,
+  brackets of its own included. An `ipccode` past 32 bits is not recorded.
+- A directory `<root>/.trace-idl-generated` that exists on disk is reported
+  with one warning when headers are synthesized: it becomes a dependency
+  root with whatever it holds, and its headers are indexed as those of any
+  dependency root are.
+- A type nested more than 64 levels deep (generic arguments and `[]`
+  suffixes together) is a syntax error.
+- An interface that `extends` itself is reported with one warning and
+  synthesized without the clause.
+- The grammar is idl-tool's service dialect. HDI interface files
+  (`Ping();` with no return type) do not parse and are skipped with that
+  warning.
+- Each file is rendered on its own. A type named only through `import`
+  (a sequenceable or enum declared in another `.idl`, such as
+  `IdlCommon.idl`) is not qualified: it is emitted as written
+  (`HapInfoParcel`, not `OHOS::Security::AccessToken::HapInfoParcel`), and an
+  imported enum is passed as `const E&`. Only parameter spellings change;
+  method names, classes and bases, which pairing and dispatch use, do not.
+
+Each interface's names and methods (with `ipccode`) are recorded once on
+`Program::idl_interfaces`; IPC pairing reads them from there
+([OpenHarmony IPC bridges](#openharmony-ipc-bridges)).
 
 ## Dependency roots
 

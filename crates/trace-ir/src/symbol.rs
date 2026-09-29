@@ -1986,7 +1986,12 @@ impl SymbolTable {
                 if let Some(tus) = self.shared_header_tus.get(&id) {
                     return f.file == file || self.any_unit_sees(tus, file);
                 }
-                if f.tu.is_some_and(|tu| !self.file_sees(tu, file)) {
+                // A body lowered in a unit other than its own file is that
+                // unit's copy. One lowered with its header is the header's:
+                // every file that sees the header sees it.
+                if f.tu
+                    .is_some_and(|tu| tu != f.file && !self.file_sees(tu, file))
+                {
                     return false;
                 }
             }

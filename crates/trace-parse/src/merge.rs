@@ -20,6 +20,9 @@ pub struct UnitIndex {
     /// Includes the TU itself plus every `#include`d origin that produced
     /// attributed entities.
     pub files: Vec<PathBuf>,
+    /// Headers whose text a header's unit holds beside its own
+    /// (`IncludeExpansion::inlined`). What they declare is theirs.
+    pub held_headers: Vec<PathBuf>,
     pub types: trace_ir::TypeTable,
     pub functions: Vec<Function>,
     pub member_declarations: FxHashMap<FnId, Vec<trace_ir::FileId>>,
@@ -378,6 +381,20 @@ fn merge_unit(
             .copied()
             .unwrap_or(primary_file_id)
     };
+    // An entity a held header declares belongs to that header's unit, as it
+    // would had the header a unit of its own, not to the holder's.
+    let held: FxHashSet<trace_ir::FileId> = unit
+        .held_headers
+        .iter()
+        .map(|path| program.symbols.add_file_interned(path))
+        .collect();
+    let unit_of = |file: trace_ir::FileId| -> trace_ir::FileId {
+        if held.contains(&file) {
+            file
+        } else {
+            primary_file_id
+        }
+    };
     for fact in &unit.template_bases {
         match fact.anonymous_in {
             None => program.add_template_base_fact(fact),
@@ -497,11 +514,12 @@ fn merge_unit(
         }
         let span_file = map_file(func.span.file);
         let internal_cpp = func.linkage == trace_ir::Linkage::Internal && func.is_cpp;
-        // Only a body that originates in an included header can be shared.
+        // Only a body that originates in an included header can be shared,
+        // and one a held header declares is that header's own.
         let header_definition = unit
             .internal_definitions
             .get(&old_id)
-            .filter(|_| span_file != primary_file_id);
+            .filter(|_| span_file != unit_of(span_file));
         let origin = trace_ir::Span::new(span_file, func.span.line, func.span.col);
         let shared = header_definition
             .and_then(|text| program.dedup.existing_header_fn(origin, &func.name, text));
@@ -665,7 +683,7 @@ fn merge_unit(
         f.id = new_id;
         f.span.file = span_file;
         f.file = span_file;
-        f.tu = Some(primary_file_id);
+        f.tu = Some(unit_of(span_file));
         f.return_type = remap_type(f.return_type, &type_map);
         // A body written in a dependency header is not the target's code:
         // keep the signature, drop everything the body would contribute (#60).
@@ -1109,7 +1127,8 @@ fn merge_unit(
         }
         let new_id = program.symbols.alloc_call_id();
         site.id = new_id;
-        site.tu = Some(primary_file_id);
+        // A call a macro spells is owned where the macro is invoked.
+        site.tu = Some(unit_of(site.scope_file()));
         program.symbols.call_sites.push(site);
         if shared_caller {
             program.symbols.share_header_call(new_id, primary_file_id);

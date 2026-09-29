@@ -8,6 +8,7 @@ mod expansion_discovery;
 pub mod explore;
 pub mod gn_defines;
 mod gn_targets;
+mod idl;
 mod index_cache;
 mod link_commands;
 mod lower;

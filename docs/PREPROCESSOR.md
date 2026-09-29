@@ -151,6 +151,7 @@ flowchart LR
 | `#error` / `#warning` | Active directives report their spelled message as an error or warning and indexing continues. Directives inside inactive conditional arms are ignored. Unknown directives in inactive arms are ignored too. |
 | Macro argument prescan | In emitted source, function-like macro arguments are expanded before ordinary parameter substitution. Operands of `#` and `##` keep their original tokens. The active macro is suppressed on substituted tokens during the later rescan, including an identifier exposed by prescan next to an argument-produced `(`. The same rule applies to nested forwarding macros such as glibc's `__SIMD_DECL(__MATH_PRECNAME(...))`. |
 | `#undef` | |
+| Access-specifier renames | In C++, `#define private public` and its like are not applied; see [Access-specifier renames](#access-specifier-renames) |
 | Predefined | `__FILE__`, `__LINE__` — inside a macro body `__LINE__` is the line of the (outermost) invocation, C11 6.10.8.1, and both work in object-like as well as function-like bodies. **Language predefines** (#70): every run's macro table is seeded with what the language it is lexed as implies — `__STDC__ 1` in both, `__STDC_VERSION__ 201710L` in a C unit, `__cplusplus 201703L` in a C++ unit (what the OpenHarmony clang defaults to; the corpora only compare against `201103L`) — so `#ifdef __cplusplus`, `defined(__cplusplus)` and `#if __cplusplus >= 201103L` take the C++ arm in a C++ unit and the C arm in a C unit. A command-line `-D` of the same name outranks the predefined value, and a source `#undef` removes it: these are ordinary definitions, not builtin fallbacks. The warm pass seeds each header's table the same way, so a header shared by a C and a C++ unit reads `__cplusplus` bound in one run and unbound in the other — an ordinary fingerprint dependency (#55) that keeps each unit's expansion its own. Before #70 nothing was predefined and every `__cplusplus` read resolved to `0`, so `extern "C"` wrappers and C++-only declarations were silently excluded from C++ units (930 reads across the eval corpora, all unbound). No compiler is claimed: `__GNUC__` / `__clang__` stay unbound. Builtin fallback macros for headers the indexed tree does not ship are separate (see [Builtin fallback macros](#builtin-fallback-macros)) |
 | Token spacing | No space before `)` / `]`; space between `>` and `&` / `*` so `operator()` and `shared_ptr<T> &p` survive re-lexing |
 
@@ -257,6 +258,51 @@ Semantics — a fallback is a definition of last resort, never an answer to
   fallbacks included (see [Macro operations in cached
   entries](#macro-operations-in-cached-entries)).
 
+## Access-specifier renames
+
+Unit tests open the classes they test by defining an access specifier as
+another before including the class's header:
+
+```cpp
+#define private public
+#define protected public
+#include "ability_manager_service.h"
+#undef private
+#undef protected
+```
+
+In C++ an object-like definition of `public`, `protected` or `private` whose
+replacement list is one of those three names is **not applied**: the name
+stays undefined, the header keeps the specifier it spells, and the matching
+`#undef` finds nothing to remove. Any other definition of those names is an
+ordinary macro (`#define private`, `#define private public: int opened;
+private`), and so is every definition of them in C, where they are ordinary
+identifiers.
+
+Nothing lowered from the text depends on which specifier a member has: a
+call through a private member binds as one through a public member does. What
+the definition did change is the text of every header declaring a class, and
+with it the expansion cache. A header read `private` bound, so the
+expansions stored by units that do not define it matched no test unit. The
+replacement `public` is spelled where the test source defines it, which made
+the binding of each test source a different one, and an expansion made under
+one matched no other test either. Past the eight variants a header keeps,
+each such unit expanded the header, and what it includes, into its own text.
+On `ability_ability_runtime`, where 1,016 sources rename a specifier, that
+was half of all text parsed and lowered (measurements in
+`docs/EVAL_REPORT.md`). A body whose text spells a specifier (a local class in
+a header's `static` function, a lambda in a member) was also one function
+entry per distinct expansion, and is one entry now.
+
+The rule applies to every C++ file, production sources included, since it is
+about what lowering reads and not where the definition is. What it gives up
+is what could observe the definition: a conditional on the name (`#ifdef
+private`, `#if defined(private)`) reads it as undefined, and a macro whose
+replacement list spells the name (`#define ACCESS private`) expands to the
+specifier as written rather than to the renamed one. Stringizing is
+unaffected, since `#x` spells its argument before expansion. None of the four
+trees measured has a conditional on one of the three names.
+
 ## LineMap
 
 The normal indexing path stores preprocessed source payloads larger than 512 KiB
@@ -339,7 +385,7 @@ candidate probes naming 224,945 distinct paths (#83).
 |----------|-------|
 | `needs_preprocess` set | Files with `#include` edges (or included by another) run through the preprocessor |
 | `source_cache` | Reuse file text while scanning `#include` edges |
-| Reachable headers | Preprocessed file-locally, parsed/lowered **once** (PCH-style header IR), then merged into TUs |
+| Reachable headers | Preprocessed file-locally (a nested header that cannot be stored stays with its includer), parsed/lowered **once** (PCH-style header IR), then merged into TUs |
 | Orphan headers | Project `.h` never reached from any `.c` are indexed as their own units (may contain calls) |
 | Parallel index | Header IR, orphan headers, and `.c` TUs: parallel parse/lower, sequential merge |
 
@@ -388,6 +434,40 @@ expansion, not one per header. Without these rules a
 replayed entry could define a header's guard while naming no variant, or only the empty one, and
 the consumer lost the header's declarations (`PermissionDataBrief` in `security_access_token`,
 #121).
+
+**An expansion that cannot be stored.** A header a run expands itself is published as a new
+variant, or recorded as the stored variant with its signature. When neither is possible — the list
+is full, the fingerprint is one no consumer can satisfy, or the run was cut short — no record can
+name it. Its text is then not dropped from its includer's output as a stored child's is: it stays
+there, so the includer's entry (or the unit, which the settle pass rebuilds anyway) holds its
+declarations. `IncludeExpansion::inlined` lists the headers an entry holds this way, theirs
+included, and the records of the headers such an expansion replayed pass to the includer's entry
+as well, since they are reached through that entry alone.
+
+Lowering an entry merges what the headers it holds include, as it merges what its own header
+includes, so their declarations see the types they would in a unit of their own; and what a held
+header declares belongs to that header's unit, not to the holder's, so a production header held by
+a test header stays production code.
+
+An entry that skips such a header by its guard has neither its text nor a record of it. That is
+harmless where the entry, at the time of the skip, holds the header itself or records an entry
+that does (`IncludeExpansion::covers`): whoever replays it lowers the declarations with the
+holder's. Otherwise the entry would hand its consumers the guard without the declarations, and it
+is not stored; its own text stays with its includer in turn. The rule is judged when the skip
+happens, for every entry being composed, so an entry that would come to hold the header once the
+entries between them close unstored (`outer.h → mid.h → sib.h` skipping the `decl.h` that
+`mid.h → inner.h` holds) is not stored either, and a unit expands all of it. That is the
+conservative side: text a unit expands itself is lowered with everything the unit has in scope,
+where a header's own unit sees only the types of what it includes. Storing such entries was
+measured and put aside for the same reason as the header-unit limits in `docs/EVAL_REPORT.md`.
+
+Before, the includer's entry defined the header's guard, held none of its text and named no
+variant of it or of what it included: a unit replaying the entry was lowered without the header's
+classes, and a member call on one stayed unbound (`CaptureSession::AddOutput` in camera, #123).
+
+**Origins are canonical paths.** The line map names each origin file by its canonical path, not
+by the spelling include resolution found it under, so a header reached through two search
+directories (`-I inc`, `-I src/../inc`) is one file to everything downstream.
 
 **Why the order of publication matters.** Two things about a variant are decided by who publishes
 it first, not by the header and the fingerprint alone. Its index is its position, and a consumer
@@ -446,7 +526,7 @@ where `K` counts the units the committing thread ran itself. Measurements are in
 
 ### Header IR (PCH-style)
 
-Indexing sets `inline_include_bodies = false`. Nested cacheable `#include`s replay **macros and include-once state** but do not copy header tokens into the consumer's live output. Each header's preprocessed text is therefore file-local.
+Indexing sets `inline_include_bodies = false`. Nested cacheable `#include`s replay **macros and include-once state** but do not copy header tokens into the consumer's live output. Each header's preprocessed text is therefore file-local, except for a nested header whose expansion cannot be stored: its text stays in its includer's ("An expansion that cannot be stored", above).
 
 After the warm pass, reachable headers are parsed and lowered **once**. PCH order uses the include graph **plus preprocess `included_headers`** (macro includes the raw scanner misses). Independent leaves may run in parallel waves; a header is never in the same wave as a nested include it needs. Include **cycles** are not a parallel wave: leftovers are indexed in include-graph order so nested layouts stay visible. Nested `#include` IR merges **types and typedefs** from **direct** includes (plus this header's preprocess `included_headers`) so `struct StreamHost { struct IDeviceIoService service; }` sees `Dispatch`, and `GpioIrqFunc func` sees the typedef, without copying every descendant's functions/flow into ancestor units. Child PCH units already nested-merged grandchild types. Parallel isolation *without* those preprocess edges interned empty tags / `Int` and dropped field stores (`DeviceNodeExtDispatch` lost `DispatchToMessage`, `GpioOnDevEventReceive` lost `gpio->func`).
 
@@ -603,7 +683,7 @@ A mid-run stop inside ONE nested header must not invalidate the whole TU: indexi
 - Unit tests: `trace-preproc/src/` (the conditional-coverage record: chain outcomes for `#if`/`#elif`/`#else`, the
   `#if !X` first-arm case, unevaluated nested chains, reads through macro expansion, include-guard recognition against
   the default-value and late-guard shapes, per-file guard candidates across includes, unterminated chains)
-- Integration fixtures: `tests/fixtures/preproc/` (including `empty_left_paste.c` for empty left `##` operands — stringized spacing, non-stringized literal/punctuation preservation, and which `##` the GNU `, ## __VA_ARGS__` rule governs — including the same invocation spelled with and without a newline for the empty argument, `self_ref_macro.c` for C11 hide-set / X-macro lists, `include_macro.c` for `#include FOO`, `unterminated_if_include.c` + `unterminated_if_header.h` for an `#if` left open by a header, `stray_closer_include.c` + `stray_{endif,else,elif}.h` for closers that would otherwise act on the includer's frame, `stringize.c` for `#param` in log/assert-shaped macros, `raw_string.cpp` for C++11 raw string literals in the shapes the corpora use and `raw_string_shapes.c` for the same text as valid C, where `R` and the would-be ud-suffix are macros that must still expand; the `\`-newline splice cases are unit tests, checked against gcc/clang)
+- Integration fixtures: `tests/fixtures/preproc/` (`access_rename/` for a test unit that renames access specifiers and shares the header's functions with the production unit; also `empty_left_paste.c` for empty left `##` operands — stringized spacing, non-stringized literal/punctuation preservation, and which `##` the GNU `, ## __VA_ARGS__` rule governs — including the same invocation spelled with and without a newline for the empty argument, `self_ref_macro.c` for C11 hide-set / X-macro lists, `include_macro.c` for `#include FOO`, `unterminated_if_include.c` + `unterminated_if_header.h` for an `#if` left open by a header, `stray_closer_include.c` + `stray_{endif,else,elif}.h` for closers that would otherwise act on the includer's frame, `stringize.c` for `#param` in log/assert-shaped macros, `raw_string.cpp` for C++11 raw string literals in the shapes the corpora use and `raw_string_shapes.c` for the same text as valid C, where `R` and the would-be ud-suffix are macros that must still expand; the `\`-newline splice cases are unit tests, checked against gcc/clang)
 - Builtin fallback fixtures: `tests/fixtures/builtin_macros/` (`kdriver.c` for the
   kernel/driver table, `hwtest.cpp` for the gtest/OpenHarmony test macros and
   `gmock.cpp` for the gMock declaration macros in their modern, legacy,

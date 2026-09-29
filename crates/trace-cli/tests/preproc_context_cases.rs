@@ -175,3 +175,171 @@ fn cplusplus_is_predefined_for_cpp_units_only() {
         "b.c took lang.h's `#ifdef __cplusplus` arm"
     );
 }
+
+/// With one expansion slot per header, `decl.h` keeps the expansion the warm
+/// pass made without `MODE`, and the one `outer.h` makes under `MODE` cannot
+/// be stored. Its classes reach `user.cpp` through `outer.h`'s entry: the
+/// call binds to `Session::Add` and dispatches to the override.
+#[test]
+fn unstored_nested_expansion_reaches_the_includers_consumers() {
+    let root = fixture("preproc/unstored_nested_expansion");
+    let opts = default_opts(&root).with_max_expansion_variants(1);
+    let program = build_program(&root, &opts).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    for callee in ["Session::Add", "Scan::Add"] {
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                "use",
+                callee,
+                trace_analysis::ResolutionKind::Direct
+            ),
+            "{callee}: {:?}",
+            callees_of(&program, &analysis, "use")
+        );
+    }
+    // `Add(env_t)` as `decl.cpp` defines it, not a second one taking `int`.
+    for name in ["Session::Add", "Scan::Add"] {
+        let defined: Vec<bool> = program
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == name)
+            .map(|f| f.is_defined)
+            .collect();
+        assert_eq!(defined, vec![true], "{name}");
+    }
+}
+
+/// `decl.h` has both its slots taken when `b.cpp` reaches it under `MODE 1`:
+/// `e1.h` holds it, and `e2.h`, included next, skips it by its guard. A unit
+/// reaching `decl.h` through `e2.h` alone still sees its classes.
+#[test]
+fn header_skipping_a_held_header_does_not_hide_it_from_its_consumers() {
+    let root = fixture("preproc/unstored_sibling");
+    let opts = default_opts(&root).with_max_expansion_variants(2);
+    let program = build_program(&root, &opts).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    for caller in ["use", "b"] {
+        for callee in ["Session::Add", "Scan::Add"] {
+            assert!(
+                has_edge(
+                    &program,
+                    &analysis,
+                    caller,
+                    callee,
+                    trace_analysis::ResolutionKind::Direct
+                ),
+                "{caller} -> {callee}: {:?}",
+                callees_of(&program, &analysis, caller)
+            );
+        }
+    }
+}
+
+/// `test/holder.h` is the header holding `decl.h`'s text. What `decl.h`
+/// declares is still `decl.h`'s, production code: `Session::Inl` calls the
+/// production `leaf`, not the test double.
+#[test]
+fn held_header_keeps_its_own_partition() {
+    let root = fixture("preproc/unstored_held_partition");
+    let opts = default_opts(&root).with_max_expansion_variants(2);
+    let program = build_program(&root, &opts).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let file_of = |id: trace_ir::FnId| {
+        let f = program.symbols.function(id);
+        program.symbols.files[f.file.0 as usize]
+            .path
+            .strip_prefix(trace_ir::canonicalize(&root))
+            .unwrap()
+            .to_path_buf()
+    };
+    let leaves: std::collections::BTreeSet<std::path::PathBuf> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(&program, e.caller) == "Session::Inl")
+        .filter(|e| fn_name(&program, e.callee) == "leaf")
+        .map(|e| file_of(e.callee))
+        .collect();
+    assert_eq!(
+        leaves.into_iter().collect::<Vec<_>>(),
+        vec![std::path::PathBuf::from("leaf.cpp")]
+    );
+    assert!(has_any_edge(&program, &analysis, "use", "Session::Inl"));
+}
+
+/// A call a macro spells belongs where the macro is invoked. `CALL_LEAF` is
+/// written in the production `decl.h` and invoked in the test header
+/// `tdecl.h`, both held by `test/holder.h`: the call is test code and
+/// reaches the test double as well.
+#[test]
+fn held_macro_call_belongs_to_the_header_invoking_it() {
+    let root = fixture("preproc/unstored_held_macro");
+    let opts = default_opts(&root).with_max_expansion_variants(2);
+    let program = build_program(&root, &opts).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let leaves: std::collections::BTreeSet<std::path::PathBuf> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(&program, e.caller) == "TestSession::Inl")
+        .filter(|e| fn_name(&program, e.callee) == "leaf")
+        .map(|e| {
+            let f = program.symbols.function(e.callee);
+            program.symbols.files[f.file.0 as usize]
+                .path
+                .strip_prefix(trace_ir::canonicalize(&root))
+                .unwrap()
+                .to_path_buf()
+        })
+        .collect();
+    assert_eq!(
+        leaves.into_iter().collect::<Vec<_>>(),
+        vec![
+            std::path::PathBuf::from("leaf.cpp"),
+            std::path::PathBuf::from("test/mock_leaf.cpp")
+        ]
+    );
+}
+
+/// `test/klass_test.cpp` includes `klass.h` under `#define private public`.
+/// The header is the one `klass.cpp` includes: `Twice`, whose body spells
+/// `private`, is one function and both units call it.
+#[test]
+fn unit_renaming_access_specifiers_shares_the_headers_functions() {
+    let root = fixture("preproc/access_rename");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let twice = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Twice")
+        .count();
+    assert_eq!(twice, 1);
+    for caller in ["Production", "Test"] {
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                caller,
+                "Twice",
+                trace_analysis::ResolutionKind::Direct
+            ),
+            "{caller}: {:?}",
+            callees_of(&program, &analysis, caller)
+        );
+    }
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "Twice",
+        "Counter::Next",
+        trace_analysis::ResolutionKind::Direct
+    ));
+}

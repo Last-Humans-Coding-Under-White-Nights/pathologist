@@ -85,10 +85,17 @@ pub fn file_id(program: &Program, root: &Path, path: &str) -> trace_ir::FileId {
 
 /// A `compile_commands.json` in `root` compiling each of `files` as C++.
 pub fn write_compile_commands(root: &Path, files: &[&str]) {
-    let commands: Vec<_> = files
+    let commands: Vec<(&str, &str)> = files.iter().map(|file| ("c++", *file)).collect();
+    write_compile_commands_with(root, &commands);
+}
+
+/// A `compile_commands.json` in `root` with one `(driver, file)` command per
+/// entry. A `cc` driver takes the language from the file's extension.
+pub fn write_compile_commands_with(root: &Path, commands: &[(&str, &str)]) {
+    let commands: Vec<_> = commands
         .iter()
-        .map(|file| {
-            serde_json::json!({"directory": root, "file": file, "arguments": ["c++", "-c", file]})
+        .map(|(driver, file)| {
+            serde_json::json!({"directory": root, "file": file, "arguments": [driver, "-c", file]})
         })
         .collect();
     std::fs::write(

@@ -50,6 +50,7 @@ pub(super) fn build(
         .with_inline_include_bodies(false)
         .with_basename_index(Arc::new(graph.basename_index.clone()));
     let raw_sources = fallback.source_cache.clone();
+    let virtual_dirs = graph.virtual_dirs();
     let pool = index_pool(jobs)?;
     index_progress(format!(
         "compile_commands: {} commands for {} sources (jobs={jobs})",
@@ -82,6 +83,21 @@ pub(super) fn build(
                         );
                     }
                     config.record_link_ownership = !links.targets.is_empty();
+                    // Database commands never name the virtual directories;
+                    // search them last so a real `-I` header of the same name
+                    // wins (#123). They are inferred, so the test partition
+                    // decides who may take a header from one, and it is
+                    // measured from the inference root.
+                    if from_database && !virtual_dirs.is_empty() {
+                        config
+                            .inference_root
+                            .get_or_insert_with(|| graph.root.clone());
+                        for dir in &virtual_dirs {
+                            if !config.inferred_include_paths.contains(dir) {
+                                config.inferred_include_paths.push(dir.clone());
+                            }
+                        }
+                    }
                     // Neither path-keyed source entries nor header expansions are valid
                     // across commands with different search paths, even if macros match.
                     // A source with no command of its own uses the one shared
@@ -174,9 +190,12 @@ pub(super) fn build(
             }
         }
     }
-    let cpp_parse = graph.reachable_from(&cpp_sources);
+    let cpp_parse = graph.reachable_from(cpp_sources.iter().chain(&graph.virtual_headers));
+    // A virtual header no configuration consumed is indexed like an orphan
+    // project header (`IncludeGraph::virtual_headers`).
     let unconsumed_headers: Vec<&PathBuf> = headers
         .iter()
+        .chain(&graph.virtual_headers)
         .filter(|path| !consumed.contains(*path))
         .collect();
     if jobs == 1 || unconsumed_headers.len() <= 1 {

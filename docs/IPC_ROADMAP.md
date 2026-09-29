@@ -602,8 +602,9 @@ Phase 4: Export + CLI                                      [PARTIAL]
   → dedicated ipc_bridges SQLite table                      [DEFERRED]
 
 Phase 5: IDL-aware matching (optional, v2)
-  → Parse .idl files for exact interface definitions
-  → Fixture: ipc_idl_generated/
+  → Parse .idl files and synthesize interface/proxy/stub declarations [DONE, #123; docs/ANALYSIS.md "IDL-generated interfaces"]
+  → opcode (ipccode) matching [DEFERRED]
+  → Fixture: idl_basic/
 
 Eval after each phase on the 4 target repositories.
 ```

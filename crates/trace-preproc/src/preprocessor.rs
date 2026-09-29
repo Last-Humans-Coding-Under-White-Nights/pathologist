@@ -135,6 +135,11 @@ struct PreprocessorState {
     /// reached, and hdf lost 514 direct call edges to the resolution that
     /// shifted under.
     direct_variants: FxHashSet<(PathBuf, usize)>,
+    /// Headers this run knows to be held by an includer instead of stored:
+    /// those it expanded and could not store, and those the entries it
+    /// replayed cover. Skipping one by its guard is safe only where its
+    /// declarations can be reached (`CacheFrame::covered`).
+    held: FxHashSet<PathBuf>,
     conditional_stack: Vec<CondFrame>,
     /// Depth of `conditional_stack` when the current file started. Frames
     /// below it belong to includers: `#elif`/`#else`/`#endif` in this file
@@ -241,6 +246,18 @@ struct CondFrame {
     chain: Option<usize>,
 }
 
+/// Where the text of a file given to `process_file` belongs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placed {
+    /// Not in the includer's output: the file was skipped or replayed, or
+    /// its expansion is stored as a variant of its own.
+    Apart,
+    /// In the includer's output: the file was expanded here and the
+    /// expansion could not be stored (its variant list is full, or its
+    /// fingerprint serves no consumer), so no unit of its own holds it.
+    Held,
+}
+
 /// One cached header being constructed.
 #[derive(Debug)]
 struct CacheFrame {
@@ -251,6 +268,16 @@ struct CacheFrame {
     /// only: an enclosing entry pins this one, which pins these in turn, so
     /// the chain is closed by following it.
     replayed: Vec<(PathBuf, usize)>,
+    /// Nested headers whose text stays in this header's output, for
+    /// `IncludeExpansion::inlined`.
+    inlined: Vec<PathBuf>,
+    /// Held headers this frame reaches through the entries it records: a
+    /// consumer of its entry lowers their declarations with the holder's.
+    covered: FxHashSet<PathBuf>,
+    /// This frame skipped a held header by its guard and neither holds it
+    /// nor covers it. Its entry would define that guard and give no
+    /// consumer the declarations, so it is not stored.
+    uncovered: bool,
     /// The macro environment this header's expansion has read so far, which
     /// becomes `IncludeExpansion::deps`. Every open frame receives each read,
     /// so a nested header's dependencies reach its includers.
@@ -295,6 +322,7 @@ impl PreprocessorState {
             variant_used: FxHashMap::default(),
             variant_composed: FxHashMap::default(),
             direct_variants: FxHashSet::default(),
+            held: FxHashSet::default(),
             conditional_stack: Vec::new(),
             cond_base: 0,
             output: String::new(),
@@ -907,7 +935,8 @@ impl PreprocessorState {
         if let Some(&file) = self.lm_spelling_files.get(path) {
             return file;
         }
-        let file = self.line_map.intern_file(path);
+        // Canonical, as every origin is (`lm_current_file`).
+        let file = self.line_map.intern_file(&trace_ir::canonicalize(path));
         self.lm_spelling_files.insert(path.to_path_buf(), file);
         file
     }
@@ -922,13 +951,15 @@ impl PreprocessorState {
         id
     }
 
-    /// Index of the current file in the line-map table, re-interned only
-    /// when `current_file` changed since the last call.
+    /// Index of the current file in the line-map table, interned again
+    /// only after `current_file` changed. The table holds the canonical
+    /// path: `current_file` is spelled as include resolution found it, and
+    /// one header reached through two spellings is one origin.
     fn lm_current_file(&mut self) -> u32 {
-        if self.lm_cur_file == u32::MAX
-            || self.line_map.files.get(self.lm_cur_file as usize) != Some(&self.current_file)
-        {
-            self.lm_cur_file = self.line_map.intern_file(&self.current_file);
+        if self.lm_cur_file == u32::MAX {
+            self.lm_cur_file = self
+                .line_map
+                .intern_file(&trace_ir::canonicalize(&self.current_file));
         }
         self.lm_cur_file
     }
@@ -1269,6 +1300,12 @@ impl PreprocessorState {
                 self.variant_used.entry(path.clone()).or_insert(*at);
             }
         }
+        if !entry.covers.is_empty() {
+            self.held.extend(entry.covers.iter().cloned());
+            for frame in &mut self.cache_frames {
+                frame.covered.extend(entry.covers.iter().cloned());
+            }
+        }
         self.merge_recorded_deps(&entry.deps);
         // The consumer never visits the headers this entry covers, so the
         // reasons they may be skipped have to come from the entry (#56).
@@ -1372,6 +1409,8 @@ impl PreprocessorState {
             variants.push(entry);
             return Some(variants.len() - 1);
         }
+        // A stored variant with this signature stands for the expansion: one
+        // fingerprint is taken to give one content.
         variants.iter().position(|v| v.signature == entry.signature)
     }
 
@@ -1486,7 +1525,7 @@ impl PreprocessorState {
         dest_map.splice_range(src_map, from..to, dest_off);
     }
 
-    fn process_file(&mut self, path: &Path) -> Result<(), PreprocessError> {
+    fn process_file(&mut self, path: &Path) -> Result<Placed, PreprocessError> {
         let canonical = trace_ir::canonicalize(path);
         // A repeated `#include` is skipped only on a reason the file itself
         // stated — its `#pragma once`, or its include guard while that guard
@@ -1516,6 +1555,19 @@ impl PreprocessorState {
                     .get(&canonical)
                     .or_else(|| self.variant_composed.get(&canonical))
                     .copied();
+                // Every frame that reaches the header neither in its text
+                // nor through its records so far, the ones enclosing the
+                // holder included: they would hold it once the frames
+                // between close unstored, but an entry composed from text a
+                // unit could lower itself with more in scope is left to the
+                // unit (docs/PREPROCESSOR.md, "An expansion that cannot be
+                // stored").
+                if replayed_as.is_none() && self.held.contains(&canonical) {
+                    for frame in &mut self.cache_frames {
+                        frame.uncovered |= !frame.covered.contains(&canonical)
+                            && !frame.inlined.contains(&canonical);
+                    }
+                }
                 if let Some(frame) = self.cache_frames.last_mut() {
                     frame.skips.push((self.output.len(), canonical.clone()));
                     // The body is skipped here, but this header still needs
@@ -1565,7 +1617,7 @@ impl PreprocessorState {
                     }
                 }
             }
-            return Ok(());
+            return Ok(Placed::Apart);
         }
 
         if self.include_stack.len() >= self.opts.max_include_depth {
@@ -1577,7 +1629,7 @@ impl PreprocessorState {
                     path.display()
                 ),
             );
-            return Ok(());
+            return Ok(Placed::Apart);
         }
 
         // Depth does not bound repetition: an unguarded file included by
@@ -1599,7 +1651,7 @@ impl PreprocessorState {
                     ),
                 );
             }
-            return Ok(());
+            return Ok(Placed::Apart);
         }
 
         // The root of this run is the file whose text IS the output, so it
@@ -1611,7 +1663,7 @@ impl PreprocessorState {
         // `Preprocessor::new`); nested includes push on top of it.
         let is_root = self.include_stack.len() == 1 && self.forced_include_depth == 0;
         if !is_root && self.is_cacheable_header(&canonical) && self.splice_cached(&canonical) {
-            return Ok(());
+            return Ok(Placed::Apart);
         }
 
         if !is_root {
@@ -1669,6 +1721,9 @@ impl PreprocessorState {
             self.cache_frames.push(CacheFrame {
                 skips: Vec::new(),
                 replayed: Vec::new(),
+                inlined: Vec::new(),
+                covered: FxHashSet::default(),
+                uncovered: false,
                 deps: crate::MacroFingerprint::default(),
                 settled: FxHashSet::default(),
                 locally_bound: FxHashSet::default(),
@@ -1718,15 +1773,30 @@ impl PreprocessorState {
             });
         }
 
+        let mut placed = Placed::Apart;
         if cache_header && !self.opts.frozen_expansion_cache {
-            let frame = self
+            let mut frame = self
                 .cache_frames
                 .pop()
                 .expect("cacheable header has an active cache frame");
+            let mut inlined = std::mem::take(&mut frame.inlined);
+            inlined.sort();
+            inlined.dedup();
+            let inlined = Arc::new(inlined);
+            let mut covers: Vec<PathBuf> = inlined.iter().chain(&frame.covered).cloned().collect();
+            covers.sort();
+            covers.dedup();
+            let covers = Arc::new(covers);
+            let mut stored = false;
+            // The records of an expansion that was composed and not stored.
+            let mut records: Arc<Vec<(PathBuf, usize)>> = Arc::default();
             // An expansion composed after a run-wide limit cut this run
             // short is missing content; publishing it would hand that
-            // truncation to every later consumer of the header.
-            if !self.expansion_incomplete && self.opts.include_expansion_cache.is_some() {
+            // truncation to every later consumer of the header. So would one
+            // that skipped a held header it cannot reach.
+            if frame.uncovered {
+                records = Arc::new(std::mem::take(&mut frame.replayed));
+            } else if !self.expansion_incomplete && self.opts.include_expansion_cache.is_some() {
                 let output_end = self.output.len();
                 let (composed, composed_map, extra_files) = if self.opts.inline_include_bodies {
                     self.compose_cache_text(output_start, output_end, &frame.skips)
@@ -1813,6 +1883,8 @@ impl PreprocessorState {
                         deps: Arc::new(deps),
                         guards: Arc::new(guards),
                         nested_variants: Arc::new(nested_variants),
+                        inlined: Arc::clone(&inlined),
+                        covers: Arc::clone(&covers),
                         signature,
                         id: crate::journal::next_expansion_id(),
                     };
@@ -1823,7 +1895,13 @@ impl PreprocessorState {
                     // record.
                     let declares =
                         !entry.text.trim().is_empty() || !entry.nested_variants.is_empty();
+                    let nested = Arc::clone(&entry.nested_variants);
                     if let Some(handle) = self.publish_variant(canonical.clone(), entry) {
+                        stored = true;
+                        // Whoever records this entry reaches what it covers.
+                        for frame in &mut self.cache_frames {
+                            frame.covered.extend(covers.iter().cloned());
+                        }
                         if declares {
                             // An enclosing entry being composed holds this
                             // expansion as a nested include and records it
@@ -1832,8 +1910,10 @@ impl PreprocessorState {
                             if let Some(frame) = self.cache_frames.last_mut() {
                                 frame.replayed.push((canonical.clone(), handle));
                             }
-                            self.variant_composed.insert(canonical, handle);
+                            self.variant_composed.insert(canonical.clone(), handle);
                         }
+                    } else {
+                        records = nested;
                     }
                 }
             }
@@ -1842,9 +1922,28 @@ impl PreprocessorState {
             if self.cache_frames.is_empty() {
                 self.macro_ops.clear();
             }
+            if !stored {
+                // No record can name this expansion. The headers it reached
+                // are reached through the enclosing entry alone, and its
+                // text stays in that entry (`handle_include`), with what it
+                // holds in turn.
+                let held = emitted > 0;
+                if let Some(parent) = self.cache_frames.last_mut() {
+                    parent.replayed.extend(records.iter().cloned());
+                    parent.covered.extend(frame.covered);
+                    if held {
+                        parent.inlined.push(canonical.clone());
+                        parent.inlined.extend(inlined.iter().cloned());
+                    }
+                }
+                if held {
+                    self.held.insert(canonical);
+                    placed = Placed::Held;
+                }
+            }
         }
 
-        Ok(())
+        Ok(placed)
     }
 
     /// Runs one file's token stream with `conditional_stack` fenced at the
@@ -2378,7 +2477,7 @@ impl PreprocessorState {
         // Cache membership and skip records use the canonical identity.
         let canonical_include = trace_ir::canonicalize(&include_path);
         let live_at = self.output.len();
-        if let Err(e) = self.process_file(&include_path) {
+        let placed = self.process_file(&include_path).unwrap_or_else(|e| {
             // The include is already in `included_files` and contributed
             // nothing, so this expansion — and every frame enclosing it — is
             // missing the header's content. Publishing any of them would keep
@@ -2387,14 +2486,18 @@ impl PreprocessorState {
                 line,
                 format!("include preprocessing failed for {path}: {e}"),
             );
-        }
+            Placed::Apart
+        });
         // File-local output: drop a nested cacheable header's tokens from
         // the *parent* buffer after the child has been cached. The child's
         // IR is merged at index time (PCH-style) instead of re-parsed in
-        // every consumer.
+        // every consumer. A child the parent holds has no unit of its own:
+        // its tokens stay, and the parent's entry (or the unit itself) is
+        // what holds its declarations.
         if !self.opts.inline_include_bodies
             && !self.opts.frozen_expansion_cache
             && self.is_cacheable_header(&canonical_include)
+            && placed == Placed::Apart
         {
             self.output.truncate(live_at);
             self.line_map.truncate_at(live_at);
@@ -2519,6 +2622,7 @@ impl PreprocessorState {
             .as_ref()
             .is_none_or(|root| trace_ir::is_test_path(root, &file, &self.opts.test_partition));
         self.current_file = file;
+        self.lm_cur_file = u32::MAX;
     }
 
     /// Whether `path` names a header this run can read: a file on disk, or an
@@ -2539,8 +2643,9 @@ impl PreprocessorState {
     /// candidate spelled that way is settled by `is_file`, since every
     /// `source_cache` key is a file `IncludeGraph` read off disk and a cached
     /// header is therefore always also an on-disk one. A caller that seeds
-    /// `source_cache` with keys naming no file (only tests do) must spell them
-    /// the way an `#include` resolves to them.
+    /// `source_cache` with keys naming no file (tests, and the headers
+    /// synthesized from `.idl` files) must spell them the way an `#include`
+    /// resolves to them.
     fn include_exists(&self, path: &Path) -> bool {
         trace_ir::is_file_cached(path)
             || self
@@ -2702,6 +2807,19 @@ impl PreprocessorState {
             return Ok(i);
         }
         let mut replacement = read_replacement_list(tokens, &mut i);
+        // `#define private public`, which tests put before the headers of
+        // the classes they open. Nothing lowered depends on which specifier
+        // a member has, and applying it would make every header declaring a
+        // class another expansion for each such unit.
+        if self.language == Language::Cpp
+            && is_access_specifier(&name)
+            && matches!(
+                replacement.as_slice(),
+                [Token { kind: TokenKind::Identifier(to), .. }] if is_access_specifier(to)
+            )
+        {
+            return Ok(i);
+        }
         let definition_file = Arc::new(self.current_file.clone());
         for token in &mut replacement {
             token.spelling_file = Some(Arc::clone(&definition_file));
@@ -4825,6 +4943,10 @@ impl MacroEnv<'_> {
             },
         )
     }
+}
+
+fn is_access_specifier(name: &str) -> bool {
+    matches!(name, "public" | "protected" | "private")
 }
 
 /// Content hash of a macro binding, for [`crate::MacroFingerprint`].
@@ -8019,6 +8141,314 @@ int x = A;
         );
     }
 
+    /// A nested header this run expands itself but cannot store (its variant
+    /// list is full) has no unit of its own for this environment. Its text
+    /// stays in the includer's entry, which is then the one place holding
+    /// its declarations for a consumer that replays the entry.
+    #[test]
+    fn unstored_nested_expansion_stays_in_its_includers_entry() {
+        let dir = unique_tmp_dir("unstored_nested");
+        fs::write(
+            dir.join("decl.h"),
+            "#ifndef DECL_H\n#define DECL_H\n#ifdef MODE\nstruct Decl { int mode; };\n#else\nstruct Decl { int plain; };\n#endif\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("outer.h"),
+            "#ifndef OUTER_H\n#define OUTER_H\n#include \"decl.h\"\nint from_outer;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("unit.c"),
+            "#include \"outer.h\"\n#include \"decl.h\"\nstruct Decl d;\n",
+        )
+        .unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = PreprocessOptions::new()
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_include(dir.to_path_buf())
+            .with_inline_include_bodies(false)
+            .with_max_expansion_variants(1);
+        // `decl.h`'s one slot goes to the expansion without `MODE`.
+        preprocess_file(&dir.join("decl.h"), &opts).unwrap();
+        // Under `MODE` it matches nothing stored and cannot be stored.
+        let with_mode = opts.clone().with_define("MODE", "1");
+        preprocess_file(&dir.join("outer.h"), &with_mode).unwrap();
+        let decl = sole_variant(&cache, dir.join("decl.h"), Language::C).expect("decl.h cached");
+        assert!(decl.text.contains("plain"), "{}", decl.text);
+        let outer = sole_variant(&cache, dir.join("outer.h"), Language::C).expect("outer.h cached");
+        assert!(outer.text.contains("from_outer"), "{}", outer.text);
+        assert!(
+            outer.text.contains("int mode"),
+            "the unstored nested expansion must stay in the entry: {:?}",
+            outer.text
+        );
+
+        // A unit replaying the entry skips `decl.h` by its guard, and takes
+        // its declarations from the entry.
+        let unit = preprocess_file(
+            &dir.join("unit.c"),
+            &with_mode.clone().with_frozen_expansion_cache(true),
+        )
+        .unwrap();
+        assert!(!unit.output.contains("int plain"), "{}", unit.output);
+        assert!(unit.output.contains("struct Decl d"), "{}", unit.output);
+        assert!(
+            unit.replayed_variants.contains(&(dir.join("outer.h"), 0)),
+            "{:?}",
+            unit.replayed_variants
+        );
+    }
+
+    /// The headers an unstored nested expansion replayed are reached through
+    /// its includer's entry and no other, so that entry names their variants.
+    #[test]
+    fn unstored_nested_expansion_hands_its_records_to_its_includer() {
+        let dir = unique_tmp_dir("unstored_records");
+        fs::write(
+            dir.join("inner.h"),
+            "#ifndef INNER_H\n#define INNER_H\nstruct Inner { int x; };\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("decl.h"),
+            "#ifndef DECL_H\n#define DECL_H\n#include \"inner.h\"\n#ifdef MODE\nstruct Decl { int mode; };\n#else\nstruct Decl { int plain; };\n#endif\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("outer.h"),
+            "#ifndef OUTER_H\n#define OUTER_H\n#include \"decl.h\"\nint from_outer;\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("unit.c"),
+            "#include \"outer.h\"\n#include \"inner.h\"\nstruct Inner i;\n",
+        )
+        .unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = PreprocessOptions::new()
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_include(dir.to_path_buf())
+            .with_inline_include_bodies(false)
+            .with_max_expansion_variants(1);
+        preprocess_file(&dir.join("decl.h"), &opts).unwrap();
+        let with_mode = opts.clone().with_define("MODE", "1");
+        preprocess_file(&dir.join("outer.h"), &with_mode).unwrap();
+        let outer = sole_variant(&cache, dir.join("outer.h"), Language::C).expect("outer.h cached");
+        assert!(outer.text.contains("int mode"), "{:?}", outer.text);
+        assert!(!outer.text.contains("Inner"), "{:?}", outer.text);
+        assert_eq!(
+            outer.nested_variants.as_ref(),
+            &vec![(dir.join("inner.h"), 0)],
+            "inner.h is reached through this entry"
+        );
+        assert_eq!(
+            outer.inlined.as_ref(),
+            &vec![dir.join("decl.h")],
+            "and it holds decl.h's text"
+        );
+        let decl = sole_variant(&cache, dir.join("decl.h"), Language::C).expect("decl.h cached");
+        assert!(decl.inlined.is_empty(), "{:?}", decl.inlined);
+
+        let unit = preprocess_file(
+            &dir.join("unit.c"),
+            &with_mode.clone().with_frozen_expansion_cache(true),
+        )
+        .unwrap();
+        assert!(
+            unit.replayed_variants.contains(&(dir.join("inner.h"), 0)),
+            "the unit must name the variant holding `Inner`: {:?}",
+            unit.replayed_variants
+        );
+    }
+
+    /// Writes `decl.h` (its one slot taken without `MODE`) and `e1.h`,
+    /// `e2.h`, which both include it.
+    fn held_header_tree(tag: &str) -> (TmpTree, ExpansionCache, PreprocessOptions) {
+        let dir = unique_tmp_dir(tag);
+        fs::write(
+            dir.join("decl.h"),
+            "#ifndef DECL_H\n#define DECL_H\n#ifdef MODE\nstruct Decl { int mode; };\n#else\nstruct Decl { int plain; };\n#endif\n#endif\n",
+        )
+        .unwrap();
+        for name in ["e1", "e2"] {
+            fs::write(
+                dir.join(format!("{name}.h")),
+                format!(
+                    "#ifndef {0}_H\n#define {0}_H\n#include \"decl.h\"\nint from_{name};\n#endif\n",
+                    name.to_uppercase()
+                ),
+            )
+            .unwrap();
+        }
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = PreprocessOptions::new()
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_include(dir.to_path_buf())
+            .with_inline_include_bodies(false)
+            .with_max_expansion_variants(1);
+        preprocess_file(&dir.join("decl.h"), &opts).unwrap();
+        (dir, cache, opts.with_define("MODE", "1"))
+    }
+
+    /// An entry that skips a held header by its guard, and neither holds it
+    /// nor records an entry that does, would hand its consumers the guard
+    /// without the declarations. It is not stored.
+    #[test]
+    fn entry_skipping_a_held_header_it_cannot_reach_is_not_stored() {
+        let (dir, cache, with_mode) = held_header_tree("skips_held");
+        fs::write(dir.join("unit.c"), "#include \"e1.h\"\n#include \"e2.h\"\n").unwrap();
+        let unit = preprocess_file(&dir.join("unit.c"), &with_mode).unwrap();
+        let e1 = sole_variant(&cache, dir.join("e1.h"), Language::C).expect("e1.h cached");
+        assert_eq!(e1.inlined.as_ref(), &vec![dir.join("decl.h")]);
+        assert!(
+            sole_variant(&cache, dir.join("e2.h"), Language::C).is_none(),
+            "e2.h skipped decl.h, which e1.h holds and e2.h does not record"
+        );
+        assert!(unit.output.contains("from_e2"), "{}", unit.output);
+    }
+
+    /// The holder may be several unstored entries up. `outer.h` holds
+    /// `mid.h`, which holds `inner.h`, which holds `decl.h`; `sib.h`, inside
+    /// `mid.h`, skips `decl.h` by its guard and reaches it through none of
+    /// its own records. At that point no open entry holds `decl.h` either:
+    /// `outer.h` would, once `mid.h` closes unstored, but that entry is not
+    /// stored, and a unit expands all of it itself. Nothing is lost on the
+    /// way: the unit holds every one of the five.
+    #[test]
+    fn held_header_skipped_inside_a_chain_of_unstored_entries_reaches_the_consumer() {
+        let (dir, cache, with_mode) = held_header_tree("skips_chain");
+        for (name, includes) in [
+            ("inner", "#include \"decl.h\"\n"),
+            // Reads `MODE` itself, so its warm expansion serves no unit
+            // under `MODE` and its one slot is taken.
+            ("sib", "#include \"decl.h\"\n#ifdef MODE\n#endif\n"),
+            ("mid", "#include \"inner.h\"\n#include \"sib.h\"\n"),
+            ("outer", "#include \"mid.h\"\n"),
+        ] {
+            fs::write(
+                dir.join(format!("{name}.h")),
+                format!(
+                    "#ifndef {0}_H\n#define {0}_H\n{includes}int from_{name};\n#endif\n",
+                    name.to_uppercase()
+                ),
+            )
+            .unwrap();
+        }
+        // `inner.h`, `sib.h` and `mid.h` have their one slot taken without
+        // `MODE`; `outer.h` is first seen under it.
+        let mut warm = with_mode.clone();
+        warm.defines.clear();
+        preprocess_file(&dir.join("inner.h"), &warm).unwrap();
+        preprocess_file(&dir.join("mid.h"), &warm).unwrap();
+        fs::write(
+            dir.join("a.c"),
+            "#include \"outer.h\"\n#include \"sib.h\"\n#include \"inner.h\"\nstruct Decl d;\n",
+        )
+        .unwrap();
+        let unit = preprocess_file(&dir.join("a.c"), &with_mode).unwrap();
+
+        let held = |names: &[&str]| -> Vec<PathBuf> {
+            let mut v: Vec<PathBuf> = names.iter().map(|n| dir.join(format!("{n}.h"))).collect();
+            v.sort();
+            v
+        };
+        assert!(sole_variant(&cache, dir.join("outer.h"), Language::C).is_none());
+        for name in ["inner", "sib", "mid"] {
+            let stored = sole_variant(&cache, dir.join(format!("{name}.h")), Language::C)
+                .expect("the warm expansion");
+            assert!(
+                !stored.deps.defined.iter().any(|(n, _)| &**n == "MODE"),
+                "{name}.h under MODE was not stored"
+            );
+        }
+        assert!(
+            unit.replayed_variants.is_empty(),
+            "{:?}",
+            unit.replayed_variants
+        );
+        for name in ["inner", "sib", "mid", "outer"] {
+            assert_eq!(
+                unit.output.matches(&format!("from_{name}")).count(),
+                1,
+                "{}",
+                unit.output
+            );
+        }
+        assert!(unit.output.contains("int mode"), "{}", unit.output);
+        let mut inlined = unit.inlined_headers.clone();
+        inlined.sort();
+        assert_eq!(inlined, held(&["decl", "inner", "mid", "outer", "sib"]));
+    }
+
+    /// The same skip inside an entry that records the holder is covered:
+    /// whoever replays the entry merges the holder's unit with it.
+    #[test]
+    fn entry_skipping_a_held_header_its_records_reach_is_stored() {
+        let (dir, cache, with_mode) = held_header_tree("skips_covered");
+        fs::write(
+            dir.join("both.h"),
+            "#ifndef BOTH_H\n#define BOTH_H\n#include \"e1.h\"\n#include \"decl.h\"\nint from_both;\n#endif\n",
+        )
+        .unwrap();
+        preprocess_file(&dir.join("both.h"), &with_mode).unwrap();
+        let both = sole_variant(&cache, dir.join("both.h"), Language::C).expect("both.h cached");
+        assert_eq!(both.nested_variants.as_ref(), &vec![(dir.join("e1.h"), 0)]);
+        assert!(both.inlined.is_empty(), "{:?}", both.inlined);
+    }
+
+    /// A header found through a search directory spelled with `..` is the
+    /// header its canonical path names: spans in it have one origin.
+    #[test]
+    fn line_map_origin_is_the_canonical_path() {
+        let dir = unique_tmp_dir("lm_canonical");
+        fs::create_dir_all(dir.join("inc")).unwrap();
+        fs::write(
+            dir.join("inc/h.h"),
+            "int from_h;\n#define CALL(x) callee(x)\n",
+        )
+        .unwrap();
+        // The macro's spelling is an origin too.
+        fs::write(dir.join("unit.c"), "#include \"h.h\"\nint own = CALL(1);\n").unwrap();
+        let opts = PreprocessOptions::new()
+            .with_include(dir.join("inc/../inc"))
+            .for_indexing();
+        let unit = preprocess_file(&dir.join("unit.c"), &opts).unwrap();
+        assert!(unit.output.contains("from_h"), "{}", unit.output);
+        assert_eq!(
+            unit.line_map.files,
+            vec![dir.join("inc/h.h"), dir.join("unit.c")]
+        );
+    }
+
+    /// An unstored expansion that declares nothing is not a header its
+    /// includer holds: there is nothing of it to lower.
+    #[test]
+    fn unstored_expansion_without_text_is_not_held() {
+        let dir = unique_tmp_dir("unstored_blank");
+        fs::write(
+            dir.join("decl.h"),
+            "#ifndef DECL_H\n#define DECL_H\n#ifndef MODE\nstruct Decl { int plain; };\n#endif\n#endif\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("outer.h"),
+            "#ifndef OUTER_H\n#define OUTER_H\n#include \"decl.h\"\nint from_outer;\n#endif\n",
+        )
+        .unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = PreprocessOptions::new()
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_include(dir.to_path_buf())
+            .with_inline_include_bodies(false)
+            .with_max_expansion_variants(1);
+        preprocess_file(&dir.join("decl.h"), &opts).unwrap();
+        preprocess_file(&dir.join("outer.h"), &opts.clone().with_define("MODE", "1")).unwrap();
+        let outer = sole_variant(&cache, dir.join("outer.h"), Language::C).expect("outer.h cached");
+        assert!(outer.text.contains("from_outer"), "{:?}", outer.text);
+        assert!(outer.inlined.is_empty(), "{:?}", outer.inlined);
+    }
+
     #[test]
     fn relative_parent_include_has_identical_cold_and_warm_separate_output() {
         let dir = tempfile::tempdir().unwrap();
@@ -9235,6 +9665,77 @@ int from_late;
         let entry = cached.line_map.lookup(offset).unwrap();
         assert!(cached.line_map.path_of(entry).ends_with("b.c"));
         assert_eq!((entry.line, entry.col), (3, 16));
+    }
+
+    /// Tests open a class with `#define private public` before including
+    /// its header. Which access specifier a member has changes nothing the
+    /// analysis reads, and a header expanded under that definition would be
+    /// another expansion of every header declaring a class. In C++ the
+    /// definition is dropped.
+    #[test]
+    fn access_specifier_renamed_to_another_is_not_applied() {
+        let dir = unique_tmp_dir("access_macro");
+        let path = dir.join("main.cpp");
+        fs::write(
+            &path,
+            "#define private public\n#define protected public\nclass K {\nprivate:\n    int hidden;\nprotected:\n    int kept;\n};\n#undef private\n#undef protected\n",
+        )
+        .unwrap();
+        let result = preprocess_file(&path, &PreprocessOptions::new()).unwrap();
+        assert!(result.output.contains("private"), "{}", result.output);
+        assert!(result.output.contains("protected"), "{}", result.output);
+        assert!(!result.output.contains("public"), "{}", result.output);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    /// So a unit that renames the specifiers replays what a unit that does
+    /// not has stored.
+    #[test]
+    fn unit_renaming_access_specifiers_replays_the_stored_expansion() {
+        let dir = unique_tmp_dir("access_macro_replay");
+        fs::write(
+            dir.join("klass.h"),
+            "class K {\nprivate:\n    int hidden;\n};\n",
+        )
+        .unwrap();
+        let production = dir.join("production.cpp");
+        let test = dir.join("test.cpp");
+        fs::write(&production, "#include \"klass.h\"\n").unwrap();
+        fs::write(&test, "#define private public\n#include \"klass.h\"\n").unwrap();
+        let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));
+        let opts = PreprocessOptions::new()
+            .with_include(dir.to_path_buf())
+            .with_inline_include_bodies(false)
+            .with_include_expansion_cache(cache);
+        preprocess_file(&production, &opts).unwrap();
+        let unit = preprocess_file(&test, &opts.with_frozen_expansion_cache(true)).unwrap();
+        assert_eq!(unit.replayed_variants, vec![(dir.join("klass.h"), 0)]);
+        assert!(!unit.output.contains("hidden"), "{}", unit.output);
+    }
+
+    /// In C the specifiers are ordinary names, and a definition of one is
+    /// applied as any other.
+    #[test]
+    fn access_specifier_names_are_ordinary_macros_in_c() {
+        let dir = unique_tmp_dir("access_macro_c");
+        let path = dir.join("main.c");
+        fs::write(&path, "#define private public\nint private;\n").unwrap();
+        let result = preprocess_file(&path, &PreprocessOptions::new()).unwrap();
+        assert!(result.output.contains("int public"), "{}", result.output);
+    }
+
+    /// Only a specifier renamed to a specifier is dropped.
+    #[test]
+    fn access_specifier_defined_as_anything_else_is_applied() {
+        let dir = unique_tmp_dir("access_macro_other");
+        let path = dir.join("main.cpp");
+        fs::write(
+            &path,
+            "#define private public: int opened; private\nclass K {\nprivate:\n    int hidden;\n};\n",
+        )
+        .unwrap();
+        let result = preprocess_file(&path, &PreprocessOptions::new()).unwrap();
+        assert!(result.output.contains("int opened"), "{}", result.output);
     }
 
     #[test]

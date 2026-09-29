@@ -1,9 +1,15 @@
 use indexmap::IndexMap;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet as HashSet};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use walkdir::WalkDir;
+
+/// Headers held in memory instead of on disk, by the path an `#include`
+/// resolves to them under (docs/ANALYSIS.md, "IDL-generated interfaces").
+pub type VirtualHeaders = BTreeMap<PathBuf, Arc<str>>;
 
 /// `#include` edge: dependent file → included project file (canonical paths).
 #[derive(Debug, Clone, Default)]
@@ -24,6 +30,9 @@ pub struct IncludeGraph {
     pub source_cache: FxHashMap<PathBuf, std::sync::Arc<str>>,
     /// Basename → project files (for fast include resolution without tree walks).
     pub basename_index: FxHashMap<String, Vec<PathBuf>>,
+    /// The headers held in memory, sorted. Nothing has to include one for it
+    /// to be indexed, and each is C++.
+    pub virtual_headers: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,9 +69,13 @@ impl IncludeGraph {
             dep_roots,
             dep_headers,
             &trace_ir::TestPartition::default(),
+            &VirtualHeaders::new(),
         )
     }
 
+    /// `virtual_headers` are dependency headers too, read from the map
+    /// instead of the disk.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_with_partition(
         root: &Path,
         c_files: &[PathBuf],
@@ -70,6 +83,7 @@ impl IncludeGraph {
         dep_roots: &[PathBuf],
         dep_headers: &[PathBuf],
         test_partition: &trace_ir::TestPartition,
+        virtual_headers: &VirtualHeaders,
     ) -> Self {
         let root = trace_ir::canonicalize(root);
         let mut project_files: HashSet<PathBuf> = HashSet::default();
@@ -80,18 +94,27 @@ impl IncludeGraph {
         {
             project_files.insert(canonicalize(p));
         }
+        // A virtual path names no file, so it is already as canonical as it gets.
+        project_files.extend(virtual_headers.keys().cloned());
+        let in_memory = InMemory::new(virtual_headers);
 
-        let include_dirs = discover_include_dirs(&root, h_files, dep_roots, dep_headers);
+        let include_dirs = discover_include_dirs(
+            &root,
+            h_files,
+            dep_roots,
+            dep_headers.iter().chain(virtual_headers.keys()),
+        );
         let basename_index = build_basename_index(&project_files);
 
         let mut edges: IndexMap<PathBuf, Vec<PathBuf>> = IndexMap::new();
         let mut source_cache: FxHashMap<PathBuf, std::sync::Arc<str>> = FxHashMap::default();
         let project_list: Vec<PathBuf> = project_files.iter().cloned().collect();
-        let scanned: Vec<(PathBuf, String, Vec<PathBuf>)> = project_list
+        let scanned: Vec<(PathBuf, Arc<str>, Vec<PathBuf>)> = project_list
             .par_iter()
             .filter_map(|path| {
-                let Ok(content) = std::fs::read_to_string(path) else {
-                    return None;
+                let content: Arc<str> = match virtual_headers.get(path) {
+                    Some(text) => Arc::clone(text),
+                    None => std::fs::read_to_string(path).ok()?.into(),
                 };
                 let mut deps = Vec::new();
                 let from_is_test = trace_ir::is_test_path(&root, path, test_partition);
@@ -104,6 +127,7 @@ impl IncludeGraph {
                         &inc,
                         &include_dirs,
                         &basename_index,
+                        &in_memory,
                     ) {
                         let canon = canonicalize(&resolved);
                         if project_files.contains(&canon) {
@@ -120,7 +144,7 @@ impl IncludeGraph {
         // Drop discovery memos before their idle workers retain them for the run.
         rayon::broadcast(|_| trace_ir::release_thread_path_caches());
         for (path, content, deps) in scanned {
-            source_cache.insert(path.clone(), std::sync::Arc::<str>::from(content));
+            source_cache.insert(path.clone(), content);
             if !deps.is_empty() {
                 edges.insert(path, deps);
             }
@@ -138,7 +162,27 @@ impl IncludeGraph {
             needs_preprocess,
             source_cache,
             basename_index,
+            virtual_headers: virtual_headers.keys().cloned().collect(),
         }
+    }
+
+    /// The directories the headers held in memory are in, sorted.
+    pub fn virtual_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self
+            .virtual_headers
+            .iter()
+            .filter_map(|p| p.parent().map(Path::to_path_buf))
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    }
+
+    /// Whether `path` is a header held in memory.
+    pub fn is_virtual(&self, path: &Path) -> bool {
+        self.virtual_headers
+            .binary_search_by(|held| held.as_path().cmp(path))
+            .is_ok()
     }
 
     fn compute_needs_preprocess(
@@ -396,15 +440,15 @@ fn canonicalize(path: &Path) -> PathBuf {
     trace_ir::canonicalize(path)
 }
 
-fn discover_include_dirs(
+fn discover_include_dirs<'a>(
     root: &Path,
-    headers: &[PathBuf],
+    headers: &'a [PathBuf],
     dep_roots: &[PathBuf],
-    dep_headers: &[PathBuf],
+    dep_headers: impl Iterator<Item = &'a PathBuf>,
 ) -> Vec<PathBuf> {
     let mut dirs: HashSet<PathBuf> = HashSet::default();
     dirs.insert(canonicalize(root));
-    for h in headers.iter().chain(dep_headers.iter()) {
+    for h in headers.iter().chain(dep_headers) {
         if let Some(parent) = h.parent() {
             dirs.insert(canonicalize(parent));
         }
@@ -451,6 +495,33 @@ fn scan_includes(source: &str) -> Vec<IncludeRef> {
     out
 }
 
+/// [`VirtualHeaders`] as include resolution asks about them.
+struct InMemory<'a> {
+    headers: &'a VirtualHeaders,
+    names: HashSet<&'a OsStr>,
+}
+
+impl<'a> InMemory<'a> {
+    fn new(headers: &'a VirtualHeaders) -> Self {
+        Self {
+            headers,
+            names: headers.keys().filter_map(|p| p.file_name()).collect(),
+        }
+    }
+
+    /// Whether some virtual header has the file name `spelled` ends in.
+    fn names(&self, spelled: &str) -> bool {
+        !self.names.is_empty()
+            && Path::new(spelled)
+                .file_name()
+                .is_some_and(|name| self.names.contains(name))
+    }
+
+    fn holds(&self, path: &Path) -> bool {
+        self.headers.contains_key(path)
+    }
+}
+
 fn build_basename_index(project_files: &HashSet<PathBuf>) -> FxHashMap<String, Vec<PathBuf>> {
     let mut index: FxHashMap<String, Vec<PathBuf>> = FxHashMap::default();
     for path in project_files {
@@ -467,6 +538,7 @@ fn build_basename_index(project_files: &HashSet<PathBuf>) -> FxHashMap<String, V
     index
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_include(
     root: &Path,
     test_partition: &trace_ir::TestPartition,
@@ -475,6 +547,7 @@ fn resolve_include(
     inc: &IncludeRef,
     include_dirs: &[PathBuf],
     basename_index: &FxHashMap<String, Vec<PathBuf>>,
+    in_memory: &InMemory,
 ) -> Option<PathBuf> {
     // Probed lazily, in the same order as before: the including directory
     // first for a `"..."` include, then the search list. The candidates used
@@ -491,8 +564,12 @@ fn resolve_include(
         IncludeKind::Local => from.parent(),
         IncludeKind::System => None,
     };
+    // Asked once per include, so a candidate that is not on disk costs a
+    // lookup by path only when some virtual header has its name.
+    let named = in_memory.names(&inc.path);
+    let exists = |p: &Path| trace_ir::is_file_cached(p) || (named && in_memory.holds(p));
     if let Some(cand) = local_first.map(|parent| parent.join(&inc.path)) {
-        if trace_ir::is_file_cached(&cand) {
+        if exists(&cand) {
             return Some(cand);
         }
     }
@@ -501,7 +578,7 @@ fn resolve_include(
     let admits = |p: &Path| from_is_test || !trace_ir::is_test_path(root, p, test_partition);
     for dir in include_dirs {
         let cand = dir.join(&inc.path);
-        if trace_ir::is_file_cached(&cand) && admits(&cand) {
+        if exists(&cand) && admits(&cand) {
             return Some(cand);
         }
     }
@@ -657,6 +734,7 @@ mod tests {
                 &inc,
                 &dirs,
                 &index,
+                &InMemory::new(&VirtualHeaders::new()),
             )
             .map(|p| p.strip_prefix(root_dir).unwrap().to_path_buf())
         };

@@ -1,0 +1,4 @@
+// Minimal reproduction from #123.
+interface OHOS.Security.IAtm {
+    [ipccode 1] void VerifyAccessToken([in] unsigned int tokenID, [out] int state);
+}

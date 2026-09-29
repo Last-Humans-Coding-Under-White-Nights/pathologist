@@ -1,5 +1,247 @@
 # Evaluation Report
 
+## IDL-generated interfaces — 2026-09-29 (#123)
+
+Rules are maintained in [IDL-generated interfaces](ANALYSIS.md#idl-generated-interfaces)
+and, for the preprocessor, in PREPROCESSOR.md ("Parallel discovery", "An
+expansion that cannot be stored", "Access-specifier renames"). The local
+branch is
+`feat/issue-123-idl-synthesis`, based on `0a38f1b`. Both versions use the
+same pinned, clean HDF (`cdc75a2`), hiview (`92408e2`), and camera
+(`8ffd69d`) corpora from `scripts/eval_expected.json`, release builds, eight
+jobs, and the existing eval solver settings. Baseline checks passed 94/94
+before changes; two candidate runs gave identical counts, and the exported
+tables of camera, hiview and `ability_ability_runtime`, run metadata aside,
+are identical at `--jobs 1` and `--jobs 8`.
+
+All three corpora carry `.idl` files (HDF 51, hiview 8, camera 39), so the
+counts move and the expectations are re-captured.
+
+| Corpus | Metric | Baseline | Candidate |
+|---|---|---:|---:|
+| HDF | files / functions / call edges | 1,483 / 11,989 / 76,502 | unchanged |
+| HDF | diagnostics | 1,882 | 1,920 |
+| hiview | files | 1,428 | 1,452 |
+| hiview | direct / indirect / external / ipc edges | 17,409 / 176 / 14,426 / 14 | 17,404 / 176 / 14,434 / 44 |
+| hiview | functions / external functions | 9,604 / 1,614 | 9,672 / 1,682 |
+| hiview | argument-flow edges / diagnostics | 19,648 / 3,597 | 19,653 / 3,576 |
+| camera | files | 1,593 | 1,703 |
+| camera | direct / indirect / external / ipc edges | 62,173 / 305 / 40,645 / 2 | 66,885 / 305 / 43,522 / 808 |
+| camera | functions / external functions | 22,954 / 3,148 | 23,461 / 3,655 |
+| camera | argument-flow edges / diagnostics | 48,352 / 5,350 | 49,728 / 5,051 |
+
+HDF's IDL files are hdi-gen test inputs in the HDI dialect (`Ping();` with
+no return type), all under `framework/tools/hdi-gen/test/`. 38 of the 51 do
+not parse as idl-tool interfaces and each reports one `idl` warning; no
+header is synthesized from the rest, and no file, symbol or call edge moves.
+
+Hiview synthesizes 24 headers for its 8 interfaces and camera 110 for its 37.
+Every IDL file of both parses. The added files are those headers, the added
+functions their declared-only methods (defined functions are unchanged on
+both), and the unresolved-include diagnostics for the generated names go
+(hiview 2,930 to 2,908, camera 4,709 to 4,395). On camera 338 proxy methods
+carry `ipc` edges, all 808 to defined service methods, such as
+`CameraServiceProxy::CreateCameraDevice` to
+`HCameraService::CreateCameraDevice`. A proxy method with several overloads
+pairs with each same-named service override, the `m × n` retention the IPC
+section describes: `CameraDeviceServiceProxy::Open` has 36 edges over its
+overloads and the classes deriving from the stub, test doubles among them.
+Calls through `sptr<IFoo>` now reach the declared interface, its proxy and
+the service classes deriving from the stub, which is where most of the
+direct and external edges come from. Indirect edges, dlsym edges and every
+dispatch-site and probe check are unchanged.
+
+### The expansion cache
+
+Resolving the generated headers first cost camera 575 distinct
+caller/callee pairs, chiefly virtual-dispatch targets: the `AddOutput` (204)
+and `CommitConfig` (186) overrides in `CaptureSession` subclasses. The
+cause was in the expansion cache and did not need an IDL file to occur; the
+newly resolved includes only changed which entries it hit. `capture_session.h`
+has all eight of its expansion slots taken, so a header that includes it
+under a ninth environment expands it itself and cannot store the result. Its
+text was nevertheless dropped from that header's entry, as a stored child's
+is, and the records of what it had replayed went with it. The entry then
+defined the guards of `capture_session.h` and of the headers below it, held
+none of their text and named no variant of them. `capture_session_impl.cpp`
+replays `capture_session_impl.h`, skips `capture_session.h` by its guard,
+records only its empty expansion, and was lowered without `CaptureSession`'s
+members, so `innerCaptureSession_->AddOutput(…)` stayed unbound and
+post-merge override expansion had nothing to expand.
+
+Such an expansion now stays in its includer's entry, its records pass to
+that entry, and lowering the entry merges what the headers it holds include.
+An entry that skips a held header by its guard, and neither holds it nor
+records an entry that does, is not stored: `b.cpp`-style units that include
+the holder and then a sibling used to leave the sibling's entry with the
+guard and nothing else, and a unit reaching the header through the sibling
+alone was lowered without it. What a held header declares keeps that
+header as its unit, so a production header held by a test header stays
+production code, and the line map names each origin by its canonical path.
+
+Against the baseline camera gains 7,852 distinct pairs and loses none: each
+of the 131 pairs no longer present has a successor from the same caller to
+a method of the same name — 89 edges to a synthesized external now bind to
+the definition (`CaptureSessionForSys::LockForControl`, a member the class
+does not declare, becomes `CaptureSession::LockForControl`), 39 name another
+external (an `OnRemoteRequest` now declared by the synthesized stub), and 3
+bind to the receiver's class instead of a subclass
+(`ProfessionSession::GetColorEffect` becomes `CaptureSession::GetColorEffect`).
+Hiview gains 70 pairs and loses none: of the 17 no longer present, 15 were
+calls to `StringUtil::ConvertStringTo`, a `static` function template of
+`string_util.h`, left unresolved in units that replay the header and bound
+now (below), and 2 name another external. HDF has the pairs it had.
+
+Call-edge rows count a header body once per distinct expansion of it, so
+they can fall where pairs rise: hiview's 8 sources that rename access
+specifiers no longer make a second copy of the lambdas in
+`raw_data_builder.h`, and its direct rows are 5 below the baseline's.
+
+Parse diagnostics rise (camera 202 to 217, hiview 78 to 79). The generated
+text parses cleanly. An entry that holds another header's text reports that
+header's existing parse errors under its own name, as a unit that inlines it
+does: `camera_manager.h`'s `= {}` default argument is now also reported by
+the entries and units holding it.
+
+### `ability_ability_runtime`
+
+`ability_ability_runtime` (`6c18fdc`), the other tree #123 names, is not an
+eval corpus and is measured here, release build, eight jobs:
+
+| Metric | Baseline | Candidate |
+|---|---:|---:|
+| files | 6,324 | 6,344 |
+| functions / external functions | 81,356 / 12,708 | 81,426 / 12,785 |
+| direct / indirect / external / ipc edges | 310,012 / 920 / 321,477 / 1,055 | 309,399 / 920 / 320,487 / 1,157 |
+| argument-flow edges | 316,879 | 315,417 |
+| diagnostics | 16,951 | 16,572 |
+| distinct caller/callee pairs | 273,380 | 273,773 |
+
+All 8 IDL files parse; three of them declare their parcelable types with
+`rawdata`. 21 headers are synthesized for 7 interfaces, three of them below
+`.trace-idl-generated/test/` for the one interface declared in the test
+partition. 104 `ipc` edges are added and start at the synthesized proxies:
+`UriPermissionManagerProxy` 33, `AgentManagerProxy` 30,
+`CliToolManagerProxy` 17, `CliToolManagerSchedulerProxy` 12,
+`QuickFixManagerProxy` 6, `ServiceRouterMgrProxy` 4 and `IdlServiceExtProxy`
+2. The tree keeps mock copies of four of those headers below
+`test/unittest/**/mock/include/`; they are in the test partition and do not
+stand in for the generated ones.
+
+Rows fall and pairs rise for the reason given for hiview: 1,016 sources of
+this tree rename an access specifier, and the header bodies they each held a
+copy of are lowered once. Parse diagnostics fall with them, 1,423 to 1,065.
+
+1,065 distinct pairs are added. Of the 672 no longer present, 646 were
+synthesized externals and are definitions now
+(`InsightIntentExecuteParam::IsInsightIntentExecute`, unqualified and
+unresolved, becomes
+`OHOS::AppExecFwk::InsightIntentExecuteParam::IsInsightIntentExecute`), 9
+name another external, 3 of them a definition beside it, and 1 another
+definition of the method.
+
+16 pairs the baseline resolved are not resolved now: 8 direct edges whose
+call keeps only its unresolved external, and 8 with no edge under that name
+from the caller. All 16 come from a header body that units used to expand
+into their own text and now take from the header's unit, which is lowered
+with the types of what the header includes and without their functions:
+
+- `UIAbilityRecord::CheckStartPendingState`, defined in
+  `ui_ability_record.h`, calls the inherited `GetPendingState()` unqualified.
+  The header's unit leaves the call unresolved; units holding the text bound
+  it to `AbilityRecord::GetPendingState`. This is the one production call
+  among the 16.
+- 13 start in test bodies and mock classes. Three tests call `Push` on an
+  `InsightIntentExecutorAsyncCallback`, an alias `insight_intent_executor.h`
+  declares for a class template it only forward-declares; the others bound
+  to a mock of another test's directory through text the unit held
+  (`FreeInstallTest` to the `DelayedSingleton` of
+  `modular_object_utils_test/mock`).
+- 2 are `ipc` edges from a proxy's own `SendRequest` helper to the
+  undeclared `IRemoteObject::SendRequest`, which is no stub method.
+
+The production call left with the coverage rule of the expansion cache;
+the other 15 with the access-specifier rule, which turns 1,016 units from
+holding such text to replaying it.
+
+Merging what a held header includes is what keeps its declarations the
+functions their definitions are. Without it `napi_common.h`'s entry lowered
+`napi_common_util.h`'s prototypes with `napi_env` unknown, and 532 direct
+edges on this tree went to a second, declared-only
+`WrapStringToJS(int, …)` and its like.
+
+### Header functions of internal linkage
+
+A unit that replays a header from the cache did not bind its own call to a
+`static` function the header defines: with `ns.h` defining
+`static int helper()` in `A::U` and `unit.cpp` calling `U::helper()` from
+`A::C::f`, the baseline gives `A::C::f -> U::helper (external)`. The
+baseline has the fault too; units met it here once they replayed headers
+they used to expand themselves (`CloneForAccountUtil::ProcessAppIndex`
+calling `AbilityUtil::GetBundleManagerHelper` of `ability_util.h`). The
+header's function is now visible to every file that includes the header,
+also when another header's entry holds its text
+([Shared header functions](ANALYSIS.md#shared-header-functions)). A lambda
+is still lowered by each unit that holds its text: reusing the copy of the
+header's unit cost hiview the override targets of 11 calls in
+`raw_data_builder.h`.
+
+### Cost
+
+Three runs each, eight jobs, wall time and peak resident set:
+
+| Tree | Baseline | Candidate |
+|---|---:|---:|
+| HDF (one run) | 4.2 s, 536 MB | 4.1 s, 515 MB |
+| hiview (one run) | 1.8 s, 322 MB | 1.7 s, 311 MB |
+| camera | 6.3–7.3 s, 703–817 MB | 7.0–7.6 s, 748–772 MB |
+| `ability_ability_runtime` | 61.2–62.3 s, 1,198–1,266 MB | 40.0–42.3 s, 1,223–1,273 MB |
+
+Camera's added time is the 110 synthesized headers and the text entries now
+hold. On `ability_ability_runtime` the text units parse and lower falls from
+247 MB to 122 MB and processor time from 210–226 s to 135–136 s, which is
+the access-specifier rule: without it the candidate takes 58 s. Peak memory
+does not follow the text: the heap is largest while units are preprocessed
+and again in the final merge, about 1.3 GB live at both, not while units are
+parsed and lowered.
+
+Raising `max_expansion_variants` does not help: in one session the tree
+took 38.4–38.9 s with 8 variants and 40.4–41.1 s with 16 and with 32, whose
+peak resident set was 1,317–1,391 MB against 1,232–1,309 MB.
+
+### Left for separate work
+
+- An entry that skips a header by a guard it learned from a replayed entry's
+  `guards` does not inherit that header's dependencies, so a unit in another
+  macro environment can replay it and be lowered with the wrong arm's
+  classes. No variant list has to be full for it to occur, and the baseline
+  has it. Making the entry inherit them was tried here and withdrawn: the
+  entry then also replays the skipped header's macro effects, and a consumer
+  that holds the header already has some of its bindings replaced. On HDF
+  the log calls of `audio_sapm_test.c` expanded to `DealFormat` and
+  `udk_log` of `adapter/khdf/hongmeng`'s `hdf_log_adapter.h` and the two
+  indirect edges through `MessageDispatcher`'s `Ref` and `Disref` went; hiview
+  lost 50 pairs. The guard would have to be a dependency of the entry, and
+  the comment on `guard_suppresses` records what that cost.
+- A header's unit is lowered with the types of what the header includes,
+  and a call in a header body to a member its class inherits stays
+  unresolved there (`CheckStartPendingState`, above). The same limit keeps
+  one more class of entry out of the cache: an entry enclosing a chain of
+  unstored ones, inside which a header the chain holds is skipped by its
+  guard (`docs/PREPROCESSOR.md`, "An expansion that cannot be stored").
+  Storing it was tried: units then replay it instead of expanding it, and
+  on `ability_ability_runtime` 40 virtual-dispatch targets went, among them
+  `JsUIAbility::Init` for every test calling `Init` on a `UIAbility`,
+  because the override's parameter types no longer matched when its header
+  was lowered in the entry's unit.
+- Units of `ability_ability_runtime` still find no stored expansion for
+  7,531 inclusions and expand those headers themselves. For 6,798 of them
+  the nearest stored expansion differs only in include guards: in which
+  headers had been included before it.
+
+`security_access_token` was not available locally, so the acceptance counts
+of #123 for it are not measured here.
+
 ## Installed system-header sample — 2026-09-29
 
 Measured with the current debug `trace` binary and `--system-includes --jobs 1`

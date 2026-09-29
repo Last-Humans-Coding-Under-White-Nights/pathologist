@@ -3,7 +3,7 @@
 mod configured;
 
 use crate::deps::IncludeGraph;
-use crate::discover::discover_source_files;
+use crate::discover::{discover_files, DiscoveredFiles};
 use crate::gn_defines::Candidate;
 use crate::index_cache::{IndexSourceCache, PreprocessedSource};
 use crate::merge::{
@@ -354,12 +354,32 @@ fn build_program_inner(
     program.include_paths = opts.include_paths.clone();
     // Set before any path is interned: `SymbolTable` decides `FileInfo::is_dep`
     // as it interns, so every later dep question is an O(1) file lookup (#60).
-    program.symbols.set_dep_roots(
-        opts.dep_roots
-            .iter()
-            .map(|d| trace_ir::canonicalize(d))
-            .collect(),
-    );
+    // Discovery interns nothing, so it may precede `set_dep_roots`; the
+    // generated IDL root must be known before any path is interned (#123).
+    let canonical_root = trace_ir::canonicalize(root);
+    let mut dep_roots: Vec<PathBuf> = opts
+        .dep_roots
+        .iter()
+        .map(|d| trace_ir::canonicalize(d))
+        .collect();
+    let discovered = discover_files(root);
+    let mut dep_discovered: Vec<DiscoveredFiles> =
+        dep_roots.iter().map(|d| discover_files(d)).collect();
+    let found: Vec<&DiscoveredFiles> = std::iter::once(&discovered)
+        .chain(&dep_discovered)
+        .collect();
+    let synthesized = crate::idl::synthesize_discovered(&canonical_root, opts, &found);
+    if !synthesized.headers.is_empty() {
+        // What is on disk there is a dependency root's as well, and is
+        // discovered as one: the root's own discovery gives it up below.
+        if synthesized.root.is_dir() {
+            dep_discovered.push(discover_files(&synthesized.root));
+        }
+        dep_roots.push(synthesized.root);
+    }
+    program.symbols.set_dep_roots(dep_roots.clone());
+    program.idl_interfaces = synthesized.interfaces;
+    add_warnings(&mut program, "idl", &synthesized.warnings);
     program.defines = opts
         .defines
         .iter()
@@ -372,13 +392,12 @@ fn build_program_inner(
     // A dependency root contributes headers only: its sources are never
     // translation units, even when the root sits inside the analyzed tree,
     // and its headers are discovered separately (#60).
-    let dep_roots: Vec<PathBuf> = opts
-        .dep_roots
-        .iter()
-        .map(|d| trace_ir::canonicalize(d))
-        .collect();
     let under_dep = |p: &PathBuf| dep_roots.iter().any(|dep| p.starts_with(dep));
-    let (files, headers) = discover_source_files(root);
+    let DiscoveredFiles {
+        sources: files,
+        headers,
+        ..
+    } = discovered;
     let mut files = normalize_discovered_paths(files);
     let database = crate::compile_commands::CompilationDatabase::load(root, opts)?;
     // Sources without a database entry and orphan project headers use the
@@ -431,24 +450,12 @@ fn build_program_inner(
     files.extend(database.commands.keys().cloned());
     files.sort();
     files.dedup();
-    for message in &database.warnings {
-        program.add_diagnostic(Diagnostic {
-            severity: DiagnosticSeverity::Warning,
-            file: None,
-            line: 0,
-            message: message.clone(),
-            stage: "compile_commands".into(),
-        });
-    }
+    add_warnings(&mut program, "compile_commands", &database.warnings);
     let mut headers = normalize_discovered_paths(headers);
     files.retain(|p| !under_dep(p));
     headers.retain(|p| !under_dep(p));
-    let dep_headers = normalize_discovered_paths(
-        dep_roots
-            .iter()
-            .flat_map(|dep| discover_source_files(dep).1)
-            .collect(),
-    );
+    let dep_headers =
+        normalize_discovered_paths(dep_discovered.into_iter().flat_map(|d| d.headers).collect());
     let dep_note = if dep_roots.is_empty() {
         String::new()
     } else {
@@ -479,6 +486,7 @@ fn build_program_inner(
         &dep_roots,
         &dep_headers,
         &opts.test_partition,
+        &synthesized.headers,
     );
     include_graph.dep_roots = classification_roots;
     let mut links =
@@ -497,15 +505,7 @@ fn build_program_inner(
             );
         }
     }
-    for message in &links.warnings {
-        program.add_diagnostic(Diagnostic {
-            severity: DiagnosticSeverity::Warning,
-            file: None,
-            line: 0,
-            message: message.clone(),
-            stage: "link_commands".into(),
-        });
-    }
+    add_warnings(&mut program, "link_commands", &links.warnings);
     if !database.commands.is_empty() || (!links.targets.is_empty() && !links.unscoped_inference) {
         return configured::build(
             program,
@@ -752,7 +752,9 @@ fn build_program_inner(
     // are no longer needed when the parallel TU discovery starts.
     crate::memory::reclaim_unused_pages();
     let reachable_from_c = include_graph.reachable_from(&c_sources);
-    let cpp_parse: Arc<HashSet<PathBuf>> = Arc::new(include_graph.reachable_from(&cpp_tus));
+    let cpp_parse: Arc<HashSet<PathBuf>> = Arc::new(
+        include_graph.reachable_from(cpp_tus.iter().chain(&include_graph.virtual_headers)),
+    );
     // See `index_language`: with no C translation unit in the tree, a `.h`
     // the include graph cannot tie to a C++ unit is still C++.
     let no_c_units = c_tus.is_empty();
@@ -919,11 +921,15 @@ fn build_program_inner(
     // Orphans get the same treatment: indexing a header standalone that every
     // unit already expanded for itself would reintroduce the configuration
     // the PCH filter just dropped.
+    // A virtual header is a dependency's, but nothing may include it, and
+    // it is still indexed (`IncludeGraph::virtual_headers`).
     let orphan_headers: Vec<PathBuf> = include_graph.index_order(
         &project_headers
             .iter()
             .filter(|p| {
-                !pch_set.contains(*p) && !skip_headers.contains(*p) && !program.is_dep_path(p)
+                !pch_set.contains(*p)
+                    && !skip_headers.contains(*p)
+                    && (!program.is_dep_path(p) || include_graph.is_virtual(p))
             })
             .cloned()
             .collect::<Vec<_>>(),
@@ -1871,6 +1877,18 @@ fn method_kind_of_function(name: &str) -> Option<(String, trace_ir::MethodKind)>
     Some((cls, kind))
 }
 
+fn add_warnings(program: &mut Program, stage: &str, messages: &[String]) {
+    for message in messages {
+        program.add_diagnostic(Diagnostic {
+            severity: DiagnosticSeverity::Warning,
+            file: None,
+            line: 0,
+            message: message.clone(),
+            stage: stage.into(),
+        });
+    }
+}
+
 fn normalize_discovered_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths
         .into_iter()
@@ -2098,9 +2116,11 @@ impl HeaderOrder {
 
 /// Headers whose IR must be visible before lowering `self_canon`.
 ///
-/// PCH (`types_only`): direct include-graph edges plus this file's preprocess
-/// `included_headers`. Child units already nested-merged grandchild types, so
-/// walking the full reachable DAG only repeats `merge_types`.
+/// PCH (`types_only`): direct include-graph edges of this file and of the
+/// headers whose text it holds (`inlined_headers`), plus this file's
+/// preprocess `included_headers`. Child units already nested-merged
+/// grandchild types, so walking the full reachable DAG only repeats
+/// `merge_types`.
 ///
 /// TUs: graph reachability so nested prototypes stay available even when a
 /// cached splice omits them from `included_headers` (direct-only dropped
@@ -2113,17 +2133,22 @@ fn headers_to_merge<'a>(
     pch_order: &HeaderOrder,
     self_canon: &'a Path,
     included_headers: &'a [PathBuf],
+    inlined_headers: &'a [PathBuf],
     types_only: bool,
 ) -> Vec<&'a Path> {
     let mut wanted: HashSet<&Path> = HashSet::default();
     if types_only {
-        if let Some(edges) = graph.edges.get(self_canon) {
-            for h in edges {
-                if h.as_path() != self_canon && is_index_header(h) {
-                    wanted.insert(h.as_path());
-                }
-            }
-        }
+        // A header whose text this unit holds is lowered here, so what it
+        // includes is as much a prerequisite as what this header does.
+        let holders =
+            std::iter::once(self_canon).chain(inlined_headers.iter().map(PathBuf::as_path));
+        wanted.extend(
+            holders
+                .filter_map(|holder| graph.edges.get(holder))
+                .flatten()
+                .map(PathBuf::as_path)
+                .filter(|h| *h != self_canon && is_index_header(h)),
+        );
     } else {
         for p in graph.reachable_paths(self_canon) {
             if p != self_canon && is_index_header(p) {
@@ -2188,9 +2213,10 @@ fn push_header_ir(
 /// replayed directly.
 ///
 /// Replaying an expansion pins the expansions it in turn replayed: indexing
-/// keeps each header's text file-local, so a nested header contributes no
-/// text to its includer's entry and needs its own unit — and the consumer
-/// never visits it, so only the entry itself knows which one applies.
+/// keeps each header's text file-local, so a nested header that is stored
+/// contributes no text to its includer's entry and needs its own unit — and
+/// the consumer never visits it, so only the entry itself knows which one
+/// applies.
 fn close_over_nested_variants(
     consumed: &HashSet<(PathBuf, Language, usize)>,
     cache: &trace_preproc::ExpansionCache,
@@ -2294,6 +2320,7 @@ fn index_header_variant(
     ) {
         Ok(()) => {
             let mut unit = program_into_unit(path.to_path_buf(), program);
+            unit.held_headers = expansion.inlined.as_ref().clone();
             // A header's unit is merged into every unit below it; a TU's
             // once, which the precomputation would not pay for.
             unit.merge_descs = crate::merge::merge_descs_of(&unit.types);
@@ -2556,6 +2583,7 @@ fn lower_prepared_source(
         pch_order,
         &self_canon,
         &pre.included_headers,
+        &pre.inlined_headers,
         types_only,
     );
     if let Some(ir) = header_ir {
@@ -2859,6 +2887,7 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
     let template_bases = program.take_template_bases();
     UnitIndex {
         compilation_index: None,
+        held_headers: Vec::new(),
         files: program
             .symbols
             .files
@@ -10202,7 +10231,9 @@ fn filter_targets_by_argc(
 /// Lower a C++ lambda to a synthetic function (`$lambda@line:col` under the
 /// enclosing function). Captures are unmodeled; the body is walked as a
 /// nested function so inner calls participate in the call graph. Repeated
-/// lowering of the same node reuses the first FnId.
+/// lowering of the same node reuses the first FnId; an entry merged from a
+/// header's own unit is not this unit's lowering of the node, and this unit
+/// reads the body with more declared than that unit did.
 fn lower_lambda_expression(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -10218,6 +10249,7 @@ fn lower_lambda_expression(
     if let Some(existing) = program
         .symbols
         .resolve_function_in_scope(&name, Some(ctx.current_file))
+        .filter(|&id| program.symbols.function(id).tu == Some(ctx.current_file))
     {
         return Some(existing);
     }
@@ -16168,7 +16200,7 @@ mod index_window_tests {
         let order = HeaderOrder::new(&[c.clone(), b.clone(), a.clone()]);
         let included = vec![z.clone(), a.clone(), unknown.clone(), source.clone()];
         for types_only in [false, true] {
-            let actual = headers_to_merge(&graph, &order, &source, &included, types_only);
+            let actual = headers_to_merge(&graph, &order, &source, &included, &[], types_only);
             let expected = if types_only {
                 vec![b.as_path(), a.as_path(), unknown.as_path(), z.as_path()]
             } else {
@@ -16182,6 +16214,34 @@ mod index_window_tests {
             };
             assert_eq!(actual, expected);
         }
+    }
+
+    /// A header unit holding another header's text lowers that text, so it
+    /// needs what that header includes, as it needs what its own does.
+    #[test]
+    fn header_unit_merges_what_the_headers_it_holds_include() {
+        let root = tempfile::tempdir().unwrap();
+        let mut graph = IncludeGraph::build(root.path(), &[], &[]);
+        let outer = graph.root.join("outer.h");
+        let held = graph.root.join("held.h");
+        let types = graph.root.join("types.h");
+        graph
+            .project_files
+            .extend([outer.clone(), held.clone(), types.clone()]);
+        graph.add_preprocess_includes(&outer, std::slice::from_ref(&held));
+        graph.add_preprocess_includes(&held, std::slice::from_ref(&types));
+        let order = HeaderOrder::new(&[types.clone(), held.clone(), outer.clone()]);
+        let alone = headers_to_merge(&graph, &order, &outer, &[], &[], true);
+        assert_eq!(alone, vec![held.as_path()]);
+        let holding = headers_to_merge(
+            &graph,
+            &order,
+            &outer,
+            &[],
+            std::slice::from_ref(&held),
+            true,
+        );
+        assert_eq!(holding, vec![types.as_path(), held.as_path()]);
     }
 
     #[test]
