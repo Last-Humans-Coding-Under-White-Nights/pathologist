@@ -56,8 +56,9 @@ An `-I` entry that duplicates an explicit `-isystem` or `-idirafter` directory,
 or a probed system directory, is removed from the command's earlier `-I`
 class, as the compiler ignores that duplicate. A CLI
 `--include` remains an explicit override; a `CPATH` directory repeated with
-`-I` also retains its earlier position. Configured units use these explicit
-paths without project-wide basename guessing. `-D` and `-U` execute in
+`-I` also retains its earlier position. These search rules apply to both JSON
+commands and shared flags, including orphan headers. Configured units use
+explicit paths without project-wide basename guessing. `-D` and `-U` execute in
 command order after language predefines; explicit CLI defines override the
 database. `-include` files are processed in order before the TU, in the same
 macro environment and with their original locations. Their first search
@@ -99,6 +100,19 @@ In bare-tree indexing, only headers discovered under the project or explicit
 dependency roots use separate cached header units. Other external headers stay
 inline in their including unit so their declarations reach lowering and retain
 dependency ownership.
+
+`validate_command_macros` checks command definitions with the same parser used
+by preprocessing, including function-like and variadic parameter lists, without
+reading source files. Before joining the name and replacement text, command
+definitions require the entire name portion to be an identifier, optionally
+followed by an immediately adjacent valid parameter list. Extra tokens before
+`=` are rejected; spaces and operators in the replacement text after `=` remain
+valid. Undefine names must be complete identifiers; a valid name need not already
+be defined. Shared flags are parsed once, then finalized and validated once per
+effective language (C or C++). Shared configuration errors are reported once,
+even when several sources or both languages use the same invalid arguments.
+Shared flags use this check before indexing; selection and
+fallback rules are defined in [Compilation databases](ANALYSIS.md#compilation-databases-62).
 
 ## Role in the pipeline
 

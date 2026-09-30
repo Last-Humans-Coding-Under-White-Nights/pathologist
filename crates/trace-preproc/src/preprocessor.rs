@@ -397,6 +397,10 @@ impl PreprocessorState {
             for op in &ops {
                 match op {
                     crate::CommandMacro::Define(name, value) => {
+                        if !valid_command_macro_name(name, language) {
+                            state.warn(1, format!("invalid command-line macro name: {name:?}"));
+                            continue;
+                        }
                         // A synthetic newline would splice away a trailing
                         // backslash. EOF terminates the replacement list too.
                         let text = format!("{name} {value}");
@@ -405,7 +409,15 @@ impl PreprocessorState {
                             state.warn(1, format!("invalid command-line macro: {e}"));
                         }
                     }
-                    crate::CommandMacro::Undef(name) => state.remove_macro(name),
+                    crate::CommandMacro::Undef(name) => {
+                        let tokens = Lexer::new(name, language).tokenize();
+                        if matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(identifier)) if identifier == name)
+                        {
+                            state.remove_macro(name);
+                        } else {
+                            state.warn(1, format!("invalid command-line undefine name: {name:?}"));
+                        }
+                    }
                 }
             }
             state.opts.command_macros = ops;
@@ -5494,6 +5506,82 @@ fn char_value(s: &str) -> i64 {
     }
 }
 
+/// Check the name separately so extra tokens cannot become replacement text.
+/// Source `#define` directives have no such name/value boundary.
+fn valid_command_macro_name(name: &str, language: Language) -> bool {
+    let tokens = Lexer::new(name, language).tokenize();
+    let Some(Token {
+        kind: TokenKind::Identifier(identifier),
+        ..
+    }) = tokens.first()
+    else {
+        return false;
+    };
+    if name == identifier {
+        return true;
+    }
+    // Check the raw boundary too: lexing drops whitespace and comments.
+    if !name
+        .strip_prefix(identifier)
+        .is_some_and(|tail| tail.starts_with('(') && tail.ends_with(')'))
+        || parameter_list_open(&tokens, 0).is_none()
+        || !tokens[tokens.len() - 2].is_punct(")")
+    {
+        return false;
+    }
+    let parameters = &tokens[2..tokens.len() - 2];
+    if parameters.is_empty() {
+        return true;
+    }
+    let mut seen = FxHashSet::default();
+    let mut parts = parameters.split(|token| token.is_punct(",")).peekable();
+    while let Some(part) = parts.next() {
+        let (parameter, variadic) = match part {
+            [Token {
+                kind: TokenKind::Identifier(parameter),
+                ..
+            }] => (parameter.as_str(), false),
+            [Token {
+                kind: TokenKind::Identifier(parameter),
+                ..
+            }, ellipsis]
+                if ellipsis.is_punct("...") =>
+            {
+                (parameter.as_str(), true)
+            }
+            [ellipsis] if ellipsis.is_punct("...") => ("__VA_ARGS__", true),
+            _ => return false,
+        };
+        if !seen.insert(parameter) || (variadic && parts.peek().is_some()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validate command macros with the same definition parser used during
+/// preprocessing, including function-like parameter lists. Reads no files.
+pub fn validate_command_macros(
+    macros: &[crate::CommandMacro],
+    language: Language,
+) -> Result<(), String> {
+    // Do not let a replacement beginning with an identifier supply a missing
+    // name when the command-line parts are joined for definition parsing.
+    if macros
+        .iter()
+        .any(|op| matches!(op, crate::CommandMacro::Define(name, _) if name.trim().is_empty()))
+    {
+        return Err("empty command-line macro name".into());
+    }
+    let mut opts = PreprocessOptions::new().with_language(language);
+    opts.command_macros = macros.to_vec();
+    let state = PreprocessorState::new(opts, PathBuf::from("<command-line>"));
+    match state.diagnostics.first() {
+        Some(diagnostic) => Err(diagnostic.message.clone()),
+        None => Ok(()),
+    }
+}
+
 /// Preprocess a source file on disk using the given options.
 ///
 /// # Errors
@@ -5755,6 +5843,123 @@ mod tests {
             &PreprocessOptions::new(),
         );
         assert!(result.output.contains("from_header"), "{}", result.output);
+    }
+
+    #[test]
+    fn command_undefines_require_complete_identifiers_but_need_not_exist() {
+        for language in [Language::C, Language::Cpp] {
+            for name in [
+                "123BAD",
+                "=",
+                "FOO=1",
+                "FOO BAR",
+                "F(x)",
+                "",
+                " FOO",
+                "FOO ",
+                "FOO/*comment*/",
+            ] {
+                let macros = vec![crate::CommandMacro::Undef(name.into())];
+                assert!(
+                    validate_command_macros(&macros, language).is_err(),
+                    "{name:?}"
+                );
+            }
+            let macros = vec![
+                crate::CommandMacro::Define("EXISTING".into(), "1".into()),
+                crate::CommandMacro::Undef("EXISTING".into()),
+                crate::CommandMacro::Undef("NONEXISTENT".into()),
+                crate::CommandMacro::Undef("_MISSING2".into()),
+            ];
+            assert!(validate_command_macros(&macros, language).is_ok());
+            let mut opts = PreprocessOptions::new().with_language(language);
+            opts.command_macros = macros;
+            let state = PreprocessorState::new(opts, PathBuf::from("<command-line>"));
+            assert!(state.diagnostics.is_empty());
+            assert!(!state.macros.contains_key("EXISTING"));
+        }
+    }
+
+    #[test]
+    fn command_macro_name_validation_rejects_extra_tokens_before_the_value() {
+        for language in [Language::C, Language::Cpp] {
+            for name in [
+                "A+B",
+                "FOO BAR",
+                "A-B",
+                "F(x)extra",
+                "F (x)",
+                "F(x)+Y",
+                "F(x,)",
+                "F(x,x)",
+                "F(...,x)",
+                "F(args...extra)",
+                "123BAD",
+                "",
+                " A",
+                "A ",
+                "A/*comment*/",
+                "F(x)/*comment*/",
+            ] {
+                let macros = vec![crate::CommandMacro::Define(name.into(), "1".into())];
+                assert!(
+                    validate_command_macros(&macros, language).is_err(),
+                    "{name:?}"
+                );
+                let mut opts = PreprocessOptions::new().with_language(language);
+                opts.command_macros = macros;
+                let state = PreprocessorState::new(opts, PathBuf::from("<command-line>"));
+                assert!(!state.diagnostics.is_empty(), "{name:?}");
+                for prefix in ["A", "FOO", "F"] {
+                    assert!(
+                        !state.macros.contains_key(prefix),
+                        "{name:?} defined {prefix}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn command_macro_name_validation_preserves_valid_names_and_replacement_text() {
+        for language in [Language::C, Language::Cpp] {
+            let definitions = [
+                ("_OBJECT2", "(2 + 3)"),
+                ("TEXT", "\"hello world\""),
+                ("TOKENS", "left + right == other"),
+                ("EMPTY", ""),
+                ("CONST()", "5"),
+                ("ADD(x, y)", "((x) + (y))"),
+                ("APPLY(f,...)", "f(__VA_ARGS__)"),
+                ("GNU(args...)", "ADD(args)"),
+                ("COMMENT(x/* parameter */, y)", "ADD(x, y)"),
+            ];
+            let macros = definitions
+                .into_iter()
+                .map(|(name, value)| crate::CommandMacro::Define(name.into(), value.into()))
+                .collect::<Vec<_>>();
+            assert!(validate_command_macros(&macros, language).is_ok());
+            let mut opts = PreprocessOptions::new().with_language(language);
+            opts.command_macros = macros;
+            let result = preprocess_string(
+                "#if _OBJECT2 == 5 && CONST() == 5 && APPLY(ADD, 2, 3) == 5 && GNU(2, 3) == 5 && COMMENT(2, 3) == 5\n\
+                 EMPTY int selected;\n#endif\nTEXT\nTOKENS\n",
+                Path::new("main.c"), &opts,
+            );
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+            let token_kinds = |source: &str| {
+                Lexer::new(source, language)
+                    .tokenize()
+                    .into_iter()
+                    .filter(|token| !token.is_newline() && !token.is_eof())
+                    .map(|token| token.kind)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                token_kinds(&result.output),
+                token_kinds("int selected; \"hello world\" left + right == other")
+            );
+        }
     }
 
     #[test]

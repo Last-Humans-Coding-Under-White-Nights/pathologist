@@ -3,7 +3,7 @@
 //! include search configuration for the entire tree.
 
 use super::{
-    finalize_program, index_language, index_pool, index_progress, index_source_file,
+    add_warnings, finalize_program, index_language, index_pool, index_progress, index_source_file,
     index_source_file_with_variants, project_preprocess_opts, with_project_system_paths,
     HeaderOrder,
 };
@@ -12,7 +12,7 @@ use crate::merge::{merge_unit_index, merge_unit_variants, UnitIndex};
 use crate::{IncludeGraph, IndexSourceCache};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use trace_ir::Program;
@@ -32,7 +32,7 @@ pub(super) fn build(
     files: &[PathBuf],
     headers: &[PathBuf],
     mut graph: IncludeGraph,
-    database: CompilationDatabase,
+    mut database: CompilationDatabase,
     links: crate::link_commands::LinkDatabase,
     project_compiler_paths: Option<(
         crate::compiler_includes::CompilerSearch,
@@ -51,9 +51,36 @@ pub(super) fn build(
         .with_basename_index(Arc::new(graph.basename_index.clone()));
     let raw_sources = fallback.source_cache.clone();
     let virtual_dirs = graph.virtual_dirs();
+    let cli_include_paths: BTreeSet<_> = opts
+        .include_paths
+        .iter()
+        .map(|path| trace_ir::canonicalize(path))
+        .collect();
+    let directory = if root.is_file() {
+        root.parent().unwrap_or(root)
+    } else {
+        root
+    };
+    let cpath_dirs = crate::compiler_includes::cpath_directories(
+        &trace_ir::canonicalize(directory),
+        std::env::var_os("CPATH").as_deref(),
+    );
+    let project_options = |mut config: PreprocessOptions, language| {
+        if let Some((c, cpp)) = &project_compiler_paths {
+            let searched = if language == Language::C { c } else { cpp };
+            crate::compiler_includes::remove_system_include_duplicates(
+                &mut config,
+                &searched.paths,
+                &cli_include_paths,
+                &cpath_dirs,
+            );
+        }
+        with_project_system_paths(config, language, project_compiler_paths.as_ref())
+    };
     let pool = index_pool(jobs)?;
     index_progress(format!(
-        "compile_commands: {} commands for {} sources (jobs={jobs})",
+        "{}: {} commands for {} sources (jobs={jobs})",
+        database.source_label(),
         database.commands.values().map(Vec::len).sum::<usize>(),
         database.commands.len()
     ));
@@ -74,13 +101,10 @@ pub(super) fn build(
                         .clone()
                         .for_indexing()
                         .with_inline_include_bodies(true);
-                    if !from_database {
+                    // Shared flags name no driver, so use project compiler defaults.
+                    if !from_database || database.uses_shared_flags() {
                         let language = config.language.unwrap_or_else(|| Language::from_path(path));
-                        config = with_project_system_paths(
-                            config,
-                            language,
-                            project_compiler_paths.as_ref(),
-                        );
+                        config = project_options(config, language);
                     }
                     config.record_link_ownership = !links.targets.is_empty();
                     // Database commands never name the virtual directories;
@@ -198,18 +222,36 @@ pub(super) fn build(
         .chain(&graph.virtual_headers)
         .filter(|path| !consumed.contains(*path))
         .collect();
-    if jobs == 1 || unconsumed_headers.len() <= 1 {
-        for path in unconsumed_headers {
-            let cache = IndexSourceCache::new();
-            let config = fallback.clone().with_language(index_language(
-                path,
-                &cpp_parse,
-                no_c_units,
-                opts.language,
-            ));
+    // Resolve shared configurations before workers start: validation and error
+    // reporting use the same cache as the source pass, once per language.
+    let warnings_before = database.warnings.len();
+    let header_configs: Vec<_> = unconsumed_headers
+        .into_iter()
+        .map(|path| {
+            let inferred_language = index_language(path, &cpp_parse, no_c_units, opts.language);
+            let config = if let Some(mut config) = database.shared_options(inferred_language) {
+                config.include_expansion_cache = None;
+                config.shared_macros = None;
+                config.accumulate_macros = false;
+                config.source_cache.clone_from(&raw_sources);
+                config.record_link_ownership = !links.targets.is_empty();
+                config.for_indexing().with_inline_include_bodies(true)
+            } else {
+                fallback.clone().with_language(inferred_language)
+            };
             let language = config.language.unwrap_or_else(|| Language::from_path(path));
-            let config =
-                with_project_system_paths(config, language, project_compiler_paths.as_ref());
+            let config = project_options(config, language);
+            (path, config)
+        })
+        .collect();
+    add_warnings(
+        &mut program,
+        "compile_commands",
+        &database.warnings[warnings_before..],
+    );
+    if jobs == 1 || header_configs.len() <= 1 {
+        for (path, config) in header_configs {
+            let cache = IndexSourceCache::new();
             let unit = index_source_file(
                 path,
                 root,
@@ -223,27 +265,15 @@ pub(super) fn build(
         }
     } else {
         let header_units: Vec<UnitIndex> = pool.install(|| {
-            unconsumed_headers
+            header_configs
                 .par_iter()
-                .map(|path| {
+                .map(|(path, config)| {
                     let cache = IndexSourceCache::new();
-                    let config = fallback.clone().with_language(index_language(
-                        path,
-                        &cpp_parse,
-                        no_c_units,
-                        opts.language,
-                    ));
-                    let language = config.language.unwrap_or_else(|| Language::from_path(path));
-                    let config = with_project_system_paths(
-                        config,
-                        language,
-                        project_compiler_paths.as_ref(),
-                    );
                     index_source_file(
                         path,
                         root,
                         &graph,
-                        &config,
+                        config,
                         &cache,
                         None,
                         &HeaderOrder::default(),
@@ -262,6 +292,7 @@ pub(super) fn build(
         .commands
         .values()
         .flatten()
+        .chain(database.shared_search_options())
         .chain(std::iter::once(&fallback))
         .flat_map(|config| {
             config

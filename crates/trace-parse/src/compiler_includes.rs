@@ -1,13 +1,39 @@
 //! Query driver-owned default header directories without preprocessing project code.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use trace_preproc::Language;
+use trace_preproc::{Language, PreprocessOptions};
+
+pub(super) fn cpath_directories(directory: &Path, value: Option<&OsStr>) -> BTreeSet<PathBuf> {
+    value
+        .map(|value| {
+            std::env::split_paths(value)
+                .map(|path| trace_ir::canonicalize(&directory.join(path)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The compiler ignores command -I directories that belong to its system
+/// search list. CLI includes remain trace overrides; CPATH duplicates keep
+/// their earlier -I position unless explicitly classified as -isystem.
+pub(super) fn remove_system_include_duplicates(
+    opts: &mut PreprocessOptions,
+    system_paths: &[PathBuf],
+    cli_include_paths: &BTreeSet<PathBuf>,
+    cpath_dirs: &BTreeSet<PathBuf>,
+) {
+    opts.include_paths.retain(|path| {
+        cli_include_paths.contains(path)
+            || !system_paths.contains(path)
+            || (cpath_dirs.contains(path) && !opts.system_include_paths.contains(path))
+    });
+}
 
 #[derive(Default)]
 pub(super) struct CompilerIncludes {

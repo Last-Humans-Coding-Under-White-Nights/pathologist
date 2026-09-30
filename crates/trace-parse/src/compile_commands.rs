@@ -8,6 +8,8 @@ use trace_preproc::{CommandMacro, Language, PreprocessOptions};
 
 #[derive(Default)]
 pub(crate) struct CompilationDatabase {
+    shared_flags: Option<(PathBuf, Vec<String>)>,
+    shared_configuration: Option<SharedConfiguration>,
     pub commands: BTreeMap<PathBuf, Vec<PreprocessOptions>>,
     pub warnings: Vec<String>,
     pub path: Option<PathBuf>,
@@ -46,6 +48,9 @@ impl CompilationDatabase {
         } else {
             let direct = directory.join("compile_commands.json");
             let build = directory.join("build").join("compile_commands.json");
+            if !direct.exists() && !build.exists() {
+                return Ok(Self::load_flags(directory));
+            }
             if !direct.exists() && build.exists() {
                 build
             } else {
@@ -128,34 +133,20 @@ impl CompilationDatabase {
                             &opts.system_include_paths,
                         );
                         if !search.paths.is_empty() {
-                            // The probe includes explicit -isystem directories
-                            // in their actual position relative to CPATH and
-                            // the compiler's builtins. GCC ignores a command
-                            // -I that names a system directory, so remove
-                            // those duplicates from the earlier -I class.
-                            // CPATH acts like -I, though, and a repeated
-                            // CPATH directory must keep its early position.
-                            // A CLI --include is an explicit trace override.
                             let cpath_dirs = cpath_by_directory
                                 .entry(directory.clone())
                                 .or_insert_with(|| {
-                                    cpath
-                                        .as_ref()
-                                        .map(|value| {
-                                            std::env::split_paths(value)
-                                                .map(|path| {
-                                                    trace_ir::canonicalize(&directory.join(path))
-                                                })
-                                                .collect()
-                                        })
-                                        .unwrap_or_default()
+                                    crate::compiler_includes::cpath_directories(
+                                        &directory,
+                                        cpath.as_deref(),
+                                    )
                                 });
-                            opts.include_paths.retain(|path| {
-                                cli_include_paths.contains(path)
-                                    || !search.paths.contains(path)
-                                    || (cpath_dirs.contains(path)
-                                        && !opts.system_include_paths.contains(path))
-                            });
+                            crate::compiler_includes::remove_system_include_duplicates(
+                                &mut opts,
+                                &search.paths,
+                                &cli_include_paths,
+                                cpath_dirs,
+                            );
                             opts.system_include_paths = search.paths;
                             opts.compiler_defines.extend(search.target_defines);
                         }
@@ -173,6 +164,153 @@ impl CompilationDatabase {
             }
         }
         Ok(db)
+    }
+
+    fn load_flags(directory: &Path) -> Self {
+        let path = directory.join("compile_flags.txt");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => return Self::default().warned(&path, e),
+        };
+        if text.contains('\0') {
+            return Self::default().warned(&path, "NUL byte in flags");
+        }
+        // Supply a neutral driver solely for the existing argument parser.
+        // Each nonempty line is one literal argument, including its spaces.
+        let args: Vec<String> = std::iter::once("cc".to_string())
+            .chain(
+                text.lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(str::to_owned),
+            )
+            .collect();
+        if args.len() == 1 {
+            return Self::default();
+        }
+        Self {
+            shared_flags: Some((path, args)),
+            ..Self::default()
+        }
+    }
+
+    /// Parse shared flags for discovered sources and orphan project headers.
+    pub fn configure_discovered(
+        &mut self,
+        files: &[PathBuf],
+        headers: &[PathBuf],
+        overrides: &PreprocessOptions,
+    ) {
+        let Some((path, args)) = self.shared_flags.as_ref() else {
+            return;
+        };
+        let directory = path.parent().expect("flags file has a parent");
+        // Linker options do not affect preprocessing. The shared file has no
+        // compiler driver or source position, so discard its linker tail before
+        // parsing the shared configuration.
+        let compiler_args = &args[..args
+            .iter()
+            .position(|arg| arg == "/link" || arg == "-link")
+            .unwrap_or(args.len())];
+        let Some(first) = files.first().or_else(|| headers.first()) else {
+            return;
+        };
+        let entry = Entry {
+            directory: directory.to_path_buf(),
+            file: first.clone(),
+            arguments: Some(compiler_args.to_vec()),
+            command: None,
+            output: None,
+        };
+        // No synthetic source operand: trailing options must stay errors.
+        let parsed =
+            match entry.parse_options(directory.to_path_buf(), first, overrides, false, true) {
+                Ok((parsed, _, _)) => parsed,
+                Err(error) => {
+                    self.warnings.push(format!(
+                        "{}: {error}; using inferred configuration",
+                        path.display()
+                    ));
+                    return;
+                }
+            };
+        self.shared_configuration = Some(SharedConfiguration {
+            path: path.clone(),
+            parsed,
+            configs: [None, None],
+            reported: BTreeSet::new(),
+        });
+        for file in files {
+            if let Some(opts) = self.shared_options(Language::from_path(file)) {
+                self.commands.insert(file.clone(), vec![opts]);
+            }
+        }
+        // With no TUs, index_language treats ambiguous project headers as C++.
+        // Prime the cache before system-path discovery and dep classification.
+        if files.is_empty() {
+            self.shared_options(overrides.language.unwrap_or(Language::Cpp));
+        }
+    }
+
+    pub fn has_shared_configuration(&self) -> bool {
+        self.shared_configuration.is_some()
+    }
+
+    /// Reuse the same language-specific validation for sources and headers.
+    pub fn shared_options(&mut self, inferred_language: Language) -> Option<PreprocessOptions> {
+        let shared = self.shared_configuration.as_mut()?;
+        let language = shared.parsed.opts.language.unwrap_or(inferred_language);
+        let slot = match language {
+            Language::C => 0,
+            Language::Cpp => 1,
+        };
+        let config = shared.configs[slot].get_or_insert_with(|| {
+            let opts = shared.parsed.clone().finish(language)?;
+            // Caller-supplied operations keep their normal preprocessing
+            // diagnostics; only malformed flags invalidate the shared file.
+            trace_preproc::validate_command_macros(&shared.parsed.macros, language)?;
+            Ok(opts)
+        });
+        match config {
+            Ok(opts) => Some(opts.clone()),
+            Err(error) => {
+                if shared.reported.insert(error.clone()) {
+                    self.warnings.push(format!(
+                        "{}: {error}; using inferred configuration",
+                        shared.path.display()
+                    ));
+                }
+                None
+            }
+        }
+    }
+
+    pub fn shared_search_options(&self) -> Option<&PreprocessOptions> {
+        self.shared_configuration
+            .as_ref()?
+            .configs
+            .iter()
+            .flatten()
+            .find_map(|config| config.as_ref().ok())
+    }
+
+    /// Shared flags use the project compiler; their parsed system paths already
+    /// include CLI overrides and resolve relative to the flags file directory.
+    pub fn shared_system_paths(&self) -> Option<&[PathBuf]> {
+        self.shared_search_options()
+            .map(|config| config.system_include_paths.as_slice())
+    }
+
+    pub fn uses_shared_flags(&self) -> bool {
+        self.shared_flags.is_some()
+    }
+
+    pub fn source_label(&self) -> &'static str {
+        if self.uses_shared_flags() {
+            "compile_flags"
+        } else {
+            "compile_commands"
+        }
     }
 
     /// Record why one entry is unusable. Only entries this run would have used
@@ -204,6 +342,19 @@ impl Entry {
         overrides: &PreprocessOptions,
         wants_output: bool,
     ) -> Result<(PreprocessOptions, Option<PathBuf>, Vec<String>), String> {
+        let (parsed, output, args) =
+            self.parse_options(directory, file, overrides, wants_output, false)?;
+        Ok((parsed.finish(Language::from_path(file))?, output, args))
+    }
+
+    fn parse_options(
+        self,
+        directory: PathBuf,
+        file: &Path,
+        overrides: &PreprocessOptions,
+        wants_output: bool,
+        flags_only: bool,
+    ) -> Result<(ParsedCommand, Option<PathBuf>, Vec<String>), String> {
         if !file.is_file() {
             return Err(format!("source does not exist: {}", file.display()));
         }
@@ -232,11 +383,13 @@ impl Entry {
             || args.iter().any(|arg| arg == "--driver-mode=cl");
         let driver_cpp = binary_stem(&args[driver_idx]).contains("++");
         let default_language = if driver_cpp {
-            Language::Cpp
+            Some(Language::Cpp)
+        } else if flags_only {
+            None
         } else {
-            Language::from_path(file)
+            Some(Language::from_path(file))
         };
-        opts.language = Some(default_language);
+        opts.language = default_language;
         let mut explicit_x = false;
         // `-idirafter`/`-iwithprefix` land after every `-isystem` directory,
         // so they are collected separately and appended once parsing is done.
@@ -257,7 +410,10 @@ impl Entry {
         while let Some(arg) = args.next() {
             // Check the actual input before slash options: an absolute Unix
             // path can start with /I, /D, or /U too.
-            if !arg.starts_with('-') && trace_ir::canonicalize(&directory.join(arg)) == file {
+            if !flags_only
+                && !arg.starts_with('-')
+                && trace_ir::canonicalize(&directory.join(arg)) == file
+            {
                 source_language = opts.language;
                 source_explicit_x = explicit_x;
                 continue;
@@ -331,6 +487,12 @@ impl Entry {
                 arg
             };
             if arg == "--" {
+                if flags_only {
+                    return Err(
+                        "end-of-options separator is not allowed in shared compilation flags"
+                            .into(),
+                    );
+                }
                 break;
             }
             if arg.starts_with('@')
@@ -434,12 +596,12 @@ impl Entry {
                     "-U" => macros.push(CommandMacro::Undef(value.into())),
                     "-x" => {
                         explicit_x = true;
-                        opts.language = Some(match value {
-                            "c" | "c-header" => Language::C,
-                            "c++" | "c++-header" => Language::Cpp,
+                        opts.language = match value {
+                            "c" | "c-header" => Some(Language::C),
+                            "c++" | "c++-header" => Some(Language::Cpp),
                             "none" => default_language,
                             _ => return Err(format!("unsupported language {value}")),
-                        })
+                        }
                     }
                     _ => unreachable!(),
                 }
@@ -468,6 +630,17 @@ impl Entry {
                 args.next()
                     .ok_or_else(|| format!("missing operand for {arg}"))?;
             }
+            if flags_only && (arg == "-" || !(arg.starts_with('-') || msvc && arg.starts_with('/')))
+            {
+                return Err(format!(
+                    "unexpected positional argument {arg:?} in shared compilation flags"
+                ));
+            }
+        }
+        // Shared flags apply their final -x state to every discovered input.
+        if flags_only {
+            source_language = opts.language;
+            source_explicit_x = explicit_x;
         }
         // A standard is command-wide, but -x applies only to following inputs.
         // Do not let the default captured at the source hide a later -std.
@@ -484,6 +657,70 @@ impl Entry {
                 msvc_language.or(source_language)
             })
             .or(opts.language);
+        opts.after_include_paths.extend(after_include_paths);
+        for paths in [
+            &mut opts.include_paths,
+            &mut opts.quote_include_paths,
+            &mut opts.system_include_paths,
+            &mut opts.after_include_paths,
+        ] {
+            for path in paths.iter_mut() {
+                *path = trace_ir::canonicalize(path);
+            }
+            let mut seen = std::collections::HashSet::new();
+            paths.retain(|path| seen.insert(path.clone()));
+        }
+        // A directory supplied as both -I and a later system/after directory
+        // belongs in that later class, as in GCC/Clang. Keep class order.
+        let systems: std::collections::HashSet<PathBuf> = opts
+            .system_include_paths
+            .iter()
+            .chain(opts.after_include_paths.iter())
+            .cloned()
+            .collect();
+        opts.include_paths.retain(|p| !systems.contains(p));
+        Ok((
+            ParsedCommand {
+                opts,
+                macros,
+                standard,
+                msvc,
+                updated_cplusplus,
+            },
+            output,
+            args_for_probe,
+        ))
+    }
+}
+
+struct SharedConfiguration {
+    path: PathBuf,
+    parsed: ParsedCommand,
+    configs: [Option<Result<PreprocessOptions, String>>; 2],
+    reported: BTreeSet<String>,
+}
+
+/// Parsed once; language-dependent standard macros are applied when the
+/// source's effective language is known. Command macros follow standard macros.
+#[derive(Clone)]
+struct ParsedCommand {
+    opts: PreprocessOptions,
+    macros: Vec<CommandMacro>,
+    standard: Option<String>,
+    msvc: bool,
+    updated_cplusplus: bool,
+}
+
+impl ParsedCommand {
+    fn finish(self, default_language: Language) -> Result<PreprocessOptions, String> {
+        let Self {
+            mut opts,
+            macros,
+            mut standard,
+            msvc,
+            updated_cplusplus,
+        } = self;
+        opts.language.get_or_insert(default_language);
         // cl accepts shared project flags for mixed C/C++ sources and ignores
         // a standard switch that does not apply to this source's language.
         if msvc
@@ -537,29 +774,7 @@ impl Entry {
             }
         }
         opts.command_macros.extend(macros);
-        opts.after_include_paths.extend(after_include_paths);
-        for paths in [
-            &mut opts.include_paths,
-            &mut opts.quote_include_paths,
-            &mut opts.system_include_paths,
-            &mut opts.after_include_paths,
-        ] {
-            for path in paths.iter_mut() {
-                *path = trace_ir::canonicalize(path);
-            }
-            let mut seen = std::collections::HashSet::new();
-            paths.retain(|path| seen.insert(path.clone()));
-        }
-        // A directory supplied as both -I and a later system/after directory
-        // belongs in that later class, as in GCC/Clang. Keep class order.
-        let systems: std::collections::HashSet<PathBuf> = opts
-            .system_include_paths
-            .iter()
-            .chain(opts.after_include_paths.iter())
-            .cloned()
-            .collect();
-        opts.include_paths.retain(|p| !systems.contains(p));
-        Ok((opts, output, args_for_probe))
+        Ok(opts)
     }
 }
 

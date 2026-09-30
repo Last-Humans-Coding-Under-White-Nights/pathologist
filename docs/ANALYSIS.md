@@ -2904,7 +2904,51 @@ their override order.
 See [Compilation database options](PREPROCESSOR.md#compilation-database-options-62)
 for search order and probe limits.
 
-The reader accepts `arguments` or a shell-quoted `command`, preferring `arguments`
+When neither an explicit JSON database nor either automatically discovered JSON
+path is selected, indexing reads `compile_flags.txt` only in the analysis root
+(or the source's parent directory for a single-file analysis). It does not search
+ancestors, subdirectories, or `build/` for flags. A selected JSON database always
+wins, even if empty, unreadable, malformed, or missing usable source entries;
+flags never supplement it or change its error handling.
+
+With shared flags, `--system-includes` uses the project fallback compiler because
+the flags file does not name a compiler driver. The probe receives the parsed
+shared `-isystem` directories, including CLI overrides, so the compiler's search
+list retains them in order. Shared `-iquote` directories remain in the quoted
+include search class; relative paths resolve from the flags file's directory.
+
+The flags file supplies one literal argument per line, with LF or CRLF endings.
+Compiler names, source filenames, and other positional arguments are rejected;
+separate operands to recognized flags remain valid. Progress logs identify this
+configuration as `compile_flags`.
+Empty and whitespace-only lines are ignored; all spaces in nonempty arguments
+are preserved, with no shell splitting, unquoting, expansion, response-file
+support, or command execution.
+For example, `-Iinclude space` is one argument; `-include` and `forced header.h`
+occupy two lines. Relative paths resolve from the flags file's directory.
+An MSVC `/link` (or `-link`) line ends the compilation flags; it and all
+following linker arguments are ignored during analysis.
+The existing command argument parser applies include paths, ordered `-D`/`-U`,
+forced includes, and language/standard switches to every discovered translation
+unit and to project headers not consumed by any unit. The orphan-header pass
+reuses the shared language-specific configuration and validation cache, with
+the usual header language inference and CLI override precedence. This also
+applies to projects containing only headers. Shared configuration errors are
+reported once across source and orphan-header passes.
+Source discovery and dependency exclusions remain unchanged; flags cannot
+introduce additional sources. Language defaults to each source's extension unless
+overridden by language/standard options. CLI include and macro precedence is the
+same as for JSON commands. Unreadable flags, invalid text, and rejected arguments
+produce `compile_commands` configuration diagnostics naming `compile_flags.txt`
+and fall back to inferred configuration without aborting analysis. Macro operations
+from the flags file are validated with the preprocessor, including function-like
+definitions and undefines; a malformed operation discards the entire shared
+configuration for the source. Caller-supplied `command_macros` retain their usual
+preprocessing diagnostics and do not invalidate the flags file. Explicit language
+selections are checked against the standard for the effective source language.
+Unknown non-preprocessing switches retain the existing argument parser's behavior.
+
+The JSON reader accepts `arguments` or a shell-quoted `command`, preferring `arguments`
 when both exist. Leading compiler launchers (`ccache`, `sccache`, `distcc`,
 `distcc-pump`, `gomacc`, `icecc`, `icerun`, `buildcache`), including chains of
 them, are skipped so the real driver decides the default language. Launcher and
@@ -2933,7 +2977,7 @@ output-file operands are skipped. C++ standards set `_MSVC_LANG`; `cl` keeps
 MSVC standard options do not introduce `__STRICT_ANSI__`. Compiler-version and
 platform predefines and implicit SDK include paths are not inferred; supply
 needed defines and directories explicitly. This is preprocessing-option support,
-not full compiler emulation. `compile_flags.txt` is not read.
+not full compiler emulation.
 
 Include directories are canonicalized and deduplicated within each search class
 without changing their order. Source-cache-only headers participate in the same
@@ -2998,8 +3042,9 @@ No SQLite schema change is needed. Global `defines` metadata continues to descri
 user overrides; include paths are the union of observed configuration paths,
 not a replacement for per-command search order.
 
-Regression coverage: `crates/trace-cli/tests/compile_commands_tests.rs` and
-`tests/fixtures/compile_commands/`. Format and search semantics follow the
+Regression coverage: `crates/trace-cli/tests/compile_commands_tests.rs`,
+`crates/trace-cli/tests/compile_flags_tests.rs`, and the corresponding
+`tests/fixtures/compile_commands/` and `tests/fixtures/compile_flags/` fixtures. Format and search semantics follow the
 [Clang database specification](https://clang.llvm.org/docs/JSONCompilationDatabase.html)
 and [GCC directory options](https://gcc.gnu.org/onlinedocs/gcc/Directory-Options.html).
 

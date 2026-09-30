@@ -1,0 +1,8 @@
+-Iinclude space
+-DMODE=9
+-UMODE
+-DMODE=1 + 2
+-DREMOVED
+-UREMOVED
+-include
+forced header.h
