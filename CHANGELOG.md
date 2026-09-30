@@ -4,6 +4,18 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Static data member sharing without link information (#143)
+
+Static data members of C++ classes now share one variable across
+translation units when no link information is available, so callbacks stored
+in one unit are resolved in another (`h->cb = handler;` in `register.cpp`,
+`h->cb();` in `run.cpp`). A definition's original location wins over a
+declaration's, strong over weak, and every unit's initializer and writes are
+unioned. Anonymous-namespace members, namespace-scope globals and C globals are
+unchanged, as is every run whose link targets scope its symbols. Rules:
+[Static data member storage](docs/ANALYSIS.md#static-data-member-storage);
+measurements in `docs/EVAL_REPORT.md`.
+
 ### IDL-generated interfaces (#123)
 
 OpenHarmony `.idl` files under the analysis root and under `--dep` roots are

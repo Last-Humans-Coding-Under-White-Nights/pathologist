@@ -362,6 +362,12 @@ fn merge_unit(
         matches!(mode, MergeMode::Variant),
         Some(unit.merge_descs.as_slice()).filter(|d| d.len() == unit.types.all().len()),
     );
+    // Decided once per unit: a unit is scoped or unscoped as a whole, and
+    // `merge_linked_units` merges every image's units before the unassigned
+    // ones, so once an image has claimed a symbol no later unit shares
+    // (`docs/ANALYSIS.md`, "Static data member storage"). Inferred targets
+    // that stay informational never scope a symbol.
+    let share_static_members = !program.symbols.has_target_scopes();
 
     let mut file_map: Vec<trace_ir::FileId> = Vec::with_capacity(unit.files.len());
     for path in &unit.files {
@@ -870,6 +876,13 @@ fn merge_unit(
                     var.name.clone(),
                 );
                 if let Some(&existing) = seen.file_vars.get(&file_key) {
+                    // A configuration that turns a member declaration into
+                    // a definition at the same site promotes the merged
+                    // record (`docs/ANALYSIS.md`, "Static data member
+                    // storage"); ordinary variables keep the first variant's.
+                    if var.is_static_member {
+                        adopt_definition(program, existing, var, span_file, &type_map);
+                    }
                     var_map.insert(var.id, existing);
                     continue;
                 }
@@ -897,27 +910,23 @@ fn merge_unit(
         }
 
         // One external symbol is one variable per image, keyed by its
-        // canonical name: `a::counter` and `b::counter` stay two, and an
-        // internal-linkage variable has no symbol to unify under.
-        if let (Some(target), Some(symbol)) = (var.target, var.external_symbol_name()) {
-            if let Some(existing) = program.symbols.target_global(target, symbol) {
-                let current = program.symbols.variable(existing);
-                if var.is_defined
-                    && trace_ir::definition_supersedes(
-                        current.is_defined,
-                        current.is_weak,
-                        var.is_weak,
-                    )
-                {
-                    let mut replacement = var.clone();
-                    replacement.id = existing;
-                    replacement.type_id = remap_type(var.type_id, &type_map);
-                    replacement.span.file = span_file;
-                    *program.symbols.variable_mut(existing) = replacement;
-                }
-                var_map.insert(var.id, existing);
-                continue;
+        // canonical name (`docs/ANALYSIS.md`, "Canonical variable identity"):
+        // `a::counter` and `b::counter` stay two, and an internal-linkage
+        // variable has no symbol to unify under. While no image scopes the
+        // program, a static data member is additionally one variable per
+        // program (#143, "Static data member storage"); ordinary globals are
+        // not.
+        let canonical = match (var.target, var.external_symbol_name()) {
+            (Some(target), Some(symbol)) => program.symbols.target_global(target, symbol),
+            (None, Some(symbol)) if var.is_static_member && share_static_members => {
+                program.symbols.unscoped_static_member(symbol)
             }
+            _ => None,
+        };
+        if let Some(existing) = canonical {
+            adopt_definition(program, existing, var, span_file, &type_map);
+            var_map.insert(var.id, existing);
+            continue;
         }
 
         if matches!(mode, MergeMode::SymbolsOnly)
@@ -1366,6 +1375,37 @@ fn return_flow_fns(flow: &ReturnFlow) -> impl Iterator<Item = FnId> {
         _ => None,
     }
     .into_iter()
+}
+
+/// Replace the canonical variable's record with an incoming definition when
+/// `definition_supersedes` says so, keeping the canonical id and target and
+/// remapping the incoming type and file (`docs/ANALYSIS.md`, "Static data
+/// member storage").
+fn adopt_definition(
+    program: &mut Program,
+    existing: VarId,
+    var: &Variable,
+    span_file: trace_ir::FileId,
+    type_map: &[TypeId],
+) {
+    if !var.is_defined {
+        return;
+    }
+    let current = program.symbols.variable(existing);
+    if !trace_ir::definition_supersedes(current.is_defined, current.is_weak, var.is_weak) {
+        return;
+    }
+    let mut replacement = var.clone();
+    replacement.id = existing;
+    replacement.target = current.target;
+    replacement.type_id = remap_type(var.type_id, type_map);
+    replacement.span.file = span_file;
+    // The record bypasses `add_variable`, which would have noted the
+    // weakness; a weak definition can be adopted over a declaration.
+    if replacement.is_weak {
+        program.symbols.mark_has_weak_symbols();
+    }
+    *program.symbols.variable_mut(existing) = replacement;
 }
 
 /// `map` is indexed by the source table's id: those are dense and
@@ -1934,6 +1974,7 @@ mod tests {
                 is_namespaced: false,
                 qualified_name: None,
                 c_linkage: false,
+                is_static_member: false,
                 id: param,
                 name: param_name.into(),
                 type_id: param_type,
@@ -1988,6 +2029,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_static_member: false,
             id: VarId(id),
             name,
             type_id: TypeId(0),
@@ -2366,5 +2408,287 @@ mod tests {
         let variant = unit_reporting("a.c", "parse");
         merge_unit_variants(&mut program, &base, std::slice::from_ref(&variant));
         assert_eq!(program.diagnostics.len(), 2, "{:?}", program.diagnostics);
+    }
+
+    /// How one unit spells `Holder::cb` (#143).
+    #[derive(Clone, Copy)]
+    struct MemberSpec {
+        /// Out-of-class definition (`Callback Holder::cb;`) rather than the
+        /// in-class declaration.
+        defined: bool,
+        weak: bool,
+        /// `true`: the unit's function stores `handler`'s address into the
+        /// member; `false`: it calls through the member.
+        writes: bool,
+        /// The member's declaration/definition line, to tell units apart.
+        line: u32,
+        /// Ordinary namespace global (`ns::cb`) instead of a static member.
+        namespace_global: bool,
+        /// Member of an anonymous-namespace class: `FileStatic`, no symbol.
+        internal: bool,
+    }
+
+    const DECL: MemberSpec = MemberSpec {
+        defined: false,
+        weak: false,
+        writes: true,
+        line: 2,
+        namespace_global: false,
+        internal: false,
+    };
+    const DEF: MemberSpec = MemberSpec {
+        defined: true,
+        line: 5,
+        ..DECL
+    };
+    const WEAK_DEF: MemberSpec = MemberSpec {
+        weak: true,
+        line: 7,
+        ..DEF
+    };
+
+    fn member_unit(path: &str, spec: MemberSpec) -> UnitIndex {
+        let file = trace_ir::FileId(0);
+        let fn_id = FnId(1);
+        let member = VarId(2);
+        let mut types = trace_ir::TypeTable::new();
+        let fn_ptr = types.intern(trace_ir::TypeDesc::FnPtr {
+            ret: Box::new(trace_ir::TypeDesc::Void),
+            params: Vec::new(),
+        });
+        let function = Function {
+            is_weak: false,
+            target: None,
+            id: fn_id,
+            name: if spec.writes {
+                "writer".into()
+            } else {
+                "reader".into()
+            },
+            linkage: trace_ir::Linkage::External,
+            return_type: TypeId(0),
+            params: Vec::new(),
+            locals: Vec::new(),
+            span: trace_ir::Span::new(file, 10, 1),
+            end_line: 12,
+            file,
+            is_defined: true,
+            param_type_ids: Vec::new(),
+            explicit_arity: Some(0),
+            default_args: 0,
+            reference_params: Vec::new(),
+            owner_unresolved: false,
+            variadic: false,
+            defaulted_in_class: false,
+            declared_in_class: false,
+            is_virtual: false,
+            is_final: false,
+            is_cpp: true,
+            c_linkage: false,
+            tu: None,
+        };
+        let member_var = Variable {
+            is_defined: spec.defined,
+            is_weak: spec.weak,
+            target: None,
+            is_namespaced: true,
+            qualified_name: Some(
+                if spec.namespace_global {
+                    "ns::cb"
+                } else {
+                    "Holder::cb"
+                }
+                .into(),
+            ),
+            c_linkage: false,
+            is_static_member: !spec.namespace_global,
+            id: member,
+            name: "cb".into(),
+            type_id: fn_ptr,
+            storage: if spec.internal {
+                trace_ir::StorageClass::FileStatic
+            } else {
+                trace_ir::StorageClass::Global
+            },
+            fn_id: None,
+            param_index: None,
+            span: trace_ir::Span::new(file, spec.line, 1),
+            is_pointer: true,
+        };
+        // `FnId(9)` stands for `handler`; merge's `rf` remaps a function id it
+        // has no entry for to itself, so the flow survives without a `handler`
+        // function in the unit.
+        let (flow, call_sites) = if spec.writes {
+            (
+                vec![FlowConstraint::AddrOfFn {
+                    dst: member,
+                    callee: FnId(9),
+                }],
+                Vec::new(),
+            )
+        } else {
+            (
+                Vec::new(),
+                vec![CallSite {
+                    id: trace_ir::CallSiteId(0),
+                    caller: fn_id,
+                    callee_name: "cb".into(),
+                    callee_var: Some(member),
+                    callee_fn_id: None,
+                    var_args: Vec::new(),
+                    fn_args: Vec::new(),
+                    addr_of_member_args: Vec::new(),
+                    addr_of_args: Vec::new(),
+                    args_bound_past_this: false,
+                    span: trace_ir::Span::new(file, 11, 5),
+                    expansion_span: None,
+                    occurrence: None,
+                    is_direct: false,
+                    receiver_class: None,
+                    return_dst: None,
+                    tu: None,
+                }],
+            )
+        };
+        UnitIndex {
+            path: PathBuf::from(path),
+            files: vec![PathBuf::from(path)],
+            types,
+            functions: vec![function],
+            variables: vec![member_var],
+            flow,
+            call_sites,
+            ..Default::default()
+        }
+    }
+
+    /// Merge `units` in order into a fresh program.
+    fn merge_all(units: &[(&str, MemberSpec)]) -> Program {
+        let mut program = Program::default();
+        for (path, spec) in units {
+            merge_unit_index(&mut program, &member_unit(path, *spec));
+        }
+        program
+    }
+
+    fn members_named<'p>(program: &'p Program, name: &str) -> Vec<&'p Variable> {
+        program
+            .symbols
+            .variables
+            .iter()
+            .filter(|v| v.lookup_name() == name)
+            .collect()
+    }
+
+    /// The one merged `Holder::cb`, with every reference to it remapped.
+    fn the_shared_member<'p>(program: &'p Program, case: &str) -> &'p Variable {
+        let members = members_named(program, "Holder::cb");
+        assert_eq!(members.len(), 1, "{case}: {members:?}");
+        let m = members[0];
+        for flow in &program.flow {
+            if let FlowConstraint::AddrOfFn { dst, .. } = flow {
+                assert_eq!(*dst, m.id, "{case}: store remapped to the canonical id");
+            }
+        }
+        for site in &program.symbols.call_sites {
+            if site.callee_name == "cb" {
+                assert_eq!(site.callee_var, Some(m.id), "{case}: call site remapped");
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn unscoped_static_member_merges_to_one_variable_in_either_order() {
+        let reader = MemberSpec {
+            writes: false,
+            ..DECL
+        };
+        for (first, second) in [
+            (
+                DECL,
+                MemberSpec {
+                    writes: false,
+                    ..DEF
+                },
+            ),
+            (DEF, reader),
+        ] {
+            let program = merge_all(&[("register.cpp", first), ("run.cpp", second)]);
+            let m = the_shared_member(&program, &format!("first.defined={}", first.defined));
+            assert!(m.is_defined && m.is_static_member && m.target.is_none() && !m.is_weak);
+            assert_eq!(
+                m.span.line, DEF.line,
+                "the definition's span wins in either order"
+            );
+        }
+    }
+
+    #[test]
+    fn unscoped_static_member_declarations_alone_still_share() {
+        let program = merge_all(&[
+            ("register.cpp", DECL),
+            (
+                "run.cpp",
+                MemberSpec {
+                    writes: false,
+                    ..DECL
+                },
+            ),
+        ]);
+        let m = the_shared_member(&program, "declarations only");
+        assert!(!m.is_defined);
+        assert_eq!(m.span.line, DECL.line);
+    }
+
+    #[test]
+    fn unscoped_static_member_strong_definition_displaces_weak_in_either_order() {
+        for order in [[WEAK_DEF, DEF], [DEF, WEAK_DEF]] {
+            let program = merge_all(&[("a.cpp", order[0]), ("b.cpp", order[1])]);
+            let m = the_shared_member(&program, &format!("first.weak={}", order[0].weak));
+            assert!(m.is_defined && !m.is_weak);
+            assert_eq!(m.span.line, DEF.line, "the strong definition's span wins");
+        }
+    }
+
+    #[test]
+    fn adopting_a_weak_definition_marks_the_table_weak() {
+        let program = merge_all(&[("decl.cpp", DECL), ("weak.cpp", WEAK_DEF)]);
+        let m = the_shared_member(&program, "weak definition adopted");
+        assert!(m.is_defined && m.is_weak);
+        assert!(program.symbols.has_weak_symbols());
+    }
+
+    #[test]
+    fn unscoped_static_member_equal_strength_keeps_first_merged() {
+        let later = MemberSpec { line: 9, ..DEF };
+        for (order, winner) in [([DEF, later], DEF.line), ([later, DEF], later.line)] {
+            let program = merge_all(&[("a.cpp", order[0]), ("b.cpp", order[1])]);
+            let m = the_shared_member(&program, &format!("first.line={}", order[0].line));
+            assert_eq!(m.span.line, winner, "first merged definition is kept");
+        }
+    }
+
+    #[test]
+    fn unscoped_namespace_globals_and_internal_members_stay_distinct() {
+        let ns = MemberSpec {
+            namespace_global: true,
+            ..DEF
+        };
+        let internal = MemberSpec {
+            internal: true,
+            ..DEF
+        };
+        for (spec, name, why) in [
+            (ns, "ns::cb", "decision 1: namespace globals stay per unit"),
+            (internal, "Holder::cb", "no external symbol, no sharing"),
+        ] {
+            let reader = MemberSpec {
+                writes: false,
+                ..spec
+            };
+            let program = merge_all(&[("a.cpp", spec), ("b.cpp", reader)]);
+            assert_eq!(members_named(&program, name).len(), 2, "{why}");
+        }
     }
 }

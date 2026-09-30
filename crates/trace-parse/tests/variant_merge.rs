@@ -191,3 +191,69 @@ fn unnamed_parameters_remain_distinct_across_variants() {
     assert_eq!(names, ["$arg0", "$arg1"]);
     assert!(function.locals.is_empty());
 }
+
+/// #143: a configuration that turns a member declaration into a definition
+/// at the same site promotes the merged record, not just the first variant's.
+#[test]
+fn static_member_variant_definition_promotes_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    // GN defines are exploration candidates, not the base: the base unit
+    // holds the declaration and the explored `DEFINE_CB` variant holds the
+    // definition, the order that needs the fast path to adopt metadata.
+    std::fs::write(
+        dir.path().join("BUILD.gn"),
+        "config(\"x\") { defines = [ \"DEFINE_CB\" ] }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+typedef void (*Callback)();
+void handler() {}
+void other() {}
+#ifdef DEFINE_CB
+#define MEMBER_INIT = handler
+#else
+#define MEMBER_INIT
+#endif
+// Both configurations start the member declaration at one original
+// column (no `inline`, which would shift it), so the variant's copy takes
+// `merge_unit`'s positional `file_vars` fast path; lowering treats an
+// in-class initializer as a definition.
+struct Holder { static Callback cb MEMBER_INIT; };
+void run() { Holder::cb(); }
+void set() { Holder::cb = other; }
+"#,
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &PreprocessOptions::new().with_explore(true)).unwrap();
+    assert!(program.variants_merged > 0);
+    let members: Vec<_> = program
+        .symbols
+        .variables
+        .iter()
+        .filter(|v| v.lookup_name() == "Holder::cb")
+        .collect();
+    assert_eq!(members.len(), 1, "{members:?}");
+    assert!(
+        members[0].is_defined,
+        "the defining configuration's metadata is adopted"
+    );
+    // `trace-parse` cannot depend on `trace-analysis`: assert the IR facts
+    // the solver will consume — both configurations' stores into the member.
+    let stored: std::collections::BTreeSet<_> = program
+        .flow
+        .iter()
+        .filter_map(|f| match f {
+            trace_ir::FlowConstraint::AddrOfFn { dst, callee } if *dst == members[0].id => {
+                Some(program.symbols.function(*callee).name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stored,
+        ["handler".to_string(), "other".to_string()].into(),
+        "{stored:?}"
+    );
+}

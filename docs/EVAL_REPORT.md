@@ -1,5 +1,81 @@
 # Evaluation Report
 
+## Static data member sharing without link information — 2026-09-30 (#143)
+
+Without link information an externally linked C++ static data member is now
+one variable per program instead of one per translation unit, so a callback
+stored through it in one unit is called through it in another
+([Static data member storage](ANALYSIS.md#static-data-member-storage)).
+Accepted on correctness: no corpus edge moved, the corpora are deterministic
+across job counts, and the per-unit member copies the #133 Stage 6 exception
+recorded are gone from the merged program.
+
+**Method.** Baseline `cf26476` (`trace-baseline`, sha256 `498556ff…8cb1`);
+candidate the working tree of this change on top of it (`trace-candidate`,
+sha256 `eb17320a…2da`). Both built with
+`cargo build -p trace-cli --release --locked`, rustc
+`1.100.0-nightly (bff8e12ff 2026-08-26)`, Apple M1 `MacBookAir10,1` (8 cores,
+8 GB, macOS 26.6.2). Corpora at their pinned revisions (hdf `cdc75a2`, hiview
+`92408e2`, camera `8ffd69d`), clean. Commands:
+
+```bash
+python3 scripts/eval_check.py --bin $RUN/trace-<side> --corpus-base ~ --outdir $RUN/<side>-eval
+sqlite3 $RUN/<side>-eval/eval_check_<corpus>.db "SELECT a.name, b.name, e.resolution FROM call_edges e JOIN functions a ON a.id=e.caller_fn_id JOIN functions b ON b.id=e.callee_fn_id ORDER BY 1,2,3;"
+$RUN/trace-candidate analyze ~/hiviewdfx_hiview --jobs {1,8} --solve-budget-pops 800000 -o $RUN/hiview-j{1,8}.db
+/usr/bin/time -l $RUN/trace-<side> analyze ~/hiviewdfx_hiview --jobs 8 --solve-budget-pops 800000 -o …
+```
+
+**Corpus results.** `eval_check.py` gives both binaries PASS 94/94 against
+the unchanged `scripts/eval_expected.json`; no expectation moved. Edges
+compared by (caller name, callee name, resolution):
+
+| Corpus | Edge rows | Added | Removed | Variables, baseline → candidate | Flow-graph edges, baseline → candidate |
+|---|---:|---:|---:|---:|---:|
+| hdf | 76,530 | 0 | 0 | 125,776 → 125,379 | 150,313 → 150,301 |
+| hiview | 32,058 | 0 | 0 | 89,355 → 79,855 | 47,831 → 47,633 |
+| camera | 111,520 | 0 | 0 | 216,714 → 169,377 | 102,031 → 101,882 |
+
+Arg-flow edge counts are identical in every corpus. The flow-graph edge
+drop is duplicate collapse, not lost flow: keyed by (kind, source name,
+destination name), hiview has 22,717 distinct flow edges in both databases
+and the two sets are equal. Every corpus records inferred GN targets as
+informational metadata (hdf 131, hiview 409, camera 285 `link_targets`
+rows) with every variable's `target_id` NULL, so all three run through the
+unscoped path this change adds; the merged members carried no callback that
+a reader in another unit calls through, so no edge appears. The spot-check
+of added indirect edges is therefore vacuous; the isolation, link-image and
+export behaviour is pinned by `crates/trace-cli/tests/static_member_sharing.rs`.
+
+**Determinism.** hiview at jobs 1 and jobs 8 (minimal export, fresh
+databases): every table except `analysis_run` is row-for-row identical
+(9,672 functions, 32,058 call edges, 19,653 arg-flow edges in both).
+
+**Structural reading (hiview, full export).** `variables WHERE kind='global'`:
+37,163 → 27,663; all variables 89,355 → 79,855. The 9,500 rows removed are
+the per-unit copies of header-declared static members that
+[Performance — Stage 6](#performance--stage-6-accepted-with-exceptions)
+recorded as the source of its peak-memory exception (hiview globals 28,252 →
+37,212 at #133); the candidate is now below the pre-#133 count because the
+in-class declarations also merge with each other. The ten most repeated
+variable names are unchanged (`this` 6,188, `ret` 553, … `FILE_PERM_775`
+286): they are locals and constants, not members.
+
+**Peak RSS (hiview, jobs 8, three alternating pairs, `/usr/bin/time -l`).**
+Baseline 293 / 310 / 260 MiB (median 293, range 260–310); candidate 312 /
+309 / 305 MiB (median 309, range 305–312). Wall 1.53–1.65 s baseline,
+1.51–1.62 s candidate. Three readings with a 50 MiB baseline spread are a
+reading, not a measurement: the eight-configuration × nine-pair matrix from
+Stage 6 is filed as a follow-up (decision 7 of the plan) and is not claimed
+here. `size_of::<Variable>()` is 104 bytes before and after (the new `bool`
+lands in existing padding).
+
+**Limitations.** Equal external member names without link scopes are one
+storage even across unrelated binaries or tests in the same tree
+(may-analysis over-approximation, as for any unscoped global). Namespace
+`extern` variables and C globals stay per unit without link information;
+sharing them is a global-linkage policy question outside #143. Real link
+targets keep their per-image members and their weak selection.
+
 ## IDL-generated interfaces — 2026-09-29 (#123)
 
 Rules are maintained in [IDL-generated interfaces](ANALYSIS.md#idl-generated-interfaces)
@@ -1445,7 +1521,10 @@ commits changed that, each without changing any result:
 
 **What remains.**
 
-- **Peak memory** (hiview +3.2% / +5.5%, camera jobs 1 +2%). The peak is at
+- **Peak memory** (hiview +3.2% / +5.5%, camera jobs 1 +2%). The per-unit
+  copies described here are merged since #143 when there is no link
+  information; see [Static data member sharing without link information](#static-data-member-sharing-without-link-information--2026-09-30-143)
+  for the structural count and RSS reading. The peak is at
   the end of indexing, when the merged program is built; every earlier phase
   peaks lower than the baseline. The merged program now holds one variable
   per unit for each in-class static member a header declares: hiview's

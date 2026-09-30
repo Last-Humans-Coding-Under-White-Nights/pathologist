@@ -1201,6 +1201,7 @@ mod tests {
                 is_namespaced: true,
                 qualified_name: Some(format!("H::{name}")),
                 c_linkage: false,
+                is_static_member: false,
             });
             id
         };
@@ -1263,6 +1264,7 @@ mod tests {
                 is_namespaced: false,
                 qualified_name: None,
                 c_linkage: false,
+                is_static_member: false,
             });
             program.flow.push(FlowConstraint::NewHeap { dst: id });
             vars.push(id);
@@ -1361,6 +1363,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_static_member: false,
         });
         // The key follows the layout's own member name, not the caller's:
         // asked first with a wrong name, the member still maps by its own.
@@ -1409,6 +1412,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_static_member: false,
         });
         id
     }
@@ -1472,6 +1476,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_static_member: false,
             id: var,
             name: "object".into(),
             type_id,

@@ -1386,3 +1386,78 @@ fn implicit_this_member_array_subscript_and_fn_ptr() {
     });
     assert!(has_single_store, "must emit Store to single_cb_");
 }
+
+/// #143: `is_static_member` is set for class/union static data members only.
+#[test]
+fn static_member_classification_tracks_the_declaration_owner() {
+    let program = build_cpp(
+        r#"
+typedef void (*Callback)();
+struct Holder { static Callback cb; int field; static Callback defined; };
+Callback Holder::defined = 0;
+struct Outer { struct Inner { static int *nested; }; };
+union U { static int *shared; int a; float b; };
+namespace { struct Hidden { static Callback internal; }; }
+namespace ns { extern int *ns_var; int *ns_var = 0; }
+int *plain = 0;
+void f() { static int *fn_local = 0; (void)fn_local; }
+"#,
+    );
+    let flag = |name: &str| the_variable_named(&program, name).is_static_member;
+    assert!(flag("Holder::cb"));
+    assert!(
+        flag("Holder::defined"),
+        "out-of-class definition keeps the flag and one id"
+    );
+    assert!(flag("Outer::Inner::nested"));
+    assert!(flag("U::shared"));
+    let hidden = the_variable_named(&program, "Hidden::internal");
+    assert!(hidden.is_static_member);
+    assert_eq!(hidden.storage, StorageClass::FileStatic);
+    assert_eq!(hidden.external_symbol_name(), None);
+    // Every variable spelled `name` (a namespace `extern` + definition pair
+    // is two variables in one unit today, not this issue's concern).
+    let none_flagged = |name: &str| {
+        let hits: Vec<_> = program
+            .symbols
+            .variables
+            .iter()
+            .filter(|v| v.lookup_name() == name)
+            .collect();
+        assert!(!hits.is_empty(), "{name}: no variable found");
+        assert!(hits.iter().all(|v| !v.is_static_member), "{name}: {hits:?}");
+    };
+    none_flagged("ns::ns_var");
+    none_flagged("plain");
+    none_flagged("fn_local");
+    assert!(
+        !program.symbols.variables.iter().any(|v| v.name == "field"),
+        "an instance field is no variable at all"
+    );
+}
+
+/// #143 decision 5: a qualified definition is a member only when its owner
+/// is known to be a class.
+#[test]
+fn qualified_definition_does_not_imply_class_membership() {
+    let program = build_cpp(
+        r#"
+struct Fwd;
+typedef void (*Callback)();
+Callback Fwd::late = 0;
+namespace ns { }
+int *ns::from_ns = 0;
+int *unknown::owner = 0;
+"#,
+    );
+    let flag = |name: &str| the_variable_named(&program, name).is_static_member;
+    assert!(
+        flag("Fwd::late"),
+        "forward-declared class is a known class owner"
+    );
+    assert!(!flag("ns::from_ns"), "namespace owner is not a class");
+    assert!(
+        !flag("unknown::owner"),
+        "unknown owner is not guessed to be a class"
+    );
+}

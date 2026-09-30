@@ -3822,6 +3822,7 @@ fn register_static_data_member(
             is_namespaced: true,
             qualified_name: Some(qualified_name),
             c_linkage: false,
+            is_static_member: true,
             id: var_id,
             name,
             type_id,
@@ -5173,6 +5174,7 @@ fn add_this_param(program: &mut Program, cls: &str, fn_id: FnId, span: Span) -> 
         is_namespaced: false,
         qualified_name: None,
         c_linkage: false,
+        is_static_member: false,
         id: this_id,
         name: "this".to_string(),
         type_id: this_type,
@@ -5507,6 +5509,7 @@ fn lower_parameter(
         is_namespaced: false,
         qualified_name: None,
         c_linkage: false,
+        is_static_member: false,
         id: var_id,
         name: name.clone(),
         type_id,
@@ -7145,6 +7148,7 @@ fn lower_declaration(
                     is_namespaced,
                     qualified_name,
                     c_linkage,
+                    is_static_member: false,
                     id: var_id,
                     name: name.clone(),
                     type_id,
@@ -7204,7 +7208,7 @@ fn direct_init_arguments(
         }
         "qualified_identifier" if ctx.current_fn.is_none() => {
             let raw = normalize_qualified(node_text(source, &declared));
-            let canonical = static_member_canonical_name(program, ctx, &raw);
+            let (canonical, _) = static_member_canonical_name(program, ctx, &raw);
             program
                 .symbols
                 .variable_named_in_scope(&canonical, ctx.current_file)?;
@@ -7483,6 +7487,7 @@ fn lower_one_declarator(
             is_namespaced,
             qualified_name,
             c_linkage,
+            is_static_member: false,
             id: var_id,
             name: name.clone(),
             type_id,
@@ -7517,6 +7522,7 @@ fn lower_one_declarator(
         is_namespaced,
         qualified_name,
         c_linkage,
+        is_static_member: false,
         id: var_id,
         name: name.clone(),
         type_id,
@@ -7607,22 +7613,29 @@ fn declared_c_linkage(program: &Program, ctx: &LowerContext, lookup_name: &str) 
 /// variable, through the class a `using namespace` directive brings the
 /// owner to — the same recovery an out-of-class member function definition
 /// gets (`class_seen_from`). The class alone decides: a unit that only
-/// forward-declares it still defines the member other units declare.
-fn static_member_canonical_name(program: &Program, ctx: &LowerContext, raw_name: &str) -> String {
+/// forward-declares it still defines the member other units declare. The
+/// flag says whether that recovery found the owner to be a known class; it
+/// is `false` when an existing variable answered the probe, whose record
+/// already carries its classification.
+fn static_member_canonical_name(
+    program: &Program,
+    ctx: &LowerContext,
+    raw_name: &str,
+) -> (String, bool) {
     let canonical = ctx.qualify_decl(raw_name);
     if program
         .symbols
         .variable_named_in_scope(&canonical, ctx.current_file)
         .is_some()
     {
-        return canonical;
+        return (canonical, false);
     }
     canonical
         .rsplit_once("::")
         .and_then(|(owner, member)| {
-            class_seen_from(program, ctx, owner).map(|cls| format!("{cls}::{member}"))
+            class_seen_from(program, ctx, owner).map(|cls| (format!("{cls}::{member}"), true))
         })
-        .unwrap_or(canonical)
+        .unwrap_or((canonical, false))
 }
 
 /// Reconcile an out-of-class static data member definition
@@ -7656,7 +7669,10 @@ fn reconcile_static_member_definition(
     raw_name: &str,
     init_expr: Option<Node>,
 ) -> Option<VarId> {
-    let canonical = static_member_canonical_name(program, ctx, raw_name);
+    // Decision 5 of #143: a fallback definition is a member only when its
+    // owner is a known class (`docs/ANALYSIS.md`, "Static data member
+    // storage").
+    let (canonical, owner_is_class) = static_member_canonical_name(program, ctx, raw_name);
     let owner = canonical
         .rsplit_once("::")
         .map(|(owner, _)| owner.to_string());
@@ -7705,6 +7721,7 @@ fn reconcile_static_member_definition(
                 is_namespaced: true,
                 qualified_name: Some(canonical),
                 c_linkage,
+                is_static_member: owner_is_class,
                 id: var_id,
                 name: leaf,
                 type_id,
@@ -10416,6 +10433,7 @@ fn lower_lambda_expression(
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_static_member: false,
             id: var_id,
             name: name.clone(),
             type_id,
@@ -12130,6 +12148,7 @@ fn alloc_gep_temp(
         is_namespaced: false,
         qualified_name: None,
         c_linkage: false,
+        is_static_member: false,
         id: var_id,
         name: format!("_gep{}", var_id.0),
         type_id: program.types.int(),
@@ -13227,6 +13246,7 @@ fn alloc_recv_temp(
         is_namespaced: false,
         qualified_name: None,
         c_linkage: false,
+        is_static_member: false,
         id: var_id,
         name: format!("_recv{}", var_id.0),
         type_id: pointee,
@@ -13256,6 +13276,7 @@ fn alloc_load_temp(
         is_namespaced: false,
         qualified_name: None,
         c_linkage: false,
+        is_static_member: false,
         id: load_var,
         name: format!("_load{}", load_var.0),
         type_id,
@@ -13284,6 +13305,7 @@ fn alloc_ret_temp_spanned(program: &mut Program, owner: Option<FnId>, span: Span
         is_namespaced: false,
         qualified_name: None,
         c_linkage: false,
+        is_static_member: false,
         id: var_id,
         name: format!("_ret{}", var_id.0),
         type_id: program.types.int(),
@@ -16721,6 +16743,7 @@ mod qualified_variable_lookup_tests {
             is_namespaced: qualified_name.is_some(),
             qualified_name: qualified_name.map(str::to_string),
             c_linkage: false,
+            is_static_member: false,
         });
         id
     }
@@ -16806,6 +16829,7 @@ mod qualified_variable_lookup_tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_static_member: false,
         });
         let ns_ctx = test_ctx(file, None, vec![Some("a".to_string())], HashMap::default());
         assert_eq!(

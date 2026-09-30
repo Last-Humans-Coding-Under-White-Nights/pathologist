@@ -57,6 +57,13 @@ pub struct Variable {
     /// still goes through the qualified name. See `docs/ANALYSIS.md`,
     /// "Canonical variable identity".
     pub c_linkage: bool,
+    /// A class's or union's `static` data member (`register_static_data_member`,
+    /// or an out-of-class definition whose owner resolves to a known class).
+    /// Classification only; identity still goes through `lookup_name` /
+    /// `external_symbol_name`, and an anonymous-namespace member is `true` here
+    /// yet has no external symbol. A member always has a `qualified_name` and
+    /// never C linkage. See `docs/ANALYSIS.md`, "Static data member storage".
+    pub is_static_member: bool,
 }
 
 impl Variable {
@@ -665,6 +672,10 @@ pub struct SymbolTable {
     base_by_name: FxHashMap<String, Vec<FnId>>,
     pub global_by_name: IndexMap<String, VarId>,
     target_globals: FxHashMap<crate::TargetId, FxHashMap<String, VarId>>,
+    /// Unscoped externally linked static data members by linker symbol; the
+    /// value is the first registration, which merge keeps as the canonical ID
+    /// (`docs/ANALYSIS.md`, "Static data member storage").
+    unscoped_static_members: FxHashMap<String, VarId>,
     /// File-`static` variables per file, the first registered of a name
     /// winning.
     /// One entry per file, kept sorted by FileId (see `insert_by_file`).
@@ -1694,6 +1705,12 @@ impl SymbolTable {
         self.target_globals.get(&target)?.get(name).copied()
     }
 
+    /// The canonical unscoped static data member carrying linker `symbol`
+    /// (`docs/ANALYSIS.md`, "Static data member storage").
+    pub fn unscoped_static_member(&self, symbol: &str) -> Option<VarId> {
+        self.unscoped_static_members.get(symbol).copied()
+    }
+
     pub fn add_variable(&mut self, var: Variable) -> VarId {
         self.has_target_scopes |= var.target.is_some();
         self.has_weak_symbols |= var.is_weak;
@@ -1729,6 +1746,14 @@ impl SymbolTable {
                 None => {
                     self.global_by_name
                         .insert(var.lookup_name().to_string(), id);
+                    // First registration owns the slot: callers have
+                    // allocated ids and hold references, so merge, not this
+                    // index, unifies later registrations.
+                    if var.is_static_member {
+                        self.unscoped_static_members
+                            .entry(symbol.to_string())
+                            .or_insert(id);
+                    }
                 }
             }
         } else if var.storage == StorageClass::FileStatic {
@@ -3121,6 +3146,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_static_member: false,
         }
     }
 
@@ -3133,6 +3159,7 @@ mod tests {
             is_namespaced: true,
             qualified_name: Some("ns::cb".to_string()),
             c_linkage: true,
+            is_static_member: false,
             target,
             ..fake_variable(VarId(id), "cb", StorageClass::Global, file, 1)
         };
@@ -3457,6 +3484,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_static_member: false,
             id: proto.params[0],
             name: "$arg0".into(),
             type_id: TypeId(4),
@@ -3718,6 +3746,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_static_member: false,
             id: fint.params[0],
             name: "a".into(),
             type_id: TypeId(4),
@@ -3747,6 +3776,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_static_member: false,
             id: fdouble.params[0],
             name: "b".into(),
             type_id: TypeId(8),
