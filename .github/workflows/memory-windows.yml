@@ -1,0 +1,139 @@
+# Peak memory of `trace analyze` on Windows under several heap
+# configurations (#179). Not a gate: it builds two release binaries and runs
+# the camera corpus a dozen times, so it runs on demand and when its own
+# inputs change. Results go to the step summary and an artifact; the numbers
+# are recorded by hand in docs/EVAL_REPORT.md, "Windows heap configurations".
+name: Memory (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Alternating rounds per configuration
+        default: "3"
+      jobs:
+        description: Analyzer worker count (--jobs)
+        default: "8"
+  pull_request:
+    paths:
+      - .github/workflows/memory-windows.yml
+      - scripts/profile_memory_windows.py
+      - scripts/memory_runs_summary.py
+      - scripts/db_digest.py
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-pc-windows-gnu
+  ROUNDS: ${{ github.event.inputs.rounds || '3' }}
+  JOBS: ${{ github.event.inputs.jobs || '8' }}
+
+jobs:
+  measure:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: memory-${{ env.TARGET }}
+
+      - name: Pin build metadata
+        run: |
+          "TRACE_BUILD_GIT_SHA=$(git rev-parse --short=7 HEAD)" >> $env:GITHUB_ENV
+          "TRACE_BUILD_GIT_DIRTY=false" >> $env:GITHUB_ENV
+          "TRACE_BUILD_DATE=$(Get-Date -Format yyyy-MM-dd -AsUTC)" >> $env:GITHUB_ENV
+
+      # The same target the shipped binary is built for (ci.yml cross-builds
+      # it from Linux); the CRT differs from MSVC's but both allocate from
+      # the process heap.
+      - name: Build release (default heap)
+        run: cargo build -p trace-cli --release --locked --target $env:TARGET
+
+      - name: Build release (mimalloc)
+        run: cargo build -p trace-cli --release --locked --target $env:TARGET --features mimalloc,mimalloc/override --target-dir target/mimalloc
+
+      - name: Heap-trim status line (integration test)
+        run: cargo test -p trace-cli --locked --target $env:TARGET --test heap_trim_tests
+
+      - name: Script tests
+        run: python -m unittest discover -s scripts -p "test_*.py"
+
+      - name: Fetch camera corpus
+        run: python scripts/fetch_corpora.py --base corpora camera
+
+      - name: Runner details
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $details = @(
+            "OS: $($os.Caption) $($os.Version) (build $($os.BuildNumber))",
+            "RAM: $([math]::Round($os.TotalVisibleMemorySize / 1MB, 1)) GiB",
+            "CPU: $($cpu.Name), $($env:NUMBER_OF_PROCESSORS) logical processors",
+            "rustc: $(rustc --version)",
+            "trace: $(& target/$env:TARGET/release/trace.exe --version)"
+          )
+          $details | Tee-Object -FilePath runner.txt
+          "## Runner", "", "``````", $details, "``````", "" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+
+      # Configurations, alternated within each round so that runner drift
+      # spreads evenly:
+      #   default      the process heap as built today;
+      #   trim         TRACE_HEAP_TRIM=1, HeapSetInformation(HeapOptimizeResources)
+      #                after the index and analyze phases;
+      #   mimalloc     the `mimalloc` feature build;
+      #   segment-heap the default binary with Windows' segment heap selected
+      #                for trace.exe through Image File Execution Options
+      #                (FrontEndHeapDebugOptions=8), the allocator-mode
+      #                counterpart of macOS's MallocSpaceEfficient.
+      - name: Measure
+        run: |
+          $ErrorActionPreference = "Stop"
+          $corpus = Resolve-Path corpora/multimedia_camera_framework
+          $default = Resolve-Path target/$env:TARGET/release/trace.exe
+          $mimalloc = Resolve-Path target/mimalloc/$env:TARGET/release/trace.exe
+          $ifeo = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\trace.exe"
+          New-Item -ItemType Directory -Force mem | Out-Null
+          $mem = Resolve-Path mem
+          function Run($label, $exe) {
+            $db = Join-Path $mem "$label.db"
+            python scripts/profile_memory_windows.py --label $label --out $mem -- `
+              $exe analyze $corpus --jobs $env:JOBS -o $db
+            if ($LASTEXITCODE -ne 0) { throw "$label failed with $LASTEXITCODE" }
+            python scripts/db_digest.py --total $db | Out-File -Encoding ascii (Join-Path $mem "$label.digest")
+            if ($LASTEXITCODE -ne 0) { throw "$label digest failed" }
+            Remove-Item $db
+          }
+          for ($round = 1; $round -le [int]$env:ROUNDS; $round++) {
+            $env:TRACE_HEAP_TRIM = "0"
+            Run "default-$round" $default
+            $env:TRACE_HEAP_TRIM = "1"
+            Run "trim-$round" $default
+            $env:TRACE_HEAP_TRIM = "0"
+            Run "mimalloc-$round" $mimalloc
+            New-Item -Path $ifeo -Force | Out-Null
+            Set-ItemProperty -Path $ifeo -Name FrontEndHeapDebugOptions -Type DWord -Value 8
+            try { Run "segment-heap-$round" $default }
+            finally { Remove-Item -Path $ifeo -Recurse -Force }
+          }
+
+      - name: Summary
+        run: |
+          python scripts/memory_runs_summary.py mem --baseline default | Tee-Object -FilePath mem/summary.md
+          if ($LASTEXITCODE -ne 0) { throw "summary failed (digest mismatch or failed run)" }
+          "## Camera, --jobs $env:JOBS, $env:ROUNDS rounds", "", (Get-Content mem/summary.md) | Out-File -Append $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-windows
+          path: |
+            mem/
+            runner.txt

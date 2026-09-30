@@ -35,6 +35,9 @@ jobs:
       - name: Fmt
         run: cargo fmt --all -- --check
 
+      - name: Script tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
       - name: Build C API (cdylib)
         run: cargo build -p trace-capi
 

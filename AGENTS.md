@@ -135,7 +135,7 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 |------|---------------|
 | Fix include resolution / graph | `trace-parse/src/deps.rs`, `trace-preproc/src/preprocessor.rs` |
 | Analyze-phase cost / points-to propagation | `trace-analysis/src/solver.rs` → [Propagation highlights](docs/ANALYSIS.md#propagation-highlights) |
-| Measure peak memory / phase CPU (Linux: `scripts/profile_memory.py`; macOS: `scripts/profile_memory_macos.py`, compare `phys_footprint`) | `docs/MEMORY_PROFILE.md`, [macOS measurements](docs/PERFORMANCE_REVIEW.md#incremental-per-tu-ir-cache-macos-measurements-and-decision-175) |
+| Measure peak memory / phase CPU (Linux: `scripts/profile_memory.py`; macOS: `scripts/profile_memory_macos.py`, compare `phys_footprint`; Windows: `scripts/profile_memory_windows.py`, `.github/workflows/memory-windows.yml`; output identity: `scripts/db_digest.py`) | `docs/MEMORY_PROFILE.md`, [macOS measurements](docs/PERFORMANCE_REVIEW.md#incremental-per-tu-ir-cache-macos-measurements-and-decision-175), [Windows heap configurations](docs/EVAL_REPORT.md#windows-heap-configurations--2026-10-01-179) |
 | Analyze-phase name lookup order | `trace-ir/src/symbol.rs` → [Shared header functions](docs/ANALYSIS.md#shared-header-functions) |
 | Return-value / call assignment flow | `trace-parse/src/lower.rs`, `pag.expand_return_flows` |
 | Static / internal call resolution | `symbol.rs` (`resolve_function_in_scope_in_target`), `solver.rs`, `pag.rs` |

@@ -169,7 +169,17 @@ python3 scripts/profile_memory.py ~/multimedia_camera_framework --jobs 16 \
   --massif --outdir /tmp/memory-camera-massif
 ```
 
-The script builds the current release binary before running. The new tool's
+On macOS `scripts/profile_memory_macos.py` and on Windows
+`scripts/profile_memory_windows.py` take the analyzer command after `--`
+and sample the native process counters (`phys_footprint`; working set and
+private bytes) by phase with the same JSON/log output;
+`scripts/db_digest.py` prints the row count and SHA-256 of every analysis
+table so runs can be checked for identical output, and
+`scripts/memory_runs_summary.py` tabulates a directory of runs
+([Windows heap configurations](EVAL_REPORT.md#windows-heap-configurations--2026-10-01-179)
+is produced by `.github/workflows/memory-windows.yml` this way).
+
+The Linux script builds the current release binary before running. The new tool's
 Massif threshold is 0.1% for finer attribution; the investigation's original
 profile used 1%. Keep the worker count fixed when comparing memory profiles.
 Temporary observer libraries clean up automatically. Results go under the

@@ -141,12 +141,18 @@ respected, so `MallocSpaceEfficient=0 trace analyze …` keeps the default
 allocator; an empty or invalid value, which libmalloc warns about on every
 run, is replaced. `inspect` never re-executes, nor does a build with the
 `mimalloc` feature. The mode in effect is the `malloc:` line at the start
-of the progress output. See
+of the progress output. On Windows the process heap is used as built;
+`TRACE_HEAP_TRIM=1` additionally decommits the heaps' free memory after
+the index and analyze phases (`HeapOptimizeResources`), the measurement
+configuration of
+[Windows heap configurations](docs/EVAL_REPORT.md#windows-heap-configurations--2026-10-01-179),
+and the `heap:` line reports the choice. See
 [memory measurements](docs/EVAL_REPORT.md#compacting-cached-header-type-tables--2026-09-28),
 [macOS space-efficient malloc](docs/EVAL_REPORT.md#macos-space-efficient-malloc--2026-09-30),
 the [memory investigation](docs/MEMORY_PROFILE.md), and the
 [macOS measurements](docs/PERFORMANCE_REVIEW.md#incremental-per-tu-ir-cache-macos-measurements-and-decision-175)
-(`scripts/profile_memory_macos.py`; on macOS compare `phys_footprint`, not RSS).
+(`scripts/profile_memory_macos.py`; on macOS compare `phys_footprint`, not
+RSS; `scripts/profile_memory_windows.py` on Windows).
 
 **Examples**
 

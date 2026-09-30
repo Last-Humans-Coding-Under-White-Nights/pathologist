@@ -297,6 +297,89 @@ fn select_space_efficient_malloc() {
     }
 }
 
+/// Whether `analyze` should trim the process heaps at phase boundaries on
+/// Windows, given `TRACE_HEAP_TRIM` as found in the environment: only an
+/// explicit `1` does (measurement configuration of #179; policy: README.md,
+/// "trace analyze"; numbers: docs/EVAL_REPORT.md, "Windows heap
+/// configurations").
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wants_heap_trim(value: Option<&OsStr>) -> bool {
+    value.and_then(OsStr::to_str) == Some("1")
+}
+
+/// A one-shot decommit of the free memory the process heaps hold
+/// (`HeapSetInformation(NULL, HeapOptimizeResources, …)`), Windows'
+/// counterpart of `malloc_trim`. It is not a persistent mode: called at
+/// startup it does nothing, so `analyze` calls it after the index and
+/// analyze phases, the only points where trimming what indexing left
+/// fragmented can lower a later peak. On other platforms it is a no-op.
+struct HeapTrim {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    enabled: bool,
+}
+
+impl HeapTrim {
+    /// Reads `TRACE_HEAP_TRIM`; on Windows reports the choice as a `heap:`
+    /// line on stderr, next to macOS's `malloc:` line.
+    fn select() -> Self {
+        let enabled = wants_heap_trim(std::env::var_os("TRACE_HEAP_TRIM").as_deref());
+        #[cfg(windows)]
+        eprintln!("heap: {}", if enabled { "trim" } else { "default" });
+        Self { enabled }
+    }
+
+    fn trim(&self) {
+        #[cfg(windows)]
+        if self.enabled && !win_heap::optimize_resources() {
+            eprintln!("heap: trim failed");
+        }
+    }
+}
+
+#[cfg(windows)]
+mod win_heap {
+    use std::ffi::c_void;
+
+    /// `HEAP_INFORMATION_CLASS::HeapOptimizeResources`.
+    const HEAP_OPTIMIZE_RESOURCES: u32 = 3;
+    const HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION: u32 = 1;
+
+    #[repr(C)]
+    struct HeapOptimizeResourcesInformation {
+        version: u32,
+        flags: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn HeapSetInformation(
+            heap: *mut c_void,
+            class: u32,
+            information: *mut c_void,
+            length: usize,
+        ) -> i32;
+    }
+
+    /// Asks every heap in the process to release its caches and decommit
+    /// free pages. A null heap handle addresses all of them.
+    pub(super) fn optimize_resources() -> bool {
+        let mut info = HeapOptimizeResourcesInformation {
+            version: HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION,
+            flags: 0,
+        };
+        // SAFETY: `info` is a correctly sized and initialized
+        // HEAP_OPTIMIZE_RESOURCES_INFORMATION that outlives the call.
+        unsafe {
+            HeapSetInformation(
+                std::ptr::null_mut(),
+                HEAP_OPTIMIZE_RESOURCES,
+                (&mut info as *mut HeapOptimizeResourcesInformation).cast(),
+                std::mem::size_of::<HeapOptimizeResourcesInformation>(),
+            ) != 0
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -389,6 +472,7 @@ fn run_analyze(
     solve_budget_secs: Option<u64>,
 ) -> Result<()> {
     select_space_efficient_malloc();
+    let heap = HeapTrim::select();
     if let Some(secs) = timeout_secs {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(secs));
@@ -544,6 +628,7 @@ fn run_analyze(
         program.symbols.functions.len(),
         program.flow.len(),
     );
+    heap.trim();
 
     let t1 = Instant::now();
     let (pag, analysis) = analyze_with_options(
@@ -583,6 +668,7 @@ fn run_analyze(
         analysis.call_edges.len(),
         indirect,
     );
+    heap.trim();
 
     let t2 = Instant::now();
     export_to_sqlite(
@@ -879,6 +965,21 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod heap_trim_tests {
+    use super::wants_heap_trim;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn only_an_explicit_one_enables_the_trim() {
+        assert!(wants_heap_trim(Some(OsStr::new("1"))));
+        assert!(!wants_heap_trim(None));
+        for value in ["0", "", "true", "2"] {
+            assert!(!wants_heap_trim(Some(OsStr::new(value))), "{value:?}");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,69 @@
 # Evaluation Report
 
+## Windows heap configurations — 2026-10-01 (#179)
+
+The first peak-memory numbers on Windows, a primary deployment target that
+CI cross-builds from Linux and had never run. Same allocation pattern as
+[macOS](#macos-space-efficient-malloc--2026-09-30): eight workers free each
+translation unit's IR right after the ordered merge takes it, and how much
+of that the process keeps depends on the allocator. The Windows build
+allocates from the process heap (`HeapAlloc`, low-fragmentation heap
+front end), which behaves like neither glibc nor libmalloc.
+
+**Method.** `.github/workflows/memory-windows.yml` on a `windows-latest`
+runner (details recorded in its step summary and the `memory-windows`
+artifact): release build for `x86_64-pc-windows-gnu`, the target ci.yml
+ships; pinned camera corpus (`scripts/fetch_corpora.py camera`, the
+smallest of the three); `trace analyze --jobs 8`, minimal export, default
+budgets; three rounds, each running every configuration once in a fixed
+order so runner drift spreads evenly; `scripts/profile_memory_windows.py`
+sampling `GetProcessMemoryInfo` and `GetProcessTimes` at 100 ms by phase;
+`scripts/db_digest.py` of every run's database, and
+`scripts/memory_runs_summary.py` fails the job unless all runs' 15
+non-metadata tables are identical by row count and SHA-256 of rows in
+rowid order.
+
+Configurations:
+
+1. **default** — the process heap as built today.
+2. **trim** — `TRACE_HEAP_TRIM=1`: `HeapSetInformation(NULL,
+   HeapOptimizeResources, …)` after the index and analyze phases. The issue
+   asked for it at startup, but it is a one-shot decommit of the free memory
+   the heaps hold (Windows' `malloc_trim`, the counterpart of the pressure
+   relief macOS found useless), not a mode; at startup there is nothing to
+   trim. Called after indexing it can only lower a peak that comes later,
+   so on a corpus whose peak is the index phase itself, as on macOS, it is
+   expected to move the post-merge footprint and not the peak.
+3. **mimalloc** — `--features mimalloc,mimalloc/override`. Rust
+   allocations go through mimalloc as the global allocator; `override` is a
+   build-script no-op on Windows (static override needs the shared-library
+   mode), so sqlite and tree-sitter keep allocating from the process heap.
+   On macOS mimalloc raised the peak by about 20%, so this is a measurement,
+   not an expectation.
+4. **segment-heap** — the default binary with Windows' segment heap
+   selected for `trace.exe` through Image File Execution Options
+   (`FrontEndHeapDebugOptions=8`, set for those runs only): the one real
+   allocator-mode switch Windows offers, the analogue of
+   `MallocSpaceEfficient`. Shipping it would need an embedded application
+   manifest (`<heapType>SegmentHeap</heapType>`), not a registry key.
+
+Decision rule (from #179): a configuration that lowers the peak working
+set by at least 20% for no more than 5% wall becomes the Windows default at
+startup, with an environment opt-out and notes in the README and CAPI.md;
+otherwise the remaining Windows reduction comes from the live-data items
+(merged `Program`, per-worker transients, header IR), which help every
+platform.
+
+**Results.** Pending the first workflow run; the table below is filled
+from its `memory-windows` artifact.
+
+| Configuration | Peak working set | Peak private bytes | Wall | CPU (user+sys) |
+|---|---:|---:|---:|---:|
+| default | | | | |
+| trim | | | | |
+| mimalloc | | | | |
+| segment-heap | | | | |
+
 ## macOS space-efficient malloc — 2026-09-30
 
 On macOS `trace analyze` now runs under libmalloc's space-efficient mode by
