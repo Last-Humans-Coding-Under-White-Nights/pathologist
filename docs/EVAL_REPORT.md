@@ -54,15 +54,48 @@ otherwise the remaining Windows reduction comes from the live-data items
 (merged `Program`, per-worker transients, header IR), which help every
 platform.
 
-**Results.** Pending the first workflow run; the table below is filled
-from its `memory-windows` artifact.
+**Results.** Run [36781371959](https://github.com/Last-Humans-Coding-Under-White-Nights/pathologist/actions/runs/36781371959)
+on the PR #180 head: Windows Server 2025 Datacenter 10.0.26100, 16 GiB,
+AMD EPYC 9V45 at 4 logical processors, rustc 1.98.1, `trace 0.1.0`.
+Camera (`8ffd69dc`), `--jobs 8`, three rounds; all twelve runs' 15
+non-metadata tables were identical (digest `f89360e7…dd5453`). Peaks are
+the kernel's `PeakWorkingSetSize` / `PeakPagefileUsage`; the 100 ms
+samples came within 1% of them. Change is of medians against `default`.
 
 | Configuration | Peak working set | Peak private bytes | Wall | CPU (user+sys) |
 |---|---:|---:|---:|---:|
-| default | | | | |
-| trim | | | | |
-| mimalloc | | | | |
-| segment-heap | | | | |
+| default | 545 / 542 / 538 MiB | 588 / 583 / 579 MiB | 11.9 / 12.9 / 11.9 s | 33.2 / 36.0 / 33.2 s |
+| trim | 543 / 539 / 546 MiB (+0%) | 583 / 580 / 589 MiB (−0%) | 11.7 / 12.7 / 11.9 s (−0.4%) | 32.3 / 36.1 / 33.4 s |
+| mimalloc | 670 / 670 / 666 MiB (+24%) | 1,010 / 1,020 / 1,004 MiB (+73%) | 11.1 / 11.5 / 11.1 s (−7.1%) | 31.1 / 31.4 / 31.0 s |
+| segment-heap | 572 / 579 / 585 MiB (+7%) | 583 / 588 / 593 MiB (+1%) | 11.9 / 11.7 / 12.1 s (−0.3%) | 33.4 / 32.7 / 32.5 s |
+
+Per phase (round 1, working set): the peak is the TU phase in every
+configuration, as on macOS — default 111 MiB after the include graph,
+301 warm, 491 preprocess, 509 pch, 539 at the ordered merge, 354 when it
+ends, 316 through analysis, 325 export. The trim changes only what comes
+after its first call: the TU phase ends at 308 MiB instead of 354 (−13%)
+and export runs at 302 instead of 325, at no cost in wall; the peak, which
+is before it, does not move. mimalloc commits far more than it touches
+(private bytes 953 MiB against a 595 MiB working set already in
+preprocessing) and trades that for 7% of wall. The segment heap's profile
+differs from the default's throughout (539 MiB in preprocessing, 463 at
+the start of analysis), so the registry opt-in was in effect, but it holds
+more at the peak, not less; the workflow does not read the heap type back
+directly.
+
+**Decision: nothing helps, and the default heap stays.** No configuration
+lowers the peak working set at all, let alone by 20%; two raise it. The
+Windows process heap already keeps the indexing peak within about 5% of
+its committed size (545 MiB working set against 588 MiB private bytes),
+so there is no allocator-held gap of the kind libmalloc had on macOS for a
+heap setting to close. The remaining Windows reduction comes from the
+live-data items — the merged `Program`, per-worker transients and header
+IR — which help every platform. `TRACE_HEAP_TRIM` stays as an opt-in
+measurement knob for re-running this comparison once those move the peak
+into a later phase, where a trim after indexing could reach it; it is not
+a default and the C API does not use it. mimalloc remains a speed trade
+(−7% wall for +24% peak working set), not a memory one, on Windows as on
+macOS.
 
 ## macOS space-efficient malloc — 2026-09-30
 
@@ -108,8 +141,9 @@ from live data: the merged `Program` (~600 MiB here), per-worker transients
 (~260 MiB) and header IR (227 MiB), in that order; the include-graph phase's
 760 MiB transient sets the floor before any of them.
 
-Linux/glibc and Windows are unaffected by this change. Windows was not
-measured.
+Linux/glibc and Windows are unaffected by this change. Windows was measured
+afterwards ([Windows heap configurations](#windows-heap-configurations--2026-10-01-179)):
+its default heap holds no comparable gap.
 
 ## Static data member sharing without link information — 2026-09-30 (#143)
 
