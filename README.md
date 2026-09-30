@@ -133,8 +133,10 @@ discard lowering-only indexes and layouts once their merge descriptors are
 ready. Type tables share immutable descriptors across headers and TUs while
 retaining local IDs. On Linux/glibc, indexing returns freed heap pages at phase
 boundaries and between ordered TU merge batches. See
-[memory measurements](docs/EVAL_REPORT.md#compacting-cached-header-type-tables--2026-09-28)
-and the [memory investigation](docs/MEMORY_PROFILE.md).
+[memory measurements](docs/EVAL_REPORT.md#compacting-cached-header-type-tables--2026-09-28),
+the [memory investigation](docs/MEMORY_PROFILE.md), and the
+[macOS measurements](docs/PERFORMANCE_REVIEW.md#incremental-per-tu-ir-cache-macos-measurements-and-decision-175)
+(`scripts/profile_memory_macos.py`; on macOS compare `phys_footprint`, not RSS).
 
 **Examples**
 
