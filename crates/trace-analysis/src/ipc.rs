@@ -13,6 +13,8 @@
 //!   the presence of a call whose final callable segment is `SendRequest`.
 //! - Bridges pair proxy methods to stub handlers by interface class name +
 //!   method name correspondence (e.g. `FooProxy::Bar` → `FooStub::Bar`).
+//! - A proxy/stub pair named by an `.idl` interface (`Program::idl_interfaces`)
+//!   is registered without a `SendRequest` call or handler bodies.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use trace_ir::{FnId, IpcBridge, Program, TypeKind};
@@ -36,6 +38,16 @@ pub fn detect_ipc_pairs(program: &Program) -> Vec<IpcBridge> {
     let mut stub_index: FxHashMap<&str, &Vec<FnId>> = FxHashMap::default();
     for (class, handlers) in &stubs {
         stub_index.insert(class.as_str(), handlers);
+    }
+    // By stub class, which is what a sender pairs with: the proxy the
+    // interface names, and a `*Client` written by hand beside it. Indexing
+    // records at most one fact per pair (the owner of its headers). Of
+    // several, however a program came to hold them, the first names it.
+    let mut descriptors: FxHashMap<&str, &str> = FxHashMap::default();
+    for idl in &program.idl_interfaces {
+        descriptors
+            .entry(idl.stub.as_str())
+            .or_insert(idl.descriptor.as_str());
     }
 
     // Indexed once a proxy pairs with a stub; ancestries per class, not per
@@ -61,12 +73,13 @@ pub fn detect_ipc_pairs(program: &Program) -> Vec<IpcBridge> {
         if !compatible {
             continue;
         }
+        let descriptor = descriptors.get(stub_class).copied().unwrap_or_default();
         let matched_handlers = find_handlers(program, handlers, method);
         if !matched_handlers.is_empty() {
             bridges.extend(matched_handlers.into_iter().map(|stub_handler| IpcBridge {
                 proxy_method: *proxy_method,
                 stub_handler,
-                descriptor: String::new(),
+                descriptor: descriptor.to_string(),
             }));
             continue;
         }
@@ -83,7 +96,7 @@ pub fn detect_ipc_pairs(program: &Program) -> Vec<IpcBridge> {
                 .map(|stub_handler| IpcBridge {
                     proxy_method: *proxy_method,
                     stub_handler,
-                    descriptor: String::new(),
+                    descriptor: descriptor.to_string(),
                 }),
         );
     }
@@ -144,6 +157,29 @@ fn scan(program: &Program) -> (StubClasses, ProxyMethods) {
             for (method, id) in methods {
                 if senders.contains(id) {
                     proxies.push((class.clone(), method.clone(), *id));
+                }
+            }
+        }
+    }
+
+    if program.idl_interfaces.is_empty() {
+        return (stubs, proxies);
+    }
+    // IDL-generated pairs (docs/ANALYSIS.md, "IDL-generated interfaces"): the
+    // synthesized proxy and stub are declarations only, so neither shows a
+    // `SendRequest` call or a handler body. The IDL itself declares them a
+    // pair; its stub has no handlers, so pairing takes the interface fallback.
+    let mut known_stubs: FxHashSet<String> = stubs.iter().map(|(c, _)| c.clone()).collect();
+    let mut known_senders: FxHashSet<FnId> = proxies.iter().map(|(_, _, id)| *id).collect();
+    for idl in &program.idl_interfaces {
+        if known_stubs.insert(idl.stub.clone()) {
+            stubs.push((idl.stub.clone(), Vec::new()));
+        }
+        for method in &idl.methods {
+            let name = format!("{}::{}", idl.proxy, method.name);
+            for id in program.symbols.resolve_function_candidates(&name, None) {
+                if known_senders.insert(id) {
+                    proxies.push((idl.proxy.clone(), method.name.clone(), id));
                 }
             }
         }
@@ -561,7 +597,21 @@ mod tests {
 
     fn add_external_method(program: &mut Program, file: trace_ir::FileId, name: &str) -> FnId {
         let id = program.symbols.alloc_fn_id();
-        program.symbols.push_synthetic_function(Function {
+        program
+            .symbols
+            .push_synthetic_function(external_method(id, file, name))
+    }
+
+    /// As a header's declaration is: found by name.
+    fn add_declared_method(program: &mut Program, file: trace_ir::FileId, name: &str) -> FnId {
+        let id = program.symbols.alloc_fn_id();
+        program
+            .symbols
+            .add_function(external_method(id, file, name))
+    }
+
+    fn external_method(id: FnId, file: trace_ir::FileId, name: &str) -> Function {
+        Function {
             is_weak: false,
             target: None,
             id,
@@ -587,8 +637,38 @@ mod tests {
             is_cpp: true,
             c_linkage: false,
             tu: None,
-        });
-        id
+        }
+    }
+
+    /// `detect_ipc_pairs` takes any `Program`: two facts naming one proxy
+    /// class pair it once, under the first fact's descriptor.
+    #[test]
+    fn facts_naming_one_proxy_keep_the_first_descriptor() {
+        let mut program = Program::new(PathBuf::from("/fixture"));
+        let file = program.symbols.add_file(PathBuf::from("/fixture/atm.h"));
+        let proxy = add_declared_method(&mut program, file, "p::AtmProxy::Run");
+        let interface = add_declared_method(&mut program, file, "p::IAtm::Run");
+        program.add_inheritance("p::AtmStub", "p::IAtm");
+        for descriptor in ["p.IAtm", "p.Atm"] {
+            program.idl_interfaces.push(trace_ir::IdlInterface {
+                descriptor: descriptor.into(),
+                interface: "p::IAtm".into(),
+                proxy: "p::AtmProxy".into(),
+                stub: "p::AtmStub".into(),
+                methods: vec![trace_ir::IdlMethod {
+                    name: "Run".into(),
+                    ipccode: None,
+                }],
+            });
+        }
+
+        let bridges = detect_ipc_pairs(&program);
+
+        let found: Vec<(FnId, FnId, &str)> = bridges
+            .iter()
+            .map(|b| (b.proxy_method, b.stub_handler, b.descriptor.as_str()))
+            .collect();
+        assert_eq!(found, vec![(proxy, interface, "p.IAtm")]);
     }
 
     #[test]

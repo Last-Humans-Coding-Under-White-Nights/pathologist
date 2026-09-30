@@ -23,7 +23,8 @@ pub struct PreprocessedSource {
     /// rather than replaying from the shared expansion cache (#55). Indexing
     /// runs with `inline_include_bodies` off, so these are the headers whose
     /// declarations are in THIS unit and must not also be merged from a PCH
-    /// unit built under a different macro environment.
+    /// unit built under a different macro environment. For a header's
+    /// stored expansion, the headers it holds (`IncludeExpansion::inlined`).
     pub inlined_headers: Arc<Vec<PathBuf>>,
     /// The language this text was lexed as; `replayed_variants` indexes the
     /// variant list for this language only.
@@ -455,8 +456,10 @@ impl PreprocessedSource {
     /// One stored expansion of a header, ready to lower.
     ///
     /// Indexing preprocesses with `inline_include_bodies` off, so a cached
-    /// expansion's text is exactly that header's own contribution — nested
-    /// headers keep their own entries — and its `LineMap` offsets are
+    /// expansion's text is that header's own contribution — nested headers
+    /// keep their own entries, except those that could not be stored
+    /// (`IncludeExpansion::inlined`), whose text is here too — and its
+    /// `LineMap` offsets are
     /// already relative to the start of that text. Lowering it therefore
     /// yields the same unit re-preprocessing the header would, but under
     /// the macro environment this expansion was actually built in, which is
@@ -466,7 +469,7 @@ impl PreprocessedSource {
             text: Arc::clone(&expansion.text),
             line_map: Arc::clone(&expansion.line_map),
             included_headers: Arc::new(expansion.files.iter().cloned().collect()),
-            inlined_headers: Arc::new(Vec::new()),
+            inlined_headers: Arc::clone(&expansion.inlined),
             replayed_variants: Arc::new(group_variants(expansion.nested_variants.iter().cloned())),
             language,
             diagnostics: expansion.diagnostics.as_ref().clone(),

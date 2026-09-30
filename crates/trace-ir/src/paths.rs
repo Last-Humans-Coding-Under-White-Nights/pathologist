@@ -301,7 +301,8 @@ impl TestPartition {
         !self.directories.is_empty()
     }
 
-    fn matches(&self, name: &std::ffi::OsStr) -> bool {
+    /// Whether a directory called `name` puts what is below it in the partition.
+    pub fn matches(&self, name: &std::ffi::OsStr) -> bool {
         self.directories
             .iter()
             .any(|dir| name == std::ffi::OsStr::new(dir))

@@ -376,6 +376,9 @@ pub struct Program {
     /// Per-function return-value summaries collected during lowering.
     pub fn_returns: IndexMap<FnId, Vec<ReturnFlow>>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Interfaces declared by `.idl` files, in sorted IDL path order
+    /// (docs/ANALYSIS.md, "IDL-generated interfaces").
+    pub idl_interfaces: Vec<crate::IdlInterface>,
     pub include_paths: Vec<PathBuf>,
     /// `#include` dependency edges (dependent → included), project-local only.
     pub include_deps: Vec<(PathBuf, PathBuf)>,

@@ -4,6 +4,34 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### IDL-generated interfaces (#123)
+
+OpenHarmony `.idl` files under the analysis root and under `--dep` roots are
+parsed, and the interface, proxy and stub headers idl-tool would generate are
+synthesized in memory as declarations-only dependency headers. A client call
+through `sptr<IFoo>` reaches the proxy, and the proxy's methods bridge to the
+service deriving from the stub (`resolution = 'ipc'`). Rules:
+[IDL-generated interfaces](docs/ANALYSIS.md#idl-generated-interfaces);
+measurements in `docs/EVAL_REPORT.md`.
+
+A header the expansion cache cannot store (its variant list is full) is no
+longer dropped from its includer's cached expansion. Units replaying that
+expansion were lowered without the header's classes, and member calls on
+them stayed unbound. The line map names origin files by their canonical
+paths. See `docs/PREPROCESSOR.md`, "Parallel discovery".
+
+A unit's call to a `static` function of a header it replays from the cache
+binds to the header's function; it was left unresolved. See
+[Shared header functions](docs/ANALYSIS.md#shared-header-functions).
+
+In C++, `#define private public` and the other renames of one access
+specifier to another are not applied. Every test source that opened a class
+this way made each header it included another expansion, and past the
+variant limit expanded those headers into its own text.
+`ability_ability_runtime` is analyzed in 40–42 s instead of 61–62 s, with
+half the text parsed; peak memory is unchanged. See
+[Access-specifier renames](docs/PREPROCESSOR.md#access-specifier-renames).
+
 ### System-header preprocessing improvements
 
 - Skip diagnostic and unknown directives in inactive conditional arms; report

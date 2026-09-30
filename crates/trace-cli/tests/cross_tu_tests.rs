@@ -715,6 +715,149 @@ fn identical_header_statics_share_bodies_and_keep_visibility() {
     );
 }
 
+/// A header's `static` function is every includer's. A unit that replays the
+/// header from the cache has no copy of its own, and a call it spells with
+/// the namespace binds to the header's.
+#[test]
+fn unit_calls_a_replayed_headers_static_by_qualified_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("ns.h"),
+        "#ifndef NS_H\n#define NS_H\nnamespace A { namespace U {\n[[maybe_unused]] static int helper() { return 1; }\n} }\n#endif\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("unit.cpp"),
+        "#include \"ns.h\"\nnamespace A {\nstruct C { static int f(); };\nint C::f() { return U::helper(); }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("other.cpp"),
+        "namespace A { namespace U {\nstatic int helper() { return 2; }\n} }\nint other() { return A::U::helper(); }\n",
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).unwrap();
+    let (_, analysis) = analyze(&program);
+    let callee_files = |caller: &str| -> Vec<trace_ir::FileId> {
+        analysis
+            .call_edges
+            .iter()
+            .filter(|e| fn_name(&program, e.caller) == caller)
+            .filter(|e| fn_name(&program, e.callee) == "A::U::helper")
+            .filter(|e| e.resolution == ResolutionKind::Direct)
+            .map(|e| program.symbols.function(e.callee).file)
+            .collect()
+    };
+    assert_eq!(
+        callee_files("A::C::f"),
+        vec![file_id(&program, root, "ns.h")]
+    );
+    // Another unit's `static` of the same name stays that unit's.
+    assert_eq!(
+        callee_files("other"),
+        vec![file_id(&program, root, "other.cpp")]
+    );
+}
+
+/// `decl.h` has one expansion slot, taken without `MODE`; the expansion
+/// `outer.h` makes under `MODE` stays in `outer.h`'s entry. The `static`
+/// function it holds is still `decl.h`'s, and a unit that replays `outer.h`
+/// calls it.
+#[test]
+fn unit_calls_a_static_of_a_header_another_header_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("decl.h"),
+        "#ifndef DECL_H\n#define DECL_H\nnamespace A { namespace U {\n#ifdef MODE\n[[maybe_unused]] static int helper() { return 1; }\n#else\n[[maybe_unused]] static int plain() { return 0; }\n#endif\n} }\n#endif\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("outer.h"),
+        "#ifndef OUTER_H\n#define OUTER_H\n#define MODE 1\n#include \"decl.h\"\nint from_outer(void);\n#endif\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("unit.cpp"),
+        "#include \"outer.h\"\nnamespace A {\nint f() { return U::helper(); }\n}\n",
+    )
+    .unwrap();
+    let opts = default_opts(root).with_max_expansion_variants(1);
+    let program = build_program(root, &opts).unwrap();
+    let (_, analysis) = analyze(&program);
+    let callees: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(&program, e.caller) == "A::f")
+        .map(|e| {
+            (
+                fn_name(&program, e.callee),
+                e.resolution,
+                program.symbols.function(e.callee).file,
+            )
+        })
+        .collect();
+    assert_eq!(
+        callees,
+        vec![(
+            "A::U::helper".to_string(),
+            ResolutionKind::Direct,
+            file_id(&program, root, "decl.h")
+        )]
+    );
+}
+
+/// `unit.cpp` reads `user.h` under `MODE`, which the header's one stored
+/// expansion was not made under, so the header's text is the unit's own. The
+/// lambda in it is lowered with the unit, where `Base::Get` is a known
+/// virtual function, and its call dispatches to the override. The copy the
+/// header's own unit holds does not stand for it.
+#[test]
+fn unit_holding_a_headers_text_lowers_its_lambdas_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("base.h"),
+        "#ifndef BASE_H\n#define BASE_H\n#include <memory>\n#include <vector>\nstruct Base {\n    virtual bool Get(std::vector<int> &dest);\n};\nstruct Derived : Base {\n    bool Get(std::vector<int> &dest) override { return true; }\n};\n#endif\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("user.h"),
+        "#ifndef USER_H\n#define USER_H\n#include <functional>\n#include \"base.h\"\n#ifdef MODE\n#endif\nclass Builder {\npublic:\n    template<typename T>\n    bool Use(std::shared_ptr<Base> b, T &val)\n    {\n        std::function<bool(std::shared_ptr<Base>, T &)> get =\n            [] (std::shared_ptr<Base> p, T &val) {\n                p->Get(val);\n                return true;\n            };\n        return get(b, val);\n    }\n};\n#endif\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("base.cpp"),
+        "#include \"base.h\"\nbool Base::Get(std::vector<int> &dest) { return false; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("unit.cpp"),
+        "#define MODE 1\n#include \"user.h\"\nbool Run(std::shared_ptr<Base> b, std::vector<int> &v)\n{\n    Builder builder;\n    return builder.Use(b, v);\n}\n",
+    )
+    .unwrap();
+    // `other.cpp` replays the stored expansion, so the header has a unit.
+    std::fs::write(
+        root.join("other.cpp"),
+        "#include \"user.h\"\nbool Other(std::shared_ptr<Base> b, std::vector<int> &v)\n{\n    Builder builder;\n    return builder.Use(b, v);\n}\n",
+    )
+    .unwrap();
+    let opts = default_opts(root).with_max_expansion_variants(1);
+    let program = build_program(root, &opts).unwrap();
+    let (_, analysis) = analyze(&program);
+    let mut callees: Vec<String> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(&program, e.caller).contains("Use::$lambda"))
+        .filter(|e| e.resolution == ResolutionKind::Direct)
+        .map(|e| fn_name(&program, e.callee))
+        .collect();
+    callees.sort();
+    callees.dedup();
+    assert_eq!(callees, vec!["Base::Get", "Derived::Get"]);
+}
+
 #[test]
 fn header_static_macro_expansions_remain_distinct() {
     let dir = tempfile::tempdir().unwrap();

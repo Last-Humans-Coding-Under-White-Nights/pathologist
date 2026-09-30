@@ -314,8 +314,19 @@ pub struct IncludeExpansion {
     /// brought in. Indexing keeps each header's text file-local, so those
     /// nested headers contribute no text here and need their own lowered
     /// units — and a consumer of this entry never visits them, so it cannot
-    /// work out which expansion of each applies. This is that record.
+    /// work out which expansion of each applies. This is that record. A
+    /// nested header that could not be stored has none: see `inlined`.
     pub nested_variants: Arc<Vec<(PathBuf, usize)>>,
+    /// Headers whose text `text` holds beside this header's own: nested ones
+    /// this expansion's run expanded itself and could not store, and those
+    /// they hold in turn. They have no unit of their own for this
+    /// environment, so whoever lowers this text lowers theirs with it.
+    pub inlined: Arc<Vec<PathBuf>>,
+    /// `inlined`, and the headers the entries this one records cover in
+    /// turn, sorted: the held headers whose declarations a consumer of this
+    /// entry reaches. A run that replays the entry may skip those by their
+    /// guards inside entries that record this one.
+    pub covers: Arc<Vec<PathBuf>>,
     /// `deps.signature()`, computed once.
     pub signature: u64,
     /// Unique for the process, so a deferred run can name this entry before

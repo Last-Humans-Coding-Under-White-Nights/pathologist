@@ -36,31 +36,45 @@ pub fn is_cpp_header_path(path: &Path) -> bool {
     has_extension_in(path, HEADER_EXTENSIONS) && Language::from_path(path) == Language::Cpp
 }
 
+/// `.idl` interface definitions (docs/ANALYSIS.md, "IDL-generated interfaces").
+const IDL_EXTENSION: &str = "idl";
+
+/// Everything one directory walk classifies, each list sorted.
+#[derive(Debug, Default)]
+pub(crate) struct DiscoveredFiles {
+    pub sources: Vec<PathBuf>,
+    pub headers: Vec<PathBuf>,
+    pub idl: Vec<PathBuf>,
+}
+
+/// Single directory walk collecting C/C++ TU, header and `.idl` paths.
+pub(crate) fn discover_files(root: &Path) -> DiscoveredFiles {
+    let mut out = DiscoveredFiles::default();
+    let mut classify = |path: &Path| match path.extension().and_then(|x| x.to_str()) {
+        Some(e) if TU_EXTENSIONS.contains(&e) => out.sources.push(path.to_path_buf()),
+        Some(e) if HEADER_EXTENSIONS.contains(&e) => out.headers.push(path.to_path_buf()),
+        Some(IDL_EXTENSION) => out.idl.push(path.to_path_buf()),
+        _ => {}
+    };
+    if root.is_file() {
+        classify(root);
+        return out;
+    }
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            classify(entry.path());
+        }
+    }
+    out.sources.sort();
+    out.headers.sort();
+    out.idl.sort();
+    out
+}
+
 /// Single directory walk collecting C/C++ TU paths and header paths.
 pub fn discover_source_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    if root.is_file() {
-        let ext = root.extension().and_then(|e| e.to_str());
-        return match ext {
-            Some(e) if TU_EXTENSIONS.contains(&e) => (vec![root.to_path_buf()], Vec::new()),
-            Some(e) if HEADER_EXTENSIONS.contains(&e) => (Vec::new(), vec![root.to_path_buf()]),
-            _ => (Vec::new(), Vec::new()),
-        };
-    }
-    let mut c_files = Vec::new();
-    let mut h_files = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        match entry.path().extension().and_then(|x| x.to_str()) {
-            Some(e) if TU_EXTENSIONS.contains(&e) => c_files.push(entry.path().to_path_buf()),
-            Some(e) if HEADER_EXTENSIONS.contains(&e) => h_files.push(entry.path().to_path_buf()),
-            _ => {}
-        }
-    }
-    c_files.sort();
-    h_files.sort();
-    (c_files, h_files)
+    let found = discover_files(root);
+    (found.sources, found.headers)
 }
 
 #[allow(dead_code)]
