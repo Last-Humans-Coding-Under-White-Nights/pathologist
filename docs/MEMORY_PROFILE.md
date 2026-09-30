@@ -3,7 +3,10 @@
 This document records the 2026-09-15 camera-corpus investigation and its
 follow-ups. The later `ability_ability_runtime` measurements, including compact
 cached header type tables and earlier release of discarded payloads, are in
-[EVAL_REPORT.md](EVAL_REPORT.md#compacting-cached-header-type-tables--2026-09-28).
+[EVAL_REPORT.md](EVAL_REPORT.md#compacting-cached-header-type-tables--2026-09-28);
+the macOS phase peaks, live-byte floors and CPU profile of the same corpus,
+with the decision on an incremental IR cache (#175), are in
+[PERFORMANCE_REVIEW.md](PERFORMANCE_REVIEW.md#incremental-per-tu-ir-cache-macos-measurements-and-decision-175).
 
 Measured 2026-09-15 on the pinned OpenHarmony camera corpus (744 TUs, 849
 headers), with 16 indexing workers and the existing spilling/small-batch

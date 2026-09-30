@@ -433,3 +433,275 @@ are recorded in the
 What the solver does about allocation and store filtering is defined in
 [Propagation highlights](ANALYSIS.md#propagation-highlights); name-lookup
 ordering is in [Shared header functions](ANALYSIS.md#shared-header-functions).
+
+## Incremental per-TU IR cache: macOS measurements and decision (#175)
+
+Issue #175 asked whether a ccache-like cache of lowered per-TU `UnitIndex`
+values could reduce **peak memory** on a re-index after a partial change,
+gated on measurements before any implementation. This section records the
+Gate 0–3 findings on macOS (one of the two primary targets), the decision,
+and what the measurements say the peak is actually made of. **Windows was not
+measured**; nothing here claims a Windows result.
+
+Setup: repository `a284120`, release profile (thin LTO, one codegen unit),
+default system allocator unless stated, `analyze ~/ability_ability_runtime
+--jobs 8`, minimal export, default solver budgets. Corpus
+`ability_ability_runtime` at `6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`
+(clean; 3,331 TUs, 2,992 headers, 6,344 files in the include graph, 49.4 MiB
+of source text). Machine: Apple M1 (4 performance + 4 efficiency cores),
+8 GB RAM, macOS 26.6.2 arm64, rustc 1.100.0-nightly (bff8e12ff 2026-08-26).
+Memory was sampled every 100 ms with
+[`scripts/profile_memory_macos.py`](../scripts/profile_memory_macos.py)
+(`proc_pid_rusage`: resident size, `phys_footprint`, the kernel's lifetime
+maximum footprint, CPU time), attributed to phases by the analyzer's stderr
+lines, with `ru_maxrss` from `wait4`. Live allocator bytes came from a scratch
+build that printed `malloc_zone_statistics` at phase boundaries and from a
+100 ms in-process sampler of the same counter; those probes are not in the
+tree.
+
+### What "peak" means on macOS
+
+`ru_maxrss` and sampled RSS **understate** demand here: with 8 GB the kernel
+compresses pages under pressure, and compressed pages leave RSS but stay in
+`phys_footprint`. Across fifteen system-allocator runs (instrumented ones
+included) the lifetime maximum footprint ranged **1,758–2,408 MiB** (median
+2,155 MiB) while `ru_maxrss` ranged 1,217–1,551 MiB. Footprint is the number
+the kernel acts on and the one that lines up with the Linux `ru_maxrss` of
+≈1.81 GiB in
+[EVAL_REPORT.md](EVAL_REPORT.md#compacting-cached-header-type-tables--2026-09-28);
+all peaks below are footprint unless labelled otherwise. The run-to-run spread
+(±15%) comes from discovery scheduling (which unit pioneers a variant) and
+from when the kernel reclaims freed pages, not from live data: identical
+output every run.
+
+The macOS allocator (`DefaultMallocZone` on macOS 26) returns freed pages
+eagerly with `MADV_FREE_REUSABLE`: after indexing on the camera corpus it
+reported 763 MiB "allocated" against 127 MiB live while the footprint was
+≈262 MiB, and `malloc_zone_pressure_relief(NULL, 0)` released **0 bytes** at
+every phase boundary in three instrumented runs. So the Linux `malloc_trim`
+lever has no macOS counterpart worth adding, and the high resident numbers
+are reusable pages the kernel reclaims lazily. `mimalloc` (`--features
+mimalloc,mimalloc/override`) is a trade: 32.8–34.4 s wall and 122–123 s CPU
+against 35.3–36.6 s and 143–147 s, but a peak footprint **about 20%
+higher** (2,310–2,382 MiB versus 1,749–2,131 MiB in the alternating pairs
+below).
+
+### Gate 1 — the cold-run peak and the warm-run floor
+
+Three alternating pairs, phase peak footprint in MiB, measured with the
+script as committed (the `warm` phase is the sequential header warming,
+whose peak sits below the include-graph transient):
+
+| Run | Wall | CPU | `ru_maxrss` | Max footprint | graph | warm | preprocess | pch | TU merge | analyze | export |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| system 1 | 36.6 s | 143 s | 1,409 | 1,749 | 950 | 704 | 1,586 | 1,702 | 1,749 | 1,090 | 1,097 |
+| mimalloc 1 | 33.2 s | 123 s | 1,682 | 2,382 | 967 | 969 | 2,327 | 2,327 | 2,373 | 2,172 | 1,128 |
+| system 2 | 35.3 s | 144 s | 1,611 | 2,106 | 1,021 | 744 | 1,681 | 1,816 | 2,081 | 2,100 | 870 |
+| mimalloc 2 | 34.4 s | 122 s | 1,382 | 2,328 | 843 | 854 | 2,305 | 2,262 | 2,326 | 2,164 | 1,150 |
+| system 3 | 36.5 s | 147 s | 1,493 | 2,131 | 999 | 704 | 1,590 | 1,737 | 2,101 | 2,103 | 882 |
+| mimalloc 3 | 32.8 s | 123 s | 1,665 | 2,310 | 968 | 832 | 2,270 | 2,249 | 2,310 | 2,022 | 1,286 |
+
+Live allocator bytes tell a different story from the footprint. At phase
+boundaries (one run): 85 MiB after the include graph, 1,033 MiB after
+preprocessing, 806 MiB after header IR, **645 MiB after `index` returns**
+(the merged `Program`, caches dropped), 810 MiB after analysis and export.
+Sampled every 100 ms, the live peaks were: include graph **760 MiB** at
+t = 2.0 s, warm 521 MiB, **preprocessing 1,357 MiB** at t = 10.6 s, header IR
+1,181 MiB, TU merge 1,262 MiB, analyze 814 MiB. So the live peak is
+discovery, not the TU merge; the TU-merge footprint peak carries 0.6–1.1 GiB
+of freed pages the kernel has not reclaimed yet, and the include-graph phase
+burns a 760 MiB transient that leaves 85 MiB behind.
+
+The warm-run floor is therefore max(include-graph transient ≈ 0.95–1.05 GiB
+footprint, `Program` + analysis ≈ 0.86–1.03 GiB) ≈ **1.0 GiB, 45–55% of the
+cold peak** — under the 80% no-go line, but it caps the best case of any
+cache at roughly the ≤ 60% acceptance bar before a single changed TU is
+processed.
+
+**Closure experiment.** A scratch build kept every *k*-th TU in index order
+before warming (`TRACE_RESEARCH_TU_STRIDE`), treating headers reachable only
+from dropped TUs as covered by hypothetical cached IR (excluded from the
+orphan path). This models the best case where warm, discovery and header-IR
+selection are all driven by the changed subset — which the code as written
+does not do (all three derive from the full TU set, `lower.rs` 629–659,
+825–833, 884–970). Phase peak footprint, two runs each:
+
+| TUs kept | Closure files | Header IR | preprocess | pch | TU merge | Process peak | Wall |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 334 (10%) | 1,440 | 1,054 headers / 1,866 expansions | 778–824 | 846–899 | 931–940 | **983–986** (= include graph) | 8.2–8.5 s |
+| 1,666 (50%) | 3,632 | 1,894 / 3,489 | 1,227–1,293 | 1,389–1,414 | 1,441–1,578 | 1,485–1,579 | 19.7 s |
+| 3,331 (100%) | 6,344 | 2,410 / 4,511 | 1,543–1,735 | 1,606–1,892 | 1,945–2,255 | 1,946–2,381 | 33–36 s |
+
+Header IR and the expansion cache do shrink with the closure of the
+preprocessed subset (that part of Gate 1 passes), and at 10% the process
+peak is set entirely by the include-graph phase, which is run-wide. The
+reduced-TU rows merge a smaller `Program`, so they are not a partially warm
+full-corpus run; the full-corpus floor above is the number to add back.
+
+### Gate 2 — the key cannot be computed without preprocessing
+
+On the unconfigured path — the one this corpus takes, since its GN metadata
+is incomplete and no symbol carries a `target_id` — a TU's lowered IR is not
+a function of its own bytes, include closure and flags:
+
+- `matching_variant` takes the **first** stored variant whose
+  `MacroFingerprint` the environment satisfies
+  (`crates/trace-preproc/src/preprocessor.rs` 1421–1437); `publish_variant`
+  appends only while fewer than `max_expansion_variants` (8, never
+  overridden) are stored (1386–1415). A ninth environment gets
+  `Placed::Held`: the header's declarations land in that TU's own unit
+  (`inlined_headers`), and no header unit exists for it. Renaming an earlier
+  TU so it sorts after this one flips that outcome — same bytes, same
+  closure, different `UnitIndex`.
+- Guard reads are deliberately not charged to fingerprints
+  (`guard_suppresses`, 875–898; charging them cost camera 879 edges), so two
+  entries can satisfy one environment yet differ in `nested_variants`,
+  `guards` and `ops`; the first publisher wins. The tree records this
+  class: with racing publication camera produced 20,299 / 20,326 / 20,847
+  direct edges in three runs of one checkout
+  ([PREPROCESSOR.md](PREPROCESSOR.md#parallel-discovery-88)).
+- A TU with no record for a header merges **every** lowered variant of it
+  (`lower.rs` 2593–2597); header language follows reachability from all C++
+  TUs (`cpp_parse`, 755–760); the order of header-origin entities in a unit
+  follows the global `pch_order` rank (2164–2172, a topological order over
+  the whole tree's `pch_headers`), and entities first introduced by a TU
+  take ids in that order (`merge.rs` 684, 945) — so the same unit lowered
+  under a different tree state can shift merged ids and export rowids.
+- Binding hashes include the defining spelling's file, line and column
+  (`hash_macro_binding`, 4956–4979): moving a `#define` by one line
+  invalidates every fingerprint that read it.
+
+A correct key must therefore include the settled preprocess output, the
+identities and contents of the header variants the unit merged, the
+reachable header set with its `HeaderOrder` ranks, dependency and system
+roots, the test partition, ignored macros (including `--models` noise
+macros), explore candidates and the tool version — a "preprocessor-mode"
+key that exists only after discovery and settle have run for that TU.
+Skipping preprocessing would require persisting each unit's
+`ExpansionJournal` and re-validating it with `ExpansionJournal::agrees` at
+its commit turn; the in-memory protocol supports that check, but
+`IncludeExpansion::id` is a process-local counter, entries hold
+`Arc<LineMap>`, macro token vectors and a `MacroHistory` undo log, and
+nothing serializes them. Its feasibility is not determined and is not
+small. The configured path (compilation database or scoped link targets)
+inlines every header and touches no shared cache
+(`configured.rs` 69–134), so a direct-mode key is plausible there, with the
+usual shadowing hazard (a new file resolving earlier via the basename
+fallback or a new inferred include directory).
+
+Consequence for memory: on the unconfigured path a warm run still runs
+warm, discovery and settle for **every** TU, so the preprocessing phase keeps
+its 1.5–1.7 GiB footprint peak (≈ 75–80% of cold) and its 1.36 GiB live peak.
+The memory objective fails at this gate.
+
+### Gate 3 — per-TU IR is serializable but embeds its closure
+
+`UnitIndex` holds unit-local ids remapped at merge, no raw pointers, `Rc`,
+tree-sitter nodes or `Arc<dyn>`; `merge_descs` is a rebuildable cache;
+merge does not depend on how a unit was produced (`merge.rs` 325–779,
+`program.rs` 194–240); `CallReturn` expands in `pag.rs`, and lowering's
+`resolve_function*` calls query the per-unit `Program` only. Two blockers:
+`TypeTable` has no serde and holds a process-global `DescriptorPool` handle,
+an address-keyed map and a `CanonicalCache` (needs a re-interning
+deserializer), and `program_into_unit` (`lower.rs` 2885–2923) moves the whole
+per-unit `Program` — every reachable header's types, prototypes, globals and
+internal C++ bodies — into the TU's unit. A naive per-TU cache duplicates
+each closure on disk; caching per `(header, language, variant)` plus the TU's
+own part is the only sane shape, and it inherits the Gate 2 key.
+
+### Gate 0 — workloads
+
+CI runs on fresh checkouts (cold). The eval loop (`scripts/eval_check.py`)
+re-runs each corpus with a *different binary*, so a lowering-crate
+fingerprint in the key invalidates everything unless only `trace-analysis`
+/ `trace-db` changed (an *f* = 0 case, not a small-*f* one). `--explore`
+re-preprocesses within one run. The C API's `trace_index` runs the whole
+pipeline per call; a long-lived host or a developer's edit-and-rerun loop is
+the only small-*f* consumer, and no such host exists in the tree.
+
+### Decision: no-go for the cache as specified
+
+- Memory: fails Gate 2 on the unconfigured path (preprocessing must run for
+  every TU; 75–80% of cold peak remains) and would, even with discovery
+  solved, bottom out at the ≈ 1.0 GiB include-graph / `Program` floor
+  (45–55% of cold), right at the ≤ 60% bar with nothing left for the changed
+  TUs' closure.
+- Time: a hit skips parse + lower + closure re-merge (≈ 16 s of the 29 s
+  index phase, ≈ 55%) but not discovery, warm, header IR or merge; a fully
+  warm run lands near 50–55% of cold against the ≤ 40% criterion.
+- Not measured: Windows. A configured-path-only cache (direct-mode key) is
+  a separate, narrower proposal and needs its own numbers.
+
+The three approaches raised during review map onto these findings: caching
+header IR per variant is the right *unit* but inherits the Gate 2 key;
+persisting discovery state is the crux and is undetermined; streaming cached
+units into the ordered merge is already how the window works (4–32 units
+ahead of the merge), and the floor it would stream into is the problem.
+
+### What the peak is made of, and where the time goes
+
+These are cold-run levers; they are what the measurements point at, and
+they lower any future warm run's floor too.
+
+Per-phase wall, CPU and average busy cores (one run):
+
+| Phase | Wall | CPU | Cores | Notes |
+|---|---:|---:|---:|---|
+| include graph | 2.3 s | 12.5 s | 5.6 | 760 MiB live transient, 85 MiB retained |
+| warm | 2.0 s | 2.0 s | 1.0 | sequential by design |
+| preprocess | 6.3 s | 36.2 s | 5.8 | 1,299 of 3,331 units preprocessed twice (settle) |
+| header IR (pch) | 2.1 s | 6.5 s | 3.1 | 2,410 headers, 4,511 expansions |
+| TU parse / lower / merge | 15.6 s | 68.5 s | 4.4 | 52% of all CPU |
+| analyze | 0.9 s | 0.9 s | 1.0 | |
+| export | 2.9 s | 2.7 s | 1.0 | |
+
+`sample` call-stack profiles (1 ms, all threads) of the busy worker time:
+
+1. **TU phase, 33%: re-merging the header closure into a fresh per-unit
+   `Program`.** Each TU merges the symbols of every reachable header unit
+   (`lower.rs` 2581–2606): 3,331 TUs perform **328,588 header-unit merges**
+   (median 32, mean 99, max 528 per TU), re-interning **31.7 M** type
+   entries of which 1.16 M survive — each type is merged about **27×**
+   overall (a median TU meets each of its types 8×, the largest 64×) —
+   because a header unit carries its nested closure's types again.
+   Functions are a smaller story: header units carry only their own
+   prototypes, so 10.2 M declarations merge to 4.2 M kept (2.4×,
+   concentrated in large closures; the median TU merges no duplicate). The
+   per-unit program ends with a median of 377 functions and 184 types
+   (means 1,269 and 349); the cost is the dedup itself
+   (`merge_types` → `intern_ref`/`intern_shared` with `TypeDesc` hash,
+   `compute_layout` per fresh table, `merge_struct_declarations`;
+   `register_function_inner`, `MergeDedup::insert_fn`). Exact-closure
+   memoization would save only 7% (2,935 distinct closures among 3,331 TUs);
+   not re-merging imported entries is the lever: header units recording,
+   for each nested unit merged at their own lowering, the remap from that
+   unit's ids to theirs, so a TU composes remaps for imported entries and
+   interns only a header's own additions. That is the "immutable
+   declaration environment with per-unit additions/remaps" of
+   [MEMORY_PROFILE.md](MEMORY_PROFILE.md#changes-with-the-greatest-potential),
+   and it shrinks header IR as well (type tables were 93% of it).
+2. **TU phase, 24% tree-sitter parse, 22% `lower_tree`; malloc/free show up
+   in ≈ 18% of busy samples across all of it.**
+   The coordinator's merge (`VariantMerge::start`) is busy 31% of the phase
+   and waiting otherwise; the workers, not the ordered merge, bound the
+   phase at 4.4 of 8 cores.
+3. **Preprocessing: `process_file` is 86% of busy time**, the lexer 14%,
+   malloc/free ≈ 18%; discovery holds the live peak (1,357 MiB: expansion
+   cache entries with their `ops`, diagnostics and line maps, plus
+   journals and per-unit texts in flight).
+4. **Include graph: `is_file_cached` is 40% of the phase** and is dominated
+   by `realloc`/`RawVec::finish_grow` growing the per-thread probe caches
+   keyed by full candidate paths; the allocator's own bookkeeping on `free`
+   (which reads `mach_absolute_time`) is another ≈ 10% of the phase's busy
+   samples, so the churn costs twice. This is the 760 MiB transient and the floor of any
+   warm run; camera already showed 1.1 M probe entries and 117 MiB of path
+   keys ([MEMORY_PROFILE.md](MEMORY_PROFILE.md#what-occupies-memory)).
+5. Sequential tails: warm (2.0 s), export (2.9 s) and analyze (0.9 s) run on
+   one core — 17% of wall.
+
+Reproduce: `python3 scripts/profile_memory_macos.py --label base --out
+/tmp/mem -- target/release/trace analyze ~/ability_ability_runtime --jobs 8
+-o /tmp/mem/base.db`; the script prints the child's pid at launch, so
+`sample <pid> 10 1 -mayDie` (with `sudo` unless the machine allows
+unprivileged process inspection) can be started during the phase of
+interest. Compare only within one platform and allocator.
