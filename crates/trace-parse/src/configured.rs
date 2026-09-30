@@ -4,7 +4,8 @@
 
 use super::{
     finalize_program, index_language, index_pool, index_progress, index_source_file,
-    index_source_file_with_variants, project_preprocess_opts, HeaderOrder,
+    index_source_file_with_variants, project_preprocess_opts, with_project_system_paths,
+    HeaderOrder,
 };
 use crate::compile_commands::CompilationDatabase;
 use crate::merge::{merge_unit_index, merge_unit_variants, UnitIndex};
@@ -33,6 +34,10 @@ pub(super) fn build(
     mut graph: IncludeGraph,
     database: CompilationDatabase,
     links: crate::link_commands::LinkDatabase,
+    project_compiler_paths: Option<(
+        crate::compiler_includes::CompilerSearch,
+        crate::compiler_includes::CompilerSearch,
+    )>,
 ) -> Result<Program, String> {
     let candidates = (opts.explore && opts.explore_budget > 0)
         .then(|| crate::explore::scan_project_gn_candidates(root));
@@ -68,6 +73,14 @@ pub(super) fn build(
                         .clone()
                         .for_indexing()
                         .with_inline_include_bodies(true);
+                    if !from_database {
+                        let language = config.language.unwrap_or_else(|| Language::from_path(path));
+                        config = with_project_system_paths(
+                            config,
+                            language,
+                            project_compiler_paths.as_ref(),
+                        );
+                    }
                     config.record_link_ownership = !links.targets.is_empty();
                     // Neither path-keyed source entries nor header expansions are valid
                     // across commands with different search paths, even if macros match.
@@ -175,6 +188,9 @@ pub(super) fn build(
                 no_c_units,
                 opts.language,
             ));
+            let language = config.language.unwrap_or_else(|| Language::from_path(path));
+            let config =
+                with_project_system_paths(config, language, project_compiler_paths.as_ref());
             let unit = index_source_file(
                 path,
                 root,
@@ -198,6 +214,12 @@ pub(super) fn build(
                         no_c_units,
                         opts.language,
                     ));
+                    let language = config.language.unwrap_or_else(|| Language::from_path(path));
+                    let config = with_project_system_paths(
+                        config,
+                        language,
+                        project_compiler_paths.as_ref(),
+                    );
                     index_source_file(
                         path,
                         root,
@@ -228,6 +250,7 @@ pub(super) fn build(
                 .iter()
                 .chain(&config.include_paths)
                 .chain(&config.system_include_paths)
+                .chain(&config.after_include_paths)
                 .chain(&config.inferred_include_paths)
         })
         .cloned()
@@ -252,7 +275,11 @@ fn configs_for<'a>(
 }
 
 fn effective_defines(opts: &PreprocessOptions) -> BTreeMap<String, String> {
-    let mut defines = BTreeMap::new();
+    let mut defines: BTreeMap<String, String> = opts
+        .compiler_defines
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
     for op in &opts.command_macros {
         match op {
             trace_preproc::CommandMacro::Define(name, value) => {

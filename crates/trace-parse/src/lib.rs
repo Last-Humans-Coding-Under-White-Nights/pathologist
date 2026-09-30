@@ -1,6 +1,7 @@
 //! Parse preprocessed C source into trace IR.
 
 mod compile_commands;
+mod compiler_includes;
 mod deps;
 mod discover;
 mod expansion_discovery;

@@ -36,3 +36,21 @@ fn inferred_directory_resolves_when_nothing_else_does() {
     let output = resolve(|_, _| {});
     assert!(output.contains("from_tree"), "{output}");
 }
+
+#[test]
+fn system_directory_precedes_after_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let system = dir.path().join("system");
+    let after = dir.path().join("after");
+    std::fs::create_dir(&system).unwrap();
+    std::fs::create_dir(&after).unwrap();
+    std::fs::write(system.join("shared.h"), "int from_system;\n").unwrap();
+    std::fs::write(after.join("shared.h"), "int from_after;\n").unwrap();
+    let mut opts = PreprocessOptions::new();
+    opts.system_include_paths.push(system);
+    opts.after_include_paths.push(after);
+    let output =
+        preprocess_string("#include <shared.h>\n", &dir.path().join("main.c"), &opts).output;
+    assert!(output.contains("from_system"), "{output}");
+    assert!(!output.contains("from_after"), "{output}");
+}

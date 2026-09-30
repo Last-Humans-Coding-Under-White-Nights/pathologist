@@ -2679,6 +2679,27 @@ entries and unreadable databases produce `compile_commands` diagnostics and fall
 back to inferred configuration for sources with no usable entry. A database is
 never required.
 
+`--system-includes` opts into compiler search-path discovery; the library
+equivalent is `PreprocessOptions::with_system_includes(true)`. With a database,
+trace probes each command's driver from that command's working directory and
+caches equivalent results. Sources lacking a usable command and orphan project
+headers use one fallback compiler for the project. GCC is preferred when it
+supplies both C and C++ search lists; otherwise Clang is tried. Reached
+external system headers have dependency ownership. Probe flag and executable
+path rules are specified in [Compilation database options](PREPROCESSOR.md#compilation-database-options-62).
+For C++ dependency headers, the parse input approximates simple
+pointer-to-member types (`T C::*`) as ordinary pointers (`T *`). This spelling
+confuses the tree-sitter C++ grammar, while dependency bodies are
+declaration-only. The normalization preserves byte offsets and newlines, so
+LineMap locations still refer to the original source. Project-origin text is
+left intact. Other C++ grammar gaps may still produce parse diagnostics.
+
+The probe also supplies selected target and hosted-mode macros to the custom
+preprocessor; explicit database macro operations and CLI definitions retain
+their override order.
+See [Compilation database options](PREPROCESSOR.md#compilation-database-options-62)
+for search order and probe limits.
+
 The reader accepts `arguments` or a shell-quoted `command`, preferring `arguments`
 when both exist. Leading compiler launchers (`ccache`, `sccache`, `distcc`,
 `distcc-pump`, `gomacc`, `icecc`, `icerun`, `buildcache`), including chains of

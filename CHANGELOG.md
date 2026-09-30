@@ -4,6 +4,35 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### System-header preprocessing improvements
+
+- Skip diagnostic and unknown directives in inactive conditional arms; report
+  active `#error` and `#warning` with their messages and severities.
+- Prescan ordinary function-like macro arguments before substitution while
+  keeping original tokens for `#` and `##`. This fixes nested macro pastes in
+  installed C headers such as glibc's `<math.h>`.
+- In `--system-includes` mode, seed target architecture, data-model,
+  endianness, and hosted-mode macros from the selected compiler. This avoids
+  wrong-target branches in installed headers without enabling vendor extension
+  macros wholesale.
+
+### Opt-in compiler system-header discovery
+
+- `trace analyze --system-includes` queries the compilation command's compiler
+  for its effective C or C++ include search list. Probes run in the command's
+  working directory and are cached by compiler, language, include-affecting
+  options (including `-arch`), and environment. The compiler's ordering
+  preserves relative `CPATH` and explicit `-isystem` precedence; a command
+  `-I` duplicate of a system directory does not jump ahead of `CPATH`, while
+  a `CPATH` directory repeated with `-I` keeps its earlier position.
+- For sources without a compilation database entry, one fallback compiler is
+  selected for the project: GCC first, then Clang. A failed probe keeps the
+  existing explicit and inferred include paths. The custom preprocessor
+  remains responsible for expanding headers; reached external system headers
+  contribute declarations and macros as dependencies.
+- Discovery is off by default. Existing explicit system and `-idirafter`
+  directories still resolve and classify dependency headers without the flag.
+
 ### Configurable bare-tree test partition (#161)
 
 Added `--no-test-partition` and repeatable `--test-dir NAME` options, with
