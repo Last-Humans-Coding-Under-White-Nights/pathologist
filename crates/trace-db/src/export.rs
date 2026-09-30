@@ -832,6 +832,7 @@ mod tests {
                 is_namespaced: false,
                 qualified_name: None,
                 c_linkage: false,
+                is_static_member: false,
             });
             // A flow fact puts the variable in the graph minimal export
             // writes variables from.

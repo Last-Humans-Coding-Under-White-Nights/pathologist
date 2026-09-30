@@ -1595,39 +1595,6 @@ fn qualified_variables_issue_133() {
     }
 }
 
-/// `trace analyze <root> <args>` into a fresh database.
-fn cli_analyze(root: &std::path::Path, args: &[&str]) -> TempDb {
-    let db = TempDb::new("cli.db");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_trace"))
-        .arg("analyze")
-        .arg(root)
-        .args(args)
-        .arg("-o")
-        .arg(db.path())
-        .output()
-        .expect("run trace analyze");
-    assert!(
-        out.status.success(),
-        "trace analyze failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    db
-}
-
-/// Every row of `sql`, each column rendered as text.
-fn text_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let mut stmt = conn.prepare(sql).unwrap();
-    let columns = stmt.column_count();
-    stmt.query_map([], |row| {
-        (0..columns)
-            .map(|i| Ok(format!("{:?}", row.get::<_, rusqlite::types::Value>(i)?)))
-            .collect()
-    })
-    .unwrap()
-    .map(Result::unwrap)
-    .collect()
-}
-
 /// The exported value-flow graph, nodes and edges by id.
 fn flow_graph(db: &TempDb) -> Vec<Vec<String>> {
     let conn = open_db(db).unwrap();
@@ -1667,30 +1634,6 @@ fn qualified_variables_issue_133_cli_export() {
     }
     let minimal = cli_analyze(&root, &["--jobs", "1"]);
     assert_eq!(flow_graph(&minimal), flow_graph(&full));
-}
-
-/// Every analysis row of `db`, table by table and sorted, leaving out the run
-/// metadata (`analysis_run`, which records when and how the run happened).
-fn analysis_rows(db: &TempDb) -> Vec<(String, Vec<Vec<String>>)> {
-    let conn = open_db(db).unwrap();
-    let tables: Vec<String> = conn
-        .prepare(
-            "SELECT name FROM sqlite_master \
-             WHERE type = 'table' AND name <> 'analysis_run' ORDER BY name",
-        )
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    tables
-        .into_iter()
-        .map(|table| {
-            let mut rows = text_rows(&conn, &format!("SELECT * FROM \"{table}\""));
-            rows.sort();
-            (table, rows)
-        })
-        .collect()
 }
 
 /// Repeated runs at one job and at eight export the same analysis rows, ids

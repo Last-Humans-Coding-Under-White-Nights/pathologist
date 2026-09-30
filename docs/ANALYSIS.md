@@ -514,7 +514,41 @@ untargeted (`target: None`); cross-TU reconciliation (image unification and
 weak selection) is the merge's job, not lowering's, and keys a member on its
 external symbol name like any other global.
 
+**Sharing across translation units without link information (#143).** While
+no image scopes a symbol (`SymbolTable::has_target_scopes` is false — inferred
+targets that stay informational never set it, and neither does a link database
+whose sources match no indexed unit, which scopes nothing and so shares as an
+unscoped run does), an externally linked static data member is one variable
+per program: `merge_unit` keys it by
+`Variable::external_symbol_name` in `SymbolTable::unscoped_static_member`,
+populated by `add_variable` from `Variable::is_static_member` (set by
+`register_static_data_member`, kept by an out-of-class definition, and gained
+by a fallback definition whose owner resolved to a class, above), so a
+callback stored in one unit (`h->cb = handler;`) is called in another
+(`h->cb();`). Equal member names are then one storage even across unrelated
+binaries or tests in the same tree.
+
+Declaration and definition are one identity and precedence is
+`definition_supersedes`: a definition fills a declaration, a strong definition
+displaces a weak one, and equal strength keeps the first merged record; the
+surviving record carries the definition's original file, line and column, its
+remapped type, and the canonical `VarId` (`adopt_definition`, also applied
+when a configuration variant of the same source turns the declaration into a
+definition at the same site). Every contributing unit's initializer and writes
+are unioned — a may-analysis, with no weak-initializer suppression without
+image information. An anonymous-namespace member (`FileStatic`, no external
+symbol) stays one variable per unit, and namespace-scope and C globals are
+unchanged: they remain per unit without link information. With link targets,
+`target_globals` per image governs exactly as before
+([Link targets and weak symbols](#link-targets-and-weak-symbols)), and units
+no image claims are not unified.
+
 ## Link targets and weak symbols
+
+Without link targets, a C++ static data member is the one global that is
+still unified across translation units; see
+[Static data member storage](#static-data-member-storage), "Sharing across
+translation units without link information".
 
 `--link-commands PATH` selects a link commands database. Otherwise indexing
 checks `link_commands.json` at the analysis root, then `build/`, then the
