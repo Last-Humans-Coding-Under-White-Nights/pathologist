@@ -132,8 +132,18 @@ IR without making a batch wait for its slowest unit. Cached header type tables
 discard lowering-only indexes and layouts once their merge descriptors are
 ready. Type tables share immutable descriptors across headers and TUs while
 retaining local IDs. On Linux/glibc, indexing returns freed heap pages at phase
-boundaries and between ordered TU merge batches. See
+boundaries and between ordered TU merge batches. On macOS `analyze` runs
+under libmalloc's space-efficient mode, which holds the peak footprint at
+the live heap size for a few percent of wall time on large trees: it
+re-executes itself once with `MallocSpaceEfficient=1` (same pid and
+`argv[0]`). A `MallocSpaceEfficient` already set to `0` or `1` is
+respected, so `MallocSpaceEfficient=0 trace analyze …` keeps the default
+allocator; an empty or invalid value, which libmalloc warns about on every
+run, is replaced. `inspect` never re-executes, nor does a build with the
+`mimalloc` feature. The mode in effect is the `malloc:` line at the start
+of the progress output. See
 [memory measurements](docs/EVAL_REPORT.md#compacting-cached-header-type-tables--2026-09-28),
+[macOS space-efficient malloc](docs/EVAL_REPORT.md#macos-space-efficient-malloc--2026-09-30),
 the [memory investigation](docs/MEMORY_PROFILE.md), and the
 [macOS measurements](docs/PERFORMANCE_REVIEW.md#incremental-per-tu-ir-cache-macos-measurements-and-decision-175)
 (`scripts/profile_memory_macos.py`; on macOS compare `phys_footprint`, not RSS).

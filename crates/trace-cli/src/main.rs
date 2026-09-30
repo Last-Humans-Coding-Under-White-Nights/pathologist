@@ -4,6 +4,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::Instant;
 use trace_analysis::{analyze_with_options, AnalyzeOptions, ResolutionKind};
@@ -247,6 +248,55 @@ impl OutputFormat {
     }
 }
 
+/// Whether `analyze` should re-execute under libmalloc's space-efficient
+/// mode, given `MallocSpaceEfficient` as found in the environment: an
+/// explicit `0` or `1` stands; anything else (unset, empty or invalid, which
+/// libmalloc warns about on every run) is replaced by `1`.
+#[cfg_attr(
+    not(all(target_os = "macos", not(feature = "mimalloc"))),
+    allow(dead_code)
+)]
+fn wants_space_efficient_malloc(mode: Option<&OsStr>) -> bool {
+    !matches!(mode.and_then(OsStr::to_str), Some("0") | Some("1"))
+}
+
+/// On macOS, run `analyze` under libmalloc's space-efficient mode, which
+/// keeps the indexing peak at the live heap size (policy: README.md, "trace
+/// analyze"; measurements: docs/EVAL_REPORT.md, "macOS space-efficient
+/// malloc"). libmalloc reads the option before `main`, so the binary
+/// re-executes itself once with `MallocSpaceEfficient=1`, keeping `argv[0]`
+/// and the pid; a failed exec continues on the default configuration. A
+/// build with the `mimalloc` feature does not use libmalloc and never
+/// re-executes. The mode in effect is reported on stderr.
+fn select_space_efficient_malloc() {
+    #[cfg(all(target_os = "macos", not(feature = "mimalloc")))]
+    {
+        use std::os::unix::process::CommandExt;
+        /// Returns only when the exec failed.
+        fn reexec() -> std::io::Error {
+            let exe = match std::env::current_exe() {
+                Ok(exe) => exe,
+                Err(err) => return err,
+            };
+            let mut args = std::env::args_os();
+            let mut command = std::process::Command::new(exe);
+            if let Some(arg0) = args.next() {
+                command.arg0(arg0);
+            }
+            command.args(args).env("MallocSpaceEfficient", "1").exec()
+        }
+        let mode = std::env::var_os("MallocSpaceEfficient");
+        if wants_space_efficient_malloc(mode.as_deref()) {
+            let err = reexec();
+            eprintln!("malloc: default (re-exec failed: {err})");
+        } else if mode.as_deref() == Some(OsStr::new("1")) {
+            eprintln!("malloc: space-efficient");
+        } else {
+            eprintln!("malloc: default");
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -338,6 +388,7 @@ fn run_analyze(
     solve_budget_pops: Option<u64>,
     solve_budget_secs: Option<u64>,
 ) -> Result<()> {
+    select_space_efficient_malloc();
     if let Some(secs) = timeout_secs {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(secs));
@@ -828,4 +879,33 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod malloc_mode_tests {
+    use super::wants_space_efficient_malloc;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn an_explicit_valid_choice_stands() {
+        for value in ["0", "1"] {
+            assert!(
+                !wants_space_efficient_malloc(Some(OsStr::new(value))),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unset_empty_or_invalid_value_is_replaced() {
+        // libmalloc prints "MallocSpaceEfficient must be 0 or 1" for the
+        // set values on every run; re-executing with `1` silences it.
+        assert!(wants_space_efficient_malloc(None));
+        for value in ["", "true", "2"] {
+            assert!(
+                wants_space_efficient_malloc(Some(OsStr::new(value))),
+                "{value:?}"
+            );
+        }
+    }
 }

@@ -1,5 +1,52 @@
 # Evaluation Report
 
+## macOS space-efficient malloc — 2026-09-30
+
+On macOS `trace analyze` now runs under libmalloc's space-efficient mode by
+re-executing itself once with `MallocSpaceEfficient=1`; the policy (what is
+respected, how to keep the default allocator, `mimalloc` builds) is in the
+[README](../README.md#trace-analyze), and a host of the C API sets the
+variable itself ([CAPI.md](CAPI.md#peak-memory-on-macos)).
+
+Why: indexing frees each translation unit's IR right after the ordered merge
+takes it, and eight workers doing that leave the default allocator holding
+fragmented pages. On `ability_ability_runtime` (`6c18fdc9`) the live heap
+peaks at 1.26 GiB while the process footprint peaked at 1.7–1.9 GiB; the gap
+is 0.57 GiB even at `--jobs 1`. It is not returnable memory:
+`malloc_zone_pressure_relief` released nothing at any phase boundary, and
+routing every unit's transient allocations to per-thread malloc zones (a
+scratch build) left the peak unchanged while making every `free` search the
+zones (TU phase 17–19 s → 25–27 s). mimalloc's eager purge settings lowered
+the post-merge footprint (2,096 → 1,086 MiB) but not the peak (2.3 GiB).
+The space-efficient mode is the one setting that removed the gap.
+
+Release build, Apple M1 (8 GB, macOS 26.6.2), `--jobs 8`, minimal export,
+default budgets, `scripts/profile_memory_macos.py` (`phys_footprint`;
+`ru_maxrss` understates on this machine because the kernel compresses
+pages). Three alternating pairs of a master binary (`a284120`) and this
+change; every run's 15 non-metadata tables were identical by row count and
+SHA-256 of rows in rowid order:
+
+| Corpus | Peak footprint, master | Peak footprint, space-efficient | Wall, master | Wall, space-efficient | CPU (user+sys), master | CPU, space-efficient |
+|---|---:|---:|---:|---:|---:|---:|
+| ability-runtime | 1,789 / 1,731 / 1,773 MiB | 1,317 / 1,330 / 1,245 MiB (−26…−30%) | 33.8 / 33.8 / 33.5 s | 36.4 / 35.7 / 35.0 s (+4.5…+7.7%) | 130 / 138 / 139 s | 143 / 148 / 147 s |
+| camera | 690 MiB | 243 MiB (−65%) | 6.3 s | 6.4 s | 24.6 s | 26.0 s |
+| HDF | 470 MiB | 186 MiB (−60%) | 3.7 s | 3.7 s | 12.0 s | 12.7 s |
+| hiview | 220 MiB | 87 MiB (−60%) | 1.6 s | 1.6 s | 5.6 s | 5.8 s |
+
+The cost on the largest corpus is about 5% of wall, most of it system time
+(`madvise`), for a quarter less peak memory; on the three pinned corpora the
+peak halves at unchanged wall time. That is the opposite trade from the
+rejected `MALLOC_ARENA_MAX=8` (9% memory for 10% time, above), so the mode
+is on by default for `analyze`. With it on, the macOS peak sits at the live
+heap size, so further reductions have to come
+from live data: the merged `Program` (~600 MiB here), per-worker transients
+(~260 MiB) and header IR (227 MiB), in that order; the include-graph phase's
+760 MiB transient sets the floor before any of them.
+
+Linux/glibc and Windows are unaffected by this change. Windows was not
+measured.
+
 ## Static data member sharing without link information — 2026-09-30 (#143)
 
 Without link information an externally linked C++ static data member is now
