@@ -1,5 +1,52 @@
 # Evaluation Report
 
+## Attributed friend operator declarations — 2026-09-30 (#166)
+
+Rules are maintained in [Friend declarations and operator attributes](ANALYSIS.md#c-support-first-step).
+The local branch is `fix/issue-166-attributed-friend-operators`. Both versions
+use the same pinned, clean HDF (`cdc75a2`), hiview (`92408e2`), and camera
+(`8ffd69d`) corpora from `scripts/eval_expected.json`, release builds, eight
+jobs, and the existing eval solver settings. Measurements were taken comparing
+release builds of base `a28412068aea0fb66e4d5c1909823200ac5d8808` against candidate
+using `python3 scripts/eval_check.py --bin target/release/trace --outdir <separate-directory>`.
+All 94/94 checks pass on both revisions.
+
+Standard-library headers and C++ code place attributes such as `[[nodiscard]]`
+and `[[__nodiscard__]]` before `friend` operator declarations (e.g.
+`[[nodiscard]] friend bool operator==(Value a, Value b)` or `[[nodiscard]] constexpr friend ...`).
+Tree-sitter C++ grammar does not admit attribute specifiers before `friend`,
+triggering unrecovered syntax errors. In-place whitespace normalization
+(`normalize_cpp_parse_syntax`) blanks these attributes without altering line or
+column positions, and friend lowering (`lower_friend_declarations`) lowers
+friend function definitions and friend operator declarations into the enclosing
+namespace without implicit `this` parameters or class qualification, while
+preserving lexical class lookup for static member calls within the friend body.
+
+| Corpus | Metric | Baseline (`a284120`) | Candidate | Diff |
+|---|---|---:|---:|---:|
+| HDF | files | 1,483 | 1,483 | unchanged |
+| HDF | functions (defined / external) | 11,996 (10,294 / 1,702) | 11,996 (10,294 / 1,702) | unchanged |
+| HDF | call edges (dir / ind / ext / ipc) | 76,530 (47,856 / 4,980 / 23,694 / 0) | 76,530 (47,856 / 4,980 / 23,694 / 0) | unchanged |
+| HDF | arg-flow edges / diagnostics | 69,999 / 1,917 | 69,999 / 1,917 | unchanged |
+| hiview | files | 1,452 | 1,452 | unchanged |
+| hiview | functions (defined / external) | 9,672 (7,990 / 1,682) | 9,674 (7,992 / 1,682) | +2 defined |
+| hiview | call edges (dir / ind / ext / ipc) | 32,058 (17,404 / 176 / 14,434 / 44) | 32,058 (17,404 / 176 / 14,434 / 44) | unchanged |
+| hiview | arg-flow edges / diagnostics | 19,653 / 3,574 | 19,653 / 3,574 | unchanged |
+| camera | files | 1,703 | 1,703 | unchanged |
+| camera | functions (defined / external) | 23,461 (19,806 / 3,655) | 23,461 (19,806 / 3,655) | unchanged |
+| camera | call edges (dir / ind / ext / ipc) | 111,520 (66,885 / 305 / 43,522 / 808) | 111,520 (66,885 / 305 / 43,522 / 808) | unchanged |
+| camera | argument-flow edges / diagnostics | 49,728 / 5,051 | 49,728 / 5,051 | unchanged |
+
+In HDF, the 5 friend operator declarations in `ast.h`, `token.h`, and `lexer.h`
+belong to namespace `OHOS::Hardware`, properly merging with their out-of-line
+definitions instead of creating unmerged member prototypes.
+In hiview, two inline friend operator definitions in `app_event_handler.h`
+(`OHOS::HiviewDFX::operator<<` on `ThreadInfo` and `LogInfo`) are now indexed as
+defined namespace functions (+2 defined functions).
+In camera, all counts match baseline exactly; bodyless non-operator friend
+declarations (such as `friend int CameraInput::Open(...)` inside `CameraManager`)
+are not misidentified as member prototypes. All 94 evaluation checks pass.
+
 ## Static data member sharing without link information — 2026-09-30 (#143)
 
 Without link information an externally linked C++ static data member is now
