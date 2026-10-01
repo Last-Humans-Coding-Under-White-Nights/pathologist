@@ -384,6 +384,72 @@ fn shared_system_paths_reach_project_probe_and_enable_external_header_call() {
 }
 
 #[test]
+fn orphan_headers_with_shared_flags_resolve_generated_idl_interfaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = fixture("idl_basic");
+    for rel in [
+        "idl/IAtm.idl",
+        "client/client.cpp",
+        "service/atm_service.cpp",
+    ] {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::copy(source.join(rel), path).unwrap();
+    }
+    std::fs::write(root.join("compile_flags.txt"), "-DSHARED_FLAG=1\n").unwrap();
+    // Two orphan headers exercise the parallel header pass when jobs = 4.
+    for name in ["OrphanClient", "OtherOrphanClient"] {
+        std::fs::write(
+            root.join(format!("client/{name}.h")),
+            format!(
+                "#include \"iatm.h\"\n\
+                 #if SHARED_FLAG\nnamespace OHOS {{ namespace Security {{\n\
+                 struct {name} {{\n    sptr<IAtm> proxy_;\n\
+                 int Check(unsigned id) {{ int s; return proxy_->VerifyAccessToken(id, s); }}\n\
+                 }};\n}} }}\n#endif\n"
+            ),
+        )
+        .unwrap();
+    }
+    for jobs in [1, 4] {
+        let program = build_program_with_jobs(root, &PreprocessOptions::new(), jobs).unwrap();
+        assert!(
+            program.diagnostics.iter().all(|d| !(d.stage == "preprocess"
+                && d.message.contains("include file not found")
+                && d.message.contains("iatm.h"))),
+            "jobs={jobs}: {:?}",
+            program.diagnostics
+        );
+        let (_, analysis) = trace_analysis::analyze(&program);
+        for caller in [
+            "Client::Verify",
+            "OrphanClient::Check",
+            "OtherOrphanClient::Check",
+        ] {
+            for callee in ["IAtm::VerifyAccessToken", "AtmProxy::VerifyAccessToken"] {
+                assert!(
+                    has_any_edge(
+                        &program,
+                        &analysis,
+                        &format!("OHOS::Security::{caller}"),
+                        &format!("OHOS::Security::{callee}"),
+                    ),
+                    "jobs={jobs}: {caller} -> {callee}"
+                );
+            }
+        }
+        assert!(has_edge(
+            &program,
+            &analysis,
+            "OHOS::Security::AtmProxy::VerifyAccessToken",
+            "OHOS::Security::AtmService::VerifyAccessToken",
+            trace_analysis::ResolutionKind::IpcBridge,
+        ));
+    }
+}
+
+#[test]
 fn orphan_headers_use_shared_flags_include_paths_and_cli_overrides() {
     for source in [Some("main.c"), Some("main.cpp"), None] {
         let dir = tempfile::tempdir().unwrap();
@@ -934,6 +1000,48 @@ fn shared_flags_ignore_linker_tail() {
             "{link}: {:?}",
             program.diagnostics
         );
+    }
+}
+
+#[test]
+fn progress_identifies_inferred_configuration_after_shared_flags_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("main.c"), "void entry(void) {}\n").unwrap();
+    // Link metadata routes indexing through configured::build even when no
+    // usable preprocessing configuration remains.
+    std::fs::write(
+        root.join("link_commands.json"),
+        json!([{
+            "directory": root,
+            "arguments": ["cc", "main.c", "-o", "app"]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    for (index, flags) in ["-I\n", "-DA+B=1\n"].into_iter().enumerate() {
+        std::fs::write(root.join("compile_flags.txt"), flags).unwrap();
+        let database = root.join(format!("inferred-{index}.db"));
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_trace"))
+            .arg("analyze")
+            .arg(root)
+            .args(["--jobs", "1", "-o"])
+            .arg(&database)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        let conn = rusqlite::Connection::open(database).unwrap();
+        let warnings: i64 = conn.query_row(
+            "SELECT count(*) FROM diagnostics WHERE stage='compile_commands' AND message LIKE '%using inferred configuration%'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(warnings, 1);
+        assert!(
+            stderr.contains("inferred: 0 commands for 0 sources (jobs=1)"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("compile_flags: 0 commands"), "{stderr}");
     }
 }
 

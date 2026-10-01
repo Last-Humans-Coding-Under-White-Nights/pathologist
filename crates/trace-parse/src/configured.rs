@@ -107,20 +107,8 @@ pub(super) fn build(
                         config = project_options(config, language);
                     }
                     config.record_link_ownership = !links.targets.is_empty();
-                    // Database commands never name the virtual directories;
-                    // search them last so a real `-I` header of the same name
-                    // wins (#123). They are inferred, so the test partition
-                    // decides who may take a header from one, and it is
-                    // measured from the inference root.
-                    if from_database && !virtual_dirs.is_empty() {
-                        config
-                            .inference_root
-                            .get_or_insert_with(|| graph.root.clone());
-                        for dir in &virtual_dirs {
-                            if !config.inferred_include_paths.contains(dir) {
-                                config.inferred_include_paths.push(dir.clone());
-                            }
-                        }
+                    if from_database {
+                        add_virtual_include_paths(&mut config, &graph.root, &virtual_dirs);
                     }
                     // Neither path-keyed source entries nor header expansions are valid
                     // across commands with different search paths, even if macros match.
@@ -235,6 +223,7 @@ pub(super) fn build(
                 config.accumulate_macros = false;
                 config.source_cache.clone_from(&raw_sources);
                 config.record_link_ownership = !links.targets.is_empty();
+                add_virtual_include_paths(&mut config, &graph.root, &virtual_dirs);
                 config.for_indexing().with_inline_include_bodies(true)
             } else {
                 fallback.clone().with_language(inferred_language)
@@ -307,6 +296,27 @@ pub(super) fn build(
         .collect();
     finalize_program(&mut program, &graph, observed_dirs);
     Ok(program)
+}
+
+/// Explicit commands and shared flags never name IDL virtual directories.
+/// Search them last so a real `-I` header wins (#123), and retain the inference
+/// root so inferred-header test partitioning uses the project boundary.
+fn add_virtual_include_paths(
+    config: &mut PreprocessOptions,
+    root: &Path,
+    virtual_dirs: &[PathBuf],
+) {
+    if virtual_dirs.is_empty() {
+        return;
+    }
+    config
+        .inference_root
+        .get_or_insert_with(|| root.to_path_buf());
+    for dir in virtual_dirs {
+        if !config.inferred_include_paths.contains(dir) {
+            config.inferred_include_paths.push(dir.clone());
+        }
+    }
 }
 
 /// The commands for `path`, or the inferred configuration when it has none.

@@ -306,7 +306,9 @@ impl CompilationDatabase {
     }
 
     pub fn source_label(&self) -> &'static str {
-        if self.uses_shared_flags() {
+        if self.commands.is_empty() && self.shared_search_options().is_none() {
+            "inferred"
+        } else if self.uses_shared_flags() {
             "compile_flags"
         } else {
             "compile_commands"
