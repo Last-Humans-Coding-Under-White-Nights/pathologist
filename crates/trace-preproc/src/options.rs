@@ -287,7 +287,7 @@ pub struct IncludeExpansion {
     /// Diagnostics emitted while producing this expansion, including
     /// diagnostics replayed from nested cached headers. Cache hits append
     /// these to the current preprocessing result in their original order.
-    pub diagnostics: Arc<Vec<crate::Diagnostic>>,
+    pub diagnostics: Arc<[crate::Diagnostic]>,
     /// Origin map for `text`: offsets are relative to the start of the
     /// expansion. Empty when line-map tracking is disabled.
     pub line_map: Arc<crate::LineMap>,
@@ -299,7 +299,7 @@ pub struct IncludeExpansion {
     /// its cached text. An ordered log rather than a table diff: a diff
     /// cannot represent a no-op `#undef` or an undef-then-redefine of a
     /// name that existed at both capture boundaries.
-    pub ops: Arc<Vec<crate::MacroOp>>,
+    pub ops: Arc<[crate::MacroOp]>,
     /// The macro environment this expansion read (see [`MacroFingerprint`]).
     /// A consumer may replay this entry only when its own environment binds
     /// every one of these names the same way.
@@ -309,24 +309,24 @@ pub struct IncludeExpansion {
     /// text without ever visiting those files, so without this record it
     /// cannot tell a later `#include` that a guard already suppresses from
     /// one that must re-expand (#56).
-    pub guards: Arc<Vec<(PathBuf, FileGuard)>>,
+    pub guards: Arc<[(PathBuf, FileGuard)]>,
     /// The variants this expansion itself replayed for the headers it
     /// brought in. Indexing keeps each header's text file-local, so those
     /// nested headers contribute no text here and need their own lowered
     /// units — and a consumer of this entry never visits them, so it cannot
     /// work out which expansion of each applies. This is that record. A
     /// nested header that could not be stored has none: see `inlined`.
-    pub nested_variants: Arc<Vec<(PathBuf, usize)>>,
+    pub nested_variants: Arc<[(PathBuf, usize)]>,
     /// Headers whose text `text` holds beside this header's own: nested ones
     /// this expansion's run expanded itself and could not store, and those
     /// they hold in turn. They have no unit of their own for this
     /// environment, so whoever lowers this text lowers theirs with it.
-    pub inlined: Arc<Vec<PathBuf>>,
+    pub inlined: Arc<[PathBuf]>,
     /// `inlined`, and the headers the entries this one records cover in
     /// turn, sorted: the held headers whose declarations a consumer of this
     /// entry reaches. A run that replays the entry may skip those by their
     /// guards inside entries that record this one.
-    pub covers: Arc<Vec<PathBuf>>,
+    pub covers: Arc<[PathBuf]>,
     /// `deps.signature()`, computed once.
     pub signature: u64,
     /// Unique for the process, so a deferred run can name this entry before

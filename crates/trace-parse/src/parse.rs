@@ -57,8 +57,18 @@ pub fn parse_source_with_lang(
         source
     };
     let tree = match lang {
-        SourceLang::C => PARSER_C.with(|p| p.borrow_mut().parse(source.as_ref(), None)),
-        SourceLang::Cpp => PARSER_CPP.with(|p| p.borrow_mut().parse(source.as_ref(), None)),
+        SourceLang::C => PARSER_C.with(|p| {
+            let mut parser = p.borrow_mut();
+            let res = parser.parse(source.as_ref(), None);
+            parser.reset();
+            res
+        }),
+        SourceLang::Cpp => PARSER_CPP.with(|p| {
+            let mut parser = p.borrow_mut();
+            let res = parser.parse(source.as_ref(), None);
+            parser.reset();
+            res
+        }),
     };
     let tree = tree.ok_or_else(|| "tree-sitter returned no tree".to_string())?;
     Ok(ParseResult { tree, source })

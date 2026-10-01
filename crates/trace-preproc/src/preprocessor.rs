@@ -441,9 +441,9 @@ impl PreprocessorState {
     /// replaces it.
     fn install_builtin_macros(&mut self) {
         for (name, def) in BUILTIN_FALLBACK_MACROS.iter() {
-            if !self.macros.contains_key(name.as_str()) {
-                self.macros.insert(name.clone(), def.clone());
-                self.fallback_macros.insert(name.clone());
+            if !self.macros.contains_key(name.as_ref()) {
+                self.macros.insert(Arc::clone(name), Arc::clone(def));
+                self.fallback_macros.insert(name.to_string());
             }
         }
     }
@@ -704,24 +704,31 @@ impl PreprocessorState {
         }
     }
 
-    /// Record a directive for the enclosing cached-header entries, if any.
-    /// Logged unconditionally within a frame — even a `#undef` of an absent
-    /// name is a no-op only locally and can still take effect in a
-    /// translation unit that replays the entry.
-    fn log_macro_op(&mut self, op: MacroOp) {
+    fn insert_macro_arc(&mut self, name: Arc<str>, def: Arc<MacroDef>) {
         if !self.cache_frames.is_empty() {
-            self.macro_ops.push(op);
+            self.macro_ops
+                .push(MacroOp::Define(Arc::clone(&name), Arc::clone(&def)));
         }
+        self.insert_macro_internal(name, def);
     }
 
-    fn insert_macro(&mut self, name: String, def: MacroDef) {
-        self.log_macro_op(MacroOp::Define(name.clone(), def.clone()));
-        self.note_local_binding(&name);
-        self.macro_hashes.remove(&name);
-        let was_fallback = self.fallback_macros.remove(&name);
-        let before = self.macros.insert(name.clone(), def.clone());
+    fn insert_macro(&mut self, name: impl Into<Arc<str>>, def: MacroDef) {
+        let name_arc: Arc<str> = name.into();
+        let def_arc = Arc::new(def);
+        if !self.cache_frames.is_empty() {
+            self.macro_ops
+                .push(MacroOp::Define(Arc::clone(&name_arc), Arc::clone(&def_arc)));
+        }
+        self.insert_macro_internal(name_arc, def_arc);
+    }
+
+    fn insert_macro_internal(&mut self, name: Arc<str>, def: Arc<MacroDef>) {
+        self.note_local_binding(name.as_ref());
+        self.macro_hashes.remove(name.as_ref());
+        let was_fallback = self.fallback_macros.remove(name.as_ref());
+        let before = self.macros.insert(Arc::clone(&name), Arc::clone(&def));
         if let Some(journal) = self.journal.as_mut() {
-            journal.record_macro_change(&name, before.map(|def| (def, was_fallback)));
+            journal.record_macro_change(name.as_ref(), before.map(|d| (d, was_fallback)));
         }
         if self.opts.accumulate_macros {
             if let Some(shared) = &self.opts.shared_macros {
@@ -732,8 +739,22 @@ impl PreprocessorState {
         }
     }
 
+    fn remove_macro_arc(&mut self, name: &Arc<str>) {
+        if !self.cache_frames.is_empty() {
+            self.macro_ops.push(MacroOp::Undef(Arc::clone(name)));
+        }
+        self.remove_macro_internal(name.as_ref());
+    }
+
     fn remove_macro(&mut self, name: &str) {
-        self.log_macro_op(MacroOp::Undef(name.to_string()));
+        if !self.cache_frames.is_empty() {
+            let name_arc: Arc<str> = Arc::from(name);
+            self.macro_ops.push(MacroOp::Undef(name_arc));
+        }
+        self.remove_macro_internal(name);
+    }
+
+    fn remove_macro_internal(&mut self, name: &str) {
         self.note_local_binding(name);
         self.macro_hashes.remove(name);
         let was_fallback = self.fallback_macros.remove(name);
@@ -988,13 +1009,12 @@ impl PreprocessorState {
         self.output.push_str(text);
         if self.opts.track_line_map {
             let macro_id = tok
-                .expansion_macro
-                .as_ref()
+                .expansion_macro()
                 .map(|m| self.lm_macro(m))
                 .unwrap_or(u32::MAX);
 
             if let (Some(spelling_file), Some((expansion_line, expansion_col))) =
-                (&tok.spelling_file, tok.origin)
+                (tok.spelling_file(), tok.origin())
             {
                 let spelling_fid = self.lm_spelling_file(spelling_file);
                 let expansion_fid = self.lm_current_file();
@@ -1006,7 +1026,7 @@ impl PreprocessorState {
                     expansion_fid,
                     expansion_line,
                     expansion_col,
-                    tok.expansion_id,
+                    tok.expansion_id(),
                     macro_id,
                 );
             } else if macro_id != u32::MAX {
@@ -1015,8 +1035,7 @@ impl PreprocessorState {
                 // map to expansion_site() without fabricating a macro-body expansion span,
                 // while recording outermost macro attribution for filtering.
                 let fid = tok
-                    .spelling_file
-                    .as_deref()
+                    .spelling_file()
                     .map(|sf| self.lm_spelling_file(sf))
                     .unwrap_or_else(|| self.lm_current_file());
                 let (line, col) = tok.expansion_site();
@@ -1028,7 +1047,7 @@ impl PreprocessorState {
                     u32::MAX,
                     0,
                     0,
-                    tok.expansion_id,
+                    tok.expansion_id(),
                     macro_id,
                 );
             } else {
@@ -1376,8 +1395,10 @@ impl PreprocessorState {
     fn replay_macro_delta(&mut self, entry: &crate::IncludeExpansion) {
         for op in entry.ops.iter() {
             match op {
-                MacroOp::Undef(name) => self.remove_macro(name),
-                MacroOp::Define(name, def) => self.insert_macro(name.clone(), def.clone()),
+                MacroOp::Undef(name) => self.remove_macro_arc(name),
+                MacroOp::Define(name, def) => {
+                    self.insert_macro_arc(Arc::clone(name), Arc::clone(def))
+                }
             }
         }
     }
@@ -1607,25 +1628,29 @@ impl PreprocessorState {
                     // Only the final operation for each name matters here.
                     for op in entry.ops.iter().rev() {
                         let (MacroOp::Define(name, _) | MacroOp::Undef(name)) = op;
-                        if !seen.insert(name) {
+                        if !seen.insert(name.as_ref()) {
                             continue;
                         }
                         let original = match op {
-                            MacroOp::Define(_, def) => Some(hash_macro_binding(def, false)),
+                            MacroOp::Define(_, def) => {
+                                Some(hash_macro_binding(def.as_ref(), false))
+                            }
                             MacroOp::Undef(_) => None,
                         };
                         // An unchanged binding is already supplied by B's
                         // own final directive. In particular, do not require
                         // an ordinary include guard to be both absent (B's
                         // input) and present (B's effect) in the consumer.
-                        if self.binding_hash(name) != original {
-                            self.record_snapshot_read(name);
+                        if self.binding_hash(name.as_ref()) != original {
+                            self.record_snapshot_read(name.as_ref());
                         }
-                        let current = match self.macros.get(name) {
-                            Some(def) => MacroOp::Define(name.clone(), def.clone()),
-                            None => MacroOp::Undef(name.clone()),
-                        };
-                        self.log_macro_op(current);
+                        if !self.cache_frames.is_empty() {
+                            let current = match self.macros.get(name.as_ref()) {
+                                Some(def) => MacroOp::Define(Arc::clone(name), Arc::clone(def)),
+                                None => MacroOp::Undef(Arc::clone(name)),
+                            };
+                            self.macro_ops.push(current);
+                        }
                     }
                 }
             }
@@ -1794,20 +1819,20 @@ impl PreprocessorState {
             let mut inlined = std::mem::take(&mut frame.inlined);
             inlined.sort();
             inlined.dedup();
-            let inlined = Arc::new(inlined);
+            let inlined: Arc<[PathBuf]> = inlined.into();
             let mut covers: Vec<PathBuf> = inlined.iter().chain(&frame.covered).cloned().collect();
             covers.sort();
             covers.dedup();
-            let covers = Arc::new(covers);
+            let covers: Arc<[PathBuf]> = covers.into();
             let mut stored = false;
             // The records of an expansion that was composed and not stored.
-            let mut records: Arc<Vec<(PathBuf, usize)>> = Arc::default();
+            let mut records: Arc<[(PathBuf, usize)]> = Arc::default();
             // An expansion composed after a run-wide limit cut this run
             // short is missing content; publishing it would hand that
             // truncation to every later consumer of the header. So would one
             // that skipped a held header it cannot reach.
             if frame.uncovered {
-                records = Arc::new(std::mem::take(&mut frame.replayed));
+                records = frame.replayed.into();
             } else if !self.expansion_incomplete && self.opts.include_expansion_cache.is_some() {
                 let output_end = self.output.len();
                 let (composed, composed_map, extra_files) = if self.opts.inline_include_bodies {
@@ -1826,11 +1851,11 @@ impl PreprocessorState {
                     .cloned()
                     .collect();
                 new_files.extend(extra_files);
-                let ops: Arc<Vec<MacroOp>> = match ops_start {
-                    Some(start) => Arc::new(self.macro_ops[start..].to_vec()),
-                    None => Arc::default(),
+                let ops: Arc<[MacroOp]> = match ops_start {
+                    Some(start) if start < self.macro_ops.len() => self.macro_ops[start..].into(),
+                    _ => Arc::default(),
                 };
-                let diagnostics: Arc<Vec<Diagnostic>> = Arc::new(frame.diagnostics);
+                let diagnostics: Arc<[Diagnostic]> = frame.diagnostics.into();
                 let deps = frame.deps;
                 let replayed = frame.replayed;
                 // Only for the files this entry actually covers. A frame
@@ -1893,8 +1918,8 @@ impl PreprocessorState {
                         line_map: Arc::new(composed_map),
                         ops,
                         deps: Arc::new(deps),
-                        guards: Arc::new(guards),
-                        nested_variants: Arc::new(nested_variants),
+                        guards: guards.into(),
+                        nested_variants: nested_variants.into(),
                         inlined: Arc::clone(&inlined),
                         covers: Arc::clone(&covers),
                         signature,
@@ -1933,6 +1958,7 @@ impl PreprocessorState {
             // header closes, nothing references these entries any more.
             if self.cache_frames.is_empty() {
                 self.macro_ops.clear();
+                self.macro_ops.shrink_to(256);
             }
             if !stored {
                 // No record can name this expansion. The headers it reached
@@ -2035,7 +2061,7 @@ impl PreprocessorState {
                     // balanced group at the same rescan boundary that sees
                     // attributes produced by another macro's replacement.
                     if is_compiler_attribute(name)
-                        && (tok.is_hidden(name) || self.macros.get(name).is_none())
+                        && (tok.is_hidden(name) || self.macros.get(name.as_str()).is_none())
                     {
                         if let Some(end) = self.elide_attribute_group(tokens, i)? {
                             i = end;
@@ -2050,8 +2076,8 @@ impl PreprocessorState {
                         self.emit_token(tok);
                     } else {
                         self.record_read(name);
-                        if let Some(macro_def) = self.macros.get(name).cloned() {
-                            match macro_def {
+                        if let Some(macro_def) = self.macros.get(name.as_str()).cloned() {
+                            match macro_def.as_ref() {
                                 MacroDef::Function { .. } | MacroDef::GmockMethod => {
                                     if Self::next_non_newline_is(tokens, i + 1, "(") {
                                         if !self.push_expansion(tok.line) {
@@ -2082,7 +2108,7 @@ impl PreprocessorState {
                                         i += 1;
                                         continue;
                                     }
-                                    let painted = Self::paint_replacement(&replacement, tok, name);
+                                    let painted = Self::paint_replacement(replacement, tok, name);
                                     if let Some(end) =
                                         self.elide_attribute_macro_group(tokens, i, &painted)?
                                     {
@@ -2129,7 +2155,7 @@ impl PreprocessorState {
             if self.is_active() {
                 if let TokenKind::Identifier(name) = &tok.kind {
                     if is_compiler_attribute(name)
-                        && (tok.is_hidden(name) || self.macros.get(name).is_none())
+                        && (tok.is_hidden(name) || self.macros.get(name.as_str()).is_none())
                     {
                         if let Some(end) = self.elide_attribute_group(tokens, i)? {
                             i = end;
@@ -2142,14 +2168,15 @@ impl PreprocessorState {
                     }
                     if !tok.is_hidden(name) {
                         self.record_read(name);
-                        match self.macros.get(name).cloned() {
+                        let macro_def = self.macros.get(name.as_str()).cloned();
+                        match macro_def.as_deref() {
                             Some(MacroDef::Object { replacement }) => {
                                 if !self.push_expansion(tok.line) {
                                     self.emit_token(tok);
                                     i += 1;
                                     continue;
                                 }
-                                let painted = Self::paint_replacement(&replacement, tok, name);
+                                let painted = Self::paint_replacement(replacement, tok, name);
                                 if let Some(end) =
                                     self.elide_attribute_macro_group(tokens, i, &painted)?
                                 {
@@ -2169,9 +2196,9 @@ impl PreprocessorState {
                             // nested definitions like
                             // `#define A SHARED_OBJ(T)` leak `SHARED_OBJ(T)`
                             // verbatim into the output.
-                            Some(
-                                macro_def @ (MacroDef::Function { .. } | MacroDef::GmockMethod),
-                            ) if Self::next_non_newline_is(tokens, i + 1, "(") => {
+                            Some(MacroDef::Function { .. } | MacroDef::GmockMethod)
+                                if Self::next_non_newline_is(tokens, i + 1, "(") =>
+                            {
                                 if !self.push_expansion(tok.line) {
                                     self.emit_token(tok);
                                     i += 1;
@@ -2185,11 +2212,11 @@ impl PreprocessorState {
                                         return Err(e);
                                     }
                                 };
-                                let r = self
-                                    .expand_invocation(name, tok, &macro_def, &args)
-                                    .and_then(|expanded| {
-                                        self.expand_tokens_no_directives(&expanded)
-                                    });
+                                let def_arc = macro_def.unwrap();
+                                let r =
+                                    self.expand_invocation(name, tok, &def_arc, &args).and_then(
+                                        |expanded| self.expand_tokens_no_directives(&expanded),
+                                    );
                                 self.pop_expansion();
                                 r?;
                                 i = j;
@@ -2552,14 +2579,15 @@ impl PreprocessorState {
                 continue;
             }
             self.record_read(name);
-            match self.macros.get(name).cloned() {
+            let macro_def = self.macros.get(name.as_str()).cloned();
+            match macro_def.as_deref() {
                 Some(MacroDef::Object { replacement }) => {
                     if !self.push_expansion(tokens[i].line) {
                         out.push(tokens[i].clone());
                         i += 1;
                         continue;
                     }
-                    let painted = Self::paint_replacement(&replacement, &tokens[i], name);
+                    let painted = Self::paint_replacement(replacement, &tokens[i], name);
                     // Every exit from an expansion pops it: an operand that
                     // stops mid-expansion is warned about and the enclosing
                     // file continues, so a leaked level would shrink the
@@ -2569,7 +2597,7 @@ impl PreprocessorState {
                     out.extend(nested?);
                     i += 1;
                 }
-                Some(def @ (MacroDef::Function { .. } | MacroDef::GmockMethod))
+                Some(MacroDef::Function { .. } | MacroDef::GmockMethod)
                     if Self::next_non_newline_is(tokens, i + 1, "(") =>
                 {
                     if !self.push_expansion(tokens[i].line) {
@@ -2579,8 +2607,9 @@ impl PreprocessorState {
                     }
                     let origin = tokens[i].clone();
                     i += 1;
+                    let def_arc = macro_def.unwrap();
                     let nested = self.parse_macro_args(tokens, &mut i).and_then(|args| {
-                        let expanded = self.expand_invocation(name, &origin, &def, &args)?;
+                        let expanded = self.expand_invocation(name, &origin, &def_arc, &args)?;
                         self.expand_operand_tokens(&expanded)
                     });
                     self.pop_expansion();
@@ -2791,7 +2820,7 @@ impl PreprocessorState {
             let mut replacement = read_replacement_list(tokens, &mut i);
             let definition_file = Arc::new(self.current_file.clone());
             for token in &mut replacement {
-                token.spelling_file = Some(Arc::clone(&definition_file));
+                token.set_spelling_file(Arc::clone(&definition_file));
             }
             // Normalize at define time: a named GNU variadic (`args...`)
             // whose body nevertheless spells `__VA_ARGS__` (gcc rejects the
@@ -2834,7 +2863,7 @@ impl PreprocessorState {
         }
         let definition_file = Arc::new(self.current_file.clone());
         for token in &mut replacement {
-            token.spelling_file = Some(Arc::clone(&definition_file));
+            token.set_spelling_file(Arc::clone(&definition_file));
         }
         self.insert_macro(
             name,
@@ -3109,7 +3138,7 @@ impl PreprocessorState {
                     self.record_read(name);
                 }
                 if !tok.is_hidden(name) && !self.fallback_macros.contains(name.as_str()) {
-                    match self.macros.get(name) {
+                    match self.macros.get(name.as_str()).map(Arc::as_ref) {
                         Some(MacroDef::Object { replacement }) => {
                             let painted = Self::paint_replacement(replacement, &tok, name);
                             work.splice(i..=i, painted);
@@ -3753,10 +3782,11 @@ impl PreprocessorState {
                     .into_iter()
                     .map(|t| {
                         let gmock_name = match &t.kind {
-                            TokenKind::Identifier(n) => {
-                                matches!(self.macros.get(n.as_str()), Some(MacroDef::GmockMethod))
-                                    .then(|| n.clone())
-                            }
+                            TokenKind::Identifier(n) => matches!(
+                                self.macros.get(n.as_str()).map(Arc::as_ref),
+                                Some(MacroDef::GmockMethod)
+                            )
+                            .then(|| n.clone()),
                             _ => None,
                         };
                         match gmock_name {
@@ -4328,7 +4358,7 @@ fn substitute_macro(
     // Conditional expressions pass None because they rescan raw arguments;
     // emitted-source expansion passes its prescan result.
     let active_hidden = expanded_args.map(|_| {
-        let mut hidden = origin.hidden.as_deref().cloned().unwrap_or_default();
+        let mut hidden = origin.hidden().map(|h| (**h).clone()).unwrap_or_default();
         hidden.insert(macro_name.to_string());
         Arc::new(hidden)
     });
@@ -4568,23 +4598,23 @@ fn concat_width_at(tokens: &[Token], i: usize) -> usize {
 /// dropped from the index (`docs/PARSE_FAILURES.md` catalogs the impact).
 /// Built once; `install_builtin_macros` clones entries per preprocess. The
 /// bodies are plain C, so the C lexer serves both languages.
-static BUILTIN_FALLBACK_MACROS: LazyLock<Vec<(String, MacroDef)>> = LazyLock::new(|| {
+static BUILTIN_FALLBACK_MACROS: LazyLock<Vec<(Arc<str>, Arc<MacroDef>)>> = LazyLock::new(|| {
     let object = |name: &str, replacement: &str| {
         (
-            name.to_string(),
-            MacroDef::Object {
+            Arc::from(name),
+            Arc::new(MacroDef::Object {
                 replacement: lex_macro_body(replacement, Language::C).into(),
-            },
+            }),
         )
     };
     let function = |name: &str, params: &[&str], replacement: &str| {
         (
-            name.to_string(),
-            MacroDef::Function {
+            Arc::from(name),
+            Arc::new(MacroDef::Function {
                 params: params.iter().map(ToString::to_string).collect(),
                 replacement: lex_macro_body(replacement, Language::C).into(),
                 variadic: false,
-            },
+            }),
         )
     };
     let mut table = Vec::new();
@@ -4656,11 +4686,14 @@ static BUILTIN_FALLBACK_MACROS: LazyLock<Vec<(String, MacroDef)>> = LazyLock::ne
     // declares (see expand_gmock_method); a replacement list cannot do this
     // because the legacy forms carry the whole signature in one argument
     // and the modern form parenthesizes comma-containing return types.
-    table.push(("MOCK_METHOD".to_string(), MacroDef::GmockMethod));
+    table.push((Arc::from("MOCK_METHOD"), Arc::new(MacroDef::GmockMethod)));
     for arity in 0..=10 {
         for prefix in ["MOCK_METHOD", "MOCK_CONST_METHOD"] {
             for suffix in ["", "_T", "_WITH_CALLTYPE", "_T_WITH_CALLTYPE"] {
-                table.push((format!("{prefix}{arity}{suffix}"), MacroDef::GmockMethod));
+                table.push((
+                    Arc::from(format!("{prefix}{arity}{suffix}")),
+                    Arc::new(MacroDef::GmockMethod),
+                ));
             }
         }
     }
@@ -4677,28 +4710,44 @@ fn paste_two_tokens(left: &Token, right: &Token) -> Token {
     // no `spelling_file`; if it is pasted on the left of a replacement-list
     // token, borrowing only the right token's file would pair a header path
     // with argument coordinates from the invocation.
-    let (line, col, spelling_file) = if left.spelling_file.is_some() {
-        (left.line, left.col, left.spelling_file.clone())
-    } else if right.spelling_file.is_some() {
-        (right.line, right.col, right.spelling_file.clone())
+    let (line, col, spelling_file) = if let Some(sf) = left.spelling_file() {
+        (left.line, left.col, Some(Arc::clone(sf)))
+    } else if let Some(sf) = right.spelling_file() {
+        (right.line, right.col, Some(Arc::clone(sf)))
     } else {
         (left.line, left.col, None)
+    };
+    let hidden = Token::union_hidden(left, right);
+    let origin = left.origin().or_else(|| right.origin());
+    let expansion_id = left.expansion_id() ^ right.expansion_id().rotate_left(1);
+    let expansion_macro = left
+        .expansion_macro()
+        .cloned()
+        .or_else(|| right.expansion_macro().cloned());
+    let macro_prov = if hidden.is_some()
+        || origin.is_some()
+        || expansion_id != 0
+        || expansion_macro.is_some()
+        || spelling_file.is_some()
+    {
+        Some(Arc::new(crate::lexer::TokenMacroProvenance {
+            hidden,
+            origin,
+            expansion_id,
+            expansion_macro,
+            spelling_file,
+        }))
+    } else {
+        None
     };
     Token {
         kind: TokenKind::Identifier(text),
         line,
         col,
-        hidden: Token::union_hidden(left, right),
-        origin: left.origin.or(right.origin),
-        expansion_id: left.expansion_id ^ right.expansion_id.rotate_left(1),
-        expansion_macro: left
-            .expansion_macro
-            .clone()
-            .or_else(|| right.expansion_macro.clone()),
-        spelling_file,
         // Whatever separated `left` from the token before it still
         // separates the pasted result from it.
         adjacent_before: left.adjacent_before,
+        macro_prov,
     }
 }
 
@@ -4931,7 +4980,7 @@ impl MacroEnv<'_> {
         if let Some(h) = self.hashes.get(name) {
             return Some(*h);
         }
-        let h = hash_macro_binding(def, self.fallbacks.contains(name));
+        let h = hash_macro_binding(def.as_ref(), self.fallbacks.contains(name));
         self.hashes.insert(name.to_string(), h);
         Some(h)
     }
@@ -4950,7 +4999,7 @@ impl MacroEnv<'_> {
                         .iter()
                         .any(|name| macros.contains_key(name.as_ref()))
                 } else {
-                    macros.keys().any(|name| undefined.contains(name.as_str()))
+                    macros.keys().any(|name| undefined.contains(name.as_ref()))
                 }
             },
         )
@@ -4972,8 +5021,8 @@ pub(crate) fn hash_macro_binding(def: &MacroDef, fallback: bool) -> u64 {
     let hash_tokens = |h: &mut std::collections::hash_map::DefaultHasher, toks: &[Token]| {
         for t in toks {
             t.adjacent_before.hash(h);
-            t.spelling_file.hash(h);
-            if t.spelling_file.is_some() {
+            t.spelling_file().hash(h);
+            if t.spelling_file().is_some() {
                 // The path was hashed with the option discriminant above.
                 t.line.hash(h);
                 t.col.hash(h);
@@ -7882,10 +7931,10 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
                 .filter(|t| !matches!(t.kind, TokenKind::Eof))
                 .collect();
             t.insert(
-                "G_H".to_string(),
-                MacroDef::Object {
+                "G_H".into(),
+                Arc::new(MacroDef::Object {
                     replacement: toks.into(),
-                },
+                }),
             );
         }
         let cache: ExpansionCache = Arc::new(RwLock::new(FxHashMap::default()));

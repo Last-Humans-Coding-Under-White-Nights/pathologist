@@ -25,7 +25,7 @@ pub struct PreprocessedSource {
     /// declarations are in THIS unit and must not also be merged from a PCH
     /// unit built under a different macro environment. For a header's
     /// stored expansion, the headers it holds (`IncludeExpansion::inlined`).
-    pub inlined_headers: Arc<Vec<PathBuf>>,
+    pub inlined_headers: Arc<[PathBuf]>,
     /// The language this text was lexed as; `replayed_variants` indexes the
     /// variant list for this language only.
     pub language: Language,
@@ -472,7 +472,7 @@ impl PreprocessedSource {
             inlined_headers: Arc::clone(&expansion.inlined),
             replayed_variants: Arc::new(group_variants(expansion.nested_variants.iter().cloned())),
             language,
-            diagnostics: expansion.diagnostics.as_ref().clone(),
+            diagnostics: expansion.diagnostics.as_ref().to_vec(),
             conditionals: Vec::new(),
         }
     }
@@ -502,7 +502,7 @@ impl PreprocessedSource {
             text,
             line_map: Arc::new(LineMap::new()),
             included_headers: Arc::new(Vec::new()),
-            inlined_headers: Arc::new(Vec::new()),
+            inlined_headers: Arc::default(),
             replayed_variants: Arc::new(HashMap::default()),
             language: Language::C,
             diagnostics: Vec::new(),
@@ -537,7 +537,7 @@ fn read_index_source(
         text: Arc::from(preproc_result.output),
         line_map: Arc::new(preproc_result.line_map),
         included_headers: Arc::new(preproc_result.included_headers),
-        inlined_headers: Arc::new(preproc_result.inlined_headers),
+        inlined_headers: preproc_result.inlined_headers.into(),
         replayed_variants: Arc::new(group_variants(preproc_result.replayed_variants)),
         language: preproc_result.language,
         diagnostics: preproc_result.diagnostics,
@@ -685,7 +685,7 @@ mod tests {
         let graph = IncludeGraph::default();
         let cache = IndexSourceCache::new();
         let mut src = PreprocessedSource::raw(Arc::from("int x;"));
-        src.inlined_headers = Arc::new(vec![PathBuf::from("/inner.h")]);
+        src.inlined_headers = Arc::from([PathBuf::from("/inner.h")]);
         cache.inner.write().unwrap().insert(
             graph.intern_path(&path),
             CachedSource::Resident(Arc::new(src)),

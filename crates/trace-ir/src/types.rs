@@ -3,6 +3,7 @@ use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -139,10 +140,129 @@ pub struct TypeInfo {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TypeLayout {
-    pub fields: IndexMap<FieldId, FieldLayout>,
+    pub fields: TypeFields,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
+pub struct TypeFields(pub(crate) Option<Box<IndexMap<FieldId, FieldLayout>>>);
+
+static EMPTY_FIELDS: std::sync::LazyLock<IndexMap<FieldId, FieldLayout>> =
+    std::sync::LazyLock::new(IndexMap::new);
+
+impl TypeFields {
+    pub fn new() -> Self {
+        Self(None)
+    }
+
+    pub fn clear(&mut self) {
+        self.0 = None;
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.as_ref().is_none_or(|m| m.is_empty())
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, |m| m.len())
+    }
+}
+
+impl std::ops::Deref for TypeFields {
+    type Target = IndexMap<FieldId, FieldLayout>;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            Some(map) => map.as_ref(),
+            None => &EMPTY_FIELDS,
+        }
+    }
+}
+
+impl std::ops::DerefMut for TypeFields {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.get_or_insert_with(Box::default).as_mut()
+    }
+}
+
+impl IntoIterator for TypeFields {
+    type Item = (FieldId, FieldLayout);
+    type IntoIter = indexmap::map::IntoIter<FieldId, FieldLayout>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self.0 {
+            Some(map) => (*map).into_iter(),
+            None => IndexMap::new().into_iter(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a TypeFields {
+    type Item = (&'a FieldId, &'a FieldLayout);
+    type IntoIter = indexmap::map::Iter<'a, FieldId, FieldLayout>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.deref().iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut TypeFields {
+    type Item = (&'a FieldId, &'a mut FieldLayout);
+    type IntoIter = indexmap::map::IterMut<'a, FieldId, FieldLayout>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.deref_mut().iter_mut()
+    }
+}
+
+impl PartialEq for TypeFields {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a == b,
+            (Some(a), None) => a.is_empty(),
+            (None, Some(b)) => b.is_empty(),
+        }
+    }
+}
+
+impl Eq for TypeFields {}
+
+impl From<IndexMap<FieldId, FieldLayout>> for TypeFields {
+    fn from(map: IndexMap<FieldId, FieldLayout>) -> Self {
+        if map.is_empty() {
+            Self(None)
+        } else {
+            Self(Some(Box::new(map)))
+        }
+    }
+}
+
+impl Serialize for TypeFields {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.deref().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TypeFields {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let map = IndexMap::<FieldId, FieldLayout>::deserialize(deserializer)?;
+        if map.is_empty() {
+            Ok(Self(None))
+        } else {
+            Ok(Self(Some(Box::new(map))))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FieldLayout {
     pub name: String,
     pub offset: u64,
@@ -647,8 +767,10 @@ impl TypeTable {
         self.struct_tags = FxHashMap::default();
         self.union_tags = FxHashMap::default();
         for info in &mut self.types {
-            info.layout.fields = IndexMap::new();
+            info.layout.fields.clear();
         }
+        self.types.shrink_to_fit();
+        self.aliases.shrink_to_fit();
     }
 
     pub fn compute_struct_layout(
@@ -2044,5 +2166,11 @@ mod tests {
         );
         assert_eq!(split_instance("A<B<C>>"), Some(("A", vec!["B<C>"])));
         assert_eq!(split_instance("A<X>::B<Y>"), None);
+    }
+
+    #[test]
+    fn type_info_and_layout_sizes() {
+        assert_eq!(std::mem::size_of::<TypeLayout>(), 8);
+        assert_eq!(std::mem::size_of::<TypeInfo>(), 40);
     }
 }

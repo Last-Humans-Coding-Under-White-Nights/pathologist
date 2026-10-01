@@ -32,7 +32,7 @@ fn provisional_id(handle: usize) -> Option<usize> {
 }
 
 /// A macro's definition and whether it is a builtin fallback.
-pub(crate) type Binding = (MacroDef, bool);
+pub(crate) type Binding = (Arc<MacroDef>, bool);
 
 type StoredVariants = FxHashMap<ExpansionKey, ExpansionVariants>;
 
@@ -168,11 +168,11 @@ impl MacroHistory {
             Some(at) => self.undo[*at]
                 .1
                 .as_ref()
-                .map(|(def, fallback)| (def, *fallback)),
+                .map(|(def, fallback)| (def.as_ref(), *fallback)),
             None => self
                 .last
                 .get(name)
-                .map(|def| (def, self.last_fallbacks.contains(name))),
+                .map(|def| (def.as_ref(), self.last_fallbacks.contains(name))),
         }
     }
 
@@ -489,7 +489,7 @@ fn with_indices(
             .iter()
             .map(|(path, handle)| Some((path.clone(), resolve(path, *handle)?)))
             .collect::<Option<Vec<_>>>()?;
-        entry.nested_variants = Arc::new(nested);
+        entry.nested_variants = nested.into();
     }
     Some(entry)
 }

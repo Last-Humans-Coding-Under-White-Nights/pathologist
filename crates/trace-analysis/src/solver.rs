@@ -149,9 +149,13 @@ pub fn analyze_with_options(program: &Program, opts: AnalyzeOptions) -> (Pag, An
         opts.solve_budget_pops,
         opts.solve_budget_secs,
     );
-    let call_edges = result.call_edges.clone();
-    let wired = result.wired_arg_flow.clone();
-    extract_arg_flow(program, &pag, &call_edges, &wired, &mut result);
+    extract_arg_flow(
+        program,
+        &pag,
+        &result.call_edges,
+        &result.wired_arg_flow,
+        &mut result.arg_flow_edges,
+    );
     (pag, result)
 }
 
@@ -1021,7 +1025,7 @@ fn solve(
                     for idx in idxs {
                         let (dst, src, field) = {
                             let c = &pag.constraints[idx];
-                            (c.dst, c.src, c.field)
+                            (c.dst, c.src, c.field())
                         };
                         let Some(field) = field else {
                             continue;
@@ -1030,7 +1034,8 @@ fn solve(
                             let summary_opt = if program.layouts_unioned {
                                 // Cloned only here: `ensure_*` needs `&mut pag`,
                                 // and the baseline path must not pay for it.
-                                let expected = pag.constraints[idx].field_name.clone();
+                                let expected =
+                                    pag.constraints[idx].field_name().map(str::to_string);
                                 pag.ensure_field_summary_for_var_named(
                                     program,
                                     base_var,
@@ -1143,7 +1148,7 @@ fn solve(
             'gep: for idx in idxs {
                 let (dst, src, field, ref expected_name) = {
                     let c = &pag.constraints[idx];
-                    (c.dst, c.src, c.field, c.field_name.clone())
+                    (c.dst, c.src, c.field(), c.field_name_arc())
                 };
                 let Some(field) = field else {
                     continue;
@@ -1172,7 +1177,7 @@ fn solve(
                     // Function values are judged by the table-member and
                     // arity rules below, not by a struct field name.
                     if let Some(expected) = expected_name
-                        .as_ref()
+                        .as_deref()
                         .filter(|_| fn_for_loc(pag, loc).is_none())
                     {
                         // A pointee with no struct type has no such field.
@@ -1182,7 +1187,7 @@ fn solve(
                         };
                         {
                             match program.types.get(parent_type).layout.fields.get(&field) {
-                                Some(fl) if fl.name == *expected => {}
+                                Some(fl) if fl.name == expected => {}
                                 _ if program.layouts_unioned => {
                                     if let Some(fid) =
                                         program.types.field_id_by_name(parent_type, expected)
@@ -1562,8 +1567,7 @@ fn apply_fn_model(
                             kind: ConstraintKind::Store,
                             dst: p,
                             src: v,
-                            field: None,
-                            field_name: None,
+                            field_info: None,
                         });
                         pag.indices.store_dst.entry(p).or_default().push(idx);
                         pag.indices.store_src.entry(v).or_default().push(idx);
@@ -1872,8 +1876,7 @@ fn ensure_param_copy(
         kind: crate::constraints::ConstraintKind::Copy,
         dst: formal_node,
         src: actual_node,
-        field: None,
-        field_name: None,
+        field_info: None,
     });
     pag.indices
         .copy_src
@@ -2324,7 +2327,7 @@ fn extract_arg_flow(
     pag: &Pag,
     call_edges: &[CallGraphEdge],
     wired: &FxHashSet<(CallSiteId, u32, FnId)>,
-    result: &mut AnalysisResult,
+    arg_flow_edges: &mut Vec<ArgFlowEdge>,
 ) {
     for edge in call_edges {
         // Synthetic edges (IPC bridges) have no source-level call site and no
@@ -2343,7 +2346,7 @@ fn extract_arg_flow(
             let idx = i as u32;
             if wired.contains(&(edge.call_site, idx, edge.callee)) {
                 if let Some(actual) = pag.argument_var(cs, idx) {
-                    result.arg_flow_edges.push(ArgFlowEdge {
+                    arg_flow_edges.push(ArgFlowEdge {
                         call_site: edge.call_site,
                         arg_index: idx,
                         actual_var: Some(actual),
@@ -2352,7 +2355,7 @@ fn extract_arg_flow(
                     });
                 } else {
                     for &(_, fn_id) in cs.fn_args.iter().filter(|(j, _)| *j == idx) {
-                        result.arg_flow_edges.push(ArgFlowEdge {
+                        arg_flow_edges.push(ArgFlowEdge {
                             call_site: edge.call_site,
                             arg_index: idx,
                             actual_var: None,

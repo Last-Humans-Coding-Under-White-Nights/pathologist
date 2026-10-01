@@ -31,40 +31,22 @@ pub enum TokenKind {
     Eof,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TokenMacroProvenance {
+    pub(crate) hidden: Option<Arc<FxHashSet<String>>>,
+    pub(crate) origin: Option<(u32, u32)>,
+    pub(crate) expansion_id: u64,
+    pub(crate) expansion_macro: Option<Arc<str>>,
+    pub(crate) spelling_file: Option<Arc<PathBuf>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Token {
     pub kind: TokenKind,
     pub line: u32,
     pub col: u32,
-    /// Macros that must not expand this token again (C11 6.10.3.4 hide set).
-    pub(crate) hidden: Option<Arc<FxHashSet<String>>>,
-    /// Whether this token touched the previous one in the token stream:
-    /// no whitespace, comment or newline between them. `\`-newline is
-    /// deleted in translation phase 2 (C11 5.1.1.2p1), before tokens are
-    /// recognized, so a splice alone never separates two tokens. This is
-    /// the *logical* adjacency `#` stringizing and the function-like
-    /// `#define` test need; `line`/`col` are physical positions and, once
-    /// splices are deleted, no longer answer "did these tokens touch" —
-    /// `a\`-newline-`b` is one token starting at `a`, and `a-\`-newline-`>`
-    /// one `->` whose halves sit on different lines. A synthesized token
-    /// (`Token::new`) is never adjacent; a token substituted for a macro
-    /// parameter takes the parameter's flag, like gcc's `PREV_WHITE`.
     pub(crate) adjacent_before: bool,
-    /// For a token that came out of a macro replacement list: the
-    /// `(line, col)` of the outermost invocation that produced it, in the
-    /// file being processed. `line`/`col` keep the definition-site
-    /// coordinates. The [`crate::LineMap`] records both; `__LINE__` reads the
-    /// invocation coordinates, inherited through forwarding macros.
-    pub(crate) origin: Option<(u32, u32)>,
-    /// Deterministic fingerprint of the macro invocation and parameter-
-    /// substitution chain that produced this token. Zero denotes source text.
-    pub(crate) expansion_id: u64,
-    /// Name of the outermost macro whose expansion produced this token.
-    pub(crate) expansion_macro: Option<Arc<str>>,
-    /// File containing this token's spelling when it came from a source
-    /// macro replacement list. The invocation file is the preprocessor's
-    /// current file when the token is emitted.
-    pub(crate) spelling_file: Option<Arc<PathBuf>>,
+    pub(crate) macro_prov: Option<Arc<TokenMacroProvenance>>,
 }
 
 impl Token {
@@ -74,13 +56,53 @@ impl Token {
             kind,
             line,
             col,
-            hidden: None,
-            origin: None,
-            expansion_id: 0,
-            expansion_macro: None,
-            spelling_file: None,
             adjacent_before: false,
+            macro_prov: None,
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn hidden(&self) -> Option<&Arc<FxHashSet<String>>> {
+        self.macro_prov.as_ref().and_then(|p| p.hidden.as_ref())
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn origin(&self) -> Option<(u32, u32)> {
+        self.macro_prov.as_ref().and_then(|p| p.origin)
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn expansion_id(&self) -> u64 {
+        self.macro_prov.as_ref().map_or(0, |p| p.expansion_id)
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn expansion_macro(&self) -> Option<&Arc<str>> {
+        self.macro_prov
+            .as_ref()
+            .and_then(|p| p.expansion_macro.as_ref())
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn spelling_file(&self) -> Option<&Arc<PathBuf>> {
+        self.macro_prov
+            .as_ref()
+            .and_then(|p| p.spelling_file.as_ref())
+    }
+
+    #[inline]
+    pub(crate) fn macro_prov_mut(&mut self) -> &mut TokenMacroProvenance {
+        Arc::make_mut(self.macro_prov.get_or_insert_with(Arc::default))
+    }
+
+    #[inline]
+    pub(crate) fn set_spelling_file(&mut self, file: Arc<PathBuf>) {
+        self.macro_prov_mut().spelling_file = Some(file);
     }
 
     #[must_use]
@@ -107,12 +129,12 @@ impl Token {
     /// the outermost invocation for macro-expanded text.
     #[must_use]
     pub(crate) fn expansion_site(&self) -> (u32, u32) {
-        self.origin.unwrap_or((self.line, self.col))
+        self.origin().unwrap_or((self.line, self.col))
     }
 
     #[must_use]
     pub(crate) fn is_hidden(&self, name: &str) -> bool {
-        self.hidden.as_ref().is_some_and(|h| h.contains(name))
+        self.hidden().is_some_and(|h| h.contains(name))
     }
 
     /// Paint this replacement-list token with the invoking token's hide set
@@ -123,27 +145,31 @@ impl Token {
     #[must_use]
     pub(crate) fn with_macro_hide(&self, origin: &Token, name: &str) -> Token {
         let mut set = FxHashSet::default();
-        if let Some(h) = &origin.hidden {
+        if let Some(h) = origin.hidden() {
             set.extend(h.iter().cloned());
         }
-        if let Some(h) = &self.hidden {
+        if let Some(h) = self.hidden() {
             set.extend(h.iter().cloned());
         }
         set.insert(name.to_string());
         let expansion_macro = origin
-            .expansion_macro
-            .clone()
+            .expansion_macro()
+            .cloned()
             .or_else(|| Some(Arc::from(name)));
+        let expansion_id = expansion_fingerprint(origin, name, None, self.expansion_id());
+        let prov = TokenMacroProvenance {
+            hidden: Some(Arc::new(set)),
+            origin: Some(origin.expansion_site()),
+            expansion_id,
+            expansion_macro,
+            spelling_file: self.spelling_file().cloned(),
+        };
         Token {
             kind: self.kind.clone(),
             line: self.line,
             col: self.col,
-            hidden: Some(Arc::new(set)),
-            origin: Some(origin.expansion_site()),
-            expansion_id: expansion_fingerprint(origin, name, None, self.expansion_id),
-            expansion_macro,
-            spelling_file: self.spelling_file.clone(),
             adjacent_before: self.adjacent_before,
+            macro_prov: Some(Arc::new(prov)),
         }
     }
 
@@ -163,8 +189,8 @@ impl Token {
         // substitution does the active invocation become unavailable during
         // emitted-source rescan. Conditional expressions rescan raw arguments
         // and retain their original hide state.
-        if let Some(active_hidden) = active_hidden {
-            token.hidden = Some(match &self.hidden {
+        let new_hidden = if let Some(active_hidden) = active_hidden {
+            Some(match self.hidden() {
                 None => Arc::clone(active_hidden),
                 Some(previous) if previous.is_subset(active_hidden) => Arc::clone(active_hidden),
                 Some(previous) => {
@@ -172,20 +198,26 @@ impl Token {
                     combined.extend(previous.iter().cloned());
                     Arc::new(combined)
                 }
-            });
-        }
-        token.expansion_id =
-            expansion_fingerprint(origin, macro_name, Some(parameter), self.expansion_id);
-        token.expansion_macro = origin
-            .expansion_macro
-            .clone()
+            })
+        } else {
+            self.hidden().cloned()
+        };
+        let expansion_id =
+            expansion_fingerprint(origin, macro_name, Some(parameter), self.expansion_id());
+        let expansion_macro = origin
+            .expansion_macro()
+            .cloned()
             .or_else(|| Some(Arc::from(macro_name)));
+        let prov = token.macro_prov_mut();
+        prov.hidden = new_hidden;
+        prov.expansion_id = expansion_id;
+        prov.expansion_macro = expansion_macro;
         token
     }
 
     #[must_use]
     pub(crate) fn union_hidden(left: &Token, right: &Token) -> Option<Arc<FxHashSet<String>>> {
-        match (&left.hidden, &right.hidden) {
+        match (left.hidden(), right.hidden()) {
             (None, None) => None,
             (Some(x), None) | (None, Some(x)) => Some(Arc::clone(x)),
             (Some(x), Some(y)) => {
@@ -217,18 +249,18 @@ fn expansion_fingerprint(
         hash ^= 0xff;
         hash = hash.wrapping_mul(PRIME);
     };
-    bytes(&origin.expansion_id.to_le_bytes());
+    bytes(&origin.expansion_id().to_le_bytes());
     bytes(&prior.to_le_bytes());
     bytes(macro_name.as_bytes());
     bytes(&origin.line.to_le_bytes());
     bytes(&origin.col.to_le_bytes());
-    if let Some(path) = &origin.spelling_file {
+    if let Some(path) = origin.spelling_file() {
         bytes(path.to_string_lossy().as_bytes());
     }
     if let Some(parameter) = parameter {
         bytes(&parameter.line.to_le_bytes());
         bytes(&parameter.col.to_le_bytes());
-        if let Some(path) = &parameter.spelling_file {
+        if let Some(path) = parameter.spelling_file() {
             bytes(path.to_string_lossy().as_bytes());
         }
     }
@@ -1521,5 +1553,10 @@ mod tests {
         // identifier, and `(` after them touches `a`.
         assert_eq!(flags("a\\\n\\\nb"), vec![false]);
         assert_eq!(flags("a\\\n\\\n(b"), vec![false, true, true]);
+    }
+
+    #[test]
+    fn token_size() {
+        assert_eq!(std::mem::size_of::<Token>(), 56);
     }
 }

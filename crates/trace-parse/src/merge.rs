@@ -22,7 +22,7 @@ pub struct UnitIndex {
     pub files: Vec<PathBuf>,
     /// Headers whose text a header's unit holds beside its own
     /// (`IncludeExpansion::inlined`). What they declare is theirs.
-    pub held_headers: Vec<PathBuf>,
+    pub held_headers: Arc<[PathBuf]>,
     pub types: trace_ir::TypeTable,
     pub functions: Vec<Function>,
     pub member_declarations: FxHashMap<FnId, Vec<trace_ir::FileId>>,
@@ -66,6 +66,24 @@ pub struct UnitIndex {
     /// a consumer that already holds it answers by address. Empty when the
     /// unit was built without it; the merge then rebuilds as it goes.
     pub merge_descs: Vec<Arc<TypeDesc>>,
+}
+
+impl UnitIndex {
+    pub fn shrink_to_fit(&mut self) {
+        self.files.shrink_to_fit();
+        self.functions.shrink_to_fit();
+        self.member_declarations.shrink_to_fit();
+        self.internal_definitions.shrink_to_fit();
+        self.variables.shrink_to_fit();
+        self.call_sites.shrink_to_fit();
+        self.flow.shrink_to_fit();
+        self.diagnostics.shrink_to_fit();
+        self.inheritance.shrink_to_fit();
+        self.template_bases.shrink_to_fit();
+        self.arrow_returns.shrink_to_fit();
+        self.final_classes.shrink_to_fit();
+        self.merge_descs.shrink_to_fit();
+    }
 }
 
 /// See [`UnitIndex::merge_descs`].

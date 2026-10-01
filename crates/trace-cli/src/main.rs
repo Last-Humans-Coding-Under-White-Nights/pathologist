@@ -585,6 +585,7 @@ fn run_analyze(
     );
 
     let t2 = Instant::now();
+    program.release_flow();
     export_to_sqlite(
         &program,
         &pag,

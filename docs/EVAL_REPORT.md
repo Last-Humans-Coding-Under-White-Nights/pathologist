@@ -47,6 +47,64 @@ In camera, `services/camera_service/src/camera_beauty_notification.cpp:61`
 errors, eliminating parse error diagnostics from both translation units (diagnostics
 5,048 -> 5,046). All 94 evaluation checks pass.
 
+## Struct compaction, expansion sharing, and lifecycle reclamation — 2026-10-01
+
+Rules and Rust API migrations are documented in [Type storage and TypeFields](ANALYSIS.md#typefields-and-layout-storage), [Constraint representation and accessors](ANALYSIS.md#constraint-representation-and-accessors), and [Post-solve flow-release lifecycle](ANALYSIS.md#post-solve-flow-release-lifecycle). High-level memory reductions are summarized in [Memory profile](MEMORY_PROFILE.md#implemented-follow-up-struct-compaction-expansion-sharing-and-lifecycle-reclamation).
+
+### Environment and revisions
+
+- **Target / Platform**: Apple M1, `aarch64-apple-darwin`, macOS 26.6.2.
+- **Toolchain**: `rustc 1.100.0-nightly (bff8e12ff)`.
+- **Base revision**: `18303d6a6aa228a9f0ea1a65ca3bc72de58d9bba`.
+- **Head revision**: `67e84fd2efea728b29433d4ff16090a8a26c44b3` for the peak footprint and RSS columns; `97f83c2520d06f112d23a8386e7f5d0bb89d7ee9` (`Option<Arc<TokenMacroProvenance>>` copy-on-write) for the token provenance CPU figures, including HDF head user CPU.
+- **Evaluation configuration**: release builds, `--jobs 8`, minimal export, default solver budgets (`TRACE_SOLVE_BUDGET_POPS=800000`).
+
+### Struct and enum sizes (`std::mem::size_of::<T>()`)
+
+Measured via release probe binaries linked against base (`18303d6`) and head on `aarch64-apple-darwin`:
+
+| Type | Base (`18303d6`), bytes | Head, bytes | Reduction | Notes |
+|---|---:|---:|---:|---|
+| `TypeInfo` | 104 | 40 | −61.5% | Shared `Arc<TypeDesc>` and tag/layout flags |
+| `TypeLayout` | 72 | 8 | −88.9% | `TypeFields(Option<Box<IndexMap<FieldId, FieldLayout>>>)` |
+| `Token` | 96 | 56 | −41.7% | Shared `Option<Arc<TokenMacroProvenance>>` with CoW |
+| `LineMapEntry` | 40 | 40 | 0.0% | Default struct packing; guarded by `line_map_entry_size` |
+| `MacroOp` | 64 | 24 | −62.5% | `Define(Arc<str>, Arc<MacroDef>)` and `Undef(Arc<str>)` |
+| `Constraint` | 48 | 24 | −50.0% | `field_info: Option<Box<FieldAccess>>` |
+
+Notes on measurements:
+- **`LineMapEntry`**: Rust's compiler already reorders non-`repr(C)` fields by alignment, packing `LineMapEntry` at 40 bytes on 64-bit targets on both base and head. Source reordering saves 0 bytes; the struct size is guarded by the new regression test `line_map_entry_size`.
+- **`TypeLayout`**: Constructing empty `TypeLayout` values incurs zero heap allocations on both revisions. The optimization is inline memory compaction: wrapping the map in `TypeFields(Option<Box<IndexMap<...>>>)` stores `None` for types without fields, dropping inline footprint from 72 B to 8 B per layout.
+- **`IncludeExpansion`**: Converting collection fields from `Arc<Vec<T>>` to direct boxed slices `Arc<[T]>` eliminates excess vector capacity and indirection across cached include expansions.
+
+### Token provenance sharing and macro expansion CPU
+
+Initially, `TokenMacroProvenance` was boxed as `Option<Box<TokenMacroProvenance>>`. Because `Token` implements `Clone`, cloning tokens during macro expansion (in replacement-list painting, argument substitution, and macro expansion splicing) deep-copied the boxed provenance.
+- On a repeated macro argument microbenchmark (`#define M(x) x + x + x + x + x + x + x + x\nM(a);` x 10,000), median user CPU rose from 0.2554 s to 0.3059 s (+19.8%), with allocation calls rising from 700,388 to 1,000,275 (+42.8%).
+- On `drivers_hdf_core` release runs (`--jobs 8`), median user CPU rose from 11.81–11.90 s to 12.42–12.76 s (+5–7%).
+
+Switching provenance storage to `Option<Arc<TokenMacroProvenance>>` with copy-on-write (`Arc::make_mut` in `macro_prov_mut`) retains the 56-byte `Token` size (8 bytes via null pointer optimization) while making token clones allocation-free atomic refcount increments. On HDF release benchmarks, user CPU dropped from 12.76 s back to 11.68 s, fully recovering the regression.
+
+### End-to-end benchmark results
+
+Release binaries on macOS, `--jobs 8`, medians of 7 interleaved runs:
+
+| Corpus | Workers | Base peak footprint | Head peak footprint | Base max RSS | Head max RSS | Base user CPU | Head user CPU |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| camera | 8 | 440 MiB (282–456) | 267 MiB (174–365) | 658 MiB | 645 MiB | 26.41 s | 27.04 s |
+| HDF | 8 | 171 MiB (170–237) | 175 MiB (171–236) | 514 MiB | 503 MiB | 11.90 s | 11.68 s |
+
+- On camera, peak memory footprint varied widely across runs (ranging 282–456 MiB base vs 174–365 MiB head in this set, and 364 $\to$ 400 MiB in a subsequent 3-run set); with heavy range overlap, the peak footprint medians on camera are not conclusive.
+- Max RSS remained flat on both corpora (658 MiB $\to$ 645 MiB on camera, 514 MiB $\to$ 503 MiB on HDF).
+- All 12 SQLite analysis tables match the baseline byte-for-byte across camera, HDF, and hiview corpora.
+- The solid, repeatable improvements are the struct inline footprint reductions and the recovery of macro-expansion user CPU.
+
+### Reproduction commands
+
+- **Struct size checks**: `cargo test --workspace` (verifies `type_info_and_layout_sizes`, `token_size`, `line_map_entry_size`, `macro_op_size`, and `constraint_size`).
+- **Memory profiling**: `python3 scripts/profile_memory_macos.py --label head --out /tmp/mem -- target/release/trace analyze <corpus_path> -o /tmp/mem/head.db --jobs 8` (and the same with `--label base` on a base build).
+- **Corpus verification**: `python3 scripts/eval_check.py --bin target/release/trace --outdir /tmp/eval-out`.
+
 ## C++ type syntax: #167, #169, #170 — 2026-10-01
 
 Review-fix validation against PR head `3a3e2d8`: `cargo fmt --all -- --check`,

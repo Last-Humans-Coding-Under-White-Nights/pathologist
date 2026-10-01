@@ -276,3 +276,34 @@ Rust API migration: `TypeInfo.desc` is now `Arc<TypeDesc>`; match with
 `info.desc.as_ref()` and use `info.desc.as_ref().clone()` when an owned
 mutable descriptor is needed. `TypeTable::all_aliases()` exposes shared alias
 values. Serde representation and the C ABI/SQLite schema are unchanged.
+
+## Implemented follow-up: struct compaction, expansion sharing, and lifecycle reclamation
+
+Rules and API migration contracts are documented in [Type storage and TypeFields](ANALYSIS.md#typefields-and-layout-storage), [Constraint representation and accessors](ANALYSIS.md#constraint-representation-and-accessors), and [Post-solve flow-release lifecycle](ANALYSIS.md#post-solve-flow-release-lifecycle). Measured probe details and reproduction steps are documented in [Evaluation report](EVAL_REPORT.md#struct-compaction-expansion-sharing-and-lifecycle-reclamation--2026-10-01).
+
+1. **`TypeInfo` and `TypeLayout` struct compaction (`trace-ir`)**:
+   - `TypeInfo` inline size reduced from 104 B to 40 B (−61.5%).
+   - `TypeLayout` inline size reduced from 72 B to 8 B (−88.9%).
+   - Aggregate field layouts wrapped in `TypeFields(Option<Box<IndexMap<FieldId, FieldLayout>>>)`: types without fields store `None`, taking 0 heap bytes and only 8 inline bytes instead of 72 inline bytes for an empty `IndexMap`.
+   - `TypeTable::compact_for_header_merge()` drops `TypeFields` heap allocations to `None` via `layout.fields.clear()` and calls `shrink_to_fit()` on `types` and `aliases` vectors.
+2. **`Token` and `LineMapEntry` struct compaction (`trace-preproc`)**:
+   - `Token` inline footprint reduced from 96 B to 56 B (−41.7%) by sharing macro expansion tracking in `Option<Arc<TokenMacroProvenance>>` with copy-on-write (`Arc::make_mut`), avoiding allocation churn during repeated argument substitution.
+   - `LineMapEntry` size is guarded at 40 B by regression test `line_map_entry_size` (Rust compiler layout automatically packs non-`repr(C)` fields by alignment).
+3. **`MacroOp` and `IncludeExpansion` representation (`trace-preproc`)**:
+   - `MacroOp` representation changed to `Define(Arc<str>, Arc<MacroDef>)` and `Undef(Arc<str>)`, cutting size from 64 B to 24 B (−62.5%). `MacroTable` stores definitions as `Arc<MacroDef>`, eliminating heap string allocations and deep definition copies during directive logging, cache-frame capture, and replay. When no cache frames are open during translation unit preprocessing, macro op construction is skipped entirely.
+   - `IncludeExpansion` collections (`ops`, `diagnostics`, `guards`, `nested_variants`, `inlined`, `covers`) converted from `Arc<Vec<T>>` to direct `Arc<[T]>` slices, eliminating unused vector capacity and indirection across cached include expansions.
+4. **Lifecycle reclamation and AST pruning (`trace-parse`, `trace-analysis`)**:
+   - Parse trees and transient expression caches dropped immediately upon AST lowering completion (`ctx.tree = None`).
+   - Filesystem directory listing cache (`DIR_LISTINGS`) cleared alongside thread-local path caches post-preprocessing.
+   - `UnitIndex.held_headers` shares `expansion.inlined` as `Arc<[PathBuf]>` without copying path vectors.
+   - Cached header `UnitIndex` instances shrunk to fit prior to caching in `HeaderIr`.
+   - `HeaderIr` and `include_expansion_cache` dropped immediately as translation unit parsing completes before program finalization.
+   - Program IR flow memory released via `program.release_flow()` post-solving, prior to SQLite export.
+   - PAG `Constraint` inline size reduced from 48 B to 24 B (−50.0%) by boxing field access metadata (`FieldAccess.field_name` stored as `Arc<str>`, eliminating heap allocations in solver worklist propagation); eliminated cloning and destructive modification of call edges and wired argument flows during analysis.
+
+### End-to-end benchmark measurements
+
+End-to-end peak memory footprint, RSS, and runtime measurements comparing base (`18303d6`) and head on the pinned evaluation corpora (camera and HDF) are recorded in [Evaluation report](EVAL_REPORT.md#struct-compaction-expansion-sharing-and-lifecycle-reclamation--2026-10-01). All 12 SQLite analysis tables remain byte-identical to base on camera, HDF, and hiview.
+
+
+
