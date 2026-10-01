@@ -2,6 +2,7 @@
 #[path = "configured.rs"]
 mod configured;
 
+use crate::cpp_type_names::is_fundamental_type_name;
 use crate::deps::IncludeGraph;
 use crate::discover::{discover_files, DiscoveredFiles};
 use crate::gn_defines::Candidate;
@@ -11192,48 +11193,6 @@ pub(crate) fn template_tail(raw: &str) -> &str {
     ""
 }
 
-/// A keyword scalar, `auto`, or a standard integer / `nullptr_t` name: never
-/// a class, so never qualified to the namespace it is spelled in.
-fn is_fundamental_type_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.split_whitespace().all(|word| {
-            matches!(
-                word,
-                "int"
-                    | "char"
-                    | "void"
-                    | "bool"
-                    | "float"
-                    | "double"
-                    | "short"
-                    | "long"
-                    | "signed"
-                    | "unsigned"
-                    | "wchar_t"
-                    | "char8_t"
-                    | "char16_t"
-                    | "char32_t"
-                    | "size_t"
-                    | "ssize_t"
-                    | "ptrdiff_t"
-                    | "intptr_t"
-                    | "uintptr_t"
-                    | "int8_t"
-                    | "int16_t"
-                    | "int32_t"
-                    | "int64_t"
-                    | "uint8_t"
-                    | "uint16_t"
-                    | "uint32_t"
-                    | "uint64_t"
-                    | "intmax_t"
-                    | "uintmax_t"
-                    | "nullptr_t"
-                    | "auto"
-            )
-        })
-}
-
 /// A template spelling with every class in it qualified to the current
 /// scope, so that the argument substituted at a `->` names the class the way
 /// the index does: `sptr<Plugin>` inside `namespace ohos` is
@@ -14904,6 +14863,14 @@ fn type_desc_from_node(
     node: Node,
 ) -> TypeDesc {
     let node = peel_cpp_type_node(node);
+    if node.cached_kind() == "decltype" {
+        // The type of an expression is not deduced here, whether spelled
+        // natively or re-spelled from GNU `__typeof__` (docs/ANALYSIS.md,
+        // "C++ parse-input normalization"). Falling through would read the
+        // operand's text as a type name: `decltype(avoid_copy())` was Void,
+        // `decltype(charge())` Char, anything else Int.
+        return TypeDesc::Unknown;
+    }
     if node.cached_kind() == "struct_specifier" || node.cached_kind() == "union_specifier" {
         let name = lower_struct_specifier(program, ctx, source, node);
         if node.cached_kind() == "union_specifier" {
@@ -15090,6 +15057,9 @@ fn peel_cpp_type_node(node: Node) -> Node {
             .cached_field("type")
             .map(peel_cpp_type_node)
             .unwrap_or(node),
+        // `decltype` is terminal: its child is an expression, and peeling
+        // into a qualified operand (`decltype(Outer::Inner)`) would resolve
+        // the operand as if it named the type.
         "qualified_identifier"
         | "type_identifier"
         | "template_type"
@@ -15097,7 +15067,8 @@ fn peel_cpp_type_node(node: Node) -> Node {
         | "struct_specifier"
         | "class_specifier"
         | "union_specifier"
-        | "primitive_type" => node,
+        | "primitive_type"
+        | "decltype" => node,
         _ => {
             for i in 0..node.named_child_count() {
                 if let Some(c) = node.named_child(i) {

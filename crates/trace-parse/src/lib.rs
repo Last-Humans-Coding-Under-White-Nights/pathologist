@@ -2,6 +2,7 @@
 
 mod compile_commands;
 mod compiler_includes;
+mod cpp_type_names;
 mod deps;
 mod discover;
 mod expansion_discovery;
