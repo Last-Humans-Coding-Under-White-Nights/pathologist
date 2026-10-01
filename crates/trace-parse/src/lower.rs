@@ -6,12 +6,10 @@ use crate::deps::IncludeGraph;
 use crate::discover::{discover_files, DiscoveredFiles};
 use crate::gn_defines::Candidate;
 use crate::index_cache::{IndexSourceCache, PreprocessedSource};
-use crate::merge::{
-    merge_unit_header_preamble, merge_unit_index, merge_unit_symbols, merge_unit_types,
-    merge_unit_variants, UnitIndex,
-};
+use crate::merge::{merge_unit_symbols, merge_unit_types, UnitIndex};
 use crate::node_metadata::NodeMetadata;
 use crate::parse::node_text;
+use crate::snapshot::{IndexOutput, UnitMode};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
@@ -332,9 +330,24 @@ pub fn build_program_with_jobs(
     opts: &PreprocessOptions,
     jobs: usize,
 ) -> Result<Program, String> {
-    let result = build_program_inner(root, opts, jobs);
+    let result = build_program_inner(root, opts, jobs, IndexOutput::Program);
     trace_ir::release_thread_path_caches();
     // All per-run caches and the indexing pool have dropped at this point.
+    crate::memory::reclaim_unused_pages();
+    result
+}
+
+/// Write a complete snapshot of lowered units, before the global merge.
+/// The output is replaced atomically only after successful indexing.
+pub fn write_index_with_jobs(
+    root: &Path,
+    opts: &PreprocessOptions,
+    jobs: usize,
+    output: &Path,
+) -> Result<(), String> {
+    let sink = IndexOutput::snapshot(output)?;
+    let result = build_program_inner(root, opts, jobs, sink).map(|_| ());
+    trace_ir::release_thread_path_caches();
     crate::memory::reclaim_unused_pages();
     result
 }
@@ -343,6 +356,7 @@ fn build_program_inner(
     root: &Path,
     opts: &PreprocessOptions,
     jobs: usize,
+    mut sink: IndexOutput,
 ) -> Result<Program, String> {
     let jobs = jobs.max(1);
     // Include resolution memoizes `is_file` for the run (`is_file_cached`);
@@ -520,6 +534,7 @@ fn build_program_inner(
             database,
             links,
             project_compiler_paths,
+            sink,
         );
     }
     index_progress(format!(
@@ -1100,6 +1115,7 @@ fn build_program_inner(
         pch_t.elapsed().as_secs_f64(),
         header_ir.len()
     ));
+    sink.begin(&program, &include_graph);
     for path in include_graph.index_order(&header_ir.keys().cloned().collect::<Vec<_>>()) {
         if let Some(units) = header_ir.get(&path) {
             // A dependency header's own unit is not a translation unit of
@@ -1107,14 +1123,24 @@ fn build_program_inner(
             let is_dep = program.is_dep_path(&path);
             for (_, _, unit) in units {
                 if is_dep {
-                    merge_unit_symbols(&mut program, unit.as_ref());
+                    sink.units(
+                        &mut program,
+                        &include_graph,
+                        UnitMode::Symbols,
+                        std::slice::from_ref(unit.as_ref()),
+                    );
                 } else {
-                    merge_unit_header_preamble(&mut program, unit.as_ref());
+                    sink.units(
+                        &mut program,
+                        &include_graph,
+                        UnitMode::HeaderPreamble,
+                        std::slice::from_ref(unit.as_ref()),
+                    );
                 }
             }
         }
     }
-    program.types.complete_nested_tags();
+    sink.complete_types(&mut program);
 
     if jobs == 1 {
         pool.install(|| {
@@ -1130,17 +1156,20 @@ fn build_program_inner(
                         path.display()
                     ),
                 );
-                merge_unit_index(
+                let unit = index_source_file(
+                    path,
+                    root,
+                    &include_graph,
+                    &index_opts[&index_language(path, &cpp_parse, no_c_units, forced_language)],
+                    &source_cache,
+                    Some(&header_ir),
+                    &header_order,
+                );
+                sink.units(
                     &mut program,
-                    &index_source_file(
-                        path,
-                        root,
-                        &include_graph,
-                        &index_opts[&index_language(path, &cpp_parse, no_c_units, forced_language)],
-                        &source_cache,
-                        Some(&header_ir),
-                        &header_order,
-                    ),
+                    &include_graph,
+                    UnitMode::Full,
+                    std::slice::from_ref(&unit),
                 );
                 source_cache.evict(path, &include_graph);
                 index_item_progress(
@@ -1173,7 +1202,14 @@ fn build_program_inner(
                 source_cache.evict(path, &include_graph);
                 unit
             },
-            |unit| merge_unit_index(&mut program, &unit),
+            |unit| {
+                sink.units(
+                    &mut program,
+                    &include_graph,
+                    UnitMode::Full,
+                    std::slice::from_ref(&unit),
+                )
+            },
         );
     }
 
@@ -1224,7 +1260,7 @@ fn build_program_inner(
                     opts.explore_budget,
                 );
                 source_cache.evict(path, &include_graph);
-                merge_unit_variants(&mut program, &base_unit, &var_units);
+                sink.family(&mut program, &include_graph, &base_unit, &var_units);
                 index_item_progress(
                     i,
                     file_order.len(),
@@ -1262,7 +1298,9 @@ fn build_program_inner(
                     source_cache.evict(path, &include_graph);
                     units
                 },
-                |(base_unit, var_units)| merge_unit_variants(&mut program, &base_unit, &var_units),
+                |(base_unit, var_units)| {
+                    sink.family(&mut program, &include_graph, &base_unit, &var_units)
+                },
             );
             // All workers finished this batch. Return their released AST
             // and temporary-IR pages before the next batch grows the
@@ -1271,28 +1309,35 @@ fn build_program_inner(
         }
     }
 
-    program.types.complete_nested_tags();
+    sink.complete_types(&mut program);
     // After the merges, so the headers involved already hold their ids
     // and forwarding does not reorder the file table.
     for (path, diagnostics) in second_language_diagnostics {
-        let unit_file = program
+        let mut diagnostics_program = Program::new(root.to_path_buf());
+        let unit_file = diagnostics_program
             .symbols
             .add_file_interned(include_graph.intern_path(&path));
-        add_preprocess_diagnostics(&mut program, &include_graph, unit_file, &diagnostics);
+        add_preprocess_diagnostics(
+            &mut diagnostics_program,
+            &include_graph,
+            unit_file,
+            &diagnostics,
+        );
+        sink.diagnostics(&mut program, diagnostics_program);
     }
     if links.unscoped_inference {
-        crate::merge::record_link_targets(&mut program, &links);
+        sink.link_targets(&mut program, &include_graph, &links);
     }
     let inferred_dirs = include_graph.include_dirs.clone();
     source_cache.check_load_errors()?;
-    finalize_program(&mut program, &include_graph, inferred_dirs);
+    sink.finish(&mut program, &include_graph, inferred_dirs)?;
 
     Ok(program)
 }
 
 /// The closing steps every indexing path shares. `extra_dirs` are the search
 /// directories that path observed, recorded in first-seen order.
-fn finalize_program(
+pub(crate) fn finalize_program(
     program: &mut Program,
     graph: &IncludeGraph,
     extra_dirs: impl IntoIterator<Item = PathBuf>,
@@ -1300,13 +1345,25 @@ fn finalize_program(
     program
         .symbols
         .set_inference_root(&graph.root, graph.test_partition.clone());
-    program.include_deps = graph.edge_list();
+    finalize_index_metadata(program, graph.edge_list(), extra_dirs);
+    finalize_merged_program(program);
+}
+
+pub(crate) fn finalize_index_metadata(
+    program: &mut Program,
+    include_deps: Vec<(PathBuf, PathBuf)>,
+    extra_dirs: impl IntoIterator<Item = PathBuf>,
+) {
+    program.include_deps = include_deps;
     let mut seen: HashSet<PathBuf> = program.include_paths.iter().cloned().collect();
     for dir in extra_dirs {
         if seen.insert(dir.clone()) {
             program.include_paths.push(dir);
         }
     }
+}
+
+pub(crate) fn finalize_merged_program(program: &mut Program) {
     finalize_extern_callees(program);
     // Members first: a call is bound when its callee takes `this`, which a
     // member defined without its class in view only has afterwards.
@@ -2907,7 +2964,14 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
         flow: program.flow,
         function_flow_ranges: program.function_flow_ranges,
         global_initializer_ranges: program.global_initializer_ranges,
-        fn_returns: program.fn_returns.into_iter().collect(),
+        // Preserve the pre-snapshot merger's FxHashMap traversal order while
+        // making that order explicit and stable across serialization.
+        fn_returns: program
+            .fn_returns
+            .into_iter()
+            .collect::<HashMap<_, _>>()
+            .into_iter()
+            .collect(),
         diagnostics: program.diagnostics,
         anon_type_counter: program.anon_type_counter,
         inheritance,

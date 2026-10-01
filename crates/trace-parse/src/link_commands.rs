@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use trace_ir::resolve_against;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LinkDatabase {
     pub targets: Vec<LinkTargetSpec>,
     pub warnings: Vec<String>,
@@ -18,7 +18,7 @@ pub(crate) struct LinkDatabase {
     pub unscoped_inference: bool,
     pub inferred: bool,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LinkTargetSpec {
     pub name: String,
     pub output: PathBuf,

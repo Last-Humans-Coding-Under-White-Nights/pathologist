@@ -20,7 +20,7 @@ pub struct IpcBridge {
 
 /// One interface declared by an `.idl` file, with the classes synthesized
 /// for it (docs/ANALYSIS.md, "IDL-generated interfaces").
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IdlInterface {
     /// Dotted IDL name as written (`OHOS.Security.IAtm`), idl-tool's interface descriptor.
     pub descriptor: String,
@@ -33,7 +33,7 @@ pub struct IdlInterface {
     pub methods: Vec<IdlMethod>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IdlMethod {
     pub name: String,
     pub ipccode: Option<u32>,

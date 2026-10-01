@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiagnosticSeverity {
     Error,
     Warning,
@@ -44,7 +44,7 @@ impl MethodKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Diagnostic {
     pub severity: DiagnosticSeverity,
     pub file: Option<crate::FileId>,
@@ -58,7 +58,7 @@ pub struct Diagnostic {
 /// `declaration_scope` is kept separately because an unqualified template
 /// argument is resolved in the namespace or enclosing class where the derived
 /// class is declared, not relative to the template itself or a later caller.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TemplateBase {
     pub derived: String,
     pub spelling: String,
@@ -73,7 +73,7 @@ pub struct TemplateBase {
 /// A C++ class template's parameters and the bases that mention them
 /// (`template<class I> class IRemoteStub : public I`,
 /// `template<class T> class Wrapper : public Layer<T>`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClassTemplate {
     /// Parameter names by position; `None` for an unnamed parameter.
     pub parameters: Vec<Option<String>>,
@@ -314,7 +314,7 @@ impl MergeDedup {
 /// A class-template member returning a type parameter, bare (`T *Get()`) or
 /// as the sole argument of another class template (`sptr<T> Get()`). Kept
 /// with types across header-unit merges; looked up by class and member name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TemplateReturn {
     pub arity: u32,
     /// None blocks inference for an unsupported same-arity return.
@@ -336,7 +336,7 @@ pub struct TemplateReturn {
 /// declaring header: those merge a header's *types* only, and a wrapper-typed
 /// field declared in another header is lowered without the wrapper's members
 /// in scope. Call sites follow these facts to the class `x->m` looks `m` up on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArrowReturn {
     /// The declaring class, spelled without template arguments.
     pub class_name: String,

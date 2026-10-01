@@ -3,13 +3,13 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::Instant;
 use trace_analysis::{analyze_with_options, AnalyzeOptions, ResolutionKind};
 use trace_db::{basename, export_to_sqlite, open_db, ExportOptions};
-use trace_parse::build_program_with_jobs;
+use trace_parse::{build_program_with_jobs, read_index, write_index_with_jobs};
 use trace_preproc::PreprocessOptions;
 
 mod build_info;
@@ -31,82 +31,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Analyze a C project directory and write results to SQLite.
+    /// Analyze a C/C++ project directory and write results to SQLite.
     Analyze {
-        /// Target project directory containing .c files.
-        target: PathBuf,
+        #[command(flatten)]
+        frontend: FrontendArgs,
         /// Output SQLite database path.
         #[arg(short, long, default_value = "trace.db")]
         output: PathBuf,
-        /// Add include search path (repeatable).
-        #[arg(long = "include")]
-        includes: Vec<PathBuf>,
-        /// Define preprocessor macro NAME or NAME=VALUE (repeatable).
-        #[arg(short = 'D')]
-        defines: Vec<String>,
-        /// Compilation database path (default: TARGET/compile_commands.json,
-        /// then TARGET/build/compile_commands.json).
-        #[arg(long)]
-        compile_commands: Option<PathBuf>,
-        /// Query the compiler for effective system header search paths.
-        #[arg(long)]
-        system_includes: bool,
-        /// Link commands database path (default: auto-discovery).
-        #[arg(long)]
-        link_commands: Option<PathBuf>,
-        /// Disable the bare-tree test/mock directory partition.
-        #[arg(long, conflicts_with = "test_dirs")]
-        no_test_partition: bool,
-        /// Replace the default test, tests, mock, mocks directory names (repeatable).
-        #[arg(long = "test-dir")]
-        test_dirs: Vec<String>,
-        /// Number of parallel jobs for indexing (parse/lower).
-        #[arg(long)]
-        jobs: Option<usize>,
-        /// Abort the whole analyze process after N seconds (watchdog).
-        #[arg(long)]
-        timeout_secs: Option<u64>,
-        /// Include points-to debug table in output (also retains points-to in memory during analysis).
-        #[arg(long)]
-        debug_points_to: bool,
-        /// Disable IPC proxy/stub bridge edge detection (enabled by default).
-        #[arg(long)]
-        no_ipc: bool,
-        /// Export full IR detail (types, all variables, PAG locations). Default: call graph + arg-flow only.
-        #[arg(long)]
-        full_export: bool,
-        /// Function-model TOML file (repeatable; overrides built-ins by name).
+        #[command(flatten)]
+        analysis: AnalysisArgs,
+    },
+    /// Preprocess and lower a project into an index snapshot, without global analysis.
+    Index {
+        #[command(flatten)]
+        frontend: FrontendArgs,
+        /// Output index snapshot path.
+        #[arg(short, long, default_value = "trace.index")]
+        output: PathBuf,
+        /// Models whose noise macros must be applied during lowering (repeatable).
         #[arg(long = "models")]
         models: Vec<PathBuf>,
-        /// Macro whose expansions are ignored during lowering (repeatable; supports wildcards like TAG_LOG*).
-        #[arg(long = "ignore-macro")]
-        ignore_macros: Vec<String>,
-        /// Ignore standard OpenHarmony logging macros (HILOG_*, TAG_LOG*, HIVIEW_LOG*, MEDIA_*_LOG, LOGD, LOGI, LOGW, LOGE, LOGF).
+    },
+    /// Merge an index snapshot and analyze it without reading source files.
+    AnalyzeIndex {
+        /// Input index snapshot path.
+        index: PathBuf,
+        /// Output SQLite database path.
+        #[arg(short, long, default_value = "trace.db")]
+        output: PathBuf,
+        /// Abort the process after N seconds (watchdog).
         #[arg(long)]
-        ignore_logging: bool,
-        /// Dependency root: a tree the target builds against but that is not
-        /// under analysis (repeatable). Its headers contribute declarations;
-        /// its sources are never translation units and its bodies contribute
-        /// no call sites or value flow.
-        #[arg(long = "dep")]
-        deps: Vec<PathBuf>,
-        /// Explore feasible configuration variants for conditional code regions (#59).
-        #[arg(long)]
-        explore: bool,
-        /// Maximum number of configuration variants to explore per translation unit (#59).
-        #[arg(long, default_value_t = 4)]
-        explore_budget: usize,
-        /// Solver work budget in worklist pops. The default scales with the
-        /// PAG constraint count (800 000 + 6/constraint); 0 = unlimited.
-        /// `TRACE_SOLVE_BUDGET_POPS` overrides this for experimentation.
-        #[arg(long)]
-        solve_budget_pops: Option<u64>,
-        /// Solver wall-clock budget in seconds. Off by default; 0 = no time
-        /// limit. Checked every 10 000 pops, so a run can overshoot by the
-        /// checkpoint interval plus the pop in flight, and the stop point is
-        /// non-deterministic across runs with different machine load.
-        #[arg(long)]
-        solve_budget_secs: Option<u64>,
+        timeout_secs: Option<u64>,
+        #[command(flatten)]
+        analysis: AnalysisArgs,
     },
     /// Inspect an existing analysis database.
     Inspect {
@@ -115,6 +72,85 @@ enum Commands {
         #[command(subcommand)]
         command: InspectCommands,
     },
+}
+
+#[derive(Args)]
+struct FrontendArgs {
+    /// Target project directory containing .c files.
+    target: PathBuf,
+    /// Add include search path (repeatable).
+    #[arg(long = "include")]
+    includes: Vec<PathBuf>,
+    /// Define preprocessor macro NAME or NAME=VALUE (repeatable).
+    #[arg(short = 'D')]
+    defines: Vec<String>,
+    /// Compilation database path (default: TARGET/compile_commands.json,
+    /// then TARGET/build/compile_commands.json).
+    #[arg(long)]
+    compile_commands: Option<PathBuf>,
+    /// Query the compiler for effective system header search paths.
+    #[arg(long)]
+    system_includes: bool,
+    /// Link commands database path (default: auto-discovery).
+    #[arg(long)]
+    link_commands: Option<PathBuf>,
+    /// Disable the bare-tree test/mock directory partition.
+    #[arg(long, conflicts_with = "test_dirs")]
+    no_test_partition: bool,
+    /// Replace the default test, tests, mock, mocks directory names (repeatable).
+    #[arg(long = "test-dir")]
+    test_dirs: Vec<String>,
+    /// Number of parallel jobs for indexing (parse/lower).
+    #[arg(long)]
+    jobs: Option<usize>,
+    /// Abort the whole analyze process after N seconds (watchdog).
+    #[arg(long)]
+    timeout_secs: Option<u64>,
+    /// Macro whose expansions are ignored during lowering (repeatable; supports wildcards like TAG_LOG*).
+    #[arg(long = "ignore-macro")]
+    ignore_macros: Vec<String>,
+    /// Ignore standard OpenHarmony logging macros (HILOG_*, TAG_LOG*, HIVIEW_LOG*, MEDIA_*_LOG, LOGD, LOGI, LOGW, LOGE, LOGF).
+    #[arg(long)]
+    ignore_logging: bool,
+    /// Dependency root: a tree the target builds against but that is not
+    /// under analysis (repeatable). Its headers contribute declarations;
+    /// its sources are never translation units and its bodies contribute
+    /// no call sites or value flow.
+    #[arg(long = "dep")]
+    deps: Vec<PathBuf>,
+    /// Explore feasible configuration variants for conditional code regions (#59).
+    #[arg(long)]
+    explore: bool,
+    /// Maximum number of configuration variants to explore per translation unit (#59).
+    #[arg(long, default_value_t = 4)]
+    explore_budget: usize,
+}
+
+#[derive(Args)]
+struct AnalysisArgs {
+    /// Include points-to debug table in output (also retains points-to in memory during analysis).
+    #[arg(long)]
+    debug_points_to: bool,
+    /// Disable IPC proxy/stub bridge edge detection (enabled by default).
+    #[arg(long)]
+    no_ipc: bool,
+    /// Export full IR detail (types, all variables, PAG locations). Default: call graph + arg-flow only.
+    #[arg(long)]
+    full_export: bool,
+    /// Function-model TOML file (repeatable; overrides built-ins by name).
+    #[arg(long = "models")]
+    models: Vec<PathBuf>,
+    /// Solver work budget in worklist pops. The default scales with the
+    /// PAG constraint count (800 000 + 6/constraint); 0 = unlimited.
+    /// `TRACE_SOLVE_BUDGET_POPS` overrides this for experimentation.
+    #[arg(long)]
+    solve_budget_pops: Option<u64>,
+    /// Solver wall-clock budget in seconds. Off by default; 0 = no time
+    /// limit. Checked every 10 000 pops, so a run can overshoot by the
+    /// checkpoint interval plus the pop in flight, and the stop point is
+    /// non-deterministic across runs with different machine load.
+    #[arg(long)]
+    solve_budget_secs: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -301,52 +337,21 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Analyze {
-            target,
+            frontend,
             output,
-            includes,
-            defines,
-            compile_commands,
-            system_includes,
-            link_commands,
-            no_test_partition,
-            test_dirs,
-            jobs,
-            timeout_secs,
-            debug_points_to,
-            full_export,
-            models,
-            ignore_macros,
-            ignore_logging,
-            deps,
-            no_ipc,
-            explore,
-            explore_budget,
-            solve_budget_pops,
-            solve_budget_secs,
-        } => run_analyze(
-            target,
+            analysis,
+        } => run_analyze(frontend, output, analysis),
+        Commands::Index {
+            frontend,
             output,
-            includes,
-            defines,
-            compile_commands,
-            system_includes,
-            link_commands,
-            no_test_partition,
-            test_dirs,
-            jobs,
-            timeout_secs,
-            debug_points_to,
-            full_export,
             models,
-            ignore_macros,
-            ignore_logging,
-            deps,
-            no_ipc,
-            explore,
-            explore_budget,
-            solve_budget_pops,
-            solve_budget_secs,
-        ),
+        } => run_index(frontend, output, models),
+        Commands::AnalyzeIndex {
+            index,
+            output,
+            timeout_secs,
+            analysis,
+        } => run_analyze_index(index, output, timeout_secs, analysis),
         Commands::Inspect { db, command } => run_inspect(db, command),
     }
 }
@@ -363,32 +368,7 @@ const OPENHARMONY_LOGGING_MACROS: &[&str] = &[
     "LOGF",
 ];
 
-#[allow(clippy::too_many_arguments)]
-fn run_analyze(
-    target: PathBuf,
-    output: PathBuf,
-    includes: Vec<PathBuf>,
-    defines: Vec<String>,
-    compile_commands: Option<PathBuf>,
-    system_includes: bool,
-    link_commands: Option<PathBuf>,
-    no_test_partition: bool,
-    test_dirs: Vec<String>,
-    jobs: Option<usize>,
-    timeout_secs: Option<u64>,
-    debug_points_to: bool,
-    full_export: bool,
-    model_files: Vec<PathBuf>,
-    ignore_macros: Vec<String>,
-    ignore_logging: bool,
-    deps: Vec<PathBuf>,
-    no_ipc: bool,
-    explore: bool,
-    explore_budget: usize,
-    solve_budget_pops: Option<u64>,
-    solve_budget_secs: Option<u64>,
-) -> Result<()> {
-    select_space_efficient_malloc();
+fn start_watchdog(timeout_secs: Option<u64>) {
     if let Some(secs) = timeout_secs {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(secs));
@@ -396,14 +376,11 @@ fn run_analyze(
             std::process::exit(124);
         });
     }
-    let jobs = jobs.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .max(1)
-    });
+}
+
+fn load_models(model_files: &[PathBuf]) -> Result<std::sync::Arc<trace_analysis::FnModelSet>> {
     let mut models = trace_analysis::FnModelSet::builtin();
-    for path in &model_files {
+    for path in model_files {
         let src = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read models file {}", path.display()))?;
         models
@@ -423,6 +400,37 @@ fn run_analyze(
             model_files.len()
         );
     }
+    Ok(models)
+}
+
+fn prepare_frontend(
+    frontend: FrontendArgs,
+    models: &trace_analysis::FnModelSet,
+) -> Result<(PathBuf, PreprocessOptions, usize)> {
+    let FrontendArgs {
+        target,
+        includes,
+        defines,
+        compile_commands,
+        system_includes,
+        link_commands,
+        no_test_partition,
+        test_dirs,
+        jobs,
+        timeout_secs,
+        ignore_macros,
+        ignore_logging,
+        deps,
+        explore,
+        explore_budget,
+    } = frontend;
+    start_watchdog(timeout_secs);
+    let jobs = jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1)
+    });
     let mut opts = PreprocessOptions::new();
     opts.test_partition = trace_ir::TestPartition::from_options(no_test_partition, test_dirs)
         .map_err(anyhow::Error::msg)?;
@@ -533,10 +541,15 @@ fn run_analyze(
         }
     }
 
+    Ok((target, opts, jobs))
+}
+
+fn run_analyze(frontend: FrontendArgs, output: PathBuf, options: AnalysisArgs) -> Result<()> {
+    select_space_efficient_malloc();
+    let models = load_models(&options.models)?;
+    let (target, opts, jobs) = prepare_frontend(frontend, &models)?;
     let t0 = Instant::now();
-    let mut program =
-        build_program_with_jobs(&target, &opts, jobs).map_err(|e| anyhow::anyhow!(e))?;
-    program.release_merge_state();
+    let program = build_program_with_jobs(&target, &opts, jobs).map_err(|e| anyhow::anyhow!(e))?;
     eprintln!(
         "index: {:.1}s ({} files, {} functions, {} flow)",
         t0.elapsed().as_secs_f64(),
@@ -545,6 +558,62 @@ fn run_analyze(
         program.flow.len(),
     );
 
+    analyze_program(program, output, options, models)
+}
+
+fn run_index(frontend: FrontendArgs, output: PathBuf, model_files: Vec<PathBuf>) -> Result<()> {
+    select_space_efficient_malloc();
+    let models = load_models(&model_files)?;
+    let (target, opts, jobs) = prepare_frontend(frontend, &models)?;
+    let t0 = Instant::now();
+    write_index_with_jobs(&target, &opts, jobs, &output).map_err(anyhow::Error::msg)?;
+    eprintln!(
+        "index snapshot: {:.1}s -> {}",
+        t0.elapsed().as_secs_f64(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn run_analyze_index(
+    index: PathBuf,
+    output: PathBuf,
+    timeout_secs: Option<u64>,
+    options: AnalysisArgs,
+) -> Result<()> {
+    select_space_efficient_malloc();
+    start_watchdog(timeout_secs);
+    let models = load_models(&options.models)?;
+    let t0 = Instant::now();
+    let program = read_index(&index).map_err(anyhow::Error::msg)?;
+    for noise_macro in models.noise_macros() {
+        if !program.ignored_macros.contains(noise_macro) {
+            bail!("model noise macro {noise_macro} was not applied during indexing; rebuild with trace index --models");
+        }
+    }
+    eprintln!(
+        "read and merge index: {:.1}s ({} functions)",
+        t0.elapsed().as_secs_f64(),
+        program.symbols.functions.len()
+    );
+    analyze_program(program, output, options, models)
+}
+
+fn analyze_program(
+    mut program: trace_ir::Program,
+    output: PathBuf,
+    options: AnalysisArgs,
+    models: std::sync::Arc<trace_analysis::FnModelSet>,
+) -> Result<()> {
+    program.release_merge_state();
+    let AnalysisArgs {
+        debug_points_to,
+        full_export,
+        models: model_files,
+        no_ipc,
+        solve_budget_pops,
+        solve_budget_secs,
+    } = options;
     let t1 = Instant::now();
     let (pag, analysis) = analyze_with_options(
         &program,

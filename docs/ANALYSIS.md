@@ -40,6 +40,90 @@ flowchart TD
 2. **`solve`** — worklist propagation until fixpoint; discover indirect callees when call-target points-to gains function locations.
 3. **`extract_arg_flow`** — emit `arg_flow_edges` for wired parameter copies at resolved calls.
 
+## Index snapshots
+
+`trace index ROOT -o project.index` runs discovery, the custom preprocessor,
+and per-unit parsing/lowering, then writes the lowered facts before the global
+merge. `trace analyze-index project.index -o analysis.db` reads those facts,
+merges them into one `Program`, performs global finalization, and runs the
+ordinary PAG/solver/export pipeline. `trace analyze ROOT` executes the same
+merge schedule directly in memory. The Rust entry points are
+`trace_parse::write_index_with_jobs` and `trace_parse::read_index`; the latter
+returns a finalized `Program` for the existing analysis API.
+
+A snapshot is a complete indexing run, not an incremental cache. Reading it
+requires neither the source tree nor its compilation/link databases, including
+dependency and synthesized IDL headers. Paths in the exported database retain
+their original spelling; moving a snapshot does not relocate those paths.
+Source edits do not invalidate or refresh a snapshot automatically: rerun
+`trace index` to capture them. Snapshots from unrelated runs cannot simply be
+concatenated, because header discovery and configuration families belong to
+their originating run.
+
+Format version 2 is a binary stream: the eight-byte magic
+`89 54 52 49 44 58 0d 0a`, a little-endian `u32` version, then length-prefixed
+MessagePack records
+(each length is a little-endian `u64`). Structs use positional fields, without
+field names. Encoding and decoding stream each record directly through buffered
+file I/O, without staging its encoded payload in memory. A header record and
+end record are required. Version 1 JSON snapshots must be rebuilt.
+The header records the frontend package version, root,
+canonical inference root, dependency classification roots, test partition,
+defines, include paths, IDL interface facts, frontend diagnostics, exploration
+settings, and ignored macro patterns. Unit records contain the complete
+`UnitIndex` facts, including original source spans, macro occurrence identities,
+body text used for header sharing, and configuration ordinals. The actual
+lowered facts capture the effective per-command environment; the format does
+not store a recipe for rerunning each compilation command.
+
+Records preserve the frontend's merge order and operations: declaration-only
+dependency headers, header preambles, ordinary units, configuration families,
+and link-target groups. They also preserve the points where nested type tags
+are completed, additional diagnostics, inferred link membership, and the
+configured path's per-source exploration count. The end record carries the
+settled include graph and observed search directories. Reading reuses the
+existing merger and target/weak selection policies. Global external-callee,
+implicit-`this`, template-base, virtual-dispatch, and wrapper finalization runs
+after replay; `CallReturn` expansion and IPC detection remain in PAG build.
+
+Entity IDs stay unit-local until merge. Function and variable IDs may be
+sparse after declaration deduplication; the reader checks references against
+the actual IDs rather than assuming vector positions. Return summaries retain
+insertion order across serialization, so replay preserves post-merge flow
+expansion order. Type tables persist their local IDs, descriptors, layouts,
+aliases, and declaration/tag facts; descriptor pools, address indexes, and
+canonicalization memoization are rebuilt in the reading process. Prepared
+`merge_descs` are also persisted: compacted header tables have already
+discarded layouts and cannot always reconstruct these descriptors (see
+[Type storage](#type-storage)).
+
+Writes use a temporary file beside the destination and publish it by rename
+only after all records are written and flushed. Failed indexing does not
+replace an existing snapshot. The reader rejects unsupported format versions,
+truncated streams, invalid frame lengths, extra payload bytes, trailing records,
+and invalid unit references before those units are merged. Bump the format version when the serialized facts or merge
+contract change incompatibly; analysis-only changes may reuse a compatible
+snapshot.
+
+Frontend flags (`-D`, includes, dependency roots, build databases, exploration,
+and macro filtering) belong to `index`. Solver budgets, IPC detection, function
+summary models, and export options belong to `analyze-index`. A model file's
+`[noise]` patterns affect lowering: pass it to `index` too. The reader command
+rejects model noise patterns absent from the snapshot's recorded filter list,
+because applying them requires rebuilding frontend facts. Model summary files
+are read separately by the analysis command and are not embedded in the index.
+
+Binary encoding avoids JSON field names and decimal integer overhead. Units
+still embed their header closures and repeated descriptor content; this format
+does not add cross-unit dictionaries or compression.
+The bare-tree path streams units with the existing bounded worker window;
+configured families and linked groups currently retain their whole unit set
+as the existing merger requires. Separating processes releases frontend caches
+before analysis, but does not bound the full `Program`/PAG/solver footprint or
+remove preprocessing's peak. Measurements belong in
+[EVAL_REPORT.md](EVAL_REPORT.md); the earlier incremental-cache assessment is
+in [PERFORMANCE_REVIEW.md](PERFORMANCE_REVIEW.md#incremental-per-tu-ir-cache-macos-measurements-and-decision-175).
+
 ## Call source locations
 
 A call token written in a source macro replacement list uses the token's

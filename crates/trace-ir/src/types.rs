@@ -320,6 +320,109 @@ impl Default for TypeTable {
     }
 }
 
+// Persist table-local identities and layouts, never process-local addresses or
+// memoized canonicalization answers. Old descriptor keys retained by aggregate
+// unioning also remain meaningful aliases for their original IDs.
+#[derive(Serialize, Deserialize)]
+struct StoredTypeTable {
+    types: Vec<TypeInfo>,
+    intern: Vec<(Arc<TypeDesc>, TypeId)>,
+    aliases: IndexMap<String, Arc<TypeDesc>, FxBuildHasher>,
+    declared_structs: std::collections::BTreeSet<Arc<str>>,
+    defined_structs: std::collections::BTreeSet<Arc<str>>,
+    struct_tags: std::collections::BTreeMap<String, TypeId>,
+    union_tags: std::collections::BTreeMap<String, TypeId>,
+    needs_tag_completion: bool,
+}
+
+impl Serialize for TypeTable {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Borrow the large descriptor and layout vectors during serialization.
+        // Keep the field order aligned with StoredTypeTable: binary snapshots
+        // encode structs positionally.
+        #[derive(Serialize)]
+        struct Stored<'a> {
+            types: &'a [TypeInfo],
+            intern: Vec<(&'a Arc<TypeDesc>, TypeId)>,
+            aliases: &'a IndexMap<String, Arc<TypeDesc>, FxBuildHasher>,
+            declared_structs: std::collections::BTreeSet<&'a Arc<str>>,
+            defined_structs: std::collections::BTreeSet<&'a Arc<str>>,
+            struct_tags: std::collections::BTreeMap<&'a str, TypeId>,
+            union_tags: std::collections::BTreeMap<&'a str, TypeId>,
+            needs_tag_completion: bool,
+        }
+        Stored {
+            types: &self.types,
+            intern: self.intern.iter().map(|(desc, id)| (desc, *id)).collect(),
+            aliases: &self.aliases,
+            declared_structs: self.declared_structs.iter().collect(),
+            defined_structs: self.defined_structs.iter().collect(),
+            struct_tags: self
+                .struct_tags
+                .iter()
+                .map(|(name, id)| (name.as_str(), *id))
+                .collect(),
+            union_tags: self
+                .union_tags
+                .iter()
+                .map(|(name, id)| (name.as_str(), *id))
+                .collect(),
+            needs_tag_completion: self.needs_tag_completion,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TypeTable {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let stored = StoredTypeTable::deserialize(deserializer)?;
+        let len = stored.types.len();
+        if stored
+            .types
+            .iter()
+            .enumerate()
+            .any(|(i, t)| t.id.0 as usize != i)
+            || stored
+                .types
+                .iter()
+                .flat_map(|t| t.layout.fields.values())
+                .any(|f| f.type_id.0 as usize >= len)
+            || stored
+                .intern
+                .iter()
+                .map(|(_, id)| id)
+                .chain(stored.struct_tags.values())
+                .chain(stored.union_tags.values())
+                .any(|id| id.0 as usize >= len)
+        {
+            return Err(serde::de::Error::custom("invalid type-table IDs"));
+        }
+        let mut table = Self::new();
+        table.types = stored.types;
+        for info in &mut table.types {
+            info.desc = table.descriptors.share(&info.desc);
+        }
+        table.intern.clear();
+        table.by_ptr.0.clear();
+        for (desc, id) in stored.intern {
+            let shared = table.descriptors.share(&desc);
+            table.by_ptr.0.insert(Arc::as_ptr(&shared) as usize, id);
+            table.intern.insert(shared, id);
+        }
+        table.aliases = stored
+            .aliases
+            .into_iter()
+            .map(|(name, desc)| (name, table.descriptors.share(&desc)))
+            .collect();
+        table.declared_structs = stored.declared_structs.into_iter().collect();
+        table.defined_structs = stored.defined_structs.into_iter().collect();
+        table.struct_tags = stored.struct_tags.into_iter().collect();
+        table.union_tags = stored.union_tags.into_iter().collect();
+        table.needs_tag_completion = stored.needs_tag_completion;
+        Ok(table)
+    }
+}
+
 impl TypeTable {
     pub fn new() -> Self {
         let mut table = Self {

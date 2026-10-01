@@ -3,12 +3,12 @@
 //! include search configuration for the entire tree.
 
 use super::{
-    finalize_program, index_language, index_pool, index_progress, index_source_file,
-    index_source_file_with_variants, project_preprocess_opts, with_project_system_paths,
-    HeaderOrder,
+    index_language, index_pool, index_progress, index_source_file, index_source_file_with_variants,
+    project_preprocess_opts, with_project_system_paths, HeaderOrder,
 };
 use crate::compile_commands::CompilationDatabase;
-use crate::merge::{merge_unit_index, merge_unit_variants, UnitIndex};
+use crate::merge::UnitIndex;
+use crate::snapshot::{IndexOutput, UnitMode};
 use crate::{IncludeGraph, IndexSourceCache};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
@@ -38,6 +38,7 @@ pub(super) fn build(
         crate::compiler_includes::CompilerSearch,
         crate::compiler_includes::CompilerSearch,
     )>,
+    mut sink: IndexOutput,
 ) -> Result<Program, String> {
     let candidates = (opts.explore && opts.explore_budget > 0)
         .then(|| crate::explore::scan_project_gn_candidates(root));
@@ -166,17 +167,18 @@ pub(super) fn build(
     // Merge the complete configuration family together. A shared header can
     // vary between different source files as well as between commands for one
     // source; ordinary TU deduplication would drop its second body.
+    sink.begin(&program, &graph);
     if !links.targets.is_empty() && !links.unscoped_inference {
-        crate::merge::merge_linked_units(&mut program, &units, &links);
-    } else if let Some((base, variants)) = units.split_first() {
-        merge_unit_variants(&mut program, base, variants);
+        sink.linked(&mut program, &graph, &units, &links);
+    } else {
+        sink.units(&mut program, &graph, UnitMode::Family, &units);
     }
     if links.unscoped_inference {
-        crate::merge::record_link_targets(&mut program, &links);
+        sink.link_targets(&mut program, &graph, &links);
     }
     // `merge_unit_variants` counts variants across the whole family; this field
     // means variants per source, so the per-file tally replaces it.
-    program.variants_merged = variants_merged;
+    sink.variant_count(&mut program, variants_merged);
     let mut cpp_sources = FxHashSet::default();
     let mut no_c_units = true;
     for path in files {
@@ -219,7 +221,12 @@ pub(super) fn build(
                 None,
                 &HeaderOrder::default(),
             );
-            merge_unit_index(&mut program, &unit);
+            sink.units(
+                &mut program,
+                &graph,
+                UnitMode::Full,
+                std::slice::from_ref(&unit),
+            );
         }
     } else {
         let header_units: Vec<UnitIndex> = pool.install(|| {
@@ -252,10 +259,15 @@ pub(super) fn build(
                 .collect()
         });
         for unit in &header_units {
-            merge_unit_index(&mut program, unit);
+            sink.units(
+                &mut program,
+                &graph,
+                UnitMode::Full,
+                std::slice::from_ref(unit),
+            );
         }
     }
-    program.types.complete_nested_tags();
+    sink.complete_types(&mut program);
     // Every search directory any configuration actually used, in first-seen
     // order. `fallback` carries the inferred directories the other path records.
     let observed_dirs: Vec<PathBuf> = database
@@ -274,7 +286,7 @@ pub(super) fn build(
         })
         .cloned()
         .collect();
-    finalize_program(&mut program, &graph, observed_dirs);
+    sink.finish(&mut program, &graph, observed_dirs)?;
     Ok(program)
 }
 

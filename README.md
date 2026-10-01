@@ -50,6 +50,22 @@ trace inspect /tmp/trace.db calls --from main
 trace inspect /tmp/trace.db calls --from caller --to helper
 ```
 
+Save frontend work as a binary index and rerun analysis from disk:
+
+```bash
+trace index ./tests/fixtures/direct_call -o /tmp/project.index
+trace analyze-index /tmp/project.index -o /tmp/trace.db
+trace analyze-index /tmp/project.index --full-export --debug-points-to -o /tmp/detail.db
+```
+
+The second command works without the source tree. Indexing flags such as
+`--compile-commands`, `--dep`, `-D`, and `--explore` go on `trace index`;
+solver budgets, models, and export options go on `trace analyze-index`.
+Model files with `[noise]` macro filters must also be passed to `trace index`.
+Snapshots capture one complete frontend run and must be rebuilt after source
+or indexing configuration changes. See [Index snapshots](docs/ANALYSIS.md#index-snapshots)
+for format compatibility and current storage/memory limits.
+
 Analyze a large tree (parallel indexing, minimal SQLite export):
 
 ```bash
@@ -624,7 +640,7 @@ crates/
   trace-analysis/  PAG construction, Andersen solver, call graph
   trace-db/        SQLite schema and export
   trace-capi/      C ABI wrapper library (`libtrace_capi`) and C header (`trace.h`)
-  trace-cli/       `trace` binary (`analyze`, `inspect`)
+  trace-cli/       `trace` binary (`analyze`, `index`, `analyze-index`, `inspect`)
   trace-merge/     Cross-repository database merger & callgraph reconstruction (`trace-merge`)
 docs/              Design docs (architecture, analysis, preprocessor, schema)
 tests/fixtures/    Integration test C corpora

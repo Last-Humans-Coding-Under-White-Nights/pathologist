@@ -11,7 +11,7 @@ use trace_ir::{
 };
 
 /// Per-file indexing result merged into a single [`Program`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UnitIndex {
     pub path: PathBuf,
     /// Successful command ordinal for this source in the compilation database.
@@ -34,7 +34,8 @@ pub struct UnitIndex {
     pub function_flow_ranges: FxHashMap<FnId, Vec<std::ops::Range<usize>>>,
     /// Initializer constraints, including temporaries and deferred references.
     pub global_initializer_ranges: FxHashMap<VarId, Vec<std::ops::Range<usize>>>,
-    pub fn_returns: FxHashMap<FnId, Vec<ReturnFlow>>,
+    /// Explicit merge traversal order, preserved when a unit is serialized.
+    pub fn_returns: indexmap::IndexMap<FnId, Vec<ReturnFlow>>,
     pub diagnostics: Vec<trace_ir::Diagnostic>,
     pub anon_type_counter: u32,
     /// Per-unit `(derived, base)` class edges (C++).

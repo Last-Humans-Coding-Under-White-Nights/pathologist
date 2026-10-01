@@ -16,6 +16,7 @@ mod memory;
 mod merge;
 mod node_metadata;
 mod parse;
+mod snapshot;
 mod template_bases;
 
 pub use deps::*;
@@ -26,3 +27,4 @@ pub use index_cache::IndexSourceCache;
 pub use discover::*;
 pub use lower::*;
 pub use parse::*;
+pub use snapshot::read_index;

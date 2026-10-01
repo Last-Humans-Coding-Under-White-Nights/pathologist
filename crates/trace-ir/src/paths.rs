@@ -237,7 +237,7 @@ pub fn resolve_against(directory: &Path, path: &Path) -> PathBuf {
 /// Directory-name policy for bare-tree production/test inference.
 /// An empty effective list disables the partition. See docs/ANALYSIS.md,
 /// "Declaring-header eligibility".
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TestPartition {
     directories: Vec<String>,
 }

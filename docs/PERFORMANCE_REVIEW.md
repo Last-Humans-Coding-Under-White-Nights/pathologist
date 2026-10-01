@@ -640,6 +640,23 @@ ahead of the merge), and the floor it would stream into is the problem.
 
 ### What the peak is made of, and where the time goes
 
+**Follow-up: frontend snapshots (2026-10-01).** Rechecking the current code
+confirms the Gate 2 dependency on globally settled header variants: selection
+still takes the first matching fingerprint, publication is bounded, and the
+configured path inlines headers in independent environments. The earlier
+no-go decision concerns incremental invalidation and the specified warm-run
+memory/time thresholds. A completed frontend snapshot has a different scope:
+it records the settled lowered facts once and replays the ordinary global
+merge without rerunning discovery or preprocessing. It does not establish
+safe changed-TU reuse or change the cold preprocessing peak.
+
+One Gate 3 detail has changed with header compaction: `merge_descs` is no
+longer universally rebuildable from a persisted type table, because cached
+header layouts are discarded after those descriptors are prepared. Snapshots
+must preserve both. The complete snapshot contract and limitations are in
+[ANALYSIS.md, "Index snapshots"](ANALYSIS.md#index-snapshots); new measurements
+are recorded in [EVAL_REPORT.md](EVAL_REPORT.md).
+
 These are cold-run levers; they are what the measurements point at, and
 they lower any future warm run's floor too.
 

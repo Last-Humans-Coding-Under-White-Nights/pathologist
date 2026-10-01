@@ -1,5 +1,113 @@
 # Evaluation Report
 
+## Frontend index snapshots — 2026-10-01
+
+The snapshot implementation follows the
+[Index snapshots contract](ANALYSIS.md#index-snapshots). Rechecking the earlier
+[incremental-cache investigation](PERFORMANCE_REVIEW.md#incremental-per-tu-ir-cache-macos-measurements-and-decision-175)
+confirmed its global preprocessing dependency; these measurements test reuse
+of a completed frontend run, without selective invalidation.
+
+Release build, standard Linux allocator, x86_64 AMD Ryzen 7 8845HS, 32 GB RAM,
+rustc 1.95.0. Clean HDF (`drivers_hdf_core`,
+`cdc75a20bb8f1a046cd22e189405a20d602d0521`), 802 TUs, eight indexing jobs,
+minimal export, built-in models, 800,000-pop solver budget. Direct analysis,
+snapshot creation, and replay ran sequentially as fresh processes; filesystem
+caches were not cleared. One sample per command, measured with `/usr/bin/time`:
+
+| Format | Command | Wall | User + system CPU | Peak RSS |
+|---|---|---:|---:|---:|
+| JSON baseline | `trace analyze` | 9.18 s | 22.01 s | 298.1 MiB |
+| JSON baseline | `trace index` | 4.52 s | 17.30 s | 256.0 MiB |
+| JSON baseline | `trace analyze-index` | 8.50 s | 8.35 s | 238.3 MiB |
+| Binary version 2 | `trace analyze` | 9.98 s | 23.34 s | 300.3 MiB |
+| Binary version 2 | `trace index` | 4.71 s | 18.51 s | 249.8 MiB |
+| Binary version 2 | `trace analyze-index` | 6.42 s | 7.00 s | 239.1 MiB |
+
+The MessagePack snapshot occupies 74,662,220 bytes (71.2 MiB), down from
+263,317,145 bytes (251.1 MiB) for JSON: **71.6% smaller**, without compression.
+Reading, restoring descriptor sharing, merging, and finalizing took 2.1 s
+versus 3.5 s in the JSON baseline. Total replay took 6.42 s versus 8.50 s
+(24.5% less wall time); peak replay RSS was essentially unchanged. Index
+creation remains dominated by frontend work and did not improve in these
+samples. Creating and consuming a binary snapshot once took 11.13 s versus
+9.98 s for direct analysis; repeated analysis reuses the completed frontend
+run. The direct-analysis samples also vary, so these measurements do not
+establish a general speedup or a new memory result for the ability-runtime/
+macOS investigation.
+
+All 16 SQLite tables matched by row count and SHA-256 of rows ordered by all
+columns, excluding only `analysis_run.created_at`: direct versus replay within
+each format and between the JSON and binary batches. All solves converged
+after 394,848 worklist pops. The result contains 11,996 functions, 76,530 call
+edges, and 69,999 argument-flow edges. Units still retain header closures and
+repeated descriptor content; binary encoding reduces their byte overhead.
+
+The workspace suite passes 1,660 tests, including eight snapshot integration
+tests. They compare minimal and full/debug exports after making source trees
+unavailable, exercise configured/link-target weak selection, exploration,
+dependencies, macro source positions, IDL, anonymous/template classes, deep
+types, and model noise filtering, and check reproducible bytes, failed-write
+preservation, and malformed binary snapshot rejection, with a parser unit test
+for invalid unit-local references. Clippy passes for the parser
+and CLI including all targets.
+
+Reproduce with the current release binary:
+
+```bash
+cargo build -p trace-cli --release
+/usr/bin/time -v target/release/trace analyze ~/drivers_hdf_core --jobs 8 --solve-budget-pops 800000 -o /tmp/direct.db
+/usr/bin/time -v target/release/trace index ~/drivers_hdf_core --jobs 8 -o /tmp/hdf.index
+/usr/bin/time -v target/release/trace analyze-index /tmp/hdf.index --solve-budget-pops 800000 -o /tmp/replay.db
+```
+
+### `ability_ability_runtime`: binary snapshot — 2026-10-01
+
+Same Linux host, release profile, and standard allocator as the HDF measurements
+above. Clean local corpus at `87e02b78de2dfc08cbc98cc84eb0678302cce80b`:
+3,450 TUs, 3,102 headers, 6,579 include-graph files. This is a different revision
+from the earlier macOS incremental-cache investigation. Eight indexing jobs,
+minimal export, built-in models, default adaptive solver budget, no solver time
+limit, and no compilation or link database. Direct analysis, binary indexing,
+and replay ran sequentially as fresh processes; filesystem caches were not
+cleared. One sample per command, measured with `/usr/bin/time`:
+
+| Command | Wall | User + system CPU | Peak RSS |
+|---|---:|---:|---:|
+| `trace analyze` | 96.93 s | 354.97 s | 1,616.1 MiB |
+| `trace index` | 85.60 s | 336.79 s | 1,590.5 MiB |
+| `trace analyze-index` | 60.91 s | 60.98 s | 900.1 MiB |
+
+The binary snapshot occupies **2,052,279,178 bytes (1.91 GiB)**, without
+compression. Replay used **37.2% less wall time and 44.3% less peak RSS** than
+direct analysis in this pair. Read/restore/merge/finalization took 49.9 s,
+analysis 4.7 s, and export 6.3 s. Thus loading and merging remains the dominant
+replay cost on this tree, and the artifact still reflects repeated per-unit
+header facts. These measurements do not include a JSON snapshot of this corpus.
+
+The first split run costs 146.51 s (index plus replay), versus 96.93 s for direct
+analysis. Indexing's peak remains close to direct analysis's peak; the memory
+benefit applies to subsequent analysis processes that load an existing index.
+At these sampled times, snapshot creation is amortized after three analysis
+runs against unchanged frontend facts. This is completed-run reuse, not an
+incremental invalidation result or a macOS memory measurement.
+
+All **16 SQLite tables match** by row count and SHA-256 of rows ordered by all
+columns, excluding only `analysis_run.created_at`. Both solves converged after
+**418,575 worklist pops**, below the adaptive budget of 2,449,016. Both exports
+contain 83,900 functions, 653,907 call edges (including 1,265 IPC edges), and
+321,072 argument-flow edges. The corpus remained clean after the runs.
+
+Raw logs, timing data, commands, binary hash, table hashes, and the benchmark
+harness are in `/tmp/trace-ability-binary-snapshot-eval/`. Reproduce:
+
+```bash
+cargo build -p trace-cli --release
+/usr/bin/time -v target/release/trace analyze ~/ability_ability_runtime --jobs 8 -o /tmp/ability-direct.db
+/usr/bin/time -v target/release/trace index ~/ability_ability_runtime --jobs 8 -o /tmp/ability.index
+/usr/bin/time -v target/release/trace analyze-index /tmp/ability.index -o /tmp/ability-replay.db
+```
+
 ## macOS space-efficient malloc — 2026-09-30
 
 On macOS `trace analyze` now runs under libmalloc's space-efficient mode by

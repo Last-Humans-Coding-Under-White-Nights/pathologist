@@ -3,14 +3,14 @@ use indexmap::IndexMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Linkage {
     External,
     Internal,
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum StorageClass {
     Global,
     FileStatic,
@@ -19,7 +19,7 @@ pub enum StorageClass {
     Local,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Variable {
     pub id: VarId,
     pub name: String,
@@ -93,7 +93,7 @@ impl Variable {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Function {
     pub id: FnId,
     pub name: String,
@@ -189,7 +189,7 @@ pub struct Function {
 /// span may come from a substituted receiver or member token whose provenance
 /// is shared by several calls; this location remains tied to the call's own
 /// replacement-list tokens and carries the intermediate expansion chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CallOccurrence {
     pub span: Span,
     pub expansion_span: Option<Span>,
@@ -198,7 +198,7 @@ pub struct CallOccurrence {
     pub expansion_id: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CallSite {
     pub id: crate::CallSiteId,
     pub caller: FnId,
