@@ -1804,6 +1804,28 @@ C++-aware only where it must be — everything else reuses the C machinery.
   name, so `fv.GetNumber<int>()` / `b.read<short>()` resolve directly.
   In-class template methods (`template_declaration` members in a class
   body) register as prototypes and lower their inner `function_definition`.
+- **Friend declarations and operator attributes**: Tree-sitter C++ grammar admits
+  only `[constexpr] friend (declaration | function_definition)` for
+  `friend_declaration`, rejecting attribute specifiers that precede `friend` or
+  `constexpr friend` (such as `[[nodiscard]] friend bool operator==(...)`). Before
+  parsing, C++ sources undergo parse-syntax normalization
+  (`normalize_cpp_parse_syntax`) where attribute specifiers preceding `friend`
+  (including those preceding `constexpr friend`) are blanked with ASCII spaces
+  in place, strictly preserving newlines and byte coordinates. Friend lowering
+  (`lower_friend_declarations`) lowers in-class friend function definitions and
+  friend operator declarations as non-member functions belonging to the innermost
+  enclosing namespace ([class.friend]) with `ctx.class_ctx = None`. Friend functions
+  do not receive an implicit `this` parameter, are not qualified with class scope,
+  and do not resolve identifiers via `implicit_this`, correctly matching call sites
+  and merging with out-of-class definitions. During body lowering, lexical class
+  lookup (`ctx.friend_classes`) is preserved for direct calls within the friend body
+  so static member calls (e.g. `helper()`) resolve to members of the enclosing class
+  and its bases, shadowing outer namespace definitions in accordance with standard
+  C++ scope hiding rules. Friend bodies are lowered only after the class's in-class
+  member definitions have entries (`DeferredFriendBody`), so a bare call to a
+  static member defined inline in the class resolves to that member too.
+  Function-local / block-scoped using declarations (`using X::f;`) within the body
+  take precedence, shadowing both enclosing class and namespace scopes.
 - **Classes**: layouts intern under the fully qualified tag
   (`gfx::Shape`). Inheritance facts (`Program.inheritance`) drive member
   resolution: a call walks upward to the nearest declaring base. **Non-virtual**

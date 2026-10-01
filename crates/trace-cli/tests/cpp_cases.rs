@@ -13138,3 +13138,89 @@ fn cpp_alternate_member_definitions_stay_equal_candidates() {
     lines.dedup();
     assert_eq!(lines, [3, 5], "both definitions");
 }
+
+#[test]
+fn friend_body_lexical_class_lookup_for_static_member() {
+    let (_dir, program) = build_tree(
+        &[(
+            "main.cpp",
+            "void wrong() {}\n\
+             void right() {}\n\
+             void helper() { wrong(); }\n\
+             struct C {\n\
+                 static void helper();\n\
+                 friend void run(C) { helper(); }\n\
+             };\n\
+             void C::helper() { right(); }\n\
+             void entry(C c) { run(c); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run",
+        "C::helper",
+        ResolutionKind::Direct
+    ));
+    assert!(must_not_have_edge(&program, &analysis, "run", "helper"));
+}
+
+#[test]
+fn friend_body_lexical_class_lookup_for_inline_static_member() {
+    let (_dir, program) = build_tree(
+        &[(
+            "main.cpp",
+            "void wrong() {}\n\
+             void right() {}\n\
+             void helper() { wrong(); }\n\
+             struct C {\n\
+                 static void helper() { right(); }\n\
+                 friend void run(C) { helper(); }\n\
+             };\n\
+             void entry(C c) { run(c); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run",
+        "C::helper",
+        ResolutionKind::Direct
+    ));
+    assert!(must_not_have_edge(&program, &analysis, "run", "helper"));
+}
+
+#[test]
+fn friend_body_block_scoped_import_shadows_enclosing_class() {
+    let (_dir, program) = build_tree(
+        &[(
+            "main.cpp",
+            "namespace N {\n\
+                 void target() {}\n\
+                 void helper() { target(); }\n\
+             }\n\
+             struct C {\n\
+                 static void helper() {}\n\
+                 friend void run(C) {\n\
+                     using N::helper;\n\
+                     helper();\n\
+                 }\n\
+             };\n\
+             void entry(C c) { run(c); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run",
+        "N::helper",
+        ResolutionKind::Direct
+    ));
+    assert!(must_not_have_edge(&program, &analysis, "run", "C::helper"));
+}

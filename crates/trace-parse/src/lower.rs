@@ -119,6 +119,8 @@ struct LowerContext {
     c_linkage: bool,
     /// Enclosing class while lowering in-class member definitions.
     class_ctx: Option<ClassCtx>,
+    /// Lexical enclosing classes while lowering friend function definitions in class bodies.
+    friend_classes: Vec<String>,
     /// Fully qualified classes whose scope a type name is looked up in,
     /// innermost last: the class whose body is being lowered, or the class a
     /// member function's parameters and body belong to. `RefCell` because a
@@ -2657,6 +2659,7 @@ fn lower_prepared_source(
         using_name_imports: Vec::new(),
         c_linkage: false,
         class_ctx: None,
+        friend_classes: Vec::new(),
         type_scope: RefCell::new(Vec::new()),
         local_aliases: Vec::new(),
         is_cpp,
@@ -3979,7 +3982,42 @@ fn lower_class_members(
     cls_qual: &str,
 ) {
     register_class_prototypes(program, ctx, source, node, cls_qual);
+    let mut friend_bodies = Vec::new();
+    lower_friend_declarations(program, ctx, source, node, cls_qual, &mut friend_bodies);
     lower_class_definitions(program, ctx, source, node, cls_qual);
+    lower_friend_bodies(program, ctx, source, friend_bodies);
+}
+
+/// A friend defined in a class body: signature registered, body waiting until
+/// the enclosing classes' in-class definitions have entries too.
+struct DeferredFriendBody<'t> {
+    node: Node<'t>,
+    template_depth: u32,
+    signature: FunctionSignature,
+    /// Lexical enclosing classes, outermost first.
+    classes: Vec<String>,
+}
+
+fn lower_friend_bodies(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    bodies: Vec<DeferredFriendBody>,
+) {
+    for body in bodies {
+        let saved_class = ctx.class_ctx.take();
+        let saved_depth = ctx.template_depth.replace(body.template_depth);
+        let scope_len = ctx.type_scope.borrow().len();
+        ctx.type_scope
+            .borrow_mut()
+            .extend(body.classes.iter().cloned());
+        let saved_friends = std::mem::replace(&mut ctx.friend_classes, body.classes);
+        lower_function_body(program, ctx, source, body.node, body.signature);
+        ctx.friend_classes = saved_friends;
+        ctx.type_scope.borrow_mut().truncate(scope_len);
+        ctx.template_depth.set(saved_depth);
+        ctx.class_ctx = saved_class;
+    }
 }
 
 /// The members of a class body the two member passes look at.
@@ -4207,6 +4245,112 @@ fn lower_class_definitions(
     }
     ctx.class_ctx = saved;
     ctx.type_scope.borrow_mut().pop();
+}
+
+/// Lower friend function definitions and friend operator declarations inside a class body.
+///
+/// In C++ ([class.friend]), friend functions are non-member functions belonging to the
+/// innermost enclosing namespace. They are lowered with `ctx.class_ctx = None` so they
+/// do not receive an implicit `this` parameter, are not qualified with the class name,
+/// and do not resolve bare identifiers via `implicit_this`.
+fn lower_friend_declarations<'a>(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node<'a>,
+    cls_qual: &str,
+    deferred: &mut Vec<DeferredFriendBody<'a>>,
+) {
+    let Some(body) = node.cached_field("body") else {
+        return;
+    };
+    let saved_class = ctx.class_ctx.take();
+    ctx.friend_classes.push(cls_qual.to_string());
+    ctx.type_scope.borrow_mut().push(cls_qual.to_string());
+
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        // Recurse into member classes.
+        if let Some(spec) = member_class_definition(child) {
+            if let Some(tag) = member_class_tag(ctx, source, spec) {
+                let template = i32::from(child.cached_kind() == "template_declaration");
+                ctx.step_template(template);
+                lower_friend_declarations(program, ctx, source, spec, &tag.spelling, deferred);
+                ctx.step_template(-template);
+            }
+            continue;
+        }
+
+        let (friend_node, is_template) = if child.cached_kind() == "friend_declaration" {
+            (child, false)
+        } else if child.cached_kind() == "template_declaration" {
+            let mut t_cursor = child.walk();
+            let friend_child = child
+                .children(&mut t_cursor)
+                .find(|c| c.cached_kind() == "friend_declaration");
+            match friend_child {
+                Some(f) => (f, true),
+                None => continue,
+            }
+        } else {
+            continue;
+        };
+
+        let template_step = i32::from(is_template);
+        ctx.step_template(template_step);
+
+        let mut f_cursor = friend_node.walk();
+        for inner in friend_node.children(&mut f_cursor) {
+            let (target_node, inner_template) = if inner.cached_kind() == "template_declaration" {
+                let mut it_cursor = inner.walk();
+                let inner_child = inner
+                    .children(&mut it_cursor)
+                    .find(|c| matches!(c.cached_kind(), "function_definition" | "declaration"));
+                match inner_child {
+                    Some(c) => (c, true),
+                    None => (inner, false),
+                }
+            } else {
+                (inner, false)
+            };
+            let inner_step = i32::from(inner_template);
+            ctx.step_template(inner_step);
+            match target_node.cached_kind() {
+                "function_definition" => {
+                    if let Some(sig) = lower_function_signature(program, ctx, source, target_node) {
+                        deferred.push(DeferredFriendBody {
+                            node: target_node,
+                            template_depth: ctx.template_depth.get(),
+                            signature: sig,
+                            classes: ctx.friend_classes.clone(),
+                        });
+                    }
+                }
+                "declaration" if is_friend_operator_declaration(source, target_node) => {
+                    lower_declaration(program, ctx, source, target_node, None);
+                }
+                _ => {}
+            }
+            ctx.step_template(-inner_step);
+        }
+
+        ctx.step_template(-template_step);
+    }
+
+    ctx.type_scope.borrow_mut().pop();
+    ctx.friend_classes.pop();
+    ctx.class_ctx = saved_class;
+}
+
+fn is_friend_operator_declaration(source: &str, decl: Node) -> bool {
+    let Some(declarator) = decl
+        .cached_field("declarator")
+        .or_else(|| find_function_declarator(decl))
+    else {
+        return false;
+    };
+    let (name, _) = parse_declarator_name(source, declarator);
+    name.starts_with("operator")
 }
 
 /// A `class` / `struct` / `union` specifier with a name.
@@ -5703,13 +5847,22 @@ fn call_result_shape(
             return None;
         }
         // An implicit member hides an outer free function of the same name,
-        // just as it does for collect_call_at_node.
+        // just as it does for collect_call_at_node, unless shadowed by a
+        // function-local using declaration.
         let members = match &ctx.class_ctx {
-            Some(cc) if is_bare_callee_node(func, &name) => declared_members_upward(
-                program,
-                &cc.qual_name,
-                &trace_ir::MethodKind::Named(name.clone()),
-            ),
+            Some(cc)
+                if is_bare_callee_node(func, &name)
+                    && !ctx
+                        .using_name_imports
+                        .iter()
+                        .any(|u| u.base == name && u.scope == ImportScope::Body) =>
+            {
+                declared_members_upward(
+                    program,
+                    &cc.qual_name,
+                    &trace_ir::MethodKind::Named(name.clone()),
+                )
+            }
             _ => Vec::new(),
         };
         if members.is_empty() {
@@ -8349,11 +8502,17 @@ fn collect_call_at_node_inner(
     // Bare `method(args)` inside a C++ method is implicit `this->method`.
     // Must run before name lookup, which would otherwise synthesize an
     // unqualified external stub (`OnEvent` vs `Plugin::OnEvent`).
+    // Function-local using-declarations shadow enclosing class members.
     if ctx.is_cpp && func.cached_kind() == "identifier" {
         if let Some(cls) = ctx.class_ctx.as_ref().map(|c| c.qual_name.clone()) {
             let cls = receiver_lookup_name(&cls).into_owned();
             let short = strip_template_args(&normalize_qualified(node_text(source, &func)));
-            if lookup_var(ctx, program, &short).is_none() {
+            if lookup_var(ctx, program, &short).is_none()
+                && !ctx
+                    .using_name_imports
+                    .iter()
+                    .any(|u| u.base == short && u.scope == ImportScope::Body)
+            {
                 let kind = trace_ir::MethodKind::Named(short);
                 let targets = member_targets_upward(program, &cls, &kind);
                 if !targets.is_empty() {
@@ -9657,14 +9816,18 @@ fn adl_namespaces(arg_desc: &[TypeDesc]) -> Vec<String> {
 /// `using X::f;` members, deduplicated. The caller applies arity filtering
 /// + overload ranking.
 ///
-/// Ordinary lookup follows the C++ rule: check enclosing namespaces
-/// innermost-to-outermost, stopping at the first that declares a function
-/// with the requested base name (standard hiding rule).  `using namespace`
-/// directives are checked *after* enclosing namespaces and always add
-/// candidates without hiding (they make the named namespace's declarations
-/// visible in the scope of the directive).  ADL namespaces and
-/// `using X::f;` imports are merged last (they add candidates, never
-/// replace).
+/// Ordinary lookup follows C++ scoping rules:
+/// 1. Function-local / block-scoped `using` declarations (`using X::f;` inside
+///    a function body) shadow all outer scopes, including enclosing class
+///    members and namespace scopes.
+/// 2. If inside a friend function body, enclosing lexical classes (innermost
+///    to outermost) shadow enclosing namespace scopes (class hiding rule).
+/// 3. Enclosing namespaces (innermost-to-outermost) shadow outer namespaces.
+/// 4. `using namespace` directives are checked after enclosing namespaces and
+///    always add candidates without hiding (they make the named namespace's
+///    declarations visible in the directive's scope).
+/// 5. ADL namespaces and namespace/file-scope `using X::f;` imports are merged
+///    last (they add candidates, never replace).
 fn resolve_cpp_name_candidates(
     program: &Program,
     ctx: &LowerContext,
@@ -9672,7 +9835,51 @@ fn resolve_cpp_name_candidates(
     arg_desc: &[TypeDesc],
 ) -> Vec<FnId> {
     let mut out: Vec<FnId> = Vec::new();
-    // Phase 1: enclosing namespaces (innermost to outermost).  Stop at the
+    // Phase 0: function-local / block-scoped using-declarations (`using X::f;`
+    // inside a function body) shadow enclosing class and namespace scopes.
+    let mut has_block_import = false;
+    for import in ctx.using_name_imports.iter().rev() {
+        if import.base != base || import.scope != ImportScope::Body {
+            continue;
+        }
+        has_block_import = true;
+        for import_qual in &import.candidates {
+            for id in program
+                .symbols
+                .resolve_function_candidates(import_qual, Some(ctx.current_file))
+            {
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+    }
+    if has_block_import {
+        return out;
+    }
+
+    // Phase 1: if inside a friend function body, consult the friend's enclosing
+    // lexical class(es) (innermost to outermost). Stop at the first class that
+    // declares or inherits any member with `base` — standard C++ hiding rule
+    // (class member declarations shadow enclosing namespace scopes).
+    for class in ctx.friend_classes.iter().rev() {
+        let cls_lookup = receiver_lookup_name(class);
+        let found = declared_members_upward(
+            program,
+            &cls_lookup,
+            &trace_ir::MethodKind::Named(base.to_owned()),
+        );
+        if !found.is_empty() {
+            for id in found {
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+            return out;
+        }
+    }
+
+    // Phase 2: enclosing namespaces (innermost to outermost).  Stop at the
     // first scope that declares any function with `base` — standard C++
     // hiding rule (inner declarations shadow outer ones).
     let present: Vec<&str> = ctx.ns_stack.iter().flatten().map(String::as_str).collect();
@@ -9704,7 +9911,7 @@ fn resolve_cpp_name_candidates(
             break;
         }
     }
-    // Phase 2: using namespace directives (always add, never hide — they
+    // Phase 3: using namespace directives (always add, never hide — they
     // make the named namespace's declarations visible in the directive's
     // scope, alongside any enclosing-namespace candidates).
     for ns in ctx.directive_namespaces() {
@@ -9714,7 +9921,7 @@ fn resolve_cpp_name_candidates(
             }
         }
     }
-    // Phase 3: ADL namespaces add candidates without replacing.
+    // Phase 4: ADL namespaces add candidates without replacing.
     for ns in adl_namespaces(arg_desc) {
         for id in program.symbols.functions_in_namespace(&ns, base) {
             if !out.contains(&id) {
@@ -9722,11 +9929,11 @@ fn resolve_cpp_name_candidates(
             }
         }
     }
-    // Phase 4: `using X::f;` imports: the exact qualified entry may not
-    // fall under any of the ordinary/ADL namespaces above (e.g. nested
+    // Phase 5: `using X::f;` namespace- and file-scope imports: the exact qualified
+    // entry may not fall under any of the ordinary/ADL namespaces above (e.g. nested
     // `X::Y::f`).
     for import in &ctx.using_name_imports {
-        if import.base != base {
+        if import.base != base || import.scope == ImportScope::Body {
             continue;
         }
         for import_qual in &import.candidates {
@@ -13917,15 +14124,9 @@ fn resolve_function_named(program: &Program, ctx: &LowerContext, name: &str) -> 
         return in_scope(name).or_else(|| program.symbols.resolve_function(name));
     }
     let mut probe = |candidate: &str, _global: bool| in_scope(candidate);
-    find_in_enclosing_scopes(program, ctx, name, &mut probe)
-        .or_else(|| {
-            imported_by_declaration(
-                ctx,
-                name,
-                &[ImportScope::Body, ImportScope::Namespace],
-                in_scope,
-            )
-        })
+    imported_by_declaration(ctx, name, &[ImportScope::Body], in_scope)
+        .or_else(|| find_in_enclosing_scopes(program, ctx, name, &mut probe))
+        .or_else(|| imported_by_declaration(ctx, name, &[ImportScope::Namespace], in_scope))
         .or_else(|| in_scope(global_lookup_name(name)))
         .or_else(|| imported_by_declaration(ctx, name, &[ImportScope::File], in_scope))
         .or_else(|| imported_by_directive(ctx, name, in_scope))
@@ -16691,6 +16892,7 @@ mod qualified_variable_lookup_tests {
             using_name_imports: Vec::new(),
             c_linkage: false,
             class_ctx: None,
+            friend_classes: Vec::new(),
             type_scope: RefCell::new(Vec::new()),
             local_aliases: Vec::new(),
             is_cpp: true,

@@ -51,6 +51,11 @@ pub fn parse_source_with_lang(
     lang: SourceLang,
 ) -> Result<ParseResult, String> {
     let source: Arc<str> = source.into();
+    let source = if lang == SourceLang::Cpp {
+        normalize_cpp_parse_syntax(&source)
+    } else {
+        source
+    };
     let tree = match lang {
         SourceLang::C => PARSER_C.with(|p| p.borrow_mut().parse(source.as_ref(), None)),
         SourceLang::Cpp => PARSER_CPP.with(|p| p.borrow_mut().parse(source.as_ref(), None)),
@@ -213,6 +218,194 @@ fn raw_string_end(bytes: &[u8], start: usize) -> Option<usize> {
         pos += 1;
     }
     None
+}
+
+/// Rewrite syntax in C++ parse input that tree-sitter cannot recognize without
+/// parse errors. Replaces bytes in place with spaces so node offsets and line/column
+/// numbers continue to identify the original source location.
+///
+/// In standard C++, attributes can precede `friend` declarations (e.g.
+/// `[[nodiscard]] friend bool operator==(...)`), but upstream tree-sitter C++
+/// grammar does not permit attribute specifiers before the `friend` keyword.
+/// Blanking such attributes in parse input preserves the friend declaration and
+/// all token positions without causing syntax errors.
+pub(crate) fn normalize_cpp_parse_syntax(source: &Arc<str>) -> Arc<str> {
+    if !source.contains("friend") || !source.contains("[[") {
+        return Arc::clone(source);
+    }
+    let bytes = source.as_bytes();
+    let mut changed: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"//") {
+            i = line_comment_end(bytes, i);
+            continue;
+        }
+        if bytes[i..].starts_with(b"/*") {
+            i = bytes[i + 2..]
+                .windows(2)
+                .position(|window| window == b"*/")
+                .map_or(bytes.len(), |n| i + n + 4);
+            continue;
+        }
+        if bytes[i..].starts_with(b"R\"") {
+            if let Some(end) = raw_string_end(bytes, i) {
+                i = end;
+                continue;
+            }
+        }
+        if bytes[i] == b'\'' && is_digit_separator(bytes, i) {
+            i += 1;
+            continue;
+        }
+        if matches!(bytes[i], b'\'' | b'"') {
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(bytes.len());
+                } else if bytes[i] == quote {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"[[") {
+            let mut curr = i;
+            let mut attr_spans = Vec::new();
+            while curr < bytes.len() && bytes[curr..].starts_with(b"[[") {
+                if let Some(attr_end) = find_attribute_end(bytes, curr) {
+                    attr_spans.push((curr, attr_end));
+                    curr = skip_ws_and_comments(bytes, attr_end);
+                } else {
+                    break;
+                }
+            }
+            if !attr_spans.is_empty() {
+                let mut target = curr;
+                if target + 9 <= bytes.len()
+                    && &bytes[target..target + 9] == b"constexpr"
+                    && (target + 9 == bytes.len() || !is_cpp_ident(bytes[target + 9]))
+                {
+                    target = skip_ws_and_comments(bytes, target + 9);
+                    while target < bytes.len() && bytes[target..].starts_with(b"[[") {
+                        if let Some(attr_end) = find_attribute_end(bytes, target) {
+                            attr_spans.push((target, attr_end));
+                            target = skip_ws_and_comments(bytes, attr_end);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if target + 6 <= bytes.len()
+                    && &bytes[target..target + 6] == b"friend"
+                    && (target + 6 == bytes.len() || !is_cpp_ident(bytes[target + 6]))
+                {
+                    let output = changed.get_or_insert_with(|| bytes.to_vec());
+                    for (start, end) in attr_spans {
+                        for b in &mut output[start..end] {
+                            if *b != b'\n' && *b != b'\r' {
+                                *b = b' ';
+                            }
+                        }
+                    }
+                    i = target + 6;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    changed.map_or_else(
+        || Arc::clone(source),
+        |bytes| Arc::from(String::from_utf8(bytes).expect("ASCII-only syntax edits")),
+    )
+}
+
+fn find_attribute_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if !bytes[start..].starts_with(b"[[") {
+        return None;
+    }
+    let mut j = start + 2;
+    let mut paren_depth: usize = 0;
+    while j < bytes.len() {
+        if bytes[j..].starts_with(b"//") {
+            j = line_comment_end(bytes, j);
+            continue;
+        }
+        if bytes[j..].starts_with(b"/*") {
+            j = bytes[j + 2..]
+                .windows(2)
+                .position(|w| w == b"*/")
+                .map_or(bytes.len(), |n| j + n + 4);
+            continue;
+        }
+        if bytes[j..].starts_with(b"R\"") {
+            if let Some(end) = raw_string_end(bytes, j) {
+                j = end;
+                continue;
+            }
+        }
+        if bytes[j] == b'\'' && is_digit_separator(bytes, j) {
+            j += 1;
+            continue;
+        }
+        if matches!(bytes[j], b'\'' | b'"') {
+            let quote = bytes[j];
+            j += 1;
+            while j < bytes.len() {
+                if bytes[j] == b'\\' {
+                    j = (j + 2).min(bytes.len());
+                } else if bytes[j] == quote {
+                    j += 1;
+                    break;
+                } else {
+                    j += 1;
+                }
+            }
+            continue;
+        }
+        if bytes[j] == b'(' {
+            paren_depth += 1;
+            j += 1;
+            continue;
+        }
+        if bytes[j] == b')' {
+            paren_depth = paren_depth.saturating_sub(1);
+            j += 1;
+            continue;
+        }
+        if paren_depth == 0 && bytes[j..].starts_with(b"]]") {
+            return Some(j + 2);
+        }
+        j += 1;
+    }
+    None
+}
+
+fn skip_ws_and_comments(bytes: &[u8], mut at: usize) -> usize {
+    while at < bytes.len() {
+        if bytes[at].is_ascii_whitespace() {
+            at += 1;
+            continue;
+        }
+        if bytes[at..].starts_with(b"//") {
+            at = line_comment_end(bytes, at);
+            continue;
+        }
+        if bytes[at..].starts_with(b"/*") {
+            at = bytes[at + 2..]
+                .windows(2)
+                .position(|w| w == b"*/")
+                .map_or(bytes.len(), |n| at + n + 4);
+            continue;
+        }
+        break;
+    }
+    at
 }
 
 pub fn node_text<'a>(source: &'a str, node: &Node) -> &'a str {
@@ -399,5 +592,68 @@ mod dependency_cpp_tests {
         );
         assert!(normalized.contains("still commented C::*"));
         assert!(normalized.contains("using Real = int    *;"));
+    }
+
+    #[test]
+    fn normalize_cpp_parse_syntax_blanks_attributes_before_friend() {
+        let input: Arc<str> = Arc::from(
+            "struct Value {\n\
+             \x20   [[nodiscard]] friend bool operator==(Value a, Value b);\n\
+             \x20   [[__nodiscard__]] friend bool operator!=(Value a, Value b);\n\
+             \x20   [[nodiscard]] /* note */ friend bool operator<(Value a, Value b);\n\
+             \x20   [[nodiscard]]\n\x20   friend bool operator<=(Value a, Value b);\n\
+             \x20   [[deprecated(\"old (use new)\")]] [[nodiscard]] friend bool operator>(Value a, Value b);\n\
+             };\n\
+             [[nodiscard]] bool regular_fn();\n\
+             void friend_function();\n\
+             const char* str = \"[[nodiscard]] friend\";\n\
+             const char* raw = R\"tag([[nodiscard]] friend)tag\";\n\
+             // [[nodiscard]] friend comment\n\
+             /* [[nodiscard]] friend block comment */\n",
+        );
+        let output = normalize_cpp_parse_syntax(&input);
+        assert_eq!(input.len(), output.len());
+        assert_eq!(input.matches('\n').count(), output.matches('\n').count());
+
+        // Attributes before friend should be blanked with spaces
+        let single_attr = " ".repeat("[[nodiscard]]".len());
+        assert!(output.contains(&format!(
+            "    {single_attr} friend bool operator==(Value a, Value b);"
+        )));
+        let gnu_attr = " ".repeat("[[__nodiscard__]]".len());
+        assert!(output.contains(&format!(
+            "    {gnu_attr} friend bool operator!=(Value a, Value b);"
+        )));
+        assert!(output.contains(&format!(
+            "    {single_attr} /* note */ friend bool operator<(Value a, Value b);"
+        )));
+        assert!(output.contains(&format!(
+            "    {single_attr}\n    friend bool operator<=(Value a, Value b);"
+        )));
+        let multi_attr = " ".repeat("[[deprecated(\"old (use new)\")]] [[nodiscard]]".len());
+        assert!(output.contains(&format!(
+            "    {multi_attr} friend bool operator>(Value a, Value b);"
+        )));
+
+        // Syntax not before friend or inside literals/comments must remain intact
+        assert!(output.contains("[[nodiscard]] bool regular_fn();"));
+        assert!(output.contains("void friend_function();"));
+        assert!(output.contains("\"[[nodiscard]] friend\""));
+        assert!(output.contains("R\"tag([[nodiscard]] friend)tag\""));
+        assert!(output.contains("// [[nodiscard]] friend comment"));
+        assert!(output.contains("/* [[nodiscard]] friend block comment */"));
+
+        // Parsed tree has no unrecovered errors
+        let parsed = parse_source_with_lang(output, SourceLang::Cpp).unwrap();
+        assert!(!has_parse_errors(&parsed.tree));
+
+        let test_src = "struct S {\n\
+             \x20   [[nodiscard]] constexpr friend bool operator==(S, S);\n\
+             \x20   constexpr [[nodiscard]] friend bool operator!=(S, S);\n\
+             \x20   [[deprecated(\"msg\", 1'000)]] friend bool operator<(S, S);\n\
+             \x20   [[nodiscard]] constexpr [[deprecated(\"old\", 2'000)]] friend bool operator<=(S, S);\n\
+             };\n";
+        let parsed_test = parse_source_with_lang(test_src, SourceLang::Cpp).unwrap();
+        assert!(!has_parse_errors(&parsed_test.tree));
     }
 }

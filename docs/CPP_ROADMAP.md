@@ -41,6 +41,7 @@ Do not chase STL noise (`std::string::c_str`, `parcel->WriteString`,
 | Conversion operators (`operator T()`) | indexed as `Cls::operator T` — declaration, in-class definition and out-of-class definition all merge, and the definition returns the type it converts to (#46) |
 | Members behind unknown attribute macros | a macro with no `#define` in the include path no longer supplies the name, whether it leads (`FFI_EXPORT T f()`, `MACRO operator ns::S()`), trails (`void C::M() OVERRIDE {}`) or flanks (`EXPORT_API int Get(long) GUARDED_BY(mu_)`) the declarator (#46) |
 | Members behind standard attributes | `[[deprecated]]`, `[[gnu::pure]]`, `__attribute__((pure))` no longer supply the name — camera's `CameraInput` had collapsed all 26 annotated members into one `CameraInput::deprecated` (#46) |
+| Attributed friend operator declarations | `[[nodiscard]] friend bool operator==(...)` and `[[nodiscard]] constexpr friend ...` parse cleanly without diagnostics; friend operators and in-class friend function definitions are lowered into the enclosing namespace without implicit `this` or phantom attribute symbols (#166) |
 
 ---
 
