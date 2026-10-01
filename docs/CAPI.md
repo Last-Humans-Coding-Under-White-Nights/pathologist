@@ -65,6 +65,18 @@ Full featured example: `crates/trace-capi/examples/ctrace.c` (a small CLI with
 `analyze` / `functions` / `symbols` / `calls` / `callgraph` / `dataflow` / `callchain`
 subcommands).
 
+## Peak memory on macOS
+
+`libtrace_capi` runs inside the host process, so it cannot select the
+allocator configuration the `trace` binary chooses for itself: on macOS
+`trace analyze` re-executes under libmalloc's space-efficient mode
+(`MallocSpaceEfficient=1`; policy in the [README](../README.md#trace-analyze),
+measurements in
+[EVAL_REPORT.md](EVAL_REPORT.md#macos-space-efficient-malloc--2026-09-30)).
+A host that indexes large trees sets that variable in its own environment
+before libmalloc initializes (before `main`, e.g. in its launcher or
+`Info.plist` `LSEnvironment`).
+
 ## Memory-safety model
 
 The tricky part of any C API is who owns what. The rules here:

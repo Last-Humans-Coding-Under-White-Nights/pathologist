@@ -74,6 +74,28 @@ jobs:
           name: trace-capi-docs
           path: trace-capi-docs.tar.gz
 
+  # The macOS re-exec under libmalloc's space-efficient mode
+  # (crates/trace-cli/src/main.rs, select_space_efficient_malloc) and its
+  # integration test exist only on macOS with default features: `check`
+  # runs on Linux and with --all-features, where the mimalloc feature
+  # compiles both out.
+  check-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (trace-cli, default features)
+        run: cargo clippy -p trace-cli --all-targets -- -D warnings
+
+      - name: Test (trace-cli, default features)
+        run: cargo test -p trace-cli
+
   build:
     needs: check
     strategy:
