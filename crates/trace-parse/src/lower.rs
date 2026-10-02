@@ -7606,6 +7606,7 @@ fn lower_direct_init(
         args,
         call_span,
         expansion_span,
+        None,
     );
 }
 
@@ -7770,6 +7771,7 @@ fn lower_one_declarator(
                     call_args,
                     span,
                     expansion_span,
+                    None,
                 );
             }
         }
@@ -8259,6 +8261,7 @@ fn walk_function_body(
                         call_args,
                         span,
                         expansion_span,
+                        None,
                     );
                 }
             }
@@ -8281,6 +8284,7 @@ fn walk_function_body(
                         CallArgs::empty(),
                         span,
                         expansion_span,
+                        None,
                     );
                 }
             }
@@ -8440,6 +8444,7 @@ fn collect_call_at_node_inner(
     node: Node,
     caller: FnId,
 ) {
+    let return_dst = ctx.call_return_dst.borrow().get(&node.id()).copied();
     if let Some(op) = (ctx.is_cpp)
         .then(|| explicit_member_operator_call(node, source))
         .flatten()
@@ -8474,6 +8479,7 @@ fn collect_call_at_node_inner(
                         call_args,
                         span,
                         expansion_span,
+                        return_dst,
                     );
                     return;
                 };
@@ -8494,6 +8500,7 @@ fn collect_call_at_node_inner(
                     span,
                     expansion_span,
                     targets,
+                    return_dst,
                 );
                 return;
             }
@@ -8505,6 +8512,7 @@ fn collect_call_at_node_inner(
                 call_args,
                 span,
                 expansion_span,
+                return_dst,
             );
             return;
         }
@@ -8519,6 +8527,7 @@ fn collect_call_at_node_inner(
             call_args,
             span,
             expansion_span,
+            return_dst,
         );
         return;
     }
@@ -8548,7 +8557,6 @@ fn collect_call_at_node_inner(
     }
     let span = node_call_span(program, ctx, source_node);
     let expansion_span = node_expansion_span(program, ctx, source_node);
-    let return_dst = ctx.call_return_dst.borrow().get(&node.id()).copied();
 
     // ---- C++ member calls with statically-typed receivers ----
     // `recv.method(args)` / `p->method(args)` / explicit `x.~T()` /
@@ -8593,6 +8601,7 @@ fn collect_call_at_node_inner(
                                     call_args,
                                     span,
                                     expansion_span,
+                                    return_dst,
                                 );
                                 return;
                             };
@@ -8630,6 +8639,7 @@ fn collect_call_at_node_inner(
                                 span,
                                 expansion_span,
                                 targets,
+                                return_dst,
                             );
                             return;
                         }
@@ -8656,6 +8666,7 @@ fn collect_call_at_node_inner(
                                     span,
                                     expansion_span,
                                     field_targets,
+                                    return_dst,
                                 );
                                 return;
                             }
@@ -8683,6 +8694,7 @@ fn collect_call_at_node_inner(
                                 call_args,
                                 span,
                                 expansion_span,
+                                return_dst,
                             );
                             return;
                         }
@@ -8721,6 +8733,7 @@ fn collect_call_at_node_inner(
                         span,
                         expansion_span,
                         targets,
+                        return_dst,
                     );
                     return;
                 }
@@ -8739,6 +8752,7 @@ fn collect_call_at_node_inner(
             call_args,
             span,
             expansion_span,
+            return_dst,
         );
         return;
     }
@@ -8766,6 +8780,7 @@ fn collect_call_at_node_inner(
                 call_args,
                 span,
                 expansion_span,
+                return_dst,
             );
             return;
         }
@@ -9205,6 +9220,10 @@ fn collect_call_args(
                     // effects can refuse to copy the whole container.
                     if is_addr_of_member(source, arg) {
                         addr_of_member_args.push(arg_index);
+                    }
+                } else if value.cached_kind() == "call_expression" {
+                    if let Some(temp) = lower_nested_call_arg(program, ctx, source, value) {
+                        var_args.push((arg_index, temp));
                     }
                 } else if let Some(s) = string_literal_value(source, arg) {
                     let temp = alloc_ret_temp(program, ctx, arg);
@@ -10152,6 +10171,7 @@ fn resolve_cpp_name_candidates(
 /// and an invented one is indistinguishable downstream from a real call to a
 /// function outside the tree (#64). `args` are the explicit arguments, bound
 /// past the member's `this`.
+#[allow(clippy::too_many_arguments)]
 fn emit_unresolved_site(
     program: &mut Program,
     caller: FnId,
@@ -10160,6 +10180,7 @@ fn emit_unresolved_site(
     args: CallArgs,
     span: Span,
     expansion_span: Option<Span>,
+    return_dst: Option<VarId>,
 ) {
     let CallArgs {
         var_args,
@@ -10188,7 +10209,7 @@ fn emit_unresolved_site(
         occurrence: None,
         is_direct: false,
         receiver_class,
-        return_dst: None,
+        return_dst,
         tu: program.symbols.function_by_id(caller).and_then(|f| f.tu),
     });
 }
@@ -10208,6 +10229,7 @@ fn emit_member_sites(
     args: CallArgs,
     span: Span,
     expansion_span: Option<Span>,
+    return_dst: Option<VarId>,
 ) {
     let cls = receiver_lookup_name(cls);
     let targets = member_targets_upward(program, &cls, kind);
@@ -10221,6 +10243,7 @@ fn emit_member_sites(
         span,
         expansion_span,
         targets,
+        return_dst,
     );
 }
 
@@ -10239,6 +10262,7 @@ fn emit_member_targets(
     span: Span,
     expansion_span: Option<Span>,
     targets: Vec<FnId>,
+    return_dst: Option<VarId>,
 ) {
     let tu = program.symbols.function_by_id(caller).and_then(|f| f.tu);
     let mut args = args.bind_past_this(receiver);
@@ -10276,7 +10300,7 @@ fn emit_member_targets(
             occurrence: None,
             is_direct: false,
             receiver_class: Some(cls.to_string()),
-            return_dst: None,
+            return_dst,
             tu,
         });
         return;
@@ -10307,7 +10331,7 @@ fn emit_member_targets(
             occurrence: None,
             is_direct: true,
             receiver_class: Some(cls.to_string()),
-            return_dst: None,
+            return_dst,
             tu,
         });
     }
@@ -10385,6 +10409,7 @@ fn lower_field_initializer_list(
                 call_args,
                 span,
                 expansion_span,
+                None,
             );
         }
     }
@@ -11914,7 +11939,7 @@ fn extract_flow_from_expr(
                     target.publish(program, ctx, source)
                 };
                 // `*out = (f())` stores the result as `*out = f()` does.
-                let call = peel_expression(rhs);
+                let call = peel_casts(source, rhs);
                 if let Some(src) = expr_to_store_src(program, ctx, source, rhs) {
                     let dst = ptr(program, ctx);
                     program.flow.push(FlowConstraint::Store { dst, src });
@@ -11927,12 +11952,12 @@ fn extract_flow_from_expr(
                     if let Some(src) = promoted_receiver_value(program, ctx, source, call) {
                         let dst = ptr(program, ctx);
                         program.flow.push(FlowConstraint::Store { dst, src });
-                    } else if let Some(callee_name) =
-                        resolve_direct_call(program, ctx, source, call)
+                    } else if let Some(resolved) =
+                        resolve_call_for_return(program, ctx, source, call)
                     {
-                        let dst = ptr(program, ctx);
                         let ret_temp = alloc_ret_temp(program, ctx, node);
-                        emit_call_return(program, ctx, call, ret_temp, callee_name);
+                        lower_call_return_with_resolved(program, ctx, call, ret_temp, resolved);
+                        let dst = ptr(program, ctx);
                         program
                             .flow
                             .push(FlowConstraint::Store { dst, src: ret_temp });
@@ -12156,7 +12181,7 @@ fn peel_casts<'t>(source: &str, mut node: Node<'t>) -> Node<'t> {
                 .cached_field("value")
                 .or_else(|| node.cached_field("expression"))
                 .or_else(|| node.named_child(1)),
-            "call_expression" if is_named_cast(source, node) => node
+            "call_expression" if is_named_cast(source, node) || is_std_move(source, node) => node
                 .cached_field("arguments")
                 .and_then(|args| args.named_child(0)),
             _ => None,
@@ -12197,6 +12222,27 @@ fn is_named_cast(source: &str, call: Node) -> bool {
                 "static_cast" | "reinterpret_cast" | "const_cast" | "dynamic_cast"
             )
         })
+}
+
+/// `std::move(x)` / `std::forward<T>(x)`: an rvalue cast parsed as a call expression.
+fn is_std_move(source: &str, call: Node) -> bool {
+    let Some(func) = call.cached_field("function").map(peel_expression) else {
+        return false;
+    };
+    let name_node = if func.cached_kind() == "template_function" {
+        func.cached_field("name").unwrap_or(func)
+    } else {
+        func
+    };
+    let text = normalize_qualified(node_text(source, &name_node));
+    let is_std = matches!(
+        text.as_str(),
+        "std::move" | "::std::move" | "std::forward" | "::std::forward"
+    );
+    is_std
+        && call
+            .cached_field("arguments")
+            .is_some_and(|args| args.named_child_count() == 1)
 }
 
 fn emit_call_return(
@@ -12420,34 +12466,18 @@ fn emit_store_to_location(
             }
         } else if let Some(src) = promoted_receiver_value(program, ctx, source, peeled_value) {
             program.flow.push(FlowConstraint::Store { dst, src });
+        } else if peeled_value.cached_kind() == "call_expression" {
+            if let Some(resolved) = resolve_call_for_return(program, ctx, source, peeled_value) {
+                let ret_temp = alloc_ret_temp(program, ctx, span_node);
+                lower_call_return_with_resolved(program, ctx, peeled_value, ret_temp, resolved);
+                program
+                    .flow
+                    .push(FlowConstraint::Store { dst, src: ret_temp });
+            }
         } else {
             let ret_temp = alloc_ret_temp(program, ctx, span_node);
-            let emitted = if peeled_value.cached_kind() == "call_expression" {
-                if let Some(callee_name) = resolve_direct_call(program, ctx, source, peeled_value) {
-                    emit_call_return(program, ctx, peeled_value, ret_temp, callee_name);
-                    true
-                } else if let Some(callee_var) =
-                    resolve_callee_var(program, ctx, source, peeled_value)
-                {
-                    program.flow.push(FlowConstraint::CallReturnIndirect {
-                        dst: ret_temp,
-                        callee_var,
-                    });
-                    ctx.call_return_dst
-                        .borrow_mut()
-                        .insert(peeled_value.id(), ret_temp);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                expr_to_rhs_flow(program, ctx, source, value_node, ret_temp)
-                    .map(|flow| {
-                        program.flow.push(flow);
-                    })
-                    .is_some()
-            };
-            if emitted {
+            if let Some(flow) = expr_to_rhs_flow(program, ctx, source, value_node, ret_temp) {
+                program.flow.push(flow);
                 program
                     .flow
                     .push(FlowConstraint::Store { dst, src: ret_temp });
@@ -13305,17 +13335,7 @@ fn expr_to_rhs_flow(
         "string_literal" | "concatenated_string" => string_literal_value(source, node)
             .map(|value| FlowConstraint::StringConst { dst, value }),
         "call_expression" => {
-            if let Some(src) = promoted_receiver_value(program, ctx, source, node) {
-                return Some(FlowConstraint::Copy { dst, src });
-            }
-            if let Some(callee_name) = resolve_direct_call(program, ctx, source, node) {
-                emit_call_return(program, ctx, node, dst, callee_name);
-            } else if let Some(callee_var) = resolve_callee_var(program, ctx, source, node) {
-                program
-                    .flow
-                    .push(FlowConstraint::CallReturnIndirect { dst, callee_var });
-                ctx.call_return_dst.borrow_mut().insert(node.id(), dst);
-            }
+            lower_call_return(program, ctx, source, node, dst);
             None
         }
         // `p = h->pp` reads the member's value, as any value position does
@@ -13348,6 +13368,7 @@ fn expr_to_rhs_flow(
                         call_args,
                         span,
                         expansion_span,
+                        None,
                     );
                 }
                 ctx.handled_new_exprs.borrow_mut().insert(node.id());
@@ -13525,17 +13546,34 @@ fn return_flow_from_expr(
             }
         }
         "call_expression" => {
-            let callee_name = resolve_direct_call_name(source, node)?;
-            if is_symbol_lookup_callee(&callee_name) {
-                // Materialize a temp so the inner CallSite gets a return_dst
-                // for the dlsym model; the wrapper then copies that temp.
-                let temp = alloc_ret_temp(program, ctx, node);
-                emit_call_return(program, ctx, node, temp, callee_name);
-                Some(ReturnFlow::Copy { src: temp })
-            } else {
-                Some(ReturnFlow::Call {
-                    callee_name: canonical_call_name(program, ctx, callee_name),
-                })
+            let resolved = resolve_call_for_return(program, ctx, source, node)?;
+            match resolved {
+                ResolvedCallReturn::PromotedReceiver(src) => Some(ReturnFlow::Copy { src }),
+                ResolvedCallReturn::Direct(callee_name) => {
+                    if is_symbol_lookup_callee(&callee_name) {
+                        // Materialize a temp so the inner CallSite gets a return_dst
+                        // for the dlsym model; the wrapper then copies that temp.
+                        let temp = alloc_ret_temp(program, ctx, node);
+                        emit_call_return(program, ctx, node, temp, callee_name);
+                        Some(ReturnFlow::Copy { src: temp })
+                    } else {
+                        Some(ReturnFlow::Call { callee_name })
+                    }
+                }
+                ResolvedCallReturn::Indirect(callee_var) => {
+                    let temp = alloc_ret_temp(program, ctx, node);
+                    program.flow.push(FlowConstraint::CallReturnIndirect {
+                        dst: temp,
+                        callee_var,
+                    });
+                    ctx.call_return_dst.borrow_mut().insert(node.id(), temp);
+                    Some(ReturnFlow::Copy { src: temp })
+                }
+                ResolvedCallReturn::Member => {
+                    let temp = alloc_ret_temp(program, ctx, node);
+                    ctx.call_return_dst.borrow_mut().insert(node.id(), temp);
+                    Some(ReturnFlow::Copy { src: temp })
+                }
             }
         }
         _ => None,
@@ -13547,14 +13585,59 @@ fn resolve_direct_call_name(source: &str, node: Node) -> Option<String> {
         return None;
     }
     let func = node.cached_field("function")?;
+    resolve_direct_call_name_from_func(source, func)
+}
+
+fn resolve_direct_call_name_from_func(source: &str, func: Node) -> Option<String> {
     let func = peel_expression(func);
     match func.cached_kind() {
         "identifier" => Some(node_text(source, &func).to_string()),
+        "qualified_identifier" => Some(normalize_qualified(node_text(source, &func))),
+        "template_function" => {
+            let raw = node_text(source, &func);
+            Some(strip_template_args(&normalize_qualified(raw)))
+        }
         "pointer_expression" | "parenthesized_expression" => func
             .named_child(0)
-            .and_then(|inner| resolve_direct_call_name(source, inner)),
+            .and_then(|inner| resolve_direct_call_name_from_func(source, inner)),
         _ => None,
     }
+}
+
+fn is_member_call(program: &Program, ctx: &LowerContext, source: &str, node: Node) -> bool {
+    if !ctx.is_cpp {
+        return false;
+    }
+    if explicit_member_operator_call(node, source).is_some() {
+        return true;
+    }
+    let Some(func) = node.cached_field("function") else {
+        return false;
+    };
+    let peeled = peel_expression(func);
+    if peeled.cached_kind() == "field_expression" {
+        if static_member_access(program, ctx, source, peeled).is_some() {
+            return false;
+        }
+        let (op_is_member_access, _) = member_access_op(peeled);
+        return op_is_member_access;
+    }
+    if peeled.cached_kind() == "identifier" {
+        if let Some(cls) = ctx.class_ctx.as_ref().map(|c| c.qual_name.as_str()) {
+            let short = strip_template_args(&normalize_qualified(node_text(source, &peeled)));
+            if lookup_var(ctx, program, &short).is_none()
+                && !ctx
+                    .using_name_imports
+                    .iter()
+                    .any(|u| u.base == short && u.scope == ImportScope::Body)
+            {
+                let cls = receiver_lookup_name(cls);
+                let kind = trace_ir::MethodKind::Named(short);
+                return !member_targets_upward(program, &cls, &kind).is_empty();
+            }
+        }
+    }
+    false
 }
 
 fn resolve_direct_call(
@@ -13567,7 +13650,95 @@ fn resolve_direct_call(
     if lookup_var(ctx, program, &name).is_some() {
         return None;
     }
+    if this_field_named(program, ctx, &name).is_some() {
+        return None;
+    }
     Some(canonical_call_name(program, ctx, name))
+}
+
+enum ResolvedCallReturn {
+    PromotedReceiver(VarId),
+    Direct(String),
+    Indirect(VarId),
+    Member,
+}
+
+fn resolve_call_for_return(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    call_node: Node,
+) -> Option<ResolvedCallReturn> {
+    if weak_promotion(program, ctx, source, call_node).is_some() {
+        return promoted_receiver_value(program, ctx, source, call_node)
+            .map(ResolvedCallReturn::PromotedReceiver);
+    }
+    if let Some(callee_var) = resolve_callee_var(program, ctx, source, call_node) {
+        return Some(ResolvedCallReturn::Indirect(callee_var));
+    }
+    if is_member_call(program, ctx, source, call_node) {
+        return Some(ResolvedCallReturn::Member);
+    }
+    if let Some(callee_name) = resolve_direct_call(program, ctx, source, call_node) {
+        return Some(ResolvedCallReturn::Direct(callee_name));
+    }
+    None
+}
+
+fn lower_call_return_with_resolved(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    call_node: Node,
+    dst: VarId,
+    resolved: ResolvedCallReturn,
+) {
+    match resolved {
+        ResolvedCallReturn::PromotedReceiver(src) => {
+            program.flow.push(FlowConstraint::Copy { dst, src });
+            ctx.call_return_dst.borrow_mut().insert(call_node.id(), dst);
+        }
+        ResolvedCallReturn::Direct(callee_name) => {
+            emit_call_return(program, ctx, call_node, dst, callee_name);
+        }
+        ResolvedCallReturn::Indirect(callee_var) => {
+            program
+                .flow
+                .push(FlowConstraint::CallReturnIndirect { dst, callee_var });
+            ctx.call_return_dst.borrow_mut().insert(call_node.id(), dst);
+        }
+        ResolvedCallReturn::Member => {
+            ctx.call_return_dst.borrow_mut().insert(call_node.id(), dst);
+        }
+    }
+}
+
+fn lower_call_return(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    call_node: Node,
+    dst: VarId,
+) -> bool {
+    let Some(resolved) = resolve_call_for_return(program, ctx, source, call_node) else {
+        return false;
+    };
+    lower_call_return_with_resolved(program, ctx, call_node, dst, resolved);
+    true
+}
+
+fn lower_nested_call_arg(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    call_node: Node,
+) -> Option<VarId> {
+    if let Some(&temp) = ctx.call_return_dst.borrow().get(&call_node.id()) {
+        return Some(temp);
+    }
+    let resolved = resolve_call_for_return(program, ctx, source, call_node)?;
+    let temp = alloc_ret_temp(program, ctx, call_node);
+    lower_call_return_with_resolved(program, ctx, call_node, temp, resolved);
+    Some(temp)
 }
 
 /// The name a direct call spelled `name` records for its return flow, which
