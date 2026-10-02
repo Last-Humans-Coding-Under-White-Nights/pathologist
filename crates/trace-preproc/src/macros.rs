@@ -36,11 +36,11 @@ pub enum MacroDef {
 /// that existed at both capture boundaries.
 #[derive(Debug, Clone)]
 pub enum MacroOp {
-    Define(String, MacroDef),
-    Undef(String),
+    Define(Arc<str>, Arc<MacroDef>),
+    Undef(Arc<str>),
 }
 
-pub type MacroTable = IndexMap<String, MacroDef>;
+pub type MacroTable = IndexMap<Arc<str>, Arc<MacroDef>>;
 pub type SharedMacroTable = Arc<RwLock<MacroTable>>;
 
 #[must_use]
@@ -87,10 +87,10 @@ pub fn macro_table_from_defines(
         .map(|(name, val)| (name.clone(), val.clone()));
     for (name, val) in predefined.chain(cli) {
         table.insert(
-            name,
-            MacroDef::Object {
+            name.into(),
+            Arc::new(MacroDef::Object {
                 replacement: lex_macro_body(&val, language).into(),
-            },
+            }),
         );
     }
     table
@@ -134,5 +134,10 @@ mod tests {
         };
         assert!(Arc::ptr_eq(params, &cloned_params));
         assert!(Arc::ptr_eq(replacement, &cloned_tokens));
+    }
+
+    #[test]
+    fn macro_op_size() {
+        assert_eq!(std::mem::size_of::<MacroOp>(), 24);
     }
 }

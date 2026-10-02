@@ -15,13 +15,37 @@ pub enum ConstraintKind {
     UnwrapPointer,
 }
 
+use std::sync::Arc;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldAccess {
+    pub field: FieldId,
+    pub field_name: Arc<str>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Constraint {
     pub kind: ConstraintKind,
     pub dst: PagNodeId,
     pub src: PagNodeId,
-    pub field: Option<FieldId>,
-    pub field_name: Option<String>,
+    pub field_info: Option<Box<FieldAccess>>,
+}
+
+impl Constraint {
+    #[inline]
+    pub fn field(&self) -> Option<FieldId> {
+        self.field_info.as_ref().map(|f| f.field)
+    }
+
+    #[inline]
+    pub fn field_name(&self) -> Option<&str> {
+        self.field_info.as_ref().map(|f| &*f.field_name)
+    }
+
+    #[inline]
+    pub fn field_name_arc(&self) -> Option<Arc<str>> {
+        self.field_info.as_ref().map(|f| Arc::clone(&f.field_name))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,4 +106,14 @@ pub struct AbstractLocation {
     pub field: Option<FieldId>,
     pub type_id: trace_ir::TypeId,
     pub desc: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constraint_size() {
+        assert_eq!(std::mem::size_of::<Constraint>(), 24);
+    }
 }

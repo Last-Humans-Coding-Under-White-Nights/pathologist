@@ -568,6 +568,8 @@ Standalone `preprocess_file` still inlines by default so a single-file expansion
 
 A cached expansion replays its text **without** executing the `#define`s it contains, so a header whose body *invokes* macros defined by an earlier-included header would starve: at warm time the dependency was processed inline (fine), but a consumer warmed later splices the dependency's cached body and never learns its macros. Therefore each `IncludeExpansion` records the **ordered log** of `#define` / `#undef` directives its processing executed, nested replays included (`IncludeExpansion::ops`). An ordered log rather than a table diff: a diff cannot represent a no-op `#undef` (name absent at capture, defined in a later consumer) or an undef-then-redefine of a name present at both boundaries.
 
+Macro operations are stored as `MacroOp::Define(Arc<str>, Arc<MacroDef>)` and `MacroOp::Undef(Arc<str>)` in a contiguous `Arc<[MacroOp]>` slice (24 bytes per entry), eliminating heap string allocations during directive logging, cache-frame capture, and replay.
+
 `splice_cached` replays the log through the same mutation helpers live directives use, so a cache hit and a cache miss agree on everything a directive touches: the local table (a replayed `#define` overwrites, like live execution), builtin-fallback marks, the shared table under `accumulate_macros`, and the op log feeding an enclosing cached header's own entry.
 
 ### Cache self-containment

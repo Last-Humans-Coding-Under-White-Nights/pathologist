@@ -785,7 +785,17 @@ aggregate union replaces a shared descriptor rather than modifying it.
 Sharing requires full structural equality, including collision checks, and
 weak pool entries do not retain unused descriptor payloads. The public Rust
 `TypeInfo.desc` field is an `Arc`; match through `.as_ref()`. Serialized type
-values and exported data are unchanged. See [memory measurements](MEMORY_PROFILE.md).
+values and exported data are unchanged. See [memory measurements](MEMORY_PROFILE.md)
+and [evaluation report](EVAL_REPORT.md#struct-compaction-expansion-sharing-and-lifecycle-reclamation--2026-10-01).
+
+### TypeFields and layout storage
+
+`TypeLayout.fields` is wrapped in `TypeFields` rather than a bare `IndexMap<FieldId, FieldLayout>`.
+
+- **Migration**: Callers constructing a `TypeLayout` with an existing `IndexMap` pass `fields: some_map.into()`. Existing access via indexing (`layout.fields[&fid]`) or borrowing iteration (`for (id, fl) in &layout.fields`) continues to work through `Deref` / `DerefMut` and `IntoIterator`. By-value iteration (`for (id, fl) in layout.fields`) is supported via `IntoIterator for TypeFields`.
+- **Lazy allocation**: Internally, `TypeFields(Option<Box<IndexMap<FieldId, FieldLayout>>>)` stores `None` for empty layouts, shrinking `TypeLayout` from 72 B to 8 B on 64-bit platforms. Aggregate layouts allocate the boxed map lazily on mutable dereference or when constructed from a non-empty `IndexMap`. Calling `TypeFields::clear()` drops the allocated box back to `None`. Inherent `is_empty(&self)` and `len(&self)` methods, as well as fast-path `PartialEq`, bypass static map access when either operand is `None`.
+- **Compaction**: When `TypeTable::compact_for_header_merge()` runs on cached header units, unused layout fields are dropped via `layout.fields.clear()`, releasing heap-allocated field maps before serialization or merge caching.
+- **Serialization contract**: Wire formats and SQLite export schemas are unchanged. `TypeFields` implements `Serialize` and `Deserialize` transparently as the underlying map of fields. See [memory measurements](MEMORY_PROFILE.md) and [evaluation report](EVAL_REPORT.md#struct-compaction-expansion-sharing-and-lifecycle-reclamation--2026-10-01).
 
 Sharing also makes re-interning cheap: a table answers `intern_arc` for an
 allocation it already holds by address, without hashing the descriptor tree,
@@ -1041,6 +1051,23 @@ graph names; `--full-export` still lists every variable.
 | `Store` | for each `o ∈ pts(dst)`: merge `pts(src)` into `memory_pts(o)` and field summaries |
 | `Gep` | field projection from base object locations (+ summary fallback) |
 | `UnwrapPointer` | `pts(dst) ⊇ { o ∈ pts(src) \| o compatible with dst's pointee type }` (see [Smart-pointer unwrap](#smart-pointer-unwrap)) |
+
+### Constraint representation and accessors
+
+To reduce inline footprint during PAG analysis, `Constraint` stores field projection metadata in `field_info: Option<Box<FieldAccess>>` where `FieldAccess` holds `field: FieldId` and `field_name: Arc<str>`. This shrinks `Constraint` inline size from 48 B to 24 B (a 50% reduction).
+
+- **Accessors**: Rather than accessing fields directly, consumers of `Constraint` use accessor methods:
+  - `c.field() -> Option<FieldId>`: Returns the field ID for GEP constraints, or `None`.
+  - `c.field_name() -> Option<&str>`: Returns the field name as a string slice, or `None`.
+  - `c.field_name_arc() -> Option<Arc<str>>`: Returns a refcount clone of the field name `Arc<str>` without allocating string memory.
+- **Migration**: Existing readers inspecting `c.field` or `c.field_name` must migrate to `c.field()` and `c.field_name()`.
+
+### Post-solve flow-release lifecycle
+
+Lowered IR flow constraints (`program.flow`) and function return flows (`program.fn_returns`) are consumed solely to construct the `Pag` (`Pag::build_flow_constraints`) and during solver return-flow expansion. Once solving finishes, before SQLite export, `program.release_flow()` is called:
+- Drops all `FlowConstraint` entries in `program.flow` (reallocates to an empty vector).
+- Drops all `ReturnFlow` mappings in `program.fn_returns` (reallocates to an empty map).
+- All symbol tables (`symbols`), call sites, functions, types, and the solved `Pag` (which retains its own compact `constraints` used by `export_flow_graph`) remain fully available for SQLite export, inspect queries, and C API callers. API consumers invoking analysis directly should call `program.release_flow()` after solving to reclaim flow memory before database serialization. See [memory profile](MEMORY_PROFILE.md) and [evaluation report](EVAL_REPORT.md#struct-compaction-expansion-sharing-and-lifecycle-reclamation--2026-10-01).
 
 ### Abstract location kinds
 

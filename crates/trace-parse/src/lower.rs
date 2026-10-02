@@ -177,7 +177,7 @@ struct LowerContext {
     /// variable of that name it hid; a block unwinds its own on exit.
     local_scope_log: Vec<(String, Option<VarId>)>,
     /// The unit's syntax tree, for descending to a node's ancestors.
-    tree: tree_sitter::Tree,
+    tree: Option<Arc<tree_sitter::Tree>>,
     /// Whether the unit can hold a `template_declaration` at all: a C++ unit
     /// whose text has the keyword. Most units have none, and then no
     /// signature needs its ancestors.
@@ -888,7 +888,7 @@ fn build_program_inner(
 
     // Preprocessing probes are not used by header/TU lowering. Drop both
     // serial and worker memos before retaining the header IR cache.
-    trace_ir::release_thread_path_caches();
+    trace_ir::release_filesystem_caches();
     pool.broadcast(|_| trace_ir::release_thread_path_caches());
     crate::memory::reclaim_unused_pages();
 
@@ -1284,6 +1284,15 @@ fn build_program_inner(
             crate::memory::reclaim_unused_pages();
         }
     }
+
+    // TU parsing and merging are complete. Drop the cached header IR and any
+    // remaining include expansions before program finalization begins.
+    drop(header_ir);
+    include_expansion_cache
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    crate::memory::reclaim_unused_pages();
 
     program.types.complete_nested_tags();
     // After the merges, so the headers involved already hold their ids
@@ -2336,7 +2345,7 @@ fn index_header_variant(
     ) {
         Ok(()) => {
             let mut unit = program_into_unit(path.to_path_buf(), program);
-            unit.held_headers = expansion.inlined.as_ref().clone();
+            unit.held_headers = Arc::clone(&expansion.inlined);
             // A header's unit is merged into every unit below it; a TU's
             // once, which the precomputation would not pay for.
             unit.merge_descs = crate::merge::merge_descs_of(&unit.types);
@@ -2347,6 +2356,7 @@ fn index_header_variant(
             // by the unconfigured header preamble merge.
             unit.function_flow_ranges = HashMap::default();
             unit.global_initializer_ranges = HashMap::default();
+            unit.shrink_to_fit();
             unit
         }
         Err(e) => UnitIndex {
@@ -2658,6 +2668,7 @@ fn lower_prepared_source(
     }
 
     let is_cpp = lang == crate::parse::SourceLang::Cpp;
+    let tree = Arc::new(parsed.tree);
     let mut ctx = LowerContext {
         current_fn: None,
         current_file: file_id,
@@ -2688,7 +2699,7 @@ fn lower_prepared_source(
         address_references: HashSet::default(),
         reference_returns: HashSet::default(),
         local_scope_log: Vec::new(),
-        tree: parsed.tree.clone(),
+        tree: Some(Arc::clone(&tree)),
         has_templates: is_cpp && parsed.source.contains("template"),
         template_depth: Cell::new(0),
         has_weak: source_may_annotate_weak(&parsed.source) || program.symbols.has_weak_symbols(),
@@ -2699,12 +2710,16 @@ fn lower_prepared_source(
         ignored_macros: Arc::from(program.ignored_macros.clone()),
         ignored_macro_cache: RefCell::new(HashMap::default()),
     };
-    lower_tree(
-        program,
-        &mut ctx,
-        parsed.source.as_ref(),
-        parsed.tree.root_node(),
-    );
+    lower_tree(program, &mut ctx, parsed.source.as_ref(), tree.root_node());
+    // AST lowering complete: drop syntax tree and clear transient expression caches early.
+    ctx.tree = None;
+    drop(tree);
+    ctx.handled_new_exprs.borrow_mut().clear();
+    ctx.callee_load_cache.borrow_mut().clear();
+    ctx.call_receiver_cache.borrow_mut().clear();
+    ctx.call_return_dst.borrow_mut().clear();
+    ctx.local_scope_log.clear();
+
     // Pragmas apply to the entire unit, even when placed after a definition.
     // Only a unit that spells the directive needs the line scan; after include
     // expansion the text is measured in megabytes.
@@ -2904,7 +2919,7 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
     let template_bases = program.take_template_bases();
     UnitIndex {
         compilation_index: None,
-        held_headers: Vec::new(),
+        held_headers: Arc::default(),
         files: program
             .symbols
             .files
@@ -6612,10 +6627,9 @@ fn smart_ptr_type(
 /// enclosing ones, and a preprocessed unit has thousands of top-level
 /// declarations: descend once per question.
 fn ancestors<'t>(ctx: &'t LowerContext, node: Node<'t>) -> impl Iterator<Item = Node<'t>> {
-    std::iter::successors(Some(ctx.tree.root_node()), move |cur| {
-        cur.child_with_descendant(node)
-    })
-    .take_while(move |cur| cur.id() != node.id())
+    let root = ctx.tree.as_ref().map(|t| t.root_node());
+    std::iter::successors(root, move |cur| cur.child_with_descendant(node))
+        .take_while(move |cur| cur.id() != node.id())
 }
 
 /// Whether `spelling` mentions a parameter of any `template_declaration` in
@@ -17032,8 +17046,6 @@ mod qualified_variable_lookup_tests {
         ns_stack: Vec<Option<String>>,
         locals: HashMap<String, VarId>,
     ) -> LowerContext {
-        let parsed = crate::parse::parse_source_with_lang("", crate::parse::SourceLang::Cpp)
-            .expect("empty source parses");
         LowerContext {
             current_fn,
             current_file,
@@ -17064,7 +17076,7 @@ mod qualified_variable_lookup_tests {
             address_references: HashSet::default(),
             reference_returns: HashSet::default(),
             local_scope_log: Vec::new(),
-            tree: parsed.tree,
+            tree: None,
             has_templates: false,
             template_depth: Cell::new(0),
             has_weak: false,

@@ -474,6 +474,14 @@ impl Program {
         self.template_base_set = rustc_hash::FxHashSet::default();
     }
 
+    /// Release flow constraints and return flows once analysis and solving are complete.
+    /// These are consumed during PAG building and solver return-flow expansion, and are not
+    /// read during SQLite export.
+    pub fn release_flow(&mut self) {
+        self.flow = Vec::new();
+        self.fn_returns = IndexMap::new();
+    }
+
     /// Dependency roots whose headers contribute declarations but whose
     /// sources are never indexed as translation units (`--dep`, #60).
     pub fn dep_roots(&self) -> &[PathBuf] {

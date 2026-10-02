@@ -26,6 +26,9 @@ impl Eq for LineMap {}
 /// One mapping: byte offset in preprocessed output → original location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineMapEntry {
+    /// Stable fingerprint of the full macro expansion/substitution chain.
+    /// Zero denotes source text without macro provenance.
+    pub expansion_id: u64,
     pub output_offset: u32,
     pub file: u32,
     pub line: u32,
@@ -35,9 +38,6 @@ pub struct LineMapEntry {
     pub expansion_file: u32,
     pub expansion_line: u32,
     pub expansion_col: u32,
-    /// Stable fingerprint of the full macro expansion/substitution chain.
-    /// Zero denotes source text without macro provenance.
-    pub expansion_id: u64,
     /// Interned macro name for the outermost macro invocation. `u32::MAX` means none.
     pub expansion_macro: u32,
 }
@@ -421,5 +421,10 @@ mod tests {
         assert_eq!(all.entries.len(), 2);
         all.truncate_at(0);
         assert!(all.entries.is_empty());
+    }
+
+    #[test]
+    fn line_map_entry_size() {
+        assert_eq!(std::mem::size_of::<LineMapEntry>(), 40);
     }
 }

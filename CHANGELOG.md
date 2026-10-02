@@ -4,6 +4,27 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Memory footprint reductions across preprocessor, indexing, and analysis
+
+Comprehensive memory reduction optimizations were implemented across data structures and pipeline stages:
+- **Struct and Enum Compaction**:
+  - `TypeInfo` inline footprint reduced from 104 B to 40 B (−61.5%); `TypeLayout` from 72 B to 8 B (−88.9%). Struct field layouts use `TypeFields(Option<Box<IndexMap<FieldId, FieldLayout>>>)`, storing `None` for types without fields (0 heap bytes, 8 inline bytes instead of 72 inline bytes).
+  - `Token` inline footprint reduced from 96 B to 56 B (−41.7%) by sharing macro expansion tracking in `Option<Arc<TokenMacroProvenance>>` with copy-on-write (`Arc::make_mut`), avoiding allocation churn during repeated argument substitution.
+  - `LineMapEntry` size guarded at 40 B by regression test `line_map_entry_size`.
+  - `MacroOp` representation updated to `Define(Arc<str>, Arc<MacroDef>)` and `Undef(Arc<str>)`, cutting size from 64 B to 24 B (−62.5%). `MacroTable` stores definitions as `Arc<MacroDef>`, eliminating heap string allocations and deep definition copies during directive logging, cache-frame capture, and replay. Macro op construction is skipped during translation unit preprocessing when no cache frames are open.
+  - PAG `Constraint` inline footprint reduced from 48 B to 24 B (−50.0%) by boxing sparse field access information (`FieldAccess` stores field names as `Arc<str>`, eliminating heap allocations in solver worklist propagation).
+- **Payload and Collection Sharing**:
+  - `IncludeExpansion` vectors (`ops`, `diagnostics`, `guards`, `nested_variants`, `inlined`, `covers`) converted from `Arc<Vec<T>>` to direct `Arc<[T]>` slices, eliminating unused vector capacity and indirection across cached include expansions.
+  - `UnitIndex.held_headers` shares `expansion.inlined` as `Arc<[PathBuf]>` without deep-cloning path vectors.
+- **Eager Lifecycle Reclamation**:
+  - Tree-sitter AST parse trees and transient lowering expression caches are dropped immediately upon AST lowering completion (`ctx.tree = None`).
+  - Thread-local path probe caches and shared filesystem directory listings (`DIR_LISTINGS`) are cleared post-preprocessing.
+  - Cached header `UnitIndex` instances and their `TypeTable` entries are shrunk to fit and stripped of unused layout data.
+  - Cached header IR (`HeaderIr`) and include expansion caches are dropped immediately upon TU parsing completion before program finalization.
+  - Program IR flow constraints and return flows are released post-solving, prior to SQLite export (`program.release_flow()`).
+  - Argument flow extraction borrows call edges and wired argument flows directly without cloning or clearing analysis result fields.
+See `docs/MEMORY_PROFILE.md`, `docs/EVAL_REPORT.md`, and `docs/ANALYSIS.md` for details.
+
 ### Explicit calls to overloaded operators
 
 Explicit calls to overloaded operators using member-access syntax (`value.operator->()`,

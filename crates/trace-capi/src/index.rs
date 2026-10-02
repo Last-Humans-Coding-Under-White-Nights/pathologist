@@ -216,6 +216,7 @@ fn run_index(cfg: &IndexConfig) -> Result<(TraceIndexResult, String), ApiError> 
         },
     );
     let model_files: Vec<String> = cfg.models.iter().map(|p| p.display().to_string()).collect();
+    program.release_flow();
     export_to_sqlite(
         &program,
         &pag,

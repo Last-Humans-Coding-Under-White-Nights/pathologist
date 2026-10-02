@@ -965,8 +965,7 @@ impl Pag {
             kind: crate::constraints::ConstraintKind::Copy,
             dst,
             src,
-            field: None,
-            field_name: None,
+            field_info: None,
         });
     }
 
@@ -975,8 +974,7 @@ impl Pag {
             kind: crate::constraints::ConstraintKind::UnwrapPointer,
             dst,
             src,
-            field: None,
-            field_name: None,
+            field_info: None,
         });
     }
 
@@ -985,8 +983,7 @@ impl Pag {
             kind: crate::constraints::ConstraintKind::AddrOf,
             dst,
             src: loc_node,
-            field: None,
-            field_name: None,
+            field_info: None,
         });
     }
 
@@ -995,8 +992,7 @@ impl Pag {
             kind: crate::constraints::ConstraintKind::Load,
             dst,
             src,
-            field: None,
-            field_name: None,
+            field_info: None,
         });
     }
 
@@ -1005,8 +1001,7 @@ impl Pag {
             kind: crate::constraints::ConstraintKind::Store,
             dst,
             src,
-            field: None,
-            field_name: None,
+            field_info: None,
         });
     }
 
@@ -1015,8 +1010,10 @@ impl Pag {
             kind: crate::constraints::ConstraintKind::Gep,
             dst,
             src: base,
-            field: Some(field),
-            field_name: Some(field_name),
+            field_info: Some(Box::new(crate::constraints::FieldAccess {
+                field,
+                field_name: field_name.into(),
+            })),
         });
     }
 
@@ -1025,8 +1022,7 @@ impl Pag {
             kind: crate::constraints::ConstraintKind::Dlsym,
             dst,
             src,
-            field: None,
-            field_name: None,
+            field_info: None,
         });
     }
 }

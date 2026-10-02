@@ -75,6 +75,14 @@ pub fn release_thread_path_caches() {
     PROBE_CACHE.with(|cache| cache.borrow_mut().1 = FxHashMap::default());
 }
 
+/// Release both thread-local path memos and shared directory listings.
+pub fn release_filesystem_caches() {
+    release_thread_path_caches();
+    if let Ok(mut cache) = DIR_LISTINGS.write() {
+        *cache = (0, FxHashMap::default());
+    }
+}
+
 /// Discard every memoized file probe: the tree may have changed since the last
 /// one was taken.
 ///
