@@ -1,5 +1,103 @@
 # Evaluation Report
 
+## C++ type syntax: #167, #169, #170 — 2026-10-01
+
+Review-fix validation against PR head `3a3e2d8`: `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets` and `cargo test --workspace` pass
+(1,705 tests); `python3 scripts/eval_check.py` passes all 94 checks with the
+existing expectations. The fixes cover case-label typedefs, cv-qualified
+typeof operands, unclosed raw literals and commented dependency member-pointer
+declarators; their rules are in the normalization section linked below.
+
+At candidate `4ba091b`, three alternating release runs on the same pinned camera
+corpus, with `TRACE_SOLVE_BUDGET_POPS=800000`, `--jobs 8` and a fresh output
+database per run, took 6.87 / 6.29 / 6.31 seconds before and
+6.31 / 6.38 / 6.47 seconds after (wall time measured around
+`trace analyze ~/multimedia_camera_framework --jobs 8 -o <temporary.db>`).
+Medians were 6.31 versus 6.38 seconds (+1.1%), within the observed spread;
+these runs do not establish a repeatable performance change.
+
+Rules are maintained in [C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization).
+The local branch is `fix/issues-167-169-170-cpp-type-syntax`, baseline
+`18303d6a6aa228a9f0ea1a65ca3bc72de58d9bba` (master). Both sides use the pinned,
+clean HDF (`cdc75a2`), hiview (`92408e2`) and camera (`8ffd69d`) corpora from
+`scripts/eval_expected.json`, release builds, eight jobs and the eval solver
+budget (`TRACE_SOLVE_BUDGET_POPS=800000`), following
+[Attributing a change](#attributing-a-change-baseline-vs-branch): the baseline
+binary was built from a detached worktree, and each corpus was analyzed by both
+binaries before the two databases were diffed.
+
+Three C++ spellings the pinned tree-sitter-cpp 0.23.4 grammar rejects are now
+rewritten in the parse input, byte-for-byte in place, before parsing: a class
+whose base is computed by `decltype(expression)` loses that one base entry
+(#167); GNU `__typeof__(...)` / `__typeof(...)` is unwrapped when its operand is
+a simple type and re-spelled `decltype` otherwise (#169); a parenthesized
+member-function pointer `R (C::*)(Args...) const` loses its owner in every
+declaration context, and a named typedef of one also loses the trailing
+qualifiers the grammar cannot carry on an ordinary pointer (#170). Lowering
+changed in one place: a `decltype` node, native or re-spelled, now lowers to
+`TypeDesc::Unknown` instead of a type read off the operand's text.
+
+| Corpus | Metric | Baseline (`18303d6`) | Candidate | Diff |
+|---|---|---:|---:|---:|
+| HDF | files | 1,483 | 1,483 | unchanged |
+| HDF | functions (defined / external) | 11,996 (10,294 / 1,702) | 11,996 (10,294 / 1,702) | unchanged |
+| HDF | call edges (dir / ind / ext / ipc) | 76,530 (47,856 / 4,980 / 23,694 / 0) | 76,530 (47,856 / 4,980 / 23,694 / 0) | unchanged |
+| HDF | arg-flow edges / diagnostics | 69,999 / 1,917 | 69,999 / 1,917 | unchanged |
+| hiview | files | 1,452 | 1,452 | unchanged |
+| hiview | functions (defined / external) | 9,674 (7,992 / 1,682) | 9,674 (7,992 / 1,682) | unchanged |
+| hiview | call edges (dir / ind / ext / ipc) | 32,058 (17,404 / 176 / 14,434 / 44) | 32,058 (17,404 / 176 / 14,434 / 44) | unchanged |
+| hiview | arg-flow edges / diagnostics | 19,653 / 3,574 | 19,653 / 3,574 | unchanged |
+| camera | files | 1,703 | 1,703 | unchanged |
+| camera | functions (defined / external) | 23,461 (19,806 / 3,655) | 23,461 (19,806 / 3,655) | unchanged |
+| camera | call edges (dir / ind / ext / ipc) | 111,520 (66,885 / 305 / 43,522 / 808) | 111,520 (66,885 / 305 / 43,522 / 808) | unchanged |
+| camera | arg-flow edges / diagnostics | 49,728 / 5,051 | 49,730 / 5,048 | +2 / −3 |
+
+What moved, from the database diff:
+
+- camera `diagnostics` −3: two headers no longer report `parse errors`
+  (one of them twice, once per including unit) — `camera_ability_builder.h`
+  (`typedef void (CameraAbilityBuilder::*ExecuteFunc)(MultiTypeArray&, sptr<CameraAbility>);`)
+  and `camera_rotate_param_manager.h`
+  (`typedef void (CameraRoateParamManager::*HandleEventFunc)(const AAFwk::Want &) const;`),
+  both named member-function-pointer typedefs (#170). The remaining
+  5,048 diagnostics are unchanged row for row.
+- camera `arg_flow_edges` +2: in `camera_napi_adaptor.h` the parameter
+  `int32_t (TSession::*setFunc)(T)` of both `CameraNapiAdaptor::SetArg`
+  overloads is now a function-pointer parameter, so `setFunc` flows into
+  `SetArgImpl` at argument 3 of each call. Function and call-edge rows are
+  identical.
+- No computed `decltype` base and no `__typeof__` occurs in the three corpora
+  (0 keywords; 2 `: decltype(`/`, decltype(` candidates in camera, both inside
+  template arguments and left alone), so #167 and #169 are exercised by the
+  fixtures and integration tests only.
+- `scripts/eval_expected.json`: camera `diagnostics` 5,051 → 5,048; every other
+  expectation holds, 94/94 checks after the re-capture.
+
+Scan accounting, counted over the preprocessed units each run writes with
+`TRACE_DUMP_TU_DIR` (a throwaway test over those files, not production
+instrumentation): camera 945 units, 526 satisfy the prefilter (`friend`+`[[`,
+`::`+`*`+`(`, `decltype`, `__typeof`) and take the full linear scan, 12 are
+edited; HDF (C, whose grammar path never normalizes) 830 units, none edited.
+Scratch validation parses (`cpp_type_operand_parses`) run only for an actual
+candidate — a computed base entry, a simple-type typeof operand or a named
+typedef's suffix — so camera performs on the order of ten per run.
+
+Performance, three paired runs each on the final tree (`scripts/profile_memory_macos.py`,
+eight jobs, `phys_footprint`; wall and CPU from the profiler's `wait4` line;
+both sides measured in one batch, since the lifetime footprint swings by
+~200 MiB between batches on this machine):
+
+| Corpus | Side | wall median (runs) | CPU median | preprocess / pch / tu-merge wall | lifetime max footprint (runs) |
+|---|---|---:|---:|---:|---:|
+| camera (C++, 12 units edited) | baseline | 6.30 s (6.4, 6.3, 6.2) | 25.6 s | 1.1 / 0.5 / 2.7 s | 259 MiB (259, 258, 242) |
+| camera | candidate | 6.30 s (6.3, 6.3, 6.3) | 25.4 s | 1.0 / 0.5 / 2.7 s | 273 MiB (218, 273, 234) |
+| HDF (C, unaffected) | baseline | 3.80 s (3.8, 3.9, 3.8) | 12.6 s | 0.7 / 0.1 / 0.8 s | 189 MiB (188, 189, 189) |
+| HDF | candidate | 3.80 s (3.8, 3.8, 3.9) | 12.6 s | 0.8 / 0.1 / 0.8 s | 175 MiB (173, 173, 175) |
+
+Wall medians are identical; CPU and footprint differences are inside the
+run-to-run spread of either side. No repeatable slowdown to investigate.
+
 ## macOS space-efficient malloc — 2026-09-30
 
 On macOS `trace analyze` now runs under libmalloc's space-efficient mode by

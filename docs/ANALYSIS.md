@@ -464,10 +464,14 @@ preserved in the PAG and analyzed via points-to flow. Declarator classification
 distinguishes nested callback types (e.g. pointers to functions returning function
 pointers, `void (*(*cb)(int))(double);`) from member functions returning function
 pointers (`void (*get_handler(int))(int);`) by examining the declarator binding nearest
-the declared identifier. For pointers to member functions (`void (S::*cb)(int);`),
-declarator classification traverses qualified identifiers with pointer-bearing names
-(`pointer_type_declarator`), identifying them as variable bindings while retaining
-ordinary qualified function names as terminals.
+the declared identifier. A pointer to member function (`void (S::*cb)(int);`)
+never reaches this classification as such: the parse input blanks its owner
+(see [C++ parse-input normalization](#c-parse-input-normalization)), so it is
+an ordinary function-pointer declarator and the variable is named `cb`. A
+project data-member pointer (`int S::* dm;`) is not rewritten; declarator
+classification still traverses its pointer-bearing qualified name
+(`pointer_type_declarator`) and indexes it as a variable binding, `S::*dm`,
+while retaining ordinary qualified function names as terminals.
 
 A member declared in-class and defined out-of-class (`int *Holder::member;`
 or `int *Holder::member = &object;` at namespace scope) share one `VarId`:
@@ -1811,7 +1815,9 @@ C++-aware only where it must be — everything else reuses the C machinery.
   parsing, C++ sources undergo parse-syntax normalization
   (`normalize_cpp_parse_syntax`) where attribute specifiers preceding `friend`
   (including those preceding `constexpr friend`) are blanked with ASCII spaces
-  in place, strictly preserving newlines and byte coordinates. Friend lowering
+  in place, strictly preserving newlines and byte coordinates (the rewrite
+  rules live in [C++ parse-input normalization](#c-parse-input-normalization)).
+  Friend lowering
   (`lower_friend_declarations`) lowers in-class friend function definitions and
   friend operator declarations as non-member functions belonging to the innermost
   enclosing namespace ([class.friend]) with `ctx.class_ctx = None`. Friend functions
@@ -2523,7 +2529,10 @@ Next slices (hiview-grounded): [docs/CPP_ROADMAP.md](CPP_ROADMAP.md).
 This section is the authoritative description of subclasses reached through a
 class template's parameters (`template_bases.rs`). With
 `template<class I> class IRemoteStub : public I`, a
-`class S : public IRemoteStub<IFoo>` derives from `IFoo`.
+`class S : public IRemoteStub<IFoo>` derives from `IFoo`. A base computed by
+`decltype(...)` is not a parameter base: it is omitted from the parse input
+and never resolved (see
+[C++ parse-input normalization](#c-parse-input-normalization)).
 
 The fact. Lowering records a `ClassTemplate` (`Program.class_templates`) for a
 primary class template definition whose bases mention its parameters: the
@@ -2676,6 +2685,184 @@ Limits:
 - An exact global template name wins over the scoped lookup.
 - A base spelled with a partial specialization's arguments expands through
   the primary template's bases.
+
+### C++ parse-input normalization
+
+The pinned tree-sitter C++ grammar (tree-sitter-cpp 0.23.4) rejects a few
+standard or GNU spellings. Rather than fork the grammar, the parse input of a
+C++ translation unit is rewritten in place before parsing
+(`normalize_cpp_parse_syntax` in `trace-parse/src/parse.rs`), after the
+dependency-only pass (`normalize_dependency_cpp_syntax`, see
+[Compilation databases](#compilation-databases-62)). Every rewrite replaces
+bytes with ASCII spaces, preserving CR/LF, so node offsets, LineMap lookups and
+exported line/column positions still name the original source. The rewrite is
+a parse adaptation only: it changes what the grammar sees, never what lowering
+records as semantics beyond what is stated below. Spellings the recognizers do
+not fully match stay unchanged and keep their parse diagnostic.
+
+The function first checks cheap substring triggers (`friend` with `[[`; `::`
+with `*` and `(`; `decltype`; `__typeof`) and scans the unit once, outside
+string/character literals, raw strings and comments. A standard-library-heavy
+unit satisfies the triggers without needing any edit, so the cost is one
+linear scan plus one scratch validation parse per actual candidate.
+
+Recognized spellings:
+
+- **Attributes before `friend`** — `[[nodiscard]] friend bool operator==(...)`
+  and `[[nodiscard]] constexpr friend ...`: the attribute specifiers are
+  blanked (see "Friend declarations and operator attributes" above).
+- **Parenthesized member-function pointers (#170)** — the complete shape
+  `( owner :: * [cv] [name] ) ( params ) [suffix]` with a simple,
+  identifier-qualified or globally qualified owner (`C::`, `ns::C::`,
+  `::ns::C::`) and comments or newlines
+  between tokens, in every declaration context: `using` aliases, named
+  typedefs, template specialization arguments (`traits<R (C::*)(Args...)
+  const>`), function parameters, fields and variables. The owner is blanked,
+  turning the type into the ordinary function pointer the grammar accepts;
+  `*`, the name, the parameter list and the trailing qualifiers stay. Lowering
+  therefore records the coarse ordinary function-pointer shape and no
+  owner, cv, ref or `noexcept` semantics; this matches the dependency-only
+  data-member approximation. A variable or field declared this way is named
+  by its identifier (`cb` for `void (S::*cb)(int)`), not by the recovered
+  declarator text. A **named typedef declarator** is the exception
+  for the suffix: the grammar accepts `using M = R (*)(Args...) const;` but
+  not `typedef R (*M)(Args...) const;`, so for a member pointer that is a
+  `typedef` statement's own declarator (parenthesis depth 0 after the
+  `typedef` keyword, at the brace depth of the keyword — a type body the
+  typedef introduces, `typedef struct { ... } (C::*M)() const;`, is stepped
+  over and its members stay fields — not a parameter nested in another
+  typedef, even after a brace inside that parameter list such as a lambda or
+  compound literal in a default argument) the function
+  qualifiers `const`,
+  `volatile`, `&`, `&&`, `noexcept`, `noexcept(...)` are blanked from the end
+  of the parameter list through the last qualifier token. The suffix is first
+  validated as a type on a scratch parse (`cpp_type_operand_parses`), so a
+  malformed suffix leaves the whole declarator unchanged and diagnosed. The
+  keyword is recognized directly, including after labels (`case expression:`,
+  `default:`, `public:`), `__extension__` and attributes; colons in conditional
+  expressions and template arguments do not change typedef detection. An
+  unterminated `noexcept(` is recognized as part of the shape precisely so no
+  pass degrades it to owner-only blanking. Template-qualified owners
+  (`W<int>::C::*`), bare project data-member pointers (`int C::* p`),
+  `.*` / `->*` expressions, literals and comments are untouched. In dependency
+  headers the dependency pass recognizes this shape at its opening `(`,
+  skipping comments (including line comments) and whitespace forward. It
+  leaves the owner to the general pass, before its legacy data-member rule
+  can rewrite `::*`, so the general pass can apply the
+  complete edit once, and the general pass is idempotent on text the
+  dependency pass already rewrote. A class head with a base list is scanned
+  like any other text, so a specialization such as
+  `struct traits<R (C::*)(A...) const &> : base<...>` is rewritten whatever
+  else the unit contains.
+
+- **Computed base classes (#167)** — `template<class T> struct D :
+  decltype(make<T>()) { ... }`. `base_class_clause` admits only class names,
+  so a class head (`struct`/`class`, optional `[[...]]`/`alignas(...)`/
+  `__attribute__((...))`, a simple, qualified, globally qualified or
+  template-id name such as `has_foo<T, void_t<decltype(check<T>(0))>>` or
+  `Outer::Nested`, optional `final`) followed by `:` has its base list split
+  at top-level commas, tracking template-argument nesting (`>>` included) and
+  skipping parenthesized groups and string/character literals (`S<'>'>`).
+  Concrete entries may be globally qualified (`::Base`). A complete entry of the form `[public|private|
+  protected|virtual] decltype(expression) [...]` is a computed base; its
+  operand is first validated as a type by `cpp_type_operand_parses`, and if
+  every computed entry of the list validates, each one is blanked together
+  with the separators it owned, leaving exactly one original comma between
+  retained concrete entries and blanking the colon when nothing remains. A
+  pack's `...` goes with its entry, so `: ...` is never left behind. The class
+  body and every sibling byte are untouched, so lowering records only the real
+  concrete bases; **computed-base inheritance stays unresolved**, including
+  for non-dependent expressions, and no placeholder edge or name is invented.
+  Not edited: a `decltype(...)::type` base (a qualified spelling the grammar
+  already parses), a `decltype` inside a concrete base's template arguments
+  (`Base<int, decltype(make<T>())>`), `enum class E : decltype(x)` (an
+  underlying type, stepped over as a unit, attribute groups and other
+  identifiers between `enum` and `class` included, such as an unexpanded
+  `enum MYATTR class`; the search stops at any other token, so an unscoped
+  enum's `:` or `{` ends it), template parameters
+  (`class T = decltype(0)`), ternaries, constructor initializers, and any base
+  list the recognizer cannot read completely (empty entries, double commas,
+  unknown modifiers, an unnamed class, a base spelled with `::template`). A
+  computed entry whose operand the
+  grammar rejects (`decltype(f() +)`, `decltype()`) leaves the whole list
+  unchanged, so a real syntax error is still diagnosed rather than hidden by
+  the omission.
+
+- **GNU `__typeof__` / `__typeof` (#169)** — the grammar has no typeof
+  alternative in `type_specifier`. The keyword (10 or 8 bytes) with a complete
+  parenthesized operand is handled by operand shape, classified lexically
+  (`classify_typeof_operand`) without any symbol table:
+  - *Simple type* — `[cv] core [cv] (* [cv])* [& | &&]`, where `core` is one
+    or more fundamental words (`int`, `unsigned long long`, and the
+    fixed-width/size names `is_fundamental_type_name` lists, such as
+    `uint32_t`, which the grammar also treats as primitive) or one qualified
+    name with at least one pointer/reference layer or a cv qualifier (`T *`,
+    `T &&`, `const ns::Type *`, `const MyType`, `MyType volatile`).
+    The operand text is validated as a type on a
+    scratch parse; then the keyword through `(` and the closing `)` are
+    blanked, leaving the operand in place (`typedef __typeof__(int *) type;`
+    → `typedef            int *  type;`). Lowering records the type exactly
+    as it would for the unwrapped spelling.
+  - *Expression or bare name* — operands not covered by the simple or
+    unsupported type rules, including `T() +
+    U()`, `x * y`, `x & y`, calls, and a bare name without a layer or cv
+    qualifier (`T`, `MyType`, `ns::value`), which syntax alone cannot tell
+    from a variable.
+    The keyword is re-spelled `decltype` padded to its length (`decltype  `
+    for `__typeof__`), operand bytes and positions unchanged. This is a parse
+    adaptation only; GNU typeof's reference semantics are not modeled.
+  - *Unsupported* — an operand with a fundamental core and tokens outside
+    the simple shape: abstract array or function declarators (`int[2]`,
+    `void (*)(int)`), malformed modifier runs (`int const int`). These stay
+    as written and diagnosed. This rule does not recognize every type-id:
+    template-ids (`W<int> *`), elaborated types (`struct Foo *`) and dependent
+    types (`typename T::type *`) take the expression path, are re-spelled
+    as `decltype`, and remain diagnosed.
+  Bare `typeof` (6 bytes) cannot be re-spelled in place and is left alone.
+  Keyword substrings inside identifiers, strings and comments are never
+  touched, and an unclosed group leaves the spelling unchanged. Unterminated
+  ordinary and raw literals consume the rest of the input during recognition;
+  their contents cannot close a group or introduce a rewrite. Known
+  boundaries, recorded rather than modeled: a nested
+  `__typeof__(__typeof__(x) *)` becomes a nested `decltype` and stays
+  diagnosed; `struct D : __typeof__(B)` is re-spelled as
+  `struct D : decltype  (B)` but remains diagnosed: computed-base recognition
+  reads the original source, so it does not remove a base introduced by a
+  typeof rewrite. The two adaptations do not compose in this case. A simple
+  operand that heads a declaration with more than one declarator is not
+  unwrapped, since a later declarator would get only the base type (`q` as
+  `int` in `typedef __typeof__(int *) p, q;`); it stays as written and
+  diagnosed. The scan after the operand counts a `,` at bracket depth zero
+  once it reaches the declaration's `;`, so file-scope, block-scope,
+  `for`-init and `if`/`switch`-init declarations
+  (`for (__typeof__(int *) p = 0, q = 0;;)`) are all kept. A group that closes
+  first (a parameter list, `void h(__typeof__(int *) a, int b);`), a `>`
+  before any `=` (an enclosing template argument list,
+  `std::map<__typeof__(int *) *, int> m;`), or a `,`/`>` directly after the
+  operand means the commas separate other entities, and the operand is
+  unwrapped. Template arguments in an initializer (`= g<int, int>()`) are
+  skipped when their `<`/`>` balance; an unbalanced `<` is read as a
+  comparison and a comma after it still counts (`= b < c, d;` is kept).
+  Unwrapping applies to the declaration as spelled, so a leading `const`
+  qualifies the pointee rather than the pointer.
+
+  **Unresolved `decltype` lowers to `Unknown`.** `type_desc_from_node` now
+  returns `TypeDesc::Unknown` for a `decltype` node, native or re-spelled,
+  and `peel_cpp_type_node` treats `decltype` as terminal so its operand is
+  never read as a type name. Before, the substring fallback made
+  `decltype(avoid_copy())` `Void`, `decltype(charge())` `Char`,
+  `decltype(T() + U())` `Int`, and peeling turned `decltype(Outer::Inner)`
+  into whatever `Outer::Inner` names. `Unknown` is the designed
+  over-approximation (it matches any type in `may_name_same_type`), so an
+  alias such as `sum_result::type` is registered with an explicitly
+  unresolved descriptor rather than a fabricated one. Expression type
+  deduction is not performed; operands are never lowered as calls.
+
+`cpp_type_operand_parses` parses `using __trace_base_probe = <type>;` directly
+on the thread-local C++ parser. Normalization runs before
+`parse_source_with_lang` borrows that parser, and the helper releases its
+borrow before returning; calling normalization while holding the parser would
+panic. The probe is syntax-only and never enters the IR.
 
 ## IDL-generated interfaces
 
@@ -2896,7 +3083,11 @@ pointer-to-member types (`T C::*`) as ordinary pointers (`T *`). This spelling
 confuses the tree-sitter C++ grammar, while dependency bodies are
 declaration-only. The normalization preserves byte offsets and newlines, so
 LineMap locations still refer to the original source. Project-origin text is
-left intact. Other C++ grammar gaps may still produce parse diagnostics.
+left intact by this pass; the parenthesized member-function-pointer shape is
+handled for project and dependency text alike by the general pass described
+in [C++ parse-input normalization](#c-parse-input-normalization), which the
+dependency pass leaves to it. Other C++ grammar gaps may still produce parse
+diagnostics.
 
 The probe also supplies selected target and hosted-mode macros to the custom
 preprocessor; explicit database macro operations and CLI definitions retain

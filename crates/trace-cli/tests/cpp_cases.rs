@@ -10882,15 +10882,14 @@ void (S::*cb)(int) = &S::target;
 
     let program = build_program(root, &default_opts(root)).expect("build");
 
-    // S::*cb must be registered as a variable
-    let var = program
-        .symbols
-        .variables
-        .iter()
-        .find(|v| v.name == "S::*cb");
+    // `cb` must be registered as a variable under its own identifier: the
+    // parse input approximates the member-function pointer as an ordinary
+    // function pointer (docs/ANALYSIS.md, "C++ parse-input normalization"),
+    // so the owner never leaks into the name.
+    let var = program.symbols.variables.iter().find(|v| v.name == "cb");
     assert!(
         var.is_some(),
-        "S::*cb must be registered as a variable in program.symbols.variables: {:?}",
+        "cb must be registered as a variable in program.symbols.variables: {:?}",
         program
             .symbols
             .variables
@@ -10900,14 +10899,14 @@ void (S::*cb)(int) = &S::target;
     );
     let var = var.unwrap();
 
-    // S::*cb must NOT be registered as a function
+    // cb must NOT be registered as a function
     assert!(
         !program
             .symbols
             .functions
             .iter()
             .any(|f| f.name.contains("S::*cb") || f.name == "cb"),
-        "S::*cb must NOT be registered as a function in program.symbols.functions: {:?}",
+        "cb must NOT be registered as a function in program.symbols.functions: {:?}",
         program
             .symbols
             .functions
@@ -10924,11 +10923,11 @@ void (S::*cb)(int) = &S::target;
     });
     assert!(
         has_init_flow,
-        "initializer flow must be emitted for variable S::*cb: {:?}",
+        "initializer flow must be emitted for variable cb: {:?}",
         program.flow
     );
 
-    // Verify full export to SQLite: variable S::*cb exists, no function S::*cb, and two flow edges
+    // Verify full export to SQLite: variable cb exists, no function cb, and two flow edges
     let (pag, analysis) = analyze(&program);
     let db_path = dir.path().join("out.db");
     trace_db::export_to_sqlite(
@@ -10948,12 +10947,12 @@ void (S::*cb)(int) = &S::target;
     let conn = trace_db::open_db(&db_path).expect("open db");
     let var_count: i64 = conn
         .query_row(
-            "SELECT count(*) FROM variables WHERE name = 'S::*cb'",
+            "SELECT count(*) FROM variables WHERE name = 'cb'",
             [],
             |row| row.get(0),
         )
         .expect("query var");
-    assert_eq!(var_count, 1, "S::*cb must be exported to variables table");
+    assert_eq!(var_count, 1, "cb must be exported to variables table");
 
     let fn_count: i64 = conn
         .query_row(
