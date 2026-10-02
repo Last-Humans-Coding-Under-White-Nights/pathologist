@@ -1,5 +1,52 @@
 # Evaluation Report
 
+## Explicit calls to overloaded operators — 2026-10-01
+
+Rules are maintained in [Explicit member operator calls](ANALYSIS.md#explicit-member-operator-calls).
+Both versions use the same pinned, clean HDF (`cdc75a2`), hiview (`92408e2`), and camera
+(`8ffd69d`) corpora from `scripts/eval_expected.json`, release builds, eight
+jobs, and the existing eval solver settings. Measurements were taken using
+`python3 scripts/eval_check.py --bin target/release/trace`.
+All 94/94 checks pass.
+
+C++ permits explicit operator calls using member-access syntax, such as
+`value.operator->()` and `a.operator>(b)`. Standard-library templates and
+OpenHarmony code use them in trailing return types (`decltype(value.operator->())`)
+and function bodies. Upstream `tree-sitter-cpp` 0.23 does not include `operator_name`
+in `field_expression`, parsing the operator segment (`.operator->` or `->operator>`)
+as an `ERROR` node under `call_expression` with the receiver in `function`.
+These error nodes are now recognized as benign (`is_explicit_operator_error`),
+suppressing false-positive parse error diagnostics. Lowering extracts the receiver
+and operator name (`explicit_member_operator_call`), resolving the call to the
+member operator (e.g. `Cls::operator->`, `Cls::operator>`) with the same callee
+identity as ordinary operator syntax, without creating phantom standalone functions
+named `->` or `>` or treating receiver variables as callees. In dependency headers,
+trailing return types preserve declarations without emitting internal call sites.
+
+| Corpus | Metric | Baseline (`a8ed147`) | Candidate | Diff |
+|---|---|---:|---:|---:|
+| HDF | files | 1,483 | 1,483 | unchanged |
+| HDF | functions (defined / external) | 11,996 (10,294 / 1,702) | 11,996 (10,294 / 1,702) | unchanged |
+| HDF | call edges (dir / ind / ext / ipc) | 39,419 (22,969 / 4,644 / 11,802 / 4) | 39,419 (22,969 / 4,644 / 11,802 / 4) | unchanged |
+| HDF | arg-flow edges / diagnostics | 65,992 / 1,327 | 65,992 / 1,327 | unchanged |
+| hiview | files | 1,452 | 1,452 | unchanged |
+| hiview | functions (defined / external) | 9,674 (7,992 / 1,682) | 9,674 (7,992 / 1,682) | unchanged |
+| hiview | call edges (dir / ind / ext / ipc) | 32,058 (17,404 / 176 / 14,434 / 44) | 32,058 (17,404 / 176 / 14,434 / 44) | unchanged |
+| hiview | arg-flow edges / diagnostics | 19,653 / 3,574 | 19,653 / 3,573 | −1 diagnostic |
+| camera | files | 1,703 | 1,703 | unchanged |
+| camera | functions (defined / external) | 23,461 (19,806 / 3,655) | 23,461 (19,806 / 3,655) | unchanged |
+| camera | call edges (dir / ind / ext / ipc) | 111,520 (66,885 / 305 / 43,522 / 808) | 111,520 (66,885 / 305 / 43,522 / 808) | unchanged |
+| camera | arg-flow edges / diagnostics | 49,730 / 5,048 | 49,730 / 5,046 | −2 diagnostics |
+
+In hiview, `base/event_loop.cpp:504` (`event.packagedTask->operator()()`) stops
+generating an unrecovered parse error, reducing total diagnostics from 3,574 to
+3,573.
+In camera, `services/camera_service/src/camera_beauty_notification.cpp:61`
+(`beautyTimes_.operator++()`) and `services/camera_service/src/hcamera_device.cpp:807`
+(`deviceEjectTimes_.operator++()`) now parse cleanly without unrecovered syntax
+errors, eliminating parse error diagnostics from both translation units (diagnostics
+5,048 -> 5,046). All 94 evaluation checks pass.
+
 ## C++ type syntax: #167, #169, #170 — 2026-10-01
 
 Review-fix validation against PR head `3a3e2d8`: `cargo fmt --all -- --check`,
@@ -42,8 +89,8 @@ changed in one place: a `decltype` node, native or re-spelled, now lowers to
 |---|---|---:|---:|---:|
 | HDF | files | 1,483 | 1,483 | unchanged |
 | HDF | functions (defined / external) | 11,996 (10,294 / 1,702) | 11,996 (10,294 / 1,702) | unchanged |
-| HDF | call edges (dir / ind / ext / ipc) | 76,530 (47,856 / 4,980 / 23,694 / 0) | 76,530 (47,856 / 4,980 / 23,694 / 0) | unchanged |
-| HDF | arg-flow edges / diagnostics | 69,999 / 1,917 | 69,999 / 1,917 | unchanged |
+| HDF | call edges (dir / ind / ext / ipc) | 39,419 (22,969 / 4,644 / 11,802 / 4) | 39,419 (22,969 / 4,644 / 11,802 / 4) | unchanged |
+| HDF | arg-flow edges / diagnostics | 65,992 / 1,327 | 65,992 / 1,327 | unchanged |
 | hiview | files | 1,452 | 1,452 | unchanged |
 | hiview | functions (defined / external) | 9,674 (7,992 / 1,682) | 9,674 (7,992 / 1,682) | unchanged |
 | hiview | call edges (dir / ind / ext / ipc) | 32,058 (17,404 / 176 / 14,434 / 44) | 32,058 (17,404 / 176 / 14,434 / 44) | unchanged |

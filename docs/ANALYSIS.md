@@ -2081,6 +2081,19 @@ C++-aware only where it must be — everything else reuses the C machinery.
 
   Before this, the first argument of a method call landed on `this`,
   so a callback or pointer handed to a method never reached its parameter.
+- **Explicit member operator calls**: explicit operator invocations using
+  member-access syntax, such as `value.operator->()` or `a.operator>(b)`, are
+  admitted in expression and trailing-return-type positions. Tree-sitter C++
+  parses the explicit operator segment (`.operator->` or `->operator>`)
+  inside an `ERROR` node under `call_expression`, placing the receiver in the
+  `function` field. The parser classifies these as benign parse errors so no
+  spurious parse diagnostic is generated. Lowering recovers the receiver and
+  target operator name, resolving the call to the member operator
+  (`Cls::operator->`, `Cls::operator>`) with the same callee identity as
+  ordinary operator syntax, without treating the receiver variable as a callee
+  or synthesizing isolated functions named `->` or `>`. In dependency headers,
+  expressions in trailing return types preserve the surrounding signature
+  without creating call sites.
 - **Conversion operators**: `operator T()` is a member named
   `Cls::operator T`, spelled from its `operator_cast` declarator: the name
   runs to the declarator's own parameter list, so the target type keeps its

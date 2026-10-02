@@ -13223,3 +13223,382 @@ fn friend_body_block_scoped_import_shadows_enclosing_class() {
     ));
     assert!(must_not_have_edge(&program, &analysis, "run", "C::helper"));
 }
+
+#[test]
+fn explicit_operator_calls_in_project_code_resolve_to_callee_identity() {
+    let (_dir, program) = build_tree(
+        &[(
+            "main.cpp",
+            "struct Wrapper { int* operator->() { return nullptr; } };\n\
+             template<class T>\n\
+             auto pointer_of(T& value) -> decltype(value.operator->());\n\
+             \n\
+             struct Comparable { bool operator>(const Comparable&) const { return true; } };\n\
+             template<class T>\n\
+             auto compare(T a, T b) -> decltype(a.operator>(b));\n\
+             \n\
+             int after_operator_call();\n\
+             \n\
+             void test_calls(Wrapper& w, Comparable& a, Comparable& b) {\n\
+                 w.operator->();\n\
+                 a.operator>(b);\n\
+                 Wrapper* pw = &w;\n\
+                 pw->operator->();\n\
+             }\n",
+        )],
+        default_opts,
+    );
+    assert!(
+        !program
+            .diagnostics
+            .iter()
+            .any(|d| d.stage == "parse" && d.message.starts_with("parse errors in")),
+        "diagnostics had parse errors: {:?}",
+        program.diagnostics
+    );
+    for expected in [
+        "Wrapper::operator->",
+        "Comparable::operator>",
+        "pointer_of",
+        "compare",
+        "after_operator_call",
+        "test_calls",
+    ] {
+        assert!(
+            program.symbols.functions.iter().any(|f| f.name == expected),
+            "missing function {expected}"
+        );
+    }
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == ">" || f.name == "->"),
+        "found function named > or -> alone"
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "test_calls",
+        "Wrapper::operator->",
+        ResolutionKind::Direct,
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "test_calls",
+        "Comparable::operator>",
+        ResolutionKind::Direct,
+    ));
+}
+
+#[test]
+fn explicit_operator_calls_edge_cases_and_macros() {
+    let (_dir, program) = build_tree(
+        &[(
+            "main.cpp",
+            "#define INVOKE_OP(obj, op_call) (obj).op_call\n\
+             #define CALL_SUBSCRIPT(c, idx) (c).operator[](idx)\n\
+             \n\
+             struct Container {\n\
+                 int operator[](int idx) const { return idx; }\n\
+             };\n\
+             \n\
+             struct Functor {\n\
+                 int operator()(int a, int b) const { return a + b; }\n\
+             };\n\
+             \n\
+             struct Counter {\n\
+                 Counter& operator++() { return *this; }\n\
+                 Counter operator++(int) { return *this; }\n\
+                 Counter& operator+=(int) { return *this; }\n\
+             };\n\
+             \n\
+             struct Base {\n\
+                 virtual bool operator>(const Base&) const { return true; }\n\
+                 virtual bool operator<(const Base&) const { return false; }\n\
+             };\n\
+             \n\
+             struct Derived : Base {\n\
+                 bool operator<(const Base&) const override { return true; }\n\
+             };\n\
+             \n\
+             void run_edge_cases(Container& cont, Functor& func, Counter& cnt, Derived& d, Base& b) {\n\
+                 cont.operator[](42);\n\
+                 CALL_SUBSCRIPT(cont, 10);\n\
+                 func.operator()(1, 2);\n\
+                 INVOKE_OP(func, operator()(3, 4));\n\
+                 cnt.operator++();\n\
+                 cnt.operator++(0);\n\
+                 cnt.operator+=(5);\n\
+                 d.operator>(b);\n\
+                 d.operator<(b);\n\
+                 Derived* pd = &d;\n\
+                 pd->operator>(b);\n\
+                 pd->operator<(b);\n\
+             }\n\
+             \n\
+             int main() { return 0; }\n",
+        )],
+        default_opts,
+    );
+    assert!(
+        !program
+            .diagnostics
+            .iter()
+            .any(|d| d.stage == "parse" && d.message.starts_with("parse errors in")),
+        "diagnostics had parse errors: {:?}",
+        program.diagnostics
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_edge_cases",
+        "Container::operator[]",
+        ResolutionKind::Direct,
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_edge_cases",
+        "Functor::operator()",
+        ResolutionKind::Direct,
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_edge_cases",
+        "Counter::operator++",
+        ResolutionKind::Direct,
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_edge_cases",
+        "Counter::operator+=",
+        ResolutionKind::Direct,
+    ));
+    // Derived inherits Base::operator> without overriding
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_edge_cases",
+        "Base::operator>",
+        ResolutionKind::Direct,
+    ));
+    // Derived overrides operator<
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_edge_cases",
+        "Derived::operator<",
+        ResolutionKind::Direct,
+    ));
+}
+
+#[test]
+fn explicit_operator_calls_review_fixes() {
+    let (_dir, program) = build_tree(
+        &[(
+            "main.cpp",
+            "struct SpaceComparable {\n\
+                 int operator<=>(const SpaceComparable&) const { return 0; }\n\
+             };\n\
+             struct Wrapper {\n\
+                 int* operator->() { return nullptr; }\n\
+             };\n\
+             void test_spaceship(SpaceComparable& a, SpaceComparable& b) {\n\
+                 a.operator<=>(b);\n\
+             }\n\
+             void test_comments(Wrapper& w, SpaceComparable& a, SpaceComparable& b) {\n\
+                 w./*inline_comment*/operator->();\n\
+                 w. /*space_comment*/ operator->();\n\
+                 w.operator->/*trailing_comment*/();\n\
+                 Wrapper* pw = &w;\n\
+                 pw->/*arrow_comment*/operator->();\n\
+                 a./*spaceship_comment*/operator<=>(b);\n\
+             }\n\
+             #define TWO(obj, op, a, b) (obj).op(a); (obj).op(b);\n\
+             struct CallbackInvoker {\n\
+                 void operator()(void (*cb)()) const { cb(); }\n\
+             };\n\
+             void first_cb() {}\n\
+             void second_cb() {}\n\
+             void test_macro_occurrences(CallbackInvoker& f) {\n\
+                 TWO(f, operator(), first_cb, second_cb);\n\
+             }\n\
+             template<class T>\n\
+             void test_untyped_receiver(T& x, T* p) {\n\
+                 x.operator>(x);\n\
+                 p->operator>(p);\n\
+             }\n\
+             struct DummyPtr {\n\
+                 void operator->();\n\
+             };\n\
+             void test_unresolvable_arrow(DummyPtr& ptr) {\n\
+                 ptr->operator>(0);\n\
+             }\n\
+             int main() { return 0; }\n",
+        )],
+        default_opts,
+    );
+    assert!(
+        !program
+            .diagnostics
+            .iter()
+            .any(|d| d.stage == "parse" && d.message.starts_with("parse errors in")),
+        "diagnostics had parse errors: {:?}",
+        program.diagnostics
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "test_spaceship",
+        "SpaceComparable::operator<=>",
+        ResolutionKind::Direct,
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "test_comments",
+        "Wrapper::operator->",
+        ResolutionKind::Direct,
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "test_comments",
+        "SpaceComparable::operator<=>",
+        ResolutionKind::Direct,
+    ));
+
+    let macro_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "test_macro_occurrences")
+        .unwrap();
+    let macro_sites: Vec<_> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|cs| cs.caller == macro_fn.id)
+        .collect();
+    assert_eq!(
+        macro_sites.len(),
+        2,
+        "expected 2 distinct call sites from TWO macro expansion"
+    );
+    assert_ne!(
+        macro_sites[0].occurrence.map(|o| o.span),
+        macro_sites[1].occurrence.map(|o| o.span),
+        "expected distinct occurrence spans from macro replacement punctuation"
+    );
+    assert!(macro_sites
+        .iter()
+        .any(|s| s
+            .fn_args
+            .iter()
+            .any(|(_, fid)| program.symbols.function(*fid).name == "first_cb")));
+    assert!(macro_sites
+        .iter()
+        .any(|s| s
+            .fn_args
+            .iter()
+            .any(|(_, fid)| program.symbols.function(*fid).name == "second_cb")));
+
+    let untyped_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "test_untyped_receiver")
+        .unwrap();
+    let untyped_sites: Vec<_> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|cs| cs.caller == untyped_fn.id)
+        .collect();
+    assert_eq!(untyped_sites.len(), 2);
+    for site in &untyped_sites {
+        assert_eq!(
+            site.receiver_class, None,
+            "untyped receiver should not have receiver_class populated"
+        );
+        assert!(
+            !site.resolves_by_name(),
+            "untyped member call should not resolve by name"
+        );
+    }
+    assert!(untyped_sites.iter().any(|s| s.callee_name == "x.operator>"));
+    assert!(untyped_sites
+        .iter()
+        .any(|s| s.callee_name == "p->operator>"));
+
+    let dummy_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "test_unresolvable_arrow")
+        .unwrap();
+    let dummy_sites: Vec<_> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|cs| cs.caller == dummy_fn.id)
+        .collect();
+    assert_eq!(dummy_sites.len(), 1);
+    assert_eq!(dummy_sites[0].callee_name, "ptr->operator>");
+    assert_eq!(dummy_sites[0].receiver_class, Some("DummyPtr".to_string()));
+    assert!(
+        !dummy_sites[0].resolves_by_name(),
+        "unresolvable arrow should not resolve by name"
+    );
+    assert!(!program
+        .symbols
+        .functions
+        .iter()
+        .any(|f| f.name == "DummyPtr::operator>"));
+}
+
+#[test]
+fn explicit_operator_malformed_syntax_reports_parse_diagnostics() {
+    let (_dir, program) = build_tree(
+        &[(
+            "main.cpp",
+            "struct W { int* operator->(); };\n\
+             void f_dot(W& w) { w.operator.->(); }\n\
+             void f_q(W& w) { w.operator?->(); }\n\
+             int main() { return 0; }\n",
+        )],
+        default_opts,
+    );
+    assert!(
+        program
+            .diagnostics
+            .iter()
+            .any(|d| d.stage == "parse" && d.message.starts_with("parse errors in")),
+        "expected parse diagnostics for malformed explicit operator calls: {:?}",
+        program.diagnostics
+    );
+    assert!(
+        !program
+            .symbols
+            .call_sites
+            .iter()
+            .any(|cs| cs.callee_name.contains("operator.") || cs.callee_name.contains("operator?")),
+        "malformed operator was lowered into call site"
+    );
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name.contains("operator.") || f.name.contains("operator?")),
+        "malformed operator was interned as function"
+    );
+}
