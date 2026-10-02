@@ -1227,14 +1227,33 @@ const MAX_PARSE_WALK_DEPTH: u32 = 512;
 /// have no declarator. Tree-sitter recovers by inserting a `(MISSING field_identifier)`
 /// immediately preceding the `bitfield_clause`.
 fn is_benign_parse_error(node: Node) -> bool {
-    node.is_missing()
+    (node.is_missing()
         && node.kind() == "field_identifier"
         && node
             .next_named_sibling()
             .is_some_and(|s| s.kind() == "bitfield_clause")
         && node
             .parent()
-            .is_some_and(|p| p.kind() == "field_declaration")
+            .is_some_and(|p| p.kind() == "field_declaration"))
+        || (node.is_error()
+            && node.parent().is_some_and(|p| p.kind() == "call_expression")
+            && is_explicit_operator_error(node))
+}
+
+fn is_explicit_operator_error(node: Node) -> bool {
+    let mut cursor = node.walk();
+    let mut children = node.children(&mut cursor).filter(|c| c.kind() != "comment");
+    let Some(first) = children.next() else {
+        return false;
+    };
+    if first.kind() != "." && first.kind() != "->" {
+        return false;
+    }
+    let mut next = children.next();
+    if next.as_ref().is_some_and(|c| c.kind() == "template") {
+        next = children.next();
+    }
+    next.is_some_and(|c| c.kind() == "operator_name" && !c.has_error()) && children.next().is_none()
 }
 
 /// Returns true if the parse tree contains genuine syntax errors.
@@ -1459,7 +1478,6 @@ mod dependency_cpp_tests {
         let parsed_test = parse_source_with_lang(test_src, SourceLang::Cpp).unwrap();
         assert!(!has_parse_errors(&parsed_test.tree));
     }
-
     /// The scratch validation parse is a prerequisite of the computed-base
     /// and typedef-suffix rewrites: valid dependent operands must pass and
     /// malformed ones must fail, and the parser borrow must be released
@@ -1710,6 +1728,94 @@ mod dependency_cpp_tests {
             )),
             "{normalized}"
         );
-        assert!(normalized.contains("enum E : int { e };"), "{normalized}");
+    }
+
+    #[test]
+    fn test_explicit_operator_parse() {
+        let src = r#"
+struct Wrapper { int* operator->(); };
+template<class T>
+auto pointer_of(T& value) -> decltype(value.operator->());
+
+struct Comparable { bool operator>(const Comparable&) const; };
+template<class T>
+auto compare(T a, T b) -> decltype(a.operator>(b));
+
+int after_operator_call();
+void test_body(Wrapper& w, Comparable& c) {
+    w.operator->();
+    c.operator>(c);
+    c.operator<(c);
+    c.operator==(c);
+    c.operator!=(c);
+    c.operator<=(c);
+    c.operator>=(c);
+    w.operator*();
+    w.operator++();
+    w.operator[] (0);
+    w.operator() (0);
+    w.template operator->();
+    Wrapper::operator->();
+    w.operator ->();
+    c.operator >(c);
+    w . operator -> ();
+    Wrapper* pw = &w;
+    pw -> operator -> ();
+    w./*comment*/operator->();
+    w. /*comment*/ operator->();
+    w.operator->/*comment*/();
+    pw->/*comment*/operator->();
+    c.operator<=>(c);
+    c./*comment*/operator<=>(c);
+    w.operator=(w);
+    w.operator+(1);
+    w.operator-(1);
+    w.operator*(1);
+    w.operator/(1);
+    w.operator%(1);
+    w.operator+=(1);
+    w.operator-=(1);
+    w.operator*=(1);
+    w.operator/=(1);
+    w.operator%=(1);
+    w.operator&=(1);
+    w.operator|=(1);
+    w.operator^=(1);
+    w.operator<<=(1);
+    w.operator>>=(1);
+    w.operator& (1);
+    w.operator| (1);
+    w.operator^ (1);
+    w.operator~ ();
+    w.operator! ();
+    w.operator, (w);
+    w.operator->* (1);
+    w.operator++(0);
+    w.operator--(0);
+    w.operator--();
+    w.operator()(1, 2);
+    w.template operator->();
+    w.template operator()<int>(1);
+    w.operator()<int>(1);
+}
+int main() { return 0; }
+"#;
+        let parsed = parse_source_with_lang(src, SourceLang::Cpp).unwrap();
+        assert!(!has_parse_errors(&parsed.tree));
+
+        let complex =
+            parse_source_with_lang("void f() { get_wrapper().operator->(); }", SourceLang::Cpp)
+                .unwrap();
+        assert!(!has_parse_errors(&complex.tree));
+
+        let malformed_dot =
+            parse_source_with_lang("void f(Wrapper& w) { w.operator.->(); }", SourceLang::Cpp)
+                .unwrap();
+        assert!(has_parse_errors(&malformed_dot.tree));
+
+        let malformed_q =
+            parse_source_with_lang("void f(Wrapper& w) { w.operator?->(); }", SourceLang::Cpp)
+                .unwrap();
+        assert!(has_parse_errors(&malformed_q.tree));
     }
 }

@@ -5812,7 +5812,9 @@ fn call_result_shape(
             Spelling::Source,
         )));
     }
-    if matches!(func.cached_kind(), "identifier" | "qualified_identifier") {
+    if (!ctx.is_cpp || explicit_member_operator_call(value, source).is_none())
+        && matches!(func.cached_kind(), "identifier" | "qualified_identifier")
+    {
         let spelled = normalize_qualified(node_text(source, &func));
         if lookup_var_node(program, ctx, source, func).is_none() {
             // `T(args)` constructs a `T`, as the call site reads it.
@@ -5837,7 +5839,26 @@ fn call_result_shape(
             Spelling::Lowered,
         )));
     }
-    let (candidates, receiver) = if func.cached_kind() == "field_expression" {
+    let (candidates, receiver) = if let Some(op) = (ctx.is_cpp)
+        .then(|| explicit_member_operator_call(value, source))
+        .flatten()
+    {
+        let recv = op.receiver;
+        let field = normalize_qualified(op.op_name);
+        let arrow = op.is_arrow;
+        let desc = receiver_desc(program, ctx, source, recv)?;
+        let receiver = if arrow {
+            resolve_operator_arrow_receiver(program, desc)?
+        } else {
+            class_spelling_of_desc(&desc)?.to_string()
+        };
+        let members = declared_members_upward(
+            program,
+            &receiver_lookup_name(&receiver),
+            &trace_ir::MethodKind::Named(field),
+        );
+        (Overloads::Declared(members), Some(receiver))
+    } else if func.cached_kind() == "field_expression" {
         let recv = func.cached_field("argument")?;
         let field = normalize_qualified(node_text(source, &func.cached_field("field")?));
         let arrow = is_arrow_access(func);
@@ -8306,6 +8327,63 @@ fn walk_function_body(
     ctx.ast_depth = ctx.ast_depth.saturating_sub(1);
 }
 
+pub(crate) struct ExplicitMemberOperatorCall<'a> {
+    pub receiver: Node<'a>,
+    pub is_arrow: bool,
+    pub op_name: &'a str,
+    pub op_node: Node<'a>,
+    pub punct_node: Node<'a>,
+}
+
+pub(crate) fn explicit_member_operator_call<'a>(
+    node: Node<'a>,
+    source: &'a str,
+) -> Option<ExplicitMemberOperatorCall<'a>> {
+    if node.cached_kind() != "call_expression" {
+        return None;
+    }
+    let receiver = node.cached_field("function")?;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.is_error() {
+            let mut err_cursor = child.walk();
+            let mut err_children = child
+                .children(&mut err_cursor)
+                .filter(|c| c.kind() != "comment");
+            let Some(first) = err_children.next() else {
+                continue;
+            };
+            let is_arrow = match first.kind() {
+                "." => false,
+                "->" => true,
+                _ => continue,
+            };
+            let mut next = match err_children.next() {
+                Some(n) => n,
+                None => continue,
+            };
+            if next.kind() == "template" {
+                next = match err_children.next() {
+                    Some(n) => n,
+                    None => continue,
+                };
+            }
+            if next.kind() == "operator_name" && !next.has_error() && err_children.next().is_none()
+            {
+                let op_name = node_text(source, &next);
+                return Some(ExplicitMemberOperatorCall {
+                    receiver,
+                    is_arrow,
+                    op_name,
+                    op_node: next,
+                    punct_node: first,
+                });
+            }
+        }
+    }
+    None
+}
+
 fn collect_call_at_node(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -8320,6 +8398,13 @@ fn collect_call_at_node(
         .cached_field("function")
         .filter(|func| func.cached_kind() == "field_expression")
         .and_then(member_access_token)
+        .or_else(|| {
+            if ctx.is_cpp {
+                explicit_member_operator_call(node, source).map(|op| op.punct_node)
+            } else {
+                None
+            }
+        })
         .filter(|token| node_has_expansion_location(ctx, *token));
     let first_site = program.symbols.call_sites.len();
     collect_call_at_node_inner(program, ctx, source, node, caller);
@@ -8343,6 +8428,88 @@ fn collect_call_at_node_inner(
     node: Node,
     caller: FnId,
 ) {
+    if let Some(op) = (ctx.is_cpp)
+        .then(|| explicit_member_operator_call(node, source))
+        .flatten()
+    {
+        let source_node = if node_has_expansion_location(ctx, op.op_node) {
+            op.op_node
+        } else {
+            node
+        };
+        if node_is_from_ignored_macro(ctx, node)
+            || node_is_from_ignored_macro(ctx, op.receiver)
+            || node_is_from_ignored_macro(ctx, op.punct_node)
+            || node_is_from_ignored_macro(ctx, source_node)
+        {
+            return;
+        }
+        let span = node_call_span(program, ctx, source_node);
+        let expansion_span = node_expansion_span(program, ctx, source_node);
+        let op_norm = normalize_qualified(op.op_name);
+        let kind = trace_ir::MethodKind::Named(op_norm.clone());
+        let call_args = collect_call_args(program, ctx, source, node.cached_field("arguments"));
+        if let Some(recv_cls) = infer_static_class(program, ctx, source, op.receiver) {
+            let cls = if op.is_arrow {
+                let Some(cls) = member_receiver_class(program, ctx, source, op.receiver, true)
+                else {
+                    let recv_text = normalize_qualified(node_text(source, &op.receiver));
+                    emit_unresolved_site(
+                        program,
+                        caller,
+                        format!("{recv_text}->{op_norm}"),
+                        Some(recv_cls),
+                        call_args,
+                        span,
+                        expansion_span,
+                    );
+                    return;
+                };
+                cls
+            } else {
+                recv_cls
+            };
+            let cls = receiver_lookup_name(&cls).into_owned();
+            let targets = member_targets_upward(program, &cls, &kind);
+            if !targets.is_empty() {
+                emit_member_targets(
+                    program,
+                    caller,
+                    &cls,
+                    &kind,
+                    None,
+                    call_args,
+                    span,
+                    expansion_span,
+                    targets,
+                );
+                return;
+            }
+            emit_unresolved_site(
+                program,
+                caller,
+                kind.name_on(&cls),
+                Some(cls),
+                call_args,
+                span,
+                expansion_span,
+            );
+            return;
+        }
+        let recv_text = normalize_qualified(node_text(source, &op.receiver));
+        let op_sym = if op.is_arrow { "->" } else { "." };
+        let callee_text = format!("{recv_text}{op_sym}{op_norm}");
+        emit_unresolved_site(
+            program,
+            caller,
+            callee_text,
+            None,
+            call_args,
+            span,
+            expansion_span,
+        );
+        return;
+    }
     let func = match node.cached_field("function") {
         Some(f) => f,
         None => return,
@@ -8410,7 +8577,7 @@ fn collect_call_at_node_inner(
                                     program,
                                     caller,
                                     field_callee_text(source, func),
-                                    recv_cls,
+                                    Some(recv_cls),
                                     call_args,
                                     span,
                                     expansion_span,
@@ -8500,7 +8667,7 @@ fn collect_call_at_node_inner(
                                 program,
                                 caller,
                                 kind.name_on(&cls),
-                                cls,
+                                Some(cls),
                                 call_args,
                                 span,
                                 expansion_span,
@@ -9977,7 +10144,7 @@ fn emit_unresolved_site(
     program: &mut Program,
     caller: FnId,
     callee_name: String,
-    receiver_class: String,
+    receiver_class: Option<String>,
     args: CallArgs,
     span: Span,
     expansion_span: Option<Span>,
@@ -10008,7 +10175,7 @@ fn emit_unresolved_site(
         expansion_span,
         occurrence: None,
         is_direct: false,
-        receiver_class: Some(receiver_class),
+        receiver_class,
         return_dst: None,
         tu: program.symbols.function_by_id(caller).and_then(|f| f.tu),
     });
@@ -13364,6 +13531,9 @@ fn return_flow_from_expr(
 }
 
 fn resolve_direct_call_name(source: &str, node: Node) -> Option<String> {
+    if explicit_member_operator_call(node, source).is_some() {
+        return None;
+    }
     let func = node.cached_field("function")?;
     let func = peel_expression(func);
     match func.cached_kind() {
@@ -14166,6 +14336,9 @@ fn resolve_callee_var(
     source: &str,
     node: Node,
 ) -> Option<VarId> {
+    if ctx.is_cpp && explicit_member_operator_call(node, source).is_some() {
+        return None;
+    }
     let func = node.cached_field("function")?;
     let (_, _, var) = resolve_callee_with_loads(program, ctx, source, func);
     var

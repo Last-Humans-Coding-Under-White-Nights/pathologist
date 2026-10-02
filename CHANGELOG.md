@@ -4,6 +4,19 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Explicit calls to overloaded operators
+
+Explicit calls to overloaded operators using member-access syntax (`value.operator->()`,
+`a.operator>(b)`, `c.operator[](i)`, `f.operator()(args)`) in expressions and
+trailing return types no longer trigger unrecovered parse errors or produce
+spurious parse diagnostics. The parser treats the explicit operator `ERROR` node
+under `call_expression` as benign, and lowering extracts the receiver and
+operator name to resolve member operator targets with their proper callee
+identity. In dependency headers, expressions in trailing return types preserve
+surrounding function signatures without emitting leaked call sites. Rules:
+[Explicit member operator calls](docs/ANALYSIS.md#explicit-member-operator-calls);
+measurements in `docs/EVAL_REPORT.md`.
+
 ### Static data member sharing without link information (#143)
 
 Static data members of C++ classes now share one variable across

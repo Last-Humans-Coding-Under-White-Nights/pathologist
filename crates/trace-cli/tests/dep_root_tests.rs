@@ -486,3 +486,257 @@ fn target_call_expanded_from_dependency_macro_is_retained() {
     .unwrap();
     assert_eq!(visible.len(), 1);
 }
+
+#[test]
+fn target_explicit_operator_call_expanded_from_dependency_macro_is_retained() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dep = tmp.path().join("dep");
+    std::fs::create_dir(&dep).unwrap();
+    std::fs::write(
+        dep.join("operators.h"),
+        "void dep_marker(void);\n#define EXPLICIT(x) (x).operator()()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.cpp"),
+        "#include <operators.h>\nstruct F { void operator()() {} };\nvoid explicit_case(F& f) { EXPLICIT(f); }\n",
+    )
+    .unwrap();
+
+    let program =
+        build_program_with_jobs(tmp.path(), &PreprocessOptions::new().with_dep(&dep), 1).unwrap();
+    let site = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|site| site.callee_name.contains("operator()"))
+        .expect("project explicit operator call emitted by dependency macro");
+    assert!(program.is_dep_file(site.span.file));
+    assert!(site
+        .expansion_span
+        .is_some_and(|span| !program.is_dep_file(span.file)));
+
+    let (_pag, analysis) = analyze(&program);
+    assert!(analysis.call_edges.iter().any(|edge| {
+        fn_name(&program, edge.caller) == "explicit_case"
+            && fn_name(&program, edge.callee) == "F::operator()"
+    }));
+}
+
+#[test]
+fn dependency_header_explicit_operator_calls_preserve_signatures_without_call_sites() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dep = tmp.path().join("dep");
+    std::fs::create_dir(&dep).unwrap();
+    std::fs::write(
+        dep.join("operators.hpp"),
+        r#"
+#pragma once
+struct DepWrapper { int* operator->(); };
+template<class T>
+auto pointer_of(T& value) -> decltype(value.operator->());
+
+struct DepComparable { bool operator>(const DepComparable&) const; };
+template<class T>
+auto compare(T a, T b) -> decltype(a.operator>(b));
+
+inline void dep_helper(DepWrapper& w, DepComparable& c) {
+    w.operator->();
+    c.operator>(c);
+}
+
+int after_operator_call();
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.cpp"),
+        r#"
+#include <operators.hpp>
+
+int main() {
+    DepWrapper w;
+    w.operator->();
+    DepComparable a, b;
+    a.operator>(b);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+
+    let program =
+        build_program_with_jobs(tmp.path(), &PreprocessOptions::new().with_dep(&dep), 1).unwrap();
+
+    assert!(
+        !program
+            .diagnostics
+            .iter()
+            .any(|d| d.stage == "parse" && d.message.starts_with("parse errors in")),
+        "diagnostics had parse errors: {:?}",
+        program.diagnostics
+    );
+
+    for expected in [
+        "DepWrapper::operator->",
+        "pointer_of",
+        "DepComparable::operator>",
+        "compare",
+        "dep_helper",
+        "after_operator_call",
+    ] {
+        let func = program
+            .symbols
+            .functions
+            .iter()
+            .find(|f| f.name == expected)
+            .unwrap_or_else(|| panic!("missing function {expected}"));
+        assert!(
+            program.is_dep_file(func.span.file),
+            "{expected} should be from a dependency file"
+        );
+        assert!(
+            !func.is_defined,
+            "{expected} should not be marked is_defined"
+        );
+        assert!(func.locals.is_empty(), "{expected} should have no locals");
+    }
+
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == ">" || f.name == "->"),
+        "found function named > or -> alone"
+    );
+
+    for site in &program.symbols.call_sites {
+        assert!(
+            !program.is_dep_file(site.span.file),
+            "call site leaked from dependency file: {:?}",
+            site
+        );
+    }
+
+    let (_pag, analysis) = analyze(&program);
+    let caller_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "main")
+        .unwrap()
+        .id;
+    let main_targets: Vec<String> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == caller_fn)
+        .map(|e| fn_name(&program, e.callee).to_string())
+        .collect();
+    assert!(main_targets.contains(&"DepWrapper::operator->".to_string()));
+    assert!(main_targets.contains(&"DepComparable::operator>".to_string()));
+}
+
+#[test]
+fn dependency_header_explicit_operator_calls_subscript_call_and_compound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dep = tmp.path().join("dep");
+    let dep_inc = dep.join("include");
+    std::fs::create_dir_all(&dep_inc).unwrap();
+    std::fs::write(
+        dep_inc.join("dep_ops.h"),
+        "struct DepContainer { int operator[](int) { return 0; } };\n\
+         template<class T>\n\
+         auto at(T& c, int i) -> decltype(c.operator[](i));\n\
+         \n\
+         struct DepFunctor { int operator()(int, int) { return 0; } };\n\
+         template<class T, class A, class B>\n\
+         auto invoke(T& f, A a, B b) -> decltype(f.operator()(a, b));\n\
+         \n\
+         struct DepCounter { DepCounter& operator+=(int) { return *this; } };\n\
+         template<class T>\n\
+         auto add_assign(T& c, int i) -> decltype(c.operator+=(i));\n\
+         \n\
+         int dep_after_ops();\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        tmp.path().join("main.cpp"),
+        "#include <dep_ops.h>\n\
+         int main() {\n\
+             DepContainer c;\n\
+             c.operator[](10);\n\
+             DepFunctor f;\n\
+             f.operator()(1, 2);\n\
+             DepCounter cnt;\n\
+             cnt.operator+=(3);\n\
+             return dep_after_ops();\n\
+         }\n",
+    )
+    .unwrap();
+
+    let program =
+        build_program_with_jobs(tmp.path(), &PreprocessOptions::new().with_dep(&dep), 1).unwrap();
+
+    assert!(
+        !program
+            .diagnostics
+            .iter()
+            .any(|d| d.stage == "parse" && d.message.starts_with("parse errors in")),
+        "diagnostics had parse errors: {:?}",
+        program.diagnostics
+    );
+
+    for expected in [
+        "DepContainer::operator[]",
+        "at",
+        "DepFunctor::operator()",
+        "invoke",
+        "DepCounter::operator+=",
+        "add_assign",
+        "dep_after_ops",
+    ] {
+        let func = program
+            .symbols
+            .functions
+            .iter()
+            .find(|f| f.name == expected)
+            .unwrap_or_else(|| panic!("missing function {expected}"));
+        assert!(
+            program.is_dep_file(func.span.file),
+            "{expected} should be from dependency file"
+        );
+        assert!(
+            !func.is_defined,
+            "{expected} should not be marked is_defined"
+        );
+    }
+
+    for site in &program.symbols.call_sites {
+        assert!(
+            !program.is_dep_file(site.span.file),
+            "call site leaked from dependency file: {:?}",
+            site
+        );
+    }
+
+    let (_pag, analysis) = analyze(&program);
+    let caller_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "main")
+        .unwrap()
+        .id;
+    let main_targets: Vec<String> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == caller_fn)
+        .map(|e| fn_name(&program, e.callee).to_string())
+        .collect();
+    assert!(main_targets.contains(&"DepContainer::operator[]".to_string()));
+    assert!(main_targets.contains(&"DepFunctor::operator()".to_string()));
+    assert!(main_targets.contains(&"DepCounter::operator+=".to_string()));
+    assert!(main_targets.contains(&"dep_after_ops".to_string()));
+}
