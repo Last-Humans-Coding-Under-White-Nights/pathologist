@@ -185,6 +185,9 @@ struct LowerContext {
     /// How many `template_declaration`s enclose the node being lowered, so a
     /// class asks for its ancestors only when one does.
     template_depth: Cell<u32>,
+    /// [`lifecycle_members`] answers per `(class, is_destructor)`, stamped
+    /// with the [`lifecycle_stamp`] they were computed at.
+    lifecycle_cache: std::cell::RefCell<LifecycleCache>,
     has_weak: bool,
     record_link_ownership: bool,
     /// The unit is a header indexed on its own: its own bodies are replayed
@@ -1748,7 +1751,7 @@ fn expand_virtual_overrides(program: &mut Program) {
         .collect();
     let snapshot = program.symbols.call_sites.clone();
     for cs in snapshot {
-        let Some(fid) = cs.callee_fn_id else {
+        let Some(fid) = cs.callee_fn_id.filter(|_| !cs.exact_receiver) else {
             continue;
         };
         let f = program.symbols.function(fid);
@@ -1877,6 +1880,7 @@ fn expand_virtual_overrides(program: &mut Program) {
                 occurrence: cs.occurrence,
                 is_direct: true,
                 receiver_class: cs.receiver_class.clone(),
+                exact_receiver: cs.exact_receiver,
                 return_dst: cs.return_dst,
                 tu: cs.tu,
             });
@@ -2702,6 +2706,7 @@ fn lower_prepared_source(
         tree: Some(Arc::clone(&tree)),
         has_templates: is_cpp && parsed.source.contains("template"),
         template_depth: Cell::new(0),
+        lifecycle_cache: Default::default(),
         has_weak: source_may_annotate_weak(&parsed.source) || program.symbols.has_weak_symbols(),
         record_link_ownership,
         header_unit,
@@ -5662,9 +5667,8 @@ fn lower_parameter(
         is_ptr,
         address,
     } = parameter_type(program, ctx, source, node)?;
-    let unnamed = name.is_empty();
     let declarator = node.cached_field("declarator");
-    if unnamed {
+    if name.is_empty() {
         name = format!("$arg{index}");
     }
     let var_id = program.symbols.alloc_var_id();
@@ -5684,7 +5688,7 @@ fn lower_parameter(
         c_linkage: false,
         is_static_member: false,
         id: var_id,
-        name: name.clone(),
+        name,
         type_id,
         storage: StorageClass::Param,
         fn_id: Some(fn_id),
@@ -5692,9 +5696,9 @@ fn lower_parameter(
         span,
         is_pointer: is_ptr,
     });
-    if !unnamed {
-        register_local(ctx, name, var_id);
-    }
+    // The body a parameter belongs to brings it into scope itself (a
+    // definition's, a lambda's); a lambda or a block-scope declaration lowers
+    // its parameters inside another function, whose scope they never enter.
     Some(var_id)
 }
 
@@ -6324,14 +6328,7 @@ fn substituted_parameter(
             (format!("{wrapper}<{name}>"), 0)
         }
     };
-    let mut desc = TypeDesc::Struct {
-        name,
-        fields: Vec::new(),
-    };
-    for _ in 0..arg_layers + fact.pointer_depth {
-        desc = TypeDesc::Ptr(Box::new(desc));
-    }
-    Some(desc)
+    Some(class_desc_under(name, arg_layers + fact.pointer_depth))
 }
 
 /// Resolve a stored base argument without consulting the caller's scope.
@@ -7113,11 +7110,23 @@ fn local_type(
 ) -> trace_ir::TypeId {
     let inferred = value
         .filter(|_| is_placeholder_type(ctx, type_node))
-        .and_then(|value| auto_initializer_type(program, ctx, source, value))
-        .filter(|desc| pointer_depth(desc) >= declarator_pointer_depth(decl));
-    let desc = inferred.unwrap_or_else(|| {
-        walk_declarator_shape(decl, program.types.get(type_id).desc.as_ref().clone())
-    });
+        .and_then(|value| auto_initializer_type(program, ctx, source, value));
+    deduced_local_type(program, type_id, decl, inferred)
+}
+
+/// A local's type: the type a placeholder deduced, when the declarator's `*`s
+/// fit it, else the declared type under the declarator's shape.
+fn deduced_local_type(
+    program: &mut Program,
+    type_id: trace_ir::TypeId,
+    decl: Node,
+    inferred: Option<TypeDesc>,
+) -> trace_ir::TypeId {
+    let desc = inferred
+        .filter(|desc| pointer_depth(desc) >= declarator_pointer_depth(decl))
+        .unwrap_or_else(|| {
+            walk_declarator_shape(decl, program.types.get(type_id).desc.as_ref().clone())
+        });
     program.types.intern(desc)
 }
 
@@ -7182,15 +7191,12 @@ fn lower_declaration(
             is_static,
             storage_override,
             value,
+            Lifecycle::Declared,
         );
         if let Some(var) = var {
             finish_initializer_capture(program, ctx, capture, var);
         }
-        // An explicit reference's type carries an alias layer that readers
-        // peel; an `auto&` local's is already the value's own type.
-        if let Some(var) = var.filter(|_| is_placeholder_type(ctx, type_node)) {
-            ctx.reference_vars.remove(&var);
-        }
+        forget_placeholder_alias(ctx, type_node, var);
     };
 
     // A condition declaration (`if (auto p = f())`) stores its initializer
@@ -7279,6 +7285,7 @@ fn lower_declaration(
                                             occurrence: None,
                                             is_direct: false,
                                             receiver_class: None,
+                                            exact_receiver: false,
                                             return_dst: None,
                                             tu: Some(ctx.current_file),
                                         });
@@ -7305,6 +7312,7 @@ fn lower_declaration(
                     is_static,
                     storage_override,
                     None,
+                    Lifecycle::Declared,
                 );
             }
             // `cb_t H::cb;`: an uninitialized out-of-class definition whose
@@ -7324,6 +7332,7 @@ fn lower_declaration(
                     is_static,
                     storage_override,
                     None,
+                    Lifecycle::Declared,
                 );
             }
             "identifier" => {
@@ -7359,6 +7368,7 @@ fn lower_declaration(
                     is_pointer: false,
                 });
                 register_local(ctx, name, var_id);
+                emit_automatic_lifecycle(program, ctx, source, var_id, child, child, true);
             }
             _ => {}
         }
@@ -7566,6 +7576,7 @@ fn lower_direct_init(
         is_static,
         storage_override,
         None,
+        Lifecycle::DestroyOnly,
     ) else {
         return;
     };
@@ -7626,13 +7637,240 @@ fn names_type_in_scope(program: &Program, ctx: &LowerContext, name: &str) -> boo
         .is_some()
 }
 
-/// The class a declared type names, if any: a named struct, not an anonymous
-/// one.
+/// The class a declared type names, if any: a named struct or union, not an
+/// anonymous one.
 fn named_class(program: &Program, type_id: trace_ir::TypeId) -> Option<String> {
-    match program.types.get(type_id).desc.as_ref() {
-        TypeDesc::Struct { name, .. } if !is_anonymous_tag(name) => Some(name.clone()),
+    initialized_class(program, program.types.get(type_id).desc.as_ref())
+}
+
+/// The class whose constructor an initializer of `desc` calls: a named
+/// struct, or a named union that declares a constructor (a C-style union is
+/// copied, not constructed).
+fn initialized_class(program: &Program, desc: &TypeDesc) -> Option<String> {
+    let name = class_of_desc(desc)?;
+    let constructs = !matches!(desc, TypeDesc::Union { .. })
+        || program
+            .symbols
+            .has_function_named(&trace_ir::MethodKind::Ctor.name_on(&receiver_lookup_name(&name)));
+    constructs.then_some(name)
+}
+
+fn class_of_desc(desc: &TypeDesc) -> Option<String> {
+    match desc {
+        TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } if !is_anonymous_tag(name) => {
+            Some(name.clone())
+        }
         _ => None,
     }
+}
+
+/// The element type of `desc` under any array layers, and whether there were
+/// any.
+fn peel_arrays(mut desc: &TypeDesc) -> (&TypeDesc, bool) {
+    let mut array = false;
+    while let TypeDesc::Array { elem, .. } = desc {
+        desc = elem;
+        array = true;
+    }
+    (desc, array)
+}
+
+/// The class an automatic object of `type_id` is an instance of: a named
+/// struct, or the element class of an array of them (`T a[4];`), whose
+/// elements are constructed and destroyed as one object here.
+fn automatic_object_class(program: &Program, type_id: trace_ir::TypeId) -> Option<String> {
+    class_of_desc(peel_arrays(program.types.get(type_id).desc.as_ref()).0)
+}
+
+/// The user-provided `kind` members an object of class `cls` (a
+/// [`receiver_lookup_name`]) runs when default-constructed or destroyed, by
+/// the class that provides them (docs/ANALYSIS.md, "Automatic objects":
+/// which members run).
+fn lifecycle_members(
+    program: &Program,
+    ctx: &LowerContext,
+    cls: &str,
+    kind: &trace_ir::MethodKind,
+) -> Vec<(String, Vec<FnId>)> {
+    let key = (cls.to_owned(), kind.is_destructor());
+    let stamp = lifecycle_stamp(program);
+    if let Some((at, found)) = ctx.lifecycle_cache.borrow().get(&key) {
+        if *at == stamp {
+            return found.clone();
+        }
+    }
+    let mut found = Vec::new();
+    collect_lifecycle_members(program, cls, kind, &mut Vec::new(), &mut found);
+    ctx.lifecycle_cache
+        .borrow_mut()
+        .insert(key, (stamp, found.clone()));
+    found
+}
+
+/// What [`lifecycle_members`] reads, as counts that only grow while a unit
+/// lowers: its functions (a member's `defaulted_in_class` is fixed when the
+/// function is added) and its inheritance edges. A cached answer is reused
+/// only while both are unchanged.
+fn lifecycle_stamp(program: &Program) -> (usize, usize) {
+    (program.symbols.functions.len(), program.inheritance().len())
+}
+
+type LifecycleCache = BTreeMap<(String, bool), ((usize, usize), Vec<(String, Vec<FnId>)>)>;
+
+fn collect_lifecycle_members<'a>(
+    program: &'a Program,
+    cls: &'a str,
+    kind: &trace_ir::MethodKind,
+    seen: &mut Vec<&'a str>,
+    found: &mut Vec<(String, Vec<FnId>)>,
+) {
+    if seen.contains(&cls) {
+        return;
+    }
+    seen.push(cls);
+    let declared = program.symbols.functions_named(&kind.name_on(cls));
+    let any_declared = !declared.is_empty();
+    // A destructor, or a constructor callable without arguments (or of
+    // unknown arity). One declaring no parameter at all is chosen over a
+    // template or an ellipsis one that could also take none.
+    let runs = if kind.is_destructor() {
+        declared
+    } else {
+        let mut exact = Vec::new();
+        let mut others = Vec::new();
+        for f in declared {
+            let function = program.symbols.function(f);
+            match method_explicit_arity(program, f) {
+                Some(0) if !function.variadic => exact.push(f),
+                Some(n) if !arity_takes(function, n, 0) => {}
+                _ => others.push(f),
+            }
+        }
+        if exact.is_empty() {
+            others
+        } else {
+            exact
+        }
+    };
+    let provided = |f: &FnId| !program.symbols.function(*f).defaulted_in_class;
+    if runs.iter().any(provided) {
+        found.push((cls.to_owned(), runs.into_iter().filter(provided).collect()));
+        return;
+    }
+    // Constructors declared, none of them a default one: no object of the
+    // class is default-constructed.
+    if runs.is_empty() && any_declared {
+        return;
+    }
+    // An implicit or defaulted member runs every base's.
+    for base in program.base_names(cls) {
+        collect_lifecycle_members(program, base, kind, seen, found);
+    }
+}
+
+/// The constructor site of the object `var` that declarator `decl` declares
+/// when `construct` is set (`T x;`, `T a[4];`: no initializer names its
+/// constructor), and its destructor site when it is an automatic object,
+/// both attributed to the declaration with `var` as `this`
+/// (docs/ANALYSIS.md, "Automatic objects").
+fn emit_automatic_lifecycle(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    var: VarId,
+    decl: Node,
+    span_node: Node,
+    construct: bool,
+) {
+    let Some(caller) = ctx.current_fn.filter(|_| ctx.is_cpp) else {
+        return;
+    };
+    // The variable's span is where its declaration is written, not the macro
+    // body that spells it.
+    let (type_id, storage, is_pointer, written_in) = {
+        let v = program.symbols.variable(var);
+        (v.type_id, v.storage, v.is_pointer, v.span.file)
+    };
+    if is_pointer || declares_reference(decl) || program.is_dep_file(written_in) {
+        return;
+    }
+    let local = storage == StorageClass::Local;
+    if !(construct || local) {
+        return;
+    }
+    let Some(cls) = automatic_object_class(program, type_id) else {
+        return;
+    };
+    let lookup = receiver_lookup_name(&cls);
+    let ctors = if construct {
+        lifecycle_members(program, ctx, &lookup, &trace_ir::MethodKind::Ctor)
+    } else {
+        Vec::new()
+    };
+    let mut dtors = if local {
+        lifecycle_members(program, ctx, &lookup, &trace_ir::MethodKind::Dtor)
+    } else {
+        Vec::new()
+    };
+    // The declaration's specifiers are read only for an object with members:
+    // finding it climbs the tree.
+    if ctors.is_empty() && dtors.is_empty() {
+        return;
+    }
+    let declaration = object_declaration(span_node);
+    if declaration.is_some_and(|d| declares_extern(source, d)) {
+        return;
+    }
+    if declaration.is_some_and(|d| has_storage_specifier(source, d, "thread_local")) {
+        dtors.clear();
+    }
+    let span = node_call_span(program, ctx, span_node);
+    let expansion_span = node_expansion_span(program, ctx, span_node);
+    // One site per class providing the members, each under its own name so
+    // its overloads are ranked among themselves. The object is exactly its
+    // class: the sites take no virtual dispatch.
+    let first = program.symbols.call_sites.len();
+    for (kind, groups) in [
+        (trace_ir::MethodKind::Ctor, ctors),
+        (trace_ir::MethodKind::Dtor, dtors),
+    ] {
+        for (owner, targets) in groups {
+            emit_member_targets(
+                program,
+                caller,
+                &owner,
+                &kind,
+                Some(var),
+                CallArgs::empty(),
+                span,
+                expansion_span,
+                targets,
+                None,
+            );
+        }
+    }
+    for site in &mut program.symbols.call_sites[first..] {
+        site.exact_receiver = true;
+    }
+}
+
+/// The declaration whose storage class specifiers apply to the object
+/// `declarator` declares: its own declaration, range-for loop or catch
+/// parameter, never one around the block it sits in. A range-for variable in
+/// a lambda that initializes a `thread_local` variable is no more
+/// `thread_local` than one in a plain function.
+fn object_declaration(declarator: Node) -> Option<Node> {
+    enclosing_decl(
+        declarator,
+        &[
+            "declaration",
+            "for_range_loop",
+            "parameter_declaration",
+            "optional_parameter_declaration",
+            "compound_statement",
+        ],
+    )
+    .filter(|d| d.cached_kind() != "compound_statement")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7646,6 +7884,7 @@ fn lower_one_declarator(
     is_static: bool,
     storage_override: Option<StorageClass>,
     init_expr: Option<Node>,
+    lifecycle: Lifecycle,
 ) -> Option<VarId> {
     if node_is_from_ignored_macro(ctx, decl) || node_is_from_ignored_macro(ctx, span_node) {
         return None;
@@ -7742,8 +7981,15 @@ fn lower_one_declarator(
     // field, so an argument_list "initializer" IS the ctor call. `Cls o{1, 2};`
     // calls a constructor too when the class declares a user-provided one; a
     // class without one is an aggregate, whose braces initialize its fields.
+    // `T x{};` and `T x = {};` value-initialize: they construct as `T x;`
+    // does (`emit_automatic_lifecycle`), arrays included.
+    let empty_braces = init_expr
+        .is_some_and(|n| n.cached_kind() == "initializer_list" && n.named_child_count() == 0);
     let mut braced_ctor = false;
-    if ctx.is_cpp && span_node.cached_kind() == "init_declarator" && ctx.current_fn.is_some() {
+    // A condition declaration (`if (T x{a})`) holds its initializer without
+    // an init_declarator.
+    let initialized = span_node.cached_kind() == "init_declarator" || init_expr.is_some();
+    if ctx.is_cpp && initialized && !empty_braces && ctx.current_fn.is_some() {
         if let Some(cls) = named_class(program, type_id) {
             // A constructor defaulted or deleted in its class is not
             // user-provided and leaves the class an aggregate (C++17).
@@ -7782,7 +8028,251 @@ fn lower_one_declarator(
             lower_var_initializer(program, ctx, source, var_id, type_id, decl, init);
         }
     }
+    let construct = matches!(lifecycle, Lifecycle::Declared)
+        && match init_expr {
+            None => span_node.cached_kind() != "init_declarator",
+            Some(_) => empty_braces,
+        };
+    emit_automatic_lifecycle(program, ctx, source, var_id, decl, span_node, construct);
     Some(var_id)
+}
+
+/// Which lifecycle sites [`lower_one_declarator`] records for the automatic
+/// object it declares ([`emit_automatic_lifecycle`]).
+#[derive(Clone, Copy)]
+enum Lifecycle {
+    /// Constructed as its declarator says, then destroyed.
+    Declared,
+    /// Destroyed only: constructed by a site the caller records (`T w(name);`
+    /// in `lower_direct_init`) or initialized from a range element or an
+    /// exception without naming a constructor (`for (T x : r)`,
+    /// `catch (T e)`).
+    DestroyOnly,
+}
+
+/// The variable a range-for loop or a catch clause declares (`for (T x : r)`,
+/// `catch (T e)`), lowered as a local of the statement's body
+/// (docs/ANALYSIS.md, "Automatic objects": range-for and catch variables).
+fn lower_statement_local(program: &mut Program, ctx: &mut LowerContext, source: &str, node: Node) {
+    let holder = if node.cached_kind() == "catch_clause" {
+        node.cached_field("parameters").and_then(|params| {
+            params
+                .named_children(&mut params.walk())
+                .find(|c| c.cached_kind() == "parameter_declaration")
+        })
+    } else {
+        Some(node)
+    };
+    let Some(holder) = holder else {
+        return;
+    };
+    let Some(type_node) = holder.cached_field("type") else {
+        return;
+    };
+    if node_is_from_ignored_macro(ctx, node) {
+        return;
+    }
+    let Some(decl) = holder.cached_field("declarator") else {
+        lower_unnamed_exception(program, ctx, source, holder, type_node);
+        return;
+    };
+    // An abstract declarator (`catch (T &)`) or a structured binding
+    // (`auto &[k, v]`) names no one local.
+    let bound = if decl.cached_kind() == "reference_declarator" {
+        decl.named_child(0)
+    } else {
+        Some(decl)
+    };
+    let binding = bound.is_some_and(|d| d.cached_kind() == "structured_binding_declarator");
+    if binding || decl.cached_kind().starts_with("abstract_") {
+        return;
+    }
+    let placeholder = is_placeholder_type(ctx, type_node);
+    let type_id = parse_type_node(program, ctx, source, type_node);
+    let element = node
+        .cached_field("right")
+        .filter(|_| placeholder)
+        .and_then(|range| range_element_desc(program, ctx, source, range));
+    let ty = deduced_local_type(program, type_id, decl, element);
+    let var = lower_one_declarator(
+        program,
+        ctx,
+        source,
+        decl,
+        decl,
+        ty,
+        false,
+        None,
+        None,
+        Lifecycle::DestroyOnly,
+    );
+    forget_placeholder_alias(ctx, type_node, var);
+    if let Some(var) = var {
+        flow_range_element(program, ctx, source, node, var);
+    }
+}
+
+/// The element a range-for variable starts as, for a range naming an array
+/// variable: read from the array summary, as `x = arr[i]` reads it.
+/// Containers have no element model.
+fn flow_range_element(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+    var: VarId,
+) {
+    let Some(range) = node
+        .cached_field("right")
+        .map(peel_expression)
+        .filter(|r| matches!(r.cached_kind(), "identifier" | "qualified_identifier"))
+    else {
+        return;
+    };
+    let Some(array) = resolve_expr_var(program, ctx, source, range) else {
+        return;
+    };
+    let desc = program
+        .types
+        .get(program.symbols.variable(array).type_id)
+        .desc
+        .as_ref();
+    if matches!(desc.innermost().0, TypeDesc::Array { .. }) {
+        program.flow.push(FlowConstraint::Copy {
+            dst: var,
+            src: array,
+        });
+    }
+}
+
+/// An explicit reference's type carries an alias layer that readers peel; a
+/// placeholder local's (`auto &x`) is already the value's own type.
+fn forget_placeholder_alias(ctx: &mut LowerContext, type_node: Node, var: Option<VarId>) {
+    if let Some(var) = var.filter(|_| is_placeholder_type(ctx, type_node)) {
+        ctx.reference_vars.remove(&var);
+    }
+}
+
+/// The exception object an unnamed by-value catch parameter (`catch (T)`)
+/// copy-initializes, lowered as a nameless local so its destructor site is
+/// recorded.
+fn lower_unnamed_exception(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    holder: Node,
+    type_node: Node,
+) {
+    let type_id = parse_type_node(program, ctx, source, type_node);
+    // The local exists only to carry a destructor site.
+    let has_dtor = automatic_object_class(program, type_id).is_some_and(|cls| {
+        !lifecycle_members(
+            program,
+            ctx,
+            &receiver_lookup_name(&cls),
+            &trace_ir::MethodKind::Dtor,
+        )
+        .is_empty()
+    });
+    if !has_dtor {
+        return;
+    }
+    let var_id = program.symbols.alloc_var_id();
+    let span = node_span(program, ctx, holder);
+    program.symbols.add_variable(Variable {
+        is_defined: false,
+        is_weak: false,
+        target: None,
+        is_namespaced: false,
+        qualified_name: None,
+        c_linkage: false,
+        is_static_member: false,
+        id: var_id,
+        name: "$exception".to_owned(),
+        type_id,
+        storage: StorageClass::Local,
+        fn_id: ctx.current_fn,
+        param_index: None,
+        span,
+        is_pointer: false,
+    });
+    emit_automatic_lifecycle(program, ctx, source, var_id, holder, holder, false);
+}
+
+/// The element type a range-for loop over `range` gives a placeholder
+/// variable: an array's element, or the class the first template argument of
+/// a standard sequence container names (`std::vector<std::shared_ptr<T>>`
+/// iterates `std::shared_ptr<T>`; [`spelled_element_desc`]). The range is
+/// typed as a member call's receiver is ([`receiver_desc`]): a variable,
+/// plain or qualified, a field (`items_`, `obj.items`), or `*p`.
+fn range_element_desc(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    range: Node,
+) -> Option<TypeDesc> {
+    let range = receiver_desc(program, ctx, source, range)?;
+    match range.innermost().0 {
+        TypeDesc::Array { elem, .. } => Some(elem.as_ref().clone()),
+        TypeDesc::Struct { name, .. } => {
+            const SEQUENCES: &[&str] = &[
+                "std::array",
+                "std::deque",
+                "std::forward_list",
+                "std::initializer_list",
+                "std::list",
+                "std::multiset",
+                "std::set",
+                "std::span",
+                "std::unordered_multiset",
+                "std::unordered_set",
+                "std::vector",
+            ];
+            let container = strip_template_args(name);
+            let container = container.trim_start_matches("::");
+            // A bare `vector<T>` names `std::vector` under `using namespace std;`.
+            let known = SEQUENCES.contains(&container)
+                || (!container.contains("::")
+                    && ctx.directive_namespaces().any(|ns| ns == "std")
+                    && SEQUENCES.contains(&format!("std::{container}").as_str()));
+            if !known {
+                return None;
+            }
+            let arg = template_arguments(name).into_iter().next()?;
+            spelled_element_desc(program, ctx, &arg)
+        }
+        _ => None,
+    }
+}
+
+/// The type a template argument spells when it names a class seen from this
+/// scope, or a standard smart pointer to one, under its trailing `*`s. Any
+/// other spelling (a scalar, a typedef, an enum, a template parameter) gives
+/// none: no class is made up for it.
+fn spelled_element_desc(program: &Program, ctx: &LowerContext, arg: &str) -> Option<TypeDesc> {
+    let (base, suffix) = split_pointer_suffix(arg);
+    let base = sanitize_type_name(base);
+    let class = held_class(program, ctx, &base).or_else(|| {
+        let wrapper = strip_template_args(&base);
+        let [held]: [String; 1] = template_arguments(&base).try_into().ok()?;
+        is_std_smart_ptr_name(&wrapper)
+            .then(|| held_class(program, ctx, &held))
+            .flatten()
+            .map(|held| format!("{wrapper}<{held}>"))
+    })?;
+    Some(class_desc_under(class, suffix.matches('*').count()))
+}
+
+/// Class `name` under `layers` pointers.
+fn class_desc_under(name: String, layers: usize) -> TypeDesc {
+    let mut desc = TypeDesc::Struct {
+        name,
+        fields: Vec::new(),
+    };
+    for _ in 0..layers {
+        desc = TypeDesc::Ptr(Box::new(desc));
+    }
+    desc
 }
 
 /// Whether a declarator's name is a scope-qualified identifier (`Cls::m`,
@@ -8323,8 +8813,16 @@ fn walk_function_body(
                     | "catch_clause"
             ));
     let local_scope_len = ctx.local_scope_log.len();
+    // A range-for variable or a catch parameter is in scope in the body only.
+    let statement_body = (is_local_scope
+        && matches!(node.cached_kind(), "for_range_loop" | "catch_clause"))
+    .then(|| node.cached_field("body"))
+    .flatten();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        if statement_body.is_some_and(|body| body.id() == child.id()) {
+            lower_statement_local(program, ctx, source, node);
+        }
         walk_function_body(program, ctx, source, child, caller);
     }
     if is_block {
@@ -8903,6 +9401,7 @@ fn collect_call_at_node_inner(
             occurrence: None,
             is_direct,
             receiver_class: None,
+            exact_receiver: false,
             return_dst,
             tu: Some(ctx.current_file),
         });
@@ -8945,6 +9444,7 @@ fn collect_call_at_node_inner(
             occurrence: None,
             is_direct: true,
             receiver_class: None,
+            exact_receiver: false,
             return_dst,
             tu: Some(ctx.current_file),
         });
@@ -10209,6 +10709,7 @@ fn emit_unresolved_site(
         occurrence: None,
         is_direct: false,
         receiver_class,
+        exact_receiver: false,
         return_dst,
         tu: program.symbols.function_by_id(caller).and_then(|f| f.tu),
     });
@@ -10278,7 +10779,6 @@ fn emit_member_targets(
         &args.arg_desc,
         &args.null_constants,
     );
-    let display = kind.name_on(cls);
     if targets.is_empty() {
         // Unknown method: keep an unresolved site; the solver synthesizes
         // an external entry (mirrors plain-identifier C behavior).
@@ -10287,7 +10787,7 @@ fn emit_member_targets(
         program.symbols.call_sites.push(CallSite {
             id: call_id,
             caller,
-            callee_name: display,
+            callee_name: kind.name_on(cls),
             callee_var: None,
             callee_fn_id: None,
             var_args: args.var_args,
@@ -10300,6 +10800,7 @@ fn emit_member_targets(
             occurrence: None,
             is_direct: false,
             receiver_class: Some(cls.to_string()),
+            exact_receiver: false,
             return_dst,
             tu,
         });
@@ -10331,6 +10832,7 @@ fn emit_member_targets(
             occurrence: None,
             is_direct: true,
             receiver_class: Some(cls.to_string()),
+            exact_receiver: false,
             return_dst,
             tu,
         });
@@ -10374,16 +10876,8 @@ fn lower_field_initializer_list(
                 let fid = cls_type?;
                 let info = program.types.get(fid);
                 let (_, fl) = info.layout.fields.iter().find(|(_, f)| f.name == fname)?;
-                let mut desc = program.types.get(fl.type_id).desc.as_ref().clone();
-                let mut array = false;
-                while let TypeDesc::Array { elem, .. } = desc {
-                    desc = *elem;
-                    array = true;
-                }
-                match desc {
-                    TypeDesc::Struct { name, .. } => Some((name, array)),
-                    _ => None,
-                }
+                let (desc, array) = peel_arrays(program.types.get(fl.type_id).desc.as_ref());
+                initialized_class(program, desc).map(|name| (name, array))
             });
         if let Some((target, array)) = target_cls {
             // `Base(a)` and `m_(a)` hold an argument list, `Base{a}` and
@@ -15030,12 +15524,18 @@ fn scoped_variable_unless_hidden(
 }
 
 fn declaration_is_extern(source: &str, node: Node) -> bool {
-    enclosing_decl(node, &["declaration", "field_declaration"]).is_some_and(|decl| {
-        has_storage_specifier(source, decl, "extern")
-            // `extern "C" T x;`, a linkage specification's one declaration
-            // without braces, is `extern` too.
-            || decl.parent().is_some_and(|p| p.cached_kind() == "linkage_specification")
-    })
+    enclosing_decl(node, &["declaration", "field_declaration"])
+        .is_some_and(|decl| declares_extern(source, decl))
+}
+
+/// Whether declaration `decl` is `extern`: by its storage class specifier, or
+/// as a linkage specification's one declaration without braces
+/// (`extern "C" T x;`).
+fn declares_extern(source: &str, decl: Node) -> bool {
+    has_storage_specifier(source, decl, "extern")
+        || decl
+            .parent()
+            .is_some_and(|p| p.cached_kind() == "linkage_specification")
 }
 
 /// Whether declaration `decl` spells storage class specifier `keyword`
@@ -17248,6 +17748,7 @@ mod qualified_variable_lookup_tests {
             tree: None,
             has_templates: false,
             template_depth: Cell::new(0),
+            lifecycle_cache: Default::default(),
             has_weak: false,
             record_link_ownership: false,
             header_unit: false,

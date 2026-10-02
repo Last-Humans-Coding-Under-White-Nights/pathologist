@@ -146,6 +146,7 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 | New SQLite column | `trace-db/src/schema.rs`, `export.rs`, `docs/SQLITE_SCHEMA.md` |
 | Parse new C/C++ construct | `trace-parse/src/lower.rs` |
 | C++ spellings the pinned grammar rejects (attributed `friend`, computed `decltype` bases, GNU `__typeof__`, member-function pointers) | `trace-parse/src/parse.rs` (`normalize_cpp_parse_syntax`, `cpp_type_operand_parses`), `cpp_type_names.rs` → `docs/ANALYSIS.md` ("C++ parse-input normalization") |
+| Constructor/destructor sites of automatic objects (`T x;`, scope exit, range-for/catch variables) | `trace-parse/src/lower.rs` (`emit_automatic_lifecycle`, `lifecycle_members`, `lower_statement_local`, `range_element_desc`) → `docs/ANALYSIS.md` ("Automatic objects") |
 | C++ virtual dispatch & hierarchy | `trace-ir/src/program.rs` (`inheritance`), `trace-parse/src/lower.rs` (`expand_virtual_overrides`) |
 | C++ smart pointer unwrapping | `trace-parse/src/lower.rs` (`ArrowReturn`), `symbol.rs` |
 | Smart-pointer value flow (`sp->field`, `wp.lock()`) | `trace-parse/src/lower.rs` (`decompose_field_path`, `emit_wrapper_boundaries`, `weak_promotion`, `promoted_receiver_value`), `trace-analysis/src/solver.rs` (`unwrap_admits`) → `docs/ANALYSIS.md` ("Smart-pointer unwrap", "Weak-pointer promotion") |

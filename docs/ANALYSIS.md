@@ -1866,7 +1866,9 @@ C++-aware only where it must be — everything else reuses the C machinery.
   resolution: a call walks upward to the nearest declaring base. **Non-virtual**
   methods resolve exactly to that declaring function; **`virtual` methods and
   destructors** additionally expand downward through the subclass closure
-  (one site per target — delete-through-base is the dominant dtor pattern).
+  (one site per target — delete-through-base is the dominant dtor pattern),
+  except at an automatic object's sites, whose receiver is exactly its class
+  ([Automatic objects](#automatic-objects)).
   Expansion runs again **after TU merge** so overrides declared later in the
   same file or in other TUs are included. Downward expansion is rooted at the
   **static receiver type**. Targets are filtered by **explicit arity**
@@ -2208,7 +2210,8 @@ C++-aware only where it must be — everything else reuses the C machinery.
 - **Ctors / dtors**: emitted for `new Cls(...)`, destructor calls on
   `delete p`, explicit qualified dtor calls, constructor-declarations with
   an argument list, ctor-initializer lists (base + member targets, with
-  parentheses or braces). A member that is an array of a class, nested arrays
+  parentheses or braces; a member of union type with a user-provided
+  constructor counts as a class). A member that is an array of a class, nested arrays
   included, constructs its elements: an empty list (`m_arr{}`) records the
   element's default constructor, and a non-empty list initializes the
   elements one by one, each listed expression lowered on its own rather than
@@ -2248,11 +2251,14 @@ C++-aware only where it must be — everything else reuses the C machinery.
   type (both in an unindexed header or another unit), the line reads as a
   local object: a documented imprecision. At file scope such a name still
   makes the line a declaration.
+  Automatic (stack) objects: see [Automatic objects](#automatic-objects).
 - **References** lower as pointers (aliasing stores land on caller memory).
 - **C++ locals** live until the end of their block, or of the `if`, `for`,
   `while`, `switch` or `catch` whose condition or init-statement declares
   them (`if (auto p = f())`); a variable of the same name they hid is
-  visible again afterwards. C lowering keeps one name per function.
+  visible again afterwards. C lowering keeps one name per function. A
+  lambda's parameters, and those of a function declared in a body
+  (`void take(T *p);`), are never locals of the enclosing function.
 - **`auto` local types (#87, C1)**: a call initializer copies the declared
   return type of the function it resolves to. Free, qualified, explicit and
   implicit member calls use the call-site lookup and arity filter; ranking
@@ -2567,6 +2573,87 @@ Known C++ imprecision (in addition to the general list below):
   missed but never wrongly added).
 
 Next slices (hiview-grounded): [docs/CPP_ROADMAP.md](CPP_ROADMAP.md).
+
+### Automatic objects
+
+Constructor and destructor sites of automatic C++ objects (#186). This
+section is the authoritative statement of the rules; lowering
+(`emit_automatic_lifecycle`, `lifecycle_members`, `lower_statement_local` in
+`trace-parse/src/lower.rs`), tests and reports link here.
+
+- **Which members run.** For a class whose own members of the kind
+  include a user-provided one, those members: its destructor, or its
+  constructors callable without arguments (or of unknown arity), one
+  declaring no parameter at all chosen over a template or an ellipsis one,
+  as overload resolution picks it. A member that is implicit, or defaulted
+  in its class (`Function::defaulted_in_class`), runs every base's, so the
+  rule applies to each direct base in turn: `struct D : A, B {}; D d;`
+  reaches `A::A`, `B::B`, `A::~A` and `B::~B`, and `D() = default;` beside
+  `template <class... T> D(T...)` reaches the base's constructor. A class
+  that declares constructors, none of them a default one, is never
+  default-constructed; one whose hierarchy provides none records no site.
+  Each class providing members gets a site of its own, its overloads ranked
+  among themselves.
+- **Construction.** `T x;`, and the value-initializing `T x{};` and
+  `T x = {};`, record those constructors. Any other initialized local
+  (`T x = e`, `T x{a}`, `T x(a)`, a condition's `if (T x{a})`) records the
+  constructor its initializer names, under Ctors / dtors above; non-empty
+  braces on a class whose hierarchy declares no user-provided constructor
+  initialize an aggregate (see follow-up). `static` and `thread_local`
+  locals are constructed on the function's first run, so they record the
+  constructor too.
+- **Destruction.** Every automatic local of such a class gets **one**
+  destructor site in the enclosing function, attributed to its
+  declaration, whatever way its scope is left: `return`, `break`, `goto`
+  and exceptions are not modeled per exit, keeping the analysis
+  flow-insensitive. Locals in nested blocks, `if`/`for`/`switch`
+  init-statements and conditions, and lambda bodies (the lambda is the
+  caller) are covered.
+- **`this` and dispatch.** The constructor's and destructor's implicit
+  `this` receives the local, so a virtual destructor and calls through
+  `this` inside it resolve. A local is exactly its class, so its sites
+  take no virtual dispatch (`CallSite::exact_receiver`): no subclass's
+  destructor is reached, nor a defaulted one of its own.
+- **Classes and arrays.** A local of a named struct, class or union type,
+  or an array of one: `T a[4];` and `T a[4]{};` record one constructor site
+  and one destructor site for the whole array, not one per element. An
+  initializer constructs a union only when it declares a constructor; a
+  C-style union (`U u(src);`) is copied.
+- **Range-for and catch variables.** `for (T x : r)` and `catch (T e)` are
+  lowered as locals of the statement's body, after the range expression
+  (which still names the outer entity: `for (Item item : item.list())`),
+  so they hide an outer name whatever their type. Copy-initialized, one of
+  class type gets the destructor site only. A range naming an array
+  variable gives the loop variable its elements, read from the array
+  summary as `x = arr[i]` reads them; containers have no element model.
+  Calls through a loop or catch variable resolve by its type:
+  - the declared one (`catch (const std::logic_error &e)`,
+    `for (Handler *h : hs)`);
+  - for a placeholder (`for (const auto &p : ps)`), the element type of a
+    range typed as a member call's receiver is (a variable, a field, `*p`)
+    when it is an array, or a standard sequence container (`std::vector`,
+    `std::list`, `std::set`, ..., or the bare name under
+    `using namespace std;`) whose first template argument names a class,
+    cv-qualifiers dropped; under the `auto` rule above, the declarator's
+    `*`s must fit. Anything else leaves the type unknown.
+
+  An unnamed by-value catch parameter (`catch (T)`) is lowered as a
+  nameless local when its class has a destructor to record; an unnamed
+  reference (`catch (T &)`) and a structured binding (`auto [k, v]`,
+  `auto &[k, v]`) are not lowered.
+- **No destructor site** for `static` and `thread_local` locals (destroyed
+  at exit, not by the function; a local of a lambda in a `thread_local`
+  variable's initializer is not one). **No site** for references,
+  pointers, `extern` declarations, or bodies of dependency headers, which
+  merge declaration-only. A scope guard a dependency header's macro
+  declares in the user's code is the user's local and is recorded.
+- **Left for follow-up.** Temporaries (`T().Run()`, a returned
+  `std::lock_guard`); the implicit construction and destruction of
+  members and bases a user-provided constructor or destructor runs; the
+  base constructors non-empty aggregate braces run (`struct D : B {
+  D() = default; int n; }; D d{{}, 1};` records no `B::B`); the elements a
+  partly listed array value-initializes; and copy or move constructors for
+  copy-initialized locals.
 
 ### Template-parameter bases
 
