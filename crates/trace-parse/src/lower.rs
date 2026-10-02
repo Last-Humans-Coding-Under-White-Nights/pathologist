@@ -402,7 +402,11 @@ fn build_program_inner(
         ..
     } = discovered;
     let mut files = normalize_discovered_paths(files);
-    let database = crate::compile_commands::CompilationDatabase::load(root, opts)?;
+    let mut database = crate::compile_commands::CompilationDatabase::load(root, opts)?;
+    files.retain(|p| !under_dep(p));
+    let mut headers = normalize_discovered_paths(headers);
+    headers.retain(|p| !under_dep(p));
+    database.configure_discovered(&files, &headers, opts);
     // Sources without a database entry and orphan project headers use the
     // shared fallback configuration and need compiler default headers.
     let needs_fallback = files
@@ -418,7 +422,9 @@ fn build_program_inner(
         };
         crate::compiler_includes::CompilerIncludes::default().for_project(
             &trace_ir::canonicalize(directory),
-            &opts.system_include_paths,
+            database
+                .shared_system_paths()
+                .unwrap_or(&opts.system_include_paths),
         )
     } else {
         None
@@ -434,13 +440,20 @@ fn build_program_inner(
         .chain(&opts.after_include_paths)
         .map(|path| trace_ir::canonicalize(path))
         .collect();
-    system_roots.extend(database.commands.values().flatten().flat_map(|config| {
-        config
-            .system_include_paths
-            .iter()
-            .chain(&config.after_include_paths)
-            .cloned()
-    }));
+    system_roots.extend(
+        database
+            .commands
+            .values()
+            .flatten()
+            .chain(database.shared_search_options())
+            .flat_map(|config| {
+                config
+                    .system_include_paths
+                    .iter()
+                    .chain(&config.after_include_paths)
+                    .cloned()
+            }),
+    );
     if let Some((c, cpp)) = &project_compiler_paths {
         system_roots.extend(c.paths.iter().chain(&cpp.paths).cloned());
     }
@@ -454,9 +467,6 @@ fn build_program_inner(
     files.sort();
     files.dedup();
     add_warnings(&mut program, "compile_commands", &database.warnings);
-    let mut headers = normalize_discovered_paths(headers);
-    files.retain(|p| !under_dep(p));
-    headers.retain(|p| !under_dep(p));
     let dep_headers =
         normalize_discovered_paths(dep_discovered.into_iter().flat_map(|d| d.headers).collect());
     let dep_note = if dep_roots.is_empty() {
@@ -509,7 +519,10 @@ fn build_program_inner(
         }
     }
     add_warnings(&mut program, "link_commands", &links.warnings);
-    if !database.commands.is_empty() || (!links.targets.is_empty() && !links.unscoped_inference) {
+    if !database.commands.is_empty()
+        || database.has_shared_configuration()
+        || (!links.targets.is_empty() && !links.unscoped_inference)
+    {
         return configured::build(
             program,
             root,
