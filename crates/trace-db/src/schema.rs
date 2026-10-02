@@ -1,12 +1,20 @@
+// v7 is an additive compatibility family, not a capability discriminator.
+// New tables, nullable/defaulted columns, and indexes may extend it without
+// changing existing meanings. Consumers must check the structures they use;
+// table presence alone does not imply populated data (notably merge outputs).
+// Incompatible layouts or meanings require a version bump. See
+// docs/SQLITE_SCHEMA.md, "Version and capability contract".
 pub const SCHEMA_VERSION: i64 = 7;
 
 // Keep the complete public schema and the bulk-export phases in sync without
-// duplicating SQL. The exporter defers only non-unique secondary indexes.
+// duplicating SQL. Query indexes are built before provenance export; other
+// non-unique secondary indexes remain deferred until bulk insertion finishes.
 macro_rules! define_schema {
-    ($tables:literal, $indexes:literal) => {
-        pub const SCHEMA_V7: &str = concat!($tables, $indexes);
+    ($tables:literal, $query_indexes:literal, $indexes:literal) => {
+        pub const SCHEMA_V7: &str = concat!($tables, $query_indexes, $indexes);
         pub const TABLES_V7: &str = $tables;
-        pub const INDEXES_V7: &str = $indexes;
+        pub const PROVENANCE_INDEXES_V7: &str = $query_indexes;
+        pub const INDEXES_V7: &str = concat!($query_indexes, $indexes);
     };
 }
 
@@ -77,6 +85,7 @@ CREATE TABLE IF NOT EXISTS variables (
     file_id INTEGER NOT NULL REFERENCES files(id),
     line INTEGER NOT NULL,
     col INTEGER NOT NULL DEFAULT 0,
+    is_synthetic INTEGER NOT NULL DEFAULT 0,
     is_weak INTEGER NOT NULL DEFAULT 0,
     target_id INTEGER REFERENCES link_targets(id)
 );
@@ -91,7 +100,9 @@ CREATE TABLE IF NOT EXISTS call_sites (
     expansion_line INTEGER,
     expansion_col INTEGER,
     callee_text TEXT NOT NULL,
-    is_direct INTEGER NOT NULL
+    is_direct INTEGER NOT NULL,
+    callee_var INTEGER,
+    return_dst INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS call_edges (
@@ -143,9 +154,54 @@ CREATE TABLE IF NOT EXISTS flow_nodes (
     label TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',
     var_id INTEGER REFERENCES variables(id),
-    fn_id INTEGER REFERENCES functions(id)
+    fn_id INTEGER REFERENCES functions(id),
+    call_site_id INTEGER REFERENCES call_sites(id)
 );
 
+-- Optional presentation provenance; raw graph contracts stay unchanged.
+CREATE TABLE IF NOT EXISTS flow_parameters (
+    fn_id INTEGER NOT NULL REFERENCES functions(id),
+    arg_index INTEGER NOT NULL,
+    var_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    type_name TEXT NOT NULL,
+    PRIMARY KEY (fn_id, arg_index)
+);
+
+CREATE TABLE IF NOT EXISTS flow_field_locations (
+    node_id INTEGER PRIMARY KEY REFERENCES flow_nodes(id),
+    parent_node INTEGER NOT NULL REFERENCES flow_nodes(id),
+    field_name TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS flow_field_access (
+    base_node INTEGER NOT NULL REFERENCES flow_nodes(id),
+    dst_node INTEGER NOT NULL REFERENCES flow_nodes(id),
+    field_name TEXT NOT NULL,
+    PRIMARY KEY (base_node, dst_node, field_name)
+);
+CREATE TABLE IF NOT EXISTS flow_return_calls (
+    src_node INTEGER NOT NULL, dst_node INTEGER NOT NULL,
+    call_site_id INTEGER NOT NULL REFERENCES call_sites(id),
+    callee_fn_id INTEGER NOT NULL REFERENCES functions(id)
+);
+CREATE TABLE IF NOT EXISTS flow_calls (
+    src_node INTEGER NOT NULL, dst_node INTEGER NOT NULL,
+    call_site_id INTEGER NOT NULL REFERENCES call_sites(id), arg_index INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS flow_call_expressions (
+    call_site_id INTEGER PRIMARY KEY REFERENCES call_sites(id),
+    expression TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS flow_call_origins (
+    call_site_id INTEGER PRIMARY KEY REFERENCES call_sites(id),
+    file_id INTEGER NOT NULL REFERENCES files(id),
+    line INTEGER NOT NULL, col INTEGER NOT NULL, expression TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS flow_origins (
+    src_node INTEGER NOT NULL, dst_node INTEGER NOT NULL, kind TEXT NOT NULL,
+    file_id INTEGER NOT NULL REFERENCES files(id), line INTEGER NOT NULL,
+    col INTEGER NOT NULL, expression TEXT NOT NULL, operation TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS flow_edges (
     id INTEGER PRIMARY KEY,
     src_node INTEGER NOT NULL REFERENCES flow_nodes(id),
@@ -179,13 +235,26 @@ LEFT JOIN functions f ON f.id = COALESCE(n.fn_id, v.fn_id);
 
 "#,
     r#"
+CREATE INDEX IF NOT EXISTS idx_call_sites_indirect_return ON call_sites(callee_var, return_dst)
+    WHERE callee_var IS NOT NULL AND return_dst IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_call_edges_callsite ON call_edges(call_site_id);
+"#,
+    r#"
 CREATE INDEX IF NOT EXISTS idx_call_edges_callee ON call_edges(callee_fn_id);
 CREATE INDEX IF NOT EXISTS idx_call_edges_caller ON call_edges(caller_fn_id);
-CREATE INDEX IF NOT EXISTS idx_call_edges_callsite ON call_edges(call_site_id);
 CREATE INDEX IF NOT EXISTS idx_arg_flow_callsite ON arg_flow_edges(call_site_id);
 CREATE INDEX IF NOT EXISTS idx_functions_name ON functions(name);
+CREATE INDEX IF NOT EXISTS idx_functions_file_range ON functions(file_id,is_defined,line_start,line_end);
 CREATE INDEX IF NOT EXISTS idx_flow_edges_src ON flow_edges(src_node);
 CREATE INDEX IF NOT EXISTS idx_flow_edges_dst ON flow_edges(dst_node);
+CREATE INDEX IF NOT EXISTS idx_flow_origins_src_node ON flow_origins(src_node);
+CREATE INDEX IF NOT EXISTS idx_flow_origins_dst_node ON flow_origins(dst_node);
+CREATE INDEX IF NOT EXISTS idx_flow_calls_src_node ON flow_calls(src_node);
+CREATE INDEX IF NOT EXISTS idx_flow_calls_dst_node ON flow_calls(dst_node);
+CREATE INDEX IF NOT EXISTS idx_flow_return_calls_src_node ON flow_return_calls(src_node);
+CREATE INDEX IF NOT EXISTS idx_flow_return_calls_dst_node ON flow_return_calls(dst_node);
+CREATE INDEX IF NOT EXISTS idx_flow_field_access_dst ON flow_field_access(dst_node);
+CREATE INDEX IF NOT EXISTS idx_variables_parameter_twins ON variables(fn_id,name) WHERE kind='param';
 CREATE INDEX IF NOT EXISTS idx_flow_nodes_var ON flow_nodes(var_id);
 -- Partial: without link metadata every `target_id` is NULL, and a partial
 -- index over no rows costs nothing to build or store.

@@ -8,6 +8,7 @@ trace-ir = { workspace = true }
 trace-preproc = { workspace = true }
 anyhow.workspace = true
 indexmap.workspace = true
+hashbrown.workspace = true
 thiserror.workspace = true
 tree-sitter.workspace = true
 tree-sitter-c.workspace = true

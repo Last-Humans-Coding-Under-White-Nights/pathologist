@@ -15,6 +15,23 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use trace_db::{INDEXES_V7, SCHEMA_VERSION, TABLES_V7};
 
+// Use the same projections for capability checks and ingestion. Additive v7
+// flow metadata is optional here because the merger only preserves call graphs.
+const READ_FILES: &str = "SELECT id, path, sha256, is_dep FROM files ORDER BY id";
+const READ_TARGETS: &str = "SELECT id, name, output FROM link_targets ORDER BY id";
+const READ_TARGET_SOURCES: &str =
+    "SELECT target_id, file_id FROM target_sources ORDER BY target_id, file_id";
+const READ_TARGET_DEPENDENCIES: &str =
+    "SELECT target_id, dependency_id FROM target_dependencies ORDER BY target_id, dependency_id";
+const READ_FUNCTIONS: &str = "SELECT id, name, file_id, line_start, line_end, linkage, signature, is_defined, is_dep, is_weak, target_id \
+             FROM functions ORDER BY id";
+const READ_CALL_SITES: &str = "SELECT id, caller_fn_id, file_id, line, col, expansion_file_id, expansion_line, expansion_col, callee_text, is_direct \
+             FROM call_sites ORDER BY id";
+const READ_CALL_EDGES: &str = "SELECT id, call_site_id, caller_fn_id, callee_fn_id, resolution \
+             FROM call_edges ORDER BY id";
+const READ_DIAGNOSTICS: &str =
+    "SELECT id, severity, file_id, line, message, stage FROM diagnostics ORDER BY id";
+
 #[derive(Debug, Clone)]
 pub struct MergeOptions {
     pub output: PathBuf,
@@ -193,11 +210,30 @@ pub fn merge_databases<P: AsRef<Path>>(
             })?;
         if ver != SCHEMA_VERSION {
             bail!(
-                "incompatible schema version in {}: database has version {}, expected {}",
+                "incompatible schema version in {}: database has version {}, expected {}; re-analyze the input with the current trace version",
                 path.display(),
                 ver,
                 SCHEMA_VERSION
             );
+        }
+        // Preparing every ingestion query checks required tables and columns,
+        // including empty inputs, before any output is created or replaced.
+        for (table, query) in [
+            ("files", READ_FILES),
+            ("link_targets", READ_TARGETS),
+            ("target_sources", READ_TARGET_SOURCES),
+            ("target_dependencies", READ_TARGET_DEPENDENCIES),
+            ("functions", READ_FUNCTIONS),
+            ("call_sites", READ_CALL_SITES),
+            ("call_edges", READ_CALL_EDGES),
+            ("diagnostics", READ_DIAGNOSTICS),
+        ] {
+            conn.prepare(query).map_err(|error| {
+                anyhow::anyhow!(
+                    "missing trace-merge capability in {} ({table}): {error}; re-analyze the input with the current trace version",
+                    path.display()
+                )
+            })?;
         }
         conns.push(conn);
     }
@@ -209,7 +245,7 @@ pub fn merge_databases<P: AsRef<Path>>(
 
     for (db_idx, conn) in conns.iter().enumerate() {
         let mut stmt = conn
-            .prepare("SELECT id, path, sha256, is_dep FROM files ORDER BY id")
+            .prepare(READ_FILES)
             .with_context(|| format!("failed to read files from {}", inputs[db_idx].display()))?;
         let rows = stmt.query_map([], |row| {
             Ok(DbFile {
@@ -251,7 +287,7 @@ pub fn merge_databases<P: AsRef<Path>>(
     let mut unified_target_dependencies: Vec<(i64, i64)> = Vec::new();
 
     for (db_idx, conn) in conns.iter().enumerate() {
-        let mut stmt = conn.prepare("SELECT id, name, output FROM link_targets ORDER BY id")?;
+        let mut stmt = conn.prepare(READ_TARGETS)?;
         let rows = stmt.query_map([], |r| {
             Ok(DbLinkTarget {
                 id: r.get(0)?,
@@ -270,8 +306,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             });
         }
 
-        let mut src_stmt = conn
-            .prepare("SELECT target_id, file_id FROM target_sources ORDER BY target_id, file_id")?;
+        let mut src_stmt = conn.prepare(READ_TARGET_SOURCES)?;
         let src_rows =
             src_stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
         for r in src_rows {
@@ -284,9 +319,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             }
         }
 
-        let mut dep_stmt = conn.prepare(
-            "SELECT target_id, dependency_id FROM target_dependencies ORDER BY target_id, dependency_id",
-        )?;
+        let mut dep_stmt = conn.prepare(READ_TARGET_DEPENDENCIES)?;
         let dep_rows =
             dep_stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
         for r in dep_rows {
@@ -314,10 +347,7 @@ pub fn merge_databases<P: AsRef<Path>>(
         vec![FxHashMap::default(); inputs.len()];
 
     for (db_idx, conn) in conns.iter().enumerate() {
-        let mut stmt = conn.prepare(
-            "SELECT id, name, file_id, line_start, line_end, linkage, signature, is_defined, is_dep, is_weak, target_id \
-             FROM functions ORDER BY id",
-        )?;
+        let mut stmt = conn.prepare(READ_FUNCTIONS)?;
         let rows = stmt.query_map([], |r| {
             Ok(DbFunction {
                 id: r.get(0)?,
@@ -521,10 +551,7 @@ pub fn merge_databases<P: AsRef<Path>>(
     let mut cs_remap: Vec<FxHashMap<i64, i64>> = vec![FxHashMap::default(); inputs.len()];
 
     for (db_idx, conn) in conns.iter().enumerate() {
-        let mut stmt = conn.prepare(
-            "SELECT id, caller_fn_id, file_id, line, col, expansion_file_id, expansion_line, expansion_col, callee_text, is_direct \
-             FROM call_sites ORDER BY id",
-        )?;
+        let mut stmt = conn.prepare(READ_CALL_SITES)?;
         let rows = stmt.query_map([], |r| {
             Ok(DbCallSite {
                 id: r.get(0)?,
@@ -577,10 +604,7 @@ pub fn merge_databases<P: AsRef<Path>>(
     let mut unresolved_external_counts: FxHashMap<String, usize> = FxHashMap::default();
 
     for (db_idx, conn) in conns.iter().enumerate() {
-        let mut stmt = conn.prepare(
-            "SELECT id, call_site_id, caller_fn_id, callee_fn_id, resolution \
-             FROM call_edges ORDER BY id",
-        )?;
+        let mut stmt = conn.prepare(READ_CALL_EDGES)?;
         let rows = stmt.query_map([], |r| {
             Ok(DbCallEdge {
                 id: r.get(0)?,
@@ -788,9 +812,7 @@ pub fn merge_databases<P: AsRef<Path>>(
     // 6. Diagnostics Ingestion
     let mut unified_diagnostics: Vec<DbDiagnostic> = Vec::new();
     for (db_idx, conn) in conns.iter().enumerate() {
-        let mut stmt = conn.prepare(
-            "SELECT id, severity, file_id, line, message, stage FROM diagnostics ORDER BY id",
-        )?;
+        let mut stmt = conn.prepare(READ_DIAGNOSTICS)?;
         let rows = stmt.query_map([], |r| {
             Ok(DbDiagnostic {
                 id: r.get(0)?,
@@ -950,7 +972,8 @@ pub fn merge_databases<P: AsRef<Path>>(
             }
         }
 
-        // Bulk insert call sites
+        // Bulk insert call sites. callee_var and return_dst deliberately stay
+        // NULL: input variable IDs have no identity in this call-graph-only output.
         {
             let mut stmt = out_conn.prepare_cached(
                 "INSERT INTO call_sites (id, caller_fn_id, file_id, line, col, expansion_file_id, expansion_line, expansion_col, callee_text, is_direct) \

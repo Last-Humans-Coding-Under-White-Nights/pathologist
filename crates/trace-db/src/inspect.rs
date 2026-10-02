@@ -404,10 +404,21 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
 
 /// True when `table` has a `column`. Table names are compile-time constants;
 /// the column name is bound as a parameter.
-fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+pub(crate) fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let sql = format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1");
     let n: i64 = conn.query_row(&sql, [column], |r| r.get(0))?;
     Ok(n != 0)
+}
+
+/// Symbol selection must reliably exclude generated intermediate variables.
+pub(crate) fn require_synthetic_metadata(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "variables", "is_synthetic")? {
+        bail!(
+            "`variables.is_synthetic` missing: database predates synthetic-variable metadata; \
+             re-run `trace analyze` with this binary"
+        );
+    }
+    Ok(())
 }
 
 /// Require the schema-v3 caller column used by synthetic call edges.
@@ -925,6 +936,9 @@ pub fn find_symbols_at(
     line: i64,
     col: i64,
 ) -> Result<Vec<SymbolRef>> {
+    if line <= 0 || col <= 0 {
+        bail!("line and column must be >= 1 (positions are 1-based)");
+    }
     if file_substring.is_empty() {
         bail!("file filter must not be empty");
     }
@@ -934,12 +948,13 @@ pub fn find_symbols_at(
              re-run `trace analyze` with this binary"
         );
     }
+    require_synthetic_metadata(conn)?;
     let mut stmt = conn.prepare(
         "SELECT v.id, v.name, v.kind, v.line, v.col, p.path, f.name \
          FROM variables v \
          JOIN files p ON p.id = v.file_id \
          LEFT JOIN functions f ON f.id = v.fn_id \
-         WHERE p.path LIKE ?1 AND v.line BETWEEN ?2 - 2 AND ?2 + 2",
+         WHERE p.path LIKE ?1 AND v.line BETWEEN ?2 - 2 AND ?2 + 2 AND v.is_synthetic = 0",
     )?;
     let pattern = format!("%{file_substring}%");
     let rows = stmt.query_map(rusqlite::params![pattern, line], |row| {
@@ -953,10 +968,11 @@ pub fn find_symbols_at(
             row.get::<_, Option<String>>(6)?,
         ))
     })?;
-    let mut candidates: Vec<(u32, i64, SymbolRef)> = Vec::new();
+    let mut candidates: Vec<((u64, u64), i64, SymbolRef)> = Vec::new();
     for r in rows {
         let (var_id, name, kind, vline, vcol, path, fn_name) = r?;
-        let name_len = name.len() as i64;
+        // LineMap columns count Unicode scalar values, not UTF-8 bytes.
+        let name_len = name.chars().count() as i64;
         let score = rank_symbol(line, col, vline, vcol, name_len);
         candidates.push((
             score,
@@ -972,37 +988,31 @@ pub fn find_symbols_at(
             },
         ));
     }
-    candidates.sort_by_key(|(score, vcol, sym)| (*score, *vcol, sym.var_id));
+    candidates.sort_by(|(rank_a, col_a, a), (rank_b, col_b, b)| {
+        rank_a
+            .cmp(rank_b)
+            .then_with(|| col_a.cmp(col_b))
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.var_id.cmp(&b.var_id))
+    });
     Ok(candidates.into_iter().map(|(_, _, s)| s).collect())
 }
 
-/// Rank a declaration against the queried position; lower wins.
-/// 0 = on this line inside the identifier, 1..5 = same line by column
-/// distance bucket (25-column bands), 10/11/12 = one/two lines away.
-fn rank_symbol(line: i64, col: i64, vline: i64, vcol: i64, name_len: i64) -> u32 {
-    let line_dist = (vline - line).abs();
-    if line_dist == 0 {
-        if col >= vcol && col <= vcol + name_len {
-            0
-        } else {
-            1 + (vcol.abs_diff(col)).min(99) as u32 / 25
-        }
+/// Identifier coverage on the requested line precedes other same-line
+/// declarations, then nearby lines. Coverage on another line is not exact.
+/// Within each category use actual distance, followed by stable identity ties.
+fn rank_symbol(line: i64, col: i64, vline: i64, vcol: i64, name_len: i64) -> (u64, u64) {
+    let line_dist = vline.abs_diff(line);
+    if line_dist == 0 && col >= vcol && col < vcol.saturating_add(name_len) {
+        (0, vcol.abs_diff(col))
     } else {
-        9 + line_dist.min(3) as u32
+        (line_dist.saturating_add(1), vcol.abs_diff(col))
     }
 }
 
-/// Bounded BFS over the PAG value-flow graph (`flow_edges`). Down follows
-/// src → dst (where the value flows), up follows reversed edges (where it
-/// came from). Start nodes are every PAG node of the given variables (the
-/// var node plus any storage/field location nodes mapped to it).
-pub fn dataflow_graph(
-    conn: &Connection,
-    symbols: &[SymbolRef],
-    dir: Direction,
-    max_depth: u32,
-) -> Result<QueryGraph> {
-    require_flow_tables(conn)?;
+/// Shared root selection, including canonical-function parameter twins.
+pub(crate) fn dataflow_starts(conn: &Connection, symbols: &[SymbolRef]) -> Result<Vec<i64>> {
     let var_ids: Vec<i64> = symbols.iter().map(|s| s.var_id).collect();
     let mut starts: Vec<i64> = Vec::new();
     for vid in &var_ids {
@@ -1064,6 +1074,22 @@ pub fn dataflow_graph(
                 .join(", ")
         );
     }
+
+    Ok(starts)
+}
+
+/// Bounded BFS over the PAG value-flow graph (`flow_edges`). Down follows
+/// src → dst (where the value flows), up follows reversed edges (where it
+/// came from). Start nodes are every PAG node of the given variables (the
+/// var node plus any storage/field location nodes mapped to it).
+pub fn dataflow_graph(
+    conn: &Connection,
+    symbols: &[SymbolRef],
+    dir: Direction,
+    max_depth: u32,
+) -> Result<QueryGraph> {
+    require_flow_tables(conn)?;
+    let starts = dataflow_starts(conn, symbols)?;
 
     // Load adjacency (both directions of every edge once).
     let mut fwd: Adjacency = FxHashMap::default();
@@ -1599,6 +1625,87 @@ mod tests {
     }
 
     #[test]
+    fn symbol_lookup_identifier_coverage_counts_characters_and_excludes_end() {
+        let conn = test_conn();
+        for (line, name) in [(100, "name"), (101, "дано"), (102, "名字")] {
+            let length = name.chars().count() as i64;
+            conn.execute(
+                "INSERT INTO variables(id,name,kind,type_id,file_id,line,col) VALUES(?1,?2,'local',0,1,?1,10)",
+                rusqlite::params![line, name],
+            ).unwrap();
+            // Competing declarations just beyond the identifier, with an
+            // identity tie to verify deterministic ordering as well as rank.
+            for id in [line + 200, line + 100] {
+                conn.execute(
+                    "INSERT INTO variables(id,name,kind,type_id,file_id,line,col) VALUES(?1,'z','local',0,1,?2,?3)",
+                    rusqlite::params![id, line, 10 + length + 1],
+                ).unwrap();
+            }
+            for col in [10, 10 + length - 1] {
+                let ids: Vec<_> = find_symbols_at(&conn, "main.c", line, col)
+                    .unwrap()
+                    .into_iter()
+                    .take(3)
+                    .map(|s| s.var_id)
+                    .collect();
+                assert_eq!(ids, [line, line + 100, line + 200], "{name}:{col}");
+            }
+            let ids: Vec<_> = find_symbols_at(&conn, "main.c", line, 10 + length)
+                .unwrap()
+                .into_iter()
+                .take(3)
+                .map(|s| s.var_id)
+                .collect();
+            assert_eq!(ids, [line + 100, line + 200, line], "after {name}");
+        }
+    }
+
+    #[test]
+    fn symbol_lookup_uses_actual_column_distance_and_stable_ties() {
+        let conn = test_conn();
+        conn.execute_batch(
+            "INSERT INTO variables(id,name,kind,type_id,file_id,line,col) VALUES
+            (90,'sbuf','param',0,1,194,24),(91,'data','param',0,1,194,46),
+            (92,'nearby','local',0,1,195,43);",
+        )
+        .unwrap();
+        // Column coverage on the neighboring line cannot outrank a
+        // declaration on the requested line.
+        assert_eq!(
+            find_symbols_at(&conn, "main.c", 194, 43).unwrap()[0].name,
+            "data"
+        );
+        // On its own line the neighbor has identifier coverage.
+        assert_eq!(
+            find_symbols_at(&conn, "main.c", 195, 44).unwrap()[0].name,
+            "nearby"
+        );
+        assert_eq!(
+            find_symbols_at(&conn, "main.c", 194, 24).unwrap()[0].name,
+            "sbuf"
+        );
+        assert_eq!(
+            find_symbols_at(&conn, "main.c", 194, 49).unwrap()[0].name,
+            "data"
+        );
+        // Equal distances retain a deterministic leftmost declaration tie.
+        assert_eq!(
+            find_symbols_at(&conn, "main.c", 194, 35).unwrap()[0].name,
+            "sbuf"
+        );
+        assert_eq!(
+            find_symbols_at(&conn, "main.c", 194, 400).unwrap()[0].name,
+            "data"
+        );
+        for (line, col) in [(0, 1), (-1, 1), (194, 0), (194, -1)] {
+            assert!(find_symbols_at(&conn, "main.c", line, col)
+                .unwrap_err()
+                .to_string()
+                .contains("positions are 1-based"));
+        }
+    }
+
+    #[test]
     fn dataflow_traverses_both_directions_with_kinds() {
         let conn = test_conn();
         let syms = require_symbols_at(&conn, "main.c", 5, 5).unwrap();
@@ -1771,6 +1878,14 @@ mod tests {
         let err = find_symbols_at(&conn, "main.c", 12, 9).unwrap_err();
         assert!(err.to_string().contains("variables.col"), "{err}");
         assert!(err.to_string().contains("re-run"), "{err}");
+
+        conn.execute_batch("ALTER TABLE variables ADD COLUMN col INTEGER NOT NULL DEFAULT 1")
+            .unwrap();
+        let err = find_symbols_at(&conn, "main.c", 12, 9).unwrap_err();
+        assert!(err.to_string().contains("variables.is_synthetic"), "{err}");
+        assert!(err.to_string().contains("re-run"), "{err}");
+        let err = crate::require_source_dataflow_metadata(&conn).unwrap_err();
+        assert!(err.to_string().contains("variables.is_synthetic"), "{err}");
 
         conn.execute_batch(
             "CREATE TABLE call_edges ( \

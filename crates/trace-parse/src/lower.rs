@@ -9,7 +9,7 @@ use crate::gn_defines::Candidate;
 use crate::index_cache::{IndexSourceCache, PreprocessedSource};
 use crate::merge::{
     merge_unit_header_preamble, merge_unit_index, merge_unit_symbols, merge_unit_types,
-    merge_unit_variants, UnitIndex,
+    merge_unit_variants, FlowOriginBindings, UnitIndex,
 };
 use crate::node_metadata::NodeMetadata;
 use crate::parse::node_text;
@@ -86,7 +86,73 @@ impl LowerContext {
     }
 }
 
+/// Original spelling and lazy character-column indexes for recovered lines.
+struct OriginalSource {
+    text: String,
+    line_starts: Vec<usize>,
+    ascii: bool,
+    columns: HashMap<usize, LineColumns>,
+}
+
+enum LineColumns {
+    Ascii,
+    Utf8(Vec<usize>),
+}
+
+impl OriginalSource {
+    fn new(text: String) -> Self {
+        let ascii = text.is_ascii();
+        let mut line_starts = vec![0];
+        line_starts.extend(
+            text.bytes()
+                .enumerate()
+                .filter_map(|(i, c)| (c == b'\n').then_some(i + 1)),
+        );
+        Self {
+            text,
+            line_starts,
+            ascii,
+            columns: HashMap::default(),
+        }
+    }
+
+    fn offset(&mut self, line: u32, col: u32) -> Option<usize> {
+        let line = line.checked_sub(1)? as usize;
+        let col = col.checked_sub(1)? as usize;
+        let start = *self.line_starts.get(line)?;
+        let end = self
+            .line_starts
+            .get(line + 1)
+            .copied()
+            .unwrap_or(self.text.len());
+        if self.ascii {
+            return (col < end - start).then(|| start + col);
+        }
+        let text = self.text.get(start..end)?;
+        // Scan a recovered line once. ASCII columns are already byte offsets;
+        // only non-ASCII lines need a character-to-byte table.
+        let columns = self.columns.entry(line).or_insert_with(|| {
+            if text.is_ascii() {
+                LineColumns::Ascii
+            } else {
+                LineColumns::Utf8(text.char_indices().map(|(i, _)| i).collect())
+            }
+        });
+        let byte = match columns {
+            LineColumns::Ascii => (col < text.len()).then_some(col)?,
+            LineColumns::Utf8(offsets) => *offsets.get(col)?,
+        };
+        start.checked_add(byte)
+    }
+}
+
 struct LowerContext {
+    /// Closest operation attribution wins for each emitted constraint occurrence.
+    recorded_flow_origins: Vec<bool>,
+    flow_origin_indices: FlowOriginBindings,
+    original_sources: HashMap<PathBuf, Option<OriginalSource>>,
+    /// Membership only; Program's origin vectors retain first-seen order.
+    flow_origin_membership: HashMap<FlowConstraint, crate::flow_origins::OriginMembership>,
     current_fn: Option<FnId>,
     current_file: trace_ir::FileId,
     locals: HashMap<String, VarId>,
@@ -202,6 +268,9 @@ struct LowerContext {
     /// The unit is a header indexed on its own: its own bodies are replayed
     /// into includers, so their definition text is kept (#116).
     header_unit: bool,
+    /// Closest operation attribution for deferred references, keyed by the
+    /// same occurrence index used for flow and initializer ownership.
+    pending_flow_origins: HashMap<usize, (Span, String)>,
     pending_flow_owners: HashMap<usize, FnId>,
     pending_initializer_owners: HashMap<usize, VarId>,
     ignored_macros: Arc<[String]>,
@@ -1453,12 +1522,16 @@ fn expand_internal_overload_refs(program: &mut Program) {
         match *constraint {
             FlowConstraint::AddrOfFn { dst, callee } => added.extend(
                 overloads(callee, var_file(dst))
-                    .map(|callee| FlowConstraint::AddrOfFn { dst, callee }),
+                    .map(|callee| (FlowConstraint::AddrOfFn { dst, callee }, constraint.clone())),
             ),
-            FlowConstraint::ArrayFnMember { array, callee } => added.extend(
-                overloads(callee, var_file(array))
-                    .map(|callee| FlowConstraint::ArrayFnMember { array, callee }),
-            ),
+            FlowConstraint::ArrayFnMember { array, callee } => {
+                added.extend(overloads(callee, var_file(array)).map(|callee| {
+                    (
+                        FlowConstraint::ArrayFnMember { array, callee },
+                        constraint.clone(),
+                    )
+                }))
+            }
             _ => {}
         }
     }
@@ -1473,7 +1546,33 @@ fn expand_internal_overload_refs(program: &mut Program) {
             }
         }
     }
-    program.flow.extend(added);
+    // Snapshot the original occurrences before any widened candidate receives
+    // origins. Repeated flow occurrences contribute each (candidate, original)
+    // pair only once, in first-seen order; retain all occurrences in `added`.
+    // A candidate can also be an original reference elsewhere; union
+    // its sites in first-seen order without borrowing newly widened provenance.
+    let mut seen_pairs = HashSet::default();
+    let added_origins: Vec<_> = added
+        .iter()
+        .filter(|pair| seen_pairs.insert((*pair).clone()))
+        .filter_map(|(flow, original)| {
+            program
+                .flow_origins
+                .get(original)
+                .map(|sites| (flow, sites.clone()))
+        })
+        .collect();
+    let mut memberships = HashMap::default();
+    for (flow, sites) in added_origins {
+        let origins = program.flow_origins.entry(flow.clone()).or_default();
+        let membership = memberships
+            .entry(flow)
+            .or_insert_with(|| crate::flow_origins::OriginMembership::new(origins));
+        for (span, expression) in sites {
+            membership.insert(origins, span, &expression);
+        }
+    }
+    program.flow.extend(added.into_iter().map(|(flow, _)| flow));
     for (owner, flow) in returns {
         program.fn_returns.entry(owner).or_default().push(flow);
     }
@@ -2481,8 +2580,8 @@ fn index_header_variant(
         header_ir,
         pch_order,
     ) {
-        Ok(()) => {
-            let mut unit = program_into_unit(path.to_path_buf(), program);
+        Ok(origin_indices) => {
+            let mut unit = program_into_unit(path.to_path_buf(), program, origin_indices);
             unit.held_headers = Arc::clone(&expansion.inlined);
             // A header's unit is merged into every unit below it; a TU's
             // once, which the precomputation would not pay for.
@@ -2557,7 +2656,7 @@ fn index_source_file(
         header_ir,
         pch_order,
     ) {
-        Ok(()) => {
+        Ok(origin_indices) => {
             if std::env::var_os("TRACE_DEBUG_UNIT").is_some() {
                 let hdr = program
                     .symbols
@@ -2578,7 +2677,7 @@ fn index_source_file(
                     hdr
                 );
             }
-            program_into_unit(path.to_path_buf(), program)
+            program_into_unit(path.to_path_buf(), program, origin_indices)
         }
         Err(e) => UnitIndex {
             path: path.to_path_buf(),
@@ -2670,8 +2769,12 @@ fn index_source_file_with_variants(
                     header_ir,
                     pch_order,
                 ) {
-                    Ok(()) => {
-                        variant_units.push(program_into_unit(path.to_path_buf(), var_program));
+                    Ok(origin_indices) => {
+                        variant_units.push(program_into_unit(
+                            path.to_path_buf(),
+                            var_program,
+                            origin_indices,
+                        ));
                     }
                     Err(e) => {
                         warn_explore(format!("variant lower failed for {}: {e}", path.display()));
@@ -2699,7 +2802,7 @@ fn process_indexed_file(
     source_cache: &IndexSourceCache,
     header_ir: Option<&HeaderIr>,
     pch_order: &HeaderOrder,
-) -> Result<(), String> {
+) -> Result<Option<FlowOriginBindings>, String> {
     let pre = source_cache.get_or_preprocess(path, graph, index_opts)?;
     // `index_opts` was chosen by `index_language`, so its language is the
     // one the text was lexed as; the grammar must not be re-derived from
@@ -2736,7 +2839,7 @@ fn lower_prepared_source(
     header_unit: bool,
     header_ir: Option<&HeaderIr>,
     pch_order: &HeaderOrder,
-) -> Result<(), String> {
+) -> Result<Option<FlowOriginBindings>, String> {
     program.symbols.set_dep_roots(graph.dep_roots.clone());
     let self_canon = graph.intern_path(path);
     let file_id = program.symbols.add_file_interned(&self_canon);
@@ -2808,6 +2911,10 @@ fn lower_prepared_source(
     let is_cpp = lang == crate::parse::SourceLang::Cpp;
     let tree = Arc::new(parsed.tree);
     let mut ctx = LowerContext {
+        recorded_flow_origins: Vec::new(),
+        flow_origin_indices: HashMap::default(),
+        original_sources: HashMap::default(),
+        flow_origin_membership: HashMap::default(),
         current_fn: None,
         current_file: file_id,
         locals: HashMap::default(),
@@ -2846,15 +2953,29 @@ fn lower_prepared_source(
         has_weak: source_may_annotate_weak(&parsed.source) || program.symbols.has_weak_symbols(),
         record_link_ownership,
         header_unit,
+        pending_flow_origins: HashMap::default(),
         pending_flow_owners: HashMap::default(),
         pending_initializer_owners: HashMap::default(),
         ignored_macros: Arc::from(program.ignored_macros.clone()),
         ignored_macro_cache: RefCell::new(HashMap::default()),
     };
+    if ctx.record_link_ownership && ctx.has_weak {
+        // Header preamble facts may already aggregate several operation sites.
+        // Bind only those existing sites, before AST origins append to the
+        // same constraint, so a header fact cannot revive a suppressed origin.
+        for (index, flow) in program.flow.iter().enumerate() {
+            if let Some(origins) = program.flow_origins.get(flow) {
+                ctx.flow_origin_indices.insert(index, 0..origins.len());
+            }
+        }
+    }
     lower_tree(program, &mut ctx, parsed.source.as_ref(), tree.root_node());
     // AST lowering complete: drop syntax tree and clear transient expression caches early.
     ctx.tree = None;
     drop(tree);
+    // Expression recovery finished with the AST walk; deferred references
+    // already carry their complete spelling in pending_flow_origins.
+    ctx.original_sources = HashMap::default();
     ctx.handled_new_exprs.borrow_mut().clear();
     ctx.callee_load_cache.borrow_mut().clear();
     ctx.call_receiver_cache.borrow_mut().clear();
@@ -2923,9 +3044,9 @@ fn lower_prepared_source(
             }
         }
     }
-    resolve_pending_fn_refs(program, &ctx);
+    resolve_pending_fn_refs(program, &mut ctx);
     program.types.complete_nested_tags();
-    Ok(())
+    Ok((ctx.record_link_ownership && ctx.has_weak).then_some(ctx.flow_origin_indices))
 }
 
 /// Forward what the preprocessor reported for this unit (missing includes,
@@ -2969,7 +3090,7 @@ fn add_preprocess_diagnostics(
 /// Second-chance resolution for references recorded while lowering: the
 /// whole unit's symbol table is now populated, so definitions that appear
 /// after their use site are visible.
-fn resolve_pending_fn_refs(program: &mut Program, ctx: &LowerContext) {
+fn resolve_pending_fn_refs(program: &mut Program, ctx: &mut LowerContext) {
     let pending: Vec<PendingFnRef> = ctx.pending.borrow_mut().drain(..).collect();
     for (index, item) in pending.into_iter().enumerate() {
         let flow_start = program.flow.len();
@@ -3034,6 +3155,9 @@ fn resolve_pending_fn_refs(program: &mut Program, ctx: &LowerContext) {
                 }
             }
         }
+        if let Some((span, expression)) = ctx.pending_flow_origins.remove(&index) {
+            record_flow_origins(program, ctx, flow_start, span, &expression);
+        }
         if let Some(&owner) = ctx.pending_initializer_owners.get(&index) {
             let end = program.flow.len();
             if end > flow_start {
@@ -3057,7 +3181,11 @@ fn resolve_pending_fn_refs(program: &mut Program, ctx: &LowerContext) {
     }
 }
 
-fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
+fn program_into_unit(
+    path: PathBuf,
+    mut program: Program,
+    origin_indices: Option<FlowOriginBindings>,
+) -> UnitIndex {
     let inheritance = program.take_inheritance();
     let template_bases = program.take_template_bases();
     UnitIndex {
@@ -3077,6 +3205,8 @@ fn program_into_unit(path: PathBuf, mut program: Program) -> UnitIndex {
         variables: program.symbols.variables,
         call_sites: program.symbols.call_sites,
         flow: program.flow,
+        flow_origins: program.flow_origins,
+        flow_origin_bindings: origin_indices,
         function_flow_ranges: program.function_flow_ranges,
         global_initializer_ranges: program.global_initializer_ranges,
         fn_returns: program.fn_returns.into_iter().collect(),
@@ -4060,6 +4190,7 @@ fn register_static_data_member(
             is_namespaced: true,
             qualified_name: Some(qualified_name),
             c_linkage: false,
+            is_synthetic: false,
             is_static_member: true,
             id: var_id,
             name,
@@ -5557,6 +5688,7 @@ fn add_this_param(program: &mut Program, cls: &str, fn_id: FnId, span: Span) -> 
         is_namespaced: false,
         qualified_name: None,
         c_linkage: false,
+        is_synthetic: false,
         is_static_member: false,
         id: this_id,
         name: "this".to_string(),
@@ -5904,7 +6036,13 @@ fn lower_parameter(
             ctx.address_references.insert(var_id);
         }
     }
-    let span = node_span(program, ctx, node);
+    // Lookup ranks declaration columns, so named parameters must point at
+    // their identifier rather than the preceding type or pointer operator.
+    let span = node_span(
+        program,
+        ctx,
+        declarator.and_then(declarator_identifier).unwrap_or(node),
+    );
     program.symbols.add_variable(Variable {
         temp: None,
         is_defined: false,
@@ -5913,6 +6051,7 @@ fn lower_parameter(
         is_namespaced: false,
         qualified_name: None,
         c_linkage: false,
+        is_synthetic: false,
         is_static_member: false,
         id: var_id,
         name,
@@ -7099,6 +7238,7 @@ fn lower_new_object(
     let span = node_call_span(program, ctx, node);
     let expansion_span = node_expansion_span(program, ctx, node);
     let call_args = collect_call_args(program, ctx, source, args);
+    let first_site = program.symbols.call_sites.len();
     construct_on_heap(
         program,
         ctx.current_fn.filter(|_| !aggregate),
@@ -7109,6 +7249,8 @@ fn lower_new_object(
         expansion_span,
         targets,
     );
+    let expression = operation_expression(ctx, source, node);
+    record_call_expressions(program, first_site, &expression);
     Some(alloc_tmp)
 }
 
@@ -7979,6 +8121,7 @@ fn lower_declaration(
                     is_namespaced,
                     qualified_name,
                     c_linkage,
+                    is_synthetic: false,
                     is_static_member: false,
                     id: var_id,
                     name: name.clone(),
@@ -8230,6 +8373,7 @@ fn lower_direct_init(
     };
     let call_span = node_call_span(program, ctx, decl);
     let expansion_span = node_expansion_span(program, ctx, decl);
+    let first_site = program.symbols.call_sites.len();
     emit_member_sites(
         program,
         caller,
@@ -8241,6 +8385,8 @@ fn lower_direct_init(
         expansion_span,
         None,
     );
+    let expression = operation_expression(ctx, source, decl);
+    record_call_expressions(program, first_site, &expression);
 }
 
 /// Whether `name` spelled in the current scope denotes a type: a
@@ -8558,6 +8704,7 @@ fn lower_one_declarator(
             is_namespaced,
             qualified_name,
             c_linkage,
+            is_synthetic: false,
             is_static_member: false,
             id: var_id,
             name: name.clone(),
@@ -8602,6 +8749,7 @@ fn lower_one_declarator(
         is_namespaced,
         qualified_name,
         c_linkage,
+        is_synthetic: false,
         is_static_member: false,
         id: var_id,
         name: name.clone(),
@@ -8649,6 +8797,7 @@ fn lower_one_declarator(
                 let expansion_span = node_expansion_span(program, ctx, span_node);
                 let call_args = collect_call_args(program, ctx, source, ctor_args);
                 // The implicit `this` points to the object being constructed.
+                let first_site = program.symbols.call_sites.len();
                 emit_member_sites(
                     program,
                     ctx.current_fn.unwrap(),
@@ -8660,6 +8809,8 @@ fn lower_one_declarator(
                     expansion_span,
                     None,
                 );
+                let expression = operation_expression(ctx, source, span_node);
+                record_call_expressions(program, first_site, &expression);
             }
         }
     }
@@ -8831,6 +8982,7 @@ fn lower_unnamed_exception(
         is_static_member: false,
         id: var_id,
         name: "$exception".to_owned(),
+        is_synthetic: true,
         type_id,
         storage: StorageClass::Local,
         fn_id: ctx.current_fn,
@@ -9056,6 +9208,7 @@ fn reconcile_static_member_definition(
                 is_namespaced: true,
                 qualified_name: Some(canonical),
                 c_linkage,
+                is_synthetic: false,
                 is_static_member: owner_is_class,
                 id: var_id,
                 name: leaf,
@@ -9211,9 +9364,13 @@ fn push_array_fn_member(
     elem: Node,
 ) {
     if let Some(callee) = resolve_call_fn_arg(program, ctx, source, elem) {
+        let first_flow = program.flow.len();
         program
             .flow
             .push(FlowConstraint::ArrayFnMember { array, callee });
+        let span = node_span(program, ctx, elem);
+        let expression = operation_expression(ctx, source, elem);
+        record_flow_origins(program, ctx, first_flow, span, &expression);
     }
 }
 
@@ -9522,6 +9679,23 @@ pub(crate) fn explicit_member_operator_call<'a>(
     None
 }
 
+/// Attribute emitted candidates without replacing a nested call's own text.
+fn record_call_expressions(program: &mut Program, first_site: usize, expression: &str) {
+    if program.symbols.call_sites[first_site..].iter().all(|site| {
+        site.details
+            .as_ref()
+            .is_some_and(|d| d.call_expression.is_some())
+    }) {
+        return;
+    }
+    let expression = program.source_expressions.intern(expression);
+    for site in &mut program.symbols.call_sites[first_site..] {
+        site.details_mut()
+            .call_expression
+            .get_or_insert_with(|| Arc::clone(&expression));
+    }
+}
+
 fn collect_call_at_node(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -9545,7 +9719,45 @@ fn collect_call_at_node(
         })
         .filter(|token| node_has_expansion_location(ctx, *token));
     let first_site = program.symbols.call_sites.len();
+    let first_flow = program.flow.len();
+    let first_pending = ctx.pending.borrow().len();
     collect_call_at_node_inner(program, ctx, source, node, caller);
+    let operation_span = node_span(program, ctx, node);
+    let expression = operation_expression(ctx, source, node);
+    record_call_expressions(program, first_site, &expression);
+    record_operation_origins(
+        program,
+        ctx,
+        first_flow,
+        first_pending,
+        operation_span,
+        &expression,
+    );
+    if ctx.call_return_dst.borrow().contains_key(&node.id()) {
+        // Bind before equivalent constraints are unioned: several assignments
+        // in one macro expansion can share endpoints and invocation coordinates.
+        let mut operation = node;
+        while let Some(parent) = operation.parent() {
+            match parent.cached_kind() {
+                "assignment_expression" | "init_declarator" => {
+                    operation = parent;
+                    break;
+                }
+                "argument_list" | "expression_statement" | "return_statement" => break,
+                _ => operation = parent,
+            }
+        }
+        let span = node_span(program, ctx, operation);
+        let expression = operation_expression(ctx, source, operation);
+        let expression = program.source_expressions.intern(&expression);
+        for site in &mut program.symbols.call_sites[first_site..] {
+            if site.return_dst.is_some() {
+                site.details_mut()
+                    .return_operation
+                    .get_or_insert_with(|| Box::new((span, expression.clone())));
+            }
+        }
+    }
     let Some(occurrence_node) = occurrence_node else {
         return;
     };
@@ -10417,6 +10629,25 @@ fn collect_call_args(
                     if let Some(temp) = lower_nested_call_arg(program, ctx, source, value) {
                         var_args.push((arg_index, temp));
                     }
+                } else if is_nullptr(source, value) {
+                    let temp = alloc_ret_temp(program, ctx, arg);
+                    let ty = program.types.ptr_to(TypeDesc::Unknown);
+                    program.symbols.variable_mut(temp).type_id = ty;
+                    let first_flow = program.flow.len();
+                    if let Some(flow) = expr_to_rhs_flow(program, ctx, source, arg, temp) {
+                        program.flow.push(flow);
+                        // Keep the literal's own spelling/site, rather than
+                        // copying the enclosing argument list per null value.
+                        let span = node_span(program, ctx, arg);
+                        record_flow_origins(
+                            program,
+                            ctx,
+                            first_flow,
+                            span,
+                            node_text(source, &arg),
+                        );
+                        var_args.push((arg_index, temp));
+                    }
                 } else if let Some(s) = string_literal_value(source, arg) {
                     let temp = alloc_ret_temp(program, ctx, arg);
                     program.flow.push(FlowConstraint::StringConst {
@@ -10489,6 +10720,9 @@ fn arg_expr_type(
 
 fn known_arg_type(program: &Program, ctx: &LowerContext, source: &str, node: Node) -> TypeDesc {
     let node = peel_expression(node);
+    if is_nullptr(source, node) {
+        return TypeDesc::Ptr(Box::new(TypeDesc::Unknown));
+    }
     match node.cached_kind() {
         // A cast's operand type is not the type of the expression. Probing
         // a receiver cannot register a new type, so keep it unknown.
@@ -10497,7 +10731,6 @@ fn known_arg_type(program: &Program, ctx: &LowerContext, source: &str, node: Nod
         "char_literal" => TypeDesc::Char,
         "true" | "false" => TypeDesc::Bool,
         "string_literal" => TypeDesc::Ptr(Box::new(TypeDesc::Char)),
-        "nullptr" => TypeDesc::Ptr(Box::new(TypeDesc::Unknown)),
         // `&x` is a pointer to `x`'s type and `*p` its pointee's, not the
         // variable's own type the operand names.
         "pointer_expression" => {
@@ -10632,6 +10865,12 @@ fn enumerator_type(
         }),
         Some(_) => None,
     }
+}
+
+/// The pinned C++ grammar wraps the `nullptr` token in a named `null` node.
+/// Do not mistake an ordinary C identifier or a zero scalar for this value.
+fn is_nullptr(source: &str, node: Node) -> bool {
+    matches!(node.cached_kind(), "null" | "nullptr") && node_text(source, &node) == "nullptr"
 }
 
 /// Whether an argument is a literal zero, which converts to any pointer:
@@ -11599,6 +11838,7 @@ fn lower_field_initializer_list(
         }
         let span = node_call_span(program, ctx, fi);
         let expansion_span = node_expansion_span(program, ctx, fi);
+        let first_site = program.symbols.call_sites.len();
         let call_args = collect_call_args(program, ctx, source, args);
         emit_member_sites(
             program,
@@ -11611,6 +11851,8 @@ fn lower_field_initializer_list(
             expansion_span,
             None,
         );
+        let expression = operation_expression(ctx, source, fi);
+        record_call_expressions(program, first_site, &expression);
     }
 }
 
@@ -11651,6 +11893,8 @@ fn store_member_initializer(
     ) {
         return;
     }
+    let first_flow = program.flow.len();
+    let first_pending = ctx.pending.borrow().len();
     emit_field_value_store(
         program,
         ctx,
@@ -11661,6 +11905,9 @@ fn store_member_initializer(
         &[fname.to_owned()],
         value,
     );
+    let span = node_span(program, ctx, fi);
+    let expression = operation_expression(ctx, source, fi);
+    record_operation_origins(program, ctx, first_flow, first_pending, span, &expression);
 }
 
 fn last_segment_of(name: &str) -> &str {
@@ -12108,6 +12355,7 @@ fn lower_lambda_expression(
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_synthetic: false,
             is_static_member: false,
             id: var_id,
             name: name.clone(),
@@ -13154,7 +13402,227 @@ fn new_expression_class(
     None
 }
 
+/// Recover unchanged source operations through token coordinates. Macro text
+/// and normalized parse input use the same lexer-based fallback; literals stay
+/// indivisible and their contents are never whitespace-normalized.
+fn operation_expression(ctx: &mut LowerContext, source: &str, node: Node) -> String {
+    let language = if ctx.is_cpp {
+        trace_preproc::Language::Cpp
+    } else {
+        trace_preproc::Language::C
+    };
+    let text = node_text(source, &node);
+    let tokens = |text: &str| {
+        trace_preproc::Lexer::new(text, language)
+            .tokenize()
+            .into_iter()
+            .filter(|t| {
+                !matches!(
+                    t.kind,
+                    trace_preproc::TokenKind::Newline | trace_preproc::TokenKind::Eof
+                )
+            })
+            .map(|t| t.kind)
+            .collect::<Vec<_>>()
+    };
+    let kinds = tokens(text);
+    let mut recover = || -> Option<String> {
+        let map = ctx.line_map.as_ref()?;
+        let first = map.lookup(node.start_byte())?;
+        let last = map.lookup(node.end_byte().checked_sub(1)?)?;
+        let begin = map
+            .entries
+            .partition_point(|e| (e.output_offset as usize) < node.start_byte());
+        let end = map
+            .entries
+            .partition_point(|e| (e.output_offset as usize) < node.end_byte());
+        if first.expansion_id != 0
+            || map.entries[begin..end]
+                .iter()
+                .any(|e| e.expansion_id != 0 || e.file != first.file)
+        {
+            return None;
+        }
+        let path = map.path_of(first).to_path_buf();
+        let original = ctx
+            .original_sources
+            .entry(path)
+            .or_insert_with_key(|path| std::fs::read_to_string(path).ok().map(OriginalSource::new))
+            .as_mut()?;
+        let start = original.offset(first.line, first.col)?.checked_add(
+            node.start_byte()
+                .checked_sub(first.output_offset as usize)?,
+        )?;
+        let end = original
+            .offset(last.line, last.col)?
+            .checked_add(node.end_byte().checked_sub(last.output_offset as usize)?)?;
+        let candidate = original.text.get(start..end)?;
+        // Reject stale files, preprocessor rewriting and noncontiguous spans.
+        (tokens(candidate) == kinds).then(|| candidate.to_owned())
+    };
+    if let Some(original) = recover() {
+        return original;
+    }
+    format_operation_tokens(&kinds, language)
+}
+
+fn format_operation_tokens(
+    tokens: &[trace_preproc::TokenKind],
+    language: trace_preproc::Language,
+) -> String {
+    use trace_preproc::TokenKind;
+    let spelling = |token: &TokenKind| match token {
+        TokenKind::Identifier(s)
+        | TokenKind::Number(s)
+        | TokenKind::String(s)
+        | TokenKind::Char(s) => s.clone(),
+        TokenKind::Punct(s) => (*s).to_owned(),
+        TokenKind::Hash => "#".into(),
+        _ => String::new(),
+    };
+    let mut result = String::new();
+    let mut previous = String::new();
+    let mut previous_unary = false;
+    for token in tokens {
+        let current = spelling(token);
+        let unary = matches!(current.as_str(), "*" | "&" | "+" | "-" | "!" | "~")
+            && (previous.is_empty()
+                || matches!(
+                    previous.as_str(),
+                    "(" | "["
+                        | "{"
+                        | ","
+                        | "="
+                        | "+="
+                        | "-="
+                        | "*="
+                        | "/="
+                        | "%="
+                        | "&="
+                        | "|="
+                        | "^="
+                        | "<<="
+                        | ">>="
+                        | "?"
+                        | ":"
+                        | "+"
+                        | "-"
+                        | "*"
+                        | "/"
+                        | "%"
+                        | "&"
+                        | "|"
+                        | "^"
+                        | "&&"
+                        | "||"
+                        | "=="
+                        | "!="
+                        | "<"
+                        | ">"
+                        | "<="
+                        | ">="
+                        | "<<"
+                        | ">>"
+                        | "!"
+                        | "~"
+                ));
+        let tight = matches!(
+            current.as_str(),
+            "." | "->" | "::" | "->*" | ".*" | ")" | "]" | "," | ";" | "(" | "["
+        ) || matches!(
+            previous.as_str(),
+            "." | "->" | "::" | "->*" | ".*" | "(" | "["
+        ) || (previous_unary && !matches!(token, TokenKind::Punct(_)));
+        if !result.is_empty() && !tight {
+            result.push(' ');
+        }
+        result.push_str(&current);
+        previous = current;
+        previous_unary = unary;
+    }
+    let reparsed: Vec<_> = trace_preproc::Lexer::new(&result, language)
+        .tokenize()
+        .into_iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Newline | TokenKind::Eof))
+        .map(|token| token.kind)
+        .collect();
+    if reparsed == tokens {
+        result
+    } else {
+        tokens.iter().map(spelling).collect::<Vec<_>>().join(" ")
+    }
+}
+
+fn record_flow_origins(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    start: usize,
+    span: Span,
+    expression: &str,
+) {
+    ctx.recorded_flow_origins.resize(program.flow.len(), false);
+    if ctx.recorded_flow_origins[start..]
+        .iter()
+        .all(|recorded| *recorded)
+    {
+        return;
+    }
+    let expression = program.source_expressions.intern(expression);
+    for (index, flow) in program.flow.iter().enumerate().skip(start) {
+        if std::mem::replace(&mut ctx.recorded_flow_origins[index], true) {
+            continue;
+        }
+        let origins = program.flow_origins.entry(flow.clone()).or_default();
+        let origin_index = if origins.len() < 2 {
+            // Most constraints have one origin: no membership allocation needed.
+            crate::flow_origins::insert_small(origins, span, &expression)
+        } else {
+            ctx.flow_origin_membership
+                .entry(flow.clone())
+                .or_insert_with(|| crate::flow_origins::OriginMembership::new(origins))
+                .insert(origins, span, &expression)
+        };
+        if ctx.record_link_ownership && ctx.has_weak {
+            ctx.flow_origin_indices
+                .insert(index, origin_index..origin_index + 1);
+        }
+    }
+}
+
+/// Attribute immediate constraints and deferred references together. Nested
+/// operation wrappers run first, so their closest attribution wins for both.
+fn record_operation_origins(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    first_flow: usize,
+    first_pending: usize,
+    span: Span,
+    expression: &str,
+) {
+    record_flow_origins(program, ctx, first_flow, span, expression);
+    for index in first_pending..ctx.pending.borrow().len() {
+        ctx.pending_flow_origins
+            .entry(index)
+            .or_insert_with(|| (span, expression.to_owned()));
+    }
+}
+
 fn extract_flow_from_expr(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+    assign_target: Option<VarId>,
+) {
+    let start = program.flow.len();
+    let first_pending = ctx.pending.borrow().len();
+    extract_flow_from_expr_inner(program, ctx, source, node, assign_target);
+    let span = node_span(program, ctx, node);
+    let expression = operation_expression(ctx, source, node);
+    record_operation_origins(program, ctx, start, first_pending, span, &expression);
+}
+
+fn extract_flow_from_expr_inner(
     program: &mut Program,
     ctx: &mut LowerContext,
     source: &str,
@@ -13274,6 +13742,8 @@ fn lower_initializer_list(
                 if !field_names.is_empty() {
                     if let Some(fname) = field_names.get(pos).and_then(|f| f.clone()) {
                         if let Some(fid) = field_id_for(program, base, &fname) {
+                            let first_flow = program.flow.len();
+                            let first_pending = ctx.pending.borrow().len();
                             emit_field_value_store(
                                 program,
                                 ctx,
@@ -13284,6 +13754,14 @@ fn lower_initializer_list(
                                 &[fname],
                                 child,
                             );
+                            record_initializer_element_origins(
+                                program,
+                                ctx,
+                                source,
+                                child,
+                                first_flow,
+                                first_pending,
+                            );
                         }
                     }
                 }
@@ -13291,6 +13769,26 @@ fn lower_initializer_list(
             }
         }
     }
+}
+
+/// Attribute an initializer element before the enclosing aggregate wrapper.
+/// Singleton braces distinguish initialization from assignment in presentation;
+/// a nested list's opening brace identifies its container without copying it.
+fn record_initializer_element_origins(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+    first_flow: usize,
+    first_pending: usize,
+) {
+    let expression = if node.cached_kind() == "initializer_list" {
+        "{".to_owned()
+    } else {
+        format!("{{ {} }}", operation_expression(ctx, source, node))
+    };
+    let span = node_span(program, ctx, node);
+    record_operation_origins(program, ctx, first_flow, first_pending, span, &expression);
 }
 
 /// Declared field names of the struct type behind `base`, in order.
@@ -13337,6 +13835,7 @@ fn lower_designated_initializer(
     base: VarId,
 ) {
     let mut field_names = Vec::new();
+    let mut field_designators = Vec::new();
     let mut value = None;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -13346,6 +13845,7 @@ fn lower_designated_initializer(
                 for c in child.children(&mut inner) {
                     if c.cached_kind() == "field_identifier" {
                         field_names.push(node_text(source, &c).to_string());
+                        field_designators.push(child);
                     }
                 }
             }
@@ -13374,11 +13874,20 @@ fn lower_designated_initializer(
         // list against the same base (array elements are index-insensitive),
         // chaining GEPs for any field designators seen so far.
         let mut current = base;
-        for fname in &field_names {
+        for (fname, designator) in field_names.iter().zip(&field_designators) {
             let Some(fid) = program.types.field_id_by_name(type_id, fname) else {
                 return;
             };
+            let first_flow = program.flow.len();
             current = alloc_gep_temp(program, ctx, node, current, fid, fname.clone());
+            let span = node_span(program, ctx, *designator);
+            record_flow_origins(
+                program,
+                ctx,
+                first_flow,
+                span,
+                node_text(source, designator),
+            );
             type_id = program.types.get(type_id).layout.fields[&fid].type_id;
             type_id = peel_ptr_to_struct(program, type_id);
         }
@@ -13398,6 +13907,8 @@ fn lower_designated_initializer(
         field_ids.push(fid);
         type_id = program.types.get(type_id).layout.fields[&fid].type_id;
     }
+    let first_flow = program.flow.len();
+    let first_pending = ctx.pending.borrow().len();
     emit_field_value_store(
         program,
         ctx,
@@ -13408,6 +13919,7 @@ fn lower_designated_initializer(
         &field_names,
         value_node,
     );
+    record_initializer_element_origins(program, ctx, source, node, first_flow, first_pending);
 }
 
 fn peel_expression(mut node: Node) -> Node {
@@ -14528,6 +15040,9 @@ fn expr_to_rhs_flow(
     if node_is_from_ignored_macro(ctx, node) {
         return None;
     }
+    if is_nullptr(source, node) {
+        return Some(FlowConstraint::NullPointer { dst });
+    }
     // `f = s.ops[i]` reads the field `ops`, as `f = ops_[i]` reads
     // `this->ops_`: an element of a member table ([`Operand`]). A static
     // member table is a variable of its own, read as its name is.
@@ -15102,6 +15617,7 @@ fn add_temp(
         is_namespaced: false,
         qualified_name: None,
         c_linkage: false,
+        is_synthetic: true,
         is_static_member: false,
         id: var_id,
         name: format!("{}{}", kind.prefix(), var_id.0),
@@ -17704,6 +18220,33 @@ mod index_window_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn original_source_columns_are_unicode_aware_and_line_bounded() {
+        let mut source = OriginalSource::new("éα中🙂 x\r\np=p;\n".into());
+        for _ in 0..2 {
+            for (col, byte) in [
+                (8, 14),
+                (1, 0),
+                (4, 7),
+                (2, 2),
+                (7, 13),
+                (3, 4),
+                (6, 12),
+                (5, 11),
+            ] {
+                assert_eq!(source.offset(1, col), Some(byte));
+            }
+            assert_eq!(source.offset(2, 1), Some(15));
+            assert_eq!(source.offset(2, 5), Some(19));
+            for (line, col) in [(0, 1), (1, 0), (1, 9), (2, 6), (3, 1), (4, 1)] {
+                assert_eq!(source.offset(line, col), None);
+            }
+        }
+        let mut final_line = OriginalSource::new("p=p;".into());
+        assert_eq!(final_line.offset(1, 4), Some(3));
+        assert_eq!(final_line.offset(1, 5), None);
+    }
+
     const TEST_BYTE_BUDGET: usize = 1024 * 1024;
 
     #[test]
@@ -17793,6 +18336,83 @@ mod index_window_tests {
         )
         .unwrap();
         program
+    }
+
+    #[test]
+    fn internal_overload_origins_preserve_pair_and_occurrence_order() {
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tree.path().join("main.cpp"),
+            "static void cb(int) {}\nstatic void cb(double) {}\nstatic void cb(char) {}\nvoid (*fp)(int);\n",
+        )
+        .unwrap();
+        let mut program = build_program(tree.path(), &PreprocessOptions::new()).unwrap();
+        let callees: Vec<_> = program
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == "cb")
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(callees.len(), 3);
+        let var = program
+            .symbols
+            .variables
+            .iter()
+            .find(|v| v.name == "fp")
+            .unwrap();
+        let (dst, file) = (var.id, var.span.file);
+        for array in [false, true] {
+            let constraint = |callee| {
+                if array {
+                    FlowConstraint::ArrayFnMember { array: dst, callee }
+                } else {
+                    FlowConstraint::AddrOfFn { dst, callee }
+                }
+            };
+            let originals: Vec<_> = callees.iter().copied().map(constraint).collect();
+            // Every destination is also an original. Source order differs from
+            // candidate order, and repeated pairs straddle another source.
+            program.flow = [2, 0, 2, 1, 0].map(|i| originals[i].clone()).to_vec();
+            program.flow_origins.clear();
+            let sites: Vec<_> = (0..3)
+                .map(|i| {
+                    vec![
+                        (Span::new(file, 10 + i, 5), format!("site {i}").into()),
+                        (Span::new(file, 20 + i, 9), format!("&site {i}").into()),
+                        (Span::new(file, 30, 7), "shared".into()),
+                    ]
+                })
+                .collect();
+            for (flow, origins) in originals.iter().zip(&sites) {
+                program.flow_origins.insert(flow.clone(), origins.clone());
+            }
+            let mut expected_flow = program.flow.clone();
+            for flow in &program.flow {
+                let callee = match *flow {
+                    FlowConstraint::AddrOfFn { callee, .. }
+                    | FlowConstraint::ArrayFnMember { callee, .. } => callee,
+                    _ => unreachable!(),
+                };
+                expected_flow.extend(
+                    program
+                        .symbols
+                        .internal_overloads_seen_from(callee, file)
+                        .map(constraint),
+                );
+            }
+            expand_internal_overload_refs(&mut program);
+            assert_eq!(program.flow, expected_flow);
+            for (i, flow) in originals.iter().enumerate() {
+                let mut expected = sites[i].clone();
+                for source in [2, 0, 1] {
+                    if source != i {
+                        expected.extend(sites[source][..2].iter().cloned());
+                    }
+                }
+                assert_eq!(program.flow_origins[flow], expected);
+            }
+        }
     }
 
     #[test]
@@ -18051,6 +18671,7 @@ mod index_window_tests {
         );
         assert!(ordinary.global_initializer_ranges.is_empty());
         assert!(ordinary.function_flow_ranges.is_empty());
+        assert!(ordinary.flow_origin_bindings.is_none());
         assert!(ordinary
             .variables
             .iter()
@@ -18088,6 +18709,8 @@ mod index_window_tests {
                 "initializer flow {index} lacks owner: {:?}",
                 unit.flow
             );
+            let origin = unit.flow_origin_bindings.as_ref().unwrap()[&index].start;
+            assert!(unit.flow_origins[&unit.flow[index]][origin].0.line > 0);
         }
     }
 
@@ -18843,6 +19466,33 @@ mod qualified_variable_lookup_tests {
     /// A `LowerContext` with just the fields `lookup_var` and the helper it
     /// calls (`find_in_scope`) read: an empty parse tree stands in for the
     /// unit being lowered, since none of these calls walk it.
+    #[test]
+    fn operation_token_formatting_preserves_literals_and_distinct_operators() {
+        use trace_preproc::{Language, Lexer, TokenKind};
+        let kinds = |text: &str| {
+            Lexer::new(text, Language::Cpp)
+                .tokenize()
+                .into_iter()
+                .filter(|token| !matches!(token.kind, TokenKind::Newline | TokenKind::Eof))
+                .map(|token| token.kind)
+                .collect::<Vec<_>>()
+        };
+        for (input, expected) in [
+            ("r= q", "r = q"),
+            ("envelope .payload= r", "envelope.payload = r"),
+            ("x += + + y", "x += + +y"),
+            ("x = a < < b", "x = a < < b"),
+            ("x = 1 . 2", "x = 1 . 2"),
+            ("x = \"a  b\"", "x = \"a  b\""),
+            ("x = R\"tag(a  b)tag\"", "x = R\"tag(a  b)tag\""),
+        ] {
+            let tokens = kinds(input);
+            let formatted = format_operation_tokens(&tokens, Language::Cpp);
+            assert_eq!(formatted, expected);
+            assert_eq!(kinds(&formatted), tokens);
+        }
+    }
+
     fn test_ctx(
         current_file: trace_ir::FileId,
         current_fn: Option<FnId>,
@@ -18850,6 +19500,10 @@ mod qualified_variable_lookup_tests {
         locals: HashMap<String, VarId>,
     ) -> LowerContext {
         LowerContext {
+            recorded_flow_origins: Vec::new(),
+            flow_origin_indices: HashMap::default(),
+            original_sources: HashMap::default(),
+            flow_origin_membership: HashMap::default(),
             current_fn,
             current_file,
             locals,
@@ -18888,6 +19542,7 @@ mod qualified_variable_lookup_tests {
             has_weak: false,
             record_link_ownership: false,
             header_unit: false,
+            pending_flow_origins: HashMap::default(),
             pending_flow_owners: HashMap::default(),
             pending_initializer_owners: HashMap::default(),
             ignored_macros: Arc::from(Vec::<String>::new()),
@@ -18921,9 +19576,79 @@ mod qualified_variable_lookup_tests {
             is_namespaced: qualified_name.is_some(),
             qualified_name: qualified_name.map(str::to_string),
             c_linkage: false,
+            is_synthetic: false,
             is_static_member: false,
         });
         id
+    }
+
+    #[test]
+    fn origin_membership_preserves_existing_sites_and_closest_attribution() {
+        let mut program = Program::new(PathBuf::from("/t"));
+        let file = program.symbols.add_file(PathBuf::from("/t/main.c"));
+        let mut ctx = test_ctx(file, None, Vec::new(), HashMap::default());
+        ctx.record_link_ownership = true;
+        ctx.has_weak = true;
+        let flow = FlowConstraint::Copy {
+            dst: VarId(0),
+            src: VarId(1),
+        };
+        let span = Span::new(file, 3, 5);
+        let existing = (span, Arc::<str>::from("p = q"));
+        program
+            .flow_origins
+            .insert(flow.clone(), vec![existing.clone()]);
+        for expression in ["p = q", "p = (q)", "p = q", "p = (q)"] {
+            let start = program.flow.len();
+            program.flow.push(flow.clone());
+            record_flow_origins(&mut program, &mut ctx, start, span, expression);
+            // A containing expression must not replace or add to attribution.
+            record_flow_origins(&mut program, &mut ctx, start, span, "outer expression");
+        }
+        assert_eq!(
+            program.flow_origins[&flow],
+            vec![existing, (span, Arc::<str>::from("p = (q)"))]
+        );
+        assert_eq!(
+            (0..4)
+                .map(|i| ctx.flow_origin_indices[&i].start)
+                .collect::<Vec<_>>(),
+            [0, 1, 0, 1]
+        );
+    }
+
+    #[test]
+    fn same_coordinate_origins_keep_complete_expressions_after_membership_growth() {
+        let mut program = Program::new(PathBuf::from("/t"));
+        let file = program.symbols.add_file(PathBuf::from("/t/main.c"));
+        let mut ctx = test_ctx(file, None, Vec::new(), HashMap::default());
+        let flow = FlowConstraint::Copy {
+            dst: VarId(0),
+            src: VarId(1),
+        };
+        // Macro operations may share invocation coordinates and endpoints
+        // while differing in their full spelling. Include an existing site
+        // and replay the operations in reverse after several index resizes.
+        let span = Span::new(file, 3, 5);
+        let expressions: Vec<_> = (0..128)
+            .map(|i| format!("p = select(q, \"{i}:{}\")", "complete literal ".repeat(32)))
+            .collect();
+        program
+            .flow_origins
+            .insert(flow.clone(), vec![(span, expressions[0].clone().into())]);
+        for expression in expressions.iter().chain(expressions.iter().rev()) {
+            let start = program.flow.len();
+            program.flow.push(flow.clone());
+            record_flow_origins(&mut program, &mut ctx, start, span, expression);
+            record_flow_origins(&mut program, &mut ctx, start, span, "outer expression");
+        }
+        assert_eq!(
+            program.flow_origins[&flow],
+            expressions
+                .into_iter()
+                .map(|e| (span, Arc::<str>::from(e)))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -19008,6 +19733,7 @@ mod qualified_variable_lookup_tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_synthetic: false,
             is_static_member: false,
         });
         let ns_ctx = test_ctx(file, None, vec![Some("a".to_string())], HashMap::default());

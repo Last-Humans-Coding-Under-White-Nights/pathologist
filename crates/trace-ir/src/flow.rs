@@ -59,6 +59,8 @@ pub enum FlowConstraint {
     NewHeap { dst: VarId },
     /// `dst` points at the given string literal (interned; copies propagate).
     StringConst { dst: VarId, value: String },
+    /// Explicit null pointer value. No abstract location or pointee is created.
+    NullPointer { dst: VarId },
     /// `sp->field`: step through a smart pointer's overloaded `->`/`*`. `src`
     /// holds the wrapper value; `dst` is the pointee-typed receiver, and its
     /// type is the one the solver admits locations by. See
@@ -81,7 +83,8 @@ impl FlowConstraint {
             FlowConstraint::AddrOfFn { dst, .. }
             | FlowConstraint::CallReturn { dst, .. }
             | FlowConstraint::NewHeap { dst }
-            | FlowConstraint::StringConst { dst, .. } => (dst, None),
+            | FlowConstraint::StringConst { dst, .. }
+            | FlowConstraint::NullPointer { dst } => (dst, None),
         };
         std::iter::once(first).chain(second)
     }

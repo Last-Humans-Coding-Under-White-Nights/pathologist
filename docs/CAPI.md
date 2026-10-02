@@ -227,8 +227,21 @@ out-of-band value is an error instead of silently running in one direction.
 
 ## Inspect details
 
+Migration note: `trace_db_find_symbols` retains its ABI layout while validating
+requests and required database capabilities more strictly. Existing callers
+should handle the errors described under **Positions**
+below; database compatibility follows the
+[v7 capability contract](SQLITE_SCHEMA.md#version-and-capability-contract).
+
 - **Positions.** Function/symbol lookup takes a file-path *substring* plus
   line (and column), mirroring `trace inspect`. The best match is `items[0]`.
+  `trace_db_find_symbols` requires positive, 1-based line and column values;
+  zero or negative values return `TRACE_ERR_INVALID_ARG` with a position error
+  in `out_err`. Its declaration ranking follows
+  [source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+  A database missing `variables.is_synthetic` returns `TRACE_ERR_ANALYSIS`
+  with an instruction to re-run `trace analyze`, so generated temporaries
+  cannot become lookup candidates.
 - **Call edges.** `trace_db_call_edges(db, from, to, file, …)` lists edges,
   filtered like `trace calls --from/--to/--file`. `caller_path` is the
   *caller's own file* (not the call-site file), so it stays meaningful for
@@ -253,8 +266,15 @@ out-of-band value is an error instead of silently running in one direction.
 - **Dataflow.** `trace_db_dataflow(db, symbols, n, direction, depth)` BFS over
   `flow_edges`. Pass a `trace_symbol` array obtained from
   `trace_db_find_symbols` (its `var_id` identifies the start variables). Pass
-  the single best candidate (`items[0]`) to start from one variable, matching
-  the CLI, whose lookup resolves position to one declaration. Node
+  the single best candidate (`items[0]`) to select the same starting declaration
+  as the CLI. This API calls `trace_db::dataflow_graph` and returns the **raw PAG**:
+  depth counts raw edges, including intermediate nodes. The CLI instead uses
+  `dataflow_view` / `render_dataflow` and the `dataflow-source-v1` contract, which
+  projects source entities and counts visible transitions after collapsing
+  technical nodes. The same start symbol and depth therefore need not produce
+  identical nodes, edges, or truncation. See the authoritative
+  [source-level dataflow contract](ANALYSIS.md#source-level-dataflow-presentation).
+  The C ABI and direction enum values are unchanged. Node
   `kind`/`loc_kind` describe the PAG nodes; edges carry `flow_kind`;
   `path`/`line`/`col` are empty because value-flow edges have no call site.
 - **`truncated`** is set when real neighbors remained beyond `depth`.

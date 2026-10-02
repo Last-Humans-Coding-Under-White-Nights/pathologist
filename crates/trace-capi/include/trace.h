@@ -442,6 +442,9 @@ void trace_function_list_free(trace_function_list *list);
  *
  * Best candidate first. Fills the arena-backed list into @p out; the list and its
  * strings are released by #trace_symbol_list_free.
+ * Line and column must be positive, 1-based positions. Zero or negative values
+ * return #TRACE_ERR_INVALID_ARG. Databases missing `variables.is_synthetic`
+ * return #TRACE_ERR_ANALYSIS with an instruction to re-run `trace analyze`.
  *
  * @param[in]  db      Database handle. Must not be NULL.
  * @param[in]  file    File path substring to match. Must not be NULL.
@@ -559,11 +562,17 @@ trace_status trace_db_call_chains(trace_db *db,
                                   char **out_err);
 
 /**
- * @brief Bounded BFS over the value-flow graph starting at the variables described by @p roots.
+ * @brief Bounded BFS over the raw PAG value-flow graph starting at the variables described by @p roots.
  *
  * Roots are typically output of #trace_db_find_symbols. `depth >= 1` and `n_roots >= 1`;
  * @p direction must be DOWN or UP (other values are rejected with #TRACE_ERR_INVALID_ARG).
- * Pass the single best candidate (`items[0]`) to start from one variable, matching the CLI.
+ * Pass the single best candidate (`items[0]`) to select the same starting declaration as the CLI.
+ * This API uses dataflow_graph: depth counts raw PAG edges, including intermediate nodes.
+ * The CLI uses dataflow_view/render_dataflow and dataflow-source-v1, projecting source
+ * entities and counting visible transitions after collapsing technical nodes. The same
+ * starting symbol and depth need not yield identical graphs or truncation. This raw
+ * representation and the C ABI remain unchanged. See the authoritative contract:
+ * [Source-level dataflow presentation](../../../docs/ANALYSIS.md#source-level-dataflow-presentation)
  * Each `roots[i].kind` is validated (#TRACE_ERR_INVALID_ARG on an out-of-band value).
  *
  * @param[in]  db          Database handle. Must not be NULL.

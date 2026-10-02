@@ -7,6 +7,7 @@ mod deps;
 mod discover;
 mod expansion_discovery;
 pub mod explore;
+mod flow_origins;
 pub mod gn_defines;
 mod gn_targets;
 mod idl;

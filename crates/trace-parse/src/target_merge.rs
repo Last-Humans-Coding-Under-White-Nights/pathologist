@@ -178,18 +178,60 @@ fn scope_unit(
             }
         }
         let vars: FxHashSet<_> = scoped.variables.iter().map(|v| v.id).collect();
+        let mut surviving_origins: FxHashMap<&FlowConstraint, FxHashSet<usize>> =
+            FxHashMap::default();
+        let mut untracked_origins = FxHashSet::default();
         scoped.flow = scoped
             .flow
             .into_iter()
             .enumerate()
-            .filter_map(|(n, f)| (!excluded[n] && f.vars().all(|v| vars.contains(&v))).then_some(f))
+            .filter_map(|(n, f)| {
+                if excluded[n] || !f.vars().all(|v| vars.contains(&v)) {
+                    return None;
+                }
+                let flow = &unit.flow[n];
+                if unit.flow_origins.contains_key(flow) {
+                    if let Some(bindings) = &unit.flow_origin_bindings {
+                        if let Some(origins) = bindings.get(&n) {
+                            surviving_origins
+                                .entry(flow)
+                                .or_default()
+                                .extend(origins.clone());
+                        }
+                    } else {
+                        // Units without occurrence ownership retain their
+                        // existing aggregate provenance, as preambles do.
+                        untracked_origins.insert(flow);
+                    }
+                }
+                Some(f)
+            })
             .collect();
+        // Equal constraints can belong to both suppressed and surviving
+        // operations. Select their origins by occurrence before merge unions
+        // provenance by constraint identity, preserving first-seen order.
+        scoped.flow_origins.retain(|flow, origins| {
+            if untracked_origins.contains(flow) {
+                return true;
+            }
+            let Some(keep) = surviving_origins.get(flow) else {
+                return false;
+            };
+            let mut index = 0;
+            origins.retain(|_| {
+                let retained = keep.contains(&index);
+                index += 1;
+                retained
+            });
+            !origins.is_empty()
+        });
     }
     // The ranges index `unit.flow`, which the filter above renumbers. Selection
     // reads them from `unit`, never from the copy, so the copy's would only be
     // a trap for a later reader — and dead weight in the meantime.
     scoped.function_flow_ranges = FxHashMap::default();
     scoped.global_initializer_ranges = FxHashMap::default();
+    scoped.flow_origin_bindings = None;
     scoped
 }
 

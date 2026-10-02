@@ -495,6 +495,33 @@ pub struct LinkTarget {
     pub dependencies: Vec<crate::TargetId>,
 }
 
+/// Shares complete source text without changing operation identity or order.
+/// The pool is only a membership index; origins and call sites own the text.
+#[derive(Debug, Clone, Default)]
+pub struct SourceExpressions {
+    strings: FxHashSet<Arc<str>>,
+}
+
+impl SourceExpressions {
+    pub fn intern(&mut self, text: &str) -> Arc<str> {
+        if let Some(existing) = self.strings.get(text) {
+            return Arc::clone(existing);
+        }
+        let text: Arc<str> = text.into();
+        self.strings.insert(Arc::clone(&text));
+        text
+    }
+
+    /// Reuse a unit's allocation when this spelling is new to the merged program.
+    pub fn intern_shared(&mut self, text: &Arc<str>) -> Arc<str> {
+        if let Some(existing) = self.strings.get(text.as_ref()) {
+            return Arc::clone(existing);
+        }
+        self.strings.insert(Arc::clone(text));
+        Arc::clone(text)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Program {
     pub root: PathBuf,
@@ -506,6 +533,10 @@ pub struct Program {
     pub types: TypeTable,
     pub symbols: SymbolTable,
     pub flow: Vec<crate::FlowConstraint>,
+    /// Source operation sites, independent of solver constraints.
+    pub flow_origins: FxHashMap<crate::FlowConstraint, Vec<(crate::Span, Arc<str>)>>,
+    /// Indexing-only expression interner; released after the last merge.
+    pub source_expressions: SourceExpressions,
     /// Per-function return-value summaries collected during lowering.
     pub fn_returns: IndexMap<FnId, Vec<ReturnFlow>>,
     pub diagnostics: Vec<Diagnostic>,
@@ -606,13 +637,28 @@ impl Program {
         self.dedup = MergeDedup::default();
         self.template_base_set = rustc_hash::FxHashSet::default();
         self.symbols.release_call_name_pool();
+        self.source_expressions = SourceExpressions::default();
+        // These facts live through provenance export. Compact the append-only
+        // buffers once growth is complete, without changing occurrence order.
+        self.flow.shrink_to_fit();
+        for origins in self.flow_origins.values_mut() {
+            origins.shrink_to_fit();
+        }
     }
 
-    /// Release flow constraints and return flows once analysis and solving are complete.
-    /// These are consumed during PAG building and solver return-flow expansion, and are not
-    /// read during SQLite export.
+    /// Release flow constraints, source provenance, and return flows after their last consumer.
+    /// PAG building, solver return-flow expansion, and source-level SQLite provenance
+    /// consume these facts. Retain them until the last of those consumers finishes.
     pub fn release_flow(&mut self) {
         self.flow = Vec::new();
+        self.flow_origins = FxHashMap::default();
+        self.source_expressions = SourceExpressions::default();
+        for site in &mut self.symbols.call_sites {
+            if let Some(details) = &mut site.details {
+                details.return_operation = None;
+                details.call_expression = None;
+            }
+        }
         self.fn_returns = IndexMap::new();
     }
 
@@ -1212,6 +1258,64 @@ mod tests {
         assert!(!bucket
             .entries()
             .any(|entry| entry.matches(&nested, &symbols)));
+    }
+
+    #[test]
+    fn source_expression_pool_shares_text_and_expires_before_analysis() {
+        let mut program = Program::default();
+        let text = "p /* full spelling */ = select(q, \"complete\")".repeat(1024);
+        let first = program.source_expressions.intern(&text);
+        let same = program.source_expressions.intern(&text);
+        let unpooled: Arc<str> = text.clone().into();
+        let merged = program.source_expressions.intern_shared(&unpooled);
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(Arc::ptr_eq(&first, &merged));
+        assert_eq!(first.as_ref(), text);
+        let different = program.source_expressions.intern(&(text + " "));
+        assert!(!Arc::ptr_eq(&first, &different));
+        program.release_merge_state();
+        assert_eq!(program.source_expressions.strings.capacity(), 0);
+        assert_eq!(Arc::strong_count(&first), 3);
+        assert_eq!(Arc::strong_count(&different), 1);
+        // Library callers releasing without indexing finalization drop the pool too.
+        program.source_expressions.intern("unused");
+        program.release_flow();
+        assert_eq!(program.source_expressions.strings.capacity(), 0);
+    }
+
+    #[test]
+    fn release_flow_drops_provenance_and_collection_allocations() {
+        let mut program = Program::default();
+        let flow = crate::FlowConstraint::Copy {
+            dst: crate::VarId(1),
+            src: crate::VarId(0),
+        };
+        program.flow.push(flow.clone());
+        program.flow_origins.insert(
+            flow,
+            vec![
+                (Span::new(FileId(0), 3, 5), "dst = src".repeat(1024).into()),
+                (Span::new(FileId(0), 4, 5), "dst = src".repeat(1024).into()),
+            ],
+        );
+        program.fn_returns.insert(
+            FnId(0),
+            vec![ReturnFlow::Copy {
+                src: crate::VarId(1),
+            }],
+        );
+        assert!(program.flow_origins.capacity() > 0);
+
+        program.release_flow();
+
+        assert!(program.flow.is_empty());
+        assert!(program.flow_origins.is_empty());
+        assert!(program.fn_returns.is_empty());
+        // Clearing entries alone retains the buckets, which library callers
+        // keeping a Program alive should also be able to reclaim.
+        assert_eq!(program.flow.capacity(), 0);
+        assert_eq!(program.flow_origins.capacity(), 0);
+        assert_eq!(program.fn_returns.capacity(), 0);
     }
 
     #[test]

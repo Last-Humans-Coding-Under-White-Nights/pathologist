@@ -8,6 +8,47 @@ constraints remain active during insertion. The complete schema is assembled fro
 
 See also the [README](../README.md) for CLI flags that control what is exported.
 
+## Version and capability contract
+
+`analysis_run.schema_version = 7` identifies an **additive compatibility
+family**, not a fixed set of capabilities. New tables, indexes, and nullable
+or defaulted columns may extend v7 while preserving existing columns and their
+meaning. Incompatible layouts or meanings require a version bump. This retains
+compatibility with earlier v7 exports without forcing re-analysis for readers
+that use only the unchanged call-graph data.
+
+Consumers must check the tables and columns needed by their query, and account
+for database origin and export mode. A version number or an empty table alone
+cannot establish that a producer supplied a capability. Source-level inspection
+checks its required structures and rejects `analysis_run.options_json.stage =
+"merge"`; an ordinary analysis with an empty `flow_origins` table remains valid.
+Optional metadata has explicit fallback behavior below. Re-analysis supplies
+new metadata and query indexes; there is no automatic migration from v6.
+
+### Merger inputs and output
+
+`trace-merge` requires v7 and structurally validates the exact columns it reads
+in `files`, `link_targets`, `target_sources`, `target_dependencies`, `functions`,
+`call_sites`, `call_edges`, and `diagnostics` before creating or replacing output.
+Earlier v7 databases without newer flow tables or `call_sites.callee_var` /
+`return_dst` can therefore still be merged. A nominal v7 database missing a
+required call-graph column is rejected with a re-analysis diagnostic.
+
+The output uses the shared v7 DDL and records `options_json.stage = "merge"`.
+It preserves/remaps those call-graph tables and diagnostics, including call-site
+spelling and expansion coordinates, and reconstructs external call edges.
+It supports function/call lookup, call graphs, call chains, and editor call
+hierarchy. It does **not** populate `variables`, `types`, `locations`,
+`points_to`, `arg_flow_edges`, or any `flow_*` tables. `call_sites.callee_var`
+and `return_dst` remain NULL because input variable IDs are not remapped.
+Creating these structures through shared DDL does not supply their capabilities.
+
+PAG and provenance merging is outside the merger's call-graph contract.
+For dataflow inspection, use an original `trace analyze` database, or analyze
+an appropriate combined source tree to produce a database with flow facts.
+Neither the CLI source-level view nor the C API raw PAG query can recover
+omitted flow data from merger output.
+
 ## Export modes vs tables
 
 | Table | Minimal (default) | `--full-export` | `--debug-points-to` |
@@ -69,7 +110,7 @@ diagnostics
 |--------|------|-------------|
 | `id` | INTEGER PK | Run id |
 | `trace_version` | TEXT | Full binary identity: package version, source revision, dirty state, and build date |
-| `schema_version` | INTEGER | Database layout version (currently `5`) |
+| `schema_version` | INTEGER | Compatibility family (currently `7`; see [contract](#version-and-capability-contract)) |
 | `target_root` | TEXT | Analyzed directory |
 | `created_at` | TEXT | Unix timestamp (seconds) |
 | `options_json` | TEXT | JSON: `test_partition`, `include_paths`, `defines`, `dep_roots`, `ignored_macros`, `include_points_to`, `full_detail`, `model_files`, `explore`, `explore_budget`, `variants_merged`, `solver_partial`, `solver_pops`, `solve_budget_pops`, `solve_budget_secs` |
@@ -170,6 +211,20 @@ at merge time (later copies redirect), so they appear once per origin and target
 | `expansion_col` | INTEGER, nullable | Outermost invocation column |
 | `callee_text` | TEXT | Surface syntax (`foo`, `p->handler`, …) |
 | `is_direct` | INTEGER | `1` direct by name; `0` indirect |
+| `callee_var` | INTEGER, nullable | IR `VarId` used as the indirect callee, when recorded; `NULL` for calls without one |
+| `return_dst` | INTEGER, nullable | IR `VarId` receiving the result, when recorded; `NULL` when no result destination is recorded |
+
+`callee_var` and `return_dst` are recorded in both minimal and full exports.
+They are IR identities without foreign keys to the minimal export's filtered
+`variables` table. The partial index
+`call_sites(callee_var, return_dst)` covers rows with both values present;
+indirect-return provenance uses it to find matching sites, then joins
+`call_edges` through its `call_site_id` index. These two indexes are built after
+call-site/edge insertion and before provenance export; remaining secondary
+indexes are deferred. Callees are deduplicated and ordered by `FnId`, preserving
+the provenance association between each return source and its root callee.
+Synthetic call edges have a `NULL` call-site ID and cannot match this join.
+These bindings are part of the v7 layout; older exports may omit them.
 
 Call sites inside header-defined functions are deduplicated by
 `(spelling file, line, col, expansion file, line, col, callee)` across TUs. Under `--explore`, variant calls
@@ -238,6 +293,9 @@ arg-flow edges reference; use `--full-export` for every variable. A global no
 fact names is listed so `trace inspect` finds it by its own declaration;
 `inspect dataflow` then reports it has no flow node.
 
+`variables.is_synthetic` (INTEGER, default 0) marks lowering-created
+intermediate values. Source selection filters this metadata, never name prefixes.
+
 ### flow_nodes
 
 PAG value-flow nodes (`trace inspect dataflow`). Always exported. A global
@@ -247,11 +305,17 @@ or static that no flow, return or call site names has no node (see
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INTEGER PK | PAG node id (same id space as `points_to.var_node_id`) |
-| `kind` | TEXT | `var`, `loc`, `call_target` (indirect-call site node), or `terminator` (function-model clears event) |
+| `kind` | TEXT | `var`, `loc`, `constant` (immutable value with no abstract location), `call_target` (indirect-call site node), or `terminator` (function-model clears event) |
 | `label` | TEXT | Human-readable label (empty for `var` nodes where label is read from `variables.name`; `loc:…`, `fn:…`, `"memset_s clears arg0"`) |
 | `detail` | TEXT | Extra context (empty for `var` nodes where detail is derived from `variables.kind`, `variables.line`, and `functions.name`; location kind for `loc`, call site for `call_target`/`terminator`) |
 | `var_id` | INTEGER FK → `variables` | Variable this node belongs to (`NULL` for function locations) |
-| `fn_id` | INTEGER FK → `functions` | Enclosing function, when known |
+| `fn_id` | INTEGER FK → `functions` | Enclosing function, when known (call targets record the caller; function locations record the function value) |
+| `call_site_id` | INTEGER FK → `call_sites` | Call occurrence for call-target/clearing nodes; otherwise `NULL` |
+
+Explicit C++ `nullptr` uses `kind='constant'`, `label='nullptr'`, and
+`detail='null_pointer'`, with no variable or function owner. Its outgoing `copy`
+edges retain value-flow connectivity; it is not a `locations` row and seeds no
+points-to facts. This uses the existing v7 columns without a layout change.
 
 **Index:** `flow_nodes(var_id)`
 
@@ -453,11 +517,78 @@ trace inspect graph.db dataflow --file SUBSTR --line N --col C [--depth N] [--di
   bounded by `--depth`. Edge labels distinguish `direct`, `indirect`,
   `external`, and `ambiguous` resolution.
 - `dataflow` resolves the variable declared nearest the given position (exact
-  identifier hit preferred; declarations only — use sites are not recorded)
-  and walks the PAG value-flow graph forward (`down`: where the value flows)
-  or backward (`up`: where it came from). Edge kinds match `flow_edges.kind`.
+  identifier hit preferred, using a half-open character-column interval;
+  declarations only — use sites are not recorded) and presents source-level
+  value flow forward (`down`: where the value flows) or backward (`up`: where
+  it came from). Depth counts visible transitions after technical PAG nodes
+  collapse; see the authoritative
+  [source-level contract](ANALYSIS.md#source-level-dataflow-presentation).
   Parameters duplicated across TUs (header prototype vs definition copies)
   are reconciled automatically when the queried copy carries no edges.
 
 Both graph commands print a forest with `(truncated at --depth …)` markers
 when the frontier was cut off.
+
+
+### Source-level presentation metadata (v7)
+
+Always exported by analysis in minimal and full modes, independently of points-to retention:
+
+- `flow_origins(src_node, dst_node, kind, file_id, line, col, expression,
+  operation)` records original source operation sites for constraint endpoint
+  pairs. `kind` matches the raw constraint (`copy`, `load`, `store`, etc.);
+  `operation` may additionally distinguish `return value` and `write field`. Multiple sites per
+  pair are allowed. Coordinates are recorded via LineMap, not declarations.
+- `flow_parameters(fn_id, arg_index, var_id, name, type_name)` records the canonical
+  function parameter list for text headers in both minimal and full exports.
+  `arg_index` is zero-based and follows the solver's parameter list (including
+  implicit receivers). Names, IDs, and display types are retained even for
+  parameters without graph nodes. `var_id` is an IR identity, without a foreign
+  key to the minimal export's filtered `variables` table. This header metadata
+  does not alter the dataflow JSON contract.
+- `flow_field_locations(node_id, parent_node, field_name)` records concrete
+  field-location parents from the PAG. `node_id` is unique; full parent chains
+  distinguish nested abstract storage sharing a root variable and field label.
+- `flow_field_access(base_node, dst_node, field_name)` records named PAG field
+  accesses with a unique key over all three columns. It reconstructs aggregate
+  initializer destinations without changing raw graph labels or operation text.
+- `flow_call_origins(call_site_id, file_id, line, col, expression)` is additive
+  optional v7 metadata, keyed by call ID. It records the closest source operation
+  for each return-assigning call before equivalent constraints are unioned,
+  preserving distinct assignments within one macro invocation. Older v7 databases
+  remain readable using endpoint/source-position fallback; re-analysis supplies
+  exact occurrence attribution. Both export modes use the same writer.
+- `flow_call_expressions(call_site_id, expression)` is additive optional v7
+  metadata, keyed by call ID. It stores the full call expression for argument
+  operation presentation, separately from return-assignment provenance.
+  Locations and macro invocation/spelling coordinates still come from
+  `call_sites`. Both export modes use the same writer. Older databases without
+  this table remain readable with empty argument expressions; re-analysis
+  supplies recorded call text.
+- `flow_return_calls(src_node, dst_node, call_site_id, callee_fn_id)` records
+  existing return wiring by the recorded call return destination and resolved
+  callee, including calls with no parameters. Each source is associated only
+  with root callees whose transitive return facts contain it, including for
+  multi-candidate indirect calls. It does not add analysis edges.
+- `flow_calls(src_node, dst_node, call_site_id, arg_index)` records each
+  actual/formal occurrence, including pairs already wired as raw `copy`.
+  Sources name the passed value (the address temporary for `&x`), following
+  the same export policy as raw `call_arg`. Call metadata and macro locations
+  come from `call_sites`; parameter/owner identities come from `variables`.
+
+Inspection indexes cover both endpoints of `flow_origins`, `flow_calls`, and
+`flow_return_calls`, the destination of `flow_field_access`, and parameter
+copies by `(fn_id, name)` under `kind='param'`. Function ownership lookup uses
+`idx_functions_file_range` on `functions(file_id, is_defined, line_start, line_end)`
+to seek definitions in the operation's file instead of building a temporary
+index over all functions for each position batch. These indexes are exported in
+minimal and full modes and built after bulk export,
+keep version 7's row layout, and support selective source-level inspection.
+Older v7 exports may lack these additive indexes; re-analysis supplies them.
+
+Raw tables keep their existing meaning under the
+[version and capability contract](#version-and-capability-contract).
+Inspect checks required structures for older exports; the source-level view
+requires its presentation metadata and an analysis origin. The CLI JSON and
+raw API compatibility rules are defined in
+[Source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).

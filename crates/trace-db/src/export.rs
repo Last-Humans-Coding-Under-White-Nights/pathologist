@@ -1,11 +1,15 @@
-use crate::schema::{INDEXES_V7, SCHEMA_VERSION, TABLES_V7};
+use crate::schema::{INDEXES_V7, PROVENANCE_INDEXES_V7, SCHEMA_VERSION, TABLES_V7};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use rustc_hash::FxHashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use trace_analysis::{AnalysisResult, ConstraintKind, LocKind, Pag, PagNodeKind};
-use trace_ir::{Linkage, Program, StorageClass, TypeDesc, VarId};
+use trace_ir::{FnId, Linkage, Program, StorageClass, TypeDesc, VarId};
+
+const INDIRECT_RETURN_CALLEES_SQL: &str = "SELECT DISTINCT e.callee_fn_id
+    FROM call_sites cs JOIN call_edges e ON e.call_site_id=cs.id
+    WHERE cs.callee_var=?1 AND cs.return_dst=?2 ORDER BY e.callee_fn_id";
 
 pub struct ExportOptions {
     pub output: PathBuf,
@@ -91,8 +95,10 @@ pub fn export_to_sqlite(
         export_files(&conn, program)?;
         export_link_targets(&conn, program)?;
         export_functions(&conn, program)?;
+        export_flow_parameters(&conn, program)?;
         export_call_sites_filtered(&conn, program, analysis)?;
         export_call_edges(&conn, analysis)?;
+        conn.execute_batch(PROVENANCE_INDEXES_V7)?;
         if opts.full_detail {
             export_types(&conn, program)?;
             export_variables(&conn, program)?;
@@ -223,7 +229,27 @@ fn type_name(desc: &TypeDesc) -> String {
     }
 }
 
-const INSERT_VARIABLE: &str = "INSERT INTO variables (id, name, kind, fn_id, type_id, file_id, line, col, is_weak, target_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+const INSERT_VARIABLE: &str = "INSERT INTO variables (id, name, kind, fn_id, type_id, file_id, line, col, is_weak, target_id, is_synthetic) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+
+fn export_flow_parameters(conn: &Connection, program: &Program) -> Result<()> {
+    let mut stmt =
+        conn.prepare_cached("INSERT INTO flow_parameters VALUES (?1, ?2, ?3, ?4, ?5)")?;
+    for func in &program.symbols.functions {
+        // Match the solver's argument numbering, including an implicit receiver.
+        for (index, &id) in func.params.iter().enumerate() {
+            let var = program.symbols.variable(id);
+            let ty = program.types.get(var.type_id);
+            stmt.execute(params![
+                func.id.0,
+                index,
+                id.0,
+                var.name,
+                param_type_name(&ty.desc)
+            ])?;
+        }
+    }
+    Ok(())
+}
 
 fn export_variables(conn: &Connection, program: &Program) -> Result<()> {
     let mut stmt = conn.prepare_cached(INSERT_VARIABLE)?;
@@ -311,6 +337,13 @@ fn export_flow_graph(
                 let fn_id = program.symbols.variable_by_id(v).and_then(|var| var.fn_id);
                 ("var", String::new(), String::new(), Some(v), fn_id)
             }
+            PagNodeKind::NullPointer => (
+                "constant",
+                "nullptr".to_owned(),
+                "null_pointer".to_owned(),
+                None,
+                None,
+            ),
             PagNodeKind::Loc(loc_id) => {
                 let loc = &pag.locations[loc_id.0 as usize];
                 let kind_str = match loc.kind {
@@ -342,7 +375,7 @@ fn export_flow_graph(
                     site.callee_name.to_string(),
                     format!("call @{}", site.span.line),
                     None,
-                    None,
+                    Some(site.caller),
                 ),
                 None => (
                     "call_target",
@@ -363,6 +396,27 @@ fn export_flow_graph(
         ])?;
     }
 
+    let mut target_sites =
+        conn.prepare_cached("UPDATE flow_nodes SET call_site_id=?2 WHERE id=?1")?;
+    for node in &pag.nodes {
+        if let PagNodeKind::CallTarget(cs) = node.kind {
+            target_sites.execute(params![node.id.0, cs.0])?;
+        }
+    }
+    let mut field_locations =
+        conn.prepare_cached("INSERT INTO flow_field_locations VALUES (?1,?2,?3)")?;
+    for ((parent, _), child) in &pag.field_loc {
+        if let (Some(parent_node), Some(child_node)) =
+            (pag.loc_node.get(parent), pag.loc_node.get(child))
+        {
+            field_locations.execute(params![
+                child_node.0,
+                parent_node.0,
+                pag.locations[child.0 as usize].desc
+            ])?;
+        }
+    }
+    export_flow_provenance(conn, program, pag, analysis)?;
     let mut edge_rows: Vec<(u32, u32, &'static str)> = Vec::new();
     for c in &pag.constraints {
         let kind = match c.kind {
@@ -400,6 +454,7 @@ fn export_flow_graph(
             wired_pairs.insert((c.src.0, c.dst.0));
         }
     }
+    let mut calls = conn.prepare_cached("INSERT INTO flow_calls VALUES (?1, ?2, ?3, ?4)")?;
     for e in &analysis.arg_flow_edges {
         let Some(formal_node) = pag.var_node.get(&e.formal) else {
             continue;
@@ -419,6 +474,12 @@ fn export_flow_graph(
                 let Some(actual_node) = pag.var_node.get(&passed) else {
                     continue;
                 };
+                calls.execute(params![
+                    actual_node.0,
+                    formal_node.0,
+                    e.call_site.0,
+                    e.arg_index
+                ])?;
                 if wired_pairs.contains(&(actual_node.0, formal_node.0)) {
                     continue;
                 }
@@ -427,6 +488,12 @@ fn export_flow_graph(
             (None, Some(actual_fn)) => {
                 if let Some(&fn_loc) = pag.fn_locations.get(&actual_fn) {
                     if let Some(&fn_node) = pag.loc_node.get(&fn_loc) {
+                        calls.execute(params![
+                            fn_node.0,
+                            formal_node.0,
+                            e.call_site.0,
+                            e.arg_index
+                        ])?;
                         edge_rows.push((fn_node.0, formal_node.0, "call_arg"));
                     }
                 }
@@ -466,12 +533,265 @@ fn export_flow_graph(
             Option::<i64>::None,
             Some(site.caller.0 as i64),
         ])?;
+        target_sites.execute(params![term_node, cs_id.0])?;
         edge_rows.push((actual_node.0, term_node as u32, "terminates"));
     }
     edge_rows.sort_unstable();
     edge_rows.dedup();
     for (i, (src, dst, kind)) in edge_rows.iter().enumerate() {
         edges.execute(params![i as i64 + 1, src, dst, kind])?;
+    }
+    Ok(())
+}
+
+// Keep provenance indexes local to their final consumer: edge export does not
+// need them and builds its own row and argument-wiring buffers.
+fn export_flow_provenance(
+    conn: &Connection,
+    program: &Program,
+    pag: &Pag,
+    analysis: &AnalysisResult,
+) -> Result<()> {
+    let mut origins =
+        conn.prepare_cached("INSERT INTO flow_origins VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
+    let field_destinations: FxHashSet<_> = program
+        .flow
+        .iter()
+        .filter_map(|flow| match flow {
+            trace_ir::FlowConstraint::GepField { dst, .. } => Some(*dst),
+            _ => None,
+        })
+        .collect();
+    // Origins are already unioned under constraint identity. Visit each
+    // constraint once in first-occurrence order, rather than replaying its
+    // complete site list for every repeated lowering fact.
+    let unique_flows: Vec<_> = {
+        let mut seen_flows = FxHashSet::default();
+        program
+            .flow
+            .iter()
+            .filter(|flow| seen_flows.insert(*flow))
+            .collect()
+    };
+    let mut field_access =
+        conn.prepare_cached("INSERT OR IGNORE INTO flow_field_access VALUES (?1, ?2, ?3)")?;
+    for constraint in &pag.constraints {
+        if constraint.kind == ConstraintKind::Gep {
+            if let Some(name) = constraint.field_name() {
+                field_access.execute(params![constraint.src.0, constraint.dst.0, name])?;
+            }
+        }
+    }
+    for flow in &unique_flows {
+        use trace_ir::FlowConstraint as F;
+        let Some(sites) = program.flow_origins.get(*flow) else {
+            continue;
+        };
+        let dst = flow.vars().next().expect("constraint destination");
+        let Some(d) = pag.var_node.get(&dst) else {
+            continue;
+        };
+        let (src, kind) = match flow {
+            F::Copy { src, .. } => (pag.var_node.get(src), "copy"),
+            F::Store { src, .. } => (pag.var_node.get(src), "store"),
+            F::Load { src, .. } => (pag.var_node.get(src), "load"),
+            F::GepField { base, .. } => (pag.var_node.get(base), "gep"),
+            F::UnwrapPointer { src, .. } => (pag.var_node.get(src), "unwrap"),
+            F::AddrOfVar { src, .. } => (
+                pag.var_location.get(src).and_then(|l| pag.loc_node.get(l)),
+                "addr_of",
+            ),
+            F::AddrOfFn { callee, .. } | F::ArrayFnMember { callee, .. } => (
+                pag.fn_locations
+                    .get(callee)
+                    .and_then(|l| pag.loc_node.get(l)),
+                "addr_of",
+            ),
+            F::NullPointer { .. } => (pag.null_node.as_ref(), "copy"),
+            F::StringConst { value, .. } => (
+                pag.string_locs.get(value).and_then(|l| pag.loc_node.get(l)),
+                "addr_of",
+            ),
+            _ => continue,
+        };
+        let Some(s) = src else {
+            continue;
+        };
+        for (span, expression) in sites {
+            origins.execute(params![
+                s.0,
+                d.0,
+                kind,
+                span.file.0,
+                span.line,
+                span.col,
+                expression.as_ref(),
+                if kind == "store" && field_destinations.contains(&dst) {
+                    "write field"
+                } else {
+                    kind
+                }
+            ])?;
+        }
+    }
+    let return_destinations: FxHashSet<_> = unique_flows
+        .iter()
+        .filter_map(|flow| match flow {
+            trace_ir::FlowConstraint::CallReturn { dst, .. }
+            | trace_ir::FlowConstraint::CallReturnIndirect { dst, .. } => {
+                pag.var_node.get(dst).copied()
+            }
+            _ => None,
+        })
+        .collect();
+    let mut incoming = std::collections::BTreeMap::<_, Vec<_>>::new();
+    let mut seen_return_wiring = FxHashSet::default();
+    for constraint in &pag.constraints {
+        if return_destinations.contains(&constraint.dst)
+            && matches!(
+                constraint.kind,
+                ConstraintKind::Copy | ConstraintKind::AddrOf
+            )
+            && seen_return_wiring.insert((constraint.kind, constraint.src, constraint.dst))
+        {
+            incoming.entry(constraint.dst).or_default().push(constraint);
+        }
+    }
+    drop(seen_return_wiring);
+    drop(return_destinations);
+    let mut indirect_return_callees = conn.prepare_cached(INDIRECT_RETURN_CALLEES_SQL)?;
+    let mut return_calls =
+        conn.prepare_cached("INSERT INTO flow_return_calls VALUES (?1,?2,?3,?4)")?;
+    let mut return_sites = std::collections::BTreeMap::<_, Vec<_>>::new();
+    let mut seen_return_sites = FxHashSet::default();
+    for edge in &analysis.call_edges {
+        if let Some(site) = program.symbols.call_site_by_id(edge.call_site) {
+            if let Some(dst) = site.return_dst {
+                if seen_return_sites.insert((dst, edge.callee, edge.call_site)) {
+                    return_sites
+                        .entry((dst, edge.callee))
+                        .or_default()
+                        .push(edge.call_site);
+                }
+            }
+        }
+    }
+    drop(seen_return_sites);
+    let mut annotated_return_wiring = FxHashSet::default();
+    // Return wiring is expanded by the PAG after merge. Attribute only
+    // existing constraints whose source is a recorded return fact, resolving
+    // through the same image-aware policy as PAG construction.
+    for flow in &unique_flows {
+        let (dst, root_callees) = match *flow {
+            trace_ir::FlowConstraint::CallReturn {
+                dst,
+                callee_name,
+                caller,
+            } => (
+                *dst,
+                program
+                    .symbols
+                    .call_return_candidates(*caller, *dst, callee_name)
+                    .to_vec(),
+            ),
+            trace_ir::FlowConstraint::CallReturnIndirect { dst, callee_var } => {
+                let candidates = indirect_return_callees
+                    .query_map(params![callee_var.0, dst.0], |r| Ok(FnId(r.get(0)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                (*dst, candidates)
+            }
+            _ => continue,
+        };
+        let Some(dst_node) = pag.var_node.get(&dst) else {
+            continue;
+        };
+        let Some(sites) = program.flow_origins.get(*flow) else {
+            continue;
+        };
+        let mut returned_by_callee = std::collections::BTreeMap::new();
+        for root in root_callees {
+            if returned_by_callee.contains_key(&root) {
+                continue;
+            }
+            let mut pending = vec![root];
+            let mut seen = FxHashSet::default();
+            let mut returned = FxHashSet::default();
+            while let Some(callee) = pending.pop() {
+                if !seen.insert(callee) {
+                    continue;
+                }
+                for ret in program.fn_returns.get(&callee).into_iter().flatten() {
+                    match ret {
+                        trace_ir::ReturnFlow::Copy { src } => {
+                            if let Some(n) = pag.var_node.get(src) {
+                                returned.insert(*n);
+                            }
+                        }
+                        trace_ir::ReturnFlow::AddrOfVar { src } => {
+                            if let Some(loc) =
+                                pag.var_location.get(src).and_then(|l| pag.loc_node.get(l))
+                            {
+                                returned.insert(*loc);
+                            }
+                        }
+                        trace_ir::ReturnFlow::AddrOfFn { callee } => {
+                            if let Some(loc) = pag
+                                .fn_locations
+                                .get(callee)
+                                .and_then(|l| pag.loc_node.get(l))
+                            {
+                                returned.insert(*loc);
+                            }
+                        }
+                        trace_ir::ReturnFlow::Call { callee_name } => pending
+                            .extend(program.symbols.return_flow_candidates(callee, callee_name)),
+                    }
+                }
+            }
+            returned_by_callee.insert(root, returned);
+        }
+        for constraint in incoming.get(dst_node).into_iter().flatten() {
+            if !returned_by_callee
+                .values()
+                .any(|sources| sources.contains(&constraint.src))
+            {
+                continue;
+            }
+            let kind = match constraint.kind {
+                ConstraintKind::Copy => "copy",
+                ConstraintKind::AddrOf => "addr_of",
+                _ => continue,
+            };
+            // Different caller constraints can share this wiring. Visit its
+            // occurrence bucket once, rather than rescanning every call for
+            // each caller. Origins below still belong to each distinct flow.
+            for (&callee, sources) in &returned_by_callee {
+                if sources.contains(&constraint.src)
+                    && annotated_return_wiring.insert((constraint.src, constraint.dst, callee))
+                {
+                    for site in return_sites.get(&(dst, callee)).into_iter().flatten() {
+                        return_calls.execute(params![
+                            constraint.src.0,
+                            constraint.dst.0,
+                            site.0,
+                            callee.0
+                        ])?;
+                    }
+                }
+            }
+            for (span, expression) in sites {
+                origins.execute(params![
+                    constraint.src.0,
+                    constraint.dst.0,
+                    kind,
+                    span.file.0,
+                    span.line,
+                    span.col,
+                    expression.as_ref(),
+                    "return value"
+                ])?;
+            }
+        }
     }
     Ok(())
 }
@@ -495,6 +815,7 @@ fn export_one_variable(stmt: &mut rusqlite::Statement<'_>, var: &trace_ir::Varia
         var.span.col,
         var.is_weak,
         var.target.map(|target| target.0),
+        var.is_synthetic,
     ])?;
     Ok(())
 }
@@ -573,8 +894,12 @@ fn export_call_sites_filtered(
     }
 
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO call_sites (id, caller_fn_id, file_id, line, col, expansion_file_id, expansion_line, expansion_col, callee_text, is_direct) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO call_sites (id, caller_fn_id, file_id, line, col, expansion_file_id, expansion_line, expansion_col, callee_text, is_direct, callee_var, return_dst) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?;
+    let mut operation_stmt =
+        conn.prepare_cached("INSERT INTO flow_call_origins VALUES (?1, ?2, ?3, ?4, ?5)")?;
+    let mut expression_stmt =
+        conn.prepare_cached("INSERT INTO flow_call_expressions VALUES (?1, ?2)")?;
     for cs in &program.symbols.call_sites {
         let export = with_edge.contains(&cs.id) || with_arg_flow.contains(&cs.id) || !cs.is_direct;
         if !export {
@@ -590,8 +915,26 @@ fn export_call_sites_filtered(
             cs.expansion_span.map(|span| span.line),
             cs.expansion_span.map(|span| span.col),
             cs.callee_name.as_str(),
-            cs.is_direct as i32
+            cs.is_direct as i32,
+            cs.callee_var.map(|id| id.0),
+            cs.return_dst.map(|id| id.0),
         ])?;
+        if let Some(expression) = cs.details.as_ref().and_then(|d| d.call_expression.as_ref()) {
+            expression_stmt.execute(params![cs.id.0, expression.as_ref()])?;
+        }
+        if let Some((span, expression)) = cs
+            .details
+            .as_ref()
+            .and_then(|d| d.return_operation.as_deref())
+        {
+            operation_stmt.execute(params![
+                cs.id.0,
+                span.file.0,
+                span.line,
+                span.col,
+                expression.as_ref()
+            ])?;
+        }
     }
     Ok(())
 }
@@ -723,6 +1066,64 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn indirect_return_join_uses_export_indexes_and_excludes_unrelated_sites() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::TABLES_V7).unwrap();
+        conn.execute(
+            "INSERT INTO files(id,path,sha256) VALUES(0,'main.c','')",
+            [],
+        )
+        .unwrap();
+        for id in [0, 2, 9, 30, 40, 50, 60, 99] {
+            conn.execute("INSERT INTO functions(id,name,file_id,line_start,line_end,linkage,signature,is_defined)
+                VALUES(?1,?2,0,1,1,'external','f()',1)", params![id,format!("f{id}")]).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO call_sites
+            (id,caller_fn_id,file_id,line,col,callee_text,is_direct,callee_var,return_dst) VALUES
+            (1,0,0,1,1,'fp',0,10,20),(2,0,0,2,1,'fp',0,10,20),
+            (3,0,0,3,1,'gp',0,11,20),(4,0,0,4,1,'fp',0,10,21),
+            (5,0,0,5,1,'direct',1,NULL,20),(6,0,0,6,1,'fp',0,10,NULL);
+            INSERT INTO call_edges VALUES
+            (1,1,0,9,'indirect'),(2,2,0,2,'indirect'),(3,2,0,9,'indirect'),
+            (4,3,0,30,'indirect'),(5,4,0,40,'indirect'),(6,5,0,50,'direct'),
+            (7,6,0,60,'indirect'),(8,NULL,0,99,'ipc');",
+        )
+        .unwrap();
+        // The lookup must be indexed during export, before deferred indexes.
+        conn.execute_batch(super::PROVENANCE_INDEXES_V7).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::INDIRECT_RETURN_CALLEES_SQL
+            ))
+            .unwrap()
+            .query_map([10, 20], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|p| p.contains("SEARCH") && p.contains("idx_call_sites_indirect_return")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|p| p.contains("SEARCH") && p.contains("idx_call_edges_callsite")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|p| p.contains("SCAN ")), "{plan:?}");
+        let candidates: Vec<u32> = conn
+            .prepare(super::INDIRECT_RETURN_CALLEES_SQL)
+            .unwrap()
+            .query_map([10, 20], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(candidates, [2, 9]);
+    }
+
     use super::*;
     use trace_ir::{Function, Span, TargetId, TypeId, Variable};
 
@@ -821,6 +1222,7 @@ mod tests {
                 is_namespaced: false,
                 qualified_name: None,
                 c_linkage: false,
+                is_synthetic: false,
                 is_static_member: false,
             });
             // A flow fact puts the variable in the graph minimal export

@@ -400,3 +400,122 @@ fn shared_header_functions_deduplicate_within_each_link_target() {
         );
     }
 }
+
+#[test]
+fn suppressed_weak_definitions_do_not_leak_origins_of_surviving_constraints() {
+    for with_header in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("weak.c"),
+        "int x;\n__attribute__((weak)) int *slot = &x;\nvoid surviving(void) { slot = &x; }\n__attribute__((weak)) void hook(void) { slot = &x; }\n"
+    ).unwrap();
+        fs::write(root.join("strong.c"), "int *slot;\nvoid hook(void) {}\n").unwrap();
+        if with_header {
+            fs::write(root.join("shared.h"), "extern int x;\nextern int *slot;\nstatic inline void header_write(void) { slot = &x; }\n").unwrap();
+            for file in ["weak.c", "strong.c"] {
+                let path = root.join(file);
+                let mut source = fs::read_to_string(&path).unwrap();
+                source.push_str("#include \"shared.h\"\n");
+                fs::write(path, source).unwrap();
+            }
+        }
+        fs::write(root.join("compile_commands.json"), json!([
+        {"directory":root,"file":"weak.c","output":"weak.o","arguments":["cc","-c","weak.c","-o","weak.o"]},
+        {"directory":root,"file":"strong.c","output":"strong.o","arguments":["cc","-c","strong.c","-o","strong.o"]}
+    ]).to_string()).unwrap();
+        fs::write(
+        root.join("link_commands.json"),
+        json!([
+            {"directory":root,"output":"full","arguments":["cc","weak.o","strong.o","-o","full"]},
+            {"directory":root,"output":"weak_only","arguments":["cc","weak.o","-o","weak_only"]}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+        let mut previous = None;
+        for args in [
+            vec!["--jobs", "1"],
+            vec!["--jobs", "4"],
+            vec!["--jobs", "4", "--full-export"],
+        ] {
+            let db = common::cli_analyze(root, &args);
+            let conn = Connection::open(db.path()).unwrap();
+            let rows: Vec<(String, i64, String)> = conn.prepare(
+            "SELECT t.name,o.line,o.expression FROM flow_origins o JOIN flow_nodes n ON n.id=o.dst_node JOIN variables v ON v.id=n.var_id JOIN link_targets t ON t.id=v.target_id JOIN files p ON p.id=o.file_id WHERE v.name='slot' AND p.path LIKE '%/weak.c' ORDER BY t.name,o.line,o.col"
+        ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<Result<_, _>>().unwrap();
+            let expected: Vec<(String, i64, String)> = vec![
+                ("full".into(), 3, "slot = &x".into()),
+                ("weak_only".into(), 2, "&x".into()),
+                ("weak_only".into(), 3, "slot = &x".into()),
+                ("weak_only".into(), 4, "slot = &x".into()),
+            ];
+            assert_eq!(rows, expected);
+            if let Some(previous) = &previous {
+                assert_eq!(&rows, previous);
+            }
+            previous = Some(rows);
+            if with_header {
+                let headers: Vec<(String, String)> = conn.prepare(
+                "SELECT t.name,o.expression FROM flow_origins o JOIN flow_nodes n ON n.id=o.dst_node JOIN variables v ON v.id=n.var_id JOIN link_targets t ON t.id=v.target_id JOIN files p ON p.id=o.file_id WHERE v.name='slot' AND p.path LIKE '%/shared.h' ORDER BY t.name"
+            ).unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap();
+                assert_eq!(
+                    headers,
+                    [
+                        ("full".into(), "slot = &x".into()),
+                        ("weak_only".into(), "slot = &x".into())
+                    ]
+                );
+            }
+            let full_slot: i64 = conn.query_row("SELECT v.id FROM variables v JOIN link_targets t ON t.id=v.target_id WHERE v.name='slot' AND t.name='full'", [], |r| r.get(0)).unwrap();
+            let symbol = trace_db::find_symbols_at(&conn, "strong.c", 1, 6)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.var_id == full_slot)
+                .unwrap();
+            let view =
+                trace_db::dataflow_view(&conn, &[symbol], trace_db::Direction::Up, 1).unwrap();
+            assert!(
+                view.edges
+                    .iter()
+                    .flat_map(|e| &e.provenance)
+                    .all(|p| p.location.line == 3),
+                "{view:?}"
+            );
+            for format in ["text", "json", "graphviz", "mermaid"] {
+                let output = Command::new(env!("CARGO_BIN_EXE_trace"))
+                    .args([
+                        "inspect",
+                        db.path().to_str().unwrap(),
+                        "dataflow",
+                        "--file",
+                        "strong.c",
+                        "--line",
+                        "1",
+                        "--col",
+                        "6",
+                        "--direction",
+                        "up",
+                        "--depth",
+                        "1",
+                        "--format",
+                        format,
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let text = String::from_utf8(output.stdout)
+                    .unwrap()
+                    .replace("&amp;", "&");
+                assert!(text.contains("slot = &x"), "{text}");
+                assert!(
+                    !text.contains("weak.c:2:") && !text.contains("weak.c:4:"),
+                    "{text}"
+                );
+            }
+        }
+    }
+}

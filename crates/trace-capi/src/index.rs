@@ -215,7 +215,6 @@ fn run_index(cfg: &IndexConfig) -> Result<(TraceIndexResult, String), ApiError> 
         },
     );
     let model_files: Vec<String> = cfg.models.iter().map(|p| p.display().to_string()).collect();
-    program.release_flow();
     export_to_sqlite(
         &program,
         &pag,
@@ -229,6 +228,8 @@ fn run_index(cfg: &IndexConfig) -> Result<(TraceIndexResult, String), ApiError> 
         },
     )
     .map_err(ApiError::from)?;
+    // Source provenance export also consumes the lowered flow and return facts.
+    program.release_flow();
 
     Ok((
         TraceIndexResult {
@@ -348,6 +349,43 @@ unsafe fn trace_index_impl(
 mod partition_tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn c_api_index_keeps_flow_provenance_through_export() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/dataflow_lifecycle");
+        let root = CString::new(root.to_str().unwrap()).unwrap();
+        for full_export in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let output = dir.path().join("out.db");
+            let output_c = CString::new(output.to_str().unwrap()).unwrap();
+            let mut opts: TraceIndexOptions = unsafe { std::mem::zeroed() };
+            opts.size = std::mem::size_of::<TraceIndexOptions>();
+            opts.root = root.as_ptr();
+            opts.output_db = output_c.as_ptr();
+            opts.jobs = 1;
+            opts.full_export = full_export;
+            let mut result: TraceIndexResult = unsafe { std::mem::zeroed() };
+            let mut error = ptr::null_mut();
+            assert_eq!(
+                unsafe { trace_index(&opts, &mut result, &mut error) },
+                TraceStatus::TraceOk as i32
+            );
+            assert!(error.is_null());
+            let conn = rusqlite::Connection::open(output).unwrap();
+            let sites: i64 = conn.query_row(
+                "SELECT count(DISTINCT line) FROM flow_origins WHERE kind='copy' AND line IN (4,5)",
+                [], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(sites, 2, "C API must retain assignment sites");
+            let returns: i64 = conn.query_row(
+                "SELECT count(*) FROM flow_return_calls r JOIN call_sites cs ON cs.id=r.call_site_id
+                 JOIN functions f ON f.id=r.callee_fn_id WHERE f.name='id' AND cs.line=6",
+                [], |r| r.get(0),
+            ).unwrap();
+            assert!(returns > 0, "C API must retain resolved return occurrences");
+        }
+    }
 
     #[test]
     fn c_api_rejects_invalid_partition_options_before_indexing() {

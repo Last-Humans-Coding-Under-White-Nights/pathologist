@@ -660,7 +660,14 @@ rather than a separate signature comparator. An overridden weak definition is
 demoted to a declaration of the same symbol: it keeps its signature, which is
 what tells one overload of a name from another, and contributes no local
 variables, calls, return flows, or constraints, including writes to globals. Weak global initializers are excluded when a strong global definition
-exists. A C tentative definition (`int x;` with no initializer) counts as a
+exists. Source origins follow the same occurrence suppression before provenance
+is unioned by constraint identity: a surviving assignment with the same flow
+constraint does not retain an overridden initializer's or weak body's operation
+site. Surviving occurrences keep their original provenance order, and weak-only
+targets retain the fallback's origins. Lowering records origin indices only
+when weak/link selection needs occurrence ownership; source expression strings
+remain shared in the constraint's ordered origin list.
+A C tentative definition (`int x;` with no initializer) counts as a
 strong definition and overrides a weak one, matching `-fno-common`, the default
 since GCC 10 and in Clang. Under `-fcommon` a tentative definition is a common
 symbol that a weak definition would outrank instead; the compiler flag is not
@@ -760,7 +767,7 @@ Instead, `trace` decouples intra-repository static analysis from cross-repositor
 
 ### Invariants and linking rules
 
-- **No analysis during merge**: Andersen pointer analysis, PAG construction, and interprocedural dataflow solvers do **not** run during the merge stage. Intra-repository dataflow facts (`flow_nodes`, `flow_edges`, `arg_flow_edges`) remain strictly within their original repository databases. The merge stage is purely a deterministic linker that reconnects external call edges across repositories.
+- **No analysis during merge**: Andersen pointer analysis, PAG construction, and interprocedural dataflow solvers do **not** run during the merge stage. Intra-repository dataflow facts (`flow_nodes`, `flow_edges`, `arg_flow_edges`) remain strictly within their original repository databases. The merge stage is purely a deterministic linker that reconnects external call edges across repositories. Its shared-schema output leaves flow tables empty and call-site variable bindings NULL; see the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
 - **External call re-linking and may-analysis over-approximation**:
   - In individual repositories, calls to functions declared but not defined in that repository are emitted with `resolution = 'external'` (or point to `is_defined = 0` declarations). `trace-merge` matches these calls against exported strong definitions (`is_defined = 1`, `linkage = 'external'`) from other repositories, updating `call_edges.callee_fn_id` to the survivor's unified ID and retargeting `resolution` to `'direct'` (or `'ambiguous'` if conflicting definitions exist), while preserving original non-direct resolutions (`indirect` and `ipc`). Unresolved external calls retain their original resolution.
   - When multiple strong definitions exist across different repositories (or multiple weak definitions), `trace-merge` emits an ambiguous edge (`resolution = 'ambiguous'`) to **every candidate definition**, satisfying the may-analysis invariant (AGENTS.md §2). This ensures downstream path queries such as `trace inspect callchain` do not miss valid paths.
@@ -892,7 +899,19 @@ Lowered from C during parse. Mapped to PAG in `Pag::build_flow_constraints`.
 | `CallReturnIndirect { dst, callee_var }` | `dst = *callee_var()` | `sbuf->impl->readBuffer(...)` (indirect return) |
 | `NewHeap { dst }` | heap allocation | `new T(...)` (C++ ctor result) |
 | `StringConst { dst, value }` | `dst` points at a string literal | `p = "target"`; `dlsym(h, "target")` |
+| `NullPointer { dst }` | explicit null pointer value with no points-to target | C++ `nullptr`, including a call argument |
 | `UnwrapPointer { dst, src }` | cross a smart-pointer wrapper into its pointee; `dst` is the pointee-typed receiver (see [Smart-pointer unwrap](#smart-pointer-unwrap)) | C++ `sp->field`, `(*sp).field` |
+
+`NullPointer` copies from an interned immutable PAG value node into `dst`.
+That source is not an abstract location and always has an empty points-to set:
+no `AddrOf`, object storage, or function target is seeded. Ordinary argument
+collection materializes the value in a temporary and retains its syntactic
+position; existing parameter wiring and occurrence export handle it like other
+values. A null argument therefore has a visible value-flow connection without
+adding pointees or indirect-call candidates. This does not kill other possible
+values in a context-insensitive formal or introduce path/context sensitivity.
+Integer zero/`NULL` spellings and omitted defaults are not materialized by this
+explicit C++ `nullptr` rule.
 
 ### Return-value flow
 
@@ -1147,10 +1166,12 @@ To reduce inline footprint during PAG analysis, `Constraint` stores field projec
 
 ### Post-solve flow-release lifecycle
 
-Lowered IR flow constraints (`program.flow`) and function return flows (`program.fn_returns`) are consumed solely to construct the `Pag` (`Pag::build_flow_constraints`) and during solver return-flow expansion. Once solving finishes, before SQLite export, `program.release_flow()` is called:
+Lowered IR flow constraints (`program.flow`) and function return flows (`program.fn_returns`) are consumed to construct the `Pag` (`Pag::build_flow_constraints`), during solver return-flow expansion, and to export source-level operation and return-call provenance. Source operation sites (`program.flow_origins`) retain constraint keys, origin vectors, and expression strings for that export. Calls retain their full source expression in `CallSiteDetails::call_expression`; return-assigning calls also retain their closest operation in `CallSiteDetails::return_operation`, before constraint deduplication. Complete expression text is shared as `Arc<str>` across origins, call expressions, and return operations; spans and occurrence records remain separate. The indexing-only `Program::source_expressions` pool expires in `release_merge_state` after the last merge, on the common CLI and C API indexing path. Origins and calls keep their references through export. CLI and C API retain all three collections until SQLite export succeeds, then call `program.release_flow()`:
+
 - Drops all `FlowConstraint` entries in `program.flow` (reallocates to an empty vector).
+- Drops all source provenance in `program.flow_origins`, including constraint keys, origin vectors, expression references, and map storage, and clears per-call expressions and return operation provenance. Also drops the expression pool for library callers that have not finalized merging. Shared text is freed when its last owner drops.
 - Drops all `ReturnFlow` mappings in `program.fn_returns` (reallocates to an empty map).
-- All symbol tables (`symbols`), call sites, functions, types, and the solved `Pag` (which retains its own compact `constraints` used by `export_flow_graph`) remain fully available for SQLite export, inspect queries, and C API callers. API consumers invoking analysis directly should call `program.release_flow()` after solving to reclaim flow memory before database serialization. See [memory profile](MEMORY_PROFILE.md) and [evaluation report](EVAL_REPORT.md#struct-compaction-expansion-sharing-and-lifecycle-reclamation--2026-10-01).
+- All symbol tables (`symbols`), call sites, functions, types, and the solved `Pag` (which retains its own compact `constraints` used by `export_flow_graph`) remain fully available for SQLite export, inspect queries, and C API callers. API consumers invoking analysis directly must retain these facts through provenance export; they may call `program.release_flow()` after their last consumer finishes. Releasing them immediately after solving is appropriate only when no provenance export follows. See [memory profile](MEMORY_PROFILE.md) and [evaluation report](EVAL_REPORT.md#struct-compaction-expansion-sharing-and-lifecycle-reclamation--2026-10-01).
 
 ### Abstract location kinds
 
@@ -3900,3 +3921,443 @@ Whole-program HDF-scale runs (~600 TUs, ~11k functions) target roughly:
 | Export (minimal) | ~0.1s |
 
 Key optimizations: solver adjacency index, `loc_nodes` reverse index, worklist dedup, lazy abstract locations, minimal SQLite export, skipped redundant header indexing.
+
+
+## Source-level dataflow presentation
+
+`trace inspect dataflow` describes the exported **may-flow constraint graph**.
+`trace_db::dataflow_graph` remains the raw PAG query API; the CLI uses
+`dataflow_view` and `render_dataflow`. The C API's `trace_db_dataflow` calls
+`dataflow_graph`: it returns raw PAG nodes/edges and counts raw edges for depth.
+The CLI projects source entities and counts visible transitions after technical
+nodes collapse. Selecting the same declaration and depth does not imply identical
+graph representation, reachability at that depth, or truncation. The existing
+C ABI is unchanged. Analysis and resolution are unchanged.
+
+Source-level inspection requires an analysis export with the required metadata.
+`trace-merge` output records its merge origin but omits PAG/provenance data, even
+though shared DDL creates empty flow tables. Inspection reports that limitation
+before symbol lookup; use an original analysis database or analyze a combined
+source tree. An ordinary analysis with no origins is supported, and a selected
+symbol without flow nodes retains its separate diagnostic. See the
+[SQLite capability and merger contract](SQLITE_SCHEMA.md#version-and-capability-contract).
+
+Dataflow JSON's `direction` and the output title use `down` (where values flow)
+or `up` (where values come from), matching the `--direction` argument.
+The title includes the selected variable's declaration path, line, and column;
+these are its recorded source coordinates, even when selection falls back to a
+nearby declaration.
+
+Compatibility: `dataflow-source-v1` uses only `down` and `up` as its emitted
+direction labels. The earlier, unversioned dataflow JSON and titles used
+`flows-to` and `flows-from`; those labels are not part of this source-level
+contract. Consumers must select the JSON contract by `schema` and, if they
+also support the earlier output, map its `flows-to` to `down` and `flows-from`
+to `up` in that legacy reader. Future incompatible direction or structure
+changes require a new schema discriminator. Titles are presentation text;
+machine consumers should read `direction` rather than parse the title.
+The C API's `TRACE_DIRECTION_DOWN`/`TRACE_DIRECTION_UP` numeric enum and raw
+graph API are unchanged. Rust callers of `render_dataflow` supply their own
+`GraphMeta` and must use `down`/`up` for conforming v1 JSON. The shared renderer
+also recognizes legacy labels for traversal scope ordering, preserving that
+behavior for existing Rust callers without rewriting their supplied metadata.
+
+Functions group by canonical `FnId`, source variables retain `VarId`, and
+argument and return edges retain `CallSiteId` and argument edges retain the recorded zero-based argument index
+(JSON; text and diagrams number positions from one). Call-site IDs remain
+internal and are omitted from all output formats. Names are display text, never identity.
+This preserves shadowing, overloads, namespaces, file-static ownership, link
+targets, and existing shared-header/static-inline canonicalization. Only
+entities and edges reached in the requested direction appear. Parameter-twin
+fallback reuses the raw query's canonical-function rule.
+
+The JSON document contains exactly `schema`, `title`, `direction`, `depth`,
+`truncated`, `scopes`, `nodes`, and `edges`. `schema` is the stable discriminator
+`"dataflow-source-v1"`, identifying the contract documented in this section;
+incompatible changes require a new discriminator. It has no `root` field. `scopes` is an
+object containing four arrays, always present, with unique entries sorted by
+numeric ID. Empty arrays are `[]`:
+
+| Array | Description fields | ID space |
+|-------|--------------------|----------|
+| `functions` | `id`, `name`, `signature`, `location` | Canonical `FnId` |
+| `globals` | `id`, `name`, `location` | Reached global variable's `VarId` |
+| `statics` | `id`, `name`, `location` | Reached file-level static variable's `VarId` |
+| `values` | `id`, `name`, `location` | Reached value's `PagNodeId` |
+
+Each node contains exactly `id`, `name`, `kind`, `scope`, `location`, `depth`, and
+`callees`. Node IDs are numeric `PagNodeId`s. A scope reference contains `kind`
+and a numeric `id`: `function`, `global`, `static`, or `value` refers to the
+corresponding description array. Global and file-level static variables reference
+their own descriptions. Locals, parameters, function-local statics, and other
+nodes with a known function reference that function. A function-value node
+references the function it represents. Nodes without a function or internal
+`var_id` reference their own value description; unknown ownership is `null`.
+`callees` retains the complete list of possible `FnId`s. Function descriptions
+also include every function referenced by `callees`, an operation's `callee_id`,
+or operation ownership, even when that function has no reached graph node.
+Variable and value descriptions come from the completed graph; missing function
+headers are loaded in batches without adding nodes or changing traversal depth.
+
+Each edge contains exactly `from`, `to`, `scope`, `expression`, `location`,
+and `operations`. `from` and `to` reference node IDs in source-to-destination
+order in both traversal directions. Callee IDs appear only on operations.
+Edge `scope` identifies the function performing the primary operation,
+including a function writing a global or file-level static variable. Recorded
+calls use `caller_fn_id`; other operations use the exact source path and the
+primary location's line within a function definition's inclusive line range.
+Operations outside functions, missing positions, or ambiguous definitions use
+`null`. Destination-variable ownership never supplies operation ownership.
+
+Each operation contains `kind`, `expression`, and `location`, plus `callee_id`
+when known. Null callee IDs are omitted.
+Argument operations also contain `arg_index`, using the original zero-based
+argument index recorded before intermediate chains collapse. An unknown or
+inapplicable argument index is omitted instead of serialized as `null`.
+The operation's `callee_id`, when present, is the numeric `FnId` of its original
+called function; it is retained separately for each argument or return operation
+before collapse.
+Function-pointer array initializer entries retain each element's original source
+position and expression on the function-location-to-array `addr_of` edge, even
+when the function definition is in another file. Widening an internal overload
+reference retains those same occurrences on every candidate, for both array
+entries and scalar function-pointer initializers. Widening unions each distinct
+(candidate constraint, original constraint) pair in first-seen order, using
+provenance snapshotted before any candidate receives new origins. Repeated
+constraint occurrences retain their flow order without repeating the provenance
+union; destination origins keep their original order and append only new sites.
+Synthetic copies that wire an
+indirect call target are classified as `resolve indirect call` in both operation
+labels and provenance; they do not introduce a source assignment.
+Collapsed edges retain multiple operations without introducing intermediate
+nodes. Recorded provenance supplies expressions and locations, preserving
+entries with distinct expressions, locations, argument indices, or callees and removing
+only exact duplicates. Operations retain deterministic provenance order.
+Kinds absent from recorded provenance are appended in the edge's existing
+internal operation order with `expression: ""`, `location: {"path": "",
+"line": 0, "col": 0}`, omitting both `callee_id` and `arg_index`. Primary edge
+expressions and
+locations retain their recorded attribution and output ordering; they are not
+copied into missing operation provenance. All locations contain `path`, `line`,
+and `col`; unknown coordinates remain zero.
+
+For example, an argument transition has this shape:
+
+```json
+{
+  "from": 701,
+  "to": 702,
+  "scope": { "kind": "function", "id": 31 },
+  "expression": "dispatch(message)",
+  "location": { "path": "/project/main.cpp", "line": 38, "col": 5 },
+  "operations": [
+    {
+      "kind": "pass argument",
+      "expression": "dispatch(message)",
+      "location": { "path": "/project/main.cpp", "line": 38, "col": 5 },
+      "callee_id": 32,
+      "arg_index": 0
+    }
+  ]
+}
+```
+
+JSON omits internal `target_id`, `spelling`, and `provenance`, node `fn_id`,
+`var_id`, and `targets`, and edge `fn_id`, `callee_fn_id`, `callee_id`, and
+edge-level `arg_index`. Internal graph metadata retains those identities, macro spelling,
+provenance, complete targets, and the edge argument index for other formats.
+
+Declaration lookup accepts positive, 1-based line and column positions only.
+Named parameter positions point to their declarator identifiers, including
+pointer, array, reference, and function-pointer declarators, rather than their
+type spelling; unnamed parameters retain their declaration positions.
+Within the substring-matched files and the ±2-line search window, identifier
+coverage **on the requested line** ranks first (from the declaration column
+through the column immediately after the identifier). Other declarations on
+that same line rank next by absolute distance from their declaration columns.
+Declarations on nearby lines rank last by line distance, then column distance;
+column coverage on a different line is not an exact source-position match.
+Equal distances tie by declaration column, full file path, line, and
+`VarId`. Candidate notes count declarations on the selected file's requested
+line separately from nearby/cross-file candidates and show file:line:column to
+explain ambiguity. One selection note combines fallback and ambiguity information on stderr in all formats.
+
+Generated intermediate variables are omitted from symbol selection and hints;
+source variables remain selectable regardless of their names. Symbol lookup,
+including the C API and raw query callers, requires `variables.is_synthetic`;
+databases missing it are rejected with an instruction to re-run `trace analyze`.
+The source view reuses that same compatibility check. Technical storage
+nodes are projected onto the source variable. Intermediate chains collapse
+while retaining branches and recorded operations. Hidden expansion is memoized
+per visible origin, hidden endpoint, and source/call metadata state. At
+reconvergence, operation and provenance facts are unioned in deterministic sorted
+order; they describe may-flow reachability rather than enumerated paths.
+Cycles converge through finite fact growth, independent of the visible-depth
+limit. Distinct call/argument occurrences retain separate metadata states.
+Source field-write destinations remain expression nodes rather than
+vanishing when a synthetic destination has no successor. Field-write expression
+visibility and naming use indexed incoming write provenance and field-access
+metadata for encountered destinations, even when the incoming value is outside
+the traversal. A query from the base of `s->field = p` can
+therefore reach `s->field` through its GEP even when the incoming store from `p`
+is outside the traversal. This does not add that store edge to the base's graph;
+only reached nodes and transitions are shown, with the usual visible-depth limit.
+Pointer-write destinations likewise use their recorded LHS and incoming
+metadata for visibility, without adding an unreached store to the graph. Assignment destinations
+retain the complete LHS for plain and compound assignments (including shift
+assignments), without trailing operator characters: nested comparisons,
+assignments, and quoted literals inside subscripts or receiver expressions do not delimit the outer assignment
+(for example, `s->table[i == 0] = v` targets `s->table[i == 0]`). Comments
+in recovered source slices retain their spelling but their punctuation does not
+delimit the assignment or change bracket/quote nesting, including line comments
+continued with escaped newlines. Assignment delimiter scanning uses the shared
+C++ lexer so digit separators, prefixed character/string literals, raw-string
+bodies and user-defined literal suffixes remain atomic tokens; destination text
+is still sliced from the original expression. Constructor member initializers
+record their own expression and original position on immediate and deferred
+store constraints before projection. Like aggregate initializers, their field
+destinations follow recorded field-access metadata (`s.f`, including
+nested field paths). Both field-access endpoints use the same variable/storage
+alias mapping as graph endpoints. Converging records select a deterministic
+parent; projected self references do not contribute field paths. Aggregate origins record each element's own span and singleton
+initializer text (`{ value }` or `{ .field = value }`), rather than copying the
+whole aggregate for every constraint. Nested container GEPs use their field
+designator or opening brace. This keeps provenance text storage proportional
+to the emitted element facts and their spellings in both IR and SQLite;
+deferred references retain the same element origin. Initializer text remains
+operation provenance rather than being interpreted as an assignment LHS. Real intermediate
+variables remain separate nodes. Function values, allocations, string constants,
+indirect-call targets, and modeled clearing events remain visible.
+
+Concrete field locations retain their analysis identity, including the parent
+object location. Their labels show the full **abstract storage path** and node
+ID, so differently nested locations sharing a root `VarId` and member name are
+distinguishable. These paths describe PAG storage, not necessarily legal source
+expressions. Field expansion retains root-variable ownership and uses the root
+object layout for variable-rooted locations (`struct_type_for_loc`); a reached
+field can therefore acquire further fields of that same root layout. The
+existing instance-sensitive nesting cap is four; deeper accesses use summaries.
+Exported `flow_field_locations` records each concrete parent/child relation,
+including in minimal exports. Presentation never merges equal labels or alters
+these analysis entities. Scope ownership follows the recorded parent chain,
+so file-scope initializer storage stays under its global or file-static root,
+while function-local storage retains its function. Without parent metadata,
+functionless local temporaries use the file-scope global group. Function value
+entities use their function's file and start line, with column zero because the
+export has no function column; variable entities retain variable coordinates.
+
+Operation expressions prefer original source slices when every mapped token is
+outside macro expansion, belongs to the same source file, and the recovered
+slice re-lexes to the same tokens. Mapped lexer columns count Unicode characters
+and are converted to byte offsets within the original source line before slicing.
+Original source caches retain line starts and lazily cache character-to-byte
+offsets for each recovered non-ASCII line. ASCII files and cached ASCII lines
+use columns directly as byte offsets. Repeated operations on a minified line
+therefore do not repeatedly scan its prefix.
+Original contents and line breaks are retained, including comments and spacing
+after non-ASCII text.
+Unavailable, changed, macro-expanded, or normalized input uses token-aware
+formatting instead. Literals stay indivisible; re-lexing checks that formatting
+preserves operator tokens rather than joining distinct operators or numbers.
+
+Operation provenance is recorded at lowering, remapped with the existing TU
+merge maps, and exported separately from the raw constraint tables. Repeated
+source assignments can retain separate operation sites even when the solver
+has one constraint for their endpoint pair. Lowering deduplicates each
+constraint's origins using hash membership while appending new origins to the
+ordered vector; repeated assignments do not rescan prior sites. Membership
+tables store indexes into that append-only vector, comparing the complete span
+and expression even on hash collisions. Zero/singleton lists need no table.
+The first attribution of each constraint occurrence still wins, recorded by
+a dense occurrence flag vector; the membership indexes are discarded with the
+translation unit's lowering context. Original-source recovery buffers are
+released after the AST walk, when deferred references already own their spelling. Deferred
+function references retain the same closest operation span and expression by
+the existing pending reference identity. End-of-unit resolution records those origins on
+new address and store constraints, including macro expansion locations, so
+field writes remain visible when their function value is defined later.
+Merging repeated constraints from conditional variants or shared header bodies
+unions their operation origins,
+including when the constraint itself is deduplicated. Merge visits each
+unit's origin list once per distinct constraint, using membership
+indexes while retaining first-seen origin order across units and variants. The
+constraint occurrences themselves retain their existing merge policy. Unknown or
+synthetic provenance file IDs use the merge helper's primary-file fallback,
+then deduplicate the remapped origins.
+Complete expression storage is interned by text during lowering and across TU merge,
+using `Arc<str>` for origin, call, and return-operation text. A new merged spelling
+reuses the unit's allocation. Sharing never changes span or occurrence identity,
+origin membership compares full span and text, and ordering still comes from
+the existing vectors. The pool is a lookup index only; its hash iteration order
+is never used for output. See [flow-release lifecycle](#post-solve-flow-release-lifecycle)
+for its lifetime and the facts retained through solving and export.
+Origin vectors start with one entry of capacity. The analysis indexing path
+compacts flow and origin buffers after the last merge; all facts remain alive
+through their final consumer, including CLI and C API provenance export.
+Optional call return-operation payloads are boxed so calls without a return
+assignment do not reserve inline space for a span and expression.
+Export visits each constraint's merged origins once, even when repeated lowering facts remain in
+`program.flow`; expanded return wiring is likewise deduplicated before exporting
+its provenance. Incoming return-wiring indexes cover only call-return destinations
+and expire before edge-row export allocates its buffers. Call-argument metadata replaces only generic wiring without source provenance; a recorded assignment
+between the same actual/formal endpoints remains a separate transition.
+Argument presentation collects canonical endpoint pairs and removes generic
+wiring in one pass before appending call occurrences, so repeated calls do not
+rescan previously constructed transitions. Full call expressions are captured with
+`operation_expression` at the call AST node and retained on every emitted call
+site, including cloned virtual candidates. Explicit automatic-object construction
+captures its declarator expression (such as `local(input)`); heap construction
+captures the full `new` expression at its own emission path. Both preserve nested
+calls' own text and the existing macro attribution. Additive optional v7
+`flow_call_expressions(call_site_id, expression)` metadata exports that text once
+per recorded call ID in both export modes. Argument transitions load it in the
+batched occurrence query, placing the full call expression on the edge and its
+argument operation before hidden-node collapse. Original non-macro whitespace
+is retained; macro calls use the existing token-aware expression formatter and
+keep the recorded invocation location. Nested calls retain their own expression,
+and return-assignment expressions remain separate in `flow_call_origins`.
+No source files are read or expressions reconstructed from callee names during
+inspection. Older databases lacking the table, or sites without recorded source
+expressions, keep an empty expression; re-analysis supplies available call text.
+`release_flow` clears this per-call presentation metadata after export.
+Return-value annotations identify existing PAG wiring from recorded return
+facts and the shared, target-aware resolvers (indirect returns use resolved call
+edges). Each root callee retains its own transitive return-source set, so an
+indirect call with multiple candidates associates a source only with candidates
+that can return it. Shared sources can still name multiple valid callees.
+Export groups recorded calls by destination and callee and visits each
+source/destination/callee wiring once before emitting its distinct call IDs.
+Different callers' return-flow constraints do not replay the same occurrence
+bucket; each `(src_node, dst_node, call_site_id, callee_fn_id)` tuple is exported
+once, while each constraint retains its own source origins.
+Return presentation indexes distinct canonical source/destination pairs and
+source operation positions once and constructs one transition per exported call
+occurrence, callee, and pair. New exports bind each return-assigning call's
+closest AST operation in the additive `flow_call_origins` table, keyed by call
+ID. This preserves separate expressions even when several assignments in one
+macro invocation share endpoints and expansion coordinates. Cloned virtual
+sites retain that operation; merge remaps its file with the safe helper and
+`release_flow` clears it after export. Inspection looks it up by the indexed
+call ID, without multiplying origins by calls. For older v7 exports without
+this optional table, the closest preceding assignment in that source file
+supplies expression/provenance via a position index; ambiguous same-invocation
+assignments require re-analysis for exact attribution.
+Repeated return origins do not multiply occurrence transitions; recorded
+call-site IDs, locations, and macro invocation/spelling coordinates come from
+the existing call-site records; assignment expressions and their source
+coordinates remain in the transition's provenance. A call occurrence replaces
+only origins matching its recorded or fallback source operation, including
+location and expression, or its call-expression origin at the recorded call
+position. Other origins sharing the endpoints remain visible,
+including global initializers without an annotated call occurrence; no call ID
+or callee identity is invented for them. Argument and return
+occurrences whose caller is NULL use the call's file-scope global group, with
+no invented function identity.
+Missing provenance stays missing: declaration sites are never substituted for assignment
+or call sites. Collapsed transitions retain their constituent operation sites in JSON.
+
+Macro-generated functions use their recorded expansion-site function span.
+Macro invocations are not scopes/functions. Calls use the recorded invocation
+as the prominent location and retain spelling coordinates and call ID internally;
+text and diagrams show macro spelling, while JSON omits it. Argument-spelled calls
+keep their recorded location. The authoritative
+[Call source locations](#call-source-locations) rules also apply here.
+
+Inspection first walks indexed neighborhoods with zero cost for hidden nodes
+and one for visible entities, including the extra visible frontier needed to
+detect truncation. It loads metadata only for that neighborhood and required
+aliases, field parents, and function headers; incoming write metadata never adds unreachable store
+edges. Argument, return, and target metadata are selected in batches. The raw
+`dataflow_graph` API retains its separate raw-depth traversal behavior. Fresh v7
+exports include endpoint and parameter-twin lookup indexes; older exports can
+lack these indexes and should be re-analyzed for the same lookup performance.
+Work is proportional to encountered data and finite hidden metadata states,
+so a long hidden component can still require a large walk even at depth one.
+
+BFS counts visible transitions after projection, in either direction. Every
+exported presentation edge stays oriented source to destination; `up` changes
+reachability, not edge meaning. Ordering is deterministic. Hidden-node cycles
+terminate, cross edges and merges survive, and boundary edges to already reached
+nodes remain visible. `truncated` means an additional visible entity was cut off
+by depth, rather than an unshown technical hop. Text uses fixed indentation
+within each scope. Text lists selected scopes first, then scopes in first-visit
+BFS order in the requested direction. Roots and sibling entities tie by PAG
+node ID; parallel edges tie by their complete recorded metadata. Each transition
+appears once, under its traversal origin's scope (`from` for `down`, `to` for
+`up`), with text endpoints in other scopes qualified by function name, such as
+`dispatch::payload [var#99]`. Function-value endpoints already name their function
+and are not prefixed again. Each text function section header includes its
+canonical parameter list: 1-based argument position, name, type, and `VarId`,
+including parameters outside the visible graph. Positions follow the solver's
+parameter list, including an implicit receiver when present, so they match the
+edge's argument number. Parameterless functions show `()`. Parameter metadata
+does not add graph nodes or affect depth. Older exports lacking this metadata,
+or declarations without recorded parameter variables, show `parameters unavailable`
+when their signature has parameters; re-analysis supplies available metadata.
+Call arguments and returns use the same arrow rows as local operations,
+retaining argument positions, operation sites, and macro spelling. Argument
+annotations use `pass argument [fn#29, argument 2] at main.c:39:5`; the callee
+function ID appears in the operation brackets rather than the destination
+label. Call-site IDs remain internal, including for return and indirect-call
+transitions, and are omitted from output. A return to
+an earlier scope does not repeat that scope's heading; grouping is a may-flow
+view, not an execution path. Scopes present only as operation/callee metadata
+follow reached scopes in scope-key order. After scope discovery, transitions
+within each scope sort by their recorded operation source path, then line, then
+column. Transitions without a positive source line come last. Ties sort by the
+complete edge metadata (endpoint IDs, operations, provenance, call identity,
+and other recorded fields). Sorting uses the prominent operation location,
+including a macro call's invocation, rather than declaration sites, macro
+spelling, or earlier constituent provenance sites. Text rows, the JSON `edges`
+array, and Graphviz/Mermaid edge declarations share this scope-and-source order
+in either direction. This does not change traversal, indentation, graph content,
+depth limits, or truncation. Graphviz/Mermaid scope and node declarations keep
+their existing order; diagram layout does not promise source-ordered nodes.
+Graphviz/Mermaid use scope groups.
+All formats consume the same complete `DataflowView` and traversal truncation.
+Text shows every transition in the graph selected by `--depth`.
+
+Call-target labels show the recorded callee spelling. Numeric PAG node IDs
+distinguish occurrences in structured output and diagrams; call-site IDs remain
+internal. Text
+shows its enclosing function, recorded location and macro spelling, then a
+separate possible-target count and list, once per call occurrence. Targets sort
+by `FnId`, and text shows every possible target. Diagrams use compact call labels
+and counts, with no embedded target lists. JSON retains `callees` (all `FnId`s)
+and includes every target function in `scopes.functions`; node `targets` is omitted.
+
+Text has no separate display limit. The `truncated at visible depth limit`
+marker reports traversal-depth truncation; increasing `--depth` includes more
+of the graph. Target counts and complete target lists remain attached to each
+call occurrence, with the list printed once even when multiple transitions
+reach the same call.
+
+Compatibility: raw SQLite `flow_nodes`/`flow_edges`, the raw query API, and call
+graph formats retain their existing contracts. The CLI dataflow JSON contract
+intentionally changes: scope-key objects become the four description arrays
+and typed references defined above, edge `callee_fn_id` moves to operation `callee_id`,
+operation strings become objects, and the argument index moves from the edge to
+each argument operation. Null argument indices and callee IDs are omitted;
+operations carry their original `callee_id` when known, and edges omit it. Internal-only fields are omitted. Consumers must
+update to the new contract; SQLite, analysis, text, and diagram behavior are
+preserved. Clients requiring PAG facts
+should use `dataflow_graph` or the raw tables. Source-level presentation metadata
+is part of the v7 layout; the source view requires a fresh analysis of older
+exports and reports a re-analysis instruction rather than guessing synthetic
+status or field destinations from names. Field-access and field-location parent metadata are required by the source
+view; re-analyze databases exported before they were introduced.
+
+Limitations are those of the recorded constraint graph: it is not an execution
+trace or a complete source evaluator. In the `dataflow_presentation` fixture,
+omitted default arguments are selected as calls but their values currently
+lack parameter-flow edges; `default_output` has no flow node. Explicit pointer
+arguments and C++ `nullptr` retain their recorded argument connections; `nullptr` is displayed as a null pointer value, never an object's
+address or an unknown value. Each occurrence keeps its own parameter positions
+and source location in every format, with call-site IDs retained internally.
+The graph remains restricted to values reachable from the selected variable:
+a query from one argument need not include independent arguments of that call.
+Query a receiver downstream or its formal upstream to see receiver passing,
+and query a nullable formal upstream to see its explicit null arguments. A
+presentation cannot supply absent facts. Pointer/field operations explain the
+recorded constraint connectivity; they do not introduce store-to-load alias
+edges or correlations absent from that exported graph.

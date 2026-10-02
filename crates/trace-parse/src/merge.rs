@@ -33,6 +33,9 @@ pub struct UnitIndex {
     pub variables: Vec<Variable>,
     pub call_sites: Vec<CallSite>,
     pub flow: Vec<FlowConstraint>,
+    pub flow_origins: FxHashMap<FlowConstraint, Vec<(trace_ir::Span, Arc<str>)>>,
+    /// Recorded only when weak/link selection can suppress occurrences.
+    pub flow_origin_bindings: Option<FlowOriginBindings>,
     pub function_flow_ranges: FxHashMap<FnId, Vec<std::ops::Range<usize>>>,
     /// Initializer constraints, including temporaries and deferred references.
     pub global_initializer_ranges: FxHashMap<VarId, Vec<std::ops::Range<usize>>>,
@@ -69,6 +72,11 @@ pub struct UnitIndex {
     /// unit was built without it; the merge then rebuilds as it goes.
     pub merge_descs: Vec<Arc<TypeDesc>>,
 }
+
+/// `flow` occurrence index -> range in that constraint's ordered origins.
+/// AST operations bind one origin; preamble facts bind the header origins
+/// already present before the AST walk. Missing entries have no attribution.
+pub type FlowOriginBindings = FxHashMap<usize, std::ops::Range<usize>>;
 
 impl UnitIndex {
     pub fn shrink_to_fit(&mut self) {
@@ -1178,6 +1186,13 @@ fn merge_unit(
             span
         });
         if let Some(details) = &mut site.details {
+            if let Some((span, expression)) = details.return_operation.as_deref_mut() {
+                span.file = map_file(span.file);
+                *expression = program.source_expressions.intern_shared(expression);
+            }
+            if let Some(expression) = &mut details.call_expression {
+                *expression = program.source_expressions.intern_shared(expression);
+            }
             if let Some(occurrence) = &mut details.occurrence {
                 occurrence.span.file = map_file(occurrence.span.file);
                 if let Some(span) = &mut occurrence.expansion_span {
@@ -1386,6 +1401,7 @@ fn merge_unit(
     // Shared header facts span TU families, whereas variant facts are local
     // to one family. Every flow of a shared body passes through the
     // program-wide header index, which therefore subsumes the family's own.
+    let mut merged_origin_flows = FxHashSet::default();
     for flow in &unit.flow {
         if matches!(mode, MergeMode::SymbolsOnly) && !replay_in_tu(flow) {
             continue;
@@ -1400,6 +1416,24 @@ fn merge_unit(
         } else {
             variant_dedup.as_deref_mut().map(|seen| &mut seen.flow)
         };
+        // Constraint identity does not include operation sites. Variants and
+        // shared bodies may repeat a constraint at distinct source positions.
+        // Its complete unit origin list is merged once, even if the fact occurs
+        // many times; hash membership preserves the first-seen output order.
+        if let Some(origins) = unit
+            .flow_origins
+            .get(flow)
+            .filter(|_| merged_origin_flows.insert(flow))
+        {
+            let dst = program.flow_origins.entry(remapped.clone()).or_default();
+            let mut membership = crate::flow_origins::OriginMembership::new(dst);
+            for (span, expr) in origins {
+                let mut span = *span;
+                span.file = map_file(span.file);
+                let expr = program.source_expressions.intern_shared(expr);
+                membership.insert(dst, span, &expr);
+            }
+        }
         if seen.is_some_and(|seen| !seen.insert(remapped.clone())) {
             continue;
         }
@@ -1739,6 +1773,7 @@ fn remap_flow(
             }
         }
         FlowConstraint::NewHeap { dst } => FlowConstraint::NewHeap { dst: rv(*dst) },
+        FlowConstraint::NullPointer { dst } => FlowConstraint::NullPointer { dst: rv(*dst) },
         FlowConstraint::StringConst { dst, value } => FlowConstraint::StringConst {
             dst: rv(*dst),
             value: value.clone(),
@@ -1782,6 +1817,7 @@ mod tests {
         let ty = TypeId(7);
         let var = |name: &str, temp: Option<TempKind>| Variable {
             temp,
+            is_synthetic: temp.is_some(),
             is_defined: false,
             is_weak: false,
             target: None,
@@ -2061,6 +2097,160 @@ mod tests {
         unit_declaring_param(path, defined, nested_fields, "object")
     }
 
+    #[test]
+    fn flow_origins_safely_remap_unknown_files_and_deduplicate_fallbacks() {
+        let mut unit = unit_declaring("/source/header.hpp", true, Vec::new());
+        unit.path = PathBuf::from("/source/main.cpp");
+        let flow = FlowConstraint::Copy {
+            dst: VarId(0),
+            src: VarId(0),
+        };
+        unit.flow = vec![flow.clone(); 2];
+        unit.flow_origins.insert(
+            flow,
+            vec![
+                (
+                    trace_ir::Span::new(trace_ir::FileId(0), 10, 3),
+                    "object = object".into(),
+                ),
+                (
+                    trace_ir::Span::new(trace_ir::FileId(u32::MAX), 20, 5),
+                    "object = object".into(),
+                ),
+                (
+                    trace_ir::Span::new(trace_ir::FileId(99), 20, 5),
+                    "object = object".into(),
+                ),
+            ],
+        );
+        for (id, file) in [0, u32::MAX, 99].into_iter().enumerate() {
+            let mut site = CallSite {
+                id: CallSiteId(id as u32),
+                caller: FnId(0),
+                callee_name: format!("callee{id}").into(),
+                callee_var: None,
+                callee_fn_id: None,
+                var_args: Vec::new(),
+                details: None,
+                args_bound_past_this: false,
+                span: trace_ir::Span::new(trace_ir::FileId(0), 30 + id as u32, 1),
+                expansion_span: None,
+                is_direct: true,
+                receiver_class: None,
+                exact_receiver: false,
+                return_dst: Some(VarId(0)),
+                tu: None,
+            };
+            site.details_mut().return_operation = Some(Box::new((
+                trace_ir::Span::new(trace_ir::FileId(file), 20, 5),
+                "object = callee()".into(),
+            )));
+            site.details_mut().call_expression = Some("callee(object)".into());
+            unit.call_sites.push(site);
+        }
+        let mut program = Program::new(PathBuf::from("/source"));
+        program
+            .symbols
+            .add_file_interned(Path::new("/source/other.cpp"));
+        merge_unit_index(&mut program, &unit);
+        merge_unit_index(&mut program, &unit);
+        assert_eq!(program.symbols.call_sites.len(), 3);
+        for (id, site) in program.symbols.call_sites.iter().enumerate() {
+            let (span, expression) = site
+                .details
+                .as_ref()
+                .unwrap()
+                .return_operation
+                .as_deref()
+                .unwrap();
+            assert_eq!(expression.as_ref(), "object = callee()");
+            assert_eq!(
+                site.details.as_ref().unwrap().call_expression.as_deref(),
+                Some("callee(object)")
+            );
+            assert_eq!(
+                program.symbols.files[span.file.0 as usize].path,
+                Path::new(if id == 0 {
+                    "/source/header.hpp"
+                } else {
+                    "/source/main.cpp"
+                })
+            );
+        }
+        let origins = program.flow_origins.values().next().unwrap();
+        assert_eq!(origins.len(), 2);
+        assert_eq!(
+            program.symbols.files[origins[0].0.file.0 as usize].path,
+            Path::new("/source/header.hpp")
+        );
+        assert_eq!(
+            program.symbols.files[origins[1].0.file.0 as usize].path,
+            Path::new("/source/main.cpp")
+        );
+        program.release_flow();
+        assert!(program.symbols.call_sites.iter().all(|site| site
+            .details
+            .as_ref()
+            .unwrap()
+            .return_operation
+            .is_none()));
+        assert!(program.symbols.call_sites.iter().all(|site| site
+            .details
+            .as_ref()
+            .unwrap()
+            .call_expression
+            .is_none()));
+    }
+
+    #[test]
+    fn repeated_constraints_union_origins_once_across_units_and_variants() {
+        let flow = FlowConstraint::Copy {
+            dst: VarId(0),
+            src: VarId(0),
+        };
+        let mut base = unit_declaring("/source/shared.hpp", true, Vec::new());
+        base.path = PathBuf::from("/source/a.cpp");
+        base.internal_definitions
+            .insert(FnId(0), "shared recycle body".into());
+        base.flow = vec![flow.clone(); 256];
+        let origins = |start| {
+            (start..start + 256)
+                .map(|line| {
+                    (
+                        trace_ir::Span::new(trace_ir::FileId(0), line, 3),
+                        "object = object".into(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        base.flow_origins.insert(flow.clone(), origins(100));
+        let mut later = base.clone();
+        later.flow_origins.insert(flow.clone(), origins(228));
+        for variants in [false, true] {
+            let mut program = Program::new(PathBuf::from("/source"));
+            if variants {
+                merge_unit_variants(&mut program, &base, &[later.clone(), later.clone()]);
+            } else {
+                let mut later = later.clone();
+                later.path = PathBuf::from("/source/b.cpp");
+                merge_unit_index(&mut program, &base);
+                merge_unit_index(&mut program, &later);
+                merge_unit_index(&mut program, &later);
+            }
+            assert_eq!(program.flow_origins.len(), 1);
+            let sites = program.flow_origins.values().next().unwrap();
+            assert_eq!(sites.len(), 384);
+            assert_eq!(
+                sites.iter().map(|(span, _)| span.line).collect::<Vec<_>>(),
+                (100..484).collect::<Vec<_>>()
+            );
+            assert!(sites
+                .iter()
+                .all(|(span, _)| program.symbols.files[span.file.0 as usize].path
+                    == Path::new("/source/shared.hpp")));
+        }
+    }
+
     /// As [`unit_declaring`], but naming the parameter, so a test can tell
     /// which unit's variable a merged function's `params` point at.
     fn unit_declaring_param(
@@ -2122,6 +2312,7 @@ mod tests {
                 is_namespaced: false,
                 qualified_name: None,
                 c_linkage: false,
+                is_synthetic: false,
                 is_static_member: false,
                 id: param,
                 name: param_name.into(),
@@ -2179,6 +2370,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_synthetic: false,
             is_static_member: false,
             id: VarId(id),
             name,
@@ -2651,6 +2843,7 @@ mod tests {
                 .into(),
             ),
             c_linkage: false,
+            is_synthetic: false,
             is_static_member: !spec.namespace_global,
             id: member,
             name: "cb".into(),
