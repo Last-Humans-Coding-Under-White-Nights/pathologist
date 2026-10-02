@@ -11305,7 +11305,11 @@ fn cpp_singleton_missing_template_fallback() {
         assert!(guessed.is_empty(), "{caller} guessed {guessed:?}");
     }
     assert!(!p.derives_from("MissInh", "MissInh"));
-    // No accessor is invented as a defined function.
+    assert_no_singleton_member_invented(p);
+}
+
+/// No c_utils accessor is invented as a defined function.
+fn assert_no_singleton_member_invented(p: &trace_ir::Program) {
     assert!(
         !p.symbols
             .functions
@@ -11315,9 +11319,15 @@ fn cpp_singleton_missing_template_fallback() {
     );
 }
 
-/// A tree declaring `DelayedSingleton` with `accessor` as its whole body,
-/// in the tree or in a dependency root.
-fn declared_singleton_tree(accessor: &str, dep: bool) -> tempfile::TempDir {
+/// A tree declaring the singleton `template` with `accessor` as its whole
+/// body, in the tree or in a dependency root, and calling `Run` on
+/// `template<OvSvc>::GetInstance()` through `op`.
+fn declared_template_tree(
+    template: &str,
+    accessor: &str,
+    op: &str,
+    dep: bool,
+) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     let headers = if dep {
         tmp.path().join("dep")
@@ -11328,13 +11338,15 @@ fn declared_singleton_tree(accessor: &str, dep: bool) -> tempfile::TempDir {
     std::fs::write(
         headers.join("singleton.h"),
         format!(
-            "#pragma once\nclass Registry {{\npublic:\n    void Run();\n}};\ntemplate <typename T> class DelayedSingleton {{\npublic:\n    {accessor}\n}};\n"
+            "#pragma once\nclass Registry {{\npublic:\n    void Run();\n}};\ntemplate <typename T> class {template} {{\npublic:\n    {accessor}\n}};\n"
         ),
     )
     .unwrap();
     std::fs::write(
         tmp.path().join("main.cpp"),
-        "#include \"singleton.h\"\nclass OvSvc {\npublic:\n    void Run() {}\n};\nvoid ov() { DelayedSingleton<OvSvc>::GetInstance()->Run(); }\n",
+        format!(
+            "#include \"singleton.h\"\nclass OvSvc {{\npublic:\n    void Run() {{}}\n}};\nvoid ov() {{ {template}<OvSvc>::GetInstance(){op}Run(); }}\n"
+        ),
     )
     .unwrap();
     tmp
@@ -11343,30 +11355,41 @@ fn declared_singleton_tree(accessor: &str, dep: bool) -> tempfile::TempDir {
 #[test]
 fn cpp_singleton_declared_return_overrides_fallback() {
     for dep in [false, true] {
-        for (accessor, expected) in [
-            ("static Registry *GetInstance();", Some("Registry::Run")),
-            ("static int GetInstance();", None),
+        for (template, declarator) in [
+            ("DelayedSingleton", "*"),
+            ("Singleton", "&"),
+            ("DelayedRefSingleton", "&"),
         ] {
-            let tmp = declared_singleton_tree(accessor, dep);
-            let mut opts =
-                trace_preproc::PreprocessOptions::new().with_include(tmp.path().to_path_buf());
-            if dep {
-                opts = opts
-                    .with_include(tmp.path().join("dep"))
-                    .with_dep(tmp.path().join("dep"));
-            }
-            let program = build_program(tmp.path(), &opts).expect("build");
-            let (_pag, analysis) = analyze(&program);
-            let callees = common::callees_of(&program, &analysis, "ov");
-            assert!(
-                !callees.iter().any(|(c, _)| c == "OvSvc::Run"),
-                "{accessor} (dep {dep}) wins over the heuristic: {callees:?}"
-            );
-            if let Some(target) = expected {
+            for (accessor, expected) in [
+                (
+                    format!("static Registry {declarator}GetInstance();"),
+                    Some("Registry::Run"),
+                ),
+                ("static int GetInstance();".to_owned(), None),
+            ] {
+                // c_utils hands out `->` for a shared pointer, `.` for a reference.
+                let op = if declarator == "*" { "->" } else { "." };
+                let tmp = declared_template_tree(template, &accessor, op, dep);
+                let mut opts =
+                    trace_preproc::PreprocessOptions::new().with_include(tmp.path().to_path_buf());
+                if dep {
+                    opts = opts
+                        .with_include(tmp.path().join("dep"))
+                        .with_dep(tmp.path().join("dep"));
+                }
+                let program = build_program(tmp.path(), &opts).expect("build");
+                let (_pag, analysis) = analyze(&program);
+                let callees = common::callees_of(&program, &analysis, "ov");
                 assert!(
-                    callees.iter().any(|(c, _)| c == target),
-                    "{accessor} (dep {dep}) reaches {target}: {callees:?}"
+                    !callees.iter().any(|(c, _)| c == "OvSvc::Run"),
+                    "{template}: {accessor} (dep {dep}) wins over the heuristic: {callees:?}"
                 );
+                if let Some(target) = expected {
+                    assert!(
+                        callees.iter().any(|(c, _)| c == target),
+                        "{template}: {accessor} (dep {dep}) reaches {target}: {callees:?}"
+                    );
+                }
             }
         }
     }
@@ -11475,6 +11498,67 @@ fn cpp_singleton_nested_template_is_not_c_utils() {
     let (p, a) = cpp_singleton_missing();
     let nested = common::callees_of(p, a, "nested_singleton");
     assert!(!nested.iter().any(|(c, _)| c == "NestA::Run"), "{nested:?}");
+}
+
+analyzed_fixture!(cpp_singleton_delayed_ref);
+
+/// #184: c_utils' `DelayedRefSingleton<T>::GetInstance()` returns `T &`, as
+/// `Singleton`'s does; with no definition in view it is typed the same way.
+#[test]
+fn cpp_singleton_delayed_ref_fallback() {
+    let (p, a) = cpp_singleton_delayed_ref();
+    // The accessor edge stays the external declaration it was. The
+    // qualified row names an `OHOS` namespace the fixture never declares, so
+    // its accessor's exported spelling is not pinned.
+    for (caller, accessor, target) in [
+        ("ref_inherited", Some("RefSvc::GetInstance"), "RefSvc::Run"),
+        (
+            "ref_spelled",
+            Some("DelayedRefSingleton::GetInstance"),
+            "RefSvc::Run",
+        ),
+        ("ref_qualified", None, "RefSvc::Run"),
+        ("ref_auto", Some("RefSvc::GetInstance"), "RefSvc::Stop"),
+        (
+            "OHOS::Use",
+            Some("Machine::GetInstance"),
+            "OHOS::Machine::Open",
+        ),
+        (
+            "OHOS::UseSpelled",
+            Some("DelayedRefSingleton::GetInstance"),
+            "OHOS::Machine::Open",
+        ),
+    ] {
+        let callees = common::callees_of(p, a, caller);
+        assert_eq!(
+            edge_resolutions(p, a, caller, target),
+            [ResolutionKind::Direct],
+            "{caller} reaches {target}: {callees:?}"
+        );
+        if let Some(accessor) = accessor {
+            assert_eq!(
+                edge_resolutions(p, a, caller, accessor),
+                [ResolutionKind::External],
+                "{caller} keeps its accessor edge: {callees:?}"
+            );
+        }
+    }
+    for caller in [
+        "ref_other_member",
+        "ref_multi",
+        "ref_unresolved",
+        "ref_dependent",
+        "ref_nested",
+    ] {
+        let guessed: Vec<_> = common::callees_of(p, a, caller)
+            .into_iter()
+            // Whatever class a wrong guess would name (`Unknown`, `RefNest`).
+            .filter(|(callee, _)| callee.ends_with("::Run"))
+            .collect();
+        assert!(guessed.is_empty(), "{caller} guessed {guessed:?}");
+    }
+    assert_no_singleton_member_invented(p);
 }
 
 /// R2-9: two units see the wrapper's namespace differently; both record the

@@ -1,5 +1,62 @@
 # Evaluation Report
 
+## DelayedRefSingleton receivers: #184 — 2026-10-02
+
+c_utils' third singleton template, `DelayedRefSingleton<T>`, whose
+`GetInstance()` returns `T &`, is now recognised alongside `DelayedSingleton`
+and `Singleton` when the unit sees no definition of it; the rule is
+**Undefined singleton templates** in the
+[Templates bullet](ANALYSIS.md#c-support-first-step). Baseline is `bc5505f`
+(master), built in a scratch worktree of that revision; both sides use the
+pinned, clean HDF (`cdc75a2`), hiview (`92408e2`) and camera (`8ffd69d`)
+corpora, release builds, eight jobs and `TRACE_SOLVE_BUDGET_POPS=800000`,
+following [Attributing a change](#attributing-a-change-baseline-vs-branch).
+Against the re-captured expectations the baseline misses only the five
+hiview checks this change moves (95 checks, 5 failures); HDF and camera are
+unchanged.
+
+| Corpus | Metric | Baseline (`bc5505f`) | Candidate | Diff |
+|---|---|---:|---:|---:|
+| hiview | call edges (total) | 32,058 | 32,623 | +565 |
+| hiview | direct | 17,404 | 17,963 | +559 |
+| hiview | indirect | 176 | 178 | +2 |
+| hiview | external | 14,434 | 14,438 | +4 |
+| hiview | arg-flow edges | 19,653 | 20,085 | +432 |
+| hiview | functions / diagnostics | 9,674 / 3,573 | 9,674 / 3,573 | unchanged |
+
+Calls chained on `X::GetInstance()` for the 15 hiview classes deriving from
+`DelayedRefSingleton` (keyed by the baseline's file, line and member name;
+resolved means a direct or indirect edge on that line to a qualified member
+of that name):
+
+| Receiver class | Chained calls | Resolved, baseline | Resolved, candidate |
+|---|---:|---:|---:|
+| `TraceStateMachine` | 311 | 0 | 311 |
+| `MockTraceStateMachine` | 42 | 0 | 42 |
+| `EventStoreConfig` | 29 | 0 | 29 |
+| `RunningStatusLogger` | 24 | 0 | 24 |
+| `ProcessStatus` | 20 | 0 | 19 |
+| other 10 classes | 58 | 0 | 57 |
+| **total** | **484** | **0** | **482** |
+
+The issue's 311 unresolved `TraceStateMachine::GetInstance().` sites all bind
+a `TraceStateMachine` member directly; a new hiview probe in
+`scripts/eval_expected.json` holds that count. The accessor edges stay the
+external `X::GetInstance` declarations they were, and no singleton member is
+invented. The two calls still unresolved are configuration limits, not this
+rule: `event_publish_test.cpp` calls `UserDataSizeReporter::GetInstance()`
+without including its header, and `uc_render_state_observer.cpp` names
+`ProcessStatus` only through a `using namespace` written inside an unnamed
+namespace.
+
+The other movements follow from the new direct edges: `+2` indirect are
+`TraceWorker::HandleUcollectionTask` now reached with its lambda arguments
+(`TraceZipHandler::HandleTrace` and `TraceCollectorImpl::RecoverTmpTrace`),
+`+4` external are calls on readers obtained from
+`ContentReaderFactory::GetInstance().Get(...)` reaching `ContentReader`'s
+declared-only `IsValidMagicNum` and `ReadDocDetails`, and the arg-flow growth is
+the arguments of the newly bound calls.
+
 ## Explicit calls to overloaded operators — 2026-10-01
 
 Rules are maintained in [Explicit member operator calls](ANALYSIS.md#explicit-member-operator-calls).

@@ -243,10 +243,10 @@ direct edge to `TraceStateMachine::OpenTrace` when that class is in-tree.
 static calls on a class template (`DelayedSingleton<Svc>::GetInstance()`),
 accessors inherited from one (`Svc::GetInstance()`), results returned
 inside a wrapper (`std::shared_ptr<T>`, `sptr<T>`) and c_utils' undefined
-`DelayedSingleton`/`Singleton` are typed, and calls on the result reach the
-class's members. The rules and their limits are the **Templates** bullet in
-[`docs/ANALYSIS.md`](ANALYSIS.md#c-support-first-step); measurements are in
-`docs/EVAL_REPORT.md`.
+`DelayedSingleton`/`Singleton`/`DelayedRefSingleton` are typed, and calls on
+the result reach the class's members. The rules and their limits are the
+**Templates** bullet in [`docs/ANALYSIS.md`](ANALYSIS.md#c-support-first-step);
+measurements are in `docs/EVAL_REPORT.md`.
 
 ---
 

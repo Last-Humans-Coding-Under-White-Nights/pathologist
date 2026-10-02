@@ -5984,14 +5984,15 @@ fn static_call_receiver(
     held_class(program, ctx, &static_call_scope(ctx, source, func)?.spelled)
 }
 
-/// What `DelayedSingleton<Svc>::GetInstance()` or `Singleton<Db>::GetInstance()`
-/// yields when the unit sees no definition of the template (c_utils lives
-/// outside the tree): `std::shared_ptr<Svc>` and `Db`, as c_utils declares them.
-/// `Svc::GetInstance()` yields the same when `Svc` inherits the accessor from
-/// such a base ([`inherited_singleton_result`]). Only these two templates with
-/// one class argument are recognised; a definition in view, from a dependency
-/// root too, decides instead (docs/ANALYSIS.md, "Undefined singleton
-/// templates" under "Templates").
+/// What a c_utils singleton accessor ([`CUtilsSingleton`]) such as
+/// `DelayedSingleton<Svc>::GetInstance()` yields when the unit sees no
+/// definition of the template (c_utils lives outside the tree): the
+/// `std::shared_ptr<Svc>` or `Svc` c_utils declares. `Svc::GetInstance()`
+/// yields the same when `Svc` inherits the accessor from such a base
+/// ([`inherited_singleton_result`]). Only a recognised template with one class
+/// argument is guessed; a definition in view, from a dependency root too,
+/// decides instead (docs/ANALYSIS.md, "Undefined singleton templates" under
+/// "Templates").
 fn undefined_singleton_result(
     program: &Program,
     ctx: &LowerContext,
@@ -6009,13 +6010,9 @@ fn undefined_singleton_result(
     if !scope.is_template_id {
         return inherited_singleton_result(program, ctx, &scope.spelled);
     }
+    // `static_call_scope` already rejected a dependent spelling, so a
+    // template parameter never reaches here as the argument.
     let singleton = c_utils_singleton(program, ctx, &scope.spelled)?;
-    // A template parameter names no class a shared pointer can hold.
-    if singleton.shared
-        && spelling_is_dependent(ctx, source, func, &singleton.argument, Spelling::Source)
-    {
-        return None;
-    }
     Some(singleton.result(held_class(program, ctx, &singleton.argument)?))
 }
 
@@ -6066,10 +6063,11 @@ fn inherited_singleton_result(
 }
 
 /// A c_utils singleton template spelled `spelled` (`DelayedSingleton<Svc>`,
-/// `Singleton<Db>`) whose definition the unit does not see.
+/// `Singleton<Db>`, `DelayedRefSingleton<Db>`) whose definition the unit
+/// does not see.
 struct CUtilsSingleton {
     /// `DelayedSingleton`'s accessor returns `std::shared_ptr<T>`,
-    /// `Singleton`'s `T &`.
+    /// `Singleton`'s and `DelayedRefSingleton`'s `T &`.
     shared: bool,
     /// Its one argument, sanitized (`class Svc` names `Svc`).
     argument: String,
@@ -6103,7 +6101,7 @@ fn c_utils_singleton(
     }
     let shared = match last_type_segment(&template) {
         "DelayedSingleton" => true,
-        "Singleton" => false,
+        "Singleton" | "DelayedRefSingleton" => false,
         _ => return None,
     };
     let defined = |cls: String| program.types.is_struct_defined(&cls);

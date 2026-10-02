@@ -2340,15 +2340,17 @@ C++-aware only where it must be — everything else reuses the C machinery.
   result substitutes the argument the base spells, resolved in that base
   declaration's scope. A derived declaration of the name hides the base's.
   **Undefined singleton templates.** When the unit being lowered sees no
-  definition of c_utils' `DelayedSingleton` or `Singleton` (absent from the
-  headers it includes, or only forward-declared there; lowering reads one
-  unit at a time, so a definition only another unit includes does not
-  count), `DelayedSingleton<Svc>::GetInstance()` is typed
-  `std::shared_ptr<Svc>` and `Singleton<Db>::GetInstance()` is typed `Db`,
-  as c_utils declares them; a template of that name nested in another
-  (`Outer<A>::DelayedSingleton<Svc>`) is not c_utils' and is not guessed.
+  definition of c_utils' `DelayedSingleton`, `Singleton` or
+  `DelayedRefSingleton` (absent from the headers it includes, or only
+  forward-declared there; lowering reads one unit at a time, so a definition
+  only another unit includes does not count),
+  `DelayedSingleton<Svc>::GetInstance()` is typed `std::shared_ptr<Svc>`, and
+  `Singleton<Db>::GetInstance()` and `DelayedRefSingleton<Db>::GetInstance()`
+  are typed `Db` (a reference), as c_utils declares them (#184); a template
+  of that name nested in another (`Outer<A>::DelayedSingleton<Svc>`) is not
+  c_utils' and is not guessed.
   This is a guess from a name, like the undeclared wrapper rule above
-  (#86): only `GetInstance` on these two templates, with
+  (#86): only `GetInstance` on these three templates, with
   exactly one argument naming a declared class (not a pointer), is guessed.
   The accessor itself stays the external declaration it is; no member is
   synthesized. A definition in view, a dependency root's included, decides
