@@ -3288,3 +3288,533 @@ fn deref_write_stores_into_the_members_pointee() {
     }
     assert_deref_points_to_exactly("g_slot", "g_y");
 }
+
+#[test]
+fn nested_call_argument_parity_single_and_cross_tu() {
+    let root = fixture("nested_call_args");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (pag, analysis) = analyze(&program);
+
+    // Verify indirect dispatch inside the consumers resolves to the expected target.
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "consume_direct",
+        "target_direct",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "consume_static",
+        "target_static",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "consume_indirect",
+        "target_direct",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "consume_member",
+        "target_direct",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "consume_deep",
+        "target_direct",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "consume_move",
+        "target_direct",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "consume_cross_tu",
+        "target_cross_tu",
+        ResolutionKind::Indirect
+    ));
+
+    // Verify exact call edge parity between nested call args and temporary variable equivalents.
+    let pairs = [
+        ("entry_direct_nested", "entry_direct_temp"),
+        ("entry_static_nested", "entry_static_temp"),
+        ("entry_indirect_nested", "entry_indirect_temp"),
+        ("entry_member_nested", "entry_member_temp"),
+        ("entry_deep_nested", "entry_deep_temp"),
+        ("entry_move_nested", "entry_move_temp"),
+        ("entry_cross_tu_nested", "entry_cross_tu_temp"),
+    ];
+
+    for (nested_caller, temp_caller) in pairs {
+        let mut nested_callees = callees_of(&program, &analysis, nested_caller);
+        let mut temp_callees = callees_of(&program, &analysis, temp_caller);
+        nested_callees.sort_by(|a, b| a.0.cmp(&b.0));
+        temp_callees.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            nested_callees, temp_callees,
+            "callees of {nested_caller} and {temp_caller} must match"
+        );
+    }
+
+    // Verify SQLite export of arg_flow_edges matches between nested and temp forms.
+    let db = export_program(&program, &pag, &analysis);
+    let conn = open_db(db.path()).unwrap();
+
+    for (nested_caller, temp_caller) in pairs {
+        let query = "SELECT cs.callee_text, a.arg_index, f.name FROM arg_flow_edges a \
+                     JOIN call_sites cs ON cs.id = a.call_site_id \
+                     JOIN functions c ON c.id = cs.caller_fn_id \
+                     LEFT JOIN variables f ON f.id = a.formal_var_id \
+                     WHERE c.name = ? ORDER BY cs.callee_text, a.arg_index";
+        let mut stmt = conn.prepare(query).unwrap();
+        let nested_args: Vec<(String, i64, Option<String>)> = stmt
+            .query_map([nested_caller], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let temp_args: Vec<(String, i64, Option<String>)> = stmt
+            .query_map([temp_caller], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            nested_args, temp_args,
+            "arg_flow_edges of {nested_caller} and {temp_caller} must match"
+        );
+        assert!(
+            !nested_args.is_empty(),
+            "expected at least one arg_flow_edge for {nested_caller}"
+        );
+    }
+}
+
+#[test]
+fn user_defined_move_and_forward_preserved_in_c_and_cpp() {
+    let dir = temp_root("user_move_forward");
+    let root = dir.path();
+
+    // 1. C: user-defined move and forward functions returning real_target
+    std::fs::write(
+        root.join("test_c.c"),
+        r#"
+typedef void (*Callback)(void);
+void real_target(void) {}
+void decoy_target(void) {}
+Callback move(Callback ignored) { return real_target; }
+Callback forward(Callback ignored) { return real_target; }
+void entry_c(void) {
+    Callback f = move(decoy_target);
+    f();
+    Callback g = forward(decoy_target);
+    g();
+}
+"#,
+    )
+    .unwrap();
+
+    // 2. C++: user-defined move/forward as well as std::move / ::std::move / std::forward
+    std::fs::write(
+        root.join("test_cpp.cpp"),
+        r#"
+namespace std {
+template <typename T>
+T&& move(T&& t) noexcept { return static_cast<T&&>(t); }
+template <typename T>
+T&& forward(T&& t) noexcept { return static_cast<T&&>(t); }
+}
+
+typedef void (*Callback)(void);
+void real_target_cpp(void) {}
+void decoy_target_cpp(void) {}
+Callback move(Callback ignored) { return real_target_cpp; }
+Callback forward(Callback ignored) { return real_target_cpp; }
+
+void entry_user_cpp(void) {
+    Callback f = move(decoy_target_cpp);
+    f();
+    Callback g = forward(decoy_target_cpp);
+    g();
+}
+
+void target_std(void) {}
+Callback make_std(void) { return target_std; }
+void consume_std(Callback cb) { cb(); }
+
+void entry_std_cpp(void) {
+    consume_std(std::move(make_std()));
+    consume_std(::std::move(make_std()));
+    consume_std(std::forward<Callback>(make_std()));
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &PreprocessOptions::new()).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    // Negative: user-defined move and forward calls must NOT be peeled down to decoy_target
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "entry_c",
+        "real_target",
+        ResolutionKind::Indirect
+    ));
+    assert!(!has_edge(
+        &program,
+        &analysis,
+        "entry_c",
+        "decoy_target",
+        ResolutionKind::Indirect
+    ));
+
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "entry_user_cpp",
+        "real_target_cpp",
+        ResolutionKind::Indirect
+    ));
+    assert!(!has_edge(
+        &program,
+        &analysis,
+        "entry_user_cpp",
+        "decoy_target_cpp",
+        ResolutionKind::Indirect
+    ));
+
+    // Positive: std::move and std::forward calls must unwrap and pass return flow
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "consume_std",
+        "target_std",
+        ResolutionKind::Indirect
+    ));
+}
+
+#[test]
+fn indirect_returned_call_preserves_variable_shadowing() {
+    let dir = temp_root("indirect_return_shadowing");
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("main.c"),
+        r#"
+typedef void (*Callback)(void);
+typedef Callback (*Factory)(void);
+void actual_target(void) {}
+void wrong_target(void) {}
+Callback actual_factory(void) { return actual_target; }
+Callback factory(void) { return wrong_target; }
+Callback wrap(void) {
+    Factory factory = actual_factory;
+    return (*factory)();
+}
+void entry(void) {
+    Callback cb = wrap();
+    cb();
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &PreprocessOptions::new()).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "entry",
+        "wrap",
+        ResolutionKind::Direct
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "wrap",
+        "actual_factory",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "entry",
+        "actual_target",
+        ResolutionKind::Indirect
+    ));
+    assert!(
+        !has_edge(
+            &program,
+            &analysis,
+            "entry",
+            "wrong_target",
+            ResolutionKind::Indirect
+        ),
+        "must not resolve through shadowed global function"
+    );
+    assert!(
+        !has_edge(
+            &program,
+            &analysis,
+            "wrap",
+            "wrong_target",
+            ResolutionKind::Direct
+        ),
+        "wrap must not call shadowed global function"
+    );
+}
+
+#[test]
+fn virtual_method_return_flow_in_nested_call_and_return() {
+    let dir = temp_root("virtual_member_return");
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("test.cpp"),
+        r#"
+typedef void (*Callback)(void);
+void service_target1(void) {}
+void service_target2(void) {}
+
+struct IService {
+    virtual Callback GetHandler() = 0;
+};
+
+struct ServiceImpl1 : public IService {
+    Callback GetHandler() override {
+        return service_target1;
+    }
+};
+
+struct ServiceImpl2 : public IService {
+    Callback GetHandler() override {
+        return service_target2;
+    }
+};
+
+void consume_handler(Callback f) {
+    f();
+}
+
+void entry_nested(IService *s) {
+    consume_handler(s->GetHandler());
+}
+
+void entry_assign(IService *s) {
+    Callback cb = s->GetHandler();
+    consume_handler(cb);
+}
+
+Callback return_passthrough(IService *s) {
+    return s->GetHandler();
+}
+
+void entry_return(IService *s) {
+    Callback cb = return_passthrough(s);
+    consume_handler(cb);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "consume_handler",
+        "service_target1",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "consume_handler",
+        "service_target2",
+        ResolutionKind::Indirect
+    ));
+}
+
+#[test]
+fn overloaded_member_methods_differing_arities_connect_correct_return() {
+    let dir = temp_root("overload_member_return");
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("test.cpp"),
+        r#"
+typedef void (*Callback)(void);
+void decoy_target(void) {}
+void real_target(void) {}
+
+struct OverloadedService {
+    void* Get(int a, int b) {
+        return (void*)decoy_target;
+    }
+    Callback Get() {
+        return real_target;
+    }
+};
+
+void consume_cb(Callback f) {
+    f();
+}
+
+void entry_nested_overload(OverloadedService *s) {
+    consume_cb(s->Get());
+}
+
+void entry_assign_overload(OverloadedService *s) {
+    Callback cb = s->Get();
+    consume_cb(cb);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "consume_cb",
+        "real_target",
+        ResolutionKind::Indirect
+    ));
+    assert!(
+        !has_edge(
+            &program,
+            &analysis,
+            "consume_cb",
+            "decoy_target",
+            ResolutionKind::Indirect
+        ),
+        "must not connect return flow from wrong-arity overload"
+    );
+}
+
+#[test]
+fn unresolvable_calls_do_not_leave_orphaned_ret_temps() {
+    let dir = temp_root("no_orphaned_temps");
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("test.cpp"),
+        r#"
+void entry(void* p) {
+    // Cast of an integer is not a resolvable call returning pointer
+    void* ptr = (void*)(0);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+    // Verify that every _ret temporary variable in the program is actually
+    // referenced in flow constraints or call sites.
+    for var in &program.symbols.variables {
+        if var.name.starts_with("_ret") {
+            let used_in_call_site = program.symbols.call_sites.iter().any(|cs| {
+                cs.return_dst == Some(var.id) || cs.var_args.iter().any(|(_, v)| *v == var.id)
+            });
+            let used_in_flow = program.flow.iter().any(|f| match f {
+                trace_ir::FlowConstraint::Copy { dst, src } => *dst == var.id || *src == var.id,
+                trace_ir::FlowConstraint::Store { dst, src } => *dst == var.id || *src == var.id,
+                trace_ir::FlowConstraint::CallReturn { dst, .. } => *dst == var.id,
+                trace_ir::FlowConstraint::CallReturnIndirect { dst, callee_var } => {
+                    *dst == var.id || *callee_var == var.id
+                }
+                _ => false,
+            });
+            assert!(
+                used_in_call_site || used_in_flow,
+                "orphaned _ret variable found: {:?}",
+                var.name
+            );
+        }
+    }
+}
+
+/// Separate calls assigning the same variable apply return models independently:
+/// a real return on one call does not suppress models on a subsequent bodyless call.
+#[test]
+fn multiple_calls_assigning_same_variable_apply_return_models_independently() {
+    let dir = temp_root("return_models_independent_calls");
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+typedef void (*Callback)();
+void target() {}
+struct S {
+    Callback *real() { Callback *empty = 0; return empty; }
+    Callback *external();
+    void entry() {
+        Callback *p = real();
+        p = external();
+        *p = target;
+        Callback cb = *p;
+        cb();
+    }
+};
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let models = trace_analysis::FnModelSet::from_toml_str(
+        r#"
+[[model]]
+name = "S::external"
+effects = [{ kind = "return_heap" }]
+"#,
+    )
+    .expect("parse toml");
+
+    let (pag, analysis) = trace_analysis::analyze_with_options(
+        &program,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            models: std::sync::Arc::new(models),
+            ..Default::default()
+        },
+    );
+
+    // Verify heap location S::external() storage exists
+    let has_heap_loc = pag
+        .locations
+        .iter()
+        .any(|loc| loc.desc.starts_with("S::external() storage"));
+    assert!(
+        has_heap_loc,
+        "expected heap location for S::external() storage"
+    );
+
+    // Verify indirect edge S::entry -> target
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "S::entry",
+            "target",
+            ResolutionKind::Indirect
+        ),
+        "expected indirect call edge from S::entry to target"
+    );
+}

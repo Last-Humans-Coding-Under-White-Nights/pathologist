@@ -715,6 +715,61 @@ impl Pag {
                 }
             }
         }
+        self.expand_call_site_returns(program, models);
+    }
+
+    /// Expand return flows for call sites that carry a `return_dst` (member
+    /// methods and virtual overrides, which do not pass through `CallReturn`).
+    ///
+    /// The visited set and real-return/model fallback decision are scoped to
+    /// each syntactic call (identified by its destination variable, caller, and
+    /// source occurrence), retaining candidate grouping only among overload or
+    /// virtual candidates of that specific call. This ensures a real return from
+    /// one call does not suppress return models for another call assigning the
+    /// same destination variable.
+    fn expand_call_site_returns(&mut self, program: &Program, models: &FnModelSet) {
+        let mut call_keys = Vec::new();
+        let mut by_call: FxHashMap<
+            (VarId, FnId, trace_ir::CallOccurrence),
+            Vec<&trace_ir::CallSite>,
+        > = FxHashMap::default();
+        for cs in &program.symbols.call_sites {
+            if cs.receiver_class.is_none() && !cs.args_bound_past_this {
+                continue;
+            }
+            if let Some(dst_var) = cs.return_dst {
+                let key = (dst_var, cs.caller, cs.occurrence());
+                let entry = by_call.entry(key).or_default();
+                if entry.is_empty() {
+                    call_keys.push(key);
+                }
+                entry.push(cs);
+            }
+        }
+        for (dst_var, caller, occurrence) in call_keys {
+            let sites = &by_call[&(dst_var, caller, occurrence)];
+            let dst_n = self.var_node_id(dst_var);
+            let mut visited = FxHashSet::default();
+            let mut any_real = false;
+            for cs in sites {
+                for callee in program.callees_of(cs) {
+                    if self.expand_return_flows(program, dst_n, callee, models, &mut visited) {
+                        any_real = true;
+                    }
+                }
+            }
+            if !any_real {
+                for cs in sites {
+                    if let Some(model) = models.get(&cs.callee_name) {
+                        let params = cs
+                            .callee_fn_id
+                            .map(|fid| program.symbols.function(fid).params.clone());
+                        self.apply_return_model(program, dst_n, model, params.as_deref());
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fn intern_string_loc(&mut self, program: &Program, value: &str) -> LocId {

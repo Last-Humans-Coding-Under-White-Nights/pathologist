@@ -1,5 +1,44 @@
 # Evaluation Report
 
+## Nested call return arguments — 2026-10-02
+
+Rules are maintained in [Return-value flow](ANALYSIS.md#return-value-flow).
+Both versions use the same pinned, clean HDF (`cdc75a2`), hiview (`92408e2`), and camera
+(`8ffd69d`) corpora from `scripts/eval_expected.json`, release builds, eight
+jobs, and the existing eval solver settings. Measurements were taken using
+`python3 scripts/eval_check.py --bin target/release/trace`.
+All 95/95 checks pass.
+
+When a function call's return value is passed directly as an argument to another call
+(`consume(make())`, `Register(obj->GetHandler())`, `consume(table[i]())`, `std::move(make())`),
+lowering now materializes a return temporary variable assigned via `CallReturn`, `CallReturnIndirect`, or member call return destinations
+and passes it as the actual argument into the outer call site. This restores parity between nested call
+argument expressions and equivalent code written with an intermediate temporary variable (`Callback f = make(); consume(f);`).
+Member calls preserve argument count and overload ranking (`rank_per_class`), and virtual dispatch across derived class overrides (`expand_virtual_overrides`) wires return flows from concrete derived implementations into member call return destinations via `Pag::expand_call_site_returns` (including pure virtual base interface declarations `= 0`). Only qualified `std::move` and `std::forward` calls with forwarding reference semantics (`T&&`) are peeled as cast expressions, preserving ordinary user-defined `move` and `forward` functions. Returned call expressions resolve through `resolve_call_for_return`, materializing indirect and member call returns into temporaries with `ReturnFlow::Copy` and preserving variable shadowing. Temporaries are allocated only after confirming resolution, eliminating orphaned variables in symbol tables.
+
+Across the evaluation corpora:
+- `arg_flow_edges` grows across all three corpora (+373 in HDF: 69,985 $\to$ 70,358; +844 in hiview: 20,085 $\to$ 20,929; +1,752 in camera: 49,728 $\to$ 51,480) because actual parameters from nested call returns are now connected to the callee's formal parameters.
+- `edges_indirect` increases by 2 in HDF (4,980 $\to$ 4,982), by 8 in hiview (178 $\to$ 186) and by 8 in camera (305 $\to$ 313) because returned callbacks and function pointers now flow through the receiving functions' parameters and returned calls to their indirect invocation sites.
+- `dlsym_edges` increases (+2 in HDF: 4 $\to$ 6; unchanged in hiview: 3; +5 in camera: 1 $\to$ 6) because `dlsym(...)` calls passed directly as arguments to wrapper or initialization functions now materialize `CallSite::return_dst` and propagate resolved symbols to their targets.
+
+| Corpus | Metric | Baseline | Candidate | Diff |
+|---|---|---:|---:|---:|
+| HDF | files | 1,483 | 1,483 | unchanged |
+| HDF | functions (defined / external) | 11,989 (10,290 / 1,699) | 11,996 (10,294 / 1,702) | inside tolerance |
+| HDF | call edges (dir / ind / ext / ipc) | 76,502 (47,845 / 4,980 / 23,677 / 0) | 76,532 (47,856 / 4,982 / 23,694 / 0) | +2 indirect edges |
+| HDF | arg-flow edges / diagnostics | 69,985 / 1,917 | 70,358 / 1,917 | +373 arg-flow edges |
+| HDF | dlsym edges | 4 | 6 | +2 dlsym edges |
+| hiview | files | 1,452 | 1,452 | unchanged |
+| hiview | functions (defined / external) | 9,674 (7,992 / 1,682) | 9,674 (7,992 / 1,682) | inside tolerance |
+| hiview | call edges (dir / ind / ext / ipc) | 32,623 (17,963 / 178 / 14,438 / 44) | 32,671 (18,003 / 186 / 14,438 / 44) | +8 indirect edges |
+| hiview | arg-flow edges / diagnostics | 20,085 / 3,573 | 20,929 / 3,573 | +844 arg-flow edges |
+| hiview | dlsym edges | 3 | 3 | unchanged |
+| camera | files | 1,703 | 1,703 | unchanged |
+| camera | functions (defined / external) | 23,461 (19,806 / 3,655) | 23,462 (19,806 / 3,656) | inside tolerance |
+| camera | call edges (dir / ind / ext / ipc) | 111,520 (66,885 / 305 / 43,522 / 808) | 111,530 (66,885 / 313 / 43,524 / 808) | +8 indirect edges |
+| camera | arg-flow edges / diagnostics | 49,728 / 5,046 | 51,480 / 5,046 | +1,752 arg-flow edges |
+| camera | dlsym edges | 1 | 6 | +5 dlsym edges |
+
 ## DelayedRefSingleton receivers: #184 — 2026-10-02
 
 c_utils' third singleton template, `DelayedRefSingleton<T>`, whose

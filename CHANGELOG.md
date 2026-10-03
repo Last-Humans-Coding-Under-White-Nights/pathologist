@@ -4,6 +4,10 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Return-value flow for nested call arguments (#185)
+
+When a function call's return value is passed directly as an argument into another call (`consume(make())`, `Register(obj->GetHandler())`, `consume(table[i]())`, `std::move(make())`), lowering now materializes a return temporary variable assigned via `CallReturn`, `CallReturnIndirect`, or member call return destinations and passes it as the actual argument into the outer call site. This restores parity between nested call arguments and equivalent code using intermediate variables (`Callback f = make(); consume(f);`), propagating return points-to into formal parameters and enabling indirect resolution across direct, static, indirect, member, deeper-nested, and `std::move`-wrapped calls, both within a translation unit and across units. Member calls preserve argument count and overload ranking (`rank_per_class`), and virtual dispatch across derived class overrides (`expand_virtual_overrides`) wires return flows from concrete derived implementations into member call return destinations via `Pag::expand_call_site_returns` (including pure virtual base interface declarations `= 0`). Only qualified `std::move` and `std::forward` calls with forwarding reference semantics (`T&&`) are peeled as cast expressions, preserving ordinary user-defined `move` and `forward` functions. Returned call expressions resolve through `resolve_call_for_return`, materializing indirect and member call returns into temporaries with `ReturnFlow::Copy` and preserving variable shadowing. Temporaries are allocated only after confirming resolution, eliminating orphaned variables in symbol tables. Rules: [Return-value flow](docs/ANALYSIS.md#return-value-flow); measurements in `docs/EVAL_REPORT.md` ("Nested call return arguments").
+
 ### Memory footprint reductions across preprocessor, indexing, and analysis
 
 Comprehensive memory reduction optimizations were implemented across data structures and pipeline stages:
