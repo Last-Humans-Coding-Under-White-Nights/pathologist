@@ -1,5 +1,6 @@
 use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Maps output byte offsets back to original source locations.
 ///
@@ -10,9 +11,9 @@ pub struct LineMap {
     /// Interned origin paths; entry `file` indexes into this vec.
     pub files: Vec<PathBuf>,
     /// Interned macro names; entry `expansion_macro` indexes into this vec.
-    pub macros: Vec<String>,
+    pub macros: Vec<Arc<str>>,
     #[doc(hidden)]
-    macro_indices: FxHashMap<String, u32>,
+    macro_indices: FxHashMap<Arc<str>, u32>,
     pub entries: Vec<LineMapEntry>,
 }
 
@@ -51,12 +52,12 @@ impl LineMap {
     #[must_use]
     pub fn from_raw_parts(
         files: Vec<PathBuf>,
-        macros: Vec<String>,
+        macros: Vec<Arc<str>>,
         entries: Vec<LineMapEntry>,
     ) -> Self {
         let mut macro_indices = FxHashMap::default();
         for (idx, m) in macros.iter().enumerate() {
-            macro_indices.insert(m.clone(), idx as u32);
+            macro_indices.insert(Arc::clone(m), idx as u32);
         }
         Self {
             files,
@@ -82,15 +83,35 @@ impl LineMap {
         }
         if self.macro_indices.is_empty() && !self.macros.is_empty() {
             for (idx, m) in self.macros.iter().enumerate() {
-                self.macro_indices.insert(m.clone(), idx as u32);
+                self.macro_indices.insert(Arc::clone(m), idx as u32);
             }
             if let Some(&pos) = self.macro_indices.get(name) {
                 return pos;
             }
         }
         let pos = self.macros.len() as u32;
-        self.macros.push(name.to_string());
-        self.macro_indices.insert(name.to_string(), pos);
+        let arc: Arc<str> = Arc::from(name);
+        self.macros.push(Arc::clone(&arc));
+        self.macro_indices.insert(arc, pos);
+        pos
+    }
+
+    /// Intern an existing Arc macro name without allocating.
+    pub fn intern_macro_arc(&mut self, name: &Arc<str>) -> u32 {
+        if let Some(&pos) = self.macro_indices.get(name.as_ref()) {
+            return pos;
+        }
+        if self.macro_indices.is_empty() && !self.macros.is_empty() {
+            for (idx, m) in self.macros.iter().enumerate() {
+                self.macro_indices.insert(Arc::clone(m), idx as u32);
+            }
+            if let Some(&pos) = self.macro_indices.get(name.as_ref()) {
+                return pos;
+            }
+        }
+        let pos = self.macros.len() as u32;
+        self.macros.push(Arc::clone(name));
+        self.macro_indices.insert(Arc::clone(name), pos);
         pos
     }
 
@@ -143,7 +164,7 @@ impl LineMap {
     #[must_use]
     pub fn expansion_macro_of(&self, entry: &LineMapEntry) -> Option<&str> {
         (entry.expansion_macro != u32::MAX)
-            .then(|| self.macros[entry.expansion_macro as usize].as_str())
+            .then(|| self.macros[entry.expansion_macro as usize].as_ref())
     }
 
     #[must_use]
@@ -187,7 +208,7 @@ impl LineMap {
             if e.expansion_macro != u32::MAX && macro_remap[e.expansion_macro as usize] == u32::MAX
             {
                 macro_remap[e.expansion_macro as usize] =
-                    out.intern_macro(&self.macros[e.expansion_macro as usize]);
+                    out.intern_macro_arc(&self.macros[e.expansion_macro as usize]);
             }
         }
         let entries = self.entries[idx..]
@@ -238,7 +259,11 @@ impl LineMap {
     /// Append `other`'s entries shifted by `offset`, renumbering its file
     /// indices through `remap` (indexed by `other`'s file table).
     pub fn splice(&mut self, other: &LineMap, offset: usize, remap: &[u32]) {
-        let macro_remap: Vec<u32> = other.macros.iter().map(|m| self.intern_macro(m)).collect();
+        let macro_remap: Vec<u32> = other
+            .macros
+            .iter()
+            .map(|m| self.intern_macro_arc(m))
+            .collect();
         for e in &other.entries {
             self.entries.push(LineMapEntry {
                 output_offset: e.output_offset + offset as u32,
@@ -317,7 +342,7 @@ impl LineMap {
             if e.expansion_macro != u32::MAX && macro_remap[e.expansion_macro as usize] == u32::MAX
             {
                 macro_remap[e.expansion_macro as usize] =
-                    self.intern_macro(&other.macros[e.expansion_macro as usize]);
+                    self.intern_macro_arc(&other.macros[e.expansion_macro as usize]);
             }
             self.entries.push(LineMapEntry {
                 output_offset: (e.output_offset as usize - range.start + offset) as u32,

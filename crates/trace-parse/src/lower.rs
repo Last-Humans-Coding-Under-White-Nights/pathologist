@@ -230,20 +230,44 @@ impl LowerContext {
     }
 
     fn namespace_scope(&self) -> String {
-        let mut scope = String::new();
+        let mut len = 0;
+        let mut first = true;
+        for s in self.ns_stack.iter().flatten() {
+            if !first {
+                len += 2;
+            }
+            len += s.len();
+            first = false;
+        }
+        let mut scope = String::with_capacity(len);
+        first = true;
         for segment in self.ns_stack.iter().flatten() {
-            if !scope.is_empty() {
+            if !first {
                 scope.push_str("::");
             }
             scope.push_str(segment);
+            first = false;
         }
         scope
     }
 
     fn qualify(&self, name: &str) -> String {
-        let mut parts: Vec<String> = self.ns_stack.iter().flatten().cloned().collect();
-        parts.push(name.to_string());
-        parts.join("::")
+        let mut len = name.len();
+        let mut count = 0;
+        for s in self.ns_stack.iter().flatten() {
+            len += s.len() + 2;
+            count += 1;
+        }
+        if count == 0 {
+            return name.to_string();
+        }
+        let mut res = String::with_capacity(len);
+        for s in self.ns_stack.iter().flatten() {
+            res.push_str(s);
+            res.push_str("::");
+        }
+        res.push_str(name);
+        res
     }
 
     /// Qualify a declared function name with the enclosing class / namespace:
@@ -255,7 +279,12 @@ impl LowerContext {
     /// prototypes so header-parsed declarations register the same qualified
     /// name a later out-of-line definition does.
     fn qualify_decl(&self, raw_name: &str) -> String {
-        canonicalize_conversion_target(&self.qualify_decl_spelling(raw_name))
+        let spelled = self.qualify_decl_spelling(raw_name);
+        if spelled.contains("operator ") {
+            canonicalize_conversion_target(&spelled).into_owned()
+        } else {
+            spelled
+        }
     }
 
     fn qualify_decl_spelling(&self, raw_name: &str) -> String {
@@ -4093,10 +4122,13 @@ fn register_class_prototypes(
             .chain(using_names.iter().map(String::as_str)),
     );
     for (&m, function) in members.iter().zip(&functions) {
+        let template = i32::from(m.cached_kind() == "template_declaration");
         // A member class registers its own members under its own spelling.
         if let Some(spec) = member_class_definition(m) {
             if let Some(tag) = member_class_tag(ctx, source, spec) {
+                ctx.step_template(template);
                 register_class_prototypes(program, ctx, source, spec, &tag.spelling);
+                ctx.step_template(-template);
             }
             continue;
         }
@@ -4115,8 +4147,10 @@ fn register_class_prototypes(
             _ => false,
         };
         if prototype {
+            ctx.step_template(template);
             let overload = overloaded.contains(name.as_str());
             register_member_prototype(program, ctx, source, *decl, cls_qual, name, overload);
+            ctx.step_template(-template);
         }
     }
     ctx.type_scope.borrow_mut().pop();
@@ -4752,7 +4786,12 @@ fn register_member_prototype(
     if short.is_empty() || short == "operator" {
         return;
     }
-    let full_name = canonicalize_conversion_target(&format!("{}::{}", cls_qual, short));
+    let full_name = format!("{}::{}", cls_qual, short);
+    let full_name = if full_name.contains("operator ") {
+        canonicalize_conversion_target(&full_name).into_owned()
+    } else {
+        full_name
+    };
     if short == "operator->" {
         register_arrow_return(program, ctx, source, node, cls_qual);
     }
@@ -6155,7 +6194,7 @@ fn call_result_among(
     // A member of a template parameter -- the receiver's class (`T *t`), the
     // scope (`T::make()`) or a base (`struct M : Base`) -- has no declaration
     // yet, even when a real class shares the parameter's spelling.
-    if ctx.has_templates {
+    if ctx.has_templates && ctx.template_depth.get() > 0 {
         let mut enclosing: Option<Vec<Node>> = None;
         if candidates.iter().any(|&f| {
             let Some((owner, _)) = program.symbols.function(f).name.rsplit_once("::") else {
@@ -6812,6 +6851,7 @@ fn spelling_mentions(spelling: &str, from: Spelling, name: &str) -> bool {
 /// Check names in all enclosing template parameter lists.
 fn return_is_dependent(ctx: &LowerContext, source: &str, node: Node) -> bool {
     ctx.has_templates
+        && ctx.template_depth.get() > 0
         && return_is_dependent_under(source, &ancestors(ctx, node).collect::<Vec<_>>(), node)
 }
 
@@ -6888,7 +6928,9 @@ fn spelling_is_dependent(
     spelling: &str,
     from: Spelling,
 ) -> bool {
-    ctx.has_templates && mentions_template_parameter(source, ancestors(ctx, node), spelling, from)
+    ctx.has_templates
+        && ctx.template_depth.get() > 0
+        && mentions_template_parameter(source, ancestors(ctx, node), spelling, from)
 }
 
 fn type_is_dependent(ctx: &LowerContext, source: &str, node: Node, desc: &TypeDesc) -> bool {
@@ -7065,7 +7107,7 @@ fn declared_return_type(
         .cached_field("declarator")
         .and_then(fn_decl_under_pointer)
         .map_or(0, |(_, depth, _)| depth);
-    if !ctx.has_templates {
+    if !ctx.has_templates || ctx.template_depth.get() == 0 {
         return pointer_layers(program, base, depth);
     }
     // One ancestor walk answers both questions the enclosing templates
@@ -8697,8 +8739,8 @@ fn collect_call_at_node_inner(
     // unqualified external stub (`OnEvent` vs `Plugin::OnEvent`).
     // Function-local using-declarations shadow enclosing class members.
     if ctx.is_cpp && func.cached_kind() == "identifier" {
-        if let Some(cls) = ctx.class_ctx.as_ref().map(|c| c.qual_name.clone()) {
-            let cls = receiver_lookup_name(&cls).into_owned();
+        if let Some(cls_ctx) = &ctx.class_ctx {
+            let cls = receiver_lookup_name(&cls_ctx.qual_name).into_owned();
             let short = strip_template_args(&normalize_qualified(node_text(source, &func)));
             if lookup_var(ctx, program, &short).is_none()
                 && !ctx
@@ -15448,10 +15490,10 @@ fn normalize_declared_name(raw_name: &str) -> String {
 /// there are both halves known: an in-class declaration learns its class from
 /// `register_member_prototype`, an out-of-class definition carries it in the
 /// spelling itself.
-fn canonicalize_conversion_target(name: &str) -> String {
+fn canonicalize_conversion_target(name: &str) -> std::borrow::Cow<'_, str> {
     let scope = scope_part(name);
     let Some(target) = name[scope.len()..].strip_prefix("operator ") else {
-        return name.to_string();
+        return std::borrow::Cow::Borrowed(name);
     };
     // Every qualification the author could have elided, longest first. From
     // inside `a::b::H` a type `a::b::H::T` may be written `T`, `H::T`,
@@ -15473,7 +15515,7 @@ fn canonicalize_conversion_target(name: &str) -> String {
     // alike, each position taking the longest prefix that applies to it, and
     // each deciding its own leading `::` by the same rule.
     let target = strip_own_scopes(target, &prefixes);
-    format!("{scope}operator {target}")
+    std::borrow::Cow::Owned(format!("{scope}operator {target}"))
 }
 
 /// Drop, from every qualified name inside `text`, the longest of `prefixes`
@@ -16965,7 +17007,7 @@ mod conversion_target_properties {
     }
 
     fn canonical(member_scope: &str, target: &str) -> String {
-        canonicalize_conversion_target(&format!("{member_scope}::operator {target}"))
+        canonicalize_conversion_target(&format!("{member_scope}::operator {target}")).into_owned()
     }
 
     const MEMBER_SCOPES: [&str; 4] = ["C", "n::H", "a::b::H", "a::b::c::H"];

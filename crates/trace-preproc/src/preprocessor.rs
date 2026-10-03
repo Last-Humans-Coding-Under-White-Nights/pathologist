@@ -191,7 +191,7 @@ struct PreprocessorState {
     /// `insert_macro` / `remove_macro`. A read hook that hashed a
     /// replacement list on every identifier occurrence would charge the
     /// header's whole token stream for each of its macros.
-    macro_hashes: FxHashMap<String, u64>,
+    macro_hashes: FxHashMap<Arc<str>, u64>,
     /// Set once a run-wide limit (output cap, token budget, include depth)
     /// has cut an expansion short. Everything composed from here on is
     /// missing content, so nothing further may be published to the shared
@@ -952,10 +952,31 @@ impl PreprocessorState {
     }
 
     fn paint_replacement(tokens: &[Token], origin: &Token, name: &str) -> Vec<Token> {
-        tokens
-            .iter()
-            .map(|t| t.with_macro_hide(origin, name))
-            .collect()
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        let first_sf = tokens[0].spelling_file().cloned();
+        let uniform = tokens.iter().all(|t| {
+            t.hidden().is_none() && t.expansion_id() == 0 && t.spelling_file() == first_sf.as_ref()
+        });
+        if uniform {
+            let prov = Token::make_macro_provenance(origin, name, first_sf);
+            tokens
+                .iter()
+                .map(|t| Token {
+                    kind: t.kind.clone(),
+                    line: t.line,
+                    col: t.col,
+                    adjacent_before: t.adjacent_before,
+                    macro_prov: Some(Arc::clone(&prov)),
+                })
+                .collect()
+        } else {
+            tokens
+                .iter()
+                .map(|t| t.with_macro_hide(origin, name))
+                .collect()
+        }
     }
 
     /// Intern a path into the line-map file table (no-op if present).
@@ -979,7 +1000,7 @@ impl PreprocessorState {
         if let Some(&id) = self.lm_macros.get(name) {
             return id;
         }
-        let id = self.line_map.intern_macro(name);
+        let id = self.line_map.intern_macro_arc(name);
         self.lm_macros.insert(Arc::clone(name), id);
         id
     }
@@ -4355,13 +4376,30 @@ fn substitute_macro(
         "a variadic MacroDef must name its tail parameter \
          (\"__VA_ARGS__\" for the anonymous form; see parse_macro_param_list)"
     );
+    let shared_body_prov = if !body.is_empty() {
+        let first_sf = body[0].spelling_file().cloned();
+        let uniform = body.iter().all(|t| {
+            t.hidden().is_none() && t.expansion_id() == 0 && t.spelling_file() == first_sf.as_ref()
+        });
+        if uniform {
+            Some(Token::make_macro_provenance(origin, macro_name, first_sf))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     // Conditional expressions pass None because they rescan raw arguments;
     // emitted-source expansion passes its prescan result.
-    let active_hidden = expanded_args.map(|_| {
-        let mut hidden = origin.hidden().map(|h| (**h).clone()).unwrap_or_default();
-        hidden.insert(macro_name.to_string());
-        Arc::new(hidden)
-    });
+    let active_hidden = if let Some(ref prov) = shared_body_prov {
+        expanded_args.and_then(|_| prov.hidden.clone())
+    } else {
+        expanded_args.map(|_| {
+            let mut hidden = origin.hidden().map(|h| (**h).clone()).unwrap_or_default();
+            hidden.insert(Arc::from(macro_name));
+            Arc::new(hidden)
+        })
+    };
     let expanded_args = expanded_args.unwrap_or(args);
     let mut out: Vec<Token> = Vec::new();
     // Whitespace owed to the next token emitted: a parameter that had
@@ -4515,8 +4553,19 @@ fn substitute_macro(
         }
         // Replacement-list tokens (not from arguments) inherit the hide set,
         // and their own adjacency unless they survived a placemarker paste.
-        let mut token = body[i].with_macro_hide(origin, macro_name);
-        token.adjacent_before = adjacency;
+        let token = if let Some(ref prov) = shared_body_prov {
+            Token {
+                kind: body[i].kind.clone(),
+                line: body[i].line,
+                col: body[i].col,
+                adjacent_before: adjacency,
+                macro_prov: Some(Arc::clone(prov)),
+            }
+        } else {
+            let mut token = body[i].with_macro_hide(origin, macro_name);
+            token.adjacent_before = adjacency;
+            token
+        };
         push_substituted(&mut out, &mut gap, token);
         i += 1;
     }
@@ -4969,19 +5018,19 @@ struct MacroEnv<'a> {
     fallbacks: &'a FxHashSet<String>,
     /// Memoized `hash_macro_binding` per name, invalidated by `insert_macro`
     /// / `remove_macro`.
-    hashes: &'a mut FxHashMap<String, u64>,
+    hashes: &'a mut FxHashMap<Arc<str>, u64>,
 }
 
 impl MacroEnv<'_> {
     /// Content hash of what `name` is currently bound to, or `None` when it
     /// is unbound.
     fn binding_hash(&mut self, name: &str) -> Option<u64> {
-        let def = self.macros.get(name)?;
+        let (name_arc, def) = self.macros.get_key_value(name)?;
         if let Some(h) = self.hashes.get(name) {
             return Some(*h);
         }
         let h = hash_macro_binding(def.as_ref(), self.fallbacks.contains(name));
-        self.hashes.insert(name.to_string(), h);
+        self.hashes.insert(Arc::clone(name_arc), h);
         Some(h)
     }
 

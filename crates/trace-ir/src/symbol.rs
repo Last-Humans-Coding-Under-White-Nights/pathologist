@@ -2643,18 +2643,20 @@ impl SymbolTable {
     /// under it. Other internal-linkage functions live in the per-file scope
     /// table and are not consulted.
     pub fn functions_named(&self, name: &str) -> Vec<FnId> {
-        let internal = self
-            .internal_members_by_name
-            .get(name)
-            .into_iter()
-            .flatten();
-        self.externals_by_name
-            .get(name)
-            .into_iter()
-            .flatten()
-            .chain(internal)
-            .copied()
-            .collect()
+        let ext = self.externals_by_name.get(name);
+        match self.internal_members_by_name.get(name) {
+            None => ext.cloned().unwrap_or_default(),
+            Some(internal) if internal.is_empty() => ext.cloned().unwrap_or_default(),
+            Some(internal) => match ext {
+                None => internal.clone(),
+                Some(ext) => {
+                    let mut res = Vec::with_capacity(ext.len() + internal.len());
+                    res.extend_from_slice(ext);
+                    res.extend_from_slice(internal);
+                    res
+                }
+            },
+        }
     }
 
     /// Whether [`functions_named`](Self::functions_named) finds any entry,

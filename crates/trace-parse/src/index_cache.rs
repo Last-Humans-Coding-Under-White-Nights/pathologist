@@ -109,7 +109,7 @@ struct SpilledSource {
     text_len: usize,
     entry_count: usize,
     origin_files: Vec<PathBuf>,
-    origin_macros: Vec<String>,
+    origin_macros: Vec<Arc<str>>,
 }
 
 impl SpilledSource {

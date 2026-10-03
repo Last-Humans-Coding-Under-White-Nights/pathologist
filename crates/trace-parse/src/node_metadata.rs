@@ -8,6 +8,22 @@ struct GrammarMetadata {
     language: Language,
     kinds: Vec<Option<&'static str>>,
     fields: FxHashMap<&'static str, u16>,
+    f_declarator: Option<u16>,
+    f_type: Option<u16>,
+    f_name: Option<u16>,
+    f_argument: Option<u16>,
+    f_arguments: Option<u16>,
+    f_function: Option<u16>,
+    f_field: Option<u16>,
+    f_body: Option<u16>,
+    f_parameters: Option<u16>,
+    f_value: Option<u16>,
+    f_operator: Option<u16>,
+    f_expression: Option<u16>,
+    f_left: Option<u16>,
+    f_right: Option<u16>,
+    f_scope: Option<u16>,
+    f_default_type: Option<u16>,
 }
 
 impl GrammarMetadata {
@@ -15,13 +31,45 @@ impl GrammarMetadata {
         let kinds = (0..language.node_kind_count() as u16)
             .map(|id| language.node_kind_for_id(id))
             .collect();
-        let fields = (1..=language.field_count() as u16)
+        let fields: FxHashMap<&'static str, u16> = (1..=language.field_count() as u16)
             .filter_map(|id| Some((language.field_name_for_id(id)?, id)))
             .collect();
+        let f_declarator = fields.get("declarator").copied();
+        let f_type = fields.get("type").copied();
+        let f_name = fields.get("name").copied();
+        let f_argument = fields.get("argument").copied();
+        let f_arguments = fields.get("arguments").copied();
+        let f_function = fields.get("function").copied();
+        let f_field = fields.get("field").copied();
+        let f_body = fields.get("body").copied();
+        let f_parameters = fields.get("parameters").copied();
+        let f_value = fields.get("value").copied();
+        let f_operator = fields.get("operator").copied();
+        let f_expression = fields.get("expression").copied();
+        let f_left = fields.get("left").copied();
+        let f_right = fields.get("right").copied();
+        let f_scope = fields.get("scope").copied();
+        let f_default_type = fields.get("default_type").copied();
         Self {
             language,
             kinds,
             fields,
+            f_declarator,
+            f_type,
+            f_name,
+            f_argument,
+            f_arguments,
+            f_function,
+            f_field,
+            f_body,
+            f_parameters,
+            f_value,
+            f_operator,
+            f_expression,
+            f_left,
+            f_right,
+            f_scope,
+            f_default_type,
         }
     }
 
@@ -69,7 +117,28 @@ impl<'tree> NodeMetadata<'tree> for Node<'tree> {
     #[inline]
     fn cached_field(&self, name: &str) -> Option<Node<'tree>> {
         match metadata(self) {
-            Some(m) => self.child_by_field_id(*m.fields.get(name)?),
+            Some(m) => {
+                let id = match name {
+                    "declarator" => m.f_declarator,
+                    "type" => m.f_type,
+                    "name" => m.f_name,
+                    "argument" => m.f_argument,
+                    "arguments" => m.f_arguments,
+                    "function" => m.f_function,
+                    "field" => m.f_field,
+                    "body" => m.f_body,
+                    "parameters" => m.f_parameters,
+                    "value" => m.f_value,
+                    "operator" => m.f_operator,
+                    "expression" => m.f_expression,
+                    "left" => m.f_left,
+                    "right" => m.f_right,
+                    "scope" => m.f_scope,
+                    "default_type" => m.f_default_type,
+                    _ => m.fields.get(name).copied(),
+                }?;
+                self.child_by_field_id(id)
+            }
             None => self.child_by_field_name(name),
         }
     }

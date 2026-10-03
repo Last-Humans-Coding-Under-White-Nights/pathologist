@@ -33,7 +33,7 @@ pub enum TokenKind {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TokenMacroProvenance {
-    pub(crate) hidden: Option<Arc<FxHashSet<String>>>,
+    pub(crate) hidden: Option<Arc<FxHashSet<Arc<str>>>>,
     pub(crate) origin: Option<(u32, u32)>,
     pub(crate) expansion_id: u64,
     pub(crate) expansion_macro: Option<Arc<str>>,
@@ -63,7 +63,7 @@ impl Token {
 
     #[inline]
     #[must_use]
-    pub(crate) fn hidden(&self) -> Option<&Arc<FxHashSet<String>>> {
+    pub(crate) fn hidden(&self) -> Option<&Arc<FxHashSet<Arc<str>>>> {
         self.macro_prov.as_ref().and_then(|p| p.hidden.as_ref())
     }
 
@@ -137,6 +137,33 @@ impl Token {
         self.hidden().is_some_and(|h| h.contains(name))
     }
 
+    /// Precompute shared provenance for replacement-list tokens that have no
+    /// preexisting hide set, expansion ID, or distinct spelling file.
+    #[must_use]
+    pub(crate) fn make_macro_provenance(
+        origin: &Token,
+        name: &str,
+        spelling_file: Option<Arc<PathBuf>>,
+    ) -> Arc<TokenMacroProvenance> {
+        let mut set = FxHashSet::default();
+        if let Some(h) = origin.hidden() {
+            set.extend(h.iter().cloned());
+        }
+        set.insert(Arc::from(name));
+        let expansion_macro = origin
+            .expansion_macro()
+            .cloned()
+            .or_else(|| Some(Arc::from(name)));
+        let expansion_id = expansion_fingerprint(origin, name, None, 0);
+        Arc::new(TokenMacroProvenance {
+            hidden: Some(Arc::new(set)),
+            origin: Some(origin.expansion_site()),
+            expansion_id,
+            expansion_macro,
+            spelling_file,
+        })
+    }
+
     /// Paint this replacement-list token with the invoking token's hide set
     /// plus `name` so the macro is not re-expanded (C11 6.10.3.4), and with
     /// the invocation's expansion site. `origin` may itself be a painted
@@ -151,7 +178,7 @@ impl Token {
         if let Some(h) = self.hidden() {
             set.extend(h.iter().cloned());
         }
-        set.insert(name.to_string());
+        set.insert(Arc::from(name));
         let expansion_macro = origin
             .expansion_macro()
             .cloned()
@@ -182,7 +209,7 @@ impl Token {
         origin: &Token,
         macro_name: &str,
         parameter: &Token,
-        active_hidden: Option<&Arc<FxHashSet<String>>>,
+        active_hidden: Option<&Arc<FxHashSet<Arc<str>>>>,
     ) -> Token {
         let mut token = self.clone();
         // Argument prescan must see same-name macros normally. Only after
@@ -216,7 +243,7 @@ impl Token {
     }
 
     #[must_use]
-    pub(crate) fn union_hidden(left: &Token, right: &Token) -> Option<Arc<FxHashSet<String>>> {
+    pub(crate) fn union_hidden(left: &Token, right: &Token) -> Option<Arc<FxHashSet<Arc<str>>>> {
         match (left.hidden(), right.hidden()) {
             (None, None) => None,
             (Some(x), None) | (None, Some(x)) => Some(Arc::clone(x)),
