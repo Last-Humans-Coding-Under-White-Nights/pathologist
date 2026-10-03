@@ -1,5 +1,105 @@
 # Evaluation Report
 
+## Automatic object lifecycle: #186 — 2026-10-03
+
+Constructors and destructors of automatic C++ objects now reach the call
+graph, under the rules in
+[Automatic objects](ANALYSIS.md#automatic-objects). Baseline is `6810db2` (master), built in a
+scratch worktree of that revision; both sides use the pinned, clean HDF
+(`cdc75a2`), hiview (`92408e2`) and camera (`8ffd69d`) corpora, release
+builds, eight jobs and `TRACE_SOLVE_BUDGET_POPS=800000`, following
+[Attributing a change](#attributing-a-change-baseline-vs-branch). The
+baseline passes the old expectations (95 checks, 0 failures); the candidate
+passes the re-captured ones (95 checks, 0 failures). Diagnostics, indirect,
+IPC and dlsym edges are unchanged on all three corpora.
+
+| Corpus | Metric | Baseline (`6810db2`) | Candidate | Diff |
+|---|---|---:|---:|---:|
+| HDF | call edges (total) | 76,532 | 76,925 | +393 |
+| HDF | ctor / dtor edges | 411 / 29 | 418 / 334 | +7 / +305 |
+| HDF | other edges | 76,092 | 76,173 | +81 |
+| HDF | external edges | 23,694 | 23,727 | +33 |
+| HDF | arg-flow edges | 70,420 | 70,776 | +356 |
+| hiview | call edges (total) | 32,671 | 33,562 | +891 |
+| hiview | ctor / dtor edges | 1,782 / 18 | 2,035 / 525 | +253 / +507 |
+| hiview | other edges | 30,871 | 31,002 | +132 / -1 |
+| hiview | external edges | 14,438 | 14,475 | +37 |
+| hiview | functions (external) | 9,674 (1,682) | 9,675 (1,683) | +1 (+1) |
+| hiview | arg-flow edges | 20,929 | 22,016 | +1,087 |
+| camera | call edges (total) | 111,530 | 111,886 | +356 |
+| camera | ctor / dtor edges | 5,557 / 134 | 5,563 / 235 | +6 (+22, -16) / +101 |
+| camera | other edges | 105,839 | 106,088 | +250 / -1 |
+| camera | external edges | 43,524 | 43,568 | +44 |
+| camera | functions (external) | 23,462 (3,656) | 23,457 (3,651) | -5 (-5) |
+| camera | arg-flow edges | 51,480 | 51,928 | +448 |
+
+Ctor and dtor edges are counted by callee name (`C::C`, `C::~C`). The
+largest contributors are HDF's `OHOS::HDI::AutoPtr` (212) and
+`StringBuilder` (85) locals; hiview's `WatchPoint` (75), `EventStore::Cond`
+(62), `HiviewContext` (58) and `CollectResult` (55); and camera's
+`CameraXCollie` scope guards (21) and `DeferredProcessing::VideoRecord`
+(17). Camera's `MetadataBuffer_RetainsWrappedData` test reaches
+`~UnifiedPipelineBufferWrapper` because its `UnifiedPipelineMetadataBuffer`
+local's base declares `virtual ~UnifiedPipelineBuffer() = default`, which
+runs its own bases'. A local's sites take no virtual dispatch, so no
+subclass's destructor is counted: dispatching them as `delete p` is would
+add 60 hiview and 3 camera destructor edges.
+
+The other edges move with range-for and catch variables, lowered and typed
+under [Automatic objects](ANALYSIS.md#automatic-objects). A declared class
+type resolves the calls through one: `catch (const std::logic_error &e) {
+e.what(); }` reaches `std::logic_error::what` (with
+`std::invalid_argument::what`), and camera's `for (Profile &profile :
+photoProfile_)` binds `Profile`'s members. A placeholder one takes its
+range's element class, fields included: camera's `for (auto &profile :
+profiles) profile.GetSize()` (`GetSize`, `GetCameraFormat`), HDF's loops over
+`AutoPtr` members (`~AutoPtr`), and hiview's
+`RawDataBuilder::InitValueParams`, whose `for (const auto &param : params)`
+keeps its `GetDataCodedType` overrides. The baseline reached those
+overrides only through the same-named lambda parameters leaking into the
+function's scope, which no longer happens. Taking an element type from a
+spelling the unit has no class for (`std::vector<int32_t>`,
+`std::vector<T>`) misresolved receivers elsewhere in a trial: one camera
+test body lost 58 edges.
+
+All baseline edges the candidate drops are precision gains:
+
+- hiview's `EventReporter::ReportEvent` calls through its loop variable
+  `for (auto& func : listeners) func(...)`, which the baseline bound to a
+  made-up external function `func` (the removed hiview function).
+- Camera's `GetSupportedPreviewSizeRangeFromProfileLevel` passes a
+  now-typed `StreamInfo &` loop variable, so overload ranking keeps only
+  `FillSizeListFromStreamInfo(vector<Size> &, const StreamInfo &, ...)`
+  and drops the `StreamRelatedInfo` overload.
+- Camera's 12 removed ctor edges from member initializers such as
+  `ApertureInfoChangedCallback`'s went to `anon_N::anon_N`: made-up
+  constructors of anonymous structs, which have no nameable constructor.
+  Member initializers now take their class the way locals do, so the five
+  invented external functions are gone.
+- Camera's 4 removed `SceneFeaturesMode::SceneFeaturesMode` edges came from
+  `SceneFeaturesMode x{};` in `SketchWrapper` and a test: empty braces
+  value-initialize as `T x;` does, and the class's `SceneFeaturesMode()` is
+  `= default`, so no user-provided constructor runs.
+
+The arg-flow growth is the constructors' and destructors' `this` binding
+the local, and calls passing a range-for or catch variable, which now
+record the variable as their actual (`param`, `node`, `item`, camera's
+`nextFilter`).
+
+Analyze cost: alternating runs per binary (five on hiview, seven on camera),
+wall time of `trace analyze --jobs 8` (median, seconds; min–max in
+parentheses; the `analyze` phase itself prints 0.0 s on hiview and 0.1 s on
+camera on both sides):
+
+| Corpus | Baseline | Candidate | Diff |
+|---|---:|---:|---:|
+| hiview | 1.65 (1.61–1.68) | 1.65 (1.64–1.69) | 0.00 |
+| camera | 6.63 (6.57–6.82) | 6.69 (6.53–6.79) | +0.06 |
+
+The added work is a member lookup per class-typed local and the lowering of
+range-for and catch variables, a few hundred sites against tens of
+thousands; the difference is within run-to-run spread.
+
 ## Nested call return arguments — 2026-10-02
 
 Rules are maintained in [Return-value flow](ANALYSIS.md#return-value-flow).

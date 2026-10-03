@@ -2081,6 +2081,7 @@ mod tests {
             occurrence: None,
             is_direct: true,
             receiver_class: None,
+            exact_receiver: false,
             return_dst: None,
             tu: None,
         };
@@ -2203,6 +2204,7 @@ mod tests {
                     occurrence: None,
                     is_direct: true,
                     receiver_class: None,
+                    exact_receiver: false,
                     return_dst: None,
                     tu: None,
                 }],
@@ -2563,6 +2565,7 @@ mod tests {
                     occurrence: None,
                     is_direct: false,
                     receiver_class: None,
+                    exact_receiver: false,
                     return_dst: None,
                     tu: None,
                 }],
