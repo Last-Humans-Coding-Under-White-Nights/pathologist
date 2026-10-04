@@ -237,6 +237,12 @@ pub struct CallSite {
     /// Post-merge virtual expansion uses this so `final` types are not
     /// re-expanded from the declaring base.
     pub receiver_class: Option<String>,
+    /// The receiver is an object whose dynamic type is its static type (an
+    /// automatic object's constructor or destructor site): post-merge
+    /// virtual expansion leaves the site alone. Part of the merge identity
+    /// ([`CallSite::same_facts`]): a dispatching and an exact record never
+    /// coalesce.
+    pub exact_receiver: bool,
     /// LHS of `dst = callee(...)` when the call's value is used (`CallReturn`
     /// destination). `dlsym` models write function addresses here.
     pub return_dst: Option<VarId>,
@@ -285,6 +291,7 @@ impl CallSite {
             args_bound_past_this: self.args_bound_past_this,
             is_direct: self.is_direct,
             receiver_class: self.receiver_class.as_deref(),
+            exact_receiver: self.exact_receiver,
             return_dst: self.return_dst,
         }
     }
@@ -332,6 +339,7 @@ struct CallFacts<'a> {
     args_bound_past_this: bool,
     is_direct: bool,
     receiver_class: Option<&'a str>,
+    exact_receiver: bool,
     return_dst: Option<VarId>,
 }
 
@@ -2852,6 +2860,7 @@ mod tests {
             occurrence: None,
             is_direct: true,
             receiver_class: Some("Cls".into()),
+            exact_receiver: false,
             return_dst: Some(VarId(6)),
             tu: Some(FileId(2)),
         };
@@ -2897,6 +2906,7 @@ mod tests {
             occurrence: None,
             is_direct,
             receiver_class: None,
+            exact_receiver: false,
             return_dst: None,
             tu: None,
         };
@@ -3090,6 +3100,7 @@ mod tests {
             occurrence: None,
             is_direct: true,
             receiver_class: None,
+            exact_receiver: false,
             return_dst: None,
             tu: Some(caller_file),
         };

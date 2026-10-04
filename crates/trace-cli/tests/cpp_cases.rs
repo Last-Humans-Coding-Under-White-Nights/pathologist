@@ -9566,10 +9566,7 @@ fn deref_return_by_reference_follows_the_declared_return() {
     use trace_ir::{FlowConstraint::Load, ReturnFlow::Copy};
     let (program, _) = deref_member_reads();
     let hp = common::only_variable(program, "cpp_g_hp");
-    let lambda = (program.symbols.functions.iter())
-        .find(|f| f.name.starts_with("cpp_make_lambda::$lambda"))
-        .expect("the lambda")
-        .id;
+    let lambda = common::lambda_in(program, "cpp_make_lambda").id;
     let returns = |fid: FnId| program.fn_returns[&fid].clone();
     for fid in [
         common::only_function(program, "cpp_inst"),
@@ -9602,9 +9599,7 @@ fn param_lists_record_their_declared_shape() {
         .function(common::only_function(program, "CppVariadic::vpack"));
     assert_eq!(vpack.explicit_arity, Some(0), "{vpack:?}");
     assert_eq!(vpack.reference_params, [false], "{vpack:?}");
-    let lambda = (program.symbols.functions.iter())
-        .find(|f| f.name.starts_with("cpp_lambda_params::$lambda"))
-        .expect("the lambda");
+    let lambda = common::lambda_in(program, "cpp_lambda_params");
     assert_eq!(lambda.reference_params, [false, true], "{lambda:?}");
 }
 
@@ -13685,4 +13680,369 @@ fn explicit_operator_malformed_syntax_reports_parse_diagnostics() {
             .any(|f| f.name.contains("operator.") || f.name.contains("operator?")),
         "malformed operator was interned as function"
     );
+}
+
+analyzed_fixture!(cpp_object_lifecycle);
+
+/// The callees of `caller` named `<class>::...`, one entry per edge, sorted.
+fn class_member_edges(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    class: &str,
+) -> Vec<String> {
+    let prefix = format!("{class}::");
+    let mut found: Vec<String> = common::callees_of(program, analysis, caller)
+        .into_iter()
+        .map(|(callee, _)| callee)
+        .filter(|callee| callee.starts_with(&prefix))
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn automatic_objects_construct_and_destruct() {
+    let (program, analysis) = cpp_object_lifecycle();
+    // Issue #186's table plus locals in nested blocks and init statements,
+    // and classes without members of their own, which reach their base's as
+    // `T x{};` does: exactly one constructor edge and one destructor edge each.
+    for caller in [
+        "plain",
+        "braces",
+        "parens",
+        "heap",
+        "early",
+        "nested",
+        "for_init",
+        "if_init",
+        "array",
+        "derived",
+        "derived_braces",
+        "defaulted_derived",
+        "virtual_defaulted",
+    ] {
+        assert_eq!(
+            class_member_edges(program, analysis, caller, "Guard"),
+            ["Guard::Guard", "Guard::~Guard"],
+            "{caller}"
+        );
+    }
+    // Copy-initialized automatic locals: a destructor edge, no default
+    // constructor edge.
+    for caller in ["rangefor", "catcher"] {
+        assert_eq!(
+            class_member_edges(program, analysis, caller, "Guard"),
+            ["Guard::~Guard"],
+            "{caller}"
+        );
+    }
+    // A loop variable is no more thread_local than any other automatic
+    // local for sitting in a thread_local variable's initializer.
+    let tl_lambda = &common::lambda_in(program, "tl_outer").name;
+    assert_eq!(
+        class_member_edges(program, analysis, tl_lambda, "Guard"),
+        ["Guard::~Guard"],
+        "{tl_lambda}"
+    );
+    // A condition declaration is destroyed like any other automatic local.
+    assert_eq!(
+        class_member_edges(program, analysis, "cond", "Flag"),
+        ["Flag::Flag", "Flag::~Flag"]
+    );
+    // A local of a lambda body belongs to the lambda.
+    let lambda = &common::lambda_in(program, "lam").name;
+    assert_eq!(
+        class_member_edges(program, analysis, lambda, "Guard"),
+        ["Guard::Guard", "Guard::~Guard"],
+        "{lambda}"
+    );
+    assert!(class_member_edges(program, analysis, "lam", "Guard").is_empty());
+    // The destructor's `this` receives the local, so the call through the
+    // implicit `this` inside the destructor resolves.
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "VBase::~VBase",
+        "VBase::Hook"
+    ));
+    for (caller, dtor, local) in [
+        ("vlocal", "VBase::~VBase", "v"),
+        ("plain", "Guard::~Guard", "g"),
+    ] {
+        let bindings = arg_bindings(program, analysis, caller, dtor);
+        assert!(
+            bindings
+                .iter()
+                .any(|(i, a, f)| *i == 0 && a == local && f == "this"),
+            "{caller}: `{local}` is the destructor's `this`, got {bindings:?}"
+        );
+    }
+    // `T x;` constructs with the callee `T x{};` already reaches.
+    let ctor = |caller: &str| {
+        analysis
+            .call_edges
+            .iter()
+            .find(|e| {
+                fn_name(program, e.caller) == caller && fn_name(program, e.callee) == "Guard::Guard"
+            })
+            .map(|e| e.callee)
+            .unwrap_or_else(|| panic!("{caller} constructs its Guard"))
+    };
+    assert_eq!(ctor("plain"), ctor("braces"));
+}
+
+#[test]
+fn statement_locals_keep_name_resolution() {
+    let (program, analysis) = cpp_object_lifecycle();
+    // A placeholder loop variable takes its range's element type.
+    for (caller, callee) in [
+        ("autoloop", "Param::Kind"),
+        ("autoloop", "SubParam::Kind"),
+        ("shadow_auto", "Other::Kind"),
+        ("containers", "Other::Kind"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, callee),
+            "{caller} -> {callee}: {:?}",
+            common::callees_of(program, analysis, caller)
+        );
+    }
+    // A loop variable hides the outer name it shadows, and a lambda's or a
+    // block-scope declaration's parameter never enters the enclosing scope.
+    for (caller, callee) in [
+        ("tloop", "Param::Kind"),
+        ("shadow_auto", "Param::Kind"),
+        ("decl_scope", "Other::Kind"),
+        ("lambda_scope", "Other::Kind"),
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, callee),
+            "{caller} -> {callee}: {:?}",
+            common::callees_of(program, analysis, caller)
+        );
+    }
+    for caller in ["decl_scope", "lambda_scope"] {
+        assert!(has_any_edge(program, analysis, caller, "Param::Kind"));
+    }
+    // The range expression sees the outer `item`, not the loop variable.
+    assert!(has_any_edge(program, analysis, "shadow", "Box::list"));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "shadow",
+        "Item::list"
+    ));
+    assert!(has_any_edge(program, analysis, "shadow", "Item::~Item"));
+    // A loop variable pointing to a known class resolves the call through it.
+    assert!(has_any_edge(program, analysis, "handlers", "Handler::Run"));
+}
+
+#[test]
+fn statement_locals_cover_unnamed_bindings_and_element_spellings() {
+    let (program, analysis) = cpp_object_lifecycle();
+    assert_eq!(
+        class_member_edges(program, analysis, "catch_unnamed", "Guard"),
+        ["Guard::~Guard"]
+    );
+    assert!(class_member_edges(program, analysis, "catch_unnamed_ref", "Guard").is_empty());
+    // No local is made up from a binding's or an abstract declarator's text.
+    for caller in ["bindings", "catch_unnamed_ref"] {
+        let fid = common::only_function(program, caller);
+        let made_up: Vec<_> = (program.symbols.variables.iter())
+            .filter(|v| v.fn_id == Some(fid))
+            .filter(|v| v.name.contains(['[', '&']))
+            .map(|v| &v.name)
+            .collect();
+        assert!(made_up.is_empty(), "{caller}: {made_up:?}");
+    }
+    for (caller, callee) in [
+        ("ptr_refs", "Handler::Run"),
+        ("const_shared", "Other::Kind"),
+        ("const_ptrs", "Other::Kind"),
+        ("qualified_range", "Other::Kind"),
+        ("global_std", "Other::Kind"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, callee),
+            "{caller} -> {callee}: {:?}",
+            common::callees_of(program, analysis, caller)
+        );
+    }
+}
+
+#[test]
+fn automatic_objects_reach_every_base_and_keep_aggregates() {
+    let (program, analysis) = cpp_object_lifecycle();
+    // An aggregate's defaulted constructor is not user-provided: its braces
+    // are no constructor call.
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "aggregate",
+        "Cfg::Cfg"
+    ));
+    for (caller, class, edges) in [
+        ("two_bases", "BaseA", &["BaseA::BaseA", "BaseA::~BaseA"][..]),
+        ("two_bases", "BaseB", &["BaseB::BaseB", "BaseB::~BaseB"]),
+        // Constructed on first entry by the function; destroyed at exit.
+        ("statics", "Guard", &["Guard::Guard"]),
+        ("tls", "Guard", &["Guard::Guard"]),
+    ] {
+        assert_eq!(
+            class_member_edges(program, analysis, caller, class),
+            edges,
+            "{caller}"
+        );
+    }
+    for caller in ["unions", "union_braces", "union_parens"] {
+        assert_eq!(
+            class_member_edges(program, analysis, caller, "Variant"),
+            ["Variant::Variant", "Variant::~Variant"],
+            "{caller}"
+        );
+    }
+    // A union member's initializer constructs it; implicit member destruction
+    // is left for follow-up.
+    assert_eq!(
+        class_member_edges(program, analysis, "HoldsVariant::HoldsVariant", "Variant"),
+        ["Variant::Variant"]
+    );
+    // A defaulted `D()` runs the base's, even beside an overload, a template
+    // or an ellipsis constructor that could also take no arguments.
+    for (caller, own) in [
+        ("default_plus", "DefaultPlus"),
+        ("template_ctor", "TemplateCtor"),
+        ("ellipsis_ctor", "EllipsisCtor"),
+    ] {
+        assert_eq!(
+            class_member_edges(program, analysis, caller, "Guard"),
+            ["Guard::Guard", "Guard::~Guard"],
+            "{caller}"
+        );
+        assert!(class_member_edges(program, analysis, caller, own).is_empty());
+    }
+    assert!(has_any_edge(program, analysis, "sibling", "VB::~VB"));
+    assert!(must_not_have_edge(program, analysis, "sibling", "VE::~VE"));
+}
+
+/// The destructors `caller` reaches, one entry per edge, sorted.
+fn dtor_edges(program: &Program, analysis: &AnalysisResult, caller: &str) -> Vec<String> {
+    let mut found: Vec<String> = common::callees_of(program, analysis, caller)
+        .into_iter()
+        .map(|(callee, _)| callee)
+        .filter(|callee| last_segment(callee).starts_with('~'))
+        .collect();
+    found.sort();
+    found
+}
+
+fn last_segment(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
+#[test]
+fn automatic_object_sites_take_no_virtual_dispatch() {
+    let (program, analysis) = cpp_object_lifecycle();
+    // A local is exactly its class: no subclass's destructor, and no
+    // defaulted one of its own.
+    for (caller, dtors) in [
+        ("plain", &["Guard::~Guard"][..]),
+        ("braces", &["Guard::~Guard"]),
+        ("array", &["Guard::~Guard"]),
+        ("rangefor", &["Guard::~Guard"]),
+        ("catcher", &["Guard::~Guard"]),
+        ("defaulted_derived", &["Guard::~Guard"]),
+        ("virtual_defaulted", &["Guard::~Guard"]),
+        ("sibling", &["VB::~VB"]),
+        ("mixed_bases", &["BaseA::~BaseA", "BaseC::~BaseC"]),
+    ] {
+        assert_eq!(dtor_edges(program, analysis, caller), dtors, "{caller}");
+    }
+}
+
+#[test]
+fn automatic_object_construction_shares_one_rule() {
+    let (program, analysis) = cpp_object_lifecycle();
+    for (caller, class, edges) in [
+        (
+            "mixed_bases",
+            "BaseC",
+            &["BaseC::BaseC", "BaseC::~BaseC"][..],
+        ),
+        (
+            "two_bases_braces",
+            "BaseA",
+            &["BaseA::BaseA", "BaseA::~BaseA"],
+        ),
+        (
+            "two_bases_braces",
+            "BaseB",
+            &["BaseB::BaseB", "BaseB::~BaseB"],
+        ),
+        (
+            "default_plus_braces",
+            "Guard",
+            &["Guard::Guard", "Guard::~Guard"],
+        ),
+        ("default_plus_braces", "DefaultPlus", &[]),
+        ("array_braces", "Guard", &["Guard::Guard", "Guard::~Guard"]),
+        ("array_equals", "Guard", &["Guard::Guard", "Guard::~Guard"]),
+        ("cond_braces", "Flag", &["Flag::Flag", "Flag::~Flag"]),
+    ] {
+        assert_eq!(
+            class_member_edges(program, analysis, caller, class),
+            edges,
+            "{caller} / {class}"
+        );
+    }
+    // A C-style union is copied: no made-up constructor.
+    assert!(common::callees_of(program, analysis, "raw_copy").is_empty());
+    for (caller, callee) in [
+        ("loop_table", "tab1"),
+        ("loop_table", "tab2"),
+        ("bare_list", "Other::Kind"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, callee),
+            "{caller} -> {callee}: {:?}",
+            common::callees_of(program, analysis, caller)
+        );
+    }
+}
+
+#[test]
+fn automatic_objects_without_user_members_or_scope_emit_nothing() {
+    let (program, analysis) = cpp_object_lifecycle();
+    assert!(class_member_edges(program, analysis, "triv", "Trivial").is_empty());
+    assert!(class_member_edges(program, analysis, "defl", "Defaulted").is_empty());
+    for caller in ["refs", "rangeref", "catchref"] {
+        assert!(
+            class_member_edges(program, analysis, caller, "Guard").is_empty(),
+            "{caller}"
+        );
+    }
+}
+
+/// The issue's own query over its reproducer, the fixture's first block.
+#[test]
+fn automatic_object_lifecycle_issue_query() {
+    let db = common::cli_analyze(&fixture("cpp_object_lifecycle"), &[]);
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let rows = common::text_rows(
+        &conn,
+        "SELECT c.name, t.name FROM call_edges e \
+         JOIN functions c ON c.id = e.caller_fn_id \
+         JOIN functions t ON t.id = e.callee_fn_id \
+         WHERE t.name LIKE 'Guard::%' \
+         AND c.name IN ('plain', 'braces', 'parens', 'heap', 'early') ORDER BY 1, 2",
+    );
+    let expected: Vec<Vec<String>> = ["braces", "early", "heap", "parens", "plain"]
+        .iter()
+        .flat_map(|caller| {
+            ["Guard::Guard", "Guard::~Guard"]
+                .map(|callee| vec![format!("Text({caller:?})"), format!("Text({callee:?})")])
+        })
+        .collect();
+    assert_eq!(rows, expected);
 }

@@ -25,6 +25,17 @@ pub fn fn_name(program: &Program, id: trace_ir::FnId) -> String {
     program.symbols.function(id).name.clone()
 }
 
+/// The lambda lowered inside function `outer` (`outer::$lambda<line>:<col>`).
+pub fn lambda_in<'p>(program: &'p Program, outer: &str) -> &'p trace_ir::Function {
+    let prefix = format!("{outer}::$lambda");
+    program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("the lambda in `{outer}` is lowered as a function"))
+}
+
 /// The one function entry named `name`; fails if there are none or several.
 pub fn only_function(program: &Program, name: &str) -> trace_ir::FnId {
     let found: Vec<_> = program

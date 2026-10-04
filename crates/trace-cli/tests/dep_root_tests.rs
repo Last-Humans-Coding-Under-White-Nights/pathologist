@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{fixture, fn_name, TempDb};
+use common::{callees_of, fixture, fn_name, has_any_edge, TempDb};
 use std::process::Command;
 use trace_analysis::{analyze, ResolutionKind};
 use trace_db::{export_to_sqlite, open_db, CallEdgeFilter, ExportOptions};
@@ -739,4 +739,74 @@ fn dependency_header_explicit_operator_calls_subscript_call_and_compound() {
     assert!(main_targets.contains(&"DepFunctor::operator()".to_string()));
     assert!(main_targets.contains(&"DepCounter::operator+=".to_string()));
     assert!(main_targets.contains(&"dep_after_ops".to_string()));
+}
+
+/// A scope guard declared through a dependency header's macro is the user's
+/// local: the macro body's spelling does not make it a dependency's.
+#[test]
+fn dependency_macro_scope_guard_is_destroyed() {
+    let tmp = common::scratch(&[
+        (
+            "dep/api.h",
+            r#"
+            struct Scoped {
+                explicit Scoped(int v);
+                ~Scoped();
+            };
+            #define TRACE_SCOPE(x) Scoped _scope(x)
+            "#,
+        ),
+        (
+            "main.cpp",
+            "#include <api.h>\nvoid f(int v) { TRACE_SCOPE(v); }\n",
+        ),
+    ]);
+    let dep = tmp.path().join("dep");
+    let program =
+        build_program_with_jobs(tmp.path(), &PreprocessOptions::new().with_dep(&dep), 1).unwrap();
+    let (_pag, analysis) = analyze(&program);
+    for callee in ["Scoped::Scoped", "Scoped::~Scoped"] {
+        assert!(
+            has_any_edge(&program, &analysis, "f", callee),
+            "f -> {callee}"
+        );
+    }
+}
+
+#[test]
+fn dependency_body_locals_emit_no_lifecycle_sites() {
+    let tmp = common::scratch(&[
+        (
+            "dep/api.h",
+            r#"
+            void on_ctor();
+            void on_dtor();
+            struct Guard {
+                Guard() { on_ctor(); }
+                ~Guard() { on_dtor(); }
+            };
+            inline void dep_fn() { Guard g; }
+            "#,
+        ),
+        (
+            "main.cpp",
+            "#include <api.h>\nvoid on_ctor() {}\nvoid on_dtor() {}\nvoid target() { dep_fn(); }\n",
+        ),
+    ]);
+    let dep = tmp.path().join("dep");
+    for jobs in [1, 2] {
+        let program =
+            build_program_with_jobs(tmp.path(), &PreprocessOptions::new().with_dep(&dep), jobs)
+                .unwrap();
+        assert!(program
+            .symbols
+            .call_sites
+            .iter()
+            .all(|c| !program.is_dep_file(c.span.file)));
+        let (_pag, analysis) = analyze(&program);
+        assert!(
+            callees_of(&program, &analysis, "dep_fn").is_empty(),
+            "a dependency body's local constructed or destroyed something"
+        );
+    }
 }
