@@ -251,3 +251,28 @@ void Start(struct Ctx *ctx) {
     assert!(indirect(p, a, "Worker", "OnEvent"));
     assert!(indirect(p, a, "AliasWorker", "OnEvent"));
 }
+
+#[test]
+fn cast_pointer_levels_come_from_the_declarator() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+typedef void (*Handler)(void);
+template <class T> struct Box { T item; Handler h; };
+void OnEvent(void) {}
+void *Worker(void *arg) { static_cast<Box<int *> *>(arg)->h(); return nullptr; }
+void Start(Box<int *> *box) {
+    unsigned long tid;
+    box->h = OnEvent;
+    pthread_create(&tid, nullptr, Worker, box);
+}
+"#,
+    )]);
+    let p = &build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let a = &analyze(p).1;
+    assert!(indirect(p, a, "Start", "Worker"));
+    assert!(
+        indirect(p, a, "Worker", "OnEvent"),
+        "the `*` in `Box<int *>` is the template argument's, not the cast's"
+    );
+}

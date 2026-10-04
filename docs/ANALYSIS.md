@@ -988,7 +988,10 @@ points to nothing known, `T`'s field summaries, as a `T *` local initialized
 from the cast does. `cast_root` in `lower.rs` decides:
 
 - the cast's type, read as a declaration's is (a typedef of the class or of
-  the pointer included), is one pointer level to a class the index knows;
+  the pointer included), is one pointer level to a class the index knows.
+  The cast's own levels are its abstract declarator's `*` layers, so a `*`
+  inside a template argument (`static_cast<Box<int *> *>`) is the type's and
+  a reference (`T *&`) adds none;
 - the operand is a variable. The root of any other operand (`n->data`,
   `a[i]`, `&obj`) is a different object, and such a path is left as it was;
 - an arrow follows the cast.

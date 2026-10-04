@@ -13410,10 +13410,21 @@ fn cast_root(
         return None;
     }
     let operand = resolve_lvalue_var(program, ctx, source, operand)?;
-    // The pointer levels the cast spells, on top of those its type names.
+    // The pointer levels the cast's declarator spells, on top of those its
+    // type names. A `*` inside a template argument (`Box<int *> *`) belongs
+    // to the type, and a reference (`T *&`) adds no level of its own.
     let mut desc = type_desc_from_node(program, ctx, source, descriptor);
-    for _ in 0..node_text(source, &descriptor).matches('*').count() {
-        desc = TypeDesc::Ptr(Box::new(desc));
+    let mut cur = descriptor.cached_field("declarator");
+    while let Some(n) = cur {
+        cur = match n.cached_kind() {
+            "abstract_pointer_declarator" => {
+                desc = TypeDesc::Ptr(Box::new(desc));
+                n.cached_field("declarator")
+            }
+            "abstract_reference_declarator" => n.named_child(0),
+            "abstract_parenthesized_declarator" => n.named_child(0),
+            _ => return None,
+        };
     }
     let TypeDesc::Ptr(pointee) = desc else {
         return None;
