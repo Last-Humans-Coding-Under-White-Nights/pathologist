@@ -28,10 +28,50 @@ pub enum Effect {
     /// Return value may be the address of an in-tree function whose name
     /// equals a string constant in `param[name_param]` (`dlsym` family).
     Dlsym { name_param: u32 },
-    /// The callee may invoke this zero-argument callback. Parameter indexes
-    /// count explicit arguments, excluding a member's `this`. Not restricted
-    /// to a bodyless callee, unlike the effects above that introduce a value.
-    Invoke { param: u32 },
+    /// The callee may invoke the callback in `param[param]`, passing it
+    /// `args`. Parameter indexes count explicit arguments, excluding a
+    /// member's `this`. Not restricted to a bodyless callee, unlike the
+    /// effects above that introduce a value.
+    Invoke { param: u32, args: InvokeArgs },
+}
+
+/// The arguments an [`Effect::Invoke`] callback is called with, as positions
+/// among the modelled callee's own parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvokeArgs {
+    /// Exactly these, in the callback's parameter order; none for a
+    /// zero-argument callback.
+    Listed(Vec<u32>),
+    /// Every parameter from this position on (`std::thread(f, args...)`).
+    Rest(u32),
+}
+
+impl InvokeArgs {
+    /// The callee parameter passed as the callback's `formal`-th parameter.
+    pub fn actual_for(&self, formal: u32) -> Option<u32> {
+        match self {
+            Self::Listed(args) => args.get(formal as usize).copied(),
+            Self::Rest(from) => from.checked_add(formal),
+        }
+    }
+
+    /// Whether these pass callee parameter `param` on.
+    fn forwards(&self, param: u32) -> bool {
+        match self {
+            Self::Listed(args) => args.contains(&param),
+            Self::Rest(from) => *from <= param,
+        }
+    }
+
+    /// Whether any argument is forwarded at all.
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Listed(args) if args.is_empty())
+    }
+}
+
+/// The effects of a model that only invokes one callback.
+fn invoke(param: u32, args: InvokeArgs) -> Vec<Effect> {
+    vec![Effect::Invoke { param, args }]
 }
 
 /// A per-function summary.
@@ -55,6 +95,8 @@ impl FnModel {
 #[derive(Debug, Default, Clone)]
 pub struct FnModelSet {
     by_name: FxHashMap<String, FnModel>,
+    /// Class → the model registered for its constructor (`C` → `C::C`).
+    constructors: FxHashMap<String, String>,
     noise_macros: Vec<String>,
 }
 
@@ -63,7 +105,12 @@ impl FnModelSet {
     pub fn builtin() -> Self {
         let mut set = Self::default();
         let mut reg = |name: &str, effects: Vec<Effect>| set.register(FnModel::new(name, effects));
-        reg("ffrt::queue::submit", vec![Effect::Invoke { param: 0 }]);
+        reg(
+            "ffrt::queue::submit",
+            invoke(0, InvokeArgs::Listed(Vec::new())),
+        );
+        reg("pthread_create", invoke(2, InvokeArgs::Listed(vec![3])));
+        reg("std::thread::thread", invoke(0, InvokeArgs::Rest(1)));
         for n in ["memcpy", "memmove", "strcpy", "strncpy"] {
             reg(n, vec![Effect::MemCopy { dst: 0, src: 1 }]);
         }
@@ -101,10 +148,20 @@ impl FnModelSet {
         set
     }
 
-    /// Look up a model by call-site / callee name. Exact match first, then
-    /// the last `::` segment so `::dlsym` / `ns::dlsym` share the POSIX model.
+    /// Look up a model by call-site / callee name. Exact match first; then
+    /// the constructor's model for a class name, which is how a temporary is
+    /// recorded when the unit never saw the class (`std::thread(f, x)`);
+    /// then the last `::` segment so `::dlsym` / `ns::dlsym` share the POSIX
+    /// model.
     pub fn get_for_callee(&self, name: &str) -> Option<&FnModel> {
         if let Some(m) = self.by_name.get(name) {
+            return Some(m);
+        }
+        if let Some(m) = self
+            .constructors
+            .get(name)
+            .and_then(|c| self.by_name.get(c))
+        {
             return Some(m);
         }
         name.rsplit("::")
@@ -114,6 +171,12 @@ impl FnModelSet {
     }
 
     pub fn register(&mut self, model: FnModel) {
+        if let Some((class, last)) = model.name.rsplit_once("::") {
+            if class.rsplit("::").next() == Some(last) {
+                self.constructors
+                    .insert(class.to_string(), model.name.clone());
+            }
+        }
         self.by_name.insert(model.name.clone(), model);
     }
 
@@ -209,12 +272,20 @@ struct RawEffect {
     ptr: Option<u32>,
     value: Option<u32>,
     param: Option<u32>,
+    args: Option<Vec<u32>>,
+    rest: Option<u32>,
 }
 
 fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
     let need = |v: Option<u32>, field: &str, kind: &str| -> Result<u32, String> {
         v.ok_or_else(|| format!("effect kind {kind:?} requires `{field}`"))
     };
+    if raw.kind != "invoke" && (raw.args.is_some() || raw.rest.is_some()) {
+        return Err(format!(
+            "effect kind {:?} takes no `args` or `rest`",
+            raw.kind
+        ));
+    }
     match raw.kind.as_str() {
         "alias" => Ok(Effect::Alias {
             dst: need(raw.dst, "dst", "alias")?,
@@ -232,9 +303,22 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
             param: need(raw.param, "param", "return_alias")?,
         }),
         "return_heap" => Ok(Effect::ReturnHeap),
-        "invoke" => Ok(Effect::Invoke {
-            param: need(raw.param, "param", "invoke")?,
-        }),
+        "invoke" => {
+            let param = need(raw.param, "param", "invoke")?;
+            let args = match (&raw.args, raw.rest) {
+                (Some(_), Some(_)) => {
+                    return Err("effect kind \"invoke\" takes `args` or `rest`, not both".into())
+                }
+                (_, Some(from)) => InvokeArgs::Rest(from),
+                (args, None) => InvokeArgs::Listed(args.clone().unwrap_or_default()),
+            };
+            if args.forwards(param) {
+                return Err(format!(
+                    "effect kind \"invoke\" passes the callback (param {param}) to itself"
+                ));
+            }
+            Ok(Effect::Invoke { param, args })
+        }
         "clears" => Ok(Effect::Clears {
             param: need(raw.param, "param", "clears")?,
         }),
@@ -333,6 +417,98 @@ effects = [ { kind = "dlsym", param = 1 } ]
             "[[model]]\nname = \"x\"\neffects = [{ kind = \"alias\", dst = 0 }]\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn builtin_thread_entries_forward_arguments() {
+        let m = FnModelSet::builtin();
+        let effects = |name: &str| m.get(name).unwrap().effects.clone();
+        assert_eq!(
+            effects("pthread_create"),
+            invoke(2, InvokeArgs::Listed(vec![3]))
+        );
+        assert_eq!(
+            effects("std::thread::thread"),
+            invoke(0, InvokeArgs::Rest(1))
+        );
+        assert_eq!(
+            effects("ffrt::queue::submit"),
+            invoke(0, InvokeArgs::Listed(Vec::new()))
+        );
+    }
+
+    #[test]
+    fn toml_invoke_takes_listed_or_rest_arguments() {
+        let m = FnModelSet::from_toml_str(
+            r#"
+[[model]]
+name = "plain"
+effects = [{ kind = "invoke", param = 0 }]
+[[model]]
+name = "listed"
+effects = [{ kind = "invoke", param = 1, args = [2, 0] }]
+[[model]]
+name = "rest"
+effects = [{ kind = "invoke", param = 0, rest = 1 }]
+"#,
+        )
+        .unwrap();
+        let effects = |name: &str| m.get(name).unwrap().effects.clone();
+        assert_eq!(effects("plain"), invoke(0, InvokeArgs::Listed(Vec::new())));
+        assert_eq!(effects("listed"), invoke(1, InvokeArgs::Listed(vec![2, 0])));
+        assert_eq!(effects("rest"), invoke(0, InvokeArgs::Rest(1)));
+        assert!(
+            FnModelSet::from_toml_str(
+                "[[model]]\nname = \"x\"\neffects = [{ kind = \"invoke\", param = 0, args = [1], rest = 2 }]\n"
+            )
+            .is_err(),
+            "`args` and `rest` are alternatives"
+        );
+    }
+
+    #[test]
+    fn invoke_args_map_formals_to_call_site_positions() {
+        let listed = InvokeArgs::Listed(vec![3, 1]);
+        assert_eq!(listed.actual_for(0), Some(3));
+        assert_eq!(listed.actual_for(1), Some(1));
+        assert_eq!(listed.actual_for(2), None);
+        let rest = InvokeArgs::Rest(1);
+        assert_eq!(rest.actual_for(0), Some(1));
+        assert_eq!(rest.actual_for(4), Some(5));
+    }
+
+    #[test]
+    fn constructor_model_covers_a_temporary_of_its_class() {
+        let m = FnModelSet::builtin();
+        assert!(m.get("std::thread").is_none(), "one registration");
+        assert_eq!(
+            m.get_for_callee("std::thread").unwrap().name,
+            "std::thread::thread"
+        );
+        let off =
+            FnModelSet::from_toml_str("[[model]]\nname = \"std::thread::thread\"\neffects = []\n")
+                .unwrap();
+        assert!(off
+            .get_for_callee("std::thread")
+            .unwrap()
+            .effects
+            .is_empty());
+    }
+
+    #[test]
+    fn toml_rejects_misplaced_invoke_arguments() {
+        let load = |effect: &str| {
+            FnModelSet::from_toml_str(&format!("[[model]]\nname = \"x\"\neffects = [{effect}]\n"))
+        };
+        for effect in [
+            r#"{ kind = "return_alias", param = 0, rest = 1 }"#,
+            r#"{ kind = "alias", dst = 0, src = 1, args = [2] }"#,
+            r#"{ kind = "invoke", param = 1, args = [1] }"#,
+            r#"{ kind = "invoke", param = 2, rest = 1 }"#,
+        ] {
+            assert!(load(effect).is_err(), "{effect}");
+        }
+        assert!(load(r#"{ kind = "invoke", param = 0, rest = 1 }"#).is_ok());
     }
 
     #[test]

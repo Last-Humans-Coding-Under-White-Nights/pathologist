@@ -1,0 +1,9 @@
+version = 1
+
+[[model]]
+name = "pool_post"
+effects = [{ kind = "invoke", param = 1, args = [2] }]
+
+[[model]]
+name = "pool_post_default"
+effects = [{ kind = "invoke", param = 1, args = [2] }]

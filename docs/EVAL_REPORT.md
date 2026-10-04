@@ -1,5 +1,58 @@
 # Evaluation Report
 
+## Thread entry points: #187 — 2026-10-04
+
+A function started on a new thread is now reachable from the code that
+starts it: `pthread_create` and the `std::thread` constructor are `invoke`
+models that forward their arguments, under the rules in
+[Callback invocation](ANALYSIS.md#callback-invocation-invoke). Baseline is
+`2f9a766` (master), built in a scratch worktree of that revision; both sides
+use the pinned, clean HDF (`cdc75a2`), hiview (`92408e2`) and camera
+(`8ffd69d`) corpora, release builds, eight jobs and
+`TRACE_SOLVE_BUDGET_POPS=800000`, following
+[Attributing a change](#attributing-a-change-baseline-vs-branch). The
+baseline passes the old expectations (95 checks, 0 failures); the candidate
+passes the re-captured ones (97 checks, 0 failures: two probes added).
+Functions, direct, external, IPC and dlsym edges and diagnostics are
+unchanged on all three corpora. No edge was removed.
+
+| Corpus | Metric | Baseline (`2f9a766`) | Candidate | Diff |
+|---|---|---:|---:|---:|
+| HDF | call edges (total) | 76,925 | 76,965 | +40 |
+| HDF | indirect edges | 4,982 | 5,022 | +40 |
+| HDF | arg-flow edges | 70,776 | 70,815 | +39 |
+| HDF | flow-graph nodes | 173,262 | 173,270 | +8 |
+| hiview | call edges (total) | 33,562 | 33,568 | +6 |
+| hiview | indirect edges | 186 | 192 | +6 |
+| hiview | arg-flow edges | 22,016 | 22,019 | +3 |
+| camera | call edges (total) | 111,886 | 111,903 | +17 |
+| camera | indirect edges | 313 | 330 | +17 |
+| camera | arg-flow edges | 51,928 | 51,935 | +7 |
+
+Every added edge is attributed to a starting call site:
+
+| Corpus | Starting call | Edges | What they reach |
+|---|---|---:|---|
+| HDF | `pthread_create` | 39 | `OsalCreatePthread` (`osal_thread.c:96`) to 36 distinct thread functions (`HdfThreadMain`, `DevMgrUeventThread`, `UsbIoThread`, `GpioCntlrIrqThreadHandler`, …; three names are `static` in two test units each). The entry is a variable there, so these come from what it points to once the solver has converged |
+| HDF | `std::thread::thread` | 1 | the lambda in `SampleServiceTansSmq` |
+| hiview | `std::thread::thread` | 6 | `SceneTimerOhImpl::Loop` and `ThrTaskContainer::Entry` (member functions started with `this`), and four lambdas |
+| camera | `std::thread::thread` | 13 | `SimpleTimer::InterruptableSleep`, `SimpleTimer::StartTask` (two tests), and ten lambdas |
+| camera | `std::thread` (temporary) | 4 | `RotatePicture` from `HStreamOperator::ProcessPhotoProxy` (`hstream_operator.cpp:1915`, the case in the issue) and three lambdas |
+
+The added arg-flow rows are the forwarded arguments: the context HDF's
+`OsalCreatePthread` hands each thread function, and the receivers and
+arguments of the `std::thread` starts.
+
+Two probes pin the cases: HDF's `OsalCreatePthread` reaches 36 distinct
+functions at its `pthread_create` (0 on the baseline), and camera's
+`ProcessPhotoProxy` has its edge to `RotatePicture` (0 on the baseline).
+
+Not reached: camera has two starts spelled `thread(...)` under a
+using-declaration, recorded as calls of a function `thread`; the model is
+registered under the qualified names only. No call *inside* a started
+function newly resolved on these corpora: their workers take `this` or a
+context whose fields the type-keyed summaries already served.
+
 ## Automatic object lifecycle: #186 — 2026-10-03
 
 Constructors and destructors of automatic C++ objects now reach the call

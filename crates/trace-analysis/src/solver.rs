@@ -2,7 +2,7 @@ use crate::constraints::{
     ArgFlowEdge, CallGraphEdge, Constraint, ConstraintKind, LocKind, ResolutionKind,
 };
 use crate::pag::{Pag, PagNodeKind, SolverIndices};
-use crate::summaries::{Effect, FnModelSet};
+use crate::summaries::{Effect, FnModelSet, InvokeArgs};
 use indexmap::{IndexMap, IndexSet};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use trace_ir::{CallSiteId, FnId, LocId, PagNodeId, Program, StorageClass, TargetId, VarId};
@@ -126,6 +126,9 @@ pub struct AnalysisResult {
     pub call_edges: Vec<CallGraphEdge>,
     pub arg_flow_edges: Vec<ArgFlowEdge>,
     pub wired_arg_flow: FxHashSet<(CallSiteId, u32, FnId)>,
+    /// Arguments a modelled callee forwards to a callback (`invoke`), by
+    /// call site and callback: each `(formal index, argument position)` wired.
+    pub forwarded_arg_flow: ForwardedArgFlow,
     /// Applied `clears` effects: `(call site, cleared parameter index)`.
     /// Exported as terminator nodes/edges in the flow graph.
     pub terminator_events: Vec<(CallSiteId, u32)>,
@@ -134,6 +137,8 @@ pub struct AnalysisResult {
     /// diagnostic so the database is distinguishable from a complete one.
     pub solve: SolveOutcome,
 }
+
+pub type ForwardedArgFlow = FxHashMap<(CallSiteId, FnId), Vec<(u32, u32)>>;
 
 pub fn analyze(program: &Program) -> (Pag, AnalysisResult) {
     analyze_with_options(program, AnalyzeOptions::default())
@@ -154,6 +159,7 @@ pub fn analyze_with_options(program: &Program, opts: AnalyzeOptions) -> (Pag, An
         &pag,
         &result.call_edges,
         &result.wired_arg_flow,
+        &result.forwarded_arg_flow,
         &mut result.arg_flow_edges,
     );
     (pag, result)
@@ -240,6 +246,8 @@ struct SolverState {
     /// lookup each.
     synced_cell: FxHashMap<PagNodeId, LocId>,
     cell_owner: FxHashMap<LocId, PagNodeId>,
+    /// What [`wire_callback`] wired, for the arg-flow rows.
+    forwarded_arg_flow: ForwardedArgFlow,
     /// `(call site, parameter)` terminator events already recorded, so each
     /// is recorded once without scanning the event list.
     terminators_seen: FxHashSet<(CallSiteId, u32)>,
@@ -830,6 +838,8 @@ fn solve(
     let mut resolved_indirect: FxHashMap<CallSiteId, Vec<FnId>> = FxHashMap::default();
     let mut wired_arg_flow: FxHashSet<(CallSiteId, u32, FnId)> = FxHashSet::default();
     let mut terminator_events: Vec<(CallSiteId, u32)> = Vec::new();
+    let invoked = invoked_params(program, models);
+    let mut invoke_watch = InvokeWatch::default();
 
     for var in &program.symbols.variables {
         if !seeds_own_location(program, var.id) {
@@ -897,6 +907,15 @@ fn solve(
                 &f.name,
                 models,
                 &mut terminator_events,
+            );
+            wire_invocations(
+                pag,
+                program,
+                &mut st,
+                &mut scratch,
+                cs,
+                invoked.get(&callee),
+                &mut invoke_watch,
             );
         }
     }
@@ -1401,13 +1420,38 @@ fn solve(
                             models,
                             &mut terminator_events,
                         );
+                        wire_invocations(
+                            pag,
+                            program,
+                            &mut st,
+                            &mut scratch,
+                            cs,
+                            invoked.get(&callee),
+                            &mut invoke_watch,
+                        );
                     }
+                }
+            }
+        }
+
+        // A callback variable handed to a modelled callee gained a function:
+        // the arguments the callee forwards reach its parameters.
+        // Nearly always empty: no lookup per pop for a program that hands
+        // no callback variable to a forwarding model.
+        if let Some(watchers) = (!invoke_watch.is_empty())
+            .then(|| invoke_watch.get(&node))
+            .flatten()
+        {
+            let gained: Vec<FnId> = delta.iter().filter_map(|&l| fn_for_loc(pag, l)).collect();
+            for &(cs, args) in watchers {
+                for &callback in &gained {
+                    wire_callback(pag, program, &mut st, &mut scratch, cs, callback, args);
                 }
             }
         }
     }
 
-    let callbacks = callback_edges(program, pag, &st, models, &call_edges);
+    let callbacks = callback_edges(program, pag, &st, &invoked, &call_edges);
     call_edges.extend(callbacks);
 
     // Emit synthetic call edges for IPC proxy→stub bridges detected at PAG
@@ -1458,6 +1502,7 @@ fn solve(
         }
     }
 
+    let forwarded_arg_flow = std::mem::take(&mut st.forwarded_arg_flow);
     let points_to = if retain_points_to {
         st.pts.into_iter().collect()
     } else {
@@ -1478,6 +1523,7 @@ fn solve(
         call_edges,
         arg_flow_edges: Vec::new(),
         wired_arg_flow,
+        forwarded_arg_flow,
         terminator_events,
         solve,
     }
@@ -2120,9 +2166,33 @@ fn wire_params(
     scratch: &mut Scratch,
     wired: &mut FxHashSet<(CallSiteId, u32, FnId)>,
 ) {
+    wire_actuals(pag, program, cs, callee, st, scratch, Some, |_, idx| {
+        wired.insert((cs.id, idx, callee));
+    });
+}
+
+/// Wire `cs`'s actuals into `callee`'s formals: formal `i` takes the actual
+/// at position `actual_of(i)`, and `on_wired(st, i)` records each formal that
+/// took one, for the arg-flow rows. An ordinary call passes position `i` to
+/// formal `i`; a callback a model invokes takes the positions the model
+/// forwards.
+#[allow(clippy::too_many_arguments)]
+fn wire_actuals(
+    pag: &mut Pag,
+    program: &Program,
+    cs: &trace_ir::CallSite,
+    callee: FnId,
+    st: &mut SolverState,
+    scratch: &mut Scratch,
+    actual_of: impl Fn(u32) -> Option<u32>,
+    mut on_wired: impl FnMut(&mut SolverState, u32),
+) {
     let callee_fn = program.symbols.function(callee);
     for (i, formal) in callee_fn.params.iter().enumerate() {
-        let idx = i as u32;
+        let formal_idx = i as u32;
+        let Some(idx) = actual_of(formal_idx) else {
+            continue;
+        };
         if let Some(actual) = cs.var_args.iter().find(|(j, _)| *j == idx).map(|(_, v)| *v) {
             let formal_node = pag.var_node.get(formal).copied().expect("formal var node");
             let actual_node = pag.var_node.get(&actual).copied().expect("actual var node");
@@ -2150,7 +2220,7 @@ fn wire_params(
                     scratch.wire_src.iter().copied(),
                 );
             }
-            wired.insert((cs.id, idx, callee));
+            on_wired(st, formal_idx);
         } else if cs.fn_args.iter().any(|(j, _)| *j == idx) {
             // A name with overloads passes each one it may mean.
             let formal_node = pag.var_node.get(formal).copied().expect("formal var node");
@@ -2159,7 +2229,7 @@ fn wire_params(
                     add_pts(st, formal_node, fn_loc);
                 }
             }
-            wired.insert((cs.id, idx, callee));
+            on_wired(st, formal_idx);
         }
     }
 }
@@ -2177,22 +2247,34 @@ fn add_pts(st: &mut SolverState, node: PagNodeId, loc: LocId) {
     }
 }
 
+/// The `invoke` effects of one modelled callee: each callback position with
+/// the arguments forwarded to it.
+type Invocations<'m> = Vec<(u32, &'m InvokeArgs)>;
+
+/// Callback variables handed to a modelled callee that forwards arguments,
+/// by PAG node, with the call sites that hand them over: a function reaching
+/// such a variable is wired like an indirect call's target.
+type InvokeWatch<'m> = FxHashMap<PagNodeId, Vec<(&'m trace_ir::CallSite, &'m InvokeArgs)>>;
+
 /// The callees a model says may invoke a callback argument, with the argument
 /// positions it names (`docs/ANALYSIS.md`, "Function models"). Read off the
 /// symbol table rather than off the call graph: a model that invokes is rare,
 /// so the index is nearly always empty or tiny, and the callback pass is
 /// skipped outright when it is empty.
-fn invoked_params(program: &Program, models: &FnModelSet) -> FxHashMap<FnId, Vec<u32>> {
+fn invoked_params<'m>(
+    program: &Program,
+    models: &'m FnModelSet,
+) -> FxHashMap<FnId, Invocations<'m>> {
     let mut by_callee = FxHashMap::default();
     for callee in &program.symbols.functions {
         let Some(model) = models.get_for_callee(&callee.name) else {
             continue;
         };
-        let params: Vec<u32> = model
+        let params: Invocations = model
             .effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::Invoke { param } => Some(*param),
+                Effect::Invoke { param, args } => Some((*param, args)),
                 _ => None,
             })
             .collect();
@@ -2203,28 +2285,203 @@ fn invoked_params(program: &Program, models: &FnModelSet) -> FxHashMap<FnId, Vec
     by_callee
 }
 
+/// Where `cs` records the modelled callee's explicit argument `param`: a
+/// member's arguments are recorded past its `this`.
+fn invoke_site_index(cs: &trace_ir::CallSite, param: u32) -> Option<u32> {
+    param.checked_add(u32::from(cs.args_bound_past_this))
+}
+
+/// The values `args` (a call site's `fn_args` or `var_args`) records at
+/// position `index`: several when a name has overloads.
+fn args_at<T: Copy>(args: &[(u32, T)], index: u32) -> impl Iterator<Item = T> + '_ {
+    args.iter()
+        .filter(move |(i, _)| *i == index)
+        .map(|(_, v)| *v)
+}
+
+/// The functions variable `var` may hold, in its points-to set's order.
+fn held_functions<'a>(
+    pag: &'a Pag,
+    st: &'a SolverState,
+    var: VarId,
+) -> impl Iterator<Item = FnId> + 'a {
+    pag.var_node
+        .get(&var)
+        .and_then(|node| st.pts.get(node))
+        .into_iter()
+        .flatten()
+        .filter_map(|loc| fn_for_loc(pag, *loc))
+}
+
+/// The ways `target` can be called with the `args` a model forwards at
+/// `cs`, each as the number of leading formals the arguments skip; none when
+/// it cannot take them (docs/ANALYSIS.md, "Callback invocation").
+fn invoke_alignments(
+    program: &Program,
+    cs: &trace_ir::CallSite,
+    target: FnId,
+    args: &InvokeArgs,
+) -> impl Iterator<Item = u32> {
+    let f = program.symbols.function(target);
+    let this = u32::from(program.symbols.has_this_param(target));
+    // The parameters the declaration lists, `this` not among them. An entry
+    // no declaration was read for, or an old-style `()`, takes anything.
+    let open = f.explicit_arity.is_none() && f.params.is_empty();
+    let declared = f
+        .explicit_arity
+        .unwrap_or((f.params.len() as u32).saturating_sub(this));
+    let alignments = match args {
+        // A listed form passes exactly these: never a receiver.
+        InvokeArgs::Listed(list) => {
+            let n = list.len() as u32;
+            let fits = n + f.default_args >= declared && (n <= declared || f.variadic);
+            [(open || fits).then_some(this), None]
+        }
+        // A site records the arguments that are variables or functions, not
+        // how many there are: the last one recorded is a lower bound.
+        InvokeArgs::Rest(from) => {
+            let first = invoke_site_index(cs, *from);
+            let last = (cs.var_args.iter().map(|(i, _)| *i))
+                .chain(cs.fn_args.iter().map(|(i, _)| *i))
+                .max();
+            let passed = match (first, last) {
+                (Some(first), Some(last)) if last >= first => last - first + 1,
+                _ => 0,
+            };
+            let room = |slots: u32| open || f.variadic || passed <= slots;
+            // A non-static member takes its receiver first. A static one,
+            // which lowering gives a `this` as well, takes none: both are
+            // wired where the count does not tell them apart.
+            [
+                room(declared + this).then_some(0),
+                (this == 1 && room(declared)).then_some(1),
+            ]
+        }
+    };
+    alignments.into_iter().flatten()
+}
+
+/// The definitions a callback handed over as `callback` runs when a model
+/// invokes it with `args` at `cs`: those an indirect call from the caller
+/// reaches ([`reached_definitions`]) that can take the arguments.
+fn invoke_targets<'a>(
+    program: &'a Program,
+    cs: &'a trace_ir::CallSite,
+    callback: FnId,
+    args: &'a InvokeArgs,
+) -> impl Iterator<Item = FnId> + 'a {
+    let caller_target = program.symbols.function(cs.caller).target;
+    reached_definitions(program, callback, caller_target)
+        .into_iter()
+        .filter(move |&target| {
+            invoke_alignments(program, cs, target, args)
+                .next()
+                .is_some()
+        })
+}
+
+/// Parameter wiring for the callbacks handed to a modelled callee at `cs`
+/// (`invoke` with forwarded arguments; `invocations` is the callee's entry
+/// in [`invoked_params`], if it has one). A callback named at the site is
+/// wired now; one passed in a variable is wired for the functions the
+/// variable holds, and `watch`ed for those it gains. Inside the fixpoint, so
+/// calls made through the forwarded arguments resolve; the edges themselves
+/// come from [`callback_edges`] once the points-to sets have converged.
+fn wire_invocations<'m>(
+    pag: &mut Pag,
+    program: &Program,
+    st: &mut SolverState,
+    scratch: &mut Scratch,
+    cs: &'m trace_ir::CallSite,
+    invocations: Option<&Invocations<'m>>,
+    watch: &mut InvokeWatch<'m>,
+) {
+    for &(param, args) in invocations.into_iter().flatten() {
+        if args.is_empty() {
+            continue;
+        }
+        let Some(index) = invoke_site_index(cs, param) else {
+            continue;
+        };
+        for callback in args_at(&cs.fn_args, index) {
+            wire_callback(pag, program, st, scratch, cs, callback, args);
+        }
+        for var in args_at(&cs.var_args, index) {
+            let Some(&node) = pag.var_node.get(&var) else {
+                continue;
+            };
+            let watchers = watch.entry(node).or_default();
+            if watchers.iter().any(|&(c, a)| c.id == cs.id && a == args) {
+                continue;
+            }
+            watchers.push((cs, args));
+            // A settled variable never pops again: wire what it holds now,
+            // in an order its hash set does not decide.
+            let mut held: Vec<FnId> = held_functions(pag, st, var).collect();
+            held.sort_unstable();
+            for callback in held {
+                wire_callback(pag, program, st, scratch, cs, callback, args);
+            }
+        }
+    }
+}
+
+/// Wire the arguments a modelled callee forwards at `cs` into the formals of
+/// `callback`'s definitions, as [`wire_params`] does for an indirect call's
+/// target, in each way the callback can take them ([`invoke_alignments`]).
+fn wire_callback(
+    pag: &mut Pag,
+    program: &Program,
+    st: &mut SolverState,
+    scratch: &mut Scratch,
+    cs: &trace_ir::CallSite,
+    callback: FnId,
+    args: &InvokeArgs,
+) {
+    for target in invoke_targets(program, cs, callback, args) {
+        for skip in invoke_alignments(program, cs, target, args) {
+            let actual_of =
+                |formal: u32| invoke_site_index(cs, args.actual_for(formal.checked_sub(skip)?)?);
+            wire_actuals(
+                pag,
+                program,
+                cs,
+                target,
+                st,
+                scratch,
+                actual_of,
+                |st, formal| {
+                    let pair = (
+                        formal,
+                        actual_of(formal).expect("wired formal has an actual"),
+                    );
+                    let wired = st.forwarded_arg_flow.entry((cs.id, target)).or_default();
+                    if !wired.contains(&pair) {
+                        wired.push(pair);
+                    }
+                },
+            );
+        }
+    }
+}
+
 /// Indirect edges for the callbacks handed to a modelled callee (`invoke`).
-/// A zero-argument callback needs no parameter wiring and its return is
-/// ignored, so this runs once on the converged points-to sets rather than
-/// inside the fixpoint. The edge is attributed to the submitting call site,
-/// which is where the caller hands the callback over, and stays inside the
-/// caller's link image like every other indirect edge.
+/// A callback's return is ignored and its parameters are wired inside the
+/// fixpoint ([`wire_invocations`]), so the edges are read once off the
+/// converged points-to sets. The edge is attributed to the submitting call
+/// site, which is where the caller hands the callback over, and stays inside
+/// the caller's link image like every other indirect edge.
 fn callback_edges(
     program: &Program,
     pag: &Pag,
     st: &SolverState,
-    models: &FnModelSet,
+    invoked: &FxHashMap<FnId, Invocations>,
     call_edges: &[CallGraphEdge],
 ) -> Vec<CallGraphEdge> {
-    let invoked = invoked_params(program, models);
     let mut edges = Vec::new();
     if invoked.is_empty() {
         return edges;
     }
-    // A callback's arity as `merge_unit` reads it: the explicit count when
-    // the declaration gives one, else the parameters it has.
-    let takes_nothing =
-        |f: &trace_ir::Function| f.explicit_arity.map_or(f.params.is_empty(), |n| n == 0);
     // Seeded with what the call graph already holds: a callback the callee's
     // own body reaches keeps the edge it earned there instead of gaining a
     // second one here.
@@ -2239,29 +2496,14 @@ fn callback_edges(
         let Some(cs) = program.symbols.call_site_by_id(edge.call_site) else {
             continue;
         };
-        let caller_target = program.symbols.function(cs.caller).target;
-        for param in params {
-            // A member's arguments are recorded past its `this`.
-            let Some(index) = param.checked_add(u32::from(cs.args_bound_past_this)) else {
+        for &(param, args) in params {
+            let Some(index) = invoke_site_index(cs, param) else {
                 continue;
             };
-            let named = cs
-                .fn_args
-                .iter()
-                .filter(|(i, _)| *i == index)
-                .map(|(_, f)| *f);
-            let pointed = cs
-                .var_args
-                .iter()
-                .filter(|(i, _)| *i == index)
-                .filter_map(|(_, var)| pag.var_node.get(var).and_then(|n| st.pts.get(n)))
-                .flatten()
-                .filter_map(|loc| fn_for_loc(pag, *loc));
+            let named = args_at(&cs.fn_args, index);
+            let pointed = args_at(&cs.var_args, index).flat_map(|var| held_functions(pag, st, var));
             for callee in named.chain(pointed) {
-                for target in reached_definitions(program, callee, caller_target) {
-                    if !takes_nothing(program.symbols.function(target)) {
-                        continue;
-                    }
+                for target in invoke_targets(program, cs, callee, args) {
                     if seen.insert((cs.id, target)) {
                         edges.push(CallGraphEdge {
                             call_site: cs.id,
@@ -2327,6 +2569,7 @@ fn extract_arg_flow(
     pag: &Pag,
     call_edges: &[CallGraphEdge],
     wired: &FxHashSet<(CallSiteId, u32, FnId)>,
+    forwarded: &ForwardedArgFlow,
     arg_flow_edges: &mut Vec<ArgFlowEdge>,
 ) {
     for edge in call_edges {
@@ -2342,28 +2585,40 @@ fn extract_arg_flow(
             .filter(|c| c.id == edge.call_site)
             .expect("call site for edge");
         let callee = program.symbols.function(edge.callee);
+        // One row per variable or function passed at `arg_index`.
+        let mut push_rows = |arg_index: u32, formal: VarId| {
+            if let Some(actual) = pag.argument_var(cs, arg_index) {
+                arg_flow_edges.push(ArgFlowEdge {
+                    call_site: edge.call_site,
+                    arg_index,
+                    actual_var: Some(actual),
+                    actual_fn: None,
+                    formal,
+                });
+            } else {
+                for &(_, fn_id) in cs.fn_args.iter().filter(|(j, _)| *j == arg_index) {
+                    arg_flow_edges.push(ArgFlowEdge {
+                        call_site: edge.call_site,
+                        arg_index,
+                        actual_var: None,
+                        actual_fn: Some(fn_id),
+                        formal,
+                    });
+                }
+            }
+        };
         for (i, formal) in callee.params.iter().enumerate() {
             let idx = i as u32;
             if wired.contains(&(edge.call_site, idx, edge.callee)) {
-                if let Some(actual) = pag.argument_var(cs, idx) {
-                    arg_flow_edges.push(ArgFlowEdge {
-                        call_site: edge.call_site,
-                        arg_index: idx,
-                        actual_var: Some(actual),
-                        actual_fn: None,
-                        formal: *formal,
-                    });
-                } else {
-                    for &(_, fn_id) in cs.fn_args.iter().filter(|(j, _)| *j == idx) {
-                        arg_flow_edges.push(ArgFlowEdge {
-                            call_site: edge.call_site,
-                            arg_index: idx,
-                            actual_var: None,
-                            actual_fn: Some(fn_id),
-                            formal: *formal,
-                        });
-                    }
-                }
+                push_rows(idx, *formal);
+            }
+        }
+        // A callback a model invokes: the positions the model forwards.
+        if let Some(pairs) = forwarded.get(&(edge.call_site, edge.callee)) {
+            let mut pairs = pairs.clone();
+            pairs.sort_unstable();
+            for (formal, arg_index) in pairs {
+                push_rows(arg_index, callee.params[formal as usize]);
             }
         }
     }

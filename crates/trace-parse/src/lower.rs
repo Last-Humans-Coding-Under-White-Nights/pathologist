@@ -13144,59 +13144,64 @@ fn field_path<'t>(
                 || implicit_this(program, ctx, source, *operand).is_some()
         })
         .zip(deref_class.filter(|_| !is_pointer));
-    let (root, mut raw_pointer, mut type_id) =
-        if ctx.is_cpp && cur.cached_kind() == "call_expression" {
-            // A wrapper value: the arrow is overloaded, never built in.
-            let call = call_root(program, ctx, source, cur, &arrows)?;
-            let wrapper = call.wrapper;
-            (PathRoot::Call(cur, call), false, wrapper)
-        } else if let Some(class) = arrow_root {
-            // The pointer `*x` holds: its arrow is built in.
-            let value = Operand::resolve(program, ctx, source, cur)?;
-            (PathRoot::Deref(Box::new(value)), true, class)
-        } else if let Some((operand, class)) = deref_root {
-            // A class object: an arrow on it is overloaded, never built in.
-            let value = Operand::resolve(program, ctx, source, operand)?;
-            (PathRoot::Deref(Box::new(value)), false, class)
-        } else {
-            let base = this_field
-                .or_else(|| this_root(ctx, source, cur))
-                .or_else(|| resolve_lvalue_var(program, ctx, source, cur))?;
-            // Keep the receiver's pointer provenance before layout lookup
-            // strips it. References and explicit dereferences denote the
-            // referred-to value.
-            let raw_pointer = ctx.is_cpp
-                && arrows.first() == Some(&true)
-                && if this_field.is_some() || cur.cached_kind() == "identifier" {
-                    // The common case only needs a type tag, not a cloned layout.
-                    match program
-                        .types
-                        .get(variable_type_id(program, base)?)
-                        .desc
-                        .as_ref()
-                    {
-                        TypeDesc::Ptr(inner) if ctx.reference_vars.contains(&base) => {
-                            matches!(**inner, TypeDesc::Ptr(_))
-                        }
-                        TypeDesc::Ptr(_) => true,
-                        _ => false,
-                    }
-                } else {
-                    matches!(
-                        receiver_desc(program, ctx, source, cur),
-                        Some(TypeDesc::Ptr(_))
-                    )
-                };
-            // An implicit `this` is the member's own class, a union included,
-            // which `this`'s pointer type need not tag as one.
-            let type_id = match this_field {
-                Some(_) => program
+    // Before the call root: a named cast parses as a call.
+    let cast = (arrows.first() == Some(&true))
+        .then(|| cast_root(program, ctx, source, cur))
+        .flatten();
+    let (root, mut raw_pointer, mut type_id) = if let Some((operand, class)) = cast {
+        (PathRoot::Cast(operand, class), true, class)
+    } else if ctx.is_cpp && cur.cached_kind() == "call_expression" {
+        // A wrapper value: the arrow is overloaded, never built in.
+        let call = call_root(program, ctx, source, cur, &arrows)?;
+        let wrapper = call.wrapper;
+        (PathRoot::Call(cur, call), false, wrapper)
+    } else if let Some(class) = arrow_root {
+        // The pointer `*x` holds: its arrow is built in.
+        let value = Operand::resolve(program, ctx, source, cur)?;
+        (PathRoot::Deref(Box::new(value)), true, class)
+    } else if let Some((operand, class)) = deref_root {
+        // A class object: an arrow on it is overloaded, never built in.
+        let value = Operand::resolve(program, ctx, source, operand)?;
+        (PathRoot::Deref(Box::new(value)), false, class)
+    } else {
+        let base = this_field
+            .or_else(|| this_root(ctx, source, cur))
+            .or_else(|| resolve_lvalue_var(program, ctx, source, cur))?;
+        // Keep the receiver's pointer provenance before layout lookup
+        // strips it. References and explicit dereferences denote the
+        // referred-to value.
+        let raw_pointer = ctx.is_cpp
+            && arrows.first() == Some(&true)
+            && if this_field.is_some() || cur.cached_kind() == "identifier" {
+                // The common case only needs a type tag, not a cloned layout.
+                match program
                     .types
-                    .class_type_id(&ctx.class_ctx.as_ref()?.qual_name)?,
-                None => struct_type_for_var(program, base)?,
+                    .get(variable_type_id(program, base)?)
+                    .desc
+                    .as_ref()
+                {
+                    TypeDesc::Ptr(inner) if ctx.reference_vars.contains(&base) => {
+                        matches!(**inner, TypeDesc::Ptr(_))
+                    }
+                    TypeDesc::Ptr(_) => true,
+                    _ => false,
+                }
+            } else {
+                matches!(
+                    receiver_desc(program, ctx, source, cur),
+                    Some(TypeDesc::Ptr(_))
+                )
             };
-            (PathRoot::Var(base), raw_pointer, type_id)
+        // An implicit `this` is the member's own class, a union included,
+        // which `this`'s pointer type need not tag as one.
+        let type_id = match this_field {
+            Some(_) => program
+                .types
+                .class_type_id(&ctx.class_ctx.as_ref()?.qual_name)?,
+            None => struct_type_for_var(program, base)?,
         };
+        (PathRoot::Var(base), raw_pointer, type_id)
+    };
     let mut summary_receiver = None;
     let mut field_ids = Vec::new();
     let mut member_type = program.types.unknown();
@@ -13295,6 +13300,17 @@ impl FieldPath<'_> {
         } = self;
         let base = match root {
             PathRoot::Var(base) => base,
+            PathRoot::Cast(operand, class) => {
+                // A receiver of the cast's class holding what the operand
+                // holds: the fields resolve against the class, not against
+                // the operand's declaration.
+                let receiver = alloc_recv_temp(program, ctx, node, class);
+                program.flow.push(FlowConstraint::Copy {
+                    dst: receiver,
+                    src: operand,
+                });
+                receiver
+            }
             PathRoot::Call(call, root) => {
                 let result = alloc_ret_temp(program, ctx, call);
                 program.symbols.variable_mut(result).type_id = root.wrapper;
@@ -13354,13 +13370,61 @@ impl FieldPath<'_> {
     }
 }
 
-/// Where a field path starts: a variable, a smart pointer a direct call
-/// returns, or the value a class object's dereference reads, whose own
-/// root variable is another object.
+/// Where a field path starts: a variable, one cast to another class, a smart
+/// pointer a direct call returns, or the value a class object's dereference
+/// reads, whose own root variable is another object.
 enum PathRoot<'t> {
     Var(VarId),
+    /// A variable cast to a pointer to the path's class ([`cast_root`]).
+    Cast(VarId, trace_ir::TypeId),
     Call(Node<'t>, CallRoot),
     Deref(Box<Operand<'t>>),
+}
+
+/// `(T *)x` / `static_cast<T *>(x)` as a path root: the variable `x` and the
+/// class `T`. The cast's type is read as a declaration's is, so a typedef of
+/// the class or of the pointer names `T` too; it must be one pointer level to
+/// a class, so the arrow that follows is built in. `x` must be a variable:
+/// the root of any other operand (`n->data`, `a[i]`) is a different object.
+/// A C-style cast to `x`'s own class is no root: `x` already is one.
+fn cast_root(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<(VarId, trace_ir::TypeId)> {
+    let named = node.cached_kind() == "call_expression" && is_named_cast(source, node);
+    let descriptor = match node.cached_kind() {
+        "cast_expression" => node.cached_field("type")?,
+        _ if named => node
+            .cached_field("function")?
+            .cached_field("arguments")?
+            .named_child(0)?,
+        _ => return None,
+    };
+    let operand = peel_casts(source, node);
+    if !matches!(
+        operand.cached_kind(),
+        "identifier" | "qualified_identifier" | "this"
+    ) {
+        return None;
+    }
+    let operand = resolve_lvalue_var(program, ctx, source, operand)?;
+    // The pointer levels the cast spells, on top of those its type names.
+    let mut desc = type_desc_from_node(program, ctx, source, descriptor);
+    for _ in 0..node_text(source, &descriptor).matches('*').count() {
+        desc = TypeDesc::Ptr(Box::new(desc));
+    }
+    let TypeDesc::Ptr(pointee) = desc else {
+        return None;
+    };
+    let class = match *pointee {
+        TypeDesc::Struct { ref name, .. } | TypeDesc::Union { ref name, .. } => {
+            program.types.class_type_id(name)?
+        }
+        _ => return None,
+    };
+    (named || struct_type_for_var(program, operand) != Some(class)).then_some((operand, class))
 }
 
 /// A direct call returning a smart pointer, as a field path's root.
