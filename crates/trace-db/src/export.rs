@@ -808,6 +808,7 @@ mod tests {
                 variadic: false,
                 defaulted_in_class: false,
                 declared_in_class: false,
+                is_static_member: false,
                 default_args: 0,
                 reference_params: Vec::new(),
                 is_virtual: false,

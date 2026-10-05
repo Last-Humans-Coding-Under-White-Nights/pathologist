@@ -149,6 +149,11 @@ edges**; `std::bind` is opaque.
   field so body member calls type.
 - `std::packaged_task<Sig>` intern as `FnPtr` like `std::function`.
 
+**Done so far:** `ffrt::queue::submit` and thread entry points
+(`std::thread`, `pthread_create`, #187) are `invoke` models; see
+`docs/ANALYSIS.md`, "Callback invocation". `std::bind` and
+`packaged_task` remain.
+
 **Eval when done:** `Plugin::DelayProcessEvent` reaches `OnEventProxy`;
 `EventLoop::ProcessEvent` packaged path reaches `EventHandler::OnEventProxy`;
 a sample `ffrt::submit` lambda (`FaultLogDatabase::SaveFaultLogInfo` or

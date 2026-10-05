@@ -632,6 +632,7 @@ mod tests {
             variadic: false,
             defaulted_in_class: false,
             declared_in_class: false,
+            is_static_member: false,
             is_virtual: true,
             is_final: false,
             is_cpp: true,

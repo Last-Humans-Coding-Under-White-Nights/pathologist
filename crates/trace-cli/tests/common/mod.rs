@@ -21,6 +21,38 @@ pub fn default_opts(root: &Path) -> PreprocessOptions {
         .with_include(include_dir)
 }
 
+/// `fn $name() -> &'static (Program, AnalysisResult)`: the fixture of that
+/// name, built and analysed once per test binary.
+#[allow(unused_macros)]
+macro_rules! analyzed_fixture {
+    ($(#[$attr:meta])* $name:ident) => {
+        $(#[$attr])*
+        fn $name() -> &'static (trace_ir::Program, trace_analysis::AnalysisResult) {
+            static CACHE: std::sync::OnceLock<(trace_ir::Program, trace_analysis::AnalysisResult)> =
+                std::sync::OnceLock::new();
+            CACHE.get_or_init(|| {
+                let root = $crate::common::fixture(stringify!($name));
+                let program =
+                    trace_parse::build_program(&root, &$crate::common::default_opts(&root))
+                        .expect("build");
+                let (_pag, analysis) = trace_analysis::analyze(&program);
+                (program, analysis)
+            })
+        }
+    };
+}
+
+/// `program` analysed with the built-in models plus the `--models` file
+/// contents `toml`.
+pub fn analyze_with_models(program: &Program, toml: &str) -> AnalysisResult {
+    let models = trace_analysis::FnModelSet::from_toml_str(toml).expect("models");
+    let opts = trace_analysis::AnalyzeOptions {
+        models: std::sync::Arc::new(models),
+        ..Default::default()
+    };
+    trace_analysis::analyze_with_options(program, opts).1
+}
+
 pub fn fn_name(program: &Program, id: trace_ir::FnId) -> String {
     program.symbols.function(id).name.clone()
 }

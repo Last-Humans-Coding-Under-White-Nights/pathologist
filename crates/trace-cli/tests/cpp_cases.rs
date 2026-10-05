@@ -1,6 +1,7 @@
 //! C++ lowering integration tests (first-step C++ support).
 #![allow(clippy::needless_borrow)]
 
+#[macro_use]
 mod common;
 
 use std::sync::OnceLock;
@@ -9,23 +10,6 @@ use common::{default_opts, fixture, fn_name, has_any_edge, has_edge, must_not_ha
 use trace_analysis::{analyze, AnalysisResult, ResolutionKind};
 use trace_ir::{FnId, Linkage, Program};
 use trace_parse::build_program;
-
-/// `fn $name() -> &'static (Program, AnalysisResult)`: the fixture of that
-/// name, built and analysed once per test binary.
-macro_rules! analyzed_fixture {
-    ($(#[$attr:meta])* $name:ident) => {
-        $(#[$attr])*
-        fn $name() -> &'static (Program, AnalysisResult) {
-            static CACHE: OnceLock<(Program, AnalysisResult)> = OnceLock::new();
-            CACHE.get_or_init(|| {
-                let root = fixture(stringify!($name));
-                let program = build_program(&root, &default_opts(&root)).expect("build");
-                let (_pag, analysis) = analyze(&program);
-                (program, analysis)
-            })
-        }
-    };
-}
 
 fn direct_targets(program: &Program, analysis: &AnalysisResult, caller: &str) -> Vec<String> {
     analysis

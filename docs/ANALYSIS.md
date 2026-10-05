@@ -977,6 +977,27 @@ Limits:
   `using Ref = S &;`) or deduced by `decltype(auto)` is taken as by value, so
   `return *p;` there reads one level too deep.
 
+### Cast receivers
+
+A field path rooted at a pointer cast of a variable — `((T *)x)->f`,
+`static_cast<T *>(x)->f` and the other named casts — resolves its fields
+against `T`, whatever `x` is declared as: a `void *` context argument, a base
+pointer cast down. The root is a receiver temporary of class `T` with
+`Copy(recv ← x)`, so the path sees every object `x` points to and, when `x`
+points to nothing known, `T`'s field summaries, as a `T *` local initialized
+from the cast does. `cast_root` in `lower.rs` decides:
+
+- the cast's type, read as a declaration's is (a typedef of the class or of
+  the pointer included), is one pointer level to a class the index knows.
+  The cast's own levels are its abstract declarator's `*` layers, so a `*`
+  inside a template argument (`static_cast<Box<int *> *>`) is the type's and
+  a reference (`T *&`) adds none;
+- the operand is a variable. The root of any other operand (`n->data`,
+  `a[i]`, `&obj`) is a different object, and such a path is left as it was;
+- an arrow follows the cast.
+
+A C-style cast to the operand's own class keeps the operand as the root.
+
 ### Smart-pointer unwrap
 
 `UnwrapPointer { dst, src }` is the step through a smart pointer's overloaded `operator->` or `operator*`. `src` holds the wrapper value (`sp`, or the loaded `h.item`); `dst` is the pointee-typed receiver temporary (`_recv`) that field accesses continue from. The receiver's type is the pointee class, and it is the only type the constraint consults, so merge remaps nothing but the two variables.
@@ -1558,11 +1579,62 @@ defined in-tree, so project-specific wrappers can be described too.
 | `return_heap` | returns a fresh storage location | fresh `Heap` loc per call site into the destination |
 | `clears { param }` | **terminator**: memory reachable via `param[param]` is zeroed by this call | no value introduction; terminator event exported |
 | `dlsym { param }` | return value may be the address of the in-tree function named by string constants in `param[param]` | `Dlsym` PAG constraint; unknown names add nothing |
-| `invoke { param }` | may invoke a zero-argument callback passed in `param[param]` | adds an indirect edge from the submitting caller at the submission site after points-to convergence; callback return values and scheduling are ignored. Unlike the value-introducing effects this is not restricted to a bodyless callee — a callback API is routinely a template whose body the index holds once, uninstantiated — and an edge the callee's own body already yields is not added twice |
+| `invoke { param, args / rest }` | may invoke the callback passed in `param[param]`, with the arguments `args = [..]` lists (none when omitted: a zero-argument callback) or every argument from position `rest` on | adds an indirect edge from the submitting caller at the submission site, read off the converged points-to sets; callback return values and scheduling are ignored. Forwarded arguments are wired into the callback's formals inside the fixpoint (see [Callback invocation](#callback-invocation-invoke)). Unlike the value-introducing effects this is not restricted to a bodyless callee — a callback API is routinely a template whose body the index holds once, uninstantiated — and an edge the callee's own body already yields is not added twice |
 
 Effects attach to parameter positions (0-based) of the *actual arguments* recorded at
 the call site. Arguments that are not IR variables or functions (literals like
 `sizeof(...)` or `0`) simply do not participate.
+
+### Callback invocation (`invoke`)
+
+`invoke` says the callee may call one of its arguments: a task queue running
+what was submitted, a thread running its entry point. The callback is every
+function the argument names or may point to, restricted to the caller's link
+image as an indirect call's targets are.
+
+- **Which arguments it gets.** `args = [3]` passes the callee's argument 3 as
+  the callback's first parameter (`pthread_create(&tid, attr, fn, arg)` is
+  `param = 2, args = [3]`); `rest = 1` passes argument 1 as the first
+  parameter, argument 2 as the second, and so on
+  (`std::thread(fn, args...)` is `param = 0, rest = 1`). `args` and `rest` are
+  alternatives; with neither the callback takes nothing. Positions count
+  explicit arguments, so a constructor's or member's implicit `this` is not
+  one of them. A model that passes the callback to itself, or gives `args` /
+  `rest` to another effect kind, is rejected when the file is loaded.
+- **Constructors.** A model named for a constructor (`C::C`) also applies
+  to a call recorded under the class name `C`, which is how a temporary is
+  spelled when the unit never saw the class (`task = std::thread(f, x)`).
+  One registration, so overriding or disabling it covers both.
+- **Which callbacks fit.** A listed form reaches a callback that can be
+  called with exactly that many arguments: its declared parameters, less
+  those with defaults, more if it is variadic. So a zero-argument model does
+  not run a function that needs an argument. A `rest` form has only a lower
+  bound to hold a callback to — a call site records the arguments that are
+  variables or functions, not how many there are — so it reaches a callback
+  with room for the last argument recorded. A function no declaration was
+  read for takes anything.
+- **Members.** Lowering gives every member function a `this`, a static one
+  included. A listed form never passes a receiver, so its arguments start
+  past `this`. A `rest` form passes the receiver first when the callback is
+  a non-static member (`std::thread(&C::Run, this, x)`) and starts past
+  `this` when it is a static one (`std::thread(C::Out, x)`), as its in-class
+  declaration's `static` tells (`Function::is_static_member`). Only a member
+  whose class body no unit showed could be either: where the argument count
+  allows both readings, both are wired.
+- **Wiring.** Each forwarded actual is wired into the callback's formal
+  exactly as an indirect call wires its arguments (`wire_params`): a
+  persistent `Copy` for pointer-like pairs, the function location for a
+  function named as the argument. This happens inside the fixpoint — for a
+  callback named at the site when the site is resolved, and for one held in a
+  variable whenever the variable gains a function — so calls made through the
+  forwarded values resolve. Wiring only adds copies and points-to members, so
+  convergence stays monotonic; functions already held when a site is first
+  seen are wired in `FnId` order.
+- **Arg-flow rows.** Each forwarded argument is an arg-flow row at the
+  starting call site: its position there, and the callback's formal.
+- **Not modeled.** No ordering or scheduling (the callback is simply
+  reachable from the starting site), no return value, and no bound state:
+  `std::bind` results and `std::function` objects are not looked into.
 
 ### Terminators (`clears`)
 
@@ -1593,6 +1665,8 @@ entries:
 | `realloc` | `return_alias param=0`, `return_heap` |
 | `dlsym`, `dlvsym`, `GetProcAddress` | `dlsym param=1` (symbol-name argument) |
 | `ffrt::queue::submit` | `invoke param=0` (explicit callback argument, excluding implicit `this`) |
+| `pthread_create` | `invoke param=2 args=[3]` (start routine and its argument) |
+| `std::thread::thread` | `invoke param=0 rest=1` (callable and everything after it); covers a temporary recorded as `std::thread` |
 
 ### Configuration format
 
@@ -1622,6 +1696,11 @@ effects = [ { kind = "return_heap" } ]
 name = "MyDlsym"
 effects = [ { kind = "dlsym", param = 1 } ]
 
+# A callback API: argument 1 is run with argument 2.
+[[model]]
+name = "pool_post"
+effects = [ { kind = "invoke", param = 1, args = [2] } ]
+
 # An explicitly empty effect list overrides (disables) a same-name built-in.
 [[model]]
 name = "memcpy"
@@ -1642,6 +1721,10 @@ effects = []
 - `return_alias`/`return_heap` fire only when the callee has **no body** under the
   analyzed root; defined functions keep their exact return flow.
 - Terminators kill nothing (see above).
+- **`invoke` is an immediate, unordered call**: the callback is reachable from
+  the site that hands it over, with no notion of the new thread, of when it
+  runs, or of its return value; a `rest` form checks arity only by a lower bound (see
+  [Callback invocation](#callback-invocation-invoke)).
 
 ## Noise macro filtering (`--ignore-macro`, `--ignore-logging`, `[noise]`)
 
