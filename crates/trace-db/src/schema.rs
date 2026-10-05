@@ -1,12 +1,12 @@
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 // Keep the complete public schema and the bulk-export phases in sync without
 // duplicating SQL. The exporter defers only non-unique secondary indexes.
 macro_rules! define_schema {
     ($tables:literal, $indexes:literal) => {
-        pub const SCHEMA_V6: &str = concat!($tables, $indexes);
-        pub const TABLES_V6: &str = $tables;
-        pub const INDEXES_V6: &str = $indexes;
+        pub const SCHEMA_V7: &str = concat!($tables, $indexes);
+        pub const TABLES_V7: &str = $tables;
+        pub const INDEXES_V7: &str = $indexes;
     };
 }
 
@@ -140,7 +140,7 @@ CREATE TABLE IF NOT EXISTS diagnostics (
 CREATE TABLE IF NOT EXISTS flow_nodes (
     id INTEGER PRIMARY KEY,
     kind TEXT NOT NULL,
-    label TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',
     var_id INTEGER REFERENCES variables(id),
     fn_id INTEGER REFERENCES functions(id)
@@ -152,6 +152,30 @@ CREATE TABLE IF NOT EXISTS flow_edges (
     dst_node INTEGER NOT NULL REFERENCES flow_nodes(id),
     kind TEXT NOT NULL
 );
+
+CREATE VIEW IF NOT EXISTS flow_nodes_text AS
+SELECT
+    n.id,
+    n.kind,
+    CASE
+        WHEN n.kind = 'var' AND (n.label IS NULL OR n.label = '') THEN
+            COALESCE(v.name, 'var' || COALESCE(n.var_id, n.id))
+        ELSE n.label
+    END AS label,
+    CASE
+        WHEN n.kind = 'var' AND (n.detail IS NULL OR n.detail = '') THEN
+            CASE
+                WHEN v.id IS NOT NULL THEN
+                    v.kind || ' @' || v.line || CASE WHEN f.name IS NOT NULL THEN ' in ' || f.name ELSE '' END
+                ELSE ''
+            END
+        ELSE n.detail
+    END AS detail,
+    n.var_id,
+    n.fn_id
+FROM flow_nodes n
+LEFT JOIN variables v ON v.id = n.var_id
+LEFT JOIN functions f ON f.id = COALESCE(n.fn_id, v.fn_id);
 
 "#,
     r#"
@@ -181,7 +205,7 @@ mod tests {
     fn deferred_indexes_preserve_schema_and_insertion_constraints() {
         let staged = Connection::open_in_memory().unwrap();
         staged.execute_batch("BEGIN IMMEDIATE;").unwrap();
-        staged.execute_batch(TABLES_V6).unwrap();
+        staged.execute_batch(TABLES_V7).unwrap();
         staged
             .execute(
                 "INSERT INTO files (id, path, sha256) VALUES (1, 'a.c', '')",
@@ -200,11 +224,11 @@ mod tests {
                 []
             )
             .is_err());
-        staged.execute_batch(INDEXES_V6).unwrap();
+        staged.execute_batch(INDEXES_V7).unwrap();
         staged.execute_batch("COMMIT;").unwrap();
 
         let complete = Connection::open_in_memory().unwrap();
-        complete.execute_batch(SCHEMA_V6).unwrap();
+        complete.execute_batch(SCHEMA_V7).unwrap();
         let schema = |conn: &Connection| {
             conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
                 .unwrap()

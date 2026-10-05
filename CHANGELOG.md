@@ -4,6 +4,10 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Compact flow_nodes export and on-demand dataflow inspect (#195)
+
+Variable nodes in `flow_nodes` now store empty strings for `label` and `detail` instead of duplicating `variables.name` and formatted metadata strings (`{kind} @{line} in {function}`), reducing the default export's largest table by 55 MB (-68.8%) on `ability_ability_runtime` and shrinking overall database size by 20%. Non-variable nodes (`loc`, `call_target`, `terminator`) are unchanged. A new SQLite view `flow_nodes_text` joins `variables` and `functions` through foreign keys `var_id` and `fn_id` to reconstruct the original text columns for external SQL queries. In `trace-db`, `dataflow_graph` now traverses edge adjacency first and loads only the visited nodes on demand rather than loading the full table. The schema version is bumped to **v7**. Rules: `docs/SQLITE_SCHEMA.md`; measurements in `docs/EVAL_REPORT.md` ("Compact flow_nodes export").
+
 ### Thread entry points through argument-forwarding callback models (#187)
 
 A function started on a new thread is now reachable from the code that starts it. The `invoke` model effect takes the arguments the callback is called with, as `args = [..]` or a variadic `rest = N` (loadable from `--models`), and wires them into the callback's formals inside the fixpoint; each forwarded argument is an arg-flow row at the starting call site. Built-in models cover `pthread_create` and the `std::thread` constructor, including temporaries, lambdas, static members and members started with their receiver. A field path rooted at a pointer cast of a variable (`static_cast<Ctx *>(arg)->h()`, `((Ctx *)arg)->h()`) resolves against the cast's class. Rules: [Callback invocation](docs/ANALYSIS.md#callback-invocation-invoke), [Cast receivers](docs/ANALYSIS.md#cast-receivers); measurements in `docs/EVAL_REPORT.md` ("Thread entry points").

@@ -1565,7 +1565,7 @@ fn addr_of_argument_has_one_ingress_edge_in_the_flow_graph() {
     let edges: Vec<(String, String)> = conn
         .prepare(
             "SELECT s.label, e.kind FROM flow_edges e \
-             JOIN flow_nodes s ON s.id = e.src_node JOIN flow_nodes d ON d.id = e.dst_node \
+             JOIN flow_nodes_text s ON s.id = e.src_node JOIN flow_nodes_text d ON d.id = e.dst_node \
              JOIN variables v ON v.id = d.var_id JOIN functions f ON f.id = v.fn_id \
              WHERE d.label = 'out' AND f.name = 'get_buf' AND e.kind IN ('copy', 'call_arg')",
         )
@@ -1618,7 +1618,7 @@ fn qualified_variables_issue_133_cli_export() {
         .prepare(
             "SELECT n.label, l.desc FROM points_to pt \
              JOIN locations l ON l.id = pt.loc_id \
-             JOIN flow_nodes n ON n.id = pt.var_node_id \
+             JOIN flow_nodes_text n ON n.id = pt.var_node_id \
              WHERE n.label IN ('ptr', 'member', 'from_ns', 'from_member', 'seen_arg')",
         )
         .unwrap()
@@ -3817,4 +3817,72 @@ effects = [{ kind = "return_heap" }]
         ),
         "expected indirect call edge from S::entry to target"
     );
+}
+
+#[test]
+fn flow_nodes_text_view_matches_old_flow_nodes_on_fixture_export() {
+    let root = fixture("fn_models");
+    let models_path = root.join("models.toml");
+    let models_str = models_path.to_str().unwrap();
+    let db = cli_analyze(&root, &["--jobs", "1", "--models", models_str]);
+    let conn = open_db(&db).unwrap();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT n.id, n.kind, n.label, n.detail, \
+                    v.name, v.kind, v.line, f.name, n.var_id \
+             FROM flow_nodes n \
+             LEFT JOIN variables v ON v.id = n.var_id \
+             LEFT JOIN functions f ON f.id = COALESCE(n.fn_id, v.fn_id) \
+             ORDER BY n.id",
+        )
+        .unwrap();
+
+    let expected_rows: Vec<(i64, String, String, String)> = stmt
+        .query_map([], |r| {
+            let id: i64 = r.get(0)?;
+            let kind: String = r.get(1)?;
+            let stored_label: String = r.get(2)?;
+            let stored_detail: String = r.get(3)?;
+            let v_name: Option<String> = r.get(4)?;
+            let v_kind: Option<String> = r.get(5)?;
+            let v_line: Option<i64> = r.get(6)?;
+            let f_name: Option<String> = r.get(7)?;
+            let var_id: Option<i64> = r.get(8)?;
+
+            let (label, detail) = if kind == "var" {
+                let l = if stored_label.is_empty() {
+                    v_name.unwrap_or_else(|| format!("var{}", var_id.unwrap_or(id)))
+                } else {
+                    stored_label
+                };
+                let d = if stored_detail.is_empty() {
+                    if let (Some(k), Some(line)) = (v_kind, v_line) {
+                        trace_db::format_var_flow_node(&l, &k, line, f_name.as_deref()).1
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    stored_detail
+                };
+                (l, d)
+            } else {
+                (stored_label, stored_detail)
+            };
+            Ok((id, kind, label, detail))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+
+    let mut view_stmt = conn
+        .prepare("SELECT id, kind, label, detail FROM flow_nodes_text ORDER BY id")
+        .unwrap();
+    let view_rows: Vec<(i64, String, String, String)> = view_stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+
+    assert_eq!(view_rows, expected_rows);
 }

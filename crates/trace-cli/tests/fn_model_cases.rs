@@ -132,7 +132,7 @@ fn terminator_event_recorded_and_exported() {
     // temporary lowering passes in its place.
     let cleared: String = conn
         .query_row(
-            "SELECT s.label FROM flow_edges e JOIN flow_nodes s ON s.id = e.src_node \
+            "SELECT s.label FROM flow_edges e JOIN flow_nodes_text s ON s.id = e.src_node \
              WHERE e.kind='terminates'",
             [],
             |r| r.get(0),

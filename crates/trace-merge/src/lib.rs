@@ -13,7 +13,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use trace_db::{INDEXES_V6, SCHEMA_VERSION, TABLES_V6};
+use trace_db::{INDEXES_V7, SCHEMA_VERSION, TABLES_V7};
 
 #[derive(Debug, Clone)]
 pub struct MergeOptions {
@@ -852,7 +852,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY;",
         )?;
         out_conn.execute_batch("BEGIN IMMEDIATE;")?;
-        out_conn.execute_batch(TABLES_V6)?;
+        out_conn.execute_batch(TABLES_V7)?;
 
         // Record analysis_run for the merge
         let options_json = serde_json::json!({
@@ -1014,7 +1014,7 @@ pub fn merge_databases<P: AsRef<Path>>(
         }
 
         // Build secondary indexes
-        out_conn.execute_batch(INDEXES_V6)?;
+        out_conn.execute_batch(INDEXES_V7)?;
         out_conn.execute_batch("COMMIT;")?;
     }
 

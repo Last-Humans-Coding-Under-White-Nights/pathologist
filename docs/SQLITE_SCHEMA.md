@@ -1,6 +1,6 @@
 # SQLite schema
 
-Schema version: **v6**
+Schema version: **v7**
 
 Export creates secondary indexes after bulk insertion, within the same
 transaction and before publishing the database. Primary keys and uniqueness
@@ -248,12 +248,25 @@ or static that no flow, return or call site names has no node (see
 |--------|------|-------------|
 | `id` | INTEGER PK | PAG node id (same id space as `points_to.var_node_id`) |
 | `kind` | TEXT | `var`, `loc`, `call_target` (indirect-call site node), or `terminator` (function-model clears event) |
-| `label` | TEXT | Human-readable label (variable name, `loc:…`, `fn:…`, `"memset_s clears arg0"`) |
-| `detail` | TEXT | Extra context (variable kind, enclosing function, …) |
+| `label` | TEXT | Human-readable label (empty for `var` nodes where label is read from `variables.name`; `loc:…`, `fn:…`, `"memset_s clears arg0"`) |
+| `detail` | TEXT | Extra context (empty for `var` nodes where detail is derived from `variables.kind`, `variables.line`, and `functions.name`; location kind for `loc`, call site for `call_target`/`terminator`) |
 | `var_id` | INTEGER FK → `variables` | Variable this node belongs to (`NULL` for function locations) |
 | `fn_id` | INTEGER FK → `functions` | Enclosing function, when known |
 
 **Index:** `flow_nodes(var_id)`
+
+### flow_nodes_text (view)
+
+A convenience view over `flow_nodes` joining `variables` and `functions` to reconstruct `label` and `detail` for `var` nodes (where `flow_nodes` stores empty strings to save database space, while preserving non-empty labels/details if already present). Direct queries seeking formatted node text can query this view instead of `flow_nodes`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER PK | PAG node id |
+| `kind` | TEXT | Node kind |
+| `label` | TEXT | Reconstructed label for empty `var` (`variables.name`), or stored label when present |
+| `detail` | TEXT | Reconstructed detail for empty `var` (`"{kind} @{line} in {fn}"`), or stored detail when present |
+| `var_id` | INTEGER FK → `variables` | Variable ID |
+| `fn_id` | INTEGER FK → `functions` | Function ID |
 
 ### flow_edges
 

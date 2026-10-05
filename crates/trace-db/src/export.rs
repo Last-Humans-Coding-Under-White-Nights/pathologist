@@ -1,4 +1,4 @@
-use crate::schema::{INDEXES_V6, SCHEMA_VERSION, TABLES_V6};
+use crate::schema::{INDEXES_V7, SCHEMA_VERSION, TABLES_V7};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use rustc_hash::FxHashSet;
@@ -53,7 +53,7 @@ pub fn export_to_sqlite(
             "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY;",
         )?;
         conn.execute_batch("BEGIN IMMEDIATE;")?;
-        conn.execute_batch(TABLES_V6)?;
+        conn.execute_batch(TABLES_V7)?;
 
         let options_json = serde_json::json!({
             "test_partition": {
@@ -106,7 +106,7 @@ pub fn export_to_sqlite(
             export_points_to(&conn, pag, analysis)?;
         }
         export_diagnostics(&conn, program, analysis)?;
-        conn.execute_batch(INDEXES_V6)?;
+        conn.execute_batch(INDEXES_V7)?;
         conn.execute_batch("COMMIT;")?;
     }
 
@@ -307,23 +307,10 @@ fn export_flow_graph(
 
     for node in &pag.nodes {
         let (kind, label, detail, var_id, fn_id) = match node.kind {
-            PagNodeKind::Var(v) => match program.symbols.variable_by_id(v) {
-                Some(var) => {
-                    let storage = match var.storage {
-                        StorageClass::Global => "global",
-                        StorageClass::FileStatic => "file_static",
-                        StorageClass::FnStatic => "fn_static",
-                        StorageClass::Param => "param",
-                        StorageClass::Local => "local",
-                    };
-                    let mut detail = format!("{storage} @{}", var.span.line);
-                    if let Some(f) = var.fn_id {
-                        detail.push_str(&format!(" in {}", program.symbols.function(f).name));
-                    }
-                    ("var", var.name.clone(), detail, Some(v), var.fn_id)
-                }
-                None => ("var", format!("var{}", v.0), String::new(), Some(v), None),
-            },
+            PagNodeKind::Var(v) => {
+                let fn_id = program.symbols.variable_by_id(v).and_then(|var| var.fn_id);
+                ("var", String::new(), String::new(), Some(v), fn_id)
+            }
             PagNodeKind::Loc(loc_id) => {
                 let loc = &pag.locations[loc_id.0 as usize];
                 let kind_str = match loc.kind {
@@ -760,7 +747,7 @@ mod tests {
             },
         ];
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(TABLES_V6).unwrap();
+        conn.execute_batch(TABLES_V7).unwrap();
         export_files(&conn, &program).unwrap();
         export_link_targets(&conn, &program).unwrap();
         let mut stmt = conn.prepare("SELECT t.name, t.output, f.path, d.name FROM link_targets t JOIN target_sources s ON s.target_id = t.id JOIN files f ON f.id = s.file_id JOIN target_dependencies e ON e.target_id = t.id JOIN link_targets d ON d.id = e.dependency_id").unwrap();
@@ -845,7 +832,7 @@ mod tests {
         for full_detail in [false, true] {
             let conn = Connection::open_in_memory().unwrap();
             conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-            conn.execute_batch(TABLES_V6).unwrap();
+            conn.execute_batch(TABLES_V7).unwrap();
             export_functions(&conn, &program).unwrap();
             if full_detail {
                 export_variables(&conn, &program).unwrap();

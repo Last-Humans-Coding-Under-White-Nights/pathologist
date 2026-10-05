@@ -516,7 +516,7 @@ trace inspect /tmp/unified.db callchain --from app_main --to framework_init
 
 ## SQLite database schema
 
-Schema version: **v6**. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation.
+Schema version: **v7**. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries.
 
 ### Entity relationship (overview)
 
