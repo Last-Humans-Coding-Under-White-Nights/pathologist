@@ -34,7 +34,7 @@ int main(void) { invoke(CALLBACK); }
         .call_sites
         .iter()
         .filter(|site| site.callee_name == "invoke")
-        .flat_map(|site| site.fn_args.iter())
+        .flat_map(|site| site.fn_args().iter())
         .map(|(_, id)| program.symbols.function(*id).name.as_str())
         .collect();
     callbacks.sort_unstable();

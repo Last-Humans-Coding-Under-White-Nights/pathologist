@@ -1562,7 +1562,7 @@ fn apply_fn_model(
     // `&base.member` arguments resolve to the base variable; copying the
     // whole container would pollute unrelated fields with the source's
     // pointees, so alias-style effects refuse to fire on them.
-    let member_addr = |idx: u32| cs.addr_of_member_args.binary_search(&idx).is_ok();
+    let member_addr = |idx: u32| cs.addr_of_member_args().binary_search(&idx).is_ok();
     // Actual argument node for parameter slot `idx`, when the call passed an
     // IR variable there (literals like `0` or `sizeof(..)` do not
     // participate).
@@ -2221,10 +2221,10 @@ fn wire_actuals(
                 );
             }
             on_wired(st, formal_idx);
-        } else if cs.fn_args.iter().any(|(j, _)| *j == idx) {
+        } else if cs.fn_args().iter().any(|(j, _)| *j == idx) {
             // A name with overloads passes each one it may mean.
             let formal_node = pag.var_node.get(formal).copied().expect("formal var node");
-            for &(_, fn_id) in cs.fn_args.iter().filter(|(j, _)| *j == idx) {
+            for &(_, fn_id) in cs.fn_args().iter().filter(|(j, _)| *j == idx) {
                 if let Some(&fn_loc) = pag.fn_locations.get(&fn_id) {
                     add_pts(st, formal_node, fn_loc);
                 }
@@ -2342,7 +2342,7 @@ fn invoke_alignments(
         InvokeArgs::Rest(from) => {
             let first = invoke_site_index(cs, *from);
             let last = (cs.var_args.iter().map(|(i, _)| *i))
-                .chain(cs.fn_args.iter().map(|(i, _)| *i))
+                .chain(cs.fn_args().iter().map(|(i, _)| *i))
                 .max();
             let passed = match (first, last) {
                 (Some(first), Some(last)) if last >= first => last - first + 1,
@@ -2405,7 +2405,7 @@ fn wire_invocations<'m>(
         let Some(index) = invoke_site_index(cs, param) else {
             continue;
         };
-        for callback in args_at(&cs.fn_args, index) {
+        for callback in args_at(cs.fn_args(), index) {
             wire_callback(pag, program, st, scratch, cs, callback, args);
         }
         for var in args_at(&cs.var_args, index) {
@@ -2502,7 +2502,7 @@ fn callback_edges(
             let Some(index) = invoke_site_index(cs, param) else {
                 continue;
             };
-            let named = args_at(&cs.fn_args, index);
+            let named = args_at(cs.fn_args(), index);
             let pointed = args_at(&cs.var_args, index).flat_map(|var| held_functions(pag, st, var));
             for callee in named.chain(pointed) {
                 for target in invoke_targets(program, cs, callee, args) {
@@ -2598,7 +2598,7 @@ fn extract_arg_flow(
                     formal,
                 });
             } else {
-                for &(_, fn_id) in cs.fn_args.iter().filter(|(j, _)| *j == arg_index) {
+                for &(_, fn_id) in cs.fn_args().iter().filter(|(j, _)| *j == arg_index) {
                     arg_flow_edges.push(ArgFlowEdge {
                         call_site: edge.call_site,
                         arg_index,

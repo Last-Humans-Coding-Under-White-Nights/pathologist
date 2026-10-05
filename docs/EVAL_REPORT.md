@@ -1,5 +1,768 @@
 # Evaluation Report
 
+## Review fixes and spill cleanup — 2026-10-05
+
+The review of the memory changes at `5fa6df9` identified a timeout leak:
+`std::process::exit(124)` bypasses the destructors of live source spills.
+Spills now share a randomly named temporary directory, with its lifetime tied
+to a process-wide live-file count. The wrapper adds no fields to each spill
+record. File creation uses a shared lock, allowing workers to create spills in
+parallel; timeout cleanup takes exclusive access and stops new spills before
+removing the directory. Normal release removes individual files
+and the last release removes the directory, including between indexing runs.
+The authoritative cleanup contract is in
+[Preprocessor storage](PREPROCESSOR.md#role-in-the-pipeline).
+
+The review validation rejected the first cleanup candidate's higher camera
+median (459.0 → 465.1 MiB), and the concurrent-creation revision still showed
+an ability increase. The retained source payload budget is reduced from
+64 to 32 MiB to give these transient worker allocations more headroom, using
+the same spill format and error/cleanup contracts. The earlier 64 MiB results
+below remain historical measurements. This adjustment trades additional
+temporary-file I/O for resident memory; active workers and metadata remain
+outside the payload budget.
+
+Stage probes then showed the remaining ability maximum during TU merging, with
+more than 1.4 GiB of free allocator arena space after indexing. Reusing the graph
+worker pool was tested and rejected: it raised ability's peak by about 80 MiB.
+The separate pools remain. On glibc, the ordered indexing window now returns
+unused parser/merge pages after every 64 consumed payloads, before admitting
+the next window slot. Unit order and ownership are unchanged. See
+[Call-record storage and merge lifetime](ANALYSIS.md#call-record-storage-and-merge-lifetime).
+
+The final whole-process comparison uses Linux/glibc release binaries, eight
+workers, default minimal export, the default allocator, and kernel maximum RSS
+from `/usr/bin/time -v`. The baseline is the pre-review rebased commit
+`5fa6df9`. Its three runs per corpus are retained from the alternating
+concurrent-cleanup matrix; the final candidate has three fresh runs per corpus.
+No compilation, evaluation or SQLite comparison overlapped the timed runs.
+
+| Corpus | Baseline median peak MiB (range) | Fixed median peak MiB (range) | Median wall seconds |
+|---|---:|---:|---:|
+| Camera | 463.9 (446.5–463.9) | 418.9 (418.1–422.5) | 11.02 → 12.36 |
+| Ability | 1098.4 (1090.8–1102.2) | 1052.5 (1045.4–1055.7) | 69.17 → 74.49 |
+
+Every final peak is below the lowest baseline peak for its corpus. Median peak
+falls 9.7% for camera and 4.2% for ability. Median wall time rises about 12% and
+8%, respectively: smaller retained payloads and periodic allocator reclamation
+trade throughput for the requested lower overall peak. These measurements
+cover the complete analysis and export, not just preprocessing or indexing.
+Inputs are unchanged: camera `8ffd69dcd47f533e70b4dba428439da9008b0cae`
+and ability `87e02b78de2dfc08cbc98cc84eb0678302cce80b`.
+All **15 non-metadata SQLite tables** match the baseline in each of the six
+final databases; only run metadata such as timestamps is excluded.
+
+The other comments are addressed: spill eviction reconciles nonresident
+accounting under the cache lock without discarding a replacement resident;
+releasing merge state also releases the call-name pool; configured source and
+header options reuse the diagnostic pool before `for_indexing`; diagnostic
+identity equality has an Arc pointer fast path; call names compare with `str`,
+`&str` and `String` in both operand orders; redundant borrow parentheses are
+removed; and the macro test requires explicitly recorded occurrences before
+comparing their spans. Storage/lifetime rules remain in
+[Call-record storage and merge lifetime](ANALYSIS.md#call-record-storage-and-merge-lifetime).
+
+The timeout reproduction uses 3,000 files, each with 600 `int vN_j = j;` lines,
+release builds and eight workers, with a fresh `TMPDIR` per invocation:
+
+| Timeout | Pre-review leftover files / bytes | Fixed leftover files / bytes | Fixed maximum sampled spills |
+|---|---:|---:|---:|
+| 1 second | 1,281 / 199,529,072 | 0 / 0 | 1,561 |
+| 2 seconds | 2,138 / 334,000,240 | 0 / 0 | 2,786 |
+
+Both versions exit with code 124. The fixed runs leave no empty directory
+either. Sampling every 50 ms confirms both timeouts reached actual spilling;
+these counts describe this reproduction, not a fixed scheduling requirement.
+
+`cargo clippy --workspace --all-targets --all-features --offline -- -D warnings`
+and `cargo test --workspace --all-features --offline` pass (**1,804 tests**,
+none failed or ignored). New regressions cover a destructor-skipping child
+process with an open spill and eight concurrent creators, cleanup idempotence
+and blocking later creation,
+normal directory lifetime across repeated runs, stale accounting for absent,
+released and spilled victims, call-name pool release, and symmetric string
+comparisons. The strengthened macro test passes. The pinned production evaluation passes
+**97 checks, zero failures**. Formatting and diff checks pass. Artifacts are in `/tmp/trace-review-20261005/`; workspace and lint logs are
+`/tmp/trace-review-workspace-tests-20261005.log` and
+`/tmp/trace-review-clippy-20261005.log`; the evaluation log is
+`/tmp/trace-review-eval-20261005.log`.
+
+## Additional call-record and merge-index memory reductions — 2026-10-05
+
+All five candidates from the research below are implemented on top of the
+retained optimizations at `8aa0895`:
+
+1. Terminal indexing releases merge-only state before finalization; the CLI
+   and C API use this path.
+2. Rare call metadata uses one optional boxed payload. Together with shared
+   names, `CallSite` is **144 bytes instead of 256** on this x86-64 target.
+3. Overload grouping stably sorts borrowed references, replacing the temporary
+   hash map and its mostly singleton vectors.
+4. Call-source lookup stores compact fingerprint buckets with typed call IDs,
+   eliminating copied source keys and callee strings.
+5. A per-symbol-table pool shares immutable callee spellings during lowering,
+   merging and virtual expansion, including clones of call records.
+
+The Rust API migration and authoritative storage/lifetime rules are in
+[Call-record storage and merge lifetime](ANALYSIS.md#call-record-storage-and-merge-lifetime).
+SQLite schema and C ABI are unchanged. The previously discarded disk-spool,
+sparse-line-map and header-retirement experiments remain absent.
+
+### Whole-process measurements
+
+Linux/glibc, release builds, unchanged inputs and flags, default minimal export.
+These are medians of three baseline and three final-candidate runs, measured
+with kernel `VmHWM`, with RSS sampled every 50 ms. No compiler, evaluation or
+SQLite comparison jobs overlapped the timed measurements. The baseline binary
+is the retained implementation at `8aa0895`; the final binary includes the
+linked-case guards described below. Baseline corpus runs were retained from
+the initial alternating matrix, then the final candidate was measured three
+more times after those guards were added. Wall times are included for context;
+they are noisier than the memory measurements.
+
+| Case | Baseline peak MiB | Final peak MiB | Peak change | Median wall seconds |
+|---|---:|---:|---:|---:|
+| Ability, 8 workers | 1282.8 | 1103.1 | -14.01% | 106.66 → 102.68 |
+| Camera, 8 workers | 486.6 | 467.3 | -3.96% | 17.76 → 13.74 |
+| HDF, 8 workers | 294.1 | 285.5 | -2.92% | 10.98 → 8.17 |
+| Hiview, 8 workers | 167.3 | 163.3 | -2.35% | 5.02 → 3.61 |
+| Linked fixture, 1 worker | 156.9 | 155.4 | -0.95% | 12.67 → 12.13 |
+| Linked fixture, 8 workers | 193.1 | 186.5 | -3.40% | 2.01 → 2.06 |
+
+Full/debug camera: 484.9 → 449.2 MiB (one run per binary). Full/debug linked fixture: 193.0 → 186.2 MiB (one run per binary).
+
+Every measured case has a lower peak. For every repeated case, the highest
+final-candidate peak is below the lowest baseline peak. These reductions refer to
+the entire process, including solving and export, rather than only the index
+phase. Ability's remaining peak is around preprocessing/header parsing and TU
+indexing, close to the include-graph floor; reducing additional merge scratch
+alone would therefore have a smaller effect on the overall maximum.
+
+### Rejecting the linked-case increase
+
+The initial five-change candidate improved all four production corpora but
+raised the linked fixture's eight-worker median from 192.9 to 193.6 MiB (+0.33%).
+That result was not accepted. Dropping consumed linked-unit vectors immediately
+after image merging shortened their lifetime but did not remove the peak.
+The final configured path also returns freed lexer/AST heap pages while the
+index workers are idle, before image selection builds its scoped copies.
+Combined with the earlier unit drop, this removes the increase without changing
+unit selection, weak precedence, merge order or analysis data. The final linked
+fixture was repeated at both worker counts, including full/debug export.
+
+### Validation and artifacts
+
+- `cargo test --workspace --offline`: **1,770 passed**, none failed or ignored.
+- `scripts/eval_check.py` on the pinned production trees: **95 checks passed**.
+- **32 databases** compared by sorted row hashes across all **15 non-metadata
+  tables**, excluding only `analysis_run`: every value matched the baseline.
+  This includes all three final runs on each production corpus, linked runs
+  at both worker counts, and full/debug camera and linked exports.
+- Focused tests cover terminal/retained builders with and without compilation
+  commands and conditional variants, exact overloaded-call sibling order,
+  forced source-hash collisions, binding snapshots across finalization, and
+  shared-name lifetime after clearing the pool.
+- `cargo fmt --all -- --check` and `git diff --check` pass.
+
+After rebasing onto local `master` at `83815b4`, which adds thread callback
+forwarding and schema-v7 compact flow-node export, all **1,800 workspace tests**
+and **97 pinned corpus checks** pass. The peak measurements and 32-database
+comparisons above predate that rebase and describe the saved binaries; they were
+not repeated on the new base. Rebase validation logs are
+`/tmp/trace-memory-rebase-tests-20261005.log` and
+`/tmp/trace-memory-rebase-eval-20261005.log`.
+
+Raw logs, kernel peaks, samples, saved binaries, per-candidate patches, binary
+SHA-256 provenance and sorted SQLite table signatures are in
+`/tmp/trace-memory-implementation-20261005/` (`manifest.json`, `summary-final.json`,
+`run.py`, `suite.py`, `final_suite.py`, `linked_probe.py` and `compare.py`). The
+layout probe reports `CallSite=144`, `CallSiteDetails=112`, `CallName=16`.
+
+Single-run ability pilots used separate saved builds: 1278.1 MiB baseline,
+1231.6 after the early release, 1196.1 after rare metadata, 1170.6 after overload
+sorting, and 1154.9 after compact call keys. The first complete five-change run
+was 1090.2 MiB. These pilot deltas are not additive predictions and do not
+replace the repeated final measurements above.
+
+## Remaining peak-memory opportunities — 2026-10-05
+
+Research on the retained implementation at `8aa0895`, after the follow-up
+experiments were removed. Production code was unchanged during those probes. These are allocation
+targets and projections, **not measured reductions in whole-process peak RSS**.
+The accepted whole-run measurements remain in the
+[preceding implementation report](#preprocessing-cache-budget-and-configured-streaming--2026-10-05).
+
+### Method and current ownership
+
+Temporary copies of the parse and analysis crates add observations and link
+against the current release dependency artifacts. Eight workers index the same
+pinned camera and ability corpora. HDF additionally runs the normal default
+analysis. Individual bulk clones, held briefly after indexing or solving, measure
+the change in glibc `uordblks + hblkhd`; dropping merge state measures its release
+directly. Clones share existing Arc payloads and can omit original spare vector
+capacity, so they estimate independently owned allocations. The overloaded-call
+group map is reconstructed after indexing with the same keys and values using a
+standard HashMap; it measures that scratch allocation, not a native phase peak.
+The temporary probes and their allocator effects are excluded from performance
+claims. No compiler or corpus changes are part of this research.
+
+| Measurement | Camera | Ability |
+|---|---:|---:|
+| Call records | 126,240 | 704,506 |
+| Call-record size on this target | 256 bytes | 256 bytes |
+| Call-vector capacity | 131,072 | 1,048,576 |
+| Merge-state allocations released after indexing | 25.5 MiB | 89.4 MiB |
+| Owned call-key index clone, subset of merge state | 13.5 MiB | 57.4 MiB |
+| Owned function-key index clone, subset of merge state | 10.3 MiB | 27.6 MiB |
+| Reconstructed overload-group scratch map | 16.2 MiB | 116.3 MiB |
+| Overload groups containing one record | 97.4% | 98.3% |
+| Call records requiring any of the proposed rare fields | 4.3% | 9.6% |
+| Callee-name payload capacity beyond unique spellings | 4.0 MiB | 16.2 MiB |
+
+The merge-state subsets must not be added to the containing row. Name bytes and
+record payloads likewise overlap broader symbol-clone ownership figures.
+
+### Candidates in implementation order
+
+1. **Release merge-only state before index finalization.** The CLI and C API
+   release it after the program builder returns. It therefore overlaps
+   `finalize_program`, including virtual expansion and overload-site indexing.
+   The ordinary finalization path reads the symbol table and semantic facts,
+   rather than `Program::dedup`. Moving the lifetime boundary could remove about
+   89 MiB of live allocations from ability's finalization interval, or 26 MiB
+   from camera's. Preserve the existing public builder's support for callers
+   intending further merges: use an explicit terminal build path or option,
+   and share the same finalization code with the retained-state path.
+   Source: [finalization](../crates/trace-parse/src/lower.rs),
+   [release API](../crates/trace-ir/src/program.rs),
+   [CLI lifecycle](../crates/trace-cli/src/main.rs) and
+   [C API lifecycle](../crates/trace-capi/src/index.rs).
+
+2. **Keep rare call metadata outside the fixed record.** Every `CallSite`
+   contains a 40-byte optional occurrence and three 24-byte vectors for
+   function-pointer arguments and address markers. Ability has 648,690 records
+   without the occurrence, 701,377 without function-pointer arguments, 704,182
+   without member-address markers and 695,774 without plain-address markers.
+   Only 67,791 records need any of these fields. Camera needs them on 5,481.
+   A layout-only model puts these fields into one optional boxed payload and
+   reduces the fixed record from 256 to 152 bytes. Keeping common variable
+   arguments, request/expansion spans and receiver information directly on the
+   record avoids allocating this payload for common member calls. At 128 bytes
+   per rare-payload allocation, projected live-record savings are approximately
+   62 MiB on ability and 12 MiB on camera, excluding duplicated intermediate
+   records. This projection is not an RSS result. Choose storage when creating
+   records so conversion never holds two full call tables. All occurrence,
+   argument and source-location facts must survive unchanged.
+   Source: [CallSite](../crates/trace-ir/src/symbol.rs).
+
+3. **Avoid the full hash map and singleton vectors in overload-site grouping.**
+   `index_overload_sites` constructs a scratch map of every resolved call
+   before keeping only groups with other bound callees. On ability it creates
+   579,494 groups, of which 569,379 are singletons; the reconstruction allocates
+   116 MiB. Camera creates 106,144 groups, with 103,338 singletons, using 16 MiB.
+   Sorting borrowed record references by the exact existing group identity
+   would use about 5.4 MiB for ability's reference vector, plus sorting scratch,
+   and allow scanning adjacent groups. A stable sort preserves original
+   within-group site order. A smaller change stores a group's first member
+   inline and allocates a vector only on a second member. Both approaches must
+   retain the current sibling-target order; the sorted approach trades expected
+   linear grouping time for sorting. Compare both before choosing.
+   Source: [index_overload_sites](../crates/trace-ir/src/symbol.rs).
+
+4. **Shrink merge lookup keys while merges are still active.** The call-key
+   index alone owns approximately 57 MiB on ability. Keys copy source identity
+   and callee spelling already held by call records, and merge constructs an
+   owned name even for duplicate lookup hits. A fingerprint index referring to
+   typed call IDs can compare the complete identity against the stored records.
+   Hashes must only group candidates; exact comparison must decide equality.
+   Use an inline first ID with storage for collisions, avoiding a heap vector
+   per singleton bucket. Reuse the existing source-identity rules and preserve
+   registration order. This is an alternative way to reduce retained merge
+   state during TU merging; its savings overlap candidate 1 during finalization.
+   Source: [MergeDedup](../crates/trace-ir/src/program.rs) and
+   [call registration](../crates/trace-parse/src/merge.rs).
+
+5. **Intern repeated symbol spellings within the run.** Ability's callee-name
+   strings reserve 17.9 MiB of payload capacity, while unique spellings total 1.7 MiB;
+   camera has 4.7 MiB versus 0.7 MiB. This excludes per-allocation overhead and
+   additional copies in function and lookup tables. Shared immutable strings
+   can reduce both those allocations and copies in temporary call records.
+   The interning table has a cost and should not become a process-wide registry.
+   This is a broader Rust API change than candidates 1 or 3, although textual
+   identity, resolution precedence and ordered iteration can remain unchanged.
+   Source: [symbol records and name indexes](../crates/trace-ir/src/symbol.rs).
+
+6. **Release original flow constraints between PAG construction and solving.**
+   The solver does not read `Program::flow`; it consumes PAG constraints.
+   The CLI currently releases the vector only after analysis. HDF retains
+   131,072 slots of 40 bytes, or 5 MiB of reserved element storage, while
+   solving. Ability reserves 20 MiB, with additional owned string payloads.
+   A consuming analysis entry point could release just `flow` after PAG build,
+   while preserving the existing read-only analysis API. `fn_returns` must
+   remain: indirect-call return expansion reads it during solving. Moving the
+   existing `release_flow` call unchanged would drop these required summaries.
+   This candidate targets HDF's analysis peak; it may not affect ability's
+   overall peak while indexing remains larger.
+   Source: [analysis lifecycle](../crates/trace-analysis/src/solver.rs),
+   [return expansion](../crates/trace-analysis/src/pag.rs) and
+   [flow release](../crates/trace-ir/src/program.rs).
+
+### Other targets and screened-out copies
+
+- The include-graph stage still builds per-thread full-path probe caches, even
+  for negative results answered from shared directory listings. Earlier native
+  samples on the retained implementation put ability's graph peak at about
+  1,030 MiB. Bounded negative caching or directory/name keys could lower this
+  separate floor. Retain the cheap directory-listing path and cache expensive
+  fallback probes; simply disabling caching risks repeated filesystem calls.
+  This requires its own CPU and native-peak comparison.
+  Source: [filesystem probes](../crates/trace-ir/src/paths.rs) and
+  [parallel graph scan](../crates/trace-parse/src/deps.rs).
+- HDF's solver holds 2,642,015 points-to facts and the same number of reverse
+  holder facts. Clone estimates are 34.2 MiB for points-to storage, 23.0 MiB for
+  holders, 24.2 MiB for memory-cell sets and 13.4 MiB for membership bit mirrors.
+  The reverse index is functional data, not a dispensable copy; the mirrors
+  intentionally trade space for propagation speed. Adaptive set storage or
+  tighter mirror allocation needs profiling and must preserve the original
+  set iteration order and monotonic propagation. This is a higher-risk solver
+  project than the lifetime and call-record changes above.
+- Ability's call vector reserves about 84 MiB beyond its live record count.
+  These bytes are not necessarily resident: untouched capacity can be uncommitted.
+  Shrinking after finalization cannot undo an earlier peak, while shrinking
+  before append-heavy finalization can force another growth allocation.
+  Capacity trimming alone is therefore not a proven 84 MiB peak saving.
+- Global header-flow deduplication is only 13 entries on camera and 1,432 on
+  ability, with clone estimates below 0.11 MiB. Replacing that particular set
+  is not a substantial native-corpus opportunity. Configured-family flow sets
+  have different ownership and need separate measurements.
+- Per-call parameter clones, double-copying arguments during remapping and
+  return-vector clones are allocation churn, but individual buffers are small.
+  C++ normalization already allocates changed text lazily. These did not emerge
+  as first-priority whole-peak targets.
+
+Implement and measure each candidate independently against the retained
+baseline, using whole-process high-water marks across preprocess, indexing,
+analysis, export and teardown. Compare repeated ability, camera, HDF and hiview
+runs and all non-metadata SQLite tables. Stop when another phase sets the floor;
+neither allocation estimates nor individual phase improvements establish a
+whole-run saving.
+
+Raw probes, copied sources, logs, layout model, dependency-linked binaries,
+`summary.json` and `manifest.json` are in
+`/tmp/trace-memory-hotspots-20261005/` on the measurement host.
+`prepare.py` and `prepare_analysis.py` build the observational crates;
+`census_main.rs`, `call_main.rs` and `analysis_main.rs` contain the drivers.
+There are no new production-code tests because production code was unchanged.
+
+## Preprocessing cache budget and configured streaming — 2026-10-05
+
+Implemented after the [ownership research](#preprocessing-and-indexing-memory-research--2026-10-05):
+
+- Final small resident LineMap vectors shed unused capacity. Individually large
+  allocations keep their existing spill decision, based on retained capacity.
+- Preprocessing diagnostics share immutable records across results, nested cache
+  frames, and replay. A per-indexing-run pool interns complete records, including
+  severity; emission identity, first-occurrence order and export facts are unchanged.
+- The shared source cache spills during header warming and ordered discovery
+  commits, and enforces a 64 MiB aggregate text/map payload budget. Provenance
+  remains queryable without loading text. Warmed headers can release earlier
+  spill files when only their cached expansion will be indexed.
+- Configured sources and orphan headers use ordered bounded indexing. One
+  incremental variant-preserving merge retains deduplication state across the
+  configuration family while completed units are dropped. Explicit isolated link
+  targets retain their original units for weak selection and multi-image reuse.
+
+Storage rules are authoritative in [Preprocessor: role in the pipeline](PREPROCESSOR.md#role-in-the-pipeline)
+and [diagnostics](PREPROCESSOR.md#diagnostics-in-the-export); configuration-family
+semantics remain in [Analysis: compilation databases](ANALYSIS.md#compilation-databases-62).
+No analysis rules or SQLite schema changed. The Rust preprocessing result now
+holds `SharedDiagnostic = Arc<Diagnostic>` rather than owned diagnostic records;
+the record's fields remain available through dereferencing.
+
+### Measurements
+
+Same host, pinned inputs, compiler, release profile and memory observer as the
+research below. The saved baseline is the release build of
+`2f9a766f2b67e5a568ab0281e97c9d1124e74470`; candidate SHA-256 is
+`e01041f1bf7d90c16fa1336a2af89d0a462095d3891556bc464075efa0ecbef5`.
+The final build after comment clarification has SHA-256 `4799745c54c37689bc095ce39c9f205e6146a809aba392441f99927acb69d64d`;
+a final camera smoke run matches all 15 non-metadata tables and records
+475.2 MiB overall peak in 13.46 s. The repeated
+measurements below use the saved candidate above with the same production logic.
+Three fresh runs of each binary per camera/ability/configured workload, executed
+sequentially with no compiler or other benchmark overlapping. Baseline and
+candidate were interleaved; the first camera candidate was the initial pilot.
+No allocator overrides. Tables show medians, not ownership estimates or sums
+of independent peaks. Overall peak uses sampled kernel `VmHWM`; phase windows
+use sampled RSS. All units are binary MiB.
+
+| Workload | Overall peak, baseline → candidate | Reduction | Wall time, baseline → candidate |
+|---|---:|---:|---:|
+| Camera, 8 workers | 534.3 → 483.9 MiB | 9.4% | 12.21 → 12.26 s |
+| Ability, 8 workers | 1548.2 → 1308.3 MiB | 15.5% | 78.51 → 74.30 s |
+| Configured fixture, 1 worker | 284.7 → 22.2 MiB | 92.2% | 13.61 → 8.07 s |
+| Configured fixture, 8 workers | 326.8 → 75.9 MiB | 76.8% | 2.29 → 1.32 s |
+
+| Corpus | Phase | RSS peak, baseline → candidate | Reduction |
+|---|---|---:|---:|
+| Camera | Preprocess | 499.9 → 403.9 MiB | 19.2% |
+| Camera | TU indexing | 533.9 → 483.3 MiB | 9.5% |
+| Ability | Preprocess | 1548.2 → 1083.5 MiB | 30.0% |
+| Ability | TU indexing | 1427.3 → 1308.3 MiB | 8.3% |
+
+The ability preprocessing saving is approximately 465 MiB (30%); the whole-run
+saving is approximately 240 MiB (15.5%) because TU indexing now sets its peak.
+At the end of preprocessing, live glibc allocations fall from about 1,300 MiB
+in the baseline to about 854 MiB in the first candidate run. At the return from
+indexing both retain about 687 MiB of live allocations: final Program contents
+are unchanged. Lower ownership and lower RSS are distinct measurements.
+
+Camera runtime shows no clear change at this sample size. Ability median runtime
+is 5.4% lower. The configured fixture improves by about 41–42%; its coordinator
+can merge while indexing workers continue, and does not retain every lowered
+header copy. Configured results are a controlled retention stress test, not an
+OpenHarmony compilation-database benchmark: all 256 sources include the same
+header containing 1,000 inline helper definitions. Both binaries use the exact
+same temporary source paths and compilation database, with minimal export.
+
+Ranges across the three runs:
+
+- Camera: baseline peak 532.2–546.9 MiB, candidate 481.3–484.2 MiB; wall 12.20–13.60 s versus 11.62–12.63 s.
+- Ability: baseline peak 1542.1–1553.7 MiB, candidate 1291.1–1310.9 MiB; wall 78.42–80.73 s versus 73.47–75.53 s.
+- Configured, 1 worker: baseline peak 284.6–284.8 MiB, candidate 22.2–22.3 MiB; wall 13.22–14.36 s versus 7.71–8.17 s.
+- Configured, 8 workers: baseline peak 326.8–327.7 MiB, candidate 75.7–76.1 MiB; wall 2.18–2.39 s versus 1.32–1.32 s.
+
+HDF has one candidate sanity run: preprocessing RSS 238.8 → 210.9 MiB,
+TU indexing 242.0 → 216.8 MiB, overall peak 292.6 → 293.0 MiB and wall time
+7.60 → 7.67 s. Its overall peak remains in analysis; these changes do not
+reduce that stage's live data. This single run is not a runtime trend.
+
+### Correctness and reproducibility
+
+- `cargo test --workspace --offline`: 1,765 tests passed, none ignored. New
+  coverage verifies concurrent aggregate spilling, metadata/origin round trips,
+  temporary-file cleanup and diagnostic sharing without severity substitution.
+  A 16-source configured family checks static object ownership, cross-command
+  body union, orphan-header calls and complete ordered function/variable/call/flow
+  records at one versus eight workers. Existing macro, dependency, exploration,
+  linkage and spill-failure tests pass.
+- `python3 scripts/eval_check.py --corpus-base /home/sergei`: all 95 pinned
+  HDF/hiview/camera checks passed; expected counts were not changed.
+- Thirty baseline/candidate databases were compared by row count and SHA-256
+  over every sorted row and column of all 15 non-metadata tables. There are no
+  differences within any workload group. This includes every native repeat,
+  HDF, and configured fixture runs across both worker counts.
+- The camera comparison with `--full-export --debug-points-to` also matches
+  exactly: 14,091 types, 177,066 variables, 39,984 locations and 67,202 points-to
+  rows, as well as all other tables. Only `analysis_run` metadata is excluded.
+- `cargo fmt --all -- --check` and `git diff --check` pass.
+
+After removing the follow-up experiments, the restored release build has
+SHA-256 `205fb083f870d096ac1d26e13b9600a85c4c502fcfa3be0b7b59cc1244bcb43b`.
+All 1,765 workspace tests and 95 pinned corpus checks pass again. Every sorted
+row and column of all 15 non-metadata tables on HDF, hiview and camera matches
+the earlier optimized build. Restoration logs and per-table hashes are in
+`/tmp/trace-memory-followup-discarded-20261005/`.
+
+Raw native logs, phase samples, binaries, summaries, per-table hashes and
+validation logs are under `/tmp/trace-memory-research-20261005/` on the measurement
+host. `trace_memory_validation.py` generates the temporary configured tree and
+runs both saved binaries; `trace_memory_candidate_compare.py` performs the table
+comparisons. `candidate-summary.json` contains the reported medians/ranges, and
+`candidate-table-comparisons.json` contains all row counts and hashes. To repeat
+one native run, rebuild with `cargo build -p trace-cli --release --offline`, then
+run `trace_memory_research.py LABEL CORPUS JOBS`; `TRACE_BENCH_BINARY` selects the
+saved baseline or candidate. The runner uses `scripts/memory_observer.c` and
+samples `/proc/<pid>/status` every 50 ms. Native runs were measured sequentially;
+only the subsequent correctness checks ran concurrently.
+
+### Remaining memory floors
+
+The 64 MiB limit covers retained source text and LineMap entry capacity, not
+active worker payloads, raw-file/expansion caches, provenance metadata, header
+IR, the growing Program or allocator fragmentation. It is not a process RSS
+limit. Temporary source spills trade file writes/reads for resident payloads;
+files are removed on normal release/eviction/drop, and cache I/O failures abort
+indexing. These native measurements use the host's warm filesystem cache and do
+not establish performance on slow or remote temporary storage.
+
+Configured units are bounded by source count in the window; one source's many
+commands/exploratory variants can still produce several units in its slot.
+Explicit image-scoped builds still retain all original units for weak selection
+and reuse across images; LineMaps retain dense storage. These are the remaining
+parts of research items 4 and 5. The subsequent disk-backed unit replay, sparse
+LineMaps, header-cache retirement and call-table copy experiments are excluded
+from the retained implementation.
+Expansion-cache spilling, fingerprint compaction and header IR overlays remain
+possible follow-ups; this change does not claim their projected savings.
+
+## Preprocessing and indexing memory research — 2026-10-05
+
+This section records the baseline before the implementation above; production
+code was unchanged during this research. The ordinary path already spills large
+preprocessed sources, compacts cached header types,
+shares type descriptors and macro definitions, releases frozen expansion/raw
+source caches before TU merging, and merges TUs through a bounded window.
+The September ownership figures describe earlier implementations and must not
+be used as current saving estimates.
+
+### Build, inputs, and measurement method
+
+- Repository: clean `2f9a766f2b67e5a568ab0281e97c9d1124e74470`.
+- Build: `cargo build -p trace-cli --release --locked`, workspace release
+  profile (ThinLTO, one codegen unit), default system allocator, minimal export.
+- Host: AMD Ryzen 7 8845HS, 16 logical CPUs, approximately 31 GiB RAM;
+  x86-64 WSL2 Linux `6.6.87.2-microsoft-standard-WSL2`, glibc 2.39,
+  Rust 1.95.0 (`59807616e`). No process swap was observed in the native samples.
+- Camera: clean `8ffd69dcd47f533e70b4dba428439da9008b0cae`, 744 TUs.
+- HDF: clean `cdc75a20bb8f1a046cd22e189405a20d602d0521`, 802 TUs.
+- Ability-runtime: clean `87e02b78de2dfc08cbc98cc84eb0678302cce80b`, 3,450 TUs.
+
+Native runs were sequential, with no concurrent builds, analyses, or table
+comparisons. Normal desktop background activity remained. A temporary Python
+runner sampled the child's `/proc/<pid>/status` every 50 ms and used
+`scripts/memory_observer.c` for stage-boundary `mallinfo2` snapshots. No extra
+trims were requested; the pipeline's existing trims remained enabled. Wall
+time includes startup and teardown, excluding compilation. These are fresh
+processes, not controlled cold filesystem-cache runs.
+
+RSS peaks below use sampled `VmHWM`; phase peaks use sampled `VmRSS`. Very
+short transients and allocations after the last sample can be missed. Stage
+messages mark transitions: the PCH interval initially includes the end of
+preprocessing before its cache cleanup. Allocated bytes mean glibc
+`uordblks + hblkhd`, including allocator rounding; free arena bytes can already
+be nonresident and must not be added to RSS.
+
+### Current native baseline
+
+Ranges denote two separate runs, not confidence intervals. Jobs 1 and HDF
+have one run each.
+
+| Corpus | Jobs | Wall, s | Whole-process peak RSS, MiB | Preprocess peak RSS, MiB | TU/orphan merge peak RSS, MiB |
+|---|---:|---:|---:|---:|---:|
+| Camera | 8 | 12.15–12.71 | 528.0–535.2 | 505.3–511.5 | 527.6–534.8 |
+| Camera | 1 | 32.45 | 465.4 | 464.9 | 441.9 |
+| HDF | 8 | 7.60 | 292.6 | 238.8 | 242.0 |
+| Ability-runtime | 8 | 79.77–84.14 | 1,555.2–1,576.5 | 1,555.2–1,576.5 | 1,427.7–1,440.9 |
+| Ability-runtime | 1 | 261.24 | 1,545.1 | 1,545.1 | 1,464.7 |
+
+Camera peaks in TU merging; ability-runtime peaks in preprocessing. HDF's
+whole-process peak is in analysis, so lowering its index peak need not lower
+its whole-process maximum. One worker saves only 0.7–2.0% of ability-runtime
+peak RSS while taking 3.1–3.3 times as long. Concurrency alone is a poor
+solution for this workload.
+
+Ability-runtime with eight jobs retains 1,300.2–1,302.6 MiB of allocated
+space at `preprocess-done`, 1,107.8–1,107.9 MiB at `pch-done`, and
+687.1–687.2 MiB when indexing returns. RSS when indexing returns is
+1,041.5–1,055.0 MiB. Thus there is substantial retained intermediate data
+as well as allocator retention; more trimming cannot remove live data.
+
+The include-graph scan alone peaks at 1,029.7–1,032.1 MiB on ability-runtime.
+It uses the global Rayon pool, so `--jobs 1` does not make that scan serial.
+If preprocessing improvements bring the process below this level, the graph
+scan becomes the next peak to address.
+
+### Ownership probes on the current representation
+
+A separate copy of `trace-parse` under `/tmp` added observational probes at
+the end of settling and after header lowering. It linked against the exact
+dependency artifacts of the rebuilt release crate. For each category, the
+probe held a bulk clone, measured the change in glibc allocated bytes, and
+dropped it. These instrumented processes were **not** used for native timing
+or RSS comparisons.
+
+These are estimates of independently owned buffers, including their nested
+owned paths/messages, not an exact recursive allocation census. Cloning
+shares `Arc` payloads and often reduces vector capacity to length. It omits
+allocator control structures, shared descriptors, token provenance, and some
+original spare capacity. Rows span different phases; rows labelled as subsets
+must not be added to their containing rows.
+
+| Owner / payload | Camera estimate, MiB | Ability-runtime estimate, MiB |
+|---|---:|---:|
+| Resident source text and LineMaps, **excluding spare capacity** | 80.9 | 215.4 |
+| Source-cache provenance and diagnostics | 42.9 | 217.4 |
+| ↳ Diagnostics, included in preceding row | 28.4 | 138.0 |
+| ↳ Replayed-variant path maps, included in preceding row | 11.3 | 63.0 |
+| Cached expansion LineMaps | 61.3 | 166.6 |
+| Cached expansion fingerprint tables, excluding shared name strings | 42.1 | 93.7 |
+| Cached expansion diagnostics | 17.7 | 40.6 |
+| Cached expansion text | 7.5 | 19.7 |
+| Cached expansion path/guard/nesting collections | 6.7 | 18.5 |
+| Cached macro-operation arrays, excluding shared definitions | 2.6 | 4.4 |
+| Unique cached macro-definition token buffers, excluding shared provenance | 0.6 | 1.5 |
+| Cached header units' owned data, **at the later PCH boundary** | 80.9 | 163.7 |
+
+The exact resident LineMap capacity minus length is **52.8 MiB on camera and
+111.7 MiB on ability-runtime**. This storage survives the current 512 KiB
+per-source spill threshold. Cached expansion maps have no spare entry
+capacity at this checkpoint, so shrinking those vectors would save nothing.
+
+At the end of preprocessing, ability-runtime has 6,009 source-cache entries:
+5,223 resident, 786 spilled. Of the resident entries, 2,558 are warmed headers.
+Their text plus retained entry capacity occupies 89.8 MiB; the resident TU
+payloads occupy 234.4 MiB by the same capacity calculation. These figures
+include the spare capacity above. Warmed header payloads are released only
+after preprocessing and PCH/orphan selection, so they overlap the preprocess
+peak even though most are subsequently discarded.
+
+Diagnostics are heavily duplicated across owners. Ability-runtime's source
+cache contains **632,037 diagnostic records for 11,409 distinct current
+`(file, line, message)` identity keys**. Its expansion entries contain
+185,892 records for 4,041 keys. Camera's corresponding counts are
+126,165 / 4,374 and 78,780 / 1,787. This is repeated ownership of reports
+already deduplicated within an individual preprocessing run, not a reason
+to suppress additional emitted reports or change diagnostic identity.
+
+Ability-runtime's cached expansion maps have 4,324,126 entries, of which
+135,393 (**3.1%**) carry macro provenance. Camera has 1,590,169 entries,
+with 38,175 (**2.4%**) carrying it. Every entry currently occupies 40 bytes.
+A hypothetical 16-byte base record plus a 32-byte sparse macro record would
+reduce **entry storage alone** from 165.0 to 70.1 MiB on ability-runtime,
+and from 60.7 to 25.4 MiB on camera. These are representation calculations,
+not measured implementation savings; lookup cost, public accessors, mapping
+preservation, and spill encoding still need implementation and validation.
+
+Fingerprint name strings are a smaller target than the tables: ability-runtime
+has 333,078 distinct string allocations for 28,330 different names,
+approximately 10.5 MiB of string bytes and Arc headers before allocator
+rounding. Interning names alone cannot remove the 93.7 MiB of table storage.
+
+### Independent allocation-stack check
+
+An unmodified camera run under Valgrind Massif completed, with 407.1 MiB
+of useful heap at its recorded peak and 17.7 MiB of modeled allocator
+overhead. At that peak, disjoint allocation subtrees include 109.3 MiB
+of `emit_token` vector growth and 60.7 MiB from `LineMap::slice_from`.
+The former includes retained live-output mapping buffers, rather than just
+active lexing. This independently supports investigating LineMap storage.
+The 0.5% threshold hides some allocation paths, and profiling changes
+scheduling; the 542-second profiler duration is not a runtime benchmark.
+
+### Controlled compilation-database retention experiment
+
+A `tempfile.TemporaryDirectory` held 256 C++ TUs, each including the same
+header with 1,000 inline pointer-taking helper definitions. One run used the
+ordinary path; a second added a compilation database with explicit C++17,
+the scratch include directory, and one command per TU. Both used one worker.
+
+| Same generated sources | Observed process RSS peak, MiB |
+|---|---:|
+| Ordinary path | 17.3 (maximum of sampled RSS/HWM and boundary snapshots) |
+| Compilation database | 284.5 |
+
+Both exports contain 1,256 functions, 3,256 variables, 256 calls/call edges,
+2,256 flow edges and no diagnostics. The arg-flow and flow-graph rows match;
+file ID assignment differs between these intentionally different indexing
+modes, so this is not a byte-equivalence comparison between implementations.
+This is a synthetic demonstration, not a prediction of the ratio on a real
+compilation database. It ran separately from native baselines while the
+allocation profiler was active; its timing is deliberately not reported.
+
+The mechanism is visible in `trace-parse/src/configured.rs`: it collects
+`Vec<ConfiguredUnits>` for the whole corpus, moves their `UnitIndex` values
+into another whole-family vector, and only then merges. Moving the vectors
+does not clone their payloads, but all units remain live while the final
+Program is constructed. Explicit commands inline header bodies and disable
+shared header expansions. Even one worker therefore retains repeated header
+IR across all sources.
+
+### Recommended implementation order
+
+These are proposed changes, not implemented or measured speedups.
+
+1. **Shrink resident LineMap entry buffers at publication.** Apply compaction
+   once an output is final and will stay resident; keep spilling based on
+   retained capacity so compaction does not accidentally prevent a source
+   from spilling. There is a measured 111.7 MiB capacity target on
+   ability-runtime. Benchmark realloc/copy cost and subsequent glibc page
+   reclamation. This is the smallest first experiment.
+2. **Share immutable diagnostic records across source results and expansion
+   entries.** A per-index pool plus ordered reference vectors can remove
+   repeated owned messages and paths. Preserve every record's severity and
+   coordinates, current emission/deduplication order, and cache replay
+   behavior. The 138.0 + 40.6 MiB ownership figures are targets, not guaranteed
+   RSS savings. The pool must disappear with the run rather than grow in
+   long-lived C API processes.
+3. **Give preprocessed payload retention a total byte budget.** The current
+   512 KiB threshold bounds each entry, not the aggregate: thousands of
+   smaller entries remain resident. Reuse the existing spill/load mechanism
+   and metadata/error contracts, spill warmed payloads before discovery
+   where appropriate, and spill standing discovery outputs at commit rather
+   than waiting for discovery to finish. Dirty discovery text should continue
+   to be released without writing it. Count capacity, including maps and
+   provenance; avoid one tiny file per entry by considering a per-run spool
+   with independent readers. Active units and the merged Program still need
+   memory, so this is not a hard whole-process RSS guarantee.
+4. **Stream configured units through the ordered merge window.** Without
+   explicit link-image isolation, reuse `index_in_window` and the existing
+   incremental `VariantMerge`, keeping one merge family across the same
+   sequence of configurations. Stream orphan headers too. With explicit
+   targets, weak selection needs facts from later units and units can belong
+   to several images: use a compact metadata pass and disk-backed per-unit
+   IR replay instead of assuming an ordinary one-pass merge is equivalent.
+   Preserve command ordinals, per-source exploration budgets, image membership,
+   definition precedence, and the shared resolver. This has the largest
+   demonstrated structural benefit for compilation-database workloads.
+5. **Compact LineMap representation or spill cached expansion payloads.**
+   Normal entries are overwhelmingly free of macro provenance, making a
+   sparse representation promising. Alternatively keep append-only expansion
+   identities, fingerprints, guards, macro effects and nesting metadata
+   resident, while spooling text/maps behind a bounded payload cache. This
+   would target approximately 186 MiB of expansion text/maps on
+   ability-runtime. Exact source and macro-body/invocation mappings must
+   survive; do not rerun preprocessing to reload a cached variant.
+6. **Then reduce fingerprint/provenance tables and imported header IR.**
+   Shared undefined-name sets or compact typed name IDs can target fingerprint
+   tables; shared path/variant identities can target source provenance. For
+   header IR, the current descriptors are already shared and lowering-only
+   type indexes discarded. The next substantial rewrite would let a TU
+   borrow an immutable declaration environment and own only its additions.
+   That must preserve TU-local IDs, aliases, completed types, anonymous scopes,
+   dependency declarations and internal-header bodies. Blindly serializing
+   and reloading all header units per TU would repeat imports and may lose
+   descriptor sharing.
+
+Bound filesystem probe caches as a follow-up to these changes, because the
+include-graph peak will otherwise set a floor. Cache eviction should change
+lookup cost only, preserving filesystem epochs, directory-search precedence
+and virtual-header behavior. Replacing the lexer, using fewer workers, or
+adding more trims alone has weaker support than the ownership targets above.
+A persistent incremental IR cache would primarily target re-index time and
+does not bypass today's mandatory discovery/settling work; the earlier #175
+analysis remains relevant. Disk spilling within one run is a separate option.
+
+### Correctness evidence, acceptance, and artifacts
+
+Every one of the **15 non-metadata SQLite tables** matched by row count and
+SHA-256 of rows sorted by all columns across the three native camera runs
+and across the three native ability-runtime runs. `analysis_run` was excluded.
+This verifies determinism of these baseline measurements; it does not validate
+any of the proposed representation or streaming changes. No production source
+changed, so a workspace test rerun was not needed for the research.
+
+For implementation, compare each candidate to this revision on camera, HDF,
+ability-runtime and a real compilation database, with at least three
+alternating isolated runs. Check stage and whole-process peaks, allocated
+bytes, elapsed/CPU time and temporary disk usage. Require all analysis tables
+to match, then run `cargo test --workspace --locked` and the pinned corpus
+evaluation. Add targeted round-trip/determinism regressions for changes to
+maps, diagnostics, target replay, and temporary-file failures/cleanup.
+Update the authoritative behavior sections in `docs/PREPROCESSOR.md` and
+`docs/ANALYSIS.md` when implementation changes their contracts.
+
+Raw artifacts are in `/tmp/trace-memory-research-20261005/`: native
+`*-j*.log` / `*.json` / `*.db`, `table-comparisons.json`,
+`*-census-final.log`, the instrumented `parse-census/` source copy,
+`massif-camera.out` / `.txt` / `.log`, and the synthetic exports. Temporary
+research drivers are `/tmp/trace_memory_research.py`,
+`/tmp/trace_memory_suite.py`, `/tmp/prepare_trace_census.py`,
+`/tmp/trace_memory_compare.py`, and `/tmp/trace_configured_probe.py`.
+The generated synthetic source directory was automatically removed after its
+two runs. Existing maintained profiling entry points are
+`scripts/profile_memory.py` and `scripts/profile_memory_macos.py`.
+
 ## Compact flow_nodes export: #195 — 2026-10-05
 
 Variable nodes in `flow_nodes` previously repeated the variable's name in `label`

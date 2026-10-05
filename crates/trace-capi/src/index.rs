@@ -9,7 +9,7 @@ use std::ptr;
 use std::sync::Arc;
 use trace_analysis::{analyze_with_options, AnalyzeOptions, FnModelSet};
 use trace_db::{export_to_sqlite, ExportOptions};
-use trace_parse::build_program_with_jobs;
+use trace_parse::build_program_for_analysis_with_jobs;
 use trace_preproc::PreprocessOptions;
 
 /// Rust-owned copy of the C options, so no borrowed C pointer outlives the
@@ -144,7 +144,7 @@ fn preflight_output(path: &std::path::Path) -> Result<(), ApiError> {
 /// prints. Returns the CLI message text, or `None` when nothing is outside.
 ///
 /// Mirrors the containment check and wording of `trace-cli/src/main.rs`
-/// (the `outside` filter before `build_program_with_jobs`); keep the two in
+/// (the `outside` filter before `build_program_for_analysis_with_jobs`); keep the two in
 /// step, or fold both into a shared pipeline helper.
 fn outside_root_warning(root: &Path, includes: &[PathBuf]) -> Option<String> {
     let root_canon = trace_ir::canonicalize(root);
@@ -204,9 +204,8 @@ fn run_index(cfg: &IndexConfig) -> Result<(TraceIndexResult, String), ApiError> 
     }
     popts.ignored_macros = effective_ignored_macros;
 
-    let mut program =
-        build_program_with_jobs(&cfg.root, &popts, cfg.jobs).map_err(ApiError::Analysis)?;
-    program.release_merge_state();
+    let mut program = build_program_for_analysis_with_jobs(&cfg.root, &popts, cfg.jobs)
+        .map_err(ApiError::Analysis)?;
     let (pag, analysis) = analyze_with_options(
         &program,
         AnalyzeOptions {

@@ -137,6 +137,78 @@ fn commands_for_different_sources_keep_shared_header_variants() {
 }
 
 #[test]
+fn configuration_family_preserves_static_objects_and_order_across_many_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("shared.h"),
+        "void alpha(void);\nvoid beta(void);\nstatic void (*handler)(void) = SELECTED;\nvoid header_entry(void) { handler(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("orphan.h"),
+        "void alpha(void);\nvoid orphan_entry(void) { alpha(); }\n",
+    )
+    .unwrap();
+    let mut commands = Vec::new();
+    for i in 0..16 {
+        let file = format!("unit_{i:02}.c");
+        std::fs::write(
+            root.join(&file),
+            format!("#include \"shared.h\"\nvoid entry_{i}(void) {{ header_entry(); }}\n"),
+        )
+        .unwrap();
+        let selected = if i % 2 == 0 { "alpha" } else { "beta" };
+        commands.push(json!({"directory": root, "file": file,
+            "arguments": ["cc", format!("-DSELECTED={selected}"), "-c", file]}));
+        if i == 0 {
+            commands.push(json!({"directory": root, "file": file,
+                "arguments": ["cc", "-DSELECTED=beta", "-c", file]}));
+        }
+    }
+    std::fs::write(
+        root.join("compile_commands.json"),
+        serde_json::to_string(&commands).unwrap(),
+    )
+    .unwrap();
+    let mut expected = None;
+    for jobs in [1, 8] {
+        let program = build_program_with_jobs(root, &PreprocessOptions::new(), jobs).unwrap();
+        let (_, analysis) = trace_analysis::analyze(&program);
+        assert!(has_any_edge(&program, &analysis, "header_entry", "alpha"));
+        assert!(has_any_edge(&program, &analysis, "header_entry", "beta"));
+        assert!(has_any_edge(&program, &analysis, "orphan_entry", "alpha"));
+        assert_eq!(program.variants_merged, 1);
+        assert_eq!(
+            program
+                .symbols
+                .variables
+                .iter()
+                .filter(|v| v.name == "handler")
+                .count(),
+            16,
+            "header statics belong to sources, while commands of one source share them"
+        );
+        // These ordered records contain no hash containers; compare every
+        // field, including IDs and source positions, across worker counts.
+        let facts = format!(
+            "{:?}",
+            (
+                &program.symbols.functions,
+                &program.symbols.variables,
+                &program.symbols.call_sites,
+                &program.flow,
+            )
+        );
+        if let Some(expected) = &expected {
+            assert_eq!(&facts, expected);
+        } else {
+            expected = Some(facts);
+        }
+    }
+}
+
+#[test]
 fn malformed_database_and_bad_entries_fall_back_without_losing_valid_entries() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

@@ -22,7 +22,7 @@ mod template_bases;
 pub use deps::*;
 pub use explore::*;
 pub use gn_defines::{Candidate, Confidence};
-pub use index_cache::IndexSourceCache;
+pub use index_cache::{remove_spill_dir, IndexSourceCache};
 
 pub use discover::*;
 pub use lower::*;

@@ -3,14 +3,13 @@
 //! include search configuration for the entire tree.
 
 use super::{
-    add_warnings, finalize_program, index_language, index_pool, index_progress, index_source_file,
-    index_source_file_with_variants, project_preprocess_opts, with_project_system_paths,
-    HeaderOrder,
+    add_warnings, finalize_program, index_in_window, index_language, index_pool, index_progress,
+    index_source_file, index_source_file_with_variants, project_preprocess_opts,
+    with_project_system_paths, HeaderOrder,
 };
 use crate::compile_commands::CompilationDatabase;
-use crate::merge::{merge_unit_index, merge_unit_variants, UnitIndex};
+use crate::merge::{merge_unit_index, UnitIndex, VariantMerge};
 use crate::{IncludeGraph, IndexSourceCache};
-use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -38,6 +37,7 @@ pub(super) fn build(
         crate::compiler_includes::CompilerSearch,
         crate::compiler_includes::CompilerSearch,
     )>,
+    retain_merge_state: bool,
 ) -> Result<Program, String> {
     let candidates = (opts.explore && opts.explore_budget > 0)
         .then(|| crate::explore::scan_project_gn_candidates(root));
@@ -84,104 +84,121 @@ pub(super) fn build(
         database.commands.values().map(Vec::len).sum::<usize>(),
         database.commands.len()
     ));
-    let results: Vec<ConfiguredUnits> = pool.install(|| {
-        files
-            .par_iter()
-            .map(|path| {
-                let (configs, from_database) = configs_for(&database, &fallback, path);
-                let mut result = ConfiguredUnits {
-                    units: Vec::new(),
-                    includes: Vec::new(),
-                };
-                // The budget bounds exploration for the source, not for each
-                // command: N commands must not buy N times the exploration.
-                let mut budget = opts.explore_budget;
-                for (command_index, config) in configs.iter().enumerate() {
-                    let mut config = config
-                        .clone()
-                        .for_indexing()
-                        .with_inline_include_bodies(true);
-                    // Shared flags name no driver, so use project compiler defaults.
-                    if !from_database || database.uses_shared_flags() {
-                        let language = config.language.unwrap_or_else(|| Language::from_path(path));
-                        config = project_options(config, language);
-                    }
-                    config.record_link_ownership = !links.targets.is_empty();
-                    if from_database {
-                        add_virtual_include_paths(&mut config, &graph.root, &virtual_dirs);
-                    }
-                    // Neither path-keyed source entries nor header expansions are valid
-                    // across commands with different search paths, even if macros match.
-                    // A source with no command of its own uses the one shared
-                    // configuration, where they are valid — and link metadata
-                    // alone routes every source through here, so discarding the
-                    // expansion cache for those would make `--link-commands`
-                    // re-expand every header of every unit.
-                    if from_database {
-                        config.include_expansion_cache = None;
-                        config.shared_macros = None;
-                        config.accumulate_macros = false;
-                    }
-                    config.record_conditionals = opts.explore || opts.record_conditionals;
-                    if config.source_cache.is_none() {
-                        config.source_cache.clone_from(&raw_sources);
-                    }
-                    let cache = IndexSourceCache::new();
-                    // Only read when exploration runs; skip the map otherwise.
-                    let defines = candidates
-                        .as_ref()
-                        .map(|_| effective_defines(&config))
-                        .unwrap_or_default();
-                    let (mut base, mut variants) = index_source_file_with_variants(
-                        path,
-                        root,
-                        &graph,
-                        &config,
-                        &cache,
-                        None,
-                        &HeaderOrder::default(),
-                        candidates.as_ref(),
-                        &defines,
-                        budget,
-                    );
-                    budget = budget.saturating_sub(variants.len());
-                    for (_, includes) in cache.included_by_file() {
-                        result.includes.extend(includes);
-                    }
-                    base.compilation_index = Some(command_index);
-                    for unit in &mut variants {
-                        unit.compilation_index = Some(command_index);
-                    }
-                    result.units.push(base);
-                    result.units.extend(variants);
-                }
-                result
-            })
-            .collect()
-    });
-    let mut consumed = FxHashSet::default();
-    let variants_merged = results
-        .iter()
-        .map(|r| r.units.len().saturating_sub(1))
-        .sum::<usize>();
-    let mut units = Vec::new();
-    for (path, result) in files.iter().zip(results) {
-        graph.add_preprocess_includes(path, &result.includes);
-        consumed.extend(result.includes);
-        // Include files introduced only by exploratory variants also must not
-        // be lowered again under an unrelated orphan-header configuration.
-        for unit in &result.units {
-            consumed.extend(unit.files.iter().cloned());
+    let index = |path: &PathBuf| {
+        let (configs, from_database) = configs_for(&database, &fallback, path);
+        let mut result = ConfiguredUnits {
+            units: Vec::new(),
+            includes: Vec::new(),
+        };
+        // The budget bounds exploration for the source, not for each
+        // command: N commands must not buy N times the exploration.
+        let mut budget = opts.explore_budget;
+        for (command_index, config) in configs.iter().enumerate() {
+            let mut config = config.clone();
+            config.diagnostic_pool.clone_from(&fallback.diagnostic_pool);
+            let mut config = config.for_indexing().with_inline_include_bodies(true);
+            // Shared flags name no driver, so use project compiler defaults.
+            if !from_database || database.uses_shared_flags() {
+                let language = config.language.unwrap_or_else(|| Language::from_path(path));
+                config = project_options(config, language);
+            }
+            config.record_link_ownership = !links.targets.is_empty();
+            if from_database {
+                add_virtual_include_paths(&mut config, &graph.root, &virtual_dirs);
+            }
+            // Neither path-keyed source entries nor header expansions are valid
+            // across commands with different search paths, even if macros match.
+            // A source with no command of its own uses the one shared
+            // configuration, where they are valid — and link metadata
+            // alone routes every source through here, so discarding the
+            // expansion cache for those would make `--link-commands`
+            // re-expand every header of every unit.
+            if from_database {
+                config.include_expansion_cache = None;
+                config.shared_macros = None;
+                config.accumulate_macros = false;
+            }
+            config.record_conditionals = opts.explore || opts.record_conditionals;
+            if config.source_cache.is_none() {
+                config.source_cache.clone_from(&raw_sources);
+            }
+            let cache = IndexSourceCache::new();
+            // Only read when exploration runs; skip the map otherwise.
+            let defines = candidates
+                .as_ref()
+                .map(|_| effective_defines(&config))
+                .unwrap_or_default();
+            let (mut base, mut variants) = index_source_file_with_variants(
+                path,
+                root,
+                &graph,
+                &config,
+                &cache,
+                None,
+                &HeaderOrder::default(),
+                candidates.as_ref(),
+                &defines,
+                budget,
+            );
+            budget = budget.saturating_sub(variants.len());
+            for (_, includes) in cache.included_by_file() {
+                result.includes.extend(includes);
+            }
+            base.compilation_index = Some(command_index);
+            for unit in &mut variants {
+                unit.compilation_index = Some(command_index);
+            }
+            result.units.push(base);
+            result.units.extend(variants);
         }
-        units.extend(result.units);
+        result
+    };
+    let mut consumed = FxHashSet::default();
+    let mut variants_merged = 0;
+    let mut includes_by_file = Vec::with_capacity(files.len());
+    let mut file_index = 0;
+    let scoped = !links.targets.is_empty() && !links.unscoped_inference;
+    // Explicit images need later units for weak selection and may reuse them
+    // across targets. Ordinary configuration families merge as units arrive.
+    let mut linked_units = Vec::new();
+    let mut first = None;
+    let mut family: Option<VariantMerge> = None;
+    index_in_window(&pool, files, jobs, index, |result| {
+        variants_merged += result.units.len().saturating_sub(1);
+        includes_by_file.push((files[file_index].clone(), result.includes.clone()));
+        file_index += 1;
+        consumed.extend(result.includes);
+        for unit in result.units {
+            // Exploratory includes also cannot be treated as orphan headers.
+            consumed.extend(unit.files.iter().cloned());
+            if scoped {
+                linked_units.push(unit);
+            } else if let Some(merge) = &mut family {
+                merge.push(&mut program, &unit);
+            } else if let Some(base) = first.take() {
+                // Only build variant deduplication once a second unit exists.
+                let mut merge = VariantMerge::start(&mut program, &base, true);
+                merge.push(&mut program, &unit);
+                family = Some(merge);
+            } else {
+                first = Some(unit);
+            }
+        }
+    });
+    drop(family);
+    if scoped {
+        // The indexing workers have finished. Return their freed lexer/AST
+        // pages before image selection creates its temporary scoped copies.
+        crate::memory::reclaim_unused_pages();
+        crate::merge::merge_linked_units(&mut program, &linked_units, &links);
+    } else if let Some(base) = first {
+        VariantMerge::start(&mut program, &base, false);
     }
-    // Merge the complete configuration family together. A shared header can
-    // vary between different source files as well as between commands for one
-    // source; ordinary TU deduplication would drop its second body.
-    if !links.targets.is_empty() && !links.unscoped_inference {
-        crate::merge::merge_linked_units(&mut program, &units, &links);
-    } else if let Some((base, variants)) = units.split_first() {
-        merge_unit_variants(&mut program, base, variants);
+    // Image selection and merging have consumed these copies. Release them
+    // before orphan indexing and finalization reclaim or allocate heap pages.
+    drop(linked_units);
+    for (path, includes) in includes_by_file {
+        graph.add_preprocess_includes(&path, &includes);
     }
     if links.unscoped_inference {
         crate::merge::record_link_targets(&mut program, &links);
@@ -223,6 +240,7 @@ pub(super) fn build(
                 config.accumulate_macros = false;
                 config.source_cache.clone_from(&raw_sources);
                 config.record_link_ownership = !links.targets.is_empty();
+                config.diagnostic_pool.clone_from(&fallback.diagnostic_pool);
                 add_virtual_include_paths(&mut config, &graph.root, &virtual_dirs);
                 config.for_indexing().with_inline_include_bodies(true)
             } else {
@@ -238,42 +256,24 @@ pub(super) fn build(
         "compile_commands",
         &database.warnings[warnings_before..],
     );
-    if jobs == 1 || header_configs.len() <= 1 {
-        for (path, config) in header_configs {
+    index_in_window(
+        &pool,
+        &header_configs,
+        jobs,
+        |(path, config)| {
             let cache = IndexSourceCache::new();
-            let unit = index_source_file(
+            index_source_file(
                 path,
                 root,
                 &graph,
-                &config,
+                config,
                 &cache,
                 None,
                 &HeaderOrder::default(),
-            );
-            merge_unit_index(&mut program, &unit);
-        }
-    } else {
-        let header_units: Vec<UnitIndex> = pool.install(|| {
-            header_configs
-                .par_iter()
-                .map(|(path, config)| {
-                    let cache = IndexSourceCache::new();
-                    index_source_file(
-                        path,
-                        root,
-                        &graph,
-                        config,
-                        &cache,
-                        None,
-                        &HeaderOrder::default(),
-                    )
-                })
-                .collect()
-        });
-        for unit in &header_units {
-            merge_unit_index(&mut program, unit);
-        }
-    }
+            )
+        },
+        |unit| merge_unit_index(&mut program, &unit),
+    );
     program.types.complete_nested_tags();
     // Every search directory any configuration actually used, in first-seen
     // order. `fallback` carries the inferred directories the other path records.
@@ -294,7 +294,7 @@ pub(super) fn build(
         })
         .cloned()
         .collect();
-    finalize_program(&mut program, &graph, observed_dirs);
+    finalize_program(&mut program, &graph, observed_dirs, retain_merge_state);
     Ok(program)
 }
 

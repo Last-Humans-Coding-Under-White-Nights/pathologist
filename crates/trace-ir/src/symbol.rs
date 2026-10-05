@@ -1,4 +1,4 @@
-use crate::{CallSiteId, FileId, FnId, Span, TypeId, VarId};
+use crate::{CallName, CallSiteId, FileId, FnId, Span, TypeId, VarId};
 use indexmap::IndexMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
@@ -195,7 +195,7 @@ pub struct Function {
 /// span may come from a substituted receiver or member token whose provenance
 /// is shared by several calls; this location remains tied to the call's own
 /// replacement-list tokens and carries the intermediate expansion chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CallOccurrence {
     pub span: Span,
     pub expansion_span: Option<Span>,
@@ -208,7 +208,7 @@ pub struct CallOccurrence {
 pub struct CallSite {
     pub id: crate::CallSiteId,
     pub caller: FnId,
-    pub callee_name: String,
+    pub callee_name: CallName,
     pub callee_var: Option<VarId>,
     /// Callee fixed up after lowering: a definition/prototype resolved at
     /// lowering time, or a synthesized external entry for a plain-identifier
@@ -216,16 +216,9 @@ pub struct CallSite {
     /// logging backends). `None` for indirect sites.
     pub callee_fn_id: Option<FnId>,
     pub var_args: Vec<(u32, VarId)>,
-    pub fn_args: Vec<(u32, FnId)>,
-    /// Argument positions recorded as `&base.member` / `&arr[i]` addresses.
-    /// Lowering resolves these to the *base* variable, so function-model
-    /// alias effects must not treat them as whole-object copies (copying
-    /// the containing object would pollute unrelated fields).
-    pub addr_of_member_args: Vec<u32>,
-    /// Argument positions recorded as `&x` for a plain variable `x`: the
-    /// actual there is a temporary holding x's address, and consumers that
-    /// report the argument's object (arg-flow rows, terminators) name `x`.
-    pub addr_of_args: Vec<u32>,
+    /// Rare argument metadata and explicit macro-occurrence identity. Empty
+    /// ordinary calls keep no allocation for this payload.
+    pub details: Option<Box<CallSiteDetails>>,
     /// The argument positions count the callee's implicit `this`: explicit
     /// arguments start at 1. Lowering sets it wherever it knows the callee is
     /// a member; after the merge, a site whose callee takes `this` without
@@ -235,9 +228,6 @@ pub struct CallSite {
     /// Outermost macro invocation that produced the call token. Present only
     /// when `span` points into a macro replacement list.
     pub expansion_span: Option<Span>,
-    /// Separate merge/deduplication identity when the displayed macro source
-    /// coordinates can be shared by multiple member-call occurrences.
-    pub occurrence: Option<CallOccurrence>,
     pub is_direct: bool,
     /// Static class of a C++ member-call receiver (`this`, typed pointer).
     /// Post-merge virtual expansion uses this so `final` types are not
@@ -256,15 +246,90 @@ pub struct CallSite {
     pub tu: Option<crate::FileId>,
 }
 
+/// Metadata absent from most call sites. Construct with [`Self::boxed`] to
+/// avoid allocating when all arguments are ordinary and no macro identity is
+/// needed. The vectors retain their original argument order.
+#[derive(Debug, Clone, Default)]
+pub struct CallSiteDetails {
+    pub fn_args: Vec<(u32, FnId)>,
+    /// Positions spelled as `&base.member` / `&arr[i]`; model alias effects
+    /// must not copy the whole base object into unrelated fields.
+    pub addr_of_member_args: Vec<u32>,
+    /// Positions spelled as `&x`; consumers reporting the object name `x`
+    /// rather than the temporary holding its address.
+    pub addr_of_args: Vec<u32>,
+    /// Merge identity for calls sharing their displayed macro coordinates.
+    pub occurrence: Option<CallOccurrence>,
+}
+
+impl CallSiteDetails {
+    pub fn boxed(
+        fn_args: Vec<(u32, FnId)>,
+        addr_of_member_args: Vec<u32>,
+        addr_of_args: Vec<u32>,
+        occurrence: Option<CallOccurrence>,
+    ) -> Option<Box<Self>> {
+        if fn_args.is_empty()
+            && addr_of_member_args.is_empty()
+            && addr_of_args.is_empty()
+            && occurrence.is_none()
+        {
+            None
+        } else {
+            Some(Box::new(Self {
+                fn_args,
+                addr_of_member_args,
+                addr_of_args,
+                occurrence,
+            }))
+        }
+    }
+}
+
 impl CallSite {
+    pub fn fn_args(&self) -> &[(u32, FnId)] {
+        self.details
+            .as_ref()
+            .map_or(&[], |details| &details.fn_args)
+    }
+
+    pub fn addr_of_member_args(&self) -> &[u32] {
+        self.details
+            .as_ref()
+            .map_or(&[], |details| &details.addr_of_member_args)
+    }
+
+    pub fn addr_of_args(&self) -> &[u32] {
+        self.details
+            .as_ref()
+            .map_or(&[], |details| &details.addr_of_args)
+    }
+
+    /// Allocate rare metadata only when a consumer adds a fact or occurrence.
+    pub fn details_mut(&mut self) -> &mut CallSiteDetails {
+        self.details.get_or_insert_with(Default::default)
+    }
+
     /// Source coordinates that identify this syntactic call independently of
     /// the coordinates displayed as its request position.
     pub fn occurrence(&self) -> CallOccurrence {
-        self.occurrence.unwrap_or(CallOccurrence {
-            span: self.span,
-            expansion_span: self.expansion_span,
-            expansion_id: 0,
-        })
+        self.details
+            .as_ref()
+            .and_then(|details| details.occurrence)
+            .unwrap_or(CallOccurrence {
+                span: self.span,
+                expansion_span: self.expansion_span,
+                expansion_id: 0,
+            })
+    }
+
+    /// Complete source identity before any merge-time binding remap.
+    pub fn source_key(&self) -> crate::CallSourceKey<'_> {
+        crate::CallSourceKey {
+            occurrence: self.occurrence(),
+            callee_name: self.callee_name.as_str(),
+            callee_fn_id: self.callee_fn_id,
+        }
     }
 
     /// File whose lexical scope contains this invocation. Macro-body calls
@@ -291,9 +356,9 @@ impl CallSite {
             callee_fn_id: self.callee_fn_id,
             callee_var: self.callee_var,
             var_args: &self.var_args,
-            fn_args: &self.fn_args,
-            addr_of_member_args: &self.addr_of_member_args,
-            addr_of_args: &self.addr_of_args,
+            fn_args: self.fn_args(),
+            addr_of_member_args: self.addr_of_member_args(),
+            addr_of_args: self.addr_of_args(),
             args_bound_past_this: self.args_bound_past_this,
             is_direct: self.is_direct,
             receiver_class: self.receiver_class.as_deref(),
@@ -670,6 +735,7 @@ pub struct SymbolTable {
     pub functions: Vec<Function>,
     pub variables: Vec<Variable>,
     pub call_sites: Vec<CallSite>,
+    call_names: FxHashSet<CallName>,
     /// One entry per name, the one every unqualified call site resolves
     /// through. It is not first-wins: `should_take_primary` gives the slot to
     /// a defined entry over any declaration, and a later definition of the
@@ -763,6 +829,22 @@ pub struct SymbolTable {
 }
 
 impl SymbolTable {
+    /// Intern by full text, without a process-wide registry or assigning IDs.
+    pub fn intern_call_name(&mut self, name: &str) -> CallName {
+        if let Some(held) = self.call_names.get(name) {
+            return held.clone();
+        }
+        let held = CallName::from(name);
+        self.call_names.insert(held.clone());
+        held
+    }
+
+    /// Drop the interning lookup after the final call is created. Call records
+    /// continue to own the shared text; more merging can rebuild this pool.
+    pub fn release_call_name_pool(&mut self) {
+        self.call_names = FxHashSet::default();
+    }
+
     /// Whether symbols actually carry image ownership. Observed build metadata
     /// alone may be incomplete and must not change resolution semantics.
     pub fn has_target_scopes(&self) -> bool {
@@ -1898,17 +1980,17 @@ impl SymbolTable {
             .iter()
             .enumerate()
             .filter(|(_, site)| {
-                site.fn_args.iter().any(|(_, callee)| {
+                site.fn_args().iter().any(|(_, callee)| {
                     self.scope_overloads.contains_key(callee)
                         || self.overload_primary.contains_key(callee)
                 })
             })
             .map(|(i, site)| {
                 let mut more: Vec<(u32, FnId)> = Vec::new();
-                for &(index, callee) in &site.fn_args {
+                for &(index, callee) in site.fn_args() {
                     for overload in self.internal_overloads_seen_from(callee, site.scope_file()) {
                         let arg = (index, overload);
-                        if !site.fn_args.contains(&arg) && !more.contains(&arg) {
+                        if !site.fn_args().contains(&arg) && !more.contains(&arg) {
                             more.push(arg);
                         }
                     }
@@ -1917,7 +1999,10 @@ impl SymbolTable {
             })
             .collect();
         for (i, more) in added {
-            self.call_sites[i].fn_args.extend(more);
+            if more.is_empty() {
+                continue;
+            }
+            self.call_sites[i].details_mut().fn_args.extend(more);
         }
     }
 
@@ -1982,29 +2067,47 @@ impl SymbolTable {
     /// (`overload_sites`): sites of one caller, occurrence and callee name
     /// bound to different functions.
     pub fn index_overload_sites(&mut self) {
-        // One call: its caller, occurrence and callee name.
-        type Call<'a> = (FnId, CallOccurrence, &'a str);
-        let mut calls: FxHashMap<Call, Vec<(CallSiteId, FnId)>> = FxHashMap::default();
-        for cs in &self.call_sites {
-            if let Some(callee) = cs.callee_fn_id {
-                calls
-                    .entry((cs.caller, cs.occurrence(), cs.callee_name.as_str()))
-                    .or_default()
-                    .push((cs.id, callee));
+        // Borrow records instead of allocating a hash key and a Vec for
+        // every resolved call. Most groups have only one record. A stable
+        // sort retains table order within each group, including duplicate
+        // callee IDs: that order is part of deterministic propagation.
+        let key = |site: &CallSite| (site.caller, site.occurrence());
+        let mut calls: Vec<&CallSite> = Vec::with_capacity(self.call_sites.len());
+        calls.extend(
+            self.call_sites
+                .iter()
+                .filter(|site| site.callee_fn_id.is_some()),
+        );
+        calls.sort_by(|a, b| {
+            key(a)
+                .cmp(&key(b))
+                .then_with(|| a.callee_name.cmp(&b.callee_name))
+        });
+        let mut overload_sites = FxHashMap::default();
+        let mut start = 0;
+        while start < calls.len() {
+            let first = calls[start];
+            let mut end = start + 1;
+            while end < calls.len()
+                && key(calls[end]) == key(first)
+                && calls[end].callee_name == first.callee_name
+            {
+                end += 1;
             }
-        }
-        let mut overload_sites: FxHashMap<CallSiteId, Vec<FnId>> = FxHashMap::default();
-        for sites in calls.into_values() {
-            for &(id, own) in &sites {
-                let others: Vec<FnId> = sites
-                    .iter()
-                    .map(|&(_, callee)| callee)
-                    .filter(|&callee| callee != own)
-                    .collect();
-                if !others.is_empty() {
-                    overload_sites.insert(id, others);
+            if end - start > 1 {
+                let sites = &calls[start..end];
+                for site in sites {
+                    let others: Vec<FnId> = sites
+                        .iter()
+                        .filter_map(|other| other.callee_fn_id)
+                        .filter(|&callee| Some(callee) != site.callee_fn_id)
+                        .collect();
+                    if !others.is_empty() {
+                        overload_sites.insert(site.id, others);
+                    }
                 }
             }
+            start = end;
         }
         self.overload_sites = overload_sites;
     }
@@ -2844,6 +2947,78 @@ mod tests {
     use super::*;
     use crate::{Program, TypeDesc};
 
+    #[test]
+    fn overload_sites_preserve_sibling_order_and_exact_occurrences() {
+        let make = |id, callee: Option<u32>, caller, name: &str, expansion_id| CallSite {
+            id: CallSiteId(id),
+            caller: FnId(caller),
+            callee_name: name.into(),
+            callee_var: None,
+            callee_fn_id: callee.map(FnId),
+            var_args: Vec::new(),
+            details: CallSiteDetails::boxed(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Some(CallOccurrence {
+                    span: Span::new(FileId(0), 1, 2),
+                    expansion_span: None,
+                    expansion_id,
+                }),
+            ),
+            args_bound_past_this: false,
+            span: Span::new(FileId(0), 1, 2),
+            expansion_span: None,
+            is_direct: true,
+            receiver_class: None,
+            exact_receiver: false,
+            return_dst: None,
+            tu: None,
+        };
+        let mut symbols = SymbolTable {
+            call_sites: vec![
+                make(0, Some(7), 0, "call", 1),
+                make(1, Some(2), 1, "call", 1), // different caller
+                make(2, Some(5), 0, "call", 1),
+                make(3, Some(9), 0, "other", 1), // different spelling
+                make(4, Some(3), 0, "call", 2),  // nested macro identity
+                make(5, Some(5), 0, "call", 1),  // duplicate target stays ordered
+                make(6, None, 0, "call", 1),     // unresolved record
+                make(7, Some(2), 0, "call", 1),
+                make(8, Some(8), 0, "single", 1),
+                make(9, Some(8), 0, "single", 1), // equal targets are not siblings
+            ],
+            ..Default::default()
+        };
+        symbols.index_overload_sites();
+        assert_eq!(symbols.overload_sites.len(), 4);
+        assert_eq!(
+            symbols.overload_sites[&CallSiteId(0)],
+            [FnId(5), FnId(5), FnId(2)]
+        );
+        assert_eq!(symbols.overload_sites[&CallSiteId(2)], [FnId(7), FnId(2)]);
+        assert_eq!(symbols.overload_sites[&CallSiteId(5)], [FnId(7), FnId(2)]);
+        assert_eq!(
+            symbols.overload_sites[&CallSiteId(7)],
+            [FnId(7), FnId(5), FnId(5)]
+        );
+    }
+
+    #[test]
+    fn call_names_share_text_and_outlive_the_pool() {
+        let mut symbols = SymbolTable::default();
+        let first = symbols.intern_call_name("invoke");
+        let same = symbols.intern_call_name(&String::from("invoke"));
+        let different = symbols.intern_call_name("other");
+        assert!(std::sync::Arc::ptr_eq(&first.0, &same.0));
+        assert!(!std::sync::Arc::ptr_eq(&first.0, &different.0));
+        assert_eq!(symbols.call_names.len(), 2);
+        symbols.release_call_name_pool();
+        assert!(symbols.call_names.is_empty());
+        assert_eq!(first.as_str(), "invoke");
+        assert!(std::sync::Arc::ptr_eq(&first.0, &same.0));
+    }
+
     /// `CallFacts` ties the comparison and the fingerprint to one field list,
     /// so they cannot drift. What a derive cannot state is which fields belong
     /// on that list: a record's identity, position and originating unit are
@@ -2858,31 +3033,28 @@ mod tests {
             callee_var: Some(VarId(1)),
             callee_fn_id: Some(FnId(9)),
             var_args: vec![(1, VarId(4))],
-            fn_args: vec![(2, FnId(5))],
-            addr_of_member_args: vec![1],
-            addr_of_args: Vec::new(),
+            details: CallSiteDetails::boxed(vec![(2, FnId(5))], vec![1], Vec::new(), None),
             args_bound_past_this: false,
             span: Span::new(FileId(2), 10, 3),
             expansion_span: None,
-            occurrence: None,
             is_direct: true,
             receiver_class: Some("Cls".into()),
             exact_receiver: false,
             return_dst: Some(VarId(6)),
             tu: Some(FileId(2)),
         };
-        let elsewhere = CallSite {
+        let mut elsewhere = CallSite {
             id: crate::CallSiteId(11),
             callee_name: "other".into(),
             span: Span::new(FileId(5), 99, 1),
-            occurrence: Some(CallOccurrence {
-                span: Span::new(FileId(5), 98, 7),
-                expansion_span: Some(Span::new(FileId(6), 12, 4)),
-                expansion_id: 9,
-            }),
             tu: Some(FileId(5)),
             ..base.clone()
         };
+        elsewhere.details_mut().occurrence = Some(CallOccurrence {
+            span: Span::new(FileId(5), 98, 7),
+            expansion_span: Some(Span::new(FileId(6), 12, 4)),
+            expansion_id: 9,
+        });
         assert!(base.same_facts(&elsewhere));
         assert_eq!(base.fact_fingerprint(), elsewhere.fact_fingerprint());
 
@@ -2904,13 +3076,10 @@ mod tests {
             callee_var: callee_var.map(VarId),
             callee_fn_id: None,
             var_args: Vec::new(),
-            fn_args: Vec::new(),
-            addr_of_member_args: Vec::new(),
-            addr_of_args: Vec::new(),
+            details: CallSiteDetails::boxed(Vec::new(), Vec::new(), Vec::new(), None),
             args_bound_past_this: false,
             span: Span::new(FileId(0), 1, 1),
             expansion_span: None,
-            occurrence: None,
             is_direct,
             receiver_class: None,
             exact_receiver: false,
@@ -3098,13 +3267,10 @@ mod tests {
             callee_var: None,
             callee_fn_id: Some(callee),
             var_args: vec![],
-            fn_args: vec![],
-            addr_of_member_args: vec![],
-            addr_of_args: vec![],
+            details: CallSiteDetails::boxed(vec![], vec![], vec![], None),
             args_bound_past_this: false,
             span: Span::new(caller_file, 1, 1),
             expansion_span: None,
-            occurrence: None,
             is_direct: true,
             receiver_class: None,
             exact_receiver: false,

@@ -1,3 +1,4 @@
+use crate::diagnostic::DiagnosticKey;
 use crate::macros::{lex_macro_body, MacroDef, MacroOp, MacroTable};
 use crate::{
     ArmDirective, ArmOutcome, ConditionRead, ConditionalArm, ConditionalChain, Diagnostic,
@@ -29,7 +30,7 @@ pub enum PreprocessError {
 pub struct PreprocessResult {
     pub output: String,
     pub line_map: LineMap,
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<crate::SharedDiagnostic>,
     /// Canonical paths processed by this run (`#include` closure).
     pub included_headers: Vec<PathBuf>,
     /// The subset of [`Self::included_headers`] this run expanded itself
@@ -147,11 +148,11 @@ struct PreprocessorState {
     cond_base: usize,
     output: String,
     line_map: LineMap,
-    diagnostics: Vec<Diagnostic>,
+    diagnostics: Vec<crate::SharedDiagnostic>,
     /// Diagnostic identities already emitted in this preprocessing run.
     /// Cached parent expansions can carry the same nested-header report;
     /// retain its first occurrence rather than multiplying it by cache path.
-    diagnostic_keys: FxHashSet<(Option<PathBuf>, u32, String)>,
+    diagnostic_keys: FxHashSet<DiagnosticKey>,
     current_file: PathBuf,
     /// Whether `current_file` is in the bare-tree test partition (always
     /// true without an inference root). Kept by `set_current_file` so an
@@ -297,8 +298,8 @@ struct CacheFrame {
     /// independent from `PreprocessorState::diagnostics`: a report can have
     /// been emitted earlier in this run and still be required by a cache
     /// consumer that only includes this header later.
-    diagnostics: Vec<Diagnostic>,
-    diagnostic_keys: FxHashSet<(Option<PathBuf>, u32, String)>,
+    diagnostics: Vec<crate::SharedDiagnostic>,
+    diagnostic_keys: FxHashSet<DiagnosticKey>,
 }
 
 impl PreprocessorState {
@@ -1173,7 +1174,7 @@ impl PreprocessorState {
     }
 
     fn report(&mut self, severity: DiagnosticSeverity, line: u32, message: String) {
-        self.push_diagnostic(Diagnostic {
+        self.push_new_diagnostic(Diagnostic {
             severity,
             file: Some(self.current_file.clone()),
             line,
@@ -1181,14 +1182,20 @@ impl PreprocessorState {
         });
     }
 
-    fn push_diagnostic(&mut self, diagnostic: Diagnostic) {
+    fn push_new_diagnostic(&mut self, diagnostic: Diagnostic) {
+        let diagnostic = match &self.opts.diagnostic_pool {
+            Some(pool) => pool.intern(diagnostic),
+            None => Arc::new(diagnostic),
+        };
+        self.push_diagnostic(diagnostic);
+    }
+
+    fn push_diagnostic(&mut self, diagnostic: crate::SharedDiagnostic) {
         self.record_cache_diagnostic(&diagnostic);
-        let key = (
-            diagnostic.file.clone(),
-            diagnostic.line,
-            diagnostic.message.clone(),
-        );
-        if self.diagnostic_keys.insert(key) {
+        if self
+            .diagnostic_keys
+            .insert(DiagnosticKey(Arc::clone(&diagnostic)))
+        {
             self.diagnostics.push(diagnostic);
         }
     }
@@ -1196,15 +1203,13 @@ impl PreprocessorState {
     /// Include a diagnostic in every open cache frame. A nested header's
     /// report is part of each enclosing header's cached expansion, even when
     /// result-level deduplication suppresses it for this particular run.
-    fn record_cache_diagnostic(&mut self, diagnostic: &Diagnostic) {
+    fn record_cache_diagnostic(&mut self, diagnostic: &crate::SharedDiagnostic) {
         for frame in &mut self.cache_frames {
-            let key = (
-                diagnostic.file.clone(),
-                diagnostic.line,
-                diagnostic.message.clone(),
-            );
-            if frame.diagnostic_keys.insert(key) {
-                frame.diagnostics.push(diagnostic.clone());
+            if frame
+                .diagnostic_keys
+                .insert(DiagnosticKey(Arc::clone(diagnostic)))
+            {
+                frame.diagnostics.push(Arc::clone(diagnostic));
             }
         }
     }
@@ -1802,7 +1807,7 @@ impl PreprocessorState {
             // environment. Content silently missing from a cached expansion
             // is the failure mode that starves translation units later, so
             // make it visible during the (sequential) warm/index phases.
-            self.push_diagnostic(Diagnostic {
+            self.push_new_diagnostic(Diagnostic {
                 severity: DiagnosticSeverity::Warning,
                 file: Some(path.to_path_buf()),
                 line: 1,
@@ -1855,7 +1860,7 @@ impl PreprocessorState {
                     Some(start) if start < self.macro_ops.len() => self.macro_ops[start..].into(),
                     _ => Arc::default(),
                 };
-                let diagnostics: Arc<[Diagnostic]> = frame.diagnostics.into();
+                let diagnostics: Arc<[crate::SharedDiagnostic]> = frame.diagnostics.into();
                 let deps = frame.deps;
                 let replayed = frame.replayed;
                 // Only for the files this entry actually covers. A frame

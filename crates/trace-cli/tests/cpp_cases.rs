@@ -543,7 +543,7 @@ fn header_macro_passes_all_visible_static_overloads_as_arguments() {
         .find(|site| fn_name(&program, site.caller) == "via_macro" && site.callee_name == "reg")
         .expect("macro call");
     let mut overload_lines = macro_site
-        .fn_args
+        .fn_args()
         .iter()
         .filter(|(index, _)| *index == 0)
         .map(|(_, function)| program.symbols.function(*function).span.line)
@@ -5514,7 +5514,7 @@ fn call_to_a_member_declared_only_binds_past_this() {
                 && cs.callee_name == "Remote::Declared"
         })
         .expect("site");
-    assert_eq!(site.fn_args.first().map(|&(index, _)| index), Some(1));
+    assert_eq!(site.fn_args().first().map(|&(index, _)| index), Some(1));
 }
 
 #[test]
@@ -13556,21 +13556,28 @@ fn explicit_operator_calls_review_fixes() {
         2,
         "expected 2 distinct call sites from TWO macro expansion"
     );
+    let recorded_span = |site: &trace_ir::CallSite| {
+        site.details
+            .as_ref()
+            .and_then(|details| details.occurrence)
+            .expect("macro site must record its occurrence identity")
+            .span
+    };
     assert_ne!(
-        macro_sites[0].occurrence.map(|o| o.span),
-        macro_sites[1].occurrence.map(|o| o.span),
+        recorded_span(macro_sites[0]),
+        recorded_span(macro_sites[1]),
         "expected distinct occurrence spans from macro replacement punctuation"
     );
     assert!(macro_sites
         .iter()
         .any(|s| s
-            .fn_args
+            .fn_args()
             .iter()
             .any(|(_, fid)| program.symbols.function(*fid).name == "first_cb")));
     assert!(macro_sites
         .iter()
         .any(|s| s
-            .fn_args
+            .fn_args()
             .iter()
             .any(|(_, fid)| program.symbols.function(*fid).name == "second_cb")));
 

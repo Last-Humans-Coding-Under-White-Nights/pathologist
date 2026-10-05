@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 pub(crate) use target_merge::{merge_linked_units, record_link_targets};
+#[cfg(test)]
+use trace_ir::CallSiteDetails;
 use trace_ir::{
     same_param_type_or_unresolved, CallSite, CallSiteId, FlowConstraint, FnId, Function, Program,
     ReturnFlow, TemplateBase, TypeDesc, TypeId, VarId, Variable,
@@ -122,7 +124,7 @@ pub enum MergeMode {
     Variant,
 }
 
-type SiteKey = trace_ir::CallSourceKey;
+type SiteKey<'a> = trace_ir::CallSourceKey<'a>;
 type LocalKey = (FnId, trace_ir::FileId, u32, u32, String);
 type TempKey = (FnId, trace_ir::FileId, u32, u32, &'static str);
 type FileVarKey = (u32, trace_ir::FileId, u32, u32, String);
@@ -1042,10 +1044,17 @@ fn merge_unit(
         };
         let span_file = map_file(cs.span.file);
         let occurrence = cs.occurrence();
-        let occurrence_file = map_file(occurrence.span.file);
-        let occurrence_expansion = occurrence
-            .expansion_span
-            .map(|span| (map_file(span.file), span.line, span.col));
+        let occurrence = trace_ir::CallOccurrence {
+            span: trace_ir::Span {
+                file: map_file(occurrence.span.file),
+                ..occurrence.span
+            },
+            expansion_span: occurrence.expansion_span.map(|span| trace_ir::Span {
+                file: map_file(span.file),
+                ..span
+            }),
+            expansion_id: occurrence.expansion_id,
+        };
         // Dependency roots suppress bodies, not project code emitted by a
         // macro declared in a dependency header. For a macro-body call the
         // expansion is its semantic ownership location; the spelling remains
@@ -1065,18 +1074,19 @@ fn merge_unit(
         if matches!(mode, MergeMode::SymbolsOnly) && !is_internal_caller {
             continue;
         }
-        let key: SiteKey = (
-            occurrence_file,
-            occurrence.span.line,
-            occurrence.span.col,
-            occurrence_expansion,
-            occurrence.expansion_id,
-            cs.callee_name.clone(),
-            cs.callee_fn_id.and_then(|f| fn_map.get(&f).copied()),
-        );
+        let key = SiteKey {
+            occurrence,
+            callee_fn_id: cs.callee_fn_id.and_then(|f| fn_map.get(&f).copied()),
+            ..cs.source_key()
+        };
+        let source = if remerge || !is_internal_caller {
+            program.dedup.site_keys.get(&key, &program.symbols)
+        } else {
+            None
+        };
         if !matches!(mode, MergeMode::Variant) && !is_internal_caller {
-            if let Some(&existing) = program.dedup.site_keys.get(&key) {
-                call_map.insert(cs.id, existing);
+            if let Some(existing) = source {
+                call_map.insert(cs.id, existing.primary);
                 continue;
             }
         }
@@ -1090,25 +1100,30 @@ fn merge_unit(
             .iter()
             .filter_map(|(i, v)| var_map.get(v).map(|nv| (*i, *nv)))
             .collect();
-        site.fn_args = site
-            .fn_args
-            .iter()
-            .filter_map(|(i, f)| fn_map.get(f).map(|nf| (*i, *nf)))
-            .collect();
+        if let Some(details) = &mut site.details {
+            details.fn_args.retain_mut(|(_, id)| {
+                if let Some(&mapped) = fn_map.get(id) {
+                    *id = mapped;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         site.return_dst = site.return_dst.and_then(|v| var_map.get(&v).copied());
         site.span.file = span_file;
         site.expansion_span = site.expansion_span.map(|mut span| {
             span.file = map_file(span.file);
             span
         });
-        site.occurrence = site.occurrence.map(|mut occurrence| {
-            occurrence.span.file = map_file(occurrence.span.file);
-            occurrence.expansion_span = occurrence.expansion_span.map(|mut span| {
-                span.file = map_file(span.file);
-                span
-            });
-            occurrence
-        });
+        if let Some(details) = &mut site.details {
+            if let Some(occurrence) = &mut details.occurrence {
+                occurrence.span.file = map_file(occurrence.span.file);
+                if let Some(span) = &mut occurrence.expansion_span {
+                    span.file = map_file(span.file);
+                }
+            }
+        }
         // Grouping records by their facts is a remerge concern only, so an
         // ordinary site never pays for the fingerprint — and being the one
         // spelling of "this is a remerge" from here on, it cannot disagree
@@ -1125,7 +1140,7 @@ fn merge_unit(
             // list is program-wide because a site in a header belongs to every
             // unit that includes it: scoped to one unit's variants, a fact two
             // units both recover would be recorded once per unit (#59 review).
-            let primary = program.dedup.site_keys.get(&key).copied();
+            let primary = source.map(|matched| matched.primary);
             let states_site = |id: CallSiteId| {
                 program
                     .symbols
@@ -1137,7 +1152,11 @@ fn merge_unit(
             // probe, which keeps a site whose facts differ in each of N
             // contributing units linear in N rather than quadratic.
             let existing = primary.filter(|&id| states_site(id)).or_else(|| {
-                let bucket = program.dedup.variant_site_records.get(&key)?.get(&facts)?;
+                let bucket = program
+                    .dedup
+                    .variant_site_records
+                    .get(&source?.source)?
+                    .get(&facts)?;
                 bucket
                     .iter()
                     .copied()
@@ -1156,30 +1175,28 @@ fn merge_unit(
         site.id = new_id;
         // A call a macro spells is owned where the macro is invoked.
         site.tu = Some(unit_of(site.scope_file()));
+        site.callee_name = program.symbols.intern_call_name(site.callee_name.as_str());
         program.symbols.call_sites.push(site);
         if shared_caller {
             program.symbols.share_header_call(new_id, primary_file_id);
         }
         if !is_internal_caller || shared_caller {
+            let source =
+                program
+                    .dedup
+                    .site_keys
+                    .insert(&key, new_id, facts.is_some(), &program.symbols);
             if let Some(facts) = facts {
-                // A variant adds records at a site the base configuration may
-                // already own. The key stands for the site across the whole
-                // program, and a later unit that reaches it is in the base
-                // configuration, not this variant's — so the base record stays
-                // canonical and only a site no configuration has claimed yet is
-                // registered here. The record is remembered separately either way,
-                // so a later variant can merge into it.
+                // Canonical source IDs outlive primary replacement, so facts
+                // recovered by later configurations stay program-wide.
                 program
                     .dedup
                     .variant_site_records
-                    .entry(key.clone())
+                    .entry(source)
                     .or_default()
                     .entry(facts)
                     .or_default()
                     .push(new_id);
-                program.dedup.site_keys.entry(key).or_insert(new_id);
-            } else {
-                program.dedup.site_keys.insert(key, new_id);
             }
         }
         call_map.insert(old, new_id);
@@ -2074,13 +2091,10 @@ mod tests {
             callee_var: None,
             callee_fn_id: None,
             var_args: vec![(0, VarId(owner * 10)), (2, VarId(owner * 10 + 1))],
-            fn_args: Vec::new(),
-            addr_of_member_args: Vec::new(),
-            addr_of_args: vec![2],
+            details: CallSiteDetails::boxed(Vec::new(), Vec::new(), vec![2], None),
             args_bound_past_this: false,
             span: trace_ir::Span::new(header, 86, 10),
             expansion_span: None,
-            occurrence: None,
             is_direct: true,
             receiver_class: None,
             exact_receiver: false,
@@ -2198,13 +2212,10 @@ mod tests {
                     callee_var: None,
                     callee_fn_id: bound.then_some(FnId(1)),
                     var_args: Vec::new(),
-                    fn_args: Vec::new(),
-                    addr_of_member_args: Vec::new(),
-                    addr_of_args: Vec::new(),
+                    details: CallSiteDetails::boxed(Vec::new(), Vec::new(), Vec::new(), None),
                     args_bound_past_this: false,
                     span: trace_ir::Span::new(source, 6, 10),
                     expansion_span: None,
-                    occurrence: None,
                     is_direct: true,
                     receiver_class: None,
                     exact_receiver: false,
@@ -2561,13 +2572,10 @@ mod tests {
                     callee_var: Some(member),
                     callee_fn_id: None,
                     var_args: Vec::new(),
-                    fn_args: Vec::new(),
-                    addr_of_member_args: Vec::new(),
-                    addr_of_args: Vec::new(),
+                    details: CallSiteDetails::boxed(Vec::new(), Vec::new(), Vec::new(), None),
                     args_bound_past_this: false,
                     span: trace_ir::Span::new(file, 11, 5),
                     expansion_span: None,
-                    occurrence: None,
                     is_direct: false,
                     receiver_class: None,
                     exact_receiver: false,
