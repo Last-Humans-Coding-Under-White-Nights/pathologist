@@ -1,5 +1,34 @@
 # Evaluation Report
 
+## Compact flow_nodes export: #195 — 2026-10-05
+
+Variable nodes in `flow_nodes` previously repeated the variable's name in `label`
+and stored a formatted string (`{kind} @{line} in {function}`) in `detail`.
+Because every part of those strings is already present in `variables` and
+`functions` via foreign keys `var_id` and `fn_id`, `flow_nodes` now stores empty
+strings for `var` nodes and leaves `loc`, `call_target`, and `terminator`
+unchanged. A SQL view `flow_nodes_text` reconstructs the original columns for
+external queries, and `trace inspect dataflow` reads only the walked nodes on demand
+rather than loading the entire table. Schema version bumped to **v7**.
+
+Evaluated on `ability_ability_runtime` (`6c18fdc9`), release builds, default options,
+eight jobs:
+
+| Metric | Baseline (`ability_orig.db`) | Candidate (`ability_new.db`) | Diff |
+|---|---:|---:|---:|
+| `flow_nodes` size | 80 MB | 25 MB | -55 MB (-68.8%) |
+| Total database size | 273 MB | 218 MB | -55 MB (-20.1%) |
+| Export phase time | 6.0 s | 5.7 s | -0.3 s |
+| `flow_nodes` rows | 794,431 | 794,431 | 0 |
+| `var` rows | 635,470 | 635,470 | 0 |
+| `var` avg `label` length | 7.9 | 0.0 | -7.9 |
+| `var` avg `detail` length | 80.1 | 0.0 | -80.1 |
+
+Non-variable rows (`loc`, `call_target`, `terminator`) retain their exact stored
+strings and lengths. All 794,431 rows queried through `flow_nodes_text` match the
+baseline `flow_nodes` table byte-for-byte. `trace inspect dataflow` and C API
+probes across all reference fixtures produce byte-identical output.
+
 ## Thread entry points: #187 — 2026-10-04
 
 A function started on a new thread is now reachable from the code that

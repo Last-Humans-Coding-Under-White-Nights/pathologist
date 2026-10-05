@@ -165,6 +165,22 @@ pub fn loc_kind_from_schema_str(s: &str) -> Option<LocKind> {
     }
 }
 
+/// Format the display label and detail string for a variable flow-graph node
+/// from its variable metadata and enclosing function name.
+pub fn format_var_flow_node(
+    var_name: &str,
+    var_kind: &str,
+    line: i64,
+    fn_name: Option<&str>,
+) -> (String, String) {
+    let label = var_name.to_string();
+    let mut detail = format!("{var_kind} @{line}");
+    if let Some(f) = fn_name {
+        detail.push_str(&format!(" in {f}"));
+    }
+    (label, detail)
+}
+
 /// A graph query result: flat node/edge sets plus BFS discovery order so the
 /// CLI can print an indented view without re-traversing.
 #[derive(Debug, Default)]
@@ -1082,48 +1098,6 @@ pub fn dataflow_graph(
         }
     }
 
-    // Node labels.
-    let mut labels: FxHashMap<i64, GraphNode> = FxHashMap::default();
-    {
-        let mut stmt = conn.prepare("SELECT id, kind, label, detail FROM flow_nodes")?;
-        let rows = stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let kind: String = row.get(1)?;
-            let label: String = row.get(2)?;
-            let detail: String = row.get(3)?;
-            let kind_enum = FlowNodeKind::from_schema_str(&kind);
-            let tag = match kind.as_str() {
-                "loc" => "loc",
-                "call_target" => "target",
-                "terminator" => "terminator",
-                _ => "",
-            };
-            let shown = if tag.is_empty() {
-                label.clone()
-            } else {
-                format!("{tag}:{label}")
-            };
-            let loc_kind = match kind_enum {
-                Some(FlowNodeKind::Loc) => loc_kind_from_schema_str(&detail),
-                _ => None,
-            };
-            Ok((
-                id,
-                GraphNode {
-                    id,
-                    label: shown,
-                    detail,
-                    kind: kind_enum,
-                    loc_kind,
-                },
-            ))
-        })?;
-        for r in rows {
-            let (id, node) = r?;
-            labels.insert(id, node);
-        }
-    }
-
     let mut graph = QueryGraph::default();
     let mut visited: FxHashSet<i64> = FxHashSet::default();
     struct Entry {
@@ -1142,20 +1116,6 @@ pub fn dataflow_graph(
     };
 
     while let Some(Entry { id, depth }) = queue.pop_front() {
-        if let Some(n) = labels.get(&id) {
-            graph.nodes.insert(id, n.clone());
-        } else {
-            graph.nodes.insert(
-                id,
-                GraphNode {
-                    id,
-                    label: format!("node{id}"),
-                    detail: String::new(),
-                    kind: None,
-                    loc_kind: None,
-                },
-            );
-        }
         graph.order.push((id, depth));
         if depth == max_depth {
             // Truncated only if an actually-unvisited neighbor was cut off;
@@ -1187,6 +1147,85 @@ pub fn dataflow_graph(
     graph
         .edges
         .dedup_by(|a, b| a.from == b.from && a.to == b.to && a.label == b.label);
+
+    // Read only the nodes reached during the walk in batches.
+    const CHUNK_SIZE: usize = 500;
+    for chunk in graph.order.chunks(CHUNK_SIZE) {
+        let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT n.id, n.kind, n.label, n.detail, n.var_id, \
+                    v.name, v.kind, v.line, f.name \
+             FROM flow_nodes n \
+             LEFT JOIN variables v ON v.id = n.var_id \
+             LEFT JOIN functions f ON f.id = COALESCE(n.fn_id, v.fn_id) \
+             WHERE n.id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(chunk.iter().map(|&(id, _)| id)))?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let mut label: String = row.get(2)?;
+            let mut detail: String = row.get(3)?;
+            let var_id: Option<i64> = row.get(4)?;
+            let v_name: Option<String> = row.get(5)?;
+            let v_kind: Option<String> = row.get(6)?;
+            let v_line: Option<i64> = row.get(7)?;
+            let f_name: Option<String> = row.get(8)?;
+
+            if kind == "var" {
+                if let (Some(v_name), Some(v_kind), Some(v_line)) = (v_name, v_kind, v_line) {
+                    let (l, d) = format_var_flow_node(&v_name, &v_kind, v_line, f_name.as_deref());
+                    if label.is_empty() {
+                        label = l;
+                    }
+                    if detail.is_empty() {
+                        detail = d;
+                    }
+                } else if label.is_empty() {
+                    label = format!("var{}", var_id.unwrap_or(id));
+                }
+            }
+
+            let kind_enum = FlowNodeKind::from_schema_str(&kind);
+            let tag = match kind.as_str() {
+                "loc" => "loc",
+                "call_target" => "target",
+                "terminator" => "terminator",
+                _ => "",
+            };
+            let shown = if tag.is_empty() {
+                label
+            } else {
+                format!("{tag}:{label}")
+            };
+            let loc_kind = match kind_enum {
+                Some(FlowNodeKind::Loc) => loc_kind_from_schema_str(&detail),
+                _ => None,
+            };
+            graph.nodes.insert(
+                id,
+                GraphNode {
+                    id,
+                    label: shown,
+                    detail,
+                    kind: kind_enum,
+                    loc_kind,
+                },
+            );
+        }
+    }
+
+    // Ensure any reached node that had no row in flow_nodes gets a fallback node.
+    for &(id, _) in &graph.order {
+        graph.nodes.entry(id).or_insert_with(|| GraphNode {
+            id,
+            label: format!("node{id}"),
+            detail: String::new(),
+            kind: None,
+            loc_kind: None,
+        });
+    }
     Ok(graph)
 }
 
@@ -1365,12 +1404,12 @@ pub fn require_symbols_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::SCHEMA_V6;
+    use crate::schema::SCHEMA_V7;
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        conn.execute_batch(SCHEMA_V6).unwrap();
+        conn.execute_batch(SCHEMA_V7).unwrap();
         // files: 1 = /proj/main.c
         conn.execute(
             "INSERT INTO files (id, path, sha256) VALUES (1, '/proj/main.c', '')",
@@ -1913,5 +1952,90 @@ mod tests {
         assert!(names_upper.contains(&"ns::Run"));
         assert!(!names_upper.contains(&"run"));
         assert!(!names_upper.contains(&"ns::run"));
+    }
+
+    #[test]
+    fn flow_nodes_text_view_matches_old_flow_nodes_for_all_kinds() {
+        let conn = test_conn();
+        conn.execute_batch(
+            "CREATE TABLE old_flow_nodes (
+                id INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL,
+                label TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                var_id INTEGER,
+                fn_id INTEGER
+            );
+            INSERT INTO old_flow_nodes (id, kind, label, detail, var_id, fn_id)
+            VALUES
+                (1, 'var', 'g', 'global @5', 20, NULL),
+                (2, 'var', 'x', 'local @12 in main', 21, 10),
+                (3, 'var', 'y', 'local @12 in main', 22, 10),
+                (4, 'loc', 'cell of g', 'local', NULL, 10),
+                (5, 'call_target', 'target_fn', 'call @15', NULL, NULL),
+                (6, 'terminator', 'memset_s clears arg0', 'call @18 in main', NULL, 10),
+                (7, 'var', 'custom_label', 'custom_detail', 21, 10),
+                (8, 'var', 'var999', '', 999, 10),
+                (9, 'var', 'var9', '', NULL, 10);
+
+            DELETE FROM flow_nodes;
+            INSERT INTO flow_nodes (id, kind, label, detail, var_id, fn_id)
+            VALUES
+                (1, 'var', '', '', 20, NULL),
+                (2, 'var', '', '', 21, 10),
+                (3, 'var', '', '', 22, 10),
+                (4, 'loc', 'cell of g', 'local', NULL, 10),
+                (5, 'call_target', 'target_fn', 'call @15', NULL, NULL),
+                (6, 'terminator', 'memset_s clears arg0', 'call @18 in main', NULL, 10),
+                (7, 'var', 'custom_label', 'custom_detail', 21, 10),
+                (8, 'var', '', '', 999, 10),
+                (9, 'var', '', '', NULL, 10);
+            ",
+        )
+        .unwrap();
+
+        type FlowNodeRow = (i64, String, String, String, Option<i64>, Option<i64>);
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, label, detail, var_id, fn_id FROM flow_nodes_text ORDER BY id",
+            )
+            .unwrap();
+        let view_rows: Vec<FlowNodeRow> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        let mut old_stmt = conn
+            .prepare(
+                "SELECT id, kind, label, detail, var_id, fn_id FROM old_flow_nodes ORDER BY id",
+            )
+            .unwrap();
+        let old_rows: Vec<FlowNodeRow> = old_stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        assert_eq!(view_rows, old_rows);
     }
 }
