@@ -166,10 +166,28 @@ fn static_member_entry_takes_the_arguments_past_its_this_slot() {
 }
 
 #[test]
+fn static_member_entry_leaves_its_this_slot_unwired() {
+    let (p, a) = thread_entry();
+    let this = local_variable(p, "Svc::Out", "this");
+    assert!(
+        !a.arg_flow_edges.iter().any(|row| row.formal == this),
+        "`Svc::Out` is static: no forwarded argument is its receiver"
+    );
+}
+
+#[test]
 fn member_entry_takes_its_receiver_first() {
     let (p, a) = thread_entry();
     assert!(indirect(p, a, "Svc::StartRun", "Svc::Run"));
     assert!(indirect(p, a, "Svc::Run", "OnMemberEvent"));
+    let h = local_variable(p, "Svc::Run", "h");
+    let rows: Vec<_> = a
+        .arg_flow_edges
+        .iter()
+        .filter(|row| row.formal == h)
+        .collect();
+    assert_eq!(rows.len(), 1, "the receiver is `this`, not `h`: {rows:?}");
+    assert_eq!(rows[0].actual_fn, Some(only_function(p, "OnMemberEvent")));
 }
 
 #[test]

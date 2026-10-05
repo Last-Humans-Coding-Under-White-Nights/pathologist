@@ -1586,6 +1586,7 @@ fn finalize_extern_callees(program: &mut Program) {
             variadic: false,
             defaulted_in_class: false,
             declared_in_class: false,
+            is_static_member: false,
             is_virtual: false,
             is_final: false,
             tu: None,
@@ -1690,6 +1691,7 @@ fn finalize_target_extern_callees(program: &mut Program) {
             variadic: false,
             defaulted_in_class: false,
             declared_in_class: false,
+            is_static_member: false,
             default_args: 0,
             reference_params: Vec::new(),
             is_virtual: false,
@@ -4829,6 +4831,7 @@ fn register_member_prototype(
             variadic: shape.variadic,
             defaulted_in_class: false,
             declared_in_class: true,
+            is_static_member: declaration_is_static(node),
             is_virtual: flags.is_virtual,
             is_final: flags.is_final,
             is_cpp: ctx.is_cpp,
@@ -5159,6 +5162,7 @@ fn lower_function_signature(
                     )
                 }),
             declared_in_class: ctx.class_ctx.is_some(),
+            is_static_member: ctx.class_ctx.is_some() && declaration_is_static(node),
             is_virtual: flags.is_virtual,
             is_final: flags.is_final,
             is_cpp: ctx.is_cpp,
@@ -8627,6 +8631,7 @@ fn lower_function_decl(
         variadic: shape.variadic,
         defaulted_in_class: false,
         declared_in_class: false,
+        is_static_member: false,
         is_virtual: false,
         is_final: false,
         is_cpp: ctx.is_cpp,
@@ -11248,6 +11253,7 @@ fn lower_lambda_expression(
         variadic: shape.variadic,
         defaulted_in_class: false,
         declared_in_class: false,
+        is_static_member: false,
         is_virtual: false,
         is_final: false,
         is_cpp: true,
@@ -13413,19 +13419,13 @@ fn cast_root(
     // The pointer levels the cast's declarator spells, on top of those its
     // type names. A `*` inside a template argument (`Box<int *> *`) belongs
     // to the type, and a reference (`T *&`) adds no level of its own.
-    let mut desc = type_desc_from_node(program, ctx, source, descriptor);
-    let mut cur = descriptor.cached_field("declarator");
-    while let Some(n) = cur {
-        cur = match n.cached_kind() {
-            "abstract_pointer_declarator" => {
-                desc = TypeDesc::Ptr(Box::new(desc));
-                n.cached_field("declarator")
-            }
-            "abstract_reference_declarator" => n.named_child(0),
-            "abstract_parenthesized_declarator" => n.named_child(0),
-            _ => return None,
-        };
-    }
+    let desc = type_desc_from_node(program, ctx, source, descriptor);
+    let desc = abstract_declarator_shape(
+        desc,
+        descriptor.cached_field("declarator"),
+        false,
+        ReferenceLayer::Referent,
+    );
     let TypeDesc::Ptr(pointee) = desc else {
         return None;
     };
@@ -16375,6 +16375,8 @@ enum ReferenceLayer {
     Pointer,
     /// As a parameter's reference: at most one pointer layer in all.
     Parameter,
+    /// As the referent itself: no layer, as a cast's operand is read.
+    Referent,
 }
 
 /// `desc` wrapped in the pointer, reference and function layers of an
@@ -16397,6 +16399,9 @@ fn abstract_declarator_shape(
         cur = match n.cached_kind() {
             "abstract_reference_declarator" if references == ReferenceLayer::Parameter => {
                 reference = true;
+                n.cached_field("declarator").or_else(|| n.named_child(0))
+            }
+            "abstract_reference_declarator" if references == ReferenceLayer::Referent => {
                 n.cached_field("declarator").or_else(|| n.named_child(0))
             }
             "abstract_pointer_declarator" | "abstract_reference_declarator" => {

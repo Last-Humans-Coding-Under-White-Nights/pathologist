@@ -27,7 +27,7 @@ unchanged on all three corpora. No edge was removed.
 | hiview | arg-flow edges | 22,016 | 22,019 | +3 |
 | camera | call edges (total) | 111,886 | 111,903 | +17 |
 | camera | indirect edges | 313 | 330 | +17 |
-| camera | arg-flow edges | 51,928 | 51,935 | +7 |
+| camera | arg-flow edges | 51,928 | 51,933 | +5 |
 
 Every added edge is attributed to a starting call site:
 
@@ -41,7 +41,11 @@ Every added edge is attributed to a starting call site:
 
 The added arg-flow rows are the forwarded arguments: the context HDF's
 `OsalCreatePthread` hands each thread function, and the receivers and
-arguments of the `std::thread` starts.
+arguments of the `std::thread` starts. Review follow-up: a `rest` model no
+longer wires the first forwarded argument into the unused `this` of a static
+member (`Function::is_static_member`), which takes two of camera's rows out
+(51,935 → 51,933); the other corpora and every edge count are unchanged
+(97 checks, 0 failures).
 
 Two probes pin the cases: HDF's `OsalCreatePthread` reaches 36 distinct
 functions at its `pthread_create` (0 on the baseline), and camera's

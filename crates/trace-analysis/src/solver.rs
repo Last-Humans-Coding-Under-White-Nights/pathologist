@@ -2350,11 +2350,13 @@ fn invoke_alignments(
             };
             let room = |slots: u32| open || f.variadic || passed <= slots;
             // A non-static member takes its receiver first. A static one,
-            // which lowering gives a `this` as well, takes none: both are
+            // which lowering gives a `this` as well, takes none. A member
+            // whose class body no unit showed could be either, so both are
             // wired where the count does not tell them apart.
+            let skips_this = this == 1 && (f.is_static_member || !f.declared_in_class);
             [
-                room(declared + this).then_some(0),
-                (this == 1 && room(declared)).then_some(1),
+                (!f.is_static_member && room(declared + this)).then_some(0),
+                (skips_this && room(declared)).then_some(1),
             ]
         }
     };
@@ -3270,6 +3272,7 @@ mod tests {
                 variadic: false,
                 defaulted_in_class: false,
                 declared_in_class: false,
+                is_static_member: false,
                 is_virtual: false,
                 is_final: false,
                 is_cpp: true,

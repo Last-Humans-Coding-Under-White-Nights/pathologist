@@ -1616,9 +1616,11 @@ image as an indirect call's targets are.
 - **Members.** Lowering gives every member function a `this`, a static one
   included. A listed form never passes a receiver, so its arguments start
   past `this`. A `rest` form passes the receiver first when the callback is
-  a non-static member (`std::thread(&C::Run, this, x)`); where the argument
-  count allows both readings, both are wired, and a static member's unused
-  `this` takes the first argument as well.
+  a non-static member (`std::thread(&C::Run, this, x)`) and starts past
+  `this` when it is a static one (`std::thread(C::Out, x)`), as its in-class
+  declaration's `static` tells (`Function::is_static_member`). Only a member
+  whose class body no unit showed could be either: where the argument count
+  allows both readings, both are wired.
 - **Wiring.** Each forwarded actual is wired into the callback's formal
   exactly as an indirect call wires its arguments (`wire_params`): a
   persistent `Copy` for pointer-like pairs, the function location for a
