@@ -339,7 +339,7 @@ fn export_flow_graph(
             PagNodeKind::CallTarget(cs) => match program.symbols.call_site_by_id(cs) {
                 Some(site) => (
                     "call_target",
-                    site.callee_name.clone(),
+                    site.callee_name.to_string(),
                     format!("call @{}", site.span.line),
                     None,
                     None,
@@ -413,7 +413,7 @@ fn export_flow_graph(
                 let passed = program
                     .symbols
                     .call_site_by_id(e.call_site)
-                    .filter(|cs| cs.addr_of_args.contains(&e.arg_index))
+                    .filter(|cs| cs.addr_of_args().contains(&e.arg_index))
                     .and_then(|cs| cs.var_args.iter().find(|(i, _)| *i == e.arg_index))
                     .map_or(actual, |(_, temp)| *temp);
                 let Some(actual_node) = pag.var_node.get(&passed) else {
@@ -589,7 +589,7 @@ fn export_call_sites_filtered(
             cs.expansion_span.map(|span| span.file.0),
             cs.expansion_span.map(|span| span.line),
             cs.expansion_span.map(|span| span.col),
-            cs.callee_name,
+            cs.callee_name.as_str(),
             cs.is_direct as i32
         ])?;
     }

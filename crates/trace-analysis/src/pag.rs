@@ -995,7 +995,7 @@ impl Pag {
     pub fn argument_var(&self, cs: &trace_ir::CallSite, idx: u32) -> Option<VarId> {
         let actual = cs.var_args.iter().find(|(j, _)| *j == idx)?.1;
         let addressed = cs
-            .addr_of_args
+            .addr_of_args()
             .contains(&idx)
             .then(|| {
                 self.var_node

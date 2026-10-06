@@ -1,12 +1,13 @@
 use crate::deps::IncludeGraph;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use trace_preproc::{
-    preprocess_file, Diagnostic, ExpansionCache, ExpansionJournal, IncludeExpansion, Language,
-    LineMap, PreprocessOptions,
+    preprocess_file, ExpansionCache, ExpansionJournal, IncludeExpansion, Language, LineMap,
+    PreprocessOptions, SharedDiagnostic,
 };
 
 /// Preprocessed text plus its origin map for one canonical file path.
@@ -41,7 +42,7 @@ pub struct PreprocessedSource {
     /// Everything the preprocessor reported while producing `text`, in
     /// emission order, attributed to the file it happened in (nested
     /// includes included). Empty for raw sources.
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<SharedDiagnostic>,
     /// Conditional chains recorded during preprocessing (when `record_conditionals`
     /// is enabled).
     pub conditionals: Vec<trace_preproc::ConditionalChain>,
@@ -65,9 +66,46 @@ pub struct HeaderProvenance {
 #[derive(Debug, Clone, Default)]
 pub struct IndexSourceCache {
     inner: Arc<RwLock<HashMap<PathBuf, CachedSource>>>,
+    resident: Arc<Mutex<ResidentSources>>,
+    spilling: Arc<Mutex<()>>,
     /// Lowering turns source-read errors into unit diagnostics. Disk-cache
     /// failures must additionally abort the build, rather than publish missing IR.
     load_errors: Arc<Mutex<BTreeSet<String>>>,
+}
+
+/// Retained payload accounting; paths order eviction independently of hash order.
+#[derive(Debug)]
+struct ResidentSources {
+    paths: BTreeMap<PathBuf, usize>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl Default for ResidentSources {
+    fn default() -> Self {
+        Self {
+            paths: BTreeMap::new(),
+            bytes: 0,
+            budget: 32 * 1024 * 1024,
+        }
+    }
+}
+
+impl ResidentSources {
+    fn remove(&mut self, path: &Path) {
+        if let Some(bytes) = self.paths.remove(path) {
+            self.bytes -= bytes;
+        }
+    }
+}
+
+fn payload_bytes(src: &PreprocessedSource) -> usize {
+    src.text.len().saturating_add(
+        src.line_map
+            .entries
+            .capacity()
+            .saturating_mul(LINE_MAP_ENTRY_BYTES),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +128,96 @@ impl CachedSource {
 
 /// Bytes of one serialized `LineMapEntry` in a spill file.
 const LINE_MAP_ENTRY_BYTES: usize = 40;
+const SPILL_THRESHOLD: usize = 512 * 1024;
+
+#[derive(Default)]
+struct SpillDirectory {
+    directory: Option<tempfile::TempDir>,
+    live_files: AtomicUsize,
+    shutting_down: bool,
+}
+
+static SPILL_DIRECTORY: LazyLock<RwLock<SpillDirectory>> =
+    LazyLock::new(|| RwLock::new(SpillDirectory::default()));
+
+/// Remove this process's source spills before an exit that skips destructors.
+/// Best effort: this also prevents workers from creating new spills. Call only
+/// when terminating the process; ordinary cache release cleans up through RAII.
+pub fn remove_spill_dir() {
+    let mut spills = SPILL_DIRECTORY.write().unwrap_or_else(|e| e.into_inner());
+    spills.shutting_down = true;
+    if let Some(directory) = spills.directory.take() {
+        let _ = directory.close();
+    }
+}
+
+/// A TempPath with a directory lease counted outside the per-source record.
+/// The last lease drops the directory, including after a failed spill write.
+#[derive(Debug)]
+struct SpillFile(tempfile::TempPath);
+
+impl SpillFile {
+    fn create() -> std::io::Result<(std::fs::File, Self)> {
+        loop {
+            // Shared access permits parallel file creation; the timeout's
+            // exclusive lock waits for every creator before removing the dir.
+            let spills = SPILL_DIRECTORY.read().unwrap_or_else(|e| e.into_inner());
+            if spills.shutting_down {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "source spill cleanup is in progress",
+                ));
+            }
+            if let Some(directory) = &spills.directory {
+                let file = tempfile::Builder::new()
+                    .prefix("trace-source-")
+                    .tempfile_in(directory.path());
+                match file {
+                    Ok(file) => {
+                        spills.live_files.fetch_add(1, Ordering::Relaxed);
+                        let (file, path) = file.into_parts();
+                        return Ok((file, Self(path)));
+                    }
+                    Err(error) => {
+                        drop(spills);
+                        Self::remove_unused_directory();
+                        return Err(error);
+                    }
+                }
+            }
+            drop(spills);
+            let mut spills = SPILL_DIRECTORY.write().unwrap_or_else(|e| e.into_inner());
+            if !spills.shutting_down && spills.directory.is_none() {
+                spills.directory = Some(tempfile::Builder::new().prefix("trace-spill-").tempdir()?);
+            }
+        }
+    }
+
+    fn remove_unused_directory() {
+        let mut spills = SPILL_DIRECTORY.write().unwrap_or_else(|e| e.into_inner());
+        // A creator may have acquired another lease before the exclusive lock.
+        if spills.live_files.load(Ordering::Relaxed) == 0 {
+            spills.directory.take();
+        }
+    }
+}
+
+impl AsRef<Path> for SpillFile {
+    fn as_ref(&self) -> &Path {
+        self.0.as_ref()
+    }
+}
+
+impl Drop for SpillFile {
+    fn drop(&mut self) {
+        let spills = SPILL_DIRECTORY.read().unwrap_or_else(|e| e.into_inner());
+        let last = spills.live_files.fetch_sub(1, Ordering::Relaxed) == 1;
+        drop(spills);
+        if last {
+            Self::remove_unused_directory();
+        }
+    }
+}
 
 /// `src` with its text and mappings dropped: what the provenance queries
 /// need, and nothing that a spill or release keeps out of memory.
@@ -105,7 +233,7 @@ fn without_text(src: &PreprocessedSource) -> PreprocessedSource {
 #[derive(Debug)]
 struct SpilledSource {
     metadata: PreprocessedSource,
-    file: tempfile::TempPath,
+    file: SpillFile,
     text_len: usize,
     entry_count: usize,
     origin_files: Vec<PathBuf>,
@@ -114,11 +242,9 @@ struct SpilledSource {
 
 impl SpilledSource {
     fn store(src: &PreprocessedSource) -> std::io::Result<Self> {
-        let mut file = tempfile::Builder::new()
-            .prefix("trace-source-")
-            .tempfile()?;
-        {
-            let mut writer = BufWriter::new(file.as_file_mut());
+        let (mut file, spill_file) = SpillFile::create()?;
+        let written = (|| {
+            let mut writer = BufWriter::new(&mut file);
             writer.write_all(src.text.as_bytes())?;
             // Through the buffered writer an entry at a time: no second
             // copy of the map on the heap while it is being shed.
@@ -143,10 +269,13 @@ impl SpilledSource {
                 writer.write_all(&entry)?;
             }
             writer.flush()?;
-        }
+            Ok::<(), std::io::Error>(())
+        })();
+        drop(file);
+        written?;
         Ok(Self {
             metadata: without_text(src),
-            file: file.into_temp_path(),
+            file: spill_file,
             text_len: src.text.len(),
             entry_count: src.line_map.entries.len(),
             origin_files: src.line_map.files.clone(),
@@ -260,9 +389,14 @@ impl IndexSourceCache {
 
     fn store(&self, canonical: PathBuf, src: Arc<PreprocessedSource>) {
         if let Ok(mut guard) = self.inner.write() {
-            guard
-                .entry(canonical)
-                .or_insert(CachedSource::Resident(src));
+            if let std::collections::hash_map::Entry::Vacant(entry) = guard.entry(canonical.clone())
+            {
+                let bytes = payload_bytes(&src);
+                entry.insert(CachedSource::Resident(src));
+                let mut resident = self.resident.lock().unwrap_or_else(|e| e.into_inner());
+                resident.bytes += bytes;
+                resident.paths.insert(canonical, bytes);
+            }
         }
     }
 
@@ -274,47 +408,88 @@ impl IndexSourceCache {
         let Ok(mut guard) = self.inner.write() else {
             return;
         };
-        if let Some(CachedSource::Resident(src)) = guard.get(&canonical) {
-            let released = CachedSource::Released(Arc::new(without_text(src)));
-            guard.insert(canonical, released);
+        if let Some(cached) = guard.get(&canonical) {
+            let released = CachedSource::Released(Arc::new(without_text(cached.metadata())));
+            guard.insert(canonical.clone(), released);
+            self.resident
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&canonical);
         }
     }
 
-    /// Release a large source payload after preprocessing while retaining its
-    /// original bytes on disk. Smaller entries stay resident: the saving is
-    /// not worth a temporary file each, and most units are under this.
+    /// Spill individually large entries and enforce the total retained payload
+    /// budget. Active workers may still hold their own references while writing.
     pub(crate) fn spill(&self, path: &Path, graph: &IncludeGraph) -> Result<(), String> {
-        const SPILL_THRESHOLD: usize = 512 * 1024;
         let canonical = graph.intern_path(path);
-        let cached = self
-            .inner
-            .read()
-            .map_err(|e| e.to_string())?
-            .get(&canonical)
-            .cloned();
-        let Some(CachedSource::Resident(src)) = cached else {
-            return Ok(());
+        self.spill_payload(&canonical, false)?;
+        // Serialize budget eviction so concurrent settling workers cannot choose
+        // the same victim or leave the cache over budget after the last insert.
+        let _spilling = self.spilling.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let victim = {
+                let resident = self.resident.lock().unwrap_or_else(|e| e.into_inner());
+                if resident.bytes <= resident.budget {
+                    break;
+                }
+                resident
+                    .paths
+                    .first_key_value()
+                    .map(|(path, _)| path.clone())
+            };
+            let Some(victim) = victim else {
+                break;
+            };
+            self.spill_payload(&victim, true)?;
+        }
+        Ok(())
+    }
+
+    /// Discovery cannot return an I/O error directly; retain it for the build's
+    /// error check before settling. No cache failure may become missing IR.
+    pub(crate) fn retain_committed(&self, path: &Path, graph: &IncludeGraph) {
+        if let Err(message) = self.spill(path, graph) {
+            self.load_errors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(message);
+        }
+    }
+
+    fn spill_payload(&self, canonical: &Path, force: bool) -> Result<(), String> {
+        let src = {
+            let guard = self.inner.read().map_err(|e| e.to_string())?;
+            let Some(CachedSource::Resident(src)) = guard.get(canonical) else {
+                // Keep the cache lock until accounting is reconciled, so a
+                // newly inserted resident cannot lose its budget entry.
+                self.resident
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(canonical);
+                return Ok(());
+            };
+            Arc::clone(src)
         };
-        // Nested includes can leave a large allocation after mappings are
-        // truncated. Base the threshold on retained capacity, not live length.
-        let bytes = src.text.len().saturating_add(
-            src.line_map
-                .entries
-                .capacity()
-                .saturating_mul(LINE_MAP_ENTRY_BYTES),
-        );
-        if bytes <= SPILL_THRESHOLD {
+        if !force && payload_bytes(&src) <= SPILL_THRESHOLD {
             return Ok(());
         }
-        // I/O happens outside the cache lock so other settling workers proceed.
+        // I/O outside the cache lock lets other preprocessing workers proceed.
         let spilled = Arc::new(
             SpilledSource::store(&src)
-                .map_err(|e| format!("spill preprocessed source {}: {e}", path.display()))?,
+                .map_err(|e| format!("spill preprocessed source {}: {e}", canonical.display()))?,
         );
         let mut guard = self.inner.write().map_err(|e| e.to_string())?;
-        if matches!(guard.get(&canonical), Some(CachedSource::Resident(current)) if Arc::ptr_eq(current, &src))
+        if matches!(guard.get(canonical), Some(CachedSource::Resident(current)) if Arc::ptr_eq(current, &src))
         {
-            guard.insert(canonical, CachedSource::Spilled(spilled));
+            guard.insert(canonical.to_path_buf(), CachedSource::Spilled(spilled));
+        }
+        // A concurrent eviction/release can replace the source while I/O is
+        // in flight. Reconcile stale accounting, but keep any new resident.
+        if !matches!(guard.get(canonical), Some(CachedSource::Resident(_))) {
+            self.resident
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(canonical);
         }
         Ok(())
     }
@@ -369,6 +544,10 @@ impl IndexSourceCache {
     pub fn evict_all(&self, paths: &HashSet<PathBuf>) {
         if let Ok(mut guard) = self.inner.write() {
             guard.retain(|p, _| !paths.contains(p));
+            let mut resident = self.resident.lock().unwrap_or_else(|e| e.into_inner());
+            for path in paths {
+                resident.remove(path);
+            }
         }
     }
 
@@ -396,6 +575,10 @@ impl IndexSourceCache {
         let canonical = graph.intern_path(path);
         if let Ok(mut guard) = self.inner.write() {
             guard.remove(&canonical);
+            self.resident
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&canonical);
         }
     }
 
@@ -526,6 +709,19 @@ fn read_index_source(
             .map_err(|e| e.to_string());
     }
     let mut preproc_result = preprocess_file(&canonical, eff_opts).map_err(|e| e.to_string())?;
+    // Keep the original capacity-based spill decision for large payloads.
+    // Smaller resident maps need no growth after preprocessing, and retaining
+    // thousands of partly empty vectors costs more than their live entries.
+    let retained = preproc_result.output.len().saturating_add(
+        preproc_result
+            .line_map
+            .entries
+            .capacity()
+            .saturating_mul(LINE_MAP_ENTRY_BYTES),
+    );
+    if retained <= SPILL_THRESHOLD {
+        preproc_result.line_map.entries.shrink_to_fit();
+    }
     let journal = preproc_result.expansion_journal.take();
     // Keep partial output even when preprocessing stopped mid-file. A stop
     // usually happens inside ONE nested header; discarding everything and
@@ -569,6 +765,190 @@ fn should_preprocess(path: &Path, opts: &PreprocessOptions, graph: &IncludeGraph
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn spill_directory_lifetime_and_hard_exit_cleanup() {
+        // Run in a child: hard-exit cleanup permanently disables spills in its
+        // process, and must not interfere with other parallel cache tests.
+        const CHILD_MODE: &str = "TRACE_TEST_SPILL_CLEANUP";
+        if let Some(mode) = std::env::var_os(CHILD_MODE) {
+            let source = PreprocessedSource::raw(Arc::from("small source"));
+            let first = SpilledSource::store(&source).unwrap();
+            let second = SpilledSource::store(&source).unwrap();
+            let directory = first.file.as_ref().parent().unwrap().to_path_buf();
+            assert_eq!(second.file.as_ref().parent().unwrap(), directory);
+            drop(first);
+            assert!(directory.is_dir());
+            assert!(second.file.as_ref().is_file());
+            if mode == "exit" {
+                // Simulate the CLI timeout with a worker holding an open spill.
+                let (writer, pending) = SpillFile::create().unwrap();
+                let ready = std::sync::Barrier::new(9);
+                std::thread::scope(|scope| {
+                    for _ in 0..8 {
+                        scope.spawn(|| {
+                            let (file, path) = SpillFile::create().unwrap();
+                            ready.wait();
+                            drop(file);
+                            drop(path);
+                            // Race further file creation against shutdown.
+                            while let Ok((file, path)) = SpillFile::create() {
+                                drop(file);
+                                drop(path);
+                            }
+                        });
+                    }
+                    ready.wait();
+                    remove_spill_dir();
+                });
+                assert!(!directory.exists());
+                assert!(!pending.as_ref().exists());
+                assert!(SpillFile::create().is_err());
+                // Repeated cleanup is safe. Neither these leases nor the
+                // TempPath destructors run on std::process::exit.
+                remove_spill_dir();
+                std::mem::forget(writer);
+                std::process::exit(124);
+            }
+            drop(second);
+            assert!(!directory.exists());
+            // A later indexing run gets a fresh directory, without retaining
+            // files or using the timeout-only shutdown path.
+            let next = SpilledSource::store(&source).unwrap();
+            assert_ne!(next.file.as_ref().parent().unwrap(), directory);
+            return;
+        }
+        for mode in ["normal", "exit"] {
+            let scratch = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "index_cache::tests::spill_directory_lifetime_and_hard_exit_cleanup",
+                    "--nocapture",
+                ])
+                .env(CHILD_MODE, mode)
+                .env("TMPDIR", scratch.path())
+                .env("TMP", scratch.path())
+                .env("TEMP", scratch.path())
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if mode == "exit" { 124 } else { 0 }),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn spilling_reconciles_accounting_for_nonresident_victims() {
+        let graph = IncludeGraph::default();
+        let cache = IndexSourceCache::new();
+        let source = PreprocessedSource::raw(Arc::from("small source"));
+        let absent = PathBuf::from("/absent.c");
+        let released = PathBuf::from("/released.c");
+        let spilled = PathBuf::from("/spilled.c");
+        {
+            let mut entries = cache.inner.write().unwrap();
+            entries.insert(
+                released.clone(),
+                CachedSource::Released(Arc::new(without_text(&source))),
+            );
+            entries.insert(
+                spilled.clone(),
+                CachedSource::Spilled(Arc::new(SpilledSource::store(&source).unwrap())),
+            );
+        }
+        for path in [absent, released, spilled] {
+            {
+                let mut resident = cache.resident.lock().unwrap();
+                resident.paths.insert(path.clone(), 8192);
+                resident.bytes += 8192;
+            }
+            cache.spill_payload(&path, true).unwrap();
+            assert!(cache.resident.lock().unwrap().paths.is_empty());
+            assert_eq!(cache.resident.lock().unwrap().bytes, 0);
+        }
+        // Correct accounting lets the aggregate loop move on to a real victim.
+        cache.resident.lock().unwrap().budget = 1;
+        let path = PathBuf::from("/resident.c");
+        cache.insert(&path, &graph, source);
+        cache.spill(&path, &graph).unwrap();
+        assert_eq!(cache.resident.lock().unwrap().bytes, 0);
+        let loaded = cache
+            .get_or_preprocess(&path, &graph, &PreprocessOptions::default())
+            .unwrap();
+        assert_eq!(loaded.text.as_ref(), "small source");
+    }
+
+    #[test]
+    fn aggregate_budget_spills_small_sources_and_cleans_up_released_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = IncludeGraph::default();
+        let cache = IndexSourceCache::new();
+        cache.resident.lock().unwrap().budget = 16 * 1024;
+        let paths: Vec<_> = (0..32)
+            .map(|i| dir.path().join(format!("unit_{i}.c")))
+            .collect();
+        // Individually these never spill. Concurrent retain calls must still
+        // bound their combined storage without losing source bytes or metadata.
+        std::thread::scope(|scope| {
+            for path in &paths {
+                let cache = &cache;
+                let graph = &graph;
+                scope.spawn(move || {
+                    let mut src = PreprocessedSource::raw(Arc::from("x".repeat(8192)));
+                    let mut map = LineMap::new();
+                    let file = map.intern_file(path);
+                    map.push(0, file, 7, 2);
+                    src.line_map = Arc::new(map);
+                    src.included_headers = Arc::new(vec![dir_header(path)]);
+                    cache.insert(path, graph, src);
+                    cache.spill(path, graph).unwrap();
+                });
+            }
+        });
+        {
+            let resident = cache.resident.lock().unwrap();
+            assert!(resident.bytes <= resident.budget);
+        }
+        for path in &paths {
+            let src = cache
+                .get_or_preprocess(path, &graph, &PreprocessOptions::default())
+                .unwrap();
+            assert_eq!(src.text.as_ref(), "x".repeat(8192));
+            assert_eq!(src.line_map.lookup(0).unwrap().line, 7);
+            assert_eq!(src.included_headers.as_ref(), &[dir_header(path)]);
+        }
+        let (path, spill_file) = {
+            let guard = cache.inner.read().unwrap();
+            paths
+                .iter()
+                .find_map(|path| match &guard[path] {
+                    CachedSource::Spilled(src) => {
+                        Some((path.clone(), src.file.as_ref().to_path_buf()))
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        cache.release_text(&path, &graph);
+        assert!(!spill_file.exists());
+        assert!(cache
+            .get_or_preprocess(&path, &graph, &PreprocessOptions::default())
+            .is_err());
+        cache.evict_all(&paths.into_iter().collect());
+        let resident = cache.resident.lock().unwrap();
+        assert_eq!(resident.bytes, 0);
+        assert!(resident.paths.is_empty());
+    }
+
+    fn dir_header(path: &Path) -> PathBuf {
+        path.parent().unwrap().join("shared.h")
+    }
 
     #[test]
     fn spilling_releases_reserved_map_storage_and_writes_only_live_entries() {
@@ -643,7 +1023,7 @@ mod tests {
             };
             assert!(src.metadata.text.is_empty());
             assert!(src.metadata.line_map.entries.is_empty());
-            src.file.to_path_buf()
+            src.file.as_ref().to_path_buf()
         };
         let after = cache.header_provenance(&units);
         assert_eq!(after.inlined, provenance.inlined);
@@ -706,7 +1086,7 @@ mod tests {
             .unwrap_err()
             .contains("released"));
         assert!(cache.check_load_errors().is_err());
-        // Releasing again, or releasing a spilled entry, is a no-op.
+        // Releasing again keeps the same provenance.
         cache.release_text(&path, &graph);
         assert!(cache.spill(&path, &graph).is_ok());
     }

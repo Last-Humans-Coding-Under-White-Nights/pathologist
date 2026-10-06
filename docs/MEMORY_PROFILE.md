@@ -1,5 +1,14 @@
 # Memory ownership investigation
 
+The latest measurements are in [Preprocessing cache budget and configured
+streaming](EVAL_REPORT.md#preprocessing-cache-budget-and-configured-streaming--2026-10-05).
+The preceding [ownership research](EVAL_REPORT.md#preprocessing-and-indexing-memory-research--2026-10-05)
+identified unused resident LineMap capacity, duplicated diagnostics, aggregate
+source-cache retention and whole-corpus configured-unit retention. The retained
+implementation covers the first three items and ordinary configured streaming
+from item 4. Explicit-image streaming and expansion-cache compaction/spilling
+remain unimplemented; remaining floors are listed with those measurements.
+
 This document records the 2026-09-15 camera-corpus investigation and its
 follow-ups. The later `ability_ability_runtime` measurements, including compact
 cached header type tables and earlier release of discarded payloads, are in

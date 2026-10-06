@@ -287,7 +287,7 @@ pub struct IncludeExpansion {
     /// Diagnostics emitted while producing this expansion, including
     /// diagnostics replayed from nested cached headers. Cache hits append
     /// these to the current preprocessing result in their original order.
-    pub diagnostics: Arc<[crate::Diagnostic]>,
+    pub diagnostics: Arc<[crate::SharedDiagnostic]>,
     /// Origin map for `text`: offsets are relative to the start of the
     /// expansion. Empty when line-map tracking is disabled.
     pub line_map: Arc<crate::LineMap>,
@@ -343,6 +343,9 @@ pub enum CommandMacro {
 
 #[derive(Debug, Clone)]
 pub struct PreprocessOptions {
+    /// Optional full-record sharing across preprocess runs. Indexing creates
+    /// one pool and shares it across header and translation-unit options.
+    pub diagnostic_pool: Option<Arc<crate::DiagnosticPool>>,
     /// Explicit compilation database path; otherwise indexing checks the
     /// analysis root, then its `build` directory.
     pub compilation_database: Option<PathBuf>,
@@ -467,6 +470,7 @@ pub struct PreprocessOptions {
 impl Default for PreprocessOptions {
     fn default() -> Self {
         Self {
+            diagnostic_pool: None,
             compilation_database: None,
             system_includes: false,
             link_commands: None,
@@ -541,6 +545,7 @@ impl PreprocessOptions {
     #[must_use]
     pub fn for_indexing(mut self) -> Self {
         self.track_line_map = true;
+        self.diagnostic_pool.get_or_insert_with(Default::default);
         self
     }
 

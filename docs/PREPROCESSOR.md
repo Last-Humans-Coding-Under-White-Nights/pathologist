@@ -29,7 +29,7 @@ pub fn preprocess_file(path: &Path, opts: &PreprocessOptions) -> Result<Preproce
 pub struct PreprocessResult {
     pub output: String,
     pub line_map: LineMap,
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<SharedDiagnostic>,
     pub conditionals: Vec<ConditionalChain>, // only with `record_conditionals`
 }
 ```
@@ -131,6 +131,24 @@ flowchart LR
 - **`IncludeGraph`** (`trace-parse/src/deps.rs`) scans project files for `#include` directives, builds dependency edges, discovers include directories, and marks which files need preprocessing.
 - Preprocessed output is **cached** per file (parallel cache fill when `--jobs > 1`) and released once
   the unit is lowered, so the text held at once is bounded by the parse batch in flight.
+  Final resident LineMap entry vectors shed unused capacity when their retained text/map
+  size is at most the 512 KiB individual spill threshold. Larger vectors retain
+  their capacity until the spill decision, which must still account for reserved
+  storage rather than just live entries.
+- The shared indexing source cache retains at most 32 MiB of text and LineMap
+  entry capacity after each warm/committed/settled source, and spills any single
+  payload over 512 KiB. Aggregate victims are selected by canonical path order.
+  Active preprocessing/loading workers and provenance metadata are outside this
+  payload budget. Spills retain original bytes and all mapping provenance, use
+  independent read cursors, and are deleted on eviction or release. They share
+  a randomly named `trace-spill-*` directory under the temporary directory,
+  removed when its last spill is released (also on normal completion or error).
+  CLI `--timeout-secs` blocks new spills and removes this directory on a
+  best-effort basis before exiting with code 124. SIGKILL cannot run cleanup;
+  any leftovers remain grouped in the `trace-spill-*` directory. Discovery
+  texts that must be settled are released directly. Spill or load failures abort
+  indexing rather than silently dropping facts. This budget changes storage only;
+  expansion-cache publication still follows unit order.
 - Macro definitions share immutable `Arc` token and parameter slices between live
   tables and cached directive logs. Expansion still creates invocation-specific
   tokens, preserving token origins, hide sets, and ordered define/undef replay.
@@ -665,6 +683,14 @@ cut off at a complete line. Regenerate older TSV files before using the reader. 
 | Preprocess failure (hard error) | The unit's own file cannot be read: no output, the unit is dropped with an error diagnostic carrying the I/O message. For a header in the warm pass the same failure is the warning `macro warm preprocess failed for <header>` | `parse` / `error` (no file) for a unit; `preprocess` / `warning` for the warm pass |
 
 ### Diagnostics in the export
+
+`SharedDiagnostic` is `Arc<Diagnostic>`: results and cached expansions retain
+ordered references to immutable reports. Indexing options share a per-run
+`DiagnosticPool` that interns the full record, including severity. It disappears
+with the indexing options and does not retain data in a process-wide registry.
+Standalone preprocessing may omit the pool; nested frames and cache replay still
+share their report references. Pooling changes ownership only: the existing
+within-run and export deduplication identities and order below remain unchanged.
 
 Every entry of `PreprocessResult::diagnostics` reaches the SQLite `diagnostics` table as a
 `stage = 'preprocess'` row (#20): `severity` is the preprocessor's own (`error` / `warning`),

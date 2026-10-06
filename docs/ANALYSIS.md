@@ -788,6 +788,54 @@ weak pool entries do not retain unused descriptor payloads. The public Rust
 values and exported data are unchanged. See [memory measurements](MEMORY_PROFILE.md)
 and [evaluation report](EVAL_REPORT.md#struct-compaction-expansion-sharing-and-lifecycle-reclamation--2026-10-01).
 
+### Call-record storage and merge lifetime
+
+`CallSite` keeps common facts directly on the record. Function-pointer
+arguments, member/plain address markers, and an explicit macro occurrence
+live together in `Option<Box<CallSiteDetails>>`; empty ordinary calls need no
+payload allocation. Rust callers construct this field with
+`CallSiteDetails::boxed(fn_args, addr_of_member_args, addr_of_args, occurrence)`
+or `None`, read the argument slices through `fn_args()`,
+`addr_of_member_args()` and `addr_of_args()`, and add rare facts through
+`details_mut()`. `occurrence()` still returns the effective identity, including
+its original fallback for calls without explicit macro metadata. Cloning
+records copies their argument vectors and shares immutable callee text.
+
+Callee spellings use `CallName`, an immutable `Arc<str>` wrapper interned by
+full text within each `SymbolTable`. `intern_call_name` shares repeated names
+when lowering and merging. Rust literal construction uses `.into()`, textual
+reads retain `as_str()` and string methods, and `to_string()` supplies an
+owned `String` when required. Name lookup, symbol identity and SQLite strings
+are unchanged. The pool is local to the symbol table, and dropping its lookup
+after the final call is created leaves call records owning the shared text.
+
+Merge source lookup uses a borrowed `CallSourceKey` and a fingerprint index
+referring to typed call IDs. Fingerprints only group candidates: every hit
+compares the full occurrence, callee spelling and merge-time callee binding.
+Source coordinates and names remain immutable while this index is retained;
+the binding is separately captured because finalization can resolve an unknown
+external callee. A stable source representative keys variant facts even when
+an ordinary merge replaces the canonical record. Singleton fingerprint buckets
+keep their first entry inline and allocate only for hash collisions.
+
+`build_program_with_jobs` retains merge state for callers adding further units.
+The CLI and C API use `build_program_for_analysis_with_jobs`, which releases
+merge-only indexes after the last merge and before the shared finalization
+steps. `Program::release_merge_state` also drops the call-name interning lookup;
+finalization may rebuild it, so the terminal builder clears it again after the
+last call is created. Call records retain ownership of their shared names.
+With explicit images, idle indexing workers return freed lexer/AST
+pages before scoped copies are built on glibc. Consumed linked-unit vectors
+drop immediately after image merging,
+before orphan indexing and finalization. Finalized semantic facts and IDs
+follow the same path. Overload-site
+indexing stably sorts borrowed call references by the existing group identity;
+it preserves table order within each group, including repeated sibling targets.
+On glibc, the ordered indexing window returns unused pages after every 64
+consumed payloads, once the merge callback has returned and before the next
+window slot is admitted; buffered units and the growing Program stay live.
+See [evaluation measurements](EVAL_REPORT.md) for whole-process peak results.
+
 ### TypeFields and layout storage
 
 `TypeLayout.fields` is wrapped in `TypeFields` rather than a bare `IndexMap<FieldId, FieldLayout>`.
@@ -3435,6 +3483,16 @@ include configurations. Unreached project headers retain standalone indexing;
 dependency headers contribute declarations only.
 
 Function sharing follows [Shared header functions](#shared-header-functions).
+Configured sources and orphan headers are lowered in the same ordered bounded
+window as ordinary indexing (two sources per worker, clamped to 4–32). A
+configuration family's variant-preserving merge consumes one completed unit at
+a time, keeping deduplication state across sources; it never resets that state
+between commands or files. Each source's own command/exploration results occupy
+one window slot. Explicit isolated link targets retain their completed units for
+weak-selection passes and reuse across images. See
+[preprocessor cache storage](PREPROCESSOR.md#role-in-the-pipeline) for the separate
+retained source-payload budget.
+
 The complete set of configured units uses the variant-preserving merge, so a
 shared header's differing bodies survive across both commands for one source and
 commands for different sources. Source IDs, locals, call facts, flow constraints

@@ -309,6 +309,8 @@ impl Discovery<'_> {
         self.sources.insert(path, self.graph, src);
         if needs_settle {
             self.sources.release_text(path, self.graph);
+        } else {
+            self.sources.retain_committed(path, self.graph);
         }
     }
 
@@ -321,6 +323,8 @@ impl Discovery<'_> {
                 if let Ok(src) = self.sources.get_or_preprocess(path, self.graph, opts) {
                     if !src.inlined_headers.is_empty() {
                         self.sources.release_text(path, self.graph);
+                    } else {
+                        self.sources.retain_committed(path, self.graph);
                     }
                 }
             }

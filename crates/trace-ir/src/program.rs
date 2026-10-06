@@ -133,15 +133,148 @@ pub type CallFactBuckets = FxHashMap<u64, Vec<CallSiteId>>;
 /// keeps apart; copies of a header's site in several units meet when they
 /// bound the one merged entry, as copies of a header's call to a header's
 /// function do, and stay apart where the units bound them differently.
-pub type CallSourceKey = (
-    FileId,
-    u32,
-    u32,
-    Option<(FileId, u32, u32)>,
-    u64,
-    String,
-    Option<FnId>,
-);
+///
+/// This identity borrows the name. Callee binding is captured before finalization,
+/// which may resolve an initially unknown external callee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CallSourceKey<'a> {
+    pub occurrence: crate::CallOccurrence,
+    pub callee_name: &'a str,
+    pub callee_fn_id: Option<FnId>,
+}
+
+/// Stable source representative and the current canonical call record.
+#[derive(Debug, Clone, Copy)]
+pub struct CallSourceMatch {
+    pub source: CallSiteId,
+    pub primary: CallSiteId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CallSourceEntry {
+    matched: CallSourceMatch,
+    // Finalization can change the record's binding; keep its merge-time value.
+    callee_fn_id: Option<FnId>,
+}
+
+impl CallSourceEntry {
+    fn matches(&self, key: &CallSourceKey<'_>, symbols: &SymbolTable) -> bool {
+        symbols
+            .call_site_by_id(self.matched.source)
+            .is_some_and(|site| {
+                let held = CallSourceKey {
+                    callee_fn_id: self.callee_fn_id,
+                    ..site.source_key()
+                };
+                held == *key
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CallSourceBucket {
+    first: CallSourceEntry,
+    // Almost every bucket is a singleton. Keep only one pointer inline instead
+    // of a Vec header; the extra allocation is limited to hash collisions.
+    #[allow(clippy::box_collection)]
+    collisions: Option<Box<Vec<CallSourceEntry>>>,
+}
+
+impl CallSourceBucket {
+    fn entries(&self) -> impl Iterator<Item = &CallSourceEntry> {
+        std::iter::once(&self.first)
+            .chain(self.collisions.iter().flat_map(|entries| entries.iter()))
+    }
+
+    fn entries_mut(&mut self) -> impl Iterator<Item = &mut CallSourceEntry> {
+        std::iter::once(&mut self.first).chain(
+            self.collisions
+                .iter_mut()
+                .flat_map(|entries| entries.iter_mut()),
+        )
+    }
+}
+
+/// Merge-only index borrowing immutable source coordinates and names from
+/// call records. Fingerprints group candidates; exact identity always decides
+/// equality. Singleton buckets hold their entry inline, allocating only for
+/// real hash collisions. Source fields must remain unchanged while merging.
+#[derive(Debug, Clone, Default)]
+pub struct CallSourceIndex {
+    buckets: FxHashMap<u64, CallSourceBucket>,
+    len: usize,
+}
+
+impl CallSourceIndex {
+    fn fingerprint(key: &CallSourceKey<'_>) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = rustc_hash::FxHasher::default();
+        key.hash(&mut hash);
+        hash.finish()
+    }
+
+    pub fn get(&self, key: &CallSourceKey<'_>, symbols: &SymbolTable) -> Option<CallSourceMatch> {
+        self.buckets
+            .get(&Self::fingerprint(key))?
+            .entries()
+            .find(|entry| entry.matches(key, symbols))
+            .map(|entry| entry.matched)
+    }
+
+    /// Register a record, returning the stable source representative. Variants
+    /// keep the primary; ordinary merges replace it, as in the owned-key map.
+    pub fn insert(
+        &mut self,
+        key: &CallSourceKey<'_>,
+        id: CallSiteId,
+        keep_primary: bool,
+        symbols: &SymbolTable,
+    ) -> CallSiteId {
+        let entry = CallSourceEntry {
+            matched: CallSourceMatch {
+                source: id,
+                primary: id,
+            },
+            callee_fn_id: key.callee_fn_id,
+        };
+        match self.buckets.entry(Self::fingerprint(key)) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(CallSourceBucket {
+                    first: entry,
+                    collisions: None,
+                });
+                self.len += 1;
+                id
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let bucket = slot.get_mut();
+                if let Some(held) = bucket.entries_mut().find(|held| held.matches(key, symbols)) {
+                    if !keep_primary {
+                        held.matched.primary = id;
+                    }
+                    return held.matched.source;
+                }
+                bucket
+                    .collisions
+                    .get_or_insert_with(Default::default)
+                    .push(entry);
+                self.len += 1;
+                id
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn clear(&mut self) {
+        self.buckets.clear();
+        self.len = 0;
+    }
+}
 
 /// A function merged at one `(file, line)`: its column, its entry, and the
 /// unit that met it last. Units merge one after another, so the last one is
@@ -166,7 +299,7 @@ pub struct MergeDedup {
     /// Header definitions are shared only within one link image and expansion.
     header_functions: FxHashMap<Span, HeaderFunctions>,
     pub header_flow: FxHashSet<crate::FlowConstraint>,
-    pub site_keys: FxHashMap<CallSourceKey, CallSiteId>,
+    pub site_keys: CallSourceIndex,
     /// Call records that configuration variants added at a site, beside the
     /// canonical one in `site_keys` (#59). Program-wide, so a fact recovered
     /// from a header by two units' variants merges instead of repeating: a
@@ -178,7 +311,7 @@ pub struct MergeDedup {
     /// body reached from N units would otherwise be quadratic in N. The
     /// fingerprint only groups; the merge still confirms a candidate field by
     /// field, so a collision costs a comparison and never a wrong merge.
-    pub variant_site_records: FxHashMap<CallSourceKey, CallFactBuckets>,
+    pub variant_site_records: FxHashMap<CallSiteId, CallFactBuckets>,
     /// Reports already merged into the whole program, keyed by stage as well as
     /// origin: two stages can report the same text at the same position, and
     /// one is not a duplicate of the other. Unit-local copies use different
@@ -467,11 +600,12 @@ impl Program {
         }
     }
 
-    /// Release merge-only lookup tables after the last merge and finalization.
+    /// Release merge-only lookup tables after the last merge.
     /// Callers that intend to merge more units must retain this state.
     pub fn release_merge_state(&mut self) {
         self.dedup = MergeDedup::default();
         self.template_base_set = rustc_hash::FxHashSet::default();
+        self.symbols.release_call_name_pool();
     }
 
     /// Release flow constraints and return flows once analysis and solving are complete.
@@ -957,6 +1091,128 @@ fn push_edge_index(map: &mut FxHashMap<String, Vec<usize>>, key: &str, index: us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_merge_state_releases_interning_pool_but_preserves_calls() {
+        let mut program = Program::default();
+        let unused = program.symbols.intern_call_name("unused");
+        let weak = Arc::downgrade(&unused.0);
+        drop(unused);
+        assert!(weak.upgrade().is_some());
+        let mut site = source_site(0, "call");
+        site.callee_name = program.symbols.intern_call_name("call");
+        program.symbols.call_sites.push(site);
+        program.release_merge_state();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(program.symbols.call_sites[0].callee_name, "call");
+    }
+
+    fn source_site(id: u32, name: &str) -> crate::CallSite {
+        crate::CallSite {
+            id: CallSiteId(id),
+            caller: FnId(0),
+            callee_name: name.into(),
+            callee_var: None,
+            callee_fn_id: None,
+            var_args: Vec::new(),
+            details: None,
+            args_bound_past_this: false,
+            span: Span::new(FileId(0), 1, 2),
+            expansion_span: None,
+            is_direct: false,
+            receiver_class: None,
+            exact_receiver: false,
+            return_dst: None,
+            tu: None,
+        }
+    }
+
+    #[test]
+    fn call_source_index_keeps_source_and_pre_finalization_binding() {
+        let mut symbols = SymbolTable::default();
+        symbols.call_sites = vec![source_site(0, "call"), source_site(1, "call")];
+        let key = CallSourceKey {
+            occurrence: symbols.call_sites[0].occurrence(),
+            callee_name: "call",
+            callee_fn_id: None,
+        };
+        let mut index = CallSourceIndex::default();
+        assert_eq!(
+            index.insert(&key, CallSiteId(0), true, &symbols),
+            CallSiteId(0)
+        );
+        // Variant insertion preserves the primary, ordinary replacement keeps
+        // the source representative used to retrieve all earlier variants.
+        assert_eq!(
+            index.insert(&key, CallSiteId(1), true, &symbols),
+            CallSiteId(0)
+        );
+        assert_eq!(index.get(&key, &symbols).unwrap().primary, CallSiteId(0));
+        index.insert(&key, CallSiteId(1), false, &symbols);
+        symbols.call_sites[0].callee_fn_id = Some(FnId(17));
+        let found = index.get(&key, &symbols).unwrap();
+        assert_eq!(found.source, CallSiteId(0));
+        assert_eq!(found.primary, CallSiteId(1));
+        assert_eq!(index.len(), 1);
+        assert!(index
+            .get(
+                &CallSourceKey {
+                    callee_fn_id: Some(FnId(17)),
+                    ..key
+                },
+                &symbols
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn call_source_index_checks_full_identity_on_hash_collision() {
+        let mut symbols = SymbolTable::default();
+        symbols.call_sites = vec![source_site(0, "other"), source_site(1, "call")];
+        let key = CallSourceKey {
+            occurrence: symbols.call_sites[1].occurrence(),
+            callee_name: "call",
+            callee_fn_id: None,
+        };
+        let mut index = CallSourceIndex::default();
+        // Force an unrelated spelling into this fingerprint's bucket.
+        index.buckets.insert(
+            CallSourceIndex::fingerprint(&key),
+            CallSourceBucket {
+                first: CallSourceEntry {
+                    matched: CallSourceMatch {
+                        source: CallSiteId(0),
+                        primary: CallSiteId(0),
+                    },
+                    callee_fn_id: None,
+                },
+                collisions: None,
+            },
+        );
+        index.len = 1;
+        assert!(index.get(&key, &symbols).is_none());
+        index.insert(&key, CallSiteId(1), true, &symbols);
+        assert_eq!(index.get(&key, &symbols).unwrap().primary, CallSiteId(1));
+        assert_eq!(index.len(), 2);
+        let bucket = &index.buckets[&CallSourceIndex::fingerprint(&key)];
+        let other = CallSourceKey {
+            callee_name: "other",
+            ..key
+        };
+        assert!(bucket
+            .entries()
+            .any(|entry| entry.matches(&other, &symbols)));
+        let nested = CallSourceKey {
+            occurrence: crate::CallOccurrence {
+                expansion_id: 9,
+                ..key.occurrence
+            },
+            ..key
+        };
+        assert!(!bucket
+            .entries()
+            .any(|entry| entry.matches(&nested, &symbols)));
+    }
 
     #[test]
     fn inheritance_queries_preserve_order_deduplication_and_reset() {

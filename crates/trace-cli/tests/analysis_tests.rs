@@ -1425,7 +1425,7 @@ fn cast_member_address_argument_is_flagged() {
         .iter()
         .find(|cs| cs.callee_name == "memcpy" && fn_name(&program, cs.caller) == "copy_cast_member")
         .expect("memcpy site");
-    assert_eq!(site.addr_of_member_args, vec![0]);
+    assert_eq!(site.addr_of_member_args(), vec![0]);
 }
 
 /// Review round 4: `drv.ops[i]()` and `pd->ops[i]()` call the table's element.

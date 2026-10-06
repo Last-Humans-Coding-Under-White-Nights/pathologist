@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use trace_analysis::{analyze_with_options, AnalyzeOptions, ResolutionKind};
 use trace_db::{basename, export_to_sqlite, open_db, ExportOptions};
-use trace_parse::build_program_with_jobs;
+use trace_parse::build_program_for_analysis_with_jobs;
 use trace_preproc::PreprocessOptions;
 
 mod build_info;
@@ -393,6 +393,7 @@ fn run_analyze(
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(secs));
             eprintln!("error: timed out after {secs}s");
+            trace_parse::remove_spill_dir();
             std::process::exit(124);
         });
     }
@@ -534,9 +535,8 @@ fn run_analyze(
     }
 
     let t0 = Instant::now();
-    let mut program =
-        build_program_with_jobs(&target, &opts, jobs).map_err(|e| anyhow::anyhow!(e))?;
-    program.release_merge_state();
+    let mut program = build_program_for_analysis_with_jobs(&target, &opts, jobs)
+        .map_err(|e| anyhow::anyhow!(e))?;
     eprintln!(
         "index: {:.1}s ({} files, {} functions, {} flow)",
         t0.elapsed().as_secs_f64(),

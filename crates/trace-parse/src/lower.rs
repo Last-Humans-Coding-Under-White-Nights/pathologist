@@ -23,9 +23,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use trace_ir::{
-    is_anonymous_tag, CallOccurrence, CallSite, Diagnostic, DiagnosticSeverity, FieldId,
-    FlowConstraint, FnId, Function, Linkage, Program, ReturnFlow, ScalarKind, Span, StorageClass,
-    TypeDesc, VarId, Variable,
+    is_anonymous_tag, CallOccurrence, CallSite, CallSiteDetails, Diagnostic, DiagnosticSeverity,
+    FieldId, FlowConstraint, FnId, Function, Linkage, Program, ReturnFlow, ScalarKind, Span,
+    StorageClass, TypeDesc, VarId, Variable,
 };
 use trace_preproc::{macro_table_from_defines, Language, MacroTable, PreprocessOptions};
 use tree_sitter::Node;
@@ -336,7 +336,26 @@ pub fn build_program_with_jobs(
     opts: &PreprocessOptions,
     jobs: usize,
 ) -> Result<Program, String> {
-    let result = build_program_inner(root, opts, jobs);
+    build_program_with_merge_state(root, opts, jobs, true)
+}
+
+/// Build a complete program for analysis, releasing merge-only indexes before
+/// finalization. Use `build_program_with_jobs` when more units will be merged.
+pub fn build_program_for_analysis_with_jobs(
+    root: &Path,
+    opts: &PreprocessOptions,
+    jobs: usize,
+) -> Result<Program, String> {
+    build_program_with_merge_state(root, opts, jobs, false)
+}
+
+fn build_program_with_merge_state(
+    root: &Path,
+    opts: &PreprocessOptions,
+    jobs: usize,
+    retain_merge_state: bool,
+) -> Result<Program, String> {
+    let result = build_program_inner(root, opts, jobs, retain_merge_state);
     trace_ir::release_thread_path_caches();
     // All per-run caches and the indexing pool have dropped at this point.
     crate::memory::reclaim_unused_pages();
@@ -347,6 +366,7 @@ fn build_program_inner(
     root: &Path,
     opts: &PreprocessOptions,
     jobs: usize,
+    retain_merge_state: bool,
 ) -> Result<Program, String> {
     let jobs = jobs.max(1);
     // Include resolution memoizes `is_file` for the run (`is_file_cached`);
@@ -537,6 +557,7 @@ fn build_program_inner(
             database,
             links,
             project_compiler_paths,
+            retain_merge_state,
         );
     }
     index_progress(format!(
@@ -642,7 +663,7 @@ fn build_program_inner(
     // unit; this run's text is discarded, so its diagnostics would go with
     // it. Keyed by header so an evicted, re-warmed header replaces (or
     // drops) its entry; ordered so the rows come out in a fixed order.
-    let mut second_language_diagnostics: BTreeMap<PathBuf, Vec<trace_preproc::Diagnostic>> =
+    let mut second_language_diagnostics: BTreeMap<PathBuf, Vec<trace_preproc::SharedDiagnostic>> =
         BTreeMap::new();
     let mut round = 0usize;
     loop {
@@ -727,7 +748,7 @@ fn build_program_inner(
                 let result = if k == 0 {
                     source_cache
                         .get_or_preprocess(path, &include_graph, &header_prep_opts)
-                        .map(|_| ())
+                        .map(|_| source_cache.retain_committed(path, &include_graph))
                 } else {
                     source_cache
                         .preprocess_uncached(path, &include_graph, &header_prep_opts)
@@ -751,6 +772,7 @@ fn build_program_inner(
                 }
                 warmed.push((language, header_macros));
             }
+            source_cache.check_load_errors()?;
             if failed {
                 continue;
             }
@@ -850,6 +872,7 @@ fn build_program_inner(
         language: &|p| index_language(p, &cpp_parse, no_c_units, forced_language),
     }
     .run(&pool, jobs);
+    source_cache.check_load_errors()?;
     let discover_secs = discover_t.elapsed().as_secs_f64();
     // A unit that matched every include it reached already has the text the
     // settle pass would build for it: its includes hit the same expansions
@@ -859,9 +882,9 @@ fn build_program_inner(
     // which is what turns an inlined body back into a shared one.
     let dirty: HashSet<PathBuf> = source_cache.units_that_inlined(&tu_paths);
     source_cache.evict_all(&dirty);
-    // Discovery already released text for units that expanded headers: their
-    // runs must be settled and will never be parsed. Spill the standing runs
-    // here; the settle pass spills the rebuilt dirty units.
+    // Discovery released text that must be settled and spilled standing runs
+    // at commit. Recheck retention before settling; these calls are idempotent.
+    // The settle pass spills the rebuilt dirty units.
     pool.install(|| {
         file_order
             .par_iter()
@@ -959,9 +982,9 @@ fn build_program_inner(
         orphan_headers.len(),
         file_order.len()
     ));
-    // A warmed header's text is read back only when the header is indexed on
-    // its own. Every other warmed header keeps its provenance for the
-    // queries above and drops its text without ever writing it to disk.
+    // Warmed text is read back only for standalone orphan-header indexing.
+    // Other warmed headers keep provenance, releasing their resident payload
+    // or any earlier spill file; PCH lowering reads the cached expansion.
     let orphan_set: HashSet<&Path> = orphan_headers.iter().map(PathBuf::as_path).collect();
     pool.install(|| {
         warmed_as.par_iter().try_for_each(|(path, _)| {
@@ -1311,7 +1334,12 @@ fn build_program_inner(
     }
     let inferred_dirs = include_graph.include_dirs.clone();
     source_cache.check_load_errors()?;
-    finalize_program(&mut program, &include_graph, inferred_dirs);
+    finalize_program(
+        &mut program,
+        &include_graph,
+        inferred_dirs,
+        retain_merge_state,
+    );
 
     Ok(program)
 }
@@ -1322,7 +1350,12 @@ fn finalize_program(
     program: &mut Program,
     graph: &IncludeGraph,
     extra_dirs: impl IntoIterator<Item = PathBuf>,
+    retain_merge_state: bool,
 ) {
+    if !retain_merge_state {
+        program.release_merge_state();
+        crate::memory::reclaim_unused_pages();
+    }
     program
         .symbols
         .set_inference_root(&graph.root, graph.test_partition.clone());
@@ -1344,6 +1377,9 @@ fn finalize_program(
     expand_internal_overload_refs(program);
     mark_wrapper_values(program);
     program.symbols.index_overload_sites();
+    if !retain_merge_state {
+        program.symbols.release_call_name_pool();
+    }
 }
 
 /// A smart pointer's value is its pointee's address, which is how
@@ -1477,7 +1513,7 @@ fn add_missing_this_params(program: &mut Program) {
 fn bind_calls_past_this(program: &mut Program) {
     for i in 0..program.symbols.call_sites.len() {
         let cs = &program.symbols.call_sites[i];
-        if cs.args_bound_past_this || (cs.var_args.is_empty() && cs.fn_args.is_empty()) {
+        if cs.args_bound_past_this || (cs.var_args.is_empty() && cs.fn_args().is_empty()) {
             continue;
         }
         let takes_this = match cs.callee_fn_id {
@@ -1493,12 +1529,16 @@ fn bind_calls_past_this(program: &mut Program) {
             continue;
         }
         let site = &mut program.symbols.call_sites[i];
-        shift_past_this(
-            &mut site.var_args,
-            &mut site.fn_args,
-            &mut site.addr_of_member_args,
-            &mut site.addr_of_args,
-        );
+        if let Some(details) = &mut site.details {
+            shift_past_this(
+                &mut site.var_args,
+                &mut details.fn_args,
+                &mut details.addr_of_member_args,
+                &mut details.addr_of_args,
+            );
+        } else {
+            shift_past_this(&mut site.var_args, &mut [], &mut [], &mut []);
+        }
         site.args_bound_past_this = true;
     }
 }
@@ -1516,7 +1556,7 @@ fn finalize_extern_callees(program: &mut Program) {
         finalize_target_extern_callees(program);
         return;
     }
-    let mut names: Vec<(String, trace_ir::FileId)> = program
+    let mut names: Vec<(trace_ir::CallName, trace_ir::FileId)> = program
         .symbols
         .call_sites
         .iter()
@@ -1563,7 +1603,7 @@ fn finalize_extern_callees(program: &mut Program) {
             is_weak: false,
             target: None,
             id: fid,
-            name: name.clone(),
+            name: name.to_string(),
             linkage: trace_ir::Linkage::External,
             return_type: trace_ir::TypeId(0),
             params: Vec::new(),
@@ -1866,20 +1906,18 @@ fn expand_virtual_overrides(program: &mut Program) {
             }
             let call_id = program.symbols.alloc_call_id();
             let name = program.symbols.function(t).name.clone();
+            let interned_name = program.symbols.intern_call_name(&name);
             program.symbols.call_sites.push(CallSite {
                 id: call_id,
                 caller: cs.caller,
-                callee_name: name,
+                callee_name: interned_name,
                 callee_var: None,
                 callee_fn_id: Some(t),
                 var_args: cs.var_args.clone(),
-                fn_args: cs.fn_args.clone(),
-                addr_of_member_args: cs.addr_of_member_args.clone(),
-                addr_of_args: cs.addr_of_args.clone(),
+                details: cs.details.clone(),
                 args_bound_past_this: cs.args_bound_past_this,
                 span: cs.span,
                 expansion_span: cs.expansion_span,
-                occurrence: cs.occurrence,
                 is_direct: true,
                 receiver_class: cs.receiver_class.clone(),
                 exact_receiver: cs.exact_receiver,
@@ -1958,11 +1996,11 @@ fn index_window(jobs: usize) -> usize {
 /// without the window: whoever panics marks the run cancelled on the way
 /// out and wakes every waiter, so no thread waits for a result that will
 /// never come, and the scope re-raises the panic once the rest have left.
-fn index_in_window<T: Send>(
+fn index_in_window<I: Sync, T: Send>(
     pool: &rayon::ThreadPool,
-    items: &[PathBuf],
+    items: &[I],
     jobs: usize,
-    index: impl Fn(&PathBuf) -> T + Sync,
+    index: impl Fn(&I) -> T + Sync,
     mut merge: impl FnMut(T) + Send,
 ) {
     struct Window<T> {
@@ -2063,6 +2101,11 @@ fn index_in_window<T: Send>(
                 }
             };
             merge(unit);
+            // Completed payloads have dropped. Return freed parser/merge pages
+            // periodically before the growing Program raises the next peak.
+            if (i + 1).is_multiple_of(64) {
+                crate::memory::reclaim_unused_pages();
+            }
             lock().merged = i + 1;
             signals.window_moved.notify_all();
         }
@@ -2801,7 +2844,7 @@ fn add_preprocess_diagnostics(
     program: &mut Program,
     graph: &IncludeGraph,
     unit_file: trace_ir::FileId,
-    diagnostics: &[trace_preproc::Diagnostic],
+    diagnostics: &[trace_preproc::SharedDiagnostic],
 ) {
     for d in diagnostics {
         let file = match &d.file {
@@ -7273,20 +7316,24 @@ fn lower_declaration(
                                         let call_id = program.symbols.alloc_call_id();
                                         let expansion_span =
                                             node_expansion_span(program, ctx, node);
+                                        let interned_name =
+                                            program.symbols.intern_call_name(&callee_name);
                                         program.symbols.call_sites.push(CallSite {
                                             id: call_id,
                                             caller,
-                                            callee_name,
+                                            callee_name: interned_name,
                                             callee_var,
                                             callee_fn_id: None,
                                             var_args: args.var_args,
-                                            fn_args: args.fn_args,
-                                            addr_of_member_args: args.addr_of_member_args,
-                                            addr_of_args: args.addr_of_args,
+                                            details: CallSiteDetails::boxed(
+                                                args.fn_args,
+                                                args.addr_of_member_args,
+                                                args.addr_of_args,
+                                                None,
+                                            ),
                                             args_bound_past_this: false,
                                             span,
                                             expansion_span,
-                                            occurrence: None,
                                             is_direct: false,
                                             receiver_class: None,
                                             exact_receiver: false,
@@ -8936,7 +8983,7 @@ fn collect_call_at_node(
         expansion_id: node_expansion_id(ctx, occurrence_node),
     };
     for site in &mut program.symbols.call_sites[first_site..] {
-        site.occurrence = Some(occurrence);
+        site.details_mut().occurrence = Some(occurrence);
     }
 }
 
@@ -9390,20 +9437,23 @@ fn collect_call_at_node_inner(
     if chosen.is_empty() {
         let args = args.for_callee(program, None);
         let call_id = program.symbols.alloc_call_id();
+        let interned_name = program.symbols.intern_call_name(&callee_name);
         program.symbols.call_sites.push(CallSite {
             id: call_id,
             caller,
-            callee_name,
+            callee_name: interned_name,
             callee_var,
             callee_fn_id: None,
             var_args: args.var_args,
-            fn_args: args.fn_args,
-            addr_of_member_args: args.addr_of_member_args,
-            addr_of_args: args.addr_of_args,
+            details: CallSiteDetails::boxed(
+                args.fn_args,
+                args.addr_of_member_args,
+                args.addr_of_args,
+                None,
+            ),
             args_bound_past_this: false,
             span,
             expansion_span,
-            occurrence: None,
             is_direct,
             receiver_class: None,
             exact_receiver: false,
@@ -9427,26 +9477,31 @@ fn collect_call_at_node_inner(
         };
         let site_args = site_args.for_callee(program, Some(t));
         let call_id = program.symbols.alloc_call_id();
-        program.symbols.call_sites.push(CallSite {
-            id: call_id,
-            caller,
-            callee_name: if t != chosen[0] {
+        let interned_name = program.symbols.intern_call_name(
+            &(if t != chosen[0] {
                 format!("{}::{}", callee_name, program.symbols.function(t).id.0)
             } else if is_last {
                 std::mem::take(&mut callee_name)
             } else {
                 callee_name.clone()
-            },
+            }),
+        );
+        program.symbols.call_sites.push(CallSite {
+            id: call_id,
+            caller,
+            callee_name: interned_name,
             callee_var,
             callee_fn_id: Some(t),
             var_args: site_args.var_args,
-            fn_args: site_args.fn_args,
-            addr_of_member_args: site_args.addr_of_member_args,
-            addr_of_args: site_args.addr_of_args,
+            details: CallSiteDetails::boxed(
+                site_args.fn_args,
+                site_args.addr_of_member_args,
+                site_args.addr_of_args,
+                None,
+            ),
             args_bound_past_this: bound,
             span,
             expansion_span,
-            occurrence: None,
             is_direct: true,
             receiver_class: None,
             exact_receiver: false,
@@ -10698,20 +10753,18 @@ fn emit_unresolved_site(
         null_constants: _,
     } = args.bind_past_this(None).for_callee(program, None);
     let call_id = program.symbols.alloc_call_id();
+    let interned_name = program.symbols.intern_call_name(&callee_name);
     program.symbols.call_sites.push(CallSite {
         id: call_id,
         caller,
-        callee_name,
+        callee_name: interned_name,
         callee_var: None,
         callee_fn_id: None,
         var_args,
-        fn_args,
-        addr_of_member_args,
-        addr_of_args,
+        details: CallSiteDetails::boxed(fn_args, addr_of_member_args, addr_of_args, None),
         args_bound_past_this: true,
         span,
         expansion_span,
-        occurrence: None,
         is_direct: false,
         receiver_class,
         exact_receiver: false,
@@ -10789,20 +10842,23 @@ fn emit_member_targets(
         // an external entry (mirrors plain-identifier C behavior).
         let args = args.for_callee(program, None);
         let call_id = program.symbols.alloc_call_id();
+        let interned_name = program.symbols.intern_call_name(&kind.name_on(cls));
         program.symbols.call_sites.push(CallSite {
             id: call_id,
             caller,
-            callee_name: kind.name_on(cls),
+            callee_name: interned_name,
             callee_var: None,
             callee_fn_id: None,
             var_args: args.var_args,
-            fn_args: args.fn_args,
-            addr_of_member_args: args.addr_of_member_args,
-            addr_of_args: args.addr_of_args,
+            details: CallSiteDetails::boxed(
+                args.fn_args,
+                args.addr_of_member_args,
+                args.addr_of_args,
+                None,
+            ),
             args_bound_past_this: true,
             span,
             expansion_span,
-            occurrence: None,
             is_direct: false,
             receiver_class: Some(cls.to_string()),
             exact_receiver: false,
@@ -10821,20 +10877,23 @@ fn emit_member_targets(
             let nm = program.symbols.function(t).name.clone();
             (id, nm)
         };
+        let interned_name = program.symbols.intern_call_name(&name);
         program.symbols.call_sites.push(CallSite {
             id: call_id,
             caller,
-            callee_name: name,
+            callee_name: interned_name,
             callee_var: None,
             callee_fn_id: Some(t),
             var_args: site_args.var_args,
-            fn_args: site_args.fn_args,
-            addr_of_member_args: site_args.addr_of_member_args,
-            addr_of_args: site_args.addr_of_args,
+            details: CallSiteDetails::boxed(
+                site_args.fn_args,
+                site_args.addr_of_member_args,
+                site_args.addr_of_args,
+                None,
+            ),
             args_bound_past_this: true,
             span,
             expansion_span,
-            occurrence: None,
             is_direct: true,
             receiver_class: Some(cls.to_string()),
             exact_receiver: false,
@@ -17516,7 +17575,7 @@ mod index_window_tests {
     fn empty_and_single_worker_inputs_complete() {
         let pool = index_pool(1).unwrap();
         let mut seen = Vec::new();
-        index_in_window(&pool, &[], 2, |_| 0usize, |i| seen.push(i));
+        index_in_window(&pool, &[], 2, |_: &PathBuf| 0usize, |i| seen.push(i));
         assert!(seen.is_empty());
         let items = [PathBuf::from("/a.c"), PathBuf::from("/b.c")];
         index_in_window(
