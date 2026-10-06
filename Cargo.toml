@@ -9,6 +9,7 @@ members = [
     "crates/trace-capi",
     "crates/trace-cli",
     "crates/trace-merge",
+    "crates/trace-lsp",
 ]
 
 [workspace.package]
@@ -39,6 +40,7 @@ thiserror = "2"
 toml = "0.8"
 tree-sitter = "0.25"
 tree-sitter-c = "0.24"
+url = "2"
 walkdir = "2"
 rayon = "1"
 tempfile = "3"

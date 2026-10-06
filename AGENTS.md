@@ -14,6 +14,7 @@ This file is for AI agents and human contributors working on the trace codebase.
 | `trace-capi` | C ABI wrapper library (`libtrace_capi`), C header (`crates/trace-capi/include/trace.h`), FFI indexing and inspect API |
 | `trace-cli` | CLI entry point (`analyze`, `inspect`, reporting examples) |
 | `trace-merge` | Cross-repository database merger & callgraph reconstruction (`trace-merge`) |
+| `trace-lsp` | Read-only stdio LSP server (`trace-lsp --db`): call hierarchy over an existing analysis database, via `trace-db` editor queries; see [LSP configuration](docs/LSP.md) |
 
 ## Pipeline (do not reorder casually)
 
@@ -133,6 +134,7 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 
 | Task | Where to look |
 |------|---------------|
+| Editor call hierarchy (LSP) | `crates/trace-lsp/src/`, `crates/trace-db/src/inspect/editor.rs` → [docs/LSP.md](docs/LSP.md) |
 | Fix include resolution / graph | `trace-parse/src/deps.rs`, `trace-preproc/src/preprocessor.rs` |
 | Analyze-phase cost / points-to propagation | `trace-analysis/src/solver.rs` → [Propagation highlights](docs/ANALYSIS.md#propagation-highlights) |
 | Measure peak memory / phase CPU (Linux: `scripts/profile_memory.py`; macOS: `scripts/profile_memory_macos.py`, compare `phys_footprint`) | `docs/MEMORY_PROFILE.md`, [macOS measurements](docs/PERFORMANCE_REVIEW.md#incremental-per-tu-ir-cache-macos-measurements-and-decision-175) |

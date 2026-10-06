@@ -9,6 +9,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 pub use trace_analysis::LocKind;
 
+mod editor;
+pub use editor::*;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// Forward: callees (call graph) / where a value flows to (dataflow).
