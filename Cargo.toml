@@ -9,6 +9,7 @@ members = [
     "crates/trace-capi",
     "crates/trace-cli",
     "crates/trace-merge",
+    "crates/trace-lsp",
 ]
 
 [workspace.package]

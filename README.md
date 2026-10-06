@@ -56,6 +56,22 @@ Analyze a large tree (parallel indexing, minimal SQLite export):
 trace analyze /path/to/project -o /tmp/project.db --jobs 8
 ```
 
+## Editor call hierarchy
+
+Build the separate snapshot language server and point it at an existing database:
+
+```bash
+cargo build -p trace-lsp --release
+trace analyze ./project -o analysis.db
+target/release/trace-lsp --db analysis.db
+```
+
+`trace-lsp` serves standard LSP incoming/outgoing call hierarchy over stdio.
+Default minimal exports work; no points-to export is needed. It opens schema v7
+read-only and leaves the analyzer and database format unchanged. See
+[LSP configuration and editor example](docs/LSP.md) for path mapping, range
+precision, snapshot behavior, and limitations.
+
 ## CLI reference
 
 ### Conditional coverage and GN define evidence

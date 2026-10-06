@@ -8831,3 +8831,38 @@ baseline that misses the current expectations without also swallowing a broken r
 2af1eb1 for the `...` punctuator fix (#28), at the pinned revisions; earlier captures were
 2026-09-04 on 168e643 (#15, camera only) and 2026-09-02 after `Improve cpp name lookup`.
 The metric tables in the corpus sections above show those same values.
+
+## Database-backed LSP isolation: #200
+
+Measured on macOS, 2026-10-06, against master `8c669a6`
+(including #199). The baseline was built in an isolated directory with
+`cargo build -p trace-cli --release`; the new version was built with
+`cargo build -p trace-cli -p trace-lsp --release`, covering shared dependency
+feature selection. Both used the same compiler, lockfile versions, default
+allocator, release profile, and pinned build metadata.
+
+The generated input had 512 C translation units and one shared header with
+32 static helpers. Each unit defined 64 unique leaf functions and 64 callers.
+Each caller assigned either of two leaves to a function pointer, called that
+pointer twice, and called its first leaf directly; each leaf called a shared
+helper. Analysis used `--jobs 8` and the default minimal export. After one
+warm-up per binary, ten runs per version alternated which binary ran first.
+Wall time includes process startup and export; max RSS came from macOS
+`time -l`. Medians:
+
+| Metric | Master | With LSP | Change |
+|--------|--------|----------|--------|
+| Wall time | 1.216 s | 1.219 s | +0.27% |
+| Maximum RSS | 220.01 MiB | 221.45 MiB | +0.66% |
+
+These differences are within observed run variation; this workload shows no
+measurable regression. This is an isolation check on a generated input, not
+a new measurement of the pinned OpenHarmony corpora. The analyzer and exporter
+execute no LSP code; existing dependency versions are unchanged.
+
+The schema definitions and every row in all 15 non-metadata tables matched
+exactly: 65,568 functions, 131,072 call sites, 196,608 call edges, 196,640 flow
+nodes, and 131,072 flow edges. `analysis_run` was excluded because it records
+run metadata. LSP fixture tests additionally compare behavior between minimal
+and full exports and verify that serving requests leaves database bytes
+unchanged. See [LSP behavior and configuration](LSP.md) for the server contract.
