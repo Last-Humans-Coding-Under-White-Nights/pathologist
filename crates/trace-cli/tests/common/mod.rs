@@ -226,6 +226,16 @@ impl std::ops::Deref for TempDb {
     }
 }
 
+/// `files` built and analysed with the default options, in a scratch tree
+/// that is gone once both are returned.
+#[allow(dead_code)]
+pub fn analyze_source(files: &[(&str, &str)]) -> (Program, AnalysisResult) {
+    let dir = scratch(files);
+    let program = trace_parse::build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+    (program, analysis)
+}
+
 /// A scratch tree with the given `(relative path, contents)` files; it goes
 /// away when the value is dropped, including on a failed assertion.
 pub fn scratch(files: &[(&str, &str)]) -> tempfile::TempDir {

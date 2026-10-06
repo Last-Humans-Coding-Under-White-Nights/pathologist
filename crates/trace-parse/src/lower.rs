@@ -25,7 +25,7 @@ use std::time::Instant;
 use trace_ir::{
     is_anonymous_tag, CallOccurrence, CallSite, CallSiteDetails, Diagnostic, DiagnosticSeverity,
     FieldId, FlowConstraint, FnId, Function, Linkage, Program, ReturnFlow, ScalarKind, Span,
-    StorageClass, TypeDesc, VarId, Variable,
+    StorageClass, TempKind, TypeDesc, VarId, Variable,
 };
 use trace_preproc::{macro_table_from_defines, Language, MacroTable, PreprocessOptions};
 use tree_sitter::Node;
@@ -129,7 +129,7 @@ struct LowerContext {
     type_scope: RefCell<Vec<String>>,
     /// Typedefs and `using` aliases declared in the blocks of the function
     /// being lowered, innermost last; each block drops its own on exit.
-    local_aliases: Vec<(String, TypeDesc)>,
+    local_aliases: Vec<(String, TypeDesc, bool)>,
     /// Gates C++-specific lowering (qualified members, CHA, namespaces).
     /// True for C++ TUs/headers and for `.h` files reached from a C++ TU.
     is_cpp: bool,
@@ -155,6 +155,13 @@ struct LowerContext {
     /// `call_expression` node id → `CallReturn` destination, so the matching
     /// `CallSite` can carry `return_dst` for `dlsym` models.
     call_return_dst: RefCell<HashMap<usize, VarId>>,
+    /// Whether a bare `make_shared` call (by node id and the standard
+    /// function asked about) names that function, once resolved
+    /// ([`bare_names_std`]).
+    bare_std_calls: RefCell<HashMap<(usize, &'static str), bool>>,
+    /// The heap object factory calls in a function build a class on
+    /// ([`factory_object`]).
+    factory_objects: RefCell<HashMap<(FnId, String), VarId>>,
     /// Recursion depth of `lower_tree` (comma-operator chains in
     /// `clang/test/Sema/deep_recursion.c` are thousands of nested
     /// `binary_expression` nodes).
@@ -2741,6 +2748,8 @@ fn lower_prepared_source(
         callee_load_cache: RefCell::new(HashMap::default()),
         call_receiver_cache: RefCell::new(HashMap::default()),
         call_return_dst: RefCell::new(HashMap::default()),
+        bare_std_calls: RefCell::new(HashMap::default()),
+        factory_objects: RefCell::new(HashMap::default()),
         ast_depth: 0,
         ast_depth_warned: false,
         reference_vars: HashSet::default(),
@@ -2768,6 +2777,8 @@ fn lower_prepared_source(
     ctx.callee_load_cache.borrow_mut().clear();
     ctx.call_receiver_cache.borrow_mut().clear();
     ctx.call_return_dst.borrow_mut().clear();
+    ctx.bare_std_calls.borrow_mut().clear();
+    ctx.factory_objects.borrow_mut().clear();
     ctx.local_scope_log.clear();
 
     // Pragmas apply to the entire unit, even when placed after a definition.
@@ -3024,6 +3035,7 @@ fn register_typedef_alias(
     node: Node,
     alias: &str,
     desc: TypeDesc,
+    reference: bool,
 ) {
     if ctx.is_cpp
         && node
@@ -3031,24 +3043,27 @@ fn register_typedef_alias(
             .is_some_and(|p| p.cached_kind() == "field_declaration_list")
     {
         if let Some(cls) = ctx.type_scope.borrow().last() {
+            let name = format!("{cls}::{alias}");
             program
                 .types
-                .register_alias(&format!("{cls}::{alias}"), desc);
+                .register_alias_with_reference(&name, desc, reference);
         }
         return;
     }
     if ctx.is_cpp && ctx.ns_stack.iter().any(Option::is_some) {
         program
             .types
-            .register_alias(&ctx.qualify(alias), desc.clone());
+            .register_alias_with_reference(&ctx.qualify(alias), desc.clone(), reference);
     }
-    program.types.register_alias(alias, desc);
+    program
+        .types
+        .register_alias_with_reference(alias, desc, reference);
 }
 
 /// A `typedef` or `using Alias = T;` at namespace or class scope.
 fn lower_alias(program: &mut Program, ctx: &LowerContext, source: &str, node: Node) {
-    if let Some((alias, desc)) = declared_alias(program, ctx, source, node) {
-        register_typedef_alias(program, ctx, node, &alias, desc);
+    if let Some((alias, desc, reference)) = declared_alias(program, ctx, source, node) {
+        register_typedef_alias(program, ctx, node, &alias, desc, reference);
     }
 }
 
@@ -3060,12 +3075,22 @@ fn declared_alias(
     ctx: &LowerContext,
     source: &str,
     node: Node,
-) -> Option<(String, TypeDesc)> {
-    match node.cached_kind() {
+) -> Option<(String, TypeDesc, bool)> {
+    let (name, desc) = match node.cached_kind() {
         "type_definition" => typedef_alias(program, ctx, source, node),
         "alias_declaration" => using_alias(program, ctx, source, node),
         _ => None,
-    }
+    }?;
+    let declaration = if node.cached_kind() == "alias_declaration" {
+        node.cached_field("type")?
+    } else {
+        node
+    };
+    Some((
+        name,
+        desc,
+        declaration_is_reference(program, ctx, source, declaration),
+    ))
 }
 
 /// The name a `typedef` declares and the type it stands for.
@@ -3153,8 +3178,56 @@ fn local_alias<'a>(ctx: &'a LowerContext, name: &str) -> Option<&'a TypeDesc> {
     ctx.local_aliases
         .iter()
         .rev()
-        .find(|(alias, _)| alias == name)
-        .map(|(_, desc)| desc)
+        .find(|(alias, _, _)| alias == name)
+        .map(|(_, desc, _)| desc)
+}
+
+/// Reference identity of a declaration, including a typedef or using alias.
+/// Alias descriptors use pointer layers for references; the alias's spelling
+/// retains the distinction until parameter and argument metadata are built.
+fn declaration_is_reference(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> bool {
+    if let Some(declarator) = node.cached_field("declarator") {
+        if declares_reference(declarator) {
+            return true;
+        }
+        if matches!(
+            declarator.cached_kind(),
+            "pointer_declarator" | "abstract_pointer_declarator"
+        ) {
+            return false;
+        }
+    }
+    let Some(ty) = node.cached_field("type") else {
+        return false;
+    };
+    type_is_reference_alias(program, ctx, source, ty)
+}
+
+fn type_is_reference_alias(program: &Program, ctx: &LowerContext, source: &str, ty: Node) -> bool {
+    if !program.types.has_reference_aliases() && ctx.local_aliases.is_empty() {
+        return false;
+    }
+    let name = normalize_qualified(node_text(source, &ty));
+    if let Some((_, _, reference)) = ctx
+        .local_aliases
+        .iter()
+        .rev()
+        .find(|(alias, _, _)| alias == &name)
+    {
+        return *reference;
+    }
+    find_in_scope(program, ctx, &name, |candidate, _| {
+        program
+            .types
+            .resolve_alias(candidate)
+            .map(|_| program.types.alias_is_reference(candidate))
+    })
+    .unwrap_or(false)
 }
 
 fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node: Node) {
@@ -3898,6 +3971,7 @@ fn register_static_data_member(
         let is_fn_ptr = is_function_pointer_declarator(decl);
         let var_id = program.symbols.alloc_var_id();
         program.symbols.add_variable(Variable {
+            temp: None,
             is_defined: is_inline || init_expr.is_some(),
             is_weak: weak_global(ctx, storage, source, decl),
             target: None,
@@ -4812,8 +4886,9 @@ fn register_member_prototype(
     // definitions, which supply the real param list. The count they declare
     // keeps overloads apart until then (`Get()` beside `Get(Mode&)`).
     let params: Vec<VarId> = Vec::new();
-    let shape =
-        find_params(node).map_or_else(ParamListShape::default, |p| param_list_shape(source, p));
+    let shape = find_params(node).map_or_else(ParamListShape::default, |p| {
+        param_list_shape(program, ctx, source, p)
+    });
     let explicit_arity = shape.declared();
     let span = node_span(program, ctx, node);
     let ret_type = node
@@ -5393,6 +5468,7 @@ fn add_this_param(program: &mut Program, cls: &str, fn_id: FnId, span: Span) -> 
         })));
     let this_id = program.symbols.alloc_var_id();
     program.symbols.add_variable(Variable {
+        temp: None,
         is_defined: false,
         is_weak: false,
         target: None,
@@ -5441,7 +5517,7 @@ struct ParamListShape {
 impl ParamListShape {
     /// Record one child of a parameter list. A parameter is declared the way
     /// `lower_parameter` lowers it: `(void)` declares none.
-    fn record(&mut self, source: &str, param: Node) {
+    fn record(&mut self, program: &Program, ctx: &LowerContext, source: &str, param: Node) {
         let declarator = param.cached_field("declarator");
         let declares = match param.cached_kind() {
             // C's `...` parses as `variadic_parameter`. A pack followed by
@@ -5462,7 +5538,7 @@ impl ParamListShape {
         };
         if declares {
             self.references
-                .push(declarator.is_some_and(declares_reference));
+                .push(declaration_is_reference(program, ctx, source, param));
         }
     }
 
@@ -5473,10 +5549,15 @@ impl ParamListShape {
 }
 
 /// A parameter list's [`ParamListShape`].
-fn param_list_shape(source: &str, params_node: Node) -> ParamListShape {
+fn param_list_shape(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    params_node: Node,
+) -> ParamListShape {
     let mut shape = ParamListShape::default();
     for param in params_node.children(&mut params_node.walk()) {
-        shape.record(source, param);
+        shape.record(program, ctx, source, param);
     }
     shape
 }
@@ -5496,7 +5577,7 @@ fn lower_parameters(
         return shape;
     };
     for param in params_node.children(&mut params_node.walk()) {
-        shape.record(source, param);
+        shape.record(program, ctx, source, param);
         if !is_parameter_node(param.cached_kind()) {
             continue;
         }
@@ -5517,6 +5598,7 @@ struct Parameter {
     /// A reference lowered as its referent's address (`int &r` is
     /// `Ptr(Int)`); a reference to a pointer keeps the pointer's own type.
     address: bool,
+    reference: bool,
 }
 
 /// The parameter declaration `node` declares; `None` for the `void` of
@@ -5528,6 +5610,13 @@ fn parameter_type(
     node: Node,
 ) -> Option<Parameter> {
     let declarator = node.cached_field("declarator");
+    let reference = declaration_is_reference(program, ctx, source, node);
+    // `using Ref = T &; Ref &&` collapses back to `T &`: its existing
+    // pointer layer still represents the referent's address.
+    let alias_reference = reference
+        && node
+            .cached_field("type")
+            .is_some_and(|ty| type_is_reference_alias(program, ctx, source, ty));
     let base_desc = node
         .cached_field("type")
         .map(|t| type_desc_from_node(program, ctx, source, t))
@@ -5546,7 +5635,8 @@ fn parameter_type(
             type_id: program.types.intern(type_desc),
             name: String::new(),
             is_ptr,
-            address: false,
+            address: alias_reference,
+            reference,
         });
     }
     let (name, is_ptr) = declarator.map_or((String::new(), false), |decl| {
@@ -5564,8 +5654,9 @@ fn parameter_type(
     let shape = declarator
         .map(|d| walk_declarator_shape(d, base_desc.clone()))
         .unwrap_or_else(|| base_desc.clone());
-    let address = is_ptr && !matches!(shape, TypeDesc::Ptr(_) | TypeDesc::Array { .. });
-    let type_desc = if address {
+    let declared_address = is_ptr && !matches!(shape, TypeDesc::Ptr(_) | TypeDesc::Array { .. });
+    let address = declared_address || alias_reference;
+    let type_desc = if declared_address {
         TypeDesc::Ptr(Box::new(base_desc))
     } else {
         shape
@@ -5573,8 +5664,9 @@ fn parameter_type(
     Some(Parameter {
         type_id: program.types.intern(type_desc),
         name,
-        is_ptr,
+        is_ptr: is_ptr || alias_reference,
         address,
+        reference,
     })
 }
 
@@ -5713,6 +5805,7 @@ fn lower_parameter(
         mut name,
         is_ptr,
         address,
+        reference,
     } = parameter_type(program, ctx, source, node)?;
     let declarator = node.cached_field("declarator");
     if name.is_empty() {
@@ -5721,12 +5814,17 @@ fn lower_parameter(
     let var_id = program.symbols.alloc_var_id();
     if let Some(declarator) = declarator {
         mark_reference_binding(ctx, declarator, var_id);
-        if address && ctx.reference_bindings.contains(&var_id) {
+    }
+    if reference {
+        ctx.reference_vars.insert(var_id);
+        ctx.reference_bindings.insert(var_id);
+        if address {
             ctx.address_references.insert(var_id);
         }
     }
     let span = node_span(program, ctx, node);
     program.symbols.add_variable(Variable {
+        temp: None,
         is_defined: false,
         is_weak: false,
         target: None,
@@ -5867,7 +5965,7 @@ fn call_result_shape(
     let func = value.cached_field("function")?;
     let raw = normalize_spacing(node_text(source, &func));
     let name = strip_template_args(&raw);
-    if let Some(wrapper) = smart_ptr_factory(ctx, &name) {
+    if let Some(&SmartPtrFactory { wrapper, .. }) = smart_ptr_factory(program, ctx, value, &name) {
         return Some(CallResult::Decided(smart_ptr_type(
             program,
             ctx,
@@ -5997,6 +6095,28 @@ struct StaticCallScope<'a> {
     spelled: String,
 }
 
+/// [`static_call_scope`] of a call to the static member `member`, its name
+/// checked first: the scope's dependency walk is the costly part.
+fn static_member_call_scope<'a>(
+    ctx: &LowerContext,
+    source: &str,
+    func: Node<'a>,
+    member: &str,
+) -> Option<StaticCallScope<'a>> {
+    if !node_text(source, &func).ends_with(member) {
+        return None;
+    }
+    let scope = static_call_scope(ctx, source, func)?;
+    (node_text(source, &scope.member) == member).then_some(scope)
+}
+
+/// The template `spelled` instantiates, its arguments stripped, unless it is
+/// a member of another template (`Outer<A>::Box<T>`).
+fn outermost_template(spelled: &str) -> Option<String> {
+    let template = strip_template_args(spelled);
+    (!template.contains('<')).then_some(template)
+}
+
 fn static_call_scope<'a>(
     ctx: &LowerContext,
     source: &str,
@@ -6050,14 +6170,7 @@ fn undefined_singleton_result(
     source: &str,
     func: Node,
 ) -> Option<TypeDesc> {
-    // Name checks first: the scope's dependency walk is the costly part.
-    if !node_text(source, &func).ends_with("GetInstance") {
-        return None;
-    }
-    let scope = static_call_scope(ctx, source, func)?;
-    if node_text(source, &scope.member) != "GetInstance" {
-        return None;
-    }
+    let scope = static_member_call_scope(ctx, source, func, "GetInstance")?;
     if !scope.is_template_id {
         return inherited_singleton_result(program, ctx, &scope.spelled);
     }
@@ -6145,11 +6258,7 @@ fn c_utils_singleton(
     ctx: &LowerContext,
     spelled: &str,
 ) -> Option<CUtilsSingleton> {
-    let template = strip_template_args(spelled);
-    // `Outer<A>::DelayedSingleton<Svc>` is a member of another template.
-    if template.contains('<') {
-        return None;
-    }
+    let template = outermost_template(spelled)?;
     let shared = match last_type_segment(&template) {
         "DelayedSingleton" => true,
         "Singleton" | "DelayedRefSingleton" => false,
@@ -6452,14 +6561,32 @@ fn receiver_type(program: &Program, ctx: &LowerContext, desc: TypeDesc) -> Optio
 /// cv-qualifiers dropped and template arguments kept (`const Box<int>` holds
 /// `ns::Box<int>`).
 fn held_class(program: &Program, ctx: &LowerContext, arg: &str) -> Option<String> {
-    let arg = arg.trim();
-    let arg = arg.strip_prefix("const ").unwrap_or(arg);
-    let arg = arg.strip_suffix(" const").unwrap_or(arg).trim();
+    let arg = strip_cv(arg);
     let class = class_seen_from(program, ctx, &receiver_lookup_name(arg))?;
     Some(match arg.find('<') {
         Some(at) => format!("{class}{}", &arg[at..]),
         None => class,
     })
+}
+
+/// `spelled` without the `const` / `volatile` qualifiers written before or
+/// after it, in any order (`const volatile T`, `T const`).
+fn strip_cv(spelled: &str) -> &str {
+    let mut s = spelled.trim();
+    loop {
+        let next = ["const ", "volatile "]
+            .iter()
+            .find_map(|q| s.strip_prefix(q))
+            .or_else(|| {
+                [" const", " volatile"]
+                    .iter()
+                    .find_map(|q| s.strip_suffix(q))
+            });
+        match next {
+            Some(rest) => s = rest.trim(),
+            None => return s,
+        }
+    }
 }
 
 /// The class `name` denotes from the current scope: through the enclosing
@@ -6484,29 +6611,81 @@ fn class_seen_from(program: &Program, ctx: &LowerContext, name: &str) -> Option<
     })
 }
 
-/// Standard factories whose one template argument names the class the
+/// A standard factory whose one template argument names the class the
 /// returned smart pointer holds.
-const SMART_PTR_FACTORIES: &[(&str, &str)] = &[
-    ("std::make_shared", "std::shared_ptr"),
-    ("std::make_unique", "std::unique_ptr"),
+struct SmartPtrFactory {
+    name: &'static str,
+    wrapper: &'static str,
+    /// Leading arguments that are not the constructor's: the allocator of
+    /// `std::allocate_shared`.
+    leading: u32,
+}
+
+const SMART_PTR_FACTORIES: &[SmartPtrFactory] = &[
+    SmartPtrFactory {
+        name: "std::make_shared",
+        wrapper: "std::shared_ptr",
+        leading: 0,
+    },
+    SmartPtrFactory {
+        name: "std::make_unique",
+        wrapper: "std::unique_ptr",
+        leading: 0,
+    },
+    SmartPtrFactory {
+        name: "std::allocate_shared",
+        wrapper: "std::shared_ptr",
+        leading: 1,
+    },
 ];
 
 /// The smart pointer the factory a call spells `name` returns: `std::make_shared`,
 /// `::std::make_shared`, or a bare `make_shared` that `using namespace std;` or
-/// `using std::make_shared;` brings into scope.
-fn smart_ptr_factory(ctx: &LowerContext, name: &str) -> Option<&'static str> {
+/// `using std::make_shared;` brings into scope ([`bare_names_std`]; `call`
+/// is the call spelling it).
+fn smart_ptr_factory(
+    program: &Program,
+    ctx: &LowerContext,
+    call: Node,
+    name: &str,
+) -> Option<&'static SmartPtrFactory> {
     let name = global_lookup_name(name);
-    SMART_PTR_FACTORIES
-        .iter()
-        .find(|(factory, _)| {
-            *factory == name
-                || factory.strip_prefix("std::") == Some(name)
-                    && (ctx.directive_namespaces().any(|ns| ns == "std")
-                        || ctx.using_name_imports.iter().any(|import| {
-                            import.base == name && import.candidates.iter().any(|q| q == factory)
-                        }))
-        })
-        .map(|&(_, wrapper)| wrapper)
+    SMART_PTR_FACTORIES.iter().find(|factory| {
+        factory.name == name
+            || factory.name.strip_prefix("std::") == Some(name)
+                && bare_names_std(program, ctx, call, name, factory.name)
+    })
+}
+
+/// Whether the bare `name` `call` spells denotes the standard function
+/// `qualified` (`std::name`) here, through ordinary function lookup, with
+/// an imported standard factory recognised even without its declaration.
+/// Typing and construction ask this of one call: the lookup runs once per
+/// call node and standard function, the memo keyed by both since the
+/// answer is to the pair.
+fn bare_names_std(
+    program: &Program,
+    ctx: &LowerContext,
+    call: Node,
+    name: &str,
+    qualified: &'static str,
+) -> bool {
+    let key = (call.id(), qualified);
+    if let Some(&known) = ctx.bare_std_calls.borrow().get(&key) {
+        return known;
+    }
+    let in_scope = |candidate: &str| {
+        program
+            .symbols
+            .resolve_function_in_scope(candidate, Some(ctx.current_file))
+            .map(|id| program.symbols.function(id).name == qualified)
+    };
+    let imported =
+        |candidate: &str| in_scope(candidate).or_else(|| (candidate == qualified).then_some(true));
+    let is_std = resolve_function_named_with_imports(program, ctx, name, in_scope, imported)
+        .unwrap_or_else(|| ctx.directive_namespaces().any(|ns| ns == "std"));
+    ctx.bare_std_calls.borrow_mut().insert(key, is_std);
+    is_std
 }
 
 /// Weak pointers, by their last name segment, and the method that yields the
@@ -6653,12 +6832,320 @@ fn smart_ptr_type(
     spelled: &str,
     from: Spelling,
 ) -> Option<TypeDesc> {
-    let [arg]: [String; 1] = template_arguments(spelled).try_into().ok()?;
-    let class = held_class(program, ctx, &arg)?;
-    (!spelling_is_dependent(ctx, source, value, &arg, from)).then(|| TypeDesc::Struct {
+    let class = smart_ptr_held_class(program, ctx, source, value, spelled, from)?;
+    Some(TypeDesc::Struct {
         name: format!("{wrapper}<{class}>"),
         fields: Vec::new(),
     })
+}
+
+/// The class the one template argument `spelled` carries names from this
+/// scope ([`held_class`]), unless that argument names an enclosing template
+/// parameter: what a smart-pointer model holds, and what a factory builds.
+fn smart_ptr_held_class(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    value: Node,
+    spelled: &str,
+    from: Spelling,
+) -> Option<String> {
+    let [arg]: [String; 1] = template_arguments(spelled).try_into().ok()?;
+    let class = held_class(program, ctx, &arg)?;
+    (!spelling_is_dependent(ctx, source, value, &arg, from)).then_some(class)
+}
+
+/// The class a smart-pointer factory call `call` builds, and how many of
+/// its leading arguments are not the constructor's: `T` of
+/// `std::make_shared<T>(..)` and the others [`smart_ptr_factory`]
+/// recognises, or of `sptr<T>::MakeSptr(..)`. `None` for any other call,
+/// and for a class the call site cannot name or a template parameter
+/// (docs/ANALYSIS.md, "Factory construction").
+fn factory_constructed_class(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    call: Node,
+) -> Option<(String, u32)> {
+    // Name checks first: every direct call passes here, and the scope and
+    // dependency walks below are the costly part.
+    let func = call.cached_field("function")?;
+    let text = node_text(source, &func);
+    if STATIC_FACTORIES.iter().any(|(_, m)| text.ends_with(m)) {
+        // Every row the name matches is tried: one rejecting the scope must
+        // not hide another accepting it.
+        return STATIC_FACTORIES
+            .iter()
+            .find_map(|&(wrapper, member)| {
+                static_factory_class(program, ctx, source, func, wrapper, member)
+            })
+            .map(|class| (class, 0));
+    }
+    if !SMART_PTR_FACTORIES
+        .iter()
+        .any(|factory| text.contains(last_type_segment(factory.name)))
+    {
+        return None;
+    }
+    let raw = normalize_spacing(text);
+    let factory = smart_ptr_factory(program, ctx, call, &strip_template_args(&raw))?;
+    let class = smart_ptr_held_class(program, ctx, source, call, &raw, Spelling::Source)?;
+    Some((class, factory.leading))
+}
+
+/// Static-member factories, by the last segment of the wrapper template
+/// they are members of and their own name: `sptr<T>::MakeSptr(..)`.
+const STATIC_FACTORIES: &[(&str, &str)] = &[("sptr", "MakeSptr")];
+
+/// The class `wrapper<T>::member(..)` (`func`) builds: `T`, when the scope is
+/// a non-dependent instance of a template whose last segment is `wrapper`,
+/// and `T` a class the call site names.
+fn static_factory_class(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    func: Node,
+    wrapper: &str,
+    member: &str,
+) -> Option<String> {
+    // `Foo::MakeSptr` has no template scope to walk.
+    if !node_text(source, &func).contains('<') {
+        return None;
+    }
+    let scope = static_member_call_scope(ctx, source, func, member)?;
+    if !scope.is_template_id || last_type_segment(&outermost_template(&scope.spelled)?) != wrapper {
+        return None;
+    }
+    // `static_call_scope` already rejected a dependent spelling.
+    let [arg]: [String; 1] = template_arguments(&scope.spelled).try_into().ok()?;
+    held_class(program, ctx, &arg)
+}
+
+/// The constructor call a smart-pointer factory call makes, lowered as
+/// `new T(args)` is, with `args` the factory's, already collected, past any
+/// leading ones of its own. A class whose constructors are all implicit or
+/// defaulted gets no site, not even an unresolved one, and neither does a
+/// copy or a move ([`copies_implicitly`]); either way no object is made. An
+/// empty lookup that proves nothing ([`ctor_set_known`]) keeps an unresolved
+/// site, as `new` does (docs/ANALYSIS.md, "Factory construction").
+#[allow(clippy::too_many_arguments)]
+fn emit_factory_construction(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    call: Node,
+    caller: FnId,
+    args: &CallArgs,
+    span: Span,
+    expansion_span: Option<Span>,
+) {
+    let Some((class, leading)) = factory_constructed_class(program, ctx, source, call) else {
+        return;
+    };
+    let cls = receiver_lookup_name(&class).into_owned();
+    // The set `new cls(args)` resolves against.
+    let targets = member_targets_upward(program, &cls, &trace_ir::MethodKind::Ctor);
+    let args = args.clone().drop_leading(leading);
+    if ctor_set_known(program, &cls, &args, &targets) && !any_user_provided(program, &targets)
+        || copies_implicitly(program, &cls, &args, &targets)
+    {
+        return;
+    }
+    let heap = factory_object(program, ctx, call, caller, cls.clone());
+    emit_member_targets(
+        program,
+        caller,
+        &cls,
+        &trace_ir::MethodKind::Ctor,
+        Some(heap),
+        args,
+        span,
+        expansion_span,
+        targets,
+        None,
+    );
+}
+
+/// The one heap object every factory call in `caller` building `cls` takes
+/// as its constructor's `this`, made (`NewHeap`) by the first. The object is
+/// not the call's value, so nothing outside the constructors tells two of
+/// them apart; one per function and class keeps the objects, and the field
+/// cells the solver builds on them, from growing with the call count. This
+/// relies on fields being instance-insensitive (`FieldSummary`): were they
+/// made instance-sensitive, one object per call site would be needed.
+fn factory_object(
+    program: &mut Program,
+    ctx: &LowerContext,
+    call: Node,
+    caller: FnId,
+    cls: String,
+) -> VarId {
+    if let Some(&heap) = ctx.factory_objects.borrow().get(&(caller, cls.clone())) {
+        return heap;
+    }
+    let heap = alloc_heap_temp(program, ctx, call, &cls, TempKind::Make);
+    program.flow.push(FlowConstraint::NewHeap { dst: heap });
+    ctx.factory_objects.borrow_mut().insert((caller, cls), heap);
+    heap
+}
+
+/// `new cls(args)` (`node`): its heap object, which the constructor's
+/// implicit `this` (param 0) is wired to, explicit arguments from index 1
+/// ([`construct_on_heap`]). `None` when the class does not resolve.
+fn lower_new_object(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<VarId> {
+    let cls = new_expression_class(program, ctx, source, node)?;
+    let cls = receiver_lookup_name(&cls).into_owned();
+    let alloc_tmp = alloc_heap_temp(program, ctx, node, &cls, TempKind::New);
+    let targets = member_targets_upward(program, &cls, &trace_ir::MethodKind::Ctor);
+    // The constructor's own list, not a placement one (`new (std::nothrow)`);
+    // braces are its arguments too when it has a user-provided constructor,
+    // as for a braced local, and otherwise initialize an aggregate member by
+    // member, with no constructor site.
+    let list = node.cached_field("arguments");
+    let aggregate = list.is_some_and(|c| c.cached_kind() == "initializer_list")
+        && !any_user_provided(program, &targets);
+    let args = list.filter(|c| match c.cached_kind() {
+        "argument_list" => true,
+        "initializer_list" => !aggregate,
+        _ => false,
+    });
+    let span = node_call_span(program, ctx, node);
+    let expansion_span = node_expansion_span(program, ctx, node);
+    let call_args = collect_call_args(program, ctx, source, args);
+    construct_on_heap(
+        program,
+        ctx.current_fn.filter(|_| !aggregate),
+        &cls,
+        alloc_tmp,
+        call_args,
+        span,
+        expansion_span,
+        targets,
+    );
+    Some(alloc_tmp)
+}
+
+/// The constructor sites of `cls` (`targets`, found under that lookup name)
+/// building the heap object `heap` as their `this`, with `args` bound past
+/// it, and the `NewHeap` that makes `heap` an object: `new cls(args)`.
+/// Outside a body only the `NewHeap` is pushed.
+#[allow(clippy::too_many_arguments)]
+fn construct_on_heap(
+    program: &mut Program,
+    caller: Option<FnId>,
+    cls: &str,
+    heap: VarId,
+    args: CallArgs,
+    span: Span,
+    expansion_span: Option<Span>,
+    targets: Vec<FnId>,
+) {
+    if let Some(caller) = caller {
+        emit_member_targets(
+            program,
+            caller,
+            cls,
+            &trace_ir::MethodKind::Ctor,
+            Some(heap),
+            args,
+            span,
+            expansion_span,
+            targets,
+            None,
+        );
+    }
+    program.flow.push(FlowConstraint::NewHeap { dst: heap });
+}
+
+/// Whether constructing from `args` runs the implicit copy or move
+/// constructor: one argument, which none of the class's constructors
+/// (`targets`, every arity known) takes. Arity filtering would otherwise fall
+/// back to every constructor and bind the copied object to an unrelated
+/// parameter, so no constructor site is recorded ([`emit_member_targets`]).
+///
+/// So is one argument of `cls` itself (`ref_(other)`, `T x(other)` with
+/// `other` a `T`): a copy, a move or a reference binding, which runs no
+/// constructor the class declares unless one of them takes the class (a
+/// user-declared copy or move constructor).
+fn copies_implicitly(program: &Program, cls: &str, args: &CallArgs, targets: &[FnId]) -> bool {
+    if args.argc != 1 || !ctor_set_known(program, cls, args, targets) {
+        return false;
+    }
+    let none_takes_one = !targets.is_empty()
+        && targets.iter().all(|&ctor| {
+            method_explicit_arity(program, ctor)
+                .is_some_and(|arity| !arity_takes(program.symbols.function(ctor), arity, 1))
+        });
+    none_takes_one
+        || args
+            .arg_desc
+            .first()
+            .is_some_and(|arg| names_class(arg, cls, args.address_reference_args.contains(&0)))
+            && !targets
+                .iter()
+                .any(|&ctor| takes_own_class(program, ctor, cls))
+}
+
+/// Whether `targets`, the constructors `cls` resolved to, are all it has:
+/// some were found, or the lookup ran where an empty answer is conclusive,
+/// in a translation unit (`CallArgs::ctor_set_complete`) for a class whose
+/// definition is indexed. Elsewhere an empty set proves nothing: a cached
+/// header imports included headers as types only, and a class defined
+/// outside the tree declares its constructors there. A copy test and a
+/// factory's no-constructor test both wait for a conclusive set.
+fn ctor_set_known(program: &Program, cls: &str, args: &CallArgs, targets: &[FnId]) -> bool {
+    !targets.is_empty() || args.ctor_set_complete && program.types.is_struct_defined(cls)
+}
+
+/// Whether `desc` is an object of the class `cls` (a lookup name), or a
+/// reference to one, when `address_reference` says that a pointer layer is
+/// the referent's address. Raw pointers keep their pointer shape.
+fn names_class(desc: &TypeDesc, cls: &str, address_reference: bool) -> bool {
+    let desc = if address_reference {
+        desc.pointee().unwrap_or(desc)
+    } else {
+        desc
+    };
+    matches!(desc, TypeDesc::Struct { name, .. } if receiver_lookup_name(name) == cls)
+}
+
+/// Whether constructor `ctor` of `cls` takes one parameter of the class
+/// itself, through a reference or not, or one of unknown type (a template
+/// or a forwarding parameter, which may be it).
+fn takes_own_class(program: &Program, ctor: FnId, cls: &str) -> bool {
+    let f = program.symbols.function(ctor);
+    let Some(explicit) = program.symbols.explicit_params(f) else {
+        // An unknown signature may take the copied object.
+        return true;
+    };
+    if !arity_takes(f, explicit.len(), 1) {
+        return false;
+    }
+    let Some(type_id) = explicit.get(0) else {
+        return true;
+    };
+    let desc = program.types.get(type_id).desc.as_ref();
+    matches!(desc.innermost().0, TypeDesc::Unknown)
+        || names_class(desc, cls, f.reference_params.first() == Some(&true))
+}
+
+/// A constructor (or destructor) the class's author wrote, not one implicit
+/// or defaulted in the class: the members an object's lifecycle and a
+/// factory reach.
+fn user_provided(program: &Program, member: FnId) -> bool {
+    !program.symbols.function(member).defaulted_in_class
+}
+
+/// Whether a class whose constructors are `ctors` has a user-provided one:
+/// without one it is constructed implicitly (or, braced, as an aggregate),
+/// and no constructor site is recorded.
+fn any_user_provided(program: &Program, ctors: &[FnId]) -> bool {
+    ctors.iter().any(|&ctor| user_provided(program, ctor))
 }
 
 /// The ancestors of `node`, root first, excluding `node` itself.
@@ -7068,7 +7555,8 @@ fn register_template_return(
                 .position(|p| *p == Some(returned.as_str()))
         })
         .flatten();
-    let arity = find_params(node).map_or(0, |p| param_list_shape(source, p).declared());
+    let arity =
+        find_params(node).map_or(0, |p| param_list_shape(program, ctx, source, p).declared());
     // Names and shapes only: a struct's fields differ with how complete it
     // was in the declaring unit, and would split one fact into several.
     let read;
@@ -7399,6 +7887,7 @@ fn lower_declaration(
                 let c_linkage =
                     declared_c_linkage(program, ctx, qualified_name.as_deref().unwrap_or(&name));
                 program.symbols.add_variable(Variable {
+                    temp: None,
                     is_defined: ctx.current_fn.is_none() && !declaration_is_extern(source, node),
                     // `child`, not `node`: an attribute inside a sibling
                     // declarator is that sibling's alone. `extern` is a
@@ -7803,7 +8292,7 @@ fn collect_lifecycle_members<'a>(
             exact
         }
     };
-    let provided = |f: &FnId| !program.symbols.function(*f).defaulted_in_class;
+    let provided = |f: &FnId| user_provided(program, *f);
     if runs.iter().any(provided) {
         found.push((cls.to_owned(), runs.into_iter().filter(provided).collect()));
         return;
@@ -7971,6 +8460,7 @@ fn lower_one_declarator(
         let c_linkage =
             declared_c_linkage(program, ctx, qualified_name.as_deref().unwrap_or(&name));
         program.symbols.add_variable(Variable {
+            temp: None,
             is_defined: ctx.current_fn.is_none()
                 && (init_expr.is_some() || !declaration_is_extern(source, span_node)),
             is_weak: weak_global(ctx, storage, source, span_node),
@@ -8000,12 +8490,21 @@ fn lower_one_declarator(
 
     let var_id = program.symbols.alloc_var_id();
     mark_reference_binding(ctx, decl, var_id);
+    if object_declaration(span_node)
+        .and_then(|declaration| declaration.cached_field("type"))
+        .is_some_and(|ty| type_is_reference_alias(program, ctx, source, ty))
+    {
+        ctx.reference_vars.insert(var_id);
+        ctx.reference_bindings.insert(var_id);
+        ctx.address_references.insert(var_id);
+    }
     let span = node_span(program, ctx, span_node);
     let storage = storage_override.unwrap_or_else(|| storage_for(ctx, is_static));
     let is_namespaced = namespace_scoped(ctx, storage);
     let qualified_name = is_namespaced.then(|| ctx.qualify(&name));
     let c_linkage = declared_c_linkage(program, ctx, qualified_name.as_deref().unwrap_or(&name));
     program.symbols.add_variable(Variable {
+        temp: None,
         is_defined: ctx.current_fn.is_none()
             && (init_expr.is_some() || !declaration_is_extern(source, span_node)),
         is_weak: weak_global(ctx, storage, source, span_node),
@@ -8045,9 +8544,10 @@ fn lower_one_declarator(
             // A constructor defaulted or deleted in its class is not
             // user-provided and leaves the class an aggregate (C++17).
             braced_ctor = init_expr.is_some_and(|n| n.cached_kind() == "initializer_list")
-                && declared_members_upward(program, &cls, &trace_ir::MethodKind::Ctor)
-                    .iter()
-                    .any(|&ctor| !program.symbols.function(ctor).defaulted_in_class);
+                && any_user_provided(
+                    program,
+                    &declared_members_upward(program, &cls, &trace_ir::MethodKind::Ctor),
+                );
             let ctor_args: Option<Node> = match init_expr {
                 Some(n) if n.cached_kind() == "argument_list" || braced_ctor => Some(n),
                 _ => span_node
@@ -8231,6 +8731,7 @@ fn lower_unnamed_exception(
     let var_id = program.symbols.alloc_var_id();
     let span = node_span(program, ctx, holder);
     program.symbols.add_variable(Variable {
+        temp: None,
         is_defined: false,
         is_weak: false,
         target: None,
@@ -8458,6 +8959,7 @@ fn reconcile_static_member_definition(
                     .as_ref()
                     .is_some_and(|owner| program.namespaces.contains(owner));
             program.symbols.add_variable(Variable {
+                temp: None,
                 is_defined: defines,
                 is_weak: weak_global(ctx, storage, source, span_node),
                 target: None,
@@ -8785,27 +9287,7 @@ fn walk_function_body(
             if !node_is_from_ignored_macro(ctx, node)
                 && !ctx.handled_new_exprs.borrow().contains(&node.id())
             {
-                if let Some(cls) = new_expression_class(program, ctx, source, node) {
-                    let args = node
-                        .children(&mut node.walk())
-                        .find(|c| c.cached_kind() == "argument_list");
-                    let span = node_call_span(program, ctx, node);
-                    let expansion_span = node_expansion_span(program, ctx, node);
-                    let call_args = collect_call_args(program, ctx, source, args);
-                    // `this` stays unwired; the solver creates an imprecise
-                    // summary node for it (sound over-approximation).
-                    emit_member_sites(
-                        program,
-                        caller,
-                        &cls,
-                        &trace_ir::MethodKind::Ctor,
-                        None,
-                        call_args,
-                        span,
-                        expansion_span,
-                        None,
-                    );
-                }
+                lower_new_object(program, ctx, source, node);
             }
         }
         "delete_expression" if ctx.is_cpp && !node_is_from_ignored_macro(ctx, node) => {
@@ -9367,6 +9849,19 @@ fn collect_call_at_node_inner(
         return;
     }
     let mut args = collect_call_args(program, ctx, source, node.cached_field("arguments"));
+    if ctx.is_cpp && callee_var.is_none() && !is_field_or_element_call {
+        // A factory also constructs its class; its own site follows as is.
+        emit_factory_construction(
+            program,
+            ctx,
+            source,
+            node,
+            caller,
+            &args,
+            span,
+            expansion_span,
+        );
+    }
     let argc = args.argc as usize;
     // Only ranking reads the types; the sites below need the positions.
     let arg_desc = std::mem::take(&mut args.arg_desc);
@@ -9527,6 +10022,13 @@ struct CallArgs {
     /// best-effort static type of the passed expression (literals, casts,
     /// variable types, pointer decay). Used to rank same-arity C++ overloads.
     arg_desc: Vec<TypeDesc>,
+    /// Arguments whose pointer type is only the address of a class referent
+    /// (`T &r`). A `T *` or `T *&` keeps its pointer type when testing copies.
+    address_reference_args: Vec<u32>,
+    /// Cached headers import only the types of included headers. An empty
+    /// constructor lookup there cannot prove that the class has no constructor;
+    /// retain a site for the later TU symbol merge to resolve.
+    ctor_set_complete: bool,
     /// Aligned with `arg_desc`: the position holds a literal `0` (`NULL`
     /// expanded), a null pointer constant as well as an `int`.
     null_constants: Vec<bool>,
@@ -9552,6 +10054,34 @@ impl CallArgs {
         self
     }
 
+    /// The arguments past the first `n`, renumbered from 0: what a factory
+    /// whose leading arguments are its own (an allocator) passes on.
+    fn drop_leading(mut self, n: u32) -> Self {
+        if n == 0 {
+            return self;
+        }
+        let keep = |index: &mut u32| {
+            let kept = *index >= n;
+            *index = index.wrapping_sub(n);
+            kept
+        };
+        self.var_args.retain_mut(|(index, _)| keep(index));
+        self.fn_args.retain_mut(|(index, _)| keep(index));
+        self.addr_of_member_args.retain_mut(keep);
+        self.addr_of_args.retain_mut(keep);
+        self.address_reference_args.retain_mut(keep);
+        self.deref_args.retain_mut(|deref| {
+            deref.param = deref.param.saturating_sub(n as usize);
+            keep(&mut deref.index)
+        });
+        let n_desc = (n as usize).min(self.arg_desc.len());
+        self.arg_desc.drain(..n_desc);
+        let n_null = (n as usize).min(self.null_constants.len());
+        self.null_constants.drain(..n_null);
+        self.argc = self.argc.saturating_sub(n);
+        self
+    }
+
     fn empty() -> Self {
         Self {
             var_args: Vec::new(),
@@ -9561,6 +10091,8 @@ impl CallArgs {
             deref_args: Vec::new(),
             argc: 0,
             arg_desc: Vec::new(),
+            address_reference_args: Vec::new(),
+            ctor_set_complete: false,
             null_constants: Vec::new(),
         }
     }
@@ -9695,12 +10227,22 @@ fn collect_call_args(
     let mut addr_of_args = Vec::new();
     let mut deref_args = Vec::new();
     let mut arg_desc = Vec::new();
+    let mut address_reference_args = Vec::new();
     let mut null_constants = Vec::new();
     let mut arg_index = 0u32;
     if let Some(args_node) = args_node {
         for arg in args_node.children(&mut args_node.walk()) {
             if !matches!(arg.cached_kind(), "(" | ")" | "{" | "}" | ",") {
                 let adesc = arg_expr_type(program, ctx, source, arg);
+                let value = peel_expression(arg);
+                if matches!(adesc, TypeDesc::Ptr(_))
+                    && !ctx.address_references.is_empty()
+                    && is_name(value)
+                    && resolve_expr_var(program, ctx, source, value)
+                        .is_some_and(|v| ctx.address_references.contains(&v))
+                {
+                    address_reference_args.push(arg_index);
+                }
                 null_constants.push(is_null_constant(source, arg));
                 // Parameter positions are syntactic: every argument slot
                 // advances the index even when the expression yields no IR
@@ -9810,6 +10352,8 @@ fn collect_call_args(
         deref_args,
         argc: arg_index,
         arg_desc,
+        address_reference_args,
+        ctor_set_complete: !ctx.header_unit,
         null_constants,
     }
 }
@@ -10750,6 +11294,8 @@ fn emit_unresolved_site(
         deref_args: _,
         argc: _,
         arg_desc: _,
+        address_reference_args: _,
+        ctor_set_complete: _,
         null_constants: _,
     } = args.bind_past_this(None).for_callee(program, None);
     let call_id = program.symbols.alloc_call_id();
@@ -10823,6 +11369,13 @@ fn emit_member_targets(
     targets: Vec<FnId>,
     return_dst: Option<VarId>,
 ) {
+    // A copy or a move runs the implicit constructor, wherever the object is
+    // built: `new T(o)`, a factory, `T x(o)`, a member initializer `m_(o)`.
+    if matches!(kind, trace_ir::MethodKind::Ctor)
+        && copies_implicitly(program, cls, &args, &targets)
+    {
+        return;
+    }
     let tu = program.symbols.function_by_id(caller).and_then(|f| f.tu);
     let mut args = args.bind_past_this(receiver);
     let argc = args.argc;
@@ -10904,8 +11457,9 @@ fn emit_member_targets(
 }
 
 /// Constructor member-initializer lists: `Derived() : Base(1, 2), sub_(3) {}`.
-/// A name matching a direct base constructs that base; anything else
-/// constructs the declared class of the data member.
+/// A name matching a direct base constructs that base; a data member of an
+/// indexed class type is constructed; any other member initialized from one
+/// expression stores it, as `this->m = v` does ([`store_member_initializer`]).
 fn lower_field_initializer_list(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -10943,34 +11497,85 @@ fn lower_field_initializer_list(
                 let (desc, array) = peel_arrays(program.types.get(fl.type_id).desc.as_ref());
                 initialized_class(program, desc).map(|name| (name, array))
             });
-        if let Some((target, array)) = target_cls {
-            // `Base(a)` and `m_(a)` hold an argument list, `Base{a}` and
-            // `m_{a}` an initializer list; either way `this` is not in it.
-            let args = fi
-                .children(&mut fi.walk())
-                .find(|c| matches!(c.cached_kind(), "argument_list" | "initializer_list"));
-            // A member array's list initializes its elements one by one: an
-            // empty one default-constructs them, and listed elements are
-            // expressions of their own, never one constructor's arguments.
-            if array && args.is_some_and(|list| list.named_child_count() > 0) {
-                continue;
-            }
-            let span = node_call_span(program, ctx, fi);
-            let expansion_span = node_expansion_span(program, ctx, fi);
-            let call_args = collect_call_args(program, ctx, source, args);
-            emit_member_sites(
-                program,
-                caller,
-                &target,
-                &trace_ir::MethodKind::Ctor,
-                None,
-                call_args,
-                span,
-                expansion_span,
-                None,
-            );
+        // `Base(a)` and `m_(a)` hold an argument list, `Base{a}` and
+        // `m_{a}` an initializer list; either way `this` is not in it.
+        let args = fi
+            .children(&mut fi.walk())
+            .find(|c| matches!(c.cached_kind(), "argument_list" | "initializer_list"));
+        let Some((target, array)) = target_cls else {
+            store_member_initializer(program, ctx, source, fi, &fname, args);
+            continue;
+        };
+        // A member array's list initializes its elements one by one: an
+        // empty one default-constructs them, and listed elements are
+        // expressions of their own, never one constructor's arguments.
+        if array && args.is_some_and(|list| list.named_child_count() > 0) {
+            continue;
         }
+        let span = node_call_span(program, ctx, fi);
+        let expansion_span = node_expansion_span(program, ctx, fi);
+        let call_args = collect_call_args(program, ctx, source, args);
+        emit_member_sites(
+            program,
+            caller,
+            &target,
+            &trace_ir::MethodKind::Ctor,
+            None,
+            call_args,
+            span,
+            expansion_span,
+            None,
+        );
     }
+}
+
+/// `m_(v)` / `m_{v}` for a member the index holds no class type for (a
+/// pointer, a scalar, a `std::function`): the store `this->m_ = v`. The
+/// initializer names the member even where a parameter spells it too
+/// (`cb(cb)`), so the lookup is the class's, past the body's locals.
+fn store_member_initializer(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    fi: Node,
+    fname: &str,
+    args: Option<Node>,
+) {
+    let Some(list) = args.filter(|list| list.named_child_count() == 1) else {
+        return;
+    };
+    let Some(value) = list.named_child(0) else {
+        return;
+    };
+    // A literal holds no address, and neither does a `bool` or floating member.
+    if matches!(
+        value.cached_kind(),
+        "number_literal" | "true" | "false" | "char_literal" | "null" | "nullptr"
+    ) {
+        return;
+    }
+    let Some(this) = ctx.locals.get("this").copied() else {
+        return;
+    };
+    let Some(field) = class_ctx_field(program, ctx, fname) else {
+        return;
+    };
+    if matches!(
+        program.types.get(field.type_id).desc.as_ref(),
+        TypeDesc::Bool | TypeDesc::Float | TypeDesc::Double
+    ) {
+        return;
+    }
+    emit_field_value_store(
+        program,
+        ctx,
+        source,
+        fi,
+        this,
+        &[field.field_id],
+        &[fname.to_owned()],
+        value,
+    );
 }
 
 fn last_segment_of(name: &str) -> &str {
@@ -11275,7 +11880,7 @@ fn lower_lambda_expression(
         })
     {
         for param in params_node.children(&mut params_node.walk()) {
-            shape.record(source, param);
+            shape.record(program, ctx, source, param);
             if is_parameter_node(param.cached_kind()) {
                 if let Some(var) = lower_parameter(
                     program,
@@ -11411,6 +12016,7 @@ fn lower_lambda_expression(
             .unwrap_or_else(|| program.types.int());
         let is_ptr = matches!(program.types.get(type_id).desc.as_ref(), TypeDesc::Ptr(_));
         program.symbols.add_variable(Variable {
+            temp: None,
             is_defined: false,
             is_weak: false,
             target: None,
@@ -13086,25 +13692,9 @@ fn alloc_gep_temp(
     field: FieldId,
     field_name: String,
 ) -> VarId {
-    let var_id = program.symbols.alloc_var_id();
     let span = node_span(program, ctx, span_node);
-    program.symbols.add_variable(Variable {
-        is_defined: false,
-        is_weak: false,
-        target: None,
-        is_namespaced: false,
-        qualified_name: None,
-        c_linkage: false,
-        is_static_member: false,
-        id: var_id,
-        name: format!("_gep{}", var_id.0),
-        type_id: program.types.int(),
-        storage: StorageClass::Local,
-        fn_id: ctx.current_fn,
-        param_index: None,
-        span,
-        is_pointer: true,
-    });
+    let int = program.types.int();
+    let var_id = add_temp(program, ctx.current_fn, TempKind::Gep, int, span);
     program.flow.push(FlowConstraint::GepField {
         dst: var_id,
         base,
@@ -13970,47 +14560,12 @@ fn expr_to_rhs_flow(
         // ([`Operand`]); a static data member is its own variable.
         "field_expression" => operand_flow(program, ctx, source, node, dst),
         "new_expression" if ctx.is_cpp => {
-            if let Some(cls) = new_expression_class(program, ctx, source, node) {
-                // Allocate a temp representing the heap allocation result.
-                // The constructor's implicit `this` parameter (param 0) is
-                // wired to this temp; explicit args start at index 1.
-                let alloc_tmp = alloc_ret_temp(program, ctx, node);
-                // Give alloc_tmp the class pointer type so the heap location
-                // created by NewHeap carries the correct struct type.
-                if let Some(struct_tid) = program.types.class_type_id(&cls) {
-                    program.symbols.variable_mut(alloc_tmp).type_id = struct_tid;
-                }
-                let args = node
-                    .children(&mut node.walk())
-                    .find(|c| c.cached_kind() == "argument_list");
-                let span = node_call_span(program, ctx, node);
-                let expansion_span = node_expansion_span(program, ctx, node);
-                let call_args = collect_call_args(program, ctx, source, args);
-                if let Some(caller) = ctx.current_fn {
-                    emit_member_sites(
-                        program,
-                        caller,
-                        &cls,
-                        &trace_ir::MethodKind::Ctor,
-                        Some(alloc_tmp),
-                        call_args,
-                        span,
-                        expansion_span,
-                        None,
-                    );
-                }
-                ctx.handled_new_exprs.borrow_mut().insert(node.id());
-                // Create a heap location for the allocated object so the
-                // constructor's `this` parameter has concrete pointees.
-                program
-                    .flow
-                    .push(FlowConstraint::NewHeap { dst: alloc_tmp });
-                return Some(FlowConstraint::Copy {
-                    dst,
-                    src: alloc_tmp,
-                });
-            }
-            None
+            let alloc_tmp = lower_new_object(program, ctx, source, node)?;
+            ctx.handled_new_exprs.borrow_mut().insert(node.id());
+            Some(FlowConstraint::Copy {
+                dst,
+                src: alloc_tmp,
+            })
         }
         _ => resolve_expr_var(program, ctx, source, node)
             .map(|src| FlowConstraint::Copy { dst, src }),
@@ -14178,9 +14733,9 @@ fn return_flow_from_expr(
             match resolved {
                 ResolvedCallReturn::PromotedReceiver(src) => Some(ReturnFlow::Copy { src }),
                 ResolvedCallReturn::Direct(callee_name) => {
+                    // Materialize a temp so the inner CallSite gets a return_dst
+                    // for the dlsym model; the wrapper then copies that temp.
                     if is_symbol_lookup_callee(&callee_name) {
-                        // Materialize a temp so the inner CallSite gets a return_dst
-                        // for the dlsym model; the wrapper then copies that temp.
                         let temp = alloc_ret_temp(program, ctx, node);
                         emit_call_return(program, ctx, node, temp, callee_name);
                         Some(ReturnFlow::Copy { src: temp })
@@ -14397,26 +14952,8 @@ fn alloc_recv_temp(
     span_node: Node,
     pointee: trace_ir::TypeId,
 ) -> VarId {
-    let var_id = program.symbols.alloc_var_id();
     let span = node_span(program, ctx, span_node);
-    program.symbols.add_variable(Variable {
-        is_defined: false,
-        is_weak: false,
-        target: None,
-        is_namespaced: false,
-        qualified_name: None,
-        c_linkage: false,
-        is_static_member: false,
-        id: var_id,
-        name: format!("_recv{}", var_id.0),
-        type_id: pointee,
-        storage: StorageClass::Local,
-        fn_id: ctx.current_fn,
-        param_index: None,
-        span,
-        is_pointer: true,
-    });
-    var_id
+    add_temp(program, ctx.current_fn, TempKind::Recv, pointee, span)
 }
 
 /// A temporary of type `type_id` holding the value a load reads, local to
@@ -14427,26 +14964,27 @@ fn alloc_load_temp(
     span_node: Node,
     type_id: trace_ir::TypeId,
 ) -> VarId {
-    let load_var = program.symbols.alloc_var_id();
     let span = node_span(program, ctx, span_node);
-    program.symbols.add_variable(Variable {
-        is_defined: false,
-        is_weak: false,
-        target: None,
-        is_namespaced: false,
-        qualified_name: None,
-        c_linkage: false,
-        is_static_member: false,
-        id: load_var,
-        name: format!("_load{}", load_var.0),
-        type_id,
-        storage: StorageClass::Local,
-        fn_id: ctx.current_fn,
-        param_index: None,
-        span,
-        is_pointer: true,
-    });
-    load_var
+    add_temp(program, ctx.current_fn, TempKind::Load, type_id, span)
+}
+
+/// The heap object of `new cls(..)` ([`TempKind::New`]) or of a
+/// smart-pointer factory ([`TempKind::Make`]), typed `cls` (a lookup name)
+/// when the class is indexed, so the `NewHeap` location carries its layout.
+fn alloc_heap_temp(
+    program: &mut Program,
+    ctx: &LowerContext,
+    span_node: Node,
+    cls: &str,
+    kind: TempKind,
+) -> VarId {
+    debug_assert!(matches!(kind, TempKind::New | TempKind::Make));
+    let span = node_span(program, ctx, span_node);
+    let type_id = program
+        .types
+        .class_type_id(cls)
+        .unwrap_or_else(|| program.types.int());
+    add_temp(program, ctx.current_fn, kind, type_id, span)
 }
 
 fn alloc_ret_temp(program: &mut Program, ctx: &LowerContext, span_node: Node) -> VarId {
@@ -14457,8 +14995,22 @@ fn alloc_ret_temp(program: &mut Program, ctx: &LowerContext, span_node: Node) ->
 /// A return/value temporary local to `owner`. Deferred resolution runs after
 /// the body, so it names the owner instead of reading `ctx.current_fn`.
 fn alloc_ret_temp_spanned(program: &mut Program, owner: Option<FnId>, span: Span) -> VarId {
+    let int = program.types.int();
+    add_temp(program, owner, TempKind::Ret, int, span)
+}
+
+/// A synthesized pointer temporary of `kind` local to `owner`, named the
+/// kind's prefix plus its unit-local id.
+fn add_temp(
+    program: &mut Program,
+    owner: Option<FnId>,
+    kind: TempKind,
+    type_id: trace_ir::TypeId,
+    span: Span,
+) -> VarId {
     let var_id = program.symbols.alloc_var_id();
     program.symbols.add_variable(Variable {
+        temp: Some(kind),
         is_defined: false,
         is_weak: false,
         target: None,
@@ -14467,8 +15019,8 @@ fn alloc_ret_temp_spanned(program: &mut Program, owner: Option<FnId>, span: Span
         c_linkage: false,
         is_static_member: false,
         id: var_id,
-        name: format!("_ret{}", var_id.0),
-        type_id: program.types.int(),
+        name: format!("{}{}", kind.prefix(), var_id.0),
+        type_id,
         storage: StorageClass::Local,
         fn_id: owner,
         param_index: None,
@@ -15076,14 +15628,27 @@ fn resolve_function_named(program: &Program, ctx: &LowerContext, name: &str) -> 
     if !ctx.is_cpp || !program.symbols.has_scoped_function_leaf(leaf) {
         return in_scope(name).or_else(|| program.symbols.resolve_function(name));
     }
-    let mut probe = |candidate: &str, _global: bool| in_scope(candidate);
-    imported_by_declaration(ctx, name, &[ImportScope::Body], in_scope)
-        .or_else(|| find_in_enclosing_scopes(program, ctx, name, &mut probe))
-        .or_else(|| imported_by_declaration(ctx, name, &[ImportScope::Namespace], in_scope))
-        .or_else(|| in_scope(global_lookup_name(name)))
-        .or_else(|| imported_by_declaration(ctx, name, &[ImportScope::File], in_scope))
-        .or_else(|| imported_by_directive(ctx, name, in_scope))
+    resolve_function_named_with_imports(program, ctx, name, in_scope, in_scope)
         .or_else(|| program.symbols.resolve_function(name))
+}
+
+/// Ordinary function lookup with a separate probe for using-declarations:
+/// factory models can recognise an import whose declaration is not indexed
+/// without bypassing the precedence used by real functions.
+fn resolve_function_named_with_imports<T>(
+    program: &Program,
+    ctx: &LowerContext,
+    name: &str,
+    in_scope: impl Fn(&str) -> Option<T>,
+    imported: impl Fn(&str) -> Option<T>,
+) -> Option<T> {
+    let mut probe = |candidate: &str, _global: bool| in_scope(candidate);
+    imported_by_declaration(ctx, name, &[ImportScope::Body], &imported)
+        .or_else(|| find_in_enclosing_scopes(program, ctx, name, &mut probe))
+        .or_else(|| imported_by_declaration(ctx, name, &[ImportScope::Namespace], &imported))
+        .or_else(|| in_scope(global_lookup_name(name)))
+        .or_else(|| imported_by_declaration(ctx, name, &[ImportScope::File], &imported))
+        .or_else(|| imported_by_directive(ctx, name, in_scope))
 }
 
 /// What the innermost `using X::name;` declaration written in one of
@@ -17877,6 +18442,8 @@ mod qualified_variable_lookup_tests {
             callee_load_cache: RefCell::new(HashMap::default()),
             call_receiver_cache: RefCell::new(HashMap::default()),
             call_return_dst: RefCell::new(HashMap::default()),
+            bare_std_calls: RefCell::new(HashMap::default()),
+            factory_objects: RefCell::new(HashMap::default()),
             ast_depth: 0,
             ast_depth_warned: false,
             reference_vars: HashSet::default(),
@@ -17909,6 +18476,7 @@ mod qualified_variable_lookup_tests {
         let id = program.symbols.alloc_var_id();
         let int_ty = program.types.int();
         program.symbols.add_variable(Variable {
+            temp: None,
             id,
             name: name.to_string(),
             type_id: int_ty,
@@ -17995,6 +18563,7 @@ mod qualified_variable_lookup_tests {
         let internal = program.symbols.alloc_var_id();
         let int_ty = program.types.int();
         program.symbols.add_variable(Variable {
+            temp: None,
             id: internal,
             name: "cfg".to_string(),
             type_id: int_ty,
@@ -18064,5 +18633,31 @@ mod member_function_tests {
             .filter_map(|m| member_function(source, m).map(|(_, name)| name))
             .collect();
         assert_eq!(names, ["Run"]);
+    }
+}
+
+#[cfg(test)]
+mod call_args_tests {
+    use super::*;
+
+    /// `std::allocate_shared<T>(alloc, a, f)` hands `a, f` on as the
+    /// constructor's arguments 0 and 1: the allocator's entries go, the rest
+    /// renumber, and the per-position types follow.
+    #[test]
+    fn drop_leading_renumbers_what_follows() {
+        let mut args = CallArgs::empty();
+        args.var_args = vec![(0, VarId(10)), (1, VarId(11))];
+        args.fn_args = vec![(2, FnId(5))];
+        args.addr_of_args = vec![0, 1];
+        args.argc = 3;
+        args.arg_desc = vec![TypeDesc::Unknown, TypeDesc::Int, TypeDesc::Unknown];
+        args.null_constants = vec![false, true, false];
+        let args = args.drop_leading(1);
+        assert_eq!(args.var_args, [(0, VarId(11))]);
+        assert_eq!(args.fn_args, [(1, FnId(5))]);
+        assert_eq!(args.addr_of_args, [0]);
+        assert_eq!(args.argc, 2);
+        assert_eq!(args.arg_desc.len(), 2);
+        assert_eq!(args.null_constants, [true, false]);
     }
 }

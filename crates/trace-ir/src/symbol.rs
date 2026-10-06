@@ -64,6 +64,48 @@ pub struct Variable {
     /// yet has no external symbol. A member always has a `qualified_name` and
     /// never C linkage. See `docs/ANALYSIS.md`, "Static data member storage".
     pub is_static_member: bool,
+    /// The kind of an intermediate value lowering synthesized (`_ret12`,
+    /// `$make7`); `None` for every declared variable. A variant merge pairs
+    /// temporaries by this kind and their position, never by name (see
+    /// `docs/ANALYSIS.md`, "Bounded conditional-variant exploration
+    /// (`--explore`)", on locals and temporaries).
+    pub temp: Option<TempKind>,
+}
+
+/// What a synthesized temporary holds ([`Variable::temp`]). Each kind is its
+/// own ordinal space when a variant merge pairs temporaries: one a
+/// configuration emits and another does not must not shift another kind's
+/// pairing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TempKind {
+    /// A field address (`GepField`).
+    Gep,
+    /// A loaded value.
+    Load,
+    /// A call's return value, or another value temporary.
+    Ret,
+    /// The pointee-typed receiver an overloaded `->` yields.
+    Recv,
+    /// The heap object of `new T(..)`.
+    New,
+    /// The heap object a smart-pointer factory builds; paired by its class
+    /// too, since whether it exists depends on the class's constructors.
+    Make,
+}
+
+impl TempKind {
+    /// The name prefix the temporary is displayed and exported under, before
+    /// its unit-local id.
+    pub const fn prefix(self) -> &'static str {
+        match self {
+            TempKind::Gep => "_gep",
+            TempKind::Load => "_load",
+            TempKind::Ret => "_ret",
+            TempKind::Recv => "_recv",
+            TempKind::New => "$new",
+            TempKind::Make => "$make",
+        }
+    }
 }
 
 impl Variable {
@@ -3316,6 +3358,7 @@ mod tests {
         line: u32,
     ) -> Variable {
         Variable {
+            temp: None,
             id,
             name: name.to_string(),
             type_id: TypeId(0),
@@ -3663,6 +3706,7 @@ mod tests {
             3,
         );
         let param = Variable {
+            temp: None,
             is_defined: false,
             is_weak: false,
             target: None,
@@ -3925,6 +3969,7 @@ mod tests {
             1,
         );
         let var_int = Variable {
+            temp: None,
             is_defined: false,
             is_weak: false,
             target: None,
@@ -3955,6 +4000,7 @@ mod tests {
             2,
         );
         let var_double = Variable {
+            temp: None,
             is_defined: false,
             is_weak: false,
             target: None,

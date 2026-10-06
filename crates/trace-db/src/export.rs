@@ -806,6 +806,7 @@ mod tests {
             });
             let id = program.symbols.alloc_var_id();
             program.symbols.add_variable(Variable {
+                temp: None,
                 is_defined: true,
                 id,
                 name: name.into(),

@@ -57,7 +57,7 @@ Current kinds:
 - `ArrayFnMember { array, callee }`: Function-pointer array initializer member (`{ fn0, fn1 }`).
 - `CallReturn { dst, callee_name, caller }`: Direct call assignment (`dst = callee()`), expanded during PAG construction using `fn_returns` in `caller`'s scope (`None` for a file-scope initializer; see `docs/ANALYSIS.md`, "Return-value flow").
 - `CallReturnIndirect { dst, callee_var }`: Indirect/virtual call assignment (`dst = callee_var()`), callee resolved at analysis time from points-to sets.
-- `NewHeap { dst }`: Heap allocation (`new T(...)`), allocates fresh heap location so constructor's implicit `this` has concrete pointees.
+- `NewHeap { dst }`: Heap allocation (`new T(...)`, and a smart-pointer factory's object; see `docs/ANALYSIS.md`, "Factory construction"), allocates fresh heap location so constructor's implicit `this` has concrete pointees.
 - `StringConst { dst, value }`: String literal constant interned as abstract location, enabling dynamic symbol lookup (`dlsym`, `GetProcAddress`).
 - `UnwrapPointer { dst, src }`: Step through a smart pointer's overloaded `->`/`*` (`sp->field`) into a pointee-typed receiver; the solver admits only pointee-compatible locations (see `docs/ANALYSIS.md`, "Smart-pointer unwrap").
 
@@ -149,6 +149,8 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 | Parse new C/C++ construct | `trace-parse/src/lower.rs` |
 | C++ spellings the pinned grammar rejects (attributed `friend`, computed `decltype` bases, GNU `__typeof__`, member-function pointers) | `trace-parse/src/parse.rs` (`normalize_cpp_parse_syntax`, `cpp_type_operand_parses`), `cpp_type_names.rs` → `docs/ANALYSIS.md` ("C++ parse-input normalization") |
 | Constructor/destructor sites of automatic objects (`T x;`, scope exit, range-for/catch variables) | `trace-parse/src/lower.rs` (`emit_automatic_lifecycle`, `lifecycle_members`, `lower_statement_local`, `range_element_desc`) → `docs/ANALYSIS.md` ("Automatic objects") |
+| Constructor sites of factory-built objects (`std::make_shared<T>`, `std::make_unique<T>`, `sptr<T>::MakeSptr`) | `trace-parse/src/lower.rs` (`factory_constructed_class`, `emit_factory_construction`, `construct_on_heap`, shared with `lower_new_object`) → `docs/ANALYSIS.md` ("Factory construction") |
+| Member-initializer lists (`Base(a)`, `m_(a)` constructing; `cb_(cb)` storing into a non-class member) | `trace-parse/src/lower.rs` (`lower_field_initializer_list`, `store_member_initializer`) → `docs/ANALYSIS.md` ("C++ support (first step)", constructions) |
 | C++ virtual dispatch & hierarchy | `trace-ir/src/program.rs` (`inheritance`), `trace-parse/src/lower.rs` (`expand_virtual_overrides`) |
 | C++ smart pointer unwrapping | `trace-parse/src/lower.rs` (`ArrowReturn`), `symbol.rs` |
 | Smart-pointer value flow (`sp->field`, `wp.lock()`) | `trace-parse/src/lower.rs` (`decompose_field_path`, `emit_wrapper_boundaries`, `weak_promotion`, `promoted_receiver_value`), `trace-analysis/src/solver.rs` (`unwrap_admits`) → `docs/ANALYSIS.md` ("Smart-pointer unwrap", "Weak-pointer promotion") |

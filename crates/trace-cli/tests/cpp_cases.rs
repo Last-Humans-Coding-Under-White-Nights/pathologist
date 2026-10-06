@@ -5394,16 +5394,19 @@ fn arg_bindings(
         .arg_flow_edges
         .iter()
         .filter(|e| sites.contains(&e.call_site))
-        .map(|e| {
-            let actual = match (e.actual_var, e.actual_fn) {
-                (Some(v), _) => program.symbols.variable(v).name.clone(),
-                (None, Some(f)) => fn_name(program, f),
-                (None, None) => String::new(),
-            };
-            let formal = program.symbols.variable(e.formal).name.clone();
-            (e.arg_index, actual, formal)
-        })
+        .map(|e| arg_binding(program, e))
         .collect()
+}
+
+/// `(arg_index, actual, formal)` of one arg-flow row.
+fn arg_binding(program: &Program, e: &trace_analysis::ArgFlowEdge) -> (u32, String, String) {
+    let actual = match (e.actual_var, e.actual_fn) {
+        (Some(v), _) => program.symbols.variable(v).name.clone(),
+        (None, Some(f)) => fn_name(program, f),
+        (None, None) => String::new(),
+    };
+    let formal = program.symbols.variable(e.formal).name.clone();
+    (e.arg_index, actual, formal)
 }
 
 #[test]
@@ -5586,14 +5589,12 @@ fn no_explicit_argument_binds_to_this() {
             continue;
         }
         assert!(e.actual_fn.is_none(), "a function reached `this`: {e:?}");
-        let actual = program
-            .symbols
-            .variable(e.actual_var.expect("actual"))
-            .name
-            .clone();
-        assert!(
-            actual.starts_with("_ret"),
-            "only a `new` allocation is bound to `this`, got `{actual}`"
+        let actual = program.symbols.variable(e.actual_var.expect("actual"));
+        assert_eq!(
+            actual.temp,
+            Some(trace_ir::TempKind::New),
+            "only a `new` allocation is bound to `this`, got `{}`",
+            actual.name
         );
     }
 }
@@ -14036,4 +14037,741 @@ fn automatic_object_lifecycle_issue_query() {
         })
         .collect();
     assert_eq!(rows, expected);
+}
+
+analyzed_fixture!(cpp_factory_ctor);
+
+type CtorEdge = (String, ResolutionKind, Vec<(u32, String, String)>);
+
+/// One entry per edge from `caller` to a constructor of `class`: the callee,
+/// its resolution and the edge's arg-flow rows as `(index, actual, formal)`.
+/// The heap object `this` receives (`TempKind::New` for `new`,
+/// `TempKind::Make` for a factory) reads `heap`, so the two compare equal;
+/// any other temporary keeps its name and fails the comparison.
+fn ctor_edges(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    class: &str,
+) -> Vec<CtorEdge> {
+    let ctor = format!("{class}::{}", class.rsplit("::").next().unwrap());
+    let mut found: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == caller && fn_name(program, e.callee) == ctor)
+        .map(|e| {
+            let mut flows: Vec<(u32, String, String)> = analysis
+                .arg_flow_edges
+                .iter()
+                .filter(|f| f.call_site == e.call_site)
+                .map(|f| {
+                    let (index, actual, formal) = arg_binding(program, f);
+                    let is_heap = f.actual_var.is_some_and(|v| {
+                        matches!(
+                            program.symbols.variable(v).temp,
+                            Some(trace_ir::TempKind::New | trace_ir::TempKind::Make)
+                        )
+                    });
+                    let actual = if is_heap { "heap".to_owned() } else { actual };
+                    (index, actual, formal)
+                })
+                .collect();
+            flows.sort();
+            // Overloads share the name: the formals tell them apart.
+            let formals: Vec<String> = program
+                .symbols
+                .variables
+                .iter()
+                .filter(|v| v.fn_id == Some(e.callee) && v.param_index.is_some())
+                .map(|v| v.name.clone())
+                .collect();
+            (
+                format!("{ctor}({})", formals.join(",")),
+                e.resolution,
+                flows,
+            )
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
+/// Issue #192: every factory form reaches the constructor `new Foo(...)`
+/// reaches, with the same arguments bound, and keeps its own factory site.
+#[test]
+fn factory_constructs_as_new_does() {
+    let (p, a) = cpp_factory_ctor();
+    let reference = ctor_edges(p, a, "by_new", "Foo");
+    assert_eq!(reference.len(), 1, "{reference:?}");
+    assert_eq!(reference[0].1, ResolutionKind::Direct);
+    assert_eq!(
+        reference[0].2,
+        [
+            (0, "heap".to_owned(), "this".to_owned()),
+            (2, "Handler".to_owned(), "h".to_owned()),
+        ]
+    );
+    // A placement `new (std::nothrow) Foo(..)` passes its own arguments, and
+    // braces construct as parentheses do.
+    for caller in ["by_new_nothrow", "by_new_braced"] {
+        assert_eq!(ctor_edges(p, a, caller, "Foo"), reference, "{caller}");
+    }
+    // The factory's own edge is what it was before #192. A bare template
+    // call to an undeclared function has none, then and now.
+    for (caller, factory) in [
+        ("by_shared", Some("std::make_shared")),
+        ("by_unique", Some("std::make_unique")),
+        ("by_global_shared", Some("::std::make_shared")),
+        ("by_statement", Some("std::make_shared")),
+        ("by_sptr", Some("OHOS::sptr::MakeSptr")),
+        ("by_allocate", Some("std::allocate_shared")),
+        ("uses_std::bare_shared", None),
+        ("imports_unique::bare_unique", None),
+        ("uses_ohos::bare_sptr", Some("sptr::MakeSptr")),
+        ("by_declared_sptr", Some("decl::sptr::MakeSptr")),
+    ] {
+        assert_eq!(ctor_edges(p, a, caller, "Foo"), reference, "{caller}");
+        let callees: Vec<String> = common::callees_of(p, a, caller)
+            .into_iter()
+            .map(|(callee, _)| callee)
+            .filter(|callee| callee != "Foo::Foo")
+            .collect();
+        let expected: Vec<&str> = factory.into_iter().collect();
+        assert_eq!(callees, expected, "{caller}: factory site kept");
+    }
+}
+
+#[test]
+fn factory_picks_the_overload_new_picks() {
+    let (p, a) = cpp_factory_ctor();
+    for (new_caller, factory_caller, class) in [
+        ("multi_new_int", "multi_shared_int", "Multi"),
+        ("multi_new_fn", "multi_unique_fn", "Multi"),
+        ("multi_new_two", "multi_shared_two", "Multi"),
+        ("mixed_new_none", "mixed_shared_none", "Mixed"),
+        ("mixed_new_int", "mixed_shared_int", "Mixed"),
+    ] {
+        // `new Multi(Other)` keeps both one-argument overloads: ranking
+        // cannot tell a function from an `int` here. The factory must agree.
+        let reference = ctor_edges(p, a, new_caller, class);
+        assert!(!reference.is_empty(), "{new_caller}");
+        assert_eq!(
+            ctor_edges(p, a, factory_caller, class),
+            reference,
+            "{factory_caller}"
+        );
+    }
+    // A class with a user-provided constructor keeps its in-class defaulted
+    // overload in the ranking, as `new Mixed()` does.
+    for (caller, expected) in [
+        ("mixed_shared_none", "Mixed::Mixed(this)"),
+        ("mixed_shared_int", "Mixed::Mixed(this,a)"),
+    ] {
+        let callees: Vec<String> = ctor_edges(p, a, caller, "Mixed")
+            .into_iter()
+            .map(|(callee, _, _)| callee)
+            .collect();
+        assert_eq!(callees, [expected], "{caller}");
+    }
+}
+
+/// What a factory-built constructor stores reads back through `->` on the
+/// result, as through `new`'s pointer, whether the result lands in a local,
+/// a returned value or an argument. Each form builds a class of its own,
+/// which nothing else constructs, so only the factory's constructor call
+/// fills the field read.
+#[test]
+fn factory_constructor_stores_reach_reads_through_the_result() {
+    let (p, a) = cpp_factory_ctor();
+    for caller in [
+        "holder_new",
+        "holder_shared",
+        "holder_unique",
+        "holder_sptr",
+        "holder_returned",
+        "holder_run",
+        "holder_volatile",
+    ] {
+        assert!(
+            has_edge(p, a, caller, "Handler", ResolutionKind::Indirect),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    // The nested factory constructs and hands its result to `holder_run`.
+    for callee in ["HolderArg::HolderArg", "holder_run"] {
+        assert!(
+            has_edge(p, a, "holder_nested", callee, ResolutionKind::Direct),
+            "holder_nested -> {callee}: {:?}",
+            common::callees_of(p, a, "holder_nested")
+        );
+    }
+}
+
+/// `new T(args)` as a statement binds its heap object to `this` as a factory
+/// statement does (#192 review).
+#[test]
+fn new_statement_constructs_as_factory_statement_does() {
+    let (p, a) = cpp_factory_ctor();
+    let reference = ctor_edges(p, a, "by_statement", "Foo");
+    assert_eq!(reference.len(), 1, "{reference:?}");
+    assert_eq!(ctor_edges(p, a, "by_new_statement", "Foo"), reference);
+}
+
+/// The factory's heap object is the constructor's `this`, never the value
+/// its call yields: copying it into every smart-pointer value changed no
+/// call edge on the pinned corpora or `ability_ability_runtime` yet cost 43%
+/// more solver pops there (docs/EVAL_REPORT.md, "Factory
+/// construction: #192"). A file-scope factory, which has no constructor
+/// site, makes no object at all.
+#[test]
+fn factory_object_stays_out_of_the_result() {
+    let (p, _) = cpp_factory_ctor();
+    let var = |id: trace_ir::VarId| p.symbols.variable(id);
+    let from_heap = p.flow.iter().any(|c| {
+        matches!(c, trace_ir::FlowConstraint::Copy { src, .. }
+            if var(*src).temp == Some(trace_ir::TempKind::Make))
+    });
+    assert!(!from_heap, "a factory's object is copied into a value");
+    let made = |file_scope: bool| {
+        p.symbols
+            .variables
+            .iter()
+            .any(|v| v.temp == Some(trace_ir::TempKind::Make) && v.fn_id.is_none() == file_scope)
+    };
+    // `g_holder = std::make_shared<Foo>(1, Handler)` builds a class a body's
+    // factory call does make an object for.
+    assert!(made(false), "no factory in a body made an object");
+    assert!(!made(true), "a file-scope factory made an object");
+    // `new`'s object is the expression's value.
+    assert!(p.flow.iter().any(|c| {
+        matches!(c, trace_ir::FlowConstraint::Copy { dst, src }
+            if var(*src).temp == Some(trace_ir::TempKind::New) && var(*dst).name == "c")
+    }));
+}
+
+/// A using-declaration names the standard factory even where an outer
+/// scope declares a function of the same name (#192 review).
+#[test]
+fn using_declaration_names_the_standard_factory() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        "#include <memory>\n\
+         struct Foo { Foo(int a); };\n\
+         Foo::Foo(int a) {}\n\
+         template <class T> T *make_shared(int a);\n\
+         namespace N {\n\
+         using std::make_shared;\n\
+         void f() { auto p = make_shared<Foo>(1); }\n\
+         }\n",
+    )]);
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "N::f",
+            "Foo::Foo",
+            ResolutionKind::Direct
+        ),
+        "{:?}",
+        common::callees_of(&program, &analysis, "N::f")
+    );
+}
+
+/// A factory in a header-inline function every unit lowers merges into one
+/// function with one constructor edge per factory call, and the other
+/// units' factory calls construct as `new Foo` does.
+#[test]
+fn factory_ctor_across_units_and_shared_header() {
+    let (p, a) = cpp_factory_ctor();
+    let reference = ctor_edges(p, a, "by_new", "Foo");
+    let header = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "from_header" && f.is_defined)
+        .count();
+    assert_eq!(header, 1, "header function deduplicated");
+    let header_edges = ctor_edges(p, a, "from_header", "Foo");
+    assert_eq!(header_edges.len(), 2, "{header_edges:?}");
+    for edge in &header_edges {
+        assert_eq!(edge.0, reference[0].0);
+        assert_eq!(edge.1, ResolutionKind::Direct);
+    }
+    for caller in ["other_shared", "third_unique", "third_sptr"] {
+        assert_eq!(ctor_edges(p, a, caller, "Foo"), reference, "{caller}");
+    }
+}
+
+/// No constructor is invented: not for a class without a user-provided one,
+/// one the call site cannot name, a template parameter, or a call that is
+/// not a recognised factory.
+#[test]
+fn factory_without_a_nameable_constructed_class_adds_no_edge() {
+    let (p, a) = cpp_factory_ctor();
+    for (caller, class) in [
+        ("no_ctor", "Plain"),
+        ("no_ctor", "Defaulted"),
+        ("unnamed", "Secret"),
+        ("unnamed", "hidden::Secret"),
+        ("no_using::bare_none", "Foo"),
+        ("other_wrapper", "Foo"),
+        ("make_any", "T"),
+        ("shadowed::own_factory", "Foo"),
+        ("copy_new", "Foo"),
+        ("copy_new_nothrow", "Foo"),
+        ("copy_shared", "Foo"),
+        ("copy_sptr", "Foo"),
+        ("project::in_project", "Foo"),
+    ] {
+        assert!(
+            class_member_edges(p, a, caller, class).is_empty(),
+            "{caller} -> {class}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    assert!(has_any_edge(p, a, "no_ctor", "std::make_shared"));
+    assert!(has_any_edge(p, a, "unnamed", "std::make_shared"));
+    // The shadowing factory keeps its own edge.
+    assert!(has_any_edge(
+        p,
+        a,
+        "shadowed::own_factory",
+        "project::make_shared"
+    ));
+}
+
+/// The issue's query over its reproducer: the factory lines gain a direct
+/// edge to `Foo::Foo` next to their external one, and without the `new`
+/// line the constructor still reaches `Handler`.
+#[test]
+fn factory_ctor_issue_query() {
+    const WITH_NEW: &str = "#include <memory>\n\
+        struct Foo { Foo(int a, void (*h)()); };\n\
+        void Handler();\n\
+        Foo::Foo(int a, void (*h)()) { h(); }\n\
+        void make() {\n\
+            auto a = std::make_shared<Foo>(1, Handler);\n\
+            auto b = std::make_unique<Foo>(2, Handler);\n\
+            auto c = new Foo(3, Handler);\n\
+        }\n";
+    let query = "SELECT s.line, s.callee_text, e.resolution, t.name FROM call_sites s \
+                 LEFT JOIN call_edges e ON e.call_site_id = s.id \
+                 LEFT JOIN functions t ON t.id = e.callee_fn_id ORDER BY 1, 2, 4";
+    let row = |line: i64, text: &str, resolution: &str, name: &str| {
+        vec![
+            format!("Integer({line})"),
+            format!("Text({text:?})"),
+            format!("Text({resolution:?})"),
+            format!("Text({name:?})"),
+        ]
+    };
+    let rows_of = |source: &str| {
+        let dir = common::scratch(&[("main.cpp", source)]);
+        let db = common::cli_analyze(dir.path(), &[]);
+        let conn = rusqlite::Connection::open(db.path()).unwrap();
+        common::text_rows(&conn, query)
+    };
+    let expected = [
+        row(4, "h", "indirect", "Handler"),
+        row(6, "Foo::Foo", "direct", "Foo::Foo"),
+        row(6, "std::make_shared", "external", "std::make_shared"),
+        row(7, "Foo::Foo", "direct", "Foo::Foo"),
+        row(7, "std::make_unique", "external", "std::make_unique"),
+        row(8, "Foo::Foo", "direct", "Foo::Foo"),
+    ];
+    assert_eq!(rows_of(WITH_NEW), expected);
+    // Every row but the `new` line's stays.
+    let without_new = WITH_NEW.replace("auto c = new Foo(3, Handler);\n", "");
+    assert_ne!(without_new, WITH_NEW);
+    assert_eq!(rows_of(&without_new), expected[..expected.len() - 1]);
+}
+
+#[test]
+fn factory_ctor_export_is_deterministic_across_jobs() {
+    let root = fixture("cpp_factory_ctor");
+    let reference = common::analysis_rows(&common::cli_analyze(&root, &["--jobs", "1"]));
+    for jobs in ["2", "4", "8"] {
+        assert_eq!(
+            common::analysis_rows(&common::cli_analyze(&root, &["--jobs", jobs])),
+            reference,
+            "--jobs {jobs}"
+        );
+    }
+}
+
+/// A member initializer of a non-class member stores its value as the body
+/// assignment `this->m = v` does: `cb(h)`, `cb{h}`, a parameter spelled as
+/// the member (`cb(cb)`), and a `std::function` member. What the
+/// constructor stores reads back through `new`'s object and a factory's.
+#[test]
+fn member_initializer_stores_its_value() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        "#include <functional>\n\
+         #include <memory>\n\
+         void Handler();\n\
+         struct Paren { Paren(void (*h)()) : cb(h) {} void (*cb)(); };\n\
+         struct ParenShared { ParenShared(void (*h)()) : cb(h) {} void (*cb)(); };\n\
+         struct Brace { Brace(void (*h)()); void (*cb)(); };\n\
+         Brace::Brace(void (*h)()) : cb{h} {}\n\
+         struct Shadow { Shadow(void (*cb)()) : cb(cb) {} void (*cb)(); };\n\
+         struct Wrapped { Wrapped(std::function<void()> f) : cb_(f) {} std::function<void()> cb_; };\n\
+         void paren_new() { auto p = new Paren(Handler); p->cb(); }\n\
+         void paren_shared() { auto p = std::make_shared<ParenShared>(Handler); p->cb(); }\n\
+         void brace_new() { auto p = new Brace(Handler); p->cb(); }\n\
+         void shadow_new() { auto p = new Shadow(Handler); p->cb(); }\n\
+         void wrapped_new() { auto p = new Wrapped(Handler); p->cb_(); }\n",
+    )]);
+    for caller in [
+        "paren_new",
+        "paren_shared",
+        "brace_new",
+        "shadow_new",
+        "wrapped_new",
+    ] {
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                caller,
+                "Handler",
+                ResolutionKind::Indirect
+            ),
+            "{caller}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+}
+
+/// A bare `function<Sig>` that `using namespace std;` or `using
+/// std::function;` names is the standard callable wrapper, as
+/// `std::function<Sig>` is: a function stored into it is what calling it
+/// reaches. A project's own `function` template stays a class.
+#[test]
+fn bare_std_function_is_a_callable_wrapper() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        "#include <functional>\n\
+         void Handler();\n\
+         namespace directive {\n\
+         using namespace std;\n\
+         struct W { function<void()> cb_; };\n\
+         void set(W *w) { w->cb_ = Handler; }\n\
+         void run(W *w) { w->cb_(); }\n\
+         }\n\
+         namespace declaration {\n\
+         using std::function;\n\
+         struct W { function<void()> cb_; };\n\
+         void set(W *w) { w->cb_ = Handler; }\n\
+         void run(W *w) { w->cb_(); }\n\
+         }\n",
+    )]);
+    for caller in ["directive::run", "declaration::run"] {
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                caller,
+                "Handler",
+                ResolutionKind::Indirect
+            ),
+            "{caller}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+}
+
+/// One argument no constructor takes is a copy or a move wherever the
+/// object is constructed: a local (`T x(other)`) and a class-typed member
+/// initializer (`m_(other)`) record no constructor site, as `new T(other)`
+/// and `std::make_shared<T>(other)` do not (#192 review).
+#[test]
+fn copy_construction_records_no_constructor_site() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        "void Handler();\n\
+         struct Foo { Foo(int a, void (*h)()); };\n\
+         Foo::Foo(int a, void (*h)()) { h(); }\n\
+         void copy_local(Foo *f) { Foo x(*f); }\n\
+         struct Holder { Holder(Foo *f); Foo m_; };\n\
+         Holder::Holder(Foo *f) : m_(*f) {}\n\
+         void two_args() { Foo x(1, Handler); }\n",
+    )]);
+    for caller in ["copy_local", "Holder::Holder"] {
+        assert!(
+            !has_any_edge(&program, &analysis, caller, "Foo::Foo"),
+            "{caller}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "two_args",
+        "Foo::Foo",
+        ResolutionKind::Direct
+    ));
+}
+
+/// An object of the class itself, passed alone, is copied, moved or bound by
+/// reference: no constructor the class declares runs unless one takes the
+/// class (#206 review). `Conv(int)` is no copy constructor, `Own(const Own &)`
+/// is one.
+#[test]
+fn own_class_argument_is_no_converting_construction() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        "struct Conv { Conv(int a); };\n\
+         Conv::Conv(int a) {}\n\
+         struct Own { Own(int a); Own(const Own &o); };\n\
+         Own::Own(int a) {}\n\
+         Own::Own(const Own &o) {}\n\
+         struct R { R(Conv &c, Own &o); Conv &ref_; Conv copy_; Own own_; };\n\
+         R::R(Conv &c, Own &o) : ref_(c), copy_(c), own_(o) {}\n\
+         void heap_copy(Conv &c) { auto p = new Conv(c); }\n",
+    )]);
+    for caller in ["R::R", "heap_copy"] {
+        assert!(
+            !has_any_edge(&program, &analysis, caller, "Conv::Conv"),
+            "{caller}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "R::R",
+            "Own::Own",
+            ResolutionKind::Direct
+        ),
+        "{:?}",
+        common::callees_of(&program, &analysis, "R::R")
+    );
+}
+
+/// Braces initialize an aggregate member by member: `new Agg{1, 2}` records
+/// no constructor site, as the braced local `Agg a{1, 2}` does not (#206
+/// review). Its heap object is still the expression's value.
+#[test]
+fn braced_new_of_an_aggregate_constructs_nothing() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        "struct Agg { int a; int b; };\n\
+         void heap() { Agg *p = new Agg{1, 2}; }\n\
+         void local() { Agg a{1, 2}; }\n",
+    )]);
+    for caller in ["heap", "local"] {
+        assert!(
+            common::callees_of(&program, &analysis, caller).is_empty(),
+            "{caller}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+    assert!(program
+        .symbols
+        .variables
+        .iter()
+        .any(|v| v.temp == Some(trace_ir::TempKind::New)));
+}
+
+analyzed_fixture!(cpp_factory_review);
+
+#[test]
+fn factory_review_pointer_arguments_keep_converting_constructors() {
+    let (p, a) = cpp_factory_review();
+    for (caller, ctor) in [
+        ("pointer_new", "Bar::Bar"),
+        ("pointer_shared", "Bar::Bar"),
+        ("pointer_unique", "Bar::Bar"),
+        ("pointer_allocate", "Bar::Bar"),
+        ("pointer_sptr", "Bar::Bar"),
+        ("reference_pointer", "Bar::Bar"),
+        ("alias_pointer", "Bar::Bar"),
+        ("cast_reference", "Bar::Bar"),
+        ("derived_new", "Derived::Derived"),
+        ("derived_shared", "Derived::Derived"),
+    ] {
+        assert!(
+            has_edge(p, a, caller, ctor, ResolutionKind::Direct),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+}
+
+#[test]
+fn factory_review_pointer_parameter_is_not_a_copy_constructor() {
+    let (p, a) = cpp_factory_review();
+    assert!(!has_any_edge(p, a, "implicit_copy", "Parent::Parent"));
+}
+
+#[test]
+fn factory_review_reference_aliases_preserve_copy_identity() {
+    let (p, a) = cpp_factory_review();
+    for caller in ["alias_copy", "alias_shared", "alias_allocate"] {
+        assert!(
+            has_edge(p, a, caller, "Aliased::Aliased", ResolutionKind::Direct),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    assert!(!has_any_edge(p, a, "alias_implicit_copy", "Parent::Parent"));
+    for caller in [
+        "alias_local_copy",
+        "alias_block_copy",
+        "alias_collapsed_param",
+        "alias_collapsed_local",
+    ] {
+        assert!(!has_any_edge(p, a, caller, "Parent::Parent"));
+    }
+}
+
+#[test]
+fn factory_review_header_aliases_preserve_copy_identity() {
+    let (p, a) = cpp_factory_review();
+    assert!(has_edge(
+        p,
+        a,
+        "header_alias_copy",
+        "HeaderCopy::HeaderCopy",
+        ResolutionKind::Direct
+    ));
+    assert!(!has_any_edge(
+        p,
+        a,
+        "header_alias_implicit",
+        "HeaderImplicit::HeaderImplicit"
+    ));
+    assert!(has_edge(
+        p,
+        a,
+        "HeaderHolder::HeaderHolder",
+        "HeaderValue::HeaderValue",
+        ResolutionKind::Direct
+    ));
+}
+
+#[test]
+fn factory_review_copy_and_move_constructors_keep_default_parameters() {
+    let (p, a) = cpp_factory_review();
+    for (caller, ctor) in [
+        ("default_copy_new", "Own::Own"),
+        ("default_copy_shared", "Own::Own"),
+        ("default_copy_local", "Own::Own"),
+        ("Holder::Holder", "Own::Own"),
+        ("default_move", "Move::Move"),
+    ] {
+        assert!(
+            has_edge(p, a, caller, ctor, ResolutionKind::Direct),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    assert!(has_any_edge(p, a, "declared_copy", "Declared::Declared"));
+}
+
+#[test]
+fn factory_review_aggregate_copy_has_no_unresolved_constructor() {
+    let (p, a) = cpp_factory_review();
+    assert!(
+        common::callees_of(p, a, "aggregate_copy").is_empty(),
+        "{:?}",
+        common::callees_of(p, a, "aggregate_copy")
+    );
+}
+
+#[test]
+fn factory_review_uncertain_constructor_signatures_keep_their_edges() {
+    let (p, a) = cpp_factory_review();
+    assert!(has_any_edge(p, a, "external_copy", "External::External"));
+    assert!(has_edge(
+        p,
+        a,
+        "template_copy",
+        "CopyTemplate::CopyTemplate",
+        ResolutionKind::Direct
+    ));
+}
+
+/// A constructor lookup that proves nothing keeps a site for a factory as
+/// it does for `new`: in a cached header, which imports included headers
+/// as types only, the TU merge resolves it; for a class defined outside
+/// the tree it stays unresolved.
+#[test]
+fn factory_review_inconclusive_constructor_lookup_keeps_a_site() {
+    let (p, a) = cpp_factory_review();
+    for caller in [
+        "header_new",
+        "header_shared",
+        "header_unique",
+        "header_sptr",
+    ] {
+        assert!(
+            has_edge(p, a, caller, "Widget::Widget", ResolutionKind::Direct),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    for caller in ["external_shared", "external_new_fn", "external_shared_fn"] {
+        assert!(
+            has_any_edge(p, a, caller, "External::External"),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+}
+
+#[test]
+fn factory_review_bare_names_follow_using_scope_precedence() {
+    let (p, a) = cpp_factory_review();
+    for caller in ["project::shadowed", "mixed::body_shadow"] {
+        assert!(
+            !has_any_edge(p, a, caller, "Foo::Foo"),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        let f = p
+            .symbols
+            .functions
+            .iter()
+            .find(|f| f.name == caller)
+            .unwrap();
+        assert!(!p
+            .symbols
+            .variables
+            .iter()
+            .any(|v| v.fn_id == Some(f.id) && v.temp == Some(trace_ir::TempKind::Make)));
+    }
+    // A body import hides the project's namespace function; a file import
+    // and an unshadowed namespace import also work without <memory>.
+    for caller in [
+        "project::body_import",
+        "file_import",
+        "imported::namespace_import",
+    ] {
+        assert!(
+            has_edge(p, a, caller, "Foo::Foo", ResolutionKind::Direct),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        assert!(has_edge(p, a, caller, "Foo::run", ResolutionKind::Direct));
+    }
+    let f = p
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "project::shadowed")
+        .unwrap();
+    let x = p
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.fn_id == Some(f.id) && v.name == "x")
+        .unwrap();
+    assert!(
+        !format!("{:?}", p.types.get(x.type_id).desc).contains("shared_ptr"),
+        "a project factory must use its own return type"
+    );
 }

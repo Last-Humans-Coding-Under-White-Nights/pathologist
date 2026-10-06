@@ -425,6 +425,9 @@ pub struct TypeTable {
     /// because lowering sees bare identifiers (`fn_t`, `SHandle`) whose
     /// pointer-ness is otherwise lost (they degrade to `Int`).
     aliases: IndexMap<String, Arc<TypeDesc>, FxBuildHasher>,
+    /// Aliases whose outer pointer layer represents a C++ reference.
+    /// Kept with alias descriptors through header caching and merging.
+    reference_aliases: FxHashSet<String>,
     /// Named `struct` tag → richest interned [`TypeId`] (most fields).
     struct_tags: FxHashMap<String, TypeId>,
     /// Named `union` tag → richest interned [`TypeId`] (most fields).
@@ -452,6 +455,7 @@ impl TypeTable {
             canonical: CanonicalCache::default(),
             union_epoch: 0,
             aliases: IndexMap::default(),
+            reference_aliases: FxHashSet::default(),
             struct_tags: FxHashMap::default(),
             union_tags: FxHashMap::default(),
             needs_tag_completion: false,
@@ -737,10 +741,36 @@ impl TypeTable {
     }
 
     pub fn register_alias_ref(&mut self, alias: &str, desc: &TypeDesc) {
+        self.register_alias_ref_with_reference(alias, desc, false);
+    }
+
+    pub fn register_alias_with_reference(&mut self, alias: &str, desc: TypeDesc, reference: bool) {
+        self.register_alias_ref_with_reference(alias, &desc, reference);
+    }
+
+    pub fn register_alias_ref_with_reference(
+        &mut self,
+        alias: &str,
+        desc: &TypeDesc,
+        reference: bool,
+    ) {
         if !alias.is_empty() {
             let shared = self.descriptors.share(desc);
             self.aliases.insert(alias.to_string(), shared);
+            if reference {
+                self.reference_aliases.insert(alias.to_owned());
+            } else {
+                self.reference_aliases.remove(alias);
+            }
         }
+    }
+
+    pub fn alias_is_reference(&self, alias: &str) -> bool {
+        self.reference_aliases.contains(alias)
+    }
+
+    pub fn has_reference_aliases(&self) -> bool {
+        !self.reference_aliases.is_empty()
     }
 
     pub fn resolve_alias(&self, alias: &str) -> Option<&TypeDesc> {
@@ -771,6 +801,7 @@ impl TypeTable {
         }
         self.types.shrink_to_fit();
         self.aliases.shrink_to_fit();
+        self.reference_aliases.shrink_to_fit();
     }
 
     pub fn compute_struct_layout(

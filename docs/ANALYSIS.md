@@ -930,7 +930,7 @@ Nested call arguments (`consume(make())`, `Register(obj->GetHandler())`, `consum
 
 **`CallReturnIndirect`** is the indirect-call analogue of `CallReturn`. The callee is resolved by the solver when indirect call targets are known (via function-pointer analysis). The `callee_var` is a synthetic load variable that holds the resolved function pointer; the solver wires return flows from each resolved target into `dst`.
 
-**`NewHeap`** represents C++ `new T(...)` allocations. The PAG allocates a heap location typed to the allocated struct and adds an `AddrOf` edge from `dst` to the heap location. The solver then propagates into the struct's fields, enabling resolution of function pointers stored by constructors (e.g., `MParcelImplInterfaceAssign` writing into `HdfSBufImpl.readBuffer`).
+**`NewHeap`** represents C++ `new T(...)` allocations, and the object a recognised smart-pointer factory builds ([Factory construction](#factory-construction)). The PAG allocates a heap location typed to the allocated struct and adds an `AddrOf` edge from `dst` to the heap location. The solver then propagates into the struct's fields, enabling resolution of function pointers stored by constructors (e.g., `MParcelImplInterfaceAssign` writing into `HdfSBufImpl.readBuffer`). Lowering (`lower_new_object`, `construct_on_heap` in `lower.rs`) gives every `new T(args)` its heap object, a `$new<id>` temporary typed `T`, in value and statement position alike, and at file scope too; the constructor sites (in a body) take it as `this` and the constructor's own argument list as their arguments, never a placement list (`new (std::nothrow) T(a, b)` passes `a, b`); a braced list (`new T{a, b}`) is that list when `T` has a user-provided constructor, as for a braced local, and otherwise initializes an aggregate member by member, with no constructor site; and the expression's value is that object. A construction from one argument records no constructor site (`copies_implicitly`, checked in `emit_member_targets`) wherever the object is built (`new T(other)`, a factory, a local `T x(other)`, a class-typed member initializer `m_(other)`) when either no constructor of the class takes one argument, or the argument is an object of the class itself (directly or by reference) and no constructor takes the class: that is a copy or a move, which runs the implicit constructor, where arity filtering would otherwise fall back to every constructor, or rank `T(int)`, and bind the copied object to an unrelated parameter. A pointer argument (`T *`) is not an object copy; a reference to a pointer keeps that pointer type too. A user-declared copy or move constructor (`T(const T &)`) keeps its site, including constructors whose later parameters have defaults (`T(const T &, int = 0)`). An aggregate whose definition and constructor set are indexed, copied from its own type, records no unresolved constructor site. Cached headers import included headers as types only, so an empty constructor lookup there retains a site for the later TU symbol merge to resolve. A missing class definition or an unknown constructor parameter type retains the possible constructor edge. A reference member's initializer (`ref_(other)`) is typed as its class and takes the same path: binding a reference constructs nothing, and an argument of the class records no site.
 
 **`StringConst`** intern a C string literal as an abstract location (`LocKind::StringLit`). Assignments (`const char *n = "foo"`), copies, and call arguments intern the same way, so a later `dlsym(h, n)` still sees `"foo"`. Concatenated literals (`"ta" "rget"`) are folded. String literals represent immutable constants and are excluded from being writable memory cells: stores through untyped or cast pointers do not write into string literal locations, and dereferences of pointers holding string literals do not merge cell memory (see [Propagation highlights](#propagation-highlights)). No `sprintf` / buffer writes.
 
@@ -945,6 +945,11 @@ through and passes. `*x` goes through the value `x` holds, computed as a value
   declaration whose outermost declarator is `&` or `&&` (`declares_reference`),
   so `T *&r` and `T *const &r` are bound to the pointer's value, as
   initialization and argument passing bind them.
+- Reference typedefs and `using` aliases retain their reference identity
+  alongside the pointer-shaped alias descriptor, including through cached
+  header merging. Parameter signatures and local bindings use this metadata;
+  constructor copy detection unwraps only a referent's address, keeping raw
+  pointer arguments and references to pointers distinct from class objects.
 - A member path (`h->pp`, `this->a->pp`, `(*this).m`) is projected and its cell
   loaded: `y = *h->f` is `Load(y, Load(GEP(h, f)))`, and `*h->f = v` stores
   through the loaded value the same way. An array member is its own cell
@@ -1902,7 +1907,15 @@ C++-aware only where it must be — everything else reuses the C machinery.
   the same or a nearer scope hides the class, as in C++, and the call stays
   a function call. Every constructor path binds all its arguments past
   `this`, functions passed by name included — member initializer lists
-  too (see **Methods** below).
+  too (see **Methods** below). A member initializer of a member the index
+  holds no class type for, with one expression (a pointer, a scalar, a
+  `std::function`, which is interned as a function value; `cb_(cb)`,
+  `cb_{cb}`), is instead the store `this->cb_ = cb`, as that body assignment
+  is (`store_member_initializer`): the initializer names the member even
+  where a parameter spells it too (`cb_(cb_)`), and a callback a constructor
+  keeps this way reads back through the object. A literal (`count_(0)`,
+  `ok_(false)`, `p_(nullptr)`) and a `bool` or floating member hold no
+  address and store nothing.
 - **Overloads**: same-name entries are kept apart when **both** sides are C++
   and arity (or same-arity param types) differ (`add_function`;
   `externals_by_name` bucket). Signature comparison uses real types: at TU
@@ -2421,13 +2434,20 @@ C++-aware only where it must be — everything else reuses the C machinery.
   not in the tree produce `shared_ptr<T>` / `sptr<T>` in the weak pointer's
   own scope (`OHOS::CameraStandard::wptr` promotes to
   `OHOS::CameraStandard::sptr`); a declared wrapper's own members are looked
-  up instead. `std::make_shared<T>` / `std::make_unique<T>` produce the
-  corresponding wrapper type, spelled bare too where `using namespace std;`
-  or `using std::make_shared;` is in scope, with cv-qualifiers dropped and
+  up instead. `std::make_shared<T>` / `std::make_unique<T>` /
+  `std::allocate_shared<T>` produce the corresponding wrapper type, spelled bare too where `using namespace std;`
+  or `using std::make_shared;` is in scope: recognition follows ordinary
+  function lookup precedence (body imports, enclosing declarations,
+  namespace imports, global declarations, file imports, then directives),
+  including imports of standard factories whose declarations are outside
+  the indexed tree. A nearer project declaration hides an outer import; under a
+  directive alone the bare name must not resolve to a function of another
+  scope (a project's own `make_shared` under `using namespace project;` is
+  that function, not the standard factory), with cv-qualifiers dropped and
   template arguments kept (`make_shared<const Box<int>>`). These models
   require a class the call site can name, through its scopes or a `using`
-  directive. Factories infer types only: they do not synthesize allocation
-  or additional value flows. A promotion also carries its receiver's value
+  directive. What else a factory call records is in
+  [Factory construction](#factory-construction). A promotion also carries its receiver's value
   into the result (see [Weak-pointer promotion](#weak-pointer-promotion)).
   A standard smart pointer copied from a declared return type whose
   argument names no class as written, while the scopes name one by it
@@ -2792,6 +2812,74 @@ section is the authoritative statement of the rules; lowering
   D() = default; int n; }; D d{{}, 1};` records no `B::B`); the elements a
   partly listed array value-initializes; and copy or move constructors for
   copy-initialized locals.
+
+### Factory construction
+
+Objects built by a smart-pointer factory (#192). This section is the
+authoritative statement of the rule; lowering (`factory_constructed_class`,
+`emit_factory_construction` and the `construct_on_heap` it shares with
+`new T(args)`, `trace-parse/src/lower.rs`), tests
+(`tests/fixtures/cpp_factory_ctor`) and reports link here.
+
+- **Recognised factories.** `std::make_shared<T>(args)`,
+  `std::make_unique<T>(args)` and `std::allocate_shared<T>(alloc, args)`
+  (whose allocator is no constructor argument) in every spelling the `auto`
+  rules under [C++ support](#c-support-first-step) type the result of (one
+  recogniser, `SMART_PTR_FACTORIES`, serves both); and
+  `sptr<T>::MakeSptr(args)` (`STATIC_FACTORIES`), any scope
+  whose last segment is `sptr` (`OHOS::sptr<T>`, or `sptr<T>` under
+  `using namespace OHOS;`), whether or not `refbase.h` is in the tree.
+- **Construction.** Such a call is also a constructor call of `T`, lowered
+  through the same code as `new T(args)` ([`NewHeap`](#ir-flow-constraints-trace-ir)
+  states that rule, the copy-or-move case included): a heap object, a
+  `$make<id>` temporary typed `T` that every factory call in one function
+  building `T` shares (`factory_object`; nothing tells two such objects
+  apart while fields are instance-insensitive `FieldSummary` cells, so one
+  object per call site is what to restore if they become
+  instance-sensitive), is the constructor's `this`, the
+  factory's arguments bind to the constructor's parameters in order, and
+  the constructor set `new T` looks up is filtered by arity and ranked by
+  argument type, so both pick the same overload. The factory's own call
+  site is kept unchanged (an external edge to `std::make_shared` when its
+  body is not in the tree, a direct one to a declared `sptr::MakeSptr`),
+  and both sites share the call's position.
+- **No invented constructor.** A site is recorded only when the
+  constructor set above has at least one user-provided constructor (one
+  not defaulted in its class). Unlike `new T(args)`, a class without one gets no
+  unresolved `T::T` site either. This check is class-level: once it
+  passes, the class's in-class defaulted overloads still take part in
+  ranking and can be chosen, exactly as for `new T(args)`
+  (`struct S { S() = default; S(int); };` resolves
+  `std::make_shared<S>()` to `S::S()`). That differs from
+  [Automatic objects](#automatic-objects), which drop defaulted members
+  one by one. The check waits for a conclusive set (`ctor_set_known`):
+  an empty lookup in a cached header, which imports included headers as
+  types only, or of a class whose definition is not indexed, proves
+  nothing, so the factory keeps an unresolved `T::T` site exactly as
+  `new` does ([`NewHeap`](#ir-flow-constraints-trace-ir)), for the TU
+  symbol merge to resolve (`inline` header functions) or to stay
+  unresolved (a class defined outside the tree). The copy-or-move test
+  waits for the same set.
+- **Nameable, non-dependent class.** `T` must be the one template argument,
+  name a class the call site can name through its scopes or a `using`
+  directive (`const` and `volatile` dropped, `strip_cv`), and not mention a parameter of an
+  enclosing template. Anything else records nothing beyond the factory's
+  own site.
+- **The object is not the call's value.** Unlike `new`'s, a factory's heap
+  object is only the constructor's `this`: it is not copied into the smart
+  pointer the call yields, and a file-scope factory, which has no
+  constructor site, makes none. Copying it changed no call edge on the
+  pinned corpora or, with an unlimited solver budget,
+  `ability_ability_runtime` (virtual calls dispatch by
+  class hierarchy; a field the constructor stores reads back through any
+  result, `s->cb()` reaching what `T::T` stored into `cb`, because fields
+  are instance-insensitive `FieldSummary` cells), yet it put a heap
+  location into every smart-pointer value and cost 43% more solver pops
+  there; under the eval budget the solver stopped short and lost indirect
+  edges ([measurements](EVAL_REPORT.md#factory-construction-192--2026-10-06)).
+- **Not modeled.** Factories of other names (project wrappers,
+  `std::make_shared_for_overwrite`) are not recognised; each is a table
+  row.
 
 ### Template-parameter bases
 
@@ -3601,7 +3689,21 @@ and feature implementations by exploring feasible configuration variants indepen
      before this fallback is reached.
    - Locals are recorded on their function by the merge, since lowering tracks scope in
      its own map and leaves the field empty. Synthesized temporaries are paired by
-     position — the k-th temporary of a kind at a source position — because lowering
+     position — the k-th temporary of a kind at a source position, the kind being the
+     variable's `Variable::temp` (`TempKind`), never read off its name, so a declared
+     local spelled like one (`_ret1`) is never taken for one; a temporary that exists only when
+     something resolves (a `_recv` receiver, a `$new` or `$make` heap object) is a kind of
+     its own, so a configuration lacking it shifts no other kind's pairing. A factory's
+     object (`$make`) is shared per function and class, so it pairs by that
+     identity without the first call's file/line/column. A configuration that
+     omits an earlier same-class factory changes the object's recorded position
+     but must not allocate a second object or duplicate a later constructor
+     edge. It exists only where its class has a user-provided constructor:
+     where one configuration gives `A` a
+     constructor and another does not, `make_shared<A>()`'s object never pairs with the
+     `make_shared<B>()` object beside it in one macro expansion. `new`'s (`$new`) exists
+     whenever the expression does and pairs by position alone, whether or not the
+     configuration indexes its class — because lowering
      names them after the unit-local id it just allocated, so two configurations of the
      same expression never agree on the name. The count is kept per incoming body: one
      unit can carry the same shared header body twice (a cached header expansion and its
