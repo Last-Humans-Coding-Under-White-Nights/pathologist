@@ -5,6 +5,7 @@ use super::Direction;
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use std::path::Path;
+use std::time::Duration;
 use trace_ir::{FnId, TargetId};
 
 /// Metadata available even in a minimal export. IDs are database identities,
@@ -53,6 +54,8 @@ fn function_row(row: &Row<'_>) -> rusqlite::Result<EditorFunction> {
 pub fn open_editor_snapshot(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("cannot open analysis database {} read-only", path.display()))?;
+    // Keep startup lock handling explicit rather than relying on rusqlite's default.
+    conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch("PRAGMA query_only=ON; BEGIN DEFERRED;")?;
     let versions: Vec<i64> = conn
         .prepare("SELECT schema_version FROM analysis_run")
@@ -127,7 +130,9 @@ pub struct EditorCall {
 
 /// Expand exactly one level using the existing caller/callee indexes. Preserve
 /// every recorded target and prefer the outermost macro invocation in the
-/// caller's file over a replacement-list spelling (see Call source locations).
+/// caller's file over a replacement-list spelling. This consumer-specific
+/// presentation rule is defined in docs/ANALYSIS.md, "Call source locations";
+/// CLI inspect retains the spelling position. Neither changes stored identity.
 pub fn editor_calls(conn: &Connection, id: FnId, direction: Direction) -> Result<Vec<EditorCall>> {
     let (peer, root) = match direction {
         Direction::Down => ("callee_fn_id", "caller_fn_id"),

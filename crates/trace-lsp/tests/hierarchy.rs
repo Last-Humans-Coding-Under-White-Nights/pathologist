@@ -538,6 +538,145 @@ fn startup_rejects_missing_invalid_and_incompatible_databases() {
     assert!(Server::open(&fixture.db, &[]).is_err());
 }
 
+fn store_relative_paths(fixture: &Fixture) {
+    let conn = Connection::open(&fixture.db).unwrap();
+    let root = fixture.root.canonicalize().unwrap();
+    for path in trace_db::editor_file_paths(&conn).unwrap() {
+        let relative = Path::new(&path).strip_prefix(&root).unwrap();
+        conn.execute(
+            "UPDATE files SET path=?1 WHERE path=?2",
+            rusqlite::params![relative.to_str().unwrap(), path],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn relative_paths_use_the_unique_root_across_all_runs() {
+    let fixture = Fixture::new("lsp_calls");
+    fixture.export(&fixture.program(), false);
+    let function = fixture.functions("caller").remove(0);
+    store_relative_paths(&fixture);
+    let conn = Connection::open(&fixture.db).unwrap();
+    let canonical_root = fixture.root.canonicalize().unwrap();
+    // A relative root and an equivalent absolute root are unambiguous.
+    conn.execute(
+        "UPDATE analysis_run SET target_root=?1",
+        [fixture.root.file_name().unwrap().to_str().unwrap()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO analysis_run(trace_version,schema_version,target_root,created_at,options_json)
+         SELECT trace_version,schema_version,?1,created_at,options_json FROM analysis_run",
+        [canonical_root.to_str().unwrap()],
+    )
+    .unwrap();
+    let mut server = fixture.server();
+    let caller = item(&mut server, &function);
+    assert_eq!(caller["uri"], path_uri(Path::new(&function.path)).unwrap());
+    assert!(!calls(&mut server, &caller, false)
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn relative_paths_reject_multiple_roots_and_merged_metadata() {
+    let fixture = Fixture::new("lsp_calls");
+    fixture.export(&fixture.program(), false);
+    store_relative_paths(&fixture);
+    let conn = Connection::open(&fixture.db).unwrap();
+    conn.execute(
+        "INSERT INTO analysis_run(trace_version,schema_version,target_root,created_at,options_json)
+         SELECT trace_version,schema_version,'other checkout',created_at,options_json FROM analysis_run",
+        [],
+    )
+    .unwrap();
+    assert!(Server::open(&fixture.db, &[])
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("multiple source roots"));
+    conn.execute(
+        "DELETE FROM analysis_run WHERE id=(SELECT MAX(id) FROM analysis_run)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE analysis_run SET target_root='one.db;two.db', options_json=?1",
+        [json!({"stage":"merge"}).to_string()],
+    )
+    .unwrap();
+    assert!(Server::open(&fixture.db, &[])
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("merged database"));
+}
+
+#[test]
+fn absolute_paths_ignore_multi_run_and_merged_roots() {
+    let fixture = Fixture::new("lsp_calls");
+    fixture.export(&fixture.program(), false);
+    let function = fixture.functions("caller").remove(0);
+    let conn = Connection::open(&fixture.db).unwrap();
+    conn.execute(
+        "UPDATE analysis_run SET target_root='one.db;two.db', options_json=?1",
+        [json!({"stage":"merge"}).to_string()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO analysis_run(trace_version,schema_version,target_root,created_at,options_json)
+         SELECT trace_version,schema_version,'other checkout',created_at,options_json FROM analysis_run",
+        [],
+    )
+    .unwrap();
+    let mut server = fixture.server();
+    let caller = item(&mut server, &function);
+    assert_eq!(caller["uri"], path_uri(Path::new(&function.path)).unwrap());
+    assert!(!calls(&mut server, &caller, false)
+        .as_array()
+        .unwrap()
+        .is_empty());
+    drop(server);
+    conn.execute(
+        "UPDATE analysis_run SET schema_version=999 WHERE id=(SELECT MAX(id) FROM analysis_run)",
+        [],
+    )
+    .unwrap();
+    assert!(
+        Server::open(&fixture.db, &[]).is_err(),
+        "all run versions remain validated"
+    );
+}
+
+#[test]
+fn startup_waits_for_a_transient_writer_lock() {
+    let fixture = Fixture::new("lsp_calls");
+    fixture.export(&fixture.program(), false);
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let database = &fixture.db;
+        scope.spawn(move || {
+            let writer = Connection::open(database).unwrap();
+            writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            writer.execute_batch("COMMIT").unwrap();
+        });
+        locked_rx.recv().unwrap();
+        release_tx.send(()).unwrap();
+        let conn = trace_db::open_editor_snapshot(&fixture.db).unwrap();
+        let timeout: u32 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
+        assert!(conn.execute("DELETE FROM functions", []).is_err());
+    });
+}
+
 #[test]
 fn snapshot_stays_pinned_when_database_is_replaced() {
     let fixture = Fixture::new("lsp_calls");

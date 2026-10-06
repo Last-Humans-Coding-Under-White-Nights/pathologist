@@ -80,6 +80,13 @@ header expansions. Macro definitions remain preprocessing metadata and never
 become IR functions or methods. `trace inspect calls --file` matches either the
 spelling file or expansion file and orders macro calls by their invocation.
 
+Consumers choose displayed positions from these same stored facts. CLI inspect
+shows the spelling position, including macro-body tokens. LSP call hierarchy
+`fromRanges` must belong to the caller's document: `editor_calls` prefers the
+outermost expansion position when it belongs to that file, then the spelling
+position if it belongs to that file, and otherwise supplies no range. This
+presentation choice never changes call identity or semantic ownership.
+
 ## Shared header functions
 
 This section defines header-function sharing. `SymbolTable` owns visibility

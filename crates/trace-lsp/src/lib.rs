@@ -3,7 +3,7 @@
 pub mod locations;
 pub mod transport;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use locations::{
     function_range, mapped_path, normalize, path_uri, uri_path, PathMapping, Position, Range,
     Source,
@@ -85,23 +85,18 @@ pub struct Server {
 impl Server {
     pub fn open(database: &Path, mappings: &[PathMapping]) -> Result<Self> {
         let conn = open_editor_snapshot(database)?;
-        let root: String = conn.query_row(
-            "SELECT target_root FROM analysis_run ORDER BY id LIMIT 1",
-            [],
-            |row| row.get(0),
-        )?;
-        let base = if Path::new(&root).is_absolute() {
-            PathBuf::from(root)
+        let stored_paths = editor_file_paths(&conn)?;
+        let base = if stored_paths
+            .iter()
+            .any(|path| Path::new(path).is_relative())
+        {
+            relative_path_base(&conn, database)?
         } else {
-            database
-                .canonicalize()?
-                .parent()
-                .context("database has no parent")?
-                .join(root)
+            PathBuf::new()
         };
         let mut paths: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
         let mut local_paths = BTreeMap::new();
-        for stored in editor_file_paths(&conn)? {
+        for stored in stored_paths {
             let path = mapped_path(&normalize(&base.join(&stored)), mappings);
             paths.entry(path.clone()).or_default().push(stored.clone());
             local_paths.insert(stored, path);
@@ -331,4 +326,32 @@ impl Server {
     pub fn shutdown_requested(&self) -> bool {
         self.state == State::Shutdown
     }
+}
+
+/// Relative file paths have no per-run ownership in the existing schema.
+/// Accept only one unambiguous source root; merged metadata lists input DBs.
+fn relative_path_base(conn: &Connection, database: &Path) -> Result<PathBuf> {
+    let database_path = database.canonicalize()?;
+    let directory = database_path.parent().context("database has no parent")?;
+    let mut roots = BTreeSet::new();
+    let mut stmt =
+        conn.prepare("SELECT target_root, options_json FROM analysis_run ORDER BY id")?;
+    for row in stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (root, options) = row?;
+        let options: Value = serde_json::from_str(&options)
+            .context("invalid analysis metadata for relative source paths")?;
+        if options.get("stage").and_then(Value::as_str) == Some("merge") {
+            bail!("cannot locate relative source paths in a merged database: target_root lists input databases, not a source root; regenerate with absolute source paths");
+        }
+        if root.is_empty() {
+            bail!("cannot locate relative source paths: analysis_run has an empty target_root");
+        }
+        roots.insert(normalize(&directory.join(root)));
+    }
+    if roots.len() != 1 {
+        bail!("cannot locate relative source paths: analysis_run has multiple source roots and files have no per-run ownership; regenerate with absolute source paths");
+    }
+    Ok(roots.into_iter().next().unwrap())
 }

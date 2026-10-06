@@ -74,8 +74,13 @@ File URIs are decoded and matched to exact normalized database paths, never
 by basename or substring. Spaces, Unicode, and URI escaping are supported.
 Existing local symlinks are resolved, including existing parents of missing
 files. Only local `file` URIs without queries or fragments are accepted.
-Relative stored paths are interpreted under the recorded `target_root`;
-a relative target root is interpreted relative to the database directory.
+Relative stored paths require one unambiguous recorded `target_root` across
+all analysis runs; a relative target root is interpreted relative to the
+database directory. Relative paths in a merged database or a database with
+different source roots are rejected with a startup error, because the schema
+does not associate files with individual runs. `trace-merge` records its input
+database paths in `target_root`, not a source root. Absolute stored paths work
+with either kind of metadata and do not depend on `target_root`.
 
 For databases generated in another checkout on the same operating system,
 pass repeatable `--path-map DB_PREFIX=LOCAL_PREFIX` arguments. Both prefixes
@@ -99,10 +104,8 @@ consistent policy without adding persisted columns:
 - Call `fromRanges` are point ranges at the stored call positions. One-based
   Unicode scalar columns from the preprocessor are converted to zero-based
   UTF-16 positions using source text, with columns clamped to the line length.
-- Macro calls prefer the outermost expansion position in the caller's file,
-  preserving the [call source location rules](ANALYSIS.md#call-source-locations).
-  If neither expansion nor spelling belongs to that file, the edge has no
-  `fromRanges`; it never links to a point in a different caller document.
+- Macro call ranges follow the consumer presentation policy defined in
+  [Call source locations](ANALYSIS.md#call-source-locations).
 - If source text is missing or cannot be decoded as UTF-8, a function range
   ends at character zero of the line following its last exported line. Call
   positions retain their recorded line and fall back to character zero.
@@ -113,8 +116,10 @@ consistent policy without adding persisted columns:
 
 The database is opened read-only and pinned with one read transaction for
 the server lifetime. Replacing or rebuilding it requires restarting the
-server. An in-place writer may be blocked by this read transaction. Source
-files are read lazily and cached on first access, including missing files.
+server. An in-place writer may be blocked by this read transaction. Startup
+reads wait up to five seconds for a conflicting database lock before reporting
+an error. Source files are read lazily and cached on first access, including
+missing files.
 Source edits never update analysis; changed source text may make snapshot
 locations stale. Restart after regenerating the database and keep source
 files at the analyzed revision for accurate positions.
