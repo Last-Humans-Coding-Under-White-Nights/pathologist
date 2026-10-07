@@ -403,7 +403,21 @@ long-lived host sees the tree as it is when the run begins), a first probe is an
 parent directory's listing when that settles it (a name the directory does not hold is a miss
 without a `stat`; a listed, case-folded or non-ASCII name still asks the filesystem, as does one
 under a directory that could not be listed), and step 2's directory walk is memoized per
-(spelling, quoted). When a `SourceCache` is supplied, explicit directory-search
+(spelling, quoted). Only answers the filesystem gave are memoized per path: a miss the listing
+settled is not (the listing answers a repeat as cheaply), and a candidate under a directory that
+is not there is settled from the nearest listing already in hand — the listed ancestor that does
+not hold the child on the way down — with the absent directories neither read nor recorded. Reading
+starts only below a directory a probe asked for directly: the existing levels between it and the
+candidate are read and recorded on the way down, and no ancestor is ever read on demand (that
+would snapshot directories above the analyzed tree). The
+per-thread memo and the shared listings therefore grow with the files and directories probed
+that exist, not with (search directories × spellings): a spelling such as
+`llvm/ADT/StringRef.h` names an absent `llvm/ADT` under every search directory it is tried in,
+and on the LLVM monorepo, whose inferred search list has 2,823 directories, an entry per
+candidate took more than 5 GiB before the include graph was built (#209; measurements in
+[MEMORY_PROFILE.md](MEMORY_PROFILE.md#llvm-monorepo-startup-peak-209)). The static include
+graph's scan shares the same walk per (spelling, includer partition) across every file that
+spells it, as the preprocessor does. When a `SourceCache` is supplied, explicit directory-search
 results (including misses) are shared across preprocessing runs with the same ordered quote,
 include, and system paths. These results expire at the next file-probe epoch. The
 includer-relative candidate is still probed before this cache under the rules of step 1 (quoted

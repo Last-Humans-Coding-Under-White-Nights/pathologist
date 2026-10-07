@@ -3,9 +3,9 @@
 //! include search configuration for the entire tree.
 
 use super::{
-    add_warnings, finalize_program, index_in_window, index_language, index_pool, index_progress,
-    index_source_file, index_source_file_with_variants, project_preprocess_opts,
-    with_project_system_paths, HeaderOrder,
+    add_warnings, finalize_program, index_in_window, index_item_progress, index_language,
+    index_pool, index_progress, index_source_file, index_source_file_with_variants,
+    project_preprocess_opts, with_project_system_paths, HeaderOrder,
 };
 use crate::compile_commands::CompilationDatabase;
 use crate::merge::{merge_unit_index, UnitIndex, VariantMerge};
@@ -164,6 +164,18 @@ pub(super) fn build(
     let mut first = None;
     let mut family: Option<VariantMerge> = None;
     index_in_window(&pool, files, jobs, index, |result| {
+        // Every unit here lowers its whole include closure, so a tree of
+        // this size can take hours: say where the run is (#209).
+        index_item_progress(
+            file_index,
+            files.len(),
+            format!(
+                "parse: {}/{} {}",
+                file_index + 1,
+                files.len(),
+                files[file_index].display()
+            ),
+        );
         variants_merged += result.units.len().saturating_sub(1);
         includes_by_file.push((files[file_index].clone(), result.includes.clone()));
         file_index += 1;
@@ -256,6 +268,11 @@ pub(super) fn build(
         "compile_commands",
         &database.warnings[warnings_before..],
     );
+    index_progress(format!(
+        "parse: {} headers no configuration consumed (jobs={jobs})",
+        header_configs.len()
+    ));
+    let mut header_index = 0;
     index_in_window(
         &pool,
         &header_configs,
@@ -272,7 +289,20 @@ pub(super) fn build(
                 &HeaderOrder::default(),
             )
         },
-        |unit| merge_unit_index(&mut program, &unit),
+        |unit| {
+            index_item_progress(
+                header_index,
+                header_configs.len(),
+                format!(
+                    "parse: {}/{} {}",
+                    header_index + 1,
+                    header_configs.len(),
+                    unit.path.display()
+                ),
+            );
+            header_index += 1;
+            merge_unit_index(&mut program, &unit);
+        },
     );
     program.types.complete_nested_tags();
     // Every search directory any configuration actually used, in first-seen

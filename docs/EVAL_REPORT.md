@@ -8866,3 +8866,26 @@ nodes, and 131,072 flow edges. `analysis_run` was excluded because it records
 run metadata. LSP fixture tests additionally compare behavior between minimal
 and full exports and verify that serving requests leaves database bytes
 unchanged. See [LSP behavior and configuration](LSP.md) for the server contract.
+
+## LLVM monorepo startup peak: #209
+
+`llvm/llvm-project` at `cc67eac964112fe043aa3527c2d63d2dd55f56ee` (53,990 TUs, 18,212 headers,
+2,823 inferred search directories), macOS, 8 GB, `--jobs 8`, no compilation database;
+`phys_footprint` sampled at 100 ms with a 5 GiB kill watchdog. Narrative and the dropped
+variants are in [MEMORY_PROFILE.md](MEMORY_PROFILE.md#llvm-monorepo-startup-peak-209).
+
+| Build | Include graph | Peak footprint |
+|---|---:|---:|
+| Baseline `2e17bd8` | killed at 119 s, unfinished | > 5.00 GiB |
+| Probe memo and listings bounded by what exists; one search walk per spelling | 16.6–17.7 s (2 runs) | 1.06 GiB |
+
+Pinned corpora, baseline → branch, single warm-cache runs: camera 8.1 s → 7.6 s, HDF 4.7 s →
+4.2 s, hiview 1.8 s → 1.6 s at unchanged peaks (0.24, 0.22, 0.05 GiB); every exported table
+except `analysis_run` identical on all three.
+
+With a compilation database (cmake configure of `llvm` + `clang`, X86, tests off: 3,603 commands,
+54,376 discovered TUs), the configured path is bounded but slow: footprint 2.1–3.5 GiB over a 480 s
+run (1.07 GiB before indexing), 1,340 units indexed at 2.8 units/s, each lowering its whole inlined
+include closure (median 18,401 functions per unit). It now reports `parse: i/N` progress; the
+per-unit cost is the documented configured-path limit
+([MEMORY_PROFILE.md](MEMORY_PROFILE.md#with-a-compilation-database-bounded-but-hours-of-work)).

@@ -4,7 +4,7 @@ use rustc_hash::{FxHashMap, FxHashSet as HashSet};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use walkdir::WalkDir;
 
 /// Headers held in memory instead of on disk, by the path an `#include`
@@ -105,6 +105,12 @@ impl IncludeGraph {
             dep_headers.iter().chain(virtual_headers.keys()),
         );
         let basename_index = build_basename_index(&project_files);
+        // The search-list walk depends only on the spelling and the
+        // includer's partition, so every file spelling an include shares one
+        // walk, as `Preprocessor::search_include_dirs` does. Walking the list
+        // per (file, spelling) pair -- 2,800 directories on the LLVM
+        // monorepo, for 72,000 files -- was minutes of probes (#209).
+        let search_memo = SearchMemo::default();
 
         let mut edges: IndexMap<PathBuf, Vec<PathBuf>> = IndexMap::new();
         let mut source_cache: FxHashMap<PathBuf, std::sync::Arc<str>> = FxHashMap::default();
@@ -128,6 +134,7 @@ impl IncludeGraph {
                         &include_dirs,
                         &basename_index,
                         &in_memory,
+                        &search_memo,
                     ) {
                         let canon = canonicalize(&resolved);
                         if project_files.contains(&canon) {
@@ -538,6 +545,28 @@ fn build_basename_index(project_files: &HashSet<PathBuf>) -> FxHashMap<String, V
     index
 }
 
+/// Per includer partition (production, test): spelling → what the search
+/// list and the basename fallback found, shared by every file of one graph
+/// build.
+type SearchMemo = RwLock<[FxHashMap<String, Option<PathBuf>>; 2]>;
+
+/// `search()` once per (partition, spelling), from the memo after that.
+fn memoized(
+    memo: &SearchMemo,
+    from_is_test: bool,
+    spelled: &str,
+    search: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let partition = usize::from(from_is_test);
+    if let Some(hit) = memo.read().unwrap_or_else(|e| e.into_inner())[partition].get(spelled) {
+        return hit.clone();
+    }
+    let found = search();
+    memo.write().unwrap_or_else(|e| e.into_inner())[partition]
+        .insert(spelled.to_owned(), found.clone());
+    found
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_include(
     root: &Path,
@@ -548,16 +577,16 @@ fn resolve_include(
     include_dirs: &[PathBuf],
     basename_index: &FxHashMap<String, Vec<PathBuf>>,
     in_memory: &InMemory,
+    search_memo: &SearchMemo,
 ) -> Option<PathBuf> {
     // Probed lazily, in the same order as before: the including directory
     // first for a `"..."` include, then the search list. The candidates used
     // to be collected into a `Vec` up front, so every include allocated one
     // `PathBuf` per search directory -- 205 to 291 of them on the corpora --
     // while the probe below almost always stops at the first or second (#83).
-    // The probe itself goes through the run's memo: an include naming no
-    // project file (`<string>`, `<vector>`) walks the whole list, and every
-    // file that spells it walked it again with a `stat` per candidate --
-    // ten seconds of kernel time on camera, at any job count.
+    // The probe itself goes through the run's memo, and the walk through
+    // `search_memo`: an include naming no project file (`<string>`,
+    // `<vector>`) walks the whole list, once per spelling and partition.
     // The test partition is checked only on a candidate that exists: a path
     // walk per search directory cost more than the memoized probe itself.
     let local_first = match inc.kind {
@@ -573,23 +602,25 @@ fn resolve_include(
             return Some(cand);
         }
     }
-    // A production includer never takes a test/mock candidate from the
-    // inferred search (docs/ANALYSIS.md, "Declaring-header eligibility").
-    let admits = |p: &Path| from_is_test || !trace_ir::is_test_path(root, p, test_partition);
-    for dir in include_dirs {
-        let cand = dir.join(&inc.path);
-        if exists(&cand) && admits(&cand) {
-            return Some(cand);
+    memoized(search_memo, from_is_test, &inc.path, || {
+        // A production includer never takes a test/mock candidate from the
+        // inferred search (docs/ANALYSIS.md, "Declaring-header eligibility").
+        let admits = |p: &Path| from_is_test || !trace_ir::is_test_path(root, p, test_partition);
+        for dir in include_dirs {
+            let cand = dir.join(&inc.path);
+            if exists(&cand) && admits(&cand) {
+                return Some(cand);
+            }
         }
-    }
 
-    // Last resort: the unique admitted match under project by filename.
-    let name = Path::new(&inc.path).file_name().and_then(|n| n.to_str())?;
-    let mut admitted = basename_index.get(name)?.iter().filter(|p| admits(p));
-    match (admitted.next(), admitted.next()) {
-        (Some(only), None) => Some(only.clone()),
-        _ => None,
-    }
+        // Last resort: the unique admitted match under project by filename.
+        let name = Path::new(&inc.path).file_name().and_then(|n| n.to_str())?;
+        let mut admitted = basename_index.get(name)?.iter().filter(|p| admits(p));
+        match (admitted.next(), admitted.next()) {
+            (Some(only), None) => Some(only.clone()),
+            _ => None,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -718,6 +749,9 @@ mod tests {
             .map(|f| root_dir.join(f))
             .collect(),
         );
+        // One memo for every call: a production and a test includer spelling
+        // the same header must not share an answer.
+        let memo = SearchMemo::default();
         let resolve = |from: &str, spelled: &str| {
             let from = root_dir.join(from);
             let from_is_test =
@@ -735,6 +769,7 @@ mod tests {
                 &dirs,
                 &index,
                 &InMemory::new(&VirtualHeaders::new()),
+                &memo,
             )
             .map(|p| p.strip_prefix(root_dir).unwrap().to_path_buf())
         };
