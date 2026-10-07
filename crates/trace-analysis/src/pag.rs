@@ -1238,6 +1238,7 @@ mod tests {
         let global = |program: &mut Program, name: &str| {
             let id = program.symbols.alloc_var_id();
             program.symbols.add_variable(Variable {
+                temp: None,
                 id,
                 name: name.into(),
                 type_id: int,
@@ -1301,6 +1302,7 @@ mod tests {
         ] {
             let id = program.symbols.alloc_var_id();
             program.symbols.add_variable(Variable {
+                temp: None,
                 id,
                 name: "object".into(),
                 type_id,
@@ -1400,6 +1402,7 @@ mod tests {
         let through_ptr = program.types.intern(TypeDesc::Ptr(Box::new(richest)));
         let loader_ptr = program.symbols.alloc_var_id();
         program.symbols.add_variable(Variable {
+            temp: None,
             id: loader_ptr,
             name: "loader".into(),
             type_id: through_ptr,
@@ -1449,6 +1452,7 @@ mod tests {
     fn global_of(program: &mut Program, name: &str, type_id: TypeId) -> VarId {
         let id = program.symbols.alloc_var_id();
         program.symbols.add_variable(Variable {
+            temp: None,
             id,
             name: name.into(),
             type_id,
@@ -1521,6 +1525,7 @@ mod tests {
         });
         let var = program.symbols.alloc_var_id();
         program.symbols.add_variable(Variable {
+            temp: None,
             is_defined: false,
             is_weak: false,
             target: None,

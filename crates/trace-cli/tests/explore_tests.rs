@@ -745,3 +745,227 @@ fn test_explore_keeps_base_definition_of_alternative_implementation() {
          exists to recover, got {cb_lines:?}"
     );
 }
+
+/// A factory's heap object and a `new` one spelled at one macro expansion
+/// site pair in ordinal spaces of their own (#192 review): the variant that
+/// drops the conditional factory must not hand `new B`'s object to `A`'s.
+#[test]
+fn test_explore_keeps_factory_and_new_allocations_apart() {
+    let program = explore_alpha(
+        r#"
+        #include <memory>
+        void AHandler();
+        void BHandler();
+        struct A { A(void (*h)()); void (*cb)(); };
+        A::A(void (*h)()) { cb = h; }
+        struct B { B(void (*h)()); void (*cb)(); };
+        B::B(void (*h)()) { cb = h; }
+        #ifdef FEATURE_ALPHA
+        #define MAKE_A auto a = std::make_shared<A>(AHandler);
+        #else
+        #define MAKE_A
+        #endif
+        #define BOTH MAKE_A auto b = new B(BHandler);
+        void run() { BOTH b->cb(); }
+        "#,
+    );
+    let (_pag, analysis) = analyze(&program);
+
+    let callees = callees_of(&program, &analysis, "run");
+    let b_ctor = callees.iter().filter(|(c, _)| c == "B::B").count();
+    assert_eq!(b_ctor, 1, "one `B::B` edge: {callees:?}");
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "run",
+            "BHandler",
+            ResolutionKind::Indirect
+        ),
+        "{callees:?}"
+    );
+    assert!(
+        !has_any_edge(&program, &analysis, "run", "AHandler"),
+        "`b->cb()` must not reach `A`'s handler: {callees:?}"
+    );
+}
+
+/// Two factory heap objects at one macro expansion site pair by the class
+/// they hold, not by position alone (#192 review): `A` has a constructor
+/// only in the explored configuration, so only there does its factory make
+/// an object, ahead of `B`'s.
+#[test]
+fn test_explore_pairs_factory_allocations_by_class() {
+    let program = explore_alpha(
+        r#"
+        #include <memory>
+        void AHandler();
+        void BHandler();
+        #ifdef FEATURE_ALPHA
+        struct A { void (*cb)(); };
+        #else
+        struct A { A(); void (*cb)(); };
+        A::A() { cb = AHandler; }
+        #endif
+        struct B { B(void (*h)()); void (*cb)(); };
+        B::B(void (*h)()) { cb = h; }
+        #define BOTH auto a = std::make_shared<A>(); auto b = std::make_shared<B>(BHandler);
+        void run() { BOTH b->cb(); }
+        "#,
+    );
+    let (_pag, analysis) = analyze(&program);
+
+    let callees = callees_of(&program, &analysis, "run");
+    for (ctor, count) in [("A::A", 1), ("B::B", 1)] {
+        let found = callees.iter().filter(|(c, _)| c == ctor).count();
+        assert_eq!(found, count, "{ctor}: {callees:?}");
+    }
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "run",
+            "BHandler",
+            ResolutionKind::Indirect
+        ),
+        "{callees:?}"
+    );
+    assert!(
+        !has_any_edge(&program, &analysis, "run", "AHandler"),
+        "`b->cb()` must not reach `A`'s handler: {callees:?}"
+    );
+}
+
+/// A factory shares one object per caller/class. Omitting an earlier factory
+/// must not duplicate the constructor edge at the later, unchanged call.
+#[test]
+fn test_explore_pairs_factory_allocations_when_first_call_moves() {
+    let source = r#"
+        struct Foo { Foo() {} };
+        void run() {
+        #ifdef FEATURE_ALPHA
+            std::make_shared<Foo>(); // conditional
+        #endif
+            std::make_shared<Foo>(); // retained
+            new Foo();
+        }
+        void other() { std::make_shared<Foo>(); }
+        "#;
+    let program = explore_alpha(source);
+    let (_pag, analysis) = analyze(&program);
+    let retained_line = source
+        .lines()
+        .position(|line| line.contains("// retained"))
+        .unwrap() as u32
+        + 1;
+    let run = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "run")
+        .unwrap()
+        .id;
+    let retained_edges = analysis
+        .call_edges
+        .iter()
+        .filter(|edge| {
+            edge.caller == run
+                && fn_name(&program, edge.callee) == "Foo::Foo"
+                && program
+                    .symbols
+                    .call_sites
+                    .iter()
+                    .any(|site| site.id == edge.call_site && site.span.line == retained_line)
+        })
+        .count();
+    assert_eq!(
+        retained_edges, 1,
+        "the retained factory has one constructor edge"
+    );
+    let callees = callees_of(&program, &analysis, "run");
+    assert_eq!(
+        callees
+            .iter()
+            .filter(|(name, _)| name == "Foo::Foo")
+            .count(),
+        3,
+        "two factory calls and one new expression: {callees:?}"
+    );
+    for caller in ["run", "other"] {
+        let owner = program
+            .symbols
+            .functions
+            .iter()
+            .find(|f| f.name == caller)
+            .unwrap()
+            .id;
+        let objects = program
+            .symbols
+            .variables
+            .iter()
+            .filter(|var| var.fn_id == Some(owner) && var.temp == Some(trace_ir::TempKind::Make))
+            .count();
+        assert_eq!(
+            objects, 1,
+            "one factory object per function and class: {caller}"
+        );
+    }
+    assert_eq!(
+        program
+            .symbols
+            .variables
+            .iter()
+            .filter(|var| var.fn_id == Some(run) && var.temp == Some(trace_ir::TempKind::New))
+            .count(),
+        1,
+        "new remains tied to its own expression"
+    );
+}
+
+/// `new Foo(..)` makes its heap object whether or not the configuration
+/// indexes `Foo`, so the variant merge pairs it by position alone: one
+/// object for one expression (#192 review).
+#[test]
+fn test_explore_pairs_new_allocation_whatever_its_type() {
+    let program = explore_alpha(
+        r#"
+        void Handler();
+        #ifdef FEATURE_ALPHA
+        struct Foo { Foo(void (*h)()); };
+        Foo::Foo(void (*h)()) { h(); }
+        #else
+        void Unrelated();
+        #endif
+        void run() { auto p = new Foo(Handler); }
+        "#,
+    );
+    let heaps: Vec<_> = program
+        .symbols
+        .variables
+        .iter()
+        .filter(|v| v.temp == Some(trace_ir::TempKind::New))
+        .map(|v| (v.name.clone(), v.type_id))
+        .collect();
+    assert_eq!(heaps.len(), 1, "{heaps:?}");
+}
+
+/// `main_cpp` built with `--explore` under a `BUILD.gn` defining
+/// `FEATURE_ALPHA`, which must explore at least one variant.
+fn explore_alpha(main_cpp: &str) -> trace_ir::Program {
+    let dir = scratch(&[
+        (
+            "BUILD.gn",
+            "config(\"my_config\") {\n  defines = [ \"FEATURE_ALPHA\" ]\n}\n",
+        ),
+        ("main.cpp", main_cpp),
+    ]);
+    let explore_opts = PreprocessOptions::new()
+        .with_explore(true)
+        .with_explore_budget(4);
+    let program = build_program(dir.path(), &explore_opts).expect("build program");
+    assert!(
+        program.variants_merged > 0,
+        "the fixture must explore a variant"
+    );
+    program
+}

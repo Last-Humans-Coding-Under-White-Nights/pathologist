@@ -9,7 +9,7 @@ pub(crate) use target_merge::{merge_linked_units, record_link_targets};
 use trace_ir::CallSiteDetails;
 use trace_ir::{
     same_param_type_or_unresolved, CallSite, CallSiteId, FlowConstraint, FnId, Function, Program,
-    ReturnFlow, TemplateBase, TypeDesc, TypeId, VarId, Variable,
+    ReturnFlow, TempKind, TemplateBase, TypeDesc, TypeId, VarId, Variable,
 };
 
 /// Per-file indexing result merged into a single [`Program`].
@@ -126,24 +126,42 @@ pub enum MergeMode {
 
 type SiteKey<'a> = trace_ir::CallSourceKey<'a>;
 type LocalKey = (FnId, trace_ir::FileId, u32, u32, String);
-type TempKey = (FnId, trace_ir::FileId, u32, u32, &'static str);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum TempKey {
+    Site(FnId, trace_ir::FileId, u32, u32, TempKind),
+    Factory(FnId, TypeId),
+}
+
+/// A temporary's kind and, for a factory's shared object, its class.
+type TempPairing = (TempKind, Option<TypeId>);
 type FileVarKey = (u32, trace_ir::FileId, u32, u32, String);
 
-/// The kind of a synthesized temporary, or `None` for a declared variable.
-///
-/// Lowering names these after the unit-local [`VarId`] it just allocated
-/// (`_gep41`, `_load42`, `_ret43`, `_recv44`), so the name identifies an
-/// allocation order rather than the expression, and two configurations of the
-/// same code never agree on it. Each kind keeps its own ordinal space: a temp
-/// one configuration emits and another does not must not shift the pairing of
-/// an unrelated kind at the same position.
-fn temp_prefix(name: &str) -> Option<&'static str> {
-    ["_gep", "_load", "_ret", "_recv"]
-        .into_iter()
-        .find(|prefix| {
-            name.strip_prefix(prefix)
-                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
-        })
+/// How a variant merge pairs `var`, typed `ty` in the merged program's
+/// types, or `None` for a declared variable. Lowering names a temporary
+/// after the unit-local [`VarId`] it just allocated (`_ret43`), so two
+/// configurations of the same code never agree on its name; it pairs by
+/// kind ([`Variable::temp`]) and position instead, each kind its own
+/// ordinal space. A factory's heap object ([`TempKind::Make`]) pairs by
+/// function/class instead ([`temp_key`]): its first call can move between
+/// configurations. It exists only
+/// where its class has a user-provided constructor, so one configuration
+/// can lack an object another has at the same site: paired by class too,
+/// `make_shared<A>()`'s object never takes `make_shared<B>()`'s. `new`'s
+/// ([`TempKind::New`]) exists whenever its expression spells a class, in
+/// every configuration alike, and pairs by position alone, whether or not a
+/// configuration indexes that class.
+fn temp_pairing(var: &Variable, ty: TypeId) -> Option<TempPairing> {
+    let kind = var.temp?;
+    Some((kind, (kind == TempKind::Make).then_some(ty)))
+}
+
+/// Factory lowering guarantees one object per function/class. Its first
+/// call's position is descriptive, not its identity across configurations.
+fn temp_key(var: &Variable, owner: FnId, file: trace_ir::FileId, ty: TypeId) -> Option<TempKey> {
+    temp_pairing(var, ty).map(|(kind, class)| match class {
+        Some(class) => TempKey::Factory(owner, class),
+        None => TempKey::Site(owner, file, var.span.line, var.span.col, kind),
+    })
 }
 
 #[derive(Default)]
@@ -841,18 +859,16 @@ fn merge_unit(
     // `_gep772` in a variant that lowered a different amount of code before
     // reaching it. They are matched positionally instead — the k-th temporary
     // of a given kind at a source position — which is the order lowering emits
-    // them in on both sides.
+    // them in on both sides. Factory objects instead pair by function/class,
+    // because a conditional earlier call can move their recorded position.
     let mut local_by_site: FxHashMap<LocalKey, VarId> = FxHashMap::default();
     let mut temps_by_site: FxHashMap<TempKey, Vec<VarId>> = FxHashMap::default();
     for &fn_id in &remerged_fns {
         for &var_id in &program.symbols.function(fn_id).locals {
             if let Some(var) = program.symbols.variable_by_id(var_id) {
                 let coords = (fn_id, var.span.file, var.span.line, var.span.col);
-                if let Some(prefix) = temp_prefix(&var.name) {
-                    temps_by_site
-                        .entry((coords.0, coords.1, coords.2, coords.3, prefix))
-                        .or_default()
-                        .push(var_id);
+                if let Some(key) = temp_key(var, fn_id, var.span.file, var.type_id) {
+                    temps_by_site.entry(key).or_default().push(var_id);
                 } else {
                     local_by_site
                         .entry((coords.0, coords.1, coords.2, coords.3, var.name.clone()))
@@ -911,8 +927,7 @@ fn merge_unit(
 
         let extended_fn = mapped_fn_id.filter(|id| remerged_fns.contains(id));
         let temp_key = extended_fn
-            .zip(temp_prefix(&var.name))
-            .map(|(id, prefix)| (id, span_file, var.span.line, var.span.col, prefix) as TempKey);
+            .and_then(|id| temp_key(var, id, span_file, remap_type(var.type_id, &type_map)));
         let local_key = extended_fn
             .filter(|_| temp_key.is_none())
             .map(|id| (id, span_file, var.span.line, var.span.col, var.name.clone()));
@@ -1499,7 +1514,7 @@ fn merge_types(
     }
     for (alias, desc) in src.all_aliases() {
         if dst.resolve_alias(alias).is_none() {
-            dst.register_alias_ref(alias, desc);
+            dst.register_alias_ref_with_reference(alias, desc, src.alias_is_reference(alias));
         }
     }
     map
@@ -1708,6 +1723,52 @@ fn remap_return_flow(
 mod tests {
     use super::*;
     use trace_ir::{Diagnostic, DiagnosticSeverity};
+
+    /// A temporary pairs by its kind, a factory's heap object by its class
+    /// as well; a declared variable never pairs as a temporary, whatever its
+    /// name spells (#192).
+    #[test]
+    fn temp_pairing_reads_the_kind_never_the_name() {
+        let ty = TypeId(7);
+        let var = |name: &str, temp: Option<TempKind>| Variable {
+            temp,
+            is_defined: false,
+            is_weak: false,
+            target: None,
+            is_namespaced: false,
+            qualified_name: None,
+            c_linkage: false,
+            is_static_member: false,
+            id: VarId(1),
+            name: name.into(),
+            type_id: ty,
+            storage: trace_ir::StorageClass::Local,
+            fn_id: Some(FnId(0)),
+            param_index: None,
+            span: trace_ir::Span::new(trace_ir::FileId(0), 1, 1),
+            is_pointer: true,
+        };
+        for kind in [
+            TempKind::Gep,
+            TempKind::Load,
+            TempKind::Ret,
+            TempKind::Recv,
+            TempKind::New,
+        ] {
+            let name = format!("{}3", kind.prefix());
+            assert_eq!(
+                temp_pairing(&var(&name, Some(kind)), ty),
+                Some((kind, None))
+            );
+        }
+        assert_eq!(
+            temp_pairing(&var("$make4", Some(TempKind::Make)), ty),
+            Some((TempKind::Make, Some(ty)))
+        );
+        for declared in ["_ret5", "_new1", "_make2", "value"] {
+            assert_eq!(temp_pairing(&var(declared, None), ty), None, "{declared}");
+        }
+    }
 
     fn unit_reporting(path: &str, stage: &str) -> UnitIndex {
         UnitIndex {
@@ -2004,6 +2065,7 @@ mod tests {
                 tu: None,
             }],
             variables: vec![Variable {
+                temp: None,
                 is_defined: false,
                 is_weak: false,
                 target: None,
@@ -2060,6 +2122,7 @@ mod tests {
             tu: None,
         };
         let var = |id: u32, name: String, owner: u32, param: bool| Variable {
+            temp: name.starts_with("_ret").then_some(TempKind::Ret),
             is_defined: false,
             is_weak: false,
             target: None,
@@ -2524,6 +2587,7 @@ mod tests {
             tu: None,
         };
         let member_var = Variable {
+            temp: None,
             is_defined: spec.defined,
             is_weak: spec.weak,
             target: None,

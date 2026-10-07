@@ -3121,6 +3121,7 @@ mod tests {
     fn add_var(program: &mut Program, name: &str, type_id: TypeId) -> VarId {
         let id = program.symbols.alloc_var_id();
         program.symbols.add_variable(trace_ir::Variable {
+            temp: None,
             id,
             name: name.into(),
             type_id,

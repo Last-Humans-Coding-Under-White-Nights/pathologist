@@ -95,10 +95,12 @@ method exists.
 
 Eval **H7**. Three stacked gaps; fixing only intern-as-`FnPtr` is not enough.
 
-1. **Ctor-init store.** `PluginRegistInfo(GetObject, …)` copies a factory
-   into `getPluginObject` (`base/include/plugin_factory.h:28-33`). Lower
-   `std::function` construction / assignment from a function designator as
-   `AddrOfFn`.
+1. **Ctor-init store.** Done (#192): `PluginRegistInfo(GetObject, …)`
+   copies a factory into `getPluginObject` (`base/include/plugin_factory.h:28-33`),
+   and a member initializer of a non-class member now stores its value as
+   the body assignment does, so `registInfo->getPluginObject()` reaches the
+   registered `GetObject` (`docs/EVAL_REPORT.md`, "Factory construction:
+   #192"). Steps 2 and 3 remain.
 2. **Map summary.** `RegisterPlugin` inserts into
    `unordered_map<string, shared_ptr<PluginRegistInfo>>`;
    `GetGlobalPluginInfo` does `find` + `it->second`. Model map values as
