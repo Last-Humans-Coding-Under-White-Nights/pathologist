@@ -1,5 +1,5 @@
 use crate::diagnostic::DiagnosticKey;
-use crate::macros::{lex_macro_body, MacroDef, MacroOp, MacroTable};
+use crate::macros::{intern_macro_name, lex_macro_body, MacroDef, MacroOp, MacroTable};
 use crate::{
     ArmDirective, ArmOutcome, ConditionRead, ConditionalArm, ConditionalChain, Diagnostic,
     DiagnosticSeverity, Language, Lexer, LineMap, PreprocessOptions, Token, TokenKind,
@@ -525,7 +525,7 @@ impl PreprocessorState {
             return;
         }
         let hash = self.binding_hash(name);
-        let interned: Arc<str> = Arc::from(name);
+        let interned: Arc<str> = intern_macro_name(name);
         for frame in &mut self.cache_frames {
             if !frame.settled.insert(Arc::clone(&interned)) {
                 continue;
@@ -549,7 +549,7 @@ impl PreprocessorState {
         if self.cache_frames.is_empty() {
             return;
         }
-        let interned: Arc<str> = Arc::from(name);
+        let interned: Arc<str> = intern_macro_name(name);
         for frame in &mut self.cache_frames {
             frame.settled.insert(Arc::clone(&interned));
             frame.locally_bound.insert(Arc::clone(&interned));
@@ -562,7 +562,7 @@ impl PreprocessorState {
     /// current dependency because the historical one already settled it.
     fn record_snapshot_read(&mut self, name: &str) {
         let hash = self.binding_hash(name);
-        let interned: Arc<str> = Arc::from(name);
+        let interned: Arc<str> = intern_macro_name(name);
         for frame in &mut self.cache_frames {
             if frame.locally_bound.contains(name) {
                 continue;
@@ -644,7 +644,7 @@ impl PreprocessorState {
                 continue;
             }
             self.insert_macro(
-                name.to_string(),
+                *name,
                 MacroDef::Object {
                     replacement: lex_macro_body(val, self.language).into(),
                 },
@@ -706,6 +706,7 @@ impl PreprocessorState {
     }
 
     fn insert_macro_arc(&mut self, name: Arc<str>, def: Arc<MacroDef>) {
+        let name = intern_macro_name(&name);
         if !self.cache_frames.is_empty() {
             self.macro_ops
                 .push(MacroOp::Define(Arc::clone(&name), Arc::clone(&def)));
@@ -713,8 +714,8 @@ impl PreprocessorState {
         self.insert_macro_internal(name, def);
     }
 
-    fn insert_macro(&mut self, name: impl Into<Arc<str>>, def: MacroDef) {
-        let name_arc: Arc<str> = name.into();
+    fn insert_macro(&mut self, name: impl AsRef<str>, def: MacroDef) {
+        let name_arc: Arc<str> = intern_macro_name(name.as_ref());
         let def_arc = Arc::new(def);
         if !self.cache_frames.is_empty() {
             self.macro_ops
@@ -742,14 +743,15 @@ impl PreprocessorState {
 
     fn remove_macro_arc(&mut self, name: &Arc<str>) {
         if !self.cache_frames.is_empty() {
-            self.macro_ops.push(MacroOp::Undef(Arc::clone(name)));
+            let name_arc = intern_macro_name(name.as_ref());
+            self.macro_ops.push(MacroOp::Undef(name_arc));
         }
         self.remove_macro_internal(name.as_ref());
     }
 
     fn remove_macro(&mut self, name: &str) {
         if !self.cache_frames.is_empty() {
-            let name_arc: Arc<str> = Arc::from(name);
+            let name_arc: Arc<str> = intern_macro_name(name);
             self.macro_ops.push(MacroOp::Undef(name_arc));
         }
         self.remove_macro_internal(name);
@@ -3527,7 +3529,7 @@ fn guard_opener(tokens: &[Token], i: &mut usize) -> Option<Arc<str>> {
         "if" => negated_defined_name(directive_rest(tokens, *i))?,
         _ => return None,
     };
-    let name = Arc::from(name);
+    let name = intern_macro_name(name);
     skip_directive_line(tokens, i);
     Some(name)
 }
@@ -4606,7 +4608,7 @@ fn concat_width_at(tokens: &[Token], i: usize) -> usize {
 static BUILTIN_FALLBACK_MACROS: LazyLock<Vec<(Arc<str>, Arc<MacroDef>)>> = LazyLock::new(|| {
     let object = |name: &str, replacement: &str| {
         (
-            Arc::from(name),
+            intern_macro_name(name),
             Arc::new(MacroDef::Object {
                 replacement: lex_macro_body(replacement, Language::C).into(),
             }),
@@ -4614,7 +4616,7 @@ static BUILTIN_FALLBACK_MACROS: LazyLock<Vec<(Arc<str>, Arc<MacroDef>)>> = LazyL
     };
     let function = |name: &str, params: &[&str], replacement: &str| {
         (
-            Arc::from(name),
+            intern_macro_name(name),
             Arc::new(MacroDef::Function {
                 params: params.iter().map(ToString::to_string).collect(),
                 replacement: lex_macro_body(replacement, Language::C).into(),
@@ -4691,12 +4693,15 @@ static BUILTIN_FALLBACK_MACROS: LazyLock<Vec<(Arc<str>, Arc<MacroDef>)>> = LazyL
     // declares (see expand_gmock_method); a replacement list cannot do this
     // because the legacy forms carry the whole signature in one argument
     // and the modern form parenthesizes comma-containing return types.
-    table.push((Arc::from("MOCK_METHOD"), Arc::new(MacroDef::GmockMethod)));
+    table.push((
+        intern_macro_name("MOCK_METHOD"),
+        Arc::new(MacroDef::GmockMethod),
+    ));
     for arity in 0..=10 {
         for prefix in ["MOCK_METHOD", "MOCK_CONST_METHOD"] {
             for suffix in ["", "_T", "_WITH_CALLTYPE", "_T_WITH_CALLTYPE"] {
                 table.push((
-                    Arc::from(format!("{prefix}{arity}{suffix}")),
+                    intern_macro_name(&format!("{prefix}{arity}{suffix}")),
                     Arc::new(MacroDef::GmockMethod),
                 ));
             }

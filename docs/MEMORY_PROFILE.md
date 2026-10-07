@@ -246,9 +246,12 @@ Preprocessing's serial and worker filesystem memos are released before header
 IR construction. On Linux/glibc, `malloc_trim(0)` returns unused pages after
 the preprocessing and header phases and after indexing caches and the local
 worker pool drop; it never runs while workers allocate, since a trim locks
-every arena and takes hundreds of milliseconds on a large heap. Other
-platforms retain descriptor sharing and cache-lifetime improvements, with no
-allocator-specific reclamation. Parse workers take units in order and run at
+every arena and takes hundreds of milliseconds on a large heap. On Windows,
+`EmptyWorkingSet(GetCurrentProcess())` is called via `psapi` at phase boundaries
+and indexing checkpoints as an alternative to reclaim unneeded pages from the
+working set. Other platforms retain descriptor sharing and cache-lifetime
+improvements, with no allocator-specific reclamation. Parse workers take units
+in order and run at
 most two units per worker, between 4 and 32 in total, ahead of the ordered
 merge, which bounds pending IR the way small batches did without idling
 workers behind a slow unit.
@@ -309,6 +312,11 @@ Rules and API migration contracts are documented in [Type storage and TypeFields
    - `HeaderIr` and `include_expansion_cache` dropped immediately as translation unit parsing completes before program finalization.
    - Program IR flow memory released via `program.release_flow()` post-solving, prior to SQLite export.
    - PAG `Constraint` inline size reduced from 48 B to 24 B (−50.0%) by boxing field access metadata (`FieldAccess.field_name` stored as `Arc<str>`, eliminating heap allocations in solver worklist propagation); eliminated cloning and destructive modification of call edges and wired argument flows during analysis.
+5. **Macro name interner (`trace-preproc`)**:
+   - `MacroNameInterner` provides a 128-shard bitmasked process-global deduplication table paired with a 512-slot thread-local direct-mapped L1 cache.
+   - Repeated include guards, macro definitions, undefs, dependencies, and token provenance resolve in thread-local cache on hits and share canonical `Arc<str>` allocations via `intern_macro_name(name)` instead of allocating ad-hoc `Arc::from(name)` instances across worker threads.
+6. **Windows memory reclamation via `EmptyWorkingSet` (`trace-parse`)**:
+   - `reclaim_unused_pages` calls `EmptyWorkingSet(GetCurrentProcess())` via `kernel32` and `psapi` at phase boundaries and indexing checkpoints on Windows, providing a platform alternative to glibc `malloc_trim(0)`.
 
 ### End-to-end benchmark measurements
 

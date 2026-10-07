@@ -2,7 +2,7 @@
 //! discovery pass needs it, and the rule [`ExpansionJournal::commit`]
 //! applies, are in `docs/PREPROCESSOR.md` ("Parallel discovery").
 
-use crate::macros::{MacroDef, MacroTable};
+use crate::macros::{intern_macro_name, MacroDef, MacroTable};
 use crate::options::admits_variant;
 use crate::{
     ExpansionCache, ExpansionKey, ExpansionVariants, IncludeExpansion, Language, MacroFingerprint,
@@ -205,7 +205,7 @@ impl ExpansionJournal {
 
     /// Record that `name` changed, having been bound to `before`.
     pub(crate) fn record_macro_change(&mut self, name: &str, before: Option<Binding>) {
-        self.history.undo.push((Arc::from(name), before));
+        self.history.undo.push((intern_macro_name(name), before));
     }
 
     /// Record the table the run ended with.

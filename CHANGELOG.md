@@ -4,6 +4,10 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Macro name interning and Windows EmptyWorkingSet page reclamation
+
+Macro names are now deduplicated through an optimized process-global interner (`MacroNameInterner` in `trace-preproc`), featuring a 512-slot thread-local direct-mapped L1 cache and a 128-shard bitmasked table. Lookups for frequent macro names resolve in thread-local cache without lock contention or cross-core cache invalidation, while misses fall back to the global table and share a single canonical `Arc<str>` allocation. On Windows, `reclaim_unused_pages` now invokes `EmptyWorkingSet(GetCurrentProcess())` via `kernel32` and `psapi` at phase boundaries and indexing checkpoints as an alternative to Linux `malloc_trim(0)`. Rules and docs: `docs/PREPROCESSOR.md` and `docs/MEMORY_PROFILE.md`.
+
 ### Compact flow_nodes export and on-demand dataflow inspect (#195)
 
 Variable nodes in `flow_nodes` now store empty strings for `label` and `detail` instead of duplicating `variables.name` and formatted metadata strings (`{kind} @{line} in {function}`), reducing the default export's largest table by 55 MB (-68.8%) on `ability_ability_runtime` and shrinking overall database size by 20%. Non-variable nodes (`loc`, `call_target`, `terminator`) are unchanged. A new SQLite view `flow_nodes_text` joins `variables` and `functions` through foreign keys `var_id` and `fn_id` to reconstruct the original text columns for external SQL queries. In `trace-db`, `dataflow_graph` now traverses edge adjacency first and loads only the visited nodes on demand rather than loading the full table. The schema version is bumped to **v7**. Rules: `docs/SQLITE_SCHEMA.md`; measurements in `docs/EVAL_REPORT.md` ("Compact flow_nodes export").

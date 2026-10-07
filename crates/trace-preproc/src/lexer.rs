@@ -1,4 +1,4 @@
-use crate::Language;
+use crate::{intern_macro_name, Language};
 use rustc_hash::FxHashSet;
 use std::fmt;
 use std::path::PathBuf;
@@ -155,7 +155,7 @@ impl Token {
         let expansion_macro = origin
             .expansion_macro()
             .cloned()
-            .or_else(|| Some(Arc::from(name)));
+            .or_else(|| Some(intern_macro_name(name)));
         let expansion_id = expansion_fingerprint(origin, name, None, self.expansion_id());
         let prov = TokenMacroProvenance {
             hidden: Some(Arc::new(set)),
@@ -207,7 +207,7 @@ impl Token {
         let expansion_macro = origin
             .expansion_macro()
             .cloned()
-            .or_else(|| Some(Arc::from(macro_name)));
+            .or_else(|| Some(intern_macro_name(macro_name)));
         let prov = token.macro_prov_mut();
         prov.hidden = new_hidden;
         prov.expansion_id = expansion_id;
