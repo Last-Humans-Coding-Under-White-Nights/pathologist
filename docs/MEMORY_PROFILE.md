@@ -316,3 +316,148 @@ End-to-end peak memory footprint, RSS, and runtime measurements comparing base (
 
 
 
+
+## LLVM monorepo startup peak (#209)
+
+Reported: `trace analyze` on a full `llvm/llvm-project` checkout reaches
+roughly 10 GB before any translation unit is indexed, then dies of OOM.
+Reproduced 2026-10-07 on macOS (8 GB, 8 cores, `--jobs` default 8, no
+compilation database, no `--include`) with `llvm-project` at
+`cc67eac964112fe043aa3527c2d63d2dd55f56ee`: 53,990 TUs, 18,212 headers,
+72,202 project files, 780 MB of C/C++ source text, and an inferred search
+list of **2,823 directories** (every directory holding a header, plus every
+`include` directory). `phys_footprint` was sampled every 100 ms by a
+watchdog that kills the analyzer at 5 GiB.
+
+| Build | Include graph | Peak footprint | Where |
+|---|---:|---:|---|
+| Baseline (`2e17bd8`) | killed at 119 s, unfinished | > 5.00 GiB | include-graph scan, before `include-graph:` is printed |
+| Listing-settled misses not memoized | killed at 192 s, unfinished | > 5.00 GiB | same |
+| + absent directories settled from listings in hand | 376 s | 1.06 GiB | include graph complete |
+| + one search walk per spelling | 36.5–38.5 s (3 runs) | 1.05 GiB | include graph complete |
+| + one lock per walk, existing levels recorded on the way down (retained) | **16.6–17.7 s** (2 runs) | **1.06 GiB** | include graph complete |
+
+### Root cause: memo entries per (search directory × spelling), per thread
+
+`trace_ir::is_file_cached` memoized every candidate path it was asked
+about, per thread, keyed by the full path bytes. Include resolution tries a
+spelling under each search directory until one holds it, so a spelling such
+as `llvm/ADT/StringRef.h` produces a candidate under every one of the 2,823
+directories that sort before `llvm/include`, and `<vector>` produces one
+under all of them. The directory-listing shortcut (#83) saved the `stat`
+for a name the parent's listing does not hold, but still recorded the
+answer — and for a candidate whose parent directory does not exist
+(`<dir>/llvm/ADT` under almost every `<dir>`) it could not consult a
+listing at all, so it both `stat`ed the path and memoized it, while
+`DIR_LISTINGS` recorded an entry per absent directory. Each of the 8 scan
+workers built its own memo, since the same spellings recur in every file.
+On the `llvm/` subtree alone (373 search directories) the memo held 920,098
+entries with 170 MB of keys at the end of the scan; the full tree's memo
+never finished filling.
+
+The retained change settles both from what exists: a miss the parent's
+listing settles is not memoized (the listing answers a repeat as cheaply),
+and a candidate under an absent directory is settled from the nearest
+listing already in hand -- the listed ancestor that does not hold the child
+on the way down, one lock and one lookup per level -- with the absent
+directories neither read nor recorded
+([PREPROCESSOR.md](PREPROCESSOR.md#include-resolution)). Reading starts only
+below a directory a probe asked for directly: the existing levels between
+it and the candidate are read and recorded on the way down (bounded by the
+directories that exist), while ancestors are never read on demand -- doing
+so snapshotted directories above the analyzed tree, and a sibling tree
+created later in the same epoch (one test's scratch directory after
+another's) became invisible when a first version did that. Recording the
+absent child at the listed ancestor was also tried and dropped: one entry
+per (search directory × first spelled component) cost 200 MiB. The memo and
+the listings therefore grow with the files and directories that exist, and
+the full tree's include graph now completes in 1.06 GiB, of which 780 MB
+is the source text `IncludeGraph::source_cache` keeps for preprocessing. The static include graph's scan also shares one search
+walk per (spelling, includer partition) across every file that spells it,
+as the preprocessor's own `include_search_cache` already did; without
+that, the probes the memo used to absorb cost 376 s.
+
+The `llvm/` subtree (4,663 TUs, 3,529 headers, 373 search directories)
+shows the same change at a scale the baseline completes: include graph
+1.5 s and 0.32 GiB before (920,098 memo entries, 170 MB of keys), 1.7 s
+and 0.21 GiB after (single runs; a repeated miss now walks the shared
+listings instead of hitting a thread-local entry).
+
+### What remains before indexing on the full tree
+
+With the include graph bounded, the run proceeds into the sequential warm
+pass: 12,480 reachable headers, 1.13 GiB at its start, 2.03 GiB at header
+4,950 after 300 s (about 0.18 MiB per warmed header, retained in the
+include-expansion cache and the source cache), where the run was stopped.
+The pinned corpora show the change is neutral there: camera 8.1 s → 7.6 s,
+HDF 4.7 s → 4.2 s, hiview 1.8 s → 1.6 s wall (single warm-cache runs on the
+same machine, `--jobs 8`), peak footprint unchanged (0.24, 0.22, 0.05 GiB),
+and every exported table except `analysis_run` identical to the baseline on
+all three. The 780 MB of
+retained source text and the warm pass's growth on a tree this size are
+separate items with their own owners; neither was the reported peak.
+
+### With a compilation database: bounded, but hours of work
+
+A reviewer applying the change with a `compile_commands.json` (6,672
+commands) still saw memory climb to about 5 GB and no output for ten
+minutes after the `compile_commands:` line. Reproduced with a cmake
+configure of `llvm` + `clang` (X86 only, tests off: 3,603 commands for
+3,602 sources, 54,376 discovered TUs in all) on the same machine,
+`--jobs 8`, 480 s cap:
+
+| Checkpoint | Units indexed | Footprint |
+|---|---:|---:|
+| `compile_commands:` printed (17.5 s) | 0 | 1.07 GiB |
+| 120 s | 371 | 2.19 GiB (peak so far 2.73) |
+| 240 s | 624 | 2.96 GiB (peak so far 3.47) |
+| 480 s | 1,340 | 3.13 GiB (peak 3.58) |
+
+This is the configured path (`configured.rs`), which the earlier
+measurements did not take: it had no progress output at all between the
+`compile_commands:` line and the end of indexing, so the run looked
+stalled. It now prints `parse: i/N path` every 50 units, like the ordinary
+path (`index_item_progress`; `TRACE_INDEX_VERBOSE=1` for every unit).
+
+In this run the footprint oscillates between about 2.1 and 3.5 GiB
+rather than growing. The measured configuration had no link-target
+metadata (no `link_commands.json`, no link entries in the database, no
+CMake File API reply), so `configured::build` merges each unit into the
+program as it completes and the live IR is bounded by the indexing
+window (two units per worker, 4–32 in all), on top of the 1.07 GiB of
+retained source text and include graph. What makes the bound high is
+the unit, not the count: on this path every unit lowers its whole
+inlined include closure (no shared expansion cache, no PCH header IR;
+see [Bound compilation-database IR
+accumulation](PERFORMANCE_REVIEW.md#2-bound-compilation-database-ir-accumulation)),
+and an LLVM unit's closure is 246 files on average for a command unit
+and 627 for a source without a command (the shared fallback
+configuration, mostly tests and unittests) -- 18,401 functions per unit
+at the median, 29,828 at p90, 40,696 at most. At 2.8 units/s the 54,376
+units would take about five hours; 326 fallback units averaged 3.4 s
+each and 1,014 command units 2.5 s.
+
+The window bound does not hold when the build metadata names explicit
+link targets (`scoped` in `configured.rs`: targets present and not an
+unscoped inference). Image selection and weak-symbol resolution need
+every unit of a target before any of them can merge, so that branch
+keeps each completed `UnitIndex` in `linked_units` until all sources are
+indexed, and the inlined include closures accumulate once per TU
+regardless of `--jobs`. With a `link_commands.json` or a File API reply
+for a tree this size, expect the footprint to grow with the TU count,
+not to plateau; that is the retention [PERFORMANCE_REVIEW.md
+§2](PERFORMANCE_REVIEW.md#2-bound-compilation-database-ir-accumulation)
+describes, and it was not measured here.
+
+Supported ways to analyze this scope today: fewer `--jobs` lowers the
+window and so the peak roughly in proportion (`--jobs 4` keeps eight
+units in flight instead of sixteen) on the unscoped branch, and does
+not bound the scoped one; or analyze a subtree by pointing the analysis
+root at it. The compilation database does not limit scope: every TU
+discovered under the root is indexed, and a source the database has no
+command for takes the shared fallback configuration (`configs_for`),
+whose closure is the larger of the two above. A database restricted to
+the sources of interest therefore moves the rest to the more expensive
+configuration instead of skipping them. Sharing header lowering across
+commands of one configuration family is the structural fix and is a
+separate change.

@@ -696,6 +696,9 @@ Per-phase wall, CPU and average busy cores (one run):
    samples, so the churn costs twice. This is the 760 MiB transient and the floor of any
    warm run; camera already showed 1.1 M probe entries and 117 MiB of path
    keys ([MEMORY_PROFILE.md](MEMORY_PROFILE.md#what-occupies-memory)).
+   Since #209 the memo records only answers the filesystem gave, and the
+   graph scan shares one walk per spelling; see
+   [LLVM monorepo startup peak](MEMORY_PROFILE.md#llvm-monorepo-startup-peak-209).
 5. Sequential tails: warm (2.0 s), export (2.9 s) and analyze (0.9 s) run on
    one core — 17% of wall.
 

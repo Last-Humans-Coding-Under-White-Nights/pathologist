@@ -100,8 +100,10 @@ pub fn file_probe_epoch() -> u64 {
     PROBE_EPOCH.load(Ordering::Relaxed)
 }
 
-/// Whether `path` names a regular file, memoized per thread for the current
-/// epoch (see [`start_file_probe_epoch`]).
+/// Whether `path` names a regular file. Answered from the parent's directory
+/// listing whenever that settles it, and otherwise asked of the filesystem
+/// and memoized per thread for the current epoch (see
+/// [`start_file_probe_epoch`]); a miss a listing settles is not memoized.
 ///
 /// The answer is a function of the tree under analysis, which no stage writes
 /// to, so a repeat probe of the same path can skip the `stat`. Include
@@ -111,9 +113,10 @@ pub fn file_probe_epoch() -> u64 {
 /// naming 224,945 distinct paths, and the 95% that repeat were most of the
 /// preprocessor's serial discovery pass (#83).
 ///
-/// Within one epoch a caller that creates a file it has already asked about
-/// still gets the old answer, so a caller doing that must probe the
-/// filesystem directly.
+/// Within one epoch the answers are snapshots: a file created after it was
+/// asked about, or after its directory was listed, is not seen, so a caller
+/// doing that must probe the filesystem directly. Only what no memo entry
+/// and no listing covers yet is read fresh.
 pub fn is_file_cached(path: &Path) -> bool {
     let epoch = PROBE_EPOCH.load(Ordering::Relaxed);
     let key = path.as_os_str().as_encoded_bytes();
@@ -127,10 +130,24 @@ pub fn is_file_cached(path: &Path) -> bool {
                 return *hit;
             }
         }
-        let found = probe_file(path);
-        cache.borrow_mut().1.insert(key.to_vec(), found);
-        found
+        match probe_file(path) {
+            Probe::Miss => false,
+            Probe::Stat(found) => {
+                cache.borrow_mut().1.insert(key.to_vec(), found);
+                found
+            }
+        }
     })
+}
+
+/// How [`probe_file`] answered a first probe.
+enum Probe {
+    /// Settled by a directory listing: the name is not there. Not memoized,
+    /// since the listings answer a repeat as cheaply (see [`DIR_LISTINGS`]).
+    Miss,
+    /// Asked of the filesystem; bounded by the files that exist, so worth
+    /// memoizing.
+    Stat(bool),
 }
 
 /// What one directory holds, read once per epoch: every entry name as its
@@ -141,17 +158,49 @@ struct DirListing {
     folded: FxHashSet<Vec<u8>>,
 }
 
+impl DirListing {
+    /// Whether `name` may be an entry: listed, or one a case-folding or
+    /// normalization-insensitive filesystem could still match.
+    fn may_hold(&self, name: &[u8]) -> bool {
+        if self.names.contains(name) || !name.is_ascii() {
+            return true;
+        }
+        // Folding a name with no uppercase is the identity: spare the
+        // allocation on the hot miss path.
+        if name.iter().any(u8::is_ascii_uppercase) {
+            self.folded.contains(&name.to_ascii_lowercase())
+        } else {
+            self.folded.contains(name)
+        }
+    }
+}
+
 /// Epoch and encoded directory path → its listing, or `None` when the
 /// directory could not be read in full (then every probe under it asks the
 /// filesystem, as before). Shared by every thread: the discovery workers and
 /// the other parallel phases walk the same search lists.
+///
+/// Holds only directories that exist and were probed into, or lie under one
+/// that was: never an absent directory, never a path through a regular
+/// file, and never an ancestor nobody probed into. A spelling
+/// `llvm/ADT/Foo.h` names a `llvm/ADT` under every search
+/// directory it is tried in, nearly all of them absent; an entry per (search
+/// directory × spelled subdirectory), and a memo entry per candidate, took
+/// gigabytes on the LLVM monorepo before its include graph was built
+/// (#209). An absent directory is instead settled from the nearest listing
+/// in hand, by the child it does not hold on the way down
+/// ([`settled_by_listings`]), and reading starts only below a listed
+/// directory ([`read_down_to`]): reading ancestors on demand would snapshot
+/// directories above the analyzed tree, and a tree created later in the
+/// same epoch under such an ancestor -- one test's scratch directory after
+/// another's -- would be invisible.
 static DIR_LISTINGS: LazyLock<RwLock<DirListings>> =
     LazyLock::new(|| RwLock::new((0, FxHashMap::default())));
 
 type DirListings = (u64, FxHashMap<Vec<u8>, Option<Arc<DirListing>>>);
 
-/// `Path::is_file` for a first probe, answered from the parent directory's
-/// listing whenever that settles it.
+/// `Path::is_file` for a first probe, answered from directory listings
+/// whenever those settle it.
 ///
 /// Include resolution probes a candidate per search directory until one
 /// exists, so nearly every probe is a miss and the same few hundred
@@ -164,57 +213,134 @@ type DirListings = (u64, FxHashMap<Vec<u8>, Option<Arc<DirListing>>>);
 /// only case-insensitively or is not ASCII (case-folding and
 /// normalization-insensitive filesystems) is probed as before, and so is
 /// one whose directory could not be listed.
-fn probe_file(path: &Path) -> bool {
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-        return path.is_file();
-    };
-    if parent.as_os_str().is_empty() {
-        return path.is_file();
-    }
-    let Some(listing) = dir_listing(parent) else {
-        return path.is_file();
+fn probe_file(path: &Path) -> Probe {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let (Some(parent), Some(name)) = (parent, path.file_name()) else {
+        return Probe::Stat(path.is_file());
     };
     let name = name.as_encoded_bytes();
-    if listing.names.contains(name)
-        || !name.is_ascii()
-        || listing.folded.contains(&name.to_ascii_lowercase())
-    {
-        return path.is_file();
+    let epoch = PROBE_EPOCH.load(Ordering::Relaxed);
+    let ask = settled_by_listings(parent, name, epoch)
+        .unwrap_or_else(|| read_down_to(parent, name, epoch));
+    if ask {
+        Probe::Stat(path.is_file())
+    } else {
+        Probe::Miss
     }
-    false
 }
 
-fn dir_listing(dir: &Path) -> Option<Arc<DirListing>> {
-    let epoch = PROBE_EPOCH.load(Ordering::Relaxed);
-    let key = dir.as_os_str().as_encoded_bytes();
-    if let Ok(cache) = DIR_LISTINGS.read() {
-        if cache.0 == epoch {
-            if let Some(listing) = cache.1.get(key) {
-                return listing.clone();
+/// What the listings in hand say of `name` under `dir`, reading and
+/// recording nothing: `Some(true)` when the filesystem must be asked (the
+/// name is listed, or `dir` could not be listed), `Some(false)` when `dir`
+/// or a directory on the way down to it is not there, `None` when `dir` must
+/// be read first. One lock and one lookup per level for the whole walk up.
+fn settled_by_listings(dir: &Path, name: &[u8], epoch: u64) -> Option<bool> {
+    let cache = DIR_LISTINGS.read().unwrap_or_else(|e| e.into_inner());
+    if cache.0 != epoch {
+        return None;
+    }
+    let mut child = name;
+    for ancestor in dir.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        if let Some(listing) = cache.1.get(ancestor.as_os_str().as_encoded_bytes()) {
+            let held = listing
+                .as_ref()
+                .is_none_or(|listing| listing.may_hold(child));
+            return match (held, ancestor == dir) {
+                (false, _) => Some(false),
+                (true, true) => Some(true),
+                (true, false) => None,
+            };
+        }
+        child = ancestor.file_name()?.as_encoded_bytes();
+    }
+    None
+}
+
+/// Read and record `dir` -- and first every directory between the nearest
+/// listed ancestor and it, each of which exists, so a repeat probe below
+/// them is settled from memory -- then whether the filesystem must be asked
+/// about `name` under it. With no listed ancestor only `dir` itself is read.
+/// A level `read_dir` reports absent, or a regular file rather than a
+/// directory, settles the probe as a miss and is not recorded.
+fn read_down_to(dir: &Path, name: &[u8], epoch: u64) -> bool {
+    let mut levels = vec![dir];
+    let mut below_listed = false;
+    for ancestor in dir.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        if is_listed(ancestor, epoch) {
+            below_listed = true;
+            break;
+        }
+        levels.push(ancestor);
+    }
+    if !below_listed {
+        levels.truncate(1);
+    }
+    for (i, level) in levels.iter().enumerate().rev() {
+        let child = if i == 0 {
+            Some(name)
+        } else {
+            levels[i - 1].file_name().map(|n| n.as_encoded_bytes())
+        };
+        let listing = match read_listing(level) {
+            Ok(listing) => listing.map(Arc::new),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return false;
+            }
+            Err(_) => None,
+        };
+        let mut cache = DIR_LISTINGS.write().unwrap_or_else(|e| e.into_inner());
+        if cache.0 != epoch {
+            cache.0 = epoch;
+            cache.1 = FxHashMap::default();
+        }
+        let listing = cache
+            .1
+            .entry(level.as_os_str().as_encoded_bytes().to_vec())
+            .or_insert(listing);
+        if let (Some(listing), Some(child)) = (listing, child) {
+            if !listing.may_hold(child) {
+                return false;
             }
         }
     }
-    let listing = read_listing(dir).map(Arc::new);
-    let mut cache = DIR_LISTINGS.write().unwrap_or_else(|e| e.into_inner());
-    if cache.0 != epoch {
-        cache.0 = epoch;
-        cache.1 = FxHashMap::default();
-    }
-    cache.1.entry(key.to_vec()).or_insert(listing).clone()
+    true
 }
 
-/// Every entry of `dir`, or `None` if any of it could not be read: a
-/// partial listing would turn the files it missed into false misses.
-fn read_listing(dir: &Path) -> Option<DirListing> {
+fn is_listed(dir: &Path, epoch: u64) -> bool {
+    let cache = DIR_LISTINGS.read().unwrap_or_else(|e| e.into_inner());
+    cache.0 == epoch && cache.1.contains_key(dir.as_os_str().as_encoded_bytes())
+}
+
+/// Every entry of `dir`; `None` when an entry could not be read, since a
+/// partial listing would turn the files it missed into false misses; or the
+/// error that kept the directory from being opened at all. Only the open
+/// says whether the directory is there -- an entry's error (a stale entry
+/// on a network mount, a removal race) must not.
+fn read_listing(dir: &Path) -> std::io::Result<Option<DirListing>> {
+    let entries = std::fs::read_dir(dir)?;
     let mut names = FxHashSet::default();
     let mut folded = FxHashSet::default();
-    for entry in std::fs::read_dir(dir).ok()? {
-        let name = entry.ok()?.file_name();
-        let bytes = name.as_encoded_bytes();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Ok(None);
+        };
+        let bytes = entry.file_name();
+        let bytes = bytes.as_encoded_bytes();
         folded.insert(bytes.to_ascii_lowercase());
         names.insert(bytes.to_vec());
     }
-    Some(DirListing { names, folded })
+    Ok(Some(DirListing { names, folded }))
 }
 
 /// Resolve `path` against `directory` and fold away `.` / `..` lexically before
@@ -452,6 +578,69 @@ mod tests {
     /// memo every other probe test is reading. Take this first.
     static EPOCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    fn probe_memo_len() -> usize {
+        PROBE_CACHE.with(|cache| cache.borrow().1.len())
+    }
+
+    fn listed(dir: &Path) -> bool {
+        is_listed(dir, file_probe_epoch())
+    }
+
+    /// Include resolution tries a spelling under every search directory, so
+    /// nearly every candidate names a subdirectory that is not there. Those
+    /// leave nothing behind: neither a memo entry per candidate nor a
+    /// listing entry per absent directory -- both grew with (search
+    /// directories × spellings) and exhausted memory on LLVM (#209). A
+    /// directory that does exist below a listed one is read and recorded on
+    /// the way down, so a repeat probe below it reads nothing.
+    #[test]
+    fn absent_directories_leave_no_memo_behind() {
+        let _guard = EPOCH.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let inc = dir.path().join("inc");
+        std::fs::create_dir_all(inc.join("sub")).unwrap();
+        std::fs::write(inc.join("a.h"), "int x;\n").unwrap();
+        start_file_probe_epoch();
+        release_thread_path_caches();
+        assert!(is_file_cached(&inc.join("a.h")), "lists inc");
+        for spelled in ["nope/z.h", "llvm/ADT/x.h", "sub/deep/y.h"] {
+            let candidate = inc.join(spelled);
+            for _ in 0..2 {
+                assert!(!is_file_cached(&candidate), "{}", candidate.display());
+            }
+        }
+        for absent in ["nope", "llvm", "llvm/ADT", "sub/deep"] {
+            assert!(!listed(&inc.join(absent)), "{absent} gets no entry");
+        }
+        assert!(listed(&inc.join("sub")), "an existing level is recorded");
+        assert_eq!(
+            probe_memo_len(),
+            1,
+            "only the file the filesystem was asked about is memoized"
+        );
+    }
+
+    /// Only a listing a probe asked for directly is in hand: ancestors are
+    /// never read to settle a child, so a tree created later in the same
+    /// epoch next to one already probed -- as every test's scratch directory
+    /// is -- is read when it is first asked about.
+    #[test]
+    fn a_sibling_tree_created_later_is_still_found() {
+        let _guard = EPOCH.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::write(first.join("a.h"), "").unwrap();
+        start_file_probe_epoch();
+        assert!(is_file_cached(&first.join("a.h")));
+        assert!(!is_file_cached(&first.join("sub/b.h")));
+        assert!(!listed(root.path()), "nothing probed into the root");
+        let second = root.path().join("second");
+        std::fs::create_dir(&second).unwrap();
+        std::fs::write(second.join("c.h"), "").unwrap();
+        assert!(is_file_cached(&second.join("c.h")));
+    }
+
     #[test]
     fn a_new_epoch_forgets_what_the_tree_used_to_look_like() {
         let _guard = EPOCH.lock().unwrap();
@@ -484,9 +673,12 @@ mod tests {
             let p = dir.path().join(spelling);
             assert_eq!(is_file_cached(&p), p.is_file(), "{spelling}");
         }
-        // An unreadable parent falls back to the plain probe.
+        // A path through a regular file is a miss, with no entry recorded
+        // for the file as if it were a directory; an absent parent likewise.
         assert!(!is_file_cached(&dir.path().join("Mixed.h").join("inner.h")));
+        assert!(!listed(&dir.path().join("Mixed.h")));
         assert!(!is_file_cached(&dir.path().join("nodir").join("inner.h")));
+        assert!(!listed(&dir.path().join("nodir")));
     }
 
     #[test]
