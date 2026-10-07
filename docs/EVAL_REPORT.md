@@ -1,5 +1,319 @@
 # Evaluation Report
 
+## Byte-budgeted indexing window
+
+Measured 2026-10-07 on Linux/WSL2, glibc, AMD Ryzen 7 8845HS
+(8 cores / 16 logical CPUs), eight indexing workers, Rust 1.95.0, release
+ThinLTO with one codegen unit, default allocator and minimal export. After
+rebasing `perf/byte-budgeted-index-window`, both binaries were rebuilt against
+master `32951b4`; the earlier `096df75` measurements below are exploratory
+history, not this comparison's baseline. Master includes the include-probe
+cache and factory-construction changes. The revised memory acceptance limit
+is **3%**. Corpus checkouts are clean:
+
+| Corpus | Revision | Translation units |
+|---|---|---:|
+| HDF | `cdc75a20bb8f1a046cd22e189405a20d602d0521` | 802 |
+| Hiview | `92408e2072bd6dc8fb0d980773e80b6ec898710c` | 690 |
+| Camera | `8ffd69dcd47f533e70b4dba428439da9008b0cae` | 744 |
+| Ability | `6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8` | 3,331 |
+
+### Rebased comparison
+
+These Linux ordinary-path measurements are for reviewed head `b4f9b00`. The
+configured follow-up below keeps the ordinary admission policy unchanged.
+
+The candidate uses the policy in
+[Parsing memory limits](PERFORMANCE_REVIEW.md#6-make-parsing-memory-limits-independent-of-cpu-count):
+one thirty-second of estimated corpus source storage, clamped to
+128 KiB–8 MiB; each admission costs at least 8 KiB and at most one quarter
+of the budget. The count safety cap remains 16 per worker, clamped to 4–256
+(128 slots at eight jobs). Reservations cover indexing, waiting and merge.
+Actual TU budgets are about **212 KiB on Hiview** and **4.12 MiB on Ability**;
+the 8 MiB maximum is not reached on Ability. The worker count and ordered
+merge are unchanged. Source bytes remain a proxy for IR storage, not an RSS
+bound.
+
+Three alternating runs per binary/corpus, without build, test, evaluation or
+SQLite hashing overlapping timed runs. Figures below are medians; percentages
+compare medians. Baseline uses the original count window of 16 slots.
+
+| Corpus | TU wall seconds, baseline → candidate | TU wall change | Busy cores, baseline → candidate | Whole-run seconds, baseline → candidate | Whole-run user CPU seconds, baseline → candidate |
+|---|---:|---:|---:|---:|---:|
+| HDF | 1.33 → 1.33 | −0.1% | 3.82 → 3.86 | 5.85 → 5.72 | 11.91 → 11.87 |
+| Hiview | 1.02 → 1.01 | −1.6% | 3.23 → 3.29 | 2.32 → 2.32 | 5.22 → 5.20 |
+| Camera | 4.74 → 4.84 | +1.9% | 3.71 → 3.59 | 9.15 → 9.34 | 26.64 → 26.89 |
+| Ability | 28.49 → 22.41 | **−21.4%** | 3.97 → **5.60** | 53.00 → 46.56 | 159.94 → 171.73 |
+
+Ability's TU ranges are **28.26–28.55 s** baseline and **21.80–22.54 s**
+candidate. Busy-core ranges are **3.94–3.99** and **5.51–5.70**. The whole-run
+median improves **12.2%**, with **7.4%** more user CPU. Camera retains a small
+TU regression: baseline range **4.70–4.89 s**, candidate **4.76–5.01 s**;
+its median whole-run time rises 2.1%.
+
+| Corpus | Peak RSS MiB, median baseline → candidate | Median change | Baseline range MiB | Candidate range MiB | Highest-peak change |
+|---|---:|---:|---:|---:|---:|
+| HDF | 272.8 → 273.9 | +0.4% | 271.3–277.0 | 273.3–275.4 | −0.6% |
+| Hiview | 127.5 → 129.1 | +1.3% | 126.8–127.5 | 129.0–129.7 | +1.7% |
+| Camera | 404.3 → 392.7 | −2.9% | 399.2–408.6 | 391.4–394.9 | −3.4% |
+| Ability | 1010.7 → 1000.9 | −1.0% | 1000.7–1016.3 | 997.8–1002.0 | −1.4% |
+
+Highest-peak change compares the largest candidate peak with the largest
+baseline peak. Both median and highest-peak comparisons stay below **3%** on
+all four corpora. Every paired run also stays below 3%; the largest paired
+increase is **1.9%**, on Hiview. Peak RSS is the kernel maximum from
+`/usr/bin/time`. These are Linux RSS measurements; separately reported macOS
+`phys_footprint` measurements follow below.
+
+A scratch version of `scripts/memory_observer.c` adds
+`getrusage(RUSAGE_SELF)` at the existing stage messages. TU wall and process
+CPU deltas run from `pch-done:` to `index:`, matching the macOS profiler's
+phase boundaries. They include header-preamble/orphan work before the main TU
+merges and finalization after them. Busy cores are (user + system CPU delta)
+/ wall delta. One-job runs are separate correctness checks and are not used
+as timing comparisons.
+
+### Choosing the budget and per-unit cap
+
+Fresh measurements against master changed the choice made before the rebase:
+
+- A 512 KiB floor with a corpus divisor of 24 raised Hiview's median peak
+  RSS by **5.4%** (three runs). A 256 KiB floor reduced that to **3.7%**, still
+  outside the revised 3% criterion.
+- A 128 KiB floor with divisor 32 kept all four RSS comparisons within 3%,
+  and cut Ability's median TU time by **20.7%** (three runs). However,
+  clamping oversized units to the entire budget forced them to run alone;
+  Camera's median TU time regressed **15.1%**.
+- Capping each charge at a quarter of the budget retained Ability's gain and
+  reduced Camera's measured regression to **1.9%**, with the RSS results
+  above. The mixed-charge test verifies that three large charges and two
+  small ones can proceed behind an oversized straggler, and that the next
+  large charge stays blocked through merge.
+- Doubling the count allowance from 16 to 32 per worker did not improve the
+  initial Ability comparison: **21.97 vs 21.98 s**, both about **5.75 busy
+  cores**, using divisor 24 and a 512 KiB floor. Keep the smaller count cap.
+
+### Verification and remaining acceptance checks
+
+- `cargo test --workspace --offline`: **1,860 tests pass**, including ordered
+  merge, worker availability, small-unit run-ahead, weighted admission,
+  oversized-unit overlap, reservations through merge, and panic cancellation
+  at both admission limits. The source-cache tests cover resident, spilled,
+  released, evicted and unreadable-spill size metadata.
+- `cargo clippy --workspace --all-targets --offline -- -D warnings`: passes.
+- Pinned production evaluation: **99 checks, zero failures**, with unchanged
+  expectations from master.
+- All **15 non-metadata tables** match in **32 databases**: baseline and
+  candidate, three runs at `--jobs 8` and one run at `--jobs 1`, on each of
+  the four corpora. Comparison hashes the table schemas and every row in
+  `rowid` order; only `analysis_run` is excluded. Row totals per database are
+  HDF **696,654**, Hiview **341,739**, Camera **818,869**, Ability **4,361,526**.
+
+The **15% TU wall improvement** and revised **3% Linux peak RSS limit** pass
+on this host. The **six-busy-core criterion does not pass here**: Ability's
+median is 5.60, despite a 21.4% speedup. The independent M1 review below reports
+**15.6%** TU wall improvement and **6.53 busy cores** on `b4f9b00`, supporting
+those ordinary-path criteria on the target hardware. Its footprint medians
+are within 2%, but the spread does not establish a strict worst-peak limit.
+The configured fix still needs a macOS measurement. No claim is made that all
+acceptance criteria are satisfied.
+
+Fresh binaries, logs, completed-run JSON, row hashes and scratch measurement
+scripts are in `/tmp/trace-index-window-rebased/`. `manifest.json` records the
+policies; `measure.py` runs the alternating comparisons. Final measurement
+labels are `base` and `quarter`, repetitions **10–12**; earlier labels are
+exploratory candidates. `final-summary.json` records their medians and ranges.
+`check-job1.py` runs the one-job correctness matrix;
+`check-tables-final.py` selects the 32 final databases for `compare.py`.
+Verification logs are `workspace-tests.log`, `clippy.log`, `eval.log` and
+`tables.log`. Only runs with a successful completion JSON are compared.
+
+### Apple M1 review of the ordinary path
+
+Independent review of `b4f9b0096ed68facc45647a948145295dc533884` against
+`32951b46d2ae88b333e3fd6c0425bc9b212a87fc`, supplied for PR #212. Both revisions
+were rebuilt in release mode with ThinLTO, the default allocator and
+space-efficient malloc, eight jobs, and the pinned clean corpora. Reported
+environment: Apple M1, macOS 27.0.1, Rust 1.100.0-nightly. Measurements used
+`scripts/profile_memory_macos.py`, three alternating pairs per corpus and
+six pairs for Hiview. These are review-reported results, not new Linux-host
+measurements.
+
+| Corpus | TU wall seconds, base → reviewed | Busy cores, base → reviewed | Peak footprint MiB, median base → reviewed |
+|---|---:|---:|---:|
+| HDF | 0.934 → 0.839 | 4.70 → 4.76 | 172.4 → 165.9 |
+| Hiview | 0.526 → 0.528 | 4.52 → 4.54 | 58.2 → 59.3 |
+| Camera | 2.934 → 2.842 | 4.36 → 4.27 | 141.1 → 141.8 |
+| Ability | 16.329 → 13.783 | 4.71 → 6.53 | 714.8 → 684.3 |
+
+Ability's TU median improves **15.6%** and its whole-run median falls from
+**33.75 to 31.09 s**. No median footprint increase exceeds 2%, but peak spread
+is substantial: Hiview candidate **58.4–80.8 MiB**; Camera baseline
+**137.2–298.2 MiB**, candidate **140.9–208.7 MiB**. These runs support the
+throughput gain and median footprint comparison; they do not establish a
+strict worst-peak memory acceptance result.
+
+The review reports formatting, clippy and **1,863 passing tests including
+doctests**. All 15 non-metadata schemas and ordered rows match across **34
+corpus databases**, including candidate one-job output on all four corpora;
+the six configured reproduction databases also match in all 15 table contents.
+Linux measurements and the 99-check evaluation were not independently rerun
+by that review. Reported evidence locations are
+`/tmp/pathologist-review-212-logs/` and
+`/tmp/pathologist-review-212-configured-logs/` on the review host; those paths
+are not available in this Linux workspace.
+
+### Configured multi-command follow-up
+
+The [configured-window review finding](https://github.com/Last-Humans-Coding-Under-White-Nights/pathologist/pull/212#discussion_r4208745200)
+exposes a path the four ordinary corpora do not exercise. On `b4f9b00`, four
+commands reserve 4 × 64 KiB against a fixed 1 MiB budget. Only four source
+families can run at eight jobs, regardless of source size. Larger command
+counts and command/exploration combinations also reach the per-family charge
+cap. The M1 reproduction used 64 C sources, each including a header containing
+600 inline callback functions, with four `-DMODE` commands per source. Three
+release runs per revision reported:
+
+| M1 configured metric | Base `32951b4` | Reviewed `b4f9b00` |
+|---|---:|---:|
+| Whole-run median seconds | 0.92 | 1.13 (**+22.8%**) |
+| Reported indexing seconds in each pair | 0.9 | 1.1 |
+| Whole-process CPU / wall | 7.00 | 3.87 |
+| Peak footprint MB | 21.8 | 14.0 |
+
+The fix retains configured indexing's previous source-family count limit.
+It removes fixed charges per command or exploratory variant; unconsumed
+configured headers use the same count policy. The ordinary path retains byte
+admission. Limits are defined in
+[Parsing memory limits](PERFORMANCE_REVIEW.md#6-make-parsing-memory-limits-independent-of-cpu-count).
+Both modes use the same ordered merge, cancellation, and reclamation code.
+This restores configured throughput at the cost of giving up the reviewed
+fallback's memory benefit, until a size estimate is validated for that path.
+
+Fresh measurements on the Linux host described above compare master `32951b4`,
+reviewed `b4f9b00`, and the corrected source tree. All three release binaries
+were rebuilt; the baseline uses a separate Cargo target directory to avoid
+shared executable output overwrites. The supplied fixture is reproduced with
+**1, 4 and 8 commands per source**. Each group uses three runs per revision,
+rotating binary order. Build, test, evaluation and SQLite hashing do not overlap
+timed runs. Table figures are medians; RSS ranges show the three process peaks.
+
+| Commands / source | Revision | Whole-run seconds | Index seconds | Whole-process CPU / wall | Peak RSS MiB, median (range) |
+|---|---|---:|---:|---:|---:|
+| 1 | Base | 0.24 | 0.223 | 6.75 | 48.0 (47.8–49.7) |
+| 1 | Reviewed | 0.24 | 0.223 | 6.79 | 49.2 (48.7–49.7) |
+| 1 | Fixed | 0.25 | 0.232 | 6.89 | 47.5 (47.5–50.1) |
+| 4 | Base | 0.85 | 0.832 | 7.17 | 72.6 (71.8–76.2) |
+| 4 | Reviewed | 1.46 | 1.438 | 3.58 | 63.0 (57.9–64.0) |
+| 4 | Fixed | 0.83 | 0.812 | 7.14 | 75.2 (74.5–77.7) |
+| 8 | Base | 1.68 | 1.655 | 7.26 | 108.0 (105.4–109.7) |
+| 8 | Reviewed | 2.90 | 2.881 | 3.59 | 83.1 (79.9–85.3) |
+| 8 | Fixed | 1.63 | 1.608 | 7.28 | 108.2 (102.8–111.2) |
+
+The four-command slowdown reproduces on Linux: reviewed whole-run median is
+**71.8%** above baseline, while the fix is **2.4% faster** than baseline and
+uses **7.14** rather than **3.58** busy cores overall. Eight commands restore
+**1.63 s** versus **1.68 s** baseline and **2.90 s** reviewed. At one command,
+the fix is **0.25 s** versus **0.24 s** baseline; the ranges overlap
+(0.23–0.27 s versus 0.24 s in these runs).
+
+The configured memory tradeoff is recorded separately from the ordinary-path
+3% criterion. Four-command median RSS is **75.2 MiB** fixed versus **72.6 MiB**
+base (**+3.6%**) and **63.0 MiB** reviewed; the highest peaks are **77.7 MiB**
+fixed versus **76.2 MiB** base (**+1.9%**). Eight-command median RSS is
+**108.2 MiB** fixed versus **108.0 MiB** base. Restoring the count policy does
+not provide an RSS guarantee. No macOS footprint measurement of the fix is
+available; the 21.8 → 14.0 MB review comparison describes the rejected fallback.
+
+Index wall/CPU deltas run from `compile_commands:` to `index:` using the same
+scratch observer plus a configured-stage hook. This covers configured lowering,
+ordered family merge and finalization; it is distinct from the ordinary
+`pch-done:` boundary. Whole-process CPU / wall uses GNU time's user + system
+CPU, divided by wall time. Peak RSS is its kernel maximum.
+
+All **15 non-metadata schemas and ordered rows** match in **33 reproduction
+databases**: three runs at eight jobs for all three revisions, plus base/fix
+one-job output, for each command count. Only `analysis_run` is excluded.
+A regression test proves eight active workers for four/eight-command and
+command/exploration families without invoking the byte estimator. A straggler
+test verifies the configured count cap stays reserved through merge. Worker
+and merge panic cancellation is exercised in both admission modes.
+
+Fresh validation: **1,862 workspace tests pass**, clippy with warnings denied
+passes, and the pinned evaluation passes **99 checks, zero failures**, with
+unchanged expectations. Ordinary-path admission logic and worker count are
+unchanged by this fix; the earlier ordinary measurements retain their revision
+attribution above.
+
+Reproduction generator, binaries, build/test/evaluation logs, 27 timed-run
+JSON files, all 33 databases and table hashes, and `summary.json` are in
+`/tmp/trace-configured-window-followup/`. `measure.py` creates its source tree
+with `tempfile.TemporaryDirectory`, uses one stable path for every comparison,
+and removes the inputs afterward. The source generator and header hash are
+retained for reproduction.
+
+### Review hardening (#212)
+
+The 2026-10-08 follow-up floors custom scheduler budgets and charge caps at
+the minimum charge, preventing an inverted `clamp` range below 32 KiB and
+ensuring budgets below 8 KiB can admit a unit. Remaining-budget arithmetic
+uses `saturating_sub`; reservations remain bounded by the normalized budget.
+Regression coverage exercises zero, sub-minimum and near-32-KiB budgets with
+zero and oversized estimates, ordered output, and worker/merge cancellation.
+
+Production byte budgets still start at 128 KiB, configured admission still
+uses the source-family count window, and the ordinary orphan-header estimator
+now explicitly applies the same minimum charge as translation units. These
+changes preserve the production admission charges used in the measurements
+above. The four-maximum-charge-unit limit is documented in
+[Parsing memory limits](PERFORMANCE_REVIEW.md#6-make-parsing-memory-limits-independent-of-cpu-count);
+it is independent of worker count. Ordinary orphan headers use byte admission;
+only unconsumed configured headers retain the count policy.
+
+Fresh validation: **1,863 workspace tests pass**, including small-budget
+admission and cancellation; clippy with warnings denied and formatting checks
+pass. The rebuilt release binary passes the pinned evaluation's **99 checks,
+zero failures**, with unchanged expectations. Logs are in
+`/tmp/trace-index-window-hardening/`. The performance and database matrices
+above retain their original revision attribution; they were not rerun for
+this hardening of custom budgets.
+
+### Earlier count and fixed-budget exploration
+
+These single-run sweeps used baseline `096df75`, before the rebase. They locate
+candidate settings and are not mixed into the current acceptance comparison.
+The count variants use safety caps of 64/128/256 for 4/8/16 per worker. Cells
+are **TU wall seconds / whole-process peak RSS MiB**.
+
+| Corpus | 2 per worker (16 slots) | 4 per worker (32) | 8 per worker (64) | 16 per worker (128) |
+|---|---:|---:|---:|---:|
+| HDF | 1.50 / 287.6 | 1.38 / 284.4 | 1.32 / 282.5 | 1.37 / 284.5 |
+| Hiview | 1.26 / 159.9 | 1.11 / 162.0 | 1.07 / 160.5 | 1.07 / 164.3 |
+| Camera | 5.33 / 420.1 | 4.64 / 434.5 | 4.39 / 460.7 | 4.40 / 486.5 |
+| Ability | 32.86 / 1015.8 | 28.48 / 1026.5 | 26.59 / 1010.6 | 24.31 / 1040.8 |
+
+HDF and Hiview flatten by 8 per worker; Camera flattens between 8 and 16 but
+pays 9.7–15.8% in RSS. Ability still benefits from 16 per worker. Increasing
+the count alone therefore does not satisfy the memory criterion on all inputs.
+
+The fixed-budget sweep uses an 8 KiB minimum charge and reserves unknown
+estimates at one sixteenth of the budget. These are also single runs:
+
+| Fixed source budget | Ability TU seconds | Ability peak MiB | Camera peak MiB | Hiview peak MiB |
+|---|---:|---:|---:|---:|
+| 1 MiB | 31.76 | 998.4 | 410.9 | 162.3 |
+| 2 MiB | 25.84 | 1000.6 | 435.3 | 165.7 |
+| 4 MiB | 25.70 | 1025.0 | 477.2 | 165.5 |
+| 8 MiB | 25.84 | 1048.3 | 478.2 | 167.7 |
+
+One MiB constrains Ability too much; two MiB recovers most throughput but
+still raises the smaller corpora's RSS. That motivated scaling the budget to
+the corpus. An intermediate scaled policy with an 8 MiB maximum was rejected
+under the former 2% limit (Ability about 1,048 MiB against about 1,020 MiB).
+The later interrupted validation matrix is not used for the rebased comparison.
+Earlier raw artifacts remain in `/tmp/trace-index-window/`.
+
+
 ## Factory construction: #192 — 2026-10-06
 
 The first table records the initial implementation. Current counts after

@@ -163,40 +163,51 @@ pub(super) fn build(
     let mut linked_units = Vec::new();
     let mut first = None;
     let mut family: Option<VariantMerge> = None;
-    index_in_window(&pool, files, jobs, index, |result| {
-        // Every unit here lowers its whole include closure, so a tree of
-        // this size can take hours: say where the run is (#209).
-        index_item_progress(
-            file_index,
-            files.len(),
-            format!(
-                "parse: {}/{} {}",
-                file_index + 1,
+    // Commands preprocess inside the worker, so no settled text-size estimate
+    // exists at admission. Retain the previous count window: charging each
+    // command or variant a fixed size can park workers even for small sources.
+    index_in_window(
+        &pool,
+        files,
+        jobs,
+        None,
+        |_| 0,
+        index,
+        |result| {
+            // Every unit here lowers its whole include closure, so a tree of
+            // this size can take hours: say where the run is (#209).
+            index_item_progress(
+                file_index,
                 files.len(),
-                files[file_index].display()
-            ),
-        );
-        variants_merged += result.units.len().saturating_sub(1);
-        includes_by_file.push((files[file_index].clone(), result.includes.clone()));
-        file_index += 1;
-        consumed.extend(result.includes);
-        for unit in result.units {
-            // Exploratory includes also cannot be treated as orphan headers.
-            consumed.extend(unit.files.iter().cloned());
-            if scoped {
-                linked_units.push(unit);
-            } else if let Some(merge) = &mut family {
-                merge.push(&mut program, &unit);
-            } else if let Some(base) = first.take() {
-                // Only build variant deduplication once a second unit exists.
-                let mut merge = VariantMerge::start(&mut program, &base, true);
-                merge.push(&mut program, &unit);
-                family = Some(merge);
-            } else {
-                first = Some(unit);
+                format!(
+                    "parse: {}/{} {}",
+                    file_index + 1,
+                    files.len(),
+                    files[file_index].display()
+                ),
+            );
+            variants_merged += result.units.len().saturating_sub(1);
+            includes_by_file.push((files[file_index].clone(), result.includes.clone()));
+            file_index += 1;
+            consumed.extend(result.includes);
+            for unit in result.units {
+                // Exploratory includes also cannot be treated as orphan headers.
+                consumed.extend(unit.files.iter().cloned());
+                if scoped {
+                    linked_units.push(unit);
+                } else if let Some(merge) = &mut family {
+                    merge.push(&mut program, &unit);
+                } else if let Some(base) = first.take() {
+                    // Only build variant deduplication once a second unit exists.
+                    let mut merge = VariantMerge::start(&mut program, &base, true);
+                    merge.push(&mut program, &unit);
+                    family = Some(merge);
+                } else {
+                    first = Some(unit);
+                }
             }
-        }
-    });
+        },
+    );
     drop(family);
     if scoped {
         // The indexing workers have finished. Return their freed lexer/AST
@@ -277,6 +288,8 @@ pub(super) fn build(
         &pool,
         &header_configs,
         jobs,
+        None,
+        |_| 0,
         |(path, config)| {
             let cache = IndexSourceCache::new();
             index_source_file(

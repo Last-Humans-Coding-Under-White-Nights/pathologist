@@ -518,6 +518,18 @@ impl IndexSourceCache {
         })
     }
 
+    /// Settled text size for indexing admission, without reading a spill file.
+    /// Missing or released text has no usable estimate.
+    pub(crate) fn source_bytes(&self, path: &Path, graph: &IncludeGraph) -> Option<usize> {
+        let canonical = graph.intern_path(path);
+        let guard = self.inner.read().ok()?;
+        match guard.get(&canonical)? {
+            CachedSource::Resident(src) => Some(src.text.len()),
+            CachedSource::Spilled(src) => Some(src.text_len),
+            CachedSource::Released(_) => None,
+        }
+    }
+
     /// Preprocess `path` without storing the result here, for the side
     /// effects carried by `eff_opts` (include-expansion cache, shared macro
     /// table) and for what the run reported. The warm pass uses it for the
@@ -1008,6 +1020,7 @@ mod tests {
             .with_record_conditionals(true);
         let cache = IndexSourceCache::new();
         let original = cache.get_or_preprocess(&path, &graph, &opts).unwrap();
+        assert_eq!(cache.source_bytes(&path, &graph), Some(original.text.len()));
         assert!(!original.line_map.entries.is_empty());
         assert!(!original.diagnostics.is_empty());
         assert!(!original.conditionals.is_empty());
@@ -1016,6 +1029,7 @@ mod tests {
         let includes = cache.included_by_file();
         let dirty = cache.units_that_inlined(&units);
         cache.spill(&path, &graph).unwrap();
+        assert_eq!(cache.source_bytes(&path, &graph), Some(original.text.len()));
         let spill_path = {
             let guard = cache.inner.read().unwrap();
             let CachedSource::Spilled(src) = &guard[&graph.intern_path(&path)] else {
@@ -1053,6 +1067,7 @@ mod tests {
         });
         cache.check_load_errors().unwrap();
         cache.evict_all(&units);
+        assert_eq!(cache.source_bytes(&path, &graph), None);
         assert!(
             !spill_path.exists(),
             "eviction must clean up the temporary file"
@@ -1073,6 +1088,7 @@ mod tests {
         let units = [graph.intern_path(&path)].into_iter().collect();
         let before = cache.units_that_inlined(&units);
         cache.release_text(&path, &graph);
+        assert_eq!(cache.source_bytes(&path, &graph), None);
         {
             let guard = cache.inner.read().unwrap();
             let CachedSource::Released(src) = &guard[&graph.intern_path(&path)] else {
@@ -1101,6 +1117,7 @@ mod tests {
         let opts = PreprocessOptions::default();
         cache.get_or_preprocess(&path, &graph, &opts).unwrap();
         cache.spill(&path, &graph).unwrap();
+        let bytes = cache.source_bytes(&path, &graph);
         {
             let guard = cache.inner.read().unwrap();
             let CachedSource::Spilled(src) = &guard[&graph.intern_path(&path)] else {
@@ -1113,6 +1130,8 @@ mod tests {
                 .set_len(0)
                 .unwrap();
         }
+        assert_eq!(cache.source_bytes(&path, &graph), bytes);
+        cache.check_load_errors().unwrap();
         assert!(cache
             .get_or_preprocess(&path, &graph, &opts)
             .unwrap_err()

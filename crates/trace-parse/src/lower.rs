@@ -1203,10 +1203,19 @@ fn build_program_inner(
             }
         });
     } else {
+        let estimate_bytes = |path: &PathBuf| {
+            source_cache
+                .source_bytes(path, &include_graph)
+                .unwrap_or(INDEX_WINDOW_UNKNOWN_BYTES)
+                .max(INDEX_WINDOW_MIN_BYTES)
+        };
+        let byte_budget = index_byte_budget(orphan_headers.iter().map(&estimate_bytes));
         index_in_window(
             &pool,
             &orphan_headers,
             jobs,
+            Some(byte_budget),
+            estimate_bytes,
             |path| {
                 let unit = index_source_file(
                     path,
@@ -1285,11 +1294,28 @@ fn build_program_inner(
             }
         });
     } else {
+        let estimate_bytes = |path: &PathBuf| {
+            let bytes = source_cache
+                .source_bytes(path, &include_graph)
+                .unwrap_or(INDEX_WINDOW_UNKNOWN_BYTES);
+            // A reservation covers the whole family, including the maximum
+            // number of exploratory units retained beside it.
+            let variants = gn_candidates
+                .as_ref()
+                .filter(|c| !c.is_empty())
+                .map_or(0, |_| opts.explore_budget);
+            bytes
+                .max(INDEX_WINDOW_MIN_BYTES)
+                .saturating_mul(variants.saturating_add(1))
+        };
+        let byte_budget = index_byte_budget(file_order.iter().map(&estimate_bytes));
         for batch in file_order.chunks(512) {
             index_in_window(
                 &pool,
                 batch,
                 jobs,
+                Some(byte_budget),
+                estimate_bytes,
                 |path| {
                     let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
                     let units = index_source_file_with_variants(
@@ -1972,15 +1998,43 @@ fn normalize_discovered_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Units the workers may take ahead of the merge, per worker, and the bounds
-/// on the total. This bounds the IR held before merging (at most the window
-/// indexed or in flight) without making anyone wait for a batch: a slow unit
-/// holds up the merge, not the other workers. The cap keeps a many-core host
-/// from holding dozens of lowered units behind one straggler; two per worker
-/// measured the same as four on Clang with eight workers.
-const INDEX_WINDOW_PER_WORKER: usize = 2;
+/// Admission charges settled source bytes until the unit has merged. This is
+/// an IR-size proxy, not a bound on RSS: shared-header declarations and ASTs
+/// cost memory too. A minimum charge accounts for small units' fixed overhead;
+/// unknown sizes use a conservative charge. Large units occupy up to a quarter
+/// of the budget so they can overlap, while small units can run further ahead
+/// of a straggler. Only four maximum-charge units can be admitted at once,
+/// independent of worker count. Workers still park when either the byte budget
+/// or the count safety cap fills.
+/// Measurements: docs/EVAL_REPORT.md, "Byte-budgeted indexing window".
+const INDEX_WINDOW_BYTE_BUDGET_MIN: usize = 128 * 1024;
+const INDEX_WINDOW_BYTE_BUDGET_MAX: usize = 8 * 1024 * 1024;
+const INDEX_WINDOW_BUDGET_DIVISOR: usize = 32;
+const INDEX_WINDOW_MAX_CHARGE_DIVISOR: usize = 4;
+const INDEX_WINDOW_MIN_BYTES: usize = 8 * 1024;
+const INDEX_WINDOW_UNKNOWN_BYTES: usize = 64 * 1024;
+const INDEX_WINDOW_PER_WORKER: usize = 16;
 const INDEX_WINDOW_MIN: usize = 4;
-const INDEX_WINDOW_MAX: usize = 32;
+const INDEX_WINDOW_MAX: usize = 256;
+
+/// Reserve a fraction of the corpus's estimated source storage, with fixed
+/// bounds independent of the worker count. The small-unit minimum is included
+/// in the corpus estimate as well as each admission charge.
+fn index_byte_budget(estimates: impl Iterator<Item = usize>) -> usize {
+    let bytes = estimates.fold(0usize, |total, bytes| {
+        total.saturating_add(bytes.max(INDEX_WINDOW_MIN_BYTES))
+    });
+    let budget = (bytes / INDEX_WINDOW_BUDGET_DIVISOR)
+        .clamp(INDEX_WINDOW_BYTE_BUDGET_MIN, INDEX_WINDOW_BYTE_BUDGET_MAX);
+    if std::env::var_os("TRACE_INDEX_VERBOSE").is_some() {
+        index_progress(format!(
+            "index-window: estimated {} KiB, budget {} KiB",
+            bytes / 1024,
+            budget / 1024
+        ));
+    }
+    budget
+}
 
 /// The window for `jobs` workers.
 fn index_window(jobs: usize) -> usize {
@@ -1989,15 +2043,26 @@ fn index_window(jobs: usize) -> usize {
         .clamp(INDEX_WINDOW_MIN, INDEX_WINDOW_MAX)
 }
 
+/// Configured indexing has no settled source sizes. Preserve its count limit
+/// until a byte policy is validated for command and exploration families.
+fn configured_index_window(jobs: usize) -> usize {
+    jobs.max(1).saturating_mul(2).clamp(4, 32)
+}
+
 /// Index `items` on `jobs` workers and merge them in order on the caller.
 /// Call outside the pool so waiting for a unit does not occupy a worker.
 ///
 /// Workers take units in order and park a finished unit until the merge
 /// reaches it; the merge runs on this thread while the workers go on. A
-/// worker that is [`index_window`] units ahead of the merge waits for it, so
-/// the pending IR is bounded by the window rather than by the corpus, and
-/// the merge order is that of `items` regardless of which unit finishes
-/// first.
+/// worker reserves its estimated bytes before indexing and releases them
+/// after merging, including the payload currently being merged. Charges are
+/// capped at a quarter of the budget so large units can overlap without
+/// stalling admission forever. The count safety cap is [`index_window`]. Both
+/// bounds cover units being indexed as well as finished units, and merge order
+/// is that of `items` regardless of which unit finishes first. Custom budgets
+/// and charge caps are floored at the minimum charge so admission can progress.
+/// Without a byte budget, keep the configured path's previous count limit and
+/// do not call the size estimator; commands and variants share one source slot.
 ///
 /// A panic in `index` or `merge` unwinds through the scope as it would
 /// without the window: whoever panics marks the run cancelled on the way
@@ -2007,6 +2072,8 @@ fn index_in_window<I: Sync, T: Send>(
     pool: &rayon::ThreadPool,
     items: &[I],
     jobs: usize,
+    byte_budget: Option<usize>,
+    estimate_bytes: impl Fn(&I) -> usize,
     index: impl Fn(&I) -> T + Sync,
     mut merge: impl FnMut(T) + Send,
 ) {
@@ -2015,6 +2082,8 @@ fn index_in_window<I: Sync, T: Send>(
         next: usize,
         /// Units merged so far; the window is measured from here.
         merged: usize,
+        /// Reservations for every admitted but not yet merged unit.
+        bytes: usize,
         /// Finished units the merge has not reached yet.
         done: BTreeMap<usize, T>,
         /// Set by a thread unwinding from a panic; everyone else stops.
@@ -2045,10 +2114,24 @@ fn index_in_window<I: Sync, T: Send>(
         }
     }
     let jobs = jobs.max(1);
-    let window = index_window(jobs);
+    // Estimate once, before workers can evict source-cache entries. Capping
+    // each charge preserves some parallelism for unusually large source text.
+    let (window, byte_budget, charges) = if let Some(budget) = byte_budget {
+        let budget = budget.max(INDEX_WINDOW_MIN_BYTES);
+        let max_charge = (budget / INDEX_WINDOW_MAX_CHARGE_DIVISOR).max(INDEX_WINDOW_MIN_BYTES);
+        let charges: Vec<_> = items
+            .iter()
+            .map(|item| estimate_bytes(item).clamp(INDEX_WINDOW_MIN_BYTES, max_charge))
+            .collect();
+        (index_window(jobs), budget, charges)
+    } else {
+        (configured_index_window(jobs), 0, vec![0; items.len()])
+    };
+    let charges = &charges;
     let state = Mutex::new(Window {
         next: 0,
         merged: 0,
+        bytes: 0,
         done: BTreeMap::new(),
         cancelled: false,
     });
@@ -2069,8 +2152,9 @@ fn index_in_window<I: Sync, T: Send>(
                     let i = {
                         let mut st = lock();
                         while !st.cancelled
-                            && st.next >= st.merged + window
                             && st.next < items.len()
+                            && (st.next - st.merged >= window
+                                || charges[st.next] > byte_budget.saturating_sub(st.bytes))
                         {
                             st = signals
                                 .window_moved
@@ -2080,6 +2164,7 @@ fn index_in_window<I: Sync, T: Send>(
                         if st.cancelled || st.next >= items.len() {
                             return;
                         }
+                        st.bytes += charges[st.next];
                         st.next += 1;
                         st.next - 1
                     };
@@ -2090,7 +2175,7 @@ fn index_in_window<I: Sync, T: Send>(
             });
         }
         let _cancel = CancelOnPanic { state, signals };
-        for i in 0..items.len() {
+        for (i, &charge) in charges.iter().enumerate() {
             let unit = {
                 let mut st = lock();
                 loop {
@@ -2113,7 +2198,11 @@ fn index_in_window<I: Sync, T: Send>(
             if (i + 1).is_multiple_of(64) {
                 crate::memory::reclaim_unused_pages();
             }
-            lock().merged = i + 1;
+            {
+                let mut st = lock();
+                st.bytes -= charge;
+                st.merged = i + 1;
+            }
             signals.window_moved.notify_all();
         }
     });
@@ -17551,6 +17640,66 @@ mod index_window_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    const TEST_BYTE_BUDGET: usize = 1024 * 1024;
+
+    #[test]
+    fn small_custom_byte_budgets_complete_with_bounded_reservations() {
+        let jobs = 8;
+        let pool = index_pool(jobs).unwrap();
+        let items: Vec<_> = (0..24).collect();
+        for budget in [
+            0,
+            1,
+            INDEX_WINDOW_MIN_BYTES - 1,
+            INDEX_WINDOW_MIN_BYTES,
+            INDEX_WINDOW_MIN_BYTES + 1,
+            2 * INDEX_WINDOW_MIN_BYTES,
+            4 * INDEX_WINDOW_MIN_BYTES - 1,
+            4 * INDEX_WINDOW_MIN_BYTES,
+        ] {
+            let unmerged_bytes = AtomicUsize::new(0);
+            let mut merged = Vec::new();
+            index_in_window(
+                &pool,
+                &items,
+                jobs,
+                Some(budget),
+                |&i| if i % 2 == 0 { 0 } else { usize::MAX },
+                |&i| {
+                    let bytes = unmerged_bytes.fetch_add(INDEX_WINDOW_MIN_BYTES, Ordering::SeqCst)
+                        + INDEX_WINDOW_MIN_BYTES;
+                    assert!(bytes <= budget.max(INDEX_WINDOW_MIN_BYTES));
+                    i
+                },
+                |i| {
+                    assert!(unmerged_bytes.load(Ordering::SeqCst) >= INDEX_WINDOW_MIN_BYTES);
+                    merged.push(i);
+                    unmerged_bytes.fetch_sub(INDEX_WINDOW_MIN_BYTES, Ordering::SeqCst);
+                },
+            );
+            assert_eq!(merged, items);
+            assert_eq!(unmerged_bytes.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn byte_budget_scales_with_the_corpus_with_fixed_bounds() {
+        assert_eq!(
+            index_byte_budget(std::iter::empty()),
+            INDEX_WINDOW_BYTE_BUDGET_MIN
+        );
+        let small = index_byte_budget(std::iter::repeat_n(0, 512));
+        let large = index_byte_budget(std::iter::repeat_n(0, 3331));
+        assert!(
+            large > small,
+            "reclamation batches must use the full corpus budget"
+        );
+        assert_eq!(
+            index_byte_budget([usize::MAX, usize::MAX].into_iter()),
+            INDEX_WINDOW_BYTE_BUDGET_MAX
+        );
+    }
+
     fn lower_cpp_snippet(source: &str) -> Program {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snippet.cpp");
@@ -18022,6 +18171,8 @@ mod index_window_tests {
             &pool,
             &items,
             jobs,
+            Some(TEST_BYTE_BUDGET),
+            |_| 0,
             |_| {
                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
@@ -18041,6 +18192,86 @@ mod index_window_tests {
     }
 
     #[test]
+    fn configured_families_keep_the_count_limit_and_all_workers() {
+        for (jobs, limit) in [(0, 4), (1, 4), (8, 16), (16, 32), (usize::MAX, 32)] {
+            assert_eq!(configured_index_window(jobs), limit);
+        }
+        let jobs = 8;
+        let pool = index_pool(jobs).unwrap();
+        for (commands, variants) in [(1usize, 0usize), (4, 0), (8, 0), (2, 16)] {
+            let items: Vec<_> = (0..64).map(|i| (i, commands, variants)).collect();
+            let estimates = AtomicUsize::new(0);
+            let active = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            let mut merged = Vec::new();
+            index_in_window(
+                &pool,
+                &items,
+                jobs,
+                None,
+                |(_, commands, variants)| {
+                    estimates.fetch_add(1, Ordering::SeqCst);
+                    INDEX_WINDOW_UNKNOWN_BYTES.saturating_mul(commands + variants)
+                },
+                |&(i, _, _)| {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+                    while peak.load(Ordering::SeqCst) < jobs && Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    assert_eq!(peak.load(Ordering::SeqCst), jobs);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    i
+                },
+                |i| merged.push(i),
+            );
+            assert_eq!(merged, (0..64).collect::<Vec<_>>());
+            assert_eq!(estimates.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn configured_families_hold_count_slots_through_merge() {
+        let jobs = 8;
+        let cap = configured_index_window(jobs);
+        let items: Vec<_> = (0..cap + 8).collect();
+        let pool = index_pool(jobs).unwrap();
+        let started = AtomicUsize::new(0);
+        let (send, recv) = std::sync::mpsc::channel();
+        let recv = Mutex::new(recv);
+        let mut merged = Vec::new();
+        index_in_window(
+            &pool,
+            &items,
+            jobs,
+            None,
+            |_| panic!("configured admission must not estimate source bytes"),
+            |&i| {
+                started.fetch_add(1, Ordering::SeqCst);
+                if i == cap - 1 {
+                    send.send(()).unwrap();
+                }
+                if i == 0 {
+                    recv.lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("configured families must fill the original count window");
+                    assert_eq!(started.load(Ordering::SeqCst), cap);
+                }
+                i
+            },
+            |i| {
+                if i == 0 {
+                    assert_eq!(started.load(Ordering::SeqCst), cap);
+                }
+                merged.push(i);
+            },
+        );
+        assert_eq!(merged, items);
+    }
+
+    #[test]
     fn units_merge_in_order_while_workers_run_ahead_within_the_window() {
         let jobs = 4;
         let items: Vec<PathBuf> = (0..40).map(|i| PathBuf::from(format!("/u{i}.c"))).collect();
@@ -18053,6 +18284,8 @@ mod index_window_tests {
             &pool,
             &items,
             jobs,
+            Some(TEST_BYTE_BUDGET),
+            |_| 0,
             |path| {
                 let i: usize = path.to_str().unwrap()[2..]
                     .trim_end_matches(".c")
@@ -18081,6 +18314,103 @@ mod index_window_tests {
         );
     }
 
+    #[test]
+    fn small_units_fill_count_cap_behind_a_straggler() {
+        let jobs = 4;
+        let cap = index_window(jobs);
+        let items: Vec<_> = (0..cap + 10).collect();
+        let pool = index_pool(jobs).unwrap();
+        let started = AtomicUsize::new(0);
+        let (send, recv) = std::sync::mpsc::channel();
+        let recv = Mutex::new(recv);
+        let mut merged = Vec::new();
+        index_in_window(
+            &pool,
+            &items,
+            jobs,
+            Some(TEST_BYTE_BUDGET),
+            |_| 0,
+            |&i| {
+                started.fetch_add(1, Ordering::SeqCst);
+                if i == cap - 1 {
+                    send.send(()).unwrap();
+                }
+                if i == 0 {
+                    recv.lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("small units must run past the old count window");
+                    assert_eq!(started.load(Ordering::SeqCst), cap);
+                }
+                i
+            },
+            |i| merged.push(i),
+        );
+        assert_eq!(merged, items);
+    }
+
+    #[test]
+    fn byte_charges_bound_unmerged_work_and_allow_oversized_units() {
+        let jobs = 8;
+        let pool = index_pool(jobs).unwrap();
+        let items: Vec<_> = (0..100).collect();
+        let estimate = |&i: &usize| match i % 5 {
+            0 => usize::MAX,
+            1 => TEST_BYTE_BUDGET / 2,
+            2 => TEST_BYTE_BUDGET / 4,
+            _ => 0,
+        };
+        let charge = |&i: &usize| match i % 5 {
+            0..=2 => TEST_BYTE_BUDGET / 4,
+            _ => INDEX_WINDOW_MIN_BYTES,
+        };
+        let (arrived, peers) = std::sync::mpsc::channel();
+        let peers = Mutex::new(peers);
+        let unmerged_bytes = AtomicUsize::new(0);
+        let started = AtomicUsize::new(0);
+        let mut merged = Vec::new();
+        index_in_window(
+            &pool,
+            &items,
+            jobs,
+            Some(TEST_BYTE_BUDGET),
+            estimate,
+            |&i| {
+                started.fetch_add(1, Ordering::SeqCst);
+                let bytes = unmerged_bytes.fetch_add(charge(&i), Ordering::SeqCst) + charge(&i);
+                assert!(bytes <= TEST_BYTE_BUDGET);
+                if (1..5).contains(&i) {
+                    arrived.send(i).unwrap();
+                }
+                if i == 0 {
+                    // Three large charges and two small ones fit. The next
+                    // large unit must wait, even while these workers finish.
+                    for _ in 1..5 {
+                        peers
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                    }
+                    assert_eq!(started.load(Ordering::SeqCst), 5);
+                }
+                i
+            },
+            |i| {
+                if i == 0 {
+                    // Removing a result from `done` must not release its
+                    // reservation while the merger still holds the payload.
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    assert_eq!(started.load(Ordering::SeqCst), 5);
+                }
+                merged.push(i);
+                unmerged_bytes.fetch_sub(charge(&i), Ordering::SeqCst);
+            },
+        );
+        assert_eq!(merged, items);
+        assert_eq!(unmerged_bytes.load(Ordering::SeqCst), 0);
+    }
+
     fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         payload
             .downcast_ref::<&str>()
@@ -18092,7 +18422,9 @@ mod index_window_tests {
     #[test]
     fn a_panic_on_either_side_unwinds_instead_of_hanging() {
         let jobs = 3;
-        let items: Vec<PathBuf> = (0..30).map(|i| PathBuf::from(format!("/u{i}.c"))).collect();
+        let items: Vec<PathBuf> = (0..100)
+            .map(|i| PathBuf::from(format!("/u{i}.c")))
+            .collect();
         let pool = index_pool(jobs).unwrap();
         let unit_of = |path: &PathBuf| -> usize {
             path.to_str().unwrap()[2..]
@@ -18100,53 +18432,87 @@ mod index_window_tests {
                 .parse()
                 .unwrap()
         };
-        // A worker panics while the merge waits for its unit and the other
-        // workers wait on the window.
-        let worker = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Exercise cancellation at both admission limits, including a unit
+        // whose estimate exceeds the budget.
+        for (budget, bytes) in [
+            (None, usize::MAX),
+            (Some(0), usize::MAX),
+            (Some(1), 0),
+            (Some(4 * INDEX_WINDOW_MIN_BYTES - 1), usize::MAX),
+            (Some(TEST_BYTE_BUDGET), 0),
+            (Some(TEST_BYTE_BUDGET), TEST_BYTE_BUDGET / 8),
+            (Some(TEST_BYTE_BUDGET), usize::MAX),
+        ] {
+            // A worker panics while the merge waits for its unit and the other
+            // workers wait on the window.
+            let worker = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                index_in_window(
+                    &pool,
+                    &items,
+                    jobs,
+                    budget,
+                    |_| bytes,
+                    |path| {
+                        let i = unit_of(path);
+                        assert!(i != 7, "unit 7 fails to index");
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        i
+                    },
+                    |_| {},
+                )
+            }));
+            let message = panic_message(worker.unwrap_err());
+            assert!(message.contains("unit 7 fails to index"), "{message}");
+            // The merge panics while workers wait on the window ahead of it.
+            let merge = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                index_in_window(
+                    &pool,
+                    &items,
+                    jobs,
+                    budget,
+                    |_| bytes,
+                    |path| unit_of(path),
+                    |i| assert!(i != 2, "unit 2 fails to merge"),
+                )
+            }));
+            let message = panic_message(merge.unwrap_err());
+            assert!(message.contains("unit 2 fails to merge"), "{message}");
+            // The pool is still usable afterwards.
+            let mut merged = Vec::new();
             index_in_window(
                 &pool,
-                &items,
+                &items[..5],
                 jobs,
-                |path| {
-                    let i = unit_of(path);
-                    assert!(i != 7, "unit 7 fails to index");
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                    i
-                },
-                |_| {},
-            )
-        }));
-        let message = panic_message(worker.unwrap_err());
-        assert!(message.contains("unit 7 fails to index"), "{message}");
-        // The merge panics while workers wait on the window ahead of it.
-        let merge = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            index_in_window(
-                &pool,
-                &items,
-                jobs,
-                |path| unit_of(path),
-                |i| assert!(i != 2, "unit 2 fails to merge"),
-            )
-        }));
-        let message = panic_message(merge.unwrap_err());
-        assert!(message.contains("unit 2 fails to merge"), "{message}");
-        // The pool is still usable afterwards.
-        let mut merged = Vec::new();
-        index_in_window(&pool, &items[..5], jobs, unit_of, |i| merged.push(i));
-        assert_eq!(merged, vec![0, 1, 2, 3, 4]);
+                Some(TEST_BYTE_BUDGET),
+                |_| 0,
+                unit_of,
+                |i| merged.push(i),
+            );
+            assert_eq!(merged, vec![0, 1, 2, 3, 4]);
+        }
     }
 
     #[test]
     fn empty_and_single_worker_inputs_complete() {
         let pool = index_pool(1).unwrap();
         let mut seen = Vec::new();
-        index_in_window(&pool, &[], 2, |_: &PathBuf| 0usize, |i| seen.push(i));
+        index_in_window(
+            &pool,
+            &[],
+            2,
+            Some(TEST_BYTE_BUDGET),
+            |_| 0,
+            |_: &PathBuf| 0usize,
+            |i| seen.push(i),
+        );
         assert!(seen.is_empty());
         let items = [PathBuf::from("/a.c"), PathBuf::from("/b.c")];
         index_in_window(
             &pool,
             &items,
             1,
+            Some(TEST_BYTE_BUDGET),
+            |_| 0,
             |p| p.clone(),
             |p| seen.push(p.to_str().unwrap().len()),
         );

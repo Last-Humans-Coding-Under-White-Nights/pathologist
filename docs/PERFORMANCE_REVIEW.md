@@ -90,9 +90,51 @@ These may matter much more on callback-heavy corpora such as HDF than on camera.
 
 **Where:** `crates/trace-parse/src/lower.rs`, `index_in_window`, `index_pool`; `crates/trace-cli/src/main.rs`, worker default.
 
-Batch size is four units per worker and the channel can hold one completed batch while another is being built and the consumer merges a previous batch. Backpressure limits batch count, but unit count scales with available CPUs and there is no byte bound. Large TUs also make a count bound an unreliable memory bound. Pools give each worker a 16 MiB stack; this is a virtual allocation, not necessarily 16 MiB resident per worker.
+With settled source text, the ordinary indexing window reserves estimated bytes
+before a worker takes a unit and releases the reservation after merge. The budget is
+one thirty-second of the corpus's estimated settled-source bytes, clamped to
+128 KiB–8 MiB, with an 8 KiB minimum charge for small units' fixed overhead.
+The corpus estimate includes that minimum charge too and covers the complete
+TU list, even though allocator reclamation still divides it into 512-unit
+batches. Thus a large unit occupies more of the budget, while
+many small units can proceed behind a straggler. A separate count safety cap
+is sixteen units per worker, clamped to 4–256. Both limits cover units being
+indexed, finished units waiting for their turn, and the payload being merged.
+Each charge is capped at one quarter of the budget so unusually large source
+texts can overlap instead of forcing workers to index them one at a time.
+When every unit reaches that cap, at most four units can be admitted at once,
+including finished and currently merging units, regardless of worker count.
+For example, unknown-size units hit the 32 KiB cap on a 128 KiB budget.
+Smaller charges can use more workers. This preserves the measured memory
+tradeoff; increasing the divisor with jobs needs separate validation.
 
-Expose or adapt the number of in-flight units independently of worker count. Consider smaller ordered batches for large units, or a budget based on estimated source/IR size. Keep merge order deterministic. The worker-count measurement shows that reducing concurrency helps, but most memory remains at four workers, so worker tuning alone will not solve the baseline footprint.
+The internal scheduler also accepts custom budgets. Those budgets and their
+charge caps are floored at 8 KiB so even a zero-byte request can admit a unit.
+Production budgets retain the 128 KiB minimum above.
+
+Spilled text contributes its stored length without disk reads. Missing estimates
+use 64 KiB. Ordinary-path exploration reserves for the base unit plus
+the maximum number of variants.
+
+Configured indexing preprocesses inside the worker and has no settled text-size
+estimate at admission. Its sources and unconsumed headers retain the previous
+count window: two source families per worker, clamped to 4–32. All commands and
+exploratory variants of a source occupy one slot, held through ordered merge;
+command count does not reduce worker concurrency. A fixed byte charge per command
+was rejected after the multi-command reproduction reduced throughput. A byte
+policy for this path needs separate validation; see the
+[configured measurements](EVAL_REPORT.md#configured-multi-command-follow-up).
+
+Both admission modes preserve worker count, unit
+order, merge order, and panic cancellation. Workers still park when the budget
+or count cap fills; a slow unit can therefore hold up workers as well as merge.
+
+Source size is a cheap proxy for retained IR, not an RSS guarantee: imported
+header declarations, parser temporaries and allocator retention also cost
+memory. Pools give each worker a 16 MiB stack; this is a virtual allocation,
+not necessarily 16 MiB resident per worker. Budget changes need throughput and
+whole-process memory measurements together; see
+[Byte-budgeted indexing window](EVAL_REPORT.md#byte-budgeted-indexing-window).
 
 Measure the simultaneous sizes of raw source cache, expansion text/LineMaps, retained header IR, pending TU IR, and final program. Cached expansions are self-contained and can embed nested expansions, so `Arc` sharing does not imply that each header's bytes appear only once. Raw source bytes are shared through `Arc`; cloned path maps do not duplicate those bytes. Any eviction scheme must respect headers needed by later TUs and exploration.
 
@@ -161,11 +203,13 @@ Compilation-database mode was left unchanged. The normal indexing path now:
 - Retains temporary paths rather than open file handles. Readers open separate
   cursors; eviction or dropping the cache deletes the files. Spill/load errors
   abort the normal build rather than allow publication of incomplete results.
-- Replaces fixed parse batches with a window: workers take units in order
+- Initially replaced fixed parse batches with a window: workers take units in order
   and run at most two units per worker, between 4 and 32 in total, ahead of
   the ordered merge. Worker count and merge order are unchanged, the pending
-  unit count is bounded by the window, and a slow unit holds up the merge
-  rather than the workers. A panic on either side cancels the window and
+  unit count is bounded by the window. A slow unit holds up the merge and,
+  once the window fills, the other workers. The later byte-budgeted admission
+  is described in [item 6](#6-make-parsing-memory-limits-independent-of-cpu-count).
+  A panic on either side cancels the window and
   wakes every waiter, so it unwinds through the pool as the batches did.
 
 | Corpus | Elapsed before → after | Index before → after | Peak RSS before → after |
@@ -635,8 +679,10 @@ the only small-*f* consumer, and no such host exists in the tree.
 The three approaches raised during review map onto these findings: caching
 header IR per variant is the right *unit* but inherits the Gate 2 key;
 persisting discovery state is the crux and is undetermined; streaming cached
-units into the ordered merge is already how the window works (4–32 units
-ahead of the merge), and the floor it would stream into is the problem.
+units into the ordered merge was already how the window worked in these
+measurements (4–32 units ahead of the merge), and the floor it would stream
+into is the problem. Admission now uses the
+[byte budget and count safety cap](#6-make-parsing-memory-limits-independent-of-cpu-count).
 
 ### What the peak is made of, and where the time goes
 

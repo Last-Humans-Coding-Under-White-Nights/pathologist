@@ -3578,12 +3578,16 @@ include configurations. Unreached project headers retain standalone indexing;
 dependency headers contribute declarations only.
 
 Function sharing follows [Shared header functions](#shared-header-functions).
-Configured sources and orphan headers are lowered in the same ordered bounded
-window as ordinary indexing (two sources per worker, clamped to 4–32). A
+Configured sources and unconsumed configured headers use the shared ordered
+indexing scheduler with the previous source-family count window. Ordinary
+sources and orphan headers with settled source text use a byte budget;
+admission limits are defined
+in [Parsing memory limits](PERFORMANCE_REVIEW.md#6-make-parsing-memory-limits-independent-of-cpu-count). A
 configuration family's variant-preserving merge consumes one completed unit at
 a time, keeping deduplication state across sources; it never resets that state
 between commands or files. Each source's own command/exploration results occupy
-one window slot. Explicit isolated link targets retain their completed units for
+one count slot regardless of command or variant count. Explicit isolated
+link targets retain their completed units for
 weak-selection passes and reuse across images. See
 [preprocessor cache storage](PREPROCESSOR.md#role-in-the-pipeline) for the separate
 retained source-payload budget.
