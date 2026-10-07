@@ -8,6 +8,25 @@ fn trace_bin() -> &'static str {
     env!("CARGO_BIN_EXE_trace-merge")
 }
 
+/// `trace analyze repo -o db` with the workspace's own CLI.
+fn analyze_repo(repo: &std::path::Path, db: &std::path::Path) {
+    let status = Command::new("cargo")
+        .args([
+            "run",
+            "-q",
+            "-p",
+            "trace-cli",
+            "--",
+            "analyze",
+            repo.to_str().unwrap(),
+            "-o",
+            db.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run trace analyze");
+    assert!(status.success(), "trace analyze {}", repo.display());
+}
+
 #[test]
 fn test_cross_repo_callgraph_restoration() {
     let tmp = tempdir().unwrap();
@@ -48,38 +67,10 @@ fn test_cross_repo_callgraph_restoration() {
     let db_merged = root.join("unified.db");
 
     // Run trace analyze on repo A
-    let status_a = Command::new("cargo")
-        .args([
-            "run",
-            "-q",
-            "-p",
-            "trace-cli",
-            "--",
-            "analyze",
-            repo_a.to_str().unwrap(),
-            "-o",
-            db_a.to_str().unwrap(),
-        ])
-        .status()
-        .expect("failed to run trace analyze on repo_a");
-    assert!(status_a.success());
+    analyze_repo(&repo_a, &db_a);
 
     // Run trace analyze on repo B
-    let status_b = Command::new("cargo")
-        .args([
-            "run",
-            "-q",
-            "-p",
-            "trace-cli",
-            "--",
-            "analyze",
-            repo_b.to_str().unwrap(),
-            "-o",
-            db_b.to_str().unwrap(),
-        ])
-        .status()
-        .expect("failed to run trace analyze on repo_b");
-    assert!(status_b.success());
+    analyze_repo(&repo_b, &db_b);
 
     // Verify before merge: db_a has external call edge to compute_hash
     {
@@ -220,21 +211,7 @@ fn test_merge_problem_reporting() {
     let db_merged = root.join("merged_with_problems.db");
 
     for (repo, db) in [(&repo_a, &db_a), (&repo_b, &db_b), (&repo_c, &db_c)] {
-        let status = Command::new("cargo")
-            .args([
-                "run",
-                "-q",
-                "-p",
-                "trace-cli",
-                "--",
-                "analyze",
-                repo.to_str().unwrap(),
-                "-o",
-                db.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        analyze_repo(repo, db);
     }
 
     let report = merge_databases(
@@ -302,21 +279,7 @@ fn test_cli_trace_merge() {
     let db_out = root.join("unified_cli.db");
 
     for (repo, db) in [(&repo_a, &db_a), (&repo_b, &db_b)] {
-        let status = Command::new("cargo")
-            .args([
-                "run",
-                "-q",
-                "-p",
-                "trace-cli",
-                "--",
-                "analyze",
-                repo.to_str().unwrap(),
-                "-o",
-                db.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        analyze_repo(repo, db);
     }
 
     // Run trace-merge CLI binary
@@ -378,21 +341,7 @@ fn test_weak_symbol_override_across_repos() {
     let db_merged = root.join("merged_weak.db");
 
     for (repo, db) in [(&repo_a, &db_a), (&repo_b, &db_b)] {
-        let status = Command::new("cargo")
-            .args([
-                "run",
-                "-q",
-                "-p",
-                "trace-cli",
-                "--",
-                "analyze",
-                repo.to_str().unwrap(),
-                "-o",
-                db.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        analyze_repo(repo, db);
     }
 
     let report = merge_databases(
@@ -500,37 +449,9 @@ fn test_cross_repo_cpp_overload_resolution() {
     let db_b = root.join("b.db");
     let db_merged = root.join("merged.db");
 
-    let status_a = Command::new("cargo")
-        .args([
-            "run",
-            "-q",
-            "-p",
-            "trace-cli",
-            "--",
-            "analyze",
-            repo_a.to_str().unwrap(),
-            "-o",
-            db_a.to_str().unwrap(),
-        ])
-        .status()
-        .expect("trace analyze repo_a failed");
-    assert!(status_a.success());
+    analyze_repo(&repo_a, &db_a);
 
-    let status_b = Command::new("cargo")
-        .args([
-            "run",
-            "-q",
-            "-p",
-            "trace-cli",
-            "--",
-            "analyze",
-            repo_b.to_str().unwrap(),
-            "-o",
-            db_b.to_str().unwrap(),
-        ])
-        .status()
-        .expect("trace analyze repo_b failed");
-    assert!(status_b.success());
+    analyze_repo(&repo_b, &db_b);
 
     let report = merge_databases(
         &[&db_a, &db_b],
@@ -633,21 +554,7 @@ fn test_ambiguous_calls_produce_edges_to_all_candidates() {
     let db_merged = root.join("merged.db");
 
     for (dir, db) in [(&lib_a, &db_a), (&lib_b, &db_b), (&app, &db_app)] {
-        let status = Command::new("cargo")
-            .args([
-                "run",
-                "-q",
-                "-p",
-                "trace-cli",
-                "--",
-                "analyze",
-                dir.to_str().unwrap(),
-                "-o",
-                db.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        analyze_repo(dir, db);
     }
 
     let report = merge_databases(
@@ -756,21 +663,7 @@ fn test_array_parameter_decay_signature_matching() {
     let db_merged = root.join("merged.db");
 
     for (dir, db) in [(&repo_a, &db_a), (&repo_b, &db_b)] {
-        let status = Command::new("cargo")
-            .args([
-                "run",
-                "-q",
-                "-p",
-                "trace-cli",
-                "--",
-                "analyze",
-                dir.to_str().unwrap(),
-                "-o",
-                db.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        analyze_repo(dir, db);
     }
 
     let report = merge_databases(
@@ -854,21 +747,7 @@ fn test_multi_weak_summary_count_and_edge_deduplication() {
     let db_merged = root.join("merged.db");
 
     for (repo, db) in [(&repo_a, &db_a), (&repo_b, &db_b), (&repo_c, &db_c)] {
-        let status = Command::new("cargo")
-            .args([
-                "run",
-                "-q",
-                "-p",
-                "trace-cli",
-                "--",
-                "analyze",
-                repo.to_str().unwrap(),
-                "-o",
-                db.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        analyze_repo(repo, db);
     }
 
     let report = merge_databases(
@@ -961,21 +840,7 @@ fn test_fallback_overloads_emit_ambiguous_and_no_duplicates() {
     let db_merged = root.join("merged.db");
 
     for (repo, db) in [(&repo_a, &db_a), (&repo_b, &db_b)] {
-        let status = Command::new("cargo")
-            .args([
-                "run",
-                "-q",
-                "-p",
-                "trace-cli",
-                "--",
-                "analyze",
-                repo.to_str().unwrap(),
-                "-o",
-                db.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        analyze_repo(repo, db);
     }
 
     let report = merge_databases(
@@ -1065,21 +930,7 @@ fn test_fn_prefix_overload_resolution_not_treated_as_generic() {
     let db_merged = root.join("merged.db");
 
     for (repo, db) in [(&repo_a, &db_a), (&repo_b, &db_b)] {
-        let status = Command::new("cargo")
-            .args([
-                "run",
-                "-q",
-                "-p",
-                "trace-cli",
-                "--",
-                "analyze",
-                repo.to_str().unwrap(),
-                "-o",
-                db.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        analyze_repo(repo, db);
     }
 
     let report = merge_databases(
@@ -1147,21 +998,7 @@ fn test_indirect_call_resolution_preserves_indirect_resolution() {
     let db_merged = root.join("merged.db");
 
     for (repo, db) in [(&repo_a, &db_a), (&repo_b, &db_b)] {
-        let status = Command::new("cargo")
-            .args([
-                "run",
-                "-q",
-                "-p",
-                "trace-cli",
-                "--",
-                "analyze",
-                repo.to_str().unwrap(),
-                "-o",
-                db.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        analyze_repo(repo, db);
     }
 
     let report = merge_databases(
@@ -1229,21 +1066,7 @@ fn test_weak_override_only_emitted_for_cross_repo_override() {
     let db_merged = root.join("merged.db");
 
     for (repo, db) in [(&repo_a, &db_a), (&repo_b, &db_b)] {
-        let status = Command::new("cargo")
-            .args([
-                "run",
-                "-q",
-                "-p",
-                "trace-cli",
-                "--",
-                "analyze",
-                repo.to_str().unwrap(),
-                "-o",
-                db.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        analyze_repo(repo, db);
     }
 
     let report = merge_databases(
@@ -1388,21 +1211,7 @@ fn test_cannot_overwrite_input_database() {
 
     let db_a = root.join("a.db");
 
-    let status = Command::new("cargo")
-        .args([
-            "run",
-            "-q",
-            "-p",
-            "trace-cli",
-            "--",
-            "analyze",
-            repo_a.to_str().unwrap(),
-            "-o",
-            db_a.to_str().unwrap(),
-        ])
-        .status()
-        .unwrap();
-    assert!(status.success());
+    analyze_repo(&repo_a, &db_a);
 
     let err = merge_databases(
         &[&db_a],
@@ -1417,5 +1226,111 @@ fn test_cannot_overwrite_input_database() {
     assert!(
         msg.contains("matches an input database"),
         "must error when output matches an input database: {msg}"
+    );
+}
+
+/// #193: a member call on a class the calling repository never declares is
+/// an external edge named after the class, which the merge relinks to the
+/// repository defining the member.
+#[test]
+fn test_undeclared_receiver_member_call_relinks_to_defining_repo() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+
+    let repo_a = root.join("repo_a");
+    fs::create_dir_all(&repo_a).unwrap();
+    fs::write(
+        repo_a.join("main.cpp"),
+        r#"
+        #include "message_parcel.h"
+        namespace OHOS {
+        int Send(MessageParcel &data, MessageParcel *reply) {
+            data.WriteInt32(1);
+            reply->ReadInt32();
+            return 0;
+        }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let repo_b = root.join("repo_b");
+    fs::create_dir_all(&repo_b).unwrap();
+    fs::write(
+        repo_b.join("message_parcel.h"),
+        r#"
+        namespace OHOS {
+        class MessageParcel {
+        public:
+            bool WriteInt32(int value);
+            int ReadInt32();
+        };
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        repo_b.join("message_parcel.cpp"),
+        r#"
+        #include "message_parcel.h"
+        namespace OHOS {
+        bool MessageParcel::WriteInt32(int value) { return value != 0; }
+        int MessageParcel::ReadInt32() { return 7; }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let db_a = root.join("repo_a.db");
+    let db_b = root.join("repo_b.db");
+    let db_merged = root.join("unified.db");
+    analyze_repo(&repo_a, &db_a);
+    analyze_repo(&repo_b, &db_b);
+
+    // `OHOS::Send`'s edges as (callee, resolution, callee defined).
+    let edges = |db: &std::path::Path| -> Vec<(String, String, i64)> {
+        let conn = Connection::open(db).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT callee.name, ce.resolution, callee.is_defined FROM call_edges ce \
+                 JOIN functions caller ON caller.id = ce.caller_fn_id \
+                 JOIN functions callee ON callee.id = ce.callee_fn_id \
+                 WHERE caller.name = 'OHOS::Send' ORDER BY callee.name",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    };
+    let row = |callee: &str, resolution: &str, defined: i64| {
+        (callee.to_string(), resolution.to_string(), defined)
+    };
+
+    assert_eq!(
+        edges(&db_a),
+        [
+            row("OHOS::MessageParcel::ReadInt32", "external", 0),
+            row("OHOS::MessageParcel::WriteInt32", "external", 0),
+        ]
+    );
+
+    let report = merge_databases(
+        &[&db_a, &db_b],
+        &MergeOptions {
+            output: db_merged.clone(),
+            verbose: false,
+        },
+    )
+    .expect("merge failed");
+    assert_eq!(report.cross_repo_calls_resolved, 2);
+    assert_eq!(report.external_calls_unresolved, 0);
+
+    assert_eq!(
+        edges(&db_merged),
+        [
+            row("OHOS::MessageParcel::ReadInt32", "direct", 1),
+            row("OHOS::MessageParcel::WriteInt32", "direct", 1),
+        ]
     );
 }

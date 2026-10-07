@@ -2701,6 +2701,20 @@ impl PreprocessorState {
                 .is_some_and(|cache| cache.is_virtual(path))
     }
 
+    /// [`Self::include_exists`] for the spelling `name` under the search
+    /// directory `dir`, which is listed on its first probe so every absent
+    /// subdirectory a spelling names under it is settled from the listing
+    /// (`trace_ir::is_file_in`). The virtual-header probe joins the path only
+    /// when the disk has nothing.
+    fn include_exists_in(&self, dir: &Path, name: &str) -> bool {
+        trace_ir::is_file_in(dir, Path::new(name))
+            || self
+                .opts
+                .source_cache
+                .as_ref()
+                .is_some_and(|cache| cache.is_virtual(&dir.join(name)))
+    }
+
     /// The include search proper, excluding the including file's own
     /// directory, for `key` = (spelling, quoted, test context). The directory
     /// walk is shared with every run over the same `SourceCache` and search
@@ -2732,8 +2746,8 @@ impl PreprocessorState {
                 .chain(&self.opts.include_paths)
                 .chain(&self.opts.system_include_paths)
                 .chain(&self.opts.after_include_paths)
+                .find(|inc| self.include_exists_in(inc, path))
                 .map(|inc| inc.join(path))
-                .find(|p| self.include_exists(p))
                 .or_else(|| {
                     self.opts
                         .inferred_include_paths

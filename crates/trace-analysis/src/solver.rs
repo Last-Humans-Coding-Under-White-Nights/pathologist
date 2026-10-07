@@ -1936,9 +1936,17 @@ fn ensure_param_copy(
     }
 }
 
-/// The guard a memory cell of declared type `cell_type` imposes, if any.
+/// The guard a memory cell of declared type `cell_type` imposes, if any. A
+/// class lowering only guessed for a type it could not resolve (a callback
+/// typedef from a header off the include path; `docs/ANALYSIS.md`,
+/// "Undeclared receiver classes") is untyped storage, as the `int` such a
+/// type read as before: a function address stored there is kept.
 fn slot_guard_for(program: &Program, cell_type: trace_ir::TypeId) -> Option<SlotGuard> {
-    slot_guard_of(program.types.get(cell_type).desc.as_ref())
+    let desc = program.types.get(cell_type).desc.as_ref();
+    if program.types.is_guessed_class(desc.innermost().0) {
+        return None;
+    }
+    slot_guard_of(desc)
 }
 
 fn slot_guard_of(desc: &trace_ir::TypeDesc) -> Option<SlotGuard> {

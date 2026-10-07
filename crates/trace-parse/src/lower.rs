@@ -41,13 +41,15 @@ fn index_progress(msg: impl std::fmt::Display) {
     let _ = std::io::stderr().flush();
 }
 
-fn index_item_progress(i: usize, n: usize, msg: impl std::fmt::Display) {
+/// `msg` is built only for the items that print: every item of a long
+/// phase passes through here, most of them silently.
+fn index_item_progress(i: usize, n: usize, msg: impl FnOnce() -> String) {
     if std::env::var_os("TRACE_INDEX_VERBOSE").is_some()
         || i == 0
         || i + 1 == n
         || (i + 1).is_multiple_of(INDEX_PROGRESS_EVERY)
     {
-        index_progress(msg);
+        index_progress(msg());
     }
 }
 
@@ -251,9 +253,12 @@ impl LowerContext {
     }
 
     fn qualify(&self, name: &str) -> String {
-        let mut parts: Vec<String> = self.ns_stack.iter().flatten().cloned().collect();
-        parts.push(name.to_string());
-        parts.join("::")
+        let mut qualified = self.namespace_scope();
+        if !qualified.is_empty() {
+            qualified.push_str("::");
+        }
+        qualified.push_str(name);
+        qualified
     }
 
     /// Qualify a declared function name with the enclosing class / namespace:
@@ -721,11 +726,9 @@ fn build_program_inner(
         ));
         for (i, (path, languages)) in headers_for_macro_warm.iter().enumerate() {
             let t = Instant::now();
-            index_item_progress(
-                i,
-                warm_n,
-                format!("warm: {}/{} {}", i + 1, warm_n, path.display()),
-            );
+            index_item_progress(i, warm_n, || {
+                format!("warm: {}/{} {}", i + 1, warm_n, path.display())
+            });
             if warmed_as.insert(path.clone(), languages.clone()).is_some() {
                 source_cache.evict(path, &include_graph);
                 second_language_diagnostics.remove(path);
@@ -783,16 +786,14 @@ fn build_program_inner(
             if failed {
                 continue;
             }
-            index_item_progress(
-                i,
-                warm_n,
+            index_item_progress(i, warm_n, || {
                 format!(
                     "warm-done: {}/{} {:.1}s",
                     i + 1,
                     warm_n,
                     t.elapsed().as_secs_f64()
-                ),
-            );
+                )
+            });
         }
     }
 
@@ -1167,16 +1168,14 @@ fn build_program_inner(
         pool.install(|| {
             for (i, path) in orphan_headers.iter().enumerate() {
                 let t = Instant::now();
-                index_item_progress(
-                    i,
-                    orphan_headers.len(),
+                index_item_progress(i, orphan_headers.len(), || {
                     format!(
                         "parse-orphan: {}/{} {}",
                         i + 1,
                         orphan_headers.len(),
                         path.display()
-                    ),
-                );
+                    )
+                });
                 merge_unit_index(
                     &mut program,
                     &index_source_file(
@@ -1190,16 +1189,14 @@ fn build_program_inner(
                     ),
                 );
                 source_cache.evict(path, &include_graph);
-                index_item_progress(
-                    i,
-                    orphan_headers.len(),
+                index_item_progress(i, orphan_headers.len(), || {
                     format!(
                         "parse-orphan-done: {}/{} {:.1}s",
                         i + 1,
                         orphan_headers.len(),
                         t.elapsed().as_secs_f64()
-                    ),
-                );
+                    )
+                });
             }
         });
     } else {
@@ -1261,11 +1258,9 @@ fn build_program_inner(
         pool.install(|| {
             for (i, path) in file_order.iter().enumerate() {
                 let t = Instant::now();
-                index_item_progress(
-                    i,
-                    file_order.len(),
-                    format!("parse: {}/{} {}", i + 1, file_order.len(), path.display()),
-                );
+                index_item_progress(i, file_order.len(), || {
+                    format!("parse: {}/{} {}", i + 1, file_order.len(), path.display())
+                });
                 let lang = index_language(path, &cpp_parse, no_c_units, forced_language);
                 let (base_unit, var_units) = index_source_file_with_variants(
                     path,
@@ -1281,16 +1276,14 @@ fn build_program_inner(
                 );
                 source_cache.evict(path, &include_graph);
                 merge_unit_variants(&mut program, &base_unit, &var_units);
-                index_item_progress(
-                    i,
-                    file_order.len(),
+                index_item_progress(i, file_order.len(), || {
                     format!(
                         "parse-done: {}/{} {:.1}s",
                         i + 1,
                         file_order.len(),
                         t.elapsed().as_secs_f64()
-                    ),
-                );
+                    )
+                });
             }
         });
     } else {
@@ -8274,8 +8267,16 @@ fn named_class(program: &Program, type_id: trace_ir::TypeId) -> Option<String> {
 
 /// The class whose constructor an initializer of `desc` calls: a named
 /// struct, or a named union that declares a constructor (a C-style union is
-/// copied, not constructed).
+/// copied, not constructed). A class lowering only guessed for a type it
+/// could not resolve constructs nothing: the type may be a callback typedef
+/// from a header off the include path, and the initializer's value (the
+/// function stored into the field) must reach the object, as it did when
+/// the typedef read as `int` (`docs/ANALYSIS.md`, "Undeclared receiver
+/// classes").
 fn initialized_class(program: &Program, desc: &TypeDesc) -> Option<String> {
+    if program.types.is_guessed_class(desc) {
+        return None;
+    }
     let name = class_of_desc(desc)?;
     let constructs = !matches!(desc, TypeDesc::Union { .. })
         || program
@@ -10892,12 +10893,7 @@ fn rank_overloads(program: &Program, candidates: &[FnId], arg_desc: &[TypeDesc])
     // A class the index does not declare is a guess (an out-of-tree class,
     // or the enum-shaped `E::VALUE`): it may convert to anything, so it
     // decides nothing and leaves the other arguments to rank.
-    let guessed_class = |arg: &TypeDesc| match arg {
-        TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => {
-            !program.types.declares_class(name)
-        }
-        _ => false,
-    };
+    let guessed_class = |arg: &TypeDesc| program.types.is_undeclared_class(arg);
     // A class argument meeting another class, by value or reference, may
     // bind it through a base (`Take(const Base &)` for a `Derived`) or a
     // converting constructor (`sptr<Impl>` for `const sptr<IListener> &`);
@@ -16676,8 +16672,76 @@ fn type_desc_from_node(
                 return desc.clone();
             }
         }
-        TypeDesc::Int
+        match undeclared_class_guess(ctx, source, node) {
+            Some(name) => {
+                program.types.note_guessed_class(&name);
+                TypeDesc::Struct {
+                    name,
+                    fields: Vec::new(),
+                }
+            }
+            None => TypeDesc::Int,
+        }
     }
+}
+
+/// The qualified class a C++ type name the unit cannot resolve is taken to
+/// be: the name as if forward-declared in the scope it is written in (#193),
+/// so `MessageParcel &data` inside `namespace OHOS` types `data` as
+/// `OHOS::MessageParcel` without the header, and a member call on it
+/// synthesizes the external `OHOS::MessageParcel::WriteInt32` a forward
+/// declaration would. Only a bare name typing an object -- a parameter, a
+/// local, a field, a range-for element -- is guessed: a cast or template
+/// argument is not, a function's return type is not (`auto p = GetBare();`
+/// stays untyped), and a template parameter or dependent name is not a
+/// class (`docs/ANALYSIS.md`, "Undeclared receiver classes").
+fn undeclared_class_guess(ctx: &LowerContext, source: &str, node: Node) -> Option<String> {
+    if !ctx.is_cpp || node.cached_kind() != "type_identifier" {
+        return None;
+    }
+    let name = node_text(source, &node).trim();
+    if is_fundamental_type_name(name) {
+        return None;
+    }
+    // Every `Node::parent` descends from the root: one walk answers both
+    // the parent's kind and, under templates, whether the name is dependent.
+    let path: Vec<Node> = if ctx.has_templates {
+        ancestors(ctx, node).collect()
+    } else {
+        node.parent().into_iter().collect()
+    };
+    let parent = *path.last()?;
+    let declares_object = match parent.cached_kind() {
+        "parameter_declaration"
+        | "optional_parameter_declaration"
+        | "variadic_parameter_declaration"
+        | "for_range_loop" => true,
+        // `T f();` declares a function anywhere; in a body, `T w(a);` with
+        // arguments defines an object (`direct_init_arguments`).
+        "declaration" | "field_declaration" => {
+            let function = parent
+                .cached_field("declarator")
+                .and_then(fn_decl_under_pointer)
+                .map(|(fdecl, _, _)| fdecl);
+            match function {
+                None => true,
+                Some(fdecl) => {
+                    ctx.current_fn.is_some()
+                        && fdecl
+                            .cached_field("parameters")
+                            .is_some_and(|params| params.named_child_count() > 0)
+                }
+            }
+        }
+        _ => false,
+    };
+    if !declares_object
+        || (ctx.has_templates
+            && mentions_template_parameter(source, path.iter().copied(), name, Spelling::Source))
+    {
+        return None;
+    }
+    Some(ctx.qualify(name))
 }
 
 /// Distinguish C/C++ primitive scalar parameter types (`double` vs `int`,

@@ -64,6 +64,20 @@ impl TypeDesc {
         }
         (desc, layers)
     }
+
+    /// `a` and `b` with the pointer layers both carry stripped, stopping
+    /// where either is no longer a pointer: `T **` beside `U *` is
+    /// `T *` beside `U`.
+    pub fn strip_common_pointers<'a>(
+        a: &'a TypeDesc,
+        b: &'a TypeDesc,
+    ) -> (&'a TypeDesc, &'a TypeDesc) {
+        let (mut x, mut y) = (a, b);
+        while let (Some(px), Some(py)) = (x.pointee(), y.pointee()) {
+            (x, y) = (px, py);
+        }
+        (x, y)
+    }
 }
 
 /// Numeric-category classification used by C++ overload-table construction
@@ -405,6 +419,14 @@ pub struct TypeTable {
     /// specifier carried a body: a forward declaration says a name is a
     /// class, a definition says what its members are.
     defined_structs: FxHashSet<std::sync::Arc<str>>,
+    /// Class names lowering guessed for a type it could not resolve
+    /// ([`note_guessed_class`](Self::note_guessed_class)): while no unit
+    /// declares such a name, a descriptor of it registers no tag.
+    guessed_tags: FxHashSet<std::sync::Arc<str>>,
+    /// The descriptor a guessed name withheld its tag from: registered when
+    /// a unit declares the class, since the descriptor is interned once and
+    /// never passes [`note_named_tag`](Self::note_named_tag) again.
+    untagged: FxHashMap<std::sync::Arc<str>, TypeId>,
     descriptors: Arc<DescriptorPool>,
     types: Vec<TypeInfo>,
     // Header merging repeatedly hashes nested descriptors and alias names.
@@ -448,6 +470,8 @@ impl TypeTable {
         let mut table = Self {
             declared_structs: FxHashSet::default(),
             defined_structs: FxHashSet::default(),
+            guessed_tags: FxHashSet::default(),
+            untagged: FxHashMap::default(),
             descriptors: descriptor_pool(),
             types: Vec::new(),
             intern: IndexMap::default(),
@@ -472,6 +496,32 @@ impl TypeTable {
         table.intern(TypeDesc::SizeT);
         table.intern(TypeDesc::Unknown);
         table
+    }
+
+    /// Record that lowering guessed the class `name` for a type it could not
+    /// resolve (an undeclared receiver class; `docs/ANALYSIS.md`, "Undeclared
+    /// receiver classes"). Until a unit declares the class, a descriptor of
+    /// the name -- interned here or in a table this one's types are merged
+    /// into -- registers no tag, so the guess never answers a tag lookup for
+    /// a typedef or enum of that name declared later in the unit.
+    pub fn note_guessed_class(&mut self, name: &str) {
+        if self.guessed_tags.contains(name) {
+            return;
+        }
+        self.guessed_tags.insert(name.into());
+        // A qualified spelling interned before the guess registered a tag
+        // the guess would not have: withdraw it, so the answer does not
+        // depend on which spelling came first, and keep its descriptor for
+        // the declaration that may follow (`tag_declared_guess`).
+        if !self.declared_structs.contains(name) {
+            let withdrawn = self
+                .struct_tags
+                .remove(name)
+                .or_else(|| self.union_tags.remove(name));
+            if let Some(id) = withdrawn {
+                self.untagged.insert(name.into(), id);
+            }
+        }
     }
 
     pub fn intern(&mut self, mut desc: TypeDesc) -> TypeId {
@@ -991,6 +1041,15 @@ impl TypeTable {
     pub fn declare_struct(&mut self, name: &str) {
         if !self.declared_structs.contains(name) {
             self.declared_structs.insert(name.into());
+            self.tag_declared_guess(name);
+        }
+    }
+
+    /// Register the tag a guess of `name` withheld, now that a unit declares
+    /// the class: the same answer a declaration interned first would give.
+    fn tag_declared_guess(&mut self, name: &str) {
+        if let Some(id) = self.untagged.remove(name) {
+            self.note_named_tag(id);
         }
     }
 
@@ -1005,6 +1064,7 @@ impl TypeTable {
             None => {
                 let tag: std::sync::Arc<str> = name.into();
                 self.declared_structs.insert(tag.clone());
+                self.tag_declared_guess(name);
                 tag
             }
         };
@@ -1045,30 +1105,72 @@ impl TypeTable {
         self.is_struct_declared(head.trim_start_matches("::"))
     }
 
+    /// Whether `desc` names a class the index does not declare: a type
+    /// lowering could not resolve and guessed from its spelling (an
+    /// out-of-tree class, the enum-shaped `E::VALUE`, a typedef it never
+    /// saw). The one test of a class being out of view, for every policy
+    /// that lets such a type stand in for another.
+    pub fn is_undeclared_class(&self, desc: &TypeDesc) -> bool {
+        match desc {
+            TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => {
+                !self.declares_class(name)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `desc` is a class lowering guessed for a bare type name it
+    /// could not resolve ([`note_guessed_class`](Self::note_guessed_class))
+    /// that no unit declares: what read as `int` before lowering guessed a
+    /// class (#193), and still stands in as that `int` where the spellings
+    /// of a signature are read leniently (`docs/ANALYSIS.md`, "Undeclared
+    /// receiver classes").
+    pub fn is_guessed_class(&self, desc: &TypeDesc) -> bool {
+        match desc {
+            TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => {
+                !self.guessed_tags.is_empty()
+                    && self.guessed_tags.contains(name.as_str())
+                    && !self.declared_structs.contains(name.as_str())
+            }
+            _ => false,
+        }
+    }
+
     pub fn is_struct_defined(&self, name: &str) -> bool {
         self.defined_structs.contains(name)
     }
 
     pub fn merge_struct_declarations(&mut self, other: &Self) {
-        self.declared_structs
-            .extend(other.declared_structs.iter().cloned());
+        for name in &other.declared_structs {
+            if !self.declared_structs.contains(name) {
+                self.declared_structs.insert(name.clone());
+                self.tag_declared_guess(name);
+            }
+        }
         self.defined_structs
             .extend(other.defined_structs.iter().cloned());
+        self.guessed_tags.extend(other.guessed_tags.iter().cloned());
     }
 
     fn note_named_tag(&mut self, id: TypeId) {
         let (kind, name, richness) = {
             let info = &self.types[id.0 as usize];
-            let kind = match info.desc.as_ref() {
-                TypeDesc::Struct { name, .. } if !name.is_empty() => TypeKind::Struct,
-                TypeDesc::Union { name, .. } if !name.is_empty() => TypeKind::Union,
+            let (kind, name) = match info.desc.as_ref() {
+                TypeDesc::Struct { name, .. } if !name.is_empty() => (TypeKind::Struct, name),
+                TypeDesc::Union { name, .. } if !name.is_empty() => (TypeKind::Union, name),
                 _ => return,
             };
-            let name = match info.desc.as_ref() {
-                TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => name.clone(),
-                _ => return,
-            };
-            (kind, name, tag_richness(info))
+            // A class name lowering only guessed registers no tag until a
+            // unit declares it (`note_guessed_class`).
+            if !self.guessed_tags.is_empty()
+                && self.guessed_tags.contains(name.as_str())
+                && !self.declared_structs.contains(name.as_str())
+            {
+                let name = name.clone();
+                self.untagged.entry(name.into()).or_insert(id);
+                return;
+            }
+            (kind, name.clone(), tag_richness(info))
         };
         let old = match kind {
             TypeKind::Struct => self.struct_tags.get(name.as_str()).copied(),
@@ -1299,6 +1401,20 @@ pub fn may_name_same_type(a: &TypeDesc, b: &TypeDesc) -> bool {
     }
 }
 
+/// [`may_name_same_type`], with a class lowering guessed for an unresolved
+/// type standing in as the `int` that type read as before the guess
+/// (`docs/ANALYSIS.md`, "Undeclared receiver classes"): it may be any
+/// class, however spelled, or a typedef of a scalar.
+pub fn may_name_same_type_in(types: &TypeTable, a: &TypeDesc, b: &TypeDesc) -> bool {
+    if may_name_same_type(a, b) {
+        return true;
+    }
+    let (x, y) = TypeDesc::strip_common_pointers(a, b);
+    let stands_for =
+        |t: &TypeDesc| t.is_class_like() || matches!(t, TypeDesc::Int | TypeDesc::SizeT);
+    (stands_for(y) && types.is_guessed_class(x)) || (stands_for(x) && types.is_guessed_class(y))
+}
+
 /// Whether one spelling is the other, or the other with namespace or class
 /// qualifiers in front of it: `ns::Obj` beside `Obj`. A template instance
 /// compares its class and each argument that way (`ns::sptr<ns::Base>`
@@ -1515,6 +1631,89 @@ fn align_up(value: u64, align: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// A class name lowering only guessed registers no tag, whether the
+    /// guess or a qualified spelling of the name was interned first.
+    #[test]
+    fn a_guessed_class_registers_no_tag_whichever_came_first() {
+        let desc = || super::TypeDesc::Struct {
+            name: "OHOS::Foo".into(),
+            fields: Vec::new(),
+        };
+        let mut guess_first = super::TypeTable::new();
+        guess_first.note_guessed_class("OHOS::Foo");
+        guess_first.intern(desc());
+        assert!(guess_first.class_type_id("OHOS::Foo").is_none());
+        let mut spelling_first = super::TypeTable::new();
+        spelling_first.intern(desc());
+        spelling_first.note_guessed_class("OHOS::Foo");
+        assert!(spelling_first.class_type_id("OHOS::Foo").is_none());
+        // A declaration of the name supersedes the guess.
+        spelling_first.declare_struct("OHOS::Foo");
+        spelling_first.intern(super::TypeDesc::Struct {
+            name: "OHOS::Foo".into(),
+            fields: vec![("x".into(), super::TypeDesc::Int)],
+        });
+        assert!(spelling_first.class_type_id("OHOS::Foo").is_some());
+    }
+
+    /// A forward declaration after the guess registers the tag the guessed
+    /// descriptor withheld, although that descriptor is already interned
+    /// and is not interned again; so does a declaration merged in from
+    /// another unit, whichever unit merges first.
+    #[test]
+    fn a_declaration_after_the_guess_registers_its_tag() {
+        let desc = || super::TypeDesc::Struct {
+            name: "OHOS::Foo".into(),
+            fields: Vec::new(),
+        };
+        let mut table = super::TypeTable::new();
+        table.note_guessed_class("OHOS::Foo");
+        let id = table.intern(desc());
+        assert!(table.class_type_id("OHOS::Foo").is_none());
+        table.declare_struct("OHOS::Foo");
+        assert_eq!(
+            table.intern(desc()),
+            id,
+            "the descriptor is not re-interned"
+        );
+        assert_eq!(table.class_type_id("OHOS::Foo"), Some(id));
+
+        // The spelling interned before the guess: its tag, withdrawn by the
+        // guess, comes back with the declaration too.
+        let mut table = super::TypeTable::new();
+        let id = table.intern(desc());
+        table.note_guessed_class("OHOS::Foo");
+        assert!(table.class_type_id("OHOS::Foo").is_none());
+        table.declare_struct("OHOS::Foo");
+        assert_eq!(
+            table.intern(desc()),
+            id,
+            "the descriptor is not re-interned"
+        );
+        assert_eq!(table.class_type_id("OHOS::Foo"), Some(id));
+
+        let mut guessing = super::TypeTable::new();
+        guessing.note_guessed_class("OHOS::Foo");
+        guessing.intern(desc());
+        let mut declaring = super::TypeTable::new();
+        declaring.declare_struct("OHOS::Foo");
+        declaring.intern(desc());
+        // Guessing unit first, then the declaring unit.
+        let mut merged = super::TypeTable::new();
+        merged.merge_struct_declarations(&guessing);
+        merged.intern(desc());
+        merged.merge_struct_declarations(&declaring);
+        merged.intern(desc());
+        assert!(merged.class_type_id("OHOS::Foo").is_some());
+        // Declaring unit first, then the guessing unit.
+        let mut merged = super::TypeTable::new();
+        merged.merge_struct_declarations(&declaring);
+        merged.intern(desc());
+        merged.merge_struct_declarations(&guessing);
+        merged.intern(desc());
+        assert!(merged.class_type_id("OHOS::Foo").is_some());
+    }
+
     use super::*;
 
     fn struct_desc(name: &str, fields: Vec<(&str, TypeDesc)>) -> TypeDesc {

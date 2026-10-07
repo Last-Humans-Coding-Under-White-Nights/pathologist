@@ -604,10 +604,7 @@ pub fn spelled_alike(
     tolerance: SpellingTolerance,
 ) -> bool {
     use crate::TypeDesc;
-    let (mut x, mut y) = (a, b);
-    while let (Some(px), Some(py)) = (x.pointee(), y.pointee()) {
-        (x, y) = (px, py);
-    }
+    let (x, y) = TypeDesc::strip_common_pointers(a, b);
     let named = TypeDesc::is_class_like;
     let int_against_class =
         (matches!(x, TypeDesc::Int) && named(y)) || (matches!(y, TypeDesc::Int) && named(x));
@@ -615,12 +612,8 @@ pub fn spelled_alike(
         tolerance,
         SpellingTolerance::Registration | SpellingTolerance::Override
     );
-    let undeclared_class = |t: &TypeDesc| match t {
-        TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } => !types.declares_class(name),
-        _ => false,
-    };
-    let stand_in_for_undeclared =
-        tolerance == SpellingTolerance::Redirect && (undeclared_class(x) || undeclared_class(y));
+    let stand_in_for_undeclared = tolerance == SpellingTolerance::Redirect
+        && (types.is_undeclared_class(x) || types.is_undeclared_class(y));
     if int_against_class && !lenient && !stand_in_for_undeclared {
         return false;
     }
@@ -636,24 +629,34 @@ pub fn spelled_alike(
     if crate::may_name_same_type(a, b) {
         return true;
     }
+    // What lowering reads a type it could not resolve as: `int`, or since
+    // #193 a class it guessed from the name (`docs/ANALYSIS.md`, "Undeclared
+    // receiver classes"), which stands in wherever the `int` did.
+    let stand_in = |t: &TypeDesc| matches!(t, TypeDesc::Int) || types.is_guessed_class(t);
+    // `size_t` beside such a stand-in, as `may_name_same_type` reads `int`.
+    if (stand_in(x) && matches!(y, TypeDesc::SizeT))
+        || (stand_in(y) && matches!(x, TypeDesc::SizeT))
+    {
+        return true;
+    }
     // A standard integer typedef lowering could not resolve (`size_t`,
-    // `uint32_t` without their headers) reads as `int`, so an override's
+    // `uint32_t` without their headers) reads as a stand-in, so an override's
     // `int` may be the base's `unsigned long`: dropping its dispatch would
     // lose a real target, where keeping it at worst adds one to a hiding
     // function (`On(long)` beside a base `On(int)`).
     let integral = |t: &TypeDesc| {
-        matches!(
-            t,
-            TypeDesc::Char
-                | TypeDesc::Short
-                | TypeDesc::Int
-                | TypeDesc::Long
-                | TypeDesc::LongLong
-                | TypeDesc::SizeT
-        )
+        stand_in(t)
+            || matches!(
+                t,
+                TypeDesc::Char
+                    | TypeDesc::Short
+                    | TypeDesc::Long
+                    | TypeDesc::LongLong
+                    | TypeDesc::SizeT
+            )
     };
     if tolerance == SpellingTolerance::Override
-        && (matches!(x, TypeDesc::Int) || matches!(y, TypeDesc::Int))
+        && (stand_in(x) || stand_in(y))
         && integral(x)
         && integral(y)
     {
@@ -720,17 +723,21 @@ fn c_linkage_pair(a: &Function, b: &Function) -> bool {
     a.is_cpp && b.is_cpp && a.is_defined != b.is_defined && (a.c_linkage || b.c_linkage)
 }
 
-/// Whether one side is the `int` lowering reads an unresolved name as and
-/// the other a function pointer that name may be a typedef of (a callback
-/// parameter, `OnChange cb`, which lowers as a pointer to `FnPtr`).
-fn int_stands_for_fn_ptr(a: &crate::TypeDesc, b: &crate::TypeDesc) -> bool {
+/// Whether one side is what lowering reads an unresolved name as -- the
+/// `int` stand-in, or a class guessed from the name (`docs/ANALYSIS.md`,
+/// "Undeclared receiver classes") -- and the other a function pointer that
+/// name may be a typedef of (a callback parameter, `OnChange cb`, which
+/// lowers as a pointer to `FnPtr`).
+fn int_stands_for_fn_ptr(
+    types: &crate::TypeTable,
+    a: &crate::TypeDesc,
+    b: &crate::TypeDesc,
+) -> bool {
     use crate::TypeDesc;
-    let (mut x, mut y) = (a, b);
-    while let (Some(px), Some(py)) = (x.pointee(), y.pointee()) {
-        (x, y) = (px, py);
-    }
+    let (x, y) = TypeDesc::strip_common_pointers(a, b);
     let fn_ptr = |t: &TypeDesc| matches!(t.innermost().0, TypeDesc::FnPtr { .. });
-    (matches!(x, TypeDesc::Int) && fn_ptr(y)) || (matches!(y, TypeDesc::Int) && fn_ptr(x))
+    let stand_in = |t: &TypeDesc| matches!(t, TypeDesc::Int) || types.is_guessed_class(t);
+    (fn_ptr(y) && stand_in(x)) || (fn_ptr(x) && stand_in(y))
 }
 
 #[derive(Debug, Clone)]
@@ -1740,7 +1747,7 @@ impl SymbolTable {
                                 let (x, y) =
                                     (types.get(x).desc.as_ref(), types.get(y).desc.as_ref());
                                 spelled_alike(types, x, y, SpellingTolerance::Registration)
-                                    || int_stands_for_fn_ptr(x, y)
+                                    || int_stands_for_fn_ptr(types, x, y)
                             })
                         });
                 }
