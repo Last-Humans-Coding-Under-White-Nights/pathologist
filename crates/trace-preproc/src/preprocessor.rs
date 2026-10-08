@@ -4614,7 +4614,7 @@ fn concat_width_at(tokens: &[Token], i: usize) -> usize {
 /// Fallback definitions for macros whose real definitions live in headers the
 /// indexed tree does not ship (gtest, kernel headers, `<inttypes.h>`). Left
 /// unexpanded they produce tree-sitter ERROR nodes and whole functions get
-/// dropped from the index (`docs/PARSE_FAILURES.md` catalogs the impact).
+/// dropped from the index (see `docs/PARSE_FAILURES.md` for reporting).
 /// Built once; `install_builtin_macros` clones entries per preprocess. The
 /// bodies are plain C, so the C lexer serves both languages.
 static BUILTIN_FALLBACK_MACROS: LazyLock<Vec<(Arc<str>, Arc<MacroDef>)>> = LazyLock::new(|| {
@@ -9349,7 +9349,7 @@ int from_late;
         assert!(result.output.contains("\"p, q\""), "{}", result.output);
     }
 
-    /// The log/assert shapes that dominate docs/PARSE_FAILURES.md: `#cond`
+    /// Common log/assert shapes seen in parse-failure captures: `#cond`
     /// inside a larger body, next to `__VA_ARGS__` and `__LINE__`.
     #[test]
     fn stringize_fixture_log_and_assert_macros() {

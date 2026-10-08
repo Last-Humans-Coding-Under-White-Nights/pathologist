@@ -7312,8 +7312,7 @@ row set is fixed by the sequential warm pass plus the dedup, not by scheduling),
 `scripts/eval_expected.json` `diagnostics` values are re-captured to 1,777 / 2,964 / 4,794 and
 `eval_check.py` is back to **67/67 PASS**. Every fixture directory under `tests/fixtures/` was
 also analyzed with both binaries: 62 of 72 exports are identical (the `analysis_run` timestamp
-excluded) and the other 10 differ only by the new `diagnostics` rows, see
-`docs/INSPECT_REPORT.md`.
+excluded) and the other 10 differ only by the new `diagnostics` rows.
 
 Performance was re-measured with the current binary (fresh runs, `--jobs 8`; stage timers
 are stable, wall-clock varies with cache so values are rounded).

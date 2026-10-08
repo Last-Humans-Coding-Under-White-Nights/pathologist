@@ -35,7 +35,7 @@ flowchart LR
 | Parse + lower | `trace-parse` | Preprocessed TU | `UnitIndex` (symbols, types, flow, call sites) |
 | Merge | `trace-parse` | Per-TU indices | Single `Program` |
 | Analyze | `trace-analysis` | `Program` | `Pag` + `AnalysisResult` |
-| Export | `trace-db` | Program + analysis | SQLite v6 |
+| Export | `trace-db` | Program + analysis | SQLite v7 |
 
 The pipeline is also exposed programmatically via `trace-capi` (`libtrace_capi`), providing a C ABI (`crates/trace-capi/include/trace.h`) for indexing and database inspection.
 
@@ -44,13 +44,14 @@ The pipeline is also exposed programmatically via `trace-capi` (`libtrace_capi`)
 - **Indexed TUs**: `*.c` and `*.cpp`-family files under `<TARGET>`. Each TU selects the tree-sitter C or C++ grammar by extension.
 - **Headers**: discovered for the include graph and lowered into cached header units for expansion variants consumed by TUs. Their declarations are merged into each receiving TU before its own source is lowered.
 - **Orphan headers** (not reached by a project TU) are lowered separately and merged into the program.
-- **Cross-TU linking**: external symbols merged by name in `merge_unit_index` (`fn_by_name`), or per link image in `merge_linked_units` when build metadata is available (see [ANALYSIS.md](ANALYSIS.md#link-targets-and-weak-symbols)). **`static` / internal-linkage** functions remain **per-file** and are resolved with `resolve_function_in_scope(name, file)` at analysis time; file-scope `static` variables are looked up with `SymbolTable::file_static_named`, in the file and the headers it includes.
+- **Cross-TU linking**: `merge_unit_index` merges compatible declarations and definitions, preserving distinct strong C++ definitions from different TUs. Build metadata assigns link images in `merge_linked_units`. Analysis uses the shared image-aware, scope-first resolver for internal and external functions. File-scope `static` variables use `SymbolTable::file_static_named`. See [Shared header functions](ANALYSIS.md#shared-header-functions) and [Link targets and weak symbols](ANALYSIS.md#link-targets-and-weak-symbols) for identity, ownership, and resolution precedence.
 
 ## Crate dependencies
 
 ```mermaid
 flowchart BT
   Merge[trace-merge]
+  LSP[trace-lsp]
   CLI[trace-cli]
   CAPI[trace-capi]
   DB[trace-db]
@@ -60,6 +61,8 @@ flowchart BT
   IR[trace-ir]
 
   Merge --> DB
+  LSP --> DB
+  LSP --> IR
   CLI --> DB
   CLI --> Analysis
   CLI --> Parse
@@ -86,6 +89,7 @@ flowchart BT
 | `trace-capi` | C ABI library (`libtrace_capi`), C header (`trace.h`), indexing and inspect FFI |
 | `trace-cli` | `analyze`, `inspect`, reporting examples |
 | `trace-merge` | Cross-repository database merger & callgraph reconstruction (`trace-merge`) |
+| `trace-lsp` | Read-only LSP call hierarchy over an existing database |
 
 ## Program IR (`trace-ir`)
 
@@ -121,7 +125,7 @@ Lowering (`trace-parse/src/lower.rs`) walks tree-sitter ASTs and emits **flow co
 
 | CLI flag | Effect |
 |----------|--------|
-| *(default)* | Minimal export: functions, filtered call sites, call edges, arg-flow, arg-flow variables only |
+| *(default)* | Minimal export: functions, filtered call sites, call edges, arg-flow, required variables, and the PAG flow graph |
 | `--full-export` | All types, all variables, PAG `locations` |
 | `--debug-points-to` | Retain points-to in memory; export `points_to` table |
 
@@ -140,7 +144,15 @@ Default job count: logical CPU count.
 
 ## Source locations
 
-Spans are resolved through the preprocessor `LineMap`: **all** entities use original file/line/column — code lowered from `#include`d files is attributed to the header it came from, and TU-local code keeps its original (pre-expansion) positions, so reported lines match the source in an editor. Code inside macro expansions attributes to the expansion site's origin. During merge, entities with the same origin (header file + name + line) are **deduplicated across translation units** — the first copy wins and later copies' references are redirected to it — so a header-defined function or its internal call sites appear once, attributed to the header, instead of once per including TU.
+Spans are resolved through the preprocessor `LineMap` to original file/line/column.
+Most macro-expanded entities use the invocation position. Calls spelled in a
+macro replacement list retain the macro-body position and store the outermost
+invocation in `expansion_span`; semantic ownership uses the invocation. See
+[Call source locations](ANALYSIS.md#call-source-locations).
+
+Header entities merge according to their shared identity and receiving-unit
+ownership. See [Shared header functions](ANALYSIS.md#shared-header-functions)
+for the authoritative rules.
 
 ## Error handling
 

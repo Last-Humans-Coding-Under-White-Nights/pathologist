@@ -1264,6 +1264,123 @@ fn test_cannot_overwrite_input_database() {
     );
 }
 
+fn empty_merge_input(path: &std::path::Path) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(trace_db::TABLES_V7).unwrap();
+    conn.execute(
+        "INSERT INTO analysis_run (trace_version, schema_version, target_root, created_at, options_json) \
+         VALUES ('test', ?1, '/source', '0', '{}')",
+        [trace_db::SCHEMA_VERSION],
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn merged_database_permissions_follow_umask() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("input.db");
+    empty_merge_input(&input);
+
+    for (mask, expected) in [
+        ("022", 0o644),
+        ("077", 0o600),
+        ("002", 0o644),
+        ("000", 0o644),
+    ] {
+        let output = dir.path().join(format!("merged-{mask}.db"));
+        // Change the umask only in a child process; other tests run concurrently.
+        let result = Command::new("sh")
+            .args([
+                "-c",
+                "umask \"$1\" && exec \"$2\" \"$3\" -o \"$4\"",
+                "trace-merge-umask",
+                mask,
+            ])
+            .arg(trace_bin())
+            .arg(&input)
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "merge with umask {mask} failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            expected,
+            "published database permissions with umask {mask}"
+        );
+    }
+}
+
+#[test]
+fn merge_staging_does_not_overwrite_an_input_and_replaces_existing_output() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("unified.db");
+    // This input occupied the old fixed staging filename.
+    let input = output.with_extension("db.tmp");
+    empty_merge_input(&input);
+    let before = fs::read(&input).unwrap();
+    fs::write(&output, "previous output").unwrap();
+
+    merge_databases(
+        &[&input],
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read(&input).unwrap(),
+        before,
+        "input must remain intact"
+    );
+    let conn = Connection::open(&output).unwrap();
+    let stage: String = conn
+        .query_row(
+            "SELECT json_extract(options_json, '$.stage') FROM analysis_run",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stage, "merge");
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+}
+
+#[test]
+fn failed_merge_publication_keeps_destination_and_cleans_staging() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("input.db");
+    empty_merge_input(&input);
+    let before = fs::read(&input).unwrap();
+    let output = dir.path().join("destination");
+    fs::create_dir(&output).unwrap();
+    fs::write(output.join("keep"), "existing data").unwrap();
+
+    let error = merge_databases(
+        &[&input],
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("failed to publish"));
+    assert_eq!(fs::read(&input).unwrap(), before);
+    assert_eq!(
+        fs::read_to_string(output.join("keep")).unwrap(),
+        "existing data"
+    );
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+}
+
 /// #193: a member call on a class the calling repository never declares is
 /// an external edge named after the class, which the merge relinks to the
 /// repository defining the member.

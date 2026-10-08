@@ -85,8 +85,8 @@ The reporting example records conditional branches and scans `BUILD.gn`,
 `GN_DEFINE` TSV rows retain the macro name, whether a value was supplied, the
 value, file, entry line, confidence, and enclosing GN conditions. No inferred
 define is applied. See [GN evidence](docs/GN_DEFINES.md) for ranking and limits;
-`scripts/gen_conditional_coverage_report.py` renders these candidates alongside
-the [conditional coverage report](docs/CONDITIONAL_COVERAGE.md).
+`scripts/gen_conditional_coverage_report.py` renders these candidates in a local
+report; see [conditional coverage reporting](docs/CONDITIONAL_COVERAGE.md).
 
 ### `trace analyze`
 
@@ -514,6 +514,7 @@ trace-merge [OPTIONS] <INPUT_DBS>... [-o <OUTPUT_DB>]
 - Respects ELF linker semantics: internal-linkage (`static`) functions remain file-scoped; strong definitions (`is_weak = 0`) override weak definitions (`is_weak = 1`).
 - Uses normalized parameter signatures in `functions.signature` (`name(type1, type2)`) to disambiguate C++ overloads and avoid false collisions; falls back to all same-name candidates if exact signature matching misses.
 - Prevents accidental overwriting of any input database when specifying `-o`.
+- Opens inputs read-only and publishes through a unique temporary file beside the output. Failed merges clean up staging files and preserve the existing destination.
 - Dataflow analysis remains strictly intra-repository within individual repository databases.
 - Identifies and reports merge problems:
   - **Collisions**: Multiple strong definitions of the same symbol and signature across different repositories (`MultipleDefinitions`).
@@ -657,8 +658,8 @@ tests/fixtures/    Integration test C corpora
 - **No path sensitivity** — all branches and paths are merged.
 - **Preprocessor subset** — not gcc/clang compatible for all extensions. Vendor macros such as `__GNUC__` / `__clang__` stay undefined; `--system-includes` imports only selected target and hosted-mode macros from the compiler. Without that flag, only the language's own `__cplusplus` / `__STDC__` / `__STDC_VERSION__` are predefined; see [docs/PREPROCESSOR.md](docs/PREPROCESSOR.md).
 - **Build environment** — with `--system-includes`, compiler probing locates installed standard-library headers and selected target macros, but does not supply missing SDK or generated headers. Supply additional roots with `--dep` / `--include` as needed. Other compiler-specific builtins and response files are not modeled.
-- **Configuration coverage** — without database entries or `--explore`, indexing uses one inferred configuration. A name no `-D` or reached `#define` binds resolves to `0` in `#if`; the default exclusions are measured in [docs/CONDITIONAL_COVERAGE.md](docs/CONDITIONAL_COVERAGE.md). Explicit database commands are all merged; exploratory configurations remain bounded by `--explore-budget`.
-- **Original line attribution** — entities attribute to original source files on disk via the preprocessor's `LineMap` (call sites inside macro expansions attribute to the expansion site's origin; headers are deduplicated across translation units).
+- **Configuration coverage** — without database entries or `--explore`, indexing uses one inferred configuration. A name no `-D` or reached `#define` binds resolves to `0` in `#if`; use [conditional coverage reporting](docs/CONDITIONAL_COVERAGE.md) to measure exclusions in a selected configuration. Explicit database commands are all merged; exploratory configurations remain bounded by `--explore-budget`.
+- **Original line attribution** — entities use original source positions through the preprocessor's `LineMap`. See [Call source locations](docs/ANALYSIS.md#call-source-locations) for macro-body spelling and invocation positions, and [Shared header functions](docs/ANALYSIS.md#shared-header-functions) for header identity and ownership.
 
 ## Further reading
 
@@ -666,7 +667,7 @@ tests/fixtures/    Integration test C corpora
 - [Analysis algorithm](docs/ANALYSIS.md)
 - [Preprocessor spec](docs/PREPROCESSOR.md)
 - [C API (`trace-capi`)](docs/CAPI.md)
-- [Conditional-compilation coverage (eval corpora)](docs/CONDITIONAL_COVERAGE.md)
+- [Conditional-compilation coverage reporting](docs/CONDITIONAL_COVERAGE.md)
 - [SQLite schema (detailed)](docs/SQLITE_SCHEMA.md)
 - [Roadmap](docs/ROADMAP.md)
 - [C++ next slices (hiview)](docs/CPP_ROADMAP.md)

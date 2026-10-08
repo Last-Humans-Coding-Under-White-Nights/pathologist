@@ -4,6 +4,18 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Correctness cleanup and maintained reporting guides
+
+`trace-merge` opens inputs read-only and publishes through a unique temporary
+file, avoiding collisions with input paths and cleaning up after failures.
+Published databases retain SQLite's `0644` creation mode filtered by the caller's
+umask, preserving read access without granting group or other users write access.
+Parse-failure reporting preserves empty database selections, handles Unicode
+snippets, orders files deterministically, and validates a completion record.
+Both report generators accept `--output` and default to local files under `/tmp`.
+Stale resolution and inspect reports were removed; parse-failure and conditional
+coverage snapshots were replaced with capture instructions and limitations.
+
 ### Byte-budgeted translation-unit indexing (#212)
 
 Ordinary parallel parsing now reserves estimated source bytes until each unit has
@@ -424,7 +436,7 @@ call-graph nodes read `name ([external])` and `calls` rows `-> name (external)` 
 `name (somefile.c:N [external])`; `--file` and `--line` no longer match them through their
 arbitrary stored file. Prototype-only externals keep their declaration line. C consumers must
 null-check `callee_path` (the shipped `ctrace` example assumed it was never NULL and segfaulted on
-the first libc edge). See `docs/CAPI.md` and `docs/INSPECT_REPORT.md`.
+the first libc edge). See `docs/CAPI.md` and the inspect reference in `README.md`.
 
 ### Faster analyze phase (#117)
 

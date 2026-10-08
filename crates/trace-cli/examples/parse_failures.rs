@@ -1,10 +1,11 @@
-//! One-off helper: list tree-sitter ERROR nodes for files that failed to parse.
+//! List tree-sitter ERROR nodes for files that failed to parse.
 //!
 //! Usage:
 //!   cargo run -p trace-cli --release --example parse_failures -- \
 //!     /path/to/project --from-db /tmp/out.db
 
 use std::collections::HashSet;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use trace_parse::{
@@ -14,19 +15,30 @@ use trace_parse::{
 use trace_preproc::PreprocessOptions;
 
 fn main() -> Result<(), String> {
-    let mut args = std::env::args().skip(1);
-    let root = PathBuf::from(args.next().ok_or("--from-db requires ROOT")?);
+    run(std::env::args().skip(1), &mut io::stdout().lock())
+}
+
+fn run(mut args: impl Iterator<Item = String>, output: &mut impl Write) -> Result<(), String> {
+    let root = PathBuf::from(args.next().ok_or("parse_failures requires ROOT")?);
+    if !root.is_dir() {
+        return Err(format!(
+            "source root is not a directory: {}",
+            root.display()
+        ));
+    }
     let mut from_db: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         if arg == "--from-db" {
             from_db = Some(PathBuf::from(args.next().ok_or("--from-db requires PATH")?));
+        } else {
+            return Err(format!("unknown argument: {arg}"));
         }
     }
 
     let failing = if let Some(db) = from_db {
-        load_parse_failures_from_db(&db)?
+        Some(load_parse_failures_from_db(&db)?)
     } else {
-        Vec::new()
+        None
     };
 
     let opts = PreprocessOptions::default();
@@ -47,27 +59,24 @@ fn main() -> Result<(), String> {
     let cpp_tus: HashSet<PathBuf> = files
         .iter()
         .filter(|p| trace_parse::is_cpp_path(p))
-        .cloned()
+        .map(|p| include_graph.intern_path(p))
         .collect();
 
     let source_cache = IndexSourceCache::new();
-    let targets: Vec<PathBuf> = if failing.is_empty() {
-        files
-            .into_iter()
-            .chain(headers)
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect()
-    } else {
-        failing
-    };
+    let mut targets: Vec<PathBuf> =
+        failing.unwrap_or_else(|| files.into_iter().chain(headers).collect());
+    targets.sort();
+    targets.dedup();
 
+    let mut rows = 0;
     for path in targets {
         let canonical = include_graph.intern_path(&path);
         let pre = match source_cache.get_or_preprocess(&canonical, &include_graph, &eff_opts) {
             Ok(p) => p,
             Err(e) => {
-                println!("FILE\t{}\tPREPROCESS\t{}", path.display(), e);
+                writeln!(output, "FILE\t{}\tPREPROCESS\t{}", path.display(), e)
+                    .map_err(|e| e.to_string())?;
+                rows += 1;
                 continue;
             }
         };
@@ -79,11 +88,14 @@ fn main() -> Result<(), String> {
         let mut error_nodes = Vec::new();
         collect_unrecovered_parse_errors(parsed.tree.root_node(), &mut error_nodes);
         if error_nodes.is_empty() {
-            println!(
+            writeln!(
+                output,
                 "FILE\t{}\tPARSE\t{} grammar; tree-sitter reported errors but no ERROR nodes found",
                 path.display(),
                 if lang == SourceLang::Cpp { "C++" } else { "C" }
-            );
+            )
+            .map_err(|e| e.to_string())?;
+            rows += 1;
             continue;
         }
         for node in error_nodes {
@@ -94,30 +106,39 @@ fn main() -> Result<(), String> {
                 node.kind().to_string()
             };
             let text = node_text(parsed.source.as_ref(), &node);
-            let snippet = if text.len() > 120 {
-                format!("{}…", &text[..120])
-            } else {
-                text.to_string()
-            };
-            let snippet = snippet.replace(['\t', '\n'], " ");
-            println!(
+            let snippet = snippet(text);
+            writeln!(
+                output,
                 "FILE\t{}\tERROR\tline {} col {} ({}) {}",
                 path.display(),
                 pos.row + 1,
                 pos.column + 1,
                 kind,
                 snippet
-            );
+            )
+            .map_err(|e| e.to_string())?;
+            rows += 1;
         }
     }
-    Ok(())
+    writeln!(output, "END\t{rows}").map_err(|e| e.to_string())
+}
+
+fn snippet(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut snippet: String = chars.by_ref().take(120).collect();
+    if chars.next().is_some() {
+        snippet.push('…');
+    }
+    snippet.replace(['\t', '\n', '\r'], " ")
 }
 
 fn load_parse_failures_from_db(db: &Path) -> Result<Vec<PathBuf>, String> {
-    let conn = rusqlite::Connection::open(db).map_err(|e| e.to_string())?;
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT message FROM diagnostics WHERE stage='parse' AND message LIKE 'parse errors in %'",
+            "SELECT DISTINCT message FROM diagnostics WHERE stage='parse' AND message LIKE 'parse errors in %' ORDER BY message",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -150,4 +171,62 @@ fn index_lang(path: &Path, cpp_tus: &HashSet<PathBuf>, graph: &IncludeGraph) -> 
         }
     }
     SourceLang::C
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snippets_truncate_unicode_and_keep_one_tsv_line() {
+        let text = format!("{}😀tail", "a".repeat(119));
+        assert_eq!(snippet(&text), format!("{}😀…", "a".repeat(119)));
+        assert_eq!(snippet("é😀\t\n\r"), "é😀   ");
+        assert_eq!(snippet(&"é".repeat(120)), "é".repeat(120));
+    }
+
+    #[test]
+    fn empty_database_selection_does_not_scan_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("broken.c"), "int x = ;\n").unwrap();
+        let db = dir.path().join("analysis.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE diagnostics (stage TEXT, message TEXT);")
+            .unwrap();
+        drop(conn);
+        let mut output = Vec::new();
+        run(
+            [
+                dir.path().display().to_string(),
+                "--from-db".to_owned(),
+                db.display().to_string(),
+            ]
+            .into_iter(),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(output, b"END\t0\n");
+    }
+
+    #[test]
+    fn missing_database_is_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("missing.db");
+        assert!(load_parse_failures_from_db(&db).is_err());
+        assert!(!db.exists());
+    }
+
+    #[test]
+    fn scan_orders_files_and_counts_completed_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["z.c", "a.c"] {
+            std::fs::write(dir.path().join(name), "int x = ;\n").unwrap();
+        }
+        let mut output = Vec::new();
+        run([dir.path().display().to_string()].into_iter(), &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.find("/a.c\t").unwrap() < text.find("/z.c\t").unwrap());
+        let rows: Vec<_> = text.lines().collect();
+        assert_eq!(rows.last().unwrap(), &format!("END\t{}", rows.len() - 1));
+    }
 }
