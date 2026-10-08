@@ -588,7 +588,7 @@ Phase 2: Detection + matching + synthetic edges            [DONE]
   → inspect (crate + CLI) LEFT JOINs call_sites; renders synthetic edges
     with no source location (no mis-attribution)
   → Fixtures: ipc_basic/, ipc_if_else/, ipc_enum/, ipc_callback/, ipc_stub_suffix/
-  → Integration tests: crates/trace-cli/tests/ipc_tests.rs
+  → Integration tests: crates/trace-cli/tests/it/ipc_tests.rs
   → Validated on all 4 target repos (see "Status" below)
 
 Phase 3: Parameter marshalling (optional enhancement)
@@ -636,8 +636,8 @@ both sides to be indexed. Because v1 is name-based, an exactly paired
 exclude test sources from the analysis root or use `--no-ipc` when that is not
 desired.
 
-**Fixture tests** (`cargo test -p trace-cli --test ipc_tests`): 10 tests, all
-pass. Full `cargo test --workspace` (26 suites) remains green.
+**Fixture tests** (`cargo test -p trace-cli ipc_tests`): 10 tests, all
+pass. Full `cargo test --workspace` remains green.
 
 **Debugging aid:** `TRACE_DEBUG_IPC=1` prints each bridge as
 `[ipc] bridge: <proxy> --> <stub>` plus a total. Debug logging is disabled by
