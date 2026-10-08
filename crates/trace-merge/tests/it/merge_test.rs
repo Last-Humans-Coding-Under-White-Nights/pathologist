@@ -8,94 +8,42 @@ fn trace_bin() -> &'static str {
     env!("CARGO_BIN_EXE_trace-merge")
 }
 
-fn is_trace_stale(bin_path: &std::path::Path) -> bool {
-    let Ok(bin_meta) = bin_path.metadata() else {
-        return true;
-    };
-    let Ok(bin_mtime) = bin_meta.modified() else {
-        return true;
-    };
-
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest_dir.join("../..");
-
-    let check_crates = [
-        "trace-cli",
-        "trace-parse",
-        "trace-analysis",
-        "trace-db",
-        "trace-ir",
-        "trace-preproc",
-    ];
-
-    for crate_name in check_crates {
-        let crate_dir = root.join("crates").join(crate_name);
-        if check_dir_newer(&crate_dir.join("src"), bin_mtime) {
-            return true;
-        }
-        if let Ok(meta) = crate_dir.join("Cargo.toml").metadata() {
-            if let Ok(mtime) = meta.modified() {
-                if mtime > bin_mtime {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
-fn check_dir_newer(dir: &std::path::Path, bin_mtime: std::time::SystemTime) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            if let Ok(meta) = path.metadata() {
-                if let Ok(mtime) = meta.modified() {
-                    if mtime > bin_mtime {
-                        return true;
-                    }
-                }
-            }
-        } else if path.is_dir() && check_dir_newer(&path, bin_mtime) {
-            return true;
-        }
-    }
-    false
-}
-
 fn trace_cli_bin() -> std::path::PathBuf {
     static BIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     BIN.get_or_init(|| {
-        let mut path = std::path::PathBuf::from(env!("CARGO_BIN_EXE_trace-merge"));
-        path.set_file_name(format!("trace{}", std::env::consts::EXE_SUFFIX));
-        if !path.exists() || is_trace_stale(&path) {
-            let parent = path.parent().expect("target dir");
-            let is_release = parent
-                .file_name()
-                .is_some_and(|n| n == std::ffi::OsStr::new("release"));
-            let grandparent = parent.parent().expect("target parent dir");
-            let target_triple = if grandparent.file_name() != Some(std::ffi::OsStr::new("target")) {
-                grandparent.file_name().and_then(|n| n.to_str())
-            } else {
-                None
-            };
-
-            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-            let mut cmd = Command::new(cargo);
-            cmd.args(["build", "-q", "-p", "trace-cli"]);
-            if is_release {
-                cmd.arg("--release");
-            }
-            if let Some(target) = target_triple {
-                cmd.args(["--target", target]);
-            }
-            let status = cmd.status().expect("failed to build trace-cli");
-            assert!(status.success(), "failed to build trace-cli");
+        // Let cargo decide whether `trace` is fresh and where it lives: the
+        // compiler-artifact message carries the executable path, so this works
+        // for any target dir, profile or `--target` layout.
+        let release = std::path::Path::new(env!("CARGO_BIN_EXE_trace-merge"))
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == "release");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let mut cmd = Command::new(cargo);
+        cmd.args([
+            "build",
+            "-q",
+            "-p",
+            "trace-cli",
+            "--bin",
+            "trace",
+            "--message-format=json",
+        ]);
+        if release {
+            cmd.arg("--release");
         }
-        path
+        let output = cmd.output().expect("failed to run cargo build");
+        assert!(
+            output.status.success(),
+            "failed to build trace-cli:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|msg| msg["reason"] == "compiler-artifact" && msg["target"]["name"] == "trace")
+            .and_then(|msg| msg["executable"].as_str().map(std::path::PathBuf::from))
+            .expect("cargo reported no `trace` executable")
     })
     .clone()
 }
