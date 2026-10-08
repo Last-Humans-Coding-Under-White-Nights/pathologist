@@ -81,6 +81,9 @@ pub fn release_filesystem_caches() {
     if let Ok(mut cache) = DIR_LISTINGS.write() {
         *cache = (0, FxHashMap::default());
     }
+    if let Ok(mut absent) = ABSENT_SEARCH_DIRS.write() {
+        *absent = (0, FxHashSet::default());
+    }
 }
 
 /// Discard every memoized file probe: the tree may have changed since the last
@@ -140,6 +143,99 @@ pub fn is_file_cached(path: &Path) -> bool {
     })
 }
 
+/// [`is_file_cached`] for a candidate of an include search: whether `name`,
+/// the spelling an `#include` names, is a regular file under the search
+/// directory `dir`.
+///
+/// A spelling is tried under every search directory, and nearly every
+/// candidate names a subdirectory that is not there (`llvm/ADT/Foo.h` under
+/// each of thousands of directories). The search directory is read and
+/// recorded on its first probe, so each such candidate is settled from that
+/// listing by the child it does not hold, with no `read_dir` per candidate
+/// and no entry per absent directory ([`DIR_LISTINGS`]); a search directory
+/// that is not there is remembered as such, once per epoch. Nothing above
+/// the search directory is read.
+pub fn is_file_in(dir: &Path, name: &Path) -> bool {
+    let epoch = PROBE_EPOCH.load(Ordering::Relaxed);
+    if !is_listed(dir, epoch) && !list_search_directory(dir, epoch) {
+        // A miss for every spelling, one that leaves `dir` (`../a.h`)
+        // included: the kernel resolves `missing/../a.h` a component at a
+        // time, so the file beside an absent `dir` is not reachable through
+        // it, as a compiler opening the same candidate would find.
+        return false;
+    }
+    is_file_cached(&dir.join(name))
+}
+
+/// Search directories found absent, or not directories, this epoch: one
+/// per `-I`, so bounded by the search lists, unlike the subdirectories the
+/// spellings name under them.
+static ABSENT_SEARCH_DIRS: LazyLock<RwLock<(u64, FxHashSet<Vec<u8>>)>> =
+    LazyLock::new(|| RwLock::new((0, FxHashSet::default())));
+
+/// Read and record the search directory `dir`; `false` when it is not there
+/// (or is a regular file), which is remembered for the epoch.
+fn list_search_directory(dir: &Path, epoch: u64) -> bool {
+    let key = dir.as_os_str().as_encoded_bytes();
+    {
+        let absent = ABSENT_SEARCH_DIRS.read().unwrap_or_else(|e| e.into_inner());
+        if absent.0 == epoch && absent.1.contains(key) {
+            return false;
+        }
+    }
+    let Some(listing) = listing_or_absent(dir) else {
+        let mut absent = ABSENT_SEARCH_DIRS
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if absent.0 != epoch {
+            *absent = (epoch, FxHashSet::default());
+        }
+        absent.1.insert(key.to_vec());
+        return false;
+    };
+    record_listing(dir, listing, epoch);
+    true
+}
+
+/// [`read_listing`] with its failures sorted: `None` when `dir` is not
+/// there or is a regular file (the probe is a miss), `Some(None)` when it
+/// is a directory that could not be read in full (every probe under it
+/// asks the filesystem). An error of another kind is told apart by asking
+/// whether `dir` is a directory, so a platform or mount reporting an absent
+/// path as one does not leave an entry per absent directory behind.
+fn listing_or_absent(dir: &Path) -> Option<Option<Arc<DirListing>>> {
+    match read_listing(dir) {
+        Ok(listing) => Some(listing.map(Arc::new)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            None
+        }
+        Err(_) => dir.is_dir().then_some(None),
+    }
+}
+
+/// Record `listing` for `dir` in this epoch, keeping an entry already there.
+fn record_listing(
+    dir: &Path,
+    listing: Option<Arc<DirListing>>,
+    epoch: u64,
+) -> Option<Arc<DirListing>> {
+    let mut cache = DIR_LISTINGS.write().unwrap_or_else(|e| e.into_inner());
+    if cache.0 != epoch {
+        cache.0 = epoch;
+        cache.1 = FxHashMap::default();
+    }
+    cache
+        .1
+        .entry(dir.as_os_str().as_encoded_bytes().to_vec())
+        .or_insert(listing)
+        .clone()
+}
+
 /// How [`probe_file`] answered a first probe.
 enum Probe {
     /// Settled by a directory listing: the name is not there. Not memoized,
@@ -180,9 +276,10 @@ impl DirListing {
 /// filesystem, as before). Shared by every thread: the discovery workers and
 /// the other parallel phases walk the same search lists.
 ///
-/// Holds only directories that exist and were probed into, or lie under one
-/// that was: never an absent directory, never a path through a regular
-/// file, and never an ancestor nobody probed into. A spelling
+/// Holds only directories that exist and were probed into (a search
+/// directory, by [`is_file_in`]), or lie under one that was: never an absent
+/// directory, never a path through a regular file, and never an ancestor
+/// nobody probed into. A spelling
 /// `llvm/ADT/Foo.h` names a `llvm/ADT` under every search
 /// directory it is tried in, nearly all of them absent; an entry per (search
 /// directory × spelled subdirectory), and a memo entry per candidate, took
@@ -287,27 +384,10 @@ fn read_down_to(dir: &Path, name: &[u8], epoch: u64) -> bool {
         } else {
             levels[i - 1].file_name().map(|n| n.as_encoded_bytes())
         };
-        let listing = match read_listing(level) {
-            Ok(listing) => listing.map(Arc::new),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                return false;
-            }
-            Err(_) => None,
+        let Some(listing) = listing_or_absent(level) else {
+            return false;
         };
-        let mut cache = DIR_LISTINGS.write().unwrap_or_else(|e| e.into_inner());
-        if cache.0 != epoch {
-            cache.0 = epoch;
-            cache.1 = FxHashMap::default();
-        }
-        let listing = cache
-            .1
-            .entry(level.as_os_str().as_encoded_bytes().to_vec())
-            .or_insert(listing);
+        let listing = record_listing(level, listing, epoch);
         if let (Some(listing), Some(child)) = (listing, child) {
             if !listing.may_hold(child) {
                 return false;
@@ -618,6 +698,64 @@ mod tests {
             1,
             "only the file the filesystem was asked about is memoized"
         );
+    }
+
+    /// An include search probes a spelling under every search directory, so
+    /// the search directory itself is listed once and every absent
+    /// subdirectory a spelling names under it is settled from that listing:
+    /// no `read_dir` per candidate, no entry per absent directory, and no
+    /// memo entry for a miss. A search directory that is not there is
+    /// remembered as such, once.
+    #[test]
+    fn a_search_directory_is_listed_once_for_every_spelling_under_it() {
+        let _guard = EPOCH.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let inc = dir.path().join("inc");
+        std::fs::create_dir_all(&inc).unwrap();
+        std::fs::write(inc.join("a.h"), "int x;\n").unwrap();
+        start_file_probe_epoch();
+        release_thread_path_caches();
+        for spelled in ["llvm/ADT/x.h", "llvm/ADT/y.h", "nope/z.h"] {
+            for _ in 0..2 {
+                assert!(!is_file_in(&inc, Path::new(spelled)), "{spelled}");
+            }
+        }
+        assert!(listed(&inc), "the search directory is listed");
+        for absent in ["llvm", "llvm/ADT", "nope"] {
+            assert!(!listed(&inc.join(absent)), "{absent} gets no entry");
+        }
+        assert_eq!(probe_memo_len(), 0, "a settled miss is not memoized");
+        assert!(is_file_in(&inc, Path::new("a.h")));
+        let missing = dir.path().join("missing");
+        for _ in 0..2 {
+            assert!(!is_file_in(&missing, Path::new("llvm/ADT/x.h")));
+        }
+        assert!(!listed(&missing));
+        assert!(
+            !listed(dir.path()),
+            "nothing above a search directory is read"
+        );
+    }
+
+    /// A spelling that leaves an absent search directory (`../a.h` under
+    /// `missing`) is a miss, as the filesystem resolves it: the kernel walks
+    /// `missing` before `..`, so the file beside `missing` is not reachable
+    /// through it. The early answer agrees with `Path::is_file`.
+    #[test]
+    fn an_escaping_spelling_under_an_absent_search_directory_is_a_miss() {
+        let _guard = EPOCH.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.h"), "").unwrap();
+        start_file_probe_epoch();
+        release_thread_path_caches();
+        let missing = dir.path().join("missing");
+        let escaping = missing.join("../a.h");
+        assert!(!escaping.is_file(), "{}", escaping.display());
+        assert!(!is_file_in(&missing, Path::new("../a.h")));
+        // Under a search directory that exists, the same spelling is found.
+        let present = dir.path().join("present");
+        std::fs::create_dir(&present).unwrap();
+        assert!(is_file_in(&present, Path::new("../a.h")));
     }
 
     /// Only a listing a probe asked for directly is in hand: ancestors are

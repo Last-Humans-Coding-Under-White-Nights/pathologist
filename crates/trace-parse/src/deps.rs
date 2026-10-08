@@ -596,19 +596,30 @@ fn resolve_include(
     // Asked once per include, so a candidate that is not on disk costs a
     // lookup by path only when some virtual header has its name.
     let named = in_memory.names(&inc.path);
-    let exists = |p: &Path| trace_ir::is_file_cached(p) || (named && in_memory.holds(p));
-    if let Some(cand) = local_first.map(|parent| parent.join(&inc.path)) {
-        if exists(&cand) {
-            return Some(cand);
+    // The search directory is listed on its first probe, which settles every
+    // absent subdirectory a spelling names under it (`is_file_in`); the
+    // candidate path is built only for a hit, or to ask the virtual headers.
+    let found_in = |dir: &Path| -> Option<PathBuf> {
+        if trace_ir::is_file_in(dir, Path::new(&inc.path)) {
+            return Some(dir.join(&inc.path));
         }
+        if named {
+            let cand = dir.join(&inc.path);
+            if in_memory.holds(&cand) {
+                return Some(cand);
+            }
+        }
+        None
+    };
+    if let Some(cand) = local_first.and_then(found_in) {
+        return Some(cand);
     }
     memoized(search_memo, from_is_test, &inc.path, || {
         // A production includer never takes a test/mock candidate from the
         // inferred search (docs/ANALYSIS.md, "Declaring-header eligibility").
         let admits = |p: &Path| from_is_test || !trace_ir::is_test_path(root, p, test_partition);
         for dir in include_dirs {
-            let cand = dir.join(&inc.path);
-            if exists(&cand) && admits(&cand) {
+            if let Some(cand) = found_in(dir).filter(|cand| admits(cand)) {
                 return Some(cand);
             }
         }

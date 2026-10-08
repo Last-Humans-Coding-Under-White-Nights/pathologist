@@ -1,5 +1,85 @@
 # Evaluation Report
 
+## Undeclared receiver classes: #193 — 2026-10-07
+
+A member call on a receiver whose class the unit never declares
+(`MessageParcel &data; data.WriteInt32(1);`, the header in another
+repository and off the include path) produced no edge, while the same call
+on a forward-declared class produced an external edge named after the class.
+Lowering now types a bare, unresolvable C++ type name in a parameter, local,
+field or range-for position as the class of that name in the enclosing
+namespace, as a forward declaration there would; the rules, and what is not
+guessed, are in [docs/ANALYSIS.md](ANALYSIS.md#undeclared-receiver-classes).
+Fixture: `tests/fixtures/cpp_undeclared_receiver/`; the merge relink is
+covered by `test_undeclared_receiver_member_call_relinks_to_defining_repo`
+in `crates/trace-merge/tests/merge_test.rs`.
+
+Member-call sites (`call_sites.is_direct = 0`) with no row in `call_edges`,
+default options (`--jobs 8`, pinned corpora of `scripts/eval_expected.json`
+plus the issue's `ability_ability_runtime` at `6c18fdc`), on the merge base
+`32951b4` and with this change. A site that resolves becomes a direct site
+with an external edge, so the member-site total moves too:
+
+| Corpus | Member sites before | No edge before | Member sites after | No edge after | External edges before → after |
+|---|---:|---:|---:|---:|---:|
+| `ability_ability_runtime` (`6c18fdc`) | 33,538 | 27,967 (83%) | 21,631 | 15,699 (73%) | 321,005 → 332,711 |
+| camera (`8ffd69d`) | 11,718 | 11,178 (95%) | 9,247 | 8,706 (94%) | 43,555 → 46,027 |
+| hiview (`92408e2`) | 2,766 | 2,635 (95%) | 1,554 | 1,428 (92%) | 14,476 → 15,689 |
+| hdf (`cdc75a2`) | 4,551 | 1,797 (39%) | 4,336 | 1,444 (33%) | 23,727 → 23,942 |
+
+On `ability_ability_runtime` the most frequent new externals are
+`OHOS::AAFwk::MessageParcel::WriteInt32` (601 edges),
+`OHOS::AAFwk::MessageParcel::ReadInt32` (527),
+`OHOS::AppExecFwk::MessageParcel::WriteInt32` (437) and
+`OHOS::AAFwk::MessageParcel::WriteParcelable` (387): the class is named in
+the namespace the type is written in, so `MessageParcel` is
+`OHOS::AAFwk::MessageParcel` in one component and
+`OHOS::AppExecFwk::MessageParcel` in another, as a forward declaration in
+each would be; `trace-merge` relinks those whose namespace is the defining
+one. What remains without an edge is gmock `EXPECT_CALL(...)` chains, calls
+chained on a call result (`want.GetElement().GetAbilityName()`) and
+`remote->SendRequest` (a `sptr<IRemoteObject>` whose argument the tree does
+not declare), none of which this change addresses.
+
+`scripts/eval_check.py` was re-captured; every move is one of three
+kinds:
+
+- **More external edges and entities** on every corpus (hiview
+  `edges_external` 14,476 → 15,689, `functions_external` 1,684 → 1,991;
+  camera 43,555 → 46,027 and 3,651 → 3,925; hdf 23,727 → 23,942 and
+  1,699 → 1,780): the synthesized `Class::member` entries and their edges.
+  The camera probe for template-spelled sites with no edge falls from
+  1,338: `meta->Set<Tag>(...)` on an undeclared `Meta` is now the external
+  `OHOS::CameraStandard::Meta::Set`, as a forward declaration gives.
+- **hiview `edges_indirect` 200 → 190 and hdf 5,052 → 5,034.** The edges
+  were noise: in hiview, `path.find(...)`, `path.substr(...)`,
+  `strTmp.erase(...)` on a `string` the unit never resolved (`using
+  namespace std` with the header off the path) read as `int`, and the
+  member name alone bound them to unrelated fields named `filePath`,
+  `dstPath` and `fileName`; in hdf, `parcel->ReadUint32()` and
+  `parcel->WriteRemoteObject()` on a `MessageParcel *` the C++ adapter
+  never saw bound the same way to the audio codec's `*CtrlOps` functions.
+  They are now the externals `OHOS::HiviewDFX::FileUtil::string::find` and
+  `MessageParcel::ReadUint32`, named in the enclosing namespace.
+- **camera `arg_flow_edges` 56,910 → 56,039 and `edges_direct`.**
+  `AddOrUpdateMetadata(metadata, tag, &value, 1)` binds two overloads
+  (`common_metadata_header_t *` and `std::shared_ptr<CameraMetadata> &`);
+  the call keeps one site per overload, and each site used to carry both
+  overloads' edges because the unresolved `common_metadata_header_t *` read
+  as `int *` and matched either signature at analysis time. Each site now
+  carries its own overload's edge (360 sites: 720 → 360 edges), with the
+  same two targets reached; the arg-flow rows of the duplicate edges go
+  with them.
+
+Two rules keep a guessed class from losing what the `int` stand-in kept.
+A guessed class constructs nothing, so a member initializer
+`handler_(handler)` on a field of an unseen callback typedef stores the
+value instead of calling a phantom constructor, and the solver leaves its
+cells unguarded, so the function stored there is kept: camera's eight
+`this->cameraSwitchRequest_(...)`-style callback calls in the NDK
+implementation keep their indirect edges (`edges_indirect` 371 unchanged).
+Diagnostics, `dlsym` edges and IPC edges are unchanged on all three
+corpora.
 ## Byte-budgeted indexing window
 
 Measured 2026-10-07 on Linux/WSL2, glibc, AMD Ryzen 7 8845HS

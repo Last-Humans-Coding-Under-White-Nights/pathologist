@@ -14775,3 +14775,120 @@ fn factory_review_bare_names_follow_using_scope_precedence() {
         "a project factory must use its own return type"
     );
 }
+
+analyzed_fixture!(cpp_undeclared_receiver);
+
+/// The callees of `caller` as (name, resolution) pairs, sorted, each once.
+fn sorted_callees(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+) -> Vec<(String, ResolutionKind)> {
+    let mut callees = common::callees_of(program, analysis, caller);
+    callees.sort_by_key(|(name, kind)| (name.clone(), format!("{kind:?}")));
+    callees.dedup();
+    callees
+}
+
+/// #193: a member call on a parameter whose class the unit never declares
+/// gets the external edge a forward declaration would give it.
+#[test]
+fn cpp_undeclared_receiver_parameters_get_external_edges() {
+    let (p, a) = cpp_undeclared_receiver();
+    assert_eq!(
+        sorted_callees(p, a, "OHOS::Send"),
+        [
+            ("OHOS::Declared::Run".into(), ResolutionKind::External),
+            (
+                "OHOS::MessageParcel::ReadInt32".into(),
+                ResolutionKind::External
+            ),
+            (
+                "OHOS::MessageParcel::WriteInt32".into(),
+                ResolutionKind::External
+            ),
+        ]
+    );
+}
+
+/// The undeclared unit yields the same edges as the forward-declared one,
+/// for `.` and `->`, on parameters, fields, locals, in a nested namespace
+/// and at the global scope.
+#[test]
+fn cpp_undeclared_receiver_matches_forward_declaration() {
+    let (p, a) = cpp_undeclared_receiver();
+    // `Send` alone also calls the forward-declared `Declared::Run`.
+    let callees = |caller: &str| -> Vec<_> {
+        sorted_callees(p, a, caller)
+            .into_iter()
+            .filter(|(name, _)| name != "OHOS::Declared::Run")
+            .collect()
+    };
+    for (undeclared, declared) in [
+        ("OHOS::Send", "OHOS::SendDeclared"),
+        ("OHOS::Holder::Go", "OHOS::HolderDeclared::Go"),
+        ("OHOS::Local", "OHOS::LocalDeclared"),
+        ("OHOS::AAFwk::Nested", "OHOS::AAFwk::NestedDeclared"),
+        ("OHOS::Field", "OHOS::FieldDeclared"),
+        ("Fuzz", "FuzzDeclared"),
+    ] {
+        let expected = callees(declared);
+        assert!(
+            !expected.is_empty(),
+            "{declared} resolves its member calls: {expected:?}"
+        );
+        assert_eq!(callees(undeclared), expected, "{undeclared} vs {declared}");
+    }
+}
+
+/// #147 still holds: `u->handler()` on an undeclared class names the class's
+/// member, not the free function `handler`.
+#[test]
+fn cpp_undeclared_receiver_never_falls_back_to_free_function() {
+    let (p, a) = cpp_undeclared_receiver();
+    assert!(must_not_have_edge(p, a, "OHOS::Field", "OHOS::handler"));
+    assert!(must_not_have_edge(p, a, "OHOS::Field", "handler"));
+    assert!(has_any_edge(p, a, "OHOS::Field", "OHOS::Unseen::handler"));
+}
+
+/// A template parameter and an undeclared wrapper of an unknown class are not
+/// class names: their member calls stay unresolved.
+#[test]
+fn cpp_undeclared_receiver_skips_template_parameters_and_unknown_wrappers() {
+    let (p, a) = cpp_undeclared_receiver();
+    for caller in ["OHOS::Generic", "OHOS::Wrapped"] {
+        assert!(common::callees_of(p, a, caller).is_empty(), "{caller}");
+    }
+    assert!(
+        !p.symbols.functions.iter().any(|f| f.name.contains("::T::")),
+        "no member is invented on a template parameter"
+    );
+}
+
+/// A callback field typed by a typedef the unit never sees is a guessed
+/// class, not a slot that rejects function addresses: the function stored
+/// into it is reached through the call on the field.
+#[test]
+fn cpp_undeclared_receiver_callback_field_keeps_its_function() {
+    let (p, a) = cpp_undeclared_receiver();
+    assert!(
+        has_any_edge(p, a, "OHOS::Listener::Fire", "OHOS::OnSwitchHandler"),
+        "{:?}",
+        common::callees_of(p, a, "OHOS::Listener::Fire")
+    );
+}
+
+/// `T f();` in a body declares a function (`direct_init_arguments` reads an
+/// empty parameter list as one), so its return type is not guessed.
+#[test]
+fn cpp_undeclared_receiver_skips_return_types_of_in_body_declarations() {
+    let (p, _a) = cpp_undeclared_receiver();
+    let guess = trace_ir::TypeDesc::Struct {
+        name: "OHOS::Unreturned".into(),
+        fields: Vec::new(),
+    };
+    assert!(
+        !p.types.is_guessed_class(&guess),
+        "the return type of `Unreturned Get();` is not a guessed class"
+    );
+}

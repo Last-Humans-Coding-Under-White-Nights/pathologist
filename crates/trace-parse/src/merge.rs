@@ -1620,7 +1620,11 @@ fn respelled_declarations(
             };
             let exact = |x: TypeId, y: TypeId| x == y;
             let loose = |x: TypeId, y: TypeId| {
-                trace_ir::may_name_same_type(types.get(x).desc.as_ref(), types.get(y).desc.as_ref())
+                trace_ir::may_name_same_type_in(
+                    types,
+                    types.get(x).desc.as_ref(),
+                    types.get(y).desc.as_ref(),
+                )
             };
             if let Some(definition) = only(&exact).or_else(|| only(&loose)) {
                 out.insert(declaration.id, definition);

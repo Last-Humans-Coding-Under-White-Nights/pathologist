@@ -2732,6 +2732,71 @@ Known C++ imprecision (in addition to the general list below):
 
 Next slices (hiview-grounded): [docs/CPP_ROADMAP.md](CPP_ROADMAP.md).
 
+### Undeclared receiver classes
+
+A member call on a receiver whose class the unit never declares --
+`MessageParcel &data; data.WriteInt32(1);` with `message_parcel.h` in
+another repository, off the include path -- resolves as if the class were
+forward-declared in the scope the type is written in (#193). A bare C++
+type name the unit cannot resolve (no class, typedef, alias or enum it
+sees; not a fundamental or standard integer spelling) in the type position
+of a parameter, a local, a field or a range-for element types the object as
+the class of that name in the innermost enclosing namespace
+(`OHOS::MessageParcel` inside `namespace OHOS`, `FuzzedDataProvider` at the
+global scope; `undeclared_class_guess`). `data.WriteInt32(1)` and
+`reply->ReadInt32()` then synthesize the externals
+`OHOS::MessageParcel::WriteInt32` and `OHOS::MessageParcel::ReadInt32`,
+exactly what `class MessageParcel;` beside the function yields, for `.` and
+`->`, so `trace-merge` relinks the edge against a database that defines the
+member. The callee is named from the declared type, never from the bare
+member name: `u->handler(1)` on an undeclared `Unseen` is
+`OHOS::Unseen::handler`, not a free function `handler` (#147, #153); as with
+a forward-declared class, the member may really be a function-pointer field
+of the unseen body, which the index cannot tell apart.
+
+Not guessed: a function's return type (`Unresolved GetBare(); auto p =
+GetBare();` leaves `p` untyped; `T f();` declares a function anywhere, in
+a body too, while `T w(a);` with arguments in a body defines an object), a
+cast or template argument, a template parameter or a name mentioning one (`T t;
+t.Run();` stays unresolved), and a wrapper whose argument names no declared
+class (`sptr<Unknown> p; p->Run();` stays unresolved, see
+[Smart-pointer unwrap](#smart-pointer-unwrap)). A typedef of a scalar or of
+a callback the unit cannot see is guessed like a class. The guess is
+remembered as one (`TypeTable::note_guessed_class`, carried with a header's
+types) and, while no unit declares the class
+(`TypeTable::is_guessed_class`), stays what the `int` such a type read as
+before wherever the spellings of a signature are read leniently: an
+in-class prototype meets its definition across it (`spelled_alike`, with an
+override's guessed integer typedef matching the base's integral parameter
+and `size_t`), a C-linkage prototype meets a definition missing its
+callback typedef (`int_stands_for_fn_ptr`), a redeclared internal function
+joins its definition (`may_name_same_type_in`), and ranking lets it decide
+no overload (`rank_overloads`). The strict comparison of two entries that
+both lower parameter variables (`same_param_type`) reads the guess as the
+class it names, as it reads an in-class prototype's unresolved parameter:
+`Set(Mode)` is not `Set(int)`, and a free `Count(size_t)` prototype and a
+`Count(MySize)` definition whose unit never sees the typedef are two
+entries, where before #193 the two `int`s collided. Its name registers no tag while no unit
+declares the class, whichever spelling of the name was interned first, so a
+typedef or enum of the name declared later in the unit, or an enumerator
+`E::VALUE` of it, resolves as it did; a declaration of the class after the
+guess, in the unit or merged in from another, registers the tag the guessed
+descriptor withheld (`TypeTable::declare_struct`), so the tag table does not
+depend on which unit merged first. A guessed class constructs nothing
+(`initialized_class`): a member initializer or direct initialization of an
+object of that type stores the value, since the type may be a callback
+typedef the unit never saw; and the solver leaves a cell of that type
+unguarded (`slot_guard_for`), so a function address stored into such a
+field reaches the call through it, as it did when the typedef read as
+`int`. The namespace is the innermost
+enclosing one, as a forward declaration written there would give: a class
+really living elsewhere (`Want` of `OHOS::AAFwk` written under
+`using namespace AAFwk` inside `OHOS::AbilityRuntime`) is named in the wrong
+namespace, as a forward declaration there would be, and the merge cannot
+relink that edge. Fixture: `tests/fixtures/cpp_undeclared_receiver/`
+(`main.cpp` undeclared beside `declared.cpp` forward-declared, which must
+produce the same edges).
+
 ### Automatic objects
 
 Constructor and destructor sites of automatic C++ objects (#186). This

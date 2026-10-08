@@ -176,16 +176,14 @@ pub(super) fn build(
         |result| {
             // Every unit here lowers its whole include closure, so a tree of
             // this size can take hours: say where the run is (#209).
-            index_item_progress(
-                file_index,
-                files.len(),
+            index_item_progress(file_index, files.len(), || {
                 format!(
                     "parse: {}/{} {}",
                     file_index + 1,
                     files.len(),
                     files[file_index].display()
-                ),
-            );
+                )
+            });
             variants_merged += result.units.len().saturating_sub(1);
             includes_by_file.push((files[file_index].clone(), result.includes.clone()));
             file_index += 1;
@@ -303,16 +301,14 @@ pub(super) fn build(
             )
         },
         |unit| {
-            index_item_progress(
-                header_index,
-                header_configs.len(),
+            index_item_progress(header_index, header_configs.len(), || {
                 format!(
                     "parse: {}/{} {}",
                     header_index + 1,
                     header_configs.len(),
                     unit.path.display()
-                ),
-            );
+                )
+            });
             header_index += 1;
             merge_unit_index(&mut program, &unit);
         },
