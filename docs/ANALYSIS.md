@@ -3669,8 +3669,8 @@ No SQLite schema change is needed. Global `defines` metadata continues to descri
 user overrides; include paths are the union of observed configuration paths,
 not a replacement for per-command search order.
 
-Regression coverage: `crates/trace-cli/tests/compile_commands_tests.rs`,
-`crates/trace-cli/tests/compile_flags_tests.rs`, and the corresponding
+Regression coverage: `crates/trace-cli/tests/it/compile_commands_tests.rs`,
+`crates/trace-cli/tests/it/compile_flags_tests.rs`, and the corresponding
 `tests/fixtures/compile_commands/` and `tests/fixtures/compile_flags/` fixtures. Format and search semantics follow the
 [Clang database specification](https://clang.llvm.org/docs/JSONCompilationDatabase.html)
 and [GCC directory options](https://gcc.gnu.org/onlinedocs/gcc/Directory-Options.html).

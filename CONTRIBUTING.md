@@ -72,8 +72,8 @@ values.
 2. Add one or more `.c` / `.cpp` source files that exercise the feature.
 3. Optionally add `expected.json` capturing expected metric counts; run
    `python3 scripts/eval_check.py` to verify.
-4. Add a Rust integration test (typically in the relevant crate's `tests/` or
-   in `crates/trace-cli/tests/`) that invokes the pipeline on the fixture and
+4. Add a Rust integration test (typically in the relevant crate's `tests/it/` or
+   in `crates/trace-cli/tests/it/`) that invokes the pipeline on the fixture and
    asserts on exported data.
 
 ## Adding new analysis constraints

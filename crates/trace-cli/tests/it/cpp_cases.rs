@@ -1,0 +1,14893 @@
+//! C++ lowering integration tests (first-step C++ support).
+#![allow(clippy::needless_borrow)]
+
+use crate::common;
+
+use std::sync::OnceLock;
+
+use common::{default_opts, fixture, fn_name, has_any_edge, has_edge, must_not_have_edge};
+use trace_analysis::{analyze, AnalysisResult, ResolutionKind};
+use trace_ir::{FnId, Linkage, Program};
+use trace_parse::build_program;
+
+fn direct_targets(program: &Program, analysis: &AnalysisResult, caller: &str) -> Vec<String> {
+    analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(&program, e.caller) == caller && e.resolution == ResolutionKind::Direct)
+        .map(|e| fn_name(&program, e.callee))
+        .collect()
+}
+
+analyzed_fixture!(cpp_issue113);
+
+#[test]
+fn cpp_relative_qualified_call_uses_enclosing_namespace() {
+    let (p, a) = cpp_issue113();
+    assert!(has_any_edge(p, a, "app::relative", "app::Service::Write"));
+}
+
+#[test]
+fn cpp_chained_call_uses_declared_return_type() {
+    let (p, a) = cpp_issue113();
+    for caller in ["app::chained", "app::chained_pointer"] {
+        assert!(
+            has_any_edge(p, a, caller, "app::Service::Start"),
+            "{caller}"
+        );
+    }
+}
+
+#[test]
+fn cpp_hwtest_fixture_keeps_member_context() {
+    let (p, a) = cpp_issue113();
+    for caller in [
+        "app::Fixture_CallsMember_Test::TestBody",
+        "app::Fixture_ParamCallsMember_Test::TestBody",
+    ] {
+        assert!(
+            has_any_edge(p, a, caller, "app::Service::Start"),
+            "{caller}"
+        );
+    }
+    assert!(has_any_edge(
+        p,
+        a,
+        "app::Standalone_CallsGlobal",
+        "app::Service::Write"
+    ));
+}
+
+#[test]
+fn cpp_template_return_preserves_receiver_and_virtual_dispatch() {
+    let (p, a) = cpp_issue113();
+    assert!(has_any_edge(
+        p,
+        a,
+        "app::Adapter::Filter",
+        "app::Video::Filter"
+    ));
+    // The member the substitution reads is itself a resolved call: a
+    // receiver spelled with its template arguments must still reach the
+    // class the index holds it under.
+    for caller in ["app::Adapter::Filter", "app::nested_holder"] {
+        assert!(has_any_edge(p, a, caller, "app::Holder::Get"), "{caller}");
+    }
+}
+
+#[test]
+fn cpp_external_queue_invokes_submitted_lambda() {
+    let (p, a) = cpp_issue113();
+    assert!(a
+        .call_edges
+        .iter()
+        .any(|e| fn_name(p, e.caller) == "app::queued"
+            && fn_name(p, e.callee).starts_with("app::queued::$lambda")));
+}
+
+#[test]
+fn cpp_callback_model_is_configurable_and_reaches_a_defined_callee() {
+    let (p, _) = cpp_issue113();
+    let models = trace_analysis::FnModelSet::from_toml_str(
+        r#"
+        [[model]]
+        name = "app::custom_submit"
+        effects = [{ kind = "invoke", param = 0 }]
+        [[model]]
+        name = "app::defined_submit"
+        effects = [{ kind = "invoke", param = 0 }]
+    "#,
+    )
+    .unwrap();
+    let (_, a) = trace_analysis::analyze_with_options(
+        p,
+        trace_analysis::AnalyzeOptions {
+            models: std::sync::Arc::new(models),
+            ..Default::default()
+        },
+    );
+    // A definition in view is not the same as the callback edge being in
+    // view: the shipped `ffrt::queue::submit` is a template whose body the
+    // index holds once, uninstantiated. Both sites carry the edge, once each.
+    let mut sites: Vec<_> = a
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(p, e.caller) == "app::configured" && fn_name(p, e.callee) == "callback")
+        .map(|e| {
+            p.symbols.call_sites[e.call_site.0 as usize]
+                .callee_name
+                .clone()
+        })
+        .collect();
+    sites.sort();
+    assert_eq!(sites, vec!["custom_submit", "defined_submit"]);
+    // A callback the model does not describe stays out: `callback_arg` takes
+    // an argument, and nothing says what would be passed to it.
+    assert!(!has_any_edge(p, &a, "app::queued_arg", "callback_arg"));
+}
+
+#[test]
+fn cpp_template_return_follows_pointers_and_inherited_bases() {
+    let (p, a) = cpp_issue113();
+    // A pointer receiver names the same class template its value form does.
+    for caller in ["app::holder_pointer", "app::Adopted::Run", "app::Far::Run"] {
+        assert!(has_any_edge(p, a, caller, "app::Holder::Get"), "{caller}");
+        assert!(
+            has_any_edge(p, a, caller, "app::Service::Start"),
+            "{caller} return"
+        );
+    }
+    // A receiver spelled with its template arguments still finds the members
+    // the index holds under the class's own name.
+    assert!(has_any_edge(p, a, "app::holder_arrow", "app::Holder::Ping"));
+}
+
+#[test]
+fn cpp_using_namespace_carries_a_qualified_call() {
+    let (p, a) = cpp_issue113();
+    assert!(has_any_edge(p, a, "via_using", "app::Service::Write"));
+    // Across translation units: the definition written under the directive
+    // is indexed under the class's own namespace and merges with the header's
+    // prototype, so the call reaches one defined entry rather than a stub.
+    assert!(has_any_edge(p, a, "via_using_remote", "rem::Remote::Call"));
+    let entries: Vec<_> = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name.ends_with("Remote::Call"))
+        .map(|f| (f.name.as_str(), f.is_defined))
+        .collect();
+    assert_eq!(entries, vec![("rem::Remote::Call", true)]);
+}
+
+#[test]
+fn cpp_callback_model_reaches_every_function_the_argument_may_hold() {
+    let (p, a) = cpp_issue113();
+    for callee in ["callback", "callback_alt"] {
+        assert!(has_any_edge(p, a, "app::queued_either", callee), "{callee}");
+    }
+}
+
+#[test]
+fn cpp_issue113_receiver_and_callback_boundaries() {
+    let (p, a) = cpp_issue113();
+    assert!(has_any_edge(
+        p,
+        a,
+        "app::nested_holder",
+        "app::Service::Start"
+    ));
+    assert!(has_any_edge(
+        p,
+        a,
+        "app::global_qualified",
+        "elsewhere::Service::Write"
+    ));
+    assert!(!has_any_edge(
+        p,
+        a,
+        "app::global_qualified",
+        "app::Service::Write"
+    ));
+    assert!(!has_any_edge(
+        p,
+        a,
+        "app::mixed_auto_return",
+        "app::Service::Start"
+    ));
+    // Unknown cast argument types must not select the operand's overload.
+    assert!(!has_any_edge(
+        p,
+        a,
+        "app::cast_chain",
+        "app::Service::Start"
+    ));
+    assert!(!has_any_edge(
+        p,
+        a,
+        "app::mixed_return",
+        "app::Service::Start"
+    ));
+    assert!(has_any_edge(p, a, "app::long_chain", "app::Chain::Finish"));
+    assert!(a
+        .call_edges
+        .iter()
+        .any(|e| fn_name(p, e.caller) == "app::queued_variable"
+            && fn_name(p, e.callee).starts_with("app::queued_variable::$lambda")));
+    assert!(!a
+        .call_edges
+        .iter()
+        .any(|e| fn_name(p, e.caller) == "app::unrelated"
+            && fn_name(p, e.callee).starts_with("app::unrelated::$lambda")));
+}
+
+#[test]
+fn cpp_auto_return_types_match_explicit_receivers() {
+    let root = fixture("cpp_auto_return");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_, analysis) = analyze(&program);
+    let members = |caller| {
+        let mut targets: Vec<_> = direct_targets(&program, &analysis, caller)
+            .into_iter()
+            .filter(|name| name.starts_with("Worker::") || name.starts_with("Sub::"))
+            .collect();
+        targets.sort();
+        targets
+    };
+    // The type of each local `p` in `caller`.
+    let p_types = |caller: &str| {
+        let id = program.symbols.resolve_function(caller).expect("caller");
+        program
+            .symbols
+            .variables
+            .iter()
+            .filter(move |v| v.fn_id == Some(id) && v.name == "p")
+            .map(|v| program.types.get(v.type_id).desc.as_ref())
+    };
+    assert_eq!(
+        program
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == "factories::select")
+            .count(),
+        2,
+        "qualified reference-return definitions must merge with their own prototypes"
+    );
+    let expected = vec!["Sub::go", "Worker::go", "Worker::run"];
+    for caller in [
+        "typed",
+        "inferred",
+        "chained",
+        "references",
+        "defined",
+        "qualified",
+        "member",
+        "conditional",
+        "init_statement",
+        "returned_reference",
+        "copied_reference",
+        "Owner::implicit_member",
+        "qualified_definition",
+        "global_qualified",
+        "global_free",
+        "global_shared",
+        "factories::body_scope",
+        "value_parameter",
+        "qualified_parameter_spelling",
+        "agreeing_overloads",
+        "agreeing_unknown",
+        "uses_std::bare_shared",
+        "cam::promote_in_namespace",
+        "cam::shared_const",
+        "cast_auto",
+        "bodyns::body",
+        "lock_typed",
+        "lock_auto",
+        "promote_typed",
+        "promote_auto",
+        "shared_typed",
+        "shared_auto",
+        "unique_typed",
+        "unique_auto",
+    ] {
+        assert_eq!(members(caller), expected, "{caller}");
+    }
+    for caller in [
+        "unresolved",
+        "dependent_use",
+        "partial_unknown",
+        "dependent_shared",
+        "dependent_copy",
+        "dependent_lock",
+        "dependent_value_use",
+        "box::Box::dependent_member",
+        "bare_without_using",
+        "dependent_receiver",
+        "dependent_static",
+        "Holder::use",
+        "pointer_to_value",
+        "pointer_depth_mismatch",
+        "dependent_alias",
+        "placeholder_scalar",
+        "Mixin::through_this",
+        "Mixin::implicit",
+        "strat_user::via_using",
+    ] {
+        assert!(members(caller).is_empty(), "{caller} must stay unresolved");
+        for guess in [
+            "Other::run",
+            "T::run",
+            "N::run",
+            "Event::run",
+            "SelfBase::self",
+        ] {
+            assert!(
+                !has_direct(&program, &analysis, caller, guess),
+                "{caller} -> {guess}"
+            );
+        }
+        for mut desc in p_types(caller) {
+            // A pointer declarator keeps its own layers over the unknown type.
+            while let trace_ir::TypeDesc::Ptr(inner) = desc {
+                desc = inner;
+            }
+            assert_eq!(
+                *desc,
+                trace_ir::TypeDesc::Unknown,
+                "{caller}::p must stay untyped"
+            );
+        }
+    }
+    assert!(
+        must_not_have_edge(
+            &program,
+            &analysis,
+            "reference_direct_init",
+            "Widget::Widget"
+        ),
+        "binding a reference constructs nothing"
+    );
+    let wrapper = |caller: &str| match p_types(caller).next().expect("p") {
+        trace_ir::TypeDesc::Struct { name, .. } => name.clone(),
+        other => panic!("{caller}::p is {other:?}"),
+    };
+    assert_eq!(wrapper("lock_auto"), "std::shared_ptr<Worker>");
+    assert_eq!(wrapper("promote_auto"), "OHOS::sptr<Worker>");
+    assert_eq!(wrapper("unique_auto"), "std::unique_ptr<Worker>");
+    assert_eq!(wrapper("cam::promote_in_namespace"), "cam::sptr<Worker>");
+    assert!(
+        matches!(
+            p_types("cast_auto").next(),
+            Some(trace_ir::TypeDesc::Ptr(inner)) if matches!(**inner, trace_ir::TypeDesc::Struct { .. })
+        ),
+        "`auto p = (Worker *)v` keeps the pointer layer"
+    );
+    for (caller, callee) in [
+        ("shared_template", "Box::run"),
+        ("ui::construct_local", "ui::Gadget::run"),
+        ("inherited_nested", "NodeBase::Node::run"),
+        ("new_qualified", "qual::Maker::run"),
+        ("shadowed_scope", "Worker::run"),
+        ("shadowed_scope", "Other::run"),
+    ] {
+        assert!(
+            has_direct(&program, &analysis, caller, callee),
+            "{caller} -> {callee}"
+        );
+    }
+    for (caller, callee) in [
+        ("strat_user::via_using", "Strategy::run"),
+        ("ui::construct_local", "Other::run"),
+        ("inherited_nested", "Node::run"),
+    ] {
+        assert!(
+            must_not_have_edge(&program, &analysis, caller, callee),
+            "{caller} -> {callee}"
+        );
+    }
+    assert!(
+        program.symbols.functions.iter().all(|f| f.name != "cb"),
+        "`cb && cb();` declares no function"
+    );
+}
+
+/// An `auto&` local passes the value it names, as an explicit `T&` does: it
+/// must not rank `sink(Worker *)` over `sink(Worker)`.
+#[test]
+fn cpp_auto_reference_ranks_overloads_as_explicit_reference() {
+    let root = fixture("cpp_auto_return");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_, analysis) = analyze(&program);
+    let sinks = |caller: &str| {
+        let mut targets: Vec<FnId> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(&program, e.caller) == caller && fn_name(&program, e.callee) == "sink"
+            })
+            .map(|e| e.callee)
+            .collect();
+        targets.sort();
+        targets
+    };
+    let explicit = sinks("sink_explicit");
+    assert_eq!(explicit.len(), 1, "`Worker &r` picks one overload");
+    for caller in ["sink_auto", "sink_const_auto"] {
+        assert_eq!(
+            sinks(caller),
+            explicit,
+            "{caller} ranks as `Worker &r` does"
+        );
+    }
+}
+
+/// A definition spelled `N::f` looks names up in `N` when `N` is opened only by
+/// a header the unit includes.
+#[test]
+fn cpp_body_scope_sees_namespace_opened_in_header() {
+    let root = fixture("cpp_auto_return");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_, analysis) = analyze(&program);
+    let mut targets = direct_targets(&program, &analysis, "hdrns::body");
+    targets.sort();
+    targets.dedup();
+    for callee in ["hdrns::Job::go", "hdrns::Job::run"] {
+        assert!(
+            targets.iter().any(|t| t == callee),
+            "hdrns::body -> {callee}: {targets:?}"
+        );
+    }
+}
+
+/// A variable declared in a condition (`if (Worker *p = f())`) is placed where
+/// its declarator starts, as one in a plain declaration is, not at its type.
+#[test]
+fn cpp_condition_variable_span_is_its_declarator() {
+    let root = fixture("cpp_auto_return");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let source = std::fs::read_to_string(root.join("main.cpp")).expect("fixture");
+    let (row, text) = source
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.starts_with("void condition_spans()"))
+        .expect("condition_spans");
+    for (name, declarator) in [("typed", "*typed"), ("inferred", "inferred")] {
+        let var = program
+            .symbols
+            .variables
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap_or_else(|| panic!("local `{name}`"));
+        let col = text.find(declarator).expect("declarator") as u32 + 1;
+        assert_eq!(
+            (var.span.line, var.span.col),
+            (row as u32 + 1, col),
+            "`{name}` must start at `{declarator}`"
+        );
+    }
+}
+
+#[test]
+fn cpp_virtual_dispatch_expands_to_overrides() {
+    let root = fixture("cpp_basic");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let targets = direct_targets(&program, &analysis, "main");
+    assert!(
+        targets.iter().any(|t| t == "gfx::Shape::area"),
+        "virtual s->area should target base Shape::area, got {targets:?}"
+    );
+    assert!(
+        targets.iter().any(|t| t == "gfx::Circle::area"),
+        "virtual s->area should target override Circle::area, got {targets:?}"
+    );
+}
+
+#[test]
+fn repeated_macro_virtual_calls_each_gain_cross_tu_override() {
+    let root = fixture("macro_virtual_cross_tu");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let derived = program
+        .symbols
+        .functions
+        .iter()
+        .find(|function| function.name == "Derived::run")
+        .expect("derived override")
+        .id;
+    let mut sites = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|site| {
+            fn_name(&program, site.caller) == "invoke" && site.callee_fn_id == Some(derived)
+        })
+        .collect::<Vec<_>>();
+    sites.sort_by_key(|site| site.expansion_span.map(|span| span.line));
+    assert_eq!(sites.len(), 2, "each macro invocation needs the override");
+    assert_eq!(sites[0].span, sites[1].span);
+    assert_ne!(sites[0].expansion_span, sites[1].expansion_span);
+
+    let (_pag, analysis) = analyze(&program);
+    assert_eq!(
+        analysis
+            .call_edges
+            .iter()
+            .filter(|edge| { fn_name(&program, edge.caller) == "invoke" && edge.callee == derived })
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn header_macro_passes_all_visible_static_overloads_as_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("reg.h"),
+        "void reg(void (*f)(int));\n#define REG(x) reg(x)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        "#include \"reg.h\"\nstatic void cb(int) {}\nstatic void cb(double) {}\nvoid via_macro() { REG(cb); }\nvoid direct() { reg(cb); }\n",
+    )
+    .unwrap();
+
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let macro_site = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|site| fn_name(&program, site.caller) == "via_macro" && site.callee_name == "reg")
+        .expect("macro call");
+    let mut overload_lines = macro_site
+        .fn_args()
+        .iter()
+        .filter(|(index, _)| *index == 0)
+        .map(|(_, function)| program.symbols.function(*function).span.line)
+        .collect::<Vec<_>>();
+    overload_lines.sort_unstable();
+    assert_eq!(overload_lines, vec![2, 3]);
+}
+
+#[test]
+fn cpp_non_virtual_member_call_exact() {
+    let root = fixture("cpp_basic");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let hits = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "main"
+                && fn_name(&program, e.callee) == "gfx::Shape::common"
+        })
+        .count();
+    assert_eq!(hits, 1, "s->common must resolve to exactly one site-edge");
+
+    let common = program
+        .symbols
+        .resolve_function("gfx::Shape::common")
+        .expect("common defined");
+    assert!(
+        program.symbols.function(common).is_defined,
+        "out-of-class definition must be the merged entry"
+    );
+}
+
+#[test]
+fn cpp_header_inline_method_dedups_with_out_of_class_uses() {
+    let root = fixture("cpp_basic");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    // radius is defined inline in util.hpp; main calls it once.
+    let hits = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(&program, e.callee) == "gfx::Circle::radius")
+        .count();
+    assert_eq!(hits, 1, "header-inline method should dedup across TUs");
+}
+
+/// A C++ class in a `.h` (not `.hpp`) must be parsed with the C++ grammar
+/// under PCH-style header IR. Extension-only language would lower it as C
+/// and drop CHA for out-of-line `Plugin::OnEventProxy`.
+#[test]
+fn cpp_dot_h_header_virtual_call_expands() {
+    let root = fixture("cpp_h_header");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_direct(
+            &program,
+            &analysis,
+            "Plugin::OnEventProxy",
+            "Plugin::OnEvent"
+        ),
+        "implicit this->OnEvent from .h-declared Plugin"
+    );
+    assert!(
+        has_direct(
+            &program,
+            &analysis,
+            "Plugin::OnEventProxy",
+            "Derived::OnEvent"
+        ),
+        "CHA must see Derived::OnEvent declared in plugin.h"
+    );
+    assert!(has_direct(
+        &program,
+        &analysis,
+        "drive",
+        "Plugin::OnEventProxy"
+    ));
+}
+
+#[test]
+fn cpp_ctor_and_dtor_sites() {
+    let root = fixture("cpp_basic");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let targets = direct_targets(&program, &analysis, "main");
+    assert!(
+        targets.iter().any(|t| t == "gfx::Circle::Circle"),
+        "new Circle() should emit ctor edge"
+    );
+    assert!(
+        targets.iter().any(|t| t == "gfx::Shape::~Shape"),
+        "delete via base ptr should emit base dtor"
+    );
+    assert!(
+        targets.iter().any(|t| t == "gfx::Circle::~Circle"),
+        "virtual dtor expansion should include derived dtor"
+    );
+}
+
+#[test]
+fn cpp_overload_resolution_by_arity() {
+    let root = fixture("cpp_basic");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let add_edges: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "main"
+                && fn_name(&program, e.callee).rsplit("::").next() == Some("add")
+        })
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(add_edges.len(), 2, "each arity resolves one overload");
+
+    for callee in add_edges {
+        let params = program.symbols.function(callee).params.len();
+        let body_marks = direct_targets(&program, &analysis, &fn_name(&program, callee));
+        if params == 2 {
+            assert!(body_marks.contains(&"mark_i".to_string()));
+        } else if params == 1 {
+            assert!(body_marks.contains(&"mark_d".to_string()));
+        } else {
+            panic!("unexpected add overload with {params} params");
+        }
+    }
+}
+
+#[test]
+fn cpp_namespace_qualified_call() {
+    let root = fixture("cpp_basic");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(
+        has_direct(&program, &analysis, "main", "util::tag"),
+        "namespaced util::tag should be a direct callee of main"
+    );
+}
+
+#[test]
+fn cpp_anonymous_namespace_is_internal() {
+    let root = fixture("cpp_basic");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        program.symbols.resolve_function("hidden").is_none(),
+        "anon-namespace functions must not be in external lookup"
+    );
+    assert!(has_direct(&program, &analysis, "hidden", "util::tag"));
+}
+
+fn has_direct(program: &Program, analysis: &AnalysisResult, caller: &str, callee: &str) -> bool {
+    analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller) == caller
+            && fn_name(&program, e.callee) == callee
+            && e.resolution == ResolutionKind::Direct
+    })
+}
+
+// --- cpp_more: overload ties, templates, multiple inheritance,
+// ctor-initializer lists, static member functions ---
+
+fn edges_to(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    callee_suffix: &str,
+    resolution: ResolutionKind,
+) -> Vec<String> {
+    analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == caller
+                && fn_name(&program, e.callee).ends_with(callee_suffix)
+                && e.resolution == resolution
+        })
+        .map(|e| fn_name(&program, e.callee))
+        .collect()
+}
+
+#[test]
+fn cpp_overload_tie_emits_both_sites() {
+    let root = fixture("cpp_more");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let hits = edges_to(&program, &analysis, "drive", "tie", ResolutionKind::Direct);
+    assert_eq!(
+        hits.len(),
+        2,
+        "same-arity overload tie must emit one site per candidate"
+    );
+}
+
+#[test]
+fn cpp_template_class_method_resolves_by_primary_name() {
+    let root = fixture("cpp_more");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_direct(&program, &analysis, "drive", "Box::put"),
+        "Box<Widget>::put call should resolve under primary name"
+    );
+}
+
+#[test]
+fn cpp_virtual_call_through_base_of_multiple_inheritance() {
+    let root = fixture("cpp_more");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(has_direct(&program, &analysis, "drive", "A::fa"));
+    assert!(
+        has_direct(&program, &analysis, "drive", "AB::fa"),
+        "virtual expansion must include the multiple-inheritance override"
+    );
+    assert!(!has_direct(&program, &analysis, "drive", "B::fb"));
+}
+
+#[test]
+fn cpp_ctor_initializer_list_targets() {
+    let root = fixture("cpp_more");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(has_direct(&program, &analysis, "D::D", "Base::Base"));
+    assert!(has_direct(&program, &analysis, "D::D", "Member::Member"));
+    // D d2(5): constructor-declaration with argument list.
+    assert!(has_direct(&program, &analysis, "drive", "D::D"));
+}
+
+#[test]
+fn cpp_static_member_function_resolves() {
+    let root = fixture("cpp_more");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let hits = edges_to(
+        &program,
+        &analysis,
+        "drive",
+        "S::Make",
+        ResolutionKind::Direct,
+    );
+    assert!(hits.len() >= 2, "both S::Make calls should resolve");
+}
+
+#[test]
+fn cpp_inherited_non_virtual_via_derived_receiver() {
+    let root = fixture("cpp_more");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_direct(&program, &analysis, "drive", "Base::base_value"),
+        "d2.base_value() should walk up to Base"
+    );
+    assert!(has_direct(&program, &analysis, "sink_w", "Widget::make"));
+}
+
+// --- cpp_implicit_this: bare method calls, smart_ptr unwrap ---
+
+#[test]
+fn cpp_implicit_this_virtual_call_expands() {
+    let root = fixture("cpp_implicit_this");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(has_direct(&program, &analysis, "drive", "Base::go"));
+    let hooks = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "Base::go" && e.resolution == ResolutionKind::Direct
+        })
+        .map(|e| fn_name(&program, e.callee))
+        .collect::<Vec<_>>();
+    assert!(
+        hooks.iter().any(|t| t == "Base::hook"),
+        "implicit this->hook should hit Base::hook, got {hooks:?}"
+    );
+    assert!(
+        hooks.iter().any(|t| t == "Derived::hook"),
+        "virtual expansion should include Derived::hook, got {hooks:?}"
+    );
+}
+
+#[test]
+fn cpp_smart_ptr_member_call_unwraps_pointee() {
+    let root = fixture("cpp_implicit_this");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_direct(&program, &analysis, "call_sp", "Plugin::OnEventProxy"),
+        "shared_ptr<Plugin> p; p->OnEventProxy should type as Plugin"
+    );
+    assert!(
+        has_direct(&program, &analysis, "call_sp_ref", "Plugin::OnEventProxy"),
+        "const shared_ptr<Plugin> & should unwrap to Plugin"
+    );
+    assert!(
+        has_direct(
+            &program,
+            &analysis,
+            "Plugin::OnEventProxy",
+            "Plugin::OnEvent"
+        ),
+        "OnEventProxy body implicit this->OnEvent"
+    );
+    assert!(
+        has_direct(&program, &analysis, "call_up", "Plugin::OnEventProxy"),
+        "unique_ptr<Plugin> should unwrap like shared_ptr"
+    );
+    assert!(
+        has_direct(&program, &analysis, "call_wp", "Plugin::OnEventProxy"),
+        "weak_ptr<Plugin> should unwrap like shared_ptr"
+    );
+}
+
+#[test]
+fn cpp_smart_ptr_field_receiver_unwraps() {
+    let root = fixture("cpp_implicit_this");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_direct(&program, &analysis, "Holder::go", "Plugin::OnEvent"),
+        "plugin_->OnEvent on a shared_ptr field should type as Plugin"
+    );
+}
+
+// --- cpp_smart_ptr: member access through a declared `operator->` (#64) ---
+
+analyzed_fixture!(
+    /// The `cpp_smart_ptr` fixture, analysed once.
+    cpp_smart_ptr
+);
+
+#[test]
+fn arrow_unwraps_undeclared_single_class_argument() {
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in [
+        "AbsentLocal",
+        "AbsentParameter",
+        "AbsentField",
+        "AbsentQualified",
+        "AbsentForward",
+    ] {
+        for target in ["AbsentTarget::Run", "AbsentDerived::Run"] {
+            assert!(
+                has_direct(program, analysis, caller, target),
+                "{caller} -> {target}"
+            );
+        }
+    }
+    assert!(!program
+        .symbols
+        .functions
+        .iter()
+        .any(|f| f.name.ends_with("ForwardOnly::Run")));
+}
+
+#[test]
+fn arrow_fallback_honours_global_scope_and_star() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "Outer::Inner::AbsentShadowed",
+        "Outer::Inner::Shadow::Run"
+    ));
+    assert!(
+        has_direct(
+            program,
+            analysis,
+            "Outer::Inner::AbsentGlobal",
+            "Shadow::Run"
+        ),
+        "`::Shadow` names the global class, not the enclosing namespace's"
+    );
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "Outer::Inner::AbsentGlobal",
+        "Outer::Inner::Shadow::Run"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "Outer::Inner::AbsentGlobalQualified",
+        "Outer::Scoped::Run"
+    ));
+    assert!(
+        has_direct(program, analysis, "AbsentStar", "AbsentTarget::Run"),
+        "`(*p).Run()` unwraps the same way `p->Run()` does"
+    );
+}
+
+#[test]
+fn arrow_fallback_skips_nested_types_and_spells_scalar_arguments_as_written() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(
+        must_not_have_edge(
+            program,
+            analysis,
+            "Outer::Inner::AbsentNestedType",
+            "AbsentTarget::Run"
+        ),
+        "`missing<AbsentTarget>::Inner` is not a wrapper around `AbsentTarget`"
+    );
+    assert!(!program
+        .symbols
+        .functions
+        .iter()
+        .any(|f| f.name.contains("missing")));
+    let type_of = |var: &str| -> String {
+        let v = program
+            .symbols
+            .variables
+            .iter()
+            .find(|v| v.name == var)
+            .unwrap_or_else(|| panic!("{var} must be indexed"));
+        match program.types.get(v.type_id).desc.as_ref() {
+            trace_ir::TypeDesc::Struct { name, .. } => name.clone(),
+            other => panic!("{var}: {other:?}"),
+        }
+    };
+    assert_eq!(type_of("scalar_box"), "Outer::Inner::missing<int>");
+    assert_eq!(
+        type_of("callback_box"),
+        "Outer::Inner::missing<void(int,char)>"
+    );
+    assert_eq!(
+        type_of("fnptr_box"),
+        "Outer::Inner::missing<int(*)(int,int)>"
+    );
+}
+
+#[test]
+fn cpp17_nested_namespace_definition_opens_each_scope() {
+    let root = fixture("cpp_nested_namespace");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    for name in [
+        "a::b::Deep::Go",
+        "a::b::use_deep",
+        "a::b::c::tri",
+        "a::b::c::again",
+        "a::b::inside",
+        "x::y::in_y",
+        "tabbed::ty::tabbed_leaf",
+        "global_after",
+    ] {
+        let id = program
+            .symbols
+            .resolve_function(name)
+            .unwrap_or_else(|| panic!("{name} must be indexed under its qualified name"));
+        assert_eq!(
+            program.symbols.function(id).linkage,
+            Linkage::External,
+            "{name} is not in an anonymous namespace"
+        );
+    }
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name.contains("inline")),
+        "the `inline` keyword is not part of a namespace name"
+    );
+    assert!(has_direct(
+        &program,
+        &analysis,
+        "a::b::use_deep",
+        "a::b::Deep::Go"
+    ));
+    assert!(has_direct(
+        &program,
+        &analysis,
+        "a::b::c::tri",
+        "a::b::Deep::Go"
+    ));
+    assert!(has_direct(
+        &program,
+        &analysis,
+        "a::b::c::again",
+        "a::b::c::tri"
+    ));
+    assert!(has_direct(&program, &analysis, "a::b::inside", "util::tag"));
+    assert!(
+        must_not_have_edge(&program, &analysis, "a::after", "util::tag"),
+        "a `using namespace` inside the block must not outlive it"
+    );
+    assert!(has_direct(
+        &program,
+        &analysis,
+        "global_after",
+        "a::b::use_deep"
+    ));
+}
+
+#[test]
+fn arrow_fallback_looks_the_argument_up_like_cpp() {
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in [
+        "Outer::Inner::AbsentEnclosing",
+        "Outer::Inner::AbsentAlias",
+        "Outer::Inner::AbsentEastConst",
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, "Outer::Scoped::Run"),
+            "{caller}"
+        );
+    }
+    assert!(has_direct(
+        program,
+        analysis,
+        "Outer::Other::AbsentPartial",
+        "Outer::Inner::Deep::Run"
+    ));
+}
+
+#[test]
+fn arrow_undeclared_fallback_rejects_unsupported_arguments() {
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in [
+        "AbsentTwo",
+        "AbsentScalar",
+        "AbsentUnknown",
+        "AbsentPointer",
+        "AbsentReference",
+        "AbsentMentioned",
+    ] {
+        let id = program.symbols.resolve_function(caller).expect("caller");
+        assert!(
+            !analysis.call_edges.iter().any(|e| e.caller == id),
+            "{caller} must stay unresolved"
+        );
+    }
+    assert!(!program
+        .symbols
+        .functions
+        .iter()
+        .any(|f| f.name == "OHOS::sptr::Run"));
+}
+
+#[test]
+fn arrow_fallback_preserves_dot_and_declared_wrappers() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "DrawMissingField",
+        "Widget::Draw"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "DrawNoArrow",
+        "Widget::Draw"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "AbsentDot",
+        "AbsentTarget::promote"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "DeclaredWins",
+        "RealTarget::Run"
+    ));
+    for caller in ["DeclaredWins", "DeclaredNoArrow", "DeclaredOutOfLine"] {
+        assert!(must_not_have_edge(
+            program,
+            analysis,
+            caller,
+            "AbsentTarget::Run"
+        ));
+    }
+    assert!(
+        has_direct(program, analysis, "DeclaredOutOfLine", "RealTarget::Run"),
+        "an out-of-line `operator->` without its class header still says what the arrow yields"
+    );
+}
+
+#[test]
+fn arrow_wrapper_head_is_looked_up_through_enclosing_namespaces() {
+    let (program, analysis) = cpp_smart_ptr();
+    let caller = "Outer::Inner::DeclaredFromEnclosing";
+    assert!(has_direct(program, analysis, caller, "Outer::Scoped::Run"));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        caller,
+        "AbsentTarget::Run"
+    ));
+    assert!(
+        has_any_edge(program, analysis, caller, "Outer::OuterBox::Get"),
+        "`.` stays on the wrapper, under the wrapper's own namespace"
+    );
+    assert!(!program
+        .symbols
+        .functions
+        .iter()
+        .any(|f| f.name == "Outer::Inner::OuterBox::Get"));
+}
+
+#[test]
+fn arrow_fallback_matches_a_typedef_by_its_whole_spelling() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "AbsentQualifiedAlias",
+        "Outer::Scoped::Run"
+    ));
+    assert!(
+        must_not_have_edge(
+            program,
+            analysis,
+            "Outer::Inner::AbsentNoHijack",
+            "AbsentTarget::Run"
+        ),
+        "`NoSuch::GlobalHijack` is not the global `GlobalHijack`"
+    );
+}
+
+#[test]
+fn field_access_through_a_wrapper_reaches_the_pointee_field() {
+    // A lowering-shape check: one field step per site, no duplicates.
+    // That the step reaches the pointee's summary in the solver is
+    // `wrapper_fields_share_pointee_callback_summaries`.
+    let (program, _analysis) = cpp_smart_ptr();
+    let geps = program
+        .flow
+        .iter()
+        .filter(|f| {
+            matches!(f, trace_ir::FlowConstraint::GepField { field_name, .. }
+                if field_name == "absent_payload_value")
+        })
+        .count();
+    assert_eq!(
+        geps, 3,
+        "one field step for the read, the write, and the read on the wrapper variable itself"
+    );
+}
+
+#[test]
+fn field_step_follows_its_operator_on_a_wrapper() {
+    // `b.w.own_raw` is the wrapper's own field: a dot never steps through
+    // a wrapper, even one with a declared `operator->`.
+    let (program, _analysis) = cpp_smart_ptr();
+    let own = program
+        .flow
+        .iter()
+        .filter(|f| {
+            matches!(f, trace_ir::FlowConstraint::GepField { field_name, .. }
+                if field_name == "own_raw")
+        })
+        .count();
+    assert_eq!(own, 1, "`b.w.own_raw` must reach the wrapper's own field");
+}
+
+fn struct_tag_names(program: &Program) -> Vec<String> {
+    program
+        .types
+        .all()
+        .iter()
+        .filter_map(|t| match t.desc.as_ref() {
+            trace_ir::TypeDesc::Struct { name, .. } if !name.is_empty() => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn arrow_wrapper_head_spelled_global_is_tagged_without_the_prefix() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(
+        has_direct(
+            program,
+            analysis,
+            "Elsewhere::AbsentGlobalHead",
+            "AbsentTarget::Run"
+        ),
+        "`::missing<AbsentTarget>` inside a namespace still unwraps"
+    );
+    let tags = struct_tag_names(program);
+    assert!(
+        tags.iter().any(|t| t == "missing<AbsentTarget>"),
+        "the global wrapper is tagged as it is registered: {tags:?}"
+    );
+    assert!(
+        !tags
+            .iter()
+            .any(|t| t.starts_with("::") || t.contains("::::")),
+        "no tag keeps a leading `::` or gains an empty segment: {tags:?}"
+    );
+}
+
+#[test]
+fn templated_member_type_of_a_wrapper_keeps_its_separator() {
+    let (program, analysis) = cpp_smart_ptr();
+    let tags = struct_tag_names(program);
+    assert!(
+        tags.iter()
+            .any(|t| t == "Outer2<AbsentTarget>::Cursor<AbsentTarget>"),
+        "the member type keeps its `::` although a global `Cursor` exists: {tags:?}"
+    );
+    assert!(
+        !tags.iter().any(|t| t.contains(">Cursor")),
+        "no tag glues the member type onto its owner: {tags:?}"
+    );
+    for callee in ["AbsentTarget::Run", "Cursor::Run"] {
+        assert!(
+            must_not_have_edge(program, analysis, "AbsentTemplatedTail", callee),
+            "a member type of a template is not a wrapper around its argument"
+        );
+    }
+}
+
+#[test]
+fn arrow_fallback_never_spells_a_standard_name_or_pointer_as_a_class() {
+    let (program, analysis) = cpp_smart_ptr();
+    let tags = struct_tag_names(program);
+    assert!(
+        tags.iter().any(|t| t == "Elsewhere::missing<nullptr_t>"),
+        "`nullptr_t` stays unqualified: {tags:?}"
+    );
+    assert!(
+        tags.iter()
+            .any(|t| t == "Elsewhere::missing<AbsentTarget*>"),
+        "`AbsentTarget*const` is the pointer argument `AbsentTarget*`: {tags:?}"
+    );
+    assert!(
+        !tags
+            .iter()
+            .any(|t| t.contains("Elsewhere::nullptr_t") || t.contains("const")),
+        "no tag qualifies a standard name or keeps a trailing qualifier: {tags:?}"
+    );
+    for caller in [
+        "Elsewhere::AbsentNullptrArg",
+        "Elsewhere::AbsentPtrConstArg",
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, "AbsentTarget::Run"),
+            "{caller}: neither argument is a declared class, so no guess"
+        );
+    }
+}
+
+#[test]
+fn template_arguments_that_name_no_class_are_spelled_as_written() {
+    let (program, _analysis) = cpp_smart_ptr();
+    let tags = struct_tag_names(program);
+    for expected in [
+        "Elsewhere::missing<AbsentTarget,4>",
+        "Elsewhere::missing<true>",
+        "Elsewhere::missing<AbsentTarget**>",
+    ] {
+        assert!(
+            tags.iter().any(|t| t == expected),
+            "{expected} missing from {tags:?}"
+        );
+    }
+    assert!(
+        !tags
+            .iter()
+            .any(|t| t.contains("::4") || t.contains("::true")),
+        "a literal is never qualified: {tags:?}"
+    );
+}
+
+#[test]
+fn defined_template_head_spelled_global_finds_the_declared_class() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(
+        has_any_edge(
+            program,
+            analysis,
+            "Outer::Deep::DefinedGlobalHead",
+            "Outer::Defined::Cursor::Next"
+        ),
+        "`::Outer::Defined<int>::Cursor` is the same class as `Defined<int>::Cursor`"
+    );
+    let df = program
+        .flow
+        .iter()
+        .filter(|f| {
+            matches!(f, trace_ir::FlowConstraint::GepField { field_name, .. } if field_name == "df")
+        })
+        .count();
+    assert_eq!(
+        df, 1,
+        "`::Outer::Defined<int>` is the defined class, with its layout"
+    );
+}
+
+#[test]
+fn member_type_of_a_defined_template_keeps_the_class_the_lookup_found() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(
+        has_any_edge(
+            program,
+            analysis,
+            "Outer::Deep::DefinedTail",
+            "Outer::Defined::Cursor::Next"
+        ),
+        "`Defined<int>::Cursor` inside `Outer::Deep` is `Outer::Defined::Cursor`"
+    );
+    let tags = struct_tag_names(program);
+    assert!(
+        !tags.iter().any(|t| t == "Defined::Cursor"),
+        "the enclosing namespace is not dropped from the member type: {tags:?}"
+    );
+}
+
+#[test]
+fn arrow_unwraps_by_declaration_not_by_wrapper_name() {
+    // The issue's three-way reproduction: the same source, differing only in
+    // the wrapper's name. `sptr` and `RefPtr` used to invent an external
+    // `sptr::AddOutput` / `RefPtr::AddOutput`; only `shared_ptr` unwrapped,
+    // because only `shared_ptr` was on a hardcoded list.
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in ["UseSptr", "UseRefPtr", "UseShared"] {
+        assert!(
+            has_direct(program, analysis, caller, "CaptureSession::AddOutput"),
+            "{caller}: `session->AddOutput` must resolve through the wrapper"
+        );
+    }
+    for (caller, wrapper) in [("UseSptr", "sptr"), ("UseRefPtr", "RefPtr")] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, &format!("{wrapper}::AddOutput")),
+            "no member may be invented on {wrapper} itself"
+        );
+    }
+}
+
+#[test]
+fn arrow_follows_a_chain_of_wrappers() {
+    // `Outer::operator->` yields `Inner`, whose `operator->` yields the
+    // pointee; neither is a template, so both are resolved at the call site.
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(
+        has_direct(program, analysis, "UseChain", "CaptureSession::AddOutput"),
+        "outer->AddOutput must follow Outer -> Inner -> CaptureSession"
+    );
+}
+
+#[test]
+fn arrow_through_a_wrapper_field_unwraps() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(
+        has_direct(program, analysis, "UseField", "CaptureSession::AddOutput"),
+        "holder->session_->AddOutput must unwrap the field's wrapper too"
+    );
+}
+
+#[test]
+fn an_unfollowable_arrow_chain_leaves_the_site_unresolved() {
+    // `Ping::operator->` yields `Pong`, whose `operator->` yields `Ping`:
+    // the chain names no pointee. An unresolved indirect site is honest; an
+    // invented `Ping::AddOutput` would be indistinguishable from a real call
+    // to an out-of-tree function.
+    let (program, analysis) = cpp_smart_ptr();
+    let targets: Vec<String> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == "UseCycle")
+        .map(|e| fn_name(program, e.callee))
+        .collect();
+    assert!(
+        targets.is_empty(),
+        "a cyclic operator-> chain must invent nothing, got {targets:?}"
+    );
+}
+
+#[test]
+fn a_wrapper_parameter_resolves_across_headers() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(
+        has_direct(program, analysis, "DrawThrough", "Widget::Draw"),
+        "a wrapper spelled in a .cpp signature unwraps like any other"
+    );
+}
+
+#[test]
+fn arrow_field_across_headers() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "WidgetBox::DrawHeld",
+        "Widget::Draw"
+    ));
+}
+
+#[test]
+fn arrow_preserves_wrapper_dot() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(program, analysis, "UseDot", "sptr::GetRefPtr"));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "UseDot",
+        "CaptureSession::GetRefPtr"
+    ));
+}
+
+#[test]
+fn arrow_raw_pointer() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "UseRaw",
+        "PointerTarget::Own"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "UseRaw",
+        "CaptureSession::Own"
+    ));
+}
+
+#[test]
+fn arrow_explicit_this() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "PointerTarget::ExplicitThis",
+        "PointerTarget::Own"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "PointerTarget::ExplicitThis",
+        "CaptureSession::Own"
+    ));
+}
+
+#[test]
+fn arrow_pointer_return_terminates() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "UsePointerReturn",
+        "PointerTarget::Own"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "UsePointerReturn",
+        "CaptureSession::Own"
+    ));
+}
+
+#[test]
+fn arrow_reference_receiver() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "UseReference",
+        "CaptureSession::AddOutput"
+    ));
+}
+
+#[test]
+fn arrow_second_template_parameter() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "UseSecond",
+        "CaptureSession::AddOutput"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "UseSecond",
+        "PointerTarget::AddOutput"
+    ));
+}
+
+#[test]
+fn arrow_raw_pointer_field() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "UseRawField",
+        "PointerTarget::Own"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "UseRawField",
+        "CaptureSession::Own"
+    ));
+}
+
+#[test]
+fn arrow_local_reference() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(has_direct(
+        program,
+        analysis,
+        "UseLocalReference",
+        "CaptureSession::AddOutput"
+    ));
+}
+
+#[test]
+fn arrow_disagreeing_overloads_do_not_guess_a_template_argument() {
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(program
+        .symbols
+        .call_sites
+        .iter()
+        .any(|site| fn_name(program, site.caller) == "UseAmbiguous"));
+    assert!(!analysis
+        .call_edges
+        .iter()
+        .any(|edge| fn_name(program, edge.caller) == "UseAmbiguous"));
+}
+
+#[test]
+fn arrow_unsupported_substitutions_stay_unresolved() {
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in ["UseInheritedTemplate", "UseNestedDependent"] {
+        assert!(program
+            .symbols
+            .call_sites
+            .iter()
+            .any(|site| fn_name(program, site.caller) == caller));
+        assert!(
+            !analysis
+                .call_edges
+                .iter()
+                .any(|edge| fn_name(program, edge.caller) == caller),
+            "{caller} must not invent a target"
+        );
+    }
+}
+
+#[test]
+fn raw_wrapper_pointer_preserves_callback_flow() {
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in ["RawWrapperDirect", "RawWrapperNested"] {
+        assert!(
+            has_any_edge(program, analysis, caller, "RawWrapperTarget"),
+            "{caller}: raw arrow must preserve the wrapper's callback flow"
+        );
+    }
+}
+
+#[test]
+fn a_peeled_receiver_dispatches_through_every_base() {
+    // A member found on the second base is as reachable as one on the first:
+    // the peeled receiver goes through the ordinary hierarchy lookup.
+    let (program, analysis) = cpp_smart_ptr();
+    for (caller, target) in [
+        ("AbsentMultiFirst", "MultiBaseA::FromA"),
+        ("AbsentMultiSecond", "MultiBaseB::FromB"),
+        ("AbsentMultiOwn", "MultiDerived::Own"),
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, target),
+            "{caller} must reach {target}"
+        );
+    }
+}
+
+#[test]
+fn wrapper_fields_share_pointee_callback_summaries() {
+    let (program, analysis) = cpp_smart_ptr();
+    for (caller, target) in [
+        ("FlowReadMissing", "FlowReadTarget"),
+        ("FlowReadDeclared", "FlowReadTarget"),
+        ("FlowReadDerefDot", "FlowReadTarget"),
+        ("FlowReadDerefDotDeclared", "FlowReadTarget"),
+        ("FlowReadDerefDotRaw", "FlowReadTarget"),
+        ("FlowReadDerefDotWrapperRaw", "FlowWrapperOwnTarget"),
+        ("FlowReadReference", "FlowReadTarget"),
+        ("FlowReadDereference", "FlowReadTarget"),
+        ("FlowReadStandard", "FlowReadTarget"),
+        ("FlowReadRaw", "FlowWriteTarget"),
+        ("FlowReadRaw", "FlowDerefWriteTarget"),
+        ("FlowReadNested", "FlowNestedTarget"),
+        ("FlowReadTwoArrows", "FlowNestedTarget"),
+        ("FlowReadNestedRaw", "FlowNestedTarget"),
+        ("FlowReadWrapperOwn", "FlowWrapperOwnTarget"),
+        ("FlowReadInherited", "FlowReadTarget"),
+        ("FlowReadParen", "FlowReadTarget"),
+        ("FlowReadParenWrapper", "FlowReadTarget"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, target),
+            "{caller} must reach {target}"
+        );
+    }
+    for (caller, target) in [
+        ("FlowReadDeclared", "FlowWrapperOwnTarget"),
+        ("FlowReadDerefDotDeclared", "FlowWrapperOwnTarget"),
+        ("FlowReadDerefDotWrapperRaw", "FlowReadTarget"),
+        ("FlowReadWrapperOwn", "FlowReadTarget"),
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, target),
+            "{caller} must not confuse wrapper and pointee fields"
+        );
+    }
+}
+
+#[test]
+fn wrapper_storage_stays_out_of_the_pointee() {
+    // `IsoWrapper::cb` and `IsoPayload::cb` share name and position, so only
+    // the unwrap's type filter keeps the address-taken wrapper's own storage
+    // from reaching pointee accesses (#141).
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in [
+        "IsoReadArrow",
+        "IsoReadDeref",
+        "IsoReadReference",
+        "IsoReadPointerArrow",
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, "IsoPointeeTarget"),
+            "{caller} reads the pointee's cb"
+        );
+        assert!(
+            must_not_have_edge(program, analysis, caller, "IsoWrapperTarget"),
+            "{caller} must not read the wrapper's own cb"
+        );
+    }
+    for caller in ["IsoReadWrapperDot", "IsoReadWrapperRaw"] {
+        assert!(
+            has_any_edge(program, analysis, caller, "IsoWrapperTarget"),
+            "{caller} reads the wrapper's own cb"
+        );
+        assert!(
+            must_not_have_edge(program, analysis, caller, "IsoPointeeTarget"),
+            "{caller} must not read the pointee's cb"
+        );
+    }
+}
+
+#[test]
+fn wrapper_reference_and_dereference_still_unwrap_fields() {
+    let (program, _) = cpp_smart_ptr();
+    for caller in ["RawWrapperReference", "RawWrapperDereference"] {
+        assert!(
+            program.flow.iter().any(|flow| {
+                let trace_ir::FlowConstraint::GepField {
+                    dst, field_name, ..
+                } = flow
+                else {
+                    return false;
+                };
+                field_name == "payload_value"
+                    && program.symbols.variable(*dst).fn_id
+                        == program.symbols.resolve_function(caller)
+            }),
+            "{caller}: a wrapper value must still use overloaded arrow"
+        );
+    }
+}
+
+#[test]
+fn arrow_wrapper_identity_preserves_layout_and_construction() {
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in ["UseTemplateCallback", "UseWrapperCallback"] {
+        assert!(common::has_any_edge(
+            program,
+            analysis,
+            caller,
+            "CallbackTarget"
+        ));
+    }
+    assert!(has_direct(
+        program,
+        analysis,
+        "UseWrapperCallback",
+        "CallbackHandle::CallbackHandle"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "ConstructHolder::ConstructHolder",
+        "CallbackHandle::CallbackHandle"
+    ));
+}
+
+#[test]
+fn a_dereferenced_wrapper_is_its_pointee() {
+    // `(*w).m()` and `(*pw)->m()`: a smart pointer's `operator*` names the
+    // pointee its `operator->` does, and a raw pointer to a wrapper is the
+    // wrapper itself.
+    let (program, analysis) = cpp_smart_ptr();
+    for caller in ["UseDerefDot", "UseDerefDotShared", "UseDerefArrow"] {
+        assert!(
+            has_direct(program, analysis, caller, "CaptureSession::AddOutput"),
+            "{caller}: `*w` must yield the pointee, as `w->` does"
+        );
+    }
+}
+
+#[test]
+fn a_dot_call_on_a_wrapper_is_the_wrappers_member() {
+    // The wrapper keeps its own class for `.`: `p.reset()` on a
+    // `shared_ptr<Resettable>` is the wrapper's `reset`, and must not bind
+    // to the pointee's member of the same name.
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "UseDotShadow",
+        "Resettable::reset"
+    ));
+}
+
+#[test]
+fn dereferencing_a_class_that_is_no_wrapper_invents_nothing() {
+    // `(*it)->m()` on an iterator: its `operator*` yields something the index
+    // does not follow, so the site stays unresolved instead of a member being
+    // invented on the iterator itself.
+    let (program, analysis) = cpp_smart_ptr();
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "UseIterDeref",
+        "Iter::AddOutput"
+    ));
+    assert!(!analysis
+        .call_edges
+        .iter()
+        .any(|e| fn_name(program, e.caller) == "UseIterDeref"));
+}
+
+#[test]
+fn cpp_member_virtual_overload_filters_by_arity() {
+    let root = fixture("cpp_implicit_this");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let unary: Vec<(String, usize)> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "call_unary"
+                && e.resolution == ResolutionKind::Direct
+                && fn_name(&program, e.callee).ends_with("::foo")
+        })
+        .map(|e| {
+            (
+                fn_name(&program, e.callee),
+                program.symbols.function(e.callee).params.len(),
+            )
+        })
+        .collect();
+    assert!(
+        unary.iter().any(|(t, _)| t == "Over::foo") && unary.iter().any(|(t, _)| t == "OverD::foo"),
+        "p->foo(1) should CHA to unary Over::foo / OverD::foo, got {unary:?}"
+    );
+    for (t, n) in &unary {
+        assert_eq!(*n, 2, "{t} should be this+int, params={n}, all={unary:?}");
+    }
+
+    let binary: Vec<(String, usize)> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "call_binary"
+                && e.resolution == ResolutionKind::Direct
+                && fn_name(&program, e.callee).ends_with("::foo")
+        })
+        .map(|e| {
+            (
+                fn_name(&program, e.callee),
+                program.symbols.function(e.callee).params.len(),
+            )
+        })
+        .collect();
+    for (t, n) in &binary {
+        assert_eq!(
+            *n, 3,
+            "{t} should be this+int+int, params={n}, all={binary:?}"
+        );
+    }
+}
+
+#[test]
+fn cpp_unused_attr_on_ref_param_keeps_definition() {
+    let root = fixture("cpp_implicit_this");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let sink = program
+        .symbols
+        .resolve_function("Sink::consume")
+        .expect("Sink::consume");
+    assert!(
+        program.symbols.function(sink).is_defined,
+        "T& param __UNUSED must remain a function_definition"
+    );
+}
+
+// --- cpp_callable: lambdas, std::function, functors, fn-ptr fields ---
+
+fn has_resolution(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    callee: &str,
+    resolution: ResolutionKind,
+) -> bool {
+    analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller) == caller
+            && fn_name(&program, e.callee) == callee
+            && e.resolution == resolution
+    })
+}
+
+#[test]
+fn cpp_fn_ptr_field_and_local_resolve_indirect() {
+    let root = fixture("cpp_callable");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(has_resolution(
+        &program,
+        &analysis,
+        "call_field",
+        "target",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_resolution(
+        &program,
+        &analysis,
+        "call_local",
+        "target",
+        ResolutionKind::Indirect
+    ));
+}
+
+#[test]
+fn cpp_lambda_is_addr_of_fn_and_indirect_call() {
+    let root = fixture("cpp_callable");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let lambda_names: Vec<String> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name.contains("$lambda"))
+        .map(|f| f.name.clone())
+        .collect();
+    assert!(
+        !lambda_names.is_empty(),
+        "lambda_expression should lower to a $lambda function"
+    );
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("$lambda")
+                && fn_name(&program, e.callee) == "target"
+        }),
+        "lambda body should call target, lambdas={lambda_names:?}"
+    );
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller) == "call_lambda"
+                && fn_name(&program, e.callee).contains("$lambda")
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "g() should be an indirect call to the lambda"
+    );
+}
+
+#[test]
+fn cpp_lambda_captures_resolve() {
+    let root = fixture("cpp_lambda_captures");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    // 1. Explicit by-value capture [f1] calling target1
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_explicit_val::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "explicitly captured [f1] should call target1"
+    );
+
+    // 2. Explicit by-reference capture [&f2] calling target2
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_explicit_ref::$lambda")
+                && fn_name(&program, e.callee) == "target2"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "explicitly captured [&f2] should call target2"
+    );
+
+    // 3. Default by-reference capture [&] calling target3
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_default_ref::$lambda")
+                && fn_name(&program, e.callee) == "target3"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "default-captured [&] should call target3"
+    );
+
+    // 4. Default by-value capture [=] calling target4
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_default_val::$lambda")
+                && fn_name(&program, e.callee) == "target4"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "default-captured [=] should call target4"
+    );
+
+    // 5. Mixed: default ref, except f1 by value [&, f1]
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_mixed_ref_val::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }) && analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_mixed_ref_val::$lambda")
+                && fn_name(&program, e.callee) == "target2"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "mixed capture [&, f1] should call target1 and target2"
+    );
+
+    // 6. Mixed: default val, except f2 by ref [=, &f2]
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_mixed_val_ref::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }) && analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_mixed_val_ref::$lambda")
+                && fn_name(&program, e.callee) == "target2"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "mixed capture [=, &f2] should call target1 and target2"
+    );
+
+    // 7. Init-capture [cb = f5] calling target5
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_init_capture::$lambda")
+                && fn_name(&program, e.callee) == "target5"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "init-captured [cb = f5] should call target5"
+    );
+
+    // 8. [this] in Derived calling Derived::derivedAction and inherited Base::baseAction
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Derived::testThisCapture::$lambda")
+                && fn_name(&program, e.callee) == "Derived::derivedAction"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "[this] capture should call Derived::derivedAction"
+    );
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Derived::testThisCapture::$lambda")
+                && fn_name(&program, e.callee) == "Base::baseAction"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "[this] capture should call Base::baseAction"
+    );
+
+    // 9. [*this] in Derived calling Derived::derivedAction
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Derived::testStarThisCapture::$lambda")
+                && fn_name(&program, e.callee) == "Derived::derivedAction"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "[*this] capture should call Derived::derivedAction"
+    );
+
+    // 10. [&] in Derived method capturing this
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Derived::testDefaultCapturesThis::$lambda")
+                && fn_name(&program, e.callee) == "Derived::derivedAction"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "[&] default capture in member method should capture this and call Derived::derivedAction"
+    );
+
+    // 11. [] non-capturing lambda inside member method calling global target8
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Derived::testNoCapture::$lambda")
+                && fn_name(&program, e.callee) == "target8"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "non-capturing lambda should call global target8"
+    );
+    assert!(
+        !analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Derived::testNoCapture::$lambda")
+                && fn_name(&program, e.callee).contains("Derived::")
+        }),
+        "non-capturing lambda must not call any Derived member"
+    );
+
+    // Parameter shadowing: lambda param f1 shadows captured f1
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_param_shadow::$lambda")
+                && fn_name(&program, e.callee) == "target2"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "parameter shadowing captured variable should call target2"
+    );
+    assert!(
+        !analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_param_shadow::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+        }),
+        "parameter shadowing captured variable must not call shadowed target1"
+    );
+
+    // Nested lambdas
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_nested_lambdas::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "nested lambda should access outer captured f1"
+    );
+
+    // Lambda stored in struct field
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller) == "test_lambda_in_struct"
+                && fn_name(&program, e.callee).contains("test_lambda_in_struct::$lambda")
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "call via struct field should invoke lambda"
+    );
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_lambda_in_struct::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "lambda stored in struct field should call target1"
+    );
+
+    // 13. Init-capture by reference [&cb = f9] calling target9
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_init_capture_ref::$lambda")
+                && fn_name(&program, e.callee) == "target9"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "reference init-capture [&cb = f9] should call target9"
+    );
+
+    // 14. Captured object calling method Worker::doWork
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_captured_object::$lambda")
+                && fn_name(&program, e.callee) == "Worker::doWork"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "captured object by ref should call Worker::doWork"
+    );
+
+    // 15. Captured pointer calling method Worker::doWork
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_captured_pointer::$lambda")
+                && fn_name(&program, e.callee) == "Worker::doWork"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "captured pointer should call Worker::doWork"
+    );
+
+    // 16. Captured variable passed as argument to helper_call
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_captured_arg_pass::$lambda")
+                && fn_name(&program, e.callee) == "helper_call"
+        }),
+        "captured variable passed to helper_call should record call edge"
+    );
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller) == "helper_call"
+                && fn_name(&program, e.callee) == "target11"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "helper_call receiving captured function pointer should call target11"
+    );
+
+    // 17. Service class member access and calls inside lambda
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Service::testMemberAccess::$lambda")
+                && fn_name(&program, e.callee) == "Service::process"
+        }),
+        "lambda capturing this should call Service::process"
+    );
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("Service::testMemberAccess::$lambda")
+                && fn_name(&program, e.callee) == "Worker::doWork"
+        }),
+        "lambda capturing this should call member worker.doWork"
+    );
+
+    // 18. Lambda returning a function pointer
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller) == "test_lambda_returns_fn"
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "caller of lambda returning function pointer should resolve call to target1"
+    );
+
+    // 19. Multiple captures list [f1, &f2, f3, &f4]
+    for target in &["target1", "target2", "target3", "target4"] {
+        assert!(
+            analysis.call_edges.iter().any(|e| {
+                fn_name(&program, e.caller).contains("test_multi_captures::$lambda")
+                    && fn_name(&program, e.callee) == *target
+                    && e.resolution == ResolutionKind::Indirect
+            }),
+            "multi-capture list should resolve call to {}",
+            target
+        );
+    }
+
+    // 20. Mutable lambda calling target1
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_mutable_lambda::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "mutable lambda should call target1"
+    );
+
+    // 21. Multi-level nested lambdas (outer -> mid -> inner)
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_multi_nested_lambdas")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "deeply nested lambda should resolve call to target1"
+    );
+
+    // 22. Lexical class lookup for captureless lambda calling static member
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("LexicalClass::run::$lambda")
+                && fn_name(&program, e.callee) == "LexicalClass::hit"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "captureless lambda inside member method should resolve static member LexicalClass::hit"
+    );
+
+    // 23. Write through reference init-capture
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller) == "test_ref_init_capture_write"
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }) && analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller) == "test_ref_init_capture_write"
+                && fn_name(&program, e.callee) == "target2"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "write through reference init-capture should update outer variable points-to set to target1 and target2"
+    );
+
+    // 24. Repeated callable invocations preserving distinct return destinations
+    let repeated_edges: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "test_repeated_call_returns"
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        })
+        .collect();
+    assert_eq!(
+        repeated_edges.len(),
+        2,
+        "both distinct invocations a() and b() should resolve to target1"
+    );
+
+    // 25. Reference init-capture of struct field [&cb = h.cb]
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("test_ref_init_capture_field::$lambda")
+                && fn_name(&program, e.callee) == "target1"
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "reference init-capture of struct field [&cb = h.cb] should call target1"
+    );
+}
+
+#[test]
+fn cpp_functor_operator_call_resolves() {
+    let root = fixture("cpp_callable");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_direct(&program, &analysis, "call_functor", "Fn::operator()"),
+        "f() on a functor should target operator()"
+    );
+    assert!(
+        has_direct(&program, &analysis, "call_functor_field", "Fn::operator()"),
+        "w->cb() when cb is a functor field should target operator()"
+    );
+    assert!(has_direct(&program, &analysis, "Fn::operator()", "target"));
+    assert!(
+        has_direct(
+            &program,
+            &analysis,
+            "call_bare_function_type",
+            "function::operator()"
+        ),
+        "a class named function (not std::function) should still be a functor"
+    );
+}
+
+#[test]
+fn cpp_std_function_resolves_like_fn_ptr() {
+    let root = fixture("cpp_callable");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "call_std_function",
+            "target",
+            ResolutionKind::Indirect
+        ),
+        "std::function local assigned a function should call it indirectly"
+    );
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "call_std_field",
+            "target",
+            ResolutionKind::Indirect
+        ),
+        "std::function field call should resolve like a fn-ptr field"
+    );
+}
+
+#[test]
+fn cpp_qualified_undeclared_becomes_external() {
+    let root = fixture("cpp_callable");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "check_exists",
+            "FileUtil::Exists",
+            ResolutionKind::External
+        ),
+        "qualified FileUtil::Exists prototype should be an external edge, not unresolved indirect"
+    );
+}
+
+// --- cpp_flow: cross-language C dispatcher + C++ impl (HDF sbuf pattern) ---
+
+#[test]
+fn cpp_impl_registered_into_c_ops_table_resolves_indirect() {
+    let root = fixture("cpp_flow");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    for target in ["RawImplRead", "MParcelImplRead"] {
+        let hits = edges_to(
+            &program,
+            &analysis,
+            "Read",
+            target,
+            ResolutionKind::Indirect,
+        );
+        assert_eq!(
+            hits.len(),
+            1,
+            "{target} must be an indirect target of s->impl->read exactly once"
+        );
+    }
+}
+
+// --- cpp_dispatch: virtual inheritance + final class/method ---
+
+fn cpp_direct_set(program: &Program, analysis: &AnalysisResult, caller: &str) -> Vec<String> {
+    let mut v = direct_targets(program, analysis, caller);
+    v.sort();
+    v.dedup();
+    v
+}
+
+#[test]
+fn cpp_virtual_inheritance_diamond_resolves_overrides() {
+    let root = fixture("cpp_dispatch");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        program.bases_of("Left").iter().any(|b| b == "VBase"),
+        "virtual base Left : virtual VBase must be recorded"
+    );
+    assert!(
+        program.bases_of("Right").iter().any(|b| b == "VBase"),
+        "virtual base Right : virtual VBase must be recorded"
+    );
+    let hits = cpp_direct_set(&program, &analysis, "diamond_drive");
+    assert!(
+        hits.iter().any(|t| t == "VBase::id"),
+        "diamond through VBase* should include VBase::id, got {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|t| t == "Left::id"),
+        "diamond through VBase* should include Left::id, got {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|t| t == "Diamond::id"),
+        "diamond through VBase* should include Diamond::id, got {hits:?}"
+    );
+}
+
+#[test]
+fn cpp_final_class_devirtualizes_receiver() {
+    let root = fixture("cpp_dispatch");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        program.class_is_final("Sealed"),
+        "class Sealed final must be recorded"
+    );
+    let sealed = cpp_direct_set(&program, &analysis, "sealed_drive");
+    assert_eq!(
+        sealed,
+        vec!["Sealed::f".to_string()],
+        "Sealed* is final: only Sealed::f, not OpenSib::f"
+    );
+    let open = cpp_direct_set(&program, &analysis, "open_drive");
+    assert!(open.iter().any(|t| t == "Open::f"), "got {open:?}");
+    assert!(open.iter().any(|t| t == "Sealed::f"), "got {open:?}");
+    assert!(open.iter().any(|t| t == "OpenSib::f"), "got {open:?}");
+}
+
+#[test]
+fn cpp_final_method_stops_further_overrides() {
+    let root = fixture("cpp_dispatch");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let mid_fn = program
+        .symbols
+        .resolve_function("MMid::g")
+        .expect("MMid::g");
+    assert!(
+        program.symbols.function(mid_fn).is_final,
+        "int g() final must set is_final"
+    );
+    let mid = cpp_direct_set(&program, &analysis, "mid_drive");
+    assert_eq!(
+        mid,
+        vec!["MMid::g".to_string()],
+        "MMid* with g() final is a unique target"
+    );
+    let base = cpp_direct_set(&program, &analysis, "mbase_drive");
+    assert!(base.iter().any(|t| t == "MBase::g"), "got {base:?}");
+    assert!(base.iter().any(|t| t == "MMid::g"), "got {base:?}");
+    assert!(
+        !base.iter().any(|t| t.contains("MLeaf")),
+        "final method must not pick up MLeaf, got {base:?}"
+    );
+}
+
+// --- cpp_extern_c_driver: C caller + C++ `extern "C"` heap/ops registration ---
+
+#[test]
+fn cpp_extern_c_driver_resolves_ipc_and_dispatch() {
+    let root = fixture("cpp_extern_c_driver");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(has_direct(
+        &program,
+        &analysis,
+        "test_ipc_read",
+        "SbufObtainIpc"
+    ));
+    assert!(has_resolution(
+        &program,
+        &analysis,
+        "test_ipc_read",
+        "MParcelReadBuffer",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_direct(
+        &program,
+        &analysis,
+        "test_ipc_dispatch",
+        "GetServiceOps"
+    ));
+    assert!(has_resolution(
+        &program,
+        &analysis,
+        "test_ipc_dispatch",
+        "ServiceDispatch",
+        ResolutionKind::Indirect
+    ));
+}
+
+// --- cpp_templates_overloads: scalar-type overload resolution, template
+// member calls with explicit arguments, in-class template methods ---
+
+/// Param type descriptors of a function, in signature order.
+fn fn_param_descs(program: &Program, id: FnId) -> Vec<String> {
+    program
+        .symbols
+        .function(id)
+        .params
+        .iter()
+        .map(|v| {
+            let tid = program.symbols.variable(*v).type_id;
+            format!("{:?}", program.types.get(tid).desc)
+        })
+        .collect()
+}
+
+#[test]
+fn cpp_same_arity_overloads_stay_distinct_by_scalar_type() {
+    let root = fixture("cpp_templates_overloads");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+
+    let candidates = program.symbols.resolve_function_candidates("f", None);
+    let sigs: Vec<Vec<String>> = candidates
+        .iter()
+        .map(|&f| fn_param_descs(&program, f))
+        .collect();
+    assert!(
+        sigs.contains(&vec!["Int".to_string()]),
+        "f(int) must survive as its own overload, got {sigs:?}"
+    );
+    assert!(
+        sigs.contains(&vec!["Double".to_string()]),
+        "f(double) must survive as its own overload, got {sigs:?}"
+    );
+    assert!(
+        sigs.contains(&vec!["Short".to_string()]),
+        "f(short) must survive as its own overload, got {sigs:?}"
+    );
+    assert!(
+        sigs.contains(&vec!["Int".to_string(), "Int".to_string()]),
+        "f(int, int) must survive as its own overload, got {sigs:?}"
+    );
+    let distinct: std::collections::HashSet<_> = sigs.iter().cloned().collect();
+    assert_eq!(distinct.len(), 4, "all four signatures distinct: {sigs:?}");
+}
+
+#[test]
+fn cpp_call_sites_prefer_exact_scalar_match() {
+    let root = fixture("cpp_templates_overloads");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    for (lit_call, descs) in [
+        ("f(1)", vec!["Int"]),
+        ("f(1.5)", vec!["Double"]),
+        ("f(s)", vec!["Short"]),
+        ("f(1, 2)", vec!["Int", "Int"]),
+    ] {
+        let matching: Vec<FnId> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(&program, e.caller) == "main"
+                    && fn_name(&program, e.callee) == "f"
+                    && e.resolution == ResolutionKind::Direct
+                    && fn_param_descs(&program, e.callee) == descs
+            })
+            .map(|e| e.callee)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "{lit_call} must pick exactly one overload with {descs:?}, got {matching:?}"
+        );
+    }
+
+    // No call site may emit more than one edge: the type-resolved overload is
+    // unambiguous rather than the may-tie set.
+    let multi = analysis.call_edges.iter().any(|e| {
+        analysis
+            .call_edges
+            .iter()
+            .filter(|e2| e2.call_site == e.call_site)
+            .count()
+            > 1
+    });
+    assert!(
+        !multi,
+        "type-resolved overloads must emit one site per call"
+    );
+}
+
+#[test]
+fn cpp_template_member_calls_resolve_to_primary_name() {
+    let root = fixture("cpp_templates_overloads");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    // Template primary registrations exist.
+    let candidates = program
+        .symbols
+        .resolve_function_candidates("FieldValue::GetNumber", None);
+    assert_eq!(
+        candidates.len(),
+        3,
+        "in-class template GetNumber must register alongside its overloads"
+    );
+
+    // `fv.GetNumber<int>()` and `b.read<short>()` resolve directly.
+    assert!(
+        has_direct(&program, &analysis, "main", "FieldValue::GetNumber"),
+        "fv.GetNumber<int>() must resolve to FieldValue::GetNumber"
+    );
+    assert!(
+        has_direct(&program, &analysis, "main", "Box::read"),
+        "b.read<short>() must resolve to Box::read"
+    );
+    assert!(
+        has_direct(&program, &analysis, "main", "Box::read")
+            && has_direct(&program, &analysis, "main", "FieldValue::GetNumber"),
+        "template member calls must be direct, not external stubs"
+    );
+}
+
+#[test]
+fn cpp_pointer_casts_rank_against_pointer_overloads() {
+    let root = fixture("cpp_pointer_cast_overloads");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let sig_count = |name: &str, sigs: Vec<String>| {
+        analysis
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(&program, e.caller) == "main" && e.resolution == ResolutionKind::Direct
+            })
+            .filter(|e| fn_name(&program, e.callee) == name)
+            .filter(|e| fn_param_descs(&program, e.callee) == sigs)
+            .count()
+    };
+    let int = vec!["Int".to_string()];
+    let ptr_int = vec!["Ptr(Int)".to_string()];
+    let ch = vec!["Char".to_string()];
+    let ptr_ch = vec!["Ptr(Char)".to_string()];
+    let ptr_ptr_int = vec!["Ptr(Ptr(Int))".to_string()];
+
+    assert_eq!(
+        sig_count("f", int.clone()),
+        1,
+        "f(i) must pick exactly f(int)"
+    );
+    assert_eq!(
+        sig_count("f", ptr_int),
+        2,
+        "f((int*)&i) and f(pi) must resolve to f(int*), not f(int)"
+    );
+    assert_eq!(
+        sig_count("f", ch.clone()),
+        1,
+        "f(c) must pick f(char), not f(char*)"
+    );
+    assert_eq!(
+        sig_count("f", ptr_ch),
+        2,
+        "f((char*)&c) and f(pc) must resolve to f(char*)"
+    );
+    assert_eq!(
+        sig_count("f", ptr_ptr_int.clone()),
+        2,
+        "f((int**)&pi) and f(pp) must resolve to f(int**), not one pointer level short"
+    );
+    let f_direct_total = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "main"
+                && fn_name(&program, e.callee) == "f"
+                && e.resolution == ResolutionKind::Direct
+        })
+        .count();
+    assert_eq!(
+        f_direct_total, 8,
+        "all eight f() call sites must resolve to exactly one callee each"
+    );
+}
+
+#[test]
+fn cpp_unresolvable_member_args_keep_full_candidate_set() {
+    let root = fixture("cpp_pointer_cast_overloads");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    // `g(gh.val)` and `g(hp->val)` cannot be ranked past the receiver
+    // (struct or pointer-to-struct), so BOTH the int and the Holder overload
+    // stay for each member call (may-approximation) — five edges total:
+    // g(42) -> g(int) only, plus two member calls each keeping both.
+    let g_targets: Vec<Vec<String>> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "main"
+                && fn_name(&program, e.callee) == "g"
+                && e.resolution == ResolutionKind::Direct
+        })
+        .map(|e| fn_param_descs(&program, e.callee))
+        .collect();
+    assert_eq!(
+        g_targets.len(),
+        5,
+        "g(42) + g(gh.val) + g(hp->val) must contribute 1 + 2 + 2 edges, got {g_targets:?}"
+    );
+    let mut seen: Vec<Vec<String>> = g_targets.clone();
+    seen.sort();
+    seen.dedup();
+    assert!(
+        seen.contains(&vec!["Int".to_string()]),
+        "g(int) must be present, got {g_targets:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|s| !s.is_empty() && s[0].starts_with("Struct")),
+        "g(Holder) must be among the kept candidates (both receiver shapes), got {g_targets:?}"
+    );
+}
+
+// --- cpp_name_lookup: ADL, using directives, namespace-relative lookup ---
+
+fn cpp_name_lookup() -> (Program, trace_analysis::AnalysisResult) {
+    static SHARED: OnceLock<(Program, trace_analysis::AnalysisResult)> = OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            let root = fixture("cpp_name_lookup");
+            let program = build_program(&root, &default_opts(&root)).expect("build");
+            let (_pag, analysis) = analyze(&program);
+            (program, analysis)
+        })
+        .clone()
+}
+
+#[test]
+fn cpp_adl_free_function_resolves() {
+    let (program, analysis) = cpp_name_lookup();
+    // `swap(_a, _b)` at global scope with `kit::Widget*` args: ADL finds
+    // `kit::swap`. It must be a direct in-tree edge, not an external stub.
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_drive",
+            "kit::swap",
+            ResolutionKind::Direct
+        ),
+        "ADL swap(kit::Widget*) must resolve to kit::swap"
+    );
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "swap" && !f.is_defined),
+        "bare 'swap' must not survive as an undefined external stub"
+    );
+}
+
+#[test]
+fn cpp_using_namespace_resolves_free_functions() {
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "using_ns_drive",
+            "util::helper",
+            ResolutionKind::Direct
+        ),
+        "using namespace util; helper() must resolve"
+    );
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "using_ns_drive",
+            "util::twice",
+            ResolutionKind::Direct
+        ),
+        "using namespace util; twice(3) must resolve"
+    );
+}
+
+#[test]
+fn cpp_using_member_import_resolves() {
+    let (program, analysis) = cpp_name_lookup();
+    // `using lib::bump;` imports the exact qualified function.
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "using_member_drive",
+            "lib::bump",
+            ResolutionKind::Direct
+        ),
+        "using lib::bump; bump(c) must resolve to the imported function"
+    );
+}
+
+#[test]
+fn cpp_using_import_of_static_resolves_internal_linkage() {
+    let (program, analysis) = cpp_name_lookup();
+    // `using import_static::only;` + `only(1)` must resolve to the file-local
+    // static `import_static::only(int)` (internal linkage), not degrade to
+    // the global external/overload or an external stub.
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "using_static_drive",
+            "import_static::only",
+            ResolutionKind::Direct
+        ),
+        "using import_static::only; only(1) must resolve to the static definition"
+    );
+}
+
+#[test]
+fn cpp_namespace_relative_call_resolves() {
+    let (program, analysis) = cpp_name_lookup();
+    // From inside `a::b`, bare `clamp` finds the innermost `a::b::clamp`.
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "a::b::go",
+            "a::b::clamp",
+            ResolutionKind::Direct
+        ),
+        "bare clamp() inside a::b must resolve to a::b::clamp"
+    );
+}
+
+#[test]
+fn cpp_qualified_call_unchanged() {
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "qualified_drive",
+            "util::helper",
+            ResolutionKind::Direct
+        ),
+        "util::helper() must still resolve explicitly"
+    );
+    assert!(has_resolution(
+        &program,
+        &analysis,
+        "qualified_drive",
+        "util::twice",
+        ResolutionKind::Direct
+    ));
+}
+
+#[test]
+fn cpp_header_prototypes_register_qualified_names() {
+    // Header-declared `void swap(Widget*, Widget*)` inside `namespace kit`
+    // must register as `kit::swap` (not bare `swap`), so it folds into the
+    // out-of-line definition and ADL resolves exactly once.
+    let (program, _) = cpp_name_lookup();
+    let proto = program.symbols.functions_named("kit::swap");
+    assert!(
+        proto
+            .iter()
+            .any(|&f| program.symbols.function(f).is_defined),
+        "kit::swap must have its in-tree definition registered"
+    );
+    // The header must not leave a bare `swap` *external stub* — the whole
+    // point of qualifying prototypes. (A deliberate global `swap`
+    // definition in main.cpp is fine and expected.)
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "swap" && !f.is_defined),
+        "the header must not produce an undefined bare 'swap' external stub"
+    );
+}
+
+// --- additional name-lookup edge cases ---
+
+#[test]
+fn cpp_adl_may_approx_keeps_global_overload() {
+    // A global `swap(Widget*, Widget*)` and `kit::swap(Widget*, Widget*)`
+    // share base name + arity. Under may-analysis the bare `swap(_a, _b)`
+    // call must keep BOTH candidates (global + ADL namespace), never
+    // collapse to a single wrong target.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_may_approx",
+            "swap",
+            ResolutionKind::Direct
+        ),
+        "global ::swap must remain a candidate"
+    );
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_may_approx",
+            "kit::swap",
+            ResolutionKind::Direct
+        ),
+        "ADL kit::swap must remain a candidate"
+    );
+    assert!(
+        !has_resolution(
+            &program,
+            &analysis,
+            "adl_may_approx",
+            "swap",
+            ResolutionKind::External
+        ),
+        "both candidates are defined in-tree; neither may degrade to external"
+    );
+}
+
+#[test]
+fn cpp_using_nested_member_import_resolves() {
+    // `using deep::inner::fold;` — a *nested* qualified import that no
+    // ordinary/ADL namespace covers.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_nested_import",
+            "deep::inner::fold",
+            ResolutionKind::Direct
+        ),
+        "using deep::inner::fold must resolve the nested import"
+    );
+}
+
+#[test]
+fn cpp_file_static_shadows_adl() {
+    // A file-scope `static void shadowed(int)` must resolve ahead of any
+    // global/ADL candidate of the same base name (internal linkage wins).
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_static_shadow",
+            "shadowed",
+            ResolutionKind::Direct
+        ),
+        "file-local static shadowed() must resolve"
+    );
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "shadowed" && !f.is_defined),
+        "static shadowed must not leave an external stub"
+    );
+}
+
+#[test]
+fn cpp_function_scoped_using_namespace_resolves() {
+    // `using namespace body;` inside a function body must make `poke()`
+    // resolvable only for that function.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_function_scoped_using",
+            "body::poke",
+            ResolutionKind::Direct
+        ),
+        "function-scoped using namespace body; poke() must resolve"
+    );
+}
+
+#[test]
+fn cpp_function_scoped_using_namespace_does_not_leak() {
+    // The `using namespace body;` inside `adl_function_scoped_using` must NOT
+    // make `body::poke` a candidate in `adl_using_no_leak` — a leaked
+    // directive would rob the correct in-scope global `poke` edge when the
+    // ranking later collapses to one candidate (under-approximation).
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_using_no_leak",
+            "poke",
+            ResolutionKind::Direct
+        ),
+        "global poke must resolve for a caller without the using directive"
+    );
+    assert!(
+        !has_resolution(
+            &program,
+            &analysis,
+            "adl_using_no_leak",
+            "body::poke",
+            ResolutionKind::Direct
+        ),
+        "function-body using namespace must not leak into other functions"
+    );
+}
+
+#[test]
+fn cpp_relative_using_namespace_target_finds_enclosing_namespace() {
+    // `using namespace detail;` is written inside `relns::via_directive`
+    // while an *enclosing* `relns::detail` namespace exists. C++ resolves
+    // the relative first segment to the enclosing namespace, so
+    // `drive_ns`'s bare `bump(1)` must reach `relns::detail::bump` (and may
+    // over-approximate the global `detail::bump` too; it must not miss the
+    // enclosing one).
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "relns::directive_host::user::drive_ns",
+            "relns::detail::bump",
+            ResolutionKind::Direct
+        ),
+        "relative using-namespace target must resolve against the enclosing namespace"
+    );
+}
+
+#[test]
+fn cpp_relative_using_member_target_finds_enclosing_namespace() {
+    // `using detail::bump;` written inside `relns::via_import` names the
+    // enclosing `relns::detail::bump` (first segment resolved against the
+    // namespace stack), which must end up in `drive_import`'s candidate set
+    // — not just the global-spelled `detail::bump`.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "relns::import_host::user::drive_import",
+            "relns::detail::bump",
+            ResolutionKind::Direct
+        ),
+        "relative using-declaration target must resolve against the enclosing namespace"
+    );
+}
+
+#[test]
+fn cpp_global_qualified_definition_inside_namespace_block() {
+    // `void ::qualified_global() {}` written inside `namespace global_block`
+    // registers at global scope under the normalized name `qualified_global`
+    // (leading `::` stripped by `qualify_decl` so that merge dedup works and
+    // `functions_in_namespace` needs only one comparison).  The enclosing
+    // namespace prefix must NOT be prepended.
+    // `global_block::caller`'s bare call must reach the global function.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "global_block::caller",
+            "qualified_global",
+            ResolutionKind::Direct
+        ),
+        "::global definition inside a namespace block must stay at global scope"
+    );
+}
+
+#[test]
+fn cpp_namespace_scoped_using_namespace_applies_inside_block_only() {
+    // `using namespace boost_ish;` lives inside `scoped_use::inner`. It must
+    // apply to `in_scope` but not leak to `scoped_use::out_of_scope` (which
+    // is in the enclosing namespace, declared after the block). A TU-wide
+    // leak would make `out_of_scope` bind to the better-ranking
+    // `boost_ish::tick(int)` and drop the correct global `tick(double)` edge.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "scoped_use::inner::in_scope",
+            "boost_ish::tick",
+            ResolutionKind::Direct
+        ),
+        "in-scope caller must resolve through the block-scoped directive"
+    );
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "scoped_use::out_of_scope",
+            "tick",
+            ResolutionKind::Direct
+        ),
+        "caller outside the block must fall back to the in-scope global tick"
+    );
+    assert!(
+        !has_resolution(
+            &program,
+            &analysis,
+            "scoped_use::out_of_scope",
+            "boost_ish::tick",
+            ResolutionKind::Direct
+        ),
+        "namespace-block using namespace must not leak into the enclosing namespace"
+    );
+}
+
+#[test]
+fn cpp_adl_free_function_direct_in_one_of_many_candidates() {
+    // Sanity: the original ADL drive still resolves exactly through ADL with
+    // the additional global overload present.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_drive",
+            "kit::swap",
+            ResolutionKind::Direct
+        ),
+        "adl_drive swap must still resolve to kit::swap"
+    );
+}
+
+#[test]
+fn cpp_inner_block_using_namespace_applies_inside_block_only() {
+    // `using namespace innerlib;` inside the `if` body must apply only to
+    // that block. Two `g()` call sites in one function: the one inside the
+    // block resolves through `innerlib::g`; the sibling call after the block
+    // must stay on the global `g`. A directive leaked to the whole function
+    // would add `innerlib::g` to the sibling call site too (over-approx that
+    // can collapse the ranking and rob the correct in-scope edge) — so
+    // `innerlib::g` must appear exactly once (the in-block call).
+    let (program, analysis) = cpp_name_lookup();
+    let innerlib_edges = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "inner_block_using_scoped"
+                && fn_name(&program, e.callee) == "innerlib::g"
+                && e.resolution == ResolutionKind::Direct
+        })
+        .count();
+    assert_eq!(
+        innerlib_edges, 1,
+        "inner-block using namespace must not leak to the sibling call site \
+         (expected exactly 1 innerlib::g edge, from the in-block call)"
+    );
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "inner_block_using_scoped",
+            "g",
+            ResolutionKind::Direct
+        ),
+        "sibling call after the block must resolve to the global g"
+    );
+}
+
+#[test]
+fn cpp_adl_leading_global_scope_tag_finds_namespace() {
+    // `::kit::LeadWidget` (global-scope spelling) must still derive ADL
+    // namespace `kit` (the leading `::` is the global marker, not part of
+    // the namespace), so the bare `lead_swap` resolves to `kit::lead_swap`.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_leading_global_scope_tag",
+            "kit::lead_swap",
+            ResolutionKind::Direct
+        ),
+        "leading-:: ADL tag must resolve through ADL to kit::lead_swap"
+    );
+}
+
+#[test]
+fn cpp_inner_namespace_hides_global_overload() {
+    // `hide::g() { f(1); }` with a global `::f(int)` and an inner
+    // `hide::f(double)`. The bare name inside `hide` must resolve to
+    // `hide::f` only — the global `::f` is a wrong single answer and must be
+    // dropped (its presence must not be re-added by an out-of-band global
+    // lookup that runs ahead of the hiding walk).
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "hide::g",
+            "hide::f",
+            ResolutionKind::Direct
+        ),
+        "inner-namespace declaration must shadow the global overload"
+    );
+    assert!(
+        !has_resolution(&program, &analysis, "hide::g", "f", ResolutionKind::Direct),
+        "global f(int) must be hidden by hide::f, not kept as a candidate"
+    );
+}
+
+#[test]
+fn cpp_inner_namespace_hides_global_static() {
+    // `hidesf::g() { sf(1); }` with a global file-scope `static sf(int)` and
+    // an inner `hidesf::sf(double)`. The nested namespace declaration must
+    // shadow the file-static, resolving to `hidesf::sf` only — not the
+    // wrong single global-static answer.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "hidesf::g",
+            "hidesf::sf",
+            ResolutionKind::Direct
+        ),
+        "inner-namespace declaration must shadow the global file-static"
+    );
+    assert!(
+        !has_resolution(
+            &program,
+            &analysis,
+            "hidesf::g",
+            "sf",
+            ResolutionKind::Direct
+        ),
+        "global static sf must be hidden by hidesf::sf, not kept as a candidate"
+    );
+}
+
+/// Every `(function name, is_defined)` the index holds for `src`, lowered as C++.
+fn member_entries(tag: &str, src: &str) -> Vec<(String, bool)> {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("trace_{tag}_"))
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("k.cpp"), src).unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let mut entries: Vec<(String, bool)> = program
+        .symbols
+        .functions
+        .iter()
+        .map(|f| (f.name.clone(), f.is_defined))
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// Every function name the index holds for `src`, lowered as C++.
+fn member_names(tag: &str, src: &str) -> Vec<String> {
+    member_entries(tag, src)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+#[test]
+fn decltype_return_type_does_not_swallow_the_member_name() {
+    // Issue #29: `member_short_name` walked the whole field_declaration in
+    // order and took the first `identifier` it met. In a `decltype(...)`
+    // return type that identifier belongs to the *operand expression*, so
+    // `decltype(*p_) Deref() const;` was indexed as the member `p_` at the
+    // decltype's line and `Deref` was dropped — silently, with no
+    // diagnostic, since the file parses cleanly.
+    let names = member_names(
+        "decltype_ret",
+        "class K {\n\
+         public:\n\
+         \x20   decltype(*p_) Deref() const;\n\
+         \x20   decltype(kSize) Sized() const;\n\
+         \x20   int Plain() const;\n\
+         \x20   int *p_;\n\
+         };\n",
+    );
+    assert!(
+        names.iter().any(|n| n == "K::Deref"),
+        "decltype-returning member must be indexed: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "K::Sized"),
+        "a decltype over a plain identifier too: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "K::p_" || n == "K::kSize"),
+        "the decltype operand must not be indexed as the member: {names:?}"
+    );
+    assert!(names.iter().any(|n| n == "K::Plain"), "{names:?}");
+}
+
+#[test]
+fn conversion_operator_is_indexed_under_its_operator_name() {
+    // Issue #46: tree-sitter-cpp spells `operator T()` as an `operator_cast`
+    // declarator, not an `operator_name`. Neither `member_decl_is_function`
+    // nor `member_short_name` knew that kind, so the *declaration* was never
+    // registered and the in-class *definition* fell through to a generic
+    // walk that produced `Handle::()const` — a name no call site can match
+    // and that reads like a real symbol in the `functions` table.
+    let names = member_names(
+        "conv_op",
+        "class Handle {\n\
+         public:\n\
+         \x20   operator int() const;\n\
+         \x20   operator bool() const { return true; }\n\
+         \x20   explicit operator double() { return 0; }\n\
+         \x20   operator const char *() const;\n\
+         \x20   Handle &operator=(const Handle &);\n\
+         \x20   int Plain() const;\n\
+         };\n",
+    );
+    for expected in [
+        "Handle::operator int",
+        "Handle::operator bool",
+        "Handle::operator double",
+        "Handle::operator const char*",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "conversion operator must be indexed as `{expected}`: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|n| n.contains('(')),
+        "no member may be indexed under a declarator fragment: {names:?}"
+    );
+    assert!(names.iter().any(|n| n == "Handle::operator="), "{names:?}");
+    assert!(names.iter().any(|n| n == "Handle::Plain"), "{names:?}");
+}
+
+#[test]
+fn out_of_class_conversion_operator_definition_merges_with_its_declaration() {
+    // The `Cls::operator T` spelling of an out-of-class definition must match
+    // the in-class declaration's, or the class gains a second, undefined
+    // phantom member under the same construct.
+    let entries = member_entries(
+        "conv_op_out_of_class",
+        "class Handle {\n\
+         public:\n\
+         \x20   operator int() const;\n\
+         \x20   int Plain() const;\n\
+         };\n\
+         Handle::operator int() const { return 1; }\n\
+         int Handle::Plain() const { return 0; }\n",
+    );
+    let conv: Vec<&(String, bool)> = entries
+        .iter()
+        .filter(|(n, _)| n == "Handle::operator int")
+        .collect();
+    let plain: Vec<&(String, bool)> = entries
+        .iter()
+        .filter(|(n, _)| n == "Handle::Plain")
+        .collect();
+    assert_eq!(
+        conv.len(),
+        plain.len(),
+        "a conversion operator must merge exactly like a plain method: {entries:?}"
+    );
+    assert!(
+        conv.iter().any(|(_, defined)| *defined),
+        "the out-of-class definition must mark the member defined: {entries:?}"
+    );
+}
+
+#[test]
+fn operator_names_containing_an_angle_bracket_survive() {
+    // `normalize_qualified` strips balanced `<...>` argument spans, which is
+    // right for `Box<int>` and wrong for `operator<`: the whole family
+    // truncated to the bare keyword `operator`, so `<`, `<=` and `<<`
+    // collided under one name and the two that were declarations were
+    // dropped outright by the `short == "operator"` guard.
+    let names = member_names(
+        "angle_operators",
+        "struct A {\n\
+         \x20   bool operator<(const A &) const;\n\
+         \x20   bool operator<=(const A &) const;\n\
+         \x20   A &operator<<(int) { return *this; }\n\
+         \x20   bool operator>(const A &) const { return true; }\n\
+         };\n",
+    );
+    for expected in [
+        "A::operator<",
+        "A::operator<=",
+        "A::operator<<",
+        "A::operator>",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "`{expected}` must keep its spelling: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|n| n == "A::operator"),
+        "no member may be indexed under the bare keyword: {names:?}"
+    );
+}
+
+#[test]
+fn an_error_node_in_a_member_declaration_does_not_supply_the_name() {
+    // Inside a class body the unknown attribute macro of
+    // `an_unknown_attribute_macro_does_not_glue_the_return_type_onto_the_name`
+    // recovers differently: not a fabricated `qualified_identifier` but a
+    // real declarator preceded by an `ERROR` node holding the leftover type.
+    // The member walk took the first `identifier` it met, which is inside
+    // that ERROR — the same way a `decltype` operand once supplied the name
+    // (#29). An ERROR node holds no declarator.
+    let entries = member_entries(
+        "error_node_member",
+        "struct C { FFI_EXPORT CArr Get(long id); };\n\
+         void caller(C &c) { c.Get(1); }\n",
+    );
+    assert!(
+        entries.contains(&("C::Get".to_string(), false)),
+        "the member is named by its declarator: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "C::CArr"),
+        "the leftover return type must not be indexed as a member: {entries:?}"
+    );
+}
+
+#[test]
+fn conversion_operator_target_type_matches_the_name_it_is_spelled_with() {
+    // The name keeps the `(*)` of a function-pointer target, so the recorded
+    // type must too — the pointer sits inside the `abstract_function_declarator`
+    // and both walks have to descend into it, or name and type disagree about
+    // the same declarator. A declarator nested inside that one means the
+    // `(...)` belongs to the target, which is therefore a function type: a
+    // bare `Ptr(Void)` here was indistinguishable from a pointer to `void`,
+    // so nothing downstream could see the target as callable.
+    let types = defined_return_types(
+        "conv_op_target_agrees",
+        "struct H { operator void (*)() const { return 0; } };\n",
+    );
+    assert_eq!(
+        types,
+        vec![(
+            "H::operator void(*)".to_string(),
+            trace_ir::TypeDesc::Ptr(Box::new(trace_ir::TypeDesc::FnPtr {
+                ret: Box::new(trace_ir::TypeDesc::Void),
+                params: Vec::new(),
+            }))
+        )],
+        "name and target type must agree"
+    );
+}
+
+#[test]
+fn an_unknown_attribute_macro_does_not_glue_the_return_type_onto_the_name() {
+    // `FFI_EXPORT CArrFloat32 FfiGetRange(...)` — an attribute macro the
+    // preprocessor never saw a `#define` for. tree-sitter takes the macro as
+    // the return type and has no rule left for the real one, so it recovers
+    // by pairing type and name under a `qualified_identifier` whose `::` is
+    // MISSING. Read as a real qualified name that spells the function
+    // `CArrFloat32 FfiGetRange`, which no call site can match.
+    let entries = member_entries(
+        "unknown_attr_macro",
+        "FFI_EXPORT CArrFloat32 FfiGetRange(long id) { return 0; }\n\
+         void caller() { FfiGetRange(1); }\n",
+    );
+    assert!(
+        entries.contains(&("FfiGetRange".to_string(), true)),
+        "the function is named by its declarator, not by its return type: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n.contains("CArrFloat32")),
+        "the return type must not appear in any function name: {entries:?}"
+    );
+}
+
+#[test]
+fn an_unknown_attribute_macro_does_not_glue_the_return_type_onto_a_qualified_name() {
+    // The out-of-line sibling of
+    // `an_unknown_attribute_macro_does_not_glue_the_return_type_onto_the_name`.
+    // When the definition's own name is qualified there is no MISSING `::` to
+    // spot: tree-sitter keeps the real one and parks the leftover class
+    // segment in an ERROR node, so `FFI_EXPORT void C::M()` reads as the
+    // qualified name `void C::M` and the body hides behind a phantom external
+    // `C::M` — which is what every call site resolves to instead.
+    let entries = member_entries(
+        "unknown_attr_macro_qualified",
+        "struct C { void M(); };\n\
+         FFI_EXPORT void C::M() { }\n\
+         void caller(C &c) { c.M(); }\n",
+    );
+    assert!(
+        entries.contains(&("C::M".to_string(), true)),
+        "the definition must land on the declared member: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n.contains("void")),
+        "the return type must not appear in any function name: {entries:?}"
+    );
+}
+
+#[test]
+fn a_fabricated_qualification_keeps_every_scope_of_the_real_name() {
+    // The ERROR node holds only the *first* segment the recovery split off;
+    // the rest stays in the `name` field, so reading either half alone loses
+    // the other.
+    let entries = member_entries(
+        "unknown_attr_macro_nested",
+        "namespace A { struct B { void M(); }; }\n\
+         FFI_EXPORT void A::B::M() { }\n",
+    );
+    assert_eq!(
+        entries,
+        vec![("A::B::M".to_string(), true)],
+        "the definition keeps both scopes and merges with the declaration"
+    );
+}
+
+#[test]
+fn a_conversion_operators_name_does_not_depend_on_how_its_target_is_spelled() {
+    // A class in a namespace has to name its target one way in the class body
+    // and can name it another outside: `operator S` in class, `operator ns::S`
+    // out of it. Naming the member after the spelling made those two members,
+    // splitting the definition from its declaration on ordinary code.
+    let entries = member_entries(
+        "conv_op_target_spelling",
+        "namespace ns {\n\
+         struct S { int a; };\n\
+         class Handle { public: operator S() const; };\n\
+         }\n\
+         ns::Handle::operator ns::S() const { return ns::S(); }\n",
+    );
+    let conv: Vec<&(String, bool)> = entries
+        .iter()
+        .filter(|(n, _)| n.contains("operator"))
+        .collect();
+    assert_eq!(
+        conv,
+        vec![&("ns::Handle::operator S".to_string(), true)],
+        "both spellings name one member: {entries:?}"
+    );
+}
+
+#[test]
+fn a_trailing_attribute_macro_does_not_supply_the_member_name() {
+    // The mirror of `an_error_node_in_a_member_declaration_does_not_supply_the_name`:
+    // when the unknown macro *trails* the declarator, tree-sitter parks the
+    // declarator itself in the ERROR node and leaves the macro outside it, so
+    // skipping every ERROR names each member after its macro — and a class
+    // whose members share one annotation (`OVERRIDE`, `GUARDED_BY`, a
+    // `noexcept` spelling) collapses into a single symbol.
+    let entries = member_entries(
+        "trailing_attr_macro",
+        "struct D {\n\
+         \x20   int j() const NOEXCEPT_MACRO;\n\
+         \x20   virtual int m() OVERRIDE;\n\
+         \x20   void n() GUARDED(mu_);\n\
+         \x20   void k();\n\
+         };\n",
+    );
+    for expected in ["D::j", "D::m", "D::n", "D::k"] {
+        assert!(
+            entries.iter().any(|(n, _)| n == expected),
+            "`{expected}` is named by its declarator: {entries:?}"
+        );
+    }
+    for macro_name in ["D::NOEXCEPT_MACRO", "D::OVERRIDE", "D::GUARDED"] {
+        assert!(
+            !entries.iter().any(|(n, _)| n == macro_name),
+            "no member may be named after its annotation macro: {entries:?}"
+        );
+    }
+}
+
+#[test]
+fn a_conversion_operator_to_a_template_type_names_it_the_same_either_way() {
+    // A conversion's target keeps its template arguments — they are part of
+    // what tells one conversion in a class from another — so both spellings
+    // have to reduce to the *same* argument list. They differ in scope, not
+    // in arguments, which is why dropping only the member's own scopes is
+    // enough to make them meet.
+    let entries = member_entries(
+        "conv_op_template_target",
+        "namespace ns { template <class T> struct Vec { T a; }; }\n\
+         namespace ns { class H { public: operator Vec<int>() const; }; }\n\
+         ns::H::operator ns::Vec<int>() const { return ns::Vec<int>(); }\n",
+    );
+    let conv: Vec<&(String, bool)> = entries
+        .iter()
+        .filter(|(n, _)| n.contains("operator"))
+        .collect();
+    assert_eq!(
+        conv,
+        vec![&("ns::H::operator Vec<int>".to_string(), true)],
+        "both spellings name one member: {entries:?}"
+    );
+}
+
+/// The return type the index records for each *defined* function in `src`.
+fn defined_return_types(tag: &str, src: &str) -> Vec<(String, trace_ir::TypeDesc)> {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("trace_{tag}_"))
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("k.cpp"), src).unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let mut types: Vec<(String, trace_ir::TypeDesc)> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.is_defined)
+        .map(|f| {
+            (
+                f.name.clone(),
+                program.types.get(f.return_type).desc.as_ref().clone(),
+            )
+        })
+        .collect();
+    types.sort_by(|a, b| a.0.cmp(&b.0));
+    types
+}
+
+#[test]
+fn conversion_operator_returns_the_type_it_converts_to() {
+    // A conversion operator has no `type` field on its definition — the
+    // converted-to type sits inside the `operator_cast`, with any pointer or
+    // reference layers in the abstract declarator. Read from the wrong place
+    // it defaulted to `int`, so `operator Payload *()` claimed to return an
+    // integer and its callers' points-to sets lost the pointer.
+    let types = defined_return_types(
+        "conv_op_ret",
+        "struct Payload { int v; };\n\
+         class Handle {\n\
+         public:\n\
+         \x20   operator bool() const { return true; }\n\
+         \x20   operator Payload *() const { return p_; }\n\
+         \x20   operator Payload &() const { return *p_; }\n\
+         \x20   Payload *p_;\n\
+         };\n",
+    );
+    let ret = |name: &str| {
+        types
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("{name} is not defined: {types:?}"))
+            .1
+            .clone()
+    };
+    assert_eq!(ret("Handle::operator bool"), trace_ir::TypeDesc::Bool);
+    // The prototype's return type wins the merge, so it is the prototype that
+    // has to carry a real one. A plain method's in-class declaration does
+    // (#64 reads it there, which is what lets `operator->` be followed), but a
+    // conversion operator's does not: it has no `type` node, the converted-to
+    // type sitting inside the `operator_cast` instead. Declared in the class
+    // and defined out of line, it therefore still keeps the placeholder.
+    let split = defined_return_types(
+        "conv_op_ret_split",
+        "struct Payload { int v; };\n\
+         struct Split { operator Payload *() const; int Plain() const; };\n\
+         Split::operator Payload *() const { return 0; }\n\
+         int Split::Plain() const { return 0; }\n",
+    );
+    assert_eq!(
+        split,
+        vec![
+            ("Split::Plain".to_string(), trace_ir::TypeDesc::Int),
+            (
+                "Split::operator Payload*".to_string(),
+                trace_ir::TypeDesc::Void
+            ),
+        ],
+        "a plain member prototype carries its return type; a conversion \
+         operator's does not, and the merge keeps the placeholder"
+    );
+
+    // A reference lowers as a pointer here, as it does everywhere else.
+    for name in ["Handle::operator Payload*", "Handle::operator Payload&"] {
+        let desc = ret(name);
+        assert!(
+            matches!(
+                desc.pointee(),
+                Some(trace_ir::TypeDesc::Struct { name: tag, .. }) if tag == "Payload"
+            ),
+            "{name} converts to a pointer to Payload, got {desc:?}"
+        );
+    }
+}
+
+#[test]
+fn conversion_operator_to_a_function_pointer_keeps_its_pointer() {
+    // The `(*)` of a conversion to a function pointer sits *inside* the
+    // `abstract_function_declarator`, before its parameter list — so cutting
+    // the name at that declarator drops the target type wholesale and leaves
+    // `operator void`, colliding with the real conversion to `void`. The
+    // name ends where the declarator's own parameter list begins.
+    let names = member_names(
+        "conv_op_fnptr",
+        "struct H {\n\
+         \x20   operator void (*)() const;\n\
+         \x20   operator void() const;\n\
+         };\n",
+    );
+    assert!(
+        names.iter().any(|n| n == "H::operator void(*)"),
+        "the function-pointer target keeps its pointer: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "H::operator void"),
+        "and stays distinct from the conversion to plain void: {names:?}"
+    );
+}
+
+#[test]
+fn conversion_operator_to_a_qualified_type_stays_inside_its_class() {
+    // `operator ns::S()` names a member whose *target type* carries a `::`.
+    // `qualify_decl` reads a `::` anywhere in a declared name as "this
+    // spelling already names its own scope, leave it alone" — right for the
+    // out-of-class `Cls::m()`, wrong here: the in-class definition would be
+    // registered as a free function at global scope, leaving the declaration
+    // it should have merged with stranded and undefined. `Handle` sits at
+    // global scope, so `ns::` is none of its own and the target keeps it —
+    // the member still has to end up inside its class.
+    let entries = member_entries(
+        "conv_op_qualified",
+        "namespace ns { struct S { int a; }; }\n\
+         class Handle {\n\
+         public:\n\
+         \x20   operator ns::S() const;\n\
+         \x20   operator ns::S() { return ns::S(); }\n\
+         };\n",
+    );
+    assert!(
+        entries.contains(&("Handle::operator ns::S".to_string(), true)),
+        "the in-class definition belongs to Handle and merges with the \
+         declaration: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n.starts_with("operator")),
+        "no member may escape to global scope: {entries:?}"
+    );
+}
+
+#[test]
+fn macro_declared_conversion_operator_spells_the_same_name_as_its_definition() {
+    // The lowering sees preprocessor output, where an expansion joins its
+    // tokens with whitespace (`operator int ( ) const`). The name has to
+    // survive that intact, or the macro-declared prototype and the
+    // hand-written definition land under two different members.
+    let entries = member_entries(
+        "conv_op_macro",
+        "#define CONVERTS_TO(T) operator T() const\n\
+         class Handle {\n\
+         public:\n\
+         \x20   CONVERTS_TO(int);\n\
+         };\n\
+         Handle::operator int() const { return 0; }\n",
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|(n, _)| n == "Handle::operator int")
+            .collect::<Vec<_>>()
+            .len(),
+        1,
+        "the macro-declared prototype and the definition are one member: {entries:?}"
+    );
+    assert!(
+        entries.contains(&("Handle::operator int".to_string(), true)),
+        "{entries:?}"
+    );
+}
+
+#[test]
+fn keyword_operator_names_keep_the_space_that_separates_their_words() {
+    // `normalize_qualified` deleted *all* whitespace, which is right between
+    // a name and punctuation (`~ Cls`, `A :: b` out of a macro expansion) but
+    // wrong between two words: `operator new` was indexed as `operatornew`.
+    let names = member_names(
+        "operator_new",
+        "class Pool {\n\
+         public:\n\
+         \x20   static void *operator new(unsigned long);\n\
+         \x20   static void operator delete(void *);\n\
+         };\n",
+    );
+    assert!(names.iter().any(|n| n == "Pool::operator new"), "{names:?}");
+    assert!(
+        names.iter().any(|n| n == "Pool::operator delete"),
+        "{names:?}"
+    );
+}
+
+#[test]
+fn an_out_of_class_conversion_operator_behind_a_macro_stays_in_its_class() {
+    // `EXPORT C::operator int() const {}` recovers as
+    // `scope:(C) :: (ERROR "operator") name:(int)` — the same three parts as
+    // the fabricated `FFI_EXPORT void C::M()`, in a different order: there
+    // the ERROR holds the real class and precedes the `::`, here it holds the
+    // stranded keyword and follows it, and the scope is the real class.
+    // Reading them alike cut `C::` off the front, and `qualify_decl` — with
+    // no `::` left to see — registered the body as a free function at global
+    // scope, stranding the declaration it should have merged with.
+    let entries = member_entries(
+        "conv_op_out_of_class_macro",
+        "struct C { operator int() const; };\n\
+         EXPORT C::operator int() const { return 0; }\n",
+    );
+    assert_eq!(
+        entries,
+        vec![("C::operator int".to_string(), true)],
+        "the definition belongs to C and merges with its declaration: {entries:?}"
+    );
+}
+
+#[test]
+fn a_conversion_operator_behind_a_macro_is_named_the_same_wherever_it_sits() {
+    // The target's own qualification is dropped on this path too, or the
+    // out-of-class definition and the in-class declaration are two members
+    // for the reason `strip_scope_qualifiers` exists. A qualified *class*
+    // nests the stranded keyword one `qualified_identifier` deeper per scope
+    // it carries, out of reach of a direct-children scan.
+    for (tag, src, want) in [
+        (
+            "conv_op_macro_qualified_target",
+            "namespace ns { struct S { int a; }; }\n\
+             struct C { operator ns::S() const; };\n\
+             EXPORT C::operator ns::S() const { return ns::S(); }\n",
+            "C::operator ns::S",
+        ),
+        (
+            "conv_op_macro_qualified_class",
+            "namespace ns { struct S { int a; };\n\
+             struct C { operator S() const; }; }\n\
+             EXPORT ns::C::operator ns::S() const { return ns::S(); }\n",
+            "ns::C::operator S",
+        ),
+    ] {
+        let entries = member_entries(tag, src);
+        assert!(
+            entries.contains(&(want.to_string(), true)),
+            "`{want}` is one member, defined: {entries:?}"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|(n, _)| n.contains("operator"))
+                .count(),
+            1,
+            "and only one: {entries:?}"
+        );
+    }
+}
+
+#[test]
+fn a_leading_attribute_macro_does_not_name_a_conversion_operator_after_its_target() {
+    // Inside a class body the macro takes the `type` field and the keyword is
+    // stranded in an `ERROR` of its own, leaving the target type standing in
+    // declarator position: `MACRO operator ns::S() const;` was indexed as the
+    // member `C::S` — a name that collides with the class `S` itself and
+    // matches no declaration of the real member. The pointer spelling needs
+    // none of this, keeping a real `operator_name`, and must not regress.
+    let names = member_names(
+        "conv_op_leading_macro",
+        "struct C {\n\
+         \x20   MACRO operator int() const;\n\
+         \x20   MACRO operator ns::S() const;\n\
+         \x20   MACRO operator char *() const;\n\
+         \x20   MACRO int Plain() const;\n\
+         };\n",
+    );
+    for expected in [
+        "C::operator int",
+        // `C` sits at global scope, so `ns::` is none of its own and stays —
+        // the same spelling the macro-free and out-of-class paths produce.
+        "C::operator ns::S",
+        "C::operator char*",
+        "C::Plain",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "`{expected}` must be indexed: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|n| n == "C::int" || n == "C::S"),
+        "no member may be named after the type it converts to, and none may \
+         lose the target's own scope on the way: {names:?}"
+    );
+}
+
+#[test]
+fn a_trailing_attribute_macro_does_not_supply_a_definitions_name() {
+    // The mirror of `a_trailing_attribute_macro_does_not_supply_the_member_name`
+    // for *definitions*. A nullary declarator is as good a call as it is a
+    // declarator, so `void C::M() OVERRIDE {}` parks `C::M()` in an `ERROR`
+    // and hands the `declarator` field to the macro. The definition then
+    // landed on the macro: a *defined* function named `OVERRIDE` — one per
+    // class that annotates a nullary member, all merging into a single
+    // symbol — while `C::M` stayed undefined and its body unreachable.
+    // A declarator with parameters parses fine and must not regress.
+    let entries = member_entries(
+        "trailing_macro_definition",
+        "struct C { void M(); void N(); void P(int a); };\n\
+         void C::M() OVERRIDE { }\n\
+         void C::N() ACQUIRE(mu_) { }\n\
+         void C::P(int a) OVERRIDE { a; }\n\
+         struct D { void Q() OVERRIDE { } void R() ACQUIRE(mu_) { } };\n\
+         void g() OVERRIDE { }\n",
+    );
+    for expected in ["C::M", "C::N", "C::P", "D::Q", "D::R", "g"] {
+        assert!(
+            entries.contains(&(expected.to_string(), true)),
+            "`{expected}` is defined under its own name: {entries:?}"
+        );
+    }
+    for macro_name in ["OVERRIDE", "ACQUIRE", "C::OVERRIDE", "D::OVERRIDE"] {
+        assert!(
+            !entries.iter().any(|(n, _)| n == macro_name),
+            "no function may be named after its annotation macro: {entries:?}"
+        );
+    }
+}
+
+#[test]
+fn a_fabricated_qualification_is_found_under_the_scopes_the_real_name_carries() {
+    // `FFI_EXPORT n::S C::M() {}` — the leftover return type is itself
+    // qualified, so the `ERROR` holding the real class `C` sits in the
+    // *nested* `qualified_identifier`, one level down per scope either half
+    // spells. Scanning only direct children missed it and indexed the
+    // definition as `n::S C::M`, leaving `C::M` undefined and its body
+    // unreachable — the very failure the unqualified spelling fixed.
+    for (tag, src, want) in [
+        (
+            "fabricated_qualified_ret",
+            "namespace n { struct S { int a; }; }\n\
+             struct C { n::S M(); };\n\
+             FFI_EXPORT n::S C::M() { return n::S(); }\n",
+            "C::M",
+        ),
+        (
+            "fabricated_qualified_both",
+            "namespace n { namespace q { struct S { int a; }; } }\n\
+             namespace A { struct B { n::q::S M(); }; }\n\
+             FFI_EXPORT n::q::S A::B::M() { return n::q::S(); }\n",
+            "A::B::M",
+        ),
+    ] {
+        let entries = member_entries(tag, src);
+        assert!(
+            entries.contains(&(want.to_string(), true)),
+            "`{want}` is defined under its own name: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|(n, _)| n.contains(' ')),
+            "no name may keep the return type glued to it: {entries:?}"
+        );
+    }
+}
+
+#[test]
+fn a_member_wearing_both_macros_is_still_named_by_its_declarator() {
+    // With an unknown macro on *both* sides, tree-sitter puts the leftover
+    // return type and the real declarator in the same `ERROR`
+    // (`ERROR [int Get(long)]`) rather than one in it and one beside it. The
+    // "does this ERROR hold a declarator?" test then said yes and the walk
+    // read the whole node, taking the leftover type first: every member
+    // sharing a return type collapsed into `C::int` / `C::void`, and the real
+    // members survived only as externals synthesized by their call sites.
+    let entries = member_entries(
+        "both_attr_macros",
+        "struct C {\n\
+         \x20   EXPORT_API int Get(long) GUARDED_BY(mu_);\n\
+         \x20   EXPORT_API void Set(int) GUARDED_BY(mu_);\n\
+         };\n\
+         void u(C &c) { c.Get(1); c.Set(2); }\n",
+    );
+    for expected in ["C::Get", "C::Set"] {
+        assert!(
+            entries.iter().any(|(n, _)| n == expected),
+            "`{expected}` is named by its declarator: {entries:?}"
+        );
+    }
+    assert!(
+        !entries.iter().any(|(n, _)| n == "C::int" || n == "C::void"),
+        "no member may be named after its return type: {entries:?}"
+    );
+}
+
+#[test]
+fn a_standard_attribute_does_not_supply_the_member_name() {
+    // `[[nodiscard]]`, `[[gnu::pure]]` and `__attribute__((pure))` parse
+    // cleanly — no ERROR anywhere — but each holds an identifier of its own
+    // in front of the declaration, and the member walk took it: every
+    // annotated member of a class collapsed into `H::nodiscard`. Conversion
+    // operators made this reachable for the first time, since their
+    // declarations only began registering with #46.
+    let entries = member_entries(
+        "attributed_members",
+        "struct H {\n\
+         \x20   [[nodiscard]] operator bool() const;\n\
+         \x20   [[gnu::pure]] int Plain() const;\n\
+         \x20   __attribute__((pure)) int Gnu() const;\n\
+         \x20   [[maybe_unused]] int data_;\n\
+         };\n\
+         H::operator bool() const { return true; }\n",
+    );
+    assert!(
+        entries.contains(&("H::operator bool".to_string(), true)),
+        "the declaration merges with its out-of-line definition: {entries:?}"
+    );
+    for expected in ["H::Plain", "H::Gnu"] {
+        assert!(
+            entries.iter().any(|(n, _)| n == expected),
+            "`{expected}` keeps its own name: {entries:?}"
+        );
+    }
+    for attr in ["H::nodiscard", "H::gnu", "H::pure", "H::maybe_unused"] {
+        assert!(
+            !entries.iter().any(|(n, _)| n == attr),
+            "no member may be named after an attribute: {entries:?}"
+        );
+    }
+}
+
+#[test]
+fn a_conversion_operator_wearing_both_macros_is_named_by_its_target() {
+    // With a macro on both sides the `ERROR` swallows the target too
+    // (`ERROR [operator int() const]`), and the trailing macro is what
+    // follows it — so reading the first thing after the `ERROR` named every
+    // such member `C::operator GUARDED_BY`, collapsing a class's conversions
+    // into one symbol. A declarator inside the `ERROR` is the target whenever
+    // there is one; only its absence means the target is still to come.
+    let names = member_names(
+        "conv_op_both_macros",
+        "struct C {\n\
+         \x20   EXPORT_API operator int() const GUARDED_BY(m);\n\
+         \x20   EXPORT_API operator bool() const GUARDED_BY(m);\n\
+         };\n",
+    );
+    for expected in ["C::operator int", "C::operator bool"] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "`{expected}` must be indexed: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|n| n.contains("GUARDED_BY")),
+        "no member may be named after its annotation macro: {names:?}"
+    );
+}
+
+#[test]
+fn conversions_to_same_named_types_in_different_namespaces_stay_apart() {
+    // The target type is the only thing telling one conversion in a class
+    // from another, so dropping *every* scope from it put two members — and
+    // two bodies — under one `C::operator S`. Only the scopes the member
+    // itself sits in may go; `a` and `b` are none of `C`'s, and no spelling
+    // of these declarations anywhere could have elided them.
+    let entries = member_entries(
+        "conv_op_rival_namespaces",
+        "namespace a { struct S { int x; }; }\n\
+         namespace b { struct S { int y; }; }\n\
+         struct C {\n\
+         \x20   operator a::S() const { return a::S(); }\n\
+         \x20   operator b::S() const { return b::S(); }\n\
+         };\n",
+    );
+    for expected in ["C::operator a::S", "C::operator b::S"] {
+        assert!(
+            entries.contains(&(expected.to_string(), true)),
+            "`{expected}` is its own member: {entries:?}"
+        );
+    }
+}
+
+#[test]
+fn conversions_to_one_template_with_different_arguments_stay_apart() {
+    // Same reasoning for the other half of the target's spelling: stripping
+    // `<...>` made `operator Vec<int>` and `operator Vec<double>` one symbol.
+    // Keeping the arguments costs no merge, since a declaration and its
+    // out-of-class definition differ in scope rather than in arguments.
+    let entries = member_entries(
+        "conv_op_rival_template_args",
+        "template <class T> struct Vec { T v; };\n\
+         struct C {\n\
+         \x20   operator Vec<int>() const { return Vec<int>(); }\n\
+         \x20   operator Vec<double>() const { return Vec<double>(); }\n\
+         };\n",
+    );
+    for expected in ["C::operator Vec<int>", "C::operator Vec<double>"] {
+        assert!(
+            entries.contains(&(expected.to_string(), true)),
+            "`{expected}` is its own member: {entries:?}"
+        );
+    }
+}
+
+#[test]
+fn a_function_pointer_target_lowers_the_same_however_it_is_spelled() {
+    // `operator void (*)()` and the `typedef`ed `operator FP()` name the same
+    // C++ type, so they must intern the same descriptor — and it has to be a
+    // function type, or nothing downstream can tell the target is callable.
+    let direct = defined_return_types(
+        "conv_fnptr_direct",
+        "struct H { operator void (*)() { return 0; } };\n",
+    );
+    let aliased = defined_return_types(
+        "conv_fnptr_typedef",
+        "typedef void (*FP)();\nstruct H { operator FP() { return 0; } };\n",
+    );
+    let want = trace_ir::TypeDesc::Ptr(Box::new(trace_ir::TypeDesc::FnPtr {
+        ret: Box::new(trace_ir::TypeDesc::Void),
+        params: Vec::new(),
+    }));
+    assert_eq!(
+        direct,
+        vec![("H::operator void(*)".to_string(), want.clone())]
+    );
+    assert_eq!(aliased, vec![("H::operator FP".to_string(), want)]);
+}
+
+#[test]
+fn a_conversion_target_drops_exactly_the_scopes_its_member_sits_in() {
+    // The member's own scopes are what the author could have elided at the
+    // in-class spelling, so those and only those come off — at whatever depth
+    // they sit, and inside template arguments as well as at the top.
+    for (tag, src, want) in [
+        // `a::b::` — the whole enclosing chain, longest prefix first.
+        (
+            "conv_scope_nested",
+            "namespace a { namespace b { struct S { int x; };\n\
+             \x20   struct H { operator S() const; }; } }\n\
+             a::b::H::operator a::b::S() const { return a::b::S(); }\n",
+            "a::b::H::operator S",
+        ),
+        // `a::` alone — an outer scope of the member, still elidable in class.
+        (
+            "conv_scope_outer",
+            "namespace a { struct S { int x; };\n\
+             \x20   namespace b { struct H { operator S() const; }; } }\n\
+             a::b::H::operator a::S() const { return a::S(); }\n",
+            "a::b::H::operator S",
+        ),
+        // A template argument carries the same scope and loses it the same way.
+        (
+            "conv_scope_in_template_arg",
+            "namespace ns { template <class T> struct Vec { T a; };\n\
+             \x20   struct T1 { int q; };\n\
+             \x20   struct H { operator Vec<T1>() const; }; }\n\
+             ns::H::operator ns::Vec<ns::T1>() const { return ns::Vec<ns::T1>(); }\n",
+            "ns::H::operator Vec<T1>",
+        ),
+    ] {
+        let entries = member_entries(tag, src);
+        assert!(
+            entries.contains(&(want.to_string(), true)),
+            "`{want}` is one member, defined: {entries:?}"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|(n, _)| n.contains("operator"))
+                .count(),
+            1,
+            "and only one: {entries:?}"
+        );
+    }
+}
+
+#[test]
+fn a_global_operator_new_call_still_resolves_to_a_synthesized_external() {
+    // The guard deciding which unresolved callee becomes a synthesized
+    // `external` rejects names containing a space — calibrated to the old
+    // invariant that no name had one, which giving `operator new` its space
+    // broke. Both sites lost their callee and their edge.
+    let names = member_names(
+        "global_operator_new",
+        "typedef unsigned long size_t;\n\
+         void *f(size_t n) { return ::operator new(n); }\n\
+         void g(void *p) { ::operator delete(p); }\n",
+    );
+    for expected in ["::operator new", "::operator delete"] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "`{expected}` must be synthesized as an external callee: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn a_macro_annotated_destructor_is_not_filed_under_the_constructor() {
+    // `MACRO ~D();` strands the `~` alone in an `ERROR` and leaves `D`
+    // standing as the declarator, so the destructor was indexed as `D::D` —
+    // classified a ctor, and so dropped from the override set `delete p`
+    // expands over.
+    let names = member_names(
+        "macro_destructor",
+        "struct B { MACRO virtual ~B(); virtual void f(); };\n\
+         struct D : B { MACRO ~D() override; void f() override; };\n\
+         void kill(B *b) { delete b; }\n",
+    );
+    for expected in ["B::~B", "D::~D"] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "`{expected}` must keep its destructor spelling: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|n| n == "D::D"),
+        "a destructor may not be filed under the constructor: {names:?}"
+    );
+}
+
+#[test]
+fn a_declspec_modifier_does_not_supply_the_member_name() {
+    // MSVC's spelling of the attribute collapse: `__declspec(...)` parses to
+    // `ms_declspec_modifier`, which the standard/GNU attribute guard missed,
+    // so every annotated member of a class became one `H::dllexport`.
+    let names = member_names(
+        "declspec_members",
+        "struct H {\n\
+         \x20   __declspec(dllexport) int Alpha() const;\n\
+         \x20   __declspec(dllexport) int Beta() const;\n\
+         \x20   __declspec(dllexport) operator bool() const;\n\
+         \x20   int Plain() const;\n\
+         };\n",
+    );
+    for expected in ["H::Alpha", "H::Beta", "H::operator bool", "H::Plain"] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "`{expected}` must keep its own name: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|n| n == "H::dllexport"),
+        "no member may be named after a `__declspec`: {names:?}"
+    );
+}
+
+#[test]
+fn a_pointer_returning_definition_survives_a_trailing_macro() {
+    // The return type's pointer wraps the declarator, so the `ERROR` holding
+    // the real one sits a level below the definition — out of reach of a scan
+    // over its own children, which left the body under the macro's name.
+    // `Foo *GetInstance() OVERRIDE {}` is a very ordinary singleton shape.
+    let entries = member_entries(
+        "ptr_return_trailing_macro",
+        "struct C { void *P(); char *N(); void M(); };\n\
+         void *C::P() OVERRIDE { return 0; }\n\
+         char *C::N() OVERRIDE { return 0; }\n\
+         void C::M() OVERRIDE { }\n",
+    );
+    for expected in ["C::P", "C::N", "C::M"] {
+        assert!(
+            entries.contains(&(expected.to_string(), true)),
+            "`{expected}` is defined under its own name: {entries:?}"
+        );
+    }
+    assert!(
+        !entries.iter().any(|(n, _)| n == "OVERRIDE"),
+        "no definition may land on its annotation macro: {entries:?}"
+    );
+}
+
+#[test]
+fn a_macro_annotated_conversion_operator_keeps_the_targets_own_scope() {
+    // The `ERROR` swallows the target's scope along with the keyword
+    // (`ERROR [operator ns::]`), leaving only `S` on the declarator — so
+    // reading the declarator alone spelled the member `D1::operator S` where
+    // every other path spells it `D1::operator ns::S`, and the two never met.
+    // The in-class *definition* takes the same repair, and a globally
+    // qualified target reduces to the same member.
+    let entries = member_entries(
+        "macro_conv_keeps_scope",
+        "namespace ns { struct S { int a; }; }\n\
+         struct D1 { MACRO operator ns::S() const; };\n\
+         struct D2 { operator ns::S() const; };\n\
+         struct D3 { MACRO operator ns::S() const { return ns::S(); } };\n\
+         D1::operator ns::S() const { return ns::S(); }\n",
+    );
+    assert!(
+        entries.contains(&("D1::operator ns::S".to_string(), true)),
+        "the declaration and its out-of-class definition are one member: {entries:?}"
+    );
+    assert!(
+        entries.contains(&("D2::operator ns::S".to_string(), false)),
+        "the macro-free spelling agrees: {entries:?}"
+    );
+    assert!(
+        entries.contains(&("D3::operator ns::S".to_string(), true)),
+        "and so does the in-class definition: {entries:?}"
+    );
+    for wrong in ["D1::operator S", "D3::S", "D3::operator S"] {
+        assert!(
+            !entries.iter().any(|(n, _)| n == wrong),
+            "`{wrong}` loses the target's scope: {entries:?}"
+        );
+    }
+}
+
+#[test]
+fn a_globally_qualified_conversion_target_names_the_same_member() {
+    // `operator ::ns::S` is the defensive spelling of `operator ns::S`. The
+    // space after the keyword is dropped before punctuation, which every
+    // later step keys on, and the leading `::` matched no scope prefix — so
+    // the definition stranded its declaration as an undefined phantom.
+    let entries = member_entries(
+        "conv_global_qualified_target",
+        "namespace ns { struct S { int a; }; struct H2 { operator S() const; }; }\n\
+         ns::H2::operator ::ns::S() const { return ns::S(); }\n",
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|(n, _)| n.contains("operator"))
+            .collect::<Vec<_>>(),
+        vec![&("ns::H2::operator S".to_string(), true)],
+        "one member, defined: {entries:?}"
+    );
+}
+
+#[test]
+fn a_conversion_to_a_template_type_survives_a_leading_macro() {
+    // Recovery leaves the target's argument list on the declarator, making it
+    // a `template_method` — a kind the member-vs-data test did not know, so
+    // the member was read as a data field and left out of the index entirely.
+    let names = member_names(
+        "macro_conv_template_target",
+        "template <class T> struct Vec {};\n\
+         struct C { MACRO operator Vec<int>() const; void Plain(); };\n",
+    );
+    assert!(
+        names.iter().any(|n| n.starts_with("C::operator Vec")),
+        "the conversion must reach the index at all: {names:?}"
+    );
+    assert!(names.iter().any(|n| n == "C::Plain"), "{names:?}");
+}
+
+#[test]
+fn a_global_qualifier_survives_when_the_members_namespace_shadows_the_target() {
+    // A leading `::` is redundant only when what follows re-spells a scope
+    // the member sits in. Dropping it unconditionally merged the conversion
+    // to the *global* `S` with the one to the namespace's own `S` — two
+    // types, two bodies, one symbol, which is the over-merge this whole
+    // canonicalization exists to avoid.
+    let entries = member_entries(
+        "conv_global_shadowed",
+        "struct S { int g; };\n\
+         namespace n {\n\
+         struct S { int i; };\n\
+         struct H { operator ::S() const; operator S() const; };\n\
+         }\n\
+         n::H::operator ::S() const { return ::S(); }\n\
+         n::H::operator n::S() const { return n::S(); }\n",
+    );
+    for expected in ["n::H::operator ::S", "n::H::operator S"] {
+        assert!(
+            entries.contains(&(expected.to_string(), true)),
+            "`{expected}` is its own member, defined: {entries:?}"
+        );
+    }
+}
+
+#[test]
+fn a_template_argument_does_not_decide_whether_the_global_qualifier_is_redundant() {
+    // Whether a leading `::` is redundant is a question about the top-level
+    // target alone. Deciding it from "did canonicalization change anything"
+    // let a *template argument* answer it: `operator ::Vec<n::T>` lost its
+    // `::` merely because `n::T` shed its scope, so the conversion to the
+    // global `Vec` merged into the namespace's own `Vec` — leaving the
+    // global-target declaration stranded and its body on the wrong member.
+    let entries = member_entries(
+        "conv_global_tmpl_arg",
+        "template <class> struct Vec {};\n\
+         namespace n {\n\
+         template <class> struct Vec {};\n\
+         struct T {};\n\
+         struct H { operator ::Vec<T>(); operator Vec<T>(); };\n\
+         }\n\
+         n::H::operator ::Vec<n::T>() { return ::Vec<n::T>(); }\n\
+         n::H::operator n::Vec<n::T>() { return n::Vec<n::T>(); }\n",
+    );
+    for expected in ["n::H::operator ::Vec<T>", "n::H::operator Vec<T>"] {
+        assert!(
+            entries.contains(&(expected.to_string(), true)),
+            "`{expected}` is its own member, defined by its own definition: {entries:?}"
+        );
+    }
+}
+
+#[test]
+fn a_nested_scope_does_not_preempt_canonicalizing_the_target_head() {
+    // The member's enclosing scopes nest, so one spelling can match a longer
+    // prefix in a template argument than at its head: for a member of
+    // `a::b`, the argument of `a::Vec<a::b::T>` begins with `a::b::` while
+    // the head begins only with `a::`. Choosing a single prefix for the
+    // whole target let the argument's longer match win and stop there,
+    // leaving `a::Vec<T>` — which never met the `Vec<T>` its class declares.
+    let entries = member_entries(
+        "conv_nested_prefix_head",
+        "namespace a {\n\
+         template <class> struct Vec {};\n\
+         namespace b {\n\
+         struct T {};\n\
+         struct H { operator Vec<T>(); };\n\
+         } }\n\
+         a::b::H::operator a::Vec<a::b::T>() { return a::Vec<a::b::T>(); }\n",
+    );
+    assert!(
+        entries.contains(&("a::b::H::operator Vec<T>".to_string(), true)),
+        "the definition merges with its declaration: {entries:?}"
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|(n, _)| n.contains("operator"))
+            .count(),
+        1,
+        "and is one member: {entries:?}"
+    );
+}
+
+#[test]
+fn a_macro_annotated_conversion_keeps_its_qualified_target() {
+    // The macro shapes name the member from the declarator the `ERROR` parks
+    // the target in, and that declarator was *walked* rather than spelled —
+    // so the name came out of the target's last segment alone. A qualified
+    // target lost its own scope: the annotated declaration was
+    // `C::operator S` while every unannotated spelling of the same member is
+    // `C::operator ns::S`, so the two never met and `S` collided with the
+    // class of that name.
+    let entries = member_entries(
+        "conv_op_macro_qualified_target",
+        "namespace ns { struct S { int x; }; }\n\
+         struct C {\n\
+         \x20   EXPORT_API operator ns::S() const GUARDED_BY(m);\n\
+         };\n\
+         ns::S C::operator ns::S() const { return ns::S(); }\n",
+    );
+    assert!(
+        entries.contains(&("C::operator ns::S".to_string(), true)),
+        "the annotated declaration must meet its definition: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "C::operator S"),
+        "the target's own scope may not be dropped: {entries:?}"
+    );
+}
+
+#[test]
+fn a_macro_annotated_conversion_keeps_its_template_arguments() {
+    // Same walk, other half of the spelling: `operator Vec<int>` behind both
+    // macros was named `C::operator Vec`, which merges `Vec<int>` with
+    // `Vec<double>` and meets neither the plain declaration nor the
+    // out-of-class definition of either.
+    let entries = member_entries(
+        "conv_op_macro_template_target",
+        "template <class T> struct Vec { T v; };\n\
+         struct C {\n\
+         \x20   EXPORT_API operator Vec<int>() const GUARDED_BY(m);\n\
+         \x20   EXPORT_API operator Vec<double>() const GUARDED_BY(m);\n\
+         };\n\
+         Vec<int> C::operator Vec<int>() const { return Vec<int>(); }\n",
+    );
+    assert!(
+        entries.contains(&("C::operator Vec<int>".to_string(), true)),
+        "the annotated declaration must meet its definition: {entries:?}"
+    );
+    assert!(
+        entries.contains(&("C::operator Vec<double>".to_string(), false)),
+        "and stay apart from the class's other conversion: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "C::operator Vec"),
+        "template arguments may not be dropped: {entries:?}"
+    );
+}
+
+#[test]
+fn a_macro_annotated_conversion_to_a_function_pointer_keeps_its_pointer() {
+    // The `(*)` that makes a function-pointer target nameable sits in the
+    // declarator too, and dropping it named the conversion `C::operator int`
+    // — the name of the class's conversion *to* `int`, so one symbol held
+    // two unrelated members. Both macro shapes must spell it the way the
+    // unannotated declaration does.
+    let names = member_names(
+        "conv_op_macro_fn_ptr_target",
+        "struct C {\n\
+         \x20   EXPORT_API operator int (*)() const GUARDED_BY(m);\n\
+         \x20   EXPORT_API operator int (*)(char)() const;\n\
+         \x20   operator int() const;\n\
+         };\n",
+    );
+    for expected in [
+        "C::operator int(*)",
+        "C::operator int(*)(char)",
+        "C::operator int",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "`{expected}` is its own member: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn a_macro_trailing_a_pointer_conversion_declares_no_member() {
+    // A pointer or reference target recovers differently from every other
+    // kind: the operator keeps a whole `function_declarator`, the member's
+    // `;` goes *missing*, and the trailing macro is parked after it as a
+    // `declaration` of its own — which registered the phantom
+    // `C::GUARDED_BY` that call sites on any annotated member resolve to
+    // instead of the real one. A member closed by a missing `;` is one the
+    // author wrote no `;` after, so what follows is the rest of it.
+    for (tag, target) in [("ptr", "Payload *"), ("ref", "Payload &")] {
+        let names = member_names(
+            &format!("conv_op_macro_{tag}_target"),
+            &format!(
+                "struct Payload {{ int x; }};\n\
+                 struct C {{\n\
+                 \x20   EXPORT_API operator {target}() const GUARDED_BY(m);\n\
+                 }};\n"
+            ),
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("GUARDED_BY")),
+            "no member may be named after its annotation macro: {names:?}"
+        );
+        assert_eq!(
+            names.len(),
+            1,
+            "the conversion is the class's only member: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn every_conversion_target_kind_spells_one_member_under_any_macro() {
+    // The four macro shapes are four separate recoveries, and the committed
+    // case for the pair only ever used `int` — which is why review found the
+    // other target kinds each losing a different part of the target's
+    // spelling. What every shape owes is the same: a member's name must not
+    // depend on how it is annotated, since the annotated declaration and the
+    // plain one are the same member and have to merge.
+    //
+    // Excluded: a *globally* qualified target (`operator ::ns::S`) behind a
+    // leading macro. That one recovery puts its `ERROR` at class-body level
+    // rather than inside the member — the macro and the keyword land there
+    // together and the target becomes a `declaration` beside them — so the
+    // member walk never sees it and no repair here can reach it. Recorded in
+    // `docs/ANALYSIS.md`.
+    let prelude = "namespace ns { struct S { int x; }; template <class T> struct Vec { T v; }; }\n\
+                   struct S { int y; };\n\
+                   template <class T> struct Vec { T v; };\n\
+                   struct P { int z; };\n";
+    for target in [
+        "int",
+        "bool",
+        "unsigned long",
+        "S",
+        "ns::S",
+        "Vec<int>",
+        "ns::Vec<int>",
+        "Vec<Vec<int>>",
+        "P *",
+        "P &",
+        "const P *",
+        "const char *",
+        "int (*)()",
+        "int (*)(char)",
+    ] {
+        let mut spelled: Vec<(&str, Vec<String>)> = Vec::new();
+        for (shape, decl) in [
+            ("plain", format!("operator {target}() const;")),
+            ("leading", format!("EXPORT_API operator {target}() const;")),
+            (
+                "trailing",
+                format!("operator {target}() const GUARDED_BY(m);"),
+            ),
+            (
+                "both",
+                format!("EXPORT_API operator {target}() const GUARDED_BY(m);"),
+            ),
+        ] {
+            let names = member_names(
+                "conv_op_target_matrix",
+                &format!("{prelude}struct C {{\n    {decl}\n}};\n"),
+            );
+            assert!(
+                !names.iter().any(|n| n.contains("GUARDED_BY")),
+                "`operator {target}` ({shape}): no member may be named after \
+                 its annotation macro: {names:?}"
+            );
+            spelled.push((shape, names));
+        }
+        let (_, plain) = &spelled[0];
+        assert_eq!(
+            plain.len(),
+            1,
+            "`operator {target}` is the class's only member: {plain:?}"
+        );
+        for (shape, names) in &spelled[1..] {
+            assert_eq!(
+                names, plain,
+                "`operator {target}` must spell the same member with a {shape} \
+                 macro as without one"
+            );
+        }
+    }
+}
+
+#[test]
+fn cpp_default_parameters_in_prototype_retained_and_merge() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_default_param_")
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("api.h"),
+        "int compute(int base, int multiplier = 1);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("api.cpp"),
+        "#include \"api.h\"\nint compute(int base, int multiplier) {\n    return base * multiplier;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("main.cpp"),
+        "#include \"api.h\"\nint main() {\n    return compute(5);\n}\n",
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let compute = program
+        .symbols
+        .resolve_function("compute")
+        .expect("compute resolved");
+    let func = program.symbols.function(compute);
+    assert!(
+        func.is_defined,
+        "compute must be defined (prototype and definition merged)"
+    );
+    assert_eq!(
+        func.params.len(),
+        2,
+        "optional parameter must be retained as second param"
+    );
+    let (_pag, analysis) = analyze(&program);
+    assert_eq!(
+        direct_targets(&program, &analysis, "main"),
+        vec!["compute"],
+        "main must call compute"
+    );
+}
+
+#[test]
+fn a_pointer_typedef_to_a_struct_keeps_its_pointer() {
+    // `typedef struct Session *SessionPtr` names a POINTER. The typedef's
+    // struct branch registered the alias as the bare tag and never walked the
+    // declarator, so every `SessionPtr s` was a struct VALUE: `s->fd`
+    // decomposed against a non-pointer and the field edge was lost. Only the
+    // one-statement form is affected -- `typedef struct S S;` followed by
+    // `typedef S *P;` takes the other branch, which walks the declarator.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_ptr_typedef_")
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("a.c"),
+        "struct Session { int fd; };\n\
+         typedef struct Session *SessionPtr;\n\
+         int take(SessionPtr s) { return s->fd; }\n",
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    let take = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "take")
+        .expect("take is indexed");
+    let param = take.params.first().copied().expect("take has a parameter");
+    let ty = program
+        .symbols
+        .variable_by_id(param)
+        .map(|v| v.type_id)
+        .expect("the parameter has a type");
+    assert!(
+        matches!(
+            program.types.get(ty).desc.as_ref(),
+            trace_ir::TypeDesc::Ptr(_)
+        ),
+        "SessionPtr is a pointer, got {:?}",
+        program.types.get(ty).desc
+    );
+}
+
+#[test]
+fn c_caller_reaches_a_cpp_extern_c_definition_across_units() {
+    // The shape reported in #83, end to end: a `.c` caller and a `.cpp`
+    // definition meet at one `extern "C"` prototype, and the tag in that
+    // prototype's parameter is complete in the C unit and opaque in the C++
+    // one. Each unit interns its own `TypeId` for it, so comparing the cached
+    // signature by id refused the merge, `dispatch` stayed split into a
+    // prototype and a body, and the caller kept an `external` edge to the
+    // prototype -- exactly `hdf_remote_service.c:68` failing to reach
+    // `hdf_remote_adapter.cpp:469`. Only the corpora and the `merge.rs` unit
+    // tests covered this; `cargo test` alone did not.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_extern_c_e2e_")
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("api.h"),
+        "struct Session;\n\
+         #ifdef __cplusplus\n\
+         extern \"C\" {\n\
+         #endif\n\
+         int dispatch(struct Session *s);\n\
+         #ifdef __cplusplus\n\
+         }\n\
+         #endif\n",
+    )
+    .unwrap();
+    // The C unit sees the tag complete.
+    std::fs::write(
+        root.join("caller.c"),
+        "#include \"api.h\"\n\
+         struct Session { int fd; };\n\
+         int run(struct Session *s) { return dispatch(s); }\n",
+    )
+    .unwrap();
+    // The C++ unit only ever sees it declared.
+    std::fs::write(
+        root.join("impl.cpp"),
+        "#include \"api.h\"\n\
+         extern \"C\" int dispatch(struct Session *s) { return s ? 1 : 0; }\n",
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    let dispatches: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "dispatch")
+        .collect();
+    assert_eq!(
+        dispatches.len(),
+        1,
+        "the prototype and the definition are one function, got {:?}",
+        dispatches
+            .iter()
+            .map(|f| (f.id, f.is_defined))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        dispatches[0].is_defined,
+        "the surviving entry must carry the C++ body"
+    );
+
+    let (_pag, analysis) = analyze(&program);
+    assert_eq!(
+        direct_targets(&program, &analysis, "run"),
+        vec!["dispatch"],
+        "the C caller must reach the C++ definition directly, not as an external"
+    );
+}
+
+#[test]
+fn cpp_array_parameter_prototype_merges_with_pointer_definition() {
+    // `int a[]` and `int *a` declare the same parameter, so this is one
+    // function. Before the top-level decay in `same_param_type` the two read
+    // as C++ overloads: `sum` stayed split and `go` kept an `external` edge to
+    // the undefined prototype -- the #83 symptom from a different cause. Pure
+    // C never showed it, because C prototypes and definitions collapse without
+    // consulting parameter types at all.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_arr_param_")
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("api.h"), "int sum(int a[]);\n").unwrap();
+    std::fs::write(
+        root.join("impl.cpp"),
+        "#include \"api.h\"\nint sum(int *a) { return a[0]; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("main.cpp"),
+        "#include \"api.h\"\nint go(int *p) { return sum(p); }\n",
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    let sums: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "sum")
+        .collect();
+    assert_eq!(
+        sums.len(),
+        1,
+        "the array prototype and the pointer definition are one function"
+    );
+    assert!(
+        sums[0].is_defined,
+        "the surviving entry must carry the body"
+    );
+
+    let (_pag, analysis) = analyze(&program);
+    assert_eq!(
+        direct_targets(&program, &analysis, "go"),
+        vec!["sum"],
+        "go must reach the definition directly"
+    );
+}
+
+#[test]
+fn c_typedef_self_alias_preserves_struct_pointer_type() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_typedef_self_")
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    // Header only has forward typedef struct Session Session;
+    std::fs::write(
+        root.join("session.h"),
+        "typedef struct Session Session;\nint SessionStart(Session **s);\n",
+    )
+    .unwrap();
+    // Caller TU uses the header
+    std::fs::write(
+        root.join("caller.c"),
+        "#include \"session.h\"\nint run(Session **s) {\n    return SessionStart(s);\n}\n",
+    )
+    .unwrap();
+    // Definition TU defines struct Session and the function
+    std::fs::write(
+        root.join("session.c"),
+        "#include \"session.h\"\nstruct Session { int id; };\nint SessionStart(Session **s) {\n    return 0;\n}\n",
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let start = program
+        .symbols
+        .resolve_function("SessionStart")
+        .expect("SessionStart resolved");
+    let func = program.symbols.function(start);
+    assert!(func.is_defined, "SessionStart must be defined");
+
+    // `Session **` must lower as a pointer to the struct, not degrade to
+    // `Ptr(Ptr(Int))`. Check `run`, not `SessionStart`: `run` lives in
+    // caller.c, the TU that sees ONLY `typedef struct Session Session;`, so it
+    // is the side that degraded. `SessionStart` is defined in session.c
+    // alongside `struct Session { int id; }`, so its parameter resolved
+    // through the tag either way and asserting on it proves nothing.
+    let assert_ptr_ptr_session = |fn_name: &str, id| {
+        let f = program.symbols.function(id);
+        let param_var = program.symbols.variable(f.params[0]);
+        let param_ty = program.types.get(param_var.type_id);
+        match param_ty.desc.as_ref() {
+            trace_ir::TypeDesc::Ptr(inner) => match &**inner {
+                trace_ir::TypeDesc::Ptr(elem) => match &**elem {
+                    trace_ir::TypeDesc::Struct { name, .. } => assert_eq!(name, "Session"),
+                    other => panic!("{fn_name}: expected Struct Session, got {other:?}"),
+                },
+                other => panic!("{fn_name}: expected Ptr, got {other:?}"),
+            },
+            other => panic!("{fn_name}: expected Ptr, got {other:?}"),
+        }
+    };
+    let run = program
+        .symbols
+        .resolve_function("run")
+        .expect("run resolved");
+    assert_ptr_ptr_session("run", run);
+    assert_ptr_ptr_session("SessionStart", start);
+    let (_pag, analysis) = analyze(&program);
+    assert_eq!(
+        direct_targets(&program, &analysis, "run"),
+        vec!["SessionStart"],
+        "run must call SessionStart directly"
+    );
+}
+
+/// The constructor-call check in lowering read the `anon_` prefix without
+/// the digits `is_anonymous_tag` requires, so a tree's own `struct anon_vma`
+/// (a real tag in Linux) lost its constructor calls. A synthesized
+/// `anon_<n>` cannot be spelled as a declared type from source, so the
+/// named side is the only one a test can reach.
+#[test]
+fn named_tag_with_anon_prefix_emits_its_constructor_call() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_anon_ctor_")
+        .tempdir()
+        .unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("test.cpp"),
+        r#"
+struct anon_vma {
+    anon_vma(int x);
+};
+anon_vma::anon_vma(int x) {}
+
+void test() {
+    anon_vma v(42);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let targets = direct_targets(&program, &analysis, "test");
+    assert!(
+        targets.iter().any(|t| t == "anon_vma::anon_vma"),
+        "a named tag starting with `anon_` must emit its constructor call: {targets:?}"
+    );
+}
+
+analyzed_fixture!(cpp_type_lookup);
+
+#[test]
+fn bare_type_name_resolves_through_enclosing_namespaces() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in [
+        "a::b::c::TriLocal",
+        "a::b::c::TriParam",
+        "a::b::c::TriField",
+        "a::x::Partial",
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, "a::b::Deep::Go"),
+            "{caller}"
+        );
+    }
+    assert!(has_direct(
+        program,
+        analysis,
+        "a::b::c::TriGlobal",
+        "GlobalTarget::Run"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "Outer::ArrowReturn",
+        "RealTarget::Run"
+    ));
+    let make = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "a::b::c::MakeDeep")
+        .expect("MakeDeep");
+    assert!(
+        matches!(program.types.get(make.return_type).desc.as_ref(),
+            trace_ir::TypeDesc::Ptr(inner)
+                if matches!(&**inner, trace_ir::TypeDesc::Struct { name, .. } if name == "a::b::Deep")),
+        "a return type is looked up like any other type"
+    );
+}
+
+#[test]
+fn innermost_type_declaration_shadows_outer_ones() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "n::m::Shadowed",
+        "n::Shadow::Hit"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "n::m::Shadowed",
+        "Shadow::Hit"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "n::m::GlobalShadow",
+        "Shadow::Hit"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "n::m::GlobalShadow",
+        "n::Shadow::Hit"
+    ));
+}
+
+#[test]
+fn same_named_typedefs_in_two_namespaces_stay_apart() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "p::inner::ScopedTypedef",
+        "p::PT::Run"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "p::inner::ScopedTypedef",
+        "q::QT::Run"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "q::OtherTypedef",
+        "q::QT::Run"
+    ));
+}
+
+#[test]
+fn using_alias_declaration_is_a_typedef() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in ["UsingLocal", "UsingPointer", "UsingWrapper"] {
+        assert!(
+            has_direct(program, analysis, caller, "AliasTarget::Run"),
+            "{caller}"
+        );
+    }
+    for caller in ["ua::deeper::UsingEnclosing", "UsingQualified"] {
+        assert!(
+            has_direct(program, analysis, caller, "ua::Scoped::Run"),
+            "{caller}"
+        );
+    }
+    assert!(has_any_edge(program, analysis, "UsingFnPtr", "CbTarget"));
+}
+
+#[test]
+fn class_member_alias_is_scoped_to_its_class() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in [
+        "WithMemberAlias::ViaMember",
+        "WithMemberAlias::ViaParam",
+        "MemberAliasOutside",
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, "AliasTarget::Run"),
+            "{caller}"
+        );
+    }
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "MemberAliasNoLeak",
+        "AliasTarget::Run"
+    ));
+}
+
+#[test]
+fn nested_class_is_registered_under_its_outer_class() {
+    let (program, analysis) = cpp_type_lookup();
+    let tags = struct_tag_names(program);
+    for tag in [
+        "CS::Defined::Iterator",
+        "CS::Plain::It",
+        "GMethods::GIn2",
+        "GIn",
+    ] {
+        assert!(tags.iter().any(|t| t == tag), "{tag}: {tags:?}");
+    }
+    for tag in ["CS::Iterator", "CS::It", "GIn2"] {
+        assert!(!tags.iter().any(|t| t == tag), "no {tag}: {tags:?}");
+    }
+    for phantom in ["CS::Defined::it", "CS::Plain::pit", "CS::Plain::cb"] {
+        assert!(
+            !program.symbols.functions.iter().any(|f| f.name == phantom),
+            "{phantom} is a field of the nested class"
+        );
+    }
+    let field_of = |cls: &str, field: &str| {
+        program
+            .types
+            .type_id_by_tag(cls, trace_ir::TypeKind::Struct)
+            .map(|id| match program.types.get(id).desc.as_ref() {
+                trace_ir::TypeDesc::Struct { fields, .. } => {
+                    fields.iter().any(|(name, _)| name == field)
+                }
+                _ => false,
+            })
+            .unwrap_or(false)
+    };
+    assert!(field_of("CS::Defined::Iterator", "it"));
+    assert!(field_of("CS::Plain::It", "pit"));
+    assert!(field_of("CS::Defined", "df"));
+    assert!(!field_of("CS::Defined", "it"));
+    for (caller, callee) in [
+        ("CS::Sub::P7", "CS::Defined::Iterator::Next"),
+        ("CS::Plain::Use", "CS::Plain::It::Step"),
+        ("CS::OpenBox", "CS::Plain::Box::Open"),
+        ("Built::Builder::Build", "Built::Built"),
+        ("MakeBuilt", "Built::Built"),
+    ] {
+        assert!(has_direct(program, analysis, caller, callee), "{caller}");
+    }
+    for caller in ["CallHook", "CallHook2", "CallNestedCb"] {
+        assert!(
+            has_any_edge(program, analysis, caller, "HookTarget"),
+            "{caller} calls through the nested class's field"
+        );
+    }
+    let it_reads = program
+        .flow
+        .iter()
+        .filter(|f| {
+            matches!(f, trace_ir::FlowConstraint::GepField { field_name, .. }
+                if field_name == "it")
+        })
+        .count();
+    assert_eq!(it_reads, 1, "`i.it` reaches the nested class's layout");
+}
+
+#[test]
+fn constructor_call_arguments_bind_past_this() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "ConstructTakes",
+        "Takes::Takes"
+    ));
+    assert!(
+        has_any_edge(program, analysis, "Takes::Takes", "CtorCbTarget"),
+        "the callback reaches the constructor's own parameter"
+    );
+}
+
+#[test]
+fn member_class_sees_later_members_of_its_enclosing_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "Later::Builder::Build",
+        "Later::Later"
+    ));
+}
+
+#[test]
+fn function_local_aliases_are_block_scoped() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in ["LocalUsing", "LocalTypedef"] {
+        assert!(
+            has_direct(program, analysis, caller, "LocalTarget::Run"),
+            "{caller}"
+        );
+    }
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "LocalOutOfBlock",
+        "LocalTarget::Run"
+    ));
+    assert!(has_direct(
+        program,
+        analysis,
+        "LocalAliasCtor",
+        "Built2::Built2"
+    ));
+}
+
+#[test]
+fn array_alias_keeps_its_shape() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "CallTable",
+        "TableCbTarget"
+    ));
+    let table = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "cb_table")
+        .expect("cb_table");
+    assert!(matches!(
+        program.types.get(table.type_id).desc.as_ref(),
+        trace_ir::TypeDesc::Array { .. }
+    ));
+}
+
+#[test]
+fn qualified_spellings_reach_aliases_and_constructors() {
+    let (program, analysis) = cpp_type_lookup();
+    for caller in [
+        "TemplateMemberAlias",
+        "ArrowTemplateMemberAlias",
+        "rv::GlobalAliasUse",
+        "CastReceiver",
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, "LocalTarget::Run"),
+            "{caller}"
+        );
+    }
+    for callee in ["rv::Made::Made", "rv::Made::In::In"] {
+        assert!(
+            has_direct(program, analysis, "QualifiedCtor", callee),
+            "{callee}"
+        );
+    }
+}
+
+#[test]
+fn cpp_class_nested_in_c_structs_keeps_its_whole_path() {
+    let (program, _analysis) = cpp_type_lookup();
+    let tags = struct_tag_names(program);
+    assert!(tags.iter().any(|t| t == "CPlain::CMid::CDeep"), "{tags:?}");
+    assert!(program
+        .symbols
+        .resolve_function("CPlain::CMid::CDeep::Go")
+        .is_some());
+}
+
+#[test]
+fn bodyless_class_specifier_inside_a_class_names_the_member_class() {
+    let (program, _analysis) = cpp_type_lookup();
+    let tags = struct_tag_names(program);
+    for tag in ["ListNode", "PimplImpl"] {
+        assert!(!tags.iter().any(|t| t == tag), "no bare {tag}: {tags:?}");
+    }
+    let field_points_to = |cls: &str, field: &str, target: &str| {
+        let id = program
+            .types
+            .type_id_by_tag(cls, trace_ir::TypeKind::Struct)
+            .unwrap_or_else(|| panic!("{cls}: {tags:?}"));
+        matches!(program.types.get(id).desc.as_ref(), trace_ir::TypeDesc::Struct { fields, .. }
+            if fields.iter().any(|(name, desc)| name == field
+                && matches!(desc, trace_ir::TypeDesc::Ptr(inner)
+                    if matches!(&**inner, trace_ir::TypeDesc::Struct { name, .. } if name == target))))
+    };
+    assert!(field_points_to("List::ListNode", "next", "List::ListNode"));
+    assert!(field_points_to("Pimpl", "p", "Pimpl::PimplImpl"));
+}
+
+#[test]
+fn out_of_line_member_class_is_the_declared_class() {
+    let (program, analysis) = cpp_type_lookup();
+    for callee in ["hm::Manager::Info::Info", "hm::Manager::Info::Get"] {
+        assert!(
+            has_direct(program, analysis, "hm::Manager::Add", callee),
+            "{callee}"
+        );
+    }
+}
+
+#[test]
+fn nearer_function_hides_a_class_of_the_same_name() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "hide::CallHidden",
+        "hide::HiddenCtor"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "hide::CallHidden",
+        "HiddenCtor::HiddenCtor"
+    ));
+}
+
+#[test]
+fn alias_in_a_function_local_class_stays_in_the_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "LocalClassAlias",
+        "OuterAliasTarget::Run"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "LocalClassAlias",
+        "InnerAliasTarget::Run"
+    ));
+}
+
+#[test]
+fn constructor_call_reaches_an_internal_linkage_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(program, e.caller) == "UseLocalHelper"
+                && fn_name(program, e.callee).ends_with("LocalHelper::LocalHelper")
+        }),
+        "{:?}",
+        common::callees_of(program, analysis, "UseLocalHelper")
+    );
+}
+
+#[test]
+fn function_passed_to_new_reaches_the_constructor_parameter() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "Consumer::Consumer",
+        "OnEvent"
+    ));
+}
+
+#[test]
+fn alias_of_an_alias_names_the_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "AliasChain",
+        "ChainTarget::Run"
+    ));
+}
+
+#[test]
+fn local_class_in_a_member_function_sees_the_enclosing_class() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "Enclosing::Method",
+        "Enclosing::Nested::Run"
+    ));
+}
+
+#[test]
+fn local_class_prefers_the_function_class_over_the_namespace() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "lcns::Enclosing2::Method",
+        "lcns::Enclosing2::Nested::Run"
+    ));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "lcns::Enclosing2::Method",
+        "lcns::Nested::Run"
+    ));
+}
+
+#[test]
+fn out_of_line_member_of_a_data_only_struct_keeps_its_methods() {
+    let (program, analysis) = cpp_type_lookup();
+    assert!(has_direct(
+        program,
+        analysis,
+        "CConfig::CParser::Parse",
+        "HitTarget::Hit"
+    ));
+}
+
+analyzed_fixture!(cpp_member_args);
+
+/// `(arg_index, actual, formal)` for every argument `caller` hands `callee`.
+fn arg_bindings(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    callee: &str,
+) -> Vec<(u32, String, String)> {
+    let sites: std::collections::HashSet<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == caller && fn_name(program, e.callee) == callee)
+        .map(|e| e.call_site)
+        .collect();
+    analysis
+        .arg_flow_edges
+        .iter()
+        .filter(|e| sites.contains(&e.call_site))
+        .map(|e| arg_binding(program, e))
+        .collect()
+}
+
+/// `(arg_index, actual, formal)` of one arg-flow row.
+fn arg_binding(program: &Program, e: &trace_analysis::ArgFlowEdge) -> (u32, String, String) {
+    let actual = match (e.actual_var, e.actual_fn) {
+        (Some(v), _) => program.symbols.variable(v).name.clone(),
+        (None, Some(f)) => fn_name(program, f),
+        (None, None) => String::new(),
+    };
+    let formal = program.symbols.variable(e.formal).name.clone();
+    (e.arg_index, actual, formal)
+}
+
+#[test]
+fn method_call_arguments_bind_past_this() {
+    let (program, analysis) = cpp_member_args();
+    for (callee, actual) in [
+        ("Button::SetHandler", "OnDot"),
+        ("Button::SetHandler", "OnArrow"),
+        ("Button::operator()", "OnFunctor"),
+        ("Slot::operator()", "OnFieldFunctor"),
+        ("Remote::Later", "OnRemote"),
+        ("Remote::Shared", "OnStaticDot"),
+        ("Remote::Shared", "OnStaticQualified"),
+    ] {
+        let bindings = arg_bindings(program, analysis, "Wire", callee);
+        assert!(
+            bindings.contains(&(1, actual.to_owned(), "cb".to_owned())),
+            "Wire -> {callee}: {actual} must reach `cb`, got {bindings:?}"
+        );
+        assert!(
+            has_any_edge(program, analysis, callee, actual),
+            "{callee} calls what it was handed: {actual}"
+        );
+    }
+    let bindings = arg_bindings(program, analysis, "Wire", "Button::SetHandler");
+    assert!(
+        bindings.contains(&(1, "f".to_owned(), "cb".to_owned())),
+        "a variable argument reaches `cb` too: {bindings:?}"
+    );
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "Button::SetHandler",
+        "OnVar"
+    ));
+}
+
+#[test]
+fn member_defined_without_its_class_in_view_takes_this() {
+    let (program, analysis) = cpp_member_args();
+    for (callee, actual) in [
+        ("Detached::Later", "OnDetachedLater"),
+        ("Detached::Shared", "OnDetachedShared"),
+    ] {
+        assert_eq!(
+            arg_bindings(program, analysis, "UseDetached", callee),
+            [(1, actual.to_owned(), "cb".to_owned())],
+            "{callee}: the definition's unit never saw `Detached`"
+        );
+        assert!(has_any_edge(program, analysis, callee, actual));
+        let definition = program
+            .symbols
+            .functions
+            .iter()
+            .find(|f| f.name == callee && f.is_defined)
+            .expect("defined");
+        assert_eq!(
+            program.symbols.variable(definition.params[0]).name,
+            "this",
+            "{callee} has its implicit `this`"
+        );
+    }
+    let this_of = |name: &str| {
+        program
+            .symbols
+            .functions
+            .iter()
+            .find(|f| f.name == name && f.is_defined)
+            .and_then(|f| f.params.first())
+            .map(|&p| program.symbols.variable(p).name.clone())
+    };
+    assert_eq!(
+        this_of("Detached::Reset").as_deref(),
+        Some("this"),
+        "a parameterless member defined without its class takes `this` too"
+    );
+    assert_eq!(
+        this_of("util::Init"),
+        None,
+        "a parameterless namespace function defined out of line takes no `this`"
+    );
+    assert_eq!(
+        arg_bindings(program, analysis, "CallInImplUnit", "Detached::Shared"),
+        [(1, "OnSameUnit".to_owned(), "cb".to_owned())],
+        "a call beside the definition is bound past the `this` it gains"
+    );
+}
+
+#[test]
+fn namespace_function_named_like_a_class_takes_no_this() {
+    let (program, analysis) = cpp_member_args();
+    assert_eq!(
+        arg_bindings(program, analysis, "UseClockNamespace", "ns::Clock::Format"),
+        [(0, "OnFormat".to_owned(), "cb".to_owned())],
+        "`ns::Clock` is a namespace here, whatever `clock_class.hpp` declares"
+    );
+}
+
+#[test]
+fn call_to_a_member_declared_only_binds_past_this() {
+    let (program, _) = cpp_member_args();
+    let site = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|cs| {
+            fn_name(program, cs.caller) == "CallWithoutHeader"
+                && cs.callee_name == "Remote::Declared"
+        })
+        .expect("site");
+    assert_eq!(site.fn_args().first().map(|&(index, _)| index), Some(1));
+}
+
+#[test]
+fn qualified_member_call_resolved_after_the_merge_binds_past_this() {
+    let (program, analysis) = cpp_member_args();
+    assert_eq!(
+        arg_bindings(program, analysis, "CallWithoutHeader", "Remote::Shared"),
+        [(1, "OnUnseen".to_owned(), "cb".to_owned())],
+        "the unit never saw `Remote`, yet `Remote::Shared` is a member"
+    );
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "Remote::Shared",
+        "OnUnseen"
+    ));
+    assert_eq!(
+        arg_bindings(program, analysis, "CallWithoutHeader", "util::Free"),
+        [(0, "OnUnseenFree".to_owned(), "cb".to_owned())],
+        "a namespace function has no `this`"
+    );
+}
+
+#[test]
+fn implicit_this_and_qualified_method_calls_bind_past_this() {
+    let (program, analysis) = cpp_member_args();
+    for (caller, actual) in [
+        ("Button::Relay", "OnImplicit"),
+        ("Button::RelayArrow", "OnThisArrow"),
+        ("Fancy::Qualified", "OnQualified"),
+    ] {
+        let bindings = arg_bindings(program, analysis, caller, "Button::SetHandler");
+        assert!(
+            bindings.contains(&(1, "cb".to_owned(), "cb".to_owned())),
+            "{caller} -> Button::SetHandler: `cb` must reach `cb`, got {bindings:?}"
+        );
+        assert!(
+            has_any_edge(program, analysis, "Button::SetHandler", actual),
+            "{actual} flows through {caller} into Button::SetHandler"
+        );
+    }
+}
+
+#[test]
+fn qualified_method_call_picks_overload_by_explicit_arity() {
+    let (program, analysis) = cpp_member_args();
+    let targets: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == "PickerUser::Use")
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(targets.len(), 1, "one overload takes two arguments");
+    let params = &program.symbols.function(targets[0]).params;
+    assert_eq!(params.len(), 3, "`this`, `cb` and `n`");
+    assert!(has_any_edge(
+        program,
+        analysis,
+        &fn_name(program, targets[0]),
+        "OnOverload"
+    ));
+}
+
+#[test]
+fn no_explicit_argument_binds_to_this() {
+    let (program, analysis) = cpp_member_args();
+    for e in &analysis.arg_flow_edges {
+        if program.symbols.variable(e.formal).name != "this" {
+            continue;
+        }
+        assert!(e.actual_fn.is_none(), "a function reached `this`: {e:?}");
+        let actual = program.symbols.variable(e.actual_var.expect("actual"));
+        assert_eq!(
+            actual.temp,
+            Some(trace_ir::TempKind::New),
+            "only a `new` allocation is bound to `this`, got `{}`",
+            actual.name
+        );
+    }
+}
+
+#[test]
+fn new_expression_arguments_bind_past_this() {
+    let (program, analysis) = cpp_member_args();
+    for (caller, actual) in [
+        ("MakeWithVar", "f"),
+        ("MakeByName", "OnNewName"),
+        ("MakeStatement", "OnNewStmt"),
+    ] {
+        let bindings = arg_bindings(program, analysis, caller, "Worker::Worker");
+        assert!(
+            bindings.contains(&(1, actual.to_owned(), "cb".to_owned())),
+            "{caller}: {actual} must reach `cb`, got {bindings:?}"
+        );
+    }
+    for actual in ["OnNewVar", "OnNewName", "OnNewStmt"] {
+        assert!(has_any_edge(program, analysis, "Worker::Worker", actual));
+    }
+}
+
+#[test]
+fn member_initializer_arguments_bind_past_this() {
+    let (program, analysis) = cpp_member_args();
+    for (caller, callee, actual) in [
+        ("ByName::ByName", "Base::Base", "OnBaseName"),
+        ("ByVar::ByVar", "Base::Base", "f"),
+        ("BraceBase::BraceBase", "Base::Base", "OnBraceBase"),
+        ("Holder::Holder", "Member::Member", "f"),
+        (
+            "BraceHolder::BraceHolder",
+            "Member::Member",
+            "OnBraceMember",
+        ),
+    ] {
+        let bindings = arg_bindings(program, analysis, caller, callee);
+        assert!(
+            bindings.contains(&(1, actual.to_owned(), "cb".to_owned())),
+            "{caller} -> {callee}: {actual} must reach `cb`, got {bindings:?}"
+        );
+    }
+    for (callee, actual) in [
+        ("Base::Base", "OnBaseName"),
+        ("Base::Base", "OnBaseVar"),
+        ("Base::Base", "OnBraceBase"),
+        ("Member::Member", "OnMember"),
+        ("Member::Member", "OnBraceMember"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, callee, actual),
+            "{callee} calls {actual}"
+        );
+    }
+}
+
+analyzed_fixture!(cpp_overload_prototypes);
+
+/// `callee@file:line` for every edge out of `caller`, sorted; a callee with
+/// no body in the tree is marked `(declared)`.
+fn callee_definitions(program: &Program, analysis: &AnalysisResult, caller: &str) -> Vec<String> {
+    let mut out: Vec<String> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == caller)
+        .map(|e| {
+            let f = program.symbols.function(e.callee);
+            let file = program.symbols.files[f.span.file.0 as usize]
+                .path
+                .file_name();
+            format!(
+                "{}@{}:{}{}",
+                f.name,
+                file.map(|n| n.to_string_lossy()).unwrap_or_default(),
+                f.span.line,
+                if f.is_defined { "" } else { " (declared)" }
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The file name `f` is defined (or declared) in.
+fn file_name_of(program: &Program, f: &trace_ir::Function) -> String {
+    let path = &program.symbols.files[f.span.file.0 as usize].path;
+    path.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+/// The callee of every edge out of `caller`, or only out of its overload
+/// taking `arity` explicit parameters.
+fn overload_callees(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    arity: Option<u32>,
+) -> Vec<FnId> {
+    analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            let from = program.symbols.function(e.caller);
+            from.name == caller && arity.is_none_or(|a| from.explicit_arity == Some(a))
+        })
+        .map(|e| e.callee)
+        .collect()
+}
+
+/// The explicit arities of [`overload_callees`], sorted, one per edge.
+fn overload_callee_arities(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    arity: Option<u32>,
+) -> Vec<Option<u32>> {
+    let mut arities: Vec<_> = overload_callees(program, analysis, caller, arity)
+        .into_iter()
+        .map(|id| program.symbols.function(id).explicit_arity)
+        .collect();
+    arities.sort();
+    arities
+}
+
+#[test]
+fn prototype_overloads_bind_calls_by_declared_arity() {
+    let (program, analysis) = cpp_overload_prototypes();
+    assert_eq!(
+        callee_definitions(program, analysis, "GetWithOut"),
+        ["Session::Get@session.cpp:4"],
+        "`s->Get(mode)` is `Get(Mode&)`, not `Get()`"
+    );
+    assert_eq!(
+        callee_definitions(program, analysis, "GetPlain"),
+        ["Session::Get@session.cpp:3"]
+    );
+    assert_eq!(
+        callee_definitions(program, analysis, "RunTwice"),
+        ["Session::Run@session.cpp:6"]
+    );
+    assert!(has_any_edge(program, analysis, "Session::Run", "OnRun"));
+}
+
+#[test]
+fn prototype_default_arguments_accept_shorter_calls() {
+    let (program, analysis) = cpp_overload_prototypes();
+    let targets = callee_definitions(program, analysis, "LogWithDefault");
+    assert!(
+        targets.iter().any(|t| t == "Session::Log@session.cpp:7"),
+        "`s->Log(OnLog)` fits `Log(Callback, int = 0)`: {targets:?}"
+    );
+    assert!(has_any_edge(program, analysis, "Session::Log", "OnLog"));
+}
+
+#[test]
+fn variadic_overload_stays_a_candidate_for_more_arguments() {
+    let (program, analysis) = cpp_overload_prototypes();
+    assert_eq!(
+        callee_definitions(program, analysis, "LogPointers"),
+        ["Log@variadic.cpp:2"],
+        "`Log(p, p)` fits `Log(void*, ...)`, not `Log(int, int)`"
+    );
+    assert_eq!(
+        callee_definitions(program, analysis, "NotifyOnce"),
+        ["Notify@variadic.cpp:9"],
+        "`Notify(\"ready\", 1)` takes the fixed overload before the variadic one"
+    );
+    assert_eq!(
+        callee_definitions(program, analysis, "TraceUnknown")
+            .into_iter()
+            .filter(|t| t.starts_with("Trace@"))
+            .collect::<Vec<_>>(),
+        ["Trace@variadic.cpp:15", "Trace@variadic.cpp:16"],
+        "an argument of unknown type keeps both overloads"
+    );
+    assert_eq!(
+        callee_definitions(program, analysis, "ShowNumber"),
+        ["Show@variadic.cpp:22"],
+        "`Show(2.5)` cannot take `Show(const char*)`"
+    );
+    assert_eq!(
+        callee_definitions(program, analysis, "EmitMore"),
+        ["Session::Emit@session.cpp:9"],
+        "in-class `Emit(Callback)` and `Emit(Callback, ...)` stay two overloads"
+    );
+    assert!(has_any_edge(program, analysis, "Session::Emit", "OnEmit"));
+}
+
+#[test]
+fn default_arguments_pool_only_within_one_signature() {
+    let (program, analysis) = cpp_overload_prototypes();
+    assert_eq!(
+        callee_definitions(program, analysis, "text::TrimOne"),
+        ["text::Trim@defaults.cpp:6"],
+        "the prototype's default reaches a definition spelled `string`"
+    );
+    assert_eq!(
+        callee_definitions(program, analysis, "FormatUnknown")
+            .into_iter()
+            .filter(|t| t.starts_with("Format@"))
+            .collect::<Vec<_>>(),
+        ["Format@format.cpp:3"],
+        "`Format(cb, cb)` does not borrow `Format(int, int = 0)`'s default"
+    );
+}
+
+#[test]
+fn prototype_does_not_merge_into_a_same_named_body_of_another_arity() {
+    let (program, analysis) = cpp_overload_prototypes();
+    assert_eq!(
+        callee_definitions(program, analysis, "FireNamed"),
+        ["Listener::Fire@listener.cpp:3"],
+        "the unrelated variadic template body must not take the call"
+    );
+    assert!(has_any_edge(program, analysis, "Listener::Fire", "OnFire"));
+}
+
+#[test]
+fn static_member_template_keeps_its_in_class_body() {
+    let (program, analysis) = cpp_overload_prototypes();
+    let walks: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Walker::Walk")
+        .map(|f| (f.span.line, f.is_defined, f.linkage))
+        .collect();
+    assert!(
+        walks.contains(&(7, true, Linkage::External)),
+        "a static member is not internal linkage, and its body survives: {walks:?}"
+    );
+    assert!(
+        callee_definitions(program, analysis, "Walker::Walk")
+            .iter()
+            .any(|t| t == "Walker::Walk@walker.hpp:7"),
+        "`Walk(root_, callback)` reaches the two-parameter static overload"
+    );
+}
+
+analyzed_fixture!(cpp_direct_init);
+
+#[test]
+fn direct_initialization_spelled_like_a_function_declaration_constructs() {
+    let (program, analysis) = cpp_direct_init();
+    for (caller, callee, actual) in [
+        ("ByName", "Worker::Worker", "OnName"),
+        ("ByVariable", "Worker::Worker", "f"),
+        ("ByTwo", "Pair::Pair", "OnFirst"),
+        ("ByBraces", "Worker::Worker", "OnBrace"),
+    ] {
+        let bindings = arg_bindings(program, analysis, caller, callee);
+        assert!(
+            bindings.iter().any(|(i, a, _)| *i == 1 && a == actual),
+            "{caller} -> {callee}: {actual} is argument 1, got {bindings:?}"
+        );
+        assert!(
+            bindings.iter().any(|(i, _, f)| *i == 0 && f == "this"),
+            "{caller}: the object is `this`, got {bindings:?}"
+        );
+    }
+    assert!(
+        arg_bindings(program, analysis, "ByTwo", "Pair::Pair").contains(&(
+            2,
+            "OnSecond".to_owned(),
+            "second".to_owned()
+        ))
+    );
+    for (callee, actual) in [
+        ("Worker::Worker", "OnName"),
+        ("Worker::Worker", "OnVar"),
+        ("Pair::Pair", "OnSecond"),
+        ("Worker::Worker", "OnBrace"),
+        ("PointerDirectInit", "OnPointer"),
+        ("AggregateBraces", "OnAggregate"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, callee, actual),
+            "{callee} -> {actual}"
+        );
+    }
+    let names: Vec<&str> = program
+        .symbols
+        .functions
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    for object in ["w", "p", "c"] {
+        assert!(
+            !names.contains(&object),
+            "`{object}` is an object: {names:?}"
+        );
+    }
+    assert!(
+        has_any_edge(program, analysis, "Counter::Tick", "Lock::Lock"),
+        "a data member in the parentheses is a constructor argument"
+    );
+    assert!(
+        has_any_edge(program, analysis, "PointerFromLocal", "OnTable"),
+        "`Callback *slot(table);` initializes a pointer from the local"
+    );
+    for object in ["guard", "slot"] {
+        assert!(
+            !names.contains(&object),
+            "`{object}` is an object, not a function: {names:?}"
+        );
+    }
+    assert!(
+        has_any_edge(program, analysis, "DefaultedAggregate", "OnDefaulted"),
+        "a class whose only constructor is defaulted is an aggregate"
+    );
+    assert!(
+        has_any_edge(program, analysis, "LocalAliasHidesVariable", "build"),
+        "`Worker build(Value);` declares a function when `Value` names a type"
+    );
+    for declaration in ["make", "nothing", "make_global"] {
+        assert!(
+            names.contains(&declaration),
+            "`{declaration}` stays a declaration"
+        );
+    }
+    assert!(
+        arg_bindings(program, analysis, "Parenthesized", "Worker::Worker").contains(&(
+            1,
+            "OnParenthesized".to_owned(),
+            "cb".to_owned()
+        )),
+        "a parenthesized function name is the argument"
+    );
+    for object in [
+        "global_worker",
+        "global_callback",
+        "static_worker",
+        "header_worker",
+    ] {
+        assert!(
+            !names.contains(&object),
+            "`{object}` is a file-scope object: {names:?}"
+        );
+    }
+    assert!(
+        has_direct(program, analysis, "HeaderLocal", "Worker::Worker"),
+        "`Worker w(header_callback);` constructs with a header's file `static`"
+    );
+    assert!(
+        has_any_edge(program, analysis, "CallGlobalCallback", "OnGlobalPointer"),
+        "`Callback global_callback(OnGlobalPointer);` initializes the pointer"
+    );
+}
+
+analyzed_fixture!(cpp_later_members);
+
+#[test]
+fn a_method_calls_a_method_its_class_defines_later() {
+    let (program, analysis) = cpp_later_members();
+    for (caller, callee) in [
+        ("Parser::Parse", "Parser::ReadHeader"),
+        ("Parser2::Parse", "Parser2::ReadHeader"),
+        ("Runner::Run", "Runner::Invoke"),
+        ("Shadow::Go", "Shadow::Helper"),
+        ("Derived::Call", "Derived::Name"),
+        ("Box::Open", "Box::Unpack"),
+        ("Outer::Inner::Start", "Outer::Inner::Step"),
+    ] {
+        assert_eq!(
+            direct_targets(program, analysis, caller),
+            [callee],
+            "{caller} calls {callee}"
+        );
+    }
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(program, e.caller).starts_with("Outer::Spawn::$lambda")
+                && fn_name(program, e.callee) == "Outer::Work"
+                && e.resolution == ResolutionKind::Direct
+        }),
+        "a lambda in a method body calls the later method"
+    );
+    assert!(
+        arg_bindings(program, analysis, "Runner::Run", "Runner::Invoke").contains(&(
+            1,
+            "OnLater".to_owned(),
+            "cb".to_owned()
+        )),
+        "the argument binds past `this`"
+    );
+    assert!(has_any_edge(program, analysis, "Runner::Invoke", "OnLater"));
+    assert_eq!(
+        overload_callee_arities(program, analysis, "Overloads::Use", None),
+        [Some(1), Some(2)],
+        "one call per overload, by arity"
+    );
+    for (caller, wrong) in [
+        ("Shadow::Go", "Helper"),
+        ("Derived::Call", "Base::Name"),
+        ("Local::Apply", "Local::Later"),
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, wrong),
+            "{caller} does not call {wrong}"
+        );
+    }
+    // An overload above the calling body does not stand in for the one below.
+    for (caller, caller_arity, callee_arities) in [
+        ("Forward::Process", 1, [Some(0)]),
+        ("Forward::Use", 0, [Some(2)]),
+        ("Built::Make", 0, [Some(0)]),
+        ("Built::Copy", 0, [Some(1)]),
+    ] {
+        let mut arities = overload_callee_arities(program, analysis, caller, Some(caller_arity));
+        arities.dedup();
+        assert_eq!(
+            arities, callee_arities,
+            "{caller} calls the overload its arguments fit"
+        );
+    }
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "Forward::Process",
+        "OnNoArgs"
+    ));
+    assert!(has_any_edge(program, analysis, "Forward::Get", "OnTwoArgs"));
+}
+
+analyzed_fixture!(cpp_anonymous_members);
+
+#[test]
+fn members_of_a_class_in_an_anonymous_namespace_resolve() {
+    let (program, analysis) = cpp_anonymous_members();
+    for (caller, callee) in [
+        ("Profile::Use", "Profile::Ratio"),
+        ("Profile::Use", "Profile::Later"),
+        ("Drive", "Profile::Use"),
+        ("Drive", "Profile::Take"),
+        ("Drive", "Holder::Holder"),
+        ("Drive", "Out::Run"),
+        ("Dispatch", "Impl::Fire"),
+    ] {
+        assert!(
+            has_direct(program, analysis, caller, callee),
+            "{caller} -> {callee}: {:?}",
+            direct_targets(program, analysis, caller)
+        );
+    }
+    for (caller, callee) in [
+        ("Profile::Take", "OnTake"),
+        ("Holder::Holder", "OnHolder"),
+        ("Out::Run", "OnOut"),
+        ("Impl::Fire", "OnFired"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, callee),
+            "{caller} -> {callee}"
+        );
+    }
+    let undefined: Vec<&str> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| !f.is_defined && f.name.starts_with("Profile::"))
+        .map(|f| f.name.as_str())
+        .collect();
+    assert!(
+        undefined.is_empty(),
+        "no external stands in for a defined member: {undefined:?}"
+    );
+    for ctor in ["FromPlain::FromPlain", "AnonFromPlain::AnonFromPlain"] {
+        assert!(
+            must_not_have_edge(program, analysis, ctor, ctor),
+            "`: Plain()` does not construct through {ctor}"
+        );
+    }
+    let callee_files = |caller: &str, callee: &str| -> Vec<String> {
+        let prefix = format!("{callee}@");
+        let mut files: Vec<String> = callee_definitions(program, analysis, caller)
+            .iter()
+            .filter_map(|d| Some(d.strip_prefix(&prefix)?.split(':').next()?.to_owned()))
+            .collect();
+        files.dedup();
+        files
+    };
+    // Each file's class of a name is its own, virtual members included.
+    for (caller, callee, file) in [
+        ("Profile::Use", "Profile::Ratio", "anonymous.cpp"),
+        ("DriveOther", "Profile::Ratio", "other.cpp"),
+        ("FireHere", "Impl::Fire", "anonymous.cpp"),
+        ("FireOther", "Impl::Fire", "other.cpp"),
+    ] {
+        assert_eq!(
+            callee_files(caller, callee),
+            [file],
+            "{caller} calls its own file's {callee}"
+        );
+    }
+    for (caller, other_files) in [
+        ("FireQuiet", "Quiet::Fire"),
+        ("FireInherited", "InheritsSub::Fire"),
+        ("RunPlainly", "Hides::Run"),
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, other_files),
+            "{caller} does not reach {other_files}: other.cpp's class of the name is another class"
+        );
+    }
+    assert_eq!(
+        callee_files("FireOwnFinished", "Finished::Fire"),
+        ["anonymous.cpp"],
+        "an anonymous receiver does not reach an external class of its name"
+    );
+    assert!(
+        must_not_have_edge(program, analysis, "FireOwnFinished", "FinishedSub::Fire"),
+        "nor that class's subclasses"
+    );
+    assert!(
+        has_any_edge(program, analysis, "FireFinished", "FinishedSub::Fire"),
+        "another file's anonymous `final` does not stop dispatch on an external class of its name"
+    );
+    assert!(
+        has_any_edge(program, analysis, "Dispatch", "InheritsSub::Fire"),
+        "a call through the base reaches the override in another file's anonymous namespace"
+    );
+    // Each overload's callees, in declaration order.
+    let bodies = |name: &str| -> Vec<Vec<String>> {
+        program
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == name)
+            .map(|f| {
+                analysis
+                    .call_edges
+                    .iter()
+                    .filter(|e| e.caller == f.id)
+                    .map(|e| fn_name(program, e.callee))
+                    .collect()
+            })
+            .collect()
+    };
+    assert_eq!(
+        bodies("Typed::Work"),
+        [["OnInt"], ["OnDouble"]],
+        "Typed::Work(int) and Typed::Work(double) keep their own bodies"
+    );
+    for name in ["StaticWork", "FreeWork"] {
+        assert_eq!(
+            bodies(name),
+            [["OnFreeInt"], ["OnFreeDouble"]],
+            "{name}(int) and {name}(double) keep their own bodies"
+        );
+    }
+    let mut free_calls = overload_callees(program, analysis, "DriveFreeOverloads", None);
+    free_calls.sort();
+    free_calls.dedup();
+    assert_eq!(
+        free_calls.len(),
+        4,
+        "each call reaches the overload its argument fits: {:?}",
+        callee_definitions(program, analysis, "DriveFreeOverloads")
+    );
+    for (caller, callee) in [("CallFreeWorkPtr", "FreeWork"), ("TakeWork", "StaticWork")] {
+        let reached: Vec<u32> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(program, e.caller) == caller && fn_name(program, e.callee) == callee
+            })
+            .map(|e| program.symbols.function(e.callee).span.line)
+            .collect();
+        assert_eq!(
+            reached.len(),
+            2,
+            "a pointer taken from `{callee}` may hold either overload: {reached:?}"
+        );
+    }
+    let outside: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Outside::Run")
+        .collect();
+    assert!(
+        outside.len() == 2
+            && outside
+                .iter()
+                .all(|f| f.is_defined && f.linkage == Linkage::Internal),
+        "members defined after the namespace closes are its class's internal members: {:?}",
+        outside
+            .iter()
+            .map(|f| (f.span.line, f.is_defined, f.linkage))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        program.symbols.functions_named("Outside::Run").len(),
+        2,
+        "member lookup finds both overloads"
+    );
+    for (caller, callee) in [
+        ("CallExternalRoot", "Shared::Run"),
+        ("CallNamed", "NamedSub::Run"),
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, callee),
+            "{caller} does not reach {callee}: other.cpp's class of the name derives from another class"
+        );
+    }
+    assert!(
+        has_any_edge(program, analysis, "CallOtherRoot", "Shared::Run"),
+        "a call through the base the anonymous class derives from still reaches it"
+    );
+    let respelled: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Respelled")
+        .map(|f| f.is_defined)
+        .collect();
+    assert_eq!(
+        respelled,
+        [true],
+        "a declaration and a definition spelling a type two ways are one function"
+    );
+    assert!(has_direct(program, analysis, "CallRespelled", "Respelled"));
+    let early: Vec<Vec<String>> = overload_callees(program, analysis, "EarlyPick", None)
+        .into_iter()
+        .map(|id| {
+            analysis
+                .call_edges
+                .iter()
+                .filter(|e| e.caller == id)
+                .map(|e| fn_name(program, e.callee))
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        early,
+        [["OnPickArg"]],
+        "a declaration of Pick(Arg) reaches Pick(Arg)'s body, not Pick(int)'s"
+    );
+    assert!(
+        has_any_edge(
+            program,
+            analysis,
+            "FireThroughHeaderImpl",
+            "HeaderLeaf::Fire"
+        ),
+        "a header class's member defined in the .cpp keeps its prototype's `virtual`"
+    );
+    let mut logs: Vec<String> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == "UseHeaderLog")
+        .map(|e| file_name_of(program, program.symbols.function(e.callee)))
+        .collect();
+    logs.sort();
+    assert_eq!(
+        logs,
+        ["anon_header.h", "other.cpp"],
+        "a pointer to `HeaderLog` may hold the header's overload and the .cpp's"
+    );
+    // Each unit's `static` functions under a shared header stay its own.
+    for (caller, own, file) in [
+        ("UseSharedHere", "OnSharedHere", "anonymous.cpp"),
+        ("UseSharedThere", "OnSharedThere", "other.cpp"),
+    ] {
+        for callee in ["SharedTag", "SharedDeclared"] {
+            let reached: Vec<(String, Vec<String>)> = analysis
+                .call_edges
+                .iter()
+                .filter(|e| {
+                    fn_name(program, e.caller) == caller && fn_name(program, e.callee) == callee
+                })
+                .map(|e| {
+                    let body = analysis
+                        .call_edges
+                        .iter()
+                        .filter(|b| b.caller == e.callee)
+                        .map(|b| fn_name(program, b.callee))
+                        .collect();
+                    (
+                        file_name_of(program, program.symbols.function(e.callee)),
+                        body,
+                    )
+                })
+                .collect();
+            assert!(
+                reached
+                    .iter()
+                    .any(|(f, body)| f == file && body.iter().any(|c| c == own))
+                    && reached.iter().all(|(_, body)| !body
+                        .iter()
+                        .any(|c| c.starts_with("OnShared") && c != own)),
+                "{caller} reaches its own file's {callee}, not the other unit's: {reached:?}"
+            );
+        }
+    }
+    for (caller, other_base) in [
+        ("CallMixed", "OtherRoot::Run"),
+        ("CallMixedThere", "ExternalRoot::Run"),
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, other_base),
+            "{caller} does not reach {other_base}: each file's anonymous Mixed has its own base"
+        );
+    }
+    let loads: Vec<bool> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Load")
+        .map(|f| f.is_defined)
+        .collect();
+    assert_eq!(
+        loads,
+        [false, true],
+        "Load(cfg1::Config *) and Load(cfg2::Config *) are two functions"
+    );
+    for caller in ["FireHeaderImpl", "Dispatch"] {
+        let targets: Vec<(bool, String)> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(program, e.caller) == caller
+                    && fn_name(program, e.callee) == "HeaderImpl::Fire"
+            })
+            .map(|e| {
+                let f = program.symbols.function(e.callee);
+                (f.is_defined, file_name_of(program, f))
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            [(true, "other.cpp".to_owned())],
+            "{caller} reaches the body other.cpp defines for a header's anonymous class"
+        );
+    }
+    assert!(has_any_edge(program, analysis, "Respelled", "OnRespelled"));
+    assert_eq!(
+        callee_files("FireOwnOpen", "Open::Fire"),
+        ["anonymous.cpp"],
+        "an anonymous receiver reaches its own class"
+    );
+    assert!(
+        must_not_have_edge(program, analysis, "FireOwnOpen", "OpenSub::Fire"),
+        "not a subclass of an external class of its name"
+    );
+    for (caller, callee) in [
+        ("FireOpen", "OpenSub::Fire"),
+        ("FireSealed", "SealedSub::Fire"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, callee),
+            "{caller} -> {callee}: another file's anonymous class of the name does not stop dispatch"
+        );
+    }
+    assert_eq!(
+        callee_files("Dispatch", "Impl::Fire"),
+        ["anonymous.cpp", "other.cpp"],
+        "a call through the base reaches every file's override"
+    );
+    // Overloads stay two functions, each with its own body.
+    for (arity, callee, other) in [(1, "OnOne", "OnTwo"), (2, "OnTwo", "OnOne")] {
+        let callees: Vec<String> =
+            overload_callees(program, analysis, "Overloaded::Work", Some(arity))
+                .into_iter()
+                .map(|id| fn_name(program, id))
+                .collect();
+        assert!(
+            callees.iter().any(|c| c == callee) && !callees.iter().any(|c| c == other),
+            "Overloaded::Work of arity {arity} calls {callee} only: {callees:?}"
+        );
+    }
+    assert_eq!(
+        overload_callee_arities(program, analysis, "DriveOverloads", None),
+        [Some(1), Some(2)],
+        "one call per overload"
+    );
+}
+
+#[test]
+fn cpp_inherited_template_return_uses_base_declaration_scope() {
+    let (p, a) = cpp_issue113();
+    for caller in [
+        "inherited_outside",
+        "caller_scope::inherited_elsewhere",
+        "inherited_nested",
+    ] {
+        assert!(
+            has_any_edge(p, a, caller, "base_scope::Widget::Start"),
+            "{caller}"
+        );
+        assert!(!has_any_edge(p, a, caller, "Widget::Start"));
+        assert!(!has_any_edge(p, a, caller, "caller_scope::Widget::Start"));
+    }
+}
+
+#[test]
+fn cpp_inherited_template_return_keeps_dependent_arguments_unknown() {
+    let (p, a) = cpp_issue113();
+    assert!(has_any_edge(
+        p,
+        a,
+        "DependentDerived::Run",
+        "base_scope::ScopedHolder::Get"
+    ));
+    assert!(!has_any_edge(
+        p,
+        a,
+        "DependentDerived::Run",
+        "DependentType::Start"
+    ));
+}
+
+#[test]
+fn cpp_inherited_template_return_uses_enclosing_class_scope() {
+    let (p, a) = cpp_issue113();
+    assert!(has_any_edge(
+        p,
+        a,
+        "inherited_class_scope",
+        "OuterScope::Widget::Start"
+    ));
+    assert!(!has_any_edge(
+        p,
+        a,
+        "inherited_class_scope",
+        "Widget::Start"
+    ));
+}
+
+#[test]
+fn cpp_template_return_resolves_partially_qualified_bases() {
+    let (p, a) = cpp_issue113();
+    for caller in ["partial_base::scoped", "imported_base::imported"] {
+        assert!(
+            has_any_edge(p, a, caller, "partial_base::hardware::Holder::Get"),
+            "{caller} base member"
+        );
+        assert!(
+            has_any_edge(p, a, caller, "partial_base::hardware::Widget::Start"),
+            "{caller} return"
+        );
+    }
+}
+
+#[test]
+fn relative_qualified_callee_in_enclosing_namespace_and_using_directive() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_relative_qual_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("connection.h"),
+        r#"
+namespace OHOS {
+namespace Runtime {
+namespace Utils {
+void RemoveConn(long id);
+}
+}
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a_conn.cpp"),
+        r#"
+#include "connection.h"
+namespace OHOS {
+namespace Runtime {
+namespace Utils {
+void RemoveConn(long id) {}
+}
+void CallerA() {
+    Utils::RemoveConn(1);
+}
+}
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b_manager.cpp"),
+        r#"
+#include "connection.h"
+using namespace OHOS::Runtime;
+namespace OHOS {
+namespace Manager {
+void CallerB() {
+    Utils::RemoveConn(2);
+}
+}
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let target_fn = program
+        .symbols
+        .resolve_function("OHOS::Runtime::Utils::RemoveConn")
+        .expect("resolved RemoveConn");
+    let func = program.symbols.function(target_fn);
+    assert!(func.is_defined);
+    assert_eq!(
+        &program.symbols.files[func.file.0 as usize].path,
+        root.join("a_conn.cpp").as_path()
+    );
+
+    let (_pag, analysis) = analyze(&program);
+    let callers = ["OHOS::Runtime::CallerA", "OHOS::Manager::CallerB"];
+    for caller in callers {
+        let caller_id = program
+            .symbols
+            .resolve_function(caller)
+            .unwrap_or_else(|| panic!("missing {caller}"));
+        let callees: Vec<FnId> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| e.caller == caller_id && e.resolution == ResolutionKind::Direct)
+            .map(|e| e.callee)
+            .collect();
+        assert_eq!(
+            callees,
+            vec![target_fn],
+            "{caller} must resolve directly to OHOS::Runtime::Utils::RemoveConn"
+        );
+    }
+}
+
+#[test]
+fn cpp_template_base_keeps_arguments_on_their_own_nested_class() {
+    let (p, _) = cpp_issue113();
+    let bases = p.template_bases_of("NestedDerived");
+    assert_eq!(bases.len(), 1);
+    assert_eq!(bases[0].spelling, "NestedBase<int>::Inner<double>");
+}
+
+#[test]
+fn cpp_template_return_uses_smart_pointer_pointee_arguments() {
+    let (p, a) = cpp_issue113();
+    for caller in ["arrow_return::custom", "standard_arrow"] {
+        assert!(
+            has_any_edge(p, a, caller, "arrow_return::Holder::Get"),
+            "{caller} member"
+        );
+        assert!(
+            has_any_edge(p, a, caller, "arrow_return::Service::Start"),
+            "{caller} return"
+        );
+    }
+}
+
+#[test]
+fn distinct_definitions_indexed_separately_and_context_aware_call_resolution() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_distinct_defs_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+namespace Ns {
+void Common(int x);
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a_first.cpp"),
+        r#"
+#include "common.h"
+namespace Ns {
+void Common(int x) {}
+void CallInA() { Common(1); }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b_second.cpp"),
+        r#"
+#include "common.h"
+namespace Ns {
+void Common(int x) {}
+void CallInB() { Common(2); }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("c_manager.cpp"),
+        r#"
+#include "common.h"
+namespace Ns {
+void CallInC() { Common(3); }
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let defs: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Ns::Common" && f.is_defined)
+        .collect();
+    assert_eq!(defs.len(), 2, "both definitions must be indexed separately");
+    let fn_a = defs
+        .iter()
+        .find(|f| program.symbols.files[f.file.0 as usize].path == root.join("a_first.cpp"))
+        .unwrap()
+        .id;
+    let fn_b = defs
+        .iter()
+        .find(|f| program.symbols.files[f.file.0 as usize].path == root.join("b_second.cpp"))
+        .unwrap()
+        .id;
+
+    let (_pag, analysis) = analyze(&program);
+
+    let get_callees = |caller_name: &str| -> Vec<FnId> {
+        let caller_id = program
+            .symbols
+            .resolve_function(caller_name)
+            .unwrap_or_else(|| panic!("missing {caller_name}"));
+        analysis
+            .call_edges
+            .iter()
+            .filter(|e| e.caller == caller_id && e.resolution == ResolutionKind::Direct)
+            .map(|e| e.callee)
+            .collect()
+    };
+
+    // Caller in unit A resolves exclusively to definition in A:
+    assert_eq!(get_callees("Ns::CallInA"), vec![fn_a]);
+    // Caller in unit B resolves exclusively to definition in B:
+    assert_eq!(get_callees("Ns::CallInB"), vec![fn_b]);
+    // Caller in unit C (which saw only the header declaration) treats definitions as equal and resolves to both:
+    let mut callees_c = get_callees("Ns::CallInC");
+    callees_c.sort();
+    let mut expected_c = vec![fn_a, fn_b];
+    expected_c.sort();
+    assert_eq!(callees_c, expected_c);
+}
+
+#[test]
+fn regression_declaration_only_overload_ranking() {
+    // Comment 1: Ensure declaration-only exact-match overloads are not filtered out
+    // before overload ranking in favor of viable but worse-matching definitions.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_overload_decl_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("a.cpp"),
+        r#"
+void f(int x);
+void f(double x) {}
+void caller() {
+    f(1);
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.cpp"),
+        r#"
+void f(int x) {}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    let caller_id = program.symbols.resolve_function("caller").expect("caller");
+    let f_int_defs: Vec<FnId> = program
+        .symbols
+        .functions_named("f")
+        .into_iter()
+        .filter(|&id| {
+            let func = program.symbols.function(id);
+            func.is_defined
+                && func.params.len() == 1
+                && program.symbols.variable(func.params[0]).type_id == program.types.int()
+        })
+        .collect();
+    assert_eq!(f_int_defs.len(), 1, "f(int) definition must exist");
+    let f_double_defs: Vec<FnId> = program
+        .symbols
+        .functions_named("f")
+        .into_iter()
+        .filter(|&id| {
+            let func = program.symbols.function(id);
+            func.is_defined
+                && func.params.len() == 1
+                && program.symbols.variable(func.params[0]).type_id == program.types.double()
+        })
+        .collect();
+    assert_eq!(f_double_defs.len(), 1, "f(double) definition must exist");
+
+    let callees: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == caller_id && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(
+        callees, f_int_defs,
+        "caller must resolve to f(int), not f(double)"
+    );
+}
+
+#[test]
+fn regression_relative_qualified_candidates_shadowing() {
+    // Comment 4: Stop candidate search at the first enclosing scope that resolves the qualifier.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_shadow_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("test.cpp"),
+        r#"
+namespace Outer {
+namespace Utils {
+void Run(int x) {}
+}
+namespace Inner {
+namespace Utils {
+void Run(int x) {}
+}
+void Caller() {
+    Utils::Run(1);
+}
+}
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    let caller_id = program
+        .symbols
+        .resolve_function("Outer::Inner::Caller")
+        .expect("caller");
+    let inner_run = program
+        .symbols
+        .resolve_function("Outer::Inner::Utils::Run")
+        .expect("inner Run");
+    let outer_run = program
+        .symbols
+        .resolve_function("Outer::Utils::Run")
+        .expect("outer Run");
+
+    let callees: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == caller_id && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert!(
+        callees.contains(&inner_run),
+        "caller must resolve to Outer::Inner::Utils::Run"
+    );
+    assert!(
+        !callees.contains(&outer_run),
+        "caller must NOT resolve to shadowed Outer::Utils::Run"
+    );
+}
+
+fn check_header_helper(with_compile_commands: bool) {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_header_helper_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+void Target();
+static void Helper() {
+    Target();
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a.cpp"),
+        r#"
+#include "common.h"
+void Target() {}
+void CallerA() {
+    Helper();
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.cpp"),
+        r#"
+#include "common.h"
+void Target() {}
+void CallerB() {
+    Helper();
+}
+"#,
+    )
+    .unwrap();
+    if with_compile_commands {
+        std::fs::write(
+            root.join("compile_commands.json"),
+            serde_json::json!([
+                {"directory": root, "file": "a.cpp", "arguments": ["c++", "-c", "a.cpp"]},
+                {"directory": root, "file": "b.cpp", "arguments": ["c++", "-c", "b.cpp"]}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let defs: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Target" && f.is_defined)
+        .collect();
+    assert_eq!(defs.len(), 2, "both Target definitions must exist");
+    let fn_a = defs
+        .iter()
+        .find(|f| program.symbols.files[f.file.0 as usize].path == root.join("a.cpp"))
+        .unwrap()
+        .id;
+    let fn_b = defs
+        .iter()
+        .find(|f| program.symbols.files[f.file.0 as usize].path == root.join("b.cpp"))
+        .unwrap()
+        .id;
+
+    let (_pag, analysis) = analyze(&program);
+
+    for edge in &analysis.call_edges {
+        assert!(
+            program.symbols.function_by_id(edge.caller).is_some(),
+            "edge caller {:?} must exist in program.symbols",
+            edge.caller
+        );
+        assert!(
+            program.symbols.function_by_id(edge.callee).is_some(),
+            "edge callee {:?} must exist in program.symbols",
+            edge.callee
+        );
+    }
+
+    let a_file_id = program
+        .symbols
+        .files
+        .iter()
+        .position(|f| f.path == root.join("a.cpp"))
+        .map(|i| trace_ir::FileId(i as u32))
+        .unwrap();
+    let b_file_id = program
+        .symbols
+        .files
+        .iter()
+        .position(|f| f.path == root.join("b.cpp"))
+        .map(|i| trace_ir::FileId(i as u32))
+        .unwrap();
+
+    // Call site from Helper in TU a.cpp has span.file pointing to common.h via LineMap, but tu = a.cpp:
+    let cs_target_a = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|cs| cs.tu == Some(a_file_id) && cs.callee_name == "Target")
+        .unwrap();
+    assert_eq!(
+        program.symbols.files[cs_target_a.span.file.0 as usize].path,
+        root.join("common.h"),
+        "call site inside Helper must have span.file pointing to common.h via LineMap"
+    );
+    assert_eq!(
+        program.symbols.callees_of(cs_target_a),
+        vec![fn_a],
+        "Helper call site in TU a.cpp must resolve exclusively to Target in a.cpp"
+    );
+
+    let edge_a: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.call_site == cs_target_a.id && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(edge_a, vec![fn_a]);
+
+    // Call site from Helper in TU b.cpp has span.file pointing to common.h via LineMap, but tu = b.cpp:
+    let cs_target_b = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|cs| cs.tu == Some(b_file_id) && cs.callee_name == "Target")
+        .unwrap();
+    assert_eq!(
+        program.symbols.files[cs_target_b.span.file.0 as usize].path,
+        root.join("common.h"),
+        "call site inside Helper must have span.file pointing to common.h via LineMap"
+    );
+    assert_eq!(
+        program.symbols.callees_of(cs_target_b),
+        vec![fn_b],
+        "Helper call site in TU b.cpp must resolve exclusively to Target in b.cpp"
+    );
+
+    let edge_b: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.call_site == cs_target_b.id && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(edge_b, vec![fn_b]);
+
+    let helpers: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Helper")
+        .collect();
+    assert_eq!(helpers.len(), 1, "identical header definitions are shared");
+    let helper = helpers[0].id;
+    for name in ["CallerA", "CallerB"] {
+        let caller = program.symbols.resolve_function(name).unwrap();
+        let edges: Vec<_> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| e.caller == caller)
+            .map(|e| e.callee)
+            .collect();
+        assert_eq!(edges, vec![helper]);
+    }
+    let mut targets: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == helper)
+        .map(|e| e.callee)
+        .collect();
+    targets.sort();
+    let mut expected = vec![fn_a, fn_b];
+    expected.sort();
+    assert_eq!(
+        targets, expected,
+        "sharing retains both TU-specific bindings"
+    );
+}
+
+#[test]
+fn regression_call_inside_header_helper_resolves_to_local_def() {
+    // Comment 2: Header-static function calling external function resolves exclusively
+    // to the local definition in the translation unit containing the call.
+    check_header_helper(true);
+    check_header_helper(false);
+}
+
+fn check_header_callback_initializer(with_compile_commands: bool) {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_header_cb_init_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+static void callback() {}
+static void (*handler)() = callback;
+static void helper() {
+    handler();
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a.cpp"),
+        r#"
+#include "common.h"
+void caller_a() {
+    helper();
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.cpp"),
+        r#"
+#include "common.h"
+void caller_b() {
+    helper();
+}
+"#,
+    )
+    .unwrap();
+    if with_compile_commands {
+        std::fs::write(
+            root.join("compile_commands.json"),
+            serde_json::json!([
+                {"directory": root, "file": "a.cpp", "arguments": ["c++", "-c", "a.cpp"]},
+                {"directory": root, "file": "b.cpp", "arguments": ["c++", "-c", "b.cpp"]}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    for edge in &analysis.call_edges {
+        assert!(
+            program.symbols.function_by_id(edge.caller).is_some(),
+            "caller {:?} must exist in symbols",
+            edge.caller
+        );
+        assert!(
+            program.symbols.function_by_id(edge.callee).is_some(),
+            "callee {:?} must exist in symbols",
+            edge.callee
+        );
+    }
+
+    let helpers: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "helper" && f.is_defined)
+        .collect();
+    assert_eq!(helpers.len(), 1);
+    let helper = helpers[0].id;
+    let callbacks: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "callback" && f.is_defined)
+        .collect();
+    assert_eq!(callbacks.len(), 1);
+    let expected = vec![callbacks[0].id];
+    assert_each_site_of_targets(&program, &analysis, helper, &expected);
+}
+
+/// Every call site in `helper` resolves to exactly `expected` (sorted). Each
+/// TU retains its own mutable callback storage, and both stores must remain
+/// initialized even though their function targets are shared.
+fn assert_each_site_of_targets(
+    program: &Program,
+    analysis: &AnalysisResult,
+    helper: FnId,
+    expected: &[FnId],
+) {
+    let sites: Vec<_> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|s| s.caller == helper)
+        .collect();
+    assert!(!sites.is_empty());
+    for site in sites {
+        let mut targets: Vec<_> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| e.call_site == site.id)
+            .map(|e| e.callee)
+            .collect();
+        targets.sort();
+        assert_eq!(targets, expected);
+    }
+}
+
+fn check_header_array_callback_initializer(with_compile_commands: bool) {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_header_arr_cb_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+static void cb0() {}
+static void cb1() {}
+static void (*handlers[])() = { cb0, cb1 };
+static void helper(int idx) {
+    handlers[idx]();
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a.cpp"),
+        r#"
+#include "common.h"
+void caller_a() {
+    helper(0);
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.cpp"),
+        r#"
+#include "common.h"
+void caller_b() {
+    helper(1);
+}
+"#,
+    )
+    .unwrap();
+    if with_compile_commands {
+        std::fs::write(
+            root.join("compile_commands.json"),
+            serde_json::json!([
+                {"directory": root, "file": "a.cpp", "arguments": ["c++", "-c", "a.cpp"]},
+                {"directory": root, "file": "b.cpp", "arguments": ["c++", "-c", "b.cpp"]}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    for edge in &analysis.call_edges {
+        assert!(
+            program.symbols.function_by_id(edge.caller).is_some(),
+            "caller {:?} must exist in symbols",
+            edge.caller
+        );
+        assert!(
+            program.symbols.function_by_id(edge.callee).is_some(),
+            "callee {:?} must exist in symbols",
+            edge.callee
+        );
+    }
+
+    let helpers: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "helper" && f.is_defined)
+        .collect();
+    assert_eq!(helpers.len(), 1);
+    let helper = helpers[0].id;
+    let mut expected = Vec::new();
+    for name in ["cb0", "cb1"] {
+        let callbacks: Vec<_> = program
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == name && f.is_defined)
+            .collect();
+        assert_eq!(callbacks.len(), 1);
+        expected.push(callbacks[0].id);
+    }
+    expected.sort();
+    assert_each_site_of_targets(&program, &analysis, helper, &expected);
+}
+
+fn check_header_struct_callback_initializer(with_compile_commands: bool) {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_header_struct_cb_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+struct Ops {
+    void (*fn)();
+};
+static void callback() {}
+static Ops ops = { callback };
+static void helper() {
+    ops.fn();
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a.cpp"),
+        r#"
+#include "common.h"
+void caller_a() {
+    helper();
+}
+"#,
+    )
+    .unwrap();
+    if with_compile_commands {
+        std::fs::write(
+            root.join("compile_commands.json"),
+            serde_json::json!([
+                {"directory": root, "file": "a.cpp", "arguments": ["c++", "-c", "a.cpp"]}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let helper = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "helper" && f.is_defined)
+        .unwrap()
+        .id;
+    let callback = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "callback" && f.is_defined)
+        .unwrap()
+        .id;
+
+    let edges: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == helper)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(
+        edges,
+        vec![callback],
+        "helper must resolve struct member indirect call to callback"
+    );
+}
+
+#[test]
+fn regression_header_callback_initializer_scalar() {
+    check_header_callback_initializer(true);
+    check_header_callback_initializer(false);
+}
+
+#[test]
+fn regression_header_callback_initializer_array() {
+    check_header_array_callback_initializer(true);
+    check_header_array_callback_initializer(false);
+}
+
+#[test]
+fn regression_header_callback_initializer_struct() {
+    check_header_struct_callback_initializer(true);
+    check_header_struct_callback_initializer(false);
+}
+
+#[test]
+fn regression_call_return_dataflow_isolation_across_tus() {
+    // Comment 7: Align CallReturn dataflow expansion with translation-unit call resolution.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_call_return_iso_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+int* GetPtr();
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a.cpp"),
+        r#"
+#include "common.h"
+static int val_a = 10;
+int* GetPtr() {
+    return &val_a;
+}
+void CallerA() {
+    int* p = GetPtr();
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.cpp"),
+        r#"
+#include "common.h"
+static int val_b = 20;
+int* GetPtr() {
+    return &val_b;
+}
+void CallerB() {
+    int* q = GetPtr();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (pag, analysis) = trace_analysis::analyze_with_options(
+        &program,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+
+    let val_a_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "val_a")
+        .unwrap()
+        .id;
+    let val_b_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "val_b")
+        .unwrap()
+        .id;
+    let p_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "p")
+        .unwrap()
+        .id;
+    let q_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "q")
+        .unwrap()
+        .id;
+
+    let val_a_loc = pag.var_location[&val_a_var];
+    let val_b_loc = pag.var_location[&val_b_var];
+    let p_node = pag.var_node[&p_var];
+    let q_node = pag.var_node[&q_var];
+
+    let p_pts = analysis.points_to.get(&p_node);
+    let q_pts = analysis.points_to.get(&q_node);
+
+    assert!(
+        p_pts.is_some_and(|pts| pts.contains(&val_a_loc)),
+        "p must point to val_a"
+    );
+    assert!(
+        !p_pts.is_some_and(|pts| pts.contains(&val_b_loc)),
+        "p must NOT receive return flow from b.cpp (val_b)"
+    );
+
+    assert!(
+        q_pts.is_some_and(|pts| pts.contains(&val_b_loc)),
+        "q must point to val_b"
+    );
+    assert!(
+        !q_pts.is_some_and(|pts| pts.contains(&val_a_loc)),
+        "q must NOT receive return flow from a.cpp (val_a)"
+    );
+}
+
+#[test]
+fn regression_shape_equivalence_param_types_across_tus() {
+    // Comment 6: Compare parameter types by shape equivalence rather than raw TypeId equality.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_shape_eq_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+typedef int MyInt;
+void Process(MyInt x);
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a.cpp"),
+        r#"
+#include "common.h"
+void Process(int x) {}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.cpp"),
+        r#"
+#include "common.h"
+void Caller() {
+    Process(42);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    let caller_id = program.symbols.resolve_function("Caller").unwrap();
+    let process_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "Process" && f.is_defined)
+        .unwrap()
+        .id;
+
+    let callees: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == caller_id && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(
+        callees,
+        vec![process_fn],
+        "Caller in b.cpp must resolve to Process in a.cpp via shape equivalence"
+    );
+}
+
+#[test]
+fn regression_transitive_return_flow_call_tu_isolation() {
+    // Review Comment 1: Align ReturnFlow::Call dataflow expansion with translation-unit call resolution.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_transitive_return_iso_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+int* GetPtr();
+int* Forward();
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("a.cpp"),
+        r#"
+#include "common.h"
+static int val_a = 10;
+int* GetPtr() {
+    return &val_a;
+}
+int* Forward() {
+    return GetPtr();
+}
+void CallerA() {
+    int* p = Forward();
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.cpp"),
+        r#"
+#include "common.h"
+static int val_b = 20;
+int* GetPtr() {
+    return &val_b;
+}
+int* Forward() {
+    return GetPtr();
+}
+void CallerB() {
+    int* q = Forward();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (pag, analysis) = trace_analysis::analyze_with_options(
+        &program,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+
+    let val_a_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "val_a")
+        .unwrap()
+        .id;
+    let val_b_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "val_b")
+        .unwrap()
+        .id;
+    let p_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "p")
+        .unwrap()
+        .id;
+    let q_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "q")
+        .unwrap()
+        .id;
+
+    let val_a_loc = pag.var_location[&val_a_var];
+    let val_b_loc = pag.var_location[&val_b_var];
+    let p_node = pag.var_node[&p_var];
+    let q_node = pag.var_node[&q_var];
+
+    let p_pts = analysis.points_to.get(&p_node);
+    let q_pts = analysis.points_to.get(&q_node);
+
+    assert!(
+        p_pts.is_some_and(|pts| pts.contains(&val_a_loc)),
+        "p must point to val_a via transitive ReturnFlow::Call"
+    );
+    assert!(
+        !p_pts.is_some_and(|pts| pts.contains(&val_b_loc)),
+        "p must NOT receive points-to from b.cpp (val_b) via ReturnFlow::Call"
+    );
+
+    assert!(
+        q_pts.is_some_and(|pts| pts.contains(&val_b_loc)),
+        "q must point to val_b via transitive ReturnFlow::Call"
+    );
+    assert!(
+        !q_pts.is_some_and(|pts| pts.contains(&val_a_loc)),
+        "q must NOT receive points-to from a.cpp (val_a) via ReturnFlow::Call"
+    );
+}
+
+#[test]
+fn regression_relative_qualified_template_callee() {
+    // Review Comment 2: Avoid treating relative qualified template calls like Utils::Run<int>(x) as bare callee nodes.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_rel_qual_tmpl_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("test.cpp"),
+        r#"
+namespace Ns {
+    struct Utils {
+        template <typename T>
+        static void Run(T x);
+    };
+    template <typename T>
+    void Utils::Run(T x) {}
+
+    void Caller() {
+        Utils::Run<int>(42);
+    }
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let caller_id = program.symbols.resolve_function("Ns::Caller").unwrap();
+    let run_id = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "Ns::Utils::Run" && f.is_defined)
+        .expect("Ns::Utils::Run definition must exist")
+        .id;
+
+    let callees: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == caller_id && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(
+        callees,
+        vec![run_id],
+        "Utils::Run<int>(42) inside namespace Ns must resolve to Ns::Utils::Run"
+    );
+}
+
+#[test]
+fn regression_in_class_member_decl_dedup_against_definition() {
+    // Review Comment 3: Account for explicit_arity in has_same_signature for in-class member declarations.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_in_class_dedup_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("worker.h"),
+        r#"
+#pragma once
+struct Worker {
+    static void Work(int a, int b);
+};
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("worker.cpp"),
+        r#"
+#include "worker.h"
+void Worker::Work(int a, int b) {}
+void Trigger() {
+    Worker::Work(1, 2);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let trigger_id = program.symbols.resolve_function("Trigger").unwrap();
+    let work_def = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "Worker::Work" && f.is_defined)
+        .expect("Worker::Work definition must exist")
+        .id;
+
+    let callees: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == trigger_id && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert_eq!(
+        callees,
+        vec![work_def],
+        "Call to Worker::Work must resolve solely to definition, filtering out prototype declaration"
+    );
+}
+
+#[test]
+fn regression_cross_tu_member_fn_implicit_this_and_explicit_arity() {
+    // Review Comment 4: Account for implicit this and parameterless prototypes in resolve_equal_defs.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_member_cross_tu_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("calc.h"),
+        r#"
+#pragma once
+struct Calculator {
+    int Compute(int x);
+    void Reset();
+};
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("calc.cpp"),
+        r#"
+#include "calc.h"
+int Calculator::Compute(int x) { return x * 2; }
+void Calculator::Reset() {}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("user.cpp"),
+        r#"
+#include "calc.h"
+void User(Calculator* c) {
+    c->Compute(10);
+    c->Reset();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let user_id = program.symbols.resolve_function("User").unwrap();
+    let compute_def = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "Calculator::Compute" && f.is_defined)
+        .expect("Calculator::Compute definition")
+        .id;
+    let reset_def = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "Calculator::Reset" && f.is_defined)
+        .expect("Calculator::Reset definition")
+        .id;
+
+    let callees: Vec<FnId> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.caller == user_id && e.resolution == ResolutionKind::Direct)
+        .map(|e| e.callee)
+        .collect();
+    assert!(
+        callees.contains(&compute_def),
+        "User call to c->Compute must resolve across TUs to Calculator::Compute definition"
+    );
+    assert!(
+        callees.contains(&reset_def),
+        "User call to c->Reset must resolve across TUs to Calculator::Reset definition"
+    );
+}
+
+#[test]
+fn regression_merge_c_and_cpp_def_order_symmetric() {
+    // Review Comment 5: Symmetrize is_incompatible_def check across C and C++ definitions to avoid merge-order non-determinism.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_c_cpp_order_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("impl_cpp.cpp"),
+        r#"
+extern "C" void SharedTask() {}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("impl_c.c"),
+        r#"
+void SharedTask() {}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    assert!(
+        program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "SharedTask"),
+        "SharedTask should be indexed without error"
+    );
+}
+
+#[test]
+fn regression_bind_calls_past_this_shape_aware() {
+    // Review Comment 6: Update bind_calls_past_this to call program.callees_of(cs) to preserve shape-aware type equivalence.
+    let dir = tempfile::Builder::new()
+        .prefix("trace_bind_past_this_shape_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("common.h"),
+        r#"
+#pragma once
+struct Service {
+    typedef int RequestId;
+    void Handle(RequestId req, int flags);
+};
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("service.cpp"),
+        r#"
+#include "common.h"
+void Service::Handle(int req, int flags) {}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("caller.cpp"),
+        r#"
+#include "common.h"
+void Dispatch(Service* s) {
+    s->Handle(101, 1);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let cs = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|c| c.callee_name.contains("Handle"))
+        .expect("Handle call site must exist");
+    assert!(
+        cs.args_bound_past_this,
+        "Call site to Service::Handle must have args_bound_past_this set via shape-aware callees_of"
+    );
+}
+
+// --- cpp_smart_pointer_value_flow: value flow through wrappers (#141) ---
+
+analyzed_fixture!(
+    /// The `cpp_smart_pointer_value_flow` fixture, analysed once.
+    cpp_smart_pointer_value_flow
+);
+
+/// Facts lowered into function `func`, by their destination's owner.
+fn flows_in<'a>(
+    program: &'a Program,
+    func: &str,
+) -> impl Iterator<Item = &'a trace_ir::FlowConstraint> {
+    let fn_id = common::only_function(program, func);
+    program.flow.iter().filter(move |flow| {
+        let dst = flow.vars().next().expect("every fact names a destination");
+        program.symbols.variable(dst).fn_id == Some(fn_id)
+    })
+}
+
+/// `(src, dst)` of every `UnwrapPointer` in `func`.
+fn unwraps_in(program: &Program, func: &str) -> Vec<(trace_ir::VarId, trace_ir::VarId)> {
+    flows_in(program, func)
+        .filter_map(|flow| match *flow {
+            trace_ir::FlowConstraint::UnwrapPointer { dst, src } => Some((src, dst)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether the lowered facts carry a value from `from` to `to`, following
+/// copies, unwraps, field projections and loads forward.
+fn value_reaches(program: &Program, from: trace_ir::VarId, to: trace_ir::VarId) -> bool {
+    use trace_ir::FlowConstraint as F;
+    let mut seen = std::collections::HashSet::from([from]);
+    let mut stack = vec![from];
+    while let Some(cur) = stack.pop() {
+        if cur == to {
+            return true;
+        }
+        for flow in &program.flow {
+            let next = match *flow {
+                F::Copy { dst, src } | F::Load { dst, src } | F::UnwrapPointer { dst, src }
+                    if src == cur =>
+                {
+                    dst
+                }
+                F::GepField { dst, base, .. } if base == cur => dst,
+                _ => continue,
+            };
+            if seen.insert(next) {
+                stack.push(next);
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn smart_pointer_flow_reaches_fields_through_the_wrapper_value() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let input = common::local_variable(program, "read", "input");
+    let sp = common::local_variable(program, "read", "sp");
+    let value = common::local_variable(program, "read", "value");
+    assert!(
+        unwraps_in(program, "read")
+            .iter()
+            .any(|&(src, _)| src == sp),
+        "sp->field unwraps sp itself"
+    );
+    assert!(value_reaches(program, input, value), "input -> sp -> value");
+}
+
+#[test]
+fn smart_pointer_flow_keeps_the_pointee_callback_summary() {
+    // Regression guard: passes before #141 through the type-keyed summary.
+    let (program, analysis) = cpp_smart_pointer_value_flow();
+    assert!(has_any_edge(program, analysis, "read", "PayloadTarget"));
+}
+
+#[test]
+fn smart_pointer_flow_loads_a_wrapper_member_before_unwrapping_it() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    for (func, result, unwraps) in [
+        ("nested", "nested_value", 1),
+        ("nested_dot", "dot_value", 1),
+        ("twice", "twice_value", 2),
+        ("deref_dot", "deref_dot_value", 1),
+        ("deref_twice", "deref_twice_value", 2),
+    ] {
+        let h = common::local_variable(program, func, "h");
+        let found = unwraps_in(program, func);
+        assert_eq!(
+            found.len(),
+            unwraps,
+            "{func}: one unwrap per overloaded arrow"
+        );
+        // The unwrap into the `Payload` receiver reads the loaded `item`
+        // value, never the holder.
+        let (item_value, _) = *found.last().expect("an unwrap");
+        assert_ne!(item_value, h, "{func}: the holder is not the wrapper");
+        assert!(
+            flows_in(program, func).any(|flow| matches!(
+                flow,
+                trace_ir::FlowConstraint::GepField { field_name, .. } if field_name == "item"
+            )),
+            "{func}: the path keeps its item prefix"
+        );
+        assert!(
+            flows_in(program, func).any(|flow| matches!(
+                *flow,
+                trace_ir::FlowConstraint::Load { dst, .. } if dst == item_value
+            )),
+            "{func}: the unwrapped item is a loaded value"
+        );
+        let result = common::local_variable(program, func, result);
+        assert!(value_reaches(program, h, result), "{func}: h -> {result:?}");
+    }
+}
+
+#[test]
+fn smart_pointer_flow_method_call_leaves_no_receiver() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let fn_id = common::only_function(program, "method_probe");
+    assert!(unwraps_in(program, "method_probe").is_empty());
+    assert!(
+        !program
+            .symbols
+            .variables
+            .iter()
+            .any(|v| v.fn_id == Some(fn_id) && v.name.starts_with('_')),
+        "no temporaries for a method call"
+    );
+}
+
+/// Write `files` under a fresh temporary root and build it.
+fn build_tree(
+    files: &[(&str, &str)],
+    opts: impl Fn(&std::path::Path) -> trace_preproc::PreprocessOptions,
+) -> (tempfile::TempDir, Program) {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, text) in files {
+        std::fs::write(dir.path().join(name), text).unwrap();
+    }
+    let program = build_program(dir.path(), &opts(dir.path())).expect("build");
+    (dir, program)
+}
+
+/// Every unwrap names live variables of one function; returns that function
+/// per unwrap.
+fn unwrap_owners(program: &Program) -> Vec<FnId> {
+    program
+        .flow
+        .iter()
+        .filter_map(|flow| match *flow {
+            trace_ir::FlowConstraint::UnwrapPointer { dst, src } => {
+                let dst = program.symbols.variable_by_id(dst).expect("live receiver");
+                let src = program.symbols.variable_by_id(src).expect("live source");
+                assert_eq!(dst.fn_id, src.fn_id, "an unwrap stays in one function");
+                assert!(dst.name.starts_with("_recv"), "{}", dst.name);
+                dst.fn_id
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+const SMART_PAYLOAD: &str = "struct Payload { void (*cb)(); };\n";
+
+#[test]
+fn smart_pointer_flow_shared_header_unwrap_merges_once() {
+    let header =
+        format!("{SMART_PAYLOAD}inline void Touch(std::shared_ptr<Payload> sp) {{ sp->cb(); }}\n");
+    let (_dir, program) = build_tree(
+        &[
+            ("payload.h", &header),
+            ("a.cpp", "#include \"payload.h\"\nvoid UseA() {}\n"),
+            ("b.cpp", "#include \"payload.h\"\nvoid UseB() {}\n"),
+        ],
+        default_opts,
+    );
+    let touch = common::only_function(&program, "Touch");
+    assert_eq!(
+        unwrap_owners(&program),
+        [touch],
+        "one remapped unwrap for the shared body"
+    );
+}
+
+#[test]
+fn smart_pointer_flow_explored_variants_keep_their_own_receivers() {
+    let source = format!(
+        "{SMART_PAYLOAD}#if defined(FEATURE_ALPHA)\nvoid Alpha(std::shared_ptr<Payload> sp) {{ sp->cb(); }}\n#else\nvoid Beta(std::shared_ptr<Payload> sp) {{ sp->cb(); }}\n#endif\n"
+    );
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "BUILD.gn",
+                "config(\"c\") { defines = [ \"FEATURE_ALPHA\" ] }\n",
+            ),
+            ("main.cpp", &source),
+        ],
+        |_| {
+            trace_preproc::PreprocessOptions::new()
+                .with_explore(true)
+                .with_explore_budget(4)
+        },
+    );
+    let mut owners = unwrap_owners(&program);
+    owners.sort();
+    let mut expected = vec![
+        common::only_function(&program, "Alpha"),
+        common::only_function(&program, "Beta"),
+    ];
+    expected.sort();
+    assert_eq!(owners, expected, "one receiver per variant's body");
+}
+
+#[test]
+fn smart_pointer_flow_summaries_stay_in_their_link_target() {
+    // Regression guard: each image's receivers read its own `Payload.cb`
+    // summary, so `A` and `B` never see each other's callback.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("payload.h"), SMART_PAYLOAD).unwrap();
+    let mut compiles = Vec::new();
+    let mut links = Vec::new();
+    for image in ["A", "B"] {
+        let name = image.to_lowercase();
+        std::fs::write(
+            root.join(format!("{name}.cpp")),
+            format!(
+                "#include \"payload.h\"\nvoid Target{image}() {{}}\nvoid Set{image}(Payload *p) {{ p->cb = Target{image}; }}\nvoid Read{image}(std::shared_ptr<Payload> sp) {{ sp->cb(); }}\n"
+            ),
+        )
+        .unwrap();
+        compiles.push(serde_json::json!({"directory": root, "file": format!("{name}.cpp"), "output": format!("{name}.o"), "arguments": ["c++", "-c", format!("{name}.cpp"), "-o", format!("{name}.o")]}));
+        links.push(serde_json::json!({"directory": root, "output": name, "arguments": ["c++", format!("{name}.o"), "-o", name]}));
+    }
+    std::fs::write(
+        root.join("compile_commands.json"),
+        serde_json::json!(compiles).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("link_commands.json"),
+        serde_json::json!(links).to_string(),
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "ReadA", "TargetA"));
+    assert!(has_any_edge(&program, &analysis, "ReadB", "TargetB"));
+    assert!(must_not_have_edge(&program, &analysis, "ReadA", "TargetB"));
+    assert!(must_not_have_edge(&program, &analysis, "ReadB", "TargetA"));
+}
+
+#[test]
+fn smart_pointer_promotion_result_aliases_the_receiver() {
+    let (program, analysis) = cpp_smart_pointer_value_flow();
+    // The call itself is recorded as before.
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "promote_local",
+        "std::weak_ptr::lock"
+    ));
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "promote_ohos",
+        "OHOS::wptr::promote"
+    ));
+    for (func, results) in [
+        ("promote_local", &["promoted", "promoted_value"][..]),
+        ("promote_assign", &["assigned", "assigned_value"]),
+        ("promote_ohos", &["strong"]),
+        ("promote_nested_ns", &["nested_strong"]),
+        ("promote_unnamed", &["unnamed"]),
+    ] {
+        let wp = common::local_variable(program, func, "wp");
+        for result in results {
+            let result_var = common::local_variable(program, func, result);
+            assert!(
+                value_reaches(program, wp, result_var),
+                "{func}: wp -> {result}"
+            );
+        }
+    }
+}
+
+#[test]
+fn smart_pointer_promotion_of_a_field_reads_the_loaded_weak_value() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    for (func, result) in [
+        ("promote_field", "field_promoted"),
+        ("promote_paren", "paren_promoted"),
+    ] {
+        let msg = common::local_variable(program, func, "msg");
+        let promoted = common::local_variable(program, func, result);
+        let weak_value = promotion_source(program, func, result);
+        assert_ne!(
+            weak_value, msg,
+            "{func}: the receiver is msg->weak, not msg"
+        );
+        assert!(
+            flows_in(program, func).any(|flow| matches!(
+                *flow,
+                trace_ir::FlowConstraint::Load { dst, .. } if dst == weak_value
+            )),
+            "{func}: the weak value is loaded from the field"
+        );
+        assert!(
+            value_reaches(program, msg, promoted),
+            "{func}: msg -> {result}"
+        );
+    }
+    let msg = common::local_variable(program, "promote_field", "msg");
+    let field_value = common::local_variable(program, "promote_field", "field_value");
+    assert!(value_reaches(program, msg, field_value));
+}
+
+#[test]
+fn smart_pointer_promotion_ignores_non_promotions() {
+    let (program, analysis) = cpp_smart_pointer_value_flow();
+    for (func, receiver, result) in [
+        ("mutex_lock", "m", "locked"),
+        ("promote_custom", "wp", "custom_strong"),
+        ("promote_with_arg", "wp", "with_arg"),
+    ] {
+        let receiver = common::local_variable(program, func, receiver);
+        let result_var = common::local_variable(program, func, result);
+        assert!(
+            !value_reaches(program, receiver, result_var),
+            "{func}: {result} must not alias the receiver"
+        );
+    }
+    // The defined wrapper's own member is still the call's target.
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "promote_custom",
+        "custom::wptr::promote"
+    ));
+}
+
+/// The source of the one receiver copy into `result` in `func`.
+fn promotion_source(program: &Program, func: &str, result: &str) -> trace_ir::VarId {
+    let result = common::local_variable(program, func, result);
+    let sources: Vec<_> = flows_in(program, func)
+        .filter_map(|flow| match *flow {
+            trace_ir::FlowConstraint::Copy { dst, src } if dst == result => Some(src),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sources.len(), 1, "{func}: one receiver copy");
+    sources[0]
+}
+
+#[test]
+fn smart_pointer_promotion_of_a_call_result_reads_the_returned_value() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let src = promotion_source(program, "promote_call_result", "call_promoted");
+    assert!(
+        flows_in(program, "promote_call_result").any(|flow| matches!(
+            flow,
+            trace_ir::FlowConstraint::CallReturn { dst, callee_name, .. }
+                if *dst == src && callee_name == "get_weak"
+        )),
+        "the receiver value is get_weak()'s result"
+    );
+}
+
+#[test]
+fn smart_pointer_promotion_of_a_dereferenced_member_reads_the_member() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let func = "promote_deref_field";
+    let h = common::local_variable(program, func, "h");
+    let promoted = common::local_variable(program, func, "deref_promoted");
+    assert!(
+        !flows_in(program, func)
+            .any(|flow| matches!(*flow, trace_ir::FlowConstraint::Load { src, .. } if src == h)),
+        "the holder is not loaded through"
+    );
+    assert!(
+        flows_in(program, func).any(|flow| matches!(
+            flow,
+            trace_ir::FlowConstraint::GepField { field_name, .. } if field_name == "weak"
+        )),
+        "the weak member is read"
+    );
+    assert!(value_reaches(program, h, promoted));
+}
+
+/// Issue #151: `(*get_weak_ptr()).lock()` loads through the call's
+/// result, as the receiver it promotes.
+#[test]
+fn smart_pointer_promotion_of_a_dereferenced_call_reads_the_returned_pointer() {
+    use trace_ir::FlowConstraint::{CallReturn, Load};
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let func = "promote_deref_call";
+    let src = promotion_source(program, func, "deref_call_promoted");
+    let returned: Vec<_> = flows_in(program, func)
+        .filter_map(|flow| match flow {
+            CallReturn {
+                dst, callee_name, ..
+            } if callee_name == "get_weak_ptr" => Some(*dst),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        flows_in(program, func).any(
+            |flow| matches!(*flow, Load { dst, src: from } if dst == src && returned.contains(&from))
+        ),
+        "the receiver is loaded through get_weak_ptr()'s result"
+    );
+}
+
+/// Issue #151: `wr` in `(*wr).lock()` is a reference to a pointer,
+/// bound to the pointer's value as `f(gp)` binds it, so the receiver is one
+/// load through `wr`.
+#[test]
+fn smart_pointer_promotion_of_a_dereferenced_reference_reads_through_it_once() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let func = "promote_deref_ref";
+    let wr = common::local_variable(program, func, "wr");
+    let src = promotion_source(program, func, "deref_ref_promoted");
+    let loads: Vec<_> = flows_in(program, func)
+        .filter(|flow| matches!(flow, trace_ir::FlowConstraint::Load { .. }))
+        .collect();
+    assert!(
+        matches!(loads[..], [trace_ir::FlowConstraint::Load { dst, src: from }] if *dst == src && *from == wr),
+        "{func}: {loads:?}"
+    );
+}
+
+/// Issue #151: `GetWeakPtr` in `(*obj->GetWeakPtr()).lock()` is a
+/// method, whose result nothing records, so there is no receiver value to
+/// promote: no fact, where a temporary with no input used to be copied.
+#[test]
+fn smart_pointer_promotion_of_a_dereferenced_method_result_emits_nothing() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let func = "promote_deref_member_call";
+    let facts: Vec<_> = flows_in(program, func).collect();
+    assert!(facts.is_empty(), "{func}: {facts:?}");
+}
+
+#[test]
+fn smart_pointer_promotion_of_a_reference_reads_through_it() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let weak = common::local_variable(program, "promote_ref", "weak");
+    let src = promotion_source(program, "promote_ref", "ref_strong");
+    assert!(
+        flows_in(program, "promote_ref").any(|flow| matches!(
+            *flow,
+            trace_ir::FlowConstraint::Load { dst, src: from } if dst == src && from == weak
+        )),
+        "the wptr the reference names is loaded, not the reference copied"
+    );
+}
+
+#[test]
+fn smart_pointer_promotion_stores_the_receiver_value_directly() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    for func in [
+        "promote_into_field",
+        "promote_into_field_paren",
+        "promote_into_deref",
+        "promote_into_deref_paren",
+    ] {
+        let wp = common::local_variable(program, func, "wp");
+        assert!(
+            flows_in(program, func).any(
+                |flow| matches!(*flow, trace_ir::FlowConstraint::Store { src, .. } if src == wp)
+            ),
+            "{func}: no temporary between the receiver and the store"
+        );
+    }
+}
+
+#[test]
+fn smart_pointer_flow_dereferenced_member_value_has_the_wrapper_type() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    for func in ["deref_dot", "deref_twice"] {
+        let (member_value, _) = *unwraps_in(program, func).last().expect("an unwrap");
+        let type_id = program.symbols.variable(member_value).type_id;
+        let desc = program.types.get(type_id).desc.as_ref().clone();
+        assert!(
+            !matches!(&desc, trace_ir::TypeDesc::Struct { name, .. } if name == "Holder"),
+            "{func}: the loaded member is not typed as its holder: {desc:?}"
+        );
+    }
+}
+
+/// The `cpp_smart_pointer_value_flow` fixture's points-to sets, solved once
+/// with `retain_points_to`.
+fn smart_pointer_points_to() -> &'static (trace_analysis::Pag, AnalysisResult) {
+    static CACHE: OnceLock<(trace_analysis::Pag, AnalysisResult)> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let (program, _) = cpp_smart_pointer_value_flow();
+        trace_analysis::analyze_with_options(
+            program,
+            trace_analysis::AnalyzeOptions {
+                retain_points_to: true,
+                ..Default::default()
+            },
+        )
+    })
+}
+
+/// Names of the variables whose storage each unwrap receiver in `func`
+/// points to, one sorted list per receiver, in lowering order.
+fn receiver_pointees(func: &str) -> Vec<Vec<String>> {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let (pag, analysis) = smart_pointer_points_to();
+    unwraps_in(program, func)
+        .into_iter()
+        .map(|(_, receiver)| common::points_to_names_of_var(program, pag, analysis, receiver))
+        .collect()
+}
+
+#[test]
+fn smart_pointer_flow_storage_and_value_stay_in_step() {
+    // Stored through `&filled`, read as `filled`; copied into `copied`, read
+    // through `*w`.
+    assert_eq!(receiver_pointees("ReadFilled"), [["g_filled"]]);
+    assert_eq!(receiver_pointees("ReadThrough"), [["g_copied"]]);
+}
+
+#[test]
+fn smart_pointer_flow_argument_reaches_the_parameter() {
+    assert_eq!(receiver_pointees("UseArg"), [["g_passed"]]);
+    assert_eq!(receiver_pointees("UseLate"), [["g_late"]]);
+}
+
+#[test]
+fn smart_pointer_flow_path_rooted_at_a_call_result() {
+    let (program, _) = cpp_smart_pointer_value_flow();
+    let unwraps = unwraps_in(program, "ReadReturned");
+    assert_eq!(unwraps.len(), 2, "GetSp()->cb and GetSp()->value");
+    for (wrapper_value, _) in &unwraps {
+        assert!(
+            flows_in(program, "ReadReturned").any(|flow| matches!(
+                flow,
+                trace_ir::FlowConstraint::CallReturn { dst, callee_name, .. }
+                    if dst == wrapper_value && callee_name == "GetSp"
+            )),
+            "each unwrap reads GetSp()'s result"
+        );
+        let type_id = program.symbols.variable(*wrapper_value).type_id;
+        assert!(
+            matches!(
+                program.types.get(type_id).desc.as_ref(),
+                trace_ir::TypeDesc::Struct { name, .. } if name == "OHOS::sptr<Payload>"
+            ),
+            "the call's result is typed as the wrapper it returns"
+        );
+    }
+    assert_eq!(
+        receiver_pointees("ReadReturned"),
+        [["g_returned"], ["g_returned"]]
+    );
+}
+
+#[test]
+fn implicit_this_member_assignment_flow_and_points_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct Target {
+    int val;
+};
+
+class Observer {
+    Target *target_ = nullptr;
+public:
+    void SetTarget(Target *t) {
+        target_ = t;
+    }
+    Target* GetTarget() {
+        return target_;
+    }
+};
+
+static Target g_target;
+
+void run() {
+    Observer obs;
+    obs.SetTarget(&g_target);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // Acceptance criterion 1: Running trace analyze on the reproducer emits a
+    // FlowConstraint::Store constraint storing `t` into `this->target_`.
+    let gep_target = program
+        .flow
+        .iter()
+        .find_map(|f| match f {
+            trace_ir::FlowConstraint::GepField {
+                dst,
+                base,
+                field_name,
+                ..
+            } if field_name == "target_" && program.symbols.variable(*base).name == "this" => {
+                Some(*dst)
+            }
+            _ => None,
+        })
+        .expect("must emit GepField for this->target_");
+
+    let has_store = program.flow.iter().any(|f| match f {
+        trace_ir::FlowConstraint::Store { dst, src } => {
+            *dst == gep_target && program.symbols.variable(*src).name == "t"
+        }
+        _ => false,
+    });
+    assert!(
+        has_store,
+        "must emit FlowConstraint::Store storing t into this->target_, got {:?}",
+        program.flow
+    );
+
+    // Acceptance criterion 2: Inspecting points-to sets demonstrates that
+    // `target_` contains `g_target`.
+    let (pag, analysis) = trace_analysis::analyze_with_options(
+        &program,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+
+    let gep_node = pag.var_node.get(&gep_target).expect("GEP PAG node");
+    let gep_pts = analysis.points_to.get(gep_node).expect("GEP points-to");
+    assert!(
+        !gep_pts.is_empty(),
+        "GEP node must point to the field summary location"
+    );
+
+    let summary_loc = gep_pts.iter().copied().next().unwrap();
+    assert_eq!(
+        pag.locations[summary_loc.0 as usize].desc,
+        "summary:Observer.target_"
+    );
+
+    let g_target_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "g_target")
+        .expect("g_target variable")
+        .id;
+    let g_target_loc = pag
+        .var_location
+        .get(&g_target_var)
+        .copied()
+        .expect("g_target loc");
+
+    let t_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "t" && v.fn_id.is_some())
+        .expect("t variable")
+        .id;
+    let t_node = pag.var_node.get(&t_var).expect("t PAG node");
+    let t_pts = analysis.points_to.get(t_node).expect("t points-to");
+    assert!(
+        t_pts.contains(&g_target_loc),
+        "parameter t must point to g_target; pts = {t_pts:?}"
+    );
+}
+
+#[test]
+fn memory_pressure_observer_implicit_this_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct epoll_data {
+    void *ptr;
+};
+struct epoll_event {
+    epoll_data data;
+};
+struct LevelHandler {};
+
+class MemoryPressureObserver {
+    struct LevelHandler *handlerInfo_ = nullptr;
+public:
+    void HandleEpollEvent(struct epoll_event *curEpollEvent) {
+        handlerInfo_ = (struct LevelHandler*)curEpollEvent->data.ptr;
+    }
+};
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // Acceptance criterion 3: In memory_pressure_observer.cpp,
+    // handlerInfo_ = (struct LevelHandler*)curEpollEvent->data.ptr; emits a Store to this->handlerInfo_.
+    let gep_handler = program
+        .flow
+        .iter()
+        .find_map(|f| match f {
+            trace_ir::FlowConstraint::GepField {
+                dst,
+                base,
+                field_name,
+                ..
+            } if field_name == "handlerInfo_" && program.symbols.variable(*base).name == "this" => {
+                Some(*dst)
+            }
+            _ => None,
+        })
+        .expect("must emit GepField for this->handlerInfo_");
+
+    let has_store = program.flow.iter().any(|f| match f {
+        trace_ir::FlowConstraint::Store { dst, src } => {
+            *dst == gep_handler && program.symbols.variable(*src).name == "curEpollEvent"
+        }
+        _ => false,
+    });
+    assert!(
+        has_store,
+        "must emit FlowConstraint::Store to this->handlerInfo_, got {:?}",
+        program.flow
+    );
+}
+
+#[test]
+fn inherited_and_nested_implicit_this_member_points_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct Target {
+    int val;
+};
+
+struct Inner {
+    Target *target_ptr = nullptr;
+};
+
+class Base {
+protected:
+    Inner inner_;
+};
+
+class Derived : public Base {
+public:
+    void SetTarget(Target *t) {
+        inner_.target_ptr = t;
+    }
+};
+
+static Target g_target;
+
+void run() {
+    Derived d;
+    d.SetTarget(&g_target);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (pag, analysis) = trace_analysis::analyze_with_options(
+        &program,
+        trace_analysis::AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        has_direct(&program, &analysis, "run", "Derived::SetTarget"),
+        "direct call run -> Derived::SetTarget must be present"
+    );
+
+    let gep_target_ptr = program
+        .flow
+        .iter()
+        .find_map(|f| match f {
+            trace_ir::FlowConstraint::GepField {
+                dst, field_name, ..
+            } if field_name == "target_ptr" => Some(*dst),
+            _ => None,
+        })
+        .expect("must emit GEP for target_ptr");
+
+    let has_store = program.flow.iter().any(|f| match f {
+        trace_ir::FlowConstraint::Store { dst, src } => {
+            *dst == gep_target_ptr && program.symbols.variable(*src).name == "t"
+        }
+        _ => false,
+    });
+    assert!(has_store, "must emit Store of t into inner_.target_ptr");
+
+    let gep_node = pag.var_node.get(&gep_target_ptr).expect("GEP PAG node");
+    let gep_pts = analysis.points_to.get(gep_node).expect("GEP points-to");
+    assert!(
+        !gep_pts.is_empty(),
+        "GEP node must point to the field summary location"
+    );
+
+    let summary_loc = gep_pts
+        .iter()
+        .copied()
+        .find(|l| pag.locations[l.0 as usize].desc == "summary:Inner.target_ptr")
+        .expect("gep_target_ptr must point to summary:Inner.target_ptr");
+    assert_eq!(
+        pag.locations[summary_loc.0 as usize].desc,
+        "summary:Inner.target_ptr"
+    );
+
+    let g_target_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "g_target")
+        .expect("g_target variable")
+        .id;
+    let g_target_loc = pag
+        .var_location
+        .get(&g_target_var)
+        .copied()
+        .expect("g_target loc");
+
+    let t_var = program
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.name == "t" && v.fn_id.is_some())
+        .expect("t variable")
+        .id;
+    let t_node = pag.var_node.get(&t_var).expect("t PAG node");
+    let t_pts = analysis.points_to.get(t_node).expect("t points-to");
+    assert!(
+        t_pts.contains(&g_target_loc),
+        "parameter t must point to g_target; pts = {t_pts:?}"
+    );
+}
+
+#[test]
+fn implicit_this_member_callback_flow_and_call_edge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+typedef void (*HandlerFn)();
+
+void my_handler() {}
+
+class Controller {
+    HandlerFn callback_ = nullptr;
+public:
+    void Init() {
+        callback_ = my_handler;
+    }
+    void Trigger() {
+        callback_();
+    }
+};
+
+void run() {
+    Controller c;
+    c.Init();
+    c.Trigger();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+
+    let has_call = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("Trigger")
+            && fn_name(&program, e.callee) == "my_handler"
+    });
+    assert!(
+        has_call,
+        "Controller::Trigger must resolve call to my_handler; call edges: {:?}",
+        analysis
+            .call_edges
+            .iter()
+            .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn local_array_shadows_implicit_this_member_subscript() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+typedef void (*Callback)();
+void expected() {}
+void wrong() {}
+struct C {
+    Callback callbacks[1];
+    void run() {
+        callbacks[0] = wrong;
+        Callback callbacks[1] = { expected };
+        Callback f = callbacks[0];
+        f();
+    }
+};
+struct C2 {
+    Callback callbacks[1];
+    Callback get_member() {
+        return callbacks[0];
+    }
+    Callback get_shadowed() {
+        Callback callbacks[1] = { expected };
+        return callbacks[0];
+    }
+};
+void entry() {
+    C c;
+    c.run();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+
+    let has_expected = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run") && fn_name(&program, e.callee) == "expected"
+    });
+    let has_wrong = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run") && fn_name(&program, e.callee) == "wrong"
+    });
+    assert!(
+        has_expected,
+        "C::run must call expected via shadowed local array; call edges: {:?}",
+        analysis
+            .call_edges
+            .iter()
+            .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !has_wrong,
+        "C::run must not call wrong when local array shadows member"
+    );
+
+    // Verify return_flow_from_expr shadowing:
+    // C2::get_member should return a load from the implicit this member GEP.
+    let get_member_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.ends_with("get_member"))
+        .expect("get_member fn")
+        .id;
+    let get_member_returns = program
+        .fn_returns
+        .get(&get_member_fn)
+        .expect("get_member returns");
+    assert_eq!(get_member_returns.len(), 1);
+    let member_ret_src = match &get_member_returns[0] {
+        trace_ir::ReturnFlow::Copy { src } => *src,
+        other => panic!("expected ReturnFlow::Copy, got {other:?}"),
+    };
+    // The member load temp is loaded from a GEP on this
+    let loads_from_gep = program.flow.iter().any(|f| match f {
+        trace_ir::FlowConstraint::Load { dst, .. } => *dst == member_ret_src,
+        _ => false,
+    });
+    assert!(
+        loads_from_gep,
+        "get_member must load return value from implicit this member GEP"
+    );
+
+    // C2::get_shadowed should return the local array variable directly, not loading from GEP.
+    let get_shadowed_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.ends_with("get_shadowed"))
+        .expect("get_shadowed fn")
+        .id;
+    let get_shadowed_returns = program
+        .fn_returns
+        .get(&get_shadowed_fn)
+        .expect("get_shadowed returns");
+    assert_eq!(get_shadowed_returns.len(), 1);
+    let shadowed_ret_src = match &get_shadowed_returns[0] {
+        trace_ir::ReturnFlow::Copy { src } => *src,
+        other => panic!("expected ReturnFlow::Copy, got {other:?}"),
+    };
+    let shadowed_var = program.symbols.variable(shadowed_ret_src);
+    assert_eq!(shadowed_var.name, "callbacks");
+    assert_eq!(
+        shadowed_var.fn_id,
+        Some(get_shadowed_fn),
+        "shadowed return must reference local variable"
+    );
+}
+
+#[test]
+fn derived_static_function_hides_base_field_designator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+typedef void (*Callback)();
+struct Base { Callback foo; };
+struct Derived : Base {
+    static void foo() {}
+    void run() { Callback p = foo; p(); }
+};
+void entry() { Derived d; d.run(); }
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+
+    let has_derived_foo = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run") && fn_name(&program, e.callee).ends_with("foo")
+    });
+    assert!(
+        has_derived_foo,
+        "Derived::run must call Derived::foo; call edges: {:?}",
+        analysis
+            .call_edges
+            .iter()
+            .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn implicit_this_member_address_of() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct Target { int val; };
+class Container {
+    Target target_;
+public:
+    Target* get_ptr() {
+        return &target_;
+    }
+    void run() {
+        Target* p = &target_;
+        p->val = 42;
+    }
+};
+void entry() {
+    Container c;
+    c.run();
+    Target* ptr = c.get_ptr();
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, _analysis) = trace_analysis::analyze(&program);
+
+    // Verify &target_ emits GepField on this->target_ and not an unresolved AddrOfFn
+    let gep_targets = program
+        .flow
+        .iter()
+        .filter_map(|f| match f {
+            trace_ir::FlowConstraint::GepField {
+                dst,
+                base,
+                field_name,
+                ..
+            } if field_name == "target_" && program.symbols.variable(*base).name == "this" => {
+                Some(*dst)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !gep_targets.is_empty(),
+        "must emit GepField for this->target_ in address-of expressions"
+    );
+
+    // Ensure pending function references did not treat target_ as a function
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "target_"),
+        "target_ member variable must not be registered as a function"
+    );
+}
+
+#[test]
+fn implicit_this_member_casted_and_parenthesized_call_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct Target { int x; };
+Target* make_target() { return nullptr; }
+typedef Target* (*FactoryFn)();
+
+class Holder {
+    Target* member_ = nullptr;
+    Target* member2_ = nullptr;
+public:
+    void test_direct() {
+        member_ = (Target*)make_target();
+        member2_ = (make_target());
+    }
+    void test_indirect(FactoryFn fn) {
+        member_ = (Target*)fn();
+        member2_ = (fn());
+    }
+};
+void run(FactoryFn fn) {
+    Holder h;
+    h.test_direct();
+    h.test_indirect(fn);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, _analysis) = trace_analysis::analyze(&program);
+
+    // Direct and indirect call stores
+    let stores = program
+        .flow
+        .iter()
+        .filter(|f| matches!(f, trace_ir::FlowConstraint::Store { .. }))
+        .count();
+    assert!(
+        stores >= 4,
+        "must emit Store constraints for member_ and member2_ across direct and indirect calls, found {stores}"
+    );
+
+    // Check that CallReturn constraints exist for make_target
+    let has_call_return = program.flow.iter().any(|f| match f {
+        trace_ir::FlowConstraint::CallReturn { callee_name, .. } => callee_name == "make_target",
+        _ => false,
+    });
+    assert!(
+        has_call_return,
+        "must emit CallReturn for make_target even when casted or parenthesized"
+    );
+
+    // Check that CallReturnIndirect constraints exist
+    let has_call_return_indirect = program
+        .flow
+        .iter()
+        .any(|f| matches!(f, trace_ir::FlowConstraint::CallReturnIndirect { .. }));
+    assert!(
+        has_call_return_indirect,
+        "must emit CallReturnIndirect for indirect call even when casted or parenthesized"
+    );
+}
+
+#[test]
+fn local_shadowing_inherited_member_address_of() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+typedef void (*Callback)();
+void expected() {}
+void wrong() {}
+struct Base { Callback cb; };
+struct Derived : Base {
+    void run() {
+        this->cb = wrong;
+        Callback cb = expected;
+        Callback *p = &cb;
+        (*p)();
+    }
+    Callback* get_cb() {
+        this->cb = wrong;
+        Callback cb = expected;
+        return &cb;
+    }
+    Callback* get_cb_param(Callback cb) {
+        this->cb = wrong;
+        return &cb;
+    }
+};
+void entry() {
+    Derived d;
+    d.run();
+    d.get_cb();
+    d.get_cb_param(expected);
+}
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+
+    let has_expected = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run")
+            && fn_name(&program, e.callee).ends_with("expected")
+    });
+    let has_wrong = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run")
+            && fn_name(&program, e.callee).ends_with("wrong")
+    });
+    assert!(
+        has_expected,
+        "Derived::run must call expected; call edges: {:?}",
+        analysis
+            .call_edges
+            .iter()
+            .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !has_wrong,
+        "Derived::run must not call wrong when local cb shadows Base::cb"
+    );
+
+    // Verify return address handling: return &cb must return the local variable's address,
+    // not the inherited field Base::cb
+    let get_cb_id = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.ends_with("get_cb"))
+        .map(|f| f.id)
+        .expect("get_cb function");
+    let returns = program
+        .fn_returns
+        .get(&get_cb_id)
+        .expect("returns for get_cb");
+    assert!(
+        returns.iter().any(|r| match r {
+            trace_ir::ReturnFlow::AddrOfVar { src } => {
+                let var = program.symbols.variable(*src);
+                var.name == "cb" && var.fn_id == Some(get_cb_id)
+            }
+            _ => false,
+        }),
+        "get_cb must return AddrOfVar for local cb, found returns: {:?}",
+        returns
+    );
+
+    // Verify return address handling with parameter shadowing: return &cb must return the
+    // parameter variable's address, not the inherited field Base::cb
+    let get_cb_param_id = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name.ends_with("get_cb_param"))
+        .map(|f| f.id)
+        .expect("get_cb_param function");
+    let param_returns = program
+        .fn_returns
+        .get(&get_cb_param_id)
+        .expect("returns for get_cb_param");
+    assert!(
+        param_returns.iter().any(|r| match r {
+            trace_ir::ReturnFlow::AddrOfVar { src } => {
+                let var = program.symbols.variable(*src);
+                var.name == "cb" && var.fn_id == Some(get_cb_param_id)
+            }
+            _ => false,
+        }),
+        "get_cb_param must return AddrOfVar for parameter cb, found returns: {:?}",
+        param_returns
+    );
+}
+
+#[test]
+fn smart_pointer_call_root_mixed_arrow_dot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+namespace OHOS {
+template<class T> struct sptr { sptr(T*); T* operator->(); };
+}
+typedef void (*Callback)();
+void expected() {}
+struct Inner { Callback cb; };
+struct Payload { Inner inner; };
+Payload global;
+OHOS::sptr<Payload> GetSp() {
+    OHOS::sptr<Payload> r = &global;
+    return r;
+}
+void seed(Payload *p) { p->inner.cb = expected; }
+void run() { GetSp()->inner.cb(); }
+void entry() { seed(&global); run(); }
+"#,
+    )
+    .unwrap();
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = trace_analysis::analyze(&program);
+
+    let has_expected = analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller).ends_with("run")
+            && fn_name(&program, e.callee).ends_with("expected")
+    });
+    assert!(
+        has_expected,
+        "run must call expected via GetSp()->inner.cb(); call edges: {:?}",
+        analysis
+            .call_edges
+            .iter()
+            .map(|e| (fn_name(&program, e.caller), fn_name(&program, e.callee)))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn cpp_implicit_member_pointer_fn_ptr_call_resolves_indirect() {
+    let root = fixture("cpp_implicit_fn_ptr");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let cs = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|c| c.callee_name.contains("fn"))
+        .expect("handler_->fn call site must exist");
+    assert!(
+        !cs.is_direct,
+        "handler_->fn() should be recorded as an indirect call site (is_direct = false)"
+    );
+    assert_eq!(cs.callee_name, "handler_->fn");
+    assert!(
+        cs.callee_var.is_some(),
+        "handler_->fn() should have callee_var set"
+    );
+
+    let (_pag, analysis) = analyze(&program);
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "Dispatcher::Dispatch",
+            "target_callback",
+            ResolutionKind::Indirect
+        ),
+        "Dispatcher::Dispatch should resolve indirect call to target_callback"
+    );
+}
+
+#[test]
+fn cpp_implicit_member_value_and_chained_fn_ptr_call() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_implicit_member_fn_ptr_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct Handler {
+    void (*fn)();
+};
+
+void target_val() {}
+void target_chain() {}
+
+struct Nested {
+    Handler *handler = nullptr;
+};
+
+class Dispatcher {
+    Handler val_handler_;
+    Nested *nested_ = nullptr;
+public:
+    void Init(Nested *n) {
+        val_handler_.fn = target_val;
+        // Unqualified member variable assignment produces zero flow constraints
+        // during lowering; this exercises Andersen field summary fallback until
+        // unqualified member assignments land.
+        nested_ = n;
+    }
+    void Dispatch() {
+        val_handler_.fn();
+        nested_->handler->fn();
+    }
+};
+
+static Handler g_chain_handler = { target_chain };
+static Nested g_nested = { &g_chain_handler };
+
+void run() {
+    Dispatcher d;
+    d.Init(&g_nested);
+    d.Dispatch();
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "Dispatcher::Dispatch",
+            "target_val",
+            ResolutionKind::Indirect
+        ),
+        "Dispatcher::Dispatch should resolve indirect call to target_val via val_handler_.fn()"
+    );
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "Dispatcher::Dispatch",
+            "target_chain",
+            ResolutionKind::Indirect
+        ),
+        "Dispatcher::Dispatch should resolve indirect call to target_chain via nested_->handler->fn()"
+    );
+}
+
+analyzed_fixture!(deref_member_reads);
+
+/// Issue #151 (docs/ANALYSIS.md, "Dereferenced operands"): `func`'s lowered
+/// facts in `deref_member_reads` as value-flow `(src, dst, label)` edges for
+/// [`common::flow_chain`]. A `Store` runs from the stored value to the
+/// pointer it goes through; a `GepField` is labelled `gep <field>`.
+fn deref_edges(func: &str) -> Vec<(i64, i64, String)> {
+    use trace_ir::FlowConstraint as F;
+    let (program, _) = deref_member_reads();
+    let edge = |src: &trace_ir::VarId, dst: &trace_ir::VarId, label: String| {
+        Some((i64::from(src.0), i64::from(dst.0), label))
+    };
+    flows_in(program, func)
+        .filter_map(|flow| match flow {
+            F::Copy { dst, src } => edge(src, dst, "copy".into()),
+            F::Load { dst, src } => edge(src, dst, "load".into()),
+            F::Store { dst, src } => edge(src, dst, "store".into()),
+            F::GepField {
+                dst,
+                base,
+                field_name,
+                ..
+            } => edge(base, dst, format!("gep {field_name}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `func`'s local `name` in `deref_member_reads`, as a flow-edge node.
+fn deref_local(func: &str, name: &str) -> i64 {
+    i64::from(common::local_variable(&deref_member_reads().0, func, name).0)
+}
+
+/// Assert `y` reads `pp` off `o`'s `inner` member (loading the `inner` cell
+/// or not), and never off a `pp` projection of `o` itself.
+fn assert_reads_pp_off_inner(func: &str, y: &str) {
+    let edges = deref_edges(func);
+    let (o, y) = ([deref_local(func, "o")], deref_local(func, y));
+    let mut read = common::flow_chain(&edges, &o, &["gep inner", "gep pp", "load"]);
+    read.extend(common::flow_chain(
+        &edges,
+        &o,
+        &["gep inner", "load", "gep pp", "load"],
+    ));
+    assert!(read.contains(&y), "{func}: {edges:?}");
+    let off_o = common::flow_chain(&edges, &o, &["gep pp", "load"]);
+    assert!(!off_o.contains(&y), "{func}: {edges:?}");
+}
+
+/// Issue #151 guards: `o->inner->pp` reads `pp` off the `inner` member, and
+/// a plain `*p` stays one `Load` with no temporary.
+#[test]
+fn deref_member_reads_guards_keep_their_lowering() {
+    use trace_ir::FlowConstraint::Load;
+    let (program, _) = deref_member_reads();
+    for prefix in ["", "cpp_"] {
+        assert_reads_pp_off_inner(
+            &format!("{prefix}read_arrow_root"),
+            &format!("{prefix}arrow_y"),
+        );
+        let func = format!("{prefix}read_plain");
+        let p = common::local_variable(program, &func, "p");
+        let y = common::local_variable(program, &func, &format!("{prefix}plain_y"));
+        let facts: Vec<_> = flows_in(program, &func).cloned().collect();
+        assert_eq!(facts, [Load { dst: y, src: p }], "{func}");
+        let fn_id = Some(common::only_function(program, &func));
+        let vars = program.symbols.variables.iter();
+        let locals: Vec<_> = vars.filter(|v| v.fn_id == fn_id).map(|v| v.id).collect();
+        assert_eq!(locals, [p, y], "{func} has no temporary");
+    }
+}
+
+/// Issue #151: `*h->pp` loads the `pp` member's value, then through it,
+/// and never loads straight off `h`.
+#[test]
+fn deref_of_a_member_loads_the_member_then_through_it() {
+    for prefix in ["", "cpp_"] {
+        let func = format!("{prefix}read_member");
+        let edges = deref_edges(&func);
+        let h = [deref_local(&func, "h")];
+        let y = deref_local(&func, &format!("{prefix}member_y"));
+        let loaded = common::flow_chain(&edges, &h, &["gep pp", "load", "load"]);
+        assert!(loaded.contains(&y), "{func}: {edges:?}");
+        let off_h = common::flow_chain(&edges, &h, &["load"]);
+        assert!(!off_h.contains(&y), "{func}: {edges:?}");
+    }
+}
+
+/// Issue #151: `**ppp` is two chained loads, not one.
+#[test]
+fn deref_twice_loads_through_the_first_loads_result() {
+    for prefix in ["", "cpp_"] {
+        let func = format!("{prefix}read_twice");
+        let edges = deref_edges(&func);
+        let ppp = [deref_local(&func, "ppp")];
+        let y = deref_local(&func, &format!("{prefix}twice_y"));
+        let twice = common::flow_chain(&edges, &ppp, &["load", "load"]);
+        assert!(twice.contains(&y), "{func}: {edges:?}");
+        let once = common::flow_chain(&edges, &ppp, &["load"]);
+        assert!(!once.contains(&y), "{func}: {edges:?}");
+    }
+}
+
+/// Issue #151: `(*o->inner).pp` reads `pp` off the `inner` member, like its
+/// arrow twin.
+#[test]
+fn deref_root_reads_the_member_off_the_dereferenced_root() {
+    for prefix in ["", "cpp_"] {
+        assert_reads_pp_off_inner(
+            &format!("{prefix}read_deref_root"),
+            &format!("{prefix}root_y"),
+        );
+    }
+}
+
+/// Issue #151: `*h->pp = v` stores `v` through the `pp` member's value,
+/// never into `h` or into the member's own cell.
+#[test]
+fn write_member_stores_through_the_loaded_member() {
+    for prefix in ["", "cpp_"] {
+        let func = format!("{prefix}write_member");
+        let edges = deref_edges(&func);
+        let (h, v) = ([deref_local(&func, "h")], [deref_local(&func, "v")]);
+        let stored = common::flow_chain(&edges, &v, &["store"]);
+        let member_value = common::flow_chain(&edges, &h, &["gep pp", "load"]);
+        assert!(!stored.is_disjoint(&member_value), "{func}: {edges:?}");
+        assert!(!stored.contains(&h[0]), "{func}: {edges:?}");
+        let cell = common::flow_chain(&edges, &h, &["gep pp"]);
+        assert!(stored.is_disjoint(&cell), "{func}: {edges:?}");
+    }
+}
+
+/// Assert `func`'s one call passes one explicit argument, reached from its
+/// local `root` through `hops` (see [`common::flow_chain`]).
+fn assert_passes(func: &str, root: &str, hops: &[&str]) {
+    let (program, _) = deref_member_reads();
+    let caller = common::only_function(program, func);
+    let sites: Vec<_> = (program.symbols.call_sites.iter())
+        .filter(|cs| cs.caller == caller)
+        .collect();
+    let [site] = sites[..] else {
+        panic!("{func}: {sites:?}");
+    };
+    let explicit = u32::from(site.args_bound_past_this);
+    let passed: Vec<_> = (site.var_args.iter())
+        .filter(|(i, _)| *i >= explicit)
+        .map(|(_, v)| i64::from(v.0))
+        .collect();
+    let edges = deref_edges(func);
+    let read = common::flow_chain(&edges, &[deref_local(func, root)], hops);
+    assert!(
+        matches!(passed[..], [arg] if read.contains(&arg)),
+        "{func} passes {passed:?}: {edges:?}"
+    );
+}
+
+/// Issue #151: `take_member(*h->pp)` passes the value read through the `pp`
+/// member's value, never the holder `h`; `take_plain(*p)` passes the value
+/// read through `p`, never `p` itself.
+#[test]
+fn deref_argument_passes_the_value_read() {
+    for prefix in ["", "cpp_"] {
+        assert_passes(
+            &format!("{prefix}pass_member"),
+            "h",
+            &["gep pp", "load", "load"],
+        );
+        assert_passes(&format!("{prefix}pass_plain"), "p", &["load"]);
+    }
+}
+
+/// Issue #151: `*p` passed to a reference parameter, free or member, passes
+/// `p` itself, the referent's address the reference holds, with no load; so
+/// does a parameter not yet known at the call (a member defined out of line
+/// after it). `*pp` passed to a known pointer parameter passes the value read
+/// through `pp`.
+#[test]
+fn deref_argument_to_a_reference_passes_the_address() {
+    assert_passes("cpp_call_ref", "p", &[]);
+    assert_passes("cpp_call_member_ref", "p", &[]);
+    assert_passes("cpp_call_out_of_line", "p", &[]);
+    assert_passes("cpp_call_ptr", "pp", &["load"]);
+    for func in ["cpp_call_ref", "cpp_call_out_of_line"] {
+        let edges = deref_edges(func);
+        let loads = common::flow_chain(&edges, &[deref_local(func, "p")], &["load"]);
+        assert!(loads.is_empty(), "{func} loads through p: {edges:?}");
+    }
+}
+
+/// Issue #151: reference-ness is the declaration's. A member's
+/// in-class prototype, defined only after the call, takes a pointer, so the
+/// value read is passed; an unnamed reference parameter takes the address.
+#[test]
+fn deref_argument_follows_the_declared_parameter() {
+    assert_passes("cpp_call_declared", "pp", &["load"]);
+    assert_passes("cpp_call_unnamed", "p", &[]);
+    let func = "cpp_call_unnamed";
+    let edges = deref_edges(func);
+    let loads = common::flow_chain(&edges, &[deref_local(func, "p")], &["load"]);
+    assert!(loads.is_empty(), "{func} loads through p: {edges:?}");
+}
+
+/// Issue #151: `*m_ppp` passed in a member body reads through the
+/// instance field, as `*this->m_ppp` does.
+#[test]
+fn deref_argument_of_an_implicit_this_member_passes_the_value_read() {
+    assert_passes("CppPasser::pass", "this", &["gep m_ppp", "load", "load"]);
+}
+
+/// Issue #151: one `*pp` passed to an override set is loaded once,
+/// and every target is passed that one value.
+#[test]
+fn deref_argument_loads_once_for_every_target() {
+    let (program, _) = deref_member_reads();
+    let func = "cpp_call_virtual";
+    let caller = common::only_function(program, func);
+    let sites: Vec<_> = (program.symbols.call_sites.iter())
+        .filter(|cs| cs.caller == caller)
+        .collect();
+    assert!(sites.len() >= 2, "{func}: {sites:?}");
+    let passed: std::collections::BTreeSet<_> = (sites.iter())
+        .flat_map(|cs| cs.var_args.iter().filter(|(i, _)| *i == 1).map(|(_, v)| *v))
+        .collect();
+    assert_eq!(passed.len(), 1, "{func}: {sites:?}");
+    let edges = deref_edges(func);
+    let pp = deref_local(func, "pp");
+    let loads = (edges.iter())
+        .filter(|(src, _, label)| *src == pp && label == "load")
+        .count();
+    assert_eq!(loads, 1, "{func}: {edges:?}");
+}
+
+/// Issue #151: a function pointer is read in place, so `take_fn(*fp)`
+/// passes `fp` itself and `take_fn(*o->op)` the `op` member's value.
+#[test]
+fn deref_argument_of_a_function_pointer_passes_it() {
+    let func = "pass_fn";
+    assert_passes(func, "fp", &[]);
+    let edges = deref_edges(func);
+    let loads = common::flow_chain(&edges, &[deref_local(func, "fp")], &["load"]);
+    assert!(loads.is_empty(), "{func} loads through fp: {edges:?}");
+    assert_passes("pass_member_fn", "o", &["gep op", "load"]);
+}
+
+/// Issue #151: `*(out + 1) = *h->pp` resolves no pointer to store
+/// through, nor do C's `*get_h()->pp = *h->pp` and `*&m_ap = *h->pp`, so
+/// the value is not evaluated: no fact and no temporary.
+#[test]
+fn deref_store_through_no_pointer_evaluates_no_value() {
+    let (program, _) = deref_member_reads();
+    for (func, params) in [
+        ("store_offset", &["h", "out"][..]),
+        ("store_call_root", &["h"][..]),
+        ("CppAddrOfMember::store", &["this", "h"][..]),
+    ] {
+        let facts: Vec<_> = flows_in(program, func).collect();
+        assert!(facts.is_empty(), "{func}: {facts:?}");
+        let fn_id = Some(common::only_function(program, func));
+        let vars = program.symbols.variables.iter();
+        let locals: Vec<_> = vars.filter(|v| v.fn_id == fn_id).map(|v| v.id).collect();
+        let params: Vec<_> = (params.iter())
+            .map(|name| common::local_variable(program, func, name))
+            .collect();
+        assert_eq!(locals, params, "{func} has no temporary");
+    }
+}
+
+/// Issue #151: `return *g_earr[0]`, `*out = *g_earr[0]` and
+/// `return *(int **)p` have no operand value to compute, so they emit
+/// nothing, as master did: no fact through the root one level short.
+#[test]
+fn deref_value_of_no_computable_operand_emits_nothing() {
+    let (program, _) = deref_member_reads();
+    for func in ["return_elem", "store_elem", "return_cast"] {
+        let facts: Vec<_> = flows_in(program, func).collect();
+        assert!(facts.is_empty(), "{func}: {facts:?}");
+        let returns = program
+            .fn_returns
+            .get(&common::only_function(program, func));
+        assert!(returns.is_none_or(|r| r.is_empty()), "{func}: {returns:?}");
+    }
+}
+
+/// Issue #151: `return *cpp_g_hp` from a function returning a
+/// reference returns the referent's address, `cpp_g_hp`'s value.
+#[test]
+fn deref_return_by_reference_returns_the_address() {
+    let (program, _) = deref_member_reads();
+    let returns = &program.fn_returns[&common::only_function(program, "cpp_inst")];
+    let src = common::only_variable(program, "cpp_g_hp");
+    assert_eq!(returns, &[trace_ir::ReturnFlow::Copy { src }]);
+}
+
+/// Issue #151: a function returning a reference, spelled `S &f()` or
+/// with a trailing `-> S &` (a lambda's included), returns `*cpp_g_hp` as
+/// `cpp_g_hp`'s value; `decltype(auto)` returns the value read.
+#[test]
+fn deref_return_by_reference_follows_the_declared_return() {
+    use trace_ir::{FlowConstraint::Load, ReturnFlow::Copy};
+    let (program, _) = deref_member_reads();
+    let hp = common::only_variable(program, "cpp_g_hp");
+    let lambda = common::lambda_in(program, "cpp_make_lambda").id;
+    let returns = |fid: FnId| program.fn_returns[&fid].clone();
+    for fid in [
+        common::only_function(program, "cpp_inst"),
+        common::only_function(program, "cpp_inst_trailing"),
+        lambda,
+    ] {
+        assert_eq!(returns(fid), [Copy { src: hp }], "{fid:?}");
+    }
+    let value = returns(common::only_function(program, "cpp_inst_value"));
+    let [Copy { src }] = value[..] else {
+        panic!("{value:?}");
+    };
+    assert!(
+        program
+            .flow
+            .iter()
+            .any(|flow| matches!(*flow, Load { dst, src: from } if dst == src && from == hp)),
+        "{value:?}"
+    );
+}
+
+/// Issue #151: a pack and a trailing `...` are one variadic tail, so
+/// `CppVariadic::vpack` declares no parameter; a lambda records which of its
+/// parameters are references, as a function does.
+#[test]
+fn param_lists_record_their_declared_shape() {
+    let (program, _) = deref_member_reads();
+    let vpack = program
+        .symbols
+        .function(common::only_function(program, "CppVariadic::vpack"));
+    assert_eq!(vpack.explicit_arity, Some(0), "{vpack:?}");
+    assert_eq!(vpack.reference_params, [false], "{vpack:?}");
+    let lambda = common::lambda_in(program, "cpp_lambda_params");
+    assert_eq!(lambda.reference_params, [false, true], "{lambda:?}");
+}
+
+/// Issue #151: a variadic list's extra positions and a by-value
+/// pack's elements take the value read, a reference pack's the address. A
+/// lambda is called through its closure variable, an indirect site no
+/// declaration describes, so `l(*pp)` keeps the address.
+#[test]
+fn deref_argument_past_the_declared_list_follows_the_tail() {
+    assert_passes("cpp_call_variadic", "pp", &["load"]);
+    assert_passes("cpp_call_pack", "pp", &["load"]);
+    assert_passes("cpp_call_ref_pack", "p", &[]);
+    assert_passes("cpp_call_lambda", "pp", &[]);
+}
+
+/// Issue #151: `&cache` in a member body takes the member's
+/// cell, `this->cache`, not the global of the same name.
+#[test]
+fn a_member_outranks_a_global_of_its_name() {
+    use trace_ir::FlowConstraint::{AddrOfVar, GepField};
+    let (program, _) = deref_member_reads();
+    let global = common::only_variable(program, "cache");
+    for func in ["CppCacheOwner::f", "CppCacheOwner::g"] {
+        let this = common::local_variable(program, func, "this");
+        let facts: Vec<_> = flows_in(program, func).collect();
+        let member = |flow: &&trace_ir::FlowConstraint| matches!(flow, GepField { base, field_name, .. } if *base == this && field_name == "cache");
+        assert!(facts.iter().any(member), "{func}: {facts:?}");
+        let global_address = |flow: &&trace_ir::FlowConstraint| matches!(flow, AddrOfVar { src, .. } if *src == global);
+        assert!(!facts.iter().any(global_address), "{func}: {facts:?}");
+    }
+}
+
+/// Issue #151: `(*pp)->ox` reads `ox` off the pointer `*pp` holds,
+/// loaded from `pp`, never off `pp` itself; `(*h->opp)->ox` off the pointer
+/// the `opp` member's value holds.
+#[test]
+fn deref_of_a_pointer_root_loads_the_pointer_first() {
+    for prefix in ["", "cpp_"] {
+        let func = format!("{prefix}read_out");
+        let edges = deref_edges(&func);
+        let pp = [deref_local(&func, "pp")];
+        let y = deref_local(&func, &format!("{prefix}out_y"));
+        let read = common::flow_chain(&edges, &pp, &["load", "gep ox", "load"]);
+        assert!(read.contains(&y), "{func}: {edges:?}");
+        let off_pp = common::flow_chain(&edges, &pp, &["gep ox"]);
+        assert!(off_pp.is_empty(), "{func}: {edges:?}");
+        let func = format!("{prefix}read_out_member");
+        let edges = deref_edges(&func);
+        let h = [deref_local(&func, "h")];
+        let y = deref_local(&func, &format!("{prefix}out_member_y"));
+        let hops = ["gep opp", "load", "load", "gep ox", "load"];
+        let read = common::flow_chain(&edges, &h, &hops);
+        assert!(read.contains(&y), "{func}: {edges:?}");
+    }
+}
+
+/// Issue #151: `*this` is an operand as any `*p` is. `return *this`
+/// from `CppChain &set(int *)` returns `this`; `cpp_chain_ref(*this)` passes
+/// `this` and `cpp_chain_val(*this)` the value read; `*this = *o` stores
+/// into the object.
+#[test]
+fn deref_of_this_follows_the_operand_rules() {
+    use trace_ir::FlowConstraint::{Load, Store};
+    let (program, _) = deref_member_reads();
+    let set = common::only_function(program, "CppChain::set");
+    let this = common::local_variable(program, "CppChain::set", "this");
+    assert_eq!(
+        program.fn_returns[&set],
+        [trace_ir::ReturnFlow::Copy { src: this }]
+    );
+    let pass = common::only_function(program, "CppChain::pass");
+    let this = common::local_variable(program, "CppChain::pass", "this");
+    let passed = |callee: &str| {
+        let site = (program.symbols.call_sites.iter())
+            .find(|cs| cs.caller == pass && cs.callee_name == callee)
+            .expect(callee);
+        site.var_args.iter().find(|(i, _)| *i == 0).map(|(_, v)| *v)
+    };
+    assert_eq!(passed("cpp_chain_ref"), Some(this));
+    let value = passed("cpp_chain_val").expect("passed");
+    assert!(
+        flows_in(program, "CppChain::pass")
+            .any(|flow| matches!(*flow, Load { dst, src } if dst == value && src == this)),
+        "the value read through `this`"
+    );
+    let this = common::local_variable(program, "CppChain::assign", "this");
+    assert!(
+        flows_in(program, "CppChain::assign")
+            .any(|flow| matches!(*flow, Store { dst, .. } if dst == this)),
+        "a store through `this`"
+    );
+}
+
+/// Issue #151: `m_arr{}` on a member array of `CppElem` constructs
+/// its elements, as a member of that class type is constructed.
+#[test]
+fn a_member_array_of_class_objects_is_constructed() {
+    let (program, _) = deref_member_reads();
+    let ctor = common::only_function(program, "CppArrOwner::CppArrOwner");
+    assert!(
+        program
+            .symbols
+            .call_sites
+            .iter()
+            .any(|cs| cs.caller == ctor && cs.callee_name == "CppElem::CppElem"),
+        "m_arr{{}} constructs its elements"
+    );
+}
+
+/// Issue #151: an arrow on an array member (`m_items->Run()`,
+/// `h->m_items->Run()`) calls its element's method, as on master.
+#[test]
+fn an_arrow_on_an_array_member_reaches_its_element_class() {
+    let (program, _) = deref_member_reads();
+    for func in ["CppRunHolder::a", "cpp_run_items"] {
+        let caller = common::only_function(program, func);
+        let callees: Vec<_> = (program.symbols.call_sites.iter())
+            .filter(|cs| cs.caller == caller)
+            .filter_map(|cs| cs.callee_fn_id)
+            .map(|f| program.symbols.function(f).name.clone())
+            .collect();
+        assert_eq!(callees, ["CppRunElem::Run"], "{func}");
+    }
+}
+
+/// Issue #151: a member array's brace list initializes its elements
+/// one by one. `m_arr{CppElemArgs(a), CppElemArgs(b)}` is no two-argument
+/// constructor call (its listed calls are their own sites), and the 2-D
+/// `m_grid{}` default-constructs its elements.
+#[test]
+fn a_member_array_brace_list_initializes_its_elements() {
+    let (program, _) = deref_member_reads();
+    let ctor = common::only_function(program, "CppArrOwner2::CppArrOwner2");
+    let sites: Vec<_> = (program.symbols.call_sites.iter())
+        .filter(|cs| cs.caller == ctor && cs.callee_name == "CppElemArgs::CppElemArgs")
+        .collect();
+    let (listed, default): (Vec<&&trace_ir::CallSite>, Vec<_>) =
+        sites.iter().partition(|cs| !cs.var_args.is_empty());
+    assert_eq!(listed.len(), 2, "{sites:?}");
+    let [default] = default[..] else {
+        panic!("{sites:?}");
+    };
+    let callee = program
+        .symbols
+        .function(default.callee_fn_id.expect("resolved"));
+    assert_eq!(callee.explicit_arity, Some(0), "{callee:?}");
+}
+
+/// Issue #151: an element of a member table (`*t->tcells[1]`) is read
+/// into a temporary typed as the element, not as the whole array.
+#[test]
+fn a_member_table_element_is_typed_as_the_element() {
+    use trace_ir::FlowConstraint::{GepField, Load};
+    let (program, _) = deref_member_reads();
+    let func = "cpp_read_subscript";
+    let cells: Vec<_> = flows_in(program, func)
+        .filter_map(|flow| match flow {
+            GepField {
+                dst, field_name, ..
+            } if field_name == "tcells" => Some(*dst),
+            _ => None,
+        })
+        .collect();
+    let elements: Vec<_> = flows_in(program, func)
+        .filter_map(|flow| match *flow {
+            Load { dst, src } if cells.contains(&src) => Some(dst),
+            _ => None,
+        })
+        .collect();
+    assert!(!elements.is_empty(), "{func}");
+    for element in elements {
+        let desc = program
+            .types
+            .get(program.symbols.variable(element).type_id)
+            .desc
+            .as_ref();
+        assert!(
+            !matches!(desc, trace_ir::TypeDesc::Array { .. }),
+            "{desc:?}"
+        );
+    }
+}
+
+/// Issue #151: `cb = *h->pcb` on a pointer to a function-pointer
+/// member loads the function pointer `h->pcb` points to: two loads off `h`'s
+/// `pcb` cell, not a copy of the member's value.
+#[test]
+fn deref_of_a_pointer_to_a_function_pointer_member_loads_it() {
+    let func = "call_pcb";
+    let edges = deref_edges(func);
+    let (h, cb) = ([deref_local(func, "h")], deref_local(func, "cb"));
+    let loaded = common::flow_chain(&edges, &h, &["gep pcb", "load", "load"]);
+    assert!(loaded.contains(&cb), "{func}: {edges:?}");
+    let in_place = common::flow_chain(&edges, &h, &["gep pcb", "load"]);
+    assert!(!in_place.contains(&cb), "{func}: {edges:?}");
+}
+
+/// Issue #151: `*cpp_make_noflow()->Get()` names a call whose result
+/// nothing records, so it is no operand value: no fact and no temporary.
+#[test]
+fn deref_of_an_unrecorded_call_result_emits_nothing() {
+    let (program, _) = deref_member_reads();
+    for (func, expected) in [
+        ("cpp_read_noflow", &["cpp_noflow_y"][..]),
+        ("cpp_read_noflow_var", &["cpp_noflow_var_y"][..]),
+        ("cpp_read_functor", &["h", "cpp_functor_y"][..]),
+    ] {
+        let facts: Vec<_> = flows_in(program, func).collect();
+        assert!(facts.is_empty(), "{func}: {facts:?}");
+        let fn_id = Some(common::only_function(program, func));
+        let vars = program.symbols.variables.iter();
+        let locals: Vec<_> = vars.filter(|v| v.fn_id == fn_id).map(|v| v.id).collect();
+        let expected: Vec<_> = (expected.iter())
+            .map(|name| common::local_variable(program, func, name))
+            .collect();
+        assert_eq!(locals, expected, "{func} has no temporary");
+    }
+}
+
+/// Issue #151: a member a base declares resolves through the base's layout
+/// (docs/ANALYSIS.md, "Implicit this member variable access"), so a
+/// dereference through it resolves: `*this->bpp = *h->pp` stores through
+/// `bpp`, and `*d->get()` reads the recorded result of a call through the
+/// inherited `get`.
+#[test]
+fn deref_through_an_inherited_member_resolves_it() {
+    use trace_ir::FlowConstraint as F;
+    let (program, _) = deref_member_reads();
+    let store: Vec<_> = flows_in(program, "CppDerivedHolder::store").collect();
+    assert!(
+        store
+            .iter()
+            .any(|f| matches!(f, F::GepField { field_name, .. } if field_name == "bpp")),
+        "{store:?}"
+    );
+    assert!(
+        store.iter().any(|f| matches!(f, F::Store { .. })),
+        "{store:?}"
+    );
+    let read: Vec<_> = flows_in(program, "cpp_read_inherited_get").collect();
+    assert!(
+        read.iter()
+            .any(|f| matches!(f, F::CallReturnIndirect { .. })),
+        "{read:?}"
+    );
+}
+
+/// Issue #151: a block-scope `using cpp_uns::ucache;` hides the member
+/// `ucache`, as a local does, so `&ucache` and a plain read agree on the
+/// namespace variable.
+#[test]
+fn a_body_using_hides_a_member() {
+    use trace_ir::FlowConstraint::{AddrOfVar, Copy, GepField};
+    let (program, _) = deref_member_reads();
+    let func = "CppUsingOwner::f";
+    let ucache = common::only_variable(program, "ucache");
+    let facts: Vec<_> = flows_in(program, func).collect();
+    let member = |flow: &&trace_ir::FlowConstraint| matches!(flow, GepField { field_name, .. } if field_name == "ucache");
+    assert!(!facts.iter().any(member), "{facts:?}");
+    let address =
+        |flow: &&trace_ir::FlowConstraint| matches!(flow, AddrOfVar { src, .. } if *src == ucache);
+    assert!(facts.iter().any(address), "{facts:?}");
+    let read =
+        |flow: &&trace_ir::FlowConstraint| matches!(flow, Copy { src, .. } if *src == ucache);
+    assert!(facts.iter().any(read), "{facts:?}");
+}
+
+/// Issue #151: a dereferenced root whose own path does not decompose
+/// (`o->absent`, a member no layout declares) reads no field off the holder,
+/// and emits nothing at all.
+#[test]
+fn deref_root_that_does_not_decompose_reads_nothing_off_the_holder() {
+    let func = "cpp_read_unresolved_root";
+    let edges = deref_edges(func);
+    let off_o = common::flow_chain(&edges, &[deref_local(func, "o")], &["gep pp"]);
+    assert!(off_o.is_empty(), "{func}: {edges:?}");
+    let (program, _) = deref_member_reads();
+    let facts: Vec<_> = flows_in(program, func).collect();
+    assert!(facts.is_empty(), "{func}: {facts:?}");
+}
+
+/// Issue #151: a returned member is its value, as any value
+/// position reads it. `return m_vpp;` returns a load from the member's cell
+/// typed as the member (`int **`); `return varr;`, an array member, returns
+/// the cell itself.
+#[test]
+fn a_returned_member_is_its_typed_value() {
+    use trace_ir::FlowConstraint::{GepField, Load};
+    let (program, _) = deref_member_reads();
+    let returned = |func: &str| {
+        let fn_id = common::only_function(program, func);
+        match program.fn_returns.get(&fn_id).map(Vec::as_slice) {
+            Some([trace_ir::ReturnFlow::Copy { src }]) => *src,
+            other => panic!("{func} returns {other:?}"),
+        }
+    };
+    let cell = |func: &str, member: &str| {
+        flows_in(program, func)
+            .find_map(|flow| match flow {
+                GepField {
+                    dst, field_name, ..
+                } if field_name == member => Some(*dst),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{func}: no cell of {member}"))
+    };
+
+    let value = returned("CppArrVal::ret_pp");
+    let m_vpp = cell("CppArrVal::ret_pp", "m_vpp");
+    assert!(
+        flows_in(program, "CppArrVal::ret_pp")
+            .any(|flow| matches!(flow, Load { dst, src } if *dst == value && *src == m_vpp)),
+        "ret_pp returns a load from m_vpp's cell"
+    );
+    let class = program.types.class_type_id("CppArrVal").expect("class");
+    let field = program
+        .types
+        .field_id_by_name(class, "m_vpp")
+        .expect("field");
+    let member_type = program.types.get(class).layout.fields[&field].type_id;
+    assert_eq!(
+        program.symbols.variable(value).type_id,
+        member_type,
+        "the value is typed as the member"
+    );
+
+    assert_eq!(
+        returned("CppArrVal::ret_arr"),
+        cell("CppArrVal::ret_arr", "varr"),
+        "an array member returns its cell"
+    );
+}
+
+/// Issue #151: `*c->count = 0` stores no pointer, so it resolves no
+/// pointer to store through: no fact and no temporary.
+#[test]
+fn deref_store_of_no_value_loads_no_member() {
+    let (program, _) = deref_member_reads();
+    for prefix in ["", "cpp_"] {
+        let func = format!("{prefix}zero_count");
+        let facts: Vec<_> = flows_in(program, &func).collect();
+        assert!(facts.is_empty(), "{func}: {facts:?}");
+        let fn_id = Some(common::only_function(program, &func));
+        let vars = program.symbols.variables.iter();
+        let locals: Vec<_> = vars.filter(|v| v.fn_id == fn_id).map(|v| v.id).collect();
+        let c = common::local_variable(program, &func, "c");
+        assert_eq!(locals, [c], "{func} has no temporary");
+    }
+}
+
+/// Pins the `copy`-tolerance in [`common::flow_chain`] that the #151 deref
+/// checks above rely on.
+#[test]
+fn flow_chain_tolerates_copies_around_and_between_hops() {
+    let edges = [
+        (0, 1, "copy".to_string()),
+        (1, 2, "gep pp".to_string()),
+        (2, 3, "copy".to_string()),
+        (3, 4, "load".to_string()),
+        (4, 5, "copy".to_string()),
+    ];
+    assert!(common::flow_chain(&edges, &[0], &["gep pp", "load"]).contains(&5));
+    let no_middle_copy: Vec<_> = edges
+        .iter()
+        .filter(|(s, d, _)| (s, d) != (&2, &3))
+        .cloned()
+        .collect();
+    assert!(!common::flow_chain(&no_middle_copy, &[0], &["gep pp", "load"]).contains(&5));
+    assert!(!common::flow_chain(&edges, &[0], &["load"]).contains(&5));
+}
+
+analyzed_fixture!(cpp_template_parameter_bases);
+
+/// Issue #150: a class inheriting through a template-parameter base
+/// (`class FooService : public OHOS::IRemoteStub<IFoo>`, with
+/// `template <class I> class IRemoteStub : public I`) derives from the
+/// argument `IFoo`, including through nested and scoped forms.
+#[test]
+fn template_parameter_base_derives_from_the_argument() {
+    let (program, _) = cpp_template_parameter_bases();
+    assert!(program.derives_from("FooService", "IFoo"));
+    assert!(
+        program.derives_from("BarImpl", "IBar"),
+        "through nested templates"
+    );
+    assert!(
+        program.derives_from("svc::Scoped", "svc::IFoo"),
+        "argument resolves where Scoped is declared"
+    );
+    assert!(
+        !program.derives_from("svc::Scoped", "IFoo"),
+        "not the same-named global"
+    );
+}
+
+/// Issue #150: the template base itself does not gain a spurious base named
+/// after its own type parameter.
+#[test]
+fn template_parameter_base_is_not_a_class_named_after_the_parameter() {
+    let (program, _) = cpp_template_parameter_bases();
+    assert!(
+        !program
+            .bases_of("OHOS::IRemoteStub")
+            .iter()
+            .any(|b| b == "OHOS::I"),
+        "{:?}",
+        program.bases_of("OHOS::IRemoteStub")
+    );
+    assert!(!program.bases_of("Layer").iter().any(|b| b == "I"));
+}
+
+/// Issue #150: virtual dispatch through the interface reaches overrides
+/// declared only through a template-parameter base.
+#[test]
+fn virtual_dispatch_reaches_overrides_through_template_parameter_bases() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(common::has_any_edge(
+        program,
+        analysis,
+        "Dispatch",
+        "FooService::Handle"
+    ));
+    assert!(common::has_any_edge(
+        program,
+        analysis,
+        "RunBar",
+        "BarImpl::Run"
+    ));
+}
+
+/// Issue #150: an anonymous-namespace class deriving through a
+/// template-parameter base keeps its file-scoped base, so dispatch from
+/// another file reaches its override.
+#[test]
+fn anonymous_class_reaches_overrides_through_template_parameter_bases() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(common::has_any_edge(
+        program,
+        analysis,
+        "DispatchAnon",
+        "Svc::Handle"
+    ));
+}
+
+/// Issue #150: a member lookup while lowering sees the parameter base, so a
+/// non-virtual member of the argument resolves on the derived class.
+#[test]
+fn member_lookup_sees_template_parameter_bases_while_lowering() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert_eq!(
+        direct_targets(program, analysis, "CallHelper"),
+        ["IHelp::Helper"]
+    );
+}
+
+/// Issue #150: a parameter-pack base binds every remaining argument.
+#[test]
+fn template_parameter_pack_bases_bind_every_argument() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(common::has_any_edge(program, analysis, "CallA", "Impl::A"));
+    assert!(common::has_any_edge(program, analysis, "CallB", "Impl::B"));
+}
+
+/// Issue #150: an omitted argument takes the parameter's default, which
+/// names a class in the template's scope.
+#[test]
+fn defaulted_template_parameter_bases_use_the_default() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(program.derives_from("WithDef", "tmpl::IDef"));
+    assert!(common::has_any_edge(
+        program,
+        analysis,
+        "CallD",
+        "WithDef::D"
+    ));
+}
+
+/// Issue #150: `Outer<A>::In<B>` binds `In`'s parameters to its own list.
+#[test]
+fn nested_template_bases_bind_their_own_arguments() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(program.derives_from("Nested", "IC"));
+    assert!(
+        !program.derives_from("Nested", "IA"),
+        "Outer's argument is not In's"
+    );
+    assert!(common::has_any_edge(
+        program,
+        analysis,
+        "CallC",
+        "Nested::C"
+    ));
+}
+
+/// Issue #150: a default written on a forward declaration of the template
+/// counts, since the definition may not repeat it.
+#[test]
+fn forward_declared_template_defaults_are_used() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(program.derives_from("WithFwdDef", "fwd::IFwd"));
+    assert!(common::has_any_edge(
+        program,
+        analysis,
+        "CallF",
+        "WithFwdDef::F"
+    ));
+}
+
+/// Issue #150: `: public B<T>` with a template template parameter `B` names
+/// no class `B`; an instantiation derives from the argument template.
+#[test]
+fn template_template_parameter_bases_name_the_argument_template() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(
+        !program.bases_of("Wrap").iter().any(|b| b == "B"),
+        "{:?}",
+        program.bases_of("Wrap")
+    );
+    assert!(program.derives_from("SvcC", "Layer"));
+    assert!(program.derives_from("SvcC", "IC"));
+    assert!(common::has_any_edge(program, analysis, "CallC", "SvcC::C"));
+}
+
+/// Issue #150: file-local (anonymous-namespace) templates of one name in
+/// two units are two templates; a class expands through its own unit's.
+#[test]
+fn file_local_class_templates_stay_apart() {
+    let (program, _) = cpp_template_parameter_bases();
+    assert!(program.derives_from("LocalA", "ILocal"));
+    assert!(
+        !program.derives_from("LocalA", "IExtra"),
+        "local_b.cpp's `Impl` is not local_a.cpp's"
+    );
+}
+
+/// Issue #150: a file-local template never hides or replaces a linked
+/// template of the same name, while lowering or once merged.
+#[test]
+fn file_local_class_templates_do_not_shadow_a_linked_template() {
+    let (program, _) = cpp_template_parameter_bases();
+    assert!(program.derives_from("ShadeA", "ILocal"));
+    assert!(
+        !program.derives_from("ShadeA", "IExtra"),
+        "{:?}",
+        program.bases_of("ShadeA")
+    );
+}
+
+/// Issue #150: a file-local template is visible from its own file only, so
+/// two headers' same-named templates each expand their own file's classes.
+#[test]
+fn file_local_class_templates_expand_their_own_files_classes() {
+    let (program, _) = cpp_template_parameter_bases();
+    assert!(program.derives_from("TwinOne", "ILocal"));
+    assert!(
+        !program.derives_from("TwinOne", "IExtra"),
+        "{:?}",
+        program.bases_of("TwinOne")
+    );
+    assert!(program.derives_from("TwinPair", "ILocal"));
+    assert!(program.derives_from("TwinPair", "IExtra"));
+}
+
+/// Issue #150: a file-local template is visible to its whole translation
+/// unit, so a class in a file including its header derives through it.
+#[test]
+fn file_local_class_templates_in_an_included_header_are_seen() {
+    let (program, _) = cpp_template_parameter_bases();
+    assert!(
+        program.derives_from("HdrUser", "ILocal"),
+        "{:?}",
+        program.bases_of("HdrUser")
+    );
+    assert!(
+        program.derives_from("HdrAnonUser", "IExtra"),
+        "{:?}",
+        program.bases_of("HdrAnonUser")
+    );
+}
+
+/// Issue #150: a pack forwarded inside a base's arguments (`B<Ts...>`,
+/// `B<IC, Ts...>`) substitutes the whole pack at that position.
+#[test]
+fn template_parameter_packs_forwarded_inside_arguments_expand() {
+    let (program, _) = cpp_template_parameter_bases();
+    assert!(
+        program.derives_from("S", "IA"),
+        "{:?}",
+        program.bases_of("S")
+    );
+    assert!(
+        program.derives_from("S", "IB"),
+        "{:?}",
+        program.bases_of("S")
+    );
+    assert!(program.derives_from("SMixed", "IC"));
+    assert!(program.derives_from("SMixed", "IA"));
+    assert!(!program.derives_from("SMixed", "IB"));
+}
+
+/// Issue #150: a pack expanded through a pattern (`B<Lift<Ts>...>`) copies
+/// the pattern once per element.
+#[test]
+fn template_parameter_pack_patterns_expand_per_element() {
+    let (program, _) = cpp_template_parameter_bases();
+    for base in ["IA", "IB"] {
+        assert!(
+            program.derives_from("SLifted", base),
+            "{:?}",
+            program.bases_of("SLifted")
+        );
+    }
+}
+
+/// Control: the base body itself stays a dispatch target, so this fixture
+/// shape does not lose the edges #150 does not touch. Kept in its own test
+/// so a red assertion elsewhere never masks it.
+#[test]
+fn virtual_dispatch_still_reaches_the_base_body() {
+    let (program, analysis) = cpp_template_parameter_bases();
+    assert!(common::has_any_edge(
+        program,
+        analysis,
+        "Dispatch",
+        "IFoo::Handle"
+    ));
+}
+
+/// The `cpp_template_parameter_bases` fixture's points-to sets, solved once
+/// with `retain_points_to`.
+fn template_parameter_bases_points_to() -> &'static (trace_analysis::Pag, AnalysisResult) {
+    static CACHE: OnceLock<(trace_analysis::Pag, AnalysisResult)> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let (program, _) = cpp_template_parameter_bases();
+        trace_analysis::analyze_with_options(
+            program,
+            trace_analysis::AnalyzeOptions {
+                retain_points_to: true,
+                ..Default::default()
+            },
+        )
+    })
+}
+
+/// Class names of the heap locations each `UnwrapPointer` receiver in
+/// `func` points to, sorted. This is #150's actual claim: whether the
+/// `sptr<IFoo>` unwrap admits the concrete object's own class (`FooService`,
+/// `Direct`) into the receiver's points-to set, independent of any field the
+/// receiver's class happens to declare.
+fn receiver_heap_types(func: &str) -> Vec<String> {
+    let (program, _) = cpp_template_parameter_bases();
+    let (pag, analysis) = template_parameter_bases_points_to();
+    let mut names: Vec<String> = unwraps_in(program, func)
+        .into_iter()
+        .flat_map(|(_, receiver)| {
+            let pts = pag
+                .var_node
+                .get(&receiver)
+                .and_then(|n| analysis.points_to.get(n));
+            pts.into_iter().flatten().filter_map(|loc_id| {
+                let loc = &pag.locations[loc_id.0 as usize];
+                if loc.kind != trace_analysis::LocKind::Heap {
+                    return None;
+                }
+                match program.types.get(loc.type_id).desc.as_ref() {
+                    trace_ir::TypeDesc::Struct { name, .. } if !name.is_empty() => {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                }
+            })
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Issue #150: the smart-pointer unwrap admits a subclass reached only
+/// through a template-parameter base — the `FooService` heap object behind
+/// `sptr<IFoo>` in `Stub` reaches the receiver's points-to set.
+#[test]
+fn smart_pointer_unwrap_admits_a_subclass_through_a_template_parameter_base() {
+    assert!(
+        receiver_heap_types("Stub").contains(&"FooService".to_string()),
+        "{:?}",
+        receiver_heap_types("Stub")
+    );
+}
+
+/// Control: a direct subclass behind the same wrapper shape is recognized
+/// today. Kept in its own test so a red assertion elsewhere never masks it;
+/// if this one fails, the fixture is wrong, not #150.
+#[test]
+fn smart_pointer_unwrap_admits_a_direct_subclass() {
+    assert!(
+        receiver_heap_types("Plain").contains(&"Direct".to_string()),
+        "{:?}",
+        receiver_heap_types("Plain")
+    );
+}
+
+/// Issue #150: a bare name in a member body finds a member the
+/// template-parameter argument declares (`y`, `IField`'s), and a member of
+/// the template itself hides the argument's of its name (`x`, `FieldStub`'s):
+/// each is read through a receiver of its declaring class.
+#[test]
+fn template_parameter_base_members_resolve_with_the_template_nearer() {
+    let (program, _) = cpp_template_parameter_bases();
+    let owners: Vec<_> = flows_in(program, "FieldSvc::Set")
+        .filter_map(|flow| match flow {
+            trace_ir::FlowConstraint::GepField {
+                base, field_name, ..
+            } => {
+                let base_type = program.symbols.variable(*base).type_id;
+                match program.types.get(base_type).desc.as_ref() {
+                    trace_ir::TypeDesc::Struct { name, .. } => {
+                        Some((field_name.clone(), name.clone()))
+                    }
+                    desc => Some((field_name.clone(), format!("{desc:?}"))),
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        owners,
+        [
+            ("x".to_string(), "FieldStub".to_string()),
+            ("y".to_string(), "IField".to_string())
+        ],
+        "{owners:?}"
+    );
+}
+
+/// Issue #151: a direct-initialization argument asks one rule,
+/// `implicit_this`, whether a bare name is a member: a body `using` hides
+/// the member, so `Guard g(mu_)` passes the namespace variable, while
+/// without it the member is a value with no actual.
+#[test]
+fn direct_init_argument_member_is_hidden_by_a_body_using() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cpp"),
+        r#"
+namespace ns { int *mu_; }
+struct Guard { Guard(int *m); };
+struct GuardOwner {
+    int *mu_;
+    void imported() {
+        using ns::mu_;
+        Guard g(mu_);
+    }
+    void member() { Guard g(mu_); }
+};
+"#,
+    )
+    .unwrap();
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let actuals = |func: &str| -> Vec<String> {
+        let caller = common::only_function(&program, func);
+        (program.symbols.call_sites.iter())
+            .filter(|cs| cs.caller == caller && cs.callee_name == "Guard::Guard")
+            .flat_map(|cs| cs.var_args.iter())
+            .filter(|(position, _)| *position > 0)
+            .map(|(_, var)| program.symbols.variable(*var).name.clone())
+            .collect()
+    };
+    assert_eq!(actuals("GuardOwner::imported"), ["mu_"]);
+    assert!(actuals("GuardOwner::member").is_empty());
+}
+
+#[test]
+fn cpp_member_call_and_fn_ptr_declarator_no_spurious_direct_call() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_spurious_direct_call_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct LevelHandler {
+    int data;
+    void (*handler)(int data, unsigned int events);
+};
+
+void target_handler(int data, unsigned int events) {}
+
+void invoke(LevelHandler *h) {
+    h->handler(h->data, 0);
+}
+
+static LevelHandler g_handler = { 1, target_handler };
+
+void test() {
+    invoke(&g_handler);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // Acceptance criterion 1: Struct function-pointer fields do not introduce extraneous
+    // function entries in program.symbols.functions.
+    let handler_func = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "handler" || f.name.ends_with("::handler"));
+    assert!(
+        handler_func.is_none(),
+        "function pointer member `handler` must not be registered as a function in program.symbols: {:?}",
+        handler_func
+    );
+
+    // Call site for h->handler must be indirect (is_direct = false)
+    let cs = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|c| c.callee_name.contains("handler"))
+        .expect("h->handler call site must exist");
+    assert_eq!(
+        cs.callee_name, "h->handler",
+        "h->handler call site must retain full receiver path"
+    );
+    assert!(
+        !cs.is_direct,
+        "h->handler call site must have is_direct = false, got callee_name={:?}, is_direct={}",
+        cs.callee_name, cs.is_direct
+    );
+
+    let (_pag, analysis) = analyze(&program);
+
+    // Acceptance criterion 3: invoke calls target_handler indirectly; no call edge to dummy handler.
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "invoke",
+            "target_handler",
+            ResolutionKind::Indirect
+        ),
+        "invoke should resolve indirect call to target_handler"
+    );
+    assert!(
+        !has_any_edge(&program, &analysis, "invoke", "handler"),
+        "invoke must not have any call edge to dummy function handler"
+    );
+}
+
+#[test]
+fn cpp_unresolved_member_call_does_not_fall_back_to_unrelated_free_function() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_unresolved_member_no_fallback_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct LevelHandler {
+    int data;
+    void (*handler)(int data, unsigned int events);
+};
+
+// Unrelated free function with the same name as the member
+void handler(int data, unsigned int events);
+
+void invoke(LevelHandler *h) {
+    // Member field call whose field loading cannot be resolved to any concrete target
+    h->handler(h->data, 0);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // Acceptance criterion 2: Member field calls obj->foo() whose field loading
+    // cannot be resolved remain is_direct = false with callee_var = None or field load,
+    // rather than mutating into direct calls to unrelated functions named foo.
+    let cs = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|c| c.callee_name.contains("handler"))
+        .expect("h->handler call site must exist");
+    assert_eq!(
+        cs.callee_name, "h->handler",
+        "h->handler call site must retain full receiver path"
+    );
+    assert!(
+        !cs.is_direct,
+        "h->handler call site must remain is_direct = false when field loading is unresolved"
+    );
+
+    let (_pag, analysis) = analyze(&program);
+
+    // invoke must NOT call free function handler
+    assert!(
+        !has_any_edge(&program, &analysis, "invoke", "handler"),
+        "invoke must not call unrelated free function handler"
+    );
+}
+
+#[test]
+fn cpp_member_call_edge_cases_and_declarator_variants() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_member_call_edge_cases_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct Ops {
+    int id;
+    void (*fn_ptr)(int);
+    void (*fn_init)(int) = nullptr;
+    void (*fn_arr[2])(int);
+    void (**fn_ptr_ptr)(int);
+
+    void real_method(int x) {}
+};
+
+void fn_ptr(int) {}
+void fn_init(int) {}
+void fn_arr(int) {}
+void fn_ptr_ptr(int) {}
+
+void test_edge_cases(Ops *ops_ptr, Ops ops_val) {
+    // 1. Real member call must resolve directly
+    ops_ptr->real_method(1);
+    ops_val.real_method(2);
+
+    // 2. Parenthesized member function pointer call
+    (ops_ptr->fn_ptr)(10);
+
+    // 3. Cast member function pointer call
+    ((void (*)(int))ops_ptr->fn_ptr)(20);
+
+    // 4. Dot access to member function pointer
+    ops_val.fn_ptr(30);
+
+    // 5. Initialized member function pointer
+    ops_ptr->fn_init(40);
+
+    // 6. Subscript expression on member function pointer array
+    ops_ptr->fn_arr[0](50);
+
+    // 7. Pointer-to-pointer-to-function member call with dereference
+    (*ops_ptr->fn_ptr_ptr)(60);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // Real method must be registered as a function
+    assert!(
+        program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "Ops::real_method"),
+        "Ops::real_method must be registered as a function"
+    );
+
+    // None of the function pointer fields should be registered as functions
+    for field_name in &["fn_ptr", "fn_init", "fn_arr", "fn_ptr_ptr"] {
+        assert!(
+            !program
+                .symbols
+                .functions
+                .iter()
+                .any(|f| f.name.ends_with(&format!("::{}", field_name))),
+            "{} must not be registered as a member function of Ops",
+            field_name
+        );
+    }
+
+    // Dot access must retain dot operator in callee_name
+    let cs_dot = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|c| c.callee_name.starts_with("ops_val.fn_ptr"))
+        .expect("ops_val.fn_ptr call site must exist");
+    assert_eq!(cs_dot.callee_name, "ops_val.fn_ptr");
+    assert!(!cs_dot.is_direct);
+
+    // Field layout type for initialized fn ptr must be TypeDesc::FnPtr
+    let ops_tid = program
+        .types
+        .class_type_id("Ops")
+        .expect("Ops type must exist");
+    let ops_layout = &program.types.get(ops_tid).layout;
+    let fn_init_field = ops_layout
+        .fields
+        .iter()
+        .find(|(_, f)| f.name == "fn_init")
+        .expect("fn_init field must exist");
+    let fn_init_desc = &program.types.get(fn_init_field.1.type_id).desc;
+    assert!(
+        matches!(fn_init_desc.as_ref(), trace_ir::TypeDesc::FnPtr { .. }),
+        "fn_init with in-class initializer must have TypeDesc::FnPtr, got {:?}",
+        fn_init_desc
+    );
+
+    let (_pag, analysis) = analyze(&program);
+
+    // Real method calls must resolve to Ops::real_method
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "test_edge_cases",
+            "Ops::real_method",
+            ResolutionKind::Direct
+        ),
+        "test_edge_cases should have direct calls to Ops::real_method"
+    );
+
+    // None of the member calls should fall back to free functions fn_ptr, fn_init, fn_arr, fn_ptr_ptr
+    for free_fn in &["fn_ptr", "fn_init", "fn_arr", "fn_ptr_ptr"] {
+        assert!(
+            !has_any_edge(&program, &analysis, "test_edge_cases", free_fn),
+            "test_edge_cases must not call unrelated free function {}",
+            free_fn
+        );
+    }
+}
+
+#[test]
+fn cpp_member_function_returning_fn_ptr_is_recognized_as_method() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_member_returning_fn_ptr_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct S {
+    int id;
+    void (*get_handler(int x))(int data);
+};
+
+void target_fn(int data) {}
+
+void (*S::get_handler(int x))(int data) {
+    return target_fn;
+}
+
+void test_call(S *s) {
+    s->get_handler(1)(42);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // S::get_handler must be registered as a member function, NOT a data field
+    let get_handler_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "S::get_handler" || f.name.ends_with("::get_handler"));
+    assert!(
+        get_handler_fn.is_some(),
+        "S::get_handler must be registered in program.symbols.functions"
+    );
+
+    let s_tid = program.types.class_type_id("S").expect("S type must exist");
+    let s_layout = &program.types.get(s_tid).layout;
+    assert!(
+        !s_layout.fields.iter().any(|(_, f)| f.name == "get_handler"),
+        "get_handler must NOT be a data field in struct S layout: {:?}",
+        s_layout.fields
+    );
+
+    let (_pag, analysis) = analyze(&program);
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "test_call",
+            "S::get_handler",
+            ResolutionKind::Direct
+        ),
+        "test_call must resolve call to S::get_handler"
+    );
+}
+
+#[test]
+fn cpp_implicit_member_fn_ptr_call_does_not_fall_back_to_free_function() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_implicit_member_no_fallback_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+void handler(int x);
+
+struct Worker {
+    void (*handler)(int x) = nullptr;
+
+    void process(int val) {
+        handler(val);
+    }
+};
+
+void run(Worker *w) {
+    w->process(10);
+}
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // The call site inside Worker::process must be this->handler, is_direct = false
+    let cs = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|c| c.callee_name.contains("handler"))
+        .expect("handler call site must exist");
+    assert_eq!(
+        cs.callee_name, "this->handler",
+        "implicit member call site callee_name must be this->handler"
+    );
+    assert!(
+        !cs.is_direct,
+        "implicit member call site must have is_direct = false"
+    );
+
+    let (_pag, analysis) = analyze(&program);
+
+    // Worker::process must NOT call free function handler
+    assert!(
+        !has_any_edge(&program, &analysis, "Worker::process", "handler"),
+        "Worker::process must not fall back to unrelated free function handler"
+    );
+}
+
+#[test]
+fn cpp_local_and_param_callback_shadows_member() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_callback_shadows_member_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+void target(int) {}
+struct Worker {
+    void (*handler)(int);
+    void parameter(void (*handler)(int)) { handler(1); }
+    void local() { void (*handler)(int) = target; handler(2); }
+};
+void entry(Worker *w) { w->parameter(target); w->local(); }
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "Worker::parameter",
+            "target",
+            ResolutionKind::Indirect
+        ),
+        "Worker::parameter must resolve indirect call to target via parameter callback"
+    );
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "Worker::local",
+            "target",
+            ResolutionKind::Indirect
+        ),
+        "Worker::local must resolve indirect call to target via local callback"
+    );
+}
+
+#[test]
+fn cpp_nested_callback_variable_flow() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_nested_callback_flow_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+void target(double) {}
+using Leaf = void (*)(double);
+Leaf factory(int) { return target; }
+void (*(*global_cb)(int))(double) = factory;
+void caller() { global_cb(2); }
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // global_cb must be registered as a variable, NOT as a function
+    assert!(
+        program
+            .symbols
+            .variables
+            .iter()
+            .any(|v| v.name == "global_cb"),
+        "global_cb must be registered in program.symbols.variables"
+    );
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "global_cb"),
+        "global_cb must NOT be registered as a function in program.symbols.functions"
+    );
+
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "caller",
+            "factory",
+            ResolutionKind::Indirect
+        ),
+        "caller must resolve indirect call to factory via global_cb"
+    );
+}
+
+#[test]
+fn cpp_pointer_to_member_function_variable() {
+    let dir = tempfile::Builder::new()
+        .prefix("trace_member_fn_ptr_var_")
+        .tempdir()
+        .unwrap();
+    let root_buf = dir.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    std::fs::write(
+        root.join("main.cpp"),
+        r#"
+struct S { void target(int) {} };
+void (S::*cb)(int) = &S::target;
+"#,
+    )
+    .unwrap();
+
+    let program = build_program(root, &default_opts(root)).expect("build");
+
+    // `cb` must be registered as a variable under its own identifier: the
+    // parse input approximates the member-function pointer as an ordinary
+    // function pointer (docs/ANALYSIS.md, "C++ parse-input normalization"),
+    // so the owner never leaks into the name.
+    let var = program.symbols.variables.iter().find(|v| v.name == "cb");
+    assert!(
+        var.is_some(),
+        "cb must be registered as a variable in program.symbols.variables: {:?}",
+        program
+            .symbols
+            .variables
+            .iter()
+            .map(|v| &v.name)
+            .collect::<Vec<_>>()
+    );
+    let var = var.unwrap();
+
+    // cb must NOT be registered as a function
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name.contains("S::*cb") || f.name == "cb"),
+        "cb must NOT be registered as a function in program.symbols.functions: {:?}",
+        program
+            .symbols
+            .functions
+            .iter()
+            .map(|f| &f.name)
+            .collect::<Vec<_>>()
+    );
+
+    // Initializer flow must be emitted for the variable
+    let has_init_flow = program.flow.iter().any(|f| match f {
+        trace_ir::FlowConstraint::AddrOfFn { dst, .. } => *dst == var.id,
+        trace_ir::FlowConstraint::Copy { dst, .. } => *dst == var.id,
+        _ => false,
+    });
+    assert!(
+        has_init_flow,
+        "initializer flow must be emitted for variable cb: {:?}",
+        program.flow
+    );
+
+    // Verify full export to SQLite: variable cb exists, no function cb, and two flow edges
+    let (pag, analysis) = analyze(&program);
+    let db_path = dir.path().join("out.db");
+    trace_db::export_to_sqlite(
+        &program,
+        &pag,
+        &analysis,
+        &trace_db::ExportOptions {
+            output: db_path.clone(),
+            trace_version: "test".into(),
+            include_points_to: false,
+            full_detail: true,
+            model_files: Vec::new(),
+        },
+    )
+    .expect("export");
+
+    let conn = trace_db::open_db(&db_path).expect("open db");
+    let var_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM variables WHERE name = 'cb'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query var");
+    assert_eq!(var_count, 1, "cb must be exported to variables table");
+
+    let fn_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM functions WHERE name LIKE '%S::*cb%' OR name = 'cb'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query fn");
+    assert_eq!(
+        fn_count, 0,
+        "S::*cb must NOT be exported to functions table"
+    );
+
+    let total_flow_edges: i64 = conn
+        .query_row("SELECT count(*) FROM flow_edges", [], |row| row.get(0))
+        .expect("query flow");
+    assert_eq!(
+        total_flow_edges, 2,
+        "two initializer flow edges must be exported for S::*cb"
+    );
+}
+
+analyzed_fixture!(cpp_singleton_calls);
+
+/// The resolutions of every `caller -> callee` edge.
+fn edge_resolutions(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    callee: &str,
+) -> Vec<ResolutionKind> {
+    analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == caller && fn_name(program, e.callee) == callee)
+        .map(|e| e.resolution)
+        .collect()
+}
+
+/// `(file name, line)` of the call sites behind `caller -> callee` edges.
+fn edge_site_locations(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    callee: &str,
+) -> Vec<(String, u32)> {
+    let mut locations: Vec<(String, u32)> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == caller && fn_name(program, e.callee) == callee)
+        .map(|e| {
+            let span = program.symbols.call_sites[e.call_site.0 as usize].span;
+            let path = &program.symbols.files[span.file.0 as usize].path;
+            let file = path.file_name().unwrap().to_string_lossy().into_owned();
+            (file, span.line)
+        })
+        .collect();
+    locations.sort();
+    locations.dedup();
+    locations
+}
+
+#[test]
+fn cpp_singleton_explicit_parameter_returns() {
+    let (p, a) = cpp_singleton_calls();
+    for (caller, accessor, target) in [
+        ("decl_ptr", "Box::Get", "DeclSvc::Run"),
+        ("decl_ref", "Singleton::GetInstance", "DeclDb::Open"),
+        ("decl_value", "Maker::Make", "DeclDb::Open"),
+        ("decl_auto", "Box::Get", "DeclSvc::Run"),
+        ("decl_auto_ref", "Singleton::GetInstance", "DeclDb::Open"),
+        ("decl_defined", "DefBox::Get", "DeclSvc::Run"),
+    ] {
+        assert_eq!(
+            edge_resolutions(p, a, caller, target),
+            [ResolutionKind::Direct],
+            "{caller} reaches {target}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        assert!(
+            has_any_edge(p, a, caller, accessor),
+            "{caller} calls {accessor}"
+        );
+    }
+    // A declared-only template member stays external; a defined one is direct.
+    assert_eq!(
+        edge_resolutions(p, a, "decl_ptr", "Box::Get"),
+        [ResolutionKind::External]
+    );
+    assert_eq!(
+        edge_resolutions(p, a, "decl_defined", "DefBox::Get"),
+        [ResolutionKind::Direct]
+    );
+}
+
+#[test]
+fn cpp_singleton_qualified_argument_scope() {
+    let (p, a) = cpp_singleton_calls();
+    for (caller, target, other, line) in [
+        (
+            "app::relative",
+            "app::ScopeSvc::Run",
+            "shade::ScopeSvc::Run",
+            9,
+        ),
+        ("rooted", "app::ScopeSvc::Run", "shade::ScopeSvc::Run", 12),
+        (
+            "namespaced_template",
+            "app::ScopeSvc::Run",
+            "shade::ScopeSvc::Run",
+            13,
+        ),
+        (
+            "shade::shadowed",
+            "shade::ScopeSvc::Run",
+            "app::ScopeSvc::Run",
+            21,
+        ),
+        (
+            "lib::template_relative",
+            "shade::ScopeSvc::Run",
+            "app::ScopeSvc::Run",
+            25,
+        ),
+    ] {
+        assert_eq!(
+            edge_site_locations(p, a, caller, target),
+            [("scope.cpp".to_string(), line)],
+            "{caller} reaches {target}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        assert!(
+            must_not_have_edge(p, a, caller, other),
+            "{caller} must not reach {other}"
+        );
+    }
+}
+
+#[test]
+fn cpp_singleton_wrapped_parameter_returns() {
+    let (p, a) = cpp_singleton_calls();
+    for (caller, accessor) in [
+        ("wrap_shared", "DelayedSingleton::GetInstance"),
+        ("wrap_unique", "UniqueHolder::Take"),
+        ("wrap_sptr", "SptrHolder::Get"),
+        ("wrap_shared_auto", "DelayedSingleton::GetInstance"),
+        ("wrap_sptr_auto", "SptrHolder::Get"),
+    ] {
+        assert_eq!(
+            edge_resolutions(p, a, caller, "WrapSvc::Run"),
+            [ResolutionKind::Direct],
+            "{caller} reaches WrapSvc::Run: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        assert!(
+            has_any_edge(p, a, caller, accessor),
+            "{caller} calls {accessor}"
+        );
+    }
+    // The wrapper keeps its own identity: no member is invented on it.
+    for phantom in [
+        "sptr::Run",
+        "shared_ptr::Run",
+        "std::shared_ptr::Run",
+        "unique_ptr::Run",
+    ] {
+        assert!(
+            !p.symbols.functions.iter().any(|f| f.name == phantom),
+            "phantom {phantom}"
+        );
+    }
+}
+
+#[test]
+fn cpp_singleton_conflicting_returns_stay_unknown() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        must_not_have_edge(p, a, "odd_pair", "OddSvc::Run"),
+        "Pair<T> is no wrapper of T: {:?}",
+        common::callees_of(p, a, "odd_pair")
+    );
+    assert!(
+        must_not_have_edge(p, a, "split_get", "OddSvc::Run"),
+        "a disagreeing overload lends no return: {:?}",
+        common::callees_of(p, a, "split_get")
+    );
+}
+
+/// A tree whose wrapper and accessor are declared in two headers, used by a
+/// unit named `user` and ordered first or last among the units by name.
+fn wrapped_return_tree(user: &str, dep: bool) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let headers = if dep {
+        tmp.path().join("dep")
+    } else {
+        tmp.path().to_path_buf()
+    };
+    std::fs::create_dir_all(&headers).unwrap();
+    std::fs::write(
+        headers.join("ref_ptr.h"),
+        "#pragma once\ntemplate <typename T> class sptr {\npublic:\n    T *operator->() const;\n};\n",
+    )
+    .unwrap();
+    std::fs::write(
+        headers.join("holder.h"),
+        "#pragma once\n#include \"ref_ptr.h\"\ntemplate <typename T> class Holder {\npublic:\n    static sptr<T> Get();\n    static std::shared_ptr<T> Shared();\n};\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(user),
+        "#include \"holder.h\"\nclass MergeSvc {\npublic:\n    void Run() {}\n};\nvoid use_sptr() { Holder<MergeSvc>::Get()->Run(); }\nvoid use_shared() { Holder<MergeSvc>::Shared()->Run(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("m_other.cpp"),
+        "#include \"holder.h\"\nvoid other() {}\n",
+    )
+    .unwrap();
+    tmp
+}
+
+#[test]
+fn cpp_singleton_return_facts_survive_header_merge() {
+    for dep in [false, true] {
+        for user in ["a_user.cpp", "z_user.cpp"] {
+            let tmp = wrapped_return_tree(user, dep);
+            let mut opts =
+                trace_preproc::PreprocessOptions::new().with_include(tmp.path().to_path_buf());
+            if dep {
+                opts = opts
+                    .with_include(tmp.path().join("dep"))
+                    .with_dep(tmp.path().join("dep"));
+            }
+            for jobs in [1, 8] {
+                let program =
+                    trace_parse::build_program_with_jobs(tmp.path(), &opts, jobs).expect("build");
+                let (_pag, analysis) = analyze(&program);
+                for caller in ["use_sptr", "use_shared"] {
+                    assert_eq!(
+                        edge_resolutions(&program, &analysis, caller, "MergeSvc::Run"),
+                        [ResolutionKind::Direct],
+                        "{caller} (user {user}, dep {dep}, jobs {jobs}): {:?}",
+                        common::callees_of(&program, &analysis, caller)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cpp_singleton_inherited_static_accessors() {
+    let (p, a) = cpp_singleton_calls();
+    for (caller, accessor, target) in [
+        ("inh_shared", "DelayedSingleton::GetInstance", "InhSvc::Run"),
+        ("inh_ref", "Singleton::GetInstance", "InhDb::Open"),
+        ("inh_mid", "DelayedSingleton::GetInstance", "InhMidSvc::Run"),
+        ("inh_auto", "DelayedSingleton::GetInstance", "InhSvc::Run"),
+        ("inh_hide", "InhHide::GetInstance", "InhOther::Run"),
+    ] {
+        assert_eq!(
+            edge_resolutions(p, a, caller, target),
+            [ResolutionKind::Direct],
+            "{caller} reaches {target}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        assert!(
+            has_any_edge(p, a, caller, accessor),
+            "{caller} calls {accessor}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    assert!(must_not_have_edge(p, a, "inh_hide", "InhHide::Run"));
+    assert!(must_not_have_edge(
+        p,
+        a,
+        "inh_hide",
+        "DelayedSingleton::GetInstance"
+    ));
+    // The accessor is the template's member: none is invented on a subclass.
+    for phantom in [
+        "InhSvc::GetInstance",
+        "InhDb::GetInstance",
+        "InhMidSvc::GetInstance",
+    ] {
+        assert!(
+            !p.symbols.functions.iter().any(|f| f.name == phantom),
+            "phantom {phantom}"
+        );
+    }
+    // CRTP names the subclass as an argument, never as its own base.
+    for cls in ["InhSvc", "InhDb", "InhHide"] {
+        assert!(!p.derives_from(cls, cls), "{cls} derives from itself");
+    }
+}
+
+analyzed_fixture!(cpp_singleton_issue121);
+
+#[test]
+fn cpp_singleton_issue121_fixture_reaches_every_target() {
+    let (p, a) = cpp_singleton_issue121();
+    for (caller, accessor, target) in [
+        ("f1", "DelayedSingleton::GetInstance", "Svc::Run"),
+        ("f2", "DelayedSingleton::GetInstance", "Svc::Run"),
+        ("f3", "Singleton::GetInstance", "Db::Open"),
+        ("f4", "Singleton::GetInstance", "Db::Open"),
+        ("f5", "DelayedSingleton::GetInstance", "Other::Go"),
+        ("f6", "DelayedSingleton::GetInstance", "Other::Go"),
+    ] {
+        assert!(
+            has_edge(p, a, caller, target, ResolutionKind::Direct)
+                && has_any_edge(p, a, caller, accessor),
+            "{caller} reaches {accessor} and {target}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    assert!(!p.derives_from("Svc", "Svc"));
+    assert!(!p.derives_from("Db", "Db"));
+}
+
+analyzed_fixture!(cpp_singleton_missing);
+
+#[test]
+fn cpp_singleton_missing_template_fallback() {
+    let (p, a) = cpp_singleton_missing();
+    for (caller, target) in [
+        ("miss_delayed", "MissSvc::Run"),
+        ("miss_singleton", "MissDb::Open"),
+        ("miss_qualified", "MissSvc::Run"),
+        ("miss_auto", "MissSvc::Run"),
+        ("miss_inherited", "MissInh::Run"),
+    ] {
+        assert_eq!(
+            edge_resolutions(p, a, caller, target),
+            [ResolutionKind::Direct],
+            "{caller} reaches {target}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    for caller in [
+        "miss_wrapper",
+        "miss_other_member",
+        "miss_unresolved",
+        "miss_multi",
+    ] {
+        let guessed: Vec<_> = common::callees_of(p, a, caller)
+            .into_iter()
+            .filter(|(callee, _)| callee.ends_with("::Run"))
+            .collect();
+        assert!(guessed.is_empty(), "{caller} guessed {guessed:?}");
+    }
+    assert!(!p.derives_from("MissInh", "MissInh"));
+    assert_no_singleton_member_invented(p);
+}
+
+/// No c_utils accessor is invented as a defined function.
+fn assert_no_singleton_member_invented(p: &trace_ir::Program) {
+    assert!(
+        !p.symbols
+            .functions
+            .iter()
+            .any(|f| f.is_defined && f.name.contains("Singleton::")),
+        "defined singleton member invented"
+    );
+}
+
+/// A tree declaring the singleton `template` with `accessor` as its whole
+/// body, in the tree or in a dependency root, and calling `Run` on
+/// `template<OvSvc>::GetInstance()` through `op`.
+fn declared_template_tree(
+    template: &str,
+    accessor: &str,
+    op: &str,
+    dep: bool,
+) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let headers = if dep {
+        tmp.path().join("dep")
+    } else {
+        tmp.path().to_path_buf()
+    };
+    std::fs::create_dir_all(&headers).unwrap();
+    std::fs::write(
+        headers.join("singleton.h"),
+        format!(
+            "#pragma once\nclass Registry {{\npublic:\n    void Run();\n}};\ntemplate <typename T> class {template} {{\npublic:\n    {accessor}\n}};\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.cpp"),
+        format!(
+            "#include \"singleton.h\"\nclass OvSvc {{\npublic:\n    void Run() {{}}\n}};\nvoid ov() {{ {template}<OvSvc>::GetInstance(){op}Run(); }}\n"
+        ),
+    )
+    .unwrap();
+    tmp
+}
+
+#[test]
+fn cpp_singleton_declared_return_overrides_fallback() {
+    for dep in [false, true] {
+        for (template, declarator) in [
+            ("DelayedSingleton", "*"),
+            ("Singleton", "&"),
+            ("DelayedRefSingleton", "&"),
+        ] {
+            for (accessor, expected) in [
+                (
+                    format!("static Registry {declarator}GetInstance();"),
+                    Some("Registry::Run"),
+                ),
+                ("static int GetInstance();".to_owned(), None),
+            ] {
+                // c_utils hands out `->` for a shared pointer, `.` for a reference.
+                let op = if declarator == "*" { "->" } else { "." };
+                let tmp = declared_template_tree(template, &accessor, op, dep);
+                let mut opts =
+                    trace_preproc::PreprocessOptions::new().with_include(tmp.path().to_path_buf());
+                if dep {
+                    opts = opts
+                        .with_include(tmp.path().join("dep"))
+                        .with_dep(tmp.path().join("dep"));
+                }
+                let program = build_program(tmp.path(), &opts).expect("build");
+                let (_pag, analysis) = analyze(&program);
+                let callees = common::callees_of(&program, &analysis, "ov");
+                assert!(
+                    !callees.iter().any(|(c, _)| c == "OvSvc::Run"),
+                    "{template}: {accessor} (dep {dep}) wins over the heuristic: {callees:?}"
+                );
+                if let Some(target) = expected {
+                    assert!(
+                        callees.iter().any(|(c, _)| c == target),
+                        "{template}: {accessor} (dep {dep}) reaches {target}: {callees:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cpp_singleton_ranked_definitions_keep_their_substitution() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(p, a, "ranked_get", "RankSvc::Run", ResolutionKind::Direct),
+        "{:?}",
+        common::callees_of(p, a, "ranked_get")
+    );
+    assert!(must_not_have_edge(p, a, "ranked_get", "Decoy::Run"));
+}
+
+#[test]
+fn cpp_singleton_concrete_first_prototype_lends_no_return() {
+    let (p, a) = cpp_singleton_calls();
+    let callees = common::callees_of(p, a, "concrete_first");
+    assert!(
+        !callees
+            .iter()
+            .any(|(c, _)| c == "Decoy::Run" || c == "FirstSvc::Run"),
+        "{callees:?}"
+    );
+}
+
+#[test]
+fn cpp_singleton_template_parameter_arguments_stay_dependent() {
+    let (p, a) = cpp_singleton_calls();
+    for (caller, target, accessor) in [
+        ("dep_box", "DepSvc::Run", None),
+        (
+            "dep_inherited",
+            "DepInh::Open",
+            Some("Singleton::GetInstance"),
+        ),
+    ] {
+        let callees = common::callees_of(p, a, caller);
+        assert!(
+            !callees.iter().any(|(c, _)| c == target),
+            "{caller}: {callees:?}"
+        );
+        if let Some(accessor) = accessor {
+            assert!(
+                !callees.iter().any(|(c, _)| c == accessor),
+                "{caller}: {callees:?}"
+            );
+        }
+    }
+    let (p, a) = cpp_singleton_missing();
+    let callees = common::callees_of(p, a, "miss_dependent");
+    assert!(
+        !callees.iter().any(|(c, _)| c == "MissSvc::Run"),
+        "miss_dependent: {callees:?}"
+    );
+}
+
+#[test]
+fn cpp_singleton_prototype_and_inline_definition_lend_no_return() {
+    let (p, a) = cpp_singleton_calls();
+    let callees = common::callees_of(p, a, "mixed_get");
+    assert!(
+        !callees
+            .iter()
+            .any(|(c, _)| c == "Decoy2::Run" || c == "MixSvc::Run"),
+        "{callees:?}"
+    );
+}
+
+#[test]
+fn cpp_singleton_plain_class_keeps_its_first_return() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(p, a, "plain_get", "Bar2::Foo", ResolutionKind::Direct),
+        "{:?}",
+        common::callees_of(p, a, "plain_get")
+    );
+    assert!(!p.has_template_returns("Plain"));
+}
+
+#[test]
+fn cpp_singleton_template_template_parameter_is_no_wrapper_class() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        must_not_have_edge(p, a, "tt_get", "Holder2::Run"),
+        "{:?}",
+        common::callees_of(p, a, "tt_get")
+    );
+}
+
+#[test]
+fn cpp_singleton_dependent_template_id_scope_looks_nothing_up() {
+    let (p, a) = cpp_singleton_calls();
+    let callees = common::callees_of(p, a, "wrap_dependent");
+    assert!(
+        !callees.iter().any(|(c, _)| c == "U::GetInstance"),
+        "{callees:?}"
+    );
+    assert!(must_not_have_edge(p, a, "wrap_dependent", "Decoy2::Run"));
+}
+
+#[test]
+fn cpp_singleton_nested_template_is_not_c_utils() {
+    let (p, a) = cpp_singleton_missing();
+    let nested = common::callees_of(p, a, "nested_singleton");
+    assert!(!nested.iter().any(|(c, _)| c == "NestA::Run"), "{nested:?}");
+}
+
+analyzed_fixture!(cpp_singleton_delayed_ref);
+
+/// #184: c_utils' `DelayedRefSingleton<T>::GetInstance()` returns `T &`, as
+/// `Singleton`'s does; with no definition in view it is typed the same way.
+#[test]
+fn cpp_singleton_delayed_ref_fallback() {
+    let (p, a) = cpp_singleton_delayed_ref();
+    // The accessor edge stays the external declaration it was. The
+    // qualified row names an `OHOS` namespace the fixture never declares, so
+    // its accessor's exported spelling is not pinned.
+    for (caller, accessor, target) in [
+        ("ref_inherited", Some("RefSvc::GetInstance"), "RefSvc::Run"),
+        (
+            "ref_spelled",
+            Some("DelayedRefSingleton::GetInstance"),
+            "RefSvc::Run",
+        ),
+        ("ref_qualified", None, "RefSvc::Run"),
+        ("ref_auto", Some("RefSvc::GetInstance"), "RefSvc::Stop"),
+        (
+            "OHOS::Use",
+            Some("Machine::GetInstance"),
+            "OHOS::Machine::Open",
+        ),
+        (
+            "OHOS::UseSpelled",
+            Some("DelayedRefSingleton::GetInstance"),
+            "OHOS::Machine::Open",
+        ),
+    ] {
+        let callees = common::callees_of(p, a, caller);
+        assert_eq!(
+            edge_resolutions(p, a, caller, target),
+            [ResolutionKind::Direct],
+            "{caller} reaches {target}: {callees:?}"
+        );
+        if let Some(accessor) = accessor {
+            assert_eq!(
+                edge_resolutions(p, a, caller, accessor),
+                [ResolutionKind::External],
+                "{caller} keeps its accessor edge: {callees:?}"
+            );
+        }
+    }
+    for caller in [
+        "ref_other_member",
+        "ref_multi",
+        "ref_unresolved",
+        "ref_dependent",
+        "ref_nested",
+    ] {
+        let guessed: Vec<_> = common::callees_of(p, a, caller)
+            .into_iter()
+            // Whatever class a wrong guess would name (`Unknown`, `RefNest`).
+            .filter(|(callee, _)| callee.ends_with("::Run"))
+            .collect();
+        assert!(guessed.is_empty(), "{caller} guessed {guessed:?}");
+    }
+    assert_no_singleton_member_invented(p);
+}
+
+/// R2-9: two units see the wrapper's namespace differently; both record the
+/// same fact, so substitution still agrees.
+#[test]
+fn cpp_singleton_wrapper_fact_is_unit_independent() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("sptr.h"),
+        "#pragma once\nnamespace OHOS {\ntemplate <typename T> class sptr {\npublic:\n    T *operator->() const;\n};\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("holder.h"),
+        "#pragma once\nnamespace OHOS {\ntemplate <typename T> class Holder {\npublic:\n    static sptr<T> Get();\n};\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("a_sees.cpp"),
+        "#include \"sptr.h\"\n#include \"holder.h\"\nclass UnitSvc {\npublic:\n    void Run() {}\n};\nvoid use_holder() { OHOS::Holder<UnitSvc>::Get()->Run(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("b_blind.cpp"),
+        "#include \"holder.h\"\nvoid blind() {}\n",
+    )
+    .unwrap();
+    let opts = trace_preproc::PreprocessOptions::new().with_include(tmp.path().to_path_buf());
+    let program = build_program(tmp.path(), &opts).expect("build");
+    let facts = program
+        .template_returns_of("OHOS::Holder", "OHOS::Holder::Get")
+        .unwrap_or_default();
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    let (_pag, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "use_holder",
+        "UnitSvc::Run",
+        ResolutionKind::Direct
+    ));
+}
+
+#[test]
+fn cpp_singleton_specializations_keep_primary_substitution() {
+    let (p, a) = cpp_singleton_calls();
+    for caller in ["spec_member", "spec_class"] {
+        assert!(
+            has_edge(p, a, caller, "SpecSvc::Run", ResolutionKind::Direct),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        assert!(must_not_have_edge(p, a, caller, "SpecOther::Run"));
+    }
+}
+
+#[test]
+fn cpp_same_arity_prototype_overloads_keep_their_returns() {
+    let (p, a) = cpp_singleton_calls();
+    for (caller, target, other) in [
+        ("overloaded_int", "OvBaz::Foo", "OvBar::Foo"),
+        ("overloaded_long", "OvBar::Foo", "OvBaz::Foo"),
+    ] {
+        assert!(
+            has_edge(p, a, caller, target, ResolutionKind::Direct),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        assert!(must_not_have_edge(p, a, caller, other), "{caller}");
+    }
+    let overloads = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Overloaded::Get")
+        .count();
+    assert_eq!(overloads, 2, "Get(long) and Get(int) are two entries");
+}
+
+#[test]
+fn cpp_singleton_member_template_template_parameter_is_no_wrapper_class() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        must_not_have_edge(p, a, "member_template", "P::Run"),
+        "{:?}",
+        common::callees_of(p, a, "member_template")
+    );
+}
+
+#[test]
+fn cpp_enumerator_argument_ranks_the_value_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(
+            p,
+            a,
+            "cam::enum_arg",
+            "cam::EnumSession::BeginConfig",
+            ResolutionKind::Direct
+        ),
+        "{:?}",
+        common::callees_of(p, a, "cam::enum_arg")
+    );
+}
+
+#[test]
+fn cpp_member_alias_scope_reaches_the_aliased_static_member() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(
+            p,
+            a,
+            "AliasUser::Use",
+            "AliasImpl::Reg",
+            ResolutionKind::Direct
+        ),
+        "{:?}",
+        common::callees_of(p, a, "AliasUser::Use")
+    );
+}
+
+/// The definition lines of `name`'s callees from `caller`, one per edge.
+fn callee_lines(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    name: &str,
+) -> Vec<u32> {
+    let mut lines: Vec<u32> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == caller && fn_name(program, e.callee) == name)
+        .map(|e| program.symbols.function(e.callee).span.line)
+        .collect();
+    lines.sort_unstable();
+    lines
+}
+
+#[test]
+fn cpp_prototype_call_is_not_redirected_to_another_overloads_definition() {
+    let (p, a) = cpp_singleton_calls();
+    // `Get(int)` is declared on line 15, `Get(long)` defined on line 18.
+    assert_eq!(callee_lines(p, a, "r4_redirect", "R4Sel::Get"), [15]);
+}
+
+#[test]
+fn cpp_unknown_argument_keeps_every_same_arity_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(callee_lines(p, a, "r4_unknown", "R4Sel::Get"), [15, 18]);
+}
+
+#[test]
+fn cpp_out_of_tree_namespace_constant_is_no_enumerator() {
+    let (p, a) = cpp_singleton_calls();
+    let takes = common::callees_of(p, a, "r4_constant")
+        .into_iter()
+        .filter(|(c, _)| c == "R4Take")
+        .count();
+    assert_eq!(takes, 2, "{:?}", common::callees_of(p, a, "r4_constant"));
+}
+
+#[test]
+fn cpp_int_and_class_prototypes_stay_two_overloads() {
+    let (p, a) = cpp_singleton_calls();
+    let sets = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R4Setter::Set")
+        .count();
+    assert_eq!(sets, 2);
+    // `Set(5)` reaches the undefined `Set(int)` (line 31), not `Set(R4Foo)`.
+    assert_eq!(callee_lines(p, a, "r4_set_int", "R4Setter::Set"), [31]);
+}
+
+#[test]
+fn cpp_ranked_overload_substitutes_its_own_return() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(p, a, "r4_substitute", "R4Foo::Go", ResolutionKind::Direct),
+        "{:?}",
+        common::callees_of(p, a, "r4_substitute")
+    );
+}
+
+#[test]
+fn cpp_definition_joins_its_own_prototype_not_the_int_one() {
+    let (p, a) = cpp_singleton_calls();
+    // Prototypes on lines 16 (`int`) and 17 (`sptr<Base>`); definitions on
+    // 19 (`r5::sptr<Base>`) and 20 (`int`). Each call reaches its own body.
+    assert_eq!(callee_lines(p, a, "r5::set_ptr", "r5::Setter::Set"), [19]);
+    assert_eq!(callee_lines(p, a, "r5::set_int", "r5::Setter::Set"), [20]);
+}
+
+#[test]
+fn cpp_same_named_classes_in_two_namespaces_are_two_overloads() {
+    let (p, _) = cpp_singleton_calls();
+    let applies = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R5Cfg::Apply")
+        .count();
+    assert_eq!(applies, 2);
+}
+
+#[test]
+fn cpp_template_instance_parameter_is_not_every_type() {
+    let (p, _) = cpp_singleton_calls();
+    let gets = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R5Get::Get")
+        .count();
+    assert_eq!(gets, 2);
+}
+
+#[test]
+fn cpp_alias_template_return_is_what_it_aliases() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_any_edge(p, a, "r5_alias", "R5Svc::Run"),
+        "{:?}",
+        common::callees_of(p, a, "r5_alias")
+    );
+}
+
+#[test]
+fn cpp_unnamed_reference_parameter_meets_its_prototype() {
+    let (p, _) = cpp_singleton_calls();
+    let links: Vec<_> = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R5Link::Link")
+        .map(|f| f.is_defined)
+        .collect();
+    assert_eq!(links, [true], "one defined entry");
+    let unnamed = p
+        .symbols
+        .variables
+        .iter()
+        .any(|v| v.name == "&" || v.name == "&&");
+    assert!(
+        !unnamed,
+        "no parameter is named by its declarator punctuation"
+    );
+}
+
+#[test]
+fn cpp_known_argument_rules_out_an_overload_it_cannot_bind() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(
+            p,
+            a,
+            "r5_viable",
+            "R5Output::Commit",
+            ResolutionKind::Direct
+        ),
+        "{:?}",
+        common::callees_of(p, a, "r5_viable")
+    );
+}
+
+#[test]
+fn cpp_converting_constructor_keeps_an_overload_viable() {
+    let (p, a) = cpp_singleton_calls();
+    let sets: Vec<u32> = callee_lines(p, a, "r6_convert", "R6Conv::Set");
+    assert_eq!(sets, [15, 16], "both overloads stay candidates");
+}
+
+#[test]
+fn cpp_prototype_does_not_join_another_overloads_inline_definition() {
+    let (p, a) = cpp_singleton_calls();
+    // The inline `Set(int)` is on line 22; `Set(R6Foo)` is defined on line 26.
+    assert_eq!(callee_lines(p, a, "r6_inline", "R6Inline::Set"), [26]);
+}
+
+#[test]
+fn cpp_unnamed_pointer_parameters_keep_their_depth() {
+    let (p, _) = cpp_singleton_calls();
+    let gets = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R6Ptrs::Get" && f.is_defined)
+        .count();
+    assert_eq!(gets, 2, "`int *` and `int **` are two overloads");
+    assert!(
+        !p.symbols.variables.iter().any(|v| v.name == "const"),
+        "a qualifier names no parameter"
+    );
+}
+
+#[test]
+fn cpp_enumerator_shaped_constant_keeps_every_overload() {
+    let (p, a) = cpp_singleton_calls();
+    let logs = common::callees_of(p, a, "r7_constant")
+        .into_iter()
+        .filter(|(c, _)| c == "R7Log")
+        .count();
+    assert_eq!(logs, 2, "{:?}", common::callees_of(p, a, "r7_constant"));
+}
+
+#[test]
+fn cpp_int_stand_in_argument_keeps_the_reference_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(
+        callee_lines(p, a, "r7_standin", "R7Setter::Set"),
+        [11, 12],
+        "{:?}",
+        common::callees_of(p, a, "r7_standin")
+    );
+}
+
+#[test]
+fn cpp_same_final_name_in_unrelated_namespaces_is_no_exact_match() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(
+        callee_lines(p, a, "r7_other_namespace", "R7Apply::Apply"),
+        [21, 22],
+        "{:?}",
+        common::callees_of(p, a, "r7_other_namespace")
+    );
+}
+
+fn edge_count(p: &Program, a: &AnalysisResult, caller: &str, callee: &str) -> usize {
+    common::callees_of(p, a, caller)
+        .into_iter()
+        .filter(|(c, _)| c == callee)
+        .count()
+}
+
+#[test]
+fn cpp_literal_int_does_not_fall_to_a_class_reference_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(edge_count(p, a, "r8_literal", "R8Writer::Write"), 2);
+}
+
+#[test]
+fn cpp_enum_shaped_array_constant_keeps_the_pointer_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(edge_count(p, a, "r8_args", "R8Run"), 2);
+}
+
+/// A call's edges rank on the arguments whose types are known, an unknown
+/// one ranking every candidate alike: `Make(unknown, 5)` binds
+/// `Make(R8X, int)`, as `master` always has (review round 13 reversed R8-6).
+#[test]
+fn cpp_free_call_edges_rank_on_their_known_arguments() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(edge_count(p, a, "r8_unknown", "R8Make::Make"), 1);
+}
+
+/// R8-4: two overloads declared on one line of a header two units include
+/// stay two entries through the merge.
+#[test]
+fn cpp_same_line_overloads_survive_the_merge() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("line.h"),
+        "#pragma once\nstruct LineFoo { void Go() {} };\nstruct LineBar { void Go() {} };\nstruct Line { static LineFoo *Get(int k); static LineBar *Get(const char *k); };\n",
+    )
+    .unwrap();
+    for unit in ["a.cpp", "b.cpp"] {
+        std::fs::write(
+            tmp.path().join(unit),
+            format!(
+                "#include \"line.h\"\nvoid use_{}() {{ Line::Get(\"k\")->Go(); }}\n",
+                &unit[..1]
+            ),
+        )
+        .unwrap();
+    }
+    let opts = trace_preproc::PreprocessOptions::new().with_include(tmp.path().to_path_buf());
+    let program = build_program(tmp.path(), &opts).expect("build");
+    let gets = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Line::Get")
+        .count();
+    assert_eq!(gets, 2);
+    let (_pag, analysis) = analyze(&program);
+    for caller in ["use_a", "use_b"] {
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                caller,
+                "LineBar::Go",
+                ResolutionKind::Direct
+            ),
+            "{caller}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+}
+
+#[test]
+fn cpp_unnamed_function_pointer_and_array_parameters_meet_their_prototypes() {
+    let (p, a) = cpp_singleton_calls();
+    for name in ["R9Svc::E", "R9Svc::F"] {
+        let entries: Vec<bool> = p
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| f.name == name)
+            .map(|f| f.is_defined)
+            .collect();
+        assert_eq!(entries, [true], "{name}");
+    }
+    assert!(
+        has_any_edge(p, a, "R9Svc::E", "r9_handler"),
+        "{:?}",
+        common::callees_of(p, a, "R9Svc::E")
+    );
+}
+
+#[test]
+fn cpp_unresolved_class_reference_keeps_its_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(edge_count(p, a, "r9_unresolved", "R9Setter::Set"), 2);
+}
+
+#[test]
+fn cpp_header_call_keeps_a_site_per_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(edge_count(p, a, "R10Pick::Use", "R10Pick::Pick"), 2);
+}
+
+#[test]
+fn cpp_reference_argument_keeps_the_by_value_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(edge_count(p, a, "r10_reference", "R10Taker::Take"), 2);
+}
+
+#[test]
+fn cpp_unresolved_enum_parameter_is_no_exact_match() {
+    let (p, a) = cpp_singleton_calls();
+    assert_eq!(edge_count(p, a, "r10_enum", "R10Mode::SetMode"), 2);
+}
+
+#[test]
+fn cpp_unnamed_pointer_reference_meets_its_definition() {
+    let (p, _) = cpp_singleton_calls();
+    let entries: Vec<bool> = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R10Get::Get")
+        .map(|f| f.is_defined)
+        .collect();
+    assert_eq!(entries, [true]);
+}
+
+#[test]
+fn cpp_unresolved_parameter_definition_joins_its_own_prototype() {
+    let (p, _) = cpp_singleton_calls();
+    let mut entries: Vec<(u32, bool)> = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R11M::Get")
+        .map(|f| (f.span.line, f.is_defined))
+        .collect();
+    entries.sort();
+    // Each definition (lines 16 and 17) took its own prototype's entry.
+    assert_eq!(entries, [(16, true), (17, true)]);
+    let returns: Vec<String> = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R11M::Get" && f.span.line == 16)
+        .map(|f| format!("{:?}", p.types.get(f.return_type).desc))
+        .collect();
+    assert!(returns[0].contains("R11B"), "{returns:?}");
+}
+
+/// R11-3: one header function whose declaration starts at a different
+/// column in two configurations (`API` an attribute macro in one unit, empty
+/// in the other) is one entry.
+#[test]
+fn cpp_header_function_merges_across_configurations_that_move_its_column() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("api.h"),
+        "#pragma once\nAPI inline int Shared() { return 1; }\n",
+    )
+    .unwrap();
+    for unit in ["a.cpp", "b.cpp"] {
+        std::fs::write(
+            tmp.path().join(unit),
+            format!(
+                "#include \"api.h\"\nint use_{}() {{ return Shared(); }}\n",
+                &unit[..1]
+            ),
+        )
+        .unwrap();
+    }
+    let commands = serde_json::json!([
+        {"directory": tmp.path(), "file": "a.cpp", "arguments": ["c++", "-c", "a.cpp", "-DAPI=__attribute__((visibility(\"default\")))"]},
+        {"directory": tmp.path(), "file": "b.cpp", "arguments": ["c++", "-c", "b.cpp", "-DAPI="]}
+    ]);
+    std::fs::write(
+        tmp.path().join("compile_commands.json"),
+        serde_json::to_string(&commands).unwrap(),
+    )
+    .unwrap();
+    let opts = trace_preproc::PreprocessOptions::new().with_include(tmp.path().to_path_buf());
+    let program = build_program(tmp.path(), &opts).expect("build");
+    let shared = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "Shared")
+        .count();
+    assert_eq!(shared, 1);
+}
+
+#[test]
+fn cpp_unknown_parameter_prototype_is_not_redirected_to_a_scalar_body() {
+    let (p, _) = cpp_singleton_calls();
+    let entry = |defined: bool| {
+        p.symbols
+            .functions
+            .iter()
+            .find(|f| f.name == "R11Redirect::Set" && f.is_defined == defined)
+            .expect("entry")
+    };
+    // `Set(Mode)` (declared, `Mode` unresolved) is not `Set(int)` (defined),
+    // so a call bound to the prototype is not redirected to that body.
+    assert_eq!(
+        p.symbols.explicit_params_alike(
+            entry(false),
+            entry(true),
+            &p.types,
+            trace_ir::SpellingTolerance::Redeclaration
+        ),
+        Some(false)
+    );
+}
+
+#[test]
+fn cpp_scalar_argument_does_not_bind_an_out_parameter_overload() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(
+            p,
+            a,
+            "r11_enum_global",
+            "R11Session::Stop",
+            ResolutionKind::Direct
+        ),
+        "{:?}",
+        common::callees_of(p, a, "r11_enum_global")
+    );
+}
+
+#[test]
+fn cpp_virtual_call_dispatches_only_to_the_ranked_overloads_overrides() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        must_not_have_edge(p, a, "r13_dispatch", "R13Derived::On"),
+        "{:?}",
+        common::callees_of(p, a, "r13_dispatch")
+    );
+    assert_eq!(edge_count(p, a, "r13_dispatch", "R13Base::On"), 1);
+}
+
+#[test]
+fn cpp_address_argument_binds_the_out_parameter_overload() {
+    let (p, a) = cpp_singleton_calls();
+    let lines = callee_lines(p, a, "r13_address", "R13Create");
+    assert!(lines.contains(&71), "{lines:?}");
+}
+
+#[test]
+fn cpp_subclass_only_overload_does_not_displace_the_base() {
+    let (p, a) = cpp_singleton_calls();
+    let callees = common::callees_of(p, a, "r14_static");
+    assert!(
+        callees.iter().any(|(c, _)| c == "R14Base::On"),
+        "{callees:?}"
+    );
+}
+
+#[test]
+fn cpp_in_tree_class_is_no_int_stand_in_for_the_redirect() {
+    let (p, a) = cpp_singleton_calls();
+    // `R14Set(int)` is declared on line 16; `R14Set(R14Foo)` defined on 18.
+    assert_eq!(callee_lines(p, a, "r14_redirect", "R14Set"), [16]);
+}
+
+#[test]
+fn cpp_address_of_a_reference_is_the_referent_address() {
+    let (p, a) = cpp_singleton_calls();
+    // `R14F(R14Foo *)` is on line 22.
+    assert!(
+        callee_lines(p, a, "r14_address", "R14F").contains(&22),
+        "{:?}",
+        callee_lines(p, a, "r14_address", "R14F")
+    );
+}
+
+#[test]
+fn cpp_inline_template_overloads_substitute_their_own_returns() {
+    let (p, a) = cpp_singleton_calls();
+    assert!(
+        has_edge(p, a, "r14_inline", "R14Svc::Run", ResolutionKind::Direct),
+        "{:?}",
+        common::callees_of(p, a, "r14_inline")
+    );
+}
+
+#[test]
+fn cpp_guessed_class_argument_leaves_the_others_to_rank() {
+    let (p, a) = cpp_singleton_calls();
+    // `SetParam(.., int)` is on line 5.
+    assert_eq!(callee_lines(p, a, "r15_guess", "R15Want::SetParam"), [5]);
+}
+
+#[test]
+fn cpp_address_of_an_element_through_a_reference_is_a_pointer() {
+    let (p, a) = cpp_singleton_calls();
+    // `R15Write(const int *, int)` is on line 11.
+    assert!(
+        callee_lines(p, a, "r15_subscript", "R15Write").contains(&11),
+        "{:?}",
+        callee_lines(p, a, "r15_subscript", "R15Write")
+    );
+}
+
+#[test]
+fn cpp_dereferenced_smart_pointer_reference_keeps_the_pointee_overload() {
+    let (p, a) = cpp_singleton_calls();
+    // `R16Use(R16Foo &)` is on line 9.
+    assert!(
+        callee_lines(p, a, "r16_deref", "R16Use").contains(&9),
+        "{:?}",
+        callee_lines(p, a, "r16_deref", "R16Use")
+    );
+}
+
+#[test]
+fn cpp_fixed_width_typedef_parameters_meet_their_definitions() {
+    let (p, _) = cpp_singleton_calls();
+    let writes: Vec<bool> = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "R16Writer::Write")
+        .map(|f| f.is_defined)
+        .collect();
+    assert_eq!(writes, [true, true]);
+}
+
+#[test]
+fn cpp_derived_argument_keeps_the_base_reference_overload() {
+    let (p, a) = cpp_singleton_calls();
+    // `R17Take(const R17Base &)` is on line 5.
+    assert!(
+        callee_lines(p, a, "r17_derived", "R17Take").contains(&5),
+        "{:?}",
+        callee_lines(p, a, "r17_derived", "R17Take")
+    );
+}
+
+analyzed_fixture!(cpp_template_base_fallback);
+
+#[test]
+fn cpp_template_base_fallback_reaches_proxy() {
+    let (p, a) = cpp_template_base_fallback();
+    for target in ["FooProxy::Do", "FooStub::Do", "FooMock::Do"] {
+        assert!(
+            has_any_edge(p, a, "call", target),
+            "call reaches {target}: {:?}",
+            common::callees_of(p, a, "call")
+        );
+    }
+    assert!(has_any_edge(p, a, "callbar", "BarProxy::Go"));
+    assert!(
+        has_any_edge(p, a, "ns::callscoped", "ns::ScopedProxy::X"),
+        "{:?}",
+        common::callees_of(p, a, "ns::callscoped")
+    );
+}
+
+#[test]
+fn cpp_template_base_definition_disables_guess() {
+    let (p, a) = cpp_template_base_fallback();
+    for target in ["BazPlain::Run", "BazUnrelated::Run"] {
+        assert!(must_not_have_edge(p, a, "callbaz", target), "{target}");
+    }
+    assert!(!p.derives_from("BazPlain", "IBaz"));
+    assert!(!p.derives_from("BazUnrelated", "IBaz"));
+    // Another unit's definition of `Late` decides, too.
+    assert!(!p.derives_from("LateProxy", "IFoo"));
+    assert!(must_not_have_edge(p, a, "call", "LateProxy::Do"));
+}
+
+#[test]
+fn cpp_template_base_fallback_rejects_cycles() {
+    let (p, _) = cpp_template_base_fallback();
+    for cls in ["Crtp", "SSvc", "CycleA", "CycleB"] {
+        assert!(!p.derives_from(cls, cls), "{cls} derives from itself");
+    }
+    assert!(
+        !(p.derives_from("CycleA", "CycleB") && p.derives_from("CycleB", "CycleA")),
+        "a cycle"
+    );
+    assert!(p.bases_of("Prim").iter().all(|b| b != "int"));
+    assert!(!p.derives_from("Multi", "IFoo"));
+    assert!(!p.derives_from("Multi", "IBar"));
+}
+
+#[test]
+fn cpp_template_base_guess_needs_a_class_argument() {
+    let (p, _) = cpp_template_base_fallback();
+    assert!(!p.derives_from("PtrProxy", "IFoo"));
+    assert!(!p.derives_from("NestProxy", "Holder"));
+    assert!(!p.derives_from("NestProxy", "IFoo"));
+    assert!(!p.derives_from("RefProxy", "IFoo"));
+}
+
+#[test]
+fn cpp_template_base_guess_needs_an_override() {
+    let (p, _) = cpp_template_base_fallback();
+    assert!(!p.derives_from("Registry", "Handler"));
+    assert!(!p.derives_from("CaseTest", "Case"));
+}
+
+#[test]
+fn cpp_template_base_override_may_be_in_a_subclass() {
+    let (p, a) = cpp_template_base_fallback();
+    assert!(p.derives_from("TaskStub", "ITask"));
+    assert!(has_any_edge(p, a, "calltask", "TaskService::Perform"));
+}
+
+#[test]
+fn cpp_template_base_member_of_an_instance_is_not_guessed() {
+    let (p, _) = cpp_template_base_fallback();
+    assert!(!p.derives_from("TraitImpl", "IBaz"));
+    assert!(!p.derives_from("NestedImpl", "IBaz"));
+}
+
+#[test]
+fn cpp_template_base_argument_members_include_its_bases() {
+    let (p, a) = cpp_template_base_fallback();
+    assert!(p.derives_from("AllProxy", "IFoo"));
+    assert!(has_any_edge(p, a, "call", "AllProxy::Do"));
+}
+
+#[test]
+fn cpp_template_base_evidence_is_a_virtual_member() {
+    let (p, _) = cpp_template_base_fallback();
+    assert!(!p.derives_from("InfoList", "Info"), "std templates never");
+    assert!(!p.derives_from("PlainerBox", "Plainer"), "non-virtual name");
+}
+
+#[test]
+fn cpp_template_base_file_local_class_is_guessed_in_its_file() {
+    let (p, a) = cpp_template_base_fallback();
+    assert!(has_any_edge(p, a, "call", "AnonProxy::Do"));
+}
+
+#[test]
+fn cpp_template_base_merged_declared_base_is_seen_by_a_file_local_class() {
+    let (p, a) = cpp_template_base_fallback();
+    assert!(has_any_edge(p, a, "calllocal", "LocalImpl::Local"));
+}
+
+#[test]
+fn cpp_template_base_file_local_namesake_keeps_the_global_guess() {
+    let (p, a) = cpp_template_base_fallback();
+    assert!(p.derives_from("TwinProxy", "IFoo"));
+    assert!(has_any_edge(p, a, "call", "TwinProxy::Do"));
+}
+
+#[test]
+fn cpp_template_base_guess_defers_to_a_template_of_its_name() {
+    let (p, a) = cpp_template_base_fallback();
+    assert!(!p.derives_from("BazHidden", "IBaz"));
+    assert!(must_not_have_edge(p, a, "callbaz", "BazHidden::Run"));
+}
+
+#[test]
+fn cpp_template_base_declared_edge_precedes_a_guess() {
+    let (p, _) = cpp_template_base_fallback();
+    assert!(p.derives_from("PB", "PA"), "PDefined<PA> derives from PA");
+    assert!(!p.derives_from("PA", "PB"), "the guess would close a cycle");
+}
+
+/// A definition from a dependency root decides as an in-tree one does.
+#[test]
+fn cpp_template_base_dependency_definition_disables_guess() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dep = tmp.path().join("dep");
+    std::fs::create_dir(&dep).unwrap();
+    std::fs::write(
+        dep.join("wrap.h"),
+        "#pragma once\ntemplate <class T> class DepWrap {};\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("main.cpp"),
+        "#include \"wrap.h\"\nstruct IQux { virtual void Q() = 0; };\nclass QuxWrap : public DepWrap<IQux> { public: void Q() override {} };\n",
+    )
+    .unwrap();
+    let opts = trace_preproc::PreprocessOptions::new()
+        .with_include(dep.clone())
+        .with_dep(dep);
+    let program = build_program(tmp.path(), &opts).expect("build");
+    assert!(!program.derives_from("QuxWrap", "IQux"));
+}
+
+/// Both undefined singleton templates read their argument alike: an
+/// elaborated `class Svc` names `Svc` for `DelayedSingleton` as for
+/// `Singleton`.
+#[test]
+fn cpp_undefined_singletons_read_an_elaborated_argument() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct Svc { void Run() {} };\nstruct Db { void Put() {} };\n\
+             void a() { DelayedSingleton<class Svc>::GetInstance()->Run(); }\n\
+             void b() { Singleton<class Db>::GetInstance().Put(); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "a", "Svc::Run"));
+    assert!(has_any_edge(&program, &analysis, "b", "Db::Put"));
+}
+
+/// `size_t` is `unsigned long` on LP64 (and `unsigned int` on 32-bit
+/// targets): an override spelling the other keeps its dispatch.
+#[test]
+fn cpp_override_spelling_size_t_differently_keeps_dispatch() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct B { virtual void On(size_t n) = 0; };\n\
+             struct D : B { void On(unsigned long n) override {} };\n\
+             void go(B *b) { b->On(1); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(
+        has_any_edge(&program, &analysis, "go", "D::On"),
+        "{:?}",
+        common::callees_of(&program, &analysis, "go")
+    );
+}
+
+/// A parameter typed by a typedef of an anonymous struct is one type in
+/// every unit, however each unit names the anonymous struct: an override
+/// defined in another unit keeps its dispatch.
+#[test]
+fn cpp_override_of_an_anonymous_struct_parameter_keeps_dispatch() {
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "cb.h",
+                "#pragma once\nstruct Pad { int p; };\ntypedef struct { int v; } Info;\nstruct Callback { virtual void On(Info info) = 0; };\n",
+            ),
+            (
+                "a_session.cpp",
+                "#include \"cb.h\"\nvoid go(Callback *c) { Info i; c->On(i); }\n",
+            ),
+            (
+                "z_test.cpp",
+                "typedef struct { int u; } Other;\n#include \"cb.h\"\nstruct Recording : public Callback { void On(Info info) override {} };\n",
+            ),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(
+        has_any_edge(&program, &analysis, "go", "Recording::On"),
+        "{:?}",
+        common::callees_of(&program, &analysis, "go")
+    );
+}
+
+/// `Db::GetInstance()` inherits c_utils' accessor from an undefined
+/// `DelayedSingleton<Db>` / `Singleton<Db>` base, and the chain on its
+/// result reaches `Db`'s members (#121, `AccessTokenDb::GetInstance()->`).
+#[test]
+fn cpp_accessor_inherited_from_an_undefined_singleton_base_is_typed() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct TokenDb final : public DelayedSingleton<TokenDb> { int Modify(int x) { return x; } };\n\
+             struct Brief : public Singleton<Brief> { void Put() {} };\n\
+             namespace ns { struct Svc : public DelayedSingleton<Svc> { void Go() {} }; }\n\
+             struct Own : public DelayedSingleton<Own> { static Own &GetInstance(); void Run() {} };\n\
+             void a() { TokenDb::GetInstance()->Modify(1); }\n\
+             void b() { Brief::GetInstance().Put(); }\n\
+             void d() { ns::Svc::GetInstance()->Go(); }\n\
+             void e() { Own::GetInstance().Run(); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    for (caller, callee) in [
+        ("a", "TokenDb::Modify"),
+        ("b", "Brief::Put"),
+        ("d", "ns::Svc::Go"),
+        ("e", "Own::Run"),
+    ] {
+        assert!(
+            has_any_edge(&program, &analysis, caller, callee),
+            "{caller} -> {callee}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+}
+
+/// `&r` of a reference to a class is a pointer to the referent: it reaches
+/// `f(Value *)` (a pointer against a by-value class decides nothing, so
+/// `f(Value)` may stay too), and `&q` of a reference to a pointer binds
+/// `Take(int **)`.
+#[test]
+fn cpp_address_of_a_reference_binds_the_pointer_overload() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct Value { int v; };\n\
+             void by_value(int) {}\n\
+             void by_pointer(int) {}\n\
+             void f(Value v) { by_value(v.v); }\n\
+             void f(Value *p) { by_pointer(p->v); }\n\
+             void go(Value &arg) { Value &r = arg; f(&r); }\n\
+             void by_param(Value &arg) { f(&arg); }\n\
+             void Take(int *p) {}\n\
+             void Take(int **p) {}\n\
+             void by_pointer_ref(int *&pr) { int *&q = pr; Take(&q); Take(&pr); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let lines = |caller: &str, callee: &str| -> Vec<u32> {
+        analysis
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(&program, e.caller) == caller && fn_name(&program, e.callee) == callee
+            })
+            .map(|e| program.symbols.function(e.callee).span.line)
+            .collect()
+    };
+    assert!(
+        lines("go", "f").contains(&5),
+        "a local reference reaches f(Value *)"
+    );
+    assert!(
+        lines("by_param", "f").contains(&5),
+        "a reference parameter reaches f(Value *)"
+    );
+    let take = lines("by_pointer_ref", "Take");
+    assert!(
+        take.iter().all(|&l| l == 9) && !take.is_empty(),
+        "Take(int **) on line 9: {take:?}"
+    );
+}
+
+/// An inherited singleton accessor keeps its argument's own arguments:
+/// `Inherited : Singleton<Holder<Svc>>` yields `Holder<Svc>`.
+#[test]
+fn cpp_inherited_singleton_keeps_nested_template_arguments() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct Svc { void Run() {} };\n\
+             template <class T> struct Holder { T *Get() { return nullptr; } };\n\
+             struct Inherited : public Singleton<Holder<Svc>> {};\n\
+             void a() { Inherited::GetInstance().Get()->Run(); }\n\
+             void b() { Singleton<Holder<Svc>>::GetInstance().Get()->Run(); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    for caller in ["a", "b"] {
+        assert!(
+            has_any_edge(&program, &analysis, caller, "Svc::Run"),
+            "{caller}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+}
+
+/// A reference parameter lowered as its referent's address — a scalar
+/// (`int &r`) as much as a class — gives `&r` that address; one to a pointer
+/// typedef (`VP &p`, `VP = Value *`) is not, so `&p` is one layer more.
+#[test]
+fn cpp_address_of_a_reference_parameter_follows_its_lowering() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct Value { int v; };\n\
+             using VP = Value *;\n\
+             void Take(int *p) {}\n\
+             void Take(int **p) {}\n\
+             void Pick(Value *p) {}\n\
+             void Pick(Value **p) {}\n\
+             void scalar(int &r) { Take(&r); }\n\
+             void typedef_ref(VP &p) { Pick(&p); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let lines = |caller: &str, callee: &str| -> Vec<u32> {
+        analysis
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(&program, e.caller) == caller && fn_name(&program, e.callee) == callee
+            })
+            .map(|e| program.symbols.function(e.callee).span.line)
+            .collect()
+    };
+    assert_eq!(lines("scalar", "Take"), [3], "Take(int *) is line 3");
+    assert_eq!(
+        lines("typedef_ref", "Pick"),
+        [6],
+        "Pick(Value **) is line 6"
+    );
+}
+
+/// An override declared (never defined) in the tree reads its parameter
+/// types when its base overloads the name, so a call ranked to another
+/// overload does not dispatch to it.
+#[test]
+fn cpp_declared_override_of_another_overload_gets_no_dispatch() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct B { virtual void On(int n) {} virtual void On(double d) {} };\n\
+             struct D : B { void On(int n) override; };\n\
+             void go(B *b) { b->On(1.0); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_any_edge(&program, &analysis, "go", "B::On"));
+    assert!(
+        must_not_have_edge(&program, &analysis, "go", "D::On"),
+        "{:?}",
+        common::callees_of(&program, &analysis, "go")
+    );
+}
+
+/// `using B::f;` joins `B::f` to the class's own `f` overloads, so `D::f`'s
+/// prototype records its parameter types.
+#[test]
+fn cpp_using_declaration_makes_an_overload_set() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct B { void f(char *s) {} };\n\
+             struct D : B { using B::f; void f(int n); };\n\
+             void go(D *d) { char *s = 0; d->f(s); }\n",
+        )],
+        default_opts,
+    );
+    // Member lookup stops at `D`, which declares `f`, so the call's edges
+    // do not show it; the prototype's recorded types do.
+    let f = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "D::f" && !f.is_defined)
+        .expect("D::f prototype");
+    assert!(
+        program
+            .symbols
+            .explicit_params(f)
+            .is_some_and(|p| p.get(0).is_some()),
+        "D::f records its parameter type"
+    );
+}
+
+/// A singleton base whose argument names no class does not end the search
+/// for the accessor's result; a resolvable one further up still types it.
+#[test]
+fn cpp_inherited_singleton_search_passes_an_unresolved_base() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct Svc { void Run() {} };\n\
+             struct Base : public DelayedSingleton<Svc> {};\n\
+             struct Leaf : public Singleton<Missing>, public Base {};\n\
+             void go() { Leaf::GetInstance()->Run(); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(
+        has_any_edge(&program, &analysis, "go", "Svc::Run"),
+        "{:?}",
+        common::callees_of(&program, &analysis, "go")
+    );
+}
+
+/// Parentheses around a reference change nothing: `&(x)` of an `int &x`
+/// parameter is `x`'s address, as `&x` is.
+#[test]
+fn cpp_address_of_a_parenthesized_reference_parameter() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "void take(int *p) {}\n\
+             void take(int **p) {}\n\
+             void caller(int &x) { take(&(x)); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let lines: Vec<u32> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "caller" && fn_name(&program, e.callee) == "take"
+        })
+        .map(|e| program.symbols.function(e.callee).span.line)
+        .collect();
+    assert_eq!(lines, [1], "take(int *) is line 1");
+}
+
+/// A member returning a function type whose parameters are named is named
+/// by its own declarator, not by a parameter name inside the return type.
+#[test]
+fn cpp_member_named_by_its_declarator_not_its_return_type() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "namespace std { template <class F> class function; }\n\
+             class TimeBroker {\n\
+             public:\n\
+                 std::function<void(unsigned handle)> GetExpiredFunc(unsigned handle);\n\
+             };\n",
+        )],
+        default_opts,
+    );
+    let names: Vec<&str> = program
+        .symbols
+        .functions
+        .iter()
+        .map(|f| f.name.as_str())
+        .filter(|n| n.starts_with("TimeBroker::"))
+        .collect();
+    assert_eq!(names, ["TimeBroker::GetExpiredFunc"]);
+}
+
+/// A pointer or reference return wraps the member's function declarator;
+/// the member is still named by it, not by a parameter in the return type.
+#[test]
+fn cpp_member_returning_a_pointer_named_by_its_declarator() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "namespace std { template <class F> class function; }\n\
+             class TimeBroker {\n\
+             public:\n\
+                 std::function<void(unsigned handle)> *GetExpiredFunc(unsigned handle);\n\
+                 std::function<void(unsigned token)> &GetRenewFunc(unsigned token);\n\
+             };\n",
+        )],
+        default_opts,
+    );
+    let mut names: Vec<&str> = program
+        .symbols
+        .functions
+        .iter()
+        .map(|f| f.name.as_str())
+        .filter(|n| n.starts_with("TimeBroker::"))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["TimeBroker::GetExpiredFunc", "TimeBroker::GetRenewFunc"]
+    );
+}
+
+/// A free function defined where a parameter's type does not resolve (the
+/// header declaring it is not included there) still meets its prototype,
+/// which read the type: calls through the prototype reach the body.
+#[test]
+fn cpp_free_definition_with_an_unresolved_parameter_meets_its_prototype() {
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "api.h",
+                "typedef struct Callbacks { void (*on)(void); } Callbacks;\n\
+                 struct Session;\n\
+                 extern \"C\" int Register(struct Session *s, Callbacks *cb);\n",
+            ),
+            (
+                "impl.cpp",
+                "struct Session { int id; };\n\
+                 extern \"C\" int Register(struct Session *s, Callbacks *cb) { return s->id; }\n",
+            ),
+            (
+                "user.cpp",
+                "#include \"api.h\"\nint use(Session *s) { return Register(s, 0); }\n",
+            ),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let targets: Vec<bool> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "use" && fn_name(&program, e.callee) == "Register"
+        })
+        .map(|e| program.symbols.function(e.callee).is_defined)
+        .collect();
+    assert_eq!(targets, [true], "use reaches Register's body");
+}
+
+/// An `extern "C"` prototype meets its definition by arity only where a
+/// parameter's type may be an unresolved name read as `int`: a C++ overload
+/// of the name with another known type stays a separate function.
+#[test]
+fn cpp_c_linkage_prototype_keeps_apart_an_overload_of_another_type() {
+    let (_dir, program) = build_tree(
+        &[
+            ("api.h", "extern \"C\" void f(int v);\nvoid f(double d);\n"),
+            ("impl.cpp", "#include \"api.h\"\nvoid f(double d) { }\n"),
+            ("user.cpp", "#include \"api.h\"\nvoid use() { f(1); }\n"),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let targets: Vec<bool> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(&program, e.caller) == "use" && fn_name(&program, e.callee) == "f")
+        .map(|e| program.symbols.function(e.callee).is_defined)
+        .collect();
+    assert_eq!(
+        targets,
+        [false],
+        "f(1) binds the C prototype, not f(double)'s body"
+    );
+}
+
+/// A `static` function declared inside `extern "C"` still has internal
+/// linkage: each unit's copy stays its own.
+#[test]
+fn cpp_static_prototype_with_c_linkage_stays_in_its_unit() {
+    let unit = |ret: &str, caller: &str| {
+        format!(
+            "extern \"C\" {{ static int helper(int x); }}\n\
+             static int helper(int x) {{ return {ret}; }}\n\
+             int {caller}() {{ return helper(1); }}\n"
+        )
+    };
+    let (_dir, program) = build_tree(
+        &[
+            ("one.cpp", &unit("x", "a")),
+            ("two.cpp", &unit("x + 1", "b")),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let body_line_file = |caller: &str| -> Vec<String> {
+        analysis
+            .call_edges
+            .iter()
+            .filter(|e| {
+                fn_name(&program, e.caller) == caller && fn_name(&program, e.callee) == "helper"
+            })
+            .map(|e| {
+                let f = program.symbols.function(e.callee);
+                format!(
+                    "{}:{}",
+                    program.symbols.files[f.file.0 as usize]
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy(),
+                    f.is_defined
+                )
+            })
+            .collect()
+    };
+    assert_eq!(body_line_file("a"), ["one.cpp:true"]);
+    assert_eq!(body_line_file("b"), ["two.cpp:true"]);
+}
+
+/// A header without a guard, included twice under different macros inside a
+/// cached header, contributes both expansions to a unit that replays it.
+#[test]
+fn cpp_repeated_unguarded_header_keeps_both_expansions_on_replay() {
+    let (_dir, program) = build_tree(
+        &[
+            ("decl.h", "struct NAME { void Run(); };\n"),
+            (
+                "both.h",
+                "#ifndef BOTH_H\n#define BOTH_H\n#define NAME First\n#include \"decl.h\"\n\
+                 #undef NAME\n#define NAME Second\n#include \"decl.h\"\n#undef NAME\n#endif\n",
+            ),
+            (
+                "a_impl.cpp",
+                "#include \"both.h\"\nvoid First::Run() {}\nvoid Second::Run() {}\n",
+            ),
+            (
+                "b_user.cpp",
+                "#include \"both.h\"\nvoid use(First *f, Second *s) { f->Run(); s->Run(); }\n",
+            ),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let mut callees: Vec<String> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(&program, e.caller) == "use")
+        .map(|e| fn_name(&program, e.callee))
+        .collect();
+    callees.sort();
+    assert_eq!(callees, ["First::Run", "Second::Run"]);
+}
+
+/// Copies of one header call in units that bound it differently — one to a
+/// declaration it saw, one to nothing — are one call site.
+#[test]
+fn cpp_header_call_bound_in_one_unit_only_is_one_site() {
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "h.h",
+                "#pragma once\n#ifdef WITH_S\nstruct S { void Run(); };\n#else\nstruct S;\n#endif\n\
+                 inline void f(S *s) { s->Run(); }\n",
+            ),
+            (
+                "a.cpp",
+                "#define WITH_S\n#include \"h.h\"\nvoid a(S *s) { f(s); }\n",
+            ),
+            ("b.cpp", "#include \"h.h\"\nvoid b(S *s) { f(s); }\n"),
+        ],
+        default_opts,
+    );
+    let sites: Vec<Option<String>> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|cs| cs.callee_name.ends_with("Run"))
+        .map(|cs| cs.callee_fn_id.map(|f| fn_name(&program, f)))
+        .collect();
+    for cs in &program.symbols.call_sites {
+        eprintln!(
+            "SITE {} {:?} caller={} callee={:?}",
+            cs.callee_name,
+            cs.span,
+            fn_name(&program, cs.caller),
+            cs.callee_fn_id.map(|f| fn_name(&program, f))
+        );
+    }
+    assert_eq!(sites.len(), 1, "one call to Run in h.h: {sites:?}");
+}
+
+/// A call ranked against overloads whose parameter types lowering cannot
+/// tell apart (enum classes) binds each of them once: an overload beside
+/// another in one class is not an equal definition of it.
+#[test]
+fn cpp_sibling_overloads_read_alike_are_not_equal_definitions() {
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "ret.h",
+                "#pragma once\nenum class A { X };\nenum class B { Y };\n\
+                 struct Ret {\n    explicit Ret(A a) {}\n    explicit Ret(B b) {}\n};\n",
+            ),
+            (
+                "use.cpp",
+                "#include \"ret.h\"\nvoid use() { Ret r(A::X); }\n",
+            ),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let mut edges: Vec<u32> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "use" && fn_name(&program, e.callee) == "Ret::Ret"
+        })
+        .map(|e| program.symbols.function(e.callee).span.line)
+        .collect();
+    edges.sort();
+    let distinct = {
+        let mut d = edges.clone();
+        d.dedup();
+        d
+    };
+    assert_eq!(edges, distinct, "each constructor once: {edges:?}");
+}
+
+fn overload_params_reached(
+    program: &trace_ir::Program,
+    analysis: &trace_analysis::AnalysisResult,
+    caller: &str,
+) -> Vec<String> {
+    let mut reached: Vec<String> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == caller)
+        .map(|e| {
+            let f = program.symbols.function(e.callee);
+            let params: Vec<String> = program
+                .symbols
+                .explicit_params(f)
+                .map(|p| {
+                    (0..p.len())
+                        .filter_map(|i| p.get(i))
+                        .map(|ty| format!("{:?}", program.types.get(ty).desc))
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!("{}({})", fn_name(program, e.callee), params.join(","))
+        })
+        .collect();
+    reached.sort();
+    reached.dedup();
+    reached
+}
+
+/// `NULL` (a literal `0`) converts to any pointer, so an out-parameter
+/// overload stays a callee of `Get(NULL)` beside one taking a class.
+#[test]
+fn cpp_null_argument_keeps_an_out_parameter_overload() {
+    let (_dir, program) = build_tree(
+        &[(
+            "use.cpp",
+            "#define NULL 0\ntemplate <class T> class sptr;\nstruct Foo {};\n\
+             struct Bar {};\nstruct S { int Get(Bar v); int Get(sptr<Foo> *out); };\n\
+             int use(S &s) { return s.Get(NULL); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let reached = overload_params_reached(&program, &analysis, "use");
+    assert!(
+        reached.iter().any(|r| r.contains("Ptr(")),
+        "Get(sptr<Foo> *) is reached: {reached:?}"
+    );
+}
+
+/// A negated or digit-grouped literal zero (`-0`, `0'0`) is a null pointer
+/// constant as `0` is, so it keeps the out-parameter overload too. Lowering
+/// types neither spelling yet, which keeps the overload on its own; this
+/// holds the rule once it does.
+#[test]
+fn cpp_spelled_zero_argument_keeps_an_out_parameter_overload() {
+    for zero in ["-0", "0'0", "(-(0))"] {
+        let (_dir, program) = build_tree(
+            &[(
+                "use.cpp",
+                &format!(
+                    "template <class T> class sptr;\nstruct Foo {{}};\n\
+                     struct Bar {{}};\nstruct S {{ int Get(Bar v); int Get(sptr<Foo> *out); }};\n\
+                     int use(S &s) {{ return s.Get({zero}); }}\n"
+                ),
+            )],
+            default_opts,
+        );
+        let (_, analysis) = analyze(&program);
+        let reached = overload_params_reached(&program, &analysis, "use");
+        assert!(
+            reached.iter().any(|r| r.contains("Ptr(")),
+            "Get({zero}) reaches Get(sptr<Foo> *): {reached:?}"
+        );
+    }
+}
+
+/// A result's type is chosen with the same null-constant rule as the edges:
+/// `Get(0)` may be either overload, so an `auto` local it initialises takes
+/// neither return type and no one method call is bound through it.
+#[test]
+fn cpp_null_argument_leaves_a_result_type_to_every_overload() {
+    let (_dir, program) = build_tree(
+        &[(
+            "use.cpp",
+            "template <class T> class sptr;\nstruct Foo {};\nstruct Bar {};\n\
+             struct A { void Run(); };\nstruct B { void Run(); };\n\
+             struct S { A *Get(Bar v); B *Get(sptr<Foo> *out); };\n\
+             void use(S &s) { auto p = s.Get(0); p->Run(); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(
+        must_not_have_edge(&program, &analysis, "use", "A::Run"),
+        "{:?}",
+        common::callees_of(&program, &analysis, "use")
+    );
+}
+
+/// A class value binds a reference to its base but never a pointer to it:
+/// `Take(Base *)` leaves `Take(Derived)` the exact match for a `Derived`.
+#[test]
+fn cpp_class_value_does_not_convert_to_a_pointer_to_its_base() {
+    let (_dir, program) = build_tree(
+        &[(
+            "use.cpp",
+            "struct Base {};\nstruct Derived : Base {};\n\
+             void Take(Base *b);\nvoid Take(Derived d);\n\
+             void use(Derived d) { Take(d); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let reached = overload_params_reached(&program, &analysis, "use");
+    assert_eq!(reached.len(), 1, "only Take(Derived): {reached:?}");
+    assert!(!reached[0].contains("Ptr("), "{reached:?}");
+}
+
+/// A class with a conversion operator may become the out-parameter's
+/// pointer; one without stays a value no pointer parameter takes.
+#[test]
+fn cpp_class_argument_with_a_conversion_keeps_a_pointer_overload() {
+    let (_dir, program) = build_tree(
+        &[(
+            "use.cpp",
+            "template <class T> class sptr;\nstruct Foo {};\n\
+             struct Source { operator sptr<Foo> *(); };\nstruct Plain {};\n\
+             void choose(sptr<Foo> *p);\nvoid choose(double d);\n\
+             void use(Source src) { choose(src); }\nvoid plain(Plain p) { choose(p); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let converted = overload_params_reached(&program, &analysis, "use");
+    assert_eq!(converted.len(), 2, "both choose overloads: {converted:?}");
+    let plain = overload_params_reached(&program, &analysis, "plain");
+    assert_eq!(plain.len(), 1, "only choose(double): {plain:?}");
+}
+
+/// The accessor inherited from the nearest undefined singleton base types
+/// the call: `Singleton<Svc>` one class up wins over a `DelayedSingleton`
+/// two classes up behind a later base.
+#[test]
+fn cpp_nearest_inherited_singleton_base_types_the_accessor() {
+    let (_dir, program) = build_tree(
+        &[(
+            "a.cpp",
+            "struct Svc;\nstruct Other { void Run() {} };\n\
+             struct Near : public Singleton<Svc> {};\n\
+             struct Mid : public DelayedSingleton<Other> {};\n\
+             struct Far : public Mid {};\n\
+             struct Svc : public Near, public Far { void Run() {} };\n\
+             void use() { Svc::GetInstance().Run(); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(
+        has_any_edge(&program, &analysis, "use", "Svc::Run"),
+        "{:?}",
+        common::callees_of(&program, &analysis, "use")
+    );
+    assert!(must_not_have_edge(&program, &analysis, "use", "Other::Run"));
+}
+
+/// A callback typedef the defining unit does not see reads as an `int`
+/// stand-in there; the `extern "C"` prototype naming it as a function
+/// pointer still meets that definition.
+#[test]
+fn cpp_c_linkage_prototype_meets_a_definition_missing_its_callback_typedef() {
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "api.h",
+                "struct Session;\ntypedef void (*OnChange)(struct Session *s, int v);\n\
+                 extern \"C\" int RegisterCb(struct Session *s, OnChange cb);\n",
+            ),
+            (
+                "impl.cpp",
+                "struct Session { int id; };\n\
+                 extern \"C\" int RegisterCb(struct Session *s, OnChange cb) { return s->id; }\n",
+            ),
+            (
+                "user.cpp",
+                "#include \"api.h\"\nint use(Session *s) { return RegisterCb(s, 0); }\n",
+            ),
+        ],
+        default_opts,
+    );
+    let entries = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "RegisterCb")
+        .map(|f| f.is_defined)
+        .collect::<Vec<_>>();
+    assert_eq!(entries, [true], "prototype and body are one entry");
+}
+
+/// Units that select different `#if` definitions of one function in a
+/// header leave a declaring unit's call reaching both: they are one
+/// function's definitions, not sibling overloads.
+#[test]
+fn cpp_alternate_header_definitions_stay_equal_candidates() {
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "choose.h",
+                "#ifdef FAST\nint choose() { return 1; }\n#else\nint choose() { return 2; }\n#endif\n",
+            ),
+            ("a.cpp", "#define FAST\n#include \"choose.h\"\nint a() { return choose(); }\n"),
+            ("b.cpp", "#include \"choose.h\"\nint b() { return choose(); }\n"),
+            ("c.cpp", "int choose();\nint c() { return choose(); }\n"),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let mut lines: Vec<u32> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(&program, e.caller) == "c" && fn_name(&program, e.callee) == "choose")
+        .map(|e| program.symbols.function(e.callee).span.line)
+        .collect();
+    lines.sort();
+    assert_eq!(lines, [2, 4], "both definitions");
+}
+
+/// As [`cpp_alternate_header_definitions_stay_equal_candidates`], for a
+/// member whose `#if` bodies units select inside its class.
+#[test]
+fn cpp_alternate_member_definitions_stay_equal_candidates() {
+    let (_dir, program) = build_tree(
+        &[
+            (
+                "choose.h",
+                "struct C {\n#ifdef FAST\n    int choose() { return 1; }\n#else\n    int choose() { return 2; }\n#endif\n};\n",
+            ),
+            ("a.cpp", "#define FAST\n#include \"choose.h\"\nint a(C &c) { return c.choose(); }\n"),
+            ("b.cpp", "#include \"choose.h\"\nint b(C &c) { return c.choose(); }\n"),
+            ("c.cpp", "struct C { int choose(); };\nint c(C &c) { return c.choose(); }\n"),
+        ],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    let mut lines: Vec<u32> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "c" && fn_name(&program, e.callee) == "C::choose"
+        })
+        .map(|e| program.symbols.function(e.callee).span.line)
+        .collect();
+    lines.sort();
+    lines.dedup();
+    assert_eq!(lines, [3, 5], "both definitions");
+}
+
+#[test]
+fn friend_body_lexical_class_lookup_for_static_member() {
+    let (_dir, program) = build_tree(
+        &[(
+            "main.cpp",
+            "void wrong() {}\n\
+             void right() {}\n\
+             void helper() { wrong(); }\n\
+             struct C {\n\
+                 static void helper();\n\
+                 friend void run(C) { helper(); }\n\
+             };\n\
+             void C::helper() { right(); }\n\
+             void entry(C c) { run(c); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run",
+        "C::helper",
+        ResolutionKind::Direct
+    ));
+    assert!(must_not_have_edge(&program, &analysis, "run", "helper"));
+}
+
+#[test]
+fn friend_body_lexical_class_lookup_for_inline_static_member() {
+    let (_dir, program) = build_tree(
+        &[(
+            "main.cpp",
+            "void wrong() {}\n\
+             void right() {}\n\
+             void helper() { wrong(); }\n\
+             struct C {\n\
+                 static void helper() { right(); }\n\
+                 friend void run(C) { helper(); }\n\
+             };\n\
+             void entry(C c) { run(c); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run",
+        "C::helper",
+        ResolutionKind::Direct
+    ));
+    assert!(must_not_have_edge(&program, &analysis, "run", "helper"));
+}
+
+#[test]
+fn friend_body_block_scoped_import_shadows_enclosing_class() {
+    let (_dir, program) = build_tree(
+        &[(
+            "main.cpp",
+            "namespace N {\n\
+                 void target() {}\n\
+                 void helper() { target(); }\n\
+             }\n\
+             struct C {\n\
+                 static void helper() {}\n\
+                 friend void run(C) {\n\
+                     using N::helper;\n\
+                     helper();\n\
+                 }\n\
+             };\n\
+             void entry(C c) { run(c); }\n",
+        )],
+        default_opts,
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run",
+        "N::helper",
+        ResolutionKind::Direct
+    ));
+    assert!(must_not_have_edge(&program, &analysis, "run", "C::helper"));
+}
+
+#[test]
+fn explicit_operator_calls_in_project_code_resolve_to_callee_identity() {
+    let (_dir, program) = build_tree(
+        &[(
+            "main.cpp",
+            "struct Wrapper { int* operator->() { return nullptr; } };\n\
+             template<class T>\n\
+             auto pointer_of(T& value) -> decltype(value.operator->());\n\
+             \n\
+             struct Comparable { bool operator>(const Comparable&) const { return true; } };\n\
+             template<class T>\n\
+             auto compare(T a, T b) -> decltype(a.operator>(b));\n\
+             \n\
+             int after_operator_call();\n\
+             \n\
+             void test_calls(Wrapper& w, Comparable& a, Comparable& b) {\n\
+                 w.operator->();\n\
+                 a.operator>(b);\n\
+                 Wrapper* pw = &w;\n\
+                 pw->operator->();\n\
+             }\n",
+        )],
+        default_opts,
+    );
+    assert!(
+        !program
+            .diagnostics
+            .iter()
+            .any(|d| d.stage == "parse" && d.message.starts_with("parse errors in")),
+        "diagnostics had parse errors: {:?}",
+        program.diagnostics
+    );
+    for expected in [
+        "Wrapper::operator->",
+        "Comparable::operator>",
+        "pointer_of",
+        "compare",
+        "after_operator_call",
+        "test_calls",
+    ] {
+        assert!(
+            program.symbols.functions.iter().any(|f| f.name == expected),
+            "missing function {expected}"
+        );
+    }
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == ">" || f.name == "->"),
+        "found function named > or -> alone"
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "test_calls",
+        "Wrapper::operator->",
+        ResolutionKind::Direct,
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "test_calls",
+        "Comparable::operator>",
+        ResolutionKind::Direct,
+    ));
+}
+
+#[test]
+fn explicit_operator_calls_edge_cases_and_macros() {
+    let (_dir, program) = build_tree(
+        &[(
+            "main.cpp",
+            "#define INVOKE_OP(obj, op_call) (obj).op_call\n\
+             #define CALL_SUBSCRIPT(c, idx) (c).operator[](idx)\n\
+             \n\
+             struct Container {\n\
+                 int operator[](int idx) const { return idx; }\n\
+             };\n\
+             \n\
+             struct Functor {\n\
+                 int operator()(int a, int b) const { return a + b; }\n\
+             };\n\
+             \n\
+             struct Counter {\n\
+                 Counter& operator++() { return *this; }\n\
+                 Counter operator++(int) { return *this; }\n\
+                 Counter& operator+=(int) { return *this; }\n\
+             };\n\
+             \n\
+             struct Base {\n\
+                 virtual bool operator>(const Base&) const { return true; }\n\
+                 virtual bool operator<(const Base&) const { return false; }\n\
+             };\n\
+             \n\
+             struct Derived : Base {\n\
+                 bool operator<(const Base&) const override { return true; }\n\
+             };\n\
+             \n\
+             void run_edge_cases(Container& cont, Functor& func, Counter& cnt, Derived& d, Base& b) {\n\
+                 cont.operator[](42);\n\
+                 CALL_SUBSCRIPT(cont, 10);\n\
+                 func.operator()(1, 2);\n\
+                 INVOKE_OP(func, operator()(3, 4));\n\
+                 cnt.operator++();\n\
+                 cnt.operator++(0);\n\
+                 cnt.operator+=(5);\n\
+                 d.operator>(b);\n\
+                 d.operator<(b);\n\
+                 Derived* pd = &d;\n\
+                 pd->operator>(b);\n\
+                 pd->operator<(b);\n\
+             }\n\
+             \n\
+             int main() { return 0; }\n",
+        )],
+        default_opts,
+    );
+    assert!(
+        !program
+            .diagnostics
+            .iter()
+            .any(|d| d.stage == "parse" && d.message.starts_with("parse errors in")),
+        "diagnostics had parse errors: {:?}",
+        program.diagnostics
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_edge_cases",
+        "Container::operator[]",
+        ResolutionKind::Direct,
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_edge_cases",
+        "Functor::operator()",
+        ResolutionKind::Direct,
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_edge_cases",
+        "Counter::operator++",
+        ResolutionKind::Direct,
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_edge_cases",
+        "Counter::operator+=",
+        ResolutionKind::Direct,
+    ));
+    // Derived inherits Base::operator> without overriding
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_edge_cases",
+        "Base::operator>",
+        ResolutionKind::Direct,
+    ));
+    // Derived overrides operator<
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "run_edge_cases",
+        "Derived::operator<",
+        ResolutionKind::Direct,
+    ));
+}
+
+#[test]
+fn explicit_operator_calls_review_fixes() {
+    let (_dir, program) = build_tree(
+        &[(
+            "main.cpp",
+            "struct SpaceComparable {\n\
+                 int operator<=>(const SpaceComparable&) const { return 0; }\n\
+             };\n\
+             struct Wrapper {\n\
+                 int* operator->() { return nullptr; }\n\
+             };\n\
+             void test_spaceship(SpaceComparable& a, SpaceComparable& b) {\n\
+                 a.operator<=>(b);\n\
+             }\n\
+             void test_comments(Wrapper& w, SpaceComparable& a, SpaceComparable& b) {\n\
+                 w./*inline_comment*/operator->();\n\
+                 w. /*space_comment*/ operator->();\n\
+                 w.operator->/*trailing_comment*/();\n\
+                 Wrapper* pw = &w;\n\
+                 pw->/*arrow_comment*/operator->();\n\
+                 a./*spaceship_comment*/operator<=>(b);\n\
+             }\n\
+             #define TWO(obj, op, a, b) (obj).op(a); (obj).op(b);\n\
+             struct CallbackInvoker {\n\
+                 void operator()(void (*cb)()) const { cb(); }\n\
+             };\n\
+             void first_cb() {}\n\
+             void second_cb() {}\n\
+             void test_macro_occurrences(CallbackInvoker& f) {\n\
+                 TWO(f, operator(), first_cb, second_cb);\n\
+             }\n\
+             template<class T>\n\
+             void test_untyped_receiver(T& x, T* p) {\n\
+                 x.operator>(x);\n\
+                 p->operator>(p);\n\
+             }\n\
+             struct DummyPtr {\n\
+                 void operator->();\n\
+             };\n\
+             void test_unresolvable_arrow(DummyPtr& ptr) {\n\
+                 ptr->operator>(0);\n\
+             }\n\
+             int main() { return 0; }\n",
+        )],
+        default_opts,
+    );
+    assert!(
+        !program
+            .diagnostics
+            .iter()
+            .any(|d| d.stage == "parse" && d.message.starts_with("parse errors in")),
+        "diagnostics had parse errors: {:?}",
+        program.diagnostics
+    );
+    let (_, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "test_spaceship",
+        "SpaceComparable::operator<=>",
+        ResolutionKind::Direct,
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "test_comments",
+        "Wrapper::operator->",
+        ResolutionKind::Direct,
+    ));
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "test_comments",
+        "SpaceComparable::operator<=>",
+        ResolutionKind::Direct,
+    ));
+
+    let macro_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "test_macro_occurrences")
+        .unwrap();
+    let macro_sites: Vec<_> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|cs| cs.caller == macro_fn.id)
+        .collect();
+    assert_eq!(
+        macro_sites.len(),
+        2,
+        "expected 2 distinct call sites from TWO macro expansion"
+    );
+    let recorded_span = |site: &trace_ir::CallSite| {
+        site.details
+            .as_ref()
+            .and_then(|details| details.occurrence)
+            .expect("macro site must record its occurrence identity")
+            .span
+    };
+    assert_ne!(
+        recorded_span(macro_sites[0]),
+        recorded_span(macro_sites[1]),
+        "expected distinct occurrence spans from macro replacement punctuation"
+    );
+    assert!(macro_sites
+        .iter()
+        .any(|s| s
+            .fn_args()
+            .iter()
+            .any(|(_, fid)| program.symbols.function(*fid).name == "first_cb")));
+    assert!(macro_sites
+        .iter()
+        .any(|s| s
+            .fn_args()
+            .iter()
+            .any(|(_, fid)| program.symbols.function(*fid).name == "second_cb")));
+
+    let untyped_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "test_untyped_receiver")
+        .unwrap();
+    let untyped_sites: Vec<_> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|cs| cs.caller == untyped_fn.id)
+        .collect();
+    assert_eq!(untyped_sites.len(), 2);
+    for site in &untyped_sites {
+        assert_eq!(
+            site.receiver_class, None,
+            "untyped receiver should not have receiver_class populated"
+        );
+        assert!(
+            !site.resolves_by_name(),
+            "untyped member call should not resolve by name"
+        );
+    }
+    assert!(untyped_sites.iter().any(|s| s.callee_name == "x.operator>"));
+    assert!(untyped_sites
+        .iter()
+        .any(|s| s.callee_name == "p->operator>"));
+
+    let dummy_fn = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "test_unresolvable_arrow")
+        .unwrap();
+    let dummy_sites: Vec<_> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|cs| cs.caller == dummy_fn.id)
+        .collect();
+    assert_eq!(dummy_sites.len(), 1);
+    assert_eq!(dummy_sites[0].callee_name, "ptr->operator>");
+    assert_eq!(dummy_sites[0].receiver_class, Some("DummyPtr".to_string()));
+    assert!(
+        !dummy_sites[0].resolves_by_name(),
+        "unresolvable arrow should not resolve by name"
+    );
+    assert!(!program
+        .symbols
+        .functions
+        .iter()
+        .any(|f| f.name == "DummyPtr::operator>"));
+}
+
+#[test]
+fn explicit_operator_malformed_syntax_reports_parse_diagnostics() {
+    let (_dir, program) = build_tree(
+        &[(
+            "main.cpp",
+            "struct W { int* operator->(); };\n\
+             void f_dot(W& w) { w.operator.->(); }\n\
+             void f_q(W& w) { w.operator?->(); }\n\
+             int main() { return 0; }\n",
+        )],
+        default_opts,
+    );
+    assert!(
+        program
+            .diagnostics
+            .iter()
+            .any(|d| d.stage == "parse" && d.message.starts_with("parse errors in")),
+        "expected parse diagnostics for malformed explicit operator calls: {:?}",
+        program.diagnostics
+    );
+    assert!(
+        !program
+            .symbols
+            .call_sites
+            .iter()
+            .any(|cs| cs.callee_name.contains("operator.") || cs.callee_name.contains("operator?")),
+        "malformed operator was lowered into call site"
+    );
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name.contains("operator.") || f.name.contains("operator?")),
+        "malformed operator was interned as function"
+    );
+}
+
+analyzed_fixture!(cpp_object_lifecycle);
+
+/// The callees of `caller` named `<class>::...`, one entry per edge, sorted.
+fn class_member_edges(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    class: &str,
+) -> Vec<String> {
+    let prefix = format!("{class}::");
+    let mut found: Vec<String> = common::callees_of(program, analysis, caller)
+        .into_iter()
+        .map(|(callee, _)| callee)
+        .filter(|callee| callee.starts_with(&prefix))
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn automatic_objects_construct_and_destruct() {
+    let (program, analysis) = cpp_object_lifecycle();
+    // Issue #186's table plus locals in nested blocks and init statements,
+    // and classes without members of their own, which reach their base's as
+    // `T x{};` does: exactly one constructor edge and one destructor edge each.
+    for caller in [
+        "plain",
+        "braces",
+        "parens",
+        "heap",
+        "early",
+        "nested",
+        "for_init",
+        "if_init",
+        "array",
+        "derived",
+        "derived_braces",
+        "defaulted_derived",
+        "virtual_defaulted",
+    ] {
+        assert_eq!(
+            class_member_edges(program, analysis, caller, "Guard"),
+            ["Guard::Guard", "Guard::~Guard"],
+            "{caller}"
+        );
+    }
+    // Copy-initialized automatic locals: a destructor edge, no default
+    // constructor edge.
+    for caller in ["rangefor", "catcher"] {
+        assert_eq!(
+            class_member_edges(program, analysis, caller, "Guard"),
+            ["Guard::~Guard"],
+            "{caller}"
+        );
+    }
+    // A loop variable is no more thread_local than any other automatic
+    // local for sitting in a thread_local variable's initializer.
+    let tl_lambda = &common::lambda_in(program, "tl_outer").name;
+    assert_eq!(
+        class_member_edges(program, analysis, tl_lambda, "Guard"),
+        ["Guard::~Guard"],
+        "{tl_lambda}"
+    );
+    // A condition declaration is destroyed like any other automatic local.
+    assert_eq!(
+        class_member_edges(program, analysis, "cond", "Flag"),
+        ["Flag::Flag", "Flag::~Flag"]
+    );
+    // A local of a lambda body belongs to the lambda.
+    let lambda = &common::lambda_in(program, "lam").name;
+    assert_eq!(
+        class_member_edges(program, analysis, lambda, "Guard"),
+        ["Guard::Guard", "Guard::~Guard"],
+        "{lambda}"
+    );
+    assert!(class_member_edges(program, analysis, "lam", "Guard").is_empty());
+    // The destructor's `this` receives the local, so the call through the
+    // implicit `this` inside the destructor resolves.
+    assert!(has_any_edge(
+        program,
+        analysis,
+        "VBase::~VBase",
+        "VBase::Hook"
+    ));
+    for (caller, dtor, local) in [
+        ("vlocal", "VBase::~VBase", "v"),
+        ("plain", "Guard::~Guard", "g"),
+    ] {
+        let bindings = arg_bindings(program, analysis, caller, dtor);
+        assert!(
+            bindings
+                .iter()
+                .any(|(i, a, f)| *i == 0 && a == local && f == "this"),
+            "{caller}: `{local}` is the destructor's `this`, got {bindings:?}"
+        );
+    }
+    // `T x;` constructs with the callee `T x{};` already reaches.
+    let ctor = |caller: &str| {
+        analysis
+            .call_edges
+            .iter()
+            .find(|e| {
+                fn_name(program, e.caller) == caller && fn_name(program, e.callee) == "Guard::Guard"
+            })
+            .map(|e| e.callee)
+            .unwrap_or_else(|| panic!("{caller} constructs its Guard"))
+    };
+    assert_eq!(ctor("plain"), ctor("braces"));
+}
+
+#[test]
+fn statement_locals_keep_name_resolution() {
+    let (program, analysis) = cpp_object_lifecycle();
+    // A placeholder loop variable takes its range's element type.
+    for (caller, callee) in [
+        ("autoloop", "Param::Kind"),
+        ("autoloop", "SubParam::Kind"),
+        ("shadow_auto", "Other::Kind"),
+        ("containers", "Other::Kind"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, callee),
+            "{caller} -> {callee}: {:?}",
+            common::callees_of(program, analysis, caller)
+        );
+    }
+    // A loop variable hides the outer name it shadows, and a lambda's or a
+    // block-scope declaration's parameter never enters the enclosing scope.
+    for (caller, callee) in [
+        ("tloop", "Param::Kind"),
+        ("shadow_auto", "Param::Kind"),
+        ("decl_scope", "Other::Kind"),
+        ("lambda_scope", "Other::Kind"),
+    ] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, callee),
+            "{caller} -> {callee}: {:?}",
+            common::callees_of(program, analysis, caller)
+        );
+    }
+    for caller in ["decl_scope", "lambda_scope"] {
+        assert!(has_any_edge(program, analysis, caller, "Param::Kind"));
+    }
+    // The range expression sees the outer `item`, not the loop variable.
+    assert!(has_any_edge(program, analysis, "shadow", "Box::list"));
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "shadow",
+        "Item::list"
+    ));
+    assert!(has_any_edge(program, analysis, "shadow", "Item::~Item"));
+    // A loop variable pointing to a known class resolves the call through it.
+    assert!(has_any_edge(program, analysis, "handlers", "Handler::Run"));
+}
+
+#[test]
+fn statement_locals_cover_unnamed_bindings_and_element_spellings() {
+    let (program, analysis) = cpp_object_lifecycle();
+    assert_eq!(
+        class_member_edges(program, analysis, "catch_unnamed", "Guard"),
+        ["Guard::~Guard"]
+    );
+    assert!(class_member_edges(program, analysis, "catch_unnamed_ref", "Guard").is_empty());
+    // No local is made up from a binding's or an abstract declarator's text.
+    for caller in ["bindings", "catch_unnamed_ref"] {
+        let fid = common::only_function(program, caller);
+        let made_up: Vec<_> = (program.symbols.variables.iter())
+            .filter(|v| v.fn_id == Some(fid))
+            .filter(|v| v.name.contains(['[', '&']))
+            .map(|v| &v.name)
+            .collect();
+        assert!(made_up.is_empty(), "{caller}: {made_up:?}");
+    }
+    for (caller, callee) in [
+        ("ptr_refs", "Handler::Run"),
+        ("const_shared", "Other::Kind"),
+        ("const_ptrs", "Other::Kind"),
+        ("qualified_range", "Other::Kind"),
+        ("global_std", "Other::Kind"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, callee),
+            "{caller} -> {callee}: {:?}",
+            common::callees_of(program, analysis, caller)
+        );
+    }
+}
+
+#[test]
+fn automatic_objects_reach_every_base_and_keep_aggregates() {
+    let (program, analysis) = cpp_object_lifecycle();
+    // An aggregate's defaulted constructor is not user-provided: its braces
+    // are no constructor call.
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "aggregate",
+        "Cfg::Cfg"
+    ));
+    for (caller, class, edges) in [
+        ("two_bases", "BaseA", &["BaseA::BaseA", "BaseA::~BaseA"][..]),
+        ("two_bases", "BaseB", &["BaseB::BaseB", "BaseB::~BaseB"]),
+        // Constructed on first entry by the function; destroyed at exit.
+        ("statics", "Guard", &["Guard::Guard"]),
+        ("tls", "Guard", &["Guard::Guard"]),
+    ] {
+        assert_eq!(
+            class_member_edges(program, analysis, caller, class),
+            edges,
+            "{caller}"
+        );
+    }
+    for caller in ["unions", "union_braces", "union_parens"] {
+        assert_eq!(
+            class_member_edges(program, analysis, caller, "Variant"),
+            ["Variant::Variant", "Variant::~Variant"],
+            "{caller}"
+        );
+    }
+    // A union member's initializer constructs it; implicit member destruction
+    // is left for follow-up.
+    assert_eq!(
+        class_member_edges(program, analysis, "HoldsVariant::HoldsVariant", "Variant"),
+        ["Variant::Variant"]
+    );
+    // A defaulted `D()` runs the base's, even beside an overload, a template
+    // or an ellipsis constructor that could also take no arguments.
+    for (caller, own) in [
+        ("default_plus", "DefaultPlus"),
+        ("template_ctor", "TemplateCtor"),
+        ("ellipsis_ctor", "EllipsisCtor"),
+    ] {
+        assert_eq!(
+            class_member_edges(program, analysis, caller, "Guard"),
+            ["Guard::Guard", "Guard::~Guard"],
+            "{caller}"
+        );
+        assert!(class_member_edges(program, analysis, caller, own).is_empty());
+    }
+    assert!(has_any_edge(program, analysis, "sibling", "VB::~VB"));
+    assert!(must_not_have_edge(program, analysis, "sibling", "VE::~VE"));
+}
+
+/// The destructors `caller` reaches, one entry per edge, sorted.
+fn dtor_edges(program: &Program, analysis: &AnalysisResult, caller: &str) -> Vec<String> {
+    let mut found: Vec<String> = common::callees_of(program, analysis, caller)
+        .into_iter()
+        .map(|(callee, _)| callee)
+        .filter(|callee| last_segment(callee).starts_with('~'))
+        .collect();
+    found.sort();
+    found
+}
+
+fn last_segment(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
+#[test]
+fn automatic_object_sites_take_no_virtual_dispatch() {
+    let (program, analysis) = cpp_object_lifecycle();
+    // A local is exactly its class: no subclass's destructor, and no
+    // defaulted one of its own.
+    for (caller, dtors) in [
+        ("plain", &["Guard::~Guard"][..]),
+        ("braces", &["Guard::~Guard"]),
+        ("array", &["Guard::~Guard"]),
+        ("rangefor", &["Guard::~Guard"]),
+        ("catcher", &["Guard::~Guard"]),
+        ("defaulted_derived", &["Guard::~Guard"]),
+        ("virtual_defaulted", &["Guard::~Guard"]),
+        ("sibling", &["VB::~VB"]),
+        ("mixed_bases", &["BaseA::~BaseA", "BaseC::~BaseC"]),
+    ] {
+        assert_eq!(dtor_edges(program, analysis, caller), dtors, "{caller}");
+    }
+}
+
+#[test]
+fn automatic_object_construction_shares_one_rule() {
+    let (program, analysis) = cpp_object_lifecycle();
+    for (caller, class, edges) in [
+        (
+            "mixed_bases",
+            "BaseC",
+            &["BaseC::BaseC", "BaseC::~BaseC"][..],
+        ),
+        (
+            "two_bases_braces",
+            "BaseA",
+            &["BaseA::BaseA", "BaseA::~BaseA"],
+        ),
+        (
+            "two_bases_braces",
+            "BaseB",
+            &["BaseB::BaseB", "BaseB::~BaseB"],
+        ),
+        (
+            "default_plus_braces",
+            "Guard",
+            &["Guard::Guard", "Guard::~Guard"],
+        ),
+        ("default_plus_braces", "DefaultPlus", &[]),
+        ("array_braces", "Guard", &["Guard::Guard", "Guard::~Guard"]),
+        ("array_equals", "Guard", &["Guard::Guard", "Guard::~Guard"]),
+        ("cond_braces", "Flag", &["Flag::Flag", "Flag::~Flag"]),
+    ] {
+        assert_eq!(
+            class_member_edges(program, analysis, caller, class),
+            edges,
+            "{caller} / {class}"
+        );
+    }
+    // A C-style union is copied: no made-up constructor.
+    assert!(common::callees_of(program, analysis, "raw_copy").is_empty());
+    for (caller, callee) in [
+        ("loop_table", "tab1"),
+        ("loop_table", "tab2"),
+        ("bare_list", "Other::Kind"),
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, callee),
+            "{caller} -> {callee}: {:?}",
+            common::callees_of(program, analysis, caller)
+        );
+    }
+}
+
+#[test]
+fn automatic_objects_without_user_members_or_scope_emit_nothing() {
+    let (program, analysis) = cpp_object_lifecycle();
+    assert!(class_member_edges(program, analysis, "triv", "Trivial").is_empty());
+    assert!(class_member_edges(program, analysis, "defl", "Defaulted").is_empty());
+    for caller in ["refs", "rangeref", "catchref"] {
+        assert!(
+            class_member_edges(program, analysis, caller, "Guard").is_empty(),
+            "{caller}"
+        );
+    }
+}
+
+/// The issue's own query over its reproducer, the fixture's first block.
+#[test]
+fn automatic_object_lifecycle_issue_query() {
+    let db = common::cli_analyze(&fixture("cpp_object_lifecycle"), &[]);
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let rows = common::text_rows(
+        &conn,
+        "SELECT c.name, t.name FROM call_edges e \
+         JOIN functions c ON c.id = e.caller_fn_id \
+         JOIN functions t ON t.id = e.callee_fn_id \
+         WHERE t.name LIKE 'Guard::%' \
+         AND c.name IN ('plain', 'braces', 'parens', 'heap', 'early') ORDER BY 1, 2",
+    );
+    let expected: Vec<Vec<String>> = ["braces", "early", "heap", "parens", "plain"]
+        .iter()
+        .flat_map(|caller| {
+            ["Guard::Guard", "Guard::~Guard"]
+                .map(|callee| vec![format!("Text({caller:?})"), format!("Text({callee:?})")])
+        })
+        .collect();
+    assert_eq!(rows, expected);
+}
+
+analyzed_fixture!(cpp_factory_ctor);
+
+type CtorEdge = (String, ResolutionKind, Vec<(u32, String, String)>);
+
+/// One entry per edge from `caller` to a constructor of `class`: the callee,
+/// its resolution and the edge's arg-flow rows as `(index, actual, formal)`.
+/// The heap object `this` receives (`TempKind::New` for `new`,
+/// `TempKind::Make` for a factory) reads `heap`, so the two compare equal;
+/// any other temporary keeps its name and fails the comparison.
+fn ctor_edges(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    class: &str,
+) -> Vec<CtorEdge> {
+    let ctor = format!("{class}::{}", class.rsplit("::").next().unwrap());
+    let mut found: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| fn_name(program, e.caller) == caller && fn_name(program, e.callee) == ctor)
+        .map(|e| {
+            let mut flows: Vec<(u32, String, String)> = analysis
+                .arg_flow_edges
+                .iter()
+                .filter(|f| f.call_site == e.call_site)
+                .map(|f| {
+                    let (index, actual, formal) = arg_binding(program, f);
+                    let is_heap = f.actual_var.is_some_and(|v| {
+                        matches!(
+                            program.symbols.variable(v).temp,
+                            Some(trace_ir::TempKind::New | trace_ir::TempKind::Make)
+                        )
+                    });
+                    let actual = if is_heap { "heap".to_owned() } else { actual };
+                    (index, actual, formal)
+                })
+                .collect();
+            flows.sort();
+            // Overloads share the name: the formals tell them apart.
+            let formals: Vec<String> = program
+                .symbols
+                .variables
+                .iter()
+                .filter(|v| v.fn_id == Some(e.callee) && v.param_index.is_some())
+                .map(|v| v.name.clone())
+                .collect();
+            (
+                format!("{ctor}({})", formals.join(",")),
+                e.resolution,
+                flows,
+            )
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
+/// Issue #192: every factory form reaches the constructor `new Foo(...)`
+/// reaches, with the same arguments bound, and keeps its own factory site.
+#[test]
+fn factory_constructs_as_new_does() {
+    let (p, a) = cpp_factory_ctor();
+    let reference = ctor_edges(p, a, "by_new", "Foo");
+    assert_eq!(reference.len(), 1, "{reference:?}");
+    assert_eq!(reference[0].1, ResolutionKind::Direct);
+    assert_eq!(
+        reference[0].2,
+        [
+            (0, "heap".to_owned(), "this".to_owned()),
+            (2, "Handler".to_owned(), "h".to_owned()),
+        ]
+    );
+    // A placement `new (std::nothrow) Foo(..)` passes its own arguments, and
+    // braces construct as parentheses do.
+    for caller in ["by_new_nothrow", "by_new_braced"] {
+        assert_eq!(ctor_edges(p, a, caller, "Foo"), reference, "{caller}");
+    }
+    // The factory's own edge is what it was before #192. A bare template
+    // call to an undeclared function has none, then and now.
+    for (caller, factory) in [
+        ("by_shared", Some("std::make_shared")),
+        ("by_unique", Some("std::make_unique")),
+        ("by_global_shared", Some("::std::make_shared")),
+        ("by_statement", Some("std::make_shared")),
+        ("by_sptr", Some("OHOS::sptr::MakeSptr")),
+        ("by_allocate", Some("std::allocate_shared")),
+        ("uses_std::bare_shared", None),
+        ("imports_unique::bare_unique", None),
+        ("uses_ohos::bare_sptr", Some("sptr::MakeSptr")),
+        ("by_declared_sptr", Some("decl::sptr::MakeSptr")),
+    ] {
+        assert_eq!(ctor_edges(p, a, caller, "Foo"), reference, "{caller}");
+        let callees: Vec<String> = common::callees_of(p, a, caller)
+            .into_iter()
+            .map(|(callee, _)| callee)
+            .filter(|callee| callee != "Foo::Foo")
+            .collect();
+        let expected: Vec<&str> = factory.into_iter().collect();
+        assert_eq!(callees, expected, "{caller}: factory site kept");
+    }
+}
+
+#[test]
+fn factory_picks_the_overload_new_picks() {
+    let (p, a) = cpp_factory_ctor();
+    for (new_caller, factory_caller, class) in [
+        ("multi_new_int", "multi_shared_int", "Multi"),
+        ("multi_new_fn", "multi_unique_fn", "Multi"),
+        ("multi_new_two", "multi_shared_two", "Multi"),
+        ("mixed_new_none", "mixed_shared_none", "Mixed"),
+        ("mixed_new_int", "mixed_shared_int", "Mixed"),
+    ] {
+        // `new Multi(Other)` keeps both one-argument overloads: ranking
+        // cannot tell a function from an `int` here. The factory must agree.
+        let reference = ctor_edges(p, a, new_caller, class);
+        assert!(!reference.is_empty(), "{new_caller}");
+        assert_eq!(
+            ctor_edges(p, a, factory_caller, class),
+            reference,
+            "{factory_caller}"
+        );
+    }
+    // A class with a user-provided constructor keeps its in-class defaulted
+    // overload in the ranking, as `new Mixed()` does.
+    for (caller, expected) in [
+        ("mixed_shared_none", "Mixed::Mixed(this)"),
+        ("mixed_shared_int", "Mixed::Mixed(this,a)"),
+    ] {
+        let callees: Vec<String> = ctor_edges(p, a, caller, "Mixed")
+            .into_iter()
+            .map(|(callee, _, _)| callee)
+            .collect();
+        assert_eq!(callees, [expected], "{caller}");
+    }
+}
+
+/// What a factory-built constructor stores reads back through `->` on the
+/// result, as through `new`'s pointer, whether the result lands in a local,
+/// a returned value or an argument. Each form builds a class of its own,
+/// which nothing else constructs, so only the factory's constructor call
+/// fills the field read.
+#[test]
+fn factory_constructor_stores_reach_reads_through_the_result() {
+    let (p, a) = cpp_factory_ctor();
+    for caller in [
+        "holder_new",
+        "holder_shared",
+        "holder_unique",
+        "holder_sptr",
+        "holder_returned",
+        "holder_run",
+        "holder_volatile",
+    ] {
+        assert!(
+            has_edge(p, a, caller, "Handler", ResolutionKind::Indirect),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    // The nested factory constructs and hands its result to `holder_run`.
+    for callee in ["HolderArg::HolderArg", "holder_run"] {
+        assert!(
+            has_edge(p, a, "holder_nested", callee, ResolutionKind::Direct),
+            "holder_nested -> {callee}: {:?}",
+            common::callees_of(p, a, "holder_nested")
+        );
+    }
+}
+
+/// `new T(args)` as a statement binds its heap object to `this` as a factory
+/// statement does (#192 review).
+#[test]
+fn new_statement_constructs_as_factory_statement_does() {
+    let (p, a) = cpp_factory_ctor();
+    let reference = ctor_edges(p, a, "by_statement", "Foo");
+    assert_eq!(reference.len(), 1, "{reference:?}");
+    assert_eq!(ctor_edges(p, a, "by_new_statement", "Foo"), reference);
+}
+
+/// The factory's heap object is the constructor's `this`, never the value
+/// its call yields: copying it into every smart-pointer value changed no
+/// call edge on the pinned corpora or `ability_ability_runtime` yet cost 43%
+/// more solver pops there (docs/EVAL_REPORT.md, "Factory
+/// construction: #192"). A file-scope factory, which has no constructor
+/// site, makes no object at all.
+#[test]
+fn factory_object_stays_out_of_the_result() {
+    let (p, _) = cpp_factory_ctor();
+    let var = |id: trace_ir::VarId| p.symbols.variable(id);
+    let from_heap = p.flow.iter().any(|c| {
+        matches!(c, trace_ir::FlowConstraint::Copy { src, .. }
+            if var(*src).temp == Some(trace_ir::TempKind::Make))
+    });
+    assert!(!from_heap, "a factory's object is copied into a value");
+    let made = |file_scope: bool| {
+        p.symbols
+            .variables
+            .iter()
+            .any(|v| v.temp == Some(trace_ir::TempKind::Make) && v.fn_id.is_none() == file_scope)
+    };
+    // `g_holder = std::make_shared<Foo>(1, Handler)` builds a class a body's
+    // factory call does make an object for.
+    assert!(made(false), "no factory in a body made an object");
+    assert!(!made(true), "a file-scope factory made an object");
+    // `new`'s object is the expression's value.
+    assert!(p.flow.iter().any(|c| {
+        matches!(c, trace_ir::FlowConstraint::Copy { dst, src }
+            if var(*src).temp == Some(trace_ir::TempKind::New) && var(*dst).name == "c")
+    }));
+}
+
+/// A using-declaration names the standard factory even where an outer
+/// scope declares a function of the same name (#192 review).
+#[test]
+fn using_declaration_names_the_standard_factory() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        "#include <memory>\n\
+         struct Foo { Foo(int a); };\n\
+         Foo::Foo(int a) {}\n\
+         template <class T> T *make_shared(int a);\n\
+         namespace N {\n\
+         using std::make_shared;\n\
+         void f() { auto p = make_shared<Foo>(1); }\n\
+         }\n",
+    )]);
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "N::f",
+            "Foo::Foo",
+            ResolutionKind::Direct
+        ),
+        "{:?}",
+        common::callees_of(&program, &analysis, "N::f")
+    );
+}
+
+/// A factory in a header-inline function every unit lowers merges into one
+/// function with one constructor edge per factory call, and the other
+/// units' factory calls construct as `new Foo` does.
+#[test]
+fn factory_ctor_across_units_and_shared_header() {
+    let (p, a) = cpp_factory_ctor();
+    let reference = ctor_edges(p, a, "by_new", "Foo");
+    let header = p
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "from_header" && f.is_defined)
+        .count();
+    assert_eq!(header, 1, "header function deduplicated");
+    let header_edges = ctor_edges(p, a, "from_header", "Foo");
+    assert_eq!(header_edges.len(), 2, "{header_edges:?}");
+    for edge in &header_edges {
+        assert_eq!(edge.0, reference[0].0);
+        assert_eq!(edge.1, ResolutionKind::Direct);
+    }
+    for caller in ["other_shared", "third_unique", "third_sptr"] {
+        assert_eq!(ctor_edges(p, a, caller, "Foo"), reference, "{caller}");
+    }
+}
+
+/// No constructor is invented: not for a class without a user-provided one,
+/// one the call site cannot name, a template parameter, or a call that is
+/// not a recognised factory.
+#[test]
+fn factory_without_a_nameable_constructed_class_adds_no_edge() {
+    let (p, a) = cpp_factory_ctor();
+    for (caller, class) in [
+        ("no_ctor", "Plain"),
+        ("no_ctor", "Defaulted"),
+        ("unnamed", "Secret"),
+        ("unnamed", "hidden::Secret"),
+        ("no_using::bare_none", "Foo"),
+        ("other_wrapper", "Foo"),
+        ("make_any", "T"),
+        ("shadowed::own_factory", "Foo"),
+        ("copy_new", "Foo"),
+        ("copy_new_nothrow", "Foo"),
+        ("copy_shared", "Foo"),
+        ("copy_sptr", "Foo"),
+        ("project::in_project", "Foo"),
+    ] {
+        assert!(
+            class_member_edges(p, a, caller, class).is_empty(),
+            "{caller} -> {class}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    assert!(has_any_edge(p, a, "no_ctor", "std::make_shared"));
+    assert!(has_any_edge(p, a, "unnamed", "std::make_shared"));
+    // The shadowing factory keeps its own edge.
+    assert!(has_any_edge(
+        p,
+        a,
+        "shadowed::own_factory",
+        "project::make_shared"
+    ));
+}
+
+/// The issue's query over its reproducer: the factory lines gain a direct
+/// edge to `Foo::Foo` next to their external one, and without the `new`
+/// line the constructor still reaches `Handler`.
+#[test]
+fn factory_ctor_issue_query() {
+    const WITH_NEW: &str = "#include <memory>\n\
+        struct Foo { Foo(int a, void (*h)()); };\n\
+        void Handler();\n\
+        Foo::Foo(int a, void (*h)()) { h(); }\n\
+        void make() {\n\
+            auto a = std::make_shared<Foo>(1, Handler);\n\
+            auto b = std::make_unique<Foo>(2, Handler);\n\
+            auto c = new Foo(3, Handler);\n\
+        }\n";
+    let query = "SELECT s.line, s.callee_text, e.resolution, t.name FROM call_sites s \
+                 LEFT JOIN call_edges e ON e.call_site_id = s.id \
+                 LEFT JOIN functions t ON t.id = e.callee_fn_id ORDER BY 1, 2, 4";
+    let row = |line: i64, text: &str, resolution: &str, name: &str| {
+        vec![
+            format!("Integer({line})"),
+            format!("Text({text:?})"),
+            format!("Text({resolution:?})"),
+            format!("Text({name:?})"),
+        ]
+    };
+    let rows_of = |source: &str| {
+        let dir = common::scratch(&[("main.cpp", source)]);
+        let db = common::cli_analyze(dir.path(), &[]);
+        let conn = rusqlite::Connection::open(db.path()).unwrap();
+        common::text_rows(&conn, query)
+    };
+    let expected = [
+        row(4, "h", "indirect", "Handler"),
+        row(6, "Foo::Foo", "direct", "Foo::Foo"),
+        row(6, "std::make_shared", "external", "std::make_shared"),
+        row(7, "Foo::Foo", "direct", "Foo::Foo"),
+        row(7, "std::make_unique", "external", "std::make_unique"),
+        row(8, "Foo::Foo", "direct", "Foo::Foo"),
+    ];
+    assert_eq!(rows_of(WITH_NEW), expected);
+    // Every row but the `new` line's stays.
+    let without_new = WITH_NEW.replace("auto c = new Foo(3, Handler);\n", "");
+    assert_ne!(without_new, WITH_NEW);
+    assert_eq!(rows_of(&without_new), expected[..expected.len() - 1]);
+}
+
+#[test]
+fn factory_ctor_export_is_deterministic_across_jobs() {
+    let root = fixture("cpp_factory_ctor");
+    let reference = common::analysis_rows(&common::cli_analyze(&root, &["--jobs", "1"]));
+    for jobs in ["2", "4", "8"] {
+        assert_eq!(
+            common::analysis_rows(&common::cli_analyze(&root, &["--jobs", jobs])),
+            reference,
+            "--jobs {jobs}"
+        );
+    }
+}
+
+/// A member initializer of a non-class member stores its value as the body
+/// assignment `this->m = v` does: `cb(h)`, `cb{h}`, a parameter spelled as
+/// the member (`cb(cb)`), and a `std::function` member. What the
+/// constructor stores reads back through `new`'s object and a factory's.
+#[test]
+fn member_initializer_stores_its_value() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        "#include <functional>\n\
+         #include <memory>\n\
+         void Handler();\n\
+         struct Paren { Paren(void (*h)()) : cb(h) {} void (*cb)(); };\n\
+         struct ParenShared { ParenShared(void (*h)()) : cb(h) {} void (*cb)(); };\n\
+         struct Brace { Brace(void (*h)()); void (*cb)(); };\n\
+         Brace::Brace(void (*h)()) : cb{h} {}\n\
+         struct Shadow { Shadow(void (*cb)()) : cb(cb) {} void (*cb)(); };\n\
+         struct Wrapped { Wrapped(std::function<void()> f) : cb_(f) {} std::function<void()> cb_; };\n\
+         void paren_new() { auto p = new Paren(Handler); p->cb(); }\n\
+         void paren_shared() { auto p = std::make_shared<ParenShared>(Handler); p->cb(); }\n\
+         void brace_new() { auto p = new Brace(Handler); p->cb(); }\n\
+         void shadow_new() { auto p = new Shadow(Handler); p->cb(); }\n\
+         void wrapped_new() { auto p = new Wrapped(Handler); p->cb_(); }\n",
+    )]);
+    for caller in [
+        "paren_new",
+        "paren_shared",
+        "brace_new",
+        "shadow_new",
+        "wrapped_new",
+    ] {
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                caller,
+                "Handler",
+                ResolutionKind::Indirect
+            ),
+            "{caller}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+}
+
+/// A bare `function<Sig>` that `using namespace std;` or `using
+/// std::function;` names is the standard callable wrapper, as
+/// `std::function<Sig>` is: a function stored into it is what calling it
+/// reaches. A project's own `function` template stays a class.
+#[test]
+fn bare_std_function_is_a_callable_wrapper() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        "#include <functional>\n\
+         void Handler();\n\
+         namespace directive {\n\
+         using namespace std;\n\
+         struct W { function<void()> cb_; };\n\
+         void set(W *w) { w->cb_ = Handler; }\n\
+         void run(W *w) { w->cb_(); }\n\
+         }\n\
+         namespace declaration {\n\
+         using std::function;\n\
+         struct W { function<void()> cb_; };\n\
+         void set(W *w) { w->cb_ = Handler; }\n\
+         void run(W *w) { w->cb_(); }\n\
+         }\n",
+    )]);
+    for caller in ["directive::run", "declaration::run"] {
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                caller,
+                "Handler",
+                ResolutionKind::Indirect
+            ),
+            "{caller}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+}
+
+/// One argument no constructor takes is a copy or a move wherever the
+/// object is constructed: a local (`T x(other)`) and a class-typed member
+/// initializer (`m_(other)`) record no constructor site, as `new T(other)`
+/// and `std::make_shared<T>(other)` do not (#192 review).
+#[test]
+fn copy_construction_records_no_constructor_site() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        "void Handler();\n\
+         struct Foo { Foo(int a, void (*h)()); };\n\
+         Foo::Foo(int a, void (*h)()) { h(); }\n\
+         void copy_local(Foo *f) { Foo x(*f); }\n\
+         struct Holder { Holder(Foo *f); Foo m_; };\n\
+         Holder::Holder(Foo *f) : m_(*f) {}\n\
+         void two_args() { Foo x(1, Handler); }\n",
+    )]);
+    for caller in ["copy_local", "Holder::Holder"] {
+        assert!(
+            !has_any_edge(&program, &analysis, caller, "Foo::Foo"),
+            "{caller}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "two_args",
+        "Foo::Foo",
+        ResolutionKind::Direct
+    ));
+}
+
+/// An object of the class itself, passed alone, is copied, moved or bound by
+/// reference: no constructor the class declares runs unless one takes the
+/// class (#206 review). `Conv(int)` is no copy constructor, `Own(const Own &)`
+/// is one.
+#[test]
+fn own_class_argument_is_no_converting_construction() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        "struct Conv { Conv(int a); };\n\
+         Conv::Conv(int a) {}\n\
+         struct Own { Own(int a); Own(const Own &o); };\n\
+         Own::Own(int a) {}\n\
+         Own::Own(const Own &o) {}\n\
+         struct R { R(Conv &c, Own &o); Conv &ref_; Conv copy_; Own own_; };\n\
+         R::R(Conv &c, Own &o) : ref_(c), copy_(c), own_(o) {}\n\
+         void heap_copy(Conv &c) { auto p = new Conv(c); }\n",
+    )]);
+    for caller in ["R::R", "heap_copy"] {
+        assert!(
+            !has_any_edge(&program, &analysis, caller, "Conv::Conv"),
+            "{caller}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "R::R",
+            "Own::Own",
+            ResolutionKind::Direct
+        ),
+        "{:?}",
+        common::callees_of(&program, &analysis, "R::R")
+    );
+}
+
+/// Braces initialize an aggregate member by member: `new Agg{1, 2}` records
+/// no constructor site, as the braced local `Agg a{1, 2}` does not (#206
+/// review). Its heap object is still the expression's value.
+#[test]
+fn braced_new_of_an_aggregate_constructs_nothing() {
+    let (program, analysis) = common::analyze_source(&[(
+        "main.cpp",
+        "struct Agg { int a; int b; };\n\
+         void heap() { Agg *p = new Agg{1, 2}; }\n\
+         void local() { Agg a{1, 2}; }\n",
+    )]);
+    for caller in ["heap", "local"] {
+        assert!(
+            common::callees_of(&program, &analysis, caller).is_empty(),
+            "{caller}: {:?}",
+            common::callees_of(&program, &analysis, caller)
+        );
+    }
+    assert!(program
+        .symbols
+        .variables
+        .iter()
+        .any(|v| v.temp == Some(trace_ir::TempKind::New)));
+}
+
+analyzed_fixture!(cpp_factory_review);
+
+#[test]
+fn factory_review_pointer_arguments_keep_converting_constructors() {
+    let (p, a) = cpp_factory_review();
+    for (caller, ctor) in [
+        ("pointer_new", "Bar::Bar"),
+        ("pointer_shared", "Bar::Bar"),
+        ("pointer_unique", "Bar::Bar"),
+        ("pointer_allocate", "Bar::Bar"),
+        ("pointer_sptr", "Bar::Bar"),
+        ("reference_pointer", "Bar::Bar"),
+        ("alias_pointer", "Bar::Bar"),
+        ("cast_reference", "Bar::Bar"),
+        ("derived_new", "Derived::Derived"),
+        ("derived_shared", "Derived::Derived"),
+    ] {
+        assert!(
+            has_edge(p, a, caller, ctor, ResolutionKind::Direct),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+}
+
+#[test]
+fn factory_review_pointer_parameter_is_not_a_copy_constructor() {
+    let (p, a) = cpp_factory_review();
+    assert!(!has_any_edge(p, a, "implicit_copy", "Parent::Parent"));
+}
+
+#[test]
+fn factory_review_reference_aliases_preserve_copy_identity() {
+    let (p, a) = cpp_factory_review();
+    for caller in ["alias_copy", "alias_shared", "alias_allocate"] {
+        assert!(
+            has_edge(p, a, caller, "Aliased::Aliased", ResolutionKind::Direct),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    assert!(!has_any_edge(p, a, "alias_implicit_copy", "Parent::Parent"));
+    for caller in [
+        "alias_local_copy",
+        "alias_block_copy",
+        "alias_collapsed_param",
+        "alias_collapsed_local",
+    ] {
+        assert!(!has_any_edge(p, a, caller, "Parent::Parent"));
+    }
+}
+
+#[test]
+fn factory_review_header_aliases_preserve_copy_identity() {
+    let (p, a) = cpp_factory_review();
+    assert!(has_edge(
+        p,
+        a,
+        "header_alias_copy",
+        "HeaderCopy::HeaderCopy",
+        ResolutionKind::Direct
+    ));
+    assert!(!has_any_edge(
+        p,
+        a,
+        "header_alias_implicit",
+        "HeaderImplicit::HeaderImplicit"
+    ));
+    assert!(has_edge(
+        p,
+        a,
+        "HeaderHolder::HeaderHolder",
+        "HeaderValue::HeaderValue",
+        ResolutionKind::Direct
+    ));
+}
+
+#[test]
+fn factory_review_copy_and_move_constructors_keep_default_parameters() {
+    let (p, a) = cpp_factory_review();
+    for (caller, ctor) in [
+        ("default_copy_new", "Own::Own"),
+        ("default_copy_shared", "Own::Own"),
+        ("default_copy_local", "Own::Own"),
+        ("Holder::Holder", "Own::Own"),
+        ("default_move", "Move::Move"),
+    ] {
+        assert!(
+            has_edge(p, a, caller, ctor, ResolutionKind::Direct),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    assert!(has_any_edge(p, a, "declared_copy", "Declared::Declared"));
+}
+
+#[test]
+fn factory_review_aggregate_copy_has_no_unresolved_constructor() {
+    let (p, a) = cpp_factory_review();
+    assert!(
+        common::callees_of(p, a, "aggregate_copy").is_empty(),
+        "{:?}",
+        common::callees_of(p, a, "aggregate_copy")
+    );
+}
+
+#[test]
+fn factory_review_uncertain_constructor_signatures_keep_their_edges() {
+    let (p, a) = cpp_factory_review();
+    assert!(has_any_edge(p, a, "external_copy", "External::External"));
+    assert!(has_edge(
+        p,
+        a,
+        "template_copy",
+        "CopyTemplate::CopyTemplate",
+        ResolutionKind::Direct
+    ));
+}
+
+/// A constructor lookup that proves nothing keeps a site for a factory as
+/// it does for `new`: in a cached header, which imports included headers
+/// as types only, the TU merge resolves it; for a class defined outside
+/// the tree it stays unresolved.
+#[test]
+fn factory_review_inconclusive_constructor_lookup_keeps_a_site() {
+    let (p, a) = cpp_factory_review();
+    for caller in [
+        "header_new",
+        "header_shared",
+        "header_unique",
+        "header_sptr",
+    ] {
+        assert!(
+            has_edge(p, a, caller, "Widget::Widget", ResolutionKind::Direct),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+    for caller in ["external_shared", "external_new_fn", "external_shared_fn"] {
+        assert!(
+            has_any_edge(p, a, caller, "External::External"),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+    }
+}
+
+#[test]
+fn factory_review_bare_names_follow_using_scope_precedence() {
+    let (p, a) = cpp_factory_review();
+    for caller in ["project::shadowed", "mixed::body_shadow"] {
+        assert!(
+            !has_any_edge(p, a, caller, "Foo::Foo"),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        let f = p
+            .symbols
+            .functions
+            .iter()
+            .find(|f| f.name == caller)
+            .unwrap();
+        assert!(!p
+            .symbols
+            .variables
+            .iter()
+            .any(|v| v.fn_id == Some(f.id) && v.temp == Some(trace_ir::TempKind::Make)));
+    }
+    // A body import hides the project's namespace function; a file import
+    // and an unshadowed namespace import also work without <memory>.
+    for caller in [
+        "project::body_import",
+        "file_import",
+        "imported::namespace_import",
+    ] {
+        assert!(
+            has_edge(p, a, caller, "Foo::Foo", ResolutionKind::Direct),
+            "{caller}: {:?}",
+            common::callees_of(p, a, caller)
+        );
+        assert!(has_edge(p, a, caller, "Foo::run", ResolutionKind::Direct));
+    }
+    let f = p
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "project::shadowed")
+        .unwrap();
+    let x = p
+        .symbols
+        .variables
+        .iter()
+        .find(|v| v.fn_id == Some(f.id) && v.name == "x")
+        .unwrap();
+    assert!(
+        !format!("{:?}", p.types.get(x.type_id).desc).contains("shared_ptr"),
+        "a project factory must use its own return type"
+    );
+}
+
+analyzed_fixture!(cpp_undeclared_receiver);
+
+/// The callees of `caller` as (name, resolution) pairs, sorted, each once.
+fn sorted_callees(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+) -> Vec<(String, ResolutionKind)> {
+    let mut callees = common::callees_of(program, analysis, caller);
+    callees.sort_by_key(|(name, kind)| (name.clone(), format!("{kind:?}")));
+    callees.dedup();
+    callees
+}
+
+/// #193: a member call on a parameter whose class the unit never declares
+/// gets the external edge a forward declaration would give it.
+#[test]
+fn cpp_undeclared_receiver_parameters_get_external_edges() {
+    let (p, a) = cpp_undeclared_receiver();
+    assert_eq!(
+        sorted_callees(p, a, "OHOS::Send"),
+        [
+            ("OHOS::Declared::Run".into(), ResolutionKind::External),
+            (
+                "OHOS::MessageParcel::ReadInt32".into(),
+                ResolutionKind::External
+            ),
+            (
+                "OHOS::MessageParcel::WriteInt32".into(),
+                ResolutionKind::External
+            ),
+        ]
+    );
+}
+
+/// The undeclared unit yields the same edges as the forward-declared one,
+/// for `.` and `->`, on parameters, fields, locals, in a nested namespace
+/// and at the global scope.
+#[test]
+fn cpp_undeclared_receiver_matches_forward_declaration() {
+    let (p, a) = cpp_undeclared_receiver();
+    // `Send` alone also calls the forward-declared `Declared::Run`.
+    let callees = |caller: &str| -> Vec<_> {
+        sorted_callees(p, a, caller)
+            .into_iter()
+            .filter(|(name, _)| name != "OHOS::Declared::Run")
+            .collect()
+    };
+    for (undeclared, declared) in [
+        ("OHOS::Send", "OHOS::SendDeclared"),
+        ("OHOS::Holder::Go", "OHOS::HolderDeclared::Go"),
+        ("OHOS::Local", "OHOS::LocalDeclared"),
+        ("OHOS::AAFwk::Nested", "OHOS::AAFwk::NestedDeclared"),
+        ("OHOS::Field", "OHOS::FieldDeclared"),
+        ("Fuzz", "FuzzDeclared"),
+    ] {
+        let expected = callees(declared);
+        assert!(
+            !expected.is_empty(),
+            "{declared} resolves its member calls: {expected:?}"
+        );
+        assert_eq!(callees(undeclared), expected, "{undeclared} vs {declared}");
+    }
+}
+
+/// #147 still holds: `u->handler()` on an undeclared class names the class's
+/// member, not the free function `handler`.
+#[test]
+fn cpp_undeclared_receiver_never_falls_back_to_free_function() {
+    let (p, a) = cpp_undeclared_receiver();
+    assert!(must_not_have_edge(p, a, "OHOS::Field", "OHOS::handler"));
+    assert!(must_not_have_edge(p, a, "OHOS::Field", "handler"));
+    assert!(has_any_edge(p, a, "OHOS::Field", "OHOS::Unseen::handler"));
+}
+
+/// A template parameter and an undeclared wrapper of an unknown class are not
+/// class names: their member calls stay unresolved.
+#[test]
+fn cpp_undeclared_receiver_skips_template_parameters_and_unknown_wrappers() {
+    let (p, a) = cpp_undeclared_receiver();
+    for caller in ["OHOS::Generic", "OHOS::Wrapped"] {
+        assert!(common::callees_of(p, a, caller).is_empty(), "{caller}");
+    }
+    assert!(
+        !p.symbols.functions.iter().any(|f| f.name.contains("::T::")),
+        "no member is invented on a template parameter"
+    );
+}
+
+/// A callback field typed by a typedef the unit never sees is a guessed
+/// class, not a slot that rejects function addresses: the function stored
+/// into it is reached through the call on the field.
+#[test]
+fn cpp_undeclared_receiver_callback_field_keeps_its_function() {
+    let (p, a) = cpp_undeclared_receiver();
+    assert!(
+        has_any_edge(p, a, "OHOS::Listener::Fire", "OHOS::OnSwitchHandler"),
+        "{:?}",
+        common::callees_of(p, a, "OHOS::Listener::Fire")
+    );
+}
+
+/// `T f();` in a body declares a function (`direct_init_arguments` reads an
+/// empty parameter list as one), so its return type is not guessed.
+#[test]
+fn cpp_undeclared_receiver_skips_return_types_of_in_body_declarations() {
+    let (p, _a) = cpp_undeclared_receiver();
+    let guess = trace_ir::TypeDesc::Struct {
+        name: "OHOS::Unreturned".into(),
+        fields: Vec::new(),
+    };
+    assert!(
+        !p.types.is_guessed_class(&guess),
+        "the return type of `Unreturned Get();` is not a guessed class"
+    );
+}

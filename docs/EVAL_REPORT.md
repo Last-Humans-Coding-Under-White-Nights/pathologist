@@ -2170,7 +2170,7 @@ rows) with every variable's `target_id` NULL, so all three run through the
 unscoped path this change adds; the merged members carried no callback that
 a reader in another unit calls through, so no edge appears. The spot-check
 of added indirect edges is therefore vacuous; the isolation, link-image and
-export behaviour is pinned by `crates/trace-cli/tests/static_member_sharing.rs`.
+export behaviour is pinned by `crates/trace-cli/tests/it/static_member_sharing.rs`.
 
 **Determinism.** hiview at jobs 1 and jobs 8 (minimal export, fresh
 databases): every table except `analysis_run` is row-for-row identical
@@ -3361,8 +3361,8 @@ All three are assigned to the recipient callback in the corpus, so these edges a
 - **Workspace Test Suite**: `cargo test --workspace` passes cleanly (1,132 unit, integration, and CLI tests passing).
 - **Regression Fixtures & Tests**:
   - Reproducer fixture at `tests/fixtures/cpp_implicit_fn_ptr/main.cpp`.
-  - Integration tests in `crates/trace-cli/tests/cpp_cases.rs`: `cpp_implicit_member_pointer_fn_ptr_call_resolves_indirect` and `cpp_implicit_member_value_and_chained_fn_ptr_call`.
-  - CLI inspect test in `crates/trace-cli/tests/inspect_tests.rs`: `inspect_callgraph_up_for_implicit_member_pointer_fn_ptr`.
+  - Integration tests in `crates/trace-cli/tests/it/cpp_cases.rs`: `cpp_implicit_member_pointer_fn_ptr_call_resolves_indirect` and `cpp_implicit_member_value_and_chained_fn_ptr_call`.
+  - CLI inspect test in `crates/trace-cli/tests/it/inspect_tests.rs`: `inspect_callgraph_up_for_implicit_member_pointer_fn_ptr`.
   - Verified `is_direct = 0`, `callee_var` is set, indirect call edge `Dispatcher::Dispatch -> target_callback` is resolved, and `trace inspect callgraph --direction up` lists `Dispatcher::Dispatch` as caller.
 
 ## Function pointer member declarator classification and member call fallback — 2026-09-25 (#147)
@@ -6370,7 +6370,7 @@ declared, `SymbolTable::dep_roots` is empty, `FileInfo::is_dep` is false for eve
 and dependency guards evaluate to false.
 
 Dependency behavior itself is pinned by fixture rather than by corpus, in
-`tests/fixtures/dep_root/` and `crates/trace-cli/tests/dep_root_tests.rs`: a source under the
+`tests/fixtures/dep_root/` and `crates/trace-cli/tests/it/dep_root_tests.rs`: a source under the
 dependency root stays out of the index, an unreached dependency header is never an orphan unit,
 `sptr<TargetService>` unwraps through the declared `operator->` to direct edges on
 `TargetService`, no edge lands on the wrapper, no function declared in a dependency header is

@@ -1,0 +1,34 @@
+#[macro_use]
+mod common;
+
+mod adversarial_cases;
+mod analysis_tests;
+mod callback_models;
+mod compile_commands_tests;
+mod compile_flags_tests;
+mod complex_cases;
+mod cpp_cases;
+mod cpp_type_syntax;
+mod cross_tu_tests;
+mod dep_root_tests;
+mod dlsym_cases;
+mod explore_tests;
+mod fn_model_cases;
+mod forced_lang_cases;
+mod gn_targets;
+mod idl_tests;
+mod ignore_macro_tests;
+mod inspect_tests;
+mod integration;
+mod ipc_tests;
+mod macro_paste_cases;
+mod macro_source_mapping;
+mod malloc_mode_tests;
+mod mixed_lang_cases;
+mod mock_visibility;
+mod preproc_context_cases;
+mod preproc_reinclude_cases;
+mod solver_budget_tests;
+mod static_member_sharing;
+mod thread_entry;
+mod weak_targets;
