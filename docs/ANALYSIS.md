@@ -3778,6 +3778,10 @@ and feature implementations by exploring feasible configuration variants indepen
      unit can carry the same shared header body twice (a cached header expansion and its
      own copy), and the second copy's k-th temporary is the first copy's k-th, or each call
      in the body is recorded twice (#127 review).
+     This ordinal rule assumes a stable order of same-kind temporaries at each source
+     position. If a redefined macro inserts or removes an allocation ahead of another
+     at the same expansion site, different allocations can pair across configurations.
+     This precision limitation also applies to file-scope temporaries.
    - Parameters are paired with the base signature **by name, never by position**. A
      variant routinely inserts a parameter ahead of the ones the base has (`#ifdef
      DEBUG_LOG` file/line pairs); positional pairing would map the variant's first
@@ -3789,6 +3793,13 @@ and feature implementations by exploring feasible configuration variants indepen
    - File-scope variables (`FileStatic` and `Global`) sharing origin location and name are
      paired with the base configuration's variables, unifying initializers, stores, and
      reads across variants rather than duplicating them into disconnected entities.
+     File-scope synthesized temporaries instead pair by source scope, file/line/column,
+     and `Variable::temp`, never by name, with a separate occurrence count per key in
+     each incoming configuration.
+     Multiple temporaries of one kind at the same position keep separate ordinals,
+     so an unchanged initializer's heap object is shared across configurations while
+     distinct allocations at that site retain their own ordinals, subject to the
+     ordering limitation above. Declared file-scope variables continue to pair by name.
    - Aggregate layouts (`struct` and `union`) are unioned across configurations: fields
      are matched by name; variant-specific fields not present in the base layout are
      appended with unique `FieldId`s (`union_struct_layout`, `union_union_layout`).

@@ -949,6 +949,165 @@ fn test_explore_pairs_new_allocation_whatever_its_type() {
     assert_eq!(heaps.len(), 1, "{heaps:?}");
 }
 
+/// An earlier conditional allocation changes temporary numbering, but the
+/// retained file-scope initializer must still share one heap across variants.
+#[test]
+fn test_explore_pairs_file_scope_new_after_conditional_allocation() {
+    let source = r#"
+        void Handler();
+        struct Foo { Foo(void (*h)()); };
+        Foo::Foo(void (*h)()) { h(); }
+        #ifdef FEATURE_ALPHA
+        int *gp = new int;
+        #endif
+        Foo *g = new Foo(Handler); // retained
+        "#;
+    let program = explore_alpha(source);
+    let retained_line = source
+        .lines()
+        .position(|line| line.contains("// retained"))
+        .unwrap() as u32
+        + 1;
+    let heaps: Vec<_> = program
+        .symbols
+        .variables
+        .iter()
+        .filter(|var| {
+            var.fn_id.is_none()
+                && var.temp == Some(trace_ir::TempKind::New)
+                && var.span.line == retained_line
+        })
+        .collect();
+    assert_eq!(heaps.len(), 1, "one retained file-scope heap: {heaps:?}");
+    let heap = heaps[0].id;
+    assert_eq!(
+        program
+            .flow
+            .iter()
+            .filter(
+                |flow| matches!(flow, trace_ir::FlowConstraint::NewHeap { dst } if *dst == heap)
+            )
+            .count(),
+        1,
+        "the shared heap has one allocation constraint"
+    );
+    let globals: Vec<_> = program
+        .symbols
+        .variables
+        .iter()
+        .filter(|var| var.fn_id.is_none() && var.name == "g")
+        .collect();
+    assert_eq!(globals.len(), 1, "one named global across variants");
+    assert_eq!(
+        program
+            .flow
+            .iter()
+            .filter(|flow| matches!(flow, trace_ir::FlowConstraint::Copy { dst, src } if *dst == globals[0].id && *src == heap))
+            .count(),
+        1,
+        "the retained initializer copies its shared heap to g once"
+    );
+}
+
+/// Same-kind allocations sharing a macro expansion span must retain separate
+/// identities while each allocation pairs across configurations.
+#[test]
+fn test_explore_pairs_distinct_file_scope_new_at_same_macro_site() {
+    let source = r#"
+        struct Foo { Foo() {} };
+        #ifdef FEATURE_ALPHA
+        int *gp = new int;
+        #endif
+        #define BOTH Foo *a = new Foo; Foo *b = new Foo;
+        BOTH // retained
+        "#;
+    let program = explore_alpha(source);
+    let retained_line = source
+        .lines()
+        .position(|line| line.contains("// retained"))
+        .unwrap() as u32
+        + 1;
+    let heaps: Vec<_> = program
+        .symbols
+        .variables
+        .iter()
+        .filter(|var| {
+            var.fn_id.is_none()
+                && var.temp == Some(trace_ir::TempKind::New)
+                && var.span.line == retained_line
+        })
+        .collect();
+    assert_eq!(heaps.len(), 2, "two distinct macro-site heaps: {heaps:?}");
+    let assigned_heaps: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|name| {
+            let global = program
+                .symbols
+                .variables
+                .iter()
+                .find(|var| var.fn_id.is_none() && var.name == name)
+                .unwrap();
+            let sources: Vec<_> = program
+                .flow
+                .iter()
+                .filter_map(|flow| match flow {
+                    trace_ir::FlowConstraint::Copy { dst, src }
+                        if *dst == global.id && heaps.iter().any(|heap| heap.id == *src) =>
+                    {
+                        Some(*src)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(sources.len(), 1, "one retained heap assigned to {name}");
+            sources[0]
+        })
+        .collect();
+    assert_ne!(assigned_heaps[0], assigned_heaps[1]);
+}
+
+#[test]
+fn test_explore_file_scope_new_full_export_is_deterministic_across_jobs() {
+    let source = r#"
+        void Handler();
+        struct Foo { Foo(void (*h)()); };
+        Foo::Foo(void (*h)()) { h(); }
+        #ifdef FEATURE_ALPHA
+        int *gp = new int;
+        #endif
+        Foo *g = new Foo(Handler); // retained
+        "#;
+    let dir = scratch(&[
+        (
+            "BUILD.gn",
+            "config(\"my_config\") {\n  defines = [ \"FEATURE_ALPHA\" ]\n}\n",
+        ),
+        ("main.cpp", source),
+        // Give the parallel run multiple TUs to schedule, including another
+        // file-scope allocation whose unit-local temporary ID can overlap.
+        ("other.cpp", "int *other = new int;\n"),
+    ]);
+    let single = cli_analyze(dir.path(), &["--explore", "--full-export", "--jobs", "1"]);
+    let parallel = cli_analyze(dir.path(), &["--explore", "--full-export", "--jobs", "8"]);
+    assert_eq!(analysis_rows(&single), analysis_rows(&parallel));
+    let retained_line = source
+        .lines()
+        .position(|line| line.contains("// retained"))
+        .unwrap() as u32
+        + 1;
+    for db in [&single, &parallel] {
+        let conn = Connection::open(db.path()).unwrap();
+        let heaps: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM variables WHERE fn_id IS NULL AND name GLOB '$new*' AND line = ?1",
+                [retained_line],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(heaps, 1, "full export retains one shared initializer heap");
+    }
+}
+
 /// `main_cpp` built with `--explore` under a `BUILD.gn` defining
 /// `FEATURE_ALPHA`, which must explore at least one variant.
 fn explore_alpha(main_cpp: &str) -> trace_ir::Program {
