@@ -135,6 +135,7 @@ enum TempKey {
 /// A temporary's kind and, for a factory's shared object, its class.
 type TempPairing = (TempKind, Option<TypeId>);
 type FileVarKey = (u32, trace_ir::FileId, u32, u32, String);
+type FileTempKey = (u32, trace_ir::FileId, u32, u32, TempPairing);
 
 /// How a variant merge pairs `var`, typed `ty` in the merged program's
 /// types, or `None` for a declared variable. Lowering names a temporary
@@ -164,10 +165,20 @@ fn temp_key(var: &Variable, owner: FnId, file: trace_ir::FileId, ty: TypeId) -> 
     })
 }
 
+fn file_temp_key(
+    var: &Variable,
+    source_scope: u32,
+    file: trace_ir::FileId,
+    ty: TypeId,
+) -> Option<FileTempKey> {
+    temp_pairing(var, ty).map(|pairing| (source_scope, file, var.span.line, var.span.col, pairing))
+}
+
 #[derive(Default)]
 struct VariantDedup {
     flow: FxHashSet<FlowConstraint>,
     file_vars: FxHashMap<FileVarKey, VarId>,
+    file_temps: FxHashMap<FileTempKey, Vec<VarId>>,
     /// One scope per originating translation unit. Variables dedup within a
     /// source's own configurations, never between two sources that happen to
     /// include the same header.
@@ -241,22 +252,27 @@ impl VariantMerge {
         let mut seen = VariantDedup {
             flow: program.flow[flow_start..].iter().cloned().collect(),
             file_vars: FxHashMap::default(),
+            file_temps: FxHashMap::default(),
             source_scopes: FxHashMap::default(),
             base_defs: base_definitions(program, base),
         };
         let base_scope = seen.source_scope(&base.path);
         for v in &program.symbols.variables[var_start..] {
             if v.fn_id.is_none() {
-                seen.file_vars.insert(
-                    (
-                        base_scope,
-                        v.span.file,
-                        v.span.line,
-                        v.span.col,
-                        v.name.clone(),
-                    ),
-                    v.id,
-                );
+                if let Some(key) = file_temp_key(v, base_scope, v.span.file, v.type_id) {
+                    seen.file_temps.entry(key).or_default().push(v.id);
+                } else {
+                    seen.file_vars.insert(
+                        (
+                            base_scope,
+                            v.span.file,
+                            v.span.line,
+                            v.span.col,
+                            v.name.clone(),
+                        ),
+                        v.id,
+                    );
+                }
             }
         }
         Self { seen: Some(seen) }
@@ -883,6 +899,9 @@ fn merge_unit(
     // second copy's k-th temporary is the first copy's k-th, not the one
     // after it.
     let mut temp_cursor: FxHashMap<(Option<FnId>, TempKey), usize> = FxHashMap::default();
+    // File-scope temporaries share the same per-configuration occurrence
+    // rule, with candidates retained for later variants of this source.
+    let mut file_temp_cursor: FxHashMap<FileTempKey, usize> = FxHashMap::default();
 
     for var in &unit.variables {
         if var
@@ -901,26 +920,48 @@ fn merge_unit(
         }
 
         let mapped_fn_id = var.fn_id.and_then(|id| fn_map.get(&id).copied());
+        let file_temp_key = if var.fn_id.is_none() && var.temp.is_some() && variant_dedup.is_some()
+        {
+            file_temp_key(
+                var,
+                source_scope,
+                span_file,
+                remap_type(var.type_id, &type_map),
+            )
+        } else {
+            None
+        };
 
         if var.fn_id.is_none() {
             if let Some(seen) = variant_dedup.as_deref_mut() {
-                let file_key: FileVarKey = (
-                    source_scope,
-                    span_file,
-                    var.span.line,
-                    var.span.col,
-                    var.name.clone(),
-                );
-                if let Some(&existing) = seen.file_vars.get(&file_key) {
-                    // A configuration that turns a member declaration into
-                    // a definition at the same site promotes the merged
-                    // record (`docs/ANALYSIS.md`, "Static data member
-                    // storage"); ordinary variables keep the first variant's.
-                    if var.is_static_member {
-                        adopt_definition(program, existing, var, span_file, &type_map);
+                if let Some(key) = file_temp_key {
+                    let cursor = file_temp_cursor.entry(key).or_insert(0);
+                    if let Some(&existing) =
+                        seen.file_temps.get(&key).and_then(|ids| ids.get(*cursor))
+                    {
+                        *cursor += 1;
+                        var_map.insert(var.id, existing);
+                        continue;
                     }
-                    var_map.insert(var.id, existing);
-                    continue;
+                } else {
+                    let file_key: FileVarKey = (
+                        source_scope,
+                        span_file,
+                        var.span.line,
+                        var.span.col,
+                        var.name.clone(),
+                    );
+                    if let Some(&existing) = seen.file_vars.get(&file_key) {
+                        // A configuration that turns a member declaration into
+                        // a definition at the same site promotes the merged
+                        // record (`docs/ANALYSIS.md`, "Static data member
+                        // storage"); ordinary variables keep the first variant's.
+                        if var.is_static_member {
+                            adopt_definition(program, existing, var, span_file, &type_map);
+                        }
+                        var_map.insert(var.id, existing);
+                        continue;
+                    }
                 }
             }
         }
@@ -997,16 +1038,21 @@ fn merge_unit(
         }
         if var.fn_id.is_none() {
             if let Some(seen) = variant_dedup.as_deref_mut() {
-                seen.file_vars.insert(
-                    (
-                        source_scope,
-                        span_file,
-                        var.span.line,
-                        var.span.col,
-                        var.name.clone(),
-                    ),
-                    new_id,
-                );
+                if let Some(key) = file_temp_key {
+                    seen.file_temps.entry(key).or_default().push(new_id);
+                    *file_temp_cursor.entry(key).or_insert(0) += 1;
+                } else {
+                    seen.file_vars.insert(
+                        (
+                            source_scope,
+                            span_file,
+                            var.span.line,
+                            var.span.col,
+                            var.name.clone(),
+                        ),
+                        new_id,
+                    );
+                }
             }
         }
 
