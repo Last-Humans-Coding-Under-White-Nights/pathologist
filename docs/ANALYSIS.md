@@ -949,7 +949,7 @@ Nested call arguments (`consume(make())`, `Register(obj->GetHandler())`, `consum
 
 **`CallReturnIndirect`** is the indirect-call analogue of `CallReturn`. The callee is resolved by the solver when indirect call targets are known (via function-pointer analysis). The `callee_var` is a synthetic load variable that holds the resolved function pointer; the solver wires return flows from each resolved target into `dst`.
 
-**`NewHeap`** represents C++ `new T(...)` allocations, and the object a recognised smart-pointer factory builds ([Factory construction](#factory-construction)). The PAG allocates a heap location typed to the allocated struct and adds an `AddrOf` edge from `dst` to the heap location. The solver then propagates into the struct's fields, enabling resolution of function pointers stored by constructors (e.g., `MParcelImplInterfaceAssign` writing into `HdfSBufImpl.readBuffer`). Lowering (`lower_new_object`, `construct_on_heap` in `lower.rs`) gives every `new T(args)` its heap object, a `$new<id>` temporary typed `T`, in value and statement position alike, and at file scope too; the constructor sites (in a body) take it as `this` and the constructor's own argument list as their arguments, never a placement list (`new (std::nothrow) T(a, b)` passes `a, b`); a braced list (`new T{a, b}`) is that list when `T` has a user-provided constructor, as for a braced local, and otherwise initializes an aggregate member by member, with no constructor site; and the expression's value is that object. A construction from one argument records no constructor site (`copies_implicitly`, checked in `emit_member_targets`) wherever the object is built (`new T(other)`, a factory, a local `T x(other)`, a class-typed member initializer `m_(other)`) when either no constructor of the class takes one argument, or the argument is an object of the class itself (directly or by reference) and no constructor takes the class: that is a copy or a move, which runs the implicit constructor, where arity filtering would otherwise fall back to every constructor, or rank `T(int)`, and bind the copied object to an unrelated parameter. A pointer argument (`T *`) is not an object copy; a reference to a pointer keeps that pointer type too. A user-declared copy or move constructor (`T(const T &)`) keeps its site, including constructors whose later parameters have defaults (`T(const T &, int = 0)`). An aggregate whose definition and constructor set are indexed, copied from its own type, records no unresolved constructor site. Cached headers import included headers as types only, so an empty constructor lookup there retains a site for the later TU symbol merge to resolve. A missing class definition or an unknown constructor parameter type retains the possible constructor edge. A reference member's initializer (`ref_(other)`) is typed as its class and takes the same path: binding a reference constructs nothing, and an argument of the class records no site.
+**`NewHeap`** represents C++ `new T(...)` allocations, and the object a recognised smart-pointer factory builds ([Factory construction](#factory-construction)). The PAG allocates a heap location typed to the allocated struct and adds an `AddrOf` edge from `dst` to the heap location. The solver then propagates into the struct's fields, enabling resolution of function pointers stored by constructors (e.g., `MParcelImplInterfaceAssign` writing into `HdfSBufImpl.readBuffer`). Lowering (`lower_new_object`, `construct_on_heap` in `lower.rs`) gives every `new T(args)` its heap object, a `$new<id>` temporary typed `T`, in value and statement position alike, and at file scope too; the constructor sites (in a body) take it as `this` and the constructor's own argument list as their arguments, never a placement list (`new (std::nothrow) T(a, b)` passes `a, b`); a braced list (`new T{a, b}`) is that list when `T` has a user-provided constructor, as for a braced local, and otherwise initializes an aggregate member by member, with no constructor site; and the expression's value is that object. A construction from one argument records no constructor site (`copies_implicitly`, checked in `emit_member_targets`) wherever the object is built (`new T(other)`, a factory, a local `T x(other)`, a class-typed member initializer `m_(other)`) when either no constructor of the class takes one argument, or the argument is an object of the class itself (directly or by reference) and no constructor takes the class: that is a copy or a move, which runs the implicit constructor, where arity filtering would otherwise fall back to every constructor, or rank `T(int)`, and bind the copied object to an unrelated parameter. A pointer argument (`T *`) is not an object copy; a reference to a pointer keeps that pointer type too. A user-declared copy or move constructor (`T(const T &)`) keeps its site, including constructors whose later parameters have defaults (`T(const T &, int = 0)`). An aggregate whose definition and constructor set are indexed, copied from its own type, records no unresolved constructor site. For `new` and factories, cached headers import included headers as types only, so an empty constructor lookup there retains a site for the later TU symbol merge to resolve. A missing class definition or an unknown constructor parameter type retains the possible constructor edge on those paths. Member-initializer lists omit the implicit default or copy constructor itself while retaining nontrivial construction of its base and member subobjects. A reference member's binding (`ref_(other)`) records none regardless of its class's constructors. See [Ctors / dtors](#c-support-first-step) for the member-initializer rule.
 
 **`StringConst`** intern a C string literal as an abstract location (`LocKind::StringLit`). Assignments (`const char *n = "foo"`), copies, and call arguments intern the same way, so a later `dlsym(h, n)` still sees `"foo"`. Concatenated literals (`"ta" "rget"`) are folded. String literals represent immutable constants and are excluded from being writable memory cells: stores through untyped or cast pointers do not write into string literal locations, and dereferences of pointers holding string literals do not merge cell memory (see [Propagation highlights](#propagation-highlights)). No `sprintf` / buffer writes.
 
@@ -1937,6 +1937,9 @@ C++-aware only where it must be — everything else reuses the C machinery.
   keeps this way reads back through the object. A literal (`count_(0)`,
   `ok_(false)`, `p_(nullptr)`) and a `bool` or floating member hold no
   address and store nothing.
+  Constructor-site eligibility and reference bindings follow the
+  [Ctors / dtors](#c-support-first-step) rule below, including declarations
+  imported from cached headers for nested classes and member class templates.
 - **Overloads**: same-name entries are kept apart when **both** sides are C++
   and arity (or same-arity param types) differ (`add_function`;
   `externals_by_name` bucket). Signature comparison uses real types: at TU
@@ -2383,7 +2386,85 @@ C++-aware only where it must be — everything else reuses the C machinery.
   `delete p`, explicit qualified dtor calls, constructor-declarations with
   an argument list, ctor-initializer lists (base + member targets, with
   parentheses or braces; a member of union type with a user-provided
-  constructor counts as a class). A member that is an array of a class, nested arrays
+  constructor counts as a class). A base or class-typed member initializer
+  records a site for the target class's user-provided constructors. An implicit
+  or in-class defaulted constructor has no site of its own.
+  Cached constructor metadata describes only that class's own declarations;
+  a base constructor does not make a derived constructor user-provided.
+  Empty member or base initializers reuse [automatic-object lifecycle lookup](#automatic-objects):
+  an implicit or in-class defaulted default constructor runs the base
+  constructors. With arguments, an implicit copy or aggregate initializer
+  records no constructor site for the aggregate itself. A braced aggregate
+  initializer constructs its base subobjects in declaration order, then its
+  members, binding each subobject's own initializer arguments past `this`.
+  Parenthesized aggregate initialization follows the translation unit's C++20
+  (or later) standard; parentheses do not permit brace elision. Arrays consume
+  clauses per element, including nested dimensions, and class elements run their
+  converting constructors. Array extents retain integer literals and bounded
+  arithmetic expressions over visible namespace or class constants, including
+  constants imported through cached headers. Unsupported expressions, local
+  names and conflicting constant definitions leave the extent unknown. An
+  unknown extent retains possible clause boundaries for following aggregate
+  members instead of assigning every remaining clause to the array; this may
+  add constructor candidates. Empty unknown-size arrays retain possible element
+  construction in summary storage. Empty and omitted subobjects recurse through
+  class members as well as bases. Omitted members first use their default member
+  initializer, retained with declaration scope and source mapping through cached
+  headers; explicit initializers and copies do not apply those defaults.
+  Declaration-scope namespace imports are restored for the expression, without
+  the caller's locals or aliases. Distinct initializer variants remain possible
+  alternatives when type metadata merges.
+  Scalar, pointer and reference aggregate elements retain their field identity
+  and emit value stores, so callback members remain callable. An implicit outer
+  copy or move has no site of its own but preserves nontrivial construction of
+  its base and member subobjects, with the corresponding source subobject as
+  the argument. Own declarations hide same-signature inherited constructors;
+  overload selection considers the remaining own and imported candidates
+  together. Constructor signatures retain parameter spelling, cv qualification
+  and lvalue/rvalue reference categories through cached type imports. Missing
+  or alias-erased qualification cannot prove hiding. Reference-binding checks
+  exclude a candidate only when the known argument type and value category
+  establish incompatibility; possible converting temporaries remain candidates.
+  A forward-declared union with an unavailable definition retains a
+  possible constructor site under the same rule as an unknown class.
+  See the [aggregate rules](https://eel.is/c++draft/dcl.init.aggr) and
+  [inherited-constructor initialization](https://eel.is/c++draft/class.inhctor.init).
+  Explicit subobject initializers retain separate source positions, so two
+  members invoking the same constructor remain distinct through header merges.
+  Nested braces and brace elision preserve that order; omitted bases
+  follow default lifecycle lookup. A `using Base::Base` declaration explicitly
+  brings in that base's constructors, so argument-bearing initializers can
+  call them. Inherited construction also default-initializes the derived object's
+  other bases and members, using their default member initializers, including
+  each derived level along an inherited-constructor chain. A base named through
+  a type alias (`using Alias = Base;` followed by `using Alias::Alias`) resolves
+  to the same declaring class.
+  Cached type imports preserve default- and copy-constructor eligibility and
+  these explicit constructor imports, retaining sites for later symbol merging.
+  Types-only cached-header imports retain this constructor declaration
+  metadata for every class, nested classes and member class templates included.
+  A known user-provided constructor keeps its site until the
+  translation unit merges its symbols.
+  An empty set or constructors all defaulted in the class record no call to
+  the class itself, including implicit copies. A definition discovered only at final TU merge
+  cannot restore a skipped site; construction needs a visible constructor
+  declaration in the initializer's unit or its imported type metadata.
+  This includes configuration-dependent class bodies: a constructor enabled
+  only in another unit's preprocessor variant does not enter the initializer's
+  constructor set. A missing class definition remains uncertain and retains
+  a possible constructor site instead, including one-argument copies. The
+  negative copy decision requires a known constructor set or class definition;
+  a forward declaration alone cannot establish that its copy is implicit.
+  A reference member's binding constructs nothing
+  and records no constructor site, whatever constructors its class declares;
+  a reference to a non-class type keeps the value store described above.
+  Parentheses around a reference declarator (`Value (&ref)`) preserve the binding;
+  pointer layers remain distinct from reference layers.
+  Every member declarator contributes its own field and reference metadata
+  (`T first, second`, `T &ref, value`); parentheses around a known class member's
+  name (`T (value)`) do not turn it into a method. Qualified base names and
+  unions imported through nested cached headers use the same construction rule.
+  A member that is an array of a class, nested arrays
   included, constructs its elements: an empty list (`m_arr{}`) records the
   element's default constructor, and a non-empty list initializes the
   elements one by one, each listed expression lowered on its own rather than

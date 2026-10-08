@@ -1,5 +1,164 @@
 # Evaluation Report
 
+## Four constructor follow-up findings: #207 — 2026-10-09
+
+Fixed the four follow-up constructor findings on top of `b1e33ac`, with local
+master still at `9dab736`. The rules and approximation limits are authoritative
+under [Ctors / dtors](ANALYSIS.md#c-support-first-step). Constant array extents
+keep the correct initializer boundaries, unresolved extents retain possible
+following-member construction, inherited constructors initialize the remaining
+subobjects, cv/ref distinctions survive constructor imports, and parentheses
+preserve reference bindings.
+
+Fresh Linux release analyses compare this follow-up with `b1e33ac`, using clean
+pinned revisions, minimal export, eight jobs and
+`TRACE_SOLVE_BUDGET_POPS=800000`. Ability remains at
+`6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`. All global metrics are unchanged:
+
+| Corpus | Total edges, before → after | Direct | External | Arg-flow rows |
+|---|---:|---:|---:|---:|
+| HDF | 77,461 → 77,461 | 48,487 → 48,487 | 23,940 → 23,940 | 71,699 → 71,699 |
+| hiview | 36,479 → 36,479 | 20,555 → 20,555 | 15,690 → 15,690 | 27,195 → 27,195 |
+| camera | 115,568 → 115,568 | 68,357 → 68,357 | 46,032 → 46,032 | 57,149 → 57,149 |
+| ability | 675,739 → 675,739 | 340,374 → 340,374 | 332,771 → 332,771 | 447,851 → 447,851 |
+
+File and function counts, indirect/IPC edges, diagnostics and dlsym edges are
+also unchanged. No call-edge identity changes, comparing caller, source
+file/line/column, callee and resolution with multiplicity. Recapture retains
+every global center, tolerance, pinned
+revision, dispatch expectation and production probe in
+`scripts/eval_expected.json`. The capture note records this follow-up. The
+release binary passes all **104** `eval_check.py` checks, and the recaptured
+centers match the fresh outputs exactly.
+
+Validation: all **2,017 workspace tests** pass. Nine additional regression tests
+bring `constructor_review.rs` to **31 passing tests**. They cover namespace and
+class constant bounds, arithmetic bounds, unknown boundaries, empty unknown-size
+class arrays, inherited initialization across two derived levels and another
+base, distinct cv/ref signatures, possible converting temporaries, and grouped
+reference/pointer declarators. Cached-header fixtures exercise the new facts
+while lowering member-initializer lists in a second header. Constructor arguments
+remain bound past `this`. The original reproducer still exports zero sites and
+edges. Workspace Clippy for all targets with `-D warnings`, formatting and diff
+checks pass.
+
+Fresh jobs 1 and 8 outputs match in schema/index definitions and every row,
+including insertion order, of all **23 non-metadata tables** on all four
+corpora and the five constructor fixtures listed in the subobject review below.
+All five fixtures retain zero external constructor edges. `analysis_run` is
+excluded as run metadata. Logs, databases, exact metrics and comparisons are
+under `/tmp/issue207-four-final-validation/`; the driver is
+`/tmp/issue207-four-validation.py`. No measurement artifacts are committed.
+
+## Constructor subobject review: #207 — 2026-10-09
+
+Addressed all nine constructor review findings on top of `13c7455`, already
+rebased onto local master `9dab736`. The construction rules are authoritative
+under [Ctors / dtors](ANALYSIS.md#c-support-first-step). Implicit outer
+constructors still have no site of their own; their nontrivial subobjects
+retain construction and callback flow. Header imports retain scoped default
+member initializers and constructor signatures, and header variants retain
+their language version for C++20 parenthesized aggregates.
+
+Fresh Linux release analyses compare the review fixes with `13c7455`, using
+clean pinned revisions, minimal export, eight jobs and
+`TRACE_SOLVE_BUDGET_POPS=800000`. Ability remains pinned at
+`6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`.
+
+| Corpus | Total edges, before → after | Direct | External | Arg-flow rows |
+|---|---:|---:|---:|---:|
+| HDF | 77,433 → 77,461 | 48,473 → 48,487 | 23,926 → 23,940 | 71,547 → 71,699 |
+| hiview | 36,465 → 36,479 | 20,555 → 20,555 | 15,676 → 15,690 | 27,108 → 27,195 |
+| camera | 115,551 → 115,568 | 68,357 → 68,357 | 46,015 → 46,032 | 56,793 → 57,149 |
+| ability | 675,668 → 675,739 | 340,367 → 340,374 | 332,707 → 332,771 | 447,739 → 447,851 |
+
+HDF adds 14 direct edges from the two `AutoPtr` default member initializers
+in `CCodeEmitter`; conservative overload candidates account for multiple edges
+per initializer. Ability adds seven direct edges to `StartOptions` and
+`WantParams` constructors. No prior edge is removed, comparing caller,
+source file/line, callee and resolution. External additions preserve possible
+construction of dependency subobjects whose definitions are unavailable,
+including standard-library containers and strings, smart pointers and
+`RefBase`/`Parcelable` bases. Unavailable dependency types remain an
+approximation; a guessed class name can denote an enum in the actual dependency.
+External-function counts rise by one in hiview, two in camera and four in
+ability; HDF's function counts are unchanged. File counts, defined-function
+counts, indirect edges, IPC edges, diagnostics and dlsym edges are unchanged
+on all four trees. The increased argument flow includes subobject receivers
+bound at parameter zero, while explicit arguments remain past `this`.
+
+`scripts/eval_expected.json` recaptures the three pinned global metric sets
+and the HDF argument-flow count probe. Comparison modes, tolerances, revisions,
+all existing dispatch expectations and other production probes are retained.
+A new production probe verifies both `CCodeEmitter` default member initializer
+positions. The original capture reports three count mismatches: HDF's global
+and probe argument-flow counts, and camera's global argument-flow count.
+
+Validation: all **2,008 workspace tests** pass, including **22 new review
+tests** covering all nine findings, explicit class array elements, namespace
+imports and macro provenance in default initializers, cached-header subobjects,
+and mixed C++17/C++20 compilation commands with one and eight jobs. Workspace
+Clippy for all targets with `-D warnings`, formatting and diff checks pass.
+The original reproducer still exports zero sites and edges. The freshly rebuilt
+release binary passes all **104** `eval_check.py` checks after recapture, and
+all recaptured global centers match exactly.
+
+Fresh jobs 1 and 8 outputs match in schema/index definitions and every row,
+including insertion order, of all **23 non-metadata tables** on all four
+corpora and five constructor fixtures (`cpp_implicit_member_initializers`,
+`cpp_nested_member_initializers`, `cpp_member_initializer_review`,
+`cpp_unknown_member_copy`, `cpp_constructor_subobjects`). The four original
+fixtures retain zero external constructor edges; the new subobject fixture
+also has none. `analysis_run` is excluded as run metadata. The comparisons
+include source-dataflow provenance tables. Logs, databases, exact metrics and
+the comparator are under `/tmp/issue207-nine-validation/`, with the driver at
+`/tmp/issue207-nine-validation.py`; no measurement artifacts are committed.
+
+## Member-initializer rebase on local master — 2026-10-09
+
+Rebased #207 onto local master `9dab736` (source-dataflow presentation, #140).
+Conflict resolution retains the shared argument collector's explicit-null
+value and origin recording, and records each member initializer's expression
+on its emitted constructor calls. Construction rules remain authoritative
+under [Ctors / dtors](ANALYSIS.md#c-support-first-step); the earlier #207
+measurements below describe the pre-rebase tree.
+
+Fresh Linux release analyses compare the combined tree with the prior #207
+commit `d6561b2`, using the same clean pinned revisions, minimal export,
+eight jobs and `TRACE_SOLVE_BUDGET_POPS=800000`. Ability remains pinned at
+`6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`.
+
+| Corpus | Total edges, before → after | Direct | External | Arg-flow rows |
+|---|---:|---:|---:|---:|
+| HDF | 77,432 → 77,433 | 48,472 → 48,473 | 23,926 → 23,926 | 71,118 → 71,547 |
+| hiview | 36,465 → 36,465 | 20,555 → 20,555 | 15,676 → 15,676 | 26,286 → 27,108 |
+| camera | 115,550 → 115,551 | 68,356 → 68,357 | 46,015 → 46,015 | 56,022 → 56,793 |
+| ability | 675,649 → 675,668 | 340,352 → 340,367 | 332,703 → 332,707 | 436,374 → 447,739 |
+
+These movements include master's dataflow changes as well as the retained
+constructor fixes; they do not isolate the effect of constructor lowering.
+File and function counts, indirect edges, IPC edges, diagnostics and dlsym
+edges are unchanged on all four trees.
+`scripts/eval_expected.json` captures the three pinned global metric sets;
+comparison modes, tolerances, revisions, dispatch-site expectations and
+production probes are retained. The HDF argument-flow probe remains 71,547.
+
+Validation: `cargo test --workspace` passes all **1,986 tests**, including
+485 C++ integration tests. Workspace Clippy for all targets with `-D warnings`,
+formatting and diff checks pass. The freshly rebuilt release binary passes all
+**103** `eval_check.py` checks; checking the recaptured expectations against
+those outputs also passes all 103, with every global center matching exactly.
+The original reproducer exports zero sites and edges. All four regression
+fixtures have zero external constructor edges.
+
+Fresh jobs 1 and 8 outputs match in schema/index definitions and every row,
+including insertion order, of all **23 non-metadata tables** on all four
+corpora and all four fixtures. `analysis_run` is excluded as run metadata.
+The comparison includes master's source-dataflow provenance tables. Logs,
+databases, exact metrics and the comparator are under
+`/tmp/issue207-rebase-validation/`, with the driver at
+`/tmp/issue207-rebase-validation.py`; no measurement artifacts are committed.
+
 ## af1b206 source-dataflow memory regression and expression sharing — 2026-10-08
 
 Measured **af1b206** against its first parent **95b88db** before changing
@@ -219,6 +378,235 @@ all **99** evaluation checks; Camera was retried after clearing compiler
 cache space because the first attempt ran out of disk space. All workspace
 tests and the formatting check pass. The earlier measurements below retain
 their original baselines.
+
+## Implicit member-initializer constructors: #207 — 2026-10-08
+
+Measured on Linux, 2026-10-08, against baseline `40dc834c790a` with fresh
+release builds, eight jobs, minimal export and
+`TRACE_SOLVE_BUDGET_POPS=800000`. HDF, hiview and camera use the clean
+revisions pinned in `scripts/eval_expected.json`; the additional ability
+checkout is clean at `6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`.
+The lowering rule is documented under
+[Ctors / dtors](ANALYSIS.md#c-support-first-step).
+
+| Corpus | Total edges, before → after | Direct | External | Arg-flow rows |
+|---|---:|---:|---:|---:|
+| HDF | 77,432 → 77,432 | 48,456 → 48,472 | 23,942 → 23,926 | 71,118 → 71,118 |
+| hiview | 36,484 → 36,465 | 20,561 → 20,555 | 15,689 → 15,676 | 26,288 → 26,286 |
+| camera | 115,589 → 115,550 | 68,383 → 68,356 | 46,027 → 46,015 | 56,039 → 56,022 |
+| ability | 675,663 → 675,649 | 340,358 → 340,352 | 332,711 → 332,703 | 436,376 → 436,374 |
+
+These are whole-database movements, including standard-library names, rather
+than the narrower approximate name-match counts in the issue. External
+function totals move by −4, −11, −11 and +2 respectively. Defined functions,
+files, indirect edges, IPC edges, diagnostics and dlsym flow edges are
+unchanged on all four trees. All existing dispatch-site and production probes
+remain green. The three pinned global metric sets are re-captured in
+`scripts/eval_expected.json`, with exact zero-site probes for the reported
+HDF, hiview and camera initializers.
+
+The reported `CCodeEmitter()`, `context_(context)`,
+`focusTrackingMetaInfo_(info)` and `uri(uri)` sites disappear. Direct edges
+also decrease: reference members must not invoke even a declared constructor
+(camera's `Profile`, `VideoProfile`, `CameraDevice` and `MetadataObject`,
+for example), and in-class defaulted constructors record no site
+(`ExportFileBaseBuilder`, `ListenerBase`, `NativeChildNotifyStub`). The earlier
+empty-lookup gate also lost ability's `ETSServiceExtensionConnection`,
+`JSServiceExtensionConnection` and `CJUIExtensionContext` initializer calls.
+The current review restores all three: a missing class definition remains
+uncertain, so its possible constructor site survives until final symbol merge.
+Cached headers that do contain a constructor declaration preserve that
+metadata through types-only imports, keeping their constructor edges and
+argument binding past `this`.
+
+Verification: `cargo test --workspace` passes (485 C++ integration tests), including the three reported
+spellings, reference binding to a class with a user-provided copy constructor,
+in-class defaulted constructors, reference aliases imported from a cached
+header, non-class reference-member value stores and the existing
+`member_initializer_arguments_bind_past_this` test. The original reproducer
+exports zero call sites and zero edges. Fresh `--jobs 1` and `--jobs 8`
+outputs match in schema and every row of all 15 non-metadata tables on all four
+fixtures and all four trees; `analysis_run` is excluded as run metadata.
+
+### Cached-header regression coverage
+
+The cached-header regression test initially lost `Owner::Owner` →
+`Outer::Inner::Inner`. Constructor declaration metadata was recorded only
+for the outer class, although nested classes are lowered recursively by the
+member-definition pass. Recording it in that recursive pass, after all
+signatures and their defaulting flags are registered, restores construction
+through a second header's types-only import. The fixture also covers deeper
+nesting, member class templates and an out-of-line constructor definition;
+defaulted and constructor-free nested classes still record no site. The
+authoritative rule remains under [Ctors / dtors](ANALYSIS.md#c-support-first-step).
+
+On 2026-10-08, a fresh release build passes all 102 pinned evaluation checks.
+Every global metric for all four trees is unchanged by the nested-class
+correction. The table and captured expectations also include the subsequent
+own-class lookup correction below. All three regression fixtures are under `tests/fixtures/`:
+`cpp_implicit_member_initializers/`, `cpp_nested_member_initializers/` and
+`cpp_member_initializer_review/`.
+
+### Own-class lookup review correction
+
+Both metadata recording and member-initializer constructor lookup now inspect
+only declarations on the target class. The previous inheritance walk marked
+a constructor-free derived class as having a user-provided constructor and
+could call its ancestor directly or retain a phantom external site through a
+cached import. The new regression fails before each correction: the metadata
+check first fails, and correcting metadata alone still leaves a direct call
+from `DerivedMember::DerivedMember` to `UserProvidedBase::UserProvidedBase`.
+
+The fixtures cover default construction, copying, a two-argument aggregate
+initializer and a base initializer for constructor-free derived classes,
+both with visible symbols and through a second cached header. A derived
+class declaring its own constructor still gets its direct edge. The reference
+and reference-alias constructor definitions now live in `other.cpp`, so their
+member-initializer lists lower after importing the header's reference metadata;
+constructing local owners alone did not exercise that path.
+
+At `afddbf3`, this correction also removed a real HDF call from
+`CServiceDriverCodeEmitter::CServiceDriverCodeEmitter` to
+`LightRefCountBase::LightRefCountBase`. The previous version of this report
+incorrectly described it as spurious: the implicit `CCodeEmitter` default
+constructor runs that base constructor. The lifecycle correction below
+restores it, and the production probe now requires the direct base edge.
+
+### Lifecycle, constructor imports and spelling review
+
+Empty member and base initializers now reuse `lifecycle_members`, including
+the implicit and in-class defaulted constructors that run base constructors.
+Cached type metadata distinguishes default-callable constructors from classes
+declaring only constructors that need arguments, and retains explicit
+`using Base::Base` imports. Their sites name the declaring base, so final symbol
+merging restores the real call without inventing a derived constructor.
+An inherited constructor does not replace the derived class's implicit copy.
+
+The `cpp_member_initializer_review/` fixture checks base-constructor side effects
+from both automatic objects and members, constructor imports through a second
+cached header, and each confirmed spelling gap: multiple members in one
+declaration, qualified base initializers, a union imported through a nested
+cached header and a parenthesized member name. A parenthesized class field is
+recovered from the grammar's function-shaped declaration and contributes a
+field instead of a method. Per-declarator reference flags keep mixed reference
+and value declarations distinct. The two original fixtures still contain no
+unresolved constructor sites.
+
+The configuration-dependent constructor limitation is retained explicitly
+in [Ctors / dtors](ANALYSIS.md#c-support-first-step): a class body visible in one
+unit can omit a declaration enabled only by another unit's macros. That
+requires deferring the negative decision until all variants and symbols merge;
+the shared `ctor_set_known` predicate used for copies and factories currently
+also considers an indexed class body conclusive in a translation unit.
+This review does not claim that a local empty set proves absence across
+preprocessor variants.
+
+Fresh release measurements relative to `afddbf3`:
+
+| Corpus | Total edges | Direct | External | Arg-flow rows |
+|---|---:|---:|---:|---:|
+| HDF | 77,374 → 77,416 | 48,455 → 48,472 | 23,885 → 23,910 | 71,118 → 71,118 |
+| hiview | 36,139 → 36,335 | 20,557 → 20,559 | 15,348 → 15,542 | 26,287 → 26,289 |
+| camera | 115,082 → 115,275 | 68,356 → 68,358 | 45,547 → 45,738 | 56,017 → 56,024 |
+| ability | 675,033 → 675,298 | 340,335 → 340,352 | 332,104 → 332,352 | 436,366 → 436,374 |
+
+The additions include default lifecycle calls, explicit constructor imports,
+previously missing fields and base spellings, and possible construction of
+classes whose definition is unavailable in the initializer's unit. Files,
+defined functions, indirect edges, IPC edges, diagnostics and dlsym edges are
+unchanged on all four trees. Global expectation centers are re-captured;
+the dispatch and calibration probes retain their original expectations.
+
+Validation: `cargo test --workspace` passes, including 482 C++ integration
+tests; `cargo clippy --workspace --all-targets` reports no warnings, and the
+freshly rebuilt release binary passes all 103 pinned evaluation checks. The
+three fixtures and all four corpora match in schema and every row of all 15
+non-metadata tables with one and eight jobs. All three fixtures export zero
+unresolved constructor edges. Formatting and diff checks pass.
+
+### Constructor imports through type aliases
+
+At `02067f3`, `using Alias = Base;` followed by a derived class's
+`using Alias::Alias` retained automatic construction but lost member-initializer
+calls to `Base::Base`. Constructor-import registration used tag-only lookup,
+so the alias did not match the canonical direct base. The existing alias-aware
+class lookup now resolves that base before recording the explicit import;
+the [construction rule](ANALYSIS.md#c-support-first-step) remains unchanged
+for classes without an explicit import.
+
+The added regression fails before the fix and passes afterward. It checks
+member construction in the declaring header and through a second cached
+header, automatic construction, and the base constructor's side effect.
+The derived class still has no own user-provided constructor, and its implicit
+copy records no constructor site.
+
+Fresh release measurements after rebasing onto local master `f608c77` left
+every global metric unchanged relative to `02067f3` on all four trees.
+The later review below records subsequent movements. All three pinned global expectation centers
+match the new capture exactly, and `eval_check.py` passes all 103 checks.
+`cargo test --workspace` passes, including 483 C++ integration tests, and
+`cargo clippy --workspace --all-targets` reports no warnings. The original
+reproducer still exports zero call sites and zero edges.
+Fresh one-job and eight-job outputs match in schema and every row of all 15
+non-metadata tables on all three fixtures and all four corpora. The fixtures
+retain zero external constructor edges. Formatting and diff checks pass.
+
+### Aggregate subobjects and unknown copies
+
+At `4b57206`, an argument-bearing aggregate member initializer such as
+`value{Handler}` dropped construction of its base and therefore the callback
+invoked by that base constructor. The initializer now visits aggregate
+subobjects in declaration order and lowers each subobject's own arguments,
+including nested braces, brace elision and omitted bases. It retains direct
+base-constructor calls and callback arguments bound past `this` without
+inventing an aggregate constructor. Explicit construction of an aggregate
+base and construction of class-valued aggregate members follow the same rule.
+Each explicit clause carries its own source position: a same-class pair of
+members retains both constructor calls and both callbacks through header
+merging, instead of deduplicating them at the outer aggregate's position.
+
+A second regression used a forward-declared `External`, an unavailable
+dependency header and `value(other)`; another TU defined its user-provided
+copy constructor. The initializer's local negative copy decision discarded
+the pending site before that definition could merge. Unknown copies now
+retain their possible site. Types-only imports preserve own copy-constructor
+eligibility alongside default eligibility, distinguishing a real declared
+copy from an implicit base copy. The authoritative rules remain under
+[Ctors / dtors](ANALYSIS.md#c-support-first-step).
+
+Both regressions fail before the changes and pass afterward. The aggregate
+cases extend `cpp_member_initializer_review/`; `cpp_unknown_member_copy/`
+checks both TU-local and cached-header construction against the other TU's
+copy definition. Existing implicit-copy, reference-binding and inherited
+constructor tests remain green.
+
+Fresh release measurements after rebasing onto local master `24b9bba`, relative
+to `4b57206`, with the same revisions, eight jobs and 800,000-pop budget:
+
+| Corpus | Total edges | Direct | External | Arg-flow rows |
+|---|---:|---:|---:|---:|
+| HDF | 77,416 → 77,432 | 48,472 → 48,472 | 23,910 → 23,926 | 71,118 → 71,118 |
+| hiview | 36,335 → 36,465 | 20,559 → 20,555 | 15,542 → 15,676 | 26,289 → 26,286 |
+| camera | 115,275 → 115,550 | 68,358 → 68,356 | 45,738 → 46,015 | 56,024 → 56,022 |
+| ability | 675,298 → 675,649 | 340,352 → 340,352 | 332,352 → 332,703 | 436,374 → 436,374 |
+
+The new external calls retain uncertain copies whose definitions are
+unavailable. External function totals increase by 0, 3, 12 and 7 respectively.
+The six removed direct edges were false constructor matches for implicit
+copies: hiview's `Event(event)` and `config_(config)`, and camera's
+`focusTrackingInfo_(focusTrackingInfo)`. Their classes declare ordinary
+constructors but no user-provided copy constructor; cached copy eligibility
+now prevents those matches. Files, defined functions, indirect edges, IPC
+edges, diagnostics and dlsym edges remain unchanged. Global expectation
+centers are re-captured; all dispatch and production probes remain unchanged.
+
+Final validation: `cargo test --workspace` passes, including 485 C++ integration
+tests; `cargo clippy --workspace --all-targets` reports no warnings, and the
+freshly rebuilt release binary passes all 103 pinned evaluation checks against
+the recaptured expectations. All four fixtures and all four corpora match
+in schema and every row of all 15 non-metadata tables with one and eight
+jobs. The fixtures export zero external constructor edges. Formatting and
+diff checks pass.
 
 ## Undeclared receiver classes: #193 — 2026-10-07
 

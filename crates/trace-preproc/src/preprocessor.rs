@@ -46,6 +46,7 @@ pub struct PreprocessResult {
     /// in the list for THIS language — a header reached from both C and C++
     /// has one list per language and the two are unrelated.
     pub language: crate::Language,
+    pub cpp_standard: u32,
     /// For each header this run replayed from the shared cache, the index of
     /// each variant it matched (see [`crate::ExpansionVariants`]).
     ///
@@ -76,6 +77,7 @@ struct PreprocessorState {
     /// Language the whole run lexes as: the TU's, for every header it
     /// includes (a header has no language of its own).
     language: Language,
+    cpp_standard: u32,
     macros: MacroTable,
     /// Names in `macros` defined only by a builtin fallback (see
     /// `install_builtin_macros`). These expand normally but are invisible to
@@ -262,6 +264,7 @@ enum Placed {
 /// One cached header being constructed.
 #[derive(Debug)]
 struct CacheFrame {
+    cpp_standard: u32,
     /// Guard-skipped includes at the live-output offset of the `#include`.
     skips: Vec<(usize, PathBuf)>,
     /// Cached expansions this header replayed, for
@@ -312,6 +315,7 @@ impl PreprocessorState {
         let mut state = Self {
             opts,
             language,
+            cpp_standard: 201703,
             macros: MacroTable::new(),
             fallback_macros: FxHashSet::default(),
             include_stack: vec![file.clone()],
@@ -430,6 +434,22 @@ impl PreprocessorState {
                 state.init_cli_defines();
             }
         }
+        state.cpp_standard = state
+            .macros
+            .get("__cplusplus")
+            .and_then(|definition| {
+                let MacroDef::Object { replacement } = definition.as_ref() else {
+                    return None;
+                };
+                let TokenKind::Number(text) = &replacement.first()?.kind else {
+                    return None;
+                };
+                text.trim()
+                    .trim_end_matches(['L', 'l', 'U', 'u'])
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(201703);
         // Seeding the environment is the constructor's job; a caller that
         // forgot this step would silently drop every `-include`.
         state.process_forced_includes();
@@ -1761,6 +1781,7 @@ impl PreprocessorState {
         // enclosing header to pop as if it were its own.
         if pushing_frame {
             self.cache_frames.push(CacheFrame {
+                cpp_standard: self.cpp_standard,
                 skips: Vec::new(),
                 replayed: Vec::new(),
                 inlined: Vec::new(),
@@ -1773,6 +1794,10 @@ impl PreprocessorState {
                 diagnostics: Vec::new(),
                 diagnostic_keys: FxHashSet::default(),
             });
+            if self.language == Language::Cpp {
+                // Lowering depends on the language version even without a #if.
+                self.record_read("__cplusplus");
+            }
         }
 
         let prev_file = self.current_file.clone();
@@ -1918,6 +1943,7 @@ impl PreprocessorState {
                     let signature = deps.signature();
                     let entry = crate::IncludeExpansion {
                         text: composed.into(),
+                        cpp_standard: frame.cpp_standard,
                         files: Arc::new(new_files),
                         diagnostics,
                         line_map: Arc::new(composed_map),
@@ -3232,6 +3258,7 @@ impl PreprocessorState {
             line_map: self.line_map,
             diagnostics: self.diagnostics,
             language: self.language,
+            cpp_standard: self.cpp_standard,
             included_headers: self.included_files.into_iter().collect(),
             inlined_headers: self.inlined_files.into_iter().collect(),
             replayed_variants: {

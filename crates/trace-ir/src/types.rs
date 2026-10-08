@@ -284,6 +284,60 @@ pub struct FieldLayout {
     pub type_id: TypeId,
 }
 
+/// A default member initializer's expanded expression and lexical environment.
+/// Path-based origins survive type-only header imports without symbol IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberInitializer {
+    pub expression: Arc<str>,
+    pub origins: Vec<InitializerOrigin>,
+    pub namespaces: Vec<Option<String>>,
+    pub using_namespaces: Vec<String>,
+    pub using_names: Vec<InitializerImport>,
+    pub type_scope: Vec<String>,
+}
+
+/// A namespace or file-scope using declaration visible to a member initializer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitializerImport {
+    pub name: String,
+    pub candidates: Vec<String>,
+    pub file_scope: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitializerOrigin {
+    pub offset: u32,
+    pub file: Arc<std::path::PathBuf>,
+    pub line: u32,
+    pub col: u32,
+    pub expansion: Option<(Arc<std::path::PathBuf>, u32, u32)>,
+    pub expansion_id: u64,
+    pub expansion_macro: Option<Arc<str>>,
+}
+
+/// The binding operator and known top-level qualification of a referent.
+/// Unknown qualification (for example through an opaque alias) proves nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructorReference {
+    pub rvalue: bool,
+    pub is_const: Option<bool>,
+}
+
+/// Known explicit parameter types of an own constructor that may hide an
+/// imported constructor. Unknown signatures never establish hiding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructorSignature {
+    pub parameters: Vec<Arc<TypeDesc>>,
+    pub references: Vec<bool>,
+    /// Source-level parameter types retain cv and reference categories that
+    /// the value-flow descriptors erase. Missing syntax cannot prove hiding.
+    pub parameter_syntax: Vec<Option<Arc<str>>>,
+    pub reference_forms: Vec<Option<ConstructorReference>>,
+    pub declaration: Option<(Arc<std::path::PathBuf>, u32, u32)>,
+    pub variadic: bool,
+    pub default_args: u32,
+}
+
 /// Content sharing has no effect on interning order or table-local IDs.
 /// Weak entries do not retain descriptor payloads when their tables disappear.
 ///
@@ -450,6 +504,26 @@ pub struct TypeTable {
     /// Aliases whose outer pointer layer represents a C++ reference.
     /// Kept with alias descriptors through header caching and merging.
     reference_aliases: FxHashSet<String>,
+    /// Reference members by declaring class. Field descriptors otherwise
+    /// describe the referent; preserve this distinction through header merges.
+    reference_fields: FxHashMap<String, FxHashSet<String>>,
+    /// Each class's own constructor declaration metadata needed by types-only
+    /// header imports, before constructor symbols merge into a translation unit.
+    user_provided_ctors: FxHashSet<String>,
+    /// All classes declaring constructors, and whether a constructor callable
+    /// without arguments is user-provided (false means in-class defaulted).
+    declared_ctors: FxHashSet<String>,
+    default_ctors: FxHashMap<String, bool>,
+    /// Whether an own user-provided constructor may take the class itself.
+    /// False entries prove an implicit copy through types-only header imports.
+    copy_ctors: FxHashMap<String, bool>,
+    /// Explicit `using Base::Base` imports, preserved through types-only merges.
+    inherited_ctors: FxHashMap<String, Vec<String>>,
+    constructor_epoch: usize,
+    member_initializers: FxHashMap<String, FxHashMap<String, Vec<Arc<MemberInitializer>>>>,
+    constructor_signatures: FxHashMap<String, Vec<ConstructorSignature>>,
+    /// Conflicting or unavailable constant definitions stay unknown.
+    integer_constants: FxHashMap<String, Option<i128>>,
     /// Named `struct` tag → richest interned [`TypeId`] (most fields).
     struct_tags: FxHashMap<String, TypeId>,
     /// Named `union` tag → richest interned [`TypeId`] (most fields).
@@ -480,6 +554,16 @@ impl TypeTable {
             union_epoch: 0,
             aliases: IndexMap::default(),
             reference_aliases: FxHashSet::default(),
+            reference_fields: FxHashMap::default(),
+            user_provided_ctors: FxHashSet::default(),
+            declared_ctors: FxHashSet::default(),
+            default_ctors: FxHashMap::default(),
+            copy_ctors: FxHashMap::default(),
+            inherited_ctors: FxHashMap::default(),
+            constructor_epoch: 0,
+            member_initializers: FxHashMap::default(),
+            constructor_signatures: FxHashMap::default(),
+            integer_constants: FxHashMap::default(),
             struct_tags: FxHashMap::default(),
             union_tags: FxHashMap::default(),
             needs_tag_completion: false,
@@ -823,6 +907,134 @@ impl TypeTable {
         !self.reference_aliases.is_empty()
     }
 
+    pub fn note_reference_field(&mut self, class: &str, field: &str) {
+        self.reference_fields
+            .entry(class.to_owned())
+            .or_default()
+            .insert(field.to_owned());
+    }
+
+    pub fn note_member_initializer(
+        &mut self,
+        class: &str,
+        field: &str,
+        initializer: MemberInitializer,
+    ) {
+        let initializers = self
+            .member_initializers
+            .entry(class.to_owned())
+            .or_default()
+            .entry(field.to_owned())
+            .or_default();
+        if !initializers
+            .iter()
+            .any(|known| known.as_ref() == &initializer)
+        {
+            initializers.push(Arc::new(initializer));
+        }
+    }
+
+    pub fn member_initializers(&self, class: &str, field: &str) -> &[Arc<MemberInitializer>] {
+        self.member_initializers
+            .get(class)
+            .and_then(|fields| fields.get(field))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    pub fn note_integer_constant(&mut self, name: &str, value: Option<i128>) {
+        self.integer_constants
+            .entry(name.to_owned())
+            .and_modify(|known| {
+                if *known != value {
+                    *known = None;
+                }
+            })
+            .or_insert(value);
+    }
+
+    pub fn integer_constant(&self, name: &str) -> Option<Option<i128>> {
+        self.integer_constants.get(name).copied()
+    }
+
+    pub fn note_constructor_signature(&mut self, class: &str, signature: ConstructorSignature) {
+        let signatures = self
+            .constructor_signatures
+            .entry(class.to_owned())
+            .or_default();
+        if !signatures.contains(&signature) {
+            signatures.push(signature);
+        }
+    }
+
+    pub fn constructor_signatures(&self, class: &str) -> &[ConstructorSignature] {
+        self.constructor_signatures
+            .get(class)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    pub fn field_is_reference(&self, class: &str, field: &str) -> bool {
+        self.reference_fields
+            .get(class)
+            .is_some_and(|fields| fields.contains(field))
+    }
+
+    pub fn note_constructor(
+        &mut self,
+        class: &str,
+        user_provided: bool,
+        takes_zero: bool,
+        takes_own_class: bool,
+    ) {
+        self.constructor_epoch += 1;
+        self.declared_ctors.insert(class.to_owned());
+        if user_provided {
+            self.user_provided_ctors.insert(class.to_owned());
+        }
+        if takes_zero {
+            *self.default_ctors.entry(class.to_owned()).or_default() |= user_provided;
+        }
+        *self.copy_ctors.entry(class.to_owned()).or_default() |= user_provided && takes_own_class;
+    }
+
+    pub fn has_user_provided_constructor(&self, class: &str) -> bool {
+        self.user_provided_ctors.contains(class)
+    }
+
+    pub fn has_declared_constructor(&self, class: &str) -> bool {
+        self.declared_ctors.contains(class)
+    }
+
+    /// A declared constructor callable without arguments: true if user-provided,
+    /// false if defaulted in the class. None also covers implicit construction;
+    /// `has_declared_constructor` distinguishes it from no default overload.
+    pub fn default_constructor(&self, class: &str) -> Option<bool> {
+        self.default_ctors.get(class).copied()
+    }
+
+    /// Some(true) retains a possible own copy; Some(false) records a known
+    /// constructor set with no user-provided copy. None proves nothing alone.
+    pub fn copy_constructor(&self, class: &str) -> Option<bool> {
+        self.copy_ctors.get(class).copied()
+    }
+
+    pub fn note_inherited_constructor(&mut self, class: &str, base: &str) {
+        let bases = self.inherited_ctors.entry(class.to_owned()).or_default();
+        if !bases.iter().any(|b| b == base) {
+            bases.push(base.to_owned());
+            bases.sort();
+            self.constructor_epoch += 1;
+        }
+    }
+
+    pub fn inherited_constructor_bases(&self, class: &str) -> &[String] {
+        self.inherited_ctors.get(class).map_or(&[], Vec::as_slice)
+    }
+
+    /// Invalidation stamp for lowerer's cached lifecycle lookup.
+    pub fn constructor_metadata_epoch(&self) -> usize {
+        self.constructor_epoch
+    }
+
     pub fn resolve_alias(&self, alias: &str) -> Option<&TypeDesc> {
         self.aliases.get(alias).map(Arc::as_ref)
     }
@@ -852,6 +1064,18 @@ impl TypeTable {
         self.types.shrink_to_fit();
         self.aliases.shrink_to_fit();
         self.reference_aliases.shrink_to_fit();
+        self.reference_fields.shrink_to_fit();
+        self.user_provided_ctors.shrink_to_fit();
+        self.declared_ctors.shrink_to_fit();
+        self.default_ctors.shrink_to_fit();
+        self.copy_ctors.shrink_to_fit();
+        self.member_initializers.shrink_to_fit();
+        self.constructor_signatures.shrink_to_fit();
+        self.integer_constants.shrink_to_fit();
+        for bases in self.inherited_ctors.values_mut() {
+            bases.shrink_to_fit();
+        }
+        self.inherited_ctors.shrink_to_fit();
     }
 
     pub fn compute_struct_layout(
@@ -1141,6 +1365,7 @@ impl TypeTable {
     }
 
     pub fn merge_struct_declarations(&mut self, other: &Self) {
+        self.constructor_epoch += 1;
         for name in &other.declared_structs {
             if !self.declared_structs.contains(name) {
                 self.declared_structs.insert(name.clone());
@@ -1150,6 +1375,48 @@ impl TypeTable {
         self.defined_structs
             .extend(other.defined_structs.iter().cloned());
         self.guessed_tags.extend(other.guessed_tags.iter().cloned());
+        self.user_provided_ctors
+            .extend(other.user_provided_ctors.iter().cloned());
+        self.declared_ctors
+            .extend(other.declared_ctors.iter().cloned());
+        for (class, provided) in &other.default_ctors {
+            *self.default_ctors.entry(class.clone()).or_default() |= provided;
+        }
+        for (class, provided) in &other.copy_ctors {
+            *self.copy_ctors.entry(class.clone()).or_default() |= provided;
+        }
+        for (class, bases) in &other.inherited_ctors {
+            for base in bases {
+                self.note_inherited_constructor(class, base);
+            }
+        }
+        for (class, fields) in &other.member_initializers {
+            let initializers = self.member_initializers.entry(class.clone()).or_default();
+            for (field, alternatives) in fields {
+                let entries = initializers.entry(field.clone()).or_default();
+                for initializer in alternatives {
+                    if !entries.contains(initializer) {
+                        entries.push(Arc::clone(initializer));
+                    }
+                }
+            }
+        }
+        for (name, value) in &other.integer_constants {
+            self.note_integer_constant(name, *value);
+        }
+        for (class, signatures) in &other.constructor_signatures {
+            for signature in signatures {
+                self.note_constructor_signature(class, signature.clone());
+            }
+        }
+        // Membership metadata only: iteration order cannot affect type IDs
+        // or output, just as for the declaration sets above.
+        for (class, fields) in &other.reference_fields {
+            self.reference_fields
+                .entry(class.clone())
+                .or_default()
+                .extend(fields.iter().cloned());
+        }
     }
 
     fn note_named_tag(&mut self, id: TypeId) {
