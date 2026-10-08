@@ -583,8 +583,12 @@ only the headers it needs by those ranks; cached-expansion paths absent from
 the global order follow in lexical order. This preserves the same merge
 sequence without scanning every project header for every unit.
 
-Parallel unit lowering uses a bounded window (two units per worker, clamped
-to 4–32), with ordered merging on the caller thread. The coordinator stays
+Parallel unit lowering with settled source text uses a byte budget and a count
+safety cap, with ordered merging on the caller thread. Configured indexing
+retains its previous source-family count window. Admission limits are
+defined in
+[Parsing memory limits](PERFORMANCE_REVIEW.md#6-make-parsing-memory-limits-independent-of-cpu-count).
+The coordinator stays
 outside the worker pool so all requested indexing workers can run. Sequential
 lowering still runs on the pool's 16 MiB stack; only parallel merging moves
 to the caller. Preprocessing cache publication retains its separate unit-order

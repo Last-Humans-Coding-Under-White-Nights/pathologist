@@ -142,9 +142,13 @@ Without build metadata, indexing spills large preprocessed source text
 and LineMaps to automatically cleaned temporary files and loads them for
 parsing. Discovery drops payloads that the settle pass must rebuild. After
 header lowering, settled TUs can release frozen header expansions and raw
-source copies before the ordered merge. Parsing workers run at most two units
-per worker (between 4 and 32 in total) ahead of that merge, limiting queued
-IR without making a batch wait for its slowest unit. Cached header type tables
+source copies before the ordered merge. Parallel parsing reserves estimated
+source bytes until each unit has merged, with a byte budget and a count safety
+cap. Small units can run further ahead of a slow unit; workers still wait when
+either limit fills. Compilation-command indexing retains its previous source-count
+limit. See
+[Parsing memory limits](docs/PERFORMANCE_REVIEW.md#6-make-parsing-memory-limits-independent-of-cpu-count).
+Cached header type tables
 discard lowering-only indexes and layouts once their merge descriptors are
 ready. Type tables share immutable descriptors across headers and TUs while
 retaining local IDs. On Linux/glibc, indexing returns freed heap pages at phase

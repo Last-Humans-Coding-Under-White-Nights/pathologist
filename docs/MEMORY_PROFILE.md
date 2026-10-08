@@ -242,16 +242,20 @@ Variant aggregate union replaces the descriptor without modifying another
 table's payload. Tests cover shared storage, isolated aggregate mutation,
 released payloads, and deterministic output across indexing worker counts.
 
-Preprocessing's serial and worker filesystem memos are released before header
-IR construction. On Linux/glibc, `malloc_trim(0)` returns unused pages after
-the preprocessing and header phases and after indexing caches and the local
-worker pool drop; it never runs while workers allocate, since a trim locks
-every arena and takes hundreds of milliseconds on a large heap. Other
-platforms retain descriptor sharing and cache-lifetime improvements, with no
-allocator-specific reclamation. Parse workers take units in order and run at
-most two units per worker, between 4 and 32 in total, ahead of the ordered
-merge, which bounds pending IR the way small batches did without idling
-workers behind a slow unit.
+For the measurements below, preprocessing's serial and worker filesystem memos
+were released before header IR construction. On Linux/glibc, `malloc_trim(0)`
+returned unused pages after the preprocessing and header phases and after
+indexing caches and the local worker pool dropped; in that implementation it
+ran only after workers stopped, since a trim locks every arena and takes
+hundreds of milliseconds on a large
+heap. Other platforms retain descriptor sharing and cache-lifetime improvements,
+with no allocator-specific reclamation. Parse workers then took units in order
+and ran at most two units per worker, between 4 and 32 in total, ahead of the ordered
+merge. This bounded pending IR, but a slow unit could still fill the window
+and park the other workers. Admission now uses
+[estimated bytes with a count safety cap](PERFORMANCE_REVIEW.md#6-make-parsing-memory-limits-independent-of-cpu-count);
+the current comparison is in
+[Byte-budgeted indexing window](EVAL_REPORT.md#byte-budgeted-indexing-window).
 
 Final normal release benchmarks, with compilation excluded:
 
@@ -423,8 +427,9 @@ In this run the footprint oscillates between about 2.1 and 3.5 GiB
 rather than growing. The measured configuration had no link-target
 metadata (no `link_commands.json`, no link entries in the database, no
 CMake File API reply), so `configured::build` merges each unit into the
-program as it completes and the live IR is bounded by the indexing
-window (two units per worker, 4–32 in all), on top of the 1.07 GiB of
+program in source order as indexed results become available. In this measured
+run, indexed but unmerged IR was bounded by the former count window (two units
+per worker, 4–32 in all), on top of the 1.07 GiB of
 retained source text and include graph. What makes the bound high is
 the unit, not the count: on this path every unit lowers its whole
 inlined include closure (no shared expansion cache, no PCH header IR;
@@ -435,7 +440,10 @@ and 627 for a source without a command (the shared fallback
 configuration, mostly tests and unittests) -- 18,401 functions per unit
 at the median, 29,828 at p90, 40,696 at most. At 2.8 units/s the 54,376
 units would take about five hours; 326 fallback units averaged 3.4 s
-each and 1,014 command units 2.5 s.
+each and 1,014 command units 2.5 s. Configured admission retains this source-family
+count limit; see the
+[current policy and validation](PERFORMANCE_REVIEW.md#6-make-parsing-memory-limits-independent-of-cpu-count).
+These figures describe that measured revision.
 
 The window bound does not hold when the build metadata names explicit
 link targets (`scoped` in `configured.rs`: targets present and not an

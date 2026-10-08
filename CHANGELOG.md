@@ -4,6 +4,18 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Byte-budgeted translation-unit indexing (#212)
+
+Ordinary parallel parsing now reserves estimated source bytes until each unit has
+merged, with a count safety cap. Large units consume more of the allowance,
+while small units can run further ahead of a slow unit. A cap on each charge
+allows large units to overlap. Worker count, merge order and panic cancellation
+are unchanged. Configured indexing retains its previous source-family count
+window. Limits and estimation fallbacks:
+[Parsing memory limits](docs/PERFORMANCE_REVIEW.md#6-make-parsing-memory-limits-independent-of-cpu-count).
+Measurements, database comparisons and remaining acceptance checks:
+[Byte-budgeted indexing window](docs/EVAL_REPORT.md#byte-budgeted-indexing-window).
+
 ### Smart-pointer factories reach their constructor (#192)
 
 `std::make_shared<T>(args)`, `std::make_unique<T>(args)` and `sptr<T>::MakeSptr(args)` now also record a direct constructor call of `T` with the factory's arguments bound, as `new T(args)` does; the factory's own edge is kept. The heap object of `new` is now the variable `$new<id>` (was `_ret<id>`), a factory's `$make<id>`, and a statement-position `new` now has one too. `new (std::nothrow) T(a, b)` binds `a, b` rather than the placement list, and a one-argument copy or move records no constructor site wherever the object is built (`new T(other)`, `make_shared<T>(other)`, `T x(other)`, a member initializer `m_(other)`): one argument no constructor takes, or an object of the class itself when no constructor takes the class. A reference member's binding (`ref_(other)`) constructs nothing either. `new Agg{1, 2}` of an aggregate records no constructor site. `new T{a, b}` binds its braces as arguments when `T` has a user-provided constructor, and a `volatile` template argument constructs as a `const` one does. A bare `make_shared` / `make_unique` that resolves to a project's own function is no longer taken for the standard factory, for result typing either. `std::allocate_shared<T>(alloc, args)` is recognised too. A factory call in a cached header, or of a class defined outside the tree, keeps an unresolved constructor site as `new` does, for the TU merge to resolve. A factory's object is the constructor's `this` only, not the value the call yields (copying it changed no call edge and cost 43% more solver pops on `ability_ability_runtime`). A constructor's member initializer of a non-class member (`cb_(cb)`, `cb_{cb}`) now stores its value as `this->cb_ = cb` does, so callbacks a constructor keeps reach their calls. A variant merge pairs synthesized temporaries by their recorded kind (`Variable::temp`), never by name. Rules: [Factory construction](docs/ANALYSIS.md#factory-construction); measurements in `docs/EVAL_REPORT.md` ("Factory construction").
