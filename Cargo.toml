@@ -51,7 +51,9 @@ tempfile = "3"
 lto = "thin"
 codegen-units = 1
 
-# Line-tables only for test builds reduces linker time and dSYM generation
-# overhead on macOS while preserving file:line info in panic backtraces (#214).
-[profile.test]
+# Line-tables only for dev and test builds reduces linker time and dSYM
+# generation overhead on macOS while preserving file:line info in panic
+# backtraces (#214). `test` inherits from `dev`, so keeping the setting here
+# lets `cargo build` and `cargo test` share dependency artifacts.
+[profile.dev]
 debug = 1
