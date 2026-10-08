@@ -28,6 +28,7 @@ mimalloc = ["dep:mimalloc"]
 [[example]]
 name = "parse_failures"
 path = "examples/parse_failures.rs"
+test = true
 
 [[example]]
 name = "conditional_coverage"

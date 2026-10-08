@@ -200,8 +200,8 @@ flowchart LR
 Code is indexed without a real toolchain, so macros whose definitions live in
 headers the tree does not ship (gtest, Linux kernel headers, `<inttypes.h>`)
 survive preprocessing, produce tree-sitter ERROR nodes, and can drop whole
-functions from the index (`docs/PARSE_FAILURES.md` catalogs the impact on the
-eval corpora). The preprocessor installs fallback definitions for the common
+functions from the index ([parse-failure reporting](PARSE_FAILURES.md) helps
+investigate the affected files). The preprocessor installs fallback definitions for the common
 offenders:
 
 | Macros | Fallback | Failure mode avoided |

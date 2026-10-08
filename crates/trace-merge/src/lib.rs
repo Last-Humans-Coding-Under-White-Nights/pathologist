@@ -177,7 +177,7 @@ pub fn merge_databases<P: AsRef<Path>>(
     // Verify all input databases and read schema versions.
     let mut conns = Vec::new();
     for path in &inputs {
-        let conn = Connection::open(path)
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("failed to open input database {}", path.display()))?;
         let ver: i64 = conn
             .query_row(
@@ -838,16 +838,28 @@ pub fn merge_databases<P: AsRef<Path>>(
     }
 
     // 7. Write to Merged Output SQLite Database
-    let temp = options.output.with_extension("db.tmp");
-    if let Some(parent) = temp.parent() {
-        fs::create_dir_all(parent)?;
+    let parent = options
+        .output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    // A fixed `<output>.db.tmp` can name an input or another merge's output.
+    // Keep the unique staging file beside the destination for atomic publication
+    // and automatic cleanup on every error path.
+    let mut staging = tempfile::Builder::new();
+    staging.prefix(".trace-merge-");
+    // Preserve SQLite's umask-filtered 0644 creation mode used before;
+    // tempfile otherwise creates private (0600) files that stay private on publish.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        staging.permissions(fs::Permissions::from_mode(0o644));
     }
-    if temp.exists() {
-        fs::remove_file(&temp)?;
-    }
+    let temp = staging.tempfile_in(parent)?;
 
     {
-        let out_conn = Connection::open(&temp)?;
+        let out_conn = Connection::open(temp.path())?;
         out_conn.execute_batch(
             "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY;",
         )?;
@@ -1018,10 +1030,14 @@ pub fn merge_databases<P: AsRef<Path>>(
         out_conn.execute_batch("COMMIT;")?;
     }
 
-    if options.output.exists() {
-        fs::remove_file(&options.output)?;
-    }
-    fs::rename(&temp, &options.output)?;
+    temp.persist(&options.output)
+        .map_err(|e| e.error)
+        .with_context(|| {
+            format!(
+                "failed to publish merged database {}",
+                options.output.display()
+            )
+        })?;
 
     Ok(report)
 }
