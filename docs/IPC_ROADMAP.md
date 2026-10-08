@@ -636,7 +636,7 @@ both sides to be indexed. Because v1 is name-based, an exactly paired
 exclude test sources from the analysis root or use `--no-ipc` when that is not
 desired.
 
-**Fixture tests** (`cargo test -p trace-cli ipc_tests`): 10 tests, all
+**Fixture tests** (`cargo test -p trace-cli --test it ipc_tests`): 10 tests, all
 pass. Full `cargo test --workspace` remains green.
 
 **Debugging aid:** `TRACE_DEBUG_IPC=1` prints each bridge as
