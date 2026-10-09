@@ -43,6 +43,15 @@ The pipeline is also exposed programmatically via `trace-capi` (`libtrace_capi`)
 
 - **Indexed TUs**: `*.c` and `*.cpp`-family files under `<TARGET>`. Each TU selects the tree-sitter C or C++ grammar by extension.
 - **Headers**: discovered for the include graph and lowered into cached header units for expansion variants consumed by TUs. Their declarations are merged into each receiving TU before its own source is lowered.
+- **Types-only header imports**: cached headers preserve reference-member metadata,
+  each class's own constructor signatures (including cv/reference distinctions)
+  and eligibility, explicit constructor imports, constant array bounds and scoped
+  default member initializers with its types. Visible integer constants survive
+  types-only imports; conflicting definitions retain an unknown value.
+  Preprocessed units and header variants retain their C++ language version.
+  Implicit construction expands nontrivial subobjects. Recursive
+  member lowering records it for nested classes and member class templates
+  too; see [member-initializer construction](ANALYSIS.md#c-support-first-step).
 - **Orphan headers** (not reached by a project TU) are lowered separately and merged into the program.
 - **Cross-TU linking**: `merge_unit_index` merges compatible declarations and definitions, preserving distinct strong C++ definitions from different TUs. Build metadata assigns link images in `merge_linked_units`. Analysis uses the shared image-aware, scope-first resolver for internal and external functions. File-scope `static` variables use `SymbolTable::file_static_named`. See [Shared header functions](ANALYSIS.md#shared-header-functions) and [Link targets and weak symbols](ANALYSIS.md#link-targets-and-weak-symbols) for identity, ownership, and resolution precedence.
 
@@ -98,7 +107,7 @@ After merge, `Program` contains:
 | Field | Description |
 |-------|-------------|
 | `symbols` | Files, functions, variables, call sites |
-| `types` | Struct/union layouts, pointer types |
+| `types` | Struct/union layouts, pointer types, reference-member and constructor declaration metadata |
 | `flow` | Lowered assignment facts (`Copy`, `Store`, `GepField`, …) |
 | `fn_returns` | Per-function return-value summaries (`ReturnFlow`) |
 | `diagnostics` | Preprocess and parse diagnostics (stage, severity, file, line) |

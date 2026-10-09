@@ -5588,11 +5588,14 @@ fn no_explicit_argument_binds_to_this() {
             continue;
         }
         assert!(e.actual_fn.is_none(), "a function reached `this`: {e:?}");
+        assert_eq!(e.arg_index, 0, "an explicit argument reached `this`: {e:?}");
         let actual = program.symbols.variable(e.actual_var.expect("actual"));
-        assert_eq!(
-            actual.temp,
-            Some(trace_ir::TempKind::New),
-            "only a `new` allocation is bound to `this`, got `{}`",
+        assert!(
+            matches!(
+                actual.temp,
+                Some(trace_ir::TempKind::New | trace_ir::TempKind::Gep)
+            ) || actual.name == "this",
+            "constructor receivers are allocations, subobject addresses or `this`, got `{}`",
             actual.name
         );
     }
@@ -5648,6 +5651,428 @@ fn member_initializer_arguments_bind_past_this() {
             has_any_edge(program, analysis, callee, actual),
             "{callee} calls {actual}"
         );
+    }
+}
+
+analyzed_fixture!(cpp_implicit_member_initializers);
+
+#[test]
+fn member_initializers_do_not_invent_implicit_constructor_sites() {
+    let (program, analysis) = cpp_implicit_member_initializers();
+    for caller in [
+        "R::R",
+        "Derived::Derived",
+        "Member::Member",
+        "DefaultedMember::DefaultedMember",
+        "DefaultedBase::DefaultedBase",
+        "ReferenceMember::ReferenceMember",
+        "AliasReferenceMember::AliasReferenceMember",
+    ] {
+        assert!(
+            program
+                .symbols
+                .functions
+                .iter()
+                .any(|f| f.name == caller && f.is_defined),
+            "{caller} must be indexed"
+        );
+        let sites: Vec<_> = program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|site| fn_name(program, site.caller) == caller)
+            .collect();
+        assert!(
+            sites.is_empty(),
+            "{caller} constructs nothing explicitly: {sites:?}"
+        );
+        assert!(
+            analysis
+                .call_edges
+                .iter()
+                .all(|edge| fn_name(program, edge.caller) != caller),
+            "{caller} must have no edge"
+        );
+    }
+}
+
+#[test]
+fn non_class_reference_member_initializer_keeps_value_store() {
+    let (program, analysis) = cpp_implicit_member_initializers();
+    assert!(has_edge(
+        program,
+        analysis,
+        "CallbackReference::Run",
+        "Handler",
+        ResolutionKind::Indirect
+    ));
+}
+
+#[test]
+fn member_initializer_implicit_default_construction_runs_base_constructors() {
+    let (program, analysis) = cpp_implicit_member_initializers();
+    assert!(!program
+        .types
+        .has_user_provided_constructor("ImplicitDerived"));
+    assert!(program
+        .types
+        .has_user_provided_constructor("UserProvidedBase"));
+    for caller in [
+        "DerivedCopyMember::DerivedCopyMember",
+        "DerivedAggregateMember::DerivedAggregateMember",
+    ] {
+        assert!(program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == caller && f.is_defined));
+        assert!(
+            program
+                .symbols
+                .call_sites
+                .iter()
+                .all(|site| fn_name(program, site.caller) != caller),
+            "{caller} must not call an ancestor constructor: {:?}",
+            common::callees_of(program, analysis, caller)
+        );
+    }
+    for caller in ["DerivedMember::DerivedMember", "DerivedBase::DerivedBase"] {
+        assert!(has_edge(
+            program,
+            analysis,
+            caller,
+            "UserProvidedBase::UserProvidedBase",
+            ResolutionKind::Direct
+        ));
+    }
+    assert!(has_edge(
+        program,
+        analysis,
+        "ExplicitDerivedMember::ExplicitDerivedMember",
+        "ExplicitDerived::ExplicitDerived",
+        ResolutionKind::Direct
+    ));
+}
+
+analyzed_fixture!(cpp_nested_member_initializers);
+
+#[test]
+fn nested_member_initializer_constructor_metadata_survives_cached_headers() {
+    let (program, analysis) = cpp_nested_member_initializers();
+    for (caller, callee) in [
+        ("Owner::Owner", "Outer::Inner::Inner"),
+        ("DeclaredOwner::DeclaredOwner", "Outer::Declared::Declared"),
+        ("DeeperOwner::DeeperOwner", "Outer::Deeper::Inner::Inner"),
+        (
+            "TemplateOwner::TemplateOwner",
+            "Outer::TemplateInner::TemplateInner",
+        ),
+        (
+            "ImplicitDerivedOwner::ImplicitDerivedOwner",
+            "Outer::UserBase::UserBase",
+        ),
+        (
+            "ImplicitDerivedBaseOwner::ImplicitDerivedBaseOwner",
+            "Outer::UserBase::UserBase",
+        ),
+    ] {
+        assert!(
+            has_edge(program, analysis, caller, callee, ResolutionKind::Direct),
+            "{caller} must construct {callee}: {:?}",
+            common::callees_of(program, analysis, caller)
+        );
+    }
+    assert!(!program
+        .types
+        .has_user_provided_constructor("Outer::ImplicitDerived"));
+    assert!(program
+        .types
+        .has_user_provided_constructor("Outer::UserBase"));
+    for caller in [
+        "DefaultedOwner::DefaultedOwner",
+        "PlainOwner::PlainOwner",
+        "ImplicitDerivedCopyOwner::ImplicitDerivedCopyOwner",
+        "ImplicitDerivedAggregateOwner::ImplicitDerivedAggregateOwner",
+    ] {
+        assert!(
+            program
+                .symbols
+                .functions
+                .iter()
+                .any(|f| f.name == caller && f.is_defined),
+            "{caller} must be indexed"
+        );
+        assert!(
+            program
+                .symbols
+                .call_sites
+                .iter()
+                .all(|site| fn_name(program, site.caller) != caller),
+            "{caller} must not invent a constructor site"
+        );
+    }
+}
+
+analyzed_fixture!(cpp_member_initializer_review);
+
+#[test]
+fn member_initializer_default_lifecycle_survives_cached_headers() {
+    let (program, analysis) = cpp_member_initializer_review();
+    for caller in [
+        "DefaultOwner::DefaultOwner",
+        "DefaultedOwner::DefaultedOwner",
+        "AutomaticCases",
+    ] {
+        assert!(has_edge(
+            program,
+            analysis,
+            caller,
+            "ns::DefaultBase::DefaultBase",
+            ResolutionKind::Direct
+        ));
+    }
+    assert!(has_edge(
+        program,
+        analysis,
+        "ns::DefaultBase::DefaultBase",
+        "DefaultSide",
+        ResolutionKind::Direct
+    ));
+}
+
+#[test]
+fn member_initializer_using_constructor_survives_cached_headers() {
+    let (program, analysis) = cpp_member_initializer_review();
+    for caller in [
+        "InheritedOwner::InheritedOwner",
+        "InheritedBase::InheritedBase",
+        "AutomaticCases",
+    ] {
+        assert!(has_edge(
+            program,
+            analysis,
+            caller,
+            "ns::Base::Base",
+            ResolutionKind::Direct
+        ));
+    }
+    assert!(!program.types.has_user_provided_constructor("ns::Inherited"));
+    assert!(program
+        .symbols
+        .call_sites
+        .iter()
+        .all(|s| fn_name(program, s.caller) != "InheritedCopyOwner::InheritedCopyOwner"));
+    assert!(has_edge(
+        program,
+        analysis,
+        "ns::Base::Base",
+        "InheritedSide",
+        ResolutionKind::Direct
+    ));
+}
+
+#[test]
+fn member_initializer_alias_constructor_survives_cached_headers() {
+    let (program, analysis) = cpp_member_initializer_review();
+    for caller in [
+        "AliasOwner::AliasOwner",
+        "CachedAliasOwner::CachedAliasOwner",
+        "AutomaticAlias",
+    ] {
+        assert!(
+            has_edge(
+                program,
+                analysis,
+                caller,
+                "ns::Base::Base",
+                ResolutionKind::Direct
+            ),
+            "{caller} must call the constructor imported through ns::Alias"
+        );
+    }
+    assert!(!program
+        .types
+        .has_user_provided_constructor("ns::AliasInherited"));
+    assert!(program
+        .symbols
+        .call_sites
+        .iter()
+        .all(|s| fn_name(program, s.caller) != "AliasCopyOwner::AliasCopyOwner"));
+    assert!(has_edge(
+        program,
+        analysis,
+        "ns::Base::Base",
+        "InheritedSide",
+        ResolutionKind::Direct
+    ));
+}
+
+#[test]
+fn member_initializer_aggregate_construction_preserves_base_calls() {
+    let (program, analysis) = cpp_member_initializer_review();
+    for caller in [
+        "AggregateOwner::AggregateOwner",
+        "CachedAggregateOwner::CachedAggregateOwner",
+        "NestedAggregateOwner::NestedAggregateOwner",
+        "ElidedAggregateOwner::ElidedAggregateOwner",
+        "TwoBasesOwner::TwoBasesOwner",
+        "OmittedBaseOwner::OmittedBaseOwner",
+        "AggregateMemberOwner::AggregateMemberOwner",
+        "BracedBaseOwner::BracedBaseOwner",
+        "TwoMembersOwner::TwoMembersOwner",
+    ] {
+        assert!(
+            has_edge(
+                program,
+                analysis,
+                caller,
+                "ns::CallbackBase::CallbackBase",
+                ResolutionKind::Direct
+            ),
+            "{caller} must construct its aggregate's base"
+        );
+    }
+    for (caller, callee) in [
+        (
+            "TwoBasesOwner::TwoBasesOwner",
+            "ns::SecondCallbackBase::SecondCallbackBase",
+        ),
+        (
+            "OmittedBaseOwner::OmittedBaseOwner",
+            "ns::DefaultBase::DefaultBase",
+        ),
+    ] {
+        assert!(has_edge(
+            program,
+            analysis,
+            caller,
+            callee,
+            ResolutionKind::Direct
+        ));
+    }
+    for (callee, handler) in [
+        ("ns::CallbackBase::CallbackBase", "AggregateHandler"),
+        (
+            "ns::SecondCallbackBase::SecondCallbackBase",
+            "SecondAggregateHandler",
+        ),
+    ] {
+        assert!(has_edge(
+            program,
+            analysis,
+            callee,
+            handler,
+            ResolutionKind::Indirect
+        ));
+        let site = program
+            .symbols
+            .call_sites
+            .iter()
+            .find(|site| {
+                fn_name(program, site.caller) == "TwoBasesOwner::TwoBasesOwner"
+                    && site.callee_name == callee
+            })
+            .expect("base initializer site");
+        assert_eq!(site.fn_args().len(), 1);
+        assert_eq!(site.fn_args()[0].0, 1, "callback binds past this");
+        assert_eq!(fn_name(program, site.fn_args()[0].1), handler);
+    }
+    assert!(program
+        .symbols
+        .call_sites
+        .iter()
+        .all(|site| fn_name(program, site.caller) != "AggregateCopyOwner::AggregateCopyOwner"));
+    let sites: Vec<_> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|site| {
+            fn_name(program, site.caller) == "TwoMembersOwner::TwoMembersOwner"
+                && site.callee_name == "ns::CallbackBase::CallbackBase"
+        })
+        .collect();
+    assert_eq!(
+        sites.len(),
+        2,
+        "both same-class subobjects must survive header merging"
+    );
+    for handler in ["AggregateHandler", "SecondAggregateHandler"] {
+        assert!(sites.iter().any(|site| site
+            .fn_args()
+            .iter()
+            .any(|&(index, callee)| index == 1 && fn_name(program, callee) == handler)));
+        assert!(has_edge(
+            program,
+            analysis,
+            "ns::CallbackBase::CallbackBase",
+            handler,
+            ResolutionKind::Indirect
+        ));
+    }
+}
+
+analyzed_fixture!(cpp_unknown_member_copy);
+
+#[test]
+fn member_initializer_unknown_copy_resolves_after_tu_merge() {
+    let (program, analysis) = cpp_unknown_member_copy();
+    for caller in [
+        "UnknownCopyOwner::UnknownCopyOwner",
+        "CachedUnknownCopyOwner::CachedUnknownCopyOwner",
+    ] {
+        assert!(
+            has_edge(
+                program,
+                analysis,
+                caller,
+                "External::External",
+                ResolutionKind::Direct
+            ),
+            "{caller} must retain the possible copy constructor until TU merge"
+        );
+    }
+    assert!(has_edge(
+        program,
+        analysis,
+        "External::External",
+        "ExternalCopySide",
+        ResolutionKind::Direct
+    ));
+}
+
+#[test]
+fn member_initializer_spelling_variants_keep_real_constructors() {
+    let (program, analysis) = cpp_member_initializer_review();
+    for (caller, callee, count) in [
+        ("Multiple::Multiple", "ns::Base::Base", 2),
+        ("Parenthesized::Parenthesized", "ns::Base::Base", 1),
+        ("QualifiedBase::QualifiedBase", "ns::Base::Base", 1),
+        ("UnionOwner::UnionOwner", "ns::Value::Value", 1),
+        ("MixedMembers::MixedMembers", "ns::CopyClass::CopyClass", 1),
+        (
+            "CachedCopyClassOwner::CachedCopyClassOwner",
+            "ns::CopyClass::CopyClass",
+            1,
+        ),
+    ] {
+        let sites: Vec<_> = program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|s| fn_name(program, s.caller) == caller && s.callee_name == callee)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            count,
+            "{caller} must retain every {callee} initializer"
+        );
+        assert!(has_edge(
+            program,
+            analysis,
+            caller,
+            callee,
+            ResolutionKind::Direct
+        ));
     }
 }
 
@@ -9720,8 +10145,9 @@ fn a_member_array_brace_list_initializes_its_elements() {
     let sites: Vec<_> = (program.symbols.call_sites.iter())
         .filter(|cs| cs.caller == ctor && cs.callee_name == "CppElemArgs::CppElemArgs")
         .collect();
-    let (listed, default): (Vec<&&trace_ir::CallSite>, Vec<_>) =
-        sites.iter().partition(|cs| !cs.var_args.is_empty());
+    let (listed, default): (Vec<&&trace_ir::CallSite>, Vec<_>) = sites
+        .iter()
+        .partition(|cs| cs.var_args.iter().any(|(index, _)| *index > 0));
     assert_eq!(listed.len(), 2, "{sites:?}");
     let [default] = default[..] else {
         panic!("{sites:?}");

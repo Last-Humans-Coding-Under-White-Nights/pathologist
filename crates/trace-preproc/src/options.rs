@@ -282,6 +282,8 @@ pub enum FileGuard {
 /// Cached preprocessed body for a `#include`d file (shared across translation units).
 #[derive(Debug, Clone)]
 pub struct IncludeExpansion {
+    /// Effective C++ language version for semantic lowering of this header.
+    pub cpp_standard: u32,
     pub text: Arc<str>,
     pub files: Arc<FxHashSet<PathBuf>>,
     /// Diagnostics emitted while producing this expansion, including

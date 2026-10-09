@@ -4,6 +4,42 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Member initializers avoid invented constructor edges (#207)
+
+Reference bindings such as `ref_(object)` no longer record constructor calls.
+Implicit constructors have no site of their own, including copies and
+aggregate initialization. Implicit or in-class defaulted default construction
+retains the base constructor calls it runs, including through cached headers.
+Aggregate initialization retains construction and value flow through bases,
+members and arrays, including brace elision and C++20 parenthesized aggregates.
+Constant array bounds retain their element counts; unknown bounds keep possible
+initializer boundaries for following members. Inherited construction initializes
+the remaining bases and members, including their default member initializers.
+Empty nested aggregates construct their nontrivial members. Omitted members
+use their default initializers in the declaration's scope, with source and
+macro provenance preserved through cached headers. Implicit copies and moves
+retain nontrivial base/member constructors. Own signatures hide inherited
+constructors before overload selection, preserving cv and reference categories
+and retaining candidates when signature information is incomplete. Grouped
+reference declarators such as `Value (&ref)` remain reference bindings.
+Copies of a class or union whose definition is unavailable keep a possible call
+until translation units merge.
+Explicit `using Base::Base` imports retain inherited constructor calls,
+including bases named through type aliases (`using Alias::Alias`).
+Declared constructors keep their argument binding past `this` and retain
+member-initializer expressions for source-level dataflow inspection.
+Non-class member initializers keep their value stores. Cached headers
+preserve reference-member and constructor declaration metadata, including
+nested classes and member class templates, so types-only imports retain real
+constructor calls. Constructor lookup and cached metadata no longer mistake
+a base class's constructor for its derived class's own constructor. Regression
+fixtures cover both import paths and lower reference-member initializer lists
+in a second translation unit. Multiple declarators, qualified base names,
+cached unions and parenthesized member names retain real calls. Rules and lookup limits:
+[Ctors / dtors](docs/ANALYSIS.md#c-support-first-step).
+Corpus movements and verification:
+[Constructor follow-up review](docs/EVAL_REPORT.md#four-constructor-follow-up-findings-207--2026-10-09).
+
 ### Correctness cleanup and maintained reporting guides
 
 `trace-merge` opens inputs read-only and publishes through a unique temporary

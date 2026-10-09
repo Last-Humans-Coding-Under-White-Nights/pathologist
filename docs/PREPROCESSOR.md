@@ -574,7 +574,7 @@ where `K` counts the units the committing thread ran itself. Measurements are in
 
 Indexing sets `inline_include_bodies = false`. Nested cacheable `#include`s replay **macros and include-once state** but do not copy header tokens into the consumer's live output. Each header's preprocessed text is therefore file-local, except for a nested header whose expansion cannot be stored: its text stays in its includer's ("An expansion that cannot be stored", above).
 
-After the warm pass, reachable headers are parsed and lowered **once**. PCH order uses the include graph **plus preprocess `included_headers`** (macro includes the raw scanner misses). Independent leaves may run in parallel waves; a header is never in the same wave as a nested include it needs. Include **cycles** are not a parallel wave: leftovers are indexed in include-graph order so nested layouts stay visible. Nested `#include` IR merges **types and typedefs** from **direct** includes (plus this header's preprocess `included_headers`) so `struct StreamHost { struct IDeviceIoService service; }` sees `Dispatch`, and `GpioIrqFunc func` sees the typedef, without copying every descendant's functions/flow into ancestor units. Child PCH units already nested-merged grandchild types. Parallel isolation *without* those preprocess edges interned empty tags / `Int` and dropped field stores (`DeviceNodeExtDispatch` lost `DispatchToMessage`, `GpioOnDevEventReceive` lost `gpio->func`).
+After the warm pass, reachable headers are parsed and lowered **once**. PCH order uses the include graph **plus preprocess `included_headers`** (macro includes the raw scanner misses). Independent leaves may run in parallel waves; a header is never in the same wave as a nested include it needs. Include **cycles** are not a parallel wave: leftovers are indexed in include-graph order so nested layouts stay visible. Nested `#include` IR merges **types and typedefs** from **direct** includes (plus this header's preprocess `included_headers`) so `struct StreamHost { struct IDeviceIoService service; }` sees `Dispatch`, and `GpioIrqFunc func` sees the typedef, without copying every descendant's functions/flow into ancestor units. Child PCH units already nested-merged grandchild types. Types-only merges also preserve the type table's C++ reference-member metadata, each class's own default/copy constructor eligibility and explicit constructor imports, including nested classes and member class templates; see [member-initializer construction](ANALYSIS.md#c-support-first-step). Parallel isolation *without* those preprocess edges interned empty tags / `Int` and dropped field stores (`DeviceNodeExtDispatch` lost `DispatchToMessage`, `GpioOnDevEventReceive` lost `gpio->func`).
 
 Headers that become reachable only after those preprocess edges are added join the PCH set (and leave the orphan path) so translation units can merge their prototypes.
 
@@ -599,6 +599,11 @@ Translation units parse only their own remainder and merge already-built header 
 Grammar follows the including language, not the extension alone: `.hpp`/`.hh`/`.hxx`/`.inl`/`.ipp` always use the C++ parser; a `.h` uses C++ if any C++ TU can reach it via the include graph, otherwise C. (Before PCH, header tokens were spliced into the TU and parsed with that TU's grammar, so `plugin.h` included from `plugin.cpp` was already C++.)
 
 Standalone `preprocess_file` still inlines by default so a single-file expansion remains self-contained.
+
+C++ semantic lowering retains the effective `__cplusplus` value with each
+preprocessed unit and cached header expansion. Header cache fingerprints read
+that value even when the header has no language-version conditional, so C++17
+and C++20 constructor bodies do not share an incompatible lowering environment.
 
 ### Macro operations in cached entries
 

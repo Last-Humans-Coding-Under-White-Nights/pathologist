@@ -201,10 +201,13 @@ struct LowerContext {
     /// Gates C++-specific lowering (qualified members, CHA, namespaces).
     /// True for C++ TUs/headers and for `.h` files reached from a C++ TU.
     is_cpp: bool,
+    cpp_standard: u32,
     /// `new_expression` node IDs already handled by `expr_to_rhs_flow` so
     /// `walk_function_body` skips them (avoids duplicate call sites with
     /// incorrect `this`-parameter wiring).
     handled_new_exprs: RefCell<HashSet<usize>>,
+    /// Elided class expressions already constructed into an initializer subobject.
+    handled_constructor_exprs: RefCell<HashSet<usize>>,
     /// Cache for `resolve_callee_with_loads`: maps the `func` node id of a
     /// field-expression callee to the whole answer it gave.
     /// `emit_field_value_store` (via `resolve_callee_var`) and the later
@@ -238,6 +241,7 @@ struct LowerContext {
     /// References whose type carries an alias layer that type readers peel
     /// (an `auto&` local's type is already the value's own, so it is not one).
     reference_vars: HashSet<VarId>,
+    const_variables: HashSet<VarId>,
     /// Every variable declared as a reference, `auto&` included: it holds its
     /// referent's address, so `&r` is `r`'s value rather than a cell of r's.
     reference_bindings: HashSet<VarId>,
@@ -2933,7 +2937,9 @@ fn lower_prepared_source(
         type_scope: RefCell::new(Vec::new()),
         local_aliases: Vec::new(),
         is_cpp,
+        cpp_standard: pre.cpp_standard,
         handled_new_exprs: RefCell::new(HashSet::default()),
+        handled_constructor_exprs: RefCell::new(HashSet::default()),
         callee_load_cache: RefCell::new(HashMap::default()),
         call_receiver_cache: RefCell::new(HashMap::default()),
         call_return_dst: RefCell::new(HashMap::default()),
@@ -2942,6 +2948,7 @@ fn lower_prepared_source(
         ast_depth: 0,
         ast_depth_warned: false,
         reference_vars: HashSet::default(),
+        const_variables: HashSet::default(),
         reference_bindings: HashSet::default(),
         address_references: HashSet::default(),
         reference_returns: HashSet::default(),
@@ -2977,6 +2984,7 @@ fn lower_prepared_source(
     // already carry their complete spelling in pending_flow_origins.
     ctx.original_sources = HashMap::default();
     ctx.handled_new_exprs.borrow_mut().clear();
+    ctx.handled_constructor_exprs.borrow_mut().clear();
     ctx.callee_load_cache.borrow_mut().clear();
     ctx.call_receiver_cache.borrow_mut().clear();
     ctx.call_return_dst.borrow_mut().clear();
@@ -3408,7 +3416,7 @@ fn declaration_is_reference(
             return true;
         }
         if matches!(
-            declarator.cached_kind(),
+            ungroup_declarator(declarator).cached_kind(),
             "pointer_declarator" | "abstract_pointer_declarator"
         ) {
             return false;
@@ -4081,14 +4089,51 @@ fn lower_struct_specifier(
                     // instead of sweeping it into this class's instance-field
                     // layout. See docs/ANALYSIS.md, "Canonical variable
                     // identity".
+                    if ctx.is_cpp && declaration_is_constant(source, child) {
+                        for (decl, value) in field_declarators(child) {
+                            let name = parse_declarator_name(source, decl).0;
+                            let value = value.and_then(|value| {
+                                integer_constant_expression(program, ctx, source, value, 0)
+                            });
+                            if !name.is_empty() {
+                                program
+                                    .types
+                                    .note_integer_constant(&format!("{reg_name}::{name}"), value);
+                            }
+                        }
+                    }
                     if is_cpp_class && declaration_is_static(child) {
                         register_static_data_member(program, ctx, source, child, &reg_name);
                         continue;
                     }
-                    if let Some((fname, field_type)) =
-                        type_desc_from_field_declaration(program, ctx, source, child)
-                    {
+                    for (declarator, initializer) in field_declarators(child) {
+                        let Some((fname, field_type)) = type_desc_from_field_declarator(
+                            program, ctx, source, child, declarator,
+                        ) else {
+                            continue;
+                        };
                         if !fname.is_empty() {
+                            if ctx.is_cpp
+                                && (declares_reference(declarator)
+                                    || !declarator_is_pointer(declarator)
+                                        && child.cached_field("type").is_some_and(|ty| {
+                                            type_is_reference_alias(program, ctx, source, ty)
+                                        }))
+                            {
+                                program.types.note_reference_field(&reg_name, &fname);
+                            }
+                            if ctx.is_cpp {
+                                if let Some(initializer) = initializer {
+                                    note_member_initializer(
+                                        program,
+                                        ctx,
+                                        source,
+                                        &reg_name,
+                                        &fname,
+                                        initializer,
+                                    );
+                                }
+                            }
                             fields.push((fname, field_type));
                         }
                     }
@@ -4102,6 +4147,13 @@ fn lower_struct_specifier(
                 }
                 "type_definition" | "alias_declaration" if is_cpp_class => {
                     lower_alias(program, ctx, source, child);
+                }
+                "declaration" if is_cpp_class => {
+                    if let Some((name, desc)) =
+                        parenthesized_data_member(program, ctx, source, child)
+                    {
+                        fields.push((name, desc));
+                    }
                 }
                 _ => {}
             }
@@ -4214,7 +4266,17 @@ fn field_declarators(field: Node) -> Vec<(Node, Option<Node>)> {
     }
     loop {
         match cursor.field_name() {
-            Some("declarator") => declarators.push((cursor.node(), None)),
+            Some("declarator") => {
+                let node = cursor.node();
+                if node.cached_kind() == "init_declarator" {
+                    declarators.push((
+                        node.cached_field("declarator").unwrap_or(node),
+                        node.cached_field("value"),
+                    ));
+                } else {
+                    declarators.push((node, None));
+                }
+            }
             Some("default_value") => {
                 if let Some((_, init)) = declarators.last_mut() {
                     *init = Some(cursor.node());
@@ -4307,13 +4369,25 @@ fn mark_reference_binding(ctx: &mut LowerContext, decl: Node, var_id: VarId) {
     }
 }
 
-/// Whether `declarator` binds its name, or an unnamed parameter, to a
-/// referent's address: its outermost declarator is `&` or `&&` (`T &r`,
-/// `T &`). `T *&r` is bound to the pointer's value, as initialization and
-/// argument passing bind it.
+/// Parentheses group a declarator without changing its pointer/reference layer.
+fn ungroup_declarator(mut declarator: Node) -> Node {
+    while matches!(
+        declarator.cached_kind(),
+        "parenthesized_declarator" | "abstract_parenthesized_declarator"
+    ) {
+        let Some(inner) = declarator.named_child(0) else {
+            break;
+        };
+        declarator = inner;
+    }
+    declarator
+}
+
+/// Whether the outermost ungrouped declarator is `&` or `&&` (`T &r`,
+/// `T (&r)`, `T &`). Pointer layers retain their existing value-flow meaning.
 fn declares_reference(declarator: Node) -> bool {
     matches!(
-        declarator.cached_kind(),
+        ungroup_declarator(declarator).cached_kind(),
         "reference_declarator" | "abstract_reference_declarator"
     )
 }
@@ -4418,16 +4492,44 @@ fn register_class_prototypes(
     // tell which prototypes belong to an overload set.
     let functions: Vec<Option<(Node, String)>> = members
         .iter()
-        .map(|&m| member_function(source, m))
+        .map(|&m| {
+            if parenthesized_data_member(program, ctx, source, m).is_some() {
+                None
+            } else {
+                member_function(source, m)
+            }
+        })
         .collect();
     // `using Base::f;` adds the base's `f` overloads to the class's own.
-    let using_names = using_member_names(source, node);
+    let using_targets = using_member_targets(source, node);
+    let using_names: Vec<_> = using_targets
+        .iter()
+        .filter_map(|t| t.rsplit("::").next())
+        .collect();
+    for target in &using_targets {
+        let Some((base, member)) = target.rsplit_once("::") else {
+            continue;
+        };
+        if last_segment_of(base) == member {
+            let base =
+                declared_class_in_scope(program, ctx, base).unwrap_or_else(|| base.to_owned());
+            if program
+                .bases_of(cls_qual)
+                .iter()
+                .any(|b| receiver_lookup_name(b) == receiver_lookup_name(&base))
+            {
+                program
+                    .types
+                    .note_inherited_constructor(cls_qual, &receiver_lookup_name(&base));
+            }
+        }
+    }
     let overloaded = overloaded_names(
         functions
             .iter()
             .flatten()
             .map(|(_, name)| name.as_str())
-            .chain(using_names.iter().map(String::as_str)),
+            .chain(using_names.iter().copied()),
     );
     for (&m, function) in members.iter().zip(&functions) {
         // A member class registers its own members under its own spelling.
@@ -4507,7 +4609,7 @@ fn plain_declarator_name(source: &str, declaration: Node) -> Option<String> {
 }
 
 /// The names a class body's `using Base::f;` declarations bring in.
-fn using_member_names(source: &str, class: Node) -> Vec<String> {
+fn using_member_targets(source: &str, class: Node) -> Vec<String> {
     let Some(body) = class.cached_field("body") else {
         return Vec::new();
     };
@@ -4521,7 +4623,8 @@ fn using_member_names(source: &str, class: Node) -> Vec<String> {
                 .trim()
                 .trim_end_matches(';');
             let name = named.rsplit("::").next()?.trim();
-            (!name.is_empty() && !named.starts_with("namespace")).then(|| name.to_owned())
+            (!name.is_empty() && !named.starts_with("namespace"))
+                .then(|| normalize_qualified(named))
         })
         .collect()
 }
@@ -4604,6 +4707,39 @@ fn lower_class_definitions(
             signature.map(|sig| (member, template, sig))
         })
         .collect();
+    for member in &members {
+        let member = if member.cached_kind() == "template_declaration" {
+            template_member_decl(*member).unwrap_or(*member)
+        } else {
+            *member
+        };
+        if member_function(source, member)
+            .is_some_and(|(_, name)| name == last_segment_of(cls_qual))
+        {
+            note_constructor_declaration(program, ctx, source, member, cls_qual);
+        }
+    }
+    // This pass also visits nested classes. Record their constructor metadata
+    // after signatures are registered, with in-class defaulting flags fixed.
+    // Only this class's declarations count; base constructors are not its own.
+    let ctors = program
+        .symbols
+        .functions_named(&trace_ir::MethodKind::Ctor.name_on(cls_qual));
+    for ctor in ctors {
+        let takes_zero = method_explicit_arity(program, ctor)
+            .is_none_or(|arity| arity_takes(program.symbols.function(ctor), arity, 0));
+        program.types.note_constructor(
+            cls_qual,
+            user_provided(program, ctor),
+            takes_zero,
+            takes_own_class(program, ctor, cls_qual),
+        );
+        if let Some(signature) = constructor_signature(program, ctor) {
+            program
+                .types
+                .note_constructor_signature(cls_qual, signature);
+        }
+    }
     for (member, template, signature) in signatures {
         ctx.step_template(template);
         lower_function_body(program, ctx, source, member, signature);
@@ -6026,6 +6162,9 @@ fn lower_parameter(
         name = format!("$arg{index}");
     }
     let var_id = program.symbols.alloc_var_id();
+    if declaration_is_constant(source, node) {
+        ctx.const_variables.insert(var_id);
+    }
     if let Some(declarator) = declarator {
         mark_reference_binding(ctx, declarator, var_id);
     }
@@ -7335,7 +7474,7 @@ fn names_class(desc: &TypeDesc, cls: &str, address_reference: bool) -> bool {
     } else {
         desc
     };
-    matches!(desc, TypeDesc::Struct { name, .. } if receiver_lookup_name(name) == cls)
+    matches!(desc, TypeDesc::Struct { name, .. } | TypeDesc::Union { name, .. } if receiver_lookup_name(name) == cls)
 }
 
 /// Whether constructor `ctor` of `cls` takes one parameter of the class
@@ -7932,6 +8071,18 @@ fn lower_declaration(
     };
     let type_id = parse_type_node(program, ctx, source, type_node);
     let is_static = declaration_is_static(node);
+    if ctx.is_cpp && ctx.current_fn.is_none() && declaration_is_constant(source, node) {
+        for (decl, value) in field_declarators(node) {
+            let name = parse_declarator_name(source, decl).0;
+            let value =
+                value.and_then(|value| integer_constant_expression(program, ctx, source, value, 0));
+            if !name.is_empty() {
+                program
+                    .types
+                    .note_integer_constant(&ctx.qualify_decl(&name), value);
+            }
+        }
+    }
 
     let lower_initialized = |program: &mut Program,
                              ctx: &mut LowerContext,
@@ -8425,6 +8576,12 @@ fn initialized_class(program: &Program, desc: &TypeDesc) -> Option<String> {
     }
     let name = class_of_desc(desc)?;
     let constructs = !matches!(desc, TypeDesc::Union { .. })
+        || !program
+            .types
+            .is_struct_defined(&receiver_lookup_name(&name))
+        || program
+            .types
+            .has_user_provided_constructor(&receiver_lookup_name(&name))
         || program
             .symbols
             .has_function_named(&trace_ir::MethodKind::Ctor.name_on(&receiver_lookup_name(&name)));
@@ -8486,12 +8643,16 @@ fn lifecycle_members(
 /// What [`lifecycle_members`] reads, as counts that only grow while a unit
 /// lowers: its functions (a member's `defaulted_in_class` is fixed when the
 /// function is added) and its inheritance edges. A cached answer is reused
-/// only while both are unchanged.
-fn lifecycle_stamp(program: &Program) -> (usize, usize) {
-    (program.symbols.functions.len(), program.inheritance().len())
+/// only while these and cached constructor metadata are unchanged.
+fn lifecycle_stamp(program: &Program) -> (usize, usize, usize) {
+    (
+        program.symbols.functions.len(),
+        program.inheritance().len(),
+        program.types.constructor_metadata_epoch(),
+    )
 }
 
-type LifecycleCache = BTreeMap<(String, bool), ((usize, usize), Vec<(String, Vec<FnId>)>)>;
+type LifecycleCache = BTreeMap<(String, bool), ((usize, usize, usize), Vec<(String, Vec<FnId>)>)>;
 
 fn collect_lifecycle_members<'a>(
     program: &'a Program,
@@ -8537,6 +8698,18 @@ fn collect_lifecycle_members<'a>(
     // class is default-constructed.
     if runs.is_empty() && any_declared {
         return;
+    }
+    if matches!(kind, trace_ir::MethodKind::Ctor) && !any_declared {
+        match program.types.default_constructor(cls) {
+            Some(true) => {
+                // Types-only imports retain the eligibility but not the symbols.
+                // The final symbol merge resolves this site's actual constructor.
+                found.push((cls.to_owned(), Vec::new()));
+                return;
+            }
+            None if program.types.has_declared_constructor(cls) => return,
+            _ => {}
+        }
     }
     // An implicit or defaulted member runs every base's.
     for base in program.base_names(cls) {
@@ -9561,7 +9734,7 @@ fn walk_function_body(
             }
         }
         "field_initializer_list" if ctx.is_cpp && !node_is_from_ignored_macro(ctx, node) => {
-            lower_field_initializer_list(program, ctx, source, node, caller);
+            lower_field_initializer_list(program, ctx, source, node);
         }
         _ => {}
     }
@@ -9703,6 +9876,10 @@ fn collect_call_at_node(
     node: Node,
     caller: FnId,
 ) {
+    if ctx.handled_constructor_exprs.borrow().contains(&node.id()) {
+        return;
+    }
+
     if node_is_from_ignored_macro(ctx, node) {
         return;
     }
@@ -10523,6 +10700,22 @@ fn collect_call_args(
     source: &str,
     args_node: Option<Node>,
 ) -> CallArgs {
+    let mut cursor = args_node.map(|node| node.walk());
+    let args = args_node
+        .zip(cursor.as_mut())
+        .into_iter()
+        .flat_map(|(node, cursor)| node.children(cursor));
+    collect_call_arg_nodes(program, ctx, source, args)
+}
+
+/// Collect an argument list or one aggregate subobject's expression through
+/// the same value, reference and callback binding rules.
+fn collect_call_arg_nodes<'t>(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    args: impl IntoIterator<Item = Node<'t>>,
+) -> CallArgs {
     let mut var_args = Vec::new();
     let mut fn_args = Vec::new();
     let mut addr_of_member_args = Vec::new();
@@ -10532,137 +10725,129 @@ fn collect_call_args(
     let mut address_reference_args = Vec::new();
     let mut null_constants = Vec::new();
     let mut arg_index = 0u32;
-    if let Some(args_node) = args_node {
-        for arg in args_node.children(&mut args_node.walk()) {
-            if !matches!(arg.cached_kind(), "(" | ")" | "{" | "}" | ",") {
-                let adesc = arg_expr_type(program, ctx, source, arg);
-                let value = peel_expression(arg);
-                if matches!(adesc, TypeDesc::Ptr(_))
-                    && !ctx.address_references.is_empty()
-                    && is_name(value)
-                    && resolve_expr_var(program, ctx, source, value)
-                        .is_some_and(|v| ctx.address_references.contains(&v))
-                {
-                    address_reference_args.push(arg_index);
-                }
-                null_constants.push(is_null_constant(source, arg));
-                // Parameter positions are syntactic: every argument slot
-                // advances the index even when the expression yields no IR
-                // variable (literals, sizeof, casts). Compressing indices
-                // would mis-attribute later arguments to earlier formals
-                // (e.g. `memcpy_s(d, sizeof(*d), s, n)` recording `s` at
-                // position 1) and corrupt both interprocedural wiring and
-                // function-model effects.
-                //
-                // `&x` passes x's address (docs/ANALYSIS.md, "Argument
-                // flow"): the formal must point to `x`, not receive x's own
-                // pointees.
-                if let Some(v) = addr_of_plain_var(program, ctx, source, arg) {
-                    var_args.push((arg_index, addr_of_temp(program, ctx, arg, v)));
-                    addr_of_args.push(arg_index);
-                    arg_desc.push(adesc);
-                    arg_index += 1;
-                    continue;
-                }
-                // `*x` passes the value it reads. In C++ a reference
-                // parameter takes `x`'s value instead, and so does one no
-                // declaration describes (docs/ANALYSIS.md, "Dereferenced
-                // operands"; [`CallArgs::for_callee`]). A function pointer
-                // is read in place: `*fp` passes `fp`.
-                let value = peel_casts(source, arg);
-                if let Some((x, in_place)) = deref_operand(source, value)
-                    .and_then(|_| Operand::resolve(program, ctx, source, value))
-                    .and_then(Operand::into_deref)
-                {
-                    let address = x.publish(program, ctx, source);
-                    let passed = if in_place {
-                        address
-                    } else if ctx.is_cpp {
-                        deref_args.push(DerefArg {
-                            index: arg_index,
-                            param: arg_index as usize,
-                            owner: ctx.current_fn,
-                            span: node_span(program, ctx, arg),
-                            read: Default::default(),
-                            either: Default::default(),
-                        });
-                        address
-                    } else {
-                        let read = alloc_ret_temp(program, ctx, arg);
-                        program.flow.push(FlowConstraint::Load {
-                            dst: read,
-                            src: address,
-                        });
-                        read
-                    };
-                    var_args.push((arg_index, passed));
-                    arg_desc.push(adesc);
-                    arg_index += 1;
-                    continue;
-                }
-                if let Some(v) = resolve_expr_var(program, ctx, source, arg) {
-                    // A field/subscript argument passes the *value* stored in
-                    // that memory (e.g. `take(g_h.h, 0)` passes the fn-ptr in
-                    // `g_h.h`). `resolve_expr_var` yields the base object, so
-                    // materialize a load temp and pass that instead.
-                    if matches!(
-                        value.cached_kind(),
-                        "field_expression" | "subscript_expression"
-                    ) {
-                        let temp = alloc_ret_temp(program, ctx, arg);
-                        if let Some(flow) = expr_to_rhs_flow(program, ctx, source, arg, temp) {
-                            program.flow.push(flow);
-                            var_args.push((arg_index, temp));
-                            arg_desc.push(adesc);
-                            arg_index += 1;
-                            continue;
-                        }
-                    }
-                    var_args.push((arg_index, v));
-                    // `&base.member` / `&arr[i]` resolve to the base
-                    // variable; flag the position so function-model alias
-                    // effects can refuse to copy the whole container.
-                    if is_addr_of_member(source, arg) {
-                        addr_of_member_args.push(arg_index);
-                    }
-                } else if value.cached_kind() == "call_expression" {
-                    if let Some(temp) = lower_nested_call_arg(program, ctx, source, value) {
-                        var_args.push((arg_index, temp));
-                    }
-                } else if is_nullptr(source, value) {
-                    let temp = alloc_ret_temp(program, ctx, arg);
-                    let ty = program.types.ptr_to(TypeDesc::Unknown);
-                    program.symbols.variable_mut(temp).type_id = ty;
-                    let first_flow = program.flow.len();
-                    if let Some(flow) = expr_to_rhs_flow(program, ctx, source, arg, temp) {
-                        program.flow.push(flow);
-                        // Keep the literal's own spelling/site, rather than
-                        // copying the enclosing argument list per null value.
-                        let span = node_span(program, ctx, arg);
-                        record_flow_origins(
-                            program,
-                            ctx,
-                            first_flow,
-                            span,
-                            node_text(source, &arg),
-                        );
-                        var_args.push((arg_index, temp));
-                    }
-                } else if let Some(s) = string_literal_value(source, arg) {
-                    let temp = alloc_ret_temp(program, ctx, arg);
-                    program.flow.push(FlowConstraint::StringConst {
-                        dst: temp,
-                        value: s,
-                    });
-                    var_args.push((arg_index, temp));
-                } else if let Some(gep) = addr_of_field_path(program, ctx, source, arg) {
-                    var_args.push((arg_index, gep));
-                } else if let Some(fn_id) = resolve_call_fn_arg(program, ctx, source, arg) {
-                    fn_args.push((arg_index, fn_id));
-                }
+    for arg in args {
+        if !matches!(arg.cached_kind(), "(" | ")" | "{" | "}" | ",") {
+            let adesc = arg_expr_type(program, ctx, source, arg);
+            let value = peel_expression(arg);
+            if matches!(adesc, TypeDesc::Ptr(_))
+                && !ctx.address_references.is_empty()
+                && is_name(value)
+                && resolve_expr_var(program, ctx, source, value)
+                    .is_some_and(|v| ctx.address_references.contains(&v))
+            {
+                address_reference_args.push(arg_index);
+            }
+            null_constants.push(is_null_constant(source, arg));
+            // Parameter positions are syntactic: every argument slot
+            // advances the index even when the expression yields no IR
+            // variable (literals, sizeof, casts). Compressing indices
+            // would mis-attribute later arguments to earlier formals
+            // (e.g. `memcpy_s(d, sizeof(*d), s, n)` recording `s` at
+            // position 1) and corrupt both interprocedural wiring and
+            // function-model effects.
+            //
+            // `&x` passes x's address (docs/ANALYSIS.md, "Argument
+            // flow"): the formal must point to `x`, not receive x's own
+            // pointees.
+            if let Some(v) = addr_of_plain_var(program, ctx, source, arg) {
+                var_args.push((arg_index, addr_of_temp(program, ctx, arg, v)));
+                addr_of_args.push(arg_index);
                 arg_desc.push(adesc);
                 arg_index += 1;
+                continue;
             }
+            // `*x` passes the value it reads. In C++ a reference
+            // parameter takes `x`'s value instead, and so does one no
+            // declaration describes (docs/ANALYSIS.md, "Dereferenced
+            // operands"; [`CallArgs::for_callee`]). A function pointer
+            // is read in place: `*fp` passes `fp`.
+            let value = peel_casts(source, arg);
+            if let Some((x, in_place)) = deref_operand(source, value)
+                .and_then(|_| Operand::resolve(program, ctx, source, value))
+                .and_then(Operand::into_deref)
+            {
+                let address = x.publish(program, ctx, source);
+                let passed = if in_place {
+                    address
+                } else if ctx.is_cpp {
+                    deref_args.push(DerefArg {
+                        index: arg_index,
+                        param: arg_index as usize,
+                        owner: ctx.current_fn,
+                        span: node_span(program, ctx, arg),
+                        read: Default::default(),
+                        either: Default::default(),
+                    });
+                    address
+                } else {
+                    let read = alloc_ret_temp(program, ctx, arg);
+                    program.flow.push(FlowConstraint::Load {
+                        dst: read,
+                        src: address,
+                    });
+                    read
+                };
+                var_args.push((arg_index, passed));
+                arg_desc.push(adesc);
+                arg_index += 1;
+                continue;
+            }
+            if let Some(v) = resolve_expr_var(program, ctx, source, arg) {
+                // A field/subscript argument passes the *value* stored in
+                // that memory (e.g. `take(g_h.h, 0)` passes the fn-ptr in
+                // `g_h.h`). `resolve_expr_var` yields the base object, so
+                // materialize a load temp and pass that instead.
+                if matches!(
+                    value.cached_kind(),
+                    "field_expression" | "subscript_expression"
+                ) {
+                    let temp = alloc_ret_temp(program, ctx, arg);
+                    if let Some(flow) = expr_to_rhs_flow(program, ctx, source, arg, temp) {
+                        program.flow.push(flow);
+                        var_args.push((arg_index, temp));
+                        arg_desc.push(adesc);
+                        arg_index += 1;
+                        continue;
+                    }
+                }
+                var_args.push((arg_index, v));
+                // `&base.member` / `&arr[i]` resolve to the base
+                // variable; flag the position so function-model alias
+                // effects can refuse to copy the whole container.
+                if is_addr_of_member(source, arg) {
+                    addr_of_member_args.push(arg_index);
+                }
+            } else if value.cached_kind() == "call_expression" {
+                if let Some(temp) = lower_nested_call_arg(program, ctx, source, value) {
+                    var_args.push((arg_index, temp));
+                }
+            } else if is_nullptr(source, value) {
+                let temp = alloc_ret_temp(program, ctx, arg);
+                let ty = program.types.ptr_to(TypeDesc::Unknown);
+                program.symbols.variable_mut(temp).type_id = ty;
+                let first_flow = program.flow.len();
+                if let Some(flow) = expr_to_rhs_flow(program, ctx, source, arg, temp) {
+                    program.flow.push(flow);
+                    // Keep the literal's own spelling/site, rather than
+                    // copying the enclosing argument list per null value.
+                    let span = node_span(program, ctx, arg);
+                    record_flow_origins(program, ctx, first_flow, span, node_text(source, &arg));
+                    var_args.push((arg_index, temp));
+                }
+            } else if let Some(s) = string_literal_value(source, arg) {
+                let temp = alloc_ret_temp(program, ctx, arg);
+                program.flow.push(FlowConstraint::StringConst {
+                    dst: temp,
+                    value: s,
+                });
+                var_args.push((arg_index, temp));
+            } else if let Some(gep) = addr_of_field_path(program, ctx, source, arg) {
+                var_args.push((arg_index, gep));
+            } else if let Some(fn_id) = resolve_call_fn_arg(program, ctx, source, arg) {
+                fn_args.push((arg_index, fn_id));
+            }
+            arg_desc.push(adesc);
+            arg_index += 1;
         }
     }
     CallArgs {
@@ -11780,16 +11965,1409 @@ fn emit_member_targets(
     }
 }
 
+/// The initialized subobject's type and address. Array elements share their
+/// summary storage, but explicit clauses keep separate constructor sites.
+#[derive(Clone)]
+struct InitializedObject {
+    desc: Arc<TypeDesc>,
+    address: Option<VarId>,
+    parent: Option<VarId>,
+    member: Option<(String, String)>,
+}
+
+fn initializer_field(
+    program: &mut Program,
+    ctx: &LowerContext,
+    object: &InitializedObject,
+    cls: &str,
+    field: FieldId,
+    layout: &trace_ir::FieldLayout,
+    span: Span,
+) -> InitializedObject {
+    let desc = Arc::clone(&program.types.get(layout.type_id).desc);
+    let address = object.address.map(|base| {
+        let pointer = program.types.ptr_to(desc.as_ref().clone());
+        let dst = add_temp(program, ctx.current_fn, TempKind::Gep, pointer, span);
+        program.flow.push(FlowConstraint::GepField {
+            dst,
+            base,
+            field,
+            field_name: layout.name.clone(),
+        });
+        dst
+    });
+    InitializedObject {
+        desc,
+        address,
+        parent: object.address,
+        member: Some((cls.to_owned(), layout.name.clone())),
+    }
+}
+
+/// Own constructors and explicit imports are one overload set. An own
+/// declaration hides an inherited declaration only when both signatures are
+/// known and equal; uncertainty keeps the inherited candidate.
+#[allow(clippy::too_many_arguments)]
+fn initializer_constructors(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    cls: &str,
+    values: &[Node],
+    seen: &mut Vec<String>,
+    found: &mut Vec<(String, Vec<FnId>)>,
+) {
+    if seen.iter().any(|seen| seen == cls) {
+        return;
+    }
+    seen.push(cls.to_owned());
+    let argc = values.len();
+    let own = program
+        .symbols
+        .functions_named(&trace_ir::MethodKind::Ctor.name_on(cls));
+    if any_user_provided(program, &own)
+        || own.is_empty() && program.types.has_user_provided_constructor(cls)
+    {
+        let signatures = program.types.constructor_signatures(cls);
+        if !own.is_empty()
+            || signatures.is_empty()
+            || signatures.iter().any(|signature| {
+                let arity = signature.parameters.len();
+                argc >= arity.saturating_sub(signature.default_args as usize)
+                    && (signature.variadic || argc <= arity)
+                    && signature_reference_viable(program, ctx, source, signature, values)
+            })
+        {
+            found.push((cls.to_owned(), own.clone()));
+        }
+    }
+    for base in program.types.inherited_constructor_bases(cls) {
+        let mut imported = Vec::new();
+        initializer_constructors(program, ctx, source, base, values, seen, &mut imported);
+        for (base, mut targets) in imported {
+            let unresolved = targets.is_empty();
+            targets.retain(|&target| {
+                !own.iter()
+                    .any(|&decl| constructors_same_signature(program, decl, target))
+                    && !constructor_signature(program, target).is_some_and(|signature| {
+                        program
+                            .types
+                            .constructor_signatures(cls)
+                            .iter()
+                            .any(|own| constructor_signatures_equal(own, &signature))
+                    })
+            });
+            if unresolved {
+                let signatures = program.types.constructor_signatures(&base);
+                if !signatures.is_empty()
+                    && !signatures.iter().any(|signature| {
+                        let arity = signature.parameters.len();
+                        (argc >= arity.saturating_sub(signature.default_args as usize)
+                            && (signature.variadic || argc <= arity))
+                            && !program
+                                .types
+                                .constructor_signatures(cls)
+                                .iter()
+                                .any(|own| constructor_signatures_equal(own, signature))
+                    })
+                {
+                    continue;
+                }
+            }
+            if unresolved || !targets.is_empty() {
+                found.push((base, targets));
+            }
+        }
+    }
+}
+
+fn note_constructor_declaration(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+    class: &str,
+) {
+    let parameters = prototype_param_types(program, ctx, source, node);
+    let shape = find_params(node)
+        .map(|params| param_list_shape(program, ctx, source, params))
+        .unwrap_or_default();
+    let parameter_nodes: Vec<_> = find_params(node)
+        .into_iter()
+        .flat_map(|params| {
+            params
+                .named_children(&mut params.walk())
+                .collect::<Vec<_>>()
+        })
+        .filter(|param| is_parameter_node(param.cached_kind()))
+        .filter(|param| node_text(source, param).trim() != "void")
+        .collect();
+    let syntax: Vec<_> = parameter_nodes
+        .iter()
+        .map(|&param| parameter_signature_syntax(source, param))
+        .collect();
+    let reference_forms = parameter_nodes
+        .iter()
+        .map(|&param| constructor_reference_form(program, ctx, source, param))
+        .collect();
+    if parameters.len() != syntax.len() {
+        return;
+    }
+    let span = node_span(program, ctx, node);
+    program.types.note_constructor_signature(
+        class,
+        trace_ir::ConstructorSignature {
+            parameters: parameters
+                .iter()
+                .map(|&ty| Arc::clone(&program.types.get(ty).desc))
+                .collect(),
+            references: shape.references,
+            parameter_syntax: syntax,
+            reference_forms,
+            declaration: Some((
+                Arc::new(program.symbols.files[span.file.0 as usize].path.clone()),
+                span.line,
+                span.col,
+            )),
+            variadic: shape.variadic,
+            default_args: shape.defaults,
+        },
+    );
+}
+
+fn constructor_reference_form(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    param: Node,
+) -> Option<trace_ir::ConstructorReference> {
+    if param.has_error() {
+        return None;
+    }
+    let declarator = ungroup_declarator(param.cached_field("declarator")?);
+    if !matches!(
+        declarator.cached_kind(),
+        "reference_declarator" | "abstract_reference_declarator"
+    ) {
+        return None;
+    }
+    let operator = declarator
+        .children(&mut declarator.walk())
+        .find(|child| matches!(child.cached_kind(), "&" | "&&"))?;
+    let ty = param.cached_field("type")?;
+    let name = normalize_qualified(node_text(source, &ty));
+    let alias = type_is_reference_alias(program, ctx, source, ty)
+        || find_in_scope(program, ctx, &name, |name, _| {
+            program.types.resolve_alias(name).map(|_| ())
+        })
+        .is_some();
+    let pointer = declarator
+        .named_children(&mut declarator.walk())
+        .any(|child| {
+            matches!(
+                ungroup_declarator(child).cached_kind(),
+                "pointer_declarator" | "abstract_pointer_declarator"
+            )
+        });
+    let is_const = if alias || pointer {
+        None
+    } else {
+        Some(declaration_is_constant(source, param))
+    };
+    Some(trace_ir::ConstructorReference {
+        rvalue: operator.cached_kind() == "&&",
+        is_const,
+    })
+}
+
+/// Source spelling supplements canonical value types with cv/ref distinctions.
+/// Different spellings may leave an extra candidate; absent syntax never hides one.
+fn parameter_signature_syntax(source: &str, param: Node) -> Option<Arc<str>> {
+    if param.has_error() {
+        return None;
+    }
+    let name = param
+        .cached_field("declarator")
+        .and_then(declarator_identifier);
+    let end = param
+        .cached_field("default_value")
+        .map_or(param.end_byte(), |value| value.start_byte());
+    let text = &source[param.start_byte()..end];
+    let relative = name.map(|name| {
+        name.byte_range().start - param.start_byte()..name.byte_range().end - param.start_byte()
+    });
+    let mut text = text.to_owned();
+    if let Some(range) = relative {
+        text.replace_range(range, "");
+    }
+    let tokens = trace_preproc::Lexer::new(&text, trace_preproc::Language::Cpp).tokenize();
+    let syntax: Vec<_> = tokens
+        .into_iter()
+        .filter_map(|token| match token.kind {
+            trace_preproc::TokenKind::Identifier(text) | trace_preproc::TokenKind::Number(text) => {
+                Some(text)
+            }
+            trace_preproc::TokenKind::Punct(text) => Some(text.to_owned()),
+            _ => None,
+        })
+        .take_while(|token| token != "=")
+        .collect();
+    Some(Arc::from(syntax.join(" ")))
+}
+
+fn constructor_signature(program: &Program, f: FnId) -> Option<trace_ir::ConstructorSignature> {
+    let f = program.symbols.function(f);
+    let class = f.name.rsplit_once("::")?.0;
+    let path = &program.symbols.files[f.span.file.0 as usize].path;
+    let mut declared = program
+        .types
+        .constructor_signatures(class)
+        .iter()
+        .filter(|signature| {
+            signature
+                .declaration
+                .as_ref()
+                .is_some_and(|(file, line, col)| {
+                    file.as_ref() == path && *line == f.span.line && *col == f.span.col
+                })
+        });
+    if let Some(signature) = declared.next() {
+        return declared.next().is_none().then(|| signature.clone());
+    }
+    let params = program.symbols.explicit_params(f)?;
+    let parameters: Vec<_> = (0..params.len())
+        .filter_map(|index| params.get(index))
+        .map(|id| Arc::clone(&program.types.get(id).desc))
+        .collect();
+    if parameters
+        .iter()
+        .any(|desc| matches!(desc.as_ref(), TypeDesc::Unknown))
+    {
+        return None;
+    }
+    Some(trace_ir::ConstructorSignature {
+        parameters,
+        references: f.reference_params.clone(),
+        parameter_syntax: Vec::new(),
+        reference_forms: Vec::new(),
+        declaration: None,
+        variadic: f.variadic,
+        default_args: f.default_args,
+    })
+}
+
+fn constructors_same_signature(program: &Program, a: FnId, b: FnId) -> bool {
+    constructor_signature(program, a)
+        .zip(constructor_signature(program, b))
+        .is_some_and(|(a, b)| constructor_signatures_equal(&a, &b))
+}
+
+fn constructor_reference_viable(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    ctor: FnId,
+    values: &[Node],
+) -> bool {
+    let Some(signature) = constructor_signature(program, ctor) else {
+        return true;
+    };
+    signature_reference_viable(program, ctx, source, &signature, values)
+}
+
+fn signature_reference_viable(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    signature: &trace_ir::ConstructorSignature,
+    values: &[Node],
+) -> bool {
+    signature
+        .references
+        .iter()
+        .enumerate()
+        .all(|(index, reference)| {
+            if !reference {
+                return true;
+            }
+            let Some(form) = signature
+                .reference_forms
+                .get(index)
+                .and_then(Option::as_ref)
+            else {
+                return true;
+            };
+            let Some(value) = values.get(index).copied() else {
+                return true;
+            };
+            let value = peel_expression(value);
+            let var = resolve_expr_var(program, ctx, source, value);
+            let lvalue = match value.cached_kind() {
+                "identifier"
+                | "qualified_identifier"
+                | "field_expression"
+                | "subscript_expression"
+                    if var.is_some() =>
+                {
+                    Some(true)
+                }
+                "number_literal" | "char_literal" | "true" | "false" | "new_expression" => {
+                    Some(false)
+                }
+                _ => None,
+            };
+            let Some(parameter) = signature.parameters.get(index) else {
+                return true;
+            };
+            let parameter = parameter.pointee().unwrap_or(parameter.as_ref());
+            let argument = var
+                .map(|var| {
+                    program
+                        .types
+                        .get(program.symbols.variable(var).type_id)
+                        .desc
+                        .as_ref()
+                        .clone()
+                })
+                .unwrap_or_else(|| match value.cached_kind() {
+                    "number_literal" | "char_literal" => TypeDesc::Int,
+                    "true" | "false" => TypeDesc::Bool,
+                    _ => TypeDesc::Unknown,
+                });
+            let argument = if var.is_some_and(|var| ctx.reference_vars.contains(&var)) {
+                argument.pointee().unwrap_or(&argument)
+            } else {
+                &argument
+            };
+            // Conversion to a different referent may create a temporary, so
+            // an lvalue alone cannot exclude an rvalue-reference constructor.
+            if matches!(parameter.innermost().0, TypeDesc::Unknown)
+                || matches!(argument.innermost().0, TypeDesc::Unknown)
+                || program.types.is_guessed_class(parameter)
+                || program.types.is_guessed_class(argument)
+                || !trace_ir::spelled_alike(
+                    &program.types,
+                    argument,
+                    parameter,
+                    trace_ir::SpellingTolerance::Ranking,
+                )
+            {
+                return true;
+            }
+            if form.rvalue && lvalue == Some(true) {
+                return false;
+            }
+            if !form.rvalue && form.is_const == Some(false) && lvalue == Some(false) {
+                return false;
+            }
+            if form.is_const == Some(false)
+                && var.is_some_and(|var| ctx.const_variables.contains(&var))
+            {
+                return false;
+            }
+            true
+        })
+}
+
+fn constructor_signatures_equal(
+    a: &trace_ir::ConstructorSignature,
+    b: &trace_ir::ConstructorSignature,
+) -> bool {
+    a.parameters == b.parameters
+        && a.references == b.references
+        && a.variadic == b.variadic
+        && a.parameters
+            .iter()
+            .chain(&b.parameters)
+            .all(|parameter| !matches!(parameter.innermost().0, TypeDesc::Unknown))
+        && a.references.iter().enumerate().all(|(i, reference)| {
+            !reference
+                || a.reference_forms
+                    .get(i)
+                    .and_then(Option::as_ref)
+                    .zip(b.reference_forms.get(i).and_then(Option::as_ref))
+                    .is_some_and(|(a, b)| a.is_const.is_some() && a == b)
+        })
+        && a.parameter_syntax.len() == a.parameters.len()
+        && b.parameter_syntax.len() == b.parameters.len()
+        && a.parameter_syntax
+            .iter()
+            .zip(&b.parameter_syntax)
+            .all(|(a, b)| a.as_ref().zip(b.as_ref()).is_some_and(|(a, b)| a == b))
+}
+
+fn initializer_is_aggregate(program: &Program, ctx: &LowerContext, cls: &str) -> bool {
+    program.types.is_struct_defined(cls)
+        && !program.types.has_user_provided_constructor(cls)
+        && (ctx.cpp_standard < 202002 || !program.types.has_declared_constructor(cls))
+        && program.types.inherited_constructor_bases(cls).is_empty()
+        && !any_user_provided(
+            program,
+            &program
+                .symbols
+                .functions_named(&trace_ir::MethodKind::Ctor.name_on(cls)),
+        )
+}
+
+/// Lower construction or value binding of one subobject. Return clauses
+/// consumed, so brace elision can advance the containing aggregate correctly.
+#[allow(clippy::too_many_arguments)]
+fn lower_initializer_object(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    object: &InitializedObject,
+    values: &[Node],
+    braced: bool,
+    elide: bool,
+    span: Span,
+    expansion_span: Option<Span>,
+    seen: &mut Vec<String>,
+) -> usize {
+    if let TypeDesc::Array { elem, size } = object.desc.as_ref() {
+        if values
+            .first()
+            .is_some_and(|value| string_literal_value(source, *value).is_some())
+        {
+            if let Some(address) = object.address {
+                emit_store_to_location(program, ctx, source, values[0], address, values[0]);
+            }
+            return 1;
+        }
+        let mut position = 0;
+        let count = size.unwrap_or(values.len().max(1) as u64);
+        let element = InitializedObject {
+            desc: Arc::new(elem.as_ref().clone()),
+            address: object.address,
+            parent: None,
+            member: None,
+        };
+        for _ in 0..count {
+            // Omitted elements share summary storage and argument-free sites;
+            // one expansion represents the whole omitted suffix.
+            if position >= values.len() {
+                lower_initializer_object(
+                    program,
+                    ctx,
+                    source,
+                    &element,
+                    &[],
+                    true,
+                    false,
+                    span,
+                    expansion_span,
+                    seen,
+                );
+                break;
+            }
+            position += lower_initializer_clause(
+                program,
+                ctx,
+                source,
+                &element,
+                &values[position..],
+                elide,
+                span,
+                expansion_span,
+                seen,
+            );
+        }
+        return position;
+    }
+    let reference = object
+        .member
+        .as_ref()
+        .is_some_and(|(cls, field)| program.types.field_is_reference(cls, field));
+    if !reference {
+        if let Some(class) = initialized_class(program, object.desc.as_ref()) {
+            let target = receiver_lookup_name(&class);
+            return lower_class_initializer(
+                program,
+                ctx,
+                source,
+                object,
+                &target,
+                values,
+                braced,
+                elide,
+                span,
+                expansion_span,
+                seen,
+            );
+        }
+    }
+    if let Some(value) = values.first().copied() {
+        if let Some(address) = object.address {
+            let first_flow = program.flow.len();
+            let first_pending = ctx.pending.borrow().len();
+            emit_store_to_location(program, ctx, source, value, address, value);
+            let location = node_span(program, ctx, value);
+            let expression = operation_expression(ctx, source, value);
+            record_operation_origins(
+                program,
+                ctx,
+                first_flow,
+                first_pending,
+                location,
+                &expression,
+            );
+        }
+        1
+    } else {
+        0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_initializer_clause(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    object: &InitializedObject,
+    values: &[Node],
+    elide: bool,
+    span: Span,
+    expansion_span: Option<Span>,
+    seen: &mut Vec<String>,
+) -> usize {
+    let Some(value) = values.first().copied() else {
+        // Default member initializers are handled before empty initialization.
+        if lower_default_member_initializer(program, ctx, object, seen) {
+            return 0;
+        }
+        return lower_initializer_object(
+            program,
+            ctx,
+            source,
+            object,
+            &[],
+            true,
+            false,
+            span,
+            expansion_span,
+            seen,
+        );
+    };
+    let span = node_call_span(program, ctx, value);
+    let expansion_span = node_expansion_span(program, ctx, value);
+    if value.cached_kind() == "initializer_list" {
+        let nested: Vec<_> = value.named_children(&mut value.walk()).collect();
+        lower_initializer_object(
+            program,
+            ctx,
+            source,
+            object,
+            &nested,
+            true,
+            true,
+            span,
+            expansion_span,
+            seen,
+        );
+        return 1;
+    }
+    let aggregate = matches!(object.desc.as_ref(), TypeDesc::Array { .. })
+        || initialized_class(program, object.desc.as_ref()).is_some_and(|class| {
+            initializer_is_aggregate(program, ctx, &receiver_lookup_name(&class))
+        });
+    let argument = peel_casts(source, value);
+    let copies = initialized_class(program, object.desc.as_ref()).is_some_and(|class| {
+        names_class(
+            &arg_expr_type(program, ctx, source, argument),
+            &receiver_lookup_name(&class),
+            resolve_expr_var(program, ctx, source, argument)
+                .is_some_and(|var| ctx.address_references.contains(&var)),
+        )
+    });
+    if elide && aggregate && !copies {
+        lower_initializer_object(
+            program,
+            ctx,
+            source,
+            object,
+            values,
+            true,
+            true,
+            span,
+            expansion_span,
+            seen,
+        )
+    } else {
+        lower_initializer_object(
+            program,
+            ctx,
+            source,
+            object,
+            &[value],
+            false,
+            false,
+            span,
+            expansion_span,
+            seen,
+        );
+        1
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_class_initializer(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    object: &InitializedObject,
+    target: &str,
+    values: &[Node],
+    braced: bool,
+    elide: bool,
+    span: Span,
+    expansion_span: Option<Span>,
+    seen: &mut Vec<String>,
+) -> usize {
+    let Some(caller) = ctx.current_fn else {
+        return 0;
+    };
+    // A same-type prvalue constructs this subobject directly. Lower its
+    // arguments here; the body walk still visits nested argument calls.
+    if let [value] = values {
+        if value.cached_kind() == "call_expression" {
+            if let Some(function) = value.cached_field("function") {
+                let name = normalize_qualified(node_text(source, &function));
+                if lookup_var_node(program, ctx, source, function).is_none()
+                    && constructed_class(program, ctx, &name)
+                        .is_some_and(|class| receiver_lookup_name(&class) == target)
+                {
+                    if let Some(arguments) = value.cached_field("arguments") {
+                        ctx.handled_constructor_exprs
+                            .borrow_mut()
+                            .insert(value.id());
+                        let nested: Vec<_> =
+                            arguments.named_children(&mut arguments.walk()).collect();
+                        lower_class_initializer(
+                            program,
+                            ctx,
+                            source,
+                            object,
+                            target,
+                            &nested,
+                            false,
+                            false,
+                            span,
+                            expansion_span,
+                            seen,
+                        );
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+    let copies_class = values.len() == 1 && {
+        let value = peel_casts(source, values[0]);
+        names_class(
+            &arg_expr_type(program, ctx, source, value),
+            target,
+            resolve_expr_var(program, ctx, source, value)
+                .is_some_and(|var| ctx.address_references.contains(&var)),
+        )
+    };
+    if !copies_class
+        && (braced || ctx.cpp_standard >= 202002)
+        && initializer_is_aggregate(program, ctx, target)
+    {
+        return lower_aggregate_subobjects(
+            program,
+            ctx,
+            source,
+            object,
+            target,
+            values,
+            elide,
+            span,
+            expansion_span,
+            seen,
+        );
+    }
+    let kind = trace_ir::MethodKind::Ctor;
+    let own = program.symbols.functions_named(&kind.name_on(target));
+    if copies_class {
+        let own_known = !own.is_empty()
+            || program.types.copy_constructor(target) == Some(false)
+            || program.types.is_struct_defined(target)
+                && !program.types.has_user_provided_constructor(target);
+        if own_known
+            && !own
+                .iter()
+                .any(|&f| user_provided(program, f) && takes_own_class(program, f, target))
+        {
+            let args = collect_call_arg_nodes(
+                program,
+                ctx,
+                source,
+                values.iter().map(|value| peel_casts(source, *value)),
+            );
+            lower_implicit_copy_subobjects(
+                program,
+                ctx,
+                object,
+                target,
+                &args,
+                span,
+                expansion_span,
+                seen,
+            );
+            return values.len();
+        }
+    }
+    let mut constructors = Vec::new();
+    if values.is_empty() {
+        constructors = lifecycle_members(program, ctx, target, &kind);
+        let own_default = constructors.iter().any(|(class, _)| class == target);
+        let default_possible = own.is_empty()
+            && (!program.types.has_declared_constructor(target)
+                || program.types.default_constructor(target) == Some(false))
+            || own.iter().any(|&f| {
+                !user_provided(program, f)
+                    && method_explicit_arity(program, f)
+                        .is_none_or(|arity| arity_takes(program.symbols.function(f), arity, 0))
+            });
+        if !own_default && default_possible && program.types.is_struct_defined(target) {
+            return lower_aggregate_subobjects(
+                program,
+                ctx,
+                source,
+                object,
+                target,
+                &[],
+                false,
+                span,
+                expansion_span,
+                seen,
+            );
+        }
+    } else {
+        initializer_constructors(
+            program,
+            ctx,
+            source,
+            target,
+            values,
+            &mut Vec::new(),
+            &mut constructors,
+        );
+    }
+    if constructors.is_empty() && !program.types.is_struct_defined(target) {
+        constructors.push((target.to_owned(), Vec::new()));
+    }
+    if constructors.is_empty() {
+        return values.len();
+    }
+    let mut call_args = collect_call_arg_nodes(
+        program,
+        ctx,
+        source,
+        values.iter().map(|value| peel_casts(source, *value)),
+    );
+    // Rank across own and inherited candidates before separating declaring classes.
+    let candidates: Vec<_> = constructors
+        .iter()
+        .flat_map(|(_, targets)| targets.iter().copied())
+        .filter(|&ctor| constructor_reference_viable(program, ctx, source, ctor, values))
+        .collect();
+    let selected = narrow_overloads(
+        program,
+        filter_targets_by_argc(
+            program,
+            candidates,
+            call_args.argc as usize,
+            &call_args.arg_desc,
+            true,
+        ),
+        &call_args.arg_desc,
+        &call_args.null_constants,
+        OverloadChoice::Edges,
+    );
+    let last = constructors.len() - 1;
+    for (index, (class, mut targets)) in constructors.into_iter().enumerate() {
+        let unresolved = targets.is_empty();
+        targets.retain(|target| selected.contains(target));
+        if !unresolved && targets.is_empty() {
+            continue;
+        }
+        emit_member_targets(
+            program,
+            caller,
+            &class,
+            &kind,
+            object.address,
+            call_args.take_for(index == last),
+            span,
+            expansion_span,
+            targets,
+            None,
+        );
+        if class != target {
+            lower_inherited_subobjects(
+                program,
+                ctx,
+                source,
+                object,
+                target,
+                &class,
+                span,
+                expansion_span,
+                seen,
+            );
+        }
+    }
+    values.len()
+}
+
+fn initializer_subobjects(
+    program: &mut Program,
+    ctx: &LowerContext,
+    object: &InitializedObject,
+    target: &str,
+    span: Span,
+) -> Vec<InitializedObject> {
+    let mut elements: Vec<_> = program
+        .bases_of(target)
+        .into_iter()
+        .map(|base| InitializedObject {
+            desc: Arc::new(TypeDesc::Struct {
+                name: base,
+                fields: Vec::new(),
+            }),
+            address: object.address,
+            parent: None,
+            member: None,
+        })
+        .collect();
+    if let Some(tid) = program.types.class_type_id(target) {
+        let fields: Vec<_> = program
+            .types
+            .get(tid)
+            .layout
+            .fields
+            .iter()
+            .map(|(&fid, field)| (fid, field.clone()))
+            .collect();
+        for (fid, field) in fields {
+            elements.push(initializer_field(
+                program, ctx, object, target, fid, &field, span,
+            ));
+        }
+    }
+    // Only the active union member is initialized.
+    if matches!(object.desc.as_ref(), TypeDesc::Union { .. }) {
+        elements.truncate(1);
+    }
+    elements
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_inherited_subobjects(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    object: &InitializedObject,
+    target: &str,
+    constructed_base: &str,
+    span: Span,
+    expansion_span: Option<Span>,
+    seen: &mut Vec<String>,
+) {
+    if seen.iter().any(|class| class == target) {
+        return;
+    }
+    seen.push(target.to_owned());
+    for element in initializer_subobjects(program, ctx, object, target, span) {
+        if element.member.is_none() {
+            if let Some(base) = class_of_desc(element.desc.as_ref()) {
+                if base == constructed_base {
+                    continue;
+                }
+                if program.derives_from(&base, constructed_base) {
+                    lower_inherited_subobjects(
+                        program,
+                        ctx,
+                        source,
+                        &element,
+                        &base,
+                        constructed_base,
+                        span,
+                        expansion_span,
+                        seen,
+                    );
+                    continue;
+                }
+            }
+        }
+        lower_initializer_clause(
+            program,
+            ctx,
+            source,
+            &element,
+            &[],
+            false,
+            span,
+            expansion_span,
+            seen,
+        );
+    }
+    seen.pop();
+}
+
+/// An unresolved extent can end at any remaining clause boundary. Explicit
+/// nested braces delimit that subobject independently of its extent.
+fn array_has_unknown_extent(desc: &TypeDesc) -> bool {
+    matches!(desc, TypeDesc::Array { elem, size } if size.is_none() || array_has_unknown_extent(elem))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_aggregate_subobjects(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    object: &InitializedObject,
+    target: &str,
+    values: &[Node],
+    elide: bool,
+    span: Span,
+    expansion_span: Option<Span>,
+    seen: &mut Vec<String>,
+) -> usize {
+    if seen.iter().any(|class| class == target) {
+        return 0;
+    }
+    seen.push(target.to_owned());
+    let elements = initializer_subobjects(program, ctx, object, target, span);
+    let mut positions = vec![0];
+    for element in elements {
+        let mut next = Vec::new();
+        for position in positions {
+            let remaining = &values[position.min(values.len())..];
+            let consumed = lower_initializer_clause(
+                program,
+                ctx,
+                source,
+                &element,
+                remaining,
+                elide,
+                span,
+                expansion_span,
+                seen,
+            );
+            let end = (position + consumed).min(values.len());
+            if !next.contains(&end) {
+                next.push(end);
+            }
+            if elide
+                && array_has_unknown_extent(element.desc.as_ref())
+                && remaining.first().is_some_and(|value| {
+                    value.cached_kind() != "initializer_list"
+                        && string_literal_value(source, *value).is_none()
+                })
+            {
+                for boundary in position..=values.len() {
+                    if !next.contains(&boundary) {
+                        next.push(boundary);
+                    }
+                }
+            }
+        }
+        // Positions govern source traversal order, not the order a hash set fills.
+        next.sort_unstable();
+        positions = next;
+    }
+    seen.pop();
+    positions.into_iter().max().unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_implicit_copy_subobjects(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    object: &InitializedObject,
+    target: &str,
+    args: &CallArgs,
+    span: Span,
+    expansion_span: Option<Span>,
+    seen: &mut Vec<String>,
+) {
+    if seen.iter().any(|class| class == target) {
+        return;
+    }
+    seen.push(target.to_owned());
+    for base in program.bases_of(target) {
+        let subobject = InitializedObject {
+            desc: Arc::new(TypeDesc::Struct {
+                name: base.clone(),
+                fields: Vec::new(),
+            }),
+            address: object.address,
+            parent: None,
+            member: None,
+        };
+        lower_copy_subobject(
+            program,
+            ctx,
+            &subobject,
+            &base,
+            args,
+            span,
+            expansion_span,
+            seen,
+        );
+    }
+    if let Some(tid) = program.types.class_type_id(target) {
+        let fields: Vec<_> = program
+            .types
+            .get(tid)
+            .layout
+            .fields
+            .iter()
+            .map(|(&fid, field)| (fid, field.clone()))
+            .collect();
+        for (fid, field) in fields {
+            if program.types.field_is_reference(target, &field.name) {
+                continue;
+            }
+            let element = initializer_field(program, ctx, object, target, fid, &field, span);
+            let desc = peel_arrays(element.desc.as_ref()).0;
+            if let Some(class) = initialized_class(program, desc) {
+                let mut subargs = args.clone();
+                if let Some((_, source)) = subargs.var_args.first_mut() {
+                    let source_object = InitializedObject {
+                        desc: Arc::clone(&object.desc),
+                        address: Some(*source),
+                        parent: None,
+                        member: None,
+                    };
+                    *source =
+                        initializer_field(program, ctx, &source_object, target, fid, &field, span)
+                            .address
+                            .unwrap();
+                }
+                lower_copy_subobject(
+                    program,
+                    ctx,
+                    &element,
+                    &receiver_lookup_name(&class),
+                    &subargs,
+                    span,
+                    expansion_span,
+                    seen,
+                );
+            }
+        }
+    }
+    seen.pop();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_copy_subobject(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    object: &InitializedObject,
+    target: &str,
+    args: &CallArgs,
+    span: Span,
+    expansion_span: Option<Span>,
+    seen: &mut Vec<String>,
+) {
+    let kind = trace_ir::MethodKind::Ctor;
+    let targets = program.symbols.functions_named(&kind.name_on(target));
+    let copies: Vec<_> = targets
+        .iter()
+        .copied()
+        .filter(|&f| user_provided(program, f) && takes_own_class(program, f, target))
+        .collect();
+    if !copies.is_empty()
+        || program.types.copy_constructor(target) == Some(true)
+        || !program.types.is_struct_defined(target)
+    {
+        let mut args = args.clone();
+        let desc = TypeDesc::Struct {
+            name: target.to_owned(),
+            fields: Vec::new(),
+        };
+        args.arg_desc = vec![TypeDesc::Ptr(Box::new(desc))];
+        args.address_reference_args = vec![0];
+        if let Some(caller) = ctx.current_fn {
+            emit_member_targets(
+                program,
+                caller,
+                target,
+                &kind,
+                object.address,
+                args,
+                span,
+                expansion_span,
+                copies,
+                None,
+            );
+        }
+    } else {
+        lower_implicit_copy_subobjects(
+            program,
+            ctx,
+            object,
+            target,
+            args,
+            span,
+            expansion_span,
+            seen,
+        );
+    }
+}
+
+/// Retain only mappings in this expression, in output order. Symbol-free
+/// origin paths and the declaration's lexical scope survive header imports.
+fn note_member_initializer(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    class: &str,
+    field: &str,
+    value: Node,
+) {
+    let start = value.start_byte();
+    let end = value.end_byte();
+    let mut origins = Vec::new();
+    if let Some(map) = ctx.line_map.as_ref().filter(|map| !map.entries.is_empty()) {
+        for entry in map
+            .entries
+            .iter()
+            .skip_while(|entry| (entry.output_offset as usize) < start)
+            .take_while(|entry| (entry.output_offset as usize) < end)
+        {
+            origins.push(trace_ir::InitializerOrigin {
+                offset: entry.output_offset - start as u32,
+                file: Arc::new(map.files[entry.file as usize].clone()),
+                line: entry.line,
+                col: entry.col,
+                expansion: map.expansion_path_of(entry).map(|path| {
+                    (
+                        Arc::new(path.to_path_buf()),
+                        entry.expansion_line,
+                        entry.expansion_col,
+                    )
+                }),
+                expansion_id: entry.expansion_id,
+                expansion_macro: map.expansion_macro_of(entry).map(Arc::from),
+            });
+        }
+    } else {
+        // Raw inputs have no LineMap; preserve every token's original offset.
+        let row = value.start_position().row as u32 + 1;
+        let column = value.start_position().column as u32 + 1;
+        let mut line = row;
+        let mut col = column;
+        for (offset, c) in source[value.byte_range()].char_indices() {
+            origins.push(trace_ir::InitializerOrigin {
+                offset: offset as u32,
+                file: Arc::new(ctx.primary_path.clone()),
+                line,
+                col,
+                expansion: None,
+                expansion_id: 0,
+                expansion_macro: None,
+            });
+            if c == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+    }
+    program.types.note_member_initializer(
+        class,
+        field,
+        trace_ir::MemberInitializer {
+            expression: Arc::from(node_text(source, &value)),
+            origins,
+            namespaces: ctx.ns_stack.clone(),
+            using_namespaces: ctx.using_nss.clone(),
+            using_names: ctx
+                .using_name_imports
+                .iter()
+                .filter(|import| import.scope != ImportScope::Body)
+                .map(|import| trace_ir::InitializerImport {
+                    name: import.base.clone(),
+                    candidates: import.candidates.clone(),
+                    file_scope: import.scope == ImportScope::File,
+                })
+                .collect(),
+            type_scope: ctx.type_scope.borrow().clone(),
+        },
+    );
+}
+
+/// Instantiate an omitted member's declaration expression in its lexical
+/// scope, with its containing object as this. Keep the enclosing caller and
+/// origin ownership while isolating syntax-node caches and caller locals.
+fn lower_default_member_initializer(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    object: &InitializedObject,
+    seen: &mut Vec<String>,
+) -> bool {
+    let Some((class, field)) = object.member.as_ref() else {
+        return false;
+    };
+    let initializers = program.types.member_initializers(class, field).to_vec();
+    let mut lowered = false;
+    for initializer in initializers {
+        lowered |=
+            lower_member_initializer_expression(program, ctx, object, class, &initializer, seen);
+    }
+    lowered
+}
+
+fn lower_member_initializer_expression(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    object: &InitializedObject,
+    class: &str,
+    initializer: &trace_ir::MemberInitializer,
+    seen: &mut Vec<String>,
+) -> bool {
+    const PREFIX: &str = "void __trace_init() { auto value = ";
+    let source: Arc<str> = format!("{PREFIX}{}; }}", initializer.expression).into();
+    let Ok(parsed) =
+        crate::parse::parse_source_with_lang(Arc::clone(&source), crate::parse::SourceLang::Cpp)
+    else {
+        return false;
+    };
+    let tree = Arc::new(parsed.tree);
+    let Some(value) = find_initializer_value(tree.root_node()) else {
+        return false;
+    };
+    let mut map = trace_preproc::LineMap::new();
+    for origin in &initializer.origins {
+        let file = map.intern_file(&origin.file);
+        let expansion_file = origin
+            .expansion
+            .as_ref()
+            .map_or(u32::MAX, |(path, _, _)| map.intern_file(path));
+        let (expansion_line, expansion_col) = origin
+            .expansion
+            .as_ref()
+            .map_or((0, 0), |(_, line, col)| (*line, *col));
+        let expansion_macro = origin
+            .expansion_macro
+            .as_ref()
+            .map_or(u32::MAX, |name| map.intern_macro(name));
+        map.push_expansion(
+            PREFIX.len() + origin.offset as usize,
+            file,
+            origin.line,
+            origin.col,
+            expansion_file,
+            expansion_line,
+            expansion_col,
+            origin.expansion_id,
+            expansion_macro,
+        );
+    }
+    let saved_map = ctx.line_map.replace(Arc::new(map));
+    let saved_files = std::mem::replace(
+        &mut ctx.origin_file_ids,
+        vec![Cell::new(None); ctx.line_map.as_ref().unwrap().files.len()],
+    );
+    let saved_tree = ctx.tree.replace(tree.clone());
+    let saved_locals = std::mem::take(&mut ctx.locals);
+    let saved_aliases = std::mem::take(&mut ctx.local_aliases);
+    let saved_imports = std::mem::replace(
+        &mut ctx.using_name_imports,
+        initializer
+            .using_names
+            .iter()
+            .map(|import| UsingImport {
+                base: import.name.clone(),
+                candidates: import.candidates.clone(),
+                scope: if import.file_scope {
+                    ImportScope::File
+                } else {
+                    ImportScope::Namespace
+                },
+            })
+            .collect(),
+    );
+    // A member's address is a GEP on its containing object.
+    let parent = object.parent;
+    if let Some(parent) = parent {
+        ctx.locals.insert("this".into(), parent);
+    }
+    let saved_class = ctx.class_ctx.replace(ClassCtx {
+        qual_name: class.to_owned(),
+    });
+    let saved_ns = std::mem::replace(&mut ctx.ns_stack, initializer.namespaces.clone());
+    let saved_using = std::mem::replace(&mut ctx.using_nss, initializer.using_namespaces.clone());
+    let saved_scope = ctx.type_scope.replace(initializer.type_scope.clone());
+    let saved_loads = ctx.callee_load_cache.take();
+    let saved_receivers = ctx.call_receiver_cache.take();
+    let saved_returns = ctx.call_return_dst.take();
+    let saved_news = ctx.handled_new_exprs.take();
+    let saved_constructors = ctx.handled_constructor_exprs.take();
+    let values: Vec<_> = if value.cached_kind() == "initializer_list" {
+        value.named_children(&mut value.walk()).collect()
+    } else {
+        vec![value]
+    };
+    let braced = value.cached_kind() == "initializer_list";
+    let first_site = program.symbols.call_sites.len();
+    let span = node_call_span(program, ctx, value);
+    let expansion = node_expansion_span(program, ctx, value);
+    lower_initializer_object(
+        program, ctx, &source, object, &values, braced, braced, span, expansion, seen,
+    );
+    // Nested calls in a default expression belong to the constructing caller.
+    if let Some(caller) = ctx.current_fn {
+        walk_function_body(program, ctx, &source, value, caller);
+    }
+    let expression = operation_expression(ctx, &source, value);
+    record_call_expressions(program, first_site, &expression);
+    ctx.callee_load_cache.replace(saved_loads);
+    ctx.call_receiver_cache.replace(saved_receivers);
+    ctx.call_return_dst.replace(saved_returns);
+    ctx.handled_new_exprs.replace(saved_news);
+    ctx.handled_constructor_exprs.replace(saved_constructors);
+    ctx.type_scope.replace(saved_scope);
+    ctx.using_nss = saved_using;
+    ctx.ns_stack = saved_ns;
+    ctx.class_ctx = saved_class;
+    ctx.locals = saved_locals;
+    ctx.local_aliases = saved_aliases;
+    ctx.using_name_imports = saved_imports;
+    ctx.tree = saved_tree;
+    ctx.origin_file_ids = saved_files;
+    ctx.line_map = saved_map;
+    true
+}
+
+fn find_initializer_value(node: Node) -> Option<Node> {
+    if node.cached_kind() == "init_declarator" {
+        return node.cached_field("value");
+    }
+    for child in node.named_children(&mut node.walk()) {
+        if let Some(value) = find_initializer_value(child) {
+            return Some(value);
+        }
+    }
+    None
+}
+
 /// Constructor member-initializer lists: `Derived() : Base(1, 2), sub_(3) {}`.
-/// A name matching a direct base constructs that base; a data member of an
-/// indexed class type is constructed; any other member initialized from one
-/// expression stores it, as `this->m = v` does ([`store_member_initializer`]).
+/// Default construction follows automatic-object lifecycle lookup; explicit
+/// construction finds own or explicitly imported constructors. References bind
+/// without construction; non-class members store their value.
 fn lower_field_initializer_list(
     program: &mut Program,
     ctx: &mut LowerContext,
     source: &str,
     node: Node,
-    caller: FnId,
 ) {
     let Some(cc) = ctx.class_ctx.clone() else {
         return;
@@ -11801,55 +13379,91 @@ fn lower_field_initializer_list(
         if fi.cached_kind() != "field_initializer" {
             continue;
         }
-        let Some(name_node) = fi
-            .children(&mut fi.walk())
-            .find(|c| matches!(c.cached_kind(), "field_identifier" | "identifier"))
-        else {
+        let Some(name_node) = fi.children(&mut fi.walk()).find(|c| {
+            matches!(
+                c.cached_kind(),
+                "field_identifier"
+                    | "identifier"
+                    | "qualified_identifier"
+                    | "type_identifier"
+                    | "template_type"
+            )
+        }) else {
             continue;
         };
         let fname = normalize_qualified(node_text(source, &name_node));
-        // The class a base or member initializer constructs, and whether the
-        // member is an array of it, at any depth.
-        let target_cls: Option<(String, bool)> = bases
+        // Bind a reference before considering the referent's constructors.
+        // Non-class references still take the value-store path below.
+        let reference = program.types.field_is_reference(&cls, &fname);
+        let span = node_call_span(program, ctx, fi);
+        let expansion_span = node_expansion_span(program, ctx, fi);
+        let target = bases
             .iter()
-            .find(|b| last_segment_of(b) == fname)
-            .map(|b| (b.clone(), false))
+            .find(|b| {
+                receiver_lookup_name(b) == fname
+                    || !fname.contains("::") && last_segment_of(b) == fname
+            })
+            .map(|base| InitializedObject {
+                desc: Arc::new(TypeDesc::Struct {
+                    name: base.clone(),
+                    fields: Vec::new(),
+                }),
+                address: ctx.locals.get("this").copied(),
+                parent: None,
+                member: None,
+            })
             .or_else(|| {
                 let fid = cls_type?;
-                let info = program.types.get(fid);
-                let (_, fl) = info.layout.fields.iter().find(|(_, f)| f.name == fname)?;
-                let (desc, array) = peel_arrays(program.types.get(fl.type_id).desc.as_ref());
-                initialized_class(program, desc).map(|name| (name, array))
+                let field = program
+                    .types
+                    .get(fid)
+                    .layout
+                    .fields
+                    .iter()
+                    .find(|(_, field)| field.name == fname)
+                    .map(|(&id, field)| (id, field.clone()))?;
+                let desc = program.types.get(field.1.type_id).desc.as_ref();
+                if !matches!(desc, TypeDesc::Array { .. })
+                    && initialized_class(program, desc).is_none()
+                {
+                    return None;
+                }
+                let object = InitializedObject {
+                    desc: Arc::clone(&program.types.get(fid).desc),
+                    address: ctx.locals.get("this").copied(),
+                    parent: None,
+                    member: None,
+                };
+                Some(initializer_field(
+                    program, ctx, &object, &cls, field.0, &field.1, span,
+                ))
             });
-        // `Base(a)` and `m_(a)` hold an argument list, `Base{a}` and
-        // `m_{a}` an initializer list; either way `this` is not in it.
         let args = fi
             .children(&mut fi.walk())
             .find(|c| matches!(c.cached_kind(), "argument_list" | "initializer_list"));
-        let Some((target, array)) = target_cls else {
+        let Some(target) = target else {
             store_member_initializer(program, ctx, source, fi, &fname, args);
             continue;
         };
-        // A member array's list initializes its elements one by one: an
-        // empty one default-constructs them, and listed elements are
-        // expressions of their own, never one constructor's arguments.
-        if array && args.is_some_and(|list| list.named_child_count() > 0) {
+        if reference && initialized_class(program, target.desc.as_ref()).is_some() {
             continue;
         }
-        let span = node_call_span(program, ctx, fi);
-        let expansion_span = node_expansion_span(program, ctx, fi);
+        let values: Vec<_> = args
+            .map(|list| list.named_children(&mut list.walk()).collect())
+            .unwrap_or_default();
+        let braced = args.is_some_and(|list| list.cached_kind() == "initializer_list");
         let first_site = program.symbols.call_sites.len();
-        let call_args = collect_call_args(program, ctx, source, args);
-        emit_member_sites(
+        lower_initializer_object(
             program,
-            caller,
+            ctx,
+            source,
             &target,
-            &trace_ir::MethodKind::Ctor,
-            None,
-            call_args,
+            &values,
+            braced,
+            braced,
             span,
             expansion_span,
-            None,
+            &mut Vec::new(),
         );
         let expression = operation_expression(ctx, source, fi);
         record_call_expressions(program, first_site, &expression);
@@ -16079,13 +17693,130 @@ fn find_function_declarator(node: Node) -> Option<Node> {
     None
 }
 
-fn type_desc_from_field_declaration(
+/// The C++ grammar reads `T (value);` as a function declaration without a
+/// return type. Inside another class, a known class type and one bare name
+/// identify a parenthesized data member, not a method or constructor.
+fn parenthesized_data_member(
     program: &mut Program,
     ctx: &LowerContext,
     source: &str,
     node: Node,
 ) -> Option<(String, TypeDesc)> {
+    if node.cached_kind() != "declaration" || node.cached_field("type").is_some() {
+        return None;
+    }
     let decl = node.cached_field("declarator")?;
+    if decl.cached_kind() != "function_declarator" {
+        return None;
+    }
+    let ty = decl.cached_field("declarator")?;
+    let class = declared_tag_in_scope(program, ctx, &normalize_qualified(node_text(source, &ty)))?;
+    if ctx.type_scope.borrow().last() == Some(&class) {
+        return None;
+    }
+    let params = decl.cached_field("parameters")?;
+    if params.named_child_count() != 1 {
+        return None;
+    }
+    let param = params.named_child(0)?;
+    if param.cached_kind() != "parameter_declaration" || param.cached_field("declarator").is_some()
+    {
+        return None;
+    }
+    let name = param.cached_field("type")?;
+    if name.cached_kind() != "type_identifier" {
+        return None;
+    }
+    Some((
+        node_text(source, &name).to_owned(),
+        type_desc_from_node(program, ctx, source, ty),
+    ))
+}
+
+fn declaration_is_constant(source: &str, node: Node) -> bool {
+    node.children(&mut node.walk())
+        .any(|child| matches!(node_text(source, &child), "const" | "constexpr"))
+}
+
+/// Bounded integer folding for array extents. Unknown names and unsupported
+/// expressions stay unknown; they are never substituted with zero.
+fn integer_constant_expression(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+    depth: usize,
+) -> Option<i128> {
+    if depth >= 64 {
+        return None;
+    }
+    let eval = |node| integer_constant_expression(program, ctx, source, node, depth + 1);
+    match node.cached_kind() {
+        "number_literal" => {
+            let text = node_text(source, &node).replace('\'', "");
+            let text = text.trim_end_matches(['u', 'U', 'l', 'L']);
+            let (digits, radix) = if let Some(digits) =
+                text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"))
+            {
+                (digits, 16)
+            } else if let Some(digits) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B"))
+            {
+                (digits, 2)
+            } else if text.len() > 1 && text.starts_with('0') {
+                (&text[1..], 8)
+            } else {
+                (text, 10)
+            };
+            i128::from_str_radix(digits, radix).ok()
+        }
+        "identifier" | "qualified_identifier" => {
+            let name = normalize_qualified(node_text(source, &node));
+            if ctx.current_fn.is_some() && ctx.locals.contains_key(&name) {
+                return None;
+            }
+            find_in_scope(program, ctx, &name, |name, _| {
+                program.types.integer_constant(name)
+            })
+            .flatten()
+        }
+        "parenthesized_expression" => eval(node.named_child(0)?),
+        "unary_expression" => {
+            let value = eval(node.cached_field("argument")?)?;
+            match node_text(source, &node.cached_field("operator")?) {
+                "+" => Some(value),
+                "-" => value.checked_neg(),
+                "~" => Some(!value),
+                _ => None,
+            }
+        }
+        "binary_expression" => {
+            let lhs = eval(node.cached_field("left")?)?;
+            let rhs = eval(node.cached_field("right")?)?;
+            match node_text(source, &node.cached_field("operator")?) {
+                "+" => lhs.checked_add(rhs),
+                "-" => lhs.checked_sub(rhs),
+                "*" => lhs.checked_mul(rhs),
+                "/" => lhs.checked_div(rhs),
+                "%" => lhs.checked_rem(rhs),
+                "<<" => lhs.checked_shl(u32::try_from(rhs).ok()?),
+                ">>" => lhs.checked_shr(u32::try_from(rhs).ok()?),
+                "&" => Some(lhs & rhs),
+                "|" => Some(lhs | rhs),
+                "^" => Some(lhs ^ rhs),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn type_desc_from_field_declarator(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+    decl: Node,
+) -> Option<(String, TypeDesc)> {
     let inner_decl = if decl.cached_kind() == "init_declarator" {
         decl.cached_field("declarator").unwrap_or(decl)
     } else {
@@ -16137,21 +17868,34 @@ fn type_desc_from_field_declaration(
     // cell, so `*h->arr` is `h->arr[0]` (docs/ANALYSIS.md, "Dereferenced
     // operands"). Tables of functions stay function-pointer typed.
     let mut innermost = decl;
-    while let Some(inner) = match innermost.cached_kind() {
-        "parenthesized_declarator" => innermost.named_child(0),
-        _ => innermost.cached_field("declarator"),
-    }
-    .filter(|inner| inner.cached_kind().ends_with("_declarator"))
-    {
+    let mut dimensions = Vec::new();
+    loop {
+        if innermost.cached_kind() == "array_declarator" {
+            let size = innermost
+                .cached_field("size")
+                .and_then(|node| integer_constant_expression(program, ctx, source, node, 0))
+                .and_then(|value| u64::try_from(value).ok());
+            dimensions.push(size);
+        }
+        let inner = match innermost.cached_kind() {
+            "parenthesized_declarator" => innermost.named_child(0),
+            _ => innermost.cached_field("declarator"),
+        }
+        .filter(|inner| inner.cached_kind().ends_with("_declarator"));
+        let Some(inner) = inner else {
+            break;
+        };
         innermost = inner;
     }
-    let desc = match desc {
-        TypeDesc::FnPtr { .. } => desc,
-        elem if innermost.cached_kind() == "array_declarator" => TypeDesc::Array {
-            elem: Box::new(elem),
-            size: None,
-        },
-        desc => desc,
+    let desc = if innermost.cached_kind() == "array_declarator" {
+        dimensions
+            .into_iter()
+            .fold(desc, |elem, size| TypeDesc::Array {
+                elem: Box::new(elem),
+                size,
+            })
+    } else {
+        desc
     };
     Some((fname, desc))
 }
@@ -16177,6 +17921,7 @@ fn declarator_is_pointer_to_fn(decl: Node) -> bool {
 }
 
 fn declarator_is_pointer(decl: Node) -> bool {
+    let decl = ungroup_declarator(decl);
     match decl.cached_kind() {
         "pointer_declarator" => true,
         "function_declarator" | "parenthesized_declarator" | "array_declarator" => decl
@@ -18313,6 +20058,7 @@ mod index_window_tests {
         std::fs::write(&path, source).unwrap();
         let graph = IncludeGraph::build(dir.path(), std::slice::from_ref(&path), &[]);
         let pre = PreprocessedSource {
+            cpp_standard: 201703,
             text: source.into(),
             line_map: Default::default(),
             included_headers: Default::default(),
@@ -18563,6 +20309,7 @@ mod index_window_tests {
         std::fs::write(&path, source).unwrap();
         let graph = IncludeGraph::build(dir.path(), std::slice::from_ref(&path), &[]);
         let pre = PreprocessedSource {
+            cpp_standard: 201703,
             text: source.into(),
             line_map: Default::default(),
             included_headers: Default::default(),
@@ -19522,7 +21269,9 @@ mod qualified_variable_lookup_tests {
             type_scope: RefCell::new(Vec::new()),
             local_aliases: Vec::new(),
             is_cpp: true,
+            cpp_standard: 201703,
             handled_new_exprs: RefCell::new(HashSet::default()),
+            handled_constructor_exprs: RefCell::new(HashSet::default()),
             callee_load_cache: RefCell::new(HashMap::default()),
             call_receiver_cache: RefCell::new(HashMap::default()),
             call_return_dst: RefCell::new(HashMap::default()),
@@ -19531,6 +21280,7 @@ mod qualified_variable_lookup_tests {
             ast_depth: 0,
             ast_depth_warned: false,
             reference_vars: HashSet::default(),
+            const_variables: HashSet::default(),
             reference_bindings: HashSet::default(),
             address_references: HashSet::default(),
             reference_returns: HashSet::default(),

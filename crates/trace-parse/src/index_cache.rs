@@ -30,6 +30,7 @@ pub struct PreprocessedSource {
     /// The language this text was lexed as; `replayed_variants` indexes the
     /// variant list for this language only.
     pub language: Language,
+    pub cpp_standard: u32,
     /// Header → indices of the cached expansions this run replayed for it
     /// (see `trace_preproc::ExpansionVariants`). A header here contributed
     /// no text to `text`, so its declarations must be merged from the units
@@ -667,6 +668,7 @@ impl PreprocessedSource {
             inlined_headers: Arc::clone(&expansion.inlined),
             replayed_variants: Arc::new(group_variants(expansion.nested_variants.iter().cloned())),
             language,
+            cpp_standard: expansion.cpp_standard,
             diagnostics: expansion.diagnostics.as_ref().to_vec(),
             conditionals: Vec::new(),
         }
@@ -700,6 +702,7 @@ impl PreprocessedSource {
             inlined_headers: Arc::default(),
             replayed_variants: Arc::new(HashMap::default()),
             language: Language::C,
+            cpp_standard: 201703,
             diagnostics: Vec::new(),
             conditionals: Vec::new(),
         }
@@ -748,6 +751,7 @@ fn read_index_source(
         inlined_headers: preproc_result.inlined_headers.into(),
         replayed_variants: Arc::new(group_variants(preproc_result.replayed_variants)),
         language: preproc_result.language,
+        cpp_standard: preproc_result.cpp_standard,
         diagnostics: preproc_result.diagnostics,
         conditionals: preproc_result.conditionals,
     };
