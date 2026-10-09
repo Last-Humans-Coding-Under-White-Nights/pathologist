@@ -4,6 +4,86 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Value slice with execution-context hints (#205)
+
+`trace inspect <DB> slice --file F --line N --col C` walks from a variable or
+field access back to its sources (allocations, address-of, globals, entry
+parameters), then forward from each source to its sinks, within
+`--up-depth` / `--down-depth`. Each node lists the execution contexts that
+reach it, and an edge is flagged cross-context when different contexts, or one
+self-concurrent context, touch the same memory. Output is text or JSON (spans,
+context labels, flags), and both state their limits: scalar values are not
+tracked and a flag is a hint, not a proven race. A new `flow_memory_access`
+table (additive to v7) joins each load and store to the memory cells the
+solver resolved for it, or marks it as recorded without cells (past the
+16-cell cap, or pointing at no memory); its sites are the load's or store's
+`flow_origins` rows, and `flow_edges` keeps only constraint edges, so
+`inspect dataflow` and the C API are unchanged. A
+call through a pointer field reads the field at that call, and `flow_origins`
+now also records the operations of a `return` statement and a `new`
+expression's allocation. The slice reads every position from `flow_origins`,
+attributes a statement in a lambda task's body to the lambda (so to the
+task's context), requires `flow_memory_access` and refuses `trace-merge`
+output. `--file` in inspect lookups now matches a literal substring (`%` and
+`_` are no longer wildcards). Rules:
+[Value slice](docs/ANALYSIS.md#value-slice-inspect-slice) and
+[Memory access edges](docs/ANALYSIS.md#memory-access-edges); measurements and
+the camera CVE retro-test (`scripts/cve_slice_retro.py`) in
+`docs/EVAL_REPORT.md` ("Value slice: #205").
+
+### OpenHarmony task and thread primitives (#203)
+
+Callback models for `ffrt::submit` / `submit_h` and the C forms, the
+`EventHandler::PostTask` family, `ThreadPool::AddTask`,
+`Utils::Timer::Register`, `HdfWorkInit` / `HdfDelayedWorkInit`,
+`OsalTimerCreate`, `std::async` and `std::jthread`, and entry models for
+overrides of `Thread::Run`, `EventHandler::ProcessEvent` and
+`DeathRecipient::OnRemoteDied`. One resolver now serves every model effect: it
+matches qualified names, requalified names, classes the unit never declares
+and subclasses, so a plain `PostTask` model no longer matches every class's
+`PostTask`. A `std::stop_token` or launch policy taken by reference
+(`const std::stop_token &`, `const std::launch &`) counts as one. Member call
+sites record their receiver variable, and
+`execution_contexts` gains the nullable `receiver_var_id` and `model` columns
+(additive to v7; `trace-merge` carries `model`, NULL from an input whose table
+predates it, and leaves the receiver NULL).
+Rules: [Model matching](docs/ANALYSIS.md#model-matching) and "Built-in models";
+measurements in `docs/EVAL_REPORT.md` ("Task and thread primitives: #203").
+
+### Execution contexts: thread, task and IPC entries (#202)
+
+A new `execution_contexts` table lists where code starts running on a thread,
+a task queue or the IPC worker pool: one row per resolved callback of an
+`invoke` model (`pthread_create`, `std::thread`, ...) and one per IPC stub
+handler. Each row has a kind (`thread`, `pool_task`, `serial_task`,
+`ipc_handler`, `unknown`), multi-instance evidence (`loop`, `cycle`, `parent`,
+`unknown`) and a self-concurrent flag; an `invoke` model states its kind with
+`context`. The table is an additive v7 table (no schema version change), and
+`call_edges` is unchanged. `trace-merge` carries the rows into merged
+databases, validates the table's columns when an input has it, and names an
+input without it in a `MissingExecutionContexts` diagnostic. Rules:
+[Execution contexts](docs/ANALYSIS.md#execution-contexts); merge behaviour:
+[Merger inputs and output](docs/SQLITE_SCHEMA.md#merger-inputs-and-output);
+measurements in `docs/EVAL_REPORT.md` ("Execution contexts: #202").
+
+### Source locations of flow edges (#204)
+
+Where a value moves is recorded in `flow_origins`, the single source for
+operation sites; `flow_edges` and the schema (v7) are unchanged. Fixture tests
+now pin its contract for `addr_of`, `copy`, `load`, `store` and `gep` edges:
+the original-file position (a macro's outermost invocation, a header body's
+header), one row per statement (shared header bodies and `--explore` variants
+included), no rows for solver- and export-derived edges, the enclosing function
+as the innermost definition whose line range holds the site, and identical rows
+for every `--jobs`. When several definitions hold a line, the innermost owns it
+if the line is strictly inside it (not its first or last line); a line held by
+a single definition is that definition's, its first and last lines included;
+otherwise none. A statement on its own line in a lambda body or a local
+class's method is now that definition's, in `inspect dataflow` edge scopes as
+well; before, any site two definitions held had none. Rules:
+[Where a value moves](docs/ANALYSIS.md#where-a-value-moves); query:
+[Source sites of a value move](docs/SQLITE_SCHEMA.md#source-sites-of-a-value-move).
+
 ### Member initializers avoid invented constructor edges (#207)
 
 Reference bindings such as `ref_(object)` no longer record constructor calls.

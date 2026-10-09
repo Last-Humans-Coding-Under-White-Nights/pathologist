@@ -1018,6 +1018,27 @@ impl Program {
             .map(|&i| self.inheritance[i].1.as_str())
     }
 
+    /// `cls` plus every class it transitively derives from, nearest first
+    /// (BFS in declaration order), each once with its inheritance distance
+    /// from `cls` (0 for `cls`): the inheritance graph may hold a cycle
+    /// ([`Self::add_inheritance`]).
+    pub fn ancestor_closure<'a>(&'a self, cls: &'a str) -> Vec<(&'a str, usize)> {
+        let mut out = vec![(cls, 0)];
+        let mut seen: FxHashSet<&str> = FxHashSet::default();
+        seen.insert(cls);
+        let mut i = 0;
+        while i < out.len() {
+            let (class, depth) = out[i];
+            for base in self.base_names(class) {
+                if seen.insert(base) {
+                    out.push((base, depth + 1));
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
     /// `root` plus every class transitively deriving from it (BFS).
     pub fn subclass_closure(&self, root: &str) -> Vec<String> {
         let mut out = vec![root.to_string()];
@@ -1166,9 +1187,11 @@ mod tests {
             span: Span::new(FileId(0), 1, 2),
             expansion_span: None,
             is_direct: false,
+            in_loop: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
+            receiver: None,
             tu: None,
         }
     }

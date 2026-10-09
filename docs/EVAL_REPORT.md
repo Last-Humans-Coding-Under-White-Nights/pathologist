@@ -1,5 +1,379 @@
 # Evaluation Report
 
+## Value slice: #205 — 2026-10-09
+
+`trace inspect slice` walks from a variable or field access up to the
+value's sources and down to its sinks, with the execution contexts (#202)
+that reach each node and a cross-context flag on edges where the value may
+change hands between threads, tasks or IPC requests. Rules:
+[Value slice](ANALYSIS.md#value-slice-inspect-slice); CLI:
+[README.md](../README.md#trace-inspect-slice). The export adds a
+`flow_memory_access` table, the cells each load and store reaches read off
+the converged points-to sets (or a cell-less row when none is recorded), a
+call through a pointer field (`cb_->OnError()`) records a read of the field,
+and `flow_origins` now also records a `return` statement's operations and a
+`new` expression's allocation; a memory access's sites are its load's or
+store's `flow_origins` rows, and `flow_edges` keeps its four columns and its
+constraint kinds ([Memory access edges](ANALYSIS.md#memory-access-edges),
+schema v7).
+Fixture: `tests/fixtures/value_slice/`.
+
+Measured on macOS 27.0.1, Apple M1, release build, `--jobs 8`,
+`TRACE_SOLVE_BUDGET_POPS=800000`, the pinned clean corpora of
+`scripts/eval_expected.json`. Baseline is `f53fa1d` (#203, the commit this
+change follows); each binary is built from a clean archive of its commit in
+its own target directory.
+
+| Corpus | Export | Database, baseline → candidate | Change |
+|---|---|---:|---:|
+| HDF | minimal | 54,124,544 → 55,906,304 B | +1.70 MiB (+3.3%) |
+| HDF | `--full-export` | 57,065,472 → 58,851,328 B | +1.70 MiB (+3.1%) |
+| hiview | minimal | 27,295,744 → 28,192,768 B | +0.86 MiB (+3.3%) |
+| hiview | `--full-export` | 29,245,440 → 30,167,040 B | +0.88 MiB (+3.2%) |
+| camera | minimal | 72,421,376 → 80,580,608 B | +7.78 MiB (+11.3%) |
+| camera | `--full-export` | 77,103,104 → 85,364,736 B | +7.88 MiB (+10.7%) |
+
+| Corpus | `flow_edges` rows | `flow_memory_access` rows: cells (read as `mem_read` / `mem_write` edges) | without a cell | `load` edges (field-receiver reads) | `flow_origins` rows | `variables` rows |
+|---|---:|---:|---:|---:|---:|---:|
+| HDF | 154,298 → 156,079 | 30,399 (19,912 / 10,487) | 651 | 9,801 → 10,411 | 79,748 → 82,922 | 130,143 → 132,028 |
+| hiview | 58,970 → 60,811 | 6,843 (3,253 / 3,590) | 223 | 2,400 → 3,060 | 25,860 → 28,737 | 85,164 → 87,027 |
+| camera | 131,110 → 154,992 | 21,664 (14,814 / 6,850) | 774 | 3,508 → 14,841 | 48,919 → 75,906 | 180,637 → 210,857 |
+
+The memory accesses first shipped as `mem_read` / `mem_write` rows of
+`flow_edges`, each repeating its load's or store's `flow_origins` rows (19–27%
+of `flow_origins`); as one `flow_memory_access` table naming the load or store
+they take 1.05–3.74 MiB less (HDF 59,719,680, hiview 29,171,712, camera
+82,976,768 B minimal before), with the same memory edges, every other table
+identical, and every `inspect slice` and `inspect dataflow` output unchanged
+(the fixtures' identifier positions, the slice sample below and the camera
+retro-test). Of the accesses with cells, 4 (HDF), 74 (hiview) and 125
+(camera) belong to a load or store without a `flow_origins` row (a model's
+`content_store`, or an operation lowering records no site for). The
+constraint origins grow (HDF 79,748 → 82,922, hiview 25,860 → 28,737,
+camera 48,919 → 75,906):
+the receiver reads' `gep` and `load`, the operations of `return` statements,
+and the allocation of each `new` (77, 987 and 2,561 `addr_of` rows from a
+heap object). `flow_return_calls` gains the rows of calls written in a
+`return` statement, which now have origins (HDF 10,063 → 10,460, hiview
+1,483 → 1,484, camera 3,615 → 3,618). `functions`, `files`, `diagnostics`,
+`flow_call_origins` and `flow_call_expressions` are identical to the
+baseline; `call_edges`, `call_sites`, `arg_flow_edges`,
+`execution_contexts` and `flow_parameters` hold the same rows up to the
+numbering of temporaries, which the new receiver temporaries shift, so
+`scripts/eval_check.py` passes its 104 checks with the expectations
+unchanged. The analyze phase took about the same time on both binaries
+(HDF 1.1 → 1.2 s, hiview 0.1 s, camera 0.2 s); export took 0.1 s more (HDF
+0.7 → 0.8 s, hiview 0.3 → 0.4 s, camera 1.1 → 1.2 s); peak footprint, one
+run each, HDF 205.6 → 208.5 MB, hiview 69.6 → 73.5 MB, camera 179.1 → 183.3
+MB. Every table,
+`flow_origins`, `flow_edges` and `flow_memory_access` included, holds the same
+rows at `--jobs 1` and `--jobs 8` on all three corpora.
+
+The 16-cell fan-out cap keeps accesses through generic pointers, whose
+points-to sets reach many unrelated objects, out of the graph; reading a
+field receiver at every call is most of camera's growth (11,333 reads), and
+a slice can start at any of them. **Decision: exported in every mode**,
+since `inspect` reads the default database.
+
+### Slice sizes per corpus
+
+40 starts per corpus, a deterministic sample (every k-th, by name) of the
+struct and class fields some store writes outside test directories, each
+sliced from its first store (`flow_origins` position) with the default
+depths (6 and 6): `python3 scripts/slice_sizes.py <db> --sample 40`. Times
+are per CLI run, opening the database included. Every slice of the sample
+has the same node, edge, cross-context and context counts as before a site
+in a lambda body was attributed to the lambda
+([Where a value moves](ANALYSIS.md#where-a-value-moves)). Since an entry no
+call site starts (an IPC stub handler, a framework entry) is reached by its
+own contexts only ([Contexts](ANALYSIS.md#contexts)), the same slices have
+the same nodes, edges and flags, and fewer contexts where an IPC handler or
+task called such an entry directly: hiview median 2 → 1.5, camera p90 39 →
+11 and max 230 → 144 (an edge touching memory of a self-concurrent handler
+keeps its flag, now for `self_concurrent` alone); HDF is unchanged.
+
+| Corpus | Written fields | Nodes (median / p90 / max) | Edges | Cross-context edges | Contexts | With a flag | Truncated | Time (median / max) |
+|---|---:|---|---|---|---|---:|---:|---|
+| HDF | 2,174 | 12.5 / 135 / 1,258 | 17 / 178 / 1,674 | 4.5 / 74 / 165 | 21 / 43 / 65 | 26 | 7 | 0.04 / 0.10 s |
+| hiview | 1,809 | 9 / 81 / 113 | 8.5 / 84 / 117 | 0 / 5 / 17 | 1.5 / 9 / 23 | 17 | 2 | 0.03 / 0.03 s |
+| camera | 2,391 | 5.5 / 17 / 588 | 6 / 20 / 789 | 0 / 7 / 46 | 1 / 11 / 144 | 17 | 1 | 0.05 / 0.07 s |
+
+A slice edge is one `flow_edges` row at one of its sites, so an edge
+written at many statements counts once per statement. HDF's largest sampled
+slice, `TimerManager.device` (`timer_core.c:582`, truncated), stores the
+device object every driver's `Bind` hands on and has 1,442 such edges over
+1,258 nodes; HDF's sample changed with the field count (2,160 → 2,174, from
+reading a pointer field at every call and the rebase onto master), so its
+row describes different fields than before. camera's largest
+(`CameraServerPhotoProxy.displayName_`, 144 contexts) passes through the
+photo-proxy code that most IPC handlers reach. A context count of 1 is
+mostly `root` alone. `nullptr`, one node for the whole program, is a `null`
+source that stage 2 does not walk on from
+([Stage 1](ANALYSIS.md#stage-1-up-sources)); followed, it joined every null
+assignment of camera (about 1,600 nodes per slice in the retro-test below).
+
+### Camera race-fix retro-test
+
+The three camera fixes of #197 section 4.4, re-run from their history:
+`python3 scripts/cve_slice_retro.py`, inputs in
+`scripts/cve_slice_retro.json` (the pre-fix revision is the merge's first
+parent, the post-fix one the merge; the blob hashes of each patched file are
+checked before analysing). Each start is the member the fix guarded, at the
+store the patch locked. The script passes on both trees with the inputs
+unchanged (re-run on the final binary with a fresh `--work` directory).
+
+| Fix | Pre-fix tree | Member | Write (function, line) | Read (function, line) | Flagged |
+|---|---|---|---|---|---|
+| CVE-2023-47857, PR 988 | `c863b1a8e` | `HCameraDevice::deviceSvcCallback_` | `SetCallback` 401 | `OnError` 460, `OnResult` 491 | all three |
+| CVE-2024-22180, PR 1179 | `5e682933f` | `CaptureSession::exposureCallback_` | `SetExposureCallback` 1001 | `ProcessAutoExposureUpdates` 1020 | both |
+| | | `CaptureSession::focusCallback_` | `SetFocusCallback` 1083 | `ProcessAutoFocusUpdates` 1417 | both |
+| | | `CaptureSession::appCallback_` | `SetCallback` 363 | `GetApplicationCallback` 385 | both |
+| | | `PreviewOutput::appCallback_` | `SetCallback` 164 | `GetApplicationCallback` 196 | both |
+| | | `VideoOutput::appCallback_` | `SetCallback` 84 | `GetApplicationCallback` 218 | both |
+| | | `CameraInput::errorCallback_` | `SetErrorCallback` 156 | `GetErrorCallback` 172 | both |
+| | | `PhotoOutput::appCallback_` | `SetCallback` 236 | `GetApplicationCallback` 263 | no |
+| | | `MetadataOutput::appStateCallback_` | `SetCallback` 115 | `MetadataObjectListener::OnBufferAvailable` 252 | no |
+| | | `CameraManager::cameraMngrCallback_` | `SetCallback` 592 | `GetApplicationCallback` 599 | no |
+| CVE-2026-68965, PR 4579 | `afd0a2ebf` | `HCameraDeviceManager::activeCameras_` | — | `SortDeviceByPriority` 585, `GetActiveCameraHolders` 168 | both |
+
+- **What the flags rest on.** The `exposureCallback_` slice is the race the
+  fix closed: the application's thread writes the member through the NAPI
+  `On` (`root`), and `ProcessAutoExposureUpdates` reads and calls through it
+  under `CameraDeviceServiceCallback::OnResult`, an IPC handler
+  (`contexts_differ`, `self_concurrent`). `focusCallback_` is the same; for
+  the getters (`return appCallback_;`), the read is at the `return`
+  statement's `flow_origins` position and is attributed to the handlers
+  that call the getter. The `deviceSvcCallback_` write in `SetCallback` is
+  attributed to `root` only (the stub's base comes from an IPC header outside
+  this tree), but the member is also cleared (`= nullptr`) in `Close`, which
+  six IPC handlers reach, so the write is flagged `contexts_differ`.
+- **Found but not flagged** (3 of the 9 members of PR 1179): the slice
+  shows the write and the read, but nothing attributes the read to a
+  context; both ends are `root`.
+- **The container** (`activeCameras_`, PR 4579): the slice shows the two
+  whole-vector reads, both flagged against the IPC handlers that reach them;
+  the element accesses through member calls (`.size()`, range-for,
+  `push_back`, `erase`) are not value flow
+  ([Limits](ANALYSIS.md#limits)), and the script records them as expected
+  misses.
+- **Slice sizes.** Each slice has 6–12 nodes (10 for `activeCameras_`);
+  against the earlier implementation they also show the null stores of
+  destructors and `Release` / `Close` (a `null` source and its temporary),
+  which the null-pointer node of the source-level presentation adds.
+- **After the fix** the slices are the same (lines shifted): the fixes add
+  locks, which the slice does not model, as its limits state.
+
+## Task and thread primitives: #203 — 2026-10-09
+
+OpenHarmony's task, handler, pool, timer and work-queue APIs are now
+`invoke` models, and three virtual members a framework runs are `entry`
+models whose overrides are execution contexts; the list and the kind each
+states are in [docs/ANALYSIS.md](ANALYSIS.md#built-in-models), how a member
+model meets a class the tree never declares or a subclass in
+[Model matching](ANALYSIS.md#model-matching). A member call site records
+the variable it is made on, exported as `execution_contexts.receiver_var_id`
+with the context's `model`: two nullable columns added to the table under
+the additive v7 contract
+([SQLITE_SCHEMA.md](SQLITE_SCHEMA.md#execution_contexts)). Fixture:
+`tests/fixtures/task_primitives/` (every primitive, undeclared as in the
+corpora, a bare `ThreadPool` in a nested namespace, a handler subclass,
+named and field receivers, and hiview-style declared classes named like the
+library's that must not match).
+
+Measured on macOS 27.0.1, Apple M1, release build, `--jobs 8`,
+`TRACE_SOLVE_BUDGET_POPS=800000`, the pinned clean corpora of
+`scripts/eval_expected.json` (HDF `cdc75a2`, hiview `92408e2`, camera
+`8ffd69d`). Baseline is `765d86a` (#202, the commit this change follows);
+each binary is built from a clean archive of its commit in its own target
+directory. Sizes are file sizes; the
+table size is the SQLite `dbstat` page total.
+
+| Corpus | Export | Database, baseline → candidate | Change |
+|---|---|---:|---:|
+| HDF | minimal | 54,116,352 → 54,124,544 B | +8 KiB (+0.015%) |
+| HDF | `--full-export` | 57,057,280 → 57,065,472 B | +8 KiB (+0.014%) |
+| hiview | minimal | 27,279,360 → 27,295,744 B | +16 KiB (+0.060%) |
+| hiview | `--full-export` | 29,229,056 → 29,245,440 B | +16 KiB (+0.056%) |
+| camera | minimal | 72,409,088 → 72,421,376 B | +12 KiB (+0.017%) |
+| camera | `--full-export` | 77,090,816 → 77,103,104 B | +12 KiB (+0.016%) |
+
+`execution_contexts` grows from 4 to 12 KiB (HDF, hiview) and from 32 to
+40 KiB (camera). Whole `trace analyze` runs took the same wall time on both
+binaries (HDF 4.7 / 4.7 s, hiview 1.8 / 1.8 s, camera 7.4 / 7.5 s, minimal
+export; recording the receiver at lowering costs nothing measurable), and
+`execution_contexts`, `call_edges`, `arg_flow_edges`, `flow_edges` and
+`flow_origins` are identical at `--jobs 1` and `--jobs 8`.
+
+| Corpus | Contexts, baseline → candidate | New rows by model | Start sites | Named receivers |
+|---|---:|---|---:|---:|
+| HDF | 40 → 83 | `HdfWorkInit` 18, `HdfDelayedWorkInit` 2, `OsalTimerCreate` 22, `OnRemoteDied` 1 | 2 → 44 | 1 |
+| hiview | 62 → 106 | `ffrt::submit` 36, `ffrt::submit_h` 1, `ffrt::queue::submit_h` 2, `OnRemoteDied` 5 | 17 → 56 | 6 |
+| camera | 735 → 821 | `EventHandler::PostTask` 70, `Utils::Timer::Register` 8, `OnRemoteDied` 8 | 17 → 88 | 13 |
+
+- **Edges.** Each new start is an indirect edge from the submitting site to
+  the callback, so `call_edges` gains exactly those rows (HDF +42, hiview
+  +39, camera +78, all `indirect`); HDF's work and timer models forward their
+  argument, which adds 42 `arg_flow_edges`, 42 `call_arg` flow edges and
+  their 42 `flow_calls` rows. Every other table holds the same rows,
+  `flow_origins` included (a forwarded argument is a derived edge with no
+  origin). Reading a `std::stop_token` or launch policy taken by reference
+  as one moves nothing here: no corpus calls `std::jthread` or `std::async`
+  at all. `scripts/eval_expected.json` is re-captured for these counts only;
+  it passes its 99 checks.
+- **hiview.** 37 of the 39 `ffrt::submit` / `submit_h` call sites are
+  contexts, and all 13 `ffrt::queue::submit` / `submit_h` ones. The two left
+  pass a `std::bind` result (`EventExportEngine::InitAndRunTasks`,
+  `UsageEventReport::RunTask`), which is not looked into (C4 in
+  [CPP_ROADMAP.md](CPP_ROADMAP.md)); the only C form, `ffrt_queue_submit` in
+  `TriggerExportEngine::StartTask`, passes
+  `ffrt::create_function_wrapper(taskFunc)`, whose return is not modelled
+  ([Documented imprecision](ANALYSIS.md#documented-imprecision)). The
+  submitted lambdas of `FaultLogDatabase::SaveFaultLogInfo` and the five
+  `PassthroughMonitor` handlers now have an edge from their submitter. The
+  six named receivers are `std::thread` objects; every queue is a field. No
+  hiview `EventHandler` subclass is taken for the eventhandler library's:
+  hiview declares its own `OHOS::HiviewDFX::EventHandler`.
+- **camera.** All 70 `PostTask` calls are contexts, on a handler held in a
+  field, so none records a receiver (the 13 named receivers are
+  `std::thread` objects). The 8 timer callbacks are submitted at one site,
+  the `Utils::Timer::Register` inside the `CameraTimer::Register` wrapper,
+  which collapses its callers' callbacks as `OsalThreadCreate` does HDF's;
+  the two other `Register` sites, in the `CameraCountingTimer` and `DpsTimer`
+  wrappers, are handed no function the analysis resolves. 46 `PostTask`
+  contexts are `parent`: their submitter is reachable from an IPC handler.
+- **HDF.** Each sensor, light, vibrator and test driver's work function and
+  timer is a context. Thirteen starts are made from functions on a cycle of
+  ordinary calls (twelve timers, most in `Set*Enable`, and the light
+  driver's work item), one work item in a loop (`EsdResInit`), so code they
+  reach is under a self-concurrent context: the wrapper `OsalThreadCreate`
+  is, which makes all 39 threads started at its `pthread_create` site
+  `parent`, where none had evidence before. That is the wrapper's collapse
+  documented in [Execution contexts](ANALYSIS.md#execution-contexts), now
+  with roots that reach it; 79 of 83 contexts are self-concurrent.
+- **Entries.** `OnRemoteDied` overrides are `ipc_handler` contexts: HDF 1,
+  hiview 5, camera 8, each a class deriving from
+  `IRemoteObject::DeathRecipient`. No corpus subclasses `OHOS::Thread` or
+  the library's `EventHandler`; the fixture covers both.
+
+## Execution contexts: #202 — 2026-10-09
+
+The new `execution_contexts` table lists where threads, tasks and IPC
+requests start running code: one row per resolved callback of an `invoke`
+model, then one per IPC stub handler, each with its kind and multi-instance
+evidence. The rules are in
+[docs/ANALYSIS.md](ANALYSIS.md#execution-contexts); the columns, and the
+table's place in the additive v7 contract, in
+[docs/SQLITE_SCHEMA.md](SQLITE_SCHEMA.md#execution_contexts). Fixture:
+`tests/fixtures/execution_contexts/` (`pthread_create`, `std::thread`,
+`ffrt::queue::submit`, user models with and without a `context`, an IPC
+proxy/stub pair, starts in a loop, under recursion, under a looping thread
+and under an IPC handler, and a start wrapper).
+
+Measured on macOS 27.0.1, Apple M1, release build, `--jobs 8`,
+`TRACE_SOLVE_BUDGET_POPS=800000`, the pinned clean corpora of
+`scripts/eval_expected.json` (HDF `cdc75a2`, hiview `92408e2`, camera
+`8ffd69d`). Baseline is `5011c5f` (#204, the commit this change follows);
+each binary is built from a clean archive of its commit in its own target
+directory. Sizes are file sizes; the table size is the SQLite `dbstat` page
+total.
+
+| Corpus | Export | Database, baseline → candidate | Change | `execution_contexts` |
+|---|---|---:|---:|---:|
+| HDF | minimal | 54,112,256 → 54,116,352 B | +4 KiB (+0.008%) | 40 rows, 4 KiB |
+| HDF | `--full-export` | 57,053,184 → 57,057,280 B | +4 KiB (+0.007%) | |
+| hiview | minimal | 27,275,264 → 27,279,360 B | +4 KiB (+0.015%) | 62 rows, 4 KiB |
+| hiview | `--full-export` | 29,224,960 → 29,229,056 B | +4 KiB (+0.014%) | |
+| camera | minimal | 72,376,320 → 72,409,088 B | +32 KiB (+0.045%) | 735 rows, 32 KiB |
+| camera | `--full-export` | 77,058,048 → 77,090,816 B | +32 KiB (+0.043%) | |
+
+Every other table, `flow_origins` and the other source-level presentation
+tables included, holds the same rows as the baseline on all three corpora
+(`call_edges` too: a context adds no edge). Whole `trace analyze` runs took
+the same wall time on both binaries (HDF 4.6 / 4.7 s, hiview 1.8 / 1.8 s,
+camera 7.3 / 7.4 s, minimal export), and every table, `execution_contexts`
+included, is identical at `--jobs 1` and `--jobs 8`.
+
+| Corpus | `thread` | `serial_task` | `ipc_handler` | Start sites | `loop` | `cycle` | `parent` | `self_concurrent` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| HDF | 40 | 0 | 0 | 2 | 0 | 0 | 0 | 0 |
+| hiview | 6 | 12 | 44 | 17 | 2 | 0 | 2 | 48 |
+| camera | 17 | 0 | 718 | 17 | 1 | 1 | 7 | 727 |
+
+- **HDF.** 39 of the 40 threads are started at one site, the
+  `pthread_create` in `OsalCreatePthread` under `OsalThreadCreate`; the
+  remaining one is a `std::thread`. Counting a cycle through start edges as
+  recursion would mark all 39 `cycle`: a thread started through the wrapper
+  calls the wrapper again, and the call graph cannot tell which entry that
+  call starts. Cycles are found over ordinary calls only, and none of HDF's
+  starts has evidence; the wrapper's collapsing of entries is described in
+  [Execution contexts](ANALYSIS.md#execution-contexts).
+- **hiview.** The 12 `serial_task` rows are `ffrt::queue::submit`; the
+  free `ffrt::submit` was not modelled yet, so most hiview tasks were
+  still missing (modelled since #203, see
+  [Task and thread primitives: #203](#task-and-thread-primitives-203--2026-10-09)). `loop`: a `std::thread` lambda started in a test loop and a
+  queued lambda in `RsFrameMonitor::VideoStop`. `parent`: two delay-check
+  threads in the video monitors, reached from the looping `VideoStop` task
+  and from the `XperfServiceServer::NotifyToXperf` IPC handler.
+- **camera.** IPC handlers outnumber thread starts 718 to 17.
+  `RotatePicture` is started in a loop in
+  `HStreamOperator::ProcessPhotoProxy`; the `MuxerFilter::DoStop` lambda is
+  started from a recursive function; the seven `parent` threads are all
+  started from code IPC handlers reach (for example
+  `SimpleTimer::InterruptableSleep`, started in `SimpleTimer::StartTask`).
+
+**Decision: stored in every export mode.** The table costs at most 32 KiB
+(0.045%) on these corpora, so it is written by the minimal export rather
+than computed at query time, as an additive v7 table. `trace-merge` carries
+the rows into a merged database with remapped ids. `scripts/eval_check.py`
+passes its 99 checks with the expectations unchanged.
+
+## Flow-edge source sites: #204 — 2026-10-09
+
+Where a value moves is recorded in `flow_origins`, which the source-level
+presentation (#196) already writes, so #204 adds no column and no row to the
+export: `flow_edges` keeps its four columns and one row per endpoint pair
+and kind ([Where a value moves](ANALYSIS.md#where-a-value-moves)). The
+enclosing function of a site is looked up at query time, now as the
+innermost definition holding the line. Fixture:
+`tests/fixtures/flow_origin_sites/`.
+
+Measured on macOS 27.0.1, Apple M1, release build, `--jobs 8`,
+`TRACE_SOLVE_BUDGET_POPS=800000`, the pinned clean corpora of
+`scripts/eval_expected.json` (HDF `cdc75a2`, hiview `92408e2`, camera
+`8ffd69d`). Baseline is `9dab736` (master, #196); each binary is built from
+a clean archive of its commit in its own target directory.
+
+| Corpus | Export | Database, baseline → candidate | Change |
+|---|---|---:|---:|
+| HDF | minimal | 54,112,256 → 54,112,256 B | 0 B |
+| HDF | `--full-export` | 57,053,184 → 57,053,184 B | 0 B |
+| hiview | minimal | 27,275,264 → 27,275,264 B | 0 B |
+| hiview | `--full-export` | 29,224,960 → 29,224,960 B | 0 B |
+| camera | minimal | 72,376,320 → 72,376,320 B | 0 B |
+| camera | `--full-export` | 77,058,048 → 77,058,048 B | 0 B |
+
+Every table holds the same rows as the baseline (`flow_edges` HDF 154,256,
+hiview 58,970, camera 131,110; `flow_origins` 79,748, 25,860 and 48,919),
+and `flow_edges`, `flow_origins` and `flow_nodes` are identical at `--jobs 1`
+and `--jobs 8`. The sites' cost is that of the #196 table they already live
+in: `flow_origins` takes 8,052,736 B (HDF), 2,953,216 B (hiview) and
+4,513,792 B (camera) of `dbstat` pages, against 3,436,544, 1,273,856 and
+2,899,968 B for `flow_edges`.
+
+| Corpus | `flow_origins` rows | With a function, line-range rule → innermost | Held by two or more definitions before | Of them, now resolved |
+|---|---:|---:|---:|---:|
+| HDF | 79,748 | 72,635 → 72,670 | 81 | 35 |
+| hiview | 25,860 | 22,730 → 22,998 | 558 | 268 |
+| camera | 48,919 | 45,764 → 47,089 | 1,705 | 1,325 |
+
+The rows still without a function are outside every definition (file-scope
+initializers) or on a line no single definition is innermost for (a
+one-line lambda, the line a lambda opens or closes on). The documented
+query ([Source sites of a value move](SQLITE_SCHEMA.md#source-sites-of-a-value-move))
+over every camera row takes 0.34 s against 0.14 s for the line-range rule
+alone (median of three); `inspect dataflow` and `inspect slice` resolve only
+the sites they show.
+
 ## Four constructor follow-up findings: #207 — 2026-10-09
 
 Fixed the four follow-up constructor findings on top of `b1e33ac`, with local
@@ -9660,7 +10034,11 @@ Same-class calls bind. Nested `EventStore::…`, `TriggerExportEngine`, `TimeUti
 | Dispatch site | 34 `ffrt::submit` sites (all external) |
 | Resolved targets | **0** |
 
-**Fail.** 357 `$lambda` functions exist; 7 have in-edges, none from `ffrt::submit`.
+**Fail** when recorded. Superseded: `ffrt::submit` and `submit_h` are
+`invoke` models since #203, and 37 of hiview's 39 `ffrt::submit` /
+`submit_h` calls (at `92408e2`) reach the submitted callable; see
+[Task and thread primitives: #203](#task-and-thread-primitives-203--2026-10-09).
+At recording time, 357 `$lambda` functions existed; 7 had in-edges, none from `ffrt::submit`.
 
 **Resolved function-pointer / virtual targets:** none.
 

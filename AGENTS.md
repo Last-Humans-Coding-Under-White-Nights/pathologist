@@ -145,6 +145,7 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 | Link targets / weak symbols | `link_commands.rs` (reading build metadata), `target_merge.rs` (per-image scopes and weak selection), `symbol.rs` (`TargetScope`) |
 | Fn-ptr arg-flow export | `solver.rs` (`extract_arg_flow`), `export.rs`, `arg_flow_edges.actual_fn_id` |
 | Flow-graph export / inspect queries | `export.rs` (`export_flow_graph`), `inspect.rs` |
+| Where a flow edge's operation is written (`flow_origins`; enclosing function as the innermost definition holding the line) | `trace-parse/src/lower.rs`, `flow_origins.rs`, `merge.rs`, `trace-db/src/export.rs` (`export_flow_provenance`), `inspect.rs` (`innermost_definition_holding`) → `docs/ANALYSIS.md` ("Where a value moves") |
 | Field summary / GEP fallback | `trace-analysis/src/pag.rs`, `solver.rs` |
 | New SQLite column | `trace-db/src/schema.rs`, `export.rs`, `docs/SQLITE_SCHEMA.md` |
 | Parse new C/C++ construct | `trace-parse/src/lower.rs` |
@@ -166,6 +167,9 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 | Parallel discovery pass (expansion-cache writes) | `trace-parse/src/expansion_discovery.rs`, `trace-preproc/src/journal.rs` → `docs/PREPROCESSOR.md` |
 | Compilation database (`--compile-commands`) | `trace-parse/src/compile_commands.rs`, `configured.rs`, `merge_unit_variants` → `docs/ANALYSIS.md` |
 | Function models / summaries | `trace-analysis/src/summaries.rs` (`FnModelSet`, `--models`) → `docs/ANALYSIS.md` |
+| Value slice with execution-context hints (`inspect slice`), memory access edges (`mem_read` / `mem_write`) | `trace-db/src/inspect/slice.rs` (`resolve_slice_start`, `value_slice`, `render_slice`), `trace-analysis/src/memory.rs` (`memory_accesses`), `trace-db/src/export.rs` (`export_flow_graph`, `export_memory_origins`), `trace-parse/src/lower.rs` (`read_field_receiver`) → `docs/ANALYSIS.md` ("Value slice", "Memory access edges") |
 | Callbacks a callee runs / thread entry points (`invoke`, `pthread_create`, `std::thread`) | `trace-analysis/src/summaries.rs` (`Effect::Invoke`, `InvokeArgs`), `solver.rs` (`wire_invocations`, `callback_edges`) → `docs/ANALYSIS.md` ("Callback invocation") |
+| Execution contexts (thread/task starts, IPC handlers, multi-instance evidence; `execution_contexts` table) | `trace-analysis/src/contexts.rs`, `summaries.rs` (`ContextKind`), `solver.rs` (`callback_edges`), `trace-parse/src/lower.rs` (`repeats_in_loop`, `CallSite::in_loop`), `trace-db/src/export.rs`, `trace-merge` → `docs/ANALYSIS.md` ("Execution contexts") |
+| OpenHarmony task/thread primitives (`ffrt::submit`, `PostTask`, `ThreadPool`, timers, HDF work), framework entries (`Thread::Run`, `ProcessEvent`, `OnRemoteDied`), qualified model matching, the receiver a task is queued on | `trace-analysis/src/summaries.rs` (`builtin`, `ModelLookup`: `lookup`, `model`, `entry`; `class_may_be`), `contexts.rs` (`framework_entries`), `trace-parse/src/lower.rs` (`Receiver`, `CallSite::receiver`) → `docs/ANALYSIS.md` ("Model matching", "Built-in models", "Execution contexts") |
 | Noise macro filtering (`--ignore-macro`, `--ignore-logging`) | `trace-preproc/src/line_map.rs`, `trace-parse/src/lower.rs`, `trace-analysis/src/summaries.rs` → `docs/ANALYSIS.md` |
 | Builtin fallback macros | `trace-preproc/src/preprocessor.rs`, `tests/fixtures/builtin_macros/` → `docs/PREPROCESSOR.md` |

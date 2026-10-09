@@ -247,3 +247,114 @@ fn content_store_model_writes_values_present_before_wiring() {
         );
     }
 }
+
+/// Argument and return models match the callee's exact name only
+/// (`docs/ANALYSIS.md`, "Model matching"): the libc `memset`, `memcpy` and
+/// `malloc` models do not reach a class's or namespace's own `memset`,
+/// `memcpy` or `malloc`, defined in the tree or not, while the plain,
+/// `::`- and `std::`-qualified calls keep them.
+#[test]
+fn libc_models_skip_same_named_members() {
+    let dir = scratch(&[(
+        "main.cpp",
+        r#"
+typedef unsigned long size_t;
+extern "C" void *memset(void *s, int c, size_t n);
+extern "C" void *memcpy(void *d, const void *s, size_t n);
+extern "C" void *malloc(size_t n);
+typedef int (*op_t)(int);
+static int impl_a(int x) { return x; }
+static int impl_b(int x) { return x; }
+op_t g_member_cleared;
+struct SecureBuffer {
+    void *memset(void *p, int c, size_t n);
+    void wipe() { memset(&g_member_cleared, 0, sizeof(op_t)); }
+};
+void *SecureBuffer::memset(void *p, int c, size_t n) { return p; }
+struct Pool {
+    void *memcpy(op_t *d, op_t *s, size_t n);
+    int copy() {
+        op_t src = impl_a;
+        op_t dst = 0;
+        memcpy(&dst, &src, sizeof(op_t));
+        return dst(1);
+    }
+};
+void *Pool::memcpy(op_t *d, op_t *s, size_t n) { return d; }
+struct Arena { void *malloc(size_t n); };
+op_t g_plain_cleared;
+void plain_clear(void) { memset(&g_plain_cleared, 0, sizeof(op_t)); }
+int plain_copy(void) {
+    op_t src = impl_b;
+    op_t dst = 0;
+    memcpy(&dst, &src, sizeof(op_t));
+    return dst(2);
+}
+void *member_alloc(Arena &arena) { void *p = arena.malloc(8); return p; }
+void *plain_alloc(void) { void *q = malloc(8); return q; }
+void *global_alloc(void) { void *r = ::malloc(8); return r; }
+namespace secure { void *memset(void *p, int c, size_t n) { return p; } }
+op_t g_ns_cleared;
+void ns_clear(void) { secure::memset(&g_ns_cleared, 0, sizeof(op_t)); }
+namespace std { using ::memset; }
+op_t g_std_cleared;
+void std_clear(void) { std::memset(&g_std_cleared, 0, sizeof(op_t)); }
+"#,
+    )]);
+    let program = build_program(dir.path(), &default_opts(dir.path())).expect("build");
+    let (pag, analysis) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+
+    let cleared_in: Vec<String> = analysis
+        .terminator_events
+        .iter()
+        .map(|(cs, _)| {
+            let site = program
+                .symbols
+                .call_sites
+                .iter()
+                .find(|s| s.id == *cs)
+                .expect("terminator call site");
+            fn_name(&program, site.caller)
+        })
+        .collect();
+    assert_eq!(
+        cleared_in,
+        ["plain_clear", "std_clear"],
+        "only libc memset clears"
+    );
+
+    assert!(
+        indirect_targets(&program, &analysis, "plain_copy").contains(&"impl_b".to_string()),
+        "libc memcpy copies the function pointer"
+    );
+    assert!(
+        !indirect_targets(&program, &analysis, "Pool::copy").contains(&"impl_a".to_string()),
+        "Pool::memcpy is not libc memcpy"
+    );
+
+    let points_to_heap = |function: &str, var: &str| {
+        let var = local_variable(&program, function, var);
+        pag.var_node
+            .get(&var)
+            .and_then(|n| analysis.points_to.get(n))
+            .is_some_and(|pts| {
+                pts.iter()
+                    .any(|l| pag.locations[l.0 as usize].kind == trace_analysis::LocKind::Heap)
+            })
+    };
+    assert!(points_to_heap("plain_alloc", "q"), "libc malloc allocates");
+    assert!(
+        points_to_heap("global_alloc", "r"),
+        "::malloc is libc malloc"
+    );
+    assert!(
+        !points_to_heap("member_alloc", "p"),
+        "Arena::malloc is not libc malloc"
+    );
+}

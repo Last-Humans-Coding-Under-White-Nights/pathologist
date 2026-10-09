@@ -190,6 +190,38 @@ enum InspectCommands {
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
     },
+    /// Two-stage value slice from a variable or field access at
+    /// FILE:LINE:COL, annotated with execution contexts.
+    ///
+    /// Stage 1 follows value flow backwards to the value's sources
+    /// (allocations, addresses, globals, entry parameters); stage 2 follows
+    /// it forwards from each source to its sinks. Edges where the value may
+    /// change hands between threads, tasks or IPC requests are flagged as
+    /// cross-context: a hint, not a proven race.
+    Slice {
+        /// File path substring (e.g. basename) locating the expression.
+        #[arg(long)]
+        file: String,
+        /// Line of the variable or field access.
+        #[arg(long)]
+        line: i64,
+        /// Column inside the identifier (1-based).
+        #[arg(long)]
+        col: i64,
+        /// The identifier at the position, when the source file the database
+        /// records cannot be read from here.
+        #[arg(long)]
+        name: Option<String>,
+        /// Stage 1 depth limit (edges followed backwards from the start).
+        #[arg(long = "up-depth", default_value_t = trace_db::SliceOptions::default().up_depth)]
+        up_depth: u32,
+        /// Stage 2 depth limit (edges followed forwards from each source).
+        #[arg(long = "down-depth", default_value_t = trace_db::SliceOptions::default().down_depth)]
+        down_depth: u32,
+        /// Output format: `text` (for people) or `json` (for tools).
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
     /// Call chains (paths) between two functions no longer than depth.
     #[command(alias = "chains")]
     Callchain {
@@ -779,9 +811,7 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             trace_db::require_source_dataflow_metadata(&conn)?;
             let cands = trace_db::require_symbols_at(&conn, &file, line, col)?;
             let best = &cands[0];
-            let exact = best.line == line
-                && col >= best.col
-                && col < best.col.saturating_add(best.name.chars().count() as i64);
+            let exact = best.covers(line, col);
             if !exact && cands.len() == 1 {
                 eprintln!(
                     "note: no declaration exactly at {file}:{line}:{col}; using {} [var#{}]",
@@ -849,6 +879,26 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             };
             let out = trace_db::render_dataflow(&graph, format.to_render(), &meta);
             print!("{out}");
+        }
+        InspectCommands::Slice {
+            file,
+            line,
+            col,
+            name,
+            up_depth,
+            down_depth,
+            format,
+        } => {
+            let start = trace_db::resolve_slice_start(&conn, &file, line, col, name.as_deref())?;
+            let slice = trace_db::value_slice(
+                &conn,
+                &start,
+                &trace_db::SliceOptions {
+                    up_depth,
+                    down_depth,
+                },
+            )?;
+            print!("{}", trace_db::render_slice(&slice, format.to_render())?);
         }
         InspectCommands::Callchain {
             from,

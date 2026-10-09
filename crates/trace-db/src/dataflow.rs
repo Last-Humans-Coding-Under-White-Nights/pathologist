@@ -18,7 +18,7 @@ pub struct FlowSite {
     pub col: i64,
 }
 impl FlowSite {
-    fn display(&self) -> String {
+    pub(crate) fn display(&self) -> String {
         if self.line == 0 {
             return String::new();
         }
@@ -181,8 +181,10 @@ fn operation(kind: &str) -> &str {
     }
 }
 
-/// Require an analysis export with the structures used by the source-level view.
-pub fn require_source_dataflow_metadata(conn: &Connection) -> Result<()> {
+/// Whether `conn` is a `trace-merge` output (`analysis_run.options_json.stage
+/// = "merge"`): its flow tables exist but hold no PAG flow graph or
+/// provenance (`docs/SQLITE_SCHEMA.md`, "Version and capability contract").
+pub(crate) fn is_merge_output(conn: &Connection) -> Result<bool> {
     // Legacy/scratch databases may have no run metadata; retain their
     // actionable structural diagnostics instead of failing on this query.
     let options: Option<String> =
@@ -196,16 +198,24 @@ pub fn require_source_dataflow_metadata(conn: &Connection) -> Result<()> {
         } else {
             None
         };
-    if let Some(options) = options {
-        let metadata: serde_json::Value = serde_json::from_str(&options)?;
-        if metadata["stage"] == "merge" {
-            bail!(
-                "source-level dataflow is unavailable in trace-merge output: the merger \
-                 preserves call graphs but does not merge PAG flow graphs or provenance; \
-                 inspect an original trace analyze database, or run trace analyze on \
-                 the combined source tree to obtain a database supporting dataflow"
-            );
+    Ok(match options {
+        Some(options) => {
+            let metadata: serde_json::Value = serde_json::from_str(&options)?;
+            metadata["stage"] == "merge"
         }
+        None => false,
+    })
+}
+
+/// Require an analysis export with the structures used by the source-level view.
+pub fn require_source_dataflow_metadata(conn: &Connection) -> Result<()> {
+    if is_merge_output(conn)? {
+        bail!(
+            "source-level dataflow is unavailable in trace-merge output: the merger \
+             preserves call graphs but does not merge PAG flow graphs or provenance; \
+             inspect an original trace analyze database, or run trace analyze on \
+             the combined source tree to obtain a database supporting dataflow"
+        );
     }
     crate::inspect::require_synthetic_metadata(conn)?;
     let has_metadata: bool = conn.query_row(

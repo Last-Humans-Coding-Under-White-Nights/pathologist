@@ -5,6 +5,7 @@ use rustc_hash::FxHashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use trace_analysis::{AnalysisResult, ConstraintKind, LocKind, Pag, PagNodeKind};
+use trace_ir::PagNodeId;
 use trace_ir::{FnId, Linkage, Program, StorageClass, TypeDesc, VarId};
 
 const INDIRECT_RETURN_CALLEES_SQL: &str = "SELECT DISTINCT e.callee_fn_id
@@ -107,6 +108,7 @@ pub fn export_to_sqlite(
             export_flow_and_arg_flow_vars(&conn, program, pag, analysis)?;
         }
         export_arg_flow(&conn, analysis)?;
+        export_execution_contexts(&conn, analysis)?;
         export_flow_graph(&conn, program, pag, analysis)?;
         if opts.include_points_to {
             export_points_to(&conn, pag, analysis)?;
@@ -288,6 +290,13 @@ fn export_flow_and_arg_flow_vars(
         }
         needed.insert(edge.formal);
     }
+    // The queue, handler or pool a context was submitted on.
+    needed.extend(
+        analysis
+            .execution_contexts
+            .iter()
+            .filter_map(|c| c.start.as_ref()?.receiver),
+    );
     // The flow graph must be self-contained for inspect queries: every
     // variable with a PAG node is exported, not just arg-flow participants.
     for node in &pag.nodes {
@@ -346,18 +355,7 @@ fn export_flow_graph(
             ),
             PagNodeKind::Loc(loc_id) => {
                 let loc = &pag.locations[loc_id.0 as usize];
-                let kind_str = match loc.kind {
-                    LocKind::Global => "global",
-                    LocKind::FileStatic => "file_static",
-                    LocKind::FnStatic => "fn_static",
-                    LocKind::Local => "local",
-                    LocKind::Heap => "heap",
-                    LocKind::Field => "field",
-                    LocKind::FieldSummary => "field_summary",
-                    LocKind::ArraySummary => "array_summary",
-                    LocKind::Function => "function",
-                    LocKind::StringLit => "string_lit",
-                };
+                let kind_str = crate::inspect::loc_kind_schema_str(loc.kind);
                 let label = match (loc.kind, loc.var) {
                     (LocKind::Function, _) => format!("fn:{}", loc.desc),
                     (LocKind::StringLit, _) => format!("string:{}", loc.desc),
@@ -541,6 +539,47 @@ fn export_flow_graph(
     for (i, (src, dst, kind)) in edge_rows.iter().enumerate() {
         edges.execute(params![i as i64 + 1, src, dst, kind])?;
     }
+    export_memory_accesses(conn, pag, analysis, &edge_rows)
+}
+
+/// The `flow_memory_access` rows: per load or store, by its `flow_edges` id
+/// (its rank in `edge_rows`, which is sorted), each cell it reads or writes,
+/// or one cell-less row when none is recorded (docs/ANALYSIS.md, "Memory
+/// access edges").
+fn export_memory_accesses(
+    conn: &Connection,
+    pag: &Pag,
+    analysis: &AnalysisResult,
+    edge_rows: &[(u32, u32, &'static str)],
+) -> Result<()> {
+    let mut rows: Vec<(i64, Option<u32>)> = Vec::with_capacity(analysis.memory_accesses.len());
+    for access in &analysis.memory_accesses {
+        let c = &pag.constraints[access.constraint.index()];
+        let kind = match c.kind {
+            ConstraintKind::Load => "load",
+            ConstraintKind::Store => "store",
+            _ => continue,
+        };
+        let Ok(rank) = edge_rows.binary_search(&(c.src.0, c.dst.0, kind)) else {
+            continue;
+        };
+        let cell = access
+            .loc
+            .and_then(|loc| pag.loc_node.get(&loc))
+            .map(|n| n.0);
+        rows.push((rank as i64 + 1, cell));
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    let mut insert = conn.prepare_cached("INSERT INTO flow_memory_access VALUES (?1, ?2)")?;
+    for (i, &(edge, cell)) in rows.iter().enumerate() {
+        // A cell-less row sorts first; an access with a recorded cell keeps
+        // only its cells.
+        if cell.is_none() && rows.get(i + 1).is_some_and(|&(next, _)| next == edge) {
+            continue;
+        }
+        insert.execute(params![edge, cell])?;
+    }
     Ok(())
 }
 
@@ -582,6 +621,20 @@ fn export_flow_provenance(
             }
         }
     }
+    // The heap object a `new` allocates into `dst`: the source of the
+    // `addr_of` the PAG built for its `NewHeap` fact, which the fact itself
+    // does not name.
+    let new_heap = |dst: &PagNodeId| -> Option<&PagNodeId> {
+        pag.indices.addr_of_dst.get(dst)?.iter().find_map(|&i| {
+            let src = &pag.constraints[i].src;
+            match pag.nodes[src.0 as usize].kind {
+                PagNodeKind::Loc(loc) if pag.locations[loc.0 as usize].kind == LocKind::Heap => {
+                    Some(src)
+                }
+                _ => None,
+            }
+        })
+    };
     for flow in &unique_flows {
         use trace_ir::FlowConstraint as F;
         let Some(sites) = program.flow_origins.get(*flow) else {
@@ -608,6 +661,7 @@ fn export_flow_provenance(
                 "addr_of",
             ),
             F::NullPointer { .. } => (pag.null_node.as_ref(), "copy"),
+            F::NewHeap { .. } => (new_heap(d), "addr_of"),
             F::StringConst { value, .. } => (
                 pag.string_locs.get(value).and_then(|l| pag.loc_node.get(l)),
                 "addr_of",
@@ -616,6 +670,11 @@ fn export_flow_provenance(
         };
         let Some(s) = src else {
             continue;
+        };
+        let operation = if kind == "store" && field_destinations.contains(&dst) {
+            "write field"
+        } else {
+            kind
         };
         for (span, expression) in sites {
             origins.execute(params![
@@ -626,11 +685,7 @@ fn export_flow_provenance(
                 span.line,
                 span.col,
                 expression.as_ref(),
-                if kind == "store" && field_destinations.contains(&dst) {
-                    "write field"
-                } else {
-                    kind
-                }
+                operation
             ])?;
         }
     }
@@ -982,6 +1037,32 @@ fn export_arg_flow(conn: &Connection, analysis: &AnalysisResult) -> Result<()> {
             edge.actual_var.map(|v| v.0),
             edge.actual_fn.map(|f| f.0),
             edge.formal.0
+        ])?;
+    }
+    Ok(())
+}
+
+/// One row per execution context, in the analysis' order (see
+/// `docs/SQLITE_SCHEMA.md`, `execution_contexts`).
+fn export_execution_contexts(conn: &Connection, analysis: &AnalysisResult) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO execution_contexts (id, kind, entry_fn_id, call_site_id, api_fn_id, \
+         param_index, receiver_var_id, model, multi_instance, self_concurrent) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?;
+    for (i, context) in analysis.execution_contexts.iter().enumerate() {
+        let start = context.start.as_ref();
+        stmt.execute(params![
+            i as i64 + 1,
+            context.kind.as_str(),
+            context.entry.0,
+            start.map(|s| s.call_site.0),
+            start.map(|s| s.api.0),
+            start.map(|s| s.param),
+            start.and_then(|s| s.receiver).map(|v| v.0),
+            context.model.as_deref(),
+            context.multi_instance.as_str(),
+            context.self_concurrent as i32,
         ])?;
     }
     Ok(())

@@ -122,6 +122,24 @@ CREATE TABLE IF NOT EXISTS arg_flow_edges (
     formal_var_id INTEGER NOT NULL REFERENCES variables(id)
 );
 
+-- Where threads, tasks and IPC requests start running code: one row per
+-- resolved callback invocation (`call_site_id` set), then one per entry no
+-- call site starts (`call_site_id` NULL): an override of a member a framework
+-- runs, or an IPC stub handler. `call_edges` holds the same starts as
+-- ordinary edges. Additive to v7: earlier v7 exports lack the table.
+CREATE TABLE IF NOT EXISTS execution_contexts (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    entry_fn_id INTEGER NOT NULL REFERENCES functions(id),
+    call_site_id INTEGER REFERENCES call_sites(id),
+    api_fn_id INTEGER REFERENCES functions(id),
+    param_index INTEGER,
+    receiver_var_id INTEGER REFERENCES variables(id),
+    model TEXT,
+    multi_instance TEXT NOT NULL,
+    self_concurrent INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS locations (
     id INTEGER PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -209,6 +227,16 @@ CREATE TABLE IF NOT EXISTS flow_edges (
     kind TEXT NOT NULL
 );
 
+-- The memory cell each `load` reads and each `store` writes, by the
+-- `flow_edges` row of the load or store (whose `flow_origins` rows are its
+-- sites); `cell_node` NULL: the access's cells are not recorded. Additive to
+-- v7: earlier v7 exports lack the table, and trace-merge output leaves it
+-- empty. See docs/SQLITE_SCHEMA.md, "flow_memory_access".
+CREATE TABLE IF NOT EXISTS flow_memory_access (
+    edge_id INTEGER NOT NULL REFERENCES flow_edges(id),
+    cell_node INTEGER REFERENCES flow_nodes(id)
+);
+
 CREATE VIEW IF NOT EXISTS flow_nodes_text AS
 SELECT
     n.id,
@@ -254,6 +282,8 @@ CREATE INDEX IF NOT EXISTS idx_flow_calls_dst_node ON flow_calls(dst_node);
 CREATE INDEX IF NOT EXISTS idx_flow_return_calls_src_node ON flow_return_calls(src_node);
 CREATE INDEX IF NOT EXISTS idx_flow_return_calls_dst_node ON flow_return_calls(dst_node);
 CREATE INDEX IF NOT EXISTS idx_flow_field_access_dst ON flow_field_access(dst_node);
+CREATE INDEX IF NOT EXISTS idx_flow_memory_access_edge ON flow_memory_access(edge_id);
+CREATE INDEX IF NOT EXISTS idx_flow_memory_access_cell ON flow_memory_access(cell_node);
 CREATE INDEX IF NOT EXISTS idx_variables_parameter_twins ON variables(fn_id,name) WHERE kind='param';
 CREATE INDEX IF NOT EXISTS idx_flow_nodes_var ON flow_nodes(var_id);
 -- Partial: without link metadata every `target_id` is NULL, and a partial

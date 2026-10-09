@@ -29,7 +29,8 @@ new metadata and query indexes; there is no automatic migration from v6.
 
 `trace-merge` requires v7 and structurally validates the exact columns it reads
 in `files`, `link_targets`, `target_sources`, `target_dependencies`, `functions`,
-`call_sites`, `call_edges`, and `diagnostics` before creating or replacing output.
+`call_sites`, `call_edges`, `diagnostics`, and `execution_contexts` when present
+before creating or replacing output.
 Earlier v7 databases without newer flow tables or `call_sites.callee_var` /
 `return_dst` can therefore still be merged. A nominal v7 database missing a
 required call-graph column is rejected with a re-analysis diagnostic.
@@ -38,7 +39,21 @@ The output uses the shared v7 DDL and records `options_json.stage = "merge"`.
 It preserves/remaps those call-graph tables and diagnostics, including call-site
 spelling and expansion coordinates, and reconstructs external call edges.
 It supports function/call lookup, call graphs, call chains, and editor call
-hierarchy. It does **not** populate `variables`, `types`, `locations`,
+hierarchy.
+
+`execution_contexts` is optional on input: an input without the table (an
+earlier v7 export) still merges and contributes no rows, and the merge records
+an `info` diagnostic with `stage = 'merge'` naming it
+(`MissingExecutionContexts`); an input that has the table must have every
+column the merger reads (`kind`, `entry_fn_id`, `call_site_id`, `api_fn_id`,
+`param_index`, `model`, `multi_instance`, `self_concurrent`) or it is rejected
+like a missing call-graph column. The output carries the rows of the inputs
+that have the table, with function and call-site ids remapped, each input's own
+multi-instance evidence and `receiver_var_id` NULL (no variable is carried); a merge-stage diagnostic of that kind marks an output
+whose table lists only some inputs' contexts. How rows are combined:
+[Invariants and linking rules](ANALYSIS.md#invariants-and-linking-rules).
+
+It does **not** populate `variables`, `types`, `locations`,
 `points_to`, `arg_flow_edges`, or any `flow_*` tables. `call_sites.callee_var`
 and `return_dst` remain NULL because input variable IDs are not remapped.
 Creating these structures through shared DDL does not supply their capabilities.
@@ -62,17 +77,19 @@ omitted flow data from merger output.
 | `call_sites` | filtered | filtered | filtered |
 | `call_edges` | ✓ | ✓ | ✓ |
 | `arg_flow_edges` | ✓ | ✓ | ✓ |
+| `execution_contexts` | ✓ | ✓ | ✓ |
 | `variables` | PAG-referenced | all | all (+ arg-flow) |
 | `flow_nodes` | ✓ | ✓ | ✓ |
 | `flow_edges` | ✓ | ✓ | ✓ |
+| `flow_memory_access` | ✓ | ✓ | ✓ |
 | `types` | | ✓ | ✓ |
 | `locations` | | ✓ | ✓ |
 | `points_to` | | | ✓ |
 | `diagnostics` | ✓ | ✓ | ✓ |
 
 The flow-graph tables (`flow_nodes`, `flow_edges`) and the variables they
-reference are always exported because `trace inspect dataflow` works purely
-off the database.
+reference are always exported because `trace inspect dataflow` and
+`trace inspect slice` work purely off the database.
 
 ### Call site export filter
 
@@ -92,7 +109,10 @@ link_targets ─┬─ target_sources → files
               └─ target_dependencies → link_targets
 files ─┬─ functions ─┬─ call_sites ─ arg_flow_edges → variables
        │             │  (functions.target_id → link_targets)
-       │             └─ call_edges → functions (caller and callee)
+       │             ├─ call_edges → functions (caller and callee)
+       │             └─ execution_contexts → functions (entry, modelled
+       │                callee), call_sites (start; NULL for an entry no
+       │                call site starts), variables (receiver)
        ├─ variables ─ flow_nodes ─ flow_edges → flow_nodes
        └─ variables (type_id → types when exported,
                      target_id → link_targets)
@@ -272,6 +292,33 @@ Exactly one of `actual_var_id` or `actual_fn_id` is set per row. A function name
 
 **Index:** `arg_flow_edges(call_site_id)`
 
+### execution_contexts
+
+Places where code starts running on a thread, a task queue or the IPC worker
+pool. Semantics, evidence rules and row order:
+[Execution contexts](ANALYSIS.md#execution-contexts). An additive v7 table: a
+v7 export written before it existed has no `execution_contexts` table, so a
+reader checks for the table (and the columns it reads) instead of the schema
+version; in an ordinary analysis an empty table means no context was found.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER PK | Context id |
+| `kind` | TEXT | `thread`, `pool_task`, `serial_task`, `ipc_handler` or `unknown` |
+| `entry_fn_id` | INTEGER FK → `functions` | Function the context starts running |
+| `call_site_id` | INTEGER FK → `call_sites`, nullable | Submitting call site (`pthread_create(...)`); `NULL` for an entry no call site starts (an `entry` model's override, an IPC stub handler) |
+| `api_fn_id` | INTEGER FK → `functions`, nullable | Modelled callee that runs the callback (`pthread_create`, `std::thread::thread`, `AppExecFwk::EventHandler::PostTask`); `NULL` without a call site |
+| `param_index` | INTEGER, nullable | Callee parameter the callback is passed in, counting explicit arguments (no `this`); `NULL` without a call site |
+| `receiver_var_id` | INTEGER FK → `variables`, nullable | Variable the modelled member was called on (`q` in `q.submit(f)`); `NULL` when the receiver is not a named variable, without a call site, and in a `trace-merge` output |
+| `model` | TEXT, nullable | Name of the `invoke` or `entry` model that states the context (may differ from the `api_fn_id` name); `NULL` for an IPC stub handler |
+| `multi_instance` | TEXT | Multi-instance evidence: `loop`, `cycle`, `parent` or `unknown` |
+| `self_concurrent` | INTEGER | `1` when two instances may run at the same time; `0` means no evidence, not single execution |
+
+The same starts stay in `call_edges` as `indirect` (start site to entry) and
+`ipc` (proxy to handler) edges, so the functions a context reaches are a walk
+over `call_edges` from `entry_fn_id`. Not indexed: the table is small (sizes
+in [EVAL_REPORT.md](EVAL_REPORT.md#task-and-thread-primitives-203--2026-10-09)).
+
 ### variables
 
 | Column | Type | Description |
@@ -365,7 +412,43 @@ Edge kinds:
   synthetic `terminator` node recording the call site. No points-to value
   is produced; the edge documents where a buffer's prior contents stop.
 
+Which memory cells a `load` reads and a `store` writes is not an edge here:
+see [`flow_memory_access`](#flow_memory_access).
+
+Edges have no position columns. Where the statement behind an edge is written
+is recorded once, in [`flow_origins`](#source-level-presentation-metadata-v7),
+keyed by the same `(src_node, dst_node, kind)`; edges with no statement of their
+own have no origin rows. Rules:
+[Where a value moves](ANALYSIS.md#where-a-value-moves); query:
+[Source sites of a value move](#source-sites-of-a-value-move).
+
 **Indexes:** `flow_edges(src_node)`, `flow_edges(dst_node)`
+
+### flow_memory_access
+
+The memory cells each `load` reads and each `store` writes, read off the
+converged points-to sets. Always exported by analysis; additive to v7.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `edge_id` | INTEGER FK → `flow_edges` | The `load` or `store` edge of the access |
+| `cell_node` | INTEGER FK → `flow_nodes`, nullable | A cell (`loc` node) it reads or writes; NULL: its cells are not recorded |
+
+An access with recorded cells has one row per cell; one whose cells are not
+recorded (past the fan-out cap, or a pointer that points at no memory) has one
+row with `cell_node` NULL, so "not recorded" is never inferred from a missing
+row. The access's sites are its load's or store's `flow_origins` rows (join
+`flow_edges` on `id`, then `flow_origins` on `(src_node, dst_node, kind)`); none
+are repeated for it. Read as edges, a load's row is a `mem_read` from the cell
+into the load's destination and a store's a `mem_write` from the stored value
+into the cell; `inspect slice` follows them, `inspect dataflow` and the C API
+do not. Rules: [Memory access edges](ANALYSIS.md#memory-access-edges).
+
+Detect it with the table and its two columns: an earlier v7 export lacks the
+table, and `trace-merge` output (`analysis_run.options_json.stage = "merge"`)
+has it empty, like its other flow tables.
+
+**Indexes:** `flow_memory_access(edge_id)`, `flow_memory_access(cell_node)`
 
 ### types
 
@@ -494,6 +577,41 @@ JOIN variables fv ON fv.id = af.formal_var_id
 WHERE af.actual_fn_id IS NOT NULL;
 ```
 
+### Source sites of a value move
+
+Every statement that moves `b`'s value or storage into `pp`, with the enclosing
+function by the [edge-scope rule](ANALYSIS.md#where-a-value-moves): when
+several definitions hold the line, the innermost one if the line is strictly
+inside it (not its first or last line); a line held by a single definition is
+that definition's, its first and last lines included; otherwise `NULL`:
+
+```sql
+SELECT o.kind, o.operation, p.path, o.line, o.col, o.expression,
+       (SELECT CASE WHEN COUNT(DISTINCT f.id) = 1 THEN MIN(f.name) END
+        FROM functions f
+        WHERE f.file_id = o.file_id AND f.is_defined = 1
+          AND o.line BETWEEN f.line_start AND f.line_end
+          AND NOT EXISTS (
+            SELECT 1 FROM functions g
+            WHERE g.file_id = o.file_id AND g.is_defined = 1 AND g.id <> f.id
+              AND o.line BETWEEN g.line_start AND g.line_end
+              AND NOT (g.line_start <= f.line_start AND f.line_end <= g.line_end
+                       AND o.line > f.line_start AND o.line < f.line_end)))
+       AS function
+FROM flow_origins o
+JOIN files p ON p.id = o.file_id
+JOIN flow_nodes s ON s.id = o.src_node
+JOIN flow_nodes d ON d.id = o.dst_node
+JOIN variables sv ON sv.id = s.var_id
+JOIN variables dv ON dv.id = d.var_id
+WHERE sv.name = 'b' AND dv.name = 'pp'
+ORDER BY p.path, o.line, o.col;
+```
+
+`flow_origins` rows join a `flow_edges` row on `(src_node, dst_node, kind)`.
+An `addr_of` origin's source is a storage-location node: a variable's carries
+that variable's `var_id`, a function's carries its `fn_id` instead.
+
 ## CLI inspection
 
 ```bash
@@ -580,8 +698,8 @@ Inspection indexes cover both endpoints of `flow_origins`, `flow_calls`, and
 `flow_return_calls`, the destination of `flow_field_access`, and parameter
 copies by `(fn_id, name)` under `kind='param'`. Function ownership lookup uses
 `idx_functions_file_range` on `functions(file_id, is_defined, line_start, line_end)`
-to seek definitions in the operation's file instead of building a temporary
-index over all functions for each position batch. These indexes are exported in
+to read the definitions of each operation's file once, instead of scanning all
+functions. These indexes are exported in
 minimal and full modes and built after bulk export,
 keep version 7's row layout, and support selective source-level inspection.
 Older v7 exports may lack these additive indexes; re-analysis supplies them.

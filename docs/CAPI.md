@@ -264,7 +264,9 @@ below; database compatibility follows the
   discovered chains; node `id`s are `functions.id`, edges carry call `resolution`
   and call-site location.
 - **Dataflow.** `trace_db_dataflow(db, symbols, n, direction, depth)` BFS over
-  `flow_edges`. Pass a `trace_symbol` array obtained from
+  `flow_edges` (as the CLI's `inspect dataflow`; the memory accesses the
+  CLI-only value slice follows are not edges there, see
+  [Memory access edges](ANALYSIS.md#memory-access-edges)). Pass a `trace_symbol` array obtained from
   `trace_db_find_symbols` (its `var_id` identifies the start variables). Pass
   the single best candidate (`items[0]`) to select the same starting declaration
   as the CLI. This API calls `trace_db::dataflow_graph` and returns the **raw PAG**:

@@ -1,0 +1,191 @@
+{
+  "note": "Inputs of the #205 retro-test: the three camera race fixes of #197 section 4.4, sliced from the member each fix protected, on the tree before the fix (`pre`, the merge's first parent) and after it (`post`, the merge). `patched_blobs` are the blob hashes of the files the fix changed (git diff --raw pre post); the script checks them before analysing. Each start is located by `pattern` (first occurrence in `file`; `pre_line` is where it is in the pre-fix tree), the column is the identifier's. Each expectation names a memory edge of the slice by kind, function and the line of its own pattern, and whether the slice flags it cross-context; `present: false` records a patched site the slice does not show (see docs/EVAL_REPORT.md, \"Value slice: #205\"). Locks are not modelled, so the fix does not change the flags: the post-fix tree expects the same. Run: python3 scripts/cve_slice_retro.py.",
+  "repo": "https://github.com/openharmony/multimedia_camera_framework.git",
+  "budget_pops": 800000,
+  "jobs": 8,
+  "cases": [
+    {
+      "cve": "CVE-2023-47857",
+      "pr": 988,
+      "title": "add a lock to the deviceSvcCallback_",
+      "pre": "c863b1a8ed5c8fa7fccaf90e817598f1a50cc6d0",
+      "post": "5e682933fe5477c5fc2bd38679aa321888251c73",
+      "patched_blobs": [
+        {"path": "services/camera_service/include/hcamera_device.h", "pre": "924f5b31b64b67826de7e86c3cbdd4b9e3f87188", "post": "cec609e2e90b1f9a79394b58899c3deb735ac212"},
+        {"path": "services/camera_service/src/hcamera_device.cpp", "pre": "5e07ae7979351871f56f04f759ffa4a63641baf7", "post": "3be039aae15b48d9c517857ff30d42972ab9b165"}
+      ],
+      "starts": [
+        {
+          "member": "HCameraDevice::deviceSvcCallback_",
+          "file": "services/camera_service/src/hcamera_device.cpp",
+          "pattern": "deviceSvcCallback_ = callback;",
+          "name": "deviceSvcCallback_",
+          "pre_line": 401,
+          "expect": [
+            {"kind": "mem_write", "function": "OHOS::CameraStandard::HCameraDevice::SetCallback", "pattern": "deviceSvcCallback_ = callback;", "pre_line": 401, "cross_context": true},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::HCameraDevice::OnError", "pattern": "deviceSvcCallback_->OnError(", "pre_line": 460, "cross_context": true},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::HCameraDevice::OnResult", "pattern": "deviceSvcCallback_->OnResult(", "pre_line": 491, "cross_context": true}
+          ]
+        }
+      ]
+    },
+    {
+      "cve": "CVE-2024-22180",
+      "pr": 1179,
+      "title": "add callback mutex",
+      "pre": "5e682933fe5477c5fc2bd38679aa321888251c73",
+      "post": "3a75d788dc6040188277a13061be7b2c2607e28f",
+      "patched_blobs": [
+        {"path": "frameworks/native/camera/src/input/camera_input.cpp", "pre": "c923e5eee85b8b307e56a10ab31dc36a7dc3928d", "post": "6e2dc89dfd87fc5a30c1433159092f0196f7f31a"},
+        {"path": "frameworks/native/camera/src/input/camera_manager.cpp", "pre": "9c0e2fe947e0e172689f304fb9ad17412e353142", "post": "cb5a5775fb2eb0cf9667f707da1fbb2d5940090b"},
+        {"path": "frameworks/native/camera/src/output/metadata_output.cpp", "pre": "b147424732bab62b1fd8e12db0cc2c120f858b29", "post": "c32d1e0ca4c5c0f400604f8976425d1ca6dd136c"},
+        {"path": "frameworks/native/camera/src/output/photo_output.cpp", "pre": "47d796e833832cbc5952fa4618c6905430a94bbd", "post": "4b513c43e81f7b611ceea666e87edc5bcc0d5f4a"},
+        {"path": "frameworks/native/camera/src/output/preview_output.cpp", "pre": "28fde1c88bdb3993bde5aec6904050aca74f25b0", "post": "67df2f7466a0594cc4482a693ad71a2bc552cb9a"},
+        {"path": "frameworks/native/camera/src/output/video_output.cpp", "pre": "a963113b881430987e0513936e70b4deaef5a2eb", "post": "302438bf43c5c85451297e52e580eb25b3db732d"},
+        {"path": "frameworks/native/camera/src/session/capture_session.cpp", "pre": "562ac76852e69a90c90af7602a557add89d08e76", "post": "c148b768d09c97a2ae1d24b9e717e314db6e930f"},
+        {"path": "interfaces/inner_api/native/camera/include/input/camera_input.h", "pre": "d2a1f8dbf64ce5d3d81db1d00c3c345958fadbf0", "post": "b2709bcac90b8303c955769545a6cf1190a5d6b7"},
+        {"path": "interfaces/inner_api/native/camera/include/input/camera_manager.h", "pre": "a48153a48dba966a2cb1ee05b72e8cf0761583c1", "post": "1dc31b44a9d833c522ef108cbbd9e42e0c9c28ed"},
+        {"path": "interfaces/inner_api/native/camera/include/output/metadata_output.h", "pre": "1648d30d7fbc87dcb798acd723aeab0a2fed4f87", "post": "2cf779c5145afb029c976cc1467cf5a2e787b2a7"},
+        {"path": "interfaces/inner_api/native/camera/include/output/photo_output.h", "pre": "8c31deb4a65dcf9007c931f1f8ee1bcd89bca6fa", "post": "d5a2368d50596d549eb2801459bb4321be1bb44b"},
+        {"path": "interfaces/inner_api/native/camera/include/output/preview_output.h", "pre": "e4d760b5024aabcefe14c24f557057d785a96809", "post": "fdc9f14120162faea1d6c88416d6e25a957fd4a1"},
+        {"path": "interfaces/inner_api/native/camera/include/output/video_output.h", "pre": "5d409c03288a974cd94cbbf86b7603fd86cba613", "post": "c7642dfc850cd85e11d98fb97ffb622887c69ef8"},
+        {"path": "interfaces/inner_api/native/camera/include/session/capture_session.h", "pre": "e8d4b7919a5247fd6aaa85baef4ae98b87693efa", "post": "4af3ccdee9b0cfdf276f52d31a32e213bbba77f3"},
+        {"path": "services/camera_service/include/hcapture_session.h", "pre": "c990ad2762ea6c19e2e763bd3b384c8514e63fc0", "post": "7451eb4dee5e48cccaa67994f87625d028ed8bf6"},
+        {"path": "services/camera_service/src/hcamera_device.cpp", "pre": "3be039aae15b48d9c517857ff30d42972ab9b165", "post": "fdce00f79cb65de2008ccb962a7edb209b1a9b56"},
+        {"path": "services/camera_service/src/hcapture_session.cpp", "pre": "d97948c0b8ed22496f6d59ac9c1eb50c7319c548", "post": "267fb315b21579b35cade8d83d30fc372be7da06"}
+      ],
+      "starts": [
+        {
+          "member": "CaptureSession::exposureCallback_",
+          "file": "frameworks/native/camera/src/session/capture_session.cpp",
+          "pattern": "exposureCallback_ = exposureCallback;",
+          "name": "exposureCallback_",
+          "pre_line": 1001,
+          "expect": [
+            {"kind": "mem_write", "function": "OHOS::CameraStandard::CaptureSession::SetExposureCallback", "pattern": "exposureCallback_ = exposureCallback;", "pre_line": 1001, "cross_context": true},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::CaptureSession::ProcessAutoExposureUpdates", "pattern": "exposureCallback_->OnExposureState(", "pre_line": 1020, "cross_context": true}
+          ]
+        },
+        {
+          "member": "CaptureSession::focusCallback_",
+          "file": "frameworks/native/camera/src/session/capture_session.cpp",
+          "pattern": "focusCallback_ = focusCallback;",
+          "name": "focusCallback_",
+          "pre_line": 1083,
+          "expect": [
+            {"kind": "mem_write", "function": "OHOS::CameraStandard::CaptureSession::SetFocusCallback", "pattern": "focusCallback_ = focusCallback;", "pre_line": 1083, "cross_context": true},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::CaptureSession::ProcessAutoFocusUpdates", "pattern": "focusCallback_->OnFocusState(", "pre_line": 1417, "cross_context": true}
+          ]
+        },
+        {
+          "member": "CaptureSession::appCallback_",
+          "file": "frameworks/native/camera/src/session/capture_session.cpp",
+          "pattern": "    appCallback_ = callback;",
+          "name": "appCallback_",
+          "pre_line": 363,
+          "expect": [
+            {"kind": "mem_write", "function": "OHOS::CameraStandard::CaptureSession::SetCallback", "pattern": "    appCallback_ = callback;", "pre_line": 363, "cross_context": true},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::CaptureSession::GetApplicationCallback", "pattern": "return appCallback_;", "pre_line": 385, "cross_context": true}
+          ]
+        },
+        {
+          "member": "PreviewOutput::appCallback_",
+          "file": "frameworks/native/camera/src/output/preview_output.cpp",
+          "pattern": "    appCallback_ = callback;",
+          "name": "appCallback_",
+          "pre_line": 164,
+          "expect": [
+            {"kind": "mem_write", "function": "OHOS::CameraStandard::PreviewOutput::SetCallback", "pattern": "    appCallback_ = callback;", "pre_line": 164, "cross_context": true},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::PreviewOutput::GetApplicationCallback", "pattern": "return appCallback_;", "pre_line": 196, "cross_context": true}
+          ]
+        },
+        {
+          "member": "VideoOutput::appCallback_",
+          "file": "frameworks/native/camera/src/output/video_output.cpp",
+          "pattern": "    appCallback_ = callback;",
+          "name": "appCallback_",
+          "pre_line": 84,
+          "expect": [
+            {"kind": "mem_write", "function": "OHOS::CameraStandard::VideoOutput::SetCallback", "pattern": "    appCallback_ = callback;", "pre_line": 84, "cross_context": true},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::VideoOutput::GetApplicationCallback", "pattern": "return appCallback_;", "pre_line": 218, "cross_context": true}
+          ]
+        },
+        {
+          "member": "CameraInput::errorCallback_",
+          "file": "frameworks/native/camera/src/input/camera_input.cpp",
+          "pattern": "errorCallback_ = errorCallback;",
+          "name": "errorCallback_",
+          "pre_line": 156,
+          "expect": [
+            {"kind": "mem_write", "function": "OHOS::CameraStandard::CameraInput::SetErrorCallback", "pattern": "errorCallback_ = errorCallback;", "pre_line": 156, "cross_context": true},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::CameraInput::GetErrorCallback", "pattern": "return errorCallback_;", "pre_line": 172, "cross_context": true}
+          ]
+        },
+        {
+          "member": "PhotoOutput::appCallback_",
+          "file": "frameworks/native/camera/src/output/photo_output.cpp",
+          "pattern": "    appCallback_ = callback;",
+          "name": "appCallback_",
+          "pre_line": 236,
+          "expect": [
+            {"kind": "mem_write", "function": "OHOS::CameraStandard::PhotoOutput::SetCallback", "pattern": "    appCallback_ = callback;", "pre_line": 236, "cross_context": false},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::PhotoOutput::GetApplicationCallback", "pattern": "return appCallback_;", "pre_line": 263, "cross_context": false}
+          ]
+        },
+        {
+          "member": "MetadataOutput::appStateCallback_",
+          "file": "frameworks/native/camera/src/output/metadata_output.cpp",
+          "pattern": "appStateCallback_ = metadataStateCallback;",
+          "name": "appStateCallback_",
+          "pre_line": 115,
+          "expect": [
+            {"kind": "mem_write", "function": "OHOS::CameraStandard::MetadataOutput::SetCallback", "pattern": "appStateCallback_ = metadataStateCallback;", "pre_line": 115, "cross_context": false},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::MetadataObjectListener::OnBufferAvailable", "pattern": "metadata_->appStateCallback_;", "pre_line": 252, "cross_context": false, "revisions": ["pre"]},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::MetadataOutput::GetAppStateCallback", "pattern": "return appStateCallback_;", "cross_context": false, "revisions": ["post"]}
+          ]
+        },
+        {
+          "member": "CameraManager::cameraMngrCallback_",
+          "file": "frameworks/native/camera/src/input/camera_manager.cpp",
+          "pattern": "cameraMngrCallback_ = callback;",
+          "name": "cameraMngrCallback_",
+          "pre_line": 592,
+          "expect": [
+            {"kind": "mem_write", "function": "OHOS::CameraStandard::CameraManager::SetCallback", "pattern": "cameraMngrCallback_ = callback;", "pre_line": 592, "cross_context": false},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::CameraManager::GetApplicationCallback", "pattern": "return cameraMngrCallback_;", "pre_line": 599, "cross_context": false}
+          ]
+        }
+      ]
+    },
+    {
+      "cve": "CVE-2026-68965",
+      "pr": 4579,
+      "title": "guard activeCameras_ with mapMutex_",
+      "pre": "afd0a2ebf886603adb853098646e096277ffddba",
+      "post": "3a9a8269819752d017ba8f3205253c7bf44b240e",
+      "patched_blobs": [
+        {"path": "services/camera_service/include/hcamera_device_manager.h", "pre": "6b607aaafa3cbc1220eb18a62900bb38d27cd72a", "post": "8d8e7b82f2aec971524655cb5c468cd77b56d436"},
+        {"path": "services/camera_service/src/hcamera_device_manager.cpp", "pre": "18a75785d111bcb040cc83bd4ec1a1e43e3a691c", "post": "f521814164818c9b84ae5e8044f9fb7a006b876b"}
+      ],
+      "starts": [
+        {
+          "member": "HCameraDeviceManager::activeCameras_",
+          "file": "services/camera_service/src/hcamera_device_manager.cpp",
+          "pattern": "sortedList = activeCameras_;",
+          "name": "activeCameras_",
+          "pre_line": 585,
+          "expect": [
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::HCameraDeviceManager::SortDeviceByPriority", "pattern": "sortedList = activeCameras_;", "pre_line": 585, "cross_context": true},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::HCameraDeviceManager::GetActiveCameraHolders", "pattern": "return activeCameras_;", "pre_line": 168, "cross_context": true},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::HCameraDeviceManager::GetActiveCamerasCount", "pattern": "return activeCameras_.size();", "pre_line": 67, "present": false},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::HCameraDeviceManager::HandleCameraEvictions", "pattern": "for (const auto &deviceHolder : activeCameras_)", "pre_line": 363, "present": false},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::HCameraDeviceManager::DetermineHighestPriorityOwner", "pattern": "for (const auto &x : activeCameras_) {\n        sptr<CameraProcessPriority> curPriority", "pre_line": 393, "present": false},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::HCameraDeviceManager::WouldEvict", "pattern": "for (const auto &x : activeCameras_) {\n        const std::string &curCameraId", "pre_line": 422, "present": false},
+            {"kind": "mem_read", "function": "OHOS::CameraStandard::HCameraDeviceManager::GetCurrentCost", "pattern": "for (const auto &x : activeCameras_) {\n        totalCost", "pre_line": 465, "present": false},
+            {"kind": "mem_write", "function": "OHOS::CameraStandard::HCameraDeviceManager::AddDevice", "pattern": "activeCameras_.push_back(cameraHolder);", "pre_line": 86, "present": false}
+          ]
+        }
+      ]
+    }
+  ]
+}

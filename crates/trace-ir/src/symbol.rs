@@ -276,6 +276,13 @@ pub struct CallSite {
     /// when `span` points into a macro replacement list.
     pub expansion_span: Option<Span>,
     pub is_direct: bool,
+    /// The call is lexically inside a loop of its own function: a loop body,
+    /// condition or update, not a `for` init-statement or a range-for's
+    /// range, and not the body of a lambda written in the loop (that is a
+    /// function of its own). Evidence for execution contexts started here
+    /// (`docs/ANALYSIS.md`, "Execution contexts"); not part of the merge
+    /// identity, and a merged record is in a loop when any copy is.
+    pub in_loop: bool,
     /// Static class of a C++ member-call receiver (`this`, typed pointer).
     /// Post-merge virtual expansion uses this so `final` types are not
     /// re-expanded from the declaring base.
@@ -289,6 +296,13 @@ pub struct CallSite {
     /// LHS of `dst = callee(...)` when the call's value is used (`CallReturn`
     /// destination). `dlsym` models write function addresses here.
     pub return_dst: Option<VarId>,
+    /// The variable a member call is made on, when its receiver is one by
+    /// name (`queue.submit(f)`, `handler->PostTask(f)`, `this->Run()`, the
+    /// object a constructor builds); `None` for a field, a call result or any
+    /// other expression, and for a free function. Identity only: it is not
+    /// bound to the callee's `this` (`docs/ANALYSIS.md`, "Execution
+    /// contexts").
+    pub receiver: Option<VarId>,
     /// Originating translation unit, recorded by merge. Absent before merge.
     pub tu: Option<crate::FileId>,
 }
@@ -418,6 +432,7 @@ impl CallSite {
             receiver_class: self.receiver_class.as_deref(),
             exact_receiver: self.exact_receiver,
             return_dst: self.return_dst,
+            receiver: self.receiver,
         }
     }
 
@@ -466,6 +481,7 @@ struct CallFacts<'a> {
     receiver_class: Option<&'a str>,
     exact_receiver: bool,
     return_dst: Option<VarId>,
+    receiver: Option<VarId>,
 }
 
 /// What a surviving entry takes from any redeclaration merged into it,
@@ -598,6 +614,13 @@ pub enum SpellingTolerance {
     /// (`std::string` read as `int` under `using namespace std`), never for
     /// an in-tree class (`Set(int)` is not `Set(Foo)`).
     Redirect,
+    /// Whether a definition is the override of a declared member a model
+    /// names, the entry of an execution context: as [`Self::Override`] for a
+    /// template argument and a type the index does not know, but an `int`
+    /// stands in only for a class the index does not declare, as in
+    /// [`Self::Redirect`]: `ProcessEvent(int *)` beside a declared
+    /// `ProcessEvent(const InnerEvent &)` is an overload, and no entry.
+    Entry,
 }
 
 /// Whether two declarations' parameter types may be one type read in two
@@ -624,11 +647,17 @@ pub fn spelled_alike(
         tolerance,
         SpellingTolerance::Registration | SpellingTolerance::Override
     );
-    let stand_in_for_undeclared = tolerance == SpellingTolerance::Redirect
-        && (types.is_undeclared_class(x) || types.is_undeclared_class(y));
+    let stand_in_for_undeclared = matches!(
+        tolerance,
+        SpellingTolerance::Redirect | SpellingTolerance::Entry
+    ) && (types.is_undeclared_class(x)
+        || types.is_undeclared_class(y));
     if int_against_class && !lenient && !stand_in_for_undeclared {
         return false;
     }
+    // An override's unknown is a dependent or unresolved type, as for
+    // dispatch.
+    let lenient = lenient || tolerance == SpellingTolerance::Entry;
     // A type a signature records as unknown is a class or enum lowering could
     // not resolve: it may be another spelling of a class, never a known
     // scalar or pointer (`Set(Mode)` is not `Set(int)`).
@@ -667,20 +696,18 @@ pub fn spelled_alike(
                     | TypeDesc::SizeT
             )
     };
-    if tolerance == SpellingTolerance::Override
-        && (stand_in(x) || stand_in(y))
-        && integral(x)
-        && integral(y)
-    {
+    let overriding = matches!(
+        tolerance,
+        SpellingTolerance::Override | SpellingTolerance::Entry
+    );
+    if overriding && (stand_in(x) || stand_in(y)) && integral(x) && integral(y) {
         return true;
     }
     match (x, y) {
         (
             TypeDesc::Struct { name: x, .. } | TypeDesc::Union { name: x, .. },
             TypeDesc::Struct { name: y, .. } | TypeDesc::Union { name: y, .. },
-        ) if tolerance != SpellingTolerance::Ranking => {
-            class_names_alike(types, x, y, tolerance == SpellingTolerance::Override)
-        }
+        ) if tolerance != SpellingTolerance::Ranking => class_names_alike(types, x, y, overriding),
         _ => false,
     }
 }
@@ -1841,6 +1868,21 @@ impl SymbolTable {
         }))
     }
 
+    /// Whether `a` and `b` bind their explicit parameters alike by reference
+    /// or by value (`reference_params`), at every position both record: a
+    /// reference (`const T &`) and a pointer (`T *`) lower to one pointer
+    /// type, so types alike ([`Self::explicit_params_alike`]) do not say
+    /// which an override binds. A side that recorded none, having read no
+    /// declaration, agrees with any.
+    pub fn references_alike(a: &Function, b: &Function) -> bool {
+        a.reference_params.is_empty()
+            || b.reference_params.is_empty()
+            || a.reference_params
+                .iter()
+                .zip(&b.reference_params)
+                .all(|(x, y)| x == y)
+    }
+
     /// Type of a parameter variable, for overload signature comparison.
     fn param_type(&self, var: VarId) -> Option<TypeId> {
         // Variables usually sit at their id's slot; a unit can push them in
@@ -2918,10 +2960,29 @@ impl SymbolTable {
 
     #[must_use]
     pub fn call_site_by_id(&self, id: CallSiteId) -> Option<&CallSite> {
-        self.call_sites
-            .get(id.0 as usize)
-            .filter(|c| c.id == id)
-            .or_else(|| self.call_sites.iter().find(|c| c.id == id))
+        self.call_site_slot(id).map(|slot| &self.call_sites[slot])
+    }
+
+    /// Where call `id` sits in `call_sites`: at its own index unless records
+    /// were removed or reordered, else wherever a scan finds it.
+    fn call_site_slot(&self, id: CallSiteId) -> Option<usize> {
+        let at = id.0 as usize;
+        match self.call_sites.get(at) {
+            Some(site) if site.id == id => Some(at),
+            _ => self.call_sites.iter().position(|c| c.id == id),
+        }
+    }
+
+    /// Fold `copy`, a copy of call `id` merged into it, into the record:
+    /// the record is lexically in a loop (`CallSite::in_loop`) when any copy
+    /// is.
+    pub fn absorb_call_copy(&mut self, id: CallSiteId, copy: &CallSite) {
+        if !copy.in_loop {
+            return;
+        }
+        if let Some(slot) = self.call_site_slot(id) {
+            self.call_sites[slot].in_loop = true;
+        }
     }
 
     pub fn function_ids_unique(&self) -> bool {
@@ -3031,9 +3092,11 @@ mod tests {
             span: Span::new(FileId(0), 1, 2),
             expansion_span: None,
             is_direct: true,
+            in_loop: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
+            receiver: None,
             tu: None,
         };
         let mut symbols = SymbolTable {
@@ -3099,9 +3162,11 @@ mod tests {
             span: Span::new(FileId(2), 10, 3),
             expansion_span: None,
             is_direct: true,
+            in_loop: false,
             receiver_class: Some("Cls".into()),
             exact_receiver: false,
             return_dst: Some(VarId(6)),
+            receiver: None,
             tu: Some(FileId(2)),
         };
         let mut elsewhere = CallSite {
@@ -3142,9 +3207,11 @@ mod tests {
             span: Span::new(FileId(0), 1, 1),
             expansion_span: None,
             is_direct,
+            in_loop: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
+            receiver: None,
             tu: None,
         };
         assert!(mk("OsalMemCalloc", None, false).resolves_by_name());
@@ -3333,9 +3400,11 @@ mod tests {
             span: Span::new(caller_file, 1, 1),
             expansion_span: None,
             is_direct: true,
+            in_loop: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
+            receiver: None,
             tu: Some(caller_file),
         };
         // The shortcut applies, and the walk it replaces yields the same edge.

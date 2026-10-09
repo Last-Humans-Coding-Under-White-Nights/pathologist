@@ -1,8 +1,13 @@
 use crate::constraints::{
     ArgFlowEdge, CallGraphEdge, Constraint, ConstraintKind, LocKind, ResolutionKind,
 };
+use crate::contexts::{self, ContextStart, ExecutionContext};
+use crate::memory::MemoryAccess;
 use crate::pag::{Pag, PagNodeKind, SolverIndices};
-use crate::summaries::{Effect, FnModelSet, InvokeArgs};
+use crate::summaries::{
+    class_type, is_value_of, ArgType, ContextKind, Effect, EffectGroup, FnModelSet, InvokeArgs,
+    ModelLookup,
+};
 use indexmap::{IndexMap, IndexSet};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use trace_ir::{CallSiteId, FnId, LocId, PagNodeId, Program, StorageClass, TargetId, VarId};
@@ -132,6 +137,13 @@ pub struct AnalysisResult {
     /// Applied `clears` effects: `(call site, cleared parameter index)`.
     /// Exported as terminator nodes/edges in the flow graph.
     pub terminator_events: Vec<(CallSiteId, u32)>,
+    /// Where threads, tasks and IPC requests start running code: one per
+    /// resolved callback invocation, then one per IPC stub handler
+    /// (`docs/ANALYSIS.md`, "Execution contexts").
+    pub execution_contexts: Vec<ExecutionContext>,
+    /// The cells each load reads and each store writes, read off the
+    /// converged points-to sets (`docs/ANALYSIS.md`, "Memory access edges").
+    pub memory_accesses: Vec<MemoryAccess>,
     /// How the solver run ended: converged or budget-truncated. A truncated
     /// run exports a `solver_partial` marker and an `analyze`-stage
     /// diagnostic so the database is distinguishable from a complete one.
@@ -145,12 +157,15 @@ pub fn analyze(program: &Program) -> (Pag, AnalysisResult) {
 }
 
 pub fn analyze_with_options(program: &Program, opts: AnalyzeOptions) -> (Pag, AnalysisResult) {
-    let mut pag = Pag::build_with_models_and_ipc(program, &opts.models, opts.enable_ipc);
+    // One matcher for both phases: a name's class-rule candidates are
+    // resolved once (`docs/ANALYSIS.md`, "Model matching").
+    let models = opts.models.lookup(program);
+    let mut pag = Pag::build_with_models_and_ipc(program, &models, opts.enable_ipc);
     let mut result = solve(
         &mut pag,
         program,
         opts.retain_points_to,
-        &opts.models,
+        &models,
         opts.solve_budget_pops,
         opts.solve_budget_secs,
     );
@@ -222,6 +237,18 @@ struct SolverState {
     /// Nodes whose one-time, points-to-independent constraint effects
     /// (addr-of seeding, GEP summary fallback) have already been applied.
     seen_once: FxHashSet<PagNodeId>,
+    /// The cells each `Gep` destination designates: the field cells, their
+    /// summaries and the fallback summaries the `Gep` step pointed it at
+    /// ([`Self::point_gep_at`]). Its points-to also holds those cells'
+    /// contents; this set is what a load or store through it touches
+    /// (`docs/ANALYSIS.md`, "Memory access edges").
+    designated: FxHashMap<PagNodeId, FxHashSet<LocId>>,
+    /// The `Gep` destinations whose designated cells are kept: those a load
+    /// reads through or a store writes through, the only ones
+    /// `memory_accesses` asks for, and those passed as call arguments, which
+    /// a `content_store` model may make a store's pointer mid-solve
+    /// ([`access_pointers`]).
+    access_pointers: FxHashSet<PagNodeId>,
     /// Dedup for dynamically added parameter-copy constraints: the same
     /// (actual → formal) pair recurs across many call sites and re-adding it
     /// per discovered edge explodes constraint volume on large trees.
@@ -670,6 +697,29 @@ impl SolverState {
         self.finish_merge(dst, fresh);
     }
 
+    /// A `Gep` step points `dst` at the field `cells` it designates. Their
+    /// contents also reach `dst`, so that uses of the field lvalue (`&obj.f`
+    /// passed onward, then loaded) still observe stores that lowering
+    /// recorded against a cell without an intervening load temp.
+    fn point_gep_at(
+        &mut self,
+        pag: &Pag,
+        fresh: &mut Vec<LocId>,
+        dst: PagNodeId,
+        cells: impl Iterator<Item = LocId> + Clone,
+    ) {
+        if self.access_pointers.contains(&dst) {
+            self.designated
+                .entry(dst)
+                .or_default()
+                .extend(cells.clone());
+        }
+        propagate_locs(self, fresh, dst, cells.clone());
+        for cell in cells {
+            self.merge_memory_into_if_grown(pag, fresh, dst, cell);
+        }
+    }
+
     /// A load `dst = *p` stepping over `locs`, the locations `p` newly holds,
     /// in order: a function value is `dst`'s own, anything else contributes
     /// its cell's memory ([`Self::merge_memory_into_if_grown`]). One call per
@@ -778,15 +828,46 @@ impl SolverState {
 /// cap check in `apply_store_to_targets`.
 const SUMMARY_MEM_CAP: usize = 1024;
 
+/// The `Gep` destinations the solver records designated cells for
+/// (`SolverState::designated`): the pointer of a load or store, or a call
+/// argument, which a `content_store` model wires as a store's pointer during
+/// the solve. No other constraint adds a load or store mid-solve.
+fn access_pointers(pag: &Pag, program: &Program) -> FxHashSet<PagNodeId> {
+    let gep_dsts: FxHashSet<PagNodeId> = pag
+        .constraints
+        .iter()
+        .filter(|c| c.kind == ConstraintKind::Gep)
+        .map(|c| c.dst)
+        .collect();
+    let accessed = pag.constraints.iter().filter_map(|c| match c.kind {
+        ConstraintKind::Load => Some(c.src),
+        ConstraintKind::Store => Some(c.dst),
+        _ => None,
+    });
+    let passed = program
+        .symbols
+        .call_sites
+        .iter()
+        .flat_map(|cs| &cs.var_args)
+        .filter_map(|(_, v)| pag.var_node.get(v).copied());
+    accessed
+        .chain(passed)
+        .filter(|n| gep_dsts.contains(n))
+        .collect()
+}
+
 fn solve(
     pag: &mut Pag,
     program: &Program,
     retain_points_to: bool,
-    models: &FnModelSet,
+    models: &ModelLookup,
     explicit_pops_budget: Option<u64>,
     explicit_secs_budget: Option<u64>,
 ) -> AnalysisResult {
-    let mut st = SolverState::default();
+    let mut st = SolverState {
+        access_pointers: access_pointers(pag, program),
+        ..Default::default()
+    };
     // Lives beside the state, not in it: passing a buffer to the step that
     // needs it makes two steps sharing one a compile error.
     let mut scratch = Scratch::default();
@@ -1065,12 +1146,11 @@ fn solve(
                                 pag.ensure_field_summary_for_var(program, base_var, field)
                             };
                             if let Some(summary) = summary_opt {
-                                propagate_locs(&mut st, &mut scratch.fresh, dst, [summary]);
-                                st.merge_memory_into_if_grown(
+                                st.point_gep_at(
                                     pag,
                                     &mut scratch.fresh,
                                     dst,
-                                    summary,
+                                    std::iter::once(summary),
                                 );
                             }
                         }
@@ -1258,20 +1338,9 @@ fn solve(
                         produced_cell = true;
                         // Field loc plus its instance-insensitive summary:
                         // the GEP result points AT these cells.
-                        let targets = [Some(field_loc), pag.summary_for_field_loc(field_loc)];
-                        propagate_locs(
-                            &mut st,
-                            &mut scratch.fresh,
-                            dst,
-                            targets.iter().filter_map(|t| t.as_ref().copied()),
-                        );
-                        // Cell contents reach the address node so that uses of
-                        // the field lvalue (`&obj.f` passed onward, then
-                        // loaded) still observe stores that lowering recorded
-                        // against the cell without an intervening load temp.
-                        for fl in targets.into_iter().flatten() {
-                            st.merge_memory_into_if_grown(pag, &mut scratch.fresh, dst, fl);
-                        }
+                        let summary = pag.summary_for_field_loc(field_loc);
+                        let cells = std::iter::once(field_loc).chain(summary);
+                        st.point_gep_at(pag, &mut scratch.fresh, dst, cells);
                         // ArrayFnMember element fns: reachable through
                         // the array itself or any pointer to an element.
                         if let Some(owner) = pag.locations[loc.0 as usize].var {
@@ -1305,8 +1374,7 @@ fn solve(
                             pag.ensure_field_summary_for_var(program, base_var, field)
                         };
                         if let Some(summary) = summary_opt {
-                            propagate_locs(&mut st, &mut scratch.fresh, dst, [summary]);
-                            st.merge_memory_into_if_grown(pag, &mut scratch.fresh, dst, summary);
+                            st.point_gep_at(pag, &mut scratch.fresh, dst, std::iter::once(summary));
                         }
                     }
                     continue 'gep;
@@ -1443,15 +1511,15 @@ fn solve(
             .flatten()
         {
             let gained: Vec<FnId> = delta.iter().filter_map(|&l| fn_for_loc(pag, l)).collect();
-            for &(cs, args) in watchers {
+            for (cs, invoked) in watchers {
                 for &callback in &gained {
-                    wire_callback(pag, program, &mut st, &mut scratch, cs, callback, args);
+                    wire_callback(pag, program, &mut st, &mut scratch, cs, callback, invoked);
                 }
             }
         }
     }
 
-    let callbacks = callback_edges(program, pag, &st, &invoked, &call_edges);
+    let (callbacks, invocations) = callback_edges(program, pag, &st, &invoked, &call_edges);
     call_edges.extend(callbacks);
 
     // Emit synthetic call edges for IPC proxy→stub bridges detected at PAG
@@ -1474,6 +1542,14 @@ fn solve(
             resolution: ResolutionKind::IpcBridge,
         });
     }
+    let mut entries = contexts::framework_entries(program, models);
+    entries.extend(
+        pag.ipc_bridges
+            .iter()
+            .map(|bridge| (bridge.stub_handler, ContextKind::IpcHandler, None)),
+    );
+    let execution_contexts =
+        contexts::execution_contexts(program, invocations, entries, &call_edges);
     if std::env::var("TRACE_DEBUG_IPC").is_ok() {
         for bridge in &pag.ipc_bridges {
             let caller = program.symbols.function(bridge.proxy_method).name.clone();
@@ -1503,6 +1579,7 @@ fn solve(
     }
 
     let forwarded_arg_flow = std::mem::take(&mut st.forwarded_arg_flow);
+    let memory_accesses = crate::memory::memory_accesses(pag, &st.pts, &st.designated);
     let points_to = if retain_points_to {
         st.pts.into_iter().collect()
     } else {
@@ -1525,6 +1602,8 @@ fn solve(
         wired_arg_flow,
         forwarded_arg_flow,
         terminator_events,
+        execution_contexts,
+        memory_accesses,
         solve,
     }
 }
@@ -1553,10 +1632,10 @@ fn apply_fn_model(
     scratch: &mut Scratch,
     cs: &trace_ir::CallSite,
     callee_name: &str,
-    models: &FnModelSet,
+    models: &ModelLookup,
     terminator_events: &mut Vec<(CallSiteId, u32)>,
 ) {
-    let Some(model) = models.get(callee_name) else {
+    let Some(model) = models.model(callee_name, EffectGroup::Args) else {
         return;
     };
     // `&base.member` arguments resolve to the base variable; copying the
@@ -1644,7 +1723,8 @@ fn apply_fn_model(
             Effect::ReturnAlias { .. }
             | Effect::ReturnHeap
             | Effect::Dlsym { .. }
-            | Effect::Invoke { .. } => {}
+            | Effect::Invoke { .. }
+            | Effect::Entry { .. } => {}
         }
     }
 }
@@ -2255,14 +2335,29 @@ fn add_pts(st: &mut SolverState, node: PagNodeId, loc: LocId) {
     }
 }
 
-/// The `invoke` effects of one modelled callee: each callback position with
-/// the arguments forwarded to it.
-type Invocations<'m> = Vec<(u32, &'m InvokeArgs)>;
+/// One `invoke` effect of a modelled callee, borrowed from its model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Invoked<'m> {
+    /// The callback's position.
+    param: u32,
+    /// The arguments forwarded to it.
+    args: &'m InvokeArgs,
+    /// A class the callee passes ahead of `args` to a callback that takes it.
+    supplies: Option<&'m str>,
+    /// The test a call's argument must pass for the effect to apply.
+    when: Option<&'m ArgType>,
+    context: ContextKind,
+    /// The model's name.
+    model: &'m str,
+}
+
+/// The `invoke` effects of one modelled callee.
+type Invocations<'m> = Vec<Invoked<'m>>;
 
 /// Callback variables handed to a modelled callee that forwards arguments,
 /// by PAG node, with the call sites that hand them over: a function reaching
 /// such a variable is wired like an indirect call's target.
-type InvokeWatch<'m> = FxHashMap<PagNodeId, Vec<(&'m trace_ir::CallSite, &'m InvokeArgs)>>;
+type InvokeWatch<'m> = FxHashMap<PagNodeId, Vec<(&'m trace_ir::CallSite, Invoked<'m>)>>;
 
 /// The callees a model says may invoke a callback argument, with the argument
 /// positions it names (`docs/ANALYSIS.md`, "Function models"). Read off the
@@ -2271,18 +2366,31 @@ type InvokeWatch<'m> = FxHashMap<PagNodeId, Vec<(&'m trace_ir::CallSite, &'m Inv
 /// skipped outright when it is empty.
 fn invoked_params<'m>(
     program: &Program,
-    models: &'m FnModelSet,
+    models: &ModelLookup<'m>,
 ) -> FxHashMap<FnId, Invocations<'m>> {
     let mut by_callee = FxHashMap::default();
     for callee in &program.symbols.functions {
-        let Some(model) = models.get_for_callee(&callee.name) else {
+        let Some(model) = models.model(&callee.name, EffectGroup::Invoke) else {
             continue;
         };
         let params: Invocations = model
             .effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::Invoke { param, args } => Some((*param, args)),
+                Effect::Invoke {
+                    param,
+                    args,
+                    context,
+                    supplies,
+                    when,
+                } => Some(Invoked {
+                    param: *param,
+                    args,
+                    supplies: supplies.as_deref(),
+                    when: when.as_ref(),
+                    context: *context,
+                    model: model.name.as_str(),
+                }),
                 _ => None,
             })
             .collect();
@@ -2297,6 +2405,67 @@ fn invoked_params<'m>(
 /// member's arguments are recorded past its `this`.
 fn invoke_site_index(cs: &trace_ir::CallSite, param: u32) -> Option<u32> {
     param.checked_add(u32::from(cs.args_bound_past_this))
+}
+
+/// Whether `invoked` applies at `cs`: it states no argument test, or the
+/// argument it tests may pass it (docs/ANALYSIS.md, "Function models"). A
+/// function named there is never a value of a class; a variable is one by
+/// its declared type; an argument the site records nothing for (an
+/// enumerator, a call result) and a type lowering could not resolve may be
+/// anything, so the effect applies.
+fn invocation_applies(program: &Program, cs: &trace_ir::CallSite, invoked: &Invoked) -> bool {
+    let Some(test) = invoked.when else {
+        return true;
+    };
+    let Some(index) = invoke_site_index(cs, test.param) else {
+        return false;
+    };
+    let named = class_type(&test.class);
+    let functions = args_at(cs.fn_args(), index).map(|_| Some(false));
+    let variables = args_at(&cs.var_args, index).map(|var| var_is_value_of(program, var, &named));
+    // Applies unless every recorded value tells, and tells the same.
+    let mut values = functions.chain(variables);
+    match values.next().flatten() {
+        Some(is) if values.all(|value| value == Some(is)) => is == test.is,
+        _ => true,
+    }
+}
+
+/// Whether variable `var` holds a value of the class `class`, by its declared
+/// type ([`is_value_of`]). A reference is lowered as its referent's address
+/// (`const std::launch &` as a pointer to `std::launch`), so the referent's
+/// type is the one tested: a parameter's by its function's
+/// `reference_params`, which keeps a pointer parameter a pointer. A local
+/// bound as a reference is not recorded as one once lowered, so a pointer
+/// local whose referent may be the class reads both ways.
+fn var_is_value_of(program: &Program, var: VarId, class: &trace_ir::TypeDesc) -> Option<bool> {
+    let v = program.symbols.variable(var);
+    let desc: &trace_ir::TypeDesc = &program.types.get(v.type_id).desc;
+    let trace_ir::TypeDesc::Ptr(referent) = desc else {
+        return is_value_of(&program.types, desc, class);
+    };
+    let reference = match (v.storage, v.fn_id, v.param_index) {
+        (StorageClass::Param, Some(f), Some(index)) => {
+            let this = u32::from(program.symbols.has_this_param(f));
+            let references = &program.symbols.function(f).reference_params;
+            Some(
+                index
+                    .checked_sub(this)
+                    .and_then(|i| references.get(i as usize))
+                    == Some(&true),
+            )
+        }
+        (StorageClass::Local, ..) if !v.is_synthetic => None,
+        _ => Some(false),
+    };
+    match reference {
+        Some(true) => is_value_of(&program.types, referent, class),
+        Some(false) => is_value_of(&program.types, desc, class),
+        None => match is_value_of(&program.types, referent, class) {
+            Some(false) => is_value_of(&program.types, desc, class),
+            _ => None,
+        },
+    }
 }
 
 /// The values `args` (a call site's `fn_args` or `var_args`) records at
@@ -2321,15 +2490,54 @@ fn held_functions<'a>(
         .filter_map(|loc| fn_for_loc(pag, *loc))
 }
 
-/// The ways `target` can be called with the `args` a model forwards at
+/// The receivers a callback may skip ahead of forwarded arguments: none or
+/// one ([`invoke_alignments`]).
+const RECEIVER_SKIPS: usize = 2;
+/// The supplied values that may lead forwarded arguments: none or one.
+const LEADS: usize = 2;
+
+/// The ways a callback can take forwarded arguments ([`invoke_alignments`]),
+/// in the order first found, each once: one per receiver skip and supplied
+/// lead at most. Skipping no receiver behind a supplied value and skipping
+/// the receiver with none both skip one formal, and a callback is wired once
+/// per way. Built only from a [`RECEIVER_SKIPS`] by [`LEADS`] grid, each cell
+/// adding at most one way, so the inline storage always has room.
+#[derive(Clone, Copy, Default)]
+struct Alignments {
+    skips: [u32; RECEIVER_SKIPS * LEADS],
+    len: usize,
+}
+
+impl Alignments {
+    /// The ways `grid` admits (`grid[receiver][lead]`, the formals skipped),
+    /// read row by row.
+    fn from_grid(grid: [[Option<u32>; LEADS]; RECEIVER_SKIPS]) -> Self {
+        let mut alignments = Self::default();
+        for skip in grid.into_iter().flatten().flatten() {
+            if !alignments.as_slice().contains(&skip) {
+                // In bounds: the grid has as many cells as `skips` slots.
+                alignments.skips[alignments.len] = skip;
+                alignments.len += 1;
+            }
+        }
+        alignments
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        &self.skips[..self.len]
+    }
+}
+
+/// The ways `target` can be called with the arguments `invoked` forwards at
 /// `cs`, each as the number of leading formals the arguments skip; none when
-/// it cannot take them (docs/ANALYSIS.md, "Callback invocation").
+/// it cannot take them (docs/ANALYSIS.md, "Callback invocation"). A value the
+/// callee supplies ahead of them is one of the skipped formals.
 fn invoke_alignments(
     program: &Program,
     cs: &trace_ir::CallSite,
     target: FnId,
-    args: &InvokeArgs,
-) -> impl Iterator<Item = u32> {
+    invoked: &Invoked,
+) -> Alignments {
     let f = program.symbols.function(target);
     let this = u32::from(program.symbols.has_this_param(target));
     // The parameters the declaration lists, `this` not among them. An entry
@@ -2338,12 +2546,43 @@ fn invoke_alignments(
     let declared = f
         .explicit_arity
         .unwrap_or((f.params.len() as u32).saturating_sub(this));
-    let alignments = match args {
+    // Whether the formal at `skip` may take the supplied value: both ways
+    // where its declared type does not tell.
+    let supplies = invoked.supplies.map(class_type);
+    let leads = |skip: u32| -> [Option<u32>; LEADS] {
+        let supplied = supplies.as_ref().map_or(Some(false), |class| {
+            f.params.get(skip as usize).map_or(Some(false), |&formal| {
+                var_is_value_of(program, formal, class)
+            })
+        });
+        [
+            (supplied != Some(true)).then_some(0),
+            (supplied != Some(false)).then_some(1),
+        ]
+    };
+    // The ways among `typed` that `fits` has room for. A callable that takes
+    // the supplied value but has no room for it ahead of the arguments is
+    // not invocable with it: the arguments are then forwarded as given,
+    // whatever its first formal (`std::jthread t(work, token)` for
+    // `work(std::stop_token)`; [thread.jthread.cons]).
+    let admit = |typed: [Option<u32>; LEADS], fits: &dyn Fn(u32) -> bool| {
+        let mut cells = typed.map(|lead| lead.filter(|&lead| fits(lead)));
+        if cells.iter().all(Option::is_none) && typed[1].is_some() && fits(0) {
+            cells[0] = Some(0);
+        }
+        cells
+    };
+    let mut grid = [[None; LEADS]; RECEIVER_SKIPS];
+    match invoked.args {
         // A listed form passes exactly these: never a receiver.
         InvokeArgs::Listed(list) => {
-            let n = list.len() as u32;
-            let fits = n + f.default_args >= declared && (n <= declared || f.variadic);
-            [(open || fits).then_some(this), None]
+            let fits = |lead: u32| {
+                let n = list.len() as u32 + lead;
+                open || (n + f.default_args >= declared && (n <= declared || f.variadic))
+            };
+            for (cell, lead) in grid[0].iter_mut().zip(admit(leads(this), &fits)) {
+                *cell = lead.map(|lead| this + lead);
+            }
         }
         // A site records the arguments that are variables or functions, not
         // how many there are: the last one recorded is a lower bound.
@@ -2356,37 +2595,46 @@ fn invoke_alignments(
                 (Some(first), Some(last)) if last >= first => last - first + 1,
                 _ => 0,
             };
-            let room = |slots: u32| open || f.variadic || passed <= slots;
+            let room = |slots: u32, lead: u32| open || f.variadic || passed + lead <= slots;
             // A non-static member takes its receiver first. A static one,
             // which lowering gives a `this` as well, takes none. A member
             // whose class body no unit showed could be either, so both are
             // wired where the count does not tell them apart.
             let skips_this = this == 1 && (f.is_static_member || !f.declared_in_class);
-            [
-                (!f.is_static_member && room(declared + this)).then_some(0),
-                (skips_this && room(declared)).then_some(1),
-            ]
+            let receivers: [_; RECEIVER_SKIPS] = [
+                (0, declared + this, !f.is_static_member),
+                (1, declared, skips_this),
+            ];
+            for (row, (skip, slots, admitted)) in grid.iter_mut().zip(receivers) {
+                if !admitted {
+                    continue;
+                }
+                let fits = |lead: u32| room(slots, lead);
+                for (cell, lead) in row.iter_mut().zip(admit(leads(skip), &fits)) {
+                    *cell = lead.map(|lead| skip + lead);
+                }
+            }
         }
-    };
-    alignments.into_iter().flatten()
+    }
+    Alignments::from_grid(grid)
 }
 
 /// The definitions a callback handed over as `callback` runs when a model
 /// invokes it with `args` at `cs`: those an indirect call from the caller
-/// reaches ([`reached_definitions`]) that can take the arguments.
+/// reaches ([`reached_definitions`]) that can take the arguments, each with
+/// the ways it takes them ([`invoke_alignments`]).
 fn invoke_targets<'a>(
     program: &'a Program,
     cs: &'a trace_ir::CallSite,
     callback: FnId,
-    args: &'a InvokeArgs,
-) -> impl Iterator<Item = FnId> + 'a {
+    invoked: &'a Invoked<'a>,
+) -> impl Iterator<Item = (FnId, Alignments)> + 'a {
     let caller_target = program.symbols.function(cs.caller).target;
     reached_definitions(program, callback, caller_target)
         .into_iter()
-        .filter(move |&target| {
-            invoke_alignments(program, cs, target, args)
-                .next()
-                .is_some()
+        .filter_map(move |target| {
+            let alignments = invoke_alignments(program, cs, target, invoked);
+            (alignments.len > 0).then_some((target, alignments))
         })
 }
 
@@ -2406,31 +2654,31 @@ fn wire_invocations<'m>(
     invocations: Option<&Invocations<'m>>,
     watch: &mut InvokeWatch<'m>,
 ) {
-    for &(param, args) in invocations.into_iter().flatten() {
-        if args.is_empty() {
+    for &invoked in invocations.into_iter().flatten() {
+        if invoked.args.is_empty() || !invocation_applies(program, cs, &invoked) {
             continue;
         }
-        let Some(index) = invoke_site_index(cs, param) else {
+        let Some(index) = invoke_site_index(cs, invoked.param) else {
             continue;
         };
         for callback in args_at(cs.fn_args(), index) {
-            wire_callback(pag, program, st, scratch, cs, callback, args);
+            wire_callback(pag, program, st, scratch, cs, callback, &invoked);
         }
         for var in args_at(&cs.var_args, index) {
             let Some(&node) = pag.var_node.get(&var) else {
                 continue;
             };
             let watchers = watch.entry(node).or_default();
-            if watchers.iter().any(|&(c, a)| c.id == cs.id && a == args) {
+            if watchers.iter().any(|&(c, w)| c.id == cs.id && w == invoked) {
                 continue;
             }
-            watchers.push((cs, args));
+            watchers.push((cs, invoked));
             // A settled variable never pops again: wire what it holds now,
             // in an order its hash set does not decide.
             let mut held: Vec<FnId> = held_functions(pag, st, var).collect();
             held.sort_unstable();
             for callback in held {
-                wire_callback(pag, program, st, scratch, cs, callback, args);
+                wire_callback(pag, program, st, scratch, cs, callback, &invoked);
             }
         }
     }
@@ -2446,10 +2694,11 @@ fn wire_callback(
     scratch: &mut Scratch,
     cs: &trace_ir::CallSite,
     callback: FnId,
-    args: &InvokeArgs,
+    invoked: &Invoked,
 ) {
-    for target in invoke_targets(program, cs, callback, args) {
-        for skip in invoke_alignments(program, cs, target, args) {
+    let args = invoked.args;
+    for (target, alignments) in invoke_targets(program, cs, callback, invoked) {
+        for &skip in alignments.as_slice() {
             let actual_of =
                 |formal: u32| invoke_site_index(cs, args.actual_for(formal.checked_sub(skip)?)?);
             wire_actuals(
@@ -2475,22 +2724,25 @@ fn wire_callback(
     }
 }
 
-/// Indirect edges for the callbacks handed to a modelled callee (`invoke`).
+/// Indirect edges for the callbacks handed to a modelled callee (`invoke`),
+/// and each such invocation as the start of an execution context.
 /// A callback's return is ignored and its parameters are wired inside the
 /// fixpoint ([`wire_invocations`]), so the edges are read once off the
 /// converged points-to sets. The edge is attributed to the submitting call
 /// site, which is where the caller hands the callback over, and stays inside
-/// the caller's link image like every other indirect edge.
-fn callback_edges(
+/// the caller's link image like every other indirect edge. An invocation is
+/// recorded whether or not its edge is new.
+fn callback_edges<'m>(
     program: &Program,
     pag: &Pag,
     st: &SolverState,
-    invoked: &FxHashMap<FnId, Invocations>,
+    invoked: &FxHashMap<FnId, Invocations<'m>>,
     call_edges: &[CallGraphEdge],
-) -> Vec<CallGraphEdge> {
+) -> (Vec<CallGraphEdge>, Vec<contexts::Invocation<'m>>) {
     let mut edges = Vec::new();
+    let mut invocations = Vec::new();
     if invoked.is_empty() {
-        return edges;
+        return (edges, invocations);
     }
     // Seeded with what the call graph already holds: a callback the callee's
     // own body reaches keeps the edge it earned there instead of gaining a
@@ -2506,14 +2758,30 @@ fn callback_edges(
         let Some(cs) = program.symbols.call_site_by_id(edge.call_site) else {
             continue;
         };
-        for &(param, args) in params {
+        for invoked in params {
+            if !invocation_applies(program, cs, invoked) {
+                continue;
+            }
+            let Invoked {
+                param,
+                context,
+                model,
+                ..
+            } = *invoked;
             let Some(index) = invoke_site_index(cs, param) else {
                 continue;
+            };
+            let start = ContextStart {
+                call_site: cs.id,
+                api: edge.callee,
+                param,
+                receiver: cs.receiver,
             };
             let named = args_at(cs.fn_args(), index);
             let pointed = args_at(&cs.var_args, index).flat_map(|var| held_functions(pag, st, var));
             for callee in named.chain(pointed) {
-                for target in invoke_targets(program, cs, callee, args) {
+                for (target, _) in invoke_targets(program, cs, callee, invoked) {
+                    invocations.push((start, target, context, model));
                     if seen.insert((cs.id, target)) {
                         edges.push(CallGraphEdge {
                             call_site: cs.id,
@@ -2529,7 +2797,7 @@ fn callback_edges(
     // A points-to set is a hash set; the order its members come out in must
     // not reach the export (AGENTS.md, determinism).
     edges.sort_by_key(|edge| (edge.call_site, edge.callee));
-    edges
+    (edges, invocations)
 }
 
 /// The functions an indirect call from a caller in `caller_target` reaches
@@ -3067,6 +3335,22 @@ mod tests {
         assert_eq!(pop_budget_for(Some(2), Some("garbage"), 0), Some(2));
         assert_eq!(pop_budget_for(None, Some("garbage"), 0), Some(800_000));
         assert_eq!(pop_budget_for(Some(2), Some("5000"), 0), Some(5000));
+    }
+
+    /// Skipping the receiver with no supplied value and keeping it with one
+    /// supplied ahead both skip one formal: `invoke_alignments` finds that
+    /// skip twice, and it is kept once, in first-found order.
+    #[test]
+    fn alignments_keep_each_skip_once() {
+        let alignments = Alignments::from_grid([[Some(0), Some(1)], [Some(1), Some(2)]]);
+        assert_eq!(alignments.as_slice(), [0, 1, 2]);
+        let reversed = Alignments::from_grid([[Some(2), Some(1)], [Some(1), Some(0)]]);
+        assert_eq!(reversed.as_slice(), [2, 1, 0]);
+        let sparse = Alignments::from_grid([[None, Some(1)], [None, None]]);
+        assert_eq!(sparse.as_slice(), [1]);
+        assert!(Alignments::from_grid([[None; LEADS]; RECEIVER_SKIPS])
+            .as_slice()
+            .is_empty());
     }
 
     // --- `UnwrapPointer` (docs/ANALYSIS.md, "Smart-pointer unwrap") ---

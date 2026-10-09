@@ -2048,9 +2048,11 @@ fn expand_virtual_overrides(program: &mut Program) {
                 span: cs.span,
                 expansion_span: cs.expansion_span,
                 is_direct: true,
+                in_loop: cs.in_loop,
                 receiver_class: cs.receiver_class.clone(),
                 exact_receiver: cs.exact_receiver,
                 return_dst: cs.return_dst,
+                receiver: cs.receiver,
                 tu: cs.tu,
             });
         }
@@ -5245,19 +5247,18 @@ fn register_member_prototype(
         .map(|t| parse_type_node(program, ctx, source, t))
         .unwrap_or_else(|| program.types.void());
     // Types are read where they decide something: an overload set of the
-    // class, or a virtual member whose nearest declaring ancestor overloads
-    // the name, since a call ranked to another overload does not dispatch to
-    // it. A name declared once otherwise merges with its definition by name
-    // and arity (docs/ANALYSIS.md, "In-class prototypes" under C++ support).
+    // class, or a virtual member, whose declaration is what a definition
+    // of the name in a subclass is matched against (an entry model's
+    // member, `trace-analysis/src/contexts.rs`; a call ranked to another
+    // overload of the name does not dispatch to it). A member of an
+    // interface synthesized from an `.idl` file spells its types as the IDL
+    // does (`sharedptr<T>`), not as its overrides do, so it records none
+    // and matches them by arity. A name declared once otherwise merges with
+    // its definition by name and arity (docs/ANALYSIS.md, "In-class
+    // prototypes" under C++ support).
     let read_types = overload
         || (flags.is_virtual
-            && declared_members_upward(
-                program,
-                cls_qual,
-                &trace_ir::MethodKind::Named(short.to_owned()),
-            )
-            .len()
-                > 1);
+            && !crate::idl::is_generated(&program.symbols.files[ctx.current_file.0 as usize].path));
     let param_type_ids = if ctx.is_cpp && read_types {
         prototype_param_types(program, ctx, source, node)
     } else {
@@ -7147,6 +7148,8 @@ fn promoted_receiver_value(
 /// temporary is needed: the variable itself for a plain name, the object a
 /// reference names, else a temporary the ordinary expression lowering fills
 /// (`msg->weak` loads the field, `get_weak()` receives the call's return).
+/// The temporary is allocated only once the receiver has a value
+/// ([`RhsDst::Load`]), so a receiver with none leaves none behind.
 fn receiver_value(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -7165,19 +7168,62 @@ fn receiver_value(
             });
         }
     }
-    let value = alloc_load_temp(program, ctx, receiver, type_id);
-    match expr_to_rhs_flow(program, ctx, source, receiver, value) {
-        Some(flow) => program.flow.push(flow),
+    let value = RhsDst::Load {
+        span: receiver,
+        type_id,
+        var: Cell::new(None),
+    };
+    match rhs_flow(program, ctx, source, receiver, &value) {
+        Some(flow) => {
+            program.flow.push(flow);
+            value.allocated()
+        }
         // A call receiver's result is recorded as it is lowered, as the
         // call's return destination, rather than returned.
-        None if ctx
-            .call_return_dst
-            .borrow()
-            .get(&peel_casts(source, receiver).id())
-            == Some(&value) => {}
-        None => return None,
+        None => {
+            let call = peel_casts(source, receiver).id();
+            value
+                .allocated()
+                .filter(|var| ctx.call_return_dst.borrow().get(&call) == Some(var))
+        }
     }
-    Some(value)
+}
+
+/// `node` names an instance member: a field access other than a static data
+/// member's (`cb_` through `this`, `obj->cb_`).
+fn names_instance_member(program: &Program, ctx: &LowerContext, source: &str, node: Node) -> bool {
+    match node.cached_kind() {
+        "field_expression" => static_member_access(program, ctx, source, node).is_none(),
+        "identifier" => implicit_this(program, ctx, source, node).is_some(),
+        _ => false,
+    }
+}
+
+/// A call through a pointer field (`cb_->OnError()`, `this->cb_->f()`,
+/// `obj->cb_->f()`) reads the field. Load it into a temporary at the call so
+/// the read is a value flow (and a `mem_read` edge of the export), as
+/// `auto *cb = cb_; cb->OnError();` would be: every such call reads it, each
+/// at its own position. The value is not passed on as the callee's `this`:
+/// receivers are identity, not value flow (docs/ANALYSIS.md, "Memory access
+/// edges"). Ordinary member calls and explicit member operators
+/// (`cb_->operator()()`) share this hook: `named` is the call's receiver, and
+/// only an `->` receiver naming no variable is read.
+fn read_field_receiver(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    recv: Node,
+    is_arrow: bool,
+    named: &Receiver,
+) {
+    if !is_arrow || !matches!(named, Receiver::Unnamed) {
+        return;
+    }
+    let recv = peel_casts(source, recv);
+    if names_instance_member(program, ctx, source, recv) {
+        let unknown = program.types.unknown();
+        let _ = receiver_value(program, ctx, source, recv, unknown);
+    }
 }
 
 /// `wrapper<class>` for a smart-pointer model whose one template argument is
@@ -7317,7 +7363,7 @@ fn emit_factory_construction(
         caller,
         &cls,
         &trace_ir::MethodKind::Ctor,
-        Some(heap),
+        Receiver::Bound(heap),
         args,
         span,
         expansion_span,
@@ -7414,7 +7460,7 @@ fn construct_on_heap(
             caller,
             cls,
             &trace_ir::MethodKind::Ctor,
-            Some(heap),
+            Receiver::Bound(heap),
             args,
             span,
             expansion_span,
@@ -8198,9 +8244,11 @@ fn lower_declaration(
                                             span,
                                             expansion_span,
                                             is_direct: false,
+                                            in_loop: false,
                                             receiver_class: None,
                                             exact_receiver: false,
                                             return_dst: None,
+                                            receiver: None,
                                             tu: Some(ctx.current_file),
                                         });
                                         continue;
@@ -8530,7 +8578,7 @@ fn lower_direct_init(
         caller,
         &cls,
         &trace_ir::MethodKind::Ctor,
-        Some(object),
+        Receiver::Bound(object),
         args,
         call_span,
         expansion_span,
@@ -8789,7 +8837,7 @@ fn emit_automatic_lifecycle(
                 caller,
                 &owner,
                 &kind,
-                Some(var),
+                Receiver::Bound(var),
                 CallArgs::empty(),
                 span,
                 expansion_span,
@@ -8976,7 +9024,7 @@ fn lower_one_declarator(
                     ctx.current_fn.unwrap(),
                     &cls,
                     &trace_ir::MethodKind::Ctor,
-                    Some(var_id),
+                    Receiver::Bound(var_id),
                     call_args,
                     span,
                     expansion_span,
@@ -9724,7 +9772,7 @@ fn walk_function_body(
                         caller,
                         &cls,
                         &trace_ir::MethodKind::Dtor,
-                        None,
+                        Receiver::Unnamed,
                         CallArgs::empty(),
                         span,
                         expansion_span,
@@ -9774,10 +9822,18 @@ fn walk_function_body(
     .flatten();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        let first_site = program.symbols.call_sites.len();
         if statement_body.is_some_and(|body| body.id() == child.id()) {
             lower_statement_local(program, ctx, source, node);
         }
         walk_function_body(program, ctx, source, child, caller);
+        if repeats_in_loop(node, child) {
+            // The calls this child lowered are the function's own; a lambda
+            // written here lowered its calls into a function of its own.
+            for site in &mut program.symbols.call_sites[first_site..] {
+                site.in_loop |= site.caller == caller;
+            }
+        }
     }
     if is_block {
         ctx.using_nss.truncate(using_nss_len);
@@ -9793,6 +9849,22 @@ fn walk_function_body(
         }
     }
     ctx.ast_depth = ctx.ast_depth.saturating_sub(1);
+}
+
+/// Whether `child` of `node` runs once per iteration of the loop `node` is:
+/// a loop's body, condition and update do, a `for` init-statement and a
+/// range-for's init-statement and range run once (`CallSite::in_loop`).
+fn repeats_in_loop(node: Node, child: Node) -> bool {
+    let runs_once = |field: &str| {
+        node.cached_field(field)
+            .is_some_and(|once| once.id() == child.id())
+    };
+    match node.cached_kind() {
+        "for_statement" => !runs_once("initializer"),
+        "for_range_loop" => !runs_once("initializer") && !runs_once("right"),
+        "while_statement" | "do_statement" => true,
+        _ => false,
+    }
 }
 
 pub(crate) struct ExplicitMemberOperatorCall<'a> {
@@ -9978,6 +10050,8 @@ fn collect_call_at_node_inner(
         let kind = trace_ir::MethodKind::Named(op_norm.clone());
         let call_args = collect_call_args(program, ctx, source, node.cached_field("arguments"));
         if let Some(recv_cls) = infer_static_class(program, ctx, source, op.receiver) {
+            let named = Receiver::named(program, ctx, source, op.receiver);
+            read_field_receiver(program, ctx, source, op.receiver, op.is_arrow, &named);
             let cls = if op.is_arrow {
                 let Some(cls) = member_receiver_class(program, ctx, source, op.receiver, true)
                 else {
@@ -9991,6 +10065,7 @@ fn collect_call_at_node_inner(
                         span,
                         expansion_span,
                         return_dst,
+                        None,
                     );
                     return;
                 };
@@ -10006,7 +10081,7 @@ fn collect_call_at_node_inner(
                     caller,
                     &cls,
                     &kind,
-                    None,
+                    named,
                     call_args,
                     span,
                     expansion_span,
@@ -10024,6 +10099,7 @@ fn collect_call_at_node_inner(
                 span,
                 expansion_span,
                 return_dst,
+                named.var(),
             );
             return;
         }
@@ -10039,6 +10115,7 @@ fn collect_call_at_node_inner(
             span,
             expansion_span,
             return_dst,
+            None,
         );
         return;
     }
@@ -10089,6 +10166,8 @@ fn collect_call_at_node_inner(
                     if let Some((recv, recv_cls)) = func.cached_field("argument").and_then(|recv| {
                         infer_static_class(program, ctx, source, recv).map(|c| (recv, c))
                     }) {
+                        let named = Receiver::named(program, ctx, source, recv);
+                        read_field_receiver(program, ctx, source, recv, op_is_arrow, &named);
                         // `p->m()` looks `m` up on what `p`'s `operator->`
                         // yields, not on `p`'s own class (#64). `r.m()` looks
                         // it up on `r`'s own class, which is already in hand.
@@ -10113,6 +10192,7 @@ fn collect_call_at_node_inner(
                                     span,
                                     expansion_span,
                                     return_dst,
+                                    None,
                                 );
                                 return;
                             };
@@ -10145,7 +10225,7 @@ fn collect_call_at_node_inner(
                                 caller,
                                 &cls,
                                 &kind,
-                                None,
+                                named,
                                 call_args,
                                 span,
                                 expansion_span,
@@ -10172,7 +10252,7 @@ fn collect_call_at_node_inner(
                                     caller,
                                     &field_cls,
                                     &op,
-                                    None,
+                                    Receiver::Unnamed,
                                     call_args,
                                     span,
                                     expansion_span,
@@ -10206,6 +10286,7 @@ fn collect_call_at_node_inner(
                                 span,
                                 expansion_span,
                                 return_dst,
+                                named.var(),
                             );
                             return;
                         }
@@ -10239,7 +10320,7 @@ fn collect_call_at_node_inner(
                         caller,
                         &cls,
                         &kind,
-                        None,
+                        Receiver::this_of(ctx),
                         call_args,
                         span,
                         expansion_span,
@@ -10259,7 +10340,7 @@ fn collect_call_at_node_inner(
             caller,
             &cls,
             &kind,
-            None,
+            Receiver::Unnamed,
             call_args,
             span,
             expansion_span,
@@ -10287,7 +10368,7 @@ fn collect_call_at_node_inner(
                 caller,
                 &cls,
                 &kind,
-                None,
+                Receiver::Unnamed,
                 call_args,
                 span,
                 expansion_span,
@@ -10429,9 +10510,11 @@ fn collect_call_at_node_inner(
             span,
             expansion_span,
             is_direct,
+            in_loop: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst,
+            receiver: None,
             tu: Some(ctx.current_file),
         });
         return;
@@ -10477,9 +10560,11 @@ fn collect_call_at_node_inner(
             span,
             expansion_span,
             is_direct: true,
+            in_loop: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst,
+            receiver: None,
             tu: Some(ctx.current_file),
         });
     }
@@ -10802,8 +10887,18 @@ fn collect_call_arg_nodes<'t>(
                     "field_expression" | "subscript_expression"
                 ) {
                     let temp = alloc_ret_temp(program, ctx, arg);
+                    let first_flow = program.flow.len();
+                    let first_pending = ctx.pending.borrow().len();
                     if let Some(flow) = expr_to_rhs_flow(program, ctx, source, arg, temp) {
                         program.flow.push(flow);
+                        record_argument_origins(
+                            program,
+                            ctx,
+                            source,
+                            arg,
+                            first_flow,
+                            first_pending,
+                        );
                         var_args.push((arg_index, temp));
                         arg_desc.push(adesc);
                         arg_index += 1;
@@ -10841,7 +10936,13 @@ fn collect_call_arg_nodes<'t>(
                     value: s,
                 });
                 var_args.push((arg_index, temp));
-            } else if let Some(gep) = addr_of_field_path(program, ctx, source, arg) {
+            } else if let Some(gep) = {
+                let first_flow = program.flow.len();
+                let first_pending = ctx.pending.borrow().len();
+                let gep = addr_of_field_path(program, ctx, source, arg);
+                record_argument_origins(program, ctx, source, arg, first_flow, first_pending);
+                gep
+            } {
                 var_args.push((arg_index, gep));
             } else if let Some(fn_id) = resolve_call_fn_arg(program, ctx, source, arg) {
                 fn_args.push((arg_index, fn_id));
@@ -11794,6 +11895,7 @@ fn emit_unresolved_site(
     span: Span,
     expansion_span: Option<Span>,
     return_dst: Option<VarId>,
+    receiver: Option<VarId>,
 ) {
     let CallArgs {
         var_args,
@@ -11821,25 +11923,82 @@ fn emit_unresolved_site(
         span,
         expansion_span,
         is_direct: false,
+        in_loop: false,
         receiver_class,
         exact_receiver: false,
         return_dst,
+        receiver,
         tu: program.symbols.function_by_id(caller).and_then(|f| f.tu),
     });
+}
+
+/// The object a member call runs on, as lowering knows it
+/// ([`CallSite::receiver`]).
+#[derive(Clone, Copy)]
+enum Receiver {
+    /// A field, a call result or another expression, or not known.
+    Unnamed,
+    /// A variable by name: recorded on the site, for identity only.
+    Named(VarId),
+    /// The object a constructor or destructor builds or destroys: recorded,
+    /// and bound to the callee's `this` as argument 0.
+    Bound(VarId),
+}
+
+impl Receiver {
+    /// The variable a receiver expression names, without lowering it: `q`
+    /// in `q.f()`, `p` in `p->f()`, `this` in `this->f()`, through
+    /// parentheses, casts and `std::move`. A bare instance field in a member
+    /// body (`handler_->f()`) is `this->handler_`, no variable.
+    fn named(program: &Program, ctx: &LowerContext, source: &str, receiver: Node) -> Self {
+        let receiver = peel_casts(source, receiver);
+        let var = match receiver.cached_kind() {
+            "this" => return Self::this_of(ctx),
+            "identifier" if implicit_this(program, ctx, source, receiver).is_some() => None,
+            "identifier" | "qualified_identifier" => {
+                lookup_var_node(program, ctx, source, receiver)
+            }
+            _ => None,
+        };
+        var.map_or(Self::Unnamed, Self::Named)
+    }
+
+    /// The implicit `this` of a member body, the receiver of a bare
+    /// `method()` call there.
+    fn this_of(ctx: &LowerContext) -> Self {
+        ctx.locals
+            .get("this")
+            .copied()
+            .map_or(Self::Unnamed, Self::Named)
+    }
+
+    fn var(self) -> Option<VarId> {
+        match self {
+            Self::Unnamed => None,
+            Self::Named(var) | Self::Bound(var) => Some(var),
+        }
+    }
+
+    fn bound(self) -> Option<VarId> {
+        match self {
+            Self::Bound(var) => Some(var),
+            Self::Unnamed | Self::Named(_) => None,
+        }
+    }
 }
 
 /// Emit call sites for `cls::member` — the override set across derived
 /// classes, found by walking up the inheritance chain to the nearest
 /// declaring class and expanding its subclasses. `args` are the explicit
-/// arguments, bound here past the member's `this`, which is `receiver` when
-/// the caller has the object (#93, #94).
+/// arguments, bound here past the member's `this`, which is the `receiver`
+/// when the caller has the object (#93, #94).
 #[allow(clippy::too_many_arguments)]
 fn emit_member_sites(
     program: &mut Program,
     caller: FnId,
     cls: &str,
     kind: &trace_ir::MethodKind,
-    receiver: Option<VarId>,
+    receiver: Receiver,
     args: CallArgs,
     span: Span,
     expansion_span: Option<Span>,
@@ -11871,7 +12030,7 @@ fn emit_member_targets(
     caller: FnId,
     cls: &str,
     kind: &trace_ir::MethodKind,
-    receiver: Option<VarId>,
+    receiver: Receiver,
     args: CallArgs,
     span: Span,
     expansion_span: Option<Span>,
@@ -11886,7 +12045,7 @@ fn emit_member_targets(
         return;
     }
     let tu = program.symbols.function_by_id(caller).and_then(|f| f.tu);
-    let mut args = args.bind_past_this(receiver);
+    let mut args = args.bind_past_this(receiver.bound());
     let argc = args.argc;
     let targets = filter_targets_by_argc(program, targets, argc as usize, &args.arg_desc, true);
     // Same-arity overloads the argument types tell apart (`Set(int)`,
@@ -11922,9 +12081,11 @@ fn emit_member_targets(
             span,
             expansion_span,
             is_direct: false,
+            in_loop: false,
             receiver_class: Some(cls.to_string()),
             exact_receiver: false,
             return_dst,
+            receiver: receiver.var(),
             tu,
         });
         return;
@@ -11957,9 +12118,11 @@ fn emit_member_targets(
             span,
             expansion_span,
             is_direct: true,
+            in_loop: false,
             receiver_class: Some(cls.to_string()),
             exact_receiver: false,
             return_dst,
+            receiver: receiver.var(),
             tu,
         });
     }
@@ -12798,7 +12961,7 @@ fn lower_class_initializer(
             caller,
             &class,
             &kind,
-            object.address,
+            object.address.map_or(Receiver::Unnamed, Receiver::Bound),
             call_args.take_for(index == last),
             span,
             expansion_span,
@@ -13099,7 +13262,7 @@ fn lower_copy_subobject(
                 caller,
                 target,
                 &kind,
-                object.address,
+                object.address.map_or(Receiver::Unnamed, Receiver::Bound),
                 args,
                 span,
                 expansion_span,
@@ -15221,6 +15384,50 @@ fn record_operation_origins(
     }
 }
 
+/// Attribute the flow facts and deferred references a call's argument `arg`
+/// added since `first_flow` / `first_pending`, the field or element it
+/// reads or takes the address of, to the argument's own text rather than
+/// the call's ([`record_operation_origins`]): in `sink(a->p, b->p)` each
+/// access spans its own argument, so a position on one names only that
+/// access (docs/ANALYSIS.md, "Where a value moves"). Nothing to attribute
+/// when it added none.
+fn record_argument_origins(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    arg: Node,
+    first_flow: usize,
+    first_pending: usize,
+) {
+    if program.flow.len() == first_flow && ctx.pending.borrow().len() == first_pending {
+        return;
+    }
+    let span = node_span(program, ctx, arg);
+    let expression = operation_expression(ctx, source, arg);
+    record_operation_origins(program, ctx, first_flow, first_pending, span, &expression);
+}
+
+/// Run `lower`, then attribute the flow facts and deferred references it
+/// added to the operation written at `node` ([`record_operation_origins`]);
+/// nothing to attribute when it added none.
+fn lower_operation(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+    lower: impl FnOnce(&mut Program, &mut LowerContext),
+) {
+    let first_flow = program.flow.len();
+    let first_pending = ctx.pending.borrow().len();
+    lower(program, ctx);
+    if program.flow.len() == first_flow && ctx.pending.borrow().len() == first_pending {
+        return;
+    }
+    let span = node_span(program, ctx, node);
+    let expression = operation_expression(ctx, source, node);
+    record_operation_origins(program, ctx, first_flow, first_pending, span, &expression);
+}
+
 fn extract_flow_from_expr(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -15228,12 +15435,9 @@ fn extract_flow_from_expr(
     node: Node,
     assign_target: Option<VarId>,
 ) {
-    let start = program.flow.len();
-    let first_pending = ctx.pending.borrow().len();
-    extract_flow_from_expr_inner(program, ctx, source, node, assign_target);
-    let span = node_span(program, ctx, node);
-    let expression = operation_expression(ctx, source, node);
-    record_operation_origins(program, ctx, start, first_pending, span, &expression);
+    lower_operation(program, ctx, source, node, |program, ctx| {
+        extract_flow_from_expr_inner(program, ctx, source, node, assign_target)
+    });
 }
 
 fn extract_flow_from_expr_inner(
@@ -16640,12 +16844,59 @@ fn expr_to_store_src(
     }
 }
 
+/// `dst = node`: the flow fact carrying `node`'s value into `dst`, if any.
 fn expr_to_rhs_flow(
     program: &mut Program,
     ctx: &mut LowerContext,
     source: &str,
     node: Node,
     dst: VarId,
+) -> Option<FlowConstraint> {
+    rhs_flow(program, ctx, source, node, &RhsDst::Var(dst))
+}
+
+/// Where [`rhs_flow`] writes a value: a variable the caller holds, or a load
+/// temporary allocated only once the expression has a value to hold, so
+/// that an expression with none leaves no temporary behind.
+enum RhsDst<'t> {
+    Var(VarId),
+    Load {
+        span: Node<'t>,
+        type_id: trace_ir::TypeId,
+        var: Cell<Option<VarId>>,
+    },
+}
+
+impl RhsDst<'_> {
+    /// The destination variable, allocating a load temporary on first use.
+    fn var(&self, program: &mut Program, ctx: &LowerContext) -> VarId {
+        match self {
+            Self::Var(var) => *var,
+            Self::Load { span, type_id, var } => var.get().unwrap_or_else(|| {
+                let temp = alloc_load_temp(program, ctx, *span, *type_id);
+                var.set(Some(temp));
+                temp
+            }),
+        }
+    }
+
+    /// The destination variable, unless it is a load temporary nothing has
+    /// needed yet.
+    fn allocated(&self) -> Option<VarId> {
+        match self {
+            Self::Var(var) => Some(*var),
+            Self::Load { var, .. } => var.get(),
+        }
+    }
+}
+
+/// [`expr_to_rhs_flow`] into a destination allocated on first use.
+fn rhs_flow(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+    dst: &RhsDst,
 ) -> Option<FlowConstraint> {
     if node_is_from_ignored_macro(ctx, node) {
         return None;
@@ -16655,6 +16906,7 @@ fn expr_to_rhs_flow(
         return None;
     }
     if is_nullptr(source, node) {
+        let dst = dst.var(program, ctx);
         return Some(FlowConstraint::NullPointer { dst });
     }
     // `f = s.ops[i]` reads the field `ops`, as `f = ops_[i]` reads
@@ -16662,16 +16914,19 @@ fn expr_to_rhs_flow(
     // member table is a variable of its own, read as its name is.
     if let Some(table) = field_table(program, ctx, source, node) {
         return match Operand::resolve(program, ctx, source, node) {
-            Some(element) => Some(element.read_into(program, ctx, source, dst)),
-            None => expr_to_rhs_flow(program, ctx, source, table, dst),
+            Some(element) => {
+                let dst = dst.var(program, ctx);
+                Some(element.read_into(program, ctx, source, dst))
+            }
+            None => rhs_flow(program, ctx, source, table, dst),
         };
     }
     match node.cached_kind() {
-        "this" => ctx
-            .locals
-            .get("this")
-            .copied()
-            .map(|src| FlowConstraint::Copy { dst, src }),
+        "this" => {
+            let src = ctx.locals.get("this").copied()?;
+            let dst = dst.var(program, ctx);
+            Some(FlowConstraint::Copy { dst, src })
+        }
         "identifier" => {
             // A declared name shadows a function of the same name, as in the
             // return arm: an instance field unless the body hides it (its
@@ -16684,13 +16939,16 @@ fn expr_to_rhs_flow(
             let name = node_text(source, &node);
             let found = lookup_var_unless_hidden(ctx, program, name);
             if let Some(Some(src)) = found {
+                let dst = dst.var(program, ctx);
                 Some(FlowConstraint::Copy { dst, src })
             } else if let Some(callee) = resolve_function_named(program, ctx, name) {
+                let dst = dst.var(program, ctx);
                 Some(FlowConstraint::AddrOfFn { dst, callee })
             } else if found.is_some() {
                 None
             } else {
                 // Might be a function defined later in the unit.
+                let dst = dst.var(program, ctx);
                 ctx.pending.borrow_mut().push(PendingFnRef::RhsIdent {
                     dst,
                     name: name.to_string(),
@@ -16700,10 +16958,12 @@ fn expr_to_rhs_flow(
         }
         "qualified_identifier" => {
             if let Some(src) = lookup_var_node(program, ctx, source, node) {
+                let dst = dst.var(program, ctx);
                 Some(FlowConstraint::Copy { dst, src })
             } else {
-                resolve_qualified_fn(program, ctx, source, node)
-                    .map(|callee| FlowConstraint::AddrOfFn { dst, callee })
+                let callee = resolve_qualified_fn(program, ctx, source, node)?;
+                let dst = dst.var(program, ctx);
+                Some(FlowConstraint::AddrOfFn { dst, callee })
             }
         }
         "pointer_expression" => {
@@ -16712,6 +16972,7 @@ fn expr_to_rhs_flow(
             if op.as_deref() == Some("&") {
                 let peeled = peel_expression(arg);
                 if let Some(src) = lookup_var_node(program, ctx, source, peeled) {
+                    let dst = dst.var(program, ctx);
                     Some(if names_reference_binding(ctx, peeled, src) {
                         FlowConstraint::Copy { dst, src }
                     } else {
@@ -16719,10 +16980,13 @@ fn expr_to_rhs_flow(
                     })
                 } else if let Some(gep) = addr_of_field_path(program, ctx, source, arg) {
                     // The gep temp's pts-to is the field's own location.
+                    let dst = dst.var(program, ctx);
                     Some(FlowConstraint::Copy { dst, src: gep })
                 } else if let Some(callee) = resolve_fn_ref(program, ctx, source, arg) {
+                    let dst = dst.var(program, ctx);
                     Some(FlowConstraint::AddrOfFn { dst, callee })
                 } else if let Some(src) = resolve_lvalue_var(program, ctx, source, arg) {
+                    let dst = dst.var(program, ctx);
                     Some(if names_reference_binding(ctx, arg, src) {
                         FlowConstraint::Copy { dst, src }
                     } else {
@@ -16733,6 +16997,7 @@ fn expr_to_rhs_flow(
                         let name = node_text(source, &arg);
                         if lookup_var_unless_hidden(ctx, program, name).is_none() {
                             // Might be a function defined later in the unit.
+                            let dst = dst.var(program, ctx);
                             ctx.pending.borrow_mut().push(PendingFnRef::AddrOfIdent {
                                 dst,
                                 name: name.to_string(),
@@ -16747,9 +17012,10 @@ fn expr_to_rhs_flow(
                     // `handler`, as a value names it.
                     let operand = peel_expression(arg);
                     return matches!(operand.cached_kind(), "identifier" | "qualified_identifier")
-                        .then(|| expr_to_rhs_flow(program, ctx, source, operand, dst))
+                        .then(|| rhs_flow(program, ctx, source, operand, dst))
                         .flatten();
                 };
+                let dst = dst.var(program, ctx);
                 let src = value.publish(program, ctx, source);
                 Some(if in_place {
                     FlowConstraint::Copy { dst, src }
@@ -16762,10 +17028,14 @@ fn expr_to_rhs_flow(
         }
         "lambda_expression" if ctx.is_cpp => {
             let callee = lower_lambda_expression(program, ctx, source, node)?;
+            let dst = dst.var(program, ctx);
             Some(FlowConstraint::AddrOfFn { dst, callee })
         }
-        "string_literal" | "concatenated_string" => string_literal_value(source, node)
-            .map(|value| FlowConstraint::StringConst { dst, value }),
+        "string_literal" | "concatenated_string" => {
+            let value = string_literal_value(source, node)?;
+            let dst = dst.var(program, ctx);
+            Some(FlowConstraint::StringConst { dst, value })
+        }
         "call_expression" => {
             lower_call_return(program, ctx, source, node, dst);
             None
@@ -16776,13 +17046,17 @@ fn expr_to_rhs_flow(
         "new_expression" if ctx.is_cpp => {
             let alloc_tmp = lower_new_object(program, ctx, source, node)?;
             ctx.handled_new_exprs.borrow_mut().insert(node.id());
+            let dst = dst.var(program, ctx);
             Some(FlowConstraint::Copy {
                 dst,
                 src: alloc_tmp,
             })
         }
-        _ => resolve_expr_var(program, ctx, source, node)
-            .map(|src| FlowConstraint::Copy { dst, src }),
+        _ => {
+            let src = resolve_expr_var(program, ctx, source, node)?;
+            let dst = dst.var(program, ctx);
+            Some(FlowConstraint::Copy { dst, src })
+        }
     }
 }
 
@@ -16806,7 +17080,11 @@ fn collect_return_statement(
     {
         return;
     }
-    collect_return_flow(program, ctx, source, value, fn_id);
+    // The operations reading the returned value (`return cb_;` loads the
+    // member) are written at the value, as an initializer's are.
+    lower_operation(program, ctx, source, value, |program, ctx| {
+        collect_return_flow(program, ctx, source, value, fn_id)
+    });
 }
 
 fn collect_return_flow(
@@ -17109,18 +17387,19 @@ fn lower_call_return_with_resolved(
     }
 }
 
+/// `dst = call_node()`, recorded as the call's return destination; `dst` is
+/// allocated only once the call resolves.
 fn lower_call_return(
     program: &mut Program,
     ctx: &mut LowerContext,
     source: &str,
     call_node: Node,
-    dst: VarId,
-) -> bool {
-    let Some(resolved) = resolve_call_for_return(program, ctx, source, call_node) else {
-        return false;
-    };
-    lower_call_return_with_resolved(program, ctx, call_node, dst, resolved);
-    true
+    dst: &RhsDst,
+) {
+    if let Some(resolved) = resolve_call_for_return(program, ctx, source, call_node) {
+        let dst = dst.var(program, ctx);
+        lower_call_return_with_resolved(program, ctx, call_node, dst, resolved);
+    }
 }
 
 fn lower_nested_call_arg(
@@ -17279,15 +17558,16 @@ fn operand_value(
 
 /// `dst = operand`: `operand`'s value ([`Operand`]) flows into `dst`
 /// directly, a member's without a temporary of its own; `None`, with
-/// nothing emitted, where it cannot be computed.
+/// nothing emitted (`dst` included), where it cannot be computed.
 fn operand_flow(
     program: &mut Program,
     ctx: &mut LowerContext,
     source: &str,
     operand: Node,
-    dst: VarId,
+    dst: &RhsDst,
 ) -> Option<FlowConstraint> {
     let value = Operand::resolve(program, ctx, source, operand)?;
+    let dst = dst.var(program, ctx);
     Some(value.read_into(program, ctx, source, dst))
 }
 
@@ -20161,6 +20441,116 @@ mod index_window_tests {
         }
     }
 
+    /// Load temporaries no flow fact mentions.
+    fn orphan_loads(program: &Program) -> Vec<String> {
+        let used: HashSet<VarId> = program.flow.iter().flat_map(|f| f.vars()).collect();
+        program
+            .symbols
+            .variables
+            .iter()
+            .filter(|v| v.temp == Some(TempKind::Load) && !used.contains(&v.id))
+            .map(|v| v.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn every_call_through_a_member_reads_it_with_no_orphan_temporary() {
+        let program = lower_cpp_snippet(
+            "struct Cb { virtual void On(int c) = 0; };\n\
+             struct Inner { Cb *cb_; };\n\
+             struct Holder { Inner *in_; Holder *Self(); };\n\
+             Holder *GetHolder();\n\
+             class C {\npublic:\n\
+               void Run(Holder **pp, Holder h) {\n\
+                 cb_->On(1);\n\
+                 cb_->On(2);\n\
+                 this->cb_->On(3);\n\
+                 in_->cb_->On(4);\n\
+                 GetHolder()->in_->cb_->On(5);\n\
+                 h.Self()->in_->cb_->On(6);\n\
+                 (*pp)->in_->cb_->On(7);\n\
+               }\n\
+               Cb *cb_;\n  Inner *in_;\n};\n",
+        );
+        assert_eq!(orphan_loads(&program), Vec::<String>::new());
+        let run = program
+            .symbols
+            .functions
+            .iter()
+            .find(|f| f.name.ends_with("Run"))
+            .unwrap()
+            .id;
+        // Lines of the calls whose receiver member is loaded at the call: the
+        // paths lowering does not resolve (lines 12 and 13) leave no
+        // temporary.
+        let mut lines: Vec<u32> = program
+            .symbols
+            .variables
+            .iter()
+            .filter(|v| v.temp == Some(TempKind::Load) && v.fn_id == Some(run))
+            .map(|v| v.span.line)
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        assert_eq!(lines, [8, 9, 10, 11, 14]);
+    }
+
+    /// A receiver whose value lowering cannot compute, of any kind, yields
+    /// none and leaves no temporary behind.
+    #[test]
+    fn a_receiver_with_no_value_leaves_no_temporary() {
+        let source = "void f(int c) { 0; c ? 1 : 2; (c ? f : f)(c); }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut program = Program::new(PathBuf::from("/t"));
+        let file = program.symbols.add_file(PathBuf::from("/t/r.cpp"));
+        let mut ctx = super::qualified_variable_lookup_tests::test_ctx(
+            file,
+            None,
+            Vec::new(),
+            HashMap::default(),
+        );
+        let body = tree
+            .root_node()
+            .named_child(0)
+            .and_then(|f| f.cached_field("body"))
+            .unwrap();
+        let mut cursor = body.walk();
+        let receivers: Vec<Node> = body
+            .named_children(&mut cursor)
+            .filter_map(|statement| statement.named_child(0))
+            .collect();
+        let kinds: Vec<&str> = receivers.iter().map(|r| r.cached_kind()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "number_literal",
+                "conditional_expression",
+                "call_expression"
+            ]
+        );
+        let unknown = program.types.unknown();
+        for receiver in receivers {
+            assert_eq!(
+                receiver_value(&mut program, &mut ctx, source, receiver, unknown),
+                None
+            );
+        }
+        assert_eq!(orphan_loads(&program), Vec::<String>::new());
+        // Lowered in place: a promotion through a method's result, which
+        // nothing records.
+        let program = lower_cpp_snippet(
+            "namespace std { template <class T> class weak_ptr; }\n\
+             struct P { int x; };\n\
+             struct Source { std::weak_ptr<P> *Get(); };\n\
+             void f(Source *obj) { auto p = (*obj->Get()).lock(); }\n",
+        );
+        assert_eq!(orphan_loads(&program), Vec::<String>::new());
+    }
+
     #[test]
     fn class_template_records_parameter_bases_and_no_parameter_edge() {
         let program = lower_cpp_snippet(
@@ -21240,7 +21630,7 @@ mod qualified_variable_lookup_tests {
         }
     }
 
-    fn test_ctx(
+    pub(super) fn test_ctx(
         current_file: trace_ir::FileId,
         current_fn: Option<FnId>,
         ns_stack: Vec<Option<String>>,

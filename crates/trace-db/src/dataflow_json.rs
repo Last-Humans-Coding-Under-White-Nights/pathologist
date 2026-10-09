@@ -47,20 +47,6 @@ fn id_list(ids: impl Iterator<Item = u32>) -> String {
     ids.map(|id| id.to_string()).collect::<Vec<_>>().join(",")
 }
 
-fn operation_owners_sql(positions: usize) -> String {
-    let tuples = std::iter::repeat_n("(?,?,?)", positions)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "WITH positions(path,line,col) AS (VALUES {tuples}) \
-         SELECT pos.path,pos.line,pos.col,MIN(f.id),COUNT(DISTINCT f.id) \
-         FROM positions pos LEFT JOIN files p ON p.path=pos.path \
-         LEFT JOIN functions f ON f.file_id=p.id AND f.is_defined=1 \
-           AND pos.line BETWEEN f.line_start AND f.line_end \
-         GROUP BY pos.path,pos.line,pos.col"
-    )
-}
-
 impl Metadata {
     pub(super) fn load(conn: &Connection, view: &DataflowView) -> Result<Self> {
         let mut metadata = Self::default();
@@ -113,32 +99,21 @@ impl Metadata {
             .filter(|p| !p.path.is_empty() && p.line > 0)
             .cloned()
             .collect();
-        let positions: Vec<_> = positions.into_iter().collect();
-        for chunk in positions.chunks(250) {
-            let sql = operation_owners_sql(chunk.len());
-            let params: Vec<rusqlite::types::Value> = chunk
-                .iter()
-                .flat_map(|p| [p.path.clone().into(), p.line.into(), p.col.into()])
-                .collect();
-            let mut stmt = conn.prepare(&sql)?;
-            for row in stmt.query_map(rusqlite::params_from_iter(params), |r| {
-                let count: u32 = r.get(4)?;
-                Ok((
-                    FlowSite {
-                        path: r.get(0)?,
-                        line: r.get(1)?,
-                        col: r.get(2)?,
-                    },
-                    if count == 1 {
-                        r.get::<_, Option<u32>>(3)?.map(FnId)
-                    } else {
-                        None
-                    },
-                ))
-            })? {
-                let (site, owner) = row?;
-                metadata.operation_functions.insert(site, owner);
+        let mut owners = crate::inspect::DefinitionOwners::default();
+        let mut file_ids = conn.prepare("SELECT id FROM files WHERE path = ?1")?;
+        let mut file: Option<(String, Option<i64>)> = None;
+        for site in positions {
+            // Positions are sorted: each path is looked up once.
+            if file.as_ref().is_none_or(|(path, _)| *path != site.path) {
+                let id = file_ids.query_row([&site.path], |r| r.get(0)).optional()?;
+                file = Some((site.path.clone(), id));
             }
+            let owner = match file.as_ref().and_then(|(_, id)| *id) {
+                Some(id) => owners.owner(conn, id, site.line)?,
+                None => None,
+            };
+            let owner = owner.map(|id| FnId(id as u32));
+            metadata.operation_functions.insert(site, owner);
         }
 
         let mut functions: BTreeSet<_> = view
@@ -400,7 +375,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn operation_owner_batches_seek_the_exported_function_range_index() {
+    fn operation_owners_read_each_file_through_the_function_range_index() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(crate::SCHEMA_V7).unwrap();
         conn.execute_batch("PRAGMA automatic_index=OFF;
@@ -408,40 +383,51 @@ mod tests {
             INSERT INTO functions(id,name,file_id,line_start,line_end,linkage,signature,is_defined) VALUES
             (1,'owner',0,10,20,'external','owner()',1),
             (2,'declaration',0,10,20,'external','declaration()',0),
-            (3,'unrelated',1,10,20,'external','unrelated()',1);").unwrap();
-        let sql = operation_owners_sql(2);
-        let params = rusqlite::params!["/src/main.c", 10, 1, "/src/main.c", 20, 2];
+            (3,'unrelated',1,10,20,'external','unrelated()',1),
+            (4,'lambda',0,12,14,'external','lambda()',1),
+            (5,'twin',0,12,14,'external','twin()',1);").unwrap();
         let plan: Vec<String> = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id, line_start, line_end FROM functions \
+                 WHERE file_id = ?1 AND is_defined = 1 ORDER BY id",
+            )
             .unwrap()
-            .query_map(params, |r| r.get(3))
+            .query_map([0], |r| r.get(3))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert!(
             plan.iter().any(|detail| detail
-                .contains("SEARCH f USING COVERING INDEX idx_functions_file_range")
+                .contains("USING COVERING INDEX idx_functions_file_range")
                 && detail.contains("file_id=?")
                 && detail.contains("is_defined=?")),
             "{plan:?}"
         );
-        let owners: Vec<(u32, u32)> = conn
-            .prepare(&sql)
-            .unwrap()
-            .query_map(params, |r| Ok((r.get(3)?, r.get(4)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
+        let mut owners = crate::inspect::DefinitionOwners::default();
+        // The declaration and the other file's definition own nothing here;
+        // the two definitions inside `owner` share a range, so neither is
+        // innermost, and on its first line `owner` is not enclosing either.
+        let at = |owners: &mut crate::inspect::DefinitionOwners, line| {
+            owners.owner(&conn, 0, line).unwrap()
+        };
+        assert_eq!(at(&mut owners, 10), Some(1));
+        assert_eq!(at(&mut owners, 11), Some(1));
+        assert_eq!(at(&mut owners, 12), None);
+        assert_eq!(at(&mut owners, 13), None);
+        assert_eq!(at(&mut owners, 20), Some(1));
+        assert_eq!(at(&mut owners, 21), None);
+        conn.execute_batch("DELETE FROM functions WHERE id = 5;")
             .unwrap();
-        assert_eq!(owners, [(1, 1), (1, 1)]);
+        let mut owners = crate::inspect::DefinitionOwners::default();
+        assert_eq!(at(&mut owners, 12), None, "on the lambda's first line");
+        assert_eq!(at(&mut owners, 13), Some(4), "inside the lambda");
         conn.execute_batch("DROP INDEX idx_functions_file_range;")
             .unwrap();
-        let legacy: Vec<(u32, u32)> = conn
-            .prepare(&sql)
-            .unwrap()
-            .query_map(params, |r| Ok((r.get(3)?, r.get(4)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(owners, legacy, "older v7 databases remain readable");
+        let mut legacy = crate::inspect::DefinitionOwners::default();
+        assert_eq!(
+            at(&mut legacy, 13),
+            Some(4),
+            "older v7 databases remain readable"
+        );
     }
 }

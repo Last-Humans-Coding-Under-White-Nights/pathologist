@@ -165,7 +165,7 @@ Further index-time wins: smarter header/preprocess skipping, incremental TU cach
 | C++ first-step | `cpp_basic/`, `cpp_more/`, `cpp_flow/`, `cpp_implicit_this/`, `cpp_callable/`, `cpp_dispatch/`, `cpp_extern_c_driver/` |
 | C++ member-initializer construction (#207) | `cpp_implicit_member_initializers/`, `cpp_nested_member_initializers/`, `cpp_member_initializer_review/`, `cpp_unknown_member_copy/`, `cpp_constructor_subobjects/` and `constructor_review.rs` cover own/inherited overload lookup with cv/ref distinctions, C++20 aggregates, constant and unknown array bounds, inherited construction with scoped default initializers, implicit copy/move subobjects, unknown class/union copies and cached/grouped reference bindings — [rules](ANALYSIS.md#c-support-first-step) |
 | C++ `auto` from declared returns (C1) | `cpp_auto_return/` |
-| C++ next (planned) | [CPP_ROADMAP.md](CPP_ROADMAP.md) — `DownCastTo`, `REGISTER`+map, `std::bind`/`ffrt::submit` |
+| C++ next (planned) | [CPP_ROADMAP.md](CPP_ROADMAP.md) — `DownCastTo`, `REGISTER`+map, `std::bind` (`ffrt::submit` and the other task primitives are modelled, #203) |
 | Weak symbols / link targets | `weak_symbol_override/`, `weak_annotations/` |
 | Adversarial / limitations | `tests/fixtures/adversarial_*`, `macro_*` |
 

@@ -110,7 +110,7 @@ trace analyze [OPTIONS] <TARGET>
 | `--timeout-secs <N>` | Watchdog: abort the process after N seconds (exit 124). Useful when probing hang-prone trees. |
 | `--full-export` | Export full IR detail: all types, all variables, PAG `locations`. Slower and produces a larger database. |
 | `--debug-points-to` | Retain points-to sets during analysis and export the `points_to` debug table (requires PAG in memory). Implies keeping location data needed for export. |
-| `--models <FILE>` | Load a TOML function-model file (interprocedural summaries for bodyless callees, e.g. `memcpy_s`, and noise macro lists). Repeatable; later files override earlier entries and built-ins. See `docs/ANALYSIS.md`. |
+| `--models <FILE>` | Load a TOML function-model file (interprocedural summaries for bodyless callees, e.g. `memcpy_s`, callback APIs and the execution context they start, and noise macro lists). Repeatable; later files override earlier entries and built-ins. See `docs/ANALYSIS.md`. |
 | `--ignore-macro <NAME>` | Ignore expansions of the named macro during AST lowering (repeatable). Glob wildcards (`*`) are supported (e.g. `--ignore-macro 'LOG*'`). Suppresses boilerplate call sites, temporary variables, and flow constraints. |
 | `--ignore-logging` | Preset flag to ignore common OpenHarmony and standard logging macros (`HILOG_*`, `TAG_LOG*`, `HIVIEW_LOG*`, `MEDIA_*_LOG`, `LOGD`, `LOGI`, `LOGW`, `LOGE`, `LOGF`). |
 | `--no-test-partition` | Disable the [bare-tree test partition](docs/ANALYSIS.md#declaring-header-eligibility). |
@@ -359,7 +359,9 @@ variable: use a receiver downstream or its formal upstream to inspect receiver
 passing, and a nullable formal upstream to inspect null arguments. See the
 authoritative
 [Source-level dataflow presentation](docs/ANALYSIS.md#source-level-dataflow-presentation)
-for identity, traversal, provenance, and compatibility rules.
+for identity, traversal, provenance, and compatibility rules. The walk stays on
+the constraint edges; the memory edges that join a store to the loads of the
+same cell are followed by `trace inspect slice`.
 
 Dataflow JSON contains `title`, `direction` (`down` or `up`), `depth`,
 `truncated`, `scopes`, `nodes`, and `edges`. The four scope description arrays
@@ -400,6 +402,38 @@ A dataflow edge in `--format json`:
 ```bash
 trace inspect /tmp/hdf.db dataflow --file can_test.c --line 33 --col 31
 trace inspect /tmp/hdf.db dataflow --file usb_raw_io.c --line 331 --col 23 --depth 4
+```
+
+### `trace inspect slice`
+
+A bounded value slice from a variable or field access: up to where the
+value comes from, then down to where it goes. Each node lists the
+[execution contexts](docs/ANALYSIS.md#execution-contexts) that reach it,
+and edges where the value may change hands between threads, tasks or IPC
+requests are flagged as cross-context. A flag is a hint, not a proven race.
+Rules, output fields and limits:
+[Value slice](docs/ANALYSIS.md#value-slice-inspect-slice).
+
+```text
+trace inspect <DB> slice --file SUBSTR --line N --col C [--name IDENT]
+    [--up-depth N] [--down-depth N] [--format text|json]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--file <SUBSTR>`, `--line <N>`, `--col <C>` | Position of a variable (declaration, use, or a call's argument: `p` in `sink(p);`) or of a field access (`cb_` in `cb_ = cb;`; `p` after `->` in `s->p = p;`, the other `p` being the variable). `--file` is a literal substring of the recorded path (`%` and `_` are not wildcards). The column is inside the identifier. |
+| `--name <IDENT>` | The identifier at the position, when the recorded source file cannot be read from here or the line moves several values. |
+| `--up-depth <N>` | Stage 1 limit: edges followed backwards to the sources. |
+| `--down-depth <N>` | Stage 2 limit: edges followed forwards from each source. |
+| `--format` | `text` (default, for people) or `json` (for tools). |
+
+**Examples**
+
+```bash
+trace analyze tests/fixtures/value_slice -o /tmp/slice.db
+# `callback_` in `ICallback *cb = callback_;`: written by an IPC handler, read by a thread
+trace inspect /tmp/slice.db slice --file value_slice/main.cpp --line 59 --col 25
+trace inspect /tmp/slice.db slice --file value_slice/main.cpp --line 59 --col 25 --format json
 ```
 
 ### Graph output formats
@@ -525,7 +559,7 @@ Measured changes are recorded in the [evaluation report](docs/EVAL_REPORT.md).
 
 | Mode | Flags | Database contents |
 |------|-------|-------------------|
-| **Minimal** (default) | *(none)* | `analysis_run`, `files`, `functions`, filtered `call_sites`, `call_edges`, `arg_flow_edges`, PAG-referenced variables, flow graph (`flow_nodes` / `flow_edges`), `diagnostics`. |
+| **Minimal** (default) | *(none)* | `analysis_run`, `files`, `functions`, filtered `call_sites`, `call_edges`, `arg_flow_edges`, `execution_contexts`, PAG-referenced variables, flow graph (`flow_nodes` / `flow_edges` / `flow_memory_access`), `diagnostics`. |
 | **Full IR** | `--full-export` | Minimal plus all `types`, all `variables`, PAG `locations`. |
 | **Points-to debug** | `--debug-points-to` | Adds `points_to` table (and retains PAG during analysis). Use with `--full-export` for complete debug dumps. |
 
@@ -557,7 +591,7 @@ trace-merge [OPTIONS] <INPUT_DBS>... [-o <OUTPUT_DB>]
 | `-v`, `--verbose` | Print detailed diagnostics for all unresolved external functions and weak overrides. By default, collision warnings and summary counts are printed. |
 
 **How it works**:
-- Ingests and remaps files, link targets, functions, call sites, and call edges across input databases.
+- Ingests and remaps files, link targets, functions, call sites, call edges, and execution contexts across input databases (an input exported before `execution_contexts` existed contributes none and is named in a `MissingExecutionContexts` diagnostic).
 - Shared header paths, declarations, and definitions are deduplicated across repositories; if any merged repository defines or declares an entity as non-dependency code (`is_dep = 0`), the unified entry retains `is_dep = 0`.
 - Re-links `external` call edges (`functions.is_defined = 0` or `call_edges.resolution = 'external'`) against matching exported definitions (`is_defined = 1`, `linkage = 'external'`) from other repositories, updating edge resolution to `direct` or `ambiguous`, while preserving original non-direct resolutions (`indirect` and `ipc`).
 - **May-analysis over-approximation**: When multiple definitions match an external call across repositories, an ambiguous edge (`resolution = 'ambiguous'`) is emitted to *every* candidate definition so downstream reachability queries (`trace inspect callchain`) do not miss execution paths. Deduplicates call edges per call site to eliminate duplicate edges.
@@ -570,6 +604,7 @@ trace-merge [OPTIONS] <INPUT_DBS>... [-o <OUTPUT_DB>]
   - **Collisions**: Multiple strong definitions of the same symbol and signature across different repositories (`MultipleDefinitions`).
   - **Unresolved externals**: External function calls that remain unresolved in all merged repositories (`UnresolvedExternal`).
   - **Weak symbol overrides**: Weak definitions superseded by strong definitions across repositories (`WeakOverride`, scoped to cross-repository overrides).
+  - **Inputs without execution contexts**: Inputs that have no `execution_contexts` table (`MissingExecutionContexts`).
 
 **Example**:
 
@@ -596,7 +631,7 @@ indexes before that export phase. See the
 SQLite export also builds a function-range index for operation ownership lookup
 during source-level dataflow inspection; see the [inspection index rules](docs/SQLITE_SCHEMA.md#source-level-presentation-metadata-v7).
 
-Schema version: **v7**, an additive compatibility family. Readers check required structures and database origin rather than infer available capabilities from the number alone; see the [version and capability contract](docs/SQLITE_SCHEMA.md#version-and-capability-contract). Optional `flow_call_origins` and `flow_call_expressions` metadata improves exact occurrence attribution and call text; older v7 analysis exports retain fallback behavior. Re-analysis supplies new metadata and selective-query indexes. `trace-merge` accepts v7 inputs with the required call-graph columns, rejects v6 or missing required structures before writing output, and produces a call-graph database without PAG/provenance data. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries.
+Schema version: **v7**, an additive compatibility family. Readers check required structures and database origin rather than infer available capabilities from the number alone; see the [version and capability contract](docs/SQLITE_SCHEMA.md#version-and-capability-contract). Optional `flow_call_origins` and `flow_call_expressions` metadata improves exact occurrence attribution and call text; older v7 analysis exports retain fallback behavior. Re-analysis supplies new metadata and selective-query indexes. `trace-merge` accepts v7 inputs with the required call-graph columns, rejects v6 or missing required structures before writing output, and produces a call-graph database without PAG/provenance data. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries. `flow_edges` rows carry no position: `flow_origins` records where each edge's operation is written (original file, line and column, one row per statement), and the enclosing function follows from that position (see [Where a value moves](docs/ANALYSIS.md#where-a-value-moves)). `flow_memory_access` records which memory cells each load and store reaches (its sites are that load's or store's `flow_origins` rows), or that none are recorded ([Memory access edges](docs/ANALYSIS.md#memory-access-edges)); an earlier v7 export has no such table and `trace-merge` output leaves it empty. `execution_contexts` lists where threads, tasks and IPC requests start running code — one row per resolved callback of an `invoke` model (`pthread_create`, `std::thread`, `ffrt::submit`, `EventHandler::PostTask`, `HdfWorkInit`, ...), with the model's name and the receiver variable it was submitted on when named, and one per entry no call site starts (an override of `Thread::Run`, `EventHandler::ProcessEvent` or `DeathRecipient::OnRemoteDied`; an IPC stub handler) — with its kind (`thread`, `pool_task`, `serial_task`, `ipc_handler`, `unknown`) and multi-instance evidence (`loop`, `cycle`, `parent`, `unknown`; see [Execution contexts](docs/ANALYSIS.md#execution-contexts)); an earlier v7 export has no such table.
 
 ### Entity relationship (overview)
 
@@ -606,7 +641,8 @@ link_targets ─┬─ target_sources → files
               └─ target_dependencies → link_targets
 files ─┬─ functions ─┬─ call_sites ─ arg_flow_edges → variables
        │             │  (target_id → link_targets)
-       │             └─ call_edges → functions (caller and callee)
+       │             ├─ call_edges → functions (caller and callee)
+       │             └─ execution_contexts → functions, call_sites, variables
        └─ variables ─ flow_nodes ─ flow_edges → flow_nodes
                     (fn_id → functions, type_id → types,
                      target_id → link_targets)
@@ -692,6 +728,19 @@ JOIN call_sites cs ON cs.id = af.call_site_id
 JOIN functions f ON f.id = af.actual_fn_id
 JOIN variables fv ON fv.id = af.formal_var_id
 WHERE af.actual_fn_id IS NOT NULL;
+```
+
+### Where threads and tasks start
+
+```sql
+SELECT e.kind, entry.name AS entry, e.model, caller.name AS started_in, cs.line,
+       queue.name AS submitted_on, e.multi_instance, e.self_concurrent
+FROM execution_contexts e
+JOIN functions entry ON entry.id = e.entry_fn_id
+LEFT JOIN call_sites cs ON cs.id = e.call_site_id
+LEFT JOIN functions caller ON caller.id = cs.caller_fn_id
+LEFT JOIN variables queue ON queue.id = e.receiver_var_id
+ORDER BY e.kind, entry.name;
 ```
 
 ## Project layout

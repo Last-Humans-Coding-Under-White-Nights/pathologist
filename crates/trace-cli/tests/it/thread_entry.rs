@@ -293,3 +293,111 @@ void Start(Box<int *> *box) {
         "the `*` in `Box<int *>` is the template argument's, not the cast's"
     );
 }
+
+analyzed_fixture!(thread_launch);
+
+#[test]
+fn jthread_hands_a_stop_token_taking_callable_its_own_token_first() {
+    let (p, a) = thread_launch();
+    assert!(indirect(p, a, "StartStoppable", "Work"));
+    assert!(
+        indirect(p, a, "Work", "Hit"),
+        "`Hit` is `cb`, past the token `std::jthread` supplies"
+    );
+    let token = local_variable(p, "Work", "token");
+    assert!(
+        !a.arg_flow_edges.iter().any(|row| row.formal == token),
+        "no argument of the call is the token"
+    );
+    let cb = local_variable(p, "Work", "cb");
+    let rows: Vec<_> = a
+        .arg_flow_edges
+        .iter()
+        .filter(|row| row.formal == cb)
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].actual_fn, Some(only_function(p, "Hit")));
+}
+
+#[test]
+fn jthread_hands_its_token_to_a_callable_taking_it_by_reference() {
+    let (p, a) = thread_launch();
+    assert!(indirect(p, a, "StartRefStoppable", "RefWork"));
+    assert!(
+        indirect(p, a, "RefWork", "RefHit"),
+        "`RefHit` is `cb`, past the token a `const std::stop_token &` takes"
+    );
+    let token = local_variable(p, "RefWork", "token");
+    assert!(!a.arg_flow_edges.iter().any(|row| row.formal == token));
+}
+
+#[test]
+fn jthread_hands_its_token_to_a_callable_taking_it_by_rvalue_reference() {
+    let (p, a) = thread_launch();
+    assert!(indirect(p, a, "StartRvalStoppable", "RvalWork"));
+    assert!(
+        indirect(p, a, "RvalWork", "RvalHit"),
+        "`RvalHit` is `cb`, past the token a `std::stop_token &&` takes"
+    );
+    let token = local_variable(p, "RvalWork", "token");
+    assert!(!a.arg_flow_edges.iter().any(|row| row.formal == token));
+}
+
+/// The reviewers' spellings: an unnamed reference token, a callback
+/// parameter written as a function pointer, a by-reference policy and a
+/// `std::async` whose future is discarded.
+#[test]
+fn reference_tokens_and_policies_as_reviewed() {
+    let dir = scratch(&[(
+        "main.cpp",
+        "#include <future>\n\
+         #include <stop_token>\n\
+         #include <thread>\n\
+         void Hit() {}\n\
+         void Work(const std::stop_token &, void (*cb)()) { cb(); }\n\
+         void Start() { std::jthread t(Work, Hit); }\n\
+         void hit() {}\n\
+         void asyncWork(void (*cb)()) { cb(); }\n\
+         void start(const std::launch &policy) { std::async(policy, asyncWork, hit); }\n",
+    )]);
+    let p = &build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let a = &analyze(p).1;
+    assert!(indirect(p, a, "Start", "Work"));
+    assert!(indirect(p, a, "Work", "Hit"));
+    assert!(indirect(p, a, "start", "asyncWork"));
+    assert!(indirect(p, a, "asyncWork", "hit"));
+}
+
+#[test]
+fn jthread_forwards_an_argument_to_a_pointer_to_a_token() {
+    // A pointer is not a reference: `std::jthread` supplies no token to it.
+    let (p, a) = thread_launch();
+    assert!(indirect(p, a, "StartPtr", "PtrWork"));
+    assert!(indirect(p, a, "PtrWork", "PtrHit"));
+}
+
+#[test]
+fn jthread_forwards_a_token_the_caller_passes_when_it_can_supply_none() {
+    // `TokenOnly(std::stop_token)` has no room for a supplied token ahead
+    // of the caller's: `std::jthread` forwards the arguments as given.
+    let (p, a) = thread_launch();
+    assert!(indirect(p, a, "StartTokenOnly", "TokenOnly"));
+    let token = local_variable(p, "TokenOnly", "token");
+    let rows: Vec<_> = a
+        .arg_flow_edges
+        .iter()
+        .filter(|row| row.formal == token)
+        .collect();
+    assert_eq!(rows.len(), 1, "the caller's token, forwarded: {rows:?}");
+    assert_eq!(
+        rows[0].actual_var,
+        Some(local_variable(p, "StartTokenOnly", "token"))
+    );
+}
+
+#[test]
+fn jthread_forwards_as_std_thread_to_a_callable_without_a_stop_token() {
+    let (p, a) = thread_launch();
+    assert!(indirect(p, a, "StartPlain", "Plain"));
+    assert!(indirect(p, a, "Plain", "PlainHit"));
+}
