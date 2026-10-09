@@ -2,6 +2,9 @@
 #[path = "configured.rs"]
 mod configured;
 
+#[path = "callback_declarations.rs"]
+mod callback_declarations;
+
 use crate::cpp_type_names::is_fundamental_type_name;
 use crate::deps::IncludeGraph;
 use crate::discover::{discover_files, DiscoveredFiles};
@@ -253,6 +256,12 @@ struct LowerContext {
     local_scope_log: Vec<(String, Option<VarId>)>,
     /// The unit's syntax tree, for descending to a node's ancestors.
     tree: Option<Arc<tree_sitter::Tree>>,
+    /// Recovered node IDs can be cached while lowering. Keep their trees alive
+    /// until the unit is complete so later scratch parses cannot reuse IDs.
+    recovered_trees: Vec<Arc<tree_sitter::Tree>>,
+    /// Original statement enclosing the scratch nodes currently being lowered.
+    /// Join original enclosing scopes with scratch declaration ancestry.
+    recovery_origin: Option<(usize, usize)>,
     /// Whether the unit can hold a `template_declaration` at all: a C++ unit
     /// whose text has the keyword. Most units have none, and then no
     /// signature needs its ancestors.
@@ -2947,6 +2956,8 @@ fn lower_prepared_source(
         reference_returns: HashSet::default(),
         local_scope_log: Vec::new(),
         tree: Some(Arc::clone(&tree)),
+        recovered_trees: Vec::new(),
+        recovery_origin: None,
         has_templates: is_cpp && parsed.source.contains("template"),
         template_depth: Cell::new(0),
         lifecycle_cache: Default::default(),
@@ -3443,6 +3454,11 @@ fn type_is_reference_alias(program: &Program, ctx: &LowerContext, source: &str, 
 }
 
 fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node: Node) {
+    if node.cached_kind() == "expression_statement"
+        && callback_declarations::try_lower(program, ctx, source, node)
+    {
+        return;
+    }
     if ctx.ast_depth >= MAX_AST_WALK_DEPTH {
         if !ctx.ast_depth_warned {
             program.add_diagnostic(Diagnostic {
@@ -7381,8 +7397,28 @@ fn any_user_provided(program: &Program, ctors: &[FnId]) -> bool {
 /// declarations: descend once per question.
 fn ancestors<'t>(ctx: &'t LowerContext, node: Node<'t>) -> impl Iterator<Item = Node<'t>> {
     let root = ctx.tree.as_ref().map(|t| t.root_node());
-    std::iter::successors(root, move |cur| cur.child_with_descendant(node))
-        .take_while(move |cur| cur.id() != node.id())
+    let original = ctx
+        .recovery_origin
+        .and_then(|(start, end)| root?.named_descendant_for_byte_range(start, end))
+        .unwrap_or(node);
+    let original_path = std::iter::successors(root, move |cur| cur.child_with_descendant(original))
+        .take_while(move |cur| cur.id() != original.id());
+    let mut recovered_path = Vec::new();
+    if ctx.recovery_origin.is_some() {
+        let mut parent = node.parent();
+        while let Some(cur) = parent {
+            if matches!(
+                cur.cached_kind(),
+                "field_declaration_list" | "translation_unit"
+            ) {
+                break;
+            }
+            recovered_path.push(cur);
+            parent = cur.parent();
+        }
+        recovered_path.reverse();
+    }
+    original_path.chain(recovered_path)
 }
 
 /// Whether `spelling` mentions a parameter of any `template_declaration` in
@@ -7916,19 +7952,25 @@ fn declarator_pointer_depth(decl: Node) -> usize {
     .count()
 }
 
+/// Returns whether recovery also walked the declaration's evaluated expressions.
 fn lower_declaration(
     program: &mut Program,
     ctx: &mut LowerContext,
     source: &str,
     node: Node,
     storage_override: Option<StorageClass>,
-) {
+) -> bool {
     if node_is_from_ignored_macro(ctx, node) {
-        return;
+        return false;
+    }
+    if node.cached_kind() == "declaration"
+        && callback_declarations::try_lower(program, ctx, source, node)
+    {
+        return true;
     }
     let type_node = match node.cached_field("type") {
         Some(t) => t,
-        None => return,
+        None => return false,
     };
     let type_id = parse_type_node(program, ctx, source, type_node);
     let is_static = declaration_is_static(node);
@@ -7964,11 +8006,26 @@ fn lower_declaration(
     if let (Some(decl), Some(value)) = (node.cached_field("declarator"), node.cached_field("value"))
     {
         lower_initialized(program, ctx, decl, decl, Some(value));
-        return;
+        return false;
     }
 
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    for (index, child) in node.children(&mut cursor).enumerate() {
+        // Recovered declarations use class grammar, whose initializer is a
+        // sibling field. Only declarators introduce names; an initializer's
+        // identifier must never become a variable that shadows its function.
+        if node.cached_kind() == "field_declaration"
+            && node.field_name_for_child(index as u32) != Some("declarator")
+        {
+            continue;
+        }
+        // Class grammar puts every initializer beside its declarator, including
+        // a bare name typed by an alias. Preserve its flow before dispatching
+        // on the declarator's shape.
+        if let Some(value) = callback_declarations::field_initializer(node, child) {
+            lower_initialized(program, ctx, child, child, Some(value));
+            continue;
+        }
         match child.cached_kind() {
             "init_declarator" => {
                 let decl = child.cached_field("declarator").unwrap_or(child);
@@ -8098,7 +8155,7 @@ fn lower_declaration(
                     Lifecycle::Declared,
                 );
             }
-            "identifier" => {
+            "identifier" | "field_identifier" => {
                 let name = node_text(source, &child).to_string();
                 if name.is_empty() {
                     continue;
@@ -8112,7 +8169,8 @@ fn lower_declaration(
                     declared_c_linkage(program, ctx, qualified_name.as_deref().unwrap_or(&name));
                 program.symbols.add_variable(Variable {
                     temp: None,
-                    is_defined: ctx.current_fn.is_none() && !declaration_is_extern(source, node),
+                    is_defined: ctx.current_fn.is_none()
+                        && !declaration_is_extern(ctx, source, node),
                     // `child`, not `node`: an attribute inside a sibling
                     // declarator is that sibling's alone. `extern` is a
                     // declaration specifier, so it stays declaration-scoped.
@@ -8138,6 +8196,7 @@ fn lower_declaration(
             _ => {}
         }
     }
+    false
 }
 
 /// The explicit arguments of `T w(a, b);` when it defines an object rather
@@ -8170,7 +8229,7 @@ fn direct_init_arguments(
         // defines `w`: C++ reads it as a declaration only when the name is a
         // type, and a block-scope function declaration is rare. One naming
         // a function in scope (`Widget make(Config);`) redeclares it.
-        "identifier" => {
+        "identifier" | "field_identifier" => {
             let unresolved_is_value = ctx.current_fn.is_some()
                 && resolve_function_named(program, ctx, node_text(source, &declared)).is_none();
             direct_init_call_args(
@@ -8640,6 +8699,8 @@ fn object_declaration(declarator: Node) -> Option<Node> {
         declarator,
         &[
             "declaration",
+            // Recovered namespace/local declarations use class grammar.
+            "field_declaration",
             "for_range_loop",
             "parameter_declaration",
             "optional_parameter_declaration",
@@ -8698,7 +8759,7 @@ fn lower_one_declarator(
         program.symbols.add_variable(Variable {
             temp: None,
             is_defined: ctx.current_fn.is_none()
-                && (init_expr.is_some() || !declaration_is_extern(source, span_node)),
+                && (init_expr.is_some() || !declaration_is_extern(ctx, source, span_node)),
             is_weak: weak_global(ctx, storage, source, span_node),
             target: None,
             is_namespaced,
@@ -8743,7 +8804,7 @@ fn lower_one_declarator(
     program.symbols.add_variable(Variable {
         temp: None,
         is_defined: ctx.current_fn.is_none()
-            && (init_expr.is_some() || !declaration_is_extern(source, span_node)),
+            && (init_expr.is_some() || !declaration_is_extern(ctx, source, span_node)),
         is_weak: weak_global(ctx, storage, source, span_node),
         target: None,
         is_namespaced,
@@ -9164,7 +9225,7 @@ fn reconcile_static_member_definition(
         .map(|(owner, _)| owner.to_string());
     let span = node_span(program, ctx, span_node);
     // `extern T ns::x;` redeclares; it defines nothing.
-    let defines = init_expr.is_some() || !declaration_is_extern(source, span_node);
+    let defines = init_expr.is_some() || !declaration_is_extern(ctx, source, span_node);
     let var_id = match program
         .symbols
         .variable_named_in_scope(&canonical, ctx.current_file)
@@ -9473,6 +9534,11 @@ fn walk_function_body(
     node: Node,
     caller: FnId,
 ) {
+    if node.cached_kind() == "expression_statement"
+        && callback_declarations::try_lower(program, ctx, source, node)
+    {
+        return;
+    }
     if ctx.ast_depth >= MAX_AST_WALK_DEPTH {
         if !ctx.ast_depth_warned {
             program.add_diagnostic(Diagnostic {
@@ -9490,7 +9556,14 @@ fn walk_function_body(
     }
     ctx.ast_depth += 1;
     match node.cached_kind() {
-        "declaration" => lower_declaration(program, ctx, source, node, None),
+        "declaration" => {
+            if lower_declaration(program, ctx, source, node, None) {
+                // Recovery already visited the evaluated expressions. The
+                // original misparsed children must not be walked again.
+                ctx.ast_depth = ctx.ast_depth.saturating_sub(1);
+                return;
+            }
+        }
         // `using namespace X;` / `using X::f;` scoped to a function body.
         // Collected into `ctx` for the duration of the body walk only —
         // `lower_function` snapshots/restores around the walk, so a
@@ -9737,10 +9810,29 @@ fn collect_call_at_node(
         // Bind before equivalent constraints are unioned: several assignments
         // in one macro expansion can share endpoints and invocation coordinates.
         let mut operation = node;
+        let mut recovered_extent = None;
         while let Some(parent) = operation.parent() {
             match parent.cached_kind() {
                 "assignment_expression" | "init_declarator" => {
                     operation = parent;
+                    break;
+                }
+                "field_declaration" => {
+                    for declarator in
+                        parent.children_by_field_name("declarator", &mut parent.walk())
+                    {
+                        if let Some(value) =
+                            callback_declarations::field_initializer(parent, declarator)
+                        {
+                            if value.start_byte() <= node.start_byte()
+                                && node.end_byte() <= value.end_byte()
+                            {
+                                operation = declarator;
+                                recovered_extent = Some(declarator.start_byte()..value.end_byte());
+                                break;
+                            }
+                        }
+                    }
                     break;
                 }
                 "argument_list" | "expression_statement" | "return_statement" => break,
@@ -9748,7 +9840,11 @@ fn collect_call_at_node(
             }
         }
         let span = node_span(program, ctx, operation);
-        let expression = operation_expression(ctx, source, operation);
+        let expression = if let Some(extent) = recovered_extent {
+            operation_expression_range(ctx, source, extent)
+        } else {
+            operation_expression(ctx, source, operation)
+        };
         let expression = program.source_expressions.intern(&expression);
         for site in &mut program.symbols.call_sites[first_site..] {
             if site.return_dst.is_some() {
@@ -13406,12 +13502,20 @@ fn new_expression_class(
 /// and normalized parse input use the same lexer-based fallback; literals stay
 /// indivisible and their contents are never whitespace-normalized.
 fn operation_expression(ctx: &mut LowerContext, source: &str, node: Node) -> String {
+    operation_expression_range(ctx, source, node.start_byte()..node.end_byte())
+}
+
+fn operation_expression_range(
+    ctx: &mut LowerContext,
+    source: &str,
+    extent: std::ops::Range<usize>,
+) -> String {
     let language = if ctx.is_cpp {
         trace_preproc::Language::Cpp
     } else {
         trace_preproc::Language::C
     };
-    let text = node_text(source, &node);
+    let text = source.get(extent.clone()).unwrap_or_default();
     let tokens = |text: &str| {
         trace_preproc::Lexer::new(text, language)
             .tokenize()
@@ -13428,14 +13532,14 @@ fn operation_expression(ctx: &mut LowerContext, source: &str, node: Node) -> Str
     let kinds = tokens(text);
     let mut recover = || -> Option<String> {
         let map = ctx.line_map.as_ref()?;
-        let first = map.lookup(node.start_byte())?;
-        let last = map.lookup(node.end_byte().checked_sub(1)?)?;
+        let first = map.lookup(extent.start)?;
+        let last = map.lookup(extent.end.checked_sub(1)?)?;
         let begin = map
             .entries
-            .partition_point(|e| (e.output_offset as usize) < node.start_byte());
+            .partition_point(|e| (e.output_offset as usize) < extent.start);
         let end = map
             .entries
-            .partition_point(|e| (e.output_offset as usize) < node.end_byte());
+            .partition_point(|e| (e.output_offset as usize) < extent.end);
         if first.expansion_id != 0
             || map.entries[begin..end]
                 .iter()
@@ -13449,13 +13553,12 @@ fn operation_expression(ctx: &mut LowerContext, source: &str, node: Node) -> Str
             .entry(path)
             .or_insert_with_key(|path| std::fs::read_to_string(path).ok().map(OriginalSource::new))
             .as_mut()?;
-        let start = original.offset(first.line, first.col)?.checked_add(
-            node.start_byte()
-                .checked_sub(first.output_offset as usize)?,
-        )?;
+        let start = original
+            .offset(first.line, first.col)?
+            .checked_add(extent.start.checked_sub(first.output_offset as usize)?)?;
         let end = original
             .offset(last.line, last.col)?
-            .checked_add(node.end_byte().checked_sub(last.output_offset as usize)?)?;
+            .checked_add(extent.end.checked_sub(last.output_offset as usize)?)?;
         let candidate = original.text.get(start..end)?;
         // Reject stale files, preprocessor rewriting and noncontiguous spans.
         (tokens(candidate) == kinds).then(|| candidate.to_owned())
@@ -16823,9 +16926,15 @@ fn scoped_variable_unless_hidden(
     (declares_field || names_function(program, ctx, candidate)).then_some(None)
 }
 
-fn declaration_is_extern(source: &str, node: Node) -> bool {
+fn declaration_is_extern(ctx: &LowerContext, source: &str, node: Node) -> bool {
     enclosing_decl(node, &["declaration", "field_declaration"])
         .is_some_and(|decl| declares_extern(source, decl))
+        || ctx.recovery_origin.is_some_and(|(start, end)| {
+            ctx.tree
+                .as_ref()
+                .and_then(|tree| tree.root_node().named_descendant_for_byte_range(start, end))
+                .is_some_and(|original| declares_extern(source, original))
+        })
 }
 
 /// Whether declaration `decl` is `extern`: by its storage class specifier, or
@@ -19536,6 +19645,8 @@ mod qualified_variable_lookup_tests {
             reference_returns: HashSet::default(),
             local_scope_log: Vec::new(),
             tree: None,
+            recovered_trees: Vec::new(),
+            recovery_origin: None,
             has_templates: false,
             template_depth: Cell::new(0),
             lifecycle_cache: Default::default(),
