@@ -585,7 +585,6 @@ fn run_analyze(
     );
 
     let t2 = Instant::now();
-    program.release_flow();
     export_to_sqlite(
         &program,
         &pag,
@@ -602,6 +601,8 @@ fn run_analyze(
         },
     )
     .with_context(|| format!("failed to export to {}", output.display()))?;
+    // Source provenance export also consumes the lowered flow and return facts.
+    program.release_flow();
     eprintln!("export: {:.1}s", t2.elapsed().as_secs_f64());
 
     let mut direct_edges = 0usize;
@@ -772,60 +773,81 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             if depth == 0 {
                 anyhow::bail!("depth must be >= 1");
             }
+            if line <= 0 || col <= 0 {
+                anyhow::bail!("line and column must be >= 1 (positions are 1-based)");
+            }
+            trace_db::require_source_dataflow_metadata(&conn)?;
             let cands = trace_db::require_symbols_at(&conn, &file, line, col)?;
             let best = &cands[0];
-            let exact =
-                best.line == line && col >= best.col && col <= best.col + best.name.len() as i64;
-            if !exact {
+            let exact = best.line == line
+                && col >= best.col
+                && col < best.col.saturating_add(best.name.chars().count() as i64);
+            if !exact && cands.len() == 1 {
                 eprintln!(
-                    "note: no declaration exactly at {file}:{line}:{col}; using {}",
-                    best
-                );
-            } else if cands.len() > 1 {
-                let mut others: Vec<String> = cands[1..].iter().map(|s| s.name.clone()).collect();
-                others.dedup();
-                let shown = if others.len() > 5 {
-                    format!("{} … (+{} more)", others[..5].join(", "), others.len() - 5)
-                } else {
-                    others.join(", ")
-                };
-                eprintln!(
-                    "note: {} candidates on this line; using {} (others: {})",
-                    cands.len(),
-                    best.name,
-                    shown
+                    "note: no declaration exactly at {file}:{line}:{col}; using {} [var#{}]",
+                    best, best.var_id
                 );
             }
-            let graph = trace_db::dataflow_graph(&conn, std::slice::from_ref(best), dir, depth)?;
+            if cands.len() > 1 {
+                let same_line = cands
+                    .iter()
+                    .filter(|s| s.path == best.path && s.line == line)
+                    .count();
+                let same_line_other_files = cands
+                    .iter()
+                    .filter(|s| s.path != best.path && s.line == line)
+                    .count();
+                let nearby = cands.len() - same_line - same_line_other_files;
+                let candidate_word = |count| {
+                    if count == 1 {
+                        "candidate"
+                    } else {
+                        "candidates"
+                    }
+                };
+                let describe = |s: &trace_db::SymbolRef| {
+                    format!(
+                        "{} [var#{}] at {}:{}:{}",
+                        s.name, s.var_id, s.path, s.line, s.col
+                    )
+                };
+                let others = cands[1..]
+                    .iter()
+                    .take(5)
+                    .map(describe)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = if cands.len() > 6 {
+                    format!(" … (+{} more)", cands.len() - 6)
+                } else {
+                    String::new()
+                };
+                let prefix = if exact {
+                    String::new()
+                } else {
+                    format!("no declaration exactly at {file}:{line}:{col}; ")
+                };
+                eprintln!("note: {prefix}{same_line} same-line {} in the selected file, {same_line_other_files} same-line {} in other matching files, {nearby} nearby {}; using {} (others: {others}{more})", candidate_word(same_line), candidate_word(same_line_other_files), candidate_word(nearby), describe(best));
+            }
+            let graph = trace_db::dataflow_view(&conn, std::slice::from_ref(best), dir, depth)?;
             let dir_word = match dir {
-                trace_db::Direction::Down => "flows-to",
-                trace_db::Direction::Up => "flows-from",
+                trace_db::Direction::Down => "down",
+                trace_db::Direction::Up => "up",
             };
             let meta = trace_db::GraphMeta {
-                title: &format!("dataflow for {best} ({dir_word}, depth {depth}):"),
+                title: &format!(
+                    "dataflow for {} [var#{}] at {}:{}:{} ({dir_word}, visible depth {depth}):",
+                    best.name, best.var_id, best.path, best.line, best.col
+                ),
                 direction: dir_word,
                 depth,
                 summary: &format!(
-                    "{} flow nodes, {} flow edges",
+                    "{} entities, {} possible transitions",
                     graph.nodes.len(),
                     graph.edges.len()
                 ),
             };
-            let out =
-                trace_db::render_graph(
-                    &graph,
-                    format.to_render(),
-                    &meta,
-                    &mut |id, out| match graph.nodes.get(&id) {
-                        Some(n) => {
-                            out.push_str(&n.label);
-                            if !n.detail.is_empty() {
-                                out.push_str(&format!(" ({})", n.detail));
-                            }
-                        }
-                        None => out.push_str(&format!("node{id}")),
-                    },
-                );
+            let out = trace_db::render_dataflow(&graph, format.to_render(), &meta);
             print!("{out}");
         }
         InspectCommands::Callchain {

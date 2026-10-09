@@ -135,7 +135,7 @@ export: 0.1s
 analysis complete: 11442 functions, 25478 call edges, 25803 arg-flow edges -> trace.db
 ```
 
-SQLite export builds secondary indexes after loading rows, before committing
+SQLite export builds most secondary indexes after loading rows, before committing
 and publishing the database, to reduce bulk insertion work.
 
 Without build metadata, indexing spills large preprocessed source text
@@ -322,7 +322,8 @@ trace inspect /tmp/trace.db callchain --from caller --to helper --format mermaid
 
 ### `trace inspect dataflow`
 
-Walk the PAG value-flow graph from a variable declaration.
+Show possible value flows from a source variable declaration, grouped by
+canonical function and global/file scope.
 
 ```text
 trace inspect <DB> dataflow --file SUBSTR --line N --col C [--depth N] [--direction down|up]
@@ -331,21 +332,68 @@ trace inspect <DB> dataflow --file SUBSTR --line N --col C [--depth N] [--direct
 | Option | Description |
 |--------|-------------|
 | `--file <SUBSTR>` | File path substring. |
-| `--line <N>`, `--col <C>` | Position near a variable **declaration** (use sites are not recorded). |
-| `--depth <N>` | Maximum BFS depth (default 3). |
-| `--direction` | `down` = where the value flows (default), `up` = where it came from. |
-| `--format` | Output format: `text` (default), `json`, `graphviz`, or `mermaid`. |
+| `--line <N>`, `--col <C>` | Position near a source variable **declaration**. Synthetic intermediates are excluded. |
+| `--depth <N>` | Maximum visible transitions after collapsing technical nodes (default 3). |
+| `--direction` | `down` = where values flow (default), `up` = where they come from. |
+| `--format` | `text` (default), `json`, `graphviz`, or `mermaid`. |
 
-Edges show how values move: `copy`, `addr_of`, `load`, `store`, `gep`,
-`points_to` (variable → storage), `call_arg` (argument passing into a
-callee formal), and `unwrap` (a smart pointer's `->` into its pointee; see
-[Smart-pointer unwrap](docs/ANALYSIS.md#smart-pointer-unwrap)).
-Function-pointer values appear as `fn:<name>` nodes.
+All formats retain numeric identities and omit call-site IDs.
+Text function headers list parameter positions, names, types, and variable IDs.
+Argument edges qualify cross-function parameters as `dispatch::payload` and
+identify the callee in `pass argument [fn#29, argument 2]`. Operations
+identify assignments, argument positions, returns, field access, pointer reads
+and writes, and indirect calls. Macro calls emphasize the invocation; text and
+diagrams retain the macro-body spelling. Text uses fixed indentation; diagrams group by scope.
+All formats use the same source-level graph. Text shows every transition selected
+by `--depth` and lists every possible callee once per call occurrence. Inspection
+loads the requested visible neighborhood and its supporting metadata on demand. Field
+labels identify abstract storage paths; call targets appear in separate lists.
 
-The same C parameter may exist as several IR variables (one per TU that sees
-its declaration). If nothing flows through the queried copy, the traversal
-automatically widens to same-name parameters of the same function record
-(after merge all copies share one function entry).
+These are context-insensitive possible flows. Separate call sites identify
+argument-to-parameter wiring; they do not represent separate executions or
+preserve correlations between argument pairs. Existing default-argument facts
+are not supplemented: omitted defaults currently can have no parameter flow,
+while explicit C++ `nullptr` arguments appear as null pointer values without
+points-to targets. Each query shows only the graph reachable from its selected
+variable: use a receiver downstream or its formal upstream to inspect receiver
+passing, and a nullable formal upstream to inspect null arguments. See the
+authoritative
+[Source-level dataflow presentation](docs/ANALYSIS.md#source-level-dataflow-presentation)
+for identity, traversal, provenance, and compatibility rules.
+
+Dataflow JSON contains `title`, `direction` (`down` or `up`), `depth`,
+`truncated`, `scopes`, `nodes`, and `edges`. The four scope description arrays
+(`functions`, `globals`, `statics`, `values`) are always present, unique, and
+sorted by numeric ID. Nodes and edges use typed scope references or `null` for
+unknown ownership. Every possible callee has a function description.
+Each operation has `kind`, `expression`, and `location`, plus its own `callee_id`
+when known. Null callee IDs are omitted; edges omit `callee_id` entirely. Argument operations include
+their original zero-based `arg_index`; null indices are omitted. Collapsed edges
+preserve their distinct recorded operations and callees. This changes the JSON contract:
+internal fields and the edge-level argument index are omitted. See
+[Source-level dataflow presentation](docs/ANALYSIS.md#source-level-dataflow-presentation)
+for field definitions, reference rules, and compatibility.
+
+A dataflow edge in `--format json`:
+
+```json
+{
+  "from": 701,
+  "to": 702,
+  "scope": { "kind": "function", "id": 31 },
+  "expression": "dispatch(message)",
+  "location": { "path": "/project/main.cpp", "line": 38, "col": 5 },
+  "operations": [
+    {
+      "kind": "pass argument",
+      "expression": "dispatch(message)",
+      "location": { "path": "/project/main.cpp", "line": 38, "col": 5 },
+      "callee_id": 32,
+      "arg_index": 0
+    }
+  ]
+}
+```
 
 **Examples**
 
@@ -359,7 +407,9 @@ trace inspect /tmp/hdf.db dataflow --file usb_raw_io.c --line 331 --col 23 --dep
 Both `callgraph` and `dataflow` accept `--format text|json|graphviz|mermaid`
 (`text` is the default). `text` is the indented view shown above; the other
 formats emit machine-readable graphs of the same traversal — same nodes,
-same edges, same depth limit and truncation semantics. `trace inspect dataflow`
+same edges, same depth limit and truncation semantics. Dataflow text shows
+every transition and every possible callee in the graph selected by `--depth`.
+`trace inspect dataflow`
 prints its candidate/fallback `note:` hints on stderr in every format.
 
 All examples below run the same query on `/tmp/hpp.db`
@@ -515,7 +565,7 @@ trace-merge [OPTIONS] <INPUT_DBS>... [-o <OUTPUT_DB>]
 - Uses normalized parameter signatures in `functions.signature` (`name(type1, type2)`) to disambiguate C++ overloads and avoid false collisions; falls back to all same-name candidates if exact signature matching misses.
 - Prevents accidental overwriting of any input database when specifying `-o`.
 - Opens inputs read-only and publishes through a unique temporary file beside the output. Failed merges clean up staging files and preserve the existing destination.
-- Dataflow analysis remains strictly intra-repository within individual repository databases.
+- Merger output supports call graphs, call chains, and editor call hierarchy. It omits variables, arg-flow, points-to, and all PAG/provenance tables; call-site variable bindings remain NULL. Dataflow inspection requires an original analysis database or a new analysis of the combined source tree; see the [merger schema contract](docs/SQLITE_SCHEMA.md#merger-inputs-and-output).
 - Identifies and reports merge problems:
   - **Collisions**: Multiple strong definitions of the same symbol and signature across different repositories (`MultipleDefinitions`).
   - **Unresolved externals**: External function calls that remain unresolved in all merged repositories (`UnresolvedExternal`).
@@ -537,7 +587,16 @@ trace inspect /tmp/unified.db callchain --from app_main --to framework_init
 
 ## SQLite database schema
 
-Schema version: **v7**. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries.
+Minimal and full databases record indirect callee and return-destination
+variable IDs in `call_sites.callee_var` and `call_sites.return_dst`. Export uses
+indexed SQLite joins for indirect-return provenance, building the required
+indexes before that export phase. See the
+[call-site schema](docs/SQLITE_SCHEMA.md#call_sites) for bindings and index rules.
+
+SQLite export also builds a function-range index for operation ownership lookup
+during source-level dataflow inspection; see the [inspection index rules](docs/SQLITE_SCHEMA.md#source-level-presentation-metadata-v7).
+
+Schema version: **v7**, an additive compatibility family. Readers check required structures and database origin rather than infer available capabilities from the number alone; see the [version and capability contract](docs/SQLITE_SCHEMA.md#version-and-capability-contract). Optional `flow_call_origins` and `flow_call_expressions` metadata improves exact occurrence attribution and call text; older v7 analysis exports retain fallback behavior. Re-analysis supplies new metadata and selective-query indexes. `trace-merge` accepts v7 inputs with the required call-graph columns, rejects v6 or missing required structures before writing output, and produces a call-graph database without PAG/provenance data. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries.
 
 ### Entity relationship (overview)
 

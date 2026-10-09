@@ -13,3 +13,6 @@ pub use filter::CallGraphFilter;
 pub use inspect::*;
 pub use render::*;
 pub use schema::*;
+
+mod dataflow;
+pub use dataflow::*;

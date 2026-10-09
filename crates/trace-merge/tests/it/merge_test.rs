@@ -1486,3 +1486,221 @@ fn test_undeclared_receiver_member_call_relinks_to_defining_repo() {
         ]
     );
 }
+
+#[test]
+fn schema_compatibility_checks_versions_and_required_v7_structures() {
+    let tmp = tempdir().unwrap();
+    let old = tmp.path().join("old-v6.db");
+    let conn = Connection::open(&old).unwrap();
+    // The old version predates source-dataflow columns and tables.
+    conn.execute_batch(
+        "CREATE TABLE analysis_run(id INTEGER PRIMARY KEY, schema_version INTEGER);
+        INSERT INTO analysis_run VALUES(1,6);
+        CREATE TABLE variables(id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE flow_nodes(id INTEGER PRIMARY KEY, kind TEXT, label TEXT);",
+    )
+    .unwrap();
+    drop(conn);
+    let output = tmp.path().join("merged.db");
+    let options = MergeOptions {
+        output: output.clone(),
+        verbose: false,
+    };
+    let error = merge_databases(&[&old], &options).unwrap_err().to_string();
+    assert!(
+        error.contains("database has version 6, expected 7"),
+        "{error}"
+    );
+    assert!(error.contains("re-analyze"), "{error}");
+    assert!(!output.exists());
+    fs::write(&output, b"existing output").unwrap();
+    assert!(merge_databases(&[&old], &options).is_err());
+    assert_eq!(fs::read(&output).unwrap(), b"existing output");
+
+    let mut current = Vec::new();
+    for i in 0..2 {
+        let path = tmp.path().join(format!("current-{i}.db"));
+        let conn = Connection::open(&path).unwrap();
+        // Reconstruct an earlier v7 layout without additive flow metadata
+        // or call-site variable bindings, alongside the current schema.
+        let schema = if i == 0 {
+            trace_db::TABLES_V7.replace(
+                "is_direct INTEGER NOT NULL,\n    callee_var INTEGER,\n    return_dst INTEGER",
+                "is_direct INTEGER NOT NULL",
+            )
+        } else {
+            trace_db::SCHEMA_V7.to_owned()
+        };
+        conn.execute_batch(&schema).unwrap();
+        if i == 0 {
+            conn.execute_batch(
+                "DROP TABLE flow_call_origins; DROP TABLE flow_call_expressions;
+                 DROP TABLE flow_parameters; DROP TABLE flow_field_locations;
+                 DROP TABLE flow_field_access; DROP TABLE flow_origins;
+                 DROP TABLE flow_return_calls; DROP TABLE flow_calls;",
+            )
+            .unwrap();
+            assert!(trace_db::require_source_dataflow_metadata(&conn).is_err());
+            assert!(conn.prepare("SELECT callee_var FROM call_sites").is_err());
+        }
+        conn.execute(
+            "INSERT INTO analysis_run VALUES(1,'test',?1,'/src','now','{}')",
+            [trace_db::SCHEMA_VERSION],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files VALUES(1,?1,'hash',0)",
+            [format!("/src/{i}.c")],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO functions(id,name,file_id,line_start,line_end,linkage,signature,is_defined) VALUES(1,?1,1,1,2,'external',?1,1)", [format!("f{i}")]).unwrap();
+        drop(conn);
+        current.push(path);
+    }
+    // Every input is checked, including an old database following a valid one.
+    assert!(merge_databases(&[&current[0], &old], &options).is_err());
+    assert_eq!(fs::read(&output).unwrap(), b"existing output");
+    let report = merge_databases(&current, &options).unwrap();
+    assert_eq!(report.functions_defined, 2);
+    let merged = Connection::open(&output).unwrap();
+    let version: i64 = merged
+        .query_row("SELECT schema_version FROM analysis_run", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, trace_db::SCHEMA_VERSION);
+    let count: i64 = merged
+        .query_row("SELECT COUNT(*) FROM functions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+    drop(merged);
+
+    // A nominal v7 input can still lack a capability needed by the merger.
+    let broken = Connection::open(&current[1]).unwrap();
+    broken
+        .execute_batch("ALTER TABLE call_sites RENAME COLUMN expansion_col TO unavailable_col")
+        .unwrap();
+    drop(broken);
+    fs::write(&output, b"existing output").unwrap();
+    let error = merge_databases(&current, &options).unwrap_err().to_string();
+    assert!(error.contains("missing trace-merge capability"), "{error}");
+    assert!(
+        error.contains("call_sites") && error.contains("expansion_col"),
+        "{error}"
+    );
+    assert!(error.contains("re-analyze"), "{error}");
+    assert_eq!(fs::read(&output).unwrap(), b"existing output");
+}
+
+#[test]
+fn merged_export_reports_dataflow_limitation_before_symbol_lookup() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    fs::write(
+        repo.join("flow.c"),
+        "int *identity(int *p) { return p; }\n\
+         void relay(int *source) {\n\
+             int *dest = identity(source);\n\
+         }\n\
+         int untouched;\n",
+    )
+    .unwrap();
+    let original = tmp.path().join("original.db");
+    analyze_repo(&repo, &original);
+    let conn = Connection::open(&original).unwrap();
+    trace_db::require_source_dataflow_metadata(&conn).unwrap();
+    let origins: i64 = conn
+        .query_row("SELECT COUNT(*) FROM flow_origins", [], |r| r.get(0))
+        .unwrap();
+    assert!(origins > 0);
+    let bindings: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM call_sites WHERE return_dst IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(bindings > 0, "fresh export has return destination bindings");
+    drop(conn);
+
+    let inspect = |db: &std::path::Path, line: &str, col: &str| {
+        Command::new(trace_cli_bin())
+            .args([
+                "inspect",
+                db.to_str().unwrap(),
+                "dataflow",
+                "--file",
+                "flow.c",
+                "--line",
+                line,
+                "--col",
+                col,
+                "--direction",
+                "down",
+                "--depth",
+                "2",
+                "--format",
+                "json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let supported = inspect(&original, "2", "17");
+    assert!(
+        supported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&supported.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&supported.stdout).unwrap();
+    assert_eq!(json["schema"], "dataflow-source-v1");
+    assert_eq!(json["direction"], "down");
+
+    let flowless = inspect(&original, "5", "5");
+    assert!(!flowless.status.success());
+    let error = String::from_utf8_lossy(&flowless.stderr);
+    assert!(
+        error.contains("untouched") && error.contains("no value-flow node"),
+        "{error}"
+    );
+    assert!(!error.contains("trace-merge"), "{error}");
+
+    let output = tmp.path().join("merged.db");
+    merge_databases(
+        &[&original],
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let merged = Connection::open(&output).unwrap();
+    for table in [
+        "variables",
+        "arg_flow_edges",
+        "flow_nodes",
+        "flow_edges",
+        "flow_origins",
+    ] {
+        let count: i64 = merged
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "{table} is intentionally not merged");
+    }
+    let bindings: i64 = merged.query_row("SELECT COUNT(*) FROM call_sites WHERE callee_var IS NOT NULL OR return_dst IS NOT NULL", [], |r| r.get(0)).unwrap();
+    assert_eq!(
+        bindings, 0,
+        "input variable IDs must not leak into merged output"
+    );
+    drop(merged);
+    let unavailable = inspect(&output, "2", "17");
+    assert!(!unavailable.status.success());
+    let error = String::from_utf8_lossy(&unavailable.stderr);
+    for expected in [
+        "trace-merge output",
+        "PAG flow graphs or provenance",
+        "original trace analyze database",
+        "combined source tree",
+    ] {
+        assert!(error.contains(expected), "{error}");
+    }
+    assert!(!error.contains("no symbols"), "{error}");
+}

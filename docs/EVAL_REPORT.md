@@ -1,5 +1,225 @@
 # Evaluation Report
 
+## af1b206 source-dataflow memory regression and expression sharing — 2026-10-08
+
+Measured **af1b206** against its first parent **95b88db** before changing
+production code. Earlier vector/membership compaction and optional return boxes
+([the 67578b4 storage review](#provenance-storage-memory-reduction-after-67578b4-macos-arm64-2026-10-07))
+are already in af1b206; this work does not repeat those changes.
+The implementation and lifetime rules are authoritative in
+[Source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation)
+and [flow-release lifecycle](ANALYSIS.md#post-solve-flow-release-lifecycle).
+
+### Controlled baseline and responsible phase
+
+macOS **26.6.2 (25G83), arm64**, rustc/Cargo **1.98.1**, system allocator,
+default features, repository release profile (ThinLTO, one codegen unit).
+Each revision was archived into its own source directory and built with its
+own Cargo target directory, using `--release --locked --offline -p trace-cli`.
+No malloc, DYLD, Rust, Cargo, or TRACE environment overrides were set. All
+analyses use minimal export, **jobs 8**, `--solve-budget-pops 800000`, and the
+same original input paths under `/tmp/trace-pinned-clean/`:
+
+- HDF: `drivers_hdf_core`, `cdc75a20bb8f1a046cd22e189405a20d602d0521`.
+- Hiview: `hiviewdfx_hiview`, `92408e2072bd6dc8fb0d980773e80b6ec898710c`.
+- Camera: `multimedia_camera_framework`, `8ffd69dcd47f533e70b4dba428439da9008b0cae`.
+
+Three alternating independent processes per revision/corpus were profiled
+with `scripts/profile_memory_macos.py --interval 0.005`, after both release
+builds completed. No concurrent builds or tests ran during any benchmark.
+Filesystem caches were not flushed. Physical footprint is the kernel lifetime
+maximum from `proc_pid_rusage`; RSS is `ru_maxrss`, measured separately.
+Entries are **median [minimum–maximum]**, memory in **MiB (2^20 bytes)**.
+
+| Corpus | Parent footprint | af1b206 footprint | Parent RSS | af1b206 RSS | Wall seconds, parent → af1b206 |
+|---|---:|---:|---:|---:|---:|
+| HDF | 167.55 [167.30–168.02] | 200.88 [195.59–203.56] | 389.70 [383.53–389.88] | 435.41 [427.69–436.36] | 3.86 [3.80–4.98] → 4.38 [4.22–4.52] |
+| Hiview | 60.95 [60.64–61.41] | 71.55 [71.11–71.81] | 192.86 [189.77–192.88] | 216.69 [214.91–216.88] | 1.62 [1.60–1.70] → 1.88 [1.86–1.98] |
+| Camera | 148.95 [148.30–150.89] | 171.34 [167.94–174.24] | 525.70 [522.34–525.77] | 581.50 [580.20–587.11] | 7.21 [7.17–7.52] → 8.16 [7.94–8.48] |
+
+The increase is **33.33 MiB (19.9%) HDF**, **10.60 MiB (17.4%) Hiview**,
+and **22.39 MiB (15.0%) Camera**. HDF peaks in the analysis phase (PAG
+construction plus solving); Hiview and Camera peak during TU lowering/merge.
+Sampled phase-footprint medians make the distinction explicit:
+
+| Phase | HDF parent → af1b206 | Hiview parent → af1b206 | Camera parent → af1b206 |
+|---|---:|---:|---:|
+| TU lowering/merge | 69.89 → 107.52 | 60.55 → 71.25 | 148.83 → 171.28 |
+| Analysis | 167.47 → 200.86 | 40.70 → 56.34 | 115.80 → 149.83 |
+| Export | 72.19 → 104.38 | 40.33 → 56.69 | 108.97 → 145.64 |
+
+Phase boundaries come from stderr and can miss short transients. This does
+not isolate PAG construction from solver allocations within `analyze`.
+
+### Retained allocation census and cause
+
+Separate release diagnostic examples index with `PreprocessOptions::new()`,
+built-in noise macros, default test partition, and jobs 8. They are excluded
+from timing and kernel-memory comparisons. `malloc_size` measures owned
+vector buffers, string allocations, and boxes. Map slots/control bytes are
+capacity models, **not allocator measurements**. Arc allocation measurements
+use this Rust/macOS arm64 build's two-usize reference-count prefix and count
+allocation addresses once; this diagnostic layout assumption is not used in
+production. This is an ownership census after indexing, not a whole-heap
+allocation-stack census at the process peak.
+
+HDF has 83,294 flow occurrences on the parent and 83,733 on af1b206. The latter
+retains 81,890 origins under 81,240 constraint keys, 75,402 call expressions,
+and 14,420 return operations. Complete presentation metadata dominates the
+new retained storage; flow occurrence growth is only 0.5%. In particular,
+adding expressions allocates call-detail boxes for otherwise ordinary calls.
+
+| HDF owner, allocated MiB after indexing | Parent | af1b206 | Shared expressions |
+|---|---:|---:|---:|
+| `program.flow` vector | 5.000 | 3.203 | 3.203 |
+| Strings owned by flow entries | 1.669 | 1.669 | 1.669 |
+| Origin-map slots/control, modeled (131,072 buckets, 64-byte entries) | 0 | 8.125 | 8.125 |
+| Strings owned by origin constraint keys | 0 | 1.645 | 1.645 |
+| Origin vector buffers | 0 | 3.768 | 2.521 |
+| Expression allocations reachable from origins | 0 | 5.525 | 3.238 |
+| Call-detail boxes | 0.732 | 11.505 | 11.505 |
+| Expression allocations reachable from call expressions | 0 | 4.406 | 3.058 |
+| Return-operation boxes | 0 | 0.660 | 0.440 |
+| Expression allocations reachable from return operations | 0 | 0.707 | 0.585 |
+| Return-summary vectors | 0.315 | 0.315 | 0.315 |
+| Strings owned by return summaries | 0.023 | 0.023 | 0.023 |
+
+The three expression rows overlap after sharing and **must not be summed**.
+Before sharing they own separate allocations. Their combined unique allocation
+size is 10.638 → **4.107 MiB**, including Arc headers and allocator rounding;
+distinct text is only 2.910 MiB (49,860 spellings). Smaller origin entries and
+return boxes save another 1.467 MiB. Call details shrink inline from 144 to
+136 bytes, but both round to 160-byte allocations here, so that owner does
+not save allocated bytes. The modeled map and measured owners account for
+about 33.8 MiB of added retained HDF storage before the fix; this is consistent
+with the observed increase, but allocator bytes and physical footprint are
+not interchangeable quantities.
+
+| Corpus | Separate expression allocations before | Shared unique allocations after | Additional vector/return-box savings | Total retained saving |
+|---|---:|---:|---:|---:|
+| HDF | 10.638 | 4.107 | 1.467 | **7.998** |
+| Hiview | 5.006 | 2.194 | 0.665 | **3.477** |
+| Camera | 15.905 | 5.725 | 1.728 | **11.908** |
+
+Hiview's unchanged flow vector/key strings are 2.500/0.490 MiB, origin-key
+strings 0.470 MiB, modeled origin map 4.063 MiB; origin vectors fall
+1.527 → 1.024 MiB, return boxes 0.486 → 0.324 MiB. Camera's corresponding
+unchanged vector/key strings are 2.906/0.776 MiB, origin-key strings
+0.732 MiB, modeled map 8.125 MiB; origin vectors fall 3.385 → 2.283 MiB,
+return boxes 1.878 → 1.252 MiB. All individual counts and reachable expression
+allocations are retained in the diagnostic JSON files.
+
+### Selected fix and alternatives
+
+Complete text is shared during lowering and across merges, with the existing
+ordered vectors and content-based membership retaining every original operation.
+A newly merged spelling reuses the unit's Arc allocation. The membership-only
+expression pool expires after the last merge in the common CLI/C API analysis
+indexing path; provenance owners retain the strings until post-export release.
+Rust IR expression fields now use `Arc<str>` instead of `String`; SQLite,
+CLI rendering, and the C ABI are unchanged.
+
+Releasing the original flow vector would save at most its 3.203 MiB HDF buffer
+plus 1.669 MiB of owned strings before accounting for replacement export
+metadata. It has 83,080 unique constraints among 83,733 occurrences, so simply
+removing repeated constraints offers little. Compact ordered export metadata
+could also replace origin-map keys, but requires a new preparation/lifecycle
+path; releasing only after PAG construction would not address the indexing
+peak on Hiview/Camera. Return summaries remain required by indirect-return
+solver expansion and transitive return provenance. This measured, smaller
+sharing fix keeps `release_flow()` at its existing post-export position.
+Spilling presentation metadata was not implemented: the demonstrated savings
+come from duplicate in-memory storage without introducing temporary storage
+and recovery paths. Larger-tree spill performance remains unmeasured.
+
+### Fresh before/after measurements
+
+A separately archived changed tree and isolated release target were built
+before profiling. Five alternating independent processes per variant/corpus,
+with the same inputs, flags, workers, allocator and 5 ms observer, followed
+all builds and workspace tests. Two additional Hiview/Camera pairs followed
+validation to extend their initial three pairs to five; each pair still ran
+serially, with no concurrent checks. These fresh af1b206 measurements are
+reported separately from the parent comparison above.
+
+| Corpus | af1b206 footprint | Shared footprint | af1b206 RSS | Shared RSS | Wall seconds, af1b206 → shared |
+|---|---:|---:|---:|---:|---:|
+| HDF | 201.31 [196.63–203.91] | 194.75 [191.34–200.41] | 432.36 [429.95–434.45] | 428.72 [422.86–433.52] | 4.43 [4.36–5.18] → 4.64 [4.49–5.59] |
+| Hiview | 70.48 [69.56–71.94] | 67.31 [66.66–68.75] | 216.16 [214.11–216.92] | 209.88 [208.94–210.91] | 1.86 [1.76–1.94] → 1.89 [1.79–1.95] |
+| Camera | 172.70 [165.22–179.22] | 162.91 [159.36–167.39] | 584.73 [576.02–587.28] | 568.20 [566.86–574.20] | 8.27 [7.64–8.67] → 8.09 [7.60–8.44] |
+
+Physical-footprint medians decrease **6.56 MiB (3.3%)**, **3.17 MiB (4.5%)**,
+and **9.79 MiB (5.7%)** respectively. Hiview footprint ranges do not overlap;
+HDF and Camera ranges overlap. HDF peak remains in analysis, and the others
+remain in TU lowering/merge. Sampled phase medians decrease as follows:
+
+| Phase | HDF before → after | Hiview before → after | Camera before → after |
+|---|---:|---:|---:|
+| TU lowering/merge | 107.95 → 98.72 | 70.28 → 67.25 | 172.55 → 162.81 |
+| Analysis | 200.81 → 194.49 | 55.67 → 53.19 | 153.77 → 143.53 |
+| Export | 104.92 → 98.16 | 56.88 → 53.50 | 147.36 → 137.06 |
+
+User+system CPU medians [ranges], seconds: HDF **12.37 [12.30–12.62] →
+12.66 [12.42–12.85]**, Hiview **5.86 [5.72–5.97] → 5.97 [5.75–6.02]**,
+Camera **26.21 [25.77–26.91] → 25.98 [25.40–26.81]**. HDF wall median
+increases 0.21 s (4.7%) and CPU 0.29 s (2.3%); Hiview wall increases 0.03 s;
+Camera wall decreases 0.18 s. Ranges overlap, and these small samples do not
+establish a runtime improvement or equality. Hashing/refcounting has a cost.
+
+### Equivalence, validation, and limits
+
+All **24 tables**, schema/index definitions, values, and rowid order match
+before/after for HDF minimal (998,556 rows), Hiview minimal (466,636), Camera
+minimal (1,152,512), and HDF full/debug (3,699,088). Only
+`analysis_run.created_at` and `trace_version` are excluded; run options, solver
+counts and all source text/IDs/locations are compared. HDF jobs 1 versus 8 also
+match all rows and their order. Every one of the **19 `dataflow_*` fixtures**
+matches in both minimal and full/debug modes. The comparator uses
+`NOT INDEXED ORDER BY rowid`, preserving generated insertion sequences.
+
+**1,616 rendering comparisons** match exit status, stdout and stderr byte for
+byte: up/down, depth 2, JSON/text/Graphviz/Mermaid, at the first 15 exported
+variable declarations (or all when fewer) of each fixture, plus the HDF CAN
+query at depth 1 (`can_test.c:33:31`) in both directions/all four formats.
+HDF retains 79,748 origins, 75,102 call expressions, 14,408 exact return-operation
+bindings and 10,425 return-call rows. Complete expressions and distinct
+operation sites are unchanged.
+
+`cargo test --workspace --offline --locked` passes **1,963 tests**, including
+new sharing/lifetime regressions and existing long-expression, Unicode,
+macro-coordinate, weak/target, return-flow, deterministic and C API coverage.
+`CARGO_INCREMENTAL=0` was used for tests to limit build-cache growth; it does
+not change release measurements. Workspace Clippy for all targets with
+`-D warnings`, formatting, and `git diff --check` pass.
+
+Artifacts are in `/tmp/trace-flow-memory/`: archived source trees, standalone
+binaries, census example source, build/check logs, `bench.py`, `bench-fixed.py`,
+`bench-extra.py`, `summarize.py`, and `validate.py`. `results/` holds raw observer
+samples/logs, all census JSON, binary SHA-256 identities, compared databases,
+and `validation.json`; `summary.txt` reports all ranges. Only build-cache
+subdirectories of the parent/before target directories were removed for disk
+space after their binaries were built. No benchmark artifacts are committed.
+
+This removes repeated text allocation, not the entire regression. Origin map
+keys, ordered operation records, call-detail boxes, return summaries, PAG and
+solver state remain. The pool temporarily costs space proportional to distinct
+spellings during indexing; Arc headers/refcounts can cost more on workloads
+with little repeated text. There is no Linux measurement or guarantee for a
+larger corpus, a different allocator, cold caches, or every individual run.
+
+## Source-dataflow rebase on master — 2026-10-08
+
+After combining source-dataflow presentation (#140) with master `95b88db`,
+fresh release analyses of the clean pinned HDF, Hiview and Camera corpora
+measure **71,547**, **27,110** and **56,810** argument-flow rows respectively.
+The HDF `arg_flow_rows_per_call_edge` probe also measures **71,547**.
+These four expectations were recaptured without changing revisions,
+comparison modes, tolerances or solver budgets. The combined results pass
+all **99** evaluation checks; Camera was retried after clearing compiler
+cache space because the first attempt ran out of disk space. All workspace
+tests and the formatting check pass. The earlier measurements below retain
+their original baselines.
+
 ## Undeclared receiver classes: #193 — 2026-10-07
 
 A member call on a receiver whose class the unit never declares
@@ -9669,3 +9889,1402 @@ run (1.07 GiB before indexing), 1,340 units indexed at 2.8 units/s, each lowerin
 include closure (median 18,401 functions per unit). It now reports `parse: i/N` progress; the
 per-unit cost is the documented configured-path limit
 ([MEMORY_PROFILE.md](MEMORY_PROFILE.md#with-a-compilation-database-bounded-but-hours-of-work)).
+
+## Dataflow presentation validation (2026-10-02)
+
+Validated a fresh release analysis of `drivers_hdf_core` at
+`cdc75a20bb8f1a046cd22e189405a20d602d0521`. The presentation rules are documented in [Source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+
+| Query (file:line:column, depth) | Result |
+|---|---|
+| `hdf_sbuf.c:194:43`, default depth | Historical type-based coordinates selected `data` at column 46 rather than `sbuf` at column 24; 3 nodes, 2 transitions. Current identifier coordinates change this selection, as explained below. |
+| `can_test.c:33:31`, depth 1 | Diagnostic identifies one same-line candidate and one nearby candidate (`this` in `hdf_can_test.cpp:35:1`). Complete text has 1,150 lines for all 286 transitions. Current text has no display-limit controls. The historical graph has 297 nodes and retains its traversal-depth truncation marker; current measurements are below. |
+| `usb_raw_io.c:331:23`, depth 4 | One call with 138 targets; Current text lists all 138 targets once per occurrence. The historical graph has 3 nodes and 1 transition; the old limited-text measurements do not describe the current CLI. |
+
+The four selected `service` nodes are abstract field storage at distinct parent
+paths: `hdfDev.service`, `hdfDev.service.service`,
+`hdfDev.service.service.service`, and
+`hdfDev.service.service.service.service` (nodes 158890, 166755, 166759, and
+166763). Their successive parents explain the previously identical labels;
+their identities remain separate. No analysis change was made to these cells.
+
+Compared every row in ten existing tables against the prior export:
+`functions`, `variables`, `call_sites`, `call_edges`, `arg_flow_edges`,
+`flow_nodes`, `flow_edges`, `flow_origins`, `flow_calls`, and
+`flow_return_calls`. The original all-tables-equal claim was too broad:
+parameter identifier columns and call-target function owners changed intentionally.
+The fresh comparison below reports those changes and provenance spelling
+differences explicitly. The new field-parent metadata is additive.
+
+All three queries were checked in both traversal directions and all four output
+formats, including repeated JSON output, source ordering, and diagram edge
+declaration order. Complete callee output and rejection of columns 0 and -1 were verified.
+The current implementation prints complete text without text or callee limits. The workspace suite passed all 1,674 tests,
+including focused regressions for lookup, diagnostics, field parent paths,
+callee presentation, and complete output.
+
+## Repeated-assignment merge and inspect costs (2026-10-02)
+
+Compared release builds based on `0a52704` before and after indexing return
+endpoint pairs in presentation and merging operation origins once per distinct
+unit constraint. Call occurrence identity continues to come from the existing
+TU-remapped `CallSiteId` and exported `flow_return_calls`; no IDs or graph
+semantics are changed. The authoritative rules are in
+[Source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+
+Two generated single-TU C workloads isolate the costs:
+
+- 1,000 repetitions of `x = id(p);`, where `id` returns its parameter. Both
+  binaries inspect the same baseline database, selecting `x`, direction `up`,
+  depth 2, JSON format. The complete JSON matches and contains 2,000 transitions
+  (1,000 argument transitions and 1,000 return transitions). Re-analyzing the
+  calls with the new binary also preserves all 21 non-run-metadata tables.
+- 4,000 repetitions of `q = p;`. Each binary analyzes and exports the source
+  with `--jobs 1`, minimal export. Every existing column in all 21 non-run-metadata
+  tables matches across the six databases, including all 4,000 operation sites.
+
+Three alternating runs per binary on macOS 26.6.2, release profile, observed by
+`scripts/profile_memory_macos.py --interval 0.005`. Indexing time is the interval
+from `discover:` to `index:`, including preprocessing, lowering, and merge;
+it is not a merge-only timer. Inspect wall time includes process startup and
+JSON rendering. Memory uses whole-process `ru_maxrss` and the kernel lifetime
+maximum physical footprint.
+
+| Metric (median of three runs) | Before | After |
+|---|---:|---:|
+| Inspect, 1,000 repeated calls, process wall | 0.79 s | 0.02 s |
+| Inspect peak RSS | 712.4 MiB | 15.6 MiB |
+| Inspect peak physical footprint | 710.2 MiB | 12.9 MiB |
+| Index, 4,000 repeated copies | 11.919 s | 0.016 s |
+| Analyze command, repeated copies, process wall | 11.93 s | 0.03 s |
+| Analyze peak RSS | 12.6 MiB | 12.6 MiB |
+| Analyze peak physical footprint | 4.9 MiB | 5.0 MiB |
+
+Inspect before runs range from 0.79–0.81 s; after runs from 0.01–0.74 s.
+The first after run takes 0.74 s, retained in the reported
+median and range. Copies indexing ranges from 11.907–11.978 s before and
+0.0154–0.0176 s after. These measurements demonstrate removal of the repeated
+return-transition materialization and origin-list replay rather than a change
+in selected graph size or source-operation counts.
+
+Regression tests cover repeated direct and macro calls in both directions and
+both export modes, checking each call/callee identity, invocation and spelling
+coordinates, and one provenance record per return transition. A merge test
+checks overlapping origin lists from repeated constraints across shared-header
+units and conditional variants, preserving first-seen order and remapped files.
+Existing assignment, variant, macro, cycle, and truncation tests remain in use.
+Validation: all 1,681 workspace tests, formatting, and diff checks pass.
+
+Binaries, generated sources (`calls/main.c`, `copies-4000/main.c`), database
+exports, profiler logs, and `comparison.json` are under
+`/tmp/trace-repeated-performance`. To reproduce the inspect measurement:
+
+```bash
+python3 scripts/profile_memory_macos.py --label inspect-after-1 \
+  --out /tmp/trace-repeated-performance --interval 0.005 -- \
+  target/release/trace inspect /tmp/trace-repeated-performance/calls-before.db \
+  dataflow --file main.c --line 3 --col 11 --depth 2 --direction up --format json
+```
+
+## Indexed indirect-return provenance export (2026-10-02)
+
+Compared release CLI builds before and after replacing the per-constraint
+`analysis.call_edges` scan with an indexed SQLite join. The baseline is
+`48e8532`; the branch adds call-site binding columns and builds the two query
+indexes before provenance export. The authoritative binding/index rules are in
+the [call-site schema](SQLITE_SCHEMA.md#call_sites).
+
+The generated C source contains one function pointer `fp` targeting a function
+that returns global `saved`, and 10,000 calls of the form
+`char *out00000 = fp();`. Each call has a distinct destination, retaining 10,000
+indirect-return constraints rather than deduplicating repeated assignments to
+one destination. Both exports contain 10,000 call sites, indirect edges, and
+return-provenance rows. All existing columns in 21 non-run-metadata tables
+match exactly across all six databases; the added binding columns record one
+callee variable and 10,000 distinct destinations.
+
+Three runs per binary, alternating before/after, minimal export, `--jobs 1`,
+macOS 26.6.2, libmalloc space-efficient mode. The observer was
+`scripts/profile_memory_macos.py --interval 0.01`; export wall time is measured
+between the `analyze:` and `export:` stderr timestamps. Memory is the entire
+process sampled during export, including retained program/PAG/analysis data,
+not SQLite-only allocations.
+
+| Metric | Before | After |
+|---|---:|---:|
+| Export wall time, median | 8.16 s | 7.48 s |
+| Export wall time, range | 8.03–9.99 s | 7.20–7.58 s |
+| Export peak physical footprint, median | 7,394 MiB | 7,394 MiB |
+| Export peak physical footprint, range | 7,394 MiB | 7,138–7,522 MiB |
+| Export peak RSS, median | 4,586 MiB | 4,614 MiB |
+| Whole-process maximum RSS, median (`ru_maxrss`) | 4,590 MiB | 4,615 MiB |
+
+Median export time falls by 8.4%; these runs show no material peak-memory
+reduction. Other export work still dominates this workload. `EXPLAIN QUERY
+PLAN` shows a covering-index search of `call_sites(callee_var, return_dst)` and
+an indexed search of `call_edges(call_site_id)`, with no table scan; candidate
+deduplication/order uses a temporary B-tree. A regression checks this plan
+before deferred indexes are built, ordered distinct callees, unrelated pointer
+and destination bindings, and exclusion of synthetic/null call sites. Existing
+minimal/full provenance tests check the exported binding values and correct
+return-source/callee associations.
+
+Local binaries, generated source, six database exports, phase logs, samples,
+and `comparison.json` are under `/tmp/trace-indirect-export-benchmark`.
+Validation: `cargo test --workspace` passes all 1,679 tests;
+`cargo fmt --all -- --check` and `git diff --check` pass.
+Generate the workload and reproduce a run with:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+root = Path('/tmp/trace-indirect-export-benchmark/source')
+root.mkdir(parents=True, exist_ok=True)
+source = 'char *saved;\nchar *target(void) { return saved; }\n'
+source += 'char *(*fp)(void) = target;\nvoid run(void) {\n'
+source += ''.join(f'    char *out{i:05} = fp();\n' for i in range(10000))
+(root / 'main.c').write_text(source + '}\n')
+PY
+cargo build -p trace-cli --release
+python3 scripts/profile_memory_macos.py --label after-1 \
+  --out /tmp/trace-indirect-export-benchmark --interval 0.01 -- \
+  target/release/trace analyze /tmp/trace-indirect-export-benchmark/source \
+  --jobs 1 -o /tmp/trace-indirect-export-benchmark/after-1.db
+```
+
+## Repeated call-argument presentation (#140, 2026-10-02)
+
+Compared release binaries built from `d2815fb` and the argument-transition
+cleanup change on this macOS host. Each workload defines
+`void consume(char *v) {}` and `void run(char *p)`, whose body contains
+10,000 or 40,000 separate `consume(p);` statements. Each database was analyzed
+once by the baseline binary; both binaries inspected that same database.
+Five sequential runs per binary captured complete JSON output, with no tests
+running concurrently. Times are median end-to-end wall time, including process
+startup, database reads, rendering, and output capture:
+
+| Calls | Before | After |
+|---|---:|---:|
+| 10,000 | 0.0987 s | 0.0406 s |
+| 40,000 | 1.0909 s | 0.1572 s |
+
+The command was `trace inspect <DB> dataflow --file main.c --line 2 --col 16
+--depth 1 --format json`. Four times as many calls takes 3.87 times as long
+after the change, versus 11.06 times before. Complete JSON output is
+byte-identical between binaries for both workloads. Argument endpoint pairs
+are collected once and generic wiring is filtered before call transitions
+are appended, removing the repeated scan of accumulated call occurrences.
+The parameter-coordinate correction is tested separately on fresh minimal
+and full exports; using the same database here isolates presentation cost.
+
+Validation: `cargo test --workspace` passes 1,684 tests, including all 44
+inspect integration tests. Regressions cover exact parameter identifiers,
+complex and multiline declarators, repeated direct/macro call arguments,
+source assignments sharing call endpoints, and both traversal directions.
+
+## Lowering repeated assignment origins (#140, 2026-10-05)
+
+Compared release CLI builds from `90f2a18` and the lowering-origin membership
+change on this macOS host. Each generated translation unit contains
+`void f(char *p, char *q)` with 32,000 or 128,000 separate `p = q;` statements.
+Ran `trace analyze <source> --jobs 1 -o <fresh-db>` five times per binary and
+size, sequentially after workspace tests finished. The table reports median
+wall time from process launch through receipt of the `index:` diagnostic;
+it includes startup, preprocessing, parsing, lowering, and merge, but excludes
+analysis and export. This avoids the diagnostic's one-decimal rounding.
+
+| Assignments | Before | After |
+|---|---:|---:|
+| 32,000 | 0.3158 s | 0.1187 s |
+| 128,000 | 3.6757 s | 0.4642 s |
+
+Four times as many assignments takes 3.91 times as long after the change,
+versus 11.64 times before. At 128,000 assignments indexing is 7.92 times
+faster. All exported `flow_origins` rows match between the final before/after
+runs at each size (32,000 and 128,000 rows respectively). Lowering now uses
+per-constraint hash membership alongside the ordered origin vectors; the
+sets are temporary lowering state, not exported analysis data.
+
+Validation: `cargo test --workspace` passes 1,686 tests. Regressions check
+4,096 repeated assignments, duplicate macro origins, distinct expressions
+sharing a source location, pre-existing provenance, closest-operation
+attribution, and first-seen order. Formatting and diff checks pass.
+
+## PR #196 remaining review findings (2026-10-06)
+
+The checkout began at `0694be6` on `issue-140`; GitHub's open PR still named
+`cb24452`. Existing local fixes and untracked fixtures were preserved. The
+cross-file transition sorting suggestion was excluded. The behavior rules live
+in [Source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+
+Measurements below use a freshly rebuilt release CLI on macOS 26.6.2 arm64,
+Rust 1.98.1, and the clean HDF checkout at pinned revision
+`cdc75a20bb8f1a046cd22e189405a20d602d0521`. The final measurement started at
+2026-10-06 16:08:08 UTC; the measured binary's SHA-256 was
+`5617a391179983d6cfde84f3d90347e0aad09375714acd1d278bd4371a6c3466`.
+No builds or tests ran concurrently with the measurements.
+
+Fresh CLI analysis exported **78,737 `flow_origins`** and **10,425
+`flow_return_calls`**, plus **14,408 `flow_call_origins`**. CLI analysis of
+`dataflow_review` exported 15, 10, and 5 rows respectively before the synthetic
+benchmark replaced its graph. These
+checks exercise CLI export, including retained flow facts, rather than only the
+integration tests' direct export helper.
+
+For an isolated comparison, `git archive 0694be6` was built separately in a
+`TemporaryDirectory` and analyzed the same clean corpus with `--jobs 8`.
+The archived build reports version `unknown` because it has no `.git`; its
+source revision is explicitly `0694be6`. The comparison uses the final rebuilt
+binary, including exact return-operation binding.
+It excludes run metadata and compares complete row multisets in the ten
+existing analysis tables, plus the new optional table:
+
+| Table | Before rows | After rows | Result |
+|---|---:|---:|---|
+| `functions` | 11,996 | 11,996 | Identical |
+| `variables` | 130,069 | 130,069 | Identical, including `col` |
+| `call_sites` | 75,398 | 75,398 | Identical |
+| `call_edges` | 76,965 | 76,965 | Identical |
+| `arg_flow_edges` | 71,240 | 71,240 | Identical |
+| `flow_nodes` | 173,473 | 173,473 | Identical, including `fn_id` |
+| `flow_edges` | 154,245 | 154,245 | Identical |
+| `flow_origins` | 78,737 | 78,737 | 74,917 expression spellings changed; identical excluding `expression` |
+| `flow_calls` | 71,240 | 71,240 | Identical |
+| `flow_return_calls` | 10,425 | 10,425 | Identical |
+| `flow_call_origins` | Absent | 14,408 | Additive exact call-ID provenance |
+
+The earlier October 2 "all matched" report does not describe the current
+branch. An additional comparison against its archived `3ea2497` v6 export
+found broader drift: variables 125,399 → 130,069, call sites 75,086 → 75,398,
+call edges 76,530 → 76,965, and return-call rows 9,100 → 10,425. IDs and other
+rows also moved. That historical comparison spans intervening changes and is
+not an isolated measurement of these review fixes. The fresh `0694be6`
+comparison above separates this patch's expression changes from that drift.
+
+Two intentional earlier metadata corrections remain present:
+
+- `variables.col` names the declarator identifier for named parameters rather
+  than the beginning of the parameter's type. At `hdf_sbuf.c:194`, the old
+  columns for `sbuf`, `data`, and `readSize` were 24, 46, and 65; the actual
+  identifier columns are **40, 59, and 75**. Consequently, the unchanged query
+  at column 43 now selects **`sbuf`**, rather than the historical `data`.
+- A `call_target`'s `flow_nodes.fn_id` records its caller's ownership; it is
+  not the identity of a possible callee. The fresh export has 3,506 call-target
+  nodes and **zero** caller-owner mismatches against `call_sites`. Resolved
+  callees continue to come from call edges.
+
+These corrections are already in the pre-task local baseline, so neither
+column differs in the isolated comparison. The authoritative metadata rules
+and regressions retain them.
+
+`profile_memory_macos.py` sampled at 1 ms. Inspection times are medians of
+three independent processes, including startup, SQLite reads, and complete
+JSON rendering with stdout discarded. Analysis and the all-hidden chain each
+have one sample. The observer rounds wall time to 0.01 s, so the small-query
+values should not be read as more precise than that. RSS is `wait4`'s
+`ru_maxrss`; physical footprint is the kernel lifetime maximum from
+`proc_pid_rusage`. They are different macOS memory accounts, reported
+separately in MiB; RSS is not substituted for physical footprint.
+
+| Workload | Elapsed (s) | Peak RSS (MiB) | Peak phys_footprint (MiB) | Query result |
+|---|---:|---:|---:|---|
+| HDF CLI analysis, jobs 8 | 5.24 | 467.59 | 195.70 | Fresh minimal v7 export |
+| `can_test.c:33:31`, down, depth 1 | 0.04 | 14.36 | 11.50 | `hdfDev`; 297 nodes, 286 edges, truncated |
+| `hdf_sbuf.c:194:43`, down, depth 1 | 0.01 | 7.56 | 4.78 | `sbuf`; 4 nodes, 3 edges, truncated |
+| 100,000 visible-node chain, depth 1 | 0.01 | 7.11 | 4.34 | Shallow neighborhood |
+| Disconnected two-node query beside that chain, depth 1 | 0.01 | 7.03 | 4.28 | Small component only |
+| Same chain with 99,998 hidden interior nodes, depth 1 | 3.47 | 532.61 | 477.89 | Full hidden component must be traversed |
+
+The visible and disconnected queries stay small despite the unrelated large
+component. Hidden nodes do not consume visible depth, so the all-hidden case
+necessarily reaches all 100,000 raw nodes. Its cost remains proportional to
+reached data and finite metadata states, rather than enumerated simple paths;
+visible depth is not a constant memory bound for arbitrary hidden components.
+Older v7 exports can lack the new additive lookup indexes; re-analysis supplies
+them. The schema remains v7 and existing row layouts are unchanged. The optional
+`flow_call_origins` table adds exact per-call assignment provenance; older v7
+exports without it use the indexed position fallback and require re-analysis
+for ambiguous assignments within one macro invocation.
+
+Complete text was checked against JSON: CAN emits all **286 transitions** in
+1,150 lines; SBUF emits all **3 transitions** in 21 lines. Each query prints
+one coherent selection diagnostic. Text and callee output have **no display
+limit controls**. Assignment expressions, including original line breaks and
+literal contents, remain available in JSON and text.
+
+Reproduce the current measurements with the pinned corpus available:
+
+```bash
+cargo build --release -p trace-cli
+python3 scripts/measure_dataflow_review.py \
+  --corpus /path/to/drivers_hdf_core \
+  --baseline /path/to/pre-task-0694be6.db \
+  --nodes 100000 --runs 3 --output /tmp/pr196-measurements.json
+```
+
+Omit `--baseline` to measure without a comparison database, or omit `--corpus`
+to run the synthetic workloads alone. The script uses `TemporaryDirectory`
+for databases and observer artifacts. To reproduce the isolated baseline
+without replacing local work (run from the repository root):
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import subprocess
+import tempfile
+
+repo = Path.cwd()
+corpus = Path('/path/to/drivers_hdf_core')
+with tempfile.TemporaryDirectory(prefix='trace-pr196-comparison-') as scratch:
+    work = Path(scratch)
+    source = work / 'source'
+    source.mkdir()
+    with (work / 'source.tar').open('wb') as archive:
+        subprocess.run(['git', 'archive', '0694be6'], stdout=archive, check=True)
+    subprocess.run(['tar', '-xf', str(work / 'source.tar'), '-C', str(source)], check=True)
+    subprocess.run(['cargo', 'build', '--release', '-p', 'trace-cli',
+                    '--manifest-path', str(source / 'Cargo.toml'),
+                    '--target-dir', str(work / 'target')], cwd=source, check=True)
+    subprocess.run([str(work / 'target/release/trace'), 'analyze', str(corpus),
+                    '--jobs', '8', '-o', str(work / 'baseline.db')], check=True)
+    subprocess.run(['python3', 'scripts/measure_dataflow_review.py',
+                    '--corpus', str(corpus), '--baseline', str(work / 'baseline.db'),
+                    '--output', '/tmp/pr196-measurements.json'], cwd=repo, check=True)
+PY
+```
+
+Final aggregate measurements are `/tmp/pr196-final-measurements.json` on the
+measurement host. The isolated table comparison is in
+`/tmp/pr196-isolated-measurements.json`; the historical comparison is separately
+recorded in `/tmp/pr196-measurements.json` and is not presented as a fresh
+pre-task baseline.
+
+Regression coverage maps to the review findings as follows:
+
+| Finding | Fix and regression coverage |
+|---|---|
+| 1 | Indexed zero/one-cost neighborhoods, selective metadata and occurrence batches; long hidden diamonds, cycles, both directions, parameter twins, field roots, incoming pointer-write metadata without store edges, and 50,000 unrelated nodes. Finite hidden-state union is retained. |
+| 2 | Exact call-ID operation bindings, with indexed position fallback for older v7 exports; repeated direct/indirect calls, same-line and multiline assignments, distinct assignments within one macro invocation, macro attribution, and JSON/text expressions. |
+| 3 | Nullable callers use a real file-scope group; argument and return rows with NULL callers render in JSON, text, and Graphviz; callers assigning globals retain headers even without owned graph nodes. |
+| 4 | Shared alias mapping canonicalizes both field-access endpoints; aggregate initializer tests include converging records and projected self references. |
+| 5 | Function entities use function file/start line and unknown column zero; JSON and Graphviz checks also retain variable locations. |
+| 6 | Origin merging uses safe `map_file`; valid remapping, unknown/synthetic IDs, primary-file fallback, and deduplication are tested. |
+| 7 | One selection note combines fallback and candidate details; exact/inexact stderr tests retain selection behavior. |
+| 8 | Parent chains determine field ownership; `operations.send`, `connection.ops`, function-owned fields, and distinct nested paths remain covered. |
+| 9 | Reliable original slices and re-lexed token formatting; exact strings, literals, operator boundaries, and multiline expression rendering are tested. |
+| 10 | Fresh CLI provenance, isolated/historical table comparisons, HDF and synthetic timing/memory, corrected complete-output claims, and commands above. |
+| 11 | Focused DB/inspect/merge/spelling tests pass; all 1,864 workspace tests pass, with no failures or ignored tests. Formatting, Clippy with warnings denied, and `git diff --check` pass. |
+
+## PR #196 local branch audit (2026-10-07)
+
+Verified the refs before inspecting code: local `issue-140` HEAD is
+`0457bdbb550408672d62055684217795b1800c8a`; the live GitHub API reports
+[PR #196](https://github.com/Last-Humans-Coding-Under-White-Nights/pathologist/pull/196)
+open at `cb24452d3cc00881f5114b18d86956f05c5a4c58`. The initial working tree
+was clean. These refs identify the pre-fix snapshots compared in this audit;
+the fixes were subsequently incorporated into the local feature commit by
+amendment. [Issue #140](https://github.com/Last-Humans-Coding-Under-White-Nights/pathologist/issues/140)
+asks for understandable dataflow output with fewer artificial nodes and complex
+tags; it has no additional acceptance checklist or issue comments.
+
+### Confirmed defects and reproductions
+
+Two uncovered defects reproduced before their implementation was changed:
+
+1. Recovered original expressions retain comments, but destination extraction
+   interpreted punctuation inside them. Analyzing
+   `s->field /* = note */ = p` and inspecting `p` downstream at depth one
+   produced the malformed expression node `s->field /*`. A comment containing
+   `[` or `"` also changed nesting/quoting and could replace the spelled
+   destination with the initializer fallback `s.field`. A line comment with
+   `=` similarly cut the destination short. The new
+   `dataflow_comment_destinations` fixture reproduces these cases; its inspect
+   regression failed on the unmodified implementation. Destination scanning
+   now skips comment punctuation, including escaped LF/CRLF continuations,
+   while preserving the complete original LHS and operation expression.
+   The integration regression checks roots at both the field base and stored
+   value in minimal/full exports, plus exact text/JSON spellings. A DB unit
+   regression covers nested subscripts, pointer LHSs, compound operators,
+   continued line comments, and comments without an assignment.
+2. `scripts/measure_dataflow_review.py --corpus ...` read `node['var_id']`
+   while collecting CAN/SBUF roots. Current source-level JSON intentionally
+   omits that internal field, so a valid corpus query raised
+   `KeyError: 'var_id'` before writing its report. The new end-to-end Python
+   regression reproduced that traceback using a temporary Git corpus and the
+   release CLI. Reports now record `node_id` from the public numeric PAG `id`;
+   the JSON contract remains unchanged. The regression executes both corpus
+   queries and all synthetic measurements through report completion.
+
+Reproduce the focused checks from the repository root:
+
+```bash
+cargo test -p trace-db assignment_lhs
+cargo test -p trace-cli --test inspect_tests source_dataflow_comments_do_not_delimit_write_destinations
+cargo build --release -p trace-cli
+python3 scripts/test_measure_dataflow_review.py
+```
+
+The Python check requires macOS, like the measurement script it exercises. It
+uses `TemporaryDirectory` for its Git corpus, databases, and reports. The Rust
+integration check uses `common::TempDb`. No temporary database is committed.
+
+### Fixes already present locally
+
+The clean baseline passes all **1,871** workspace tests. The existing coverage
+confirms retained CLI provenance through export; indexed bounded neighborhoods
+and finite hidden-node convergence; compound assignment destinations; prepared
+SQL and indexed indirect-return joins; v7 compatibility and v6 merge rejection;
+safe origin-file remapping; function-value locations; canonicalized field
+aliases; nullable caller groups; exact return-operation bindings; one combined
+selection diagnostic; original/token-aware expression spelling; and field
+parent ownership. The regression map in the preceding section names the
+individual cases. These are existing fixes, not outstanding defects inferred
+from historical reviews.
+
+Existing complete-output regressions also pass: all targets appear once per
+call occurrence and text includes every transition selected by visible depth.
+No display limits were restored. Source ordering remains scope traversal order,
+then line/column, with path only as a tie-breaker; path-first cross-file sorting
+remains excluded. The authoritative rules remain in
+[Source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+That section now documents comment handling and corrects a stale claim that
+call-target labels include occurrence IDs: structured/diagram PAG node IDs
+distinguish occurrences, while call-site IDs remain internal.
+
+### Published PR versus local implementation
+
+The published feature commit is based on `511bf5d`; the local feature commit
+is based on `8c669a6`. Thus `git diff cb24452 0457bdb` also includes #198
+(`83815b4`, compact flow-node export/on-demand inspection) and #199
+(`8c669a6`, preprocessing/indexing memory reductions). Those inherited changes
+must not all be attributed to this PR's review fixes.
+
+Beyond that base movement, local presentation has selective indexed metadata
+loading and finite hidden-state union; exact call-ID return-operation bindings
+and complete call expressions; original-source expression recovery; nullable
+callers and corrected field/function ownership; explicit `nullptr` values;
+and the revised JSON contract with four description arrays, typed scope
+references, and per-operation callee/argument metadata. Source provenance is
+retained until CLI/C API export completes. Current exports are v7, with
+optional additive call-expression/origin tables and lookup indexes; older v7
+exports use documented fallbacks.
+
+The published PR description still advertises three callees and 100 text
+transitions by default, removed CLI display-limit flags, structured call-site
+IDs, stale test counts, and an overly broad table-equality claim. The prepared
+replacement description states the actual complete-output/JSON behavior and
+current validation. It does not present historical HDF measurements as results
+of this audit.
+
+### Validation and limitations
+
+After the two fixes, `cargo test --workspace` passes **1,873** tests with no
+failures or ignored tests. Both focused Rust regressions pass. Formatting,
+Clippy for all workspace targets with all features and with default features
+(`-D warnings`), and `git diff --check` pass. A fresh release CLI build and the
+end-to-end measurement regression pass; Python syntax checks also pass.
+
+No additional remaining defect was confirmed in this audit. The pinned HDF,
+Hiview, and camera corpora are absent from this checkout's configured home
+paths, so their full evaluation/table comparisons and historical performance
+measurements were not repeated. The generated corpus check validates report
+execution and JSON compatibility, not HDF performance. Existing documented
+limitations remain: hidden components can exceed visible-depth memory bounds;
+older optional metadata can require re-analysis for exact attribution; omitted
+default arguments can lack flow facts; the may-flow graph is not an execution
+trace or complete source evaluator.
+
+## Provenance storage memory reduction after 67578b4 (macOS arm64, 2026-10-07)
+
+This comparison uses unmodified **67578b4** as the baseline. It measures the
+storage changes described in [Source-level dataflow
+presentation](ANALYSIS.md#source-level-dataflow-presentation), without changing
+expressions, occurrence identity, source attribution, resolution, or inspection.
+
+### Allocation owners and implementation
+
+Before selecting the fix, a diagnostic counted retained buffers by owner.
+On macOS, `malloc_size` measured actual allocation sizes for vector backing
+buffers, strings, and call-detail boxes. Hash-map/table slots and lowering
+caches were separately modeled from capacities and element sizes; they are
+not allocator measurements. This is an owner census, not a complete
+allocation-stack census at the process peak.
+
+A separate before/after diagnostic API indexing run on the pinned HDF tree
+(`PreprocessOptions::new()`, default test partition, built-in noise macros,
+jobs 8; source in the artifacts) confirms these retained allocations. It has
+80,858 origin occurrences under 80,225 constraint keys. Diagnostic API defaults
+and exported CLI rows are separate observations; exported origins can also
+omit facts without representable graph endpoints.
+
+| Owner, allocated MiB after indexing | Baseline | Changed |
+|---|---:|---:|
+| Origin vector buffers (3.08 MiB used entries) | 12.25 | 3.72 |
+| Flow vector buffer (3.19 MiB used entries) | 5.00 | 3.20 |
+| Call-detail boxes | 13.75 | 11.46 |
+| Separate optional return-operation boxes | 0 | 0.66 |
+| Origin expression buffers | 5.51 | 5.51 |
+| Call expression buffers | 4.41 | 4.41 |
+| Return-operation expression buffers | 0.74 | 0.74 |
+
+The first four owners together save **11.95 MiB of retained allocations** in
+this diagnostic. `CallSiteDetails` shrinks from 176 to 144 bytes; allocation
+rounding and the new return boxes are included above. The origin map still
+models 7.00 MiB of occupied-capacity slots, excluding bucket slack/control
+bytes. Owned constraint-key strings remain 1.66 MiB and flow-vector strings
+1.68 MiB. Return-summary vector buffers remain 0.32 MiB.
+
+The initial repeated-assignment lowering census found 8.75 MiB of membership
+slots duplicating origin records, 0.61 MiB of copied expression capacity,
+1.75 MiB of occurrence-membership slots, and 1.98 MiB of original-source text
+and line-index capacity. These are capacity models at the end of the TU,
+not simultaneous allocator or kernel peaks.
+
+The focused changes are:
+
+- Lowering and merge membership tables store indexes into the ordered origin
+  vectors. They compare full spans and expressions on lookup, including hash
+  collisions; they do not own another copy of expressions. Singleton lists
+  need no membership table. Both phases use the same private helper.
+- Dense occurrence flags replace a hash set of flow-vector positions.
+  Attribution still records the first, closest operation for each occurrence.
+- Origin vectors initially reserve one entry, and analysis indexing compacts
+  flow/origin capacity after the last merge. Constraints and summaries retain
+  their occurrence order and stay alive through provenance export.
+- Original-source recovery buffers expire after the AST walk. Pending
+  references already retain their complete expression and source span.
+- Optional return-operation payloads are boxed, keeping their storage out of
+  calls without return assignments.
+- Export incoming-wiring indexes cover only call-return destinations.
+  Membership buffers expire after building their ordered view, and provenance
+  export has its own scope before edge-row buffers are allocated.
+
+No source strings are truncated, no operation sites are coalesced by span
+alone, and no lowered fact is released before its last consumer. CLI and C
+API retain the existing post-export `release_flow` lifecycle. The private
+index helper adds a direct dependency on the already locked hashbrown version,
+with default features disabled; it does not change public entity IDs or
+crate dependency direction.
+
+### Fresh release measurements
+
+The HDF revision is
+`cdc75a20bb8f1a046cd22e189405a20d602d0521`, recovered in the original
+measurement directory. Both versions use the **same original corpus paths**,
+default features, default macOS space-efficient allocator selection, minimal
+export, and jobs 8. The original generated 128,000-assignment source path is
+also reused, with jobs 1. Baseline and changed binaries were built separately
+with the repository release profile in isolated Cargo target directories.
+Compilation and validation are excluded from every measurement interval.
+
+There are five alternating independent release processes per HDF analysis
+and CAN inspection variant, and three per synthetic variant. Measurements use
+`scripts/profile_memory_macos.py --interval 0.005`. Whole-process footprint
+is the kernel lifetime maximum from `proc_pid_rusage`; whole-process RSS is
+`ru_maxrss`. Phase peaks are sampled and approximate stderr boundaries.
+
+All memory values are MiB. Entries are **median [minimum–maximum]**.
+
+| Whole-process metric | 67578b4 | Changed |
+|---|---:|---:|
+| HDF peak physical footprint | 196.55 [187.75–200.39] | 190.06 [189.75–197.31] |
+| HDF peak RSS | 504.95 [495.72–508.94] | 491.84 [488.95–497.77] |
+| HDF wall time, seconds | 4.46 [4.37–5.58] | 4.51 [4.44–5.19] |
+| Repeated assignments peak physical footprint | 124.23 [124.22–124.25] | 110.73 [110.72–110.77] |
+| Repeated assignments peak RSS | 140.80 [140.77–140.83] | 126.50 [126.47–126.56] |
+| Repeated assignments wall time, seconds | 0.68 [0.65–0.71] | 0.63 [0.62–0.67] |
+| CAN depth-one inspection peak physical footprint | 10.25 [10.20–10.45] | 10.33 [10.23–10.50] |
+| CAN depth-one inspection peak RSS | 13.20 [13.17–13.42] | 13.34 [13.27–13.52] |
+| CAN inspection wall time, seconds | 0.05 [0.05–0.05] | 0.05 [0.05–0.05] |
+
+HDF lifetime footprint decreases **6.48 MiB (3.3%)** at the median, and RSS
+decreases 13.11 MiB (2.6%). HDF ranges overlap: this is a modest observed
+improvement, not evidence that every run improves or that the original
+regression has been eliminated. The fresh baseline differs from the original
+211.2 MiB measurement; historical and fresh batches are not combined.
+
+The synthetic lifetime footprint decreases **13.50 MiB (10.9%)**, with
+non-overlapping ranges, and RSS decreases 14.30 MiB (10.2%). Its whole-process
+peak remains during TU lowering. HDF's whole-process peak remains in analysis.
+
+HDF median wall time rises 0.05 s (1.1%); ranges overlap. Median user+system
+CPU is 13.33 → 13.52 s. Synthetic median wall time falls 0.05 s (7.4%), with
+median user+system CPU 0.66 → 0.61 s. These are small samples, not a claim of
+fine-grained timing equality. CAN timing is rounded to 0.01 s and cannot
+establish finer differences.
+
+| Sampled phase peak physical footprint | 67578b4 | Changed |
+|---|---:|---:|
+| HDF analysis | 196.05 [187.61–200.39] | 189.83 [189.59–196.77] |
+| HDF export | 100.50 [92.50–102.66] | 95.86 [95.17–104.77] |
+| Synthetic lowering (`pch` sampler tag) | 120.48 [120.34–123.25] | 110.63 [110.56–110.70] |
+| Synthetic export | 17.25 [17.23–17.36] | 19.28 [19.23–19.28] |
+
+Synthetic sampled export memory increases despite the lower lifetime peak;
+phase-local allocator retention/reuse is not the success criterion. Raw
+profiles contain all observed phases' sampled RSS and footprint, separately from
+the lifetime metrics. The reduction claim uses lifetime physical footprint
+and the measured owner allocations, not phase movement or RSS alone.
+
+Inspection uses the identical changed HDF database in both binaries:
+`dataflow --file can_test.c --line 33 --col 31 --depth 1 --format json`.
+Footprint stays around 10.3 MiB, with overlapping ranges. Inspection code and
+visible-depth semantics are unchanged from 67578b4. The older 096df75
+renderer has different visible-depth semantics and is not used for equivalence.
+
+### Equivalence and validation
+
+All **24 tables**, schemas/indexes, row values and insertion order match
+67578b4 for HDF minimal export (996,009 rows), HDF full/debug export
+(3,684,292 rows), and the synthetic minimal export (128,011 rows).
+Only `analysis_run.created_at` and `trace_version` are normalized; all
+other run options, solver counts, IDs, coordinates and expression text are
+compared. HDF retains 78,737 exported origins, 74,802 call expressions,
+14,408 exact call-return operation bindings and 10,425 return-call rows.
+
+All 12 `dataflow_*` fixture trees match in minimal and full/debug exports.
+Their selected declarations render byte-identically in both directions at
+depth two in JSON and text. CAN depth-one JSON, text, Graphviz and Mermaid
+outputs, including diagnostics, match byte-for-byte. Changed HDF minimal
+exports at jobs 1 and jobs 8 also match all rows and insertion order.
+
+A regression exercises complete expressions sharing macro coordinates and
+constraint endpoints, with pre-existing origins and reverse replay after
+membership growth. Workspace tests include macro/initializer attribution,
+exact call/return binding, long expressions, weak/target resolution, C API
+lifecycles, deterministic propagation and inspection behavior.
+
+Remaining owners include complete expression buffers, owned constraint
+keys and repeated flow occurrences, return summaries through export,
+call/argument metadata, PAG nodes/locations/indexes, and transient solver
+points-to/worklist state. This change reduces storage overhead; it does not
+remove those consumers or establish a new whole-heap allocation census.
+
+Temporary files from the first exploratory batch disappeared during the
+disk-space incident. Its reported intermediate numbers are not used here.
+The fresh retained batch above is the final measurement set.
+
+Final validation passes: **1,895 workspace tests**, workspace build (all
+targets), formatting, and Clippy for all workspace targets with default
+features and all features (`-D warnings`). Debug symbols and incremental
+compilation were disabled for validation to fit available disk space; release
+benchmark profiles and allocator settings were unchanged. Missing Cargo
+dependencies were restored before the final checks, outside measurement
+intervals.
+
+Reproduction commands (from the repository root; separate target directories):
+
+```bash
+cargo build --release -p trace-cli --target-dir /tmp/trace-provenance-memory/base-target
+cargo build --release -p trace-cli --target-dir /tmp/trace-provenance-memory/fixed-target
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo test --workspace --target-dir /tmp/trace-provenance-memory/check-target -j 1
+```
+
+The first build runs from the archived 67578b4 source; the second runs from
+the changed source. The retained driver copies the binaries into its own
+directory, alternates profiling subprocesses, and performs data/render
+comparisons after profiling has finished. Binary SHA-256 values, every raw
+profile/log, aggregate medians/ranges, per-table ordered-row hashes,
+diagnostic source and owner logs, source archives and validation logs are in:
+
+/private/var/folders/4y/k2qd8m75405_4w9jnztr01c40000gn/T/trace-provenance-memory-jttejxqp
+
+
+## Remaining source-dataflow review findings (2026-10-07)
+
+The review started from `ad584c6`. Current code inspection confirmed the outer
+call's unconditional return-operation assignment and missing expressions on
+base/member constructor initializers. Return bindings now preserve the first
+nested binding, matching `record_call_expressions`; initializer constructors
+use that helper around argument collection and emission. Real CLI regressions
+cover minimal/full exports, exact `flow_call_origins` and `flow_origins`
+assignment coordinates, rendered lambda return operations, and `Base(p)` /
+`member(p)` argument transitions in both directions. Analysis facts and
+resolution policies are unchanged.
+
+Symbol lookup deliberately rejects databases lacking `variables.is_synthetic`
+through the same check used by source-dataflow presentation. The C API returns
+`TRACE_ERR_ANALYSIS` with a re-analysis instruction for this incompatibility.
+Non-positive positions previously reached `ApiError::from(anyhow::Error)`, which
+classified them as `TRACE_ERR_ANALYSIS`. They now have explicit argument
+validation and return `TRACE_ERR_INVALID_ARG`; Rust lookup retains its positive,
+1-based contract. FFI coverage checks zero/negative lines and columns and the
+missing-column database. Ranking is unchanged: identifier coverage on the
+requested line, other declarations on that line, then nearby lines. The JSON
+contract now identifies itself with `schema: "dataflow-source-v1"`. Authoritative
+rules are in [source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation)
+and [C API inspection](CAPI.md#inspect-details).
+
+An isolated release build restores the unmodified `ad584c6` lowering file
+while keeping the current exporter, then runs the actual CLI on both regression
+fixtures. It reproduces the lambda's `id` binding as the outer `out = invoke(...)`
+assignment at **6:5**, and NULL call expressions for `Base::Base` and
+`Member::Member`. The fixed CLI exports **`inner = id(p)` at 8:9**, `Base(p)`,
+and `member(p)`. Both binaries also run CLI JSON/text inspection of the lambda's
+`inner` declaration. Exact exported results, hashes and rendered output are in
+`/tmp/trace-source-recovery/attribution-reproduction.json`,
+`original-attribution-lambda.{json,text}`, and `final-current-lambda.{json,text}`.
+This reproduction restores only lowering; it is not the source-recovery timing
+baseline and is not used for performance claims.
+
+### Pinned argument-flow recapture
+
+Fresh shallow checkouts, with matching revisions and empty `git status
+--porcelain`, were downloaded under `/tmp/trace-pinned-clean`. No revision,
+comparison mode, tolerance, solver budget, or null behavior was changed.
+
+| Corpus | Pinned revision | Previous expectation | Fresh current | Increase |
+|---|---|---:|---:|---:|
+| HDF | `cdc75a20bb8f1a046cd22e189405a20d602d0521` | 70,996 | 71,425 | 429 |
+| Hiview | `92408e2072bd6dc8fb0d980773e80b6ec898710c` | 26,281 | 27,103 | 822 |
+| Camera | `8ffd69dcd47f533e70b4dba428439da9008b0cae` | 56,910 | 57,678 | 768 |
+
+The HDF `arg_flow_rows_per_call_edge` probe also measures **71,425**. Only these
+four expectation values were updated. Before recapture the checker reproduced
+**99 checks, four failures**; afterward a fresh analysis passed **99/99**.
+
+A separate diagnostic release build skips only `collect_call_args`' explicit
+`nullptr` materialization branch. Its counts are HDF **70,998**, Hiview
+**26,281**, Camera **56,910**. Thus explicit null arguments account for **427**,
+**822**, and **768** additional rows respectively. This diagnostic is not a
+production change. Its original-source recovery was also disabled for the
+performance baseline below; that alters expression presentation, not argument
+wiring. HDF's remaining two rows are the recognized
+`OHOS::Hardware::ConfigTerm::ConfigTerm` construction in
+`framework/tools/hc-gen/src/ast.cpp:920:20`, owned by
+`OHOS::Hardware::AstObjectFactory::Build`: argument zero is the factory's heap
+receiver and argument one is the explicit return temporary. Both rows remain
+in the null-disabled diagnostic. This agrees with the factory-construction
+correction preceding the review; the old expectation is a historical baseline,
+not a freshly rebuilt pre-factory comparison.
+
+Commands from the repository root:
+
+```bash
+python3 scripts/fetch_corpora.py --base /tmp/trace-pinned-clean
+cargo build --release -p trace-cli
+TRACE_CORPUS_BASE=/tmp/trace-pinned-clean \
+  python3 scripts/eval_check.py --bin target/release/trace --outdir /tmp/trace-eval
+```
+
+The checker sets `TRACE_SOLVE_BUDGET_POPS=800000` and jobs 8. Fresh databases are
+`/tmp/trace-eval/eval_check_{hdf,hiview,camera}.db`; before/after checker logs
+are `/tmp/trace-eval-before.log` and `/tmp/trace-eval.log`. Diagnostic count
+artifacts are `/tmp/trace-source-recovery/null-deltas.json` and the corresponding
+`*-without-explicit-null.db` / `.log` files.
+
+### Original-source recovery cost: all three pinned corpora
+
+These fresh measurements extend the earlier HDF/synthetic evidence, particularly
+with Hiview and Camera comparisons. They use **macOS 26.6.2, arm64**, rustc
+**1.98.1**, Cargo **1.98.1**, default features and the default macOS allocator
+configuration, the repository release profile (**ThinLTO, one codegen unit**),
+minimal export, jobs **8**, budget **800000**, and identical corpus paths and
+revisions as above. Compilation and workspace checks finished before profiling;
+there were no concurrent agent builds or checks during the profile batch.
+Filesystem caches were not flushed; alternating independent processes measure
+warm local indexing rather than cold storage performance.
+
+The baseline is a diagnostic copy of the current reviewed production source,
+with only `operation_expression`'s call to the original-source recovery closure
+bypassed. It still formats tokens and exports the complete pipeline, with the
+same analysis facts. The current variant performs original-source recovery and
+clears `LowerContext::original_sources` immediately after each AST walk. This
+comparison measures the whole recovery path, including reads, full-source and
+line-index buffers, source validation/re-lexing, and differences from token
+formatting. It does **not** isolate cache lookup from the rest of recovery, or
+promise byte-identical expression spelling between variants. The baseline used
+for timings has no null-disabled diagnostic branch.
+
+Three alternating processes per variant/corpus were sampled by
+`scripts/profile_memory_macos.py --interval 0.005`. Physical footprint is the
+kernel lifetime maximum from `proc_pid_rusage`, not RSS. Parse/lower/merge time
+is the observer's `parse:` to `index:` stderr interval, and includes parsing,
+AST lowering, merge, and indexing finalization rather than just recovery CPU.
+Phase peaks are sampled and can miss short transients. Entries below are
+**median [minimum–maximum]**; memory is MiB and time is seconds.
+
+| Corpus / metric | Recovery disabled baseline | Current recovery |
+|---|---:|---:|
+| HDF whole-process wall | 4.54 [4.41–5.36] | 4.37 [4.31–4.94] |
+| HDF parse/lower/merge wall | 1.112 [1.098–1.165] | 1.117 [1.098–1.140] |
+| HDF lifetime physical footprint | 205.53 [201.99–207.70] | 199.67 [199.30–199.97] |
+| HDF parse/lower/merge sampled footprint | 109.17 [103.50–109.31] | 105.77 [104.20–106.16] |
+| HDF peak RSS | 445.34 [445.28–449.83] | 438.94 [436.17–439.63] |
+| Hiview whole-process wall | 1.85 [1.82–1.97] | 1.85 [1.77–1.88] |
+| Hiview parse/lower/merge wall | 0.795 [0.783–0.838] | 0.803 [0.768–0.824] |
+| Hiview lifetime physical footprint | 72.25 [71.39–72.28] | 70.64 [69.09–70.86] |
+| Hiview parse/lower/merge sampled footprint | 72.06 [71.14–72.06] | 70.16 [68.61–70.78] |
+| Hiview peak RSS | 216.33 [214.50–217.55] | 215.72 [215.53–216.83] |
+| Camera whole-process wall | 7.75 [7.65–7.76] | 7.79 [7.79–7.86] |
+| Camera parse/lower/merge wall | 3.716 [3.691–3.718] | 3.720 [3.680–3.728] |
+| Camera lifetime physical footprint | 173.60 [172.97–177.06] | 172.47 [170.78–175.09] |
+| Camera parse/lower/merge sampled footprint | 173.55 [172.44–176.34] | 172.42 [170.61–174.88] |
+| Camera peak RSS | 592.17 [590.80–596.88] | 589.52 [582.63–591.75] |
+
+Parse/lower/merge median differences are **+0.005 s HDF**, **+0.008 s Hiview**,
+and **+0.004 s Camera**, with overlapping ranges. These three-run samples cannot
+resolve recovery CPU cost at that precision. Camera whole-process time rises
+0.04 s; that is a small observed difference, not a general performance bound.
+Current lifetime footprint is lower in this batch, but the whole-process
+numbers include allocator reuse and expression-buffer differences and do not
+measure the cache's allocated bytes by subtraction. They do not justify a
+memory-reduction claim about adding source recovery.
+
+Historical evidence is kept separate: the preceding **67578b4 → changed**
+comparison measured multiple provenance-storage optimizations together,
+including earlier cache release (HDF jobs 8 and 128,000-assignment synthetic
+jobs 1). Its reported HDF lifetime footprint medians **196.55 → 190.06 MiB**
+and synthetic **124.23 → 110.73 MiB** remain valid historical evidence of that
+combined change, not a recovery-disabled baseline. The referenced raw artifact
+directory is no longer present on this host, so those historical observations
+were not re-audited or combined with the new batch.
+
+Raw new profiles, timestamped stderr, binary hashes, isolated source variants,
+profile driver and aggregates are under `/tmp/trace-source-recovery`:
+`measurements.json`, `profile.py`, `baseline.lower.rs`, `current.lower.rs`,
+`build-baseline.log`, and `{corpus}-{baseline,current}-{0,1,2}.{json,log}`.
+Reproduce an individual run (swap `baseline-trace` for `current-trace`):
+
+```bash
+TRACE_SOLVE_BUDGET_POPS=800000 \
+  python3 scripts/profile_memory_macos.py --label hiview-current-repeat \
+  --out /tmp/trace-source-recovery --interval 0.005 -- \
+  /tmp/trace-source-recovery/current-trace analyze \
+  /tmp/trace-pinned-clean/hiviewdfx_hiview --jobs 8 \
+  -o /tmp/trace-source-recovery/hiview-repeat.db
+```
+
+To reconstruct the diagnostic baseline in an isolated copy of the reviewed
+source, replace `if let Some(original) = recover() {` in `operation_expression`
+with `let _ = &mut recover; if let Some(original) = None::<String> {`, then build
+with `cargo build --release -p trace-cli`. The optimizer removes the unused
+closure; the production source is untouched. Both release build logs, binaries
+and SHA-256 hashes are retained with the batch. Future diagnostic builds should
+use separate Cargo target directories: reusing a target directory across the
+isolated sources caused the final production build to reuse an old lowering
+artifact. A forced rebuild of the production lowerer and direct release-CLI
+metadata checks resolved that artifact collision before final evaluation.
+Measurements use the separately copied, identified binaries, not whichever
+binary subsequently occupied `target/release/trace`.
+
+
+A **separate diagnostic build**, excluded from timing/footprint comparisons,
+accounts for each cached original `String` and `Vec<usize>` at insertion and
+immediately before cache release. It records lengths and capacities separately,
+uses macOS `malloc_size` on both backing buffers (including allocator rounding),
+and tracks their concurrent live allocated-byte high-water mark with atomic
+counters. It does not substitute the returned expression substring for the
+full cached source: the complete original file and complete line-start index
+are counted. There is one census run per corpus at jobs **1** and **8**.
+
+| Corpus | Lowering contexts | Largest context's backing allocations (MiB) | Concurrent backing peak, jobs 1 (MiB) | Concurrent backing peak, jobs 8 (MiB) | Cumulative source bytes read (MiB) | Cumulative line-index used bytes (MiB) |
+|---|---:|---:|---:|---:|---:|---:|
+| HDF | 1,883 | 0.217 | 0.217 | 0.441 | 8.289 | 2.084 |
+| Hiview | 1,902 | 0.135 | 0.135 | 0.209 | 6.154 | 1.396 |
+| Camera | 2,589 | 0.994 | 0.994 | 1.970 | 34.270 | 7.306 |
+
+Contexts include header walks as well as TU walks. Cumulative read/index sizes
+count repeated files in different contexts and are **not** simultaneously
+retained memory. Those cumulative totals and context counts are identical at
+jobs 1 and 8. Live high-water marks depend on worker scheduling, and diagnostic
+counters/logging can change that scheduling. They represent these particular
+runs, not a fixed peak for every job-8 execution.
+
+| Corpus | Maximum per-context source capacity (MiB) | Maximum per-context line-index capacity (MiB) | Maximum modeled map slots (KiB) | Maximum path-buffer capacity (KiB) |
+|---|---:|---:|---:|---:|
+| HDF | 0.144 | 0.066 | 3.938 | 3.234 |
+| Hiview | 0.091 | 0.038 | 0.492 | 0.493 |
+| Camera | 0.702 | 0.274 | 3.938 | 3.582 |
+
+The maxima in the last table are separate per-context maxima and need not
+occur in the same context. Map slots are modeled as map capacity times entry
+size; path buffers use their capacities. They are not allocator measurements
+and omit hash-table bucket slack/control bytes, allocator bookkeeping, and
+stack-resident context fields. Even eight times each corpus's largest combined
+map/path capacity adds less than **0.06 MiB** to the measured backing-buffer
+peak. Returned expression strings and other lowering caches are separate
+owners and are not included in these cache numbers. Atomic accounting occurs
+near allocation/release, with a short gap before actual freeing; it is not an
+allocation-stack census of the complete process.
+
+The measured recovery cache is small relative to the process/indexing peaks;
+the current post-AST release bounds its lifetime. Together with the overlapping
+indexing-time ranges, this evidence does not justify a cache optimization.
+No production cache or recovery behavior was changed. Full source spelling,
+Unicode handling, token validation and deterministic attribution remain intact.
+The owner diagnostic source and preparation script are retained as
+`/tmp/trace-source-recovery/owner.lower.rs` and `prepare-owner.py`; counters and
+per-context logs are in `owners.json` and `{corpus}-owner-j{1,8}.log`. These
+artifacts are local and temporary; no unavailable historical measurement is
+presented as a fresh completed check.
+
+
+### Final validation
+
+Focused real-CLI regressions pass in minimal and full exports, including all
+four render formats for the nested lambda return. The focused DB/C API run
+passes **68 DB tests and 26 FFI tests**. After strengthening the exported
+per-call binding and neighboring-line ranking assertions, the final workspace
+run passes **1,937 tests across 74 test binaries/doc-test suites**, with **zero
+failures and zero ignored tests**.
+
+```bash
+cargo fmt --all -- --check
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo clippy --workspace --all-targets -- -D warnings
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo test --workspace
+cargo build --release -p trace-cli
+TRACE_CORPUS_BASE=/tmp/trace-pinned-clean \
+  python3 scripts/eval_check.py --bin target/release/trace --outdir /tmp/trace-eval
+git diff --check
+```
+
+Formatting, all-target workspace Clippy with warnings denied, workspace tests,
+the release rebuild, and the final **99/99 pinned checks** pass. Direct production
+release-CLI checks also verify both attribution fixtures in minimal/full export;
+results and the final binary hash are in
+`/tmp/trace-source-recovery/production-regressions.json` and `binary-hashes.json`.
+Debug information
+and incremental compilation were disabled only for dev/test validation to limit
+disk use; release measurements use the unchanged repository release settings.
+Logs are `/tmp/trace-workspace-tests-final.log`, `/tmp/trace-clippy-final.log`,
+`/tmp/trace-release-final.log`, and `/tmp/trace-eval-final.log`.
+
+Fresh current minimal exports at jobs **1** and **8** match every row and row
+insertion order in all **23 non-run-metadata tables**, for **each** of HDF,
+Hiview, and Camera. The comparison excludes `analysis_run` (which contains run
+metadata and job options), hashes ordered row values, and retains table counts
+and hashes in `/tmp/trace-source-recovery/determinism.json`. The profiled current
+binary preceded final test-only assertion and Rust documentation edits; final
+release validation uses the rebuilt binary. Their distinct SHA-256 values are
+retained in the raw artifacts rather than implying binary identity.
+
+
+## Suppressed weak-definition source origins (2026-10-07)
+
+Verified against `fc61cc5`: `target_merge::scope_unit` removed flow occurrences
+owned by overridden weak definitions but left their constraint-keyed origin
+lists intact. When a surviving operation emitted the same constraint,
+`merge_unit_index` imported all of that constraint's origins. A real-CLI
+regression reproduced the problem with a weak `int *slot = &x`, a surviving
+`slot = &x` assignment, an overridden weak function also writing `slot`, and
+a strong tentative `int *slot` in another linked TU. The full target exported
+all three weak-source positions (initializer line 2, surviving assignment line
+3, suppressed weak-body line 4), rather than just line 3. The weak-only target
+correctly retained all three positions before and after the fix.
+
+Lowering now binds individual flow occurrences to ranges in each constraint's
+ordered origin list, using the existing origin-membership helper's canonical
+index. New operations bind their closest origin, including deferred references;
+cached header-preamble facts bind only the origins present before the TU AST
+walk appends any new sites. Target selection filters these bindings alongside
+constraints, then preserves only origins belonging to surviving occurrences
+before the usual constraint-identity union. Equal origins shared by surviving
+and suppressed occurrences remain available through the surviving binding.
+Bindings contain indices/ranges rather than duplicate expression strings,
+are recorded only when weak/link ownership is required, and expire before
+merged analysis. May-flow constraints, symbol selection and solver behavior
+are unchanged. The authoritative suppression rule is in
+[Link targets and weak symbols](ANALYSIS.md#link-targets-and-weak-symbols).
+
+Coverage includes real CLI minimal/full exports, text/JSON/Graphviz/Mermaid
+inspection, jobs 1 versus 4, weak-only control targets, both weak global
+initializers and weak function bodies, and surviving identical constraints
+from cached headers. Lowering tests also verify deferred initializer bindings
+and canonical origin-index reuse across duplicate occurrences. The original
+failure is retained in `/tmp/trace-weak-origins-before.log`; focused results
+are `/tmp/trace-weak-origins-cli.log` and `trace-weak-origins-focused.log`.
+
+Final workspace validation passes **1,938 tests**, with zero failures and zero
+ignored tests. Formatting, all-target workspace Clippy with warnings denied,
+`git diff --check`, and the release rebuild pass. Dev/test debug information
+and incremental compilation were disabled for disk use; release settings are
+unchanged. Reproduction commands:
+
+```bash
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo test -p trace-cli --test weak_targets
+cargo fmt --all -- --check
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo clippy --workspace --all-targets -- -D warnings
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo test --workspace
+cargo build --release -p trace-cli
+TRACE_CORPUS_BASE=/tmp/trace-pinned-clean \
+  python3 scripts/eval_check.py --bin target/release/trace --outdir /tmp/trace-eval
+```
+
+Full validation logs are `/tmp/trace-weak-origins-workspace.log`,
+`trace-weak-origins-clippy.log`, and `trace-weak-origins-release.log`.
+The rebuilt release binary passes **99/99 checks** on the clean pinned HDF,
+Hiview and Camera corpora, with no expectation changes; the checker log is
+`/tmp/trace-weak-origins-eval.log`.
+
+## Indirect-call and internal-overload provenance (2026-10-07)
+
+Verified both findings against `94f64f6` with failing real-CLI regressions.
+For `s->cb()`, target wiring removed `assign` from operation labels while its
+provenance retained the synthetic copy's `assign`; JSON rendered that false
+assignment before the corrected label. Reclassification now updates the
+corresponding provenance before hidden-node collapse. A separate `alias = s`
+assignment remains visible and keeps its assignment classification.
+
+Internal overload widening added `AddrOfFn` and `ArrayFnMember` candidates
+without their original occurrences. With static `cb(int)` and `cb(double)`,
+`void (*arr[])(double) = { cb, &cb }` exported both initializer positions for
+only the first overload; the other appeared as one unlocated address edge.
+Widening now snapshots the original origins, then unions them into each added
+candidate using the shared ordered origin-membership helper. Candidate
+selection, flow constraints, and solver behavior are unchanged. The regressions
+also cover scalar function-pointer initialization and duplicate constraint
+occurrences, through minimal/full exports and all four renderers at jobs 1/4.
+
+The two original failures are in `/tmp/trace-call-wiring-before.log` and
+`/tmp/trace-overload-origins-before.log`. All 12 focused CLI source-origin
+regressions pass in `/tmp/trace-provenance-review-focused.log`:
+
+```bash
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo test -p trace-cli --test inspect_tests source_dataflow_cli_
+```
+
+Final validation passes **1,940 workspace tests** across 74 suites, with zero
+failures or ignored tests, plus `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and `git diff --check`.
+Dev/test builds use the three environment overrides above to limit disk use;
+the release build retains the repository's release settings. After
+`cargo build --release -p trace-cli`, the clean pinned HDF, Hiview and Camera
+corpora pass **99/99 checks** with unchanged expectations:
+
+```bash
+TRACE_CORPUS_BASE=/tmp/trace-pinned-clean \
+  python3 scripts/eval_check.py --bin target/release/trace --outdir /tmp/trace-eval
+```
+
+Logs are `/tmp/trace-provenance-review-workspace.log`,
+`/tmp/trace-provenance-review-clippy.log`,
+`/tmp/trace-provenance-review-release.log`, and
+`/tmp/trace-provenance-review-eval.log`.
+
+## Overload provenance scaling, older baselines, and direction compatibility (2026-10-08)
+
+Starting source: `4ea37a5daa19fc852781e3ece5f5a96a3d594b1a`. Repeated
+`AddrOfFn`/`ArrayFnMember` facts previously cloned the original constraint's
+complete provenance once per occurrence, retaining all snapshots simultaneously
+and rebuilding destination membership for each union. The pass now filters
+distinct (widened constraint, original constraint) pairs in first-seen order
+before snapshotting, then reuses one `OriginMembership` per destination.
+All snapshots precede destination mutations. Overload candidates, repeated flow
+occurrences and their ordering remain intact; the rules are documented in
+[source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+
+The existing real-CLI regression now covers repeated scalar assignments and
+array entries, including the same expression at distinct columns, exact source
+positions/expressions, deduplication, origin insertion order, and identical
+JSON/text/Graphviz/Mermaid renderings across jobs 1/4 and minimal/full export.
+A lowering regression supplies overlapping original/destination constraints
+for three overloads, with repeated pairs separated by other sources and shared
+origins across distinct pairs. It verifies original flow order and exact ordered
+origin unions for both constraint kinds.
+
+### Release measurements
+
+Environment: Apple M2, 16 GiB RAM, macOS 26.6.2 (25G83), Darwin 25.6.0 arm64;
+Rust 1.98.1 (`48a229cea`, LLVM 22.1.8), Python 3.10.0. Both builds use the
+repository's release profile (ThinLTO, one codegen unit), default features and
+macOS libmalloc. `MallocSpaceEfficient` was unset in the launching environment;
+the CLI selects `MallocSpaceEfficient=1`. No allocator/profile override was used.
+
+The fixture is one `main.cpp` containing the following declarations, followed by
+N separate lines of `    fp = cb;` inside `writes`:
+
+```cpp
+static void cb(int) {}
+static void cb(double) {}
+void (*fp)(int);
+void writes() {
+    // N assignments, generated by the measurement driver
+}
+```
+
+Commands from the repository root (copy the starting binary before applying the
+lowering change):
+
+```bash
+cargo build --release -p trace-cli
+cp target/release/trace /tmp/trace-overload-baseline
+# Apply the lowering change, then rebuild before measuring it.
+cargo build --release -p trace-cli
+python3 scripts/measure_overload_provenance.py \
+  --baseline-binary /tmp/trace-overload-baseline --binary target/release/trace \
+  --runs 5 --output /tmp/trace-overload-scaling-final.json
+```
+
+The driver uses `TemporaryDirectory` for sources/databases/observer logs, invokes
+each binary as `analyze <source-dir> --jobs 1 -o <db>` (adding `--full-export`
+for full export), and profiles through `scripts/profile_memory_macos.py` at
+`--interval 0.001`. It alternates baseline/fixed order across repetitions.
+The final batch ran after compilation and validation had finished: five runs
+per binary, N and export mode, 60 analyses total, measured at
+2026-10-08 10:11:50 UTC. Binary SHA-256:
+
+- Starting: `f5ba832881f8ff5756eac7af85814b6e2cbcd324293e8ab2118f140e6de7a92c`
+- Revised: `a35148a9fc8d35c386c670dba1550ba1070fcc70e9a660ba8a000ca826f24347`
+
+Wall times and lifetime maximum physical footprints below are medians with
+min–max ranges in parentheses. RSS is `ru_maxrss`, shown as median before/after;
+physical footprint is the macOS memory comparison metric. MiB = 2^20 bytes.
+
+| N | Export | Starting wall, s | Revised wall, s | Starting footprint, MiB | Revised footprint, MiB | RSS before/after, MiB |
+|---:|---|---:|---:|---:|---:|---:|
+| 500 | minimal | 0.03 (0.03–0.03) | 0.02 (0.01–0.73) | 16.110 (16.110–16.203) | 2.203 (2.141–2.235) | 24.250 / 9.938 |
+| 500 | full | 0.03 (0.02–0.03) | 0.01 (0.01–0.02) | 16.157 (16.094–16.219) | 2.188 (2.157–2.219) | 24.250 / 9.922 |
+| 1,000 | minimal | 0.06 (0.06–0.07) | 0.02 (0.02–0.02) | 63.938 (63.907–63.969) | 2.578 (2.532–2.594) | 72.766 / 10.500 |
+| 1,000 | full | 0.06 (0.06–0.06) | 0.02 (0.02–0.02) | 63.969 (63.938–63.985) | 2.563 (2.547–2.594) | 72.719 / 10.500 |
+| 2,000 | minimal | 0.19 (0.18–0.19) | 0.02 (0.02–0.04) | 219.485 (219.454–219.547) | 3.000 (2.985–3.047) | 229.562 / 12.000 |
+| 2,000 | full | 0.19 (0.19–0.20) | 0.03 (0.02–0.03) | 219.532 (219.454–219.563) | 3.000 (2.922–3.032) | 229.625 / 12.047 |
+
+All tables and their insertion order match across builds and repetitions for
+each N/export mode. Only `analysis_run.created_at` and `trace_version` are
+excluded as run/build metadata; schema version, options, solver counts, IDs,
+coordinates and expressions are compared. Every case exports three flow edges
+and exactly 2N origins (1,000/2,000/4,000). The result JSON retains every wall,
+RSS, sampled-footprint and lifetime-peak sample plus medians/ranges and binary
+hashes; the final driver output is `/tmp/trace-overload-scaling-final.log`.
+
+Limits: this measures the repeated-reference fixture, not whole-corpus scaling.
+The observer rounds wall times to 0.01 s, limiting interpretation of small
+differences. The first revised minimal N=500 run took 0.73 s; its cause was not
+established and it is retained in the reported range and raw samples. Retained
+flow occurrences and output provenance still consume space proportional to
+input/output size, and snapshots remain proportional to distinct provenance
+pairs. Automated tests impose no timing thresholds.
+
+### Baseline comparisons and output policy
+
+`scripts/measure_dataflow_review.py::compare` now reports `skipped` with the
+reason when either database lacks a table or no columns are shared. Secondary
+comparisons report their own skip reason if exclusion removes all fields or
+shared `id`/`kind` columns are missing. Comparisons that can run retain their
+multiset addition/removal counts. Four temporary-SQLite regressions cover older
+baselines without `flow_origins`/`flow_calls`/`flow_return_calls`, missing current
+tables, disjoint columns, empty secondary projections, missing identity/kind
+columns, and normal changes including duplicate rows.
+
+The emitted direction policy is unchanged: the CLI's existing
+`schema="dataflow-source-v1"` contract uses `down`/`up`, matching its arguments
+and titles. The parent implementation used `flows-to`/`flows-from` in
+`trace-cli/src/main.rs` and unversioned JSON from `trace-db/src/render.rs`.
+Thus schema-aware consumers can distinguish the contracts already; adding a
+second version field or replacing the documented v1 labels is unnecessary.
+The authoritative compatibility rules and migration mapping now appear in
+[source-level dataflow presentation](ANALYSIS.md#source-level-dataflow-presentation).
+
+Consumer audit: the measurement script consumes current `nodes` and does not
+branch on emitted direction labels; the C API uses numeric direction enums and
+the raw graph API, not CLI source JSON. Legacy spellings also remain in old
+raw-graph examples (`SKILL.md`, `docs/INSPECT_REPORT.md`) and C API explanatory
+comments. The shared Rust renderer already recognizes both `up` and
+`flows-from` for scope ordering; caller-supplied `GraphMeta` is retained.
+CLI tests now assert the discriminator with both directions and correct titles.
+Renderer tests verify both directions' exact traversal-scope and source order,
+plus equivalent legacy-label ordering. Existing exact-key JSON tests reject
+extra version fields. External readers of unversioned output must select and
+map that older contract when migrating; their code is outside this repository.
+
+### Validation
+
+Pass: **1,941 workspace tests across 74 suites**, zero failures/ignored tests;
+all five Python measurement regressions (four SQLite cases and the real-CLI
+measurement smoke test); focused lowering, CLI provenance and renderer ordering
+regressions; formatting, Clippy with warnings denied, and whitespace checks.
+Final commands:
+
+```bash
+python3 scripts/test_measure_dataflow_review.py
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo test --workspace
+cargo fmt --all -- --check
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+cargo build --release -p trace-cli
+```
+
+The dev/test overrides limit build-artifact space; release settings are unchanged.
+Logs: `/tmp/trace-dataflow-fixes-workspace.log`,
+`/tmp/trace-dataflow-fixes-clippy.log`, `/tmp/trace-dataflow-fixes-release.log`.
+
+## Minified expression recovery and bounded ownership lookup (2026-10-08)
+
+Starting source: `174694146fd63a17c716ab0ba19836121eeb451b`. Two remaining
+costs were independent of solver propagation. Expression recovery restarted
+`char_indices().nth(col)` at the beginning of the original line for both ends
+of every operation. Ownership lookup could build a temporary function index
+over an entire database for each batch of reached operation positions.
+
+Original source recovery now caches line starts, recognizes wholly ASCII files
+once, and lazily indexes character-to-byte offsets for recovered Unicode lines.
+ASCII columns use byte offsets directly, without allocating per-column tables.
+Line bounds, token-equivalence validation, original comments/spacing and macro
+fallback behavior are retained; the authoritative rules remain in
+[source-level presentation](ANALYSIS.md#source-level-dataflow-presentation).
+
+The shared deferred schema adds
+`idx_functions_file_range(file_id,is_defined,line_start,line_end)` in both
+minimal and full exports, so the existing owner query can seek definitions in
+the selected file. Schema version 7 and all row layouts are retained. Index and
+older-export compatibility rules are documented in
+[presentation metadata](SQLITE_SCHEMA.md#source-level-presentation-metadata-v7).
+
+### Release reproduction
+
+Environment: Apple M2, 16 GiB RAM, macOS 26.6.2 arm64; Rust 1.98.1
+(`48a229cea`, LLVM 22.1.8), Python 3.10.0. Default release profile (ThinLTO,
+one codegen unit), default features, macOS libmalloc with the CLI's usual
+`MallocSpaceEfficient=1` selection for analysis. No compilation or dependency
+downloads ran during the measured batch.
+
+The initial temporary baseline copy disappeared before measurements began.
+The retained baseline was freshly rebuilt by restoring the starting versions
+of `lower.rs`, `schema.rs`, `dataflow_json.rs` and `dataflow.rs` from the revision
+above. The changed contents were saved and restored in `finally`, then the
+revised release binary was rebuilt. Other changes are documentation/tests.
+Both builds ran `cargo build --release -p trace-cli` with the same profile.
+Retained binaries and SHA-256:
+
+- `target/release/trace-column-ownership-before`:
+  `1dabf93cc85924854cb33ba4e420a615cd3156163e0dd9802fe11249108c0395`
+- `target/release/trace`:
+  `7087bb83e3912d088f4fe4ca1a481ea8580a8c81b8847804a3fc5be4379e0786`
+
+The retained driver is `/tmp/trace-column-ownership-review.py`; run from the
+repository root after building both binaries:
+
+```bash
+python3 /tmp/trace-column-ownership-review.py \
+  > /tmp/trace-column-ownership-review.log 2>&1
+```
+
+It creates sources and SQLite files in `TemporaryDirectory`, uses the existing
+macOS observer at `--interval 0.001`, and retains per-run summaries in
+`/tmp/trace-column-ownership-review.json`. Sources are generated as:
+
+```python
+body = ("p=p;\n" if separate_lines else "p=p;") * n
+# For the Unicode case only: body = "/*é🙂*/" + body
+source = "void writes(char *p){\n" + body + "\n}\n"
+```
+
+Each binary runs `analyze <source-dir> --jobs 1 -o <db>` with minimal export,
+three times per case, alternating before/after order. The observer's command is:
+
+```bash
+python3 scripts/profile_memory_macos.py --label <case> --out <scratch> \
+  --interval 0.001 -- <binary> analyze <source-dir> --jobs 1 -o <db>
+```
+
+Wall times are medians (min–max); footprint is median lifetime maximum physical
+footprint, MiB = 2^20 bytes. Every raw wall/footprint/RSS summary is retained in
+the result JSON.
+
+| Assignments | Layout | Before wall, s | After wall, s | Footprint before/after, MiB |
+|---:|---|---:|---:|---:|
+| 16,000 | one line | 0.80 (0.79–1.43) | 0.09 (0.08–0.51) | 14.20 / 14.23 |
+| 16,000 | separate lines | 0.09 (0.08–0.10) | 0.09 (0.09–0.10) | 15.05 / 14.83 |
+| 32,000 | one line | 2.99 (2.99–3.02) | 0.15 (0.15–0.17) | 27.34 / 27.42 |
+| 32,000 | separate lines | 0.16 (0.15–0.17) | 0.16 (0.16–0.19) | 29.03 / 28.64 |
+| 64,000 | one line | 11.69 (11.64–11.77) | 0.32 (0.31–0.32) | 53.88 / 52.95 |
+| 64,000 | separate lines | 0.31 (0.30–0.35) | 0.35 (0.32–0.37) | 55.50 / 56.42 |
+| 64,000 | Unicode-prefixed one line | 11.79 (11.66–12.26) | 0.32 (0.31–0.36) | 53.89 / 53.59 |
+
+All 42 analyses match every exported table's rows and insertion order within
+each case, excluding only `analysis_run.created_at` and `trace_version`.
+Each case retains exactly N original operation sites. Doubling the minified
+input previously approximately quadrupled wall time; after the change its cost
+is comparable to separate-line input. The first-case high timing samples are
+retained, without attributing their cause. The observer rounds wall time to
+0.01 s, so small differences should not be interpreted as a performance claim.
+
+### One million unrelated functions
+
+The driver exports a fixture with `void f(char *p)`, a local `char *q`, and 120
+separate `q=p;` assignments. It then inserts one million defined functions in
+another file using temporary SQLite data:
+
+```sql
+INSERT INTO files(id,path,sha256) VALUES(1,'/unrelated.c','');
+WITH RECURSIVE ids(id) AS (
+  VALUES(1) UNION ALL SELECT id+1 FROM ids WHERE id<1000000
+)
+INSERT INTO functions(id,name,file_id,line_start,line_end,linkage,signature,is_defined)
+SELECT id,'unrelated_'||id,1,1,2,'external','void unrelated()',1 FROM ids;
+```
+
+It uses the same revised CLI and identical database rows, first with the new
+index dropped and then with it restored from its exported DDL. Five runs per
+direction/state invoke `inspect <db> dataflow --file main.c --line <declaration>
+--col <declaration> --direction down|up --depth 1 --format json`, selecting `p`
+downward and `q` upward. Wall time uses `time.perf_counter()` around the CLI
+subprocess, including startup and output capture:
+
+| Direction | Without index, ms | With index, ms |
+|---|---:|---:|
+| down | 292.408 (284.099–337.165) | 5.378 (5.133–6.738) |
+| up | 288.622 (277.634–296.375) | 5.164 (5.056–5.239) |
+
+All 20 runs return two nodes and 120 transitions, with byte-identical stdout
+and stderr within each direction, including identical scopes and operations.
+The index occupies 14.188 MiB in this fixture (freed pages on dropping the
+index times page size); rebuilding it with Python's SQLite took 0.407 s.
+This is a one-off storage/build cost rather than repeated inspection work;
+the build-time number is not a whole-export benchmark.
+
+Limits: older v7 databases stay readable but retain the lookup cost until
+re-analysis supplies the index. The index narrows by file, definition status
+and starting line; many earlier/overlapping definition ranges in the same file
+can still require scanning candidates. Unicode column tables consume space
+proportional to the recovered line's character count. These are synthetic
+fixtures, not whole-corpus measurements; no automated timing thresholds were
+added.
+
+### Validation
+
+Pass: **1,961 workspace tests across 26 suites**, formatting, Clippy with
+warnings denied, and whitespace checks. Focused regressions cover UTF-8/ASCII,
+CRLF, final/empty lines, invalid bounds, 4,096 operations on one Unicode line,
+exact comments/expressions/columns and deterministic origin order. The actual
+batch ownership SQL's query-plan regression requires the exported covering
+index with automatic indexing disabled. The existing ownership regression now
+compares complete JSON before/after dropping the index in both directions,
+including overlapping definitions, declarations, exact file paths and missing
+positions. A real-CLI regression checks the exported index columns in both
+minimal and full modes. Existing macro, normalization, caller-ownership and
+source-provenance regressions also pass.
+
+```bash
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo test -p trace-parse --test flow_origins
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo test -p trace-parse --lib original_source_columns_are_unicode_aware_and_line_bounded
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo test -p trace-db --lib operation_owner_batches_seek_the_exported_function_range_index
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo test -p trace-db --lib json_operation_ownership_uses_exact_positions_and_rejects_ambiguity
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo test --workspace
+cargo fmt --all -- --check
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+cargo build --release -p trace-cli
+```
+
+Missing cached Cargo dependencies were downloaded before validation/measurement.
+Logs: `/tmp/trace-column-ownership-workspace.log`,
+`/tmp/trace-column-ownership-clippy.log`, `/tmp/trace-column-ownership-before-build.log`,
+`/tmp/trace-column-ownership-release.log`. Dev/test debug and incremental overrides
+limit artifact storage; release settings are unchanged.

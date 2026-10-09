@@ -10,6 +10,8 @@ use trace_ir::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PagNodeKind {
     Var(VarId),
+    /// Immutable null value: not storage and never a points-to target.
+    NullPointer,
     Loc(LocId),
     CallTarget(trace_ir::CallSiteId),
 }
@@ -74,6 +76,8 @@ pub struct Pag {
     pub var_node: IndexMap<VarId, PagNodeId, FxBuildHasher>,
     pub loc_node: IndexMap<LocId, PagNodeId, FxBuildHasher>,
     pub call_targets: IndexMap<trace_ir::CallSiteId, PagNodeId, FxBuildHasher>,
+    /// Interned null value node; no associated abstract location.
+    pub null_node: Option<PagNodeId>,
     pub fn_locations: IndexMap<FnId, LocId, FxBuildHasher>,
     pub var_location: IndexMap<VarId, LocId, FxBuildHasher>,
     /// Interned `StringConst` locations keyed by literal contents.
@@ -355,6 +359,7 @@ impl Pag {
         match self.nodes[node.0 as usize].kind {
             PagNodeKind::Var(var) => program.symbols.variable_by_id(var).and_then(|v| v.target),
             PagNodeKind::Loc(loc) => self.location_target(loc),
+            PagNodeKind::NullPointer => None,
             PagNodeKind::CallTarget(site) => program
                 .symbols
                 .call_site_by_id(site)
@@ -701,6 +706,20 @@ impl Pag {
                     let loc_n = self.loc_node[&loc];
                     self.locations[loc.0 as usize].type_id = type_id;
                     self.add_addr_of(dst_n, loc_n);
+                }
+                FlowConstraint::NullPointer { dst } => {
+                    let dst_n = self.var_node_id(*dst);
+                    let null_n = match self.null_node {
+                        Some(node) => node,
+                        None => {
+                            let node = self.alloc_node(PagNodeKind::NullPointer);
+                            self.null_node = Some(node);
+                            node
+                        }
+                    };
+                    // Copying an empty value preserves graph connectivity
+                    // without seeding an object or function location.
+                    self.add_copy(dst_n, null_n);
                 }
                 FlowConstraint::StringConst { dst, value } => {
                     let dst_n = self.var_node_id(*dst);
@@ -1253,6 +1272,7 @@ mod tests {
                 is_namespaced: true,
                 qualified_name: Some(format!("H::{name}")),
                 c_linkage: false,
+                is_synthetic: false,
                 is_static_member: false,
             });
             id
@@ -1317,6 +1337,7 @@ mod tests {
                 is_namespaced: false,
                 qualified_name: None,
                 c_linkage: false,
+                is_synthetic: false,
                 is_static_member: false,
             });
             program.flow.push(FlowConstraint::NewHeap { dst: id });
@@ -1417,6 +1438,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_synthetic: false,
             is_static_member: false,
         });
         // The key follows the layout's own member name, not the caller's:
@@ -1467,6 +1489,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_synthetic: false,
             is_static_member: false,
         });
         id
@@ -1532,6 +1555,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_synthetic: false,
             is_static_member: false,
             id: var,
             name: "object".into(),

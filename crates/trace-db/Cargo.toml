@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 trace-ir = { workspace = true }
+trace-preproc = { workspace = true }
 trace-analysis = { workspace = true }
 anyhow.workspace = true
 indexmap.workspace = true

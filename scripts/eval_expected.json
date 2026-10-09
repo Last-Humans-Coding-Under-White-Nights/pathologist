@@ -18,7 +18,7 @@
         "edges_indirect": {"cmp": "exact", "value": 5034},
         "edges_external": {"cmp": "band", "value": 23942, "tol": 200},
         "edges_ipc": {"cmp": "exact", "value": 0},
-        "arg_flow_edges": {"cmp": "band", "value": 71118, "tol": 150},
+        "arg_flow_edges": {"cmp": "band", "value": 71547, "tol": 150},
         "diagnostics": {"cmp": "exact", "value": 1917},
         "dlsym_edges": {"cmp": "exact", "value": 6}
       },
@@ -42,7 +42,7 @@
       {"name": "no external name carries both a definition and a declaration-only entity (#83: a prototype the overload check refused to merge with its own definition leaves callers bound to the undefined entity; hdf's C-over-C++ IPC interface put 10 names in this state)", "sql": "SELECT COUNT(*) FROM (SELECT name FROM functions WHERE linkage='external' GROUP BY name HAVING SUM(is_defined)>0 AND SUM(1-is_defined)>0)", "cmp": "exact", "value": 0},
         {"name": "DevHostServiceAddDevice reaches the driver loader's GetDriver and both ReclaimDriver bodies (#127 review: the constructor stores them through `HdfDriverLoader.super`, the call loads them through `IDriverLoader *`; two interned snapshots of `IDriverLoader` split the field summary, which the pointer-static seed used to paper over)", "sql": "SELECT COUNT(DISTINCT tf.name) FROM call_edges e JOIN functions cf ON cf.id=e.caller_fn_id JOIN functions tf ON tf.id=e.callee_fn_id WHERE cf.name='DevHostServiceAddDevice' AND e.resolution='indirect' AND tf.name IN ('HdfDriverLoaderGetDriver', 'HdfDriverLoaderReclaimDriver', 'HdfDriverLoaderFullReclaimDriver')", "cmp": "exact", "value": 3},
         {"name": "flow_graph_nodes", "sql": "SELECT COUNT(*) FROM flow_nodes", "cmp": "min", "value": 100000},
-        {"name": "arg_flow_rows_per_call_edge", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites cs ON cs.id=a.call_site_id", "cmp": "band", "value": 71118, "tol": 150},
+        {"name": "arg_flow_rows_per_call_edge", "sql": "SELECT COUNT(*) FROM arg_flow_edges a JOIN call_sites cs ON cs.id=a.call_site_id", "cmp": "band", "value": 71547, "tol": 150},
         {"name": "no member indexed under a declarator fragment (#46: a conversion operator's `operator_cast` declarator was unknown to both member walks, so `operator bool() const {...}` fell out of a generic walk as `X::()const`; the real `operator()` stays, and so does a conversion whose target is a function pointer or reference — `X::operator void(*)` is the correct name for one)", "sql": "SELECT COUNT(*) FROM functions WHERE name GLOB '*(*' AND name NOT GLOB '*operator()' AND name NOT GLOB '*operator *(*'", "cmp": "exact", "value": 0},
         {"name": "no member indexed under the bare keyword `operator` (#46: `normalize_qualified` stripped `<...>` as a template-argument span, truncating the whole `operator<` / `<=` / `<<` / `<=>` family to the keyword and collapsing a class's comparison operators into one symbol)", "sql": "SELECT COUNT(*) FROM functions WHERE name='operator' OR name GLOB '*::operator'", "cmp": "exact", "value": 0},
         {"name": "no member indexed under a standard attribute (#46 review: `[[deprecated]] void LockForControl();` parses cleanly -- no error recovery involved -- but the attribute holds an identifier in front of the declaration and the member walk took it, collapsing every annotated member of a class into one symbol; camera lost 26 `CameraInput` / `CameraManager` members to 7 such phantoms)", "sql": "SELECT COUNT(*) FROM functions WHERE name GLOB '*::deprecated' OR name GLOB '*::nodiscard' OR name GLOB '*::maybe_unused' OR name GLOB '*::noreturn' OR name GLOB '*::fallthrough' OR name GLOB '*::visibility' OR name GLOB '*::dllexport' OR name GLOB '*::dllimport'", "cmp": "exact", "value": 0},
@@ -64,7 +64,7 @@
         "edges_indirect": {"cmp": "exact", "value": 190},
         "edges_external": {"cmp": "band", "value": 15689, "tol": 160},
         "edges_ipc": {"cmp": "exact", "value": 44},
-        "arg_flow_edges": {"cmp": "band", "value": 26288, "tol": 120},
+        "arg_flow_edges": {"cmp": "band", "value": 27110, "tol": 120},
         "diagnostics": {"cmp": "exact", "value": 3573},
         "dlsym_edges": {"cmp": "exact", "value": 3}
       },
@@ -106,7 +106,7 @@
         "edges_indirect": {"cmp": "exact", "value": 371},
         "edges_external": {"cmp": "band", "value": 46027, "tol": 420},
         "edges_ipc": {"cmp": "exact", "value": 808},
-        "arg_flow_edges": {"cmp": "band", "value": 56039, "tol": 250},
+        "arg_flow_edges": {"cmp": "band", "value": 56810, "tol": 250},
         "diagnostics": {"cmp": "exact", "value": 5046},
         "dlsym_edges": {"cmp": "exact", "value": 6}
       },

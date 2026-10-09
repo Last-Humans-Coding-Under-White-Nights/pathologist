@@ -3144,6 +3144,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_synthetic: false,
             is_static_member: false,
         });
         id

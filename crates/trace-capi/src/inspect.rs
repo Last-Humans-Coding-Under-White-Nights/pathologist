@@ -233,6 +233,9 @@ fn symbol_kind_str(k: TraceSymbolKind) -> &'static str {
 /// Find variables declared on/near `line` in files whose path contains
 /// `file`, best candidate first. Fills `out`; free with
 /// `trace_symbol_list_free`.
+/// Positions must be positive and 1-based; otherwise returns
+/// `TRACE_ERR_INVALID_ARG`. Missing synthetic-variable metadata returns
+/// `TRACE_ERR_ANALYSIS` with a re-analysis instruction.
 ///
 /// # Safety
 ///
@@ -256,6 +259,11 @@ pub unsafe extern "C" fn trace_db_find_symbols(
         let file = cstr(file)?.to_owned();
         if file.is_empty() {
             return Err(ApiError::InvalidArg("file must not be empty".to_string()));
+        }
+        if line <= 0 || col <= 0 {
+            return Err(ApiError::InvalidArg(
+                "line and column must be >= 1 (positions are 1-based)".to_string(),
+            ));
         }
         let syms = trace_db::find_symbols_at(conn, &file, line, col).map_err(ApiError::from)?;
         let mut arena = Arena::new();
@@ -1006,6 +1014,43 @@ mod tests {
 
         unsafe { trace_graph_free(&mut g) };
         unsafe { trace_symbol_list_free(&mut sl) };
+        unsafe { trace_db_close(db) };
+    }
+
+    #[test]
+    fn symbol_lookup_rejects_invalid_positions_and_missing_synthetic_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = analyze_fixture(dir.path());
+        let file = CString::new("main.c").unwrap();
+        let mut list = TraceSymbolList {
+            items: ptr::null_mut(),
+            count: 0,
+            _impl: ptr::null_mut(),
+        };
+        let mut err = ptr::null_mut();
+        for (line, col) in [(0, 1), (-1, 1), (1, 0), (1, -1)] {
+            assert_eq!(
+                unsafe { trace_db_find_symbols(db, file.as_ptr(), line, col, &mut list, &mut err) },
+                TraceStatus::TraceErrInvalidArg as c_int
+            );
+            assert!(cstr_show(err).contains("positions are 1-based"));
+            assert_eq!(list.count, 0);
+            assert!(list._impl.is_null());
+            unsafe { trace_string_free(err) };
+        }
+        unsafe { trace_db_close(db) };
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE variables (col INTEGER)")
+            .unwrap();
+        let db = Box::into_raw(Box::new(TraceDb { conn }));
+        assert_eq!(
+            unsafe { trace_db_find_symbols(db, file.as_ptr(), 1, 1, &mut list, &mut err) },
+            TraceStatus::TraceErrAnalysis as c_int
+        );
+        assert!(cstr_show(err).contains("variables.is_synthetic"));
+        assert!(cstr_show(err).contains("re-run"));
+        assert_eq!(list.count, 0);
+        unsafe { trace_string_free(err) };
         unsafe { trace_db_close(db) };
     }
 

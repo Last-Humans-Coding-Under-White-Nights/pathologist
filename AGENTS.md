@@ -59,6 +59,7 @@ Current kinds:
 - `CallReturnIndirect { dst, callee_var }`: Indirect/virtual call assignment (`dst = callee_var()`), callee resolved at analysis time from points-to sets.
 - `NewHeap { dst }`: Heap allocation (`new T(...)`, and a smart-pointer factory's object; see `docs/ANALYSIS.md`, "Factory construction"), allocates fresh heap location so constructor's implicit `this` has concrete pointees.
 - `StringConst { dst, value }`: String literal constant interned as abstract location, enabling dynamic symbol lookup (`dlsym`, `GetProcAddress`).
+- `NullPointer { dst }`: Explicit C++ `nullptr` value, copied from a PAG value node with no abstract location or points-to targets.
 - `UnwrapPointer { dst, src }`: Step through a smart pointer's overloaded `->`/`*` (`sp->field`) into a pointee-typed receiver; the solver admits only pointee-compatible locations (see `docs/ANALYSIS.md`, "Smart-pointer unwrap").
 
 Return-value flow (`ReturnFlow` in `program.fn_returns`):

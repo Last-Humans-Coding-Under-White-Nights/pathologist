@@ -26,6 +26,7 @@ trace-analysis = { path = "crates/trace-analysis" }
 trace-db = { path = "crates/trace-db" }
 
 anyhow = "1"
+hashbrown = { version = "0.17", default-features = false }
 clap = { version = "4", features = ["derive"] }
 indexmap = { version = "2", features = ["serde"] }
 mimalloc = "0.1"

@@ -2,6 +2,7 @@ use crate::{CallName, CallSiteId, FileId, FnId, Span, TypeId, VarId};
 use indexmap::IndexMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Linkage {
@@ -21,6 +22,10 @@ pub enum StorageClass {
 
 #[derive(Debug, Clone)]
 pub struct Variable {
+    /// True only for an entity allocated by lowering as an intermediate value.
+    /// When constructing a `Variable`, use `false` for source declarations and
+    /// `true` for generated intermediates; do not infer this flag from the name.
+    pub is_synthetic: bool,
     pub id: VarId,
     pub name: String,
     pub type_id: TypeId,
@@ -288,9 +293,10 @@ pub struct CallSite {
     pub tu: Option<crate::FileId>,
 }
 
-/// Metadata absent from most call sites. Construct with [`Self::boxed`] to
-/// avoid allocating when all arguments are ordinary and no macro identity is
-/// needed. The vectors retain their original argument order.
+/// Optional argument and source-presentation metadata. Construct with
+/// [`Self::boxed`] to avoid allocating for ordinary argument bindings; source
+/// provenance can be attached later through [`CallSite::details_mut`]. The
+/// vectors retain their original argument order.
 #[derive(Debug, Clone, Default)]
 pub struct CallSiteDetails {
     pub fn_args: Vec<(u32, FnId)>,
@@ -302,6 +308,10 @@ pub struct CallSiteDetails {
     pub addr_of_args: Vec<u32>,
     /// Merge identity for calls sharing their displayed macro coordinates.
     pub occurrence: Option<CallOccurrence>,
+    /// Closest source operation for this return assignment, before constraint deduplication.
+    pub return_operation: Option<Box<(Span, Arc<str>)>>,
+    /// Full source call expression for argument-flow presentation.
+    pub call_expression: Option<Arc<str>>,
 }
 
 impl CallSiteDetails {
@@ -323,6 +333,8 @@ impl CallSiteDetails {
                 addr_of_member_args,
                 addr_of_args,
                 occurrence,
+                return_operation: None,
+                call_expression: None,
             }))
         }
     }
@@ -3380,6 +3392,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_synthetic: false,
             is_static_member: false,
         }
     }
@@ -3393,6 +3406,7 @@ mod tests {
             is_namespaced: true,
             qualified_name: Some("ns::cb".to_string()),
             c_linkage: true,
+            is_synthetic: false,
             is_static_member: false,
             target,
             ..fake_variable(VarId(id), "cb", StorageClass::Global, file, 1)
@@ -3720,6 +3734,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_synthetic: false,
             is_static_member: false,
             id: proto.params[0],
             name: "$arg0".into(),
@@ -3983,6 +3998,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_synthetic: false,
             is_static_member: false,
             id: fint.params[0],
             name: "a".into(),
@@ -4014,6 +4030,7 @@ mod tests {
             is_namespaced: false,
             qualified_name: None,
             c_linkage: false,
+            is_synthetic: false,
             is_static_member: false,
             id: fdouble.params[0],
             name: "b".into(),

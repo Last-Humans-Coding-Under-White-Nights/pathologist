@@ -48,7 +48,7 @@ impl RenderFormat {
 pub struct GraphMeta<'a> {
     /// First line of the text view, e.g. `callgraph from main (...)`.
     pub title: &'a str,
-    /// Direction word, e.g. `callees` / `callers` / `flows-to` / `flows-from`.
+    /// Direction word, e.g. `callees` / `callers` / `down` / `up`.
     pub direction: &'a str,
     /// Traversal depth limit.
     pub depth: u32,
@@ -443,7 +443,7 @@ fn quote_ident_attr(s: &str) -> String {
     format!("\"{}\"", s)
 }
 
-fn mermaid_escape(s: &str) -> String {
+pub(crate) fn mermaid_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

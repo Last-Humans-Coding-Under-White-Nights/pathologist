@@ -946,6 +946,7 @@ dependencies = [
  "thiserror",
  "trace-analysis",
  "trace-ir",
+ "trace-preproc",
 ]
 
 [[package]]
@@ -996,6 +997,7 @@ name = "trace-parse"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hashbrown 0.17.1",
  "indexmap",
  "rayon",
  "rustc-hash",
