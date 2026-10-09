@@ -3212,6 +3212,34 @@ Limits:
 
 ### C++ parse-input normalization
 
+**Empty-parameter callback declarations (#219).** The C++ grammar can silently
+read `void post(void (*cb)());` as an initialized variable, and `void (*cb)();`
+as an expression. Lowering recovers only these callback-shaped declarations by
+reparsing the original statement inside a scratch class body (or, for qualified
+function names, with a scratch empty function body). Recovery requires an
+error-free, complete declaration containing a named function pointer with an
+empty parameter list. Built-in types, enclosing template type parameters, and user
+types resolved in the original scope are accepted; value names hiding types
+retain their expression meaning, including instance fields and callable template
+value parameters.
+Unknown type names do not independently justify recovery. The scratch wrapper
+is replaced with the original source prefix's coordinate extent by editing the
+scratch tree, so child and parent traversal share the original positions.
+Names and LineMap positions still come from the original source; template
+ancestry joins that statement's original enclosing scopes with the recovered
+declaration's own nodes, excluding the scratch wrapper. A single-declaration
+linkage specification retains its implicit `extern` status; a braced linkage
+block does not imply it. Other declarators keep their direct initialization and
+constructor/destructor sites. Return operations for sibling field initializers
+span only their declarator and initializer. Scratch trees live until the unit
+finishes, so node-ID caches cannot alias a later recovery. Existing declaration lowering
+supplies types, linkage, initialization flow, and dependency handling; no scratch class
+or function body is indexed. Within a function, recovered declarators' array bounds
+and initializers are visited in source order; prototype parameters and their
+defaults are not evaluated in the enclosing function. Correctly parsed declarations,
+typedefs and aliases use their ordinary path. This is declaration recovery, not a
+grammar upgrade.
+
 The pinned tree-sitter C++ grammar (tree-sitter-cpp 0.23.4) rejects a few
 standard or GNU spellings. Rather than fork the grammar, the parse input of a
 C++ translation unit is rewritten in place before parsing

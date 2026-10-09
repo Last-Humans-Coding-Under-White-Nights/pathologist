@@ -3,6 +3,7 @@ mod common;
 
 mod adversarial_cases;
 mod analysis_tests;
+mod callback_declarations;
 mod callback_models;
 mod compile_commands_tests;
 mod compile_flags_tests;
