@@ -1704,3 +1704,262 @@ fn merged_export_reports_dataflow_limitation_before_symbol_lookup() {
     }
     assert!(!error.contains("no symbols"), "{error}");
 }
+
+#[test]
+fn execution_contexts_carry_over_with_remapped_ids() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let repo_a = root.join("repo_a");
+    let repo_b = root.join("repo_b");
+    fs::create_dir_all(&repo_a).unwrap();
+    fs::create_dir_all(&repo_b).unwrap();
+    fs::write(
+        repo_a.join("a.c"),
+        r#"
+        void *Worker(void *arg) { return arg; }
+        void StartMany(void *ctx, int n) {
+            unsigned long tid;
+            while (n--) { pthread_create(&tid, 0, Worker, ctx); }
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        repo_b.join("b.c"),
+        r#"
+        void *Other(void *arg) { return arg; }
+        void StartOnce(void *ctx) {
+            unsigned long tid;
+            pthread_create(&tid, 0, Other, ctx);
+        }
+        "#,
+    )
+    .unwrap();
+    let db_a = root.join("a.db");
+    let db_b = root.join("b.db");
+    analyze_repo(&repo_a, &db_a);
+    analyze_repo(&repo_b, &db_b);
+    let merged = root.join("merged.db");
+    merge_databases(
+        &[db_a, db_b],
+        &MergeOptions {
+            output: merged.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+
+    let conn = Connection::open(&merged).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.kind || ' ' || f.name || ' ' || c.name || ' ' || s.callee_text || ' ' || \
+                    a.name || ' ' || e.param_index || ' ' || e.multi_instance || ' ' || \
+                    e.self_concurrent \
+             FROM execution_contexts e \
+             JOIN functions f ON f.id = e.entry_fn_id \
+             JOIN call_sites s ON s.id = e.call_site_id \
+             JOIN functions c ON c.id = s.caller_fn_id \
+             JOIN functions a ON a.id = e.api_fn_id \
+             ORDER BY e.id",
+        )
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "thread Worker StartMany pthread_create pthread_create 2 loop 1",
+            "thread Other StartOnce pthread_create pthread_create 2 unknown 0",
+        ]
+    );
+}
+
+/// Merged rows keep the order `trace analyze` writes: every submitted
+/// context by call site, then the IPC handlers, whichever input they come
+/// from.
+#[test]
+fn merged_execution_contexts_list_ipc_handlers_last() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let repo_a = root.join("repo_a");
+    let repo_b = root.join("repo_b");
+    fs::create_dir_all(&repo_a).unwrap();
+    fs::create_dir_all(&repo_b).unwrap();
+    fs::write(
+        repo_a.join("a.cpp"),
+        r#"
+        class IRemoteObject {
+        public:
+            int SendRequest(int code, void *data, void *reply, void *option);
+        };
+        IRemoteObject *Remote();
+        class IFooStub {
+        public:
+            int HandleGetInfo(int key) { return key; }
+        };
+        class IFooProxy {
+        public:
+            int GetInfo(int key);
+        };
+        int IFooProxy::GetInfo(int key) {
+            Remote()->SendRequest(1, 0, 0, 0);
+            return key;
+        }
+        void *Worker(void *arg) { return arg; }
+        void StartA(void *ctx) {
+            unsigned long tid;
+            pthread_create(&tid, 0, Worker, ctx);
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        repo_b.join("b.c"),
+        r#"
+        void *Other(void *arg) { return arg; }
+        void StartB(void *ctx) {
+            unsigned long tid;
+            pthread_create(&tid, 0, Other, ctx);
+        }
+        "#,
+    )
+    .unwrap();
+    let db_a = root.join("a.db");
+    let db_b = root.join("b.db");
+    analyze_repo(&repo_a, &db_a);
+    analyze_repo(&repo_b, &db_b);
+    let merged = root.join("merged.db");
+    merge_databases(
+        &[db_a, db_b],
+        &MergeOptions {
+            output: merged.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+
+    let conn = Connection::open(&merged).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.kind || ' ' || f.name FROM execution_contexts e \
+             JOIN functions f ON f.id = e.entry_fn_id ORDER BY e.id",
+        )
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "thread Worker",
+            "thread Other",
+            "ipc_handler IFooStub::HandleGetInfo",
+        ]
+    );
+}
+
+/// `execution_contexts` is an additive v7 table: an input exported before it
+/// existed still merges, contributes no rows and is named in a merge-stage
+/// diagnostic; an input that has the table must have every column the
+/// merger reads.
+#[test]
+fn execution_contexts_are_optional_in_v7_inputs_and_validated_when_present() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(
+        repo.join("a.c"),
+        r#"
+        void *Worker(void *arg) { return arg; }
+        void Start(void *ctx) {
+            unsigned long tid;
+            pthread_create(&tid, 0, Worker, ctx);
+        }
+        "#,
+    )
+    .unwrap();
+    let current = root.join("current.db");
+    analyze_repo(&repo, &current);
+    let earlier = root.join("earlier.db");
+    empty_merge_input(&earlier);
+    Connection::open(&earlier)
+        .unwrap()
+        .execute_batch("DROP TABLE execution_contexts")
+        .unwrap();
+
+    let output = root.join("merged.db");
+    let options = MergeOptions {
+        output: output.clone(),
+        verbose: false,
+    };
+    let report = merge_databases(&[&current, &earlier], &options).unwrap();
+    let missing: Vec<_> = report
+        .warnings
+        .iter()
+        .filter(|w| w.kind == WarningKind::MissingExecutionContexts)
+        .collect();
+    assert_eq!(missing.len(), 1, "{:?}", report.warnings);
+    assert!(
+        missing[0].message.contains("earlier.db") && missing[0].message.contains("re-analyze"),
+        "{}",
+        missing[0].message
+    );
+    let merged = Connection::open(&output).unwrap();
+    let stage: String = merged
+        .query_row(
+            "SELECT json_extract(options_json, '$.stage') FROM analysis_run",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stage, "merge");
+    let rows: Vec<String> = merged
+        .prepare(
+            "SELECT e.kind || ' ' || f.name FROM execution_contexts e \
+             JOIN functions f ON f.id = e.entry_fn_id ORDER BY e.id",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows,
+        ["thread Worker"],
+        "the current input's rows carry over"
+    );
+    let diagnostics: i64 = merged
+        .query_row(
+            "SELECT COUNT(*) FROM diagnostics WHERE stage = 'merge' \
+             AND message LIKE '%execution_contexts%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(diagnostics, 1);
+    drop(merged);
+
+    // A nominal v7 input whose table lacks a column the merger reads is
+    // rejected before any output is replaced.
+    Connection::open(&current)
+        .unwrap()
+        .execute_batch("ALTER TABLE execution_contexts RENAME COLUMN multi_instance TO other")
+        .unwrap();
+    fs::write(&output, b"existing output").unwrap();
+    let error = merge_databases(&[&current], &options)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("missing trace-merge capability"), "{error}");
+    assert!(
+        error.contains("execution_contexts") && error.contains("multi_instance"),
+        "{error}"
+    );
+    assert!(error.contains("re-analyze"), "{error}");
+    assert_eq!(fs::read(&output).unwrap(), b"existing output");
+}

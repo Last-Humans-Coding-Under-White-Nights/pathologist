@@ -29,7 +29,8 @@ new metadata and query indexes; there is no automatic migration from v6.
 
 `trace-merge` requires v7 and structurally validates the exact columns it reads
 in `files`, `link_targets`, `target_sources`, `target_dependencies`, `functions`,
-`call_sites`, `call_edges`, and `diagnostics` before creating or replacing output.
+`call_sites`, `call_edges`, `diagnostics`, and `execution_contexts` when present
+before creating or replacing output.
 Earlier v7 databases without newer flow tables or `call_sites.callee_var` /
 `return_dst` can therefore still be merged. A nominal v7 database missing a
 required call-graph column is rejected with a re-analysis diagnostic.
@@ -38,7 +39,21 @@ The output uses the shared v7 DDL and records `options_json.stage = "merge"`.
 It preserves/remaps those call-graph tables and diagnostics, including call-site
 spelling and expansion coordinates, and reconstructs external call edges.
 It supports function/call lookup, call graphs, call chains, and editor call
-hierarchy. It does **not** populate `variables`, `types`, `locations`,
+hierarchy.
+
+`execution_contexts` is optional on input: an input without the table (an
+earlier v7 export) still merges and contributes no rows, and the merge records
+an `info` diagnostic with `stage = 'merge'` naming it
+(`MissingExecutionContexts`); an input that has the table must have every
+column the merger reads (`kind`, `entry_fn_id`, `call_site_id`, `api_fn_id`,
+`param_index`, `multi_instance`, `self_concurrent`) or it is rejected like a
+missing call-graph column. The output carries the rows of the inputs that have
+the table, with function and call-site ids remapped and each input's own
+multi-instance evidence; a merge-stage diagnostic of that kind marks an output
+whose table lists only some inputs' contexts. How rows are combined:
+[Invariants and linking rules](ANALYSIS.md#invariants-and-linking-rules).
+
+It does **not** populate `variables`, `types`, `locations`,
 `points_to`, `arg_flow_edges`, or any `flow_*` tables. `call_sites.callee_var`
 and `return_dst` remain NULL because input variable IDs are not remapped.
 Creating these structures through shared DDL does not supply their capabilities.
@@ -62,6 +77,7 @@ omitted flow data from merger output.
 | `call_sites` | filtered | filtered | filtered |
 | `call_edges` | ✓ | ✓ | ✓ |
 | `arg_flow_edges` | ✓ | ✓ | ✓ |
+| `execution_contexts` | ✓ | ✓ | ✓ |
 | `variables` | PAG-referenced | all | all (+ arg-flow) |
 | `flow_nodes` | ✓ | ✓ | ✓ |
 | `flow_edges` | ✓ | ✓ | ✓ |
@@ -92,7 +108,9 @@ link_targets ─┬─ target_sources → files
               └─ target_dependencies → link_targets
 files ─┬─ functions ─┬─ call_sites ─ arg_flow_edges → variables
        │             │  (functions.target_id → link_targets)
-       │             └─ call_edges → functions (caller and callee)
+       │             ├─ call_edges → functions (caller and callee)
+       │             └─ execution_contexts → functions (entry, modelled
+       │                callee), call_sites (start; NULL for IPC handlers)
        ├─ variables ─ flow_nodes ─ flow_edges → flow_nodes
        └─ variables (type_id → types when exported,
                      target_id → link_targets)
@@ -271,6 +289,35 @@ default and disabled with the `--no-ipc` analyze flag.
 Exactly one of `actual_var_id` or `actual_fn_id` is set per row. A function name with several internal-linkage C++ overloads (`static` or in an anonymous namespace) is passed as each of them: one row per overload at the same `call_site_id`, `arg_index` and `formal_var_id`.
 
 **Index:** `arg_flow_edges(call_site_id)`
+
+### execution_contexts
+
+Places where code starts running on a thread, a task queue or the IPC worker
+pool. Semantics and evidence rules:
+[Execution contexts](ANALYSIS.md#execution-contexts). An additive v7 table: a
+v7 export written before it existed has no `execution_contexts` table, so a
+reader checks for the table (and the columns it reads) instead of the schema
+version; in an ordinary analysis an empty table means no context was found.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER PK | Context id |
+| `kind` | TEXT | `thread`, `pool_task`, `serial_task`, `ipc_handler` or `unknown`: what the `invoke` model states (`context`), `ipc_handler` for an IPC stub handler |
+| `entry_fn_id` | INTEGER FK → `functions` | Function the context starts running |
+| `call_site_id` | INTEGER FK → `call_sites`, nullable | Submitting call site (`pthread_create(...)`); `NULL` for an IPC handler |
+| `api_fn_id` | INTEGER FK → `functions`, nullable | Modelled callee that runs the callback (`pthread_create`, `std::thread::thread`); `NULL` for an IPC handler |
+| `param_index` | INTEGER, nullable | Callee parameter the callback is passed in, counting explicit arguments as the model does (no `this`); `NULL` for an IPC handler |
+| `multi_instance` | TEXT | Evidence that more than one instance may exist: `loop` (start site inside a loop), `cycle` (submitting function in a cycle of ordinary calls), `parent` (submitting function reachable from a self-concurrent context), or `unknown` |
+| `self_concurrent` | INTEGER | `1` when two instances may run at the same time: every IPC handler (stub or modelled), and every context whose `multi_instance` is not `unknown`; `0` is no evidence, not single execution |
+
+One row per resolved callback of an `invoke` model, ordered by call site,
+then one per IPC stub handler; `trace-merge` keeps that order (see
+[Invariants and linking rules](ANALYSIS.md#invariants-and-linking-rules)
+for how it combines rows). The same starts stay in `call_edges` as
+`indirect` (start site to entry) and `ipc` (proxy to handler) edges, so the
+functions a context reaches are a walk over `call_edges` from
+`entry_fn_id`. Not indexed: a database holds tens to hundreds of rows
+(sizes in [EVAL_REPORT.md](EVAL_REPORT.md#execution-contexts-202--2026-10-09)).
 
 ### variables
 

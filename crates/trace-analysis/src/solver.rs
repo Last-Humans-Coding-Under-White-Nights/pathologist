@@ -1,8 +1,9 @@
 use crate::constraints::{
     ArgFlowEdge, CallGraphEdge, Constraint, ConstraintKind, LocKind, ResolutionKind,
 };
+use crate::contexts::{self, ContextStart, ExecutionContext};
 use crate::pag::{Pag, PagNodeKind, SolverIndices};
-use crate::summaries::{Effect, FnModelSet, InvokeArgs};
+use crate::summaries::{ContextKind, Effect, FnModelSet, InvokeArgs};
 use indexmap::{IndexMap, IndexSet};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use trace_ir::{CallSiteId, FnId, LocId, PagNodeId, Program, StorageClass, TargetId, VarId};
@@ -132,6 +133,10 @@ pub struct AnalysisResult {
     /// Applied `clears` effects: `(call site, cleared parameter index)`.
     /// Exported as terminator nodes/edges in the flow graph.
     pub terminator_events: Vec<(CallSiteId, u32)>,
+    /// Where threads, tasks and IPC requests start running code: one per
+    /// resolved callback invocation, then one per IPC stub handler
+    /// (`docs/ANALYSIS.md`, "Execution contexts").
+    pub execution_contexts: Vec<ExecutionContext>,
     /// How the solver run ended: converged or budget-truncated. A truncated
     /// run exports a `solver_partial` marker and an `analyze`-stage
     /// diagnostic so the database is distinguishable from a complete one.
@@ -1451,7 +1456,7 @@ fn solve(
         }
     }
 
-    let callbacks = callback_edges(program, pag, &st, &invoked, &call_edges);
+    let (callbacks, invocations) = callback_edges(program, pag, &st, &invoked, &call_edges);
     call_edges.extend(callbacks);
 
     // Emit synthetic call edges for IPC proxy→stub bridges detected at PAG
@@ -1474,6 +1479,12 @@ fn solve(
             resolution: ResolutionKind::IpcBridge,
         });
     }
+    let execution_contexts = contexts::execution_contexts(
+        program,
+        invocations,
+        pag.ipc_bridges.iter().map(|bridge| bridge.stub_handler),
+        &call_edges,
+    );
     if std::env::var("TRACE_DEBUG_IPC").is_ok() {
         for bridge in &pag.ipc_bridges {
             let caller = program.symbols.function(bridge.proxy_method).name.clone();
@@ -1525,6 +1536,7 @@ fn solve(
         wired_arg_flow,
         forwarded_arg_flow,
         terminator_events,
+        execution_contexts,
         solve,
     }
 }
@@ -2257,7 +2269,7 @@ fn add_pts(st: &mut SolverState, node: PagNodeId, loc: LocId) {
 
 /// The `invoke` effects of one modelled callee: each callback position with
 /// the arguments forwarded to it.
-type Invocations<'m> = Vec<(u32, &'m InvokeArgs)>;
+type Invocations<'m> = Vec<(u32, &'m InvokeArgs, ContextKind)>;
 
 /// Callback variables handed to a modelled callee that forwards arguments,
 /// by PAG node, with the call sites that hand them over: a function reaching
@@ -2282,7 +2294,11 @@ fn invoked_params<'m>(
             .effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::Invoke { param, args } => Some((*param, args)),
+                Effect::Invoke {
+                    param,
+                    args,
+                    context,
+                } => Some((*param, args, *context)),
                 _ => None,
             })
             .collect();
@@ -2406,7 +2422,7 @@ fn wire_invocations<'m>(
     invocations: Option<&Invocations<'m>>,
     watch: &mut InvokeWatch<'m>,
 ) {
-    for &(param, args) in invocations.into_iter().flatten() {
+    for &(param, args, _) in invocations.into_iter().flatten() {
         if args.is_empty() {
             continue;
         }
@@ -2475,22 +2491,25 @@ fn wire_callback(
     }
 }
 
-/// Indirect edges for the callbacks handed to a modelled callee (`invoke`).
+/// Indirect edges for the callbacks handed to a modelled callee (`invoke`),
+/// and each such invocation as the start of an execution context.
 /// A callback's return is ignored and its parameters are wired inside the
 /// fixpoint ([`wire_invocations`]), so the edges are read once off the
 /// converged points-to sets. The edge is attributed to the submitting call
 /// site, which is where the caller hands the callback over, and stays inside
-/// the caller's link image like every other indirect edge.
+/// the caller's link image like every other indirect edge. An invocation is
+/// recorded whether or not its edge is new.
 fn callback_edges(
     program: &Program,
     pag: &Pag,
     st: &SolverState,
     invoked: &FxHashMap<FnId, Invocations>,
     call_edges: &[CallGraphEdge],
-) -> Vec<CallGraphEdge> {
+) -> (Vec<CallGraphEdge>, Vec<contexts::Invocation>) {
     let mut edges = Vec::new();
+    let mut invocations = Vec::new();
     if invoked.is_empty() {
-        return edges;
+        return (edges, invocations);
     }
     // Seeded with what the call graph already holds: a callback the callee's
     // own body reaches keeps the edge it earned there instead of gaining a
@@ -2506,14 +2525,20 @@ fn callback_edges(
         let Some(cs) = program.symbols.call_site_by_id(edge.call_site) else {
             continue;
         };
-        for &(param, args) in params {
+        for &(param, args, context) in params {
             let Some(index) = invoke_site_index(cs, param) else {
                 continue;
+            };
+            let start = ContextStart {
+                call_site: cs.id,
+                api: edge.callee,
+                param,
             };
             let named = args_at(cs.fn_args(), index);
             let pointed = args_at(&cs.var_args, index).flat_map(|var| held_functions(pag, st, var));
             for callee in named.chain(pointed) {
                 for target in invoke_targets(program, cs, callee, args) {
+                    invocations.push((start, target, context));
                     if seen.insert((cs.id, target)) {
                         edges.push(CallGraphEdge {
                             call_site: cs.id,
@@ -2529,7 +2554,7 @@ fn callback_edges(
     // A points-to set is a hash set; the order its members come out in must
     // not reach the export (AGENTS.md, determinism).
     edges.sort_by_key(|edge| (edge.call_site, edge.callee));
-    edges
+    (edges, invocations)
 }
 
 /// The functions an indirect call from a caller in `caller_target` reaches

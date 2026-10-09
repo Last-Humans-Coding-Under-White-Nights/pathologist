@@ -393,7 +393,7 @@ fn leak_resolution(resolution: &str) -> &'static str {
 }
 
 /// True when `table` exists. Table names here are compile-time constants.
-fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+pub fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
         [table],
@@ -404,7 +404,7 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
 
 /// True when `table` has a `column`. Table names are compile-time constants;
 /// the column name is bound as a parameter.
-pub(crate) fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+pub fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let sql = format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1");
     let n: i64 = conn.query_row(&sql, [column], |r| r.get(0))?;
     Ok(n != 0)

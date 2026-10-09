@@ -2048,6 +2048,7 @@ fn expand_virtual_overrides(program: &mut Program) {
                 span: cs.span,
                 expansion_span: cs.expansion_span,
                 is_direct: true,
+                in_loop: cs.in_loop,
                 receiver_class: cs.receiver_class.clone(),
                 exact_receiver: cs.exact_receiver,
                 return_dst: cs.return_dst,
@@ -8198,6 +8199,7 @@ fn lower_declaration(
                                             span,
                                             expansion_span,
                                             is_direct: false,
+                                            in_loop: false,
                                             receiver_class: None,
                                             exact_receiver: false,
                                             return_dst: None,
@@ -9774,10 +9776,18 @@ fn walk_function_body(
     .flatten();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        let first_site = program.symbols.call_sites.len();
         if statement_body.is_some_and(|body| body.id() == child.id()) {
             lower_statement_local(program, ctx, source, node);
         }
         walk_function_body(program, ctx, source, child, caller);
+        if repeats_in_loop(node, child) {
+            // The calls this child lowered are the function's own; a lambda
+            // written here lowered its calls into a function of its own.
+            for site in &mut program.symbols.call_sites[first_site..] {
+                site.in_loop |= site.caller == caller;
+            }
+        }
     }
     if is_block {
         ctx.using_nss.truncate(using_nss_len);
@@ -9793,6 +9803,22 @@ fn walk_function_body(
         }
     }
     ctx.ast_depth = ctx.ast_depth.saturating_sub(1);
+}
+
+/// Whether `child` of `node` runs once per iteration of the loop `node` is:
+/// a loop's body, condition and update do, a `for` init-statement and a
+/// range-for's init-statement and range run once (`CallSite::in_loop`).
+fn repeats_in_loop(node: Node, child: Node) -> bool {
+    let runs_once = |field: &str| {
+        node.cached_field(field)
+            .is_some_and(|once| once.id() == child.id())
+    };
+    match node.cached_kind() {
+        "for_statement" => !runs_once("initializer"),
+        "for_range_loop" => !runs_once("initializer") && !runs_once("right"),
+        "while_statement" | "do_statement" => true,
+        _ => false,
+    }
 }
 
 pub(crate) struct ExplicitMemberOperatorCall<'a> {
@@ -10429,6 +10455,7 @@ fn collect_call_at_node_inner(
             span,
             expansion_span,
             is_direct,
+            in_loop: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst,
@@ -10477,6 +10504,7 @@ fn collect_call_at_node_inner(
             span,
             expansion_span,
             is_direct: true,
+            in_loop: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst,
@@ -11821,6 +11849,7 @@ fn emit_unresolved_site(
         span,
         expansion_span,
         is_direct: false,
+        in_loop: false,
         receiver_class,
         exact_receiver: false,
         return_dst,
@@ -11922,6 +11951,7 @@ fn emit_member_targets(
             span,
             expansion_span,
             is_direct: false,
+            in_loop: false,
             receiver_class: Some(cls.to_string()),
             exact_receiver: false,
             return_dst,
@@ -11957,6 +11987,7 @@ fn emit_member_targets(
             span,
             expansion_span,
             is_direct: true,
+            in_loop: false,
             receiver_class: Some(cls.to_string()),
             exact_receiver: false,
             return_dst,

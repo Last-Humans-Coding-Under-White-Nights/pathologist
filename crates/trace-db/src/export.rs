@@ -107,6 +107,7 @@ pub fn export_to_sqlite(
             export_flow_and_arg_flow_vars(&conn, program, pag, analysis)?;
         }
         export_arg_flow(&conn, analysis)?;
+        export_execution_contexts(&conn, analysis)?;
         export_flow_graph(&conn, program, pag, analysis)?;
         if opts.include_points_to {
             export_points_to(&conn, pag, analysis)?;
@@ -982,6 +983,29 @@ fn export_arg_flow(conn: &Connection, analysis: &AnalysisResult) -> Result<()> {
             edge.actual_var.map(|v| v.0),
             edge.actual_fn.map(|f| f.0),
             edge.formal.0
+        ])?;
+    }
+    Ok(())
+}
+
+/// One row per execution context, in the analysis' order (see
+/// `docs/SQLITE_SCHEMA.md`, `execution_contexts`).
+fn export_execution_contexts(conn: &Connection, analysis: &AnalysisResult) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO execution_contexts (id, kind, entry_fn_id, call_site_id, api_fn_id, \
+         param_index, multi_instance, self_concurrent) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    for (i, context) in analysis.execution_contexts.iter().enumerate() {
+        let start = context.start.as_ref();
+        stmt.execute(params![
+            i as i64 + 1,
+            context.kind.as_str(),
+            context.entry.0,
+            start.map(|s| s.call_site.0),
+            start.map(|s| s.api.0),
+            start.map(|s| s.param),
+            context.multi_instance.as_str(),
+            context.self_concurrent as i32,
         ])?;
     }
     Ok(())

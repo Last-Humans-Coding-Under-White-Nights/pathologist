@@ -1,5 +1,76 @@
 # Evaluation Report
 
+## Execution contexts: #202 — 2026-10-09
+
+The new `execution_contexts` table lists where threads, tasks and IPC
+requests start running code: one row per resolved callback of an `invoke`
+model, then one per IPC stub handler, each with its kind and multi-instance
+evidence. The rules are in
+[docs/ANALYSIS.md](ANALYSIS.md#execution-contexts); the columns, and the
+table's place in the additive v7 contract, in
+[docs/SQLITE_SCHEMA.md](SQLITE_SCHEMA.md#execution_contexts). Fixture:
+`tests/fixtures/execution_contexts/` (`pthread_create`, `std::thread`,
+`ffrt::queue::submit`, user models with and without a `context`, an IPC
+proxy/stub pair, starts in a loop, under recursion, under a looping thread
+and under an IPC handler, and a start wrapper).
+
+Measured on macOS 27.0.1, Apple M1, release build, `--jobs 8`,
+`TRACE_SOLVE_BUDGET_POPS=800000`, the pinned clean corpora of
+`scripts/eval_expected.json` (HDF `cdc75a2`, hiview `92408e2`, camera
+`8ffd69d`). Baseline is `5011c5f` (#204, the commit this change follows);
+each binary is built from a clean archive of its commit in its own target
+directory. Sizes are file sizes; the table size is the SQLite `dbstat` page
+total.
+
+| Corpus | Export | Database, baseline → candidate | Change | `execution_contexts` |
+|---|---|---:|---:|---:|
+| HDF | minimal | 54,112,256 → 54,116,352 B | +4 KiB (+0.008%) | 40 rows, 4 KiB |
+| HDF | `--full-export` | 57,053,184 → 57,057,280 B | +4 KiB (+0.007%) | |
+| hiview | minimal | 27,275,264 → 27,279,360 B | +4 KiB (+0.015%) | 62 rows, 4 KiB |
+| hiview | `--full-export` | 29,224,960 → 29,229,056 B | +4 KiB (+0.014%) | |
+| camera | minimal | 72,376,320 → 72,409,088 B | +32 KiB (+0.045%) | 735 rows, 32 KiB |
+| camera | `--full-export` | 77,058,048 → 77,090,816 B | +32 KiB (+0.043%) | |
+
+Every other table, `flow_origins` and the other source-level presentation
+tables included, holds the same rows as the baseline on all three corpora
+(`call_edges` too: a context adds no edge). Whole `trace analyze` runs took
+the same wall time on both binaries (HDF 4.6 / 4.7 s, hiview 1.8 / 1.8 s,
+camera 7.3 / 7.4 s, minimal export), and every table, `execution_contexts`
+included, is identical at `--jobs 1` and `--jobs 8`.
+
+| Corpus | `thread` | `serial_task` | `ipc_handler` | Start sites | `loop` | `cycle` | `parent` | `self_concurrent` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| HDF | 40 | 0 | 0 | 2 | 0 | 0 | 0 | 0 |
+| hiview | 6 | 12 | 44 | 17 | 2 | 0 | 2 | 48 |
+| camera | 17 | 0 | 718 | 17 | 1 | 1 | 7 | 727 |
+
+- **HDF.** 39 of the 40 threads are started at one site, the
+  `pthread_create` in `OsalCreatePthread` under `OsalThreadCreate`; the
+  remaining one is a `std::thread`. Counting a cycle through start edges as
+  recursion would mark all 39 `cycle`: a thread started through the wrapper
+  calls the wrapper again, and the call graph cannot tell which entry that
+  call starts. Cycles are found over ordinary calls only, and none of HDF's
+  starts has evidence; the wrapper's collapsing of entries is described in
+  [Execution contexts](ANALYSIS.md#execution-contexts).
+- **hiview.** The 12 `serial_task` rows are `ffrt::queue::submit`; the
+  free `ffrt::submit` is not modelled (#203), so most hiview tasks are
+  still missing. `loop`: a `std::thread` lambda started in a test loop and a
+  queued lambda in `RsFrameMonitor::VideoStop`. `parent`: two delay-check
+  threads in the video monitors, reached from the looping `VideoStop` task
+  and from the `XperfServiceServer::NotifyToXperf` IPC handler.
+- **camera.** IPC handlers outnumber thread starts 718 to 17.
+  `RotatePicture` is started in a loop in
+  `HStreamOperator::ProcessPhotoProxy`; the `MuxerFilter::DoStop` lambda is
+  started from a recursive function; the seven `parent` threads are all
+  started from code IPC handlers reach (for example
+  `SimpleTimer::InterruptableSleep`, started in `SimpleTimer::StartTask`).
+
+**Decision: stored in every export mode.** The table costs at most 32 KiB
+(0.045%) on these corpora, so it is written by the minimal export rather
+than computed at query time, as an additive v7 table. `trace-merge` carries
+the rows into a merged database with remapped ids. `scripts/eval_check.py`
+passes its 99 checks with the expectations unchanged.
+
 ## Flow-edge source sites: #204 — 2026-10-09
 
 Where a value moves is recorded in `flow_origins`, which the source-level

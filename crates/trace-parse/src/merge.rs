@@ -1155,6 +1155,7 @@ fn merge_unit(
         };
         if !matches!(mode, MergeMode::Variant) && !is_internal_caller {
             if let Some(existing) = source {
+                program.symbols.absorb_call_copy(existing.primary, cs);
                 call_map.insert(cs.id, existing.primary);
                 continue;
             }
@@ -1243,6 +1244,7 @@ fn merge_unit(
                 if shared_caller {
                     program.symbols.share_header_call(existing, primary_file_id);
                 }
+                program.symbols.absorb_call_copy(existing, &site);
                 call_map.insert(old, existing);
                 continue;
             }
@@ -2136,6 +2138,7 @@ mod tests {
                 span: trace_ir::Span::new(trace_ir::FileId(0), 30 + id as u32, 1),
                 expansion_span: None,
                 is_direct: true,
+                in_loop: false,
                 receiver_class: None,
                 exact_receiver: false,
                 return_dst: Some(VarId(0)),
@@ -2401,6 +2404,7 @@ mod tests {
             span: trace_ir::Span::new(header, 86, 10),
             expansion_span: None,
             is_direct: true,
+            in_loop: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
@@ -2522,6 +2526,7 @@ mod tests {
                     span: trace_ir::Span::new(source, 6, 10),
                     expansion_span: None,
                     is_direct: true,
+                    in_loop: false,
                     receiver_class: None,
                     exact_receiver: false,
                     return_dst: None,
@@ -2553,6 +2558,79 @@ mod tests {
                 .filter(|cs| cs.callee_name == "g")
                 .count()
         })
+    }
+
+    /// Two units whose copies of one call share its source occurrence (a
+    /// call spelled in a header macro, expanded at one header line) merge
+    /// into one record, which is in a loop when either copy is, whichever
+    /// unit merges first.
+    #[test]
+    fn a_merged_call_is_in_a_loop_when_any_copy_is() {
+        let header = trace_ir::FileId(1);
+        let unit = |path: &str, caller: &str, in_loop: bool| UnitIndex {
+            path: PathBuf::from(path),
+            files: vec![PathBuf::from(path), PathBuf::from("table.h")],
+            functions: vec![Function {
+                is_weak: false,
+                target: None,
+                id: FnId(0),
+                name: caller.into(),
+                linkage: trace_ir::Linkage::External,
+                return_type: TypeId(0),
+                params: Vec::new(),
+                locals: Vec::new(),
+                span: trace_ir::Span::new(trace_ir::FileId(0), 3, 1),
+                end_line: 3,
+                file: trace_ir::FileId(0),
+                is_defined: true,
+                param_type_ids: Vec::new(),
+                explicit_arity: Some(0),
+                default_args: 0,
+                reference_params: Vec::new(),
+                owner_unresolved: false,
+                variadic: false,
+                defaulted_in_class: false,
+                declared_in_class: false,
+                is_static_member: false,
+                is_virtual: false,
+                is_final: false,
+                is_cpp: false,
+                c_linkage: false,
+                tu: None,
+            }],
+            call_sites: vec![CallSite {
+                id: trace_ir::CallSiteId(0),
+                caller: FnId(0),
+                callee_name: "pthread_create".into(),
+                callee_var: None,
+                callee_fn_id: None,
+                var_args: Vec::new(),
+                details: CallSiteDetails::boxed(Vec::new(), Vec::new(), Vec::new(), None),
+                args_bound_past_this: false,
+                span: trace_ir::Span::new(header, 1, 1),
+                expansion_span: None,
+                is_direct: true,
+                in_loop,
+                receiver_class: None,
+                exact_receiver: false,
+                return_dst: None,
+                tu: None,
+            }],
+            ..Default::default()
+        };
+        for loop_first in [false, true] {
+            let mut program = Program::new(PathBuf::from("root"));
+            merge_unit_index(&mut program, &unit("a.c", "RunA", loop_first));
+            merge_unit_index(&mut program, &unit("b.c", "RunB", !loop_first));
+            let sites: Vec<_> = program
+                .symbols
+                .call_sites
+                .iter()
+                .filter(|cs| cs.callee_name == "pthread_create")
+                .collect();
+            assert_eq!(sites.len(), 1, "one record for the one occurrence");
+            assert!(sites[0].in_loop, "loop in the first unit: {loop_first}");
+        }
     }
 
     /// A unit that declares a name at two columns of one line declares two
@@ -2884,6 +2962,7 @@ mod tests {
                     span: trace_ir::Span::new(file, 11, 5),
                     expansion_span: None,
                     is_direct: false,
+                    in_loop: false,
                     receiver_class: None,
                     exact_receiver: false,
                     return_dst: None,

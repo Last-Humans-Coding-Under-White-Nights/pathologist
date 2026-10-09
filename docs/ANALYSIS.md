@@ -768,6 +768,7 @@ Instead, `trace` decouples intra-repository static analysis from cross-repositor
 ### Invariants and linking rules
 
 - **No analysis during merge**: Andersen pointer analysis, PAG construction, and interprocedural dataflow solvers do **not** run during the merge stage. Intra-repository dataflow facts (`flow_nodes`, `flow_edges`, `arg_flow_edges`) remain strictly within their original repository databases. The merge stage is purely a deterministic linker that reconnects external call edges across repositories. Its shared-schema output leaves flow tables empty and call-site variable bindings NULL; see the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
+- **Execution contexts carry over**: `execution_contexts` rows are copied with their function and call-site ids remapped, and one whose function or call site did not survive the merge is dropped. Rows several inputs contribute for one context (same start, modelled callee, parameter, entry and kind: an IPC handler a shared header defines, since call sites are not deduplicated) are kept once, with the evidence of all: `self_concurrent` when any input says so, and the first `multi_instance` that applies in the analysis' order. Merged rows are ordered as `trace analyze` orders them, by call site, then the IPC handlers by entry. The evidence is otherwise each input's own: a cross-repository edge re-linked here is not searched for new cycles or parents ([Execution contexts](#execution-contexts)). Which inputs supply the table, and what an input exported before it contributes, is part of the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
 - **External call re-linking and may-analysis over-approximation**:
   - In individual repositories, calls to functions declared but not defined in that repository are emitted with `resolution = 'external'` (or point to `is_defined = 0` declarations). `trace-merge` matches these calls against exported strong definitions (`is_defined = 1`, `linkage = 'external'`) from other repositories, updating `call_edges.callee_fn_id` to the survivor's unified ID and retargeting `resolution` to `'direct'` (or `'ambiguous'` if conflicting definitions exist), while preserving original non-direct resolutions (`indirect` and `ipc`). Unresolved external calls retain their original resolution.
   - When multiple strong definitions exist across different repositories (or multiple weak definitions), `trace-merge` emits an ambiguous edge (`resolution = 'ambiguous'`) to **every candidate definition**, satisfying the may-analysis invariant (AGENTS.md §2). This ensures downstream path queries such as `trace inspect callchain` do not miss valid paths.
@@ -786,6 +787,7 @@ Instead, `trace` decouples intra-repository static analysis from cross-repositor
   - `MultipleDefinitions`: Multiple strong definitions with the same signature found across different repositories. Reported as a collision warning and recorded with `stage = 'merge'`.
   - `UnresolvedExternal`: External function references that have no matching definition in any merged database.
   - `WeakOverride`: Diagnostic informing that a weak definition in one repository was overridden by a strong definition from another repository. Intra-repository weak overrides do not trigger warnings.
+  - `MissingExecutionContexts`: An input has no `execution_contexts` table (it was exported before the table existed), so it contributes no execution contexts. Recorded as an `info` diagnostic with `stage = 'merge'` naming the input.
 - **Referential integrity and safety**:
   - Staging inserts and remapping are verified using `PRAGMA foreign_key_check` before transaction commit, ensuring zero orphaned foreign keys in `call_sites`, `call_edges`, or `target_sources`.
   - Rejects attempts to write output to any path matching an active input database.
@@ -1462,7 +1464,8 @@ not link-target scoped, like pairing itself. A mock or test double
 implementing the same interface is not excluded: it stays a CHA target of
 calls through the interface.
 The edge has resolution `ipc` and no source call site, and can be disabled
-with `--no-ipc`.
+with `--no-ipc`. Each handler a bridge targets is also an `ipc_handler`
+[execution context](#execution-contexts).
 Because v1 has no opcode or parcel-type information, overloaded handlers at
 the selected naming tier are all retained as a may-analysis result. With `m`
 proxy overloads and `n` handler overloads this deliberately emits the full
@@ -1701,7 +1704,7 @@ defined in-tree, so project-specific wrappers can be described too.
 | `return_heap` | returns a fresh storage location | fresh `Heap` loc per call site into the destination |
 | `clears { param }` | **terminator**: memory reachable via `param[param]` is zeroed by this call | no value introduction; terminator event exported |
 | `dlsym { param }` | return value may be the address of the in-tree function named by string constants in `param[param]` | `Dlsym` PAG constraint; unknown names add nothing |
-| `invoke { param, args / rest }` | may invoke the callback passed in `param[param]`, with the arguments `args = [..]` lists (none when omitted: a zero-argument callback) or every argument from position `rest` on | adds an indirect edge from the submitting caller at the submission site, read off the converged points-to sets; callback return values and scheduling are ignored. Forwarded arguments are wired into the callback's formals inside the fixpoint (see [Callback invocation](#callback-invocation-invoke)). Unlike the value-introducing effects this is not restricted to a bodyless callee — a callback API is routinely a template whose body the index holds once, uninstantiated — and an edge the callee's own body already yields is not added twice |
+| `invoke { param, args / rest, context }` | may invoke the callback passed in `param[param]`, with the arguments `args = [..]` lists (none when omitted: a zero-argument callback) or every argument from position `rest` on, in an execution context of kind `context` (`unknown` when omitted) | adds an indirect edge from the submitting caller at the submission site, read off the converged points-to sets; callback return values and scheduling are ignored. Forwarded arguments are wired into the callback's formals inside the fixpoint (see [Callback invocation](#callback-invocation-invoke)). Unlike the value-introducing effects this is not restricted to a bodyless callee — a callback API is routinely a template whose body the index holds once, uninstantiated — and an edge the callee's own body already yields is not added twice. Each resolved callback is also an [execution context](#execution-contexts) |
 
 Effects attach to parameter positions (0-based) of the *actual arguments* recorded at
 the call site. Arguments that are not IR variables or functions (literals like
@@ -1754,9 +1757,82 @@ image as an indirect call's targets are.
   seen are wired in `FnId` order.
 - **Arg-flow rows.** Each forwarded argument is an arg-flow row at the
   starting call site: its position there, and the callback's formal.
+- **Context.** `context = "thread"` (a new thread), `"pool_task"` (a
+  task on a pool of worker threads), `"serial_task"` (a task on a queue that
+  runs one task at a time), `"ipc_handler"` (a request handler on the IPC
+  worker pool, self-concurrent like a stub handler) or `"unknown"` says where
+  the callback runs; a model that does not say starts an `unknown` context, and
+  `context` on another effect kind is rejected when the file is loaded. Each
+  resolved callback is exported as one execution context (next section); the
+  call graph is the same whatever the kind.
 - **Not modeled.** No ordering or scheduling (the callback is simply
   reachable from the starting site), no return value, and no bound state:
   `std::bind` results and `std::function` objects are not looked into.
+
+### Execution contexts
+
+An execution context is a place where code starts running on a thread, a
+task queue or the IPC worker pool. The analysis lists them once the call
+graph is complete (`AnalysisResult::execution_contexts`, `contexts.rs`), and
+the export writes them to `execution_contexts`
+([schema](SQLITE_SCHEMA.md#execution_contexts)). Nothing here feeds the
+solver, and `call_edges` is unchanged: a start is still an ordinary
+`indirect` edge from the submitting caller there, and an IPC handler is
+still the callee of an `ipc` edge.
+
+- **Which contexts.** One per resolved callback of an `invoke` model:
+  submitting call site, modelled callee (`pthread_create`,
+  `std::thread::thread`, `ffrt::queue::submit`), invoked parameter, callback
+  function, and the kind the model states. The callbacks are the targets of
+  the edges [Callback invocation](#callback-invocation-invoke) adds, so a
+  callback that reaches a declaration and its definition is two contexts, as
+  it is two edges. Then one per IPC stub handler a bridge targets
+  ([OpenHarmony IPC bridges](#openharmony-ipc-bridges)), of kind
+  `ipc_handler`, with no call site: the request comes from another process.
+  Rows are ordered by call site, modelled callee, parameter, callback and
+  kind, then by handler, so the export is the same at any `--jobs`, and
+  `trace-merge` orders merged rows the same way
+  ([Invariants and linking rules](#invariants-and-linking-rules)).
+- **A start site is a context, not a thread.** A wrapper every thread is
+  started through (HDF's `OsalThreadCreate` around one `pthread_create`)
+  makes one start site for every entry function the wrapper is given, and
+  the same callback started at two sites is two contexts. Which executor a
+  task is queued on is not recorded.
+- **Self-concurrency.** `self_concurrent` says two instances may run at the
+  same time: every IPC handler, a stub handler or a callback a model states
+  as `ipc_handler` (the IPC worker pool runs requests on the same stub
+  concurrently unless the stub serializes them, which is not read), and
+  every context with multi-instance evidence. For a `serial_task` this is
+  only "possibly": tasks on one queue run one at a time, and which queue is
+  not known. `0` means no evidence, not single execution.
+- **Multi-instance evidence** (`multi_instance`), the first that applies:
+  - `loop`: the start site is lexically inside a loop of its function
+    (`CallSite::in_loop`): a loop's body, condition or update, but not a
+    `for` init-statement or a range-for's range, which run once, and not the
+    body of a lambda written in the loop, which is a function of its own.
+    Lowering marks the call sites a loop's children produced; a record that
+    copies of one call merge into (an `--explore` variant's, or a call two
+    units spell at one source occurrence) is in a loop when any copy is, and
+    the sites post-merge virtual expansion adds keep the mark of the call. A
+    header function another unit compiles differently is not merged: its
+    first body is kept with that body's loop evidence, as with its other
+    calls.
+  - `cycle`: the submitting function is in a cycle of ordinary calls
+    (recursion). The edge from a start site to the context it starts and an
+    IPC bridge close no cycle: through a wrapper, a thread that starts
+    another thread would otherwise look recursive. The
+    call graph cannot tell a context that starts itself from a wrapper
+    starting a different entry, so a context that starts itself, directly or
+    through a wrapper, is not recorded either, though the instances of a
+    thread or pool task started that way may overlap.
+  - `parent`: the submitting function is reachable over the whole call
+    graph, start edges included, from the entry of a self-concurrent context,
+    so a context nested any depth below an IPC handler or a thread started in
+    a loop counts. Through a wrapper this marks every context the wrapper's
+    site starts.
+  - `unknown`: none of these. A start site several ordinary calls reach (a
+    wrapper called twice, a function called in a caller's loop) can still run
+    more than once.
 
 ### Terminators (`clears`)
 
@@ -1786,9 +1862,9 @@ entries:
 | `malloc`, `calloc`, `zalloc`, `kmalloc` | `return_heap` |
 | `realloc` | `return_alias param=0`, `return_heap` |
 | `dlsym`, `dlvsym`, `GetProcAddress` | `dlsym param=1` (symbol-name argument) |
-| `ffrt::queue::submit` | `invoke param=0` (explicit callback argument, excluding implicit `this`) |
-| `pthread_create` | `invoke param=2 args=[3]` (start routine and its argument) |
-| `std::thread::thread` | `invoke param=0 rest=1` (callable and everything after it); covers a temporary recorded as `std::thread` |
+| `ffrt::queue::submit` | `invoke param=0 context=serial_task` (explicit callback argument, excluding implicit `this`) |
+| `pthread_create` | `invoke param=2 args=[3] context=thread` (start routine and its argument) |
+| `std::thread::thread` | `invoke param=0 rest=1 context=thread` (callable and everything after it); covers a temporary recorded as `std::thread` |
 
 ### Configuration format
 
@@ -1818,10 +1894,10 @@ effects = [ { kind = "return_heap" } ]
 name = "MyDlsym"
 effects = [ { kind = "dlsym", param = 1 } ]
 
-# A callback API: argument 1 is run with argument 2.
+# A callback API: argument 1 is run with argument 2, as a task on a pool.
 [[model]]
 name = "pool_post"
-effects = [ { kind = "invoke", param = 1, args = [2] } ]
+effects = [ { kind = "invoke", param = 1, args = [2], context = "pool_task" } ]
 
 # An explicitly empty effect list overrides (disables) a same-name built-in.
 [[model]]
@@ -1846,7 +1922,11 @@ effects = []
 - **`invoke` is an immediate, unordered call**: the callback is reachable from
   the site that hands it over, with no notion of the new thread, of when it
   runs, or of its return value; a `rest` form checks arity only by a lower bound (see
-  [Callback invocation](#callback-invocation-invoke)).
+  [Callback invocation](#callback-invocation-invoke)). The context kind is the
+  model's word for it: `ffrt::queue::submit` is a `serial_task` although an
+  `ffrt::queue` can be created concurrent, and an execution context is keyed
+  by start site, not by thread or executor (see
+  [Execution contexts](#execution-contexts)).
 
 ## Noise macro filtering (`--ignore-macro`, `--ignore-logging`, `[noise]`)
 

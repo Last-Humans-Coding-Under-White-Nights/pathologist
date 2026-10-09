@@ -4,6 +4,22 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Execution contexts: thread, task and IPC entries (#202)
+
+A new `execution_contexts` table lists where code starts running on a thread,
+a task queue or the IPC worker pool: one row per resolved callback of an
+`invoke` model (`pthread_create`, `std::thread`, ...) and one per IPC stub
+handler. Each row has a kind (`thread`, `pool_task`, `serial_task`,
+`ipc_handler`, `unknown`), multi-instance evidence (`loop`, `cycle`, `parent`,
+`unknown`) and a self-concurrent flag; an `invoke` model states its kind with
+`context`. The table is an additive v7 table (no schema version change), and
+`call_edges` is unchanged. `trace-merge` carries the rows into merged
+databases, validates the table's columns when an input has it, and names an
+input without it in a `MissingExecutionContexts` diagnostic. Rules:
+[Execution contexts](docs/ANALYSIS.md#execution-contexts); merge behaviour:
+[Merger inputs and output](docs/SQLITE_SCHEMA.md#merger-inputs-and-output);
+measurements in `docs/EVAL_REPORT.md` ("Execution contexts: #202").
+
 ### Source locations of flow edges (#204)
 
 Where a value moves is recorded in `flow_origins`, the single source for

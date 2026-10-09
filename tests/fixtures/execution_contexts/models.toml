@@ -1,0 +1,9 @@
+version = 1
+
+[[model]]
+name = "pool_post"
+effects = [{ kind = "invoke", param = 0, context = "pool_task" }]
+
+[[model]]
+name = "run_later"
+effects = [{ kind = "invoke", param = 0 }]

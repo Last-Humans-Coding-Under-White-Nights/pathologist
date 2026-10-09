@@ -16,3 +16,6 @@ pub use schema::*;
 
 mod dataflow;
 pub use dataflow::*;
+/// The multi-instance evidence ranking `execution_contexts.multi_instance`
+/// stores, for readers of an exported database.
+pub use trace_analysis::MultiInstance;

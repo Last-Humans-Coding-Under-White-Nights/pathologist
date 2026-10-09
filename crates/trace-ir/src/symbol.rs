@@ -276,6 +276,13 @@ pub struct CallSite {
     /// when `span` points into a macro replacement list.
     pub expansion_span: Option<Span>,
     pub is_direct: bool,
+    /// The call is lexically inside a loop of its own function: a loop body,
+    /// condition or update, not a `for` init-statement or a range-for's
+    /// range, and not the body of a lambda written in the loop (that is a
+    /// function of its own). Evidence for execution contexts started here
+    /// (`docs/ANALYSIS.md`, "Execution contexts"); not part of the merge
+    /// identity, and a merged record is in a loop when any copy is.
+    pub in_loop: bool,
     /// Static class of a C++ member-call receiver (`this`, typed pointer).
     /// Post-merge virtual expansion uses this so `final` types are not
     /// re-expanded from the declaring base.
@@ -2918,10 +2925,29 @@ impl SymbolTable {
 
     #[must_use]
     pub fn call_site_by_id(&self, id: CallSiteId) -> Option<&CallSite> {
-        self.call_sites
-            .get(id.0 as usize)
-            .filter(|c| c.id == id)
-            .or_else(|| self.call_sites.iter().find(|c| c.id == id))
+        self.call_site_slot(id).map(|slot| &self.call_sites[slot])
+    }
+
+    /// Where call `id` sits in `call_sites`: at its own index unless records
+    /// were removed or reordered, else wherever a scan finds it.
+    fn call_site_slot(&self, id: CallSiteId) -> Option<usize> {
+        let at = id.0 as usize;
+        match self.call_sites.get(at) {
+            Some(site) if site.id == id => Some(at),
+            _ => self.call_sites.iter().position(|c| c.id == id),
+        }
+    }
+
+    /// Fold `copy`, a copy of call `id` merged into it, into the record:
+    /// the record is lexically in a loop (`CallSite::in_loop`) when any copy
+    /// is.
+    pub fn absorb_call_copy(&mut self, id: CallSiteId, copy: &CallSite) {
+        if !copy.in_loop {
+            return;
+        }
+        if let Some(slot) = self.call_site_slot(id) {
+            self.call_sites[slot].in_loop = true;
+        }
     }
 
     pub fn function_ids_unique(&self) -> bool {
@@ -3031,6 +3057,7 @@ mod tests {
             span: Span::new(FileId(0), 1, 2),
             expansion_span: None,
             is_direct: true,
+            in_loop: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
@@ -3099,6 +3126,7 @@ mod tests {
             span: Span::new(FileId(2), 10, 3),
             expansion_span: None,
             is_direct: true,
+            in_loop: false,
             receiver_class: Some("Cls".into()),
             exact_receiver: false,
             return_dst: Some(VarId(6)),
@@ -3142,6 +3170,7 @@ mod tests {
             span: Span::new(FileId(0), 1, 1),
             expansion_span: None,
             is_direct,
+            in_loop: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
@@ -3333,6 +3362,7 @@ mod tests {
             span: Span::new(caller_file, 1, 1),
             expansion_span: None,
             is_direct: true,
+            in_loop: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,

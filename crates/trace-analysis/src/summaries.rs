@@ -29,10 +29,62 @@ pub enum Effect {
     /// equals a string constant in `param[name_param]` (`dlsym` family).
     Dlsym { name_param: u32 },
     /// The callee may invoke the callback in `param[param]`, passing it
-    /// `args`. Parameter indexes count explicit arguments, excluding a
-    /// member's `this`. Not restricted to a bodyless callee, unlike the
-    /// effects above that introduce a value.
-    Invoke { param: u32, args: InvokeArgs },
+    /// `args`, in an execution context of kind `context`. Parameter indexes
+    /// count explicit arguments, excluding a member's `this`. Not restricted
+    /// to a bodyless callee, unlike the effects above that introduce a value.
+    Invoke {
+        param: u32,
+        args: InvokeArgs,
+        context: ContextKind,
+    },
+}
+
+/// Where a callback an [`Effect::Invoke`] model runs executes, as the model
+/// states it (`docs/ANALYSIS.md`, "Execution contexts"). An IPC stub handler
+/// is an [`ContextKind::IpcHandler`] context without a model; either way,
+/// every IPC handler context is self-concurrent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// Declared in spelling order, so the derived `Ord` orders kinds as
+/// [`ContextKind::as_str`] spells them (`execution_contexts.kind`).
+pub enum ContextKind {
+    /// A request handler on the IPC worker pool, which may run it twice at
+    /// once.
+    IpcHandler,
+    /// A task on a pool of worker threads.
+    PoolTask,
+    /// A task on a queue that runs its tasks one at a time.
+    SerialTask,
+    /// A new thread (`pthread_create`, `std::thread`).
+    Thread,
+    /// The model does not say, or the callback may run on the caller's own
+    /// thread.
+    Unknown,
+}
+
+impl ContextKind {
+    const ALL: [Self; 5] = [
+        Self::Thread,
+        Self::PoolTask,
+        Self::SerialTask,
+        Self::IpcHandler,
+        Self::Unknown,
+    ];
+
+    /// The spelling in a `--models` file and in `execution_contexts.kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Thread => "thread",
+            Self::PoolTask => "pool_task",
+            Self::SerialTask => "serial_task",
+            Self::IpcHandler => "ipc_handler",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn parse(spelling: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == spelling)
+    }
 }
 
 /// The arguments an [`Effect::Invoke`] callback is called with, as positions
@@ -69,9 +121,13 @@ impl InvokeArgs {
     }
 }
 
-/// The effects of a model that only invokes one callback.
-fn invoke(param: u32, args: InvokeArgs) -> Vec<Effect> {
-    vec![Effect::Invoke { param, args }]
+/// The effects of a model that only runs one callback, in a `context`.
+fn starts(param: u32, args: InvokeArgs, context: ContextKind) -> Vec<Effect> {
+    vec![Effect::Invoke {
+        param,
+        args,
+        context,
+    }]
 }
 
 /// A per-function summary.
@@ -107,10 +163,16 @@ impl FnModelSet {
         let mut reg = |name: &str, effects: Vec<Effect>| set.register(FnModel::new(name, effects));
         reg(
             "ffrt::queue::submit",
-            invoke(0, InvokeArgs::Listed(Vec::new())),
+            starts(0, InvokeArgs::Listed(Vec::new()), ContextKind::SerialTask),
         );
-        reg("pthread_create", invoke(2, InvokeArgs::Listed(vec![3])));
-        reg("std::thread::thread", invoke(0, InvokeArgs::Rest(1)));
+        reg(
+            "pthread_create",
+            starts(2, InvokeArgs::Listed(vec![3]), ContextKind::Thread),
+        );
+        reg(
+            "std::thread::thread",
+            starts(0, InvokeArgs::Rest(1), ContextKind::Thread),
+        );
         for n in ["memcpy", "memmove", "strcpy", "strncpy"] {
             reg(n, vec![Effect::MemCopy { dst: 0, src: 1 }]);
         }
@@ -274,15 +336,16 @@ struct RawEffect {
     param: Option<u32>,
     args: Option<Vec<u32>>,
     rest: Option<u32>,
+    context: Option<String>,
 }
 
 fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
     let need = |v: Option<u32>, field: &str, kind: &str| -> Result<u32, String> {
         v.ok_or_else(|| format!("effect kind {kind:?} requires `{field}`"))
     };
-    if raw.kind != "invoke" && (raw.args.is_some() || raw.rest.is_some()) {
+    if raw.kind != "invoke" && (raw.args.is_some() || raw.rest.is_some() || raw.context.is_some()) {
         return Err(format!(
-            "effect kind {:?} takes no `args` or `rest`",
+            "effect kind {:?} takes no `args`, `rest` or `context`",
             raw.kind
         ));
     }
@@ -317,7 +380,20 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
                     "effect kind \"invoke\" passes the callback (param {param}) to itself"
                 ));
             }
-            Ok(Effect::Invoke { param, args })
+            let context = match raw.context.as_deref() {
+                None => ContextKind::Unknown,
+                Some(spelling) => ContextKind::parse(spelling).ok_or_else(|| {
+                    format!(
+                        "unknown invoke context {spelling:?} (expected thread, pool_task, \
+                         serial_task, ipc_handler, unknown)"
+                    )
+                })?,
+            };
+            Ok(Effect::Invoke {
+                param,
+                args,
+                context,
+            })
         }
         "clears" => Ok(Effect::Clears {
             param: need(raw.param, "param", "clears")?,
@@ -425,15 +501,50 @@ effects = [ { kind = "dlsym", param = 1 } ]
         let effects = |name: &str| m.get(name).unwrap().effects.clone();
         assert_eq!(
             effects("pthread_create"),
-            invoke(2, InvokeArgs::Listed(vec![3]))
+            starts(2, InvokeArgs::Listed(vec![3]), ContextKind::Thread)
         );
         assert_eq!(
             effects("std::thread::thread"),
-            invoke(0, InvokeArgs::Rest(1))
+            starts(0, InvokeArgs::Rest(1), ContextKind::Thread)
         );
         assert_eq!(
             effects("ffrt::queue::submit"),
-            invoke(0, InvokeArgs::Listed(Vec::new()))
+            starts(0, InvokeArgs::Listed(Vec::new()), ContextKind::SerialTask)
+        );
+    }
+
+    #[test]
+    fn toml_invoke_states_the_context_it_starts() {
+        let load = |effect: &str| {
+            FnModelSet::from_toml_str(&format!("[[model]]\nname = \"x\"\neffects = [{effect}]\n"))
+        };
+        for kind in [
+            ContextKind::Thread,
+            ContextKind::PoolTask,
+            ContextKind::SerialTask,
+            ContextKind::IpcHandler,
+            ContextKind::Unknown,
+        ] {
+            let set = load(&format!(
+                r#"{{ kind = "invoke", param = 0, context = "{}" }}"#,
+                kind.as_str()
+            ))
+            .unwrap();
+            assert_eq!(
+                set.get("x").unwrap().effects,
+                starts(0, InvokeArgs::Listed(Vec::new()), kind)
+            );
+        }
+        let unstated = load(r#"{ kind = "invoke", param = 0 }"#).unwrap();
+        assert_eq!(
+            unstated.get("x").unwrap().effects,
+            starts(0, InvokeArgs::Listed(Vec::new()), ContextKind::Unknown),
+            "a model that does not say what it starts starts an unknown context"
+        );
+        assert!(load(r#"{ kind = "invoke", param = 0, context = "fiber" }"#).is_err());
+        assert!(
+            load(r#"{ kind = "alias", dst = 0, src = 1, context = "thread" }"#).is_err(),
+            "only `invoke` starts a context"
         );
     }
 
@@ -454,9 +565,18 @@ effects = [{ kind = "invoke", param = 0, rest = 1 }]
         )
         .unwrap();
         let effects = |name: &str| m.get(name).unwrap().effects.clone();
-        assert_eq!(effects("plain"), invoke(0, InvokeArgs::Listed(Vec::new())));
-        assert_eq!(effects("listed"), invoke(1, InvokeArgs::Listed(vec![2, 0])));
-        assert_eq!(effects("rest"), invoke(0, InvokeArgs::Rest(1)));
+        assert_eq!(
+            effects("plain"),
+            starts(0, InvokeArgs::Listed(Vec::new()), ContextKind::Unknown)
+        );
+        assert_eq!(
+            effects("listed"),
+            starts(1, InvokeArgs::Listed(vec![2, 0]), ContextKind::Unknown)
+        );
+        assert_eq!(
+            effects("rest"),
+            starts(0, InvokeArgs::Rest(1), ContextKind::Unknown)
+        );
         assert!(
             FnModelSet::from_toml_str(
                 "[[model]]\nname = \"x\"\neffects = [{ kind = \"invoke\", param = 0, args = [1], rest = 2 }]\n"

@@ -13,7 +13,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use trace_db::{INDEXES_V7, SCHEMA_VERSION, TABLES_V7};
+use trace_db::{MultiInstance, INDEXES_V7, SCHEMA_VERSION, TABLES_V7};
 
 // Use the same projections for capability checks and ingestion. Additive v7
 // flow metadata is optional here because the merger only preserves call graphs.
@@ -31,6 +31,10 @@ const READ_CALL_EDGES: &str = "SELECT id, call_site_id, caller_fn_id, callee_fn_
              FROM call_edges ORDER BY id";
 const READ_DIAGNOSTICS: &str =
     "SELECT id, severity, file_id, line, message, stage FROM diagnostics ORDER BY id";
+// Optional: an earlier v7 export has no `execution_contexts` table and
+// contributes no rows; a table that is present must have these columns.
+const READ_EXECUTION_CONTEXTS: &str = "SELECT kind, entry_fn_id, call_site_id, api_fn_id, param_index, multi_instance, self_concurrent \
+             FROM execution_contexts ORDER BY id";
 
 #[derive(Debug, Clone)]
 pub struct MergeOptions {
@@ -70,6 +74,9 @@ pub enum WarningKind {
     UnresolvedExternal,
     WeakOverride,
     DuplicateInput,
+    /// An input exported before `execution_contexts` existed: it contributes
+    /// no execution contexts to the merged database.
+    MissingExecutionContexts,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +121,65 @@ struct DbCallSite {
     expansion_col: Option<i64>,
     callee_text: String,
     is_direct: i64,
+}
+
+/// An `execution_contexts` row, ids already remapped into the merged
+/// database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DbExecutionContext {
+    kind: String,
+    entry_fn_id: i64,
+    call_site_id: Option<i64>,
+    api_fn_id: Option<i64>,
+    param_index: Option<i64>,
+    multi_instance: String,
+    self_concurrent: i64,
+}
+
+/// What makes two `execution_contexts` rows one context: call site, modelled
+/// callee, parameter, entry and kind.
+type ContextIdentity<'a> = (Option<i64>, Option<i64>, Option<i64>, i64, &'a str);
+
+impl DbExecutionContext {
+    /// What makes two rows one context: the start and what it runs, not the
+    /// evidence recorded for it.
+    fn identity(&self) -> ContextIdentity<'_> {
+        (
+            self.call_site_id,
+            self.api_fn_id,
+            self.param_index,
+            self.entry_fn_id,
+            &self.kind,
+        )
+    }
+}
+
+/// Merged `execution_contexts` rows in the order `trace analyze` writes them:
+/// the submitted contexts by call site, modelled callee, parameter, entry and
+/// kind, then the IPC handlers (no call site) by entry. Rows several inputs
+/// contribute for one context (an IPC handler a shared header defines) are
+/// one row with the evidence of all: self-concurrent when any is, and the
+/// first `multi_instance` that applies in the analysis' order.
+fn unify_execution_contexts(mut rows: Vec<DbExecutionContext>) -> Vec<DbExecutionContext> {
+    fn precedence(multi_instance: &str) -> usize {
+        MultiInstance::parse(multi_instance).map_or(usize::MAX, MultiInstance::rank)
+    }
+    // Stable: rows of one context stay in input order, so the kept row is
+    // the first and ties in `multi_instance` keep the earlier value.
+    rows.sort_by(|a, b| {
+        (a.call_site_id.is_none(), a.identity()).cmp(&(b.call_site_id.is_none(), b.identity()))
+    });
+    rows.dedup_by(|later, held| {
+        if later.identity() != held.identity() {
+            return false;
+        }
+        held.self_concurrent = held.self_concurrent.max(later.self_concurrent);
+        if precedence(&later.multi_instance) < precedence(&held.multi_instance) {
+            held.multi_instance = std::mem::take(&mut later.multi_instance);
+        }
+        true
+    });
+    rows
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +259,8 @@ pub fn merge_databases<P: AsRef<Path>>(
 
     // Verify all input databases and read schema versions.
     let mut conns = Vec::new();
+    // Per input: whether it has an `execution_contexts` table to carry over.
+    let mut has_contexts = Vec::new();
     for path in &inputs {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("failed to open input database {}", path.display()))?;
@@ -235,6 +303,16 @@ pub fn merge_databases<P: AsRef<Path>>(
                 )
             })?;
         }
+        let contexts = table_exists(&conn, "execution_contexts")?;
+        if contexts {
+            conn.prepare(READ_EXECUTION_CONTEXTS).map_err(|error| {
+                anyhow::anyhow!(
+                    "missing trace-merge capability in {} (execution_contexts): {error}; re-analyze the input with the current trace version",
+                    path.display()
+                )
+            })?;
+        }
+        has_contexts.push(contexts);
         conns.push(conn);
     }
 
@@ -809,6 +887,65 @@ pub fn merge_databases<P: AsRef<Path>>(
         });
     }
 
+    // 5b. Execution contexts, carried over with remapped ids. Each keeps the
+    // multi-instance evidence of its own input: a cross-repository edge
+    // resolved above is not searched for new cycles or parents. A row whose
+    // function or call site did not survive the merge is dropped, and an
+    // input exported before the table existed contributes none.
+    let mut carried_contexts: Vec<DbExecutionContext> = Vec::new();
+    for (db_idx, conn) in conns.iter().enumerate() {
+        if !has_contexts[db_idx] {
+            report.warnings.push(MergeWarning {
+                kind: WarningKind::MissingExecutionContexts,
+                message: format!(
+                    "input {} has no execution_contexts table; its execution contexts are not carried over (re-analyze it with the current trace version to include them)",
+                    inputs[db_idx].display()
+                ),
+                symbol: None,
+                file_id: None,
+                line: 0,
+            });
+            continue;
+        }
+        let mut stmt = conn.prepare(READ_EXECUTION_CONTEXTS)?;
+        let rows = stmt.query_map([], |r| {
+            Ok(DbExecutionContext {
+                kind: r.get(0)?,
+                entry_fn_id: r.get(1)?,
+                call_site_id: r.get(2)?,
+                api_fn_id: r.get(3)?,
+                param_index: r.get(4)?,
+                multi_instance: r.get(5)?,
+                self_concurrent: r.get(6)?,
+            })
+        })?;
+        // An optional id: absent stays absent; present but not carried
+        // (`None`) drops the row.
+        let remap_optional = |map: &FxHashMap<i64, i64>, id: Option<i64>| match id {
+            Some(id) => map.get(&id).copied().map(Some),
+            None => Some(None),
+        };
+        for r in rows {
+            let ctx = r?;
+            let Some(&entry_fn_id) = fn_remap[db_idx].get(&ctx.entry_fn_id) else {
+                continue;
+            };
+            let (Some(call_site_id), Some(api_fn_id)) = (
+                remap_optional(&cs_remap[db_idx], ctx.call_site_id),
+                remap_optional(&fn_remap[db_idx], ctx.api_fn_id),
+            ) else {
+                continue;
+            };
+            carried_contexts.push(DbExecutionContext {
+                entry_fn_id,
+                call_site_id,
+                api_fn_id,
+                ..ctx
+            });
+        }
+    }
+    let unified_contexts = unify_execution_contexts(carried_contexts);
+
     // 6. Diagnostics Ingestion
     let mut unified_diagnostics: Vec<DbDiagnostic> = Vec::new();
     for (db_idx, conn) in conns.iter().enumerate() {
@@ -847,6 +984,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             WarningKind::UnresolvedExternal => "info",
             WarningKind::WeakOverride => "info",
             WarningKind::DuplicateInput => "warning",
+            WarningKind::MissingExecutionContexts => "info",
         };
         let new_diag_id = (unified_diagnostics.len() + 1) as i64;
         unified_diagnostics.push(DbDiagnostic {
@@ -1012,6 +1150,27 @@ pub fn merge_databases<P: AsRef<Path>>(
             }
         }
 
+        // Bulk insert execution contexts
+        {
+            let mut stmt = out_conn.prepare_cached(
+                "INSERT INTO execution_contexts (id, kind, entry_fn_id, call_site_id, api_fn_id, \
+                 param_index, multi_instance, self_concurrent) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for (i, c) in unified_contexts.iter().enumerate() {
+                stmt.execute(params![
+                    i as i64 + 1,
+                    c.kind,
+                    c.entry_fn_id,
+                    c.call_site_id,
+                    c.api_fn_id,
+                    c.param_index,
+                    c.multi_instance,
+                    c.self_concurrent
+                ])?;
+            }
+        }
+
         // Bulk insert diagnostics
         {
             let mut stmt = out_conn.prepare_cached(
@@ -1065,9 +1224,80 @@ pub fn merge_databases<P: AsRef<Path>>(
     Ok(report)
 }
 
+/// Whether the database has a table named `name`.
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [name],
+        |r| r.get(0),
+    )?)
+}
+
 fn chrono_lite_now() -> String {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}", dur.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(
+        call_site: Option<i64>,
+        entry: i64,
+        multi_instance: &str,
+        self_concurrent: i64,
+    ) -> DbExecutionContext {
+        DbExecutionContext {
+            kind: if call_site.is_some() {
+                "thread"
+            } else {
+                "ipc_handler"
+            }
+            .into(),
+            entry_fn_id: entry,
+            call_site_id: call_site,
+            api_fn_id: call_site.map(|_| 100),
+            param_index: call_site.map(|_| 2),
+            multi_instance: multi_instance.into(),
+            self_concurrent,
+        }
+    }
+
+    #[test]
+    fn one_context_from_several_inputs_is_one_row_with_all_their_evidence() {
+        let unified = unify_execution_contexts(vec![
+            row(Some(1), 7, "parent", 1),
+            row(Some(1), 7, "unknown", 0),
+            row(Some(1), 7, "loop", 1),
+            row(None, 9, "unknown", 1),
+            row(None, 9, "unknown", 1),
+        ]);
+        assert_eq!(
+            unified,
+            [row(Some(1), 7, "loop", 1), row(None, 9, "unknown", 1)]
+        );
+        let unified = unify_execution_contexts(vec![
+            row(Some(1), 7, "unknown", 0),
+            row(Some(1), 7, "cycle", 1),
+        ]);
+        assert_eq!(unified, [row(Some(1), 7, "cycle", 1)]);
+    }
+
+    #[test]
+    fn rows_are_ordered_by_call_site_then_ipc_handlers() {
+        let unified = unify_execution_contexts(vec![
+            row(Some(5), 1, "unknown", 0),
+            row(None, 4, "unknown", 1),
+            row(Some(2), 3, "unknown", 0),
+            row(None, 2, "unknown", 1),
+        ]);
+        let order: Vec<_> = unified
+            .iter()
+            .map(|c| (c.call_site_id, c.entry_fn_id))
+            .collect();
+        assert_eq!(order, [(Some(2), 3), (Some(5), 1), (None, 2), (None, 4)]);
+    }
 }

@@ -12,6 +12,7 @@ mod cpp_type_syntax;
 mod cross_tu_tests;
 mod dep_root_tests;
 mod dlsym_cases;
+mod execution_contexts;
 mod explore_tests;
 mod flow_origin_sites;
 mod fn_model_cases;

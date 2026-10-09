@@ -1166,6 +1166,7 @@ mod tests {
             span: Span::new(FileId(0), 1, 2),
             expansion_span: None,
             is_direct: false,
+            in_loop: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
