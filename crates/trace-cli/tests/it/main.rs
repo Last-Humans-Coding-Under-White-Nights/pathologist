@@ -13,6 +13,7 @@ mod cross_tu_tests;
 mod dep_root_tests;
 mod dlsym_cases;
 mod explore_tests;
+mod flow_origin_sites;
 mod fn_model_cases;
 mod forced_lang_cases;
 mod gn_targets;

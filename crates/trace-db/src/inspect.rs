@@ -566,6 +566,92 @@ fn like_escape(s: &str) -> String {
     out
 }
 
+/// The function a site is written in, by the edge-scope rule
+/// (`docs/ANALYSIS.md`, "Where a value moves"): of the definitions whose line
+/// range in the site's file holds its line, the innermost. When several
+/// definitions hold the line, the innermost one, which every other encloses,
+/// owns it if the line is strictly inside it (not its first or last line); a
+/// line held by a single definition is that definition's, its first and last
+/// lines included; otherwise, as when two definitions share the innermost
+/// range, none does.
+/// Each file's definitions are read once and each line is answered once.
+#[derive(Default)]
+pub(crate) struct DefinitionOwners {
+    files: FxHashMap<i64, FileDefinitions>,
+}
+
+/// One file's definitions for [`DefinitionOwners`].
+struct FileDefinitions {
+    /// `(line_start, line_end, functions.id)`, by start line.
+    by_start: Vec<(i64, i64, i64)>,
+    /// The lines answered so far.
+    owners: FxHashMap<i64, Option<i64>>,
+}
+
+impl DefinitionOwners {
+    /// The function owning `line` of file `file_id`.
+    pub(crate) fn owner(
+        &mut self,
+        conn: &Connection,
+        file_id: i64,
+        line: i64,
+    ) -> Result<Option<i64>> {
+        let file = match self.files.entry(file_id) {
+            std::collections::hash_map::Entry::Occupied(known) => known.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let mut by_start: Vec<(i64, i64, i64)> = conn
+                    .prepare_cached(
+                        "SELECT id, line_start, line_end FROM functions \
+                         WHERE file_id = ?1 AND is_defined = 1 ORDER BY id",
+                    )?
+                    .query_map([file_id], |r| Ok((r.get(1)?, r.get(2)?, r.get(0)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                by_start.sort_unstable();
+                slot.insert(FileDefinitions {
+                    by_start,
+                    owners: FxHashMap::default(),
+                })
+            }
+        };
+        Ok(*file
+            .owners
+            .entry(line)
+            .or_insert_with(|| innermost_definition(&file.by_start, line)))
+    }
+}
+
+/// The definition of `by_start` (sorted by start line) owning `line` (see
+/// [`DefinitionOwners`]), in one pass over the definitions starting at or
+/// before it to find the innermost holder and one to check the others
+/// enclose it. Only a holder no other one starts after, or ends before at
+/// the same start, can be enclosed by all the rest.
+fn innermost_definition(by_start: &[(i64, i64, i64)], line: i64) -> Option<i64> {
+    let started = &by_start[..by_start.partition_point(|&(start, ..)| start <= line)];
+    let holding = || started.iter().filter(move |&&(_, end, _)| line <= end);
+    let mut rest = holding();
+    let (mut start, mut end, mut id) = *rest.next()?;
+    let mut alone = true;
+    for &(other_start, other_end, other) in rest {
+        alone = false;
+        if (other_start, std::cmp::Reverse(other_end)) > (start, std::cmp::Reverse(end)) {
+            (start, end, id) = (other_start, other_end, other);
+        }
+    }
+    if alone {
+        return Some(id);
+    }
+    // Every other holder must enclose it; one sharing its range is a twin,
+    // and then neither is innermost.
+    let inside = line > start && line < end;
+    let enclosed = holding().all(|&(other_start, other_end, other)| {
+        other == id
+            || (other_start <= start
+                && end <= other_end
+                && (other_start, other_end) != (start, end))
+    });
+    (inside && enclosed).then_some(id)
+}
+
 fn require_flow_tables(conn: &Connection) -> Result<()> {
     for t in ["flow_nodes", "flow_edges"] {
         if !table_exists(conn, t)? {
@@ -1434,6 +1520,95 @@ pub fn require_symbols_at(
 mod tests {
     use super::*;
     use crate::schema::SCHEMA_V7;
+
+    /// The edge-scope rule read literally (`ranges` as `(id, start, end)`):
+    /// a holder owns the line when every other holder encloses it and the
+    /// line is strictly inside it, and exactly one holder may.
+    fn owner_by_definition(ranges: &[(i64, i64, i64)], line: i64) -> Option<i64> {
+        let holding = || {
+            ranges
+                .iter()
+                .filter(move |&&(_, start, end)| start <= line && line <= end)
+        };
+        let mut owner = None;
+        for &(id, start, end) in holding() {
+            let innermost = holding().all(|&(other, other_start, other_end)| {
+                other == id
+                    || (other_start <= start && end <= other_end && line > start && line < end)
+            });
+            if innermost {
+                if owner.is_some() {
+                    return None;
+                }
+                owner = Some(id);
+            }
+        }
+        owner
+    }
+
+    /// Many nested, sibling, overlapping, twin and one-line definitions:
+    /// every line's owner, asked in a scrambled order and asked twice, is the
+    /// one the literal rule names.
+    #[test]
+    fn definition_owners_match_the_literal_rule() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = |bound: i64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as i64
+        };
+        for round in 0..40 {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            conn.execute_batch(SCHEMA_V7).unwrap();
+            let mut ranges = Vec::new();
+            let count = 1 + next(if round % 2 == 0 { 12 } else { 120 });
+            for id in 1..=count {
+                let (start, end) = match next(5) {
+                    // Twin of an earlier definition.
+                    0 if !ranges.is_empty() => {
+                        let &(_, start, end) = &ranges[next(ranges.len() as i64) as usize];
+                        (start, end)
+                    }
+                    // Nested in an earlier one, sharing its first or last line
+                    // at times.
+                    1 | 2 if !ranges.is_empty() => {
+                        let &(_, outer_start, outer_end) =
+                            &ranges[next(ranges.len() as i64) as usize];
+                        let start = outer_start + next(outer_end - outer_start + 1);
+                        (start, start + next(outer_end - start + 1))
+                    }
+                    _ => {
+                        let start = 1 + next(200);
+                        (start, start + next(40))
+                    }
+                };
+                ranges.push((id, start, end));
+                conn.execute(
+                    "INSERT INTO functions (id, name, file_id, line_start, line_end, linkage, signature, is_defined) \
+                     VALUES (?1, 'f', 1, ?2, ?3, 'external', 'f()', 1)",
+                    rusqlite::params![id, start, end],
+                )
+                .unwrap();
+            }
+            let mut owners = DefinitionOwners::default();
+            let mut lines: Vec<i64> = (0..=250).collect();
+            for i in (1..lines.len()).rev() {
+                lines.swap(i, next(i as i64 + 1) as usize);
+            }
+            for pass in 0..2 {
+                for &line in &lines {
+                    assert_eq!(
+                        owners.owner(&conn, 1, line).unwrap(),
+                        owner_by_definition(&ranges, line),
+                        "round {round}, pass {pass}, line {line}: {ranges:?}"
+                    );
+                }
+            }
+            assert_eq!(owners.owner(&conn, 2, 5).unwrap(), None, "another file");
+        }
+    }
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

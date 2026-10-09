@@ -4,6 +4,24 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Source locations of flow edges (#204)
+
+Where a value moves is recorded in `flow_origins`, the single source for
+operation sites; `flow_edges` and the schema (v7) are unchanged. Fixture tests
+now pin its contract for `addr_of`, `copy`, `load`, `store` and `gep` edges:
+the original-file position (a macro's outermost invocation, a header body's
+header), one row per statement (shared header bodies and `--explore` variants
+included), no rows for solver- and export-derived edges, the enclosing function
+as the innermost definition whose line range holds the site, and identical rows
+for every `--jobs`. When several definitions hold a line, the innermost owns it
+if the line is strictly inside it (not its first or last line); a line held by
+a single definition is that definition's, its first and last lines included;
+otherwise none. A statement on its own line in a lambda body or a local
+class's method is now that definition's, in `inspect dataflow` edge scopes as
+well; before, any site two definitions held had none. Rules:
+[Where a value moves](docs/ANALYSIS.md#where-a-value-moves); query:
+[Source sites of a value move](docs/SQLITE_SCHEMA.md#source-sites-of-a-value-move).
+
 ### Member initializers avoid invented constructor edges (#207)
 
 Reference bindings such as `ref_(object)` no longer record constructor calls.

@@ -365,6 +365,13 @@ Edge kinds:
   synthetic `terminator` node recording the call site. No points-to value
   is produced; the edge documents where a buffer's prior contents stop.
 
+Edges have no position columns. Where the statement behind an edge is written
+is recorded once, in [`flow_origins`](#source-level-presentation-metadata-v7),
+keyed by the same `(src_node, dst_node, kind)`; edges with no statement of their
+own have no origin rows. Rules:
+[Where a value moves](ANALYSIS.md#where-a-value-moves); query:
+[Source sites of a value move](#source-sites-of-a-value-move).
+
 **Indexes:** `flow_edges(src_node)`, `flow_edges(dst_node)`
 
 ### types
@@ -493,6 +500,41 @@ JOIN functions f ON f.id = af.actual_fn_id
 JOIN variables fv ON fv.id = af.formal_var_id
 WHERE af.actual_fn_id IS NOT NULL;
 ```
+
+### Source sites of a value move
+
+Every statement that moves `b`'s value or storage into `pp`, with the enclosing
+function by the [edge-scope rule](ANALYSIS.md#where-a-value-moves): when
+several definitions hold the line, the innermost one if the line is strictly
+inside it (not its first or last line); a line held by a single definition is
+that definition's, its first and last lines included; otherwise `NULL`:
+
+```sql
+SELECT o.kind, o.operation, p.path, o.line, o.col, o.expression,
+       (SELECT CASE WHEN COUNT(DISTINCT f.id) = 1 THEN MIN(f.name) END
+        FROM functions f
+        WHERE f.file_id = o.file_id AND f.is_defined = 1
+          AND o.line BETWEEN f.line_start AND f.line_end
+          AND NOT EXISTS (
+            SELECT 1 FROM functions g
+            WHERE g.file_id = o.file_id AND g.is_defined = 1 AND g.id <> f.id
+              AND o.line BETWEEN g.line_start AND g.line_end
+              AND NOT (g.line_start <= f.line_start AND f.line_end <= g.line_end
+                       AND o.line > f.line_start AND o.line < f.line_end)))
+       AS function
+FROM flow_origins o
+JOIN files p ON p.id = o.file_id
+JOIN flow_nodes s ON s.id = o.src_node
+JOIN flow_nodes d ON d.id = o.dst_node
+JOIN variables sv ON sv.id = s.var_id
+JOIN variables dv ON dv.id = d.var_id
+WHERE sv.name = 'b' AND dv.name = 'pp'
+ORDER BY p.path, o.line, o.col;
+```
+
+`flow_origins` rows join a `flow_edges` row on `(src_node, dst_node, kind)`.
+An `addr_of` origin's source is a storage-location node: a variable's carries
+that variable's `var_id`, a function's carries its `fn_id` instead.
 
 ## CLI inspection
 

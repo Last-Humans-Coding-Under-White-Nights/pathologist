@@ -1639,6 +1639,47 @@ as `flow_nodes` / `flow_edges` for the `inspect dataflow` command:
   covers scalar (non-pointer) arguments that the solver does not persist as
   PAG constraints.
 
+#### Where a value moves
+
+`flow_edges` rows carry no position. Where the statement behind an edge is
+written is exported once, in `flow_origins`, keyed by the edge's
+`(src_node, dst_node, kind)`; this section's rules apply to it, and the
+recording, merging and text rules are in
+[Source-level dataflow presentation](#source-level-dataflow-presentation).
+
+- **One row per source site.** The same endpoint pair written at several
+  statements keeps a row per statement, including two statements of one
+  shared header body, a statement only an `--explore` variant compiles, and
+  each element of a function-pointer table initializer. The copies of one
+  header statement that several units contribute merge into one row.
+- **Original-file position.** Sites follow the LineMap rule (AGENTS.md
+  invariant 1): inside a macro expansion, the outermost invocation; inside a
+  header body, the header.
+- **Enclosing function.** It follows from the site by the edge-scope rule
+  of the source-level view: the innermost defined function whose
+  `[line_start, line_end]` in the site's file holds the line. When several
+  definitions hold the line, the innermost one (every other one holding it
+  encloses its range) owns it if the line is strictly inside it, not its
+  first or last line: a statement on its own line in a lambda body or a
+  local class's method is that definition's. A line held by a single
+  definition is that definition's, its first and last lines included.
+  Otherwise the site has none: outside every function (a file-scope
+  initializer), and with no single innermost definition: a one-line lambda,
+  the line a lambda opens or closes on (the enclosing function's statement
+  may share it), or two definitions written on one line (a macro that
+  defines two functions). Lines are all the
+  export records of a definition's extent, so these stay unresolved rather
+  than guessed. The export adds no function column; the lookup uses
+  `idx_functions_file_range`. Query:
+  [Source sites of a value move](SQLITE_SCHEMA.md#source-sites-of-a-value-move).
+- **Lowered operations only.** Edges with no statement of their own have no
+  rows: `points_to`, `call_arg`, `terminates`, `dlsym`, and parameter copies
+  the solver wires at a resolved call. Calls are located by `call_sites`
+  (`flow_calls`, `flow_return_calls`).
+- **Deterministic.** Rows are written in first-occurrence order of the merged
+  constraints, so they are identical for every `--jobs` (AGENTS.md
+  invariant 10).
+
 ## Function models (configurable summaries)
 
 Bodyless functions (libc, `_s`-family secure variants, vendor externs) contribute no
@@ -4086,9 +4127,10 @@ order in both traversal directions. Callee IDs appear only on operations.
 Edge `scope` identifies the function performing the primary operation,
 including a function writing a global or file-level static variable. Recorded
 calls use `caller_fn_id`; other operations use the exact source path and the
-primary location's line within a function definition's inclusive line range.
-Operations outside functions, missing positions, or ambiguous definitions use
-`null`. Destination-variable ownership never supplies operation ownership.
+innermost function definition whose inclusive line range holds the primary
+location's line ([Where a value moves](#where-a-value-moves)).
+Operations outside functions, missing positions, or definitions with no single
+innermost one use `null`. Destination-variable ownership never supplies operation ownership.
 
 Each operation contains `kind`, `expression`, and `location`, plus `callee_id`
 when known. Null callee IDs are omitted.

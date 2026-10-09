@@ -1,5 +1,52 @@
 # Evaluation Report
 
+## Flow-edge source sites: #204 — 2026-10-09
+
+Where a value moves is recorded in `flow_origins`, which the source-level
+presentation (#196) already writes, so #204 adds no column and no row to the
+export: `flow_edges` keeps its four columns and one row per endpoint pair
+and kind ([Where a value moves](ANALYSIS.md#where-a-value-moves)). The
+enclosing function of a site is looked up at query time, now as the
+innermost definition holding the line. Fixture:
+`tests/fixtures/flow_origin_sites/`.
+
+Measured on macOS 27.0.1, Apple M1, release build, `--jobs 8`,
+`TRACE_SOLVE_BUDGET_POPS=800000`, the pinned clean corpora of
+`scripts/eval_expected.json` (HDF `cdc75a2`, hiview `92408e2`, camera
+`8ffd69d`). Baseline is `9dab736` (master, #196); each binary is built from
+a clean archive of its commit in its own target directory.
+
+| Corpus | Export | Database, baseline → candidate | Change |
+|---|---|---:|---:|
+| HDF | minimal | 54,112,256 → 54,112,256 B | 0 B |
+| HDF | `--full-export` | 57,053,184 → 57,053,184 B | 0 B |
+| hiview | minimal | 27,275,264 → 27,275,264 B | 0 B |
+| hiview | `--full-export` | 29,224,960 → 29,224,960 B | 0 B |
+| camera | minimal | 72,376,320 → 72,376,320 B | 0 B |
+| camera | `--full-export` | 77,058,048 → 77,058,048 B | 0 B |
+
+Every table holds the same rows as the baseline (`flow_edges` HDF 154,256,
+hiview 58,970, camera 131,110; `flow_origins` 79,748, 25,860 and 48,919),
+and `flow_edges`, `flow_origins` and `flow_nodes` are identical at `--jobs 1`
+and `--jobs 8`. The sites' cost is that of the #196 table they already live
+in: `flow_origins` takes 8,052,736 B (HDF), 2,953,216 B (hiview) and
+4,513,792 B (camera) of `dbstat` pages, against 3,436,544, 1,273,856 and
+2,899,968 B for `flow_edges`.
+
+| Corpus | `flow_origins` rows | With a function, line-range rule → innermost | Held by two or more definitions before | Of them, now resolved |
+|---|---:|---:|---:|---:|
+| HDF | 79,748 | 72,635 → 72,670 | 81 | 35 |
+| hiview | 25,860 | 22,730 → 22,998 | 558 | 268 |
+| camera | 48,919 | 45,764 → 47,089 | 1,705 | 1,325 |
+
+The rows still without a function are outside every definition (file-scope
+initializers) or on a line no single definition is innermost for (a
+one-line lambda, the line a lambda opens or closes on). The documented
+query ([Source sites of a value move](SQLITE_SCHEMA.md#source-sites-of-a-value-move))
+over every camera row takes 0.34 s against 0.14 s for the line-range rule
+alone (median of three); `inspect dataflow` and `inspect slice` resolve only
+the sites they show.
+
 ## Four constructor follow-up findings: #207 — 2026-10-09
 
 Fixed the four follow-up constructor findings on top of `b1e33ac`, with local

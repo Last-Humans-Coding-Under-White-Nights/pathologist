@@ -145,6 +145,7 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 | Link targets / weak symbols | `link_commands.rs` (reading build metadata), `target_merge.rs` (per-image scopes and weak selection), `symbol.rs` (`TargetScope`) |
 | Fn-ptr arg-flow export | `solver.rs` (`extract_arg_flow`), `export.rs`, `arg_flow_edges.actual_fn_id` |
 | Flow-graph export / inspect queries | `export.rs` (`export_flow_graph`), `inspect.rs` |
+| Where a flow edge's operation is written (`flow_origins`; enclosing function as the innermost definition holding the line) | `trace-parse/src/lower.rs`, `flow_origins.rs`, `merge.rs`, `trace-db/src/export.rs` (`export_flow_provenance`), `inspect.rs` (`innermost_definition_holding`) → `docs/ANALYSIS.md` ("Where a value moves") |
 | Field summary / GEP fallback | `trace-analysis/src/pag.rs`, `solver.rs` |
 | New SQLite column | `trace-db/src/schema.rs`, `export.rs`, `docs/SQLITE_SCHEMA.md` |
 | Parse new C/C++ construct | `trace-parse/src/lower.rs` |
