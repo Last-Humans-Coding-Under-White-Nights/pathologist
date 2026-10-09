@@ -117,3 +117,15 @@ mod tests {
         assert_eq!(std::mem::size_of::<Constraint>(), 24);
     }
 }
+
+/// The index of a constraint in `Pag::constraints`: which load or store a
+/// [`crate::MemoryAccess`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConstraintId(pub u32);
+
+impl ConstraintId {
+    #[inline]
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}

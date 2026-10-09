@@ -358,3 +358,39 @@ fn a_lambda_body_site_is_the_lambdas() {
         None
     );
 }
+
+/// A call through a pointer field reads the field at the call
+/// (docs/ANALYSIS.md, "Memory access edges"), however the member is spelled:
+/// an explicit member operator (`cb_->operator()()`, `cb_->operator->()`)
+/// reads it as an ordinary member call (`this->cb_->OnError()`) does.
+#[test]
+fn a_call_through_a_pointer_field_reads_it_with_any_member_spelling() {
+    let src = "struct Callback {\n    void operator()();\n    Callback *operator->();\n    \
+               void OnError();\n};\nstruct Owner {\n    Callback *cb_;\n    void Call();\n    \
+               void Arrow();\n    void Control();\n};\nvoid Owner::Call() {\n    \
+               cb_->operator()();\n}\nvoid Owner::Arrow() {\n    cb_->operator->();\n}\n\
+               void Owner::Control() {\n    this->cb_->OnError();\n}\n";
+    let dir = scratch(&[("main.cpp", src)]);
+    let db = cli_analyze(dir.path(), &[]);
+    let conn = open_db(&db).unwrap();
+    // Each load from the field's address (a `gep` result) that reads the
+    // field's cell, at the position of the load's operation.
+    let mut reads: Vec<(i64, i64)> = conn
+        .prepare(
+            "SELECT o.line, o.col FROM flow_edges e \
+             JOIN flow_edges g ON g.kind = 'gep' AND g.dst_node = e.src_node \
+             JOIN flow_memory_access a ON a.edge_id = e.id \
+             JOIN flow_nodes c ON c.id = a.cell_node \
+             JOIN flow_origins o ON o.src_node = e.src_node AND o.dst_node = e.dst_node \
+               AND o.kind = e.kind \
+             WHERE e.kind = 'load' AND c.label = 'summary:Owner.cb_'",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    reads.sort();
+    reads.dedup();
+    assert_eq!(reads, vec![(13, 5), (16, 5), (19, 5)]);
+}

@@ -2,6 +2,7 @@ use crate::constraints::{
     ArgFlowEdge, CallGraphEdge, Constraint, ConstraintKind, LocKind, ResolutionKind,
 };
 use crate::contexts::{self, ContextStart, ExecutionContext};
+use crate::memory::MemoryAccess;
 use crate::pag::{Pag, PagNodeKind, SolverIndices};
 use crate::summaries::{
     class_type, is_value_of, ArgType, ContextKind, Effect, EffectGroup, FnModelSet, InvokeArgs,
@@ -140,6 +141,9 @@ pub struct AnalysisResult {
     /// resolved callback invocation, then one per IPC stub handler
     /// (`docs/ANALYSIS.md`, "Execution contexts").
     pub execution_contexts: Vec<ExecutionContext>,
+    /// The cells each load reads and each store writes, read off the
+    /// converged points-to sets (`docs/ANALYSIS.md`, "Memory access edges").
+    pub memory_accesses: Vec<MemoryAccess>,
     /// How the solver run ended: converged or budget-truncated. A truncated
     /// run exports a `solver_partial` marker and an `analyze`-stage
     /// diagnostic so the database is distinguishable from a complete one.
@@ -233,6 +237,18 @@ struct SolverState {
     /// Nodes whose one-time, points-to-independent constraint effects
     /// (addr-of seeding, GEP summary fallback) have already been applied.
     seen_once: FxHashSet<PagNodeId>,
+    /// The cells each `Gep` destination designates: the field cells, their
+    /// summaries and the fallback summaries the `Gep` step pointed it at
+    /// ([`Self::point_gep_at`]). Its points-to also holds those cells'
+    /// contents; this set is what a load or store through it touches
+    /// (`docs/ANALYSIS.md`, "Memory access edges").
+    designated: FxHashMap<PagNodeId, FxHashSet<LocId>>,
+    /// The `Gep` destinations whose designated cells are kept: those a load
+    /// reads through or a store writes through, the only ones
+    /// `memory_accesses` asks for, and those passed as call arguments, which
+    /// a `content_store` model may make a store's pointer mid-solve
+    /// ([`access_pointers`]).
+    access_pointers: FxHashSet<PagNodeId>,
     /// Dedup for dynamically added parameter-copy constraints: the same
     /// (actual → formal) pair recurs across many call sites and re-adding it
     /// per discovered edge explodes constraint volume on large trees.
@@ -681,6 +697,29 @@ impl SolverState {
         self.finish_merge(dst, fresh);
     }
 
+    /// A `Gep` step points `dst` at the field `cells` it designates. Their
+    /// contents also reach `dst`, so that uses of the field lvalue (`&obj.f`
+    /// passed onward, then loaded) still observe stores that lowering
+    /// recorded against a cell without an intervening load temp.
+    fn point_gep_at(
+        &mut self,
+        pag: &Pag,
+        fresh: &mut Vec<LocId>,
+        dst: PagNodeId,
+        cells: impl Iterator<Item = LocId> + Clone,
+    ) {
+        if self.access_pointers.contains(&dst) {
+            self.designated
+                .entry(dst)
+                .or_default()
+                .extend(cells.clone());
+        }
+        propagate_locs(self, fresh, dst, cells.clone());
+        for cell in cells {
+            self.merge_memory_into_if_grown(pag, fresh, dst, cell);
+        }
+    }
+
     /// A load `dst = *p` stepping over `locs`, the locations `p` newly holds,
     /// in order: a function value is `dst`'s own, anything else contributes
     /// its cell's memory ([`Self::merge_memory_into_if_grown`]). One call per
@@ -789,6 +828,34 @@ impl SolverState {
 /// cap check in `apply_store_to_targets`.
 const SUMMARY_MEM_CAP: usize = 1024;
 
+/// The `Gep` destinations the solver records designated cells for
+/// (`SolverState::designated`): the pointer of a load or store, or a call
+/// argument, which a `content_store` model wires as a store's pointer during
+/// the solve. No other constraint adds a load or store mid-solve.
+fn access_pointers(pag: &Pag, program: &Program) -> FxHashSet<PagNodeId> {
+    let gep_dsts: FxHashSet<PagNodeId> = pag
+        .constraints
+        .iter()
+        .filter(|c| c.kind == ConstraintKind::Gep)
+        .map(|c| c.dst)
+        .collect();
+    let accessed = pag.constraints.iter().filter_map(|c| match c.kind {
+        ConstraintKind::Load => Some(c.src),
+        ConstraintKind::Store => Some(c.dst),
+        _ => None,
+    });
+    let passed = program
+        .symbols
+        .call_sites
+        .iter()
+        .flat_map(|cs| &cs.var_args)
+        .filter_map(|(_, v)| pag.var_node.get(v).copied());
+    accessed
+        .chain(passed)
+        .filter(|n| gep_dsts.contains(n))
+        .collect()
+}
+
 fn solve(
     pag: &mut Pag,
     program: &Program,
@@ -797,7 +864,10 @@ fn solve(
     explicit_pops_budget: Option<u64>,
     explicit_secs_budget: Option<u64>,
 ) -> AnalysisResult {
-    let mut st = SolverState::default();
+    let mut st = SolverState {
+        access_pointers: access_pointers(pag, program),
+        ..Default::default()
+    };
     // Lives beside the state, not in it: passing a buffer to the step that
     // needs it makes two steps sharing one a compile error.
     let mut scratch = Scratch::default();
@@ -1076,12 +1146,11 @@ fn solve(
                                 pag.ensure_field_summary_for_var(program, base_var, field)
                             };
                             if let Some(summary) = summary_opt {
-                                propagate_locs(&mut st, &mut scratch.fresh, dst, [summary]);
-                                st.merge_memory_into_if_grown(
+                                st.point_gep_at(
                                     pag,
                                     &mut scratch.fresh,
                                     dst,
-                                    summary,
+                                    std::iter::once(summary),
                                 );
                             }
                         }
@@ -1269,20 +1338,9 @@ fn solve(
                         produced_cell = true;
                         // Field loc plus its instance-insensitive summary:
                         // the GEP result points AT these cells.
-                        let targets = [Some(field_loc), pag.summary_for_field_loc(field_loc)];
-                        propagate_locs(
-                            &mut st,
-                            &mut scratch.fresh,
-                            dst,
-                            targets.iter().filter_map(|t| t.as_ref().copied()),
-                        );
-                        // Cell contents reach the address node so that uses of
-                        // the field lvalue (`&obj.f` passed onward, then
-                        // loaded) still observe stores that lowering recorded
-                        // against the cell without an intervening load temp.
-                        for fl in targets.into_iter().flatten() {
-                            st.merge_memory_into_if_grown(pag, &mut scratch.fresh, dst, fl);
-                        }
+                        let summary = pag.summary_for_field_loc(field_loc);
+                        let cells = std::iter::once(field_loc).chain(summary);
+                        st.point_gep_at(pag, &mut scratch.fresh, dst, cells);
                         // ArrayFnMember element fns: reachable through
                         // the array itself or any pointer to an element.
                         if let Some(owner) = pag.locations[loc.0 as usize].var {
@@ -1316,8 +1374,7 @@ fn solve(
                             pag.ensure_field_summary_for_var(program, base_var, field)
                         };
                         if let Some(summary) = summary_opt {
-                            propagate_locs(&mut st, &mut scratch.fresh, dst, [summary]);
-                            st.merge_memory_into_if_grown(pag, &mut scratch.fresh, dst, summary);
+                            st.point_gep_at(pag, &mut scratch.fresh, dst, std::iter::once(summary));
                         }
                     }
                     continue 'gep;
@@ -1522,6 +1579,7 @@ fn solve(
     }
 
     let forwarded_arg_flow = std::mem::take(&mut st.forwarded_arg_flow);
+    let memory_accesses = crate::memory::memory_accesses(pag, &st.pts, &st.designated);
     let points_to = if retain_points_to {
         st.pts.into_iter().collect()
     } else {
@@ -1545,6 +1603,7 @@ fn solve(
         forwarded_arg_flow,
         terminator_events,
         execution_contexts,
+        memory_accesses,
         solve,
     }
 }
@@ -2501,17 +2560,28 @@ fn invoke_alignments(
             (supplied != Some(false)).then_some(1),
         ]
     };
+    // The ways among `typed` that `fits` has room for. A callable that takes
+    // the supplied value but has no room for it ahead of the arguments is
+    // not invocable with it: the arguments are then forwarded as given,
+    // whatever its first formal (`std::jthread t(work, token)` for
+    // `work(std::stop_token)`; [thread.jthread.cons]).
+    let admit = |typed: [Option<u32>; LEADS], fits: &dyn Fn(u32) -> bool| {
+        let mut cells = typed.map(|lead| lead.filter(|&lead| fits(lead)));
+        if cells.iter().all(Option::is_none) && typed[1].is_some() && fits(0) {
+            cells[0] = Some(0);
+        }
+        cells
+    };
     let mut grid = [[None; LEADS]; RECEIVER_SKIPS];
     match invoked.args {
         // A listed form passes exactly these: never a receiver.
         InvokeArgs::Listed(list) => {
-            for (cell, lead) in grid[0].iter_mut().zip(leads(this)) {
-                *cell = lead
-                    .filter(|&lead| {
-                        let n = list.len() as u32 + lead;
-                        open || (n + f.default_args >= declared && (n <= declared || f.variadic))
-                    })
-                    .map(|lead| this + lead);
+            let fits = |lead: u32| {
+                let n = list.len() as u32 + lead;
+                open || (n + f.default_args >= declared && (n <= declared || f.variadic))
+            };
+            for (cell, lead) in grid[0].iter_mut().zip(admit(leads(this), &fits)) {
+                *cell = lead.map(|lead| this + lead);
             }
         }
         // A site records the arguments that are variables or functions, not
@@ -2539,10 +2609,9 @@ fn invoke_alignments(
                 if !admitted {
                     continue;
                 }
-                for (cell, lead) in row.iter_mut().zip(leads(skip)) {
-                    *cell = lead
-                        .filter(|&lead| room(slots, lead))
-                        .map(|lead| skip + lead);
+                let fits = |lead: u32| room(slots, lead);
+                for (cell, lead) in row.iter_mut().zip(admit(leads(skip), &fits)) {
+                    *cell = lead.map(|lead| skip + lead);
                 }
             }
         }

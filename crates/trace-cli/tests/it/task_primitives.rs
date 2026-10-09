@@ -320,6 +320,107 @@ fn overrides_of_framework_entry_members_are_contexts() {
 }
 
 #[test]
+fn an_overload_of_a_declared_entry_member_is_no_entry() {
+    // With the framework's `virtual bool Run()` declared in the tree, the
+    // subclass's `Run()` overrides it and `Run(int *)` only overloads the
+    // name: one thread context, entered at the override, and the overload
+    // keeps its ordinary caller.
+    let (p, a) = analyze_source(&[(
+        "main.cpp",
+        "namespace OHOS { class Thread { public: virtual bool Run(); bool Start(); }; }\n\
+         class Worker : public OHOS::Thread {\npublic:\n    bool Run() override { return true; }\n    \
+         void Run(int *flag) { *flag = 1; }\n};\n\
+         void Caller(Worker *w, int *x) { w->Run(x); }\n\
+         int main() { Worker w; int v; Caller(&w, &v); return 0; }\n",
+    )]);
+    let found = contexts_of(&p, &a, "Worker::Run");
+    assert_eq!(found.len(), 1, "{found:?}");
+    let entry = p.symbols.function(found[0].entry);
+    assert_eq!(
+        entry.params.len(),
+        usize::from(p.symbols.has_this_param(entry.id)),
+        "the override takes no parameter: {entry:?}"
+    );
+}
+
+#[test]
+fn a_same_arity_overload_of_a_declared_entry_member_is_no_entry() {
+    // The framework declares `ProcessEvent(const InnerEvent &)`. The
+    // subclass's `ProcessEvent(int *)` takes one parameter too, but of
+    // another type: an overload, and no entry. The override is the one
+    // context, and the overload keeps its ordinary caller.
+    let (p, a) = analyze_source(&[(
+        "main.cpp",
+        "namespace OHOS { namespace AppExecFwk {\nclass InnerEvent {};\n\
+         class EventHandler { public: virtual void ProcessEvent(const InnerEvent &event); };\n} }\n\
+         class Handler : public OHOS::AppExecFwk::EventHandler {\npublic:\n    \
+         void ProcessEvent(const OHOS::AppExecFwk::InnerEvent &event) override {}\n    \
+         void ProcessEvent(int *flag) { *flag = 1; }\n};\n\
+         void Caller(Handler *h, int *x) { h->ProcessEvent(x); }\n\
+         int main() { Handler h; int v; Caller(&h, &v); return 0; }\n",
+    )]);
+    let found = contexts_of(&p, &a, "Handler::ProcessEvent");
+    assert_eq!(found.len(), 1, "{found:?}");
+    let entry = p.symbols.function(found[0].entry);
+    let params = p.symbols.explicit_params(entry).unwrap();
+    let param = p.types.get(params.get(0).unwrap());
+    assert!(
+        matches!(
+            param.desc.pointee(),
+            Some(trace_ir::TypeDesc::Struct { .. })
+        ),
+        "the override takes the event: {entry:?} {param:?}"
+    );
+}
+
+#[test]
+fn a_pointer_overload_of_a_reference_entry_member_is_no_entry() {
+    // `ProcessEvent(InnerEvent *)` beside the framework's
+    // `ProcessEvent(const InnerEvent &)`: both lower to a pointer to the
+    // class, but only the reference binding overrides. The pointer overload
+    // keeps its ordinary caller.
+    let (p, a) = analyze_source(&[(
+        "main.cpp",
+        "namespace OHOS { namespace AppExecFwk {\nclass InnerEvent {};\n\
+         class EventHandler { public: virtual void ProcessEvent(const InnerEvent &event); };\n} }\n\
+         class Handler : public OHOS::AppExecFwk::EventHandler {\npublic:\n    \
+         void ProcessEvent(const OHOS::AppExecFwk::InnerEvent &event) override {}\n    \
+         void ProcessEvent(OHOS::AppExecFwk::InnerEvent *event) {}\n};\n\
+         void Caller(Handler *h, OHOS::AppExecFwk::InnerEvent *e) { h->ProcessEvent(e); }\n\
+         int main() { Handler h; OHOS::AppExecFwk::InnerEvent e; Caller(&h, &e); return 0; }\n",
+    )]);
+    let found = contexts_of(&p, &a, "Handler::ProcessEvent");
+    assert_eq!(found.len(), 1, "{found:?}");
+    let entry = p.symbols.function(found[0].entry);
+    assert_eq!(
+        entry.reference_params,
+        [true],
+        "the override binds the event by reference: {entry:?}"
+    );
+}
+
+#[test]
+fn an_override_of_a_template_base_entry_member_is_an_entry() {
+    // The framework's class is a template: its `Run(std::unique_ptr<T>)`
+    // spells the parameter where the override spells the argument. The
+    // override is still the entry: a template argument the index does not
+    // know matches any, as it does for dispatch.
+    let (p, a) = analyze_source(&[(
+        "main.cpp",
+        "namespace std { template <typename T> class unique_ptr {}; }\n\
+         namespace OHOS { template <typename T> class Thread {\npublic:\n    \
+         virtual bool Run(std::unique_ptr<T> job);\n    bool Start();\n}; }\n\
+         struct Payload {};\n\
+         class Worker : public OHOS::Thread<Payload> {\npublic:\n    \
+         bool Run(std::unique_ptr<Payload> job) override { return true; }\n};\n\
+         int main() { Worker w; w.Start(); return 0; }\n",
+    )]);
+    let found = contexts_of(&p, &a, "Worker::Run");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].kind, ContextKind::Thread);
+}
+
+#[test]
 fn classes_the_tree_declares_are_only_what_they_are_named() {
     let (p, a) = task_primitives();
     for entry in [

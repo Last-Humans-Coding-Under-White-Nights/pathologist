@@ -88,8 +88,8 @@ omitted flow data from merger output.
 | `diagnostics` | ✓ | ✓ | ✓ |
 
 The flow-graph tables (`flow_nodes`, `flow_edges`) and the variables they
-reference are always exported because `trace inspect dataflow` works purely
-off the database.
+reference are always exported because `trace inspect dataflow` and
+`trace inspect slice` work purely off the database.
 
 ### Call site export filter
 
@@ -412,6 +412,9 @@ Edge kinds:
   synthetic `terminator` node recording the call site. No points-to value
   is produced; the edge documents where a buffer's prior contents stop.
 
+Which memory cells a `load` reads and a `store` writes is not an edge here:
+see [`flow_memory_access`](#flow_memory_access).
+
 Edges have no position columns. Where the statement behind an edge is written
 is recorded once, in [`flow_origins`](#source-level-presentation-metadata-v7),
 keyed by the same `(src_node, dst_node, kind)`; edges with no statement of their
@@ -420,6 +423,32 @@ own have no origin rows. Rules:
 [Source sites of a value move](#source-sites-of-a-value-move).
 
 **Indexes:** `flow_edges(src_node)`, `flow_edges(dst_node)`
+
+### flow_memory_access
+
+The memory cells each `load` reads and each `store` writes, read off the
+converged points-to sets. Always exported by analysis; additive to v7.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `edge_id` | INTEGER FK → `flow_edges` | The `load` or `store` edge of the access |
+| `cell_node` | INTEGER FK → `flow_nodes`, nullable | A cell (`loc` node) it reads or writes; NULL: its cells are not recorded |
+
+An access with recorded cells has one row per cell; one whose cells are not
+recorded (past the fan-out cap, or a pointer that points at no memory) has one
+row with `cell_node` NULL, so "not recorded" is never inferred from a missing
+row. The access's sites are its load's or store's `flow_origins` rows (join
+`flow_edges` on `id`, then `flow_origins` on `(src_node, dst_node, kind)`); none
+are repeated for it. Read as edges, a load's row is a `mem_read` from the cell
+into the load's destination and a store's a `mem_write` from the stored value
+into the cell; `inspect slice` follows them, `inspect dataflow` and the C API
+do not. Rules: [Memory access edges](ANALYSIS.md#memory-access-edges).
+
+Detect it with the table and its two columns: an earlier v7 export lacks the
+table, and `trace-merge` output (`analysis_run.options_json.stage = "merge"`)
+has it empty, like its other flow tables.
+
+**Indexes:** `flow_memory_access(edge_id)`, `flow_memory_access(cell_node)`
 
 ### types
 
@@ -669,8 +698,8 @@ Inspection indexes cover both endpoints of `flow_origins`, `flow_calls`, and
 `flow_return_calls`, the destination of `flow_field_access`, and parameter
 copies by `(fn_id, name)` under `kind='param'`. Function ownership lookup uses
 `idx_functions_file_range` on `functions(file_id, is_defined, line_start, line_end)`
-to seek definitions in the operation's file instead of building a temporary
-index over all functions for each position batch. These indexes are exported in
+to read the definitions of each operation's file once, instead of scanning all
+functions. These indexes are exported in
 minimal and full modes and built after bulk export,
 keep version 7's row layout, and support selective source-level inspection.
 Older v7 exports may lack these additive indexes; re-analysis supplies them.

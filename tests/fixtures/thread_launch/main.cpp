@@ -57,3 +57,10 @@ void StartLocalRef(std::launch held) {
 void PtrHit() {}
 void PtrWork(std::stop_token *token, Callback cb) { cb(); }
 void StartPtr(std::stop_token *tp) { std::jthread t(PtrWork, tp, PtrHit); }
+
+// A callable that takes only a token, started with a token the caller
+// passes: `std::jthread` can supply none ahead of it (nothing would be
+// invocable), so it forwards the arguments as given.
+void TokenOnlyHit() {}
+void TokenOnly(std::stop_token token) { TokenOnlyHit(); }
+void StartTokenOnly(std::stop_token token) { std::jthread t(TokenOnly, token); }

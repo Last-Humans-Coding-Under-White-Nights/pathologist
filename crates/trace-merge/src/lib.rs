@@ -691,6 +691,12 @@ pub fn merge_databases<P: AsRef<Path>>(
     // 5. Call Edges Ingestion & Cross-Repository Resolution
     let mut unified_call_edges: Vec<DbCallEdge> = Vec::new();
     let mut emitted: FxHashSet<(Option<i64>, i64)> = FxHashSet::default();
+    // Per input edge, by its call site and callee as that input recorded
+    // them: the merged functions the edge now goes to. An execution context
+    // started at that site with that callee as its entry follows them (5b):
+    // a callback declared in one repository and defined in another enters
+    // the definition, as the edge does.
+    let mut retargets: FxHashMap<(usize, i64, i64), Vec<i64>> = FxHashMap::default();
     let mut unresolved_external_counts: FxHashMap<String, usize> = FxHashMap::default();
 
     for (db_idx, conn) in conns.iter().enumerate() {
@@ -865,6 +871,12 @@ pub fn merge_databases<P: AsRef<Path>>(
                     (vec![remapped_callee], edge.resolution)
                 };
 
+            if let Some(cs) = edge.call_site_id {
+                retargets
+                    .entry((db_idx, cs, edge.callee_fn_id))
+                    .or_default()
+                    .extend(new_callees.iter().copied());
+            }
             for new_callee_id in new_callees {
                 if new_cs_id.is_some() && !emitted.insert((new_cs_id, new_callee_id)) {
                     continue;
@@ -901,9 +913,13 @@ pub fn merge_databases<P: AsRef<Path>>(
 
     // 5b. Execution contexts, carried over with remapped ids. Each keeps the
     // multi-instance evidence of its own input: a cross-repository edge
-    // resolved above is not searched for new cycles or parents. A row whose
-    // function or call site did not survive the merge is dropped, and an
-    // input exported before the table existed contributes none.
+    // resolved above is not searched for new cycles or parents. A context a
+    // call site starts enters what the edge from that site to its entry now
+    // goes to (`retargets`): the definition another repository holds of a
+    // callback this one only declares, or each candidate of an ambiguous
+    // edge. A row whose function or call site did not survive the merge is
+    // dropped, and an input exported before the table existed contributes
+    // none.
     let mut carried_contexts: Vec<DbExecutionContext> = Vec::new();
     for (db_idx, conn) in conns.iter().enumerate() {
         if !has_contexts_table[db_idx] {
@@ -940,8 +956,21 @@ pub fn merge_databases<P: AsRef<Path>>(
         };
         for r in rows {
             let ctx = r?;
-            let Some(&entry_fn_id) = fn_remap[db_idx].get(&ctx.entry_fn_id) else {
-                continue;
+            let entries: Vec<i64> = match ctx
+                .call_site_id
+                .and_then(|cs| retargets.get(&(db_idx, cs, ctx.entry_fn_id)))
+            {
+                Some(targets) => {
+                    let mut targets = targets.clone();
+                    targets.sort_unstable();
+                    targets.dedup();
+                    targets
+                }
+                None => fn_remap[db_idx]
+                    .get(&ctx.entry_fn_id)
+                    .copied()
+                    .into_iter()
+                    .collect(),
             };
             let (Some(call_site_id), Some(api_fn_id)) = (
                 remap_optional(&cs_remap[db_idx], ctx.call_site_id),
@@ -949,12 +978,14 @@ pub fn merge_databases<P: AsRef<Path>>(
             ) else {
                 continue;
             };
-            carried_contexts.push(DbExecutionContext {
-                entry_fn_id,
-                call_site_id,
-                api_fn_id,
-                ..ctx
-            });
+            for entry_fn_id in entries {
+                carried_contexts.push(DbExecutionContext {
+                    entry_fn_id,
+                    call_site_id,
+                    api_fn_id,
+                    ..ctx.clone()
+                });
+            }
         }
     }
     let unified_contexts = unify_execution_contexts(carried_contexts);

@@ -295,6 +295,44 @@ void Setup(void) { register_handler(Handler); }
     assert!(child.self_concurrent);
 }
 
+/// An IPC handler is self-concurrent on its kind alone, but the evidence
+/// that its parent runs more than once is still recorded on it.
+#[test]
+fn a_modelled_ipc_handler_under_a_multi_instance_parent_keeps_the_evidence() {
+    let dir = scratch(&[(
+        "main.c",
+        r#"
+void Handler(void) {}
+void register_handler(void (*h)(void));
+void *LoopWorker(void *arg) {
+    register_handler(Handler);
+    return arg;
+}
+void Setup(void) {
+    int i;
+    for (i = 0; i < 3; i++) {
+        unsigned long tid;
+        pthread_create(&tid, 0, LoopWorker, 0);
+    }
+}
+"#,
+    )]);
+    let p = trace_parse::build_program(dir.path(), &default_opts(dir.path())).unwrap();
+    let a = analyze_with_models(
+        &p,
+        "[[model]]\nname = \"register_handler\"\n\
+         effects = [{ kind = \"invoke\", param = 0, context = \"ipc_handler\" }]\n",
+    );
+    assert_eq!(
+        context(&p, &a, "LoopWorker").multi_instance,
+        MultiInstance::Loop
+    );
+    let handler = context(&p, &a, "Handler");
+    assert_eq!(handler.kind, ContextKind::IpcHandler);
+    assert_eq!(handler.multi_instance, MultiInstance::Parent, "{handler:?}");
+    assert!(handler.self_concurrent);
+}
+
 /// A call through a virtual member reaches an override another unit
 /// declares through a site the merge adds; that site keeps the loop evidence
 /// of the call.

@@ -1777,6 +1777,71 @@ fn execution_contexts_carry_over_with_remapped_ids() {
     );
 }
 
+/// A callback one repository only declares and another defines: the start
+/// edge is re-linked to the definition, and so is the context it starts,
+/// whose entry would otherwise stay the declaration, with no body behind
+/// it.
+#[test]
+fn a_context_started_at_a_declared_callback_enters_its_definition() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let repo_a = root.join("repo_a");
+    let repo_b = root.join("repo_b");
+    fs::create_dir_all(&repo_a).unwrap();
+    fs::create_dir_all(&repo_b).unwrap();
+    fs::write(
+        repo_a.join("a.c"),
+        r#"
+        void *Worker(void *arg);
+        void Start(void *ctx) {
+            unsigned long tid;
+            pthread_create(&tid, 0, Worker, ctx);
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        repo_b.join("b.c"),
+        r#"
+        void Step(void *arg) {}
+        void *Worker(void *arg) { Step(arg); return arg; }
+        "#,
+    )
+    .unwrap();
+    let db_a = root.join("a.db");
+    let db_b = root.join("b.db");
+    analyze_repo(&repo_a, &db_a);
+    analyze_repo(&repo_b, &db_b);
+    let merged = root.join("merged.db");
+    merge_databases(
+        &[db_a, db_b],
+        &MergeOptions {
+            output: merged.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+
+    let conn = Connection::open(&merged).unwrap();
+    let rows: Vec<(String, i64, i64)> = conn
+        .prepare(
+            "SELECT f.name, f.is_defined, \
+                    (SELECT COUNT(*) FROM call_edges ce \
+                     WHERE ce.call_site_id = e.call_site_id AND ce.callee_fn_id = e.entry_fn_id) \
+             FROM execution_contexts e JOIN functions f ON f.id = e.entry_fn_id ORDER BY e.id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows,
+        [("Worker".to_string(), 1, 1)],
+        "the context enters the definition the start edge was re-linked to"
+    );
+}
+
 /// Merged rows keep the order `trace analyze` writes: every submitted
 /// context by call site, then the IPC handlers, whichever input they come
 /// from.

@@ -377,6 +377,25 @@ fn jthread_forwards_an_argument_to_a_pointer_to_a_token() {
 }
 
 #[test]
+fn jthread_forwards_a_token_the_caller_passes_when_it_can_supply_none() {
+    // `TokenOnly(std::stop_token)` has no room for a supplied token ahead
+    // of the caller's: `std::jthread` forwards the arguments as given.
+    let (p, a) = thread_launch();
+    assert!(indirect(p, a, "StartTokenOnly", "TokenOnly"));
+    let token = local_variable(p, "TokenOnly", "token");
+    let rows: Vec<_> = a
+        .arg_flow_edges
+        .iter()
+        .filter(|row| row.formal == token)
+        .collect();
+    assert_eq!(rows.len(), 1, "the caller's token, forwarded: {rows:?}");
+    assert_eq!(
+        rows[0].actual_var,
+        Some(local_variable(p, "StartTokenOnly", "token"))
+    );
+}
+
+#[test]
 fn jthread_forwards_as_std_thread_to_a_callable_without_a_stop_token() {
     let (p, a) = thread_launch();
     assert!(indirect(p, a, "StartPlain", "Plain"));

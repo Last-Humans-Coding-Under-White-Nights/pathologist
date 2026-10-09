@@ -614,6 +614,13 @@ pub enum SpellingTolerance {
     /// (`std::string` read as `int` under `using namespace std`), never for
     /// an in-tree class (`Set(int)` is not `Set(Foo)`).
     Redirect,
+    /// Whether a definition is the override of a declared member a model
+    /// names, the entry of an execution context: as [`Self::Override`] for a
+    /// template argument and a type the index does not know, but an `int`
+    /// stands in only for a class the index does not declare, as in
+    /// [`Self::Redirect`]: `ProcessEvent(int *)` beside a declared
+    /// `ProcessEvent(const InnerEvent &)` is an overload, and no entry.
+    Entry,
 }
 
 /// Whether two declarations' parameter types may be one type read in two
@@ -640,11 +647,17 @@ pub fn spelled_alike(
         tolerance,
         SpellingTolerance::Registration | SpellingTolerance::Override
     );
-    let stand_in_for_undeclared = tolerance == SpellingTolerance::Redirect
-        && (types.is_undeclared_class(x) || types.is_undeclared_class(y));
+    let stand_in_for_undeclared = matches!(
+        tolerance,
+        SpellingTolerance::Redirect | SpellingTolerance::Entry
+    ) && (types.is_undeclared_class(x)
+        || types.is_undeclared_class(y));
     if int_against_class && !lenient && !stand_in_for_undeclared {
         return false;
     }
+    // An override's unknown is a dependent or unresolved type, as for
+    // dispatch.
+    let lenient = lenient || tolerance == SpellingTolerance::Entry;
     // A type a signature records as unknown is a class or enum lowering could
     // not resolve: it may be another spelling of a class, never a known
     // scalar or pointer (`Set(Mode)` is not `Set(int)`).
@@ -683,20 +696,18 @@ pub fn spelled_alike(
                     | TypeDesc::SizeT
             )
     };
-    if tolerance == SpellingTolerance::Override
-        && (stand_in(x) || stand_in(y))
-        && integral(x)
-        && integral(y)
-    {
+    let overriding = matches!(
+        tolerance,
+        SpellingTolerance::Override | SpellingTolerance::Entry
+    );
+    if overriding && (stand_in(x) || stand_in(y)) && integral(x) && integral(y) {
         return true;
     }
     match (x, y) {
         (
             TypeDesc::Struct { name: x, .. } | TypeDesc::Union { name: x, .. },
             TypeDesc::Struct { name: y, .. } | TypeDesc::Union { name: y, .. },
-        ) if tolerance != SpellingTolerance::Ranking => {
-            class_names_alike(types, x, y, tolerance == SpellingTolerance::Override)
-        }
+        ) if tolerance != SpellingTolerance::Ranking => class_names_alike(types, x, y, overriding),
         _ => false,
     }
 }
@@ -1855,6 +1866,21 @@ impl SymbolTable {
                 tolerance,
             )
         }))
+    }
+
+    /// Whether `a` and `b` bind their explicit parameters alike by reference
+    /// or by value (`reference_params`), at every position both record: a
+    /// reference (`const T &`) and a pointer (`T *`) lower to one pointer
+    /// type, so types alike ([`Self::explicit_params_alike`]) do not say
+    /// which an override binds. A side that recorded none, having read no
+    /// declaration, agrees with any.
+    pub fn references_alike(a: &Function, b: &Function) -> bool {
+        a.reference_params.is_empty()
+            || b.reference_params.is_empty()
+            || a.reference_params
+                .iter()
+                .zip(&b.reference_params)
+                .all(|(x, y)| x == y)
     }
 
     /// Type of a parameter variable, for overload signature comparison.

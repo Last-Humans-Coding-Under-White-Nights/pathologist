@@ -10,7 +10,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 pub use trace_analysis::LocKind;
 
 mod editor;
+mod slice;
 pub use editor::*;
+pub use slice::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -150,6 +152,23 @@ impl FlowNodeKind {
     }
 }
 
+/// The schema's `flow_nodes.detail` string of a `loc` node of kind `kind`;
+/// [`loc_kind_from_schema_str`] reads it back.
+pub fn loc_kind_schema_str(kind: LocKind) -> &'static str {
+    match kind {
+        LocKind::Global => "global",
+        LocKind::FileStatic => "file_static",
+        LocKind::FnStatic => "fn_static",
+        LocKind::Local => "local",
+        LocKind::Heap => "heap",
+        LocKind::Field => "field",
+        LocKind::FieldSummary => "field_summary",
+        LocKind::ArraySummary => "array_summary",
+        LocKind::Function => "function",
+        LocKind::StringLit => "string_lit",
+    }
+}
+
 /// Map the schema's `flow_nodes.detail` string for `loc` nodes back to the
 /// abstract-location kind it was exported from (`LocKind`).
 pub fn loc_kind_from_schema_str(s: &str) -> Option<LocKind> {
@@ -266,11 +285,11 @@ pub fn find_functions_at(
     let sql = format!(
         "SELECT f.id, f.name, p.path, f.line_start, f.line_end, f.is_defined \
          FROM functions f JOIN files p ON p.id = f.file_id \
-         WHERE p.path LIKE ?1 AND {} AND f.line_start <= ?2 AND f.line_end >= ?2",
+         WHERE p.path LIKE ?1 ESCAPE '!' AND {} AND f.line_start <= ?2 AND f.line_end >= ?2",
         has_source_location_sql("f")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let pattern = format!("%{file_substring}%");
+    let pattern = contains_pattern(file_substring);
     let rows = stmt.query_map(rusqlite::params![pattern, line], |row| {
         Ok(FunctionRef {
             id: row.get(0)?,
@@ -498,7 +517,7 @@ pub fn call_edges(conn: &Connection, filter: &CallEdgeFilter<'_>) -> Result<Vec<
         push_fn_name_filter(&mut sql, &mut params, "callee.name", t);
     }
     if let Some(p) = filter.file {
-        params.push(format!("%{}%", like_escape(p)));
+        params.push(contains_pattern(p));
         let n = params.len();
         // A synthesized external's stored file is an arbitrary call site, so
         // it must not match a `--file` filter as if it were the callee's own.
@@ -550,6 +569,12 @@ fn push_fn_name_filter(sql: &mut String, params: &mut Vec<String>, column: &str,
     sql.push_str(&format!(
         " AND ({column} = ?{eq} OR ({column} LIKE ?{like} ESCAPE '!' AND SUBSTR({column}, -LENGTH(?{suffix})) = ?{suffix}))"
     ));
+}
+
+/// A `LIKE ... ESCAPE '!'` pattern matching text that contains `s`
+/// literally: a path filter is a substring, not a pattern.
+pub(crate) fn contains_pattern(s: &str) -> String {
+    format!("%{}%", like_escape(s))
 }
 
 fn like_escape(s: &str) -> String {
@@ -1000,6 +1025,20 @@ pub struct SymbolRef {
     pub col: i64,
 }
 
+impl SymbolRef {
+    /// Whether 1-based `line:col` is inside the declared identifier as
+    /// recorded: the declaration's line, from its column for the name's
+    /// length in characters (LineMap columns count Unicode scalar values).
+    pub fn covers(&self, line: i64, col: i64) -> bool {
+        line == self.line && covers_column(col, self.col, self.name.chars().count() as i64)
+    }
+}
+
+/// `col` lies in the `name_len` columns from `vcol`.
+fn covers_column(col: i64, vcol: i64, name_len: i64) -> bool {
+    col >= vcol && col < vcol.saturating_add(name_len)
+}
+
 impl std::fmt::Display for SymbolRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ({})", self.name, self.kind)?;
@@ -1040,9 +1079,10 @@ pub fn find_symbols_at(
          FROM variables v \
          JOIN files p ON p.id = v.file_id \
          LEFT JOIN functions f ON f.id = v.fn_id \
-         WHERE p.path LIKE ?1 AND v.line BETWEEN ?2 - 2 AND ?2 + 2 AND v.is_synthetic = 0",
+         WHERE p.path LIKE ?1 ESCAPE '!' AND v.line BETWEEN ?2 - 2 AND ?2 + 2 \
+           AND v.is_synthetic = 0",
     )?;
-    let pattern = format!("%{file_substring}%");
+    let pattern = contains_pattern(file_substring);
     let rows = stmt.query_map(rusqlite::params![pattern, line], |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -1090,7 +1130,7 @@ pub fn find_symbols_at(
 /// Within each category use actual distance, followed by stable identity ties.
 fn rank_symbol(line: i64, col: i64, vline: i64, vcol: i64, name_len: i64) -> (u64, u64) {
     let line_dist = vline.abs_diff(line);
-    if line_dist == 0 && col >= vcol && col < vcol.saturating_add(name_len) {
+    if line_dist == 0 && covers_column(col, vcol, name_len) {
         (0, vcol.abs_diff(col))
     } else {
         (line_dist.saturating_add(1), vcol.abs_diff(col))
@@ -1100,54 +1140,7 @@ fn rank_symbol(line: i64, col: i64, vline: i64, vcol: i64, name_len: i64) -> (u6
 /// Shared root selection, including canonical-function parameter twins.
 pub(crate) fn dataflow_starts(conn: &Connection, symbols: &[SymbolRef]) -> Result<Vec<i64>> {
     let var_ids: Vec<i64> = symbols.iter().map(|s| s.var_id).collect();
-    let mut starts: Vec<i64> = Vec::new();
-    for vid in &var_ids {
-        let mut stmt =
-            conn.prepare("SELECT id FROM flow_nodes WHERE var_id = ?1 ORDER BY kind, id")?;
-        let rows = stmt.query_map([vid], |row| row.get::<_, i64>(0))?;
-        for r in rows {
-            starts.push(r?);
-        }
-    }
-    // Parameter twins: the same C parameter is lowered once per TU that sees
-    // its declaration, so arg-flow wiring may attach to the header-prototype
-    // copy while the user queried the definition-site copy (or vice versa).
-    // After merge all copies share one canonical function record, so twins
-    // are same-name params under the *same* fn_id — widening must not reach
-    // unrelated same-name functions (e.g. file-`static`s in other files).
-    // Runs before the empty-start bail: a queried copy may lack flow nodes
-    // entirely while its twin carries the graph.
-    let touches_any = starts.iter().any(|&n| {
-        conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM flow_edges WHERE src_node = ?1 OR dst_node = ?1)",
-            [n],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-            != 0
-    });
-    if !touches_any {
-        for vid in &var_ids {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT v2.id FROM variables v1 \
-                 JOIN variables v2 \
-                   ON v2.fn_id = v1.fn_id AND v2.name = v1.name AND v2.kind = 'param' \
-                 WHERE v1.id = ?1 AND v2.id != v1.id",
-            )?;
-            let rows = stmt.query_map([vid], |row| row.get::<_, i64>(0))?;
-            for tw in rows.flatten() {
-                let mut nstmt =
-                    conn.prepare("SELECT id FROM flow_nodes WHERE var_id = ?1 ORDER BY kind, id")?;
-                let nrows = nstmt.query_map([tw], |row| row.get::<_, i64>(0))?;
-                for r in nrows {
-                    let nid = r?;
-                    if !starts.contains(&nid) {
-                        starts.push(nid);
-                    }
-                }
-            }
-        }
-    }
+    let starts = flow_nodes_of_variables(conn, &var_ids, true)?;
     if starts.is_empty() {
         bail!(
             "no value-flow node for symbol(s): {}; \
@@ -1161,6 +1154,69 @@ pub(crate) fn dataflow_starts(conn: &Connection, symbols: &[SymbolRef]) -> Resul
         );
     }
 
+    Ok(starts)
+}
+
+/// The `flow_nodes` of variables: each one's variable node and storage
+/// location, and with `cells` the field cells of that storage too.
+///
+/// Parameter twins: the same C parameter is lowered once per TU that sees
+/// its declaration, so arg-flow wiring may attach to the header-prototype
+/// copy while the user queried the definition-site copy (or vice versa).
+/// After merge all copies share one canonical function record, so twins are
+/// same-name params under the *same* fn_id — widening must not reach
+/// unrelated same-name functions (e.g. file-`static`s in other files). It
+/// happens when no node of the queried copies has a constraint edge: a
+/// queried copy may lack flow nodes entirely while its twin carries the
+/// graph.
+pub(crate) fn flow_nodes_of_variables(
+    conn: &Connection,
+    var_ids: &[i64],
+    cells: bool,
+) -> Result<Vec<i64>> {
+    let sql = if cells {
+        "SELECT id FROM flow_nodes WHERE var_id = ?1 ORDER BY kind, id"
+    } else {
+        "SELECT id FROM flow_nodes WHERE var_id = ?1 AND (kind = 'var' OR detail <> 'field') \
+         ORDER BY kind, id"
+    };
+    let mut nodes_of = conn.prepare(sql)?;
+    let mut starts: Vec<i64> = Vec::new();
+    for vid in var_ids {
+        for r in nodes_of.query_map([vid], |row| row.get::<_, i64>(0))? {
+            starts.push(r?);
+        }
+    }
+    let mut touches = conn
+        .prepare("SELECT EXISTS(SELECT 1 FROM flow_edges WHERE src_node = ?1 OR dst_node = ?1)")?;
+    let mut touches_any = false;
+    for &n in &starts {
+        if touches.query_row([n], |r| r.get::<_, i64>(0)).unwrap_or(0) != 0 {
+            touches_any = true;
+            break;
+        }
+    }
+    if !touches_any {
+        let mut twins = conn.prepare(
+            "SELECT DISTINCT v2.id FROM variables v1 \
+             JOIN variables v2 \
+               ON v2.fn_id = v1.fn_id AND v2.name = v1.name AND v2.kind = 'param' \
+             WHERE v1.id = ?1 AND v2.id != v1.id",
+        )?;
+        for vid in var_ids {
+            let ids: Vec<i64> = twins
+                .query_map([vid], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for tw in ids {
+                for r in nodes_of.query_map([tw], |row| row.get::<_, i64>(0))? {
+                    let nid = r?;
+                    if !starts.contains(&nid) {
+                        starts.push(nid);
+                    }
+                }
+            }
+        }
+    }
     Ok(starts)
 }
 
@@ -1370,11 +1426,11 @@ fn nearest_functions(
     line: i64,
     limit: usize,
 ) -> Result<Vec<FunctionRef>> {
-    let pattern = format!("%{file}%");
+    let pattern = contains_pattern(file);
     let mut stmt = conn.prepare(
         "SELECT f.id, f.name, p.path, f.line_start, f.line_end, f.is_defined \
          FROM functions f JOIN files p ON p.id = f.file_id \
-         WHERE p.path LIKE ?1 AND f.is_defined != 0 \
+         WHERE p.path LIKE ?1 ESCAPE '!' AND f.is_defined != 0 \
          ORDER BY min(abs(f.line_start - ?2), abs(f.line_end - ?2)), f.line_start LIMIT ?3",
     )?;
     let rows = stmt.query_map(rusqlite::params![pattern, line, limit as i64], |row| {
@@ -1413,7 +1469,7 @@ pub fn find_functions_by_name(
         format!("::{name}"),
     ];
     if let Some(fs) = file_substring {
-        params.push(format!("%{}%", like_escape(fs)));
+        params.push(contains_pattern(fs));
         let idx = params.len();
         // A synthesized external has no file of its own (its stored `file_id`
         // is an arbitrary call-site fallback), so file filters must not match

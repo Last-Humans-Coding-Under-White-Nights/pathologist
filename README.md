@@ -359,7 +359,9 @@ variable: use a receiver downstream or its formal upstream to inspect receiver
 passing, and a nullable formal upstream to inspect null arguments. See the
 authoritative
 [Source-level dataflow presentation](docs/ANALYSIS.md#source-level-dataflow-presentation)
-for identity, traversal, provenance, and compatibility rules.
+for identity, traversal, provenance, and compatibility rules. The walk stays on
+the constraint edges; the memory edges that join a store to the loads of the
+same cell are followed by `trace inspect slice`.
 
 Dataflow JSON contains `title`, `direction` (`down` or `up`), `depth`,
 `truncated`, `scopes`, `nodes`, and `edges`. The four scope description arrays
@@ -400,6 +402,38 @@ A dataflow edge in `--format json`:
 ```bash
 trace inspect /tmp/hdf.db dataflow --file can_test.c --line 33 --col 31
 trace inspect /tmp/hdf.db dataflow --file usb_raw_io.c --line 331 --col 23 --depth 4
+```
+
+### `trace inspect slice`
+
+A bounded value slice from a variable or field access: up to where the
+value comes from, then down to where it goes. Each node lists the
+[execution contexts](docs/ANALYSIS.md#execution-contexts) that reach it,
+and edges where the value may change hands between threads, tasks or IPC
+requests are flagged as cross-context. A flag is a hint, not a proven race.
+Rules, output fields and limits:
+[Value slice](docs/ANALYSIS.md#value-slice-inspect-slice).
+
+```text
+trace inspect <DB> slice --file SUBSTR --line N --col C [--name IDENT]
+    [--up-depth N] [--down-depth N] [--format text|json]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--file <SUBSTR>`, `--line <N>`, `--col <C>` | Position of a variable (declaration, use, or a call's argument: `p` in `sink(p);`) or of a field access (`cb_` in `cb_ = cb;`; `p` after `->` in `s->p = p;`, the other `p` being the variable). `--file` is a literal substring of the recorded path (`%` and `_` are not wildcards). The column is inside the identifier. |
+| `--name <IDENT>` | The identifier at the position, when the recorded source file cannot be read from here or the line moves several values. |
+| `--up-depth <N>` | Stage 1 limit: edges followed backwards to the sources. |
+| `--down-depth <N>` | Stage 2 limit: edges followed forwards from each source. |
+| `--format` | `text` (default, for people) or `json` (for tools). |
+
+**Examples**
+
+```bash
+trace analyze tests/fixtures/value_slice -o /tmp/slice.db
+# `callback_` in `ICallback *cb = callback_;`: written by an IPC handler, read by a thread
+trace inspect /tmp/slice.db slice --file value_slice/main.cpp --line 59 --col 25
+trace inspect /tmp/slice.db slice --file value_slice/main.cpp --line 59 --col 25 --format json
 ```
 
 ### Graph output formats
@@ -597,7 +631,7 @@ indexes before that export phase. See the
 SQLite export also builds a function-range index for operation ownership lookup
 during source-level dataflow inspection; see the [inspection index rules](docs/SQLITE_SCHEMA.md#source-level-presentation-metadata-v7).
 
-Schema version: **v7**, an additive compatibility family. Readers check required structures and database origin rather than infer available capabilities from the number alone; see the [version and capability contract](docs/SQLITE_SCHEMA.md#version-and-capability-contract). Optional `flow_call_origins` and `flow_call_expressions` metadata improves exact occurrence attribution and call text; older v7 analysis exports retain fallback behavior. Re-analysis supplies new metadata and selective-query indexes. `trace-merge` accepts v7 inputs with the required call-graph columns, rejects v6 or missing required structures before writing output, and produces a call-graph database without PAG/provenance data. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries. `flow_edges` rows carry no position: `flow_origins` records where each edge's operation is written (original file, line and column, one row per statement), and the enclosing function follows from that position (see [Where a value moves](docs/ANALYSIS.md#where-a-value-moves)). `execution_contexts` lists where threads, tasks and IPC requests start running code — one row per resolved callback of an `invoke` model (`pthread_create`, `std::thread`, `ffrt::submit`, `EventHandler::PostTask`, `HdfWorkInit`, ...), with the model's name and the receiver variable it was submitted on when named, and one per entry no call site starts (an override of `Thread::Run`, `EventHandler::ProcessEvent` or `DeathRecipient::OnRemoteDied`; an IPC stub handler) — with its kind (`thread`, `pool_task`, `serial_task`, `ipc_handler`, `unknown`) and multi-instance evidence (`loop`, `cycle`, `parent`, `unknown`; see [Execution contexts](docs/ANALYSIS.md#execution-contexts)); an earlier v7 export has no such table.
+Schema version: **v7**, an additive compatibility family. Readers check required structures and database origin rather than infer available capabilities from the number alone; see the [version and capability contract](docs/SQLITE_SCHEMA.md#version-and-capability-contract). Optional `flow_call_origins` and `flow_call_expressions` metadata improves exact occurrence attribution and call text; older v7 analysis exports retain fallback behavior. Re-analysis supplies new metadata and selective-query indexes. `trace-merge` accepts v7 inputs with the required call-graph columns, rejects v6 or missing required structures before writing output, and produces a call-graph database without PAG/provenance data. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries. `flow_edges` rows carry no position: `flow_origins` records where each edge's operation is written (original file, line and column, one row per statement), and the enclosing function follows from that position (see [Where a value moves](docs/ANALYSIS.md#where-a-value-moves)). `flow_memory_access` records which memory cells each load and store reaches (its sites are that load's or store's `flow_origins` rows), or that none are recorded ([Memory access edges](docs/ANALYSIS.md#memory-access-edges)); an earlier v7 export has no such table and `trace-merge` output leaves it empty. `execution_contexts` lists where threads, tasks and IPC requests start running code — one row per resolved callback of an `invoke` model (`pthread_create`, `std::thread`, `ffrt::submit`, `EventHandler::PostTask`, `HdfWorkInit`, ...), with the model's name and the receiver variable it was submitted on when named, and one per entry no call site starts (an override of `Thread::Run`, `EventHandler::ProcessEvent` or `DeathRecipient::OnRemoteDied`; an IPC stub handler) — with its kind (`thread`, `pool_task`, `serial_task`, `ipc_handler`, `unknown`) and multi-instance evidence (`loop`, `cycle`, `parent`, `unknown`; see [Execution contexts](docs/ANALYSIS.md#execution-contexts)); an earlier v7 export has no such table.
 
 ### Entity relationship (overview)
 

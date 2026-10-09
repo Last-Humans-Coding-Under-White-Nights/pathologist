@@ -34,4 +34,5 @@ mod solver_budget_tests;
 mod static_member_sharing;
 mod task_primitives;
 mod thread_entry;
+mod value_slice;
 mod weak_targets;

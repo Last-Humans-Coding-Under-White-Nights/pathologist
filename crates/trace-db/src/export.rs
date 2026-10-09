@@ -5,6 +5,7 @@ use rustc_hash::FxHashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use trace_analysis::{AnalysisResult, ConstraintKind, LocKind, Pag, PagNodeKind};
+use trace_ir::PagNodeId;
 use trace_ir::{FnId, Linkage, Program, StorageClass, TypeDesc, VarId};
 
 const INDIRECT_RETURN_CALLEES_SQL: &str = "SELECT DISTINCT e.callee_fn_id
@@ -354,18 +355,7 @@ fn export_flow_graph(
             ),
             PagNodeKind::Loc(loc_id) => {
                 let loc = &pag.locations[loc_id.0 as usize];
-                let kind_str = match loc.kind {
-                    LocKind::Global => "global",
-                    LocKind::FileStatic => "file_static",
-                    LocKind::FnStatic => "fn_static",
-                    LocKind::Local => "local",
-                    LocKind::Heap => "heap",
-                    LocKind::Field => "field",
-                    LocKind::FieldSummary => "field_summary",
-                    LocKind::ArraySummary => "array_summary",
-                    LocKind::Function => "function",
-                    LocKind::StringLit => "string_lit",
-                };
+                let kind_str = crate::inspect::loc_kind_schema_str(loc.kind);
                 let label = match (loc.kind, loc.var) {
                     (LocKind::Function, _) => format!("fn:{}", loc.desc),
                     (LocKind::StringLit, _) => format!("string:{}", loc.desc),
@@ -549,6 +539,47 @@ fn export_flow_graph(
     for (i, (src, dst, kind)) in edge_rows.iter().enumerate() {
         edges.execute(params![i as i64 + 1, src, dst, kind])?;
     }
+    export_memory_accesses(conn, pag, analysis, &edge_rows)
+}
+
+/// The `flow_memory_access` rows: per load or store, by its `flow_edges` id
+/// (its rank in `edge_rows`, which is sorted), each cell it reads or writes,
+/// or one cell-less row when none is recorded (docs/ANALYSIS.md, "Memory
+/// access edges").
+fn export_memory_accesses(
+    conn: &Connection,
+    pag: &Pag,
+    analysis: &AnalysisResult,
+    edge_rows: &[(u32, u32, &'static str)],
+) -> Result<()> {
+    let mut rows: Vec<(i64, Option<u32>)> = Vec::with_capacity(analysis.memory_accesses.len());
+    for access in &analysis.memory_accesses {
+        let c = &pag.constraints[access.constraint.index()];
+        let kind = match c.kind {
+            ConstraintKind::Load => "load",
+            ConstraintKind::Store => "store",
+            _ => continue,
+        };
+        let Ok(rank) = edge_rows.binary_search(&(c.src.0, c.dst.0, kind)) else {
+            continue;
+        };
+        let cell = access
+            .loc
+            .and_then(|loc| pag.loc_node.get(&loc))
+            .map(|n| n.0);
+        rows.push((rank as i64 + 1, cell));
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    let mut insert = conn.prepare_cached("INSERT INTO flow_memory_access VALUES (?1, ?2)")?;
+    for (i, &(edge, cell)) in rows.iter().enumerate() {
+        // A cell-less row sorts first; an access with a recorded cell keeps
+        // only its cells.
+        if cell.is_none() && rows.get(i + 1).is_some_and(|&(next, _)| next == edge) {
+            continue;
+        }
+        insert.execute(params![edge, cell])?;
+    }
     Ok(())
 }
 
@@ -590,6 +621,20 @@ fn export_flow_provenance(
             }
         }
     }
+    // The heap object a `new` allocates into `dst`: the source of the
+    // `addr_of` the PAG built for its `NewHeap` fact, which the fact itself
+    // does not name.
+    let new_heap = |dst: &PagNodeId| -> Option<&PagNodeId> {
+        pag.indices.addr_of_dst.get(dst)?.iter().find_map(|&i| {
+            let src = &pag.constraints[i].src;
+            match pag.nodes[src.0 as usize].kind {
+                PagNodeKind::Loc(loc) if pag.locations[loc.0 as usize].kind == LocKind::Heap => {
+                    Some(src)
+                }
+                _ => None,
+            }
+        })
+    };
     for flow in &unique_flows {
         use trace_ir::FlowConstraint as F;
         let Some(sites) = program.flow_origins.get(*flow) else {
@@ -616,6 +661,7 @@ fn export_flow_provenance(
                 "addr_of",
             ),
             F::NullPointer { .. } => (pag.null_node.as_ref(), "copy"),
+            F::NewHeap { .. } => (new_heap(d), "addr_of"),
             F::StringConst { value, .. } => (
                 pag.string_locs.get(value).and_then(|l| pag.loc_node.get(l)),
                 "addr_of",
@@ -624,6 +670,11 @@ fn export_flow_provenance(
         };
         let Some(s) = src else {
             continue;
+        };
+        let operation = if kind == "store" && field_destinations.contains(&dst) {
+            "write field"
+        } else {
+            kind
         };
         for (span, expression) in sites {
             origins.execute(params![
@@ -634,11 +685,7 @@ fn export_flow_provenance(
                 span.line,
                 span.col,
                 expression.as_ref(),
-                if kind == "store" && field_destinations.contains(&dst) {
-                    "write field"
-                } else {
-                    kind
-                }
+                operation
             ])?;
         }
     }

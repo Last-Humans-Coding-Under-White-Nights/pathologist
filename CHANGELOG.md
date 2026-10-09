@@ -4,6 +4,33 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Value slice with execution-context hints (#205)
+
+`trace inspect <DB> slice --file F --line N --col C` walks from a variable or
+field access back to its sources (allocations, address-of, globals, entry
+parameters), then forward from each source to its sinks, within
+`--up-depth` / `--down-depth`. Each node lists the execution contexts that
+reach it, and an edge is flagged cross-context when different contexts, or one
+self-concurrent context, touch the same memory. Output is text or JSON (spans,
+context labels, flags), and both state their limits: scalar values are not
+tracked and a flag is a hint, not a proven race. A new `flow_memory_access`
+table (additive to v7) joins each load and store to the memory cells the
+solver resolved for it, or marks it as recorded without cells (past the
+16-cell cap, or pointing at no memory); its sites are the load's or store's
+`flow_origins` rows, and `flow_edges` keeps only constraint edges, so
+`inspect dataflow` and the C API are unchanged. A
+call through a pointer field reads the field at that call, and `flow_origins`
+now also records the operations of a `return` statement and a `new`
+expression's allocation. The slice reads every position from `flow_origins`,
+attributes a statement in a lambda task's body to the lambda (so to the
+task's context), requires `flow_memory_access` and refuses `trace-merge`
+output. `--file` in inspect lookups now matches a literal substring (`%` and
+`_` are no longer wildcards). Rules:
+[Value slice](docs/ANALYSIS.md#value-slice-inspect-slice) and
+[Memory access edges](docs/ANALYSIS.md#memory-access-edges); measurements and
+the camera CVE retro-test (`scripts/cve_slice_retro.py`) in
+`docs/EVAL_REPORT.md` ("Value slice: #205").
+
 ### OpenHarmony task and thread primitives (#203)
 
 Callback models for `ffrt::submit` / `submit_h` and the C forms, the

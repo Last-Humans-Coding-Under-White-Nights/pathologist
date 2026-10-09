@@ -384,13 +384,16 @@ impl Pag {
         if let Some(&loc) = self.field_loc.get(&(parent_loc, field)) {
             return loc;
         }
-        let base_var = self.locations[parent_loc.0 as usize].var;
+        // A field cell lives in its parent's storage: a local's field cell is
+        // that function's.
+        let parent = &self.locations[parent_loc.0 as usize];
+        let (base_var, base_fn) = (parent.var, parent.fn_id);
         let loc_id = LocId(self.locations.len() as u32);
         self.alloc_loc(AbstractLocation {
             id: loc_id,
             kind: LocKind::Field,
             var: base_var,
-            fn_id: None,
+            fn_id: base_fn,
             field: Some(field),
             type_id: field_type,
             desc: name.to_string(),

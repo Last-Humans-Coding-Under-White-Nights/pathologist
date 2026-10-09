@@ -748,6 +748,13 @@ fn render(
 /// Directory under the analysis root that the synthesized headers are served from.
 const GENERATED_DIR: &str = ".trace-idl-generated";
 
+/// Whether `path` is a header synthesized from an `.idl` file: one served
+/// from [`GENERATED_DIR`], a name reserved for them.
+pub(crate) fn is_generated(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, Component::Normal(name) if name == GENERATED_DIR))
+}
+
 /// The headers synthesized for one tree, held in memory.
 #[derive(Debug, Default)]
 pub(crate) struct Synthesized {

@@ -768,7 +768,7 @@ Instead, `trace` decouples intra-repository static analysis from cross-repositor
 ### Invariants and linking rules
 
 - **No analysis during merge**: Andersen pointer analysis, PAG construction, and interprocedural dataflow solvers do **not** run during the merge stage. Intra-repository dataflow facts (`flow_nodes`, `flow_edges`, `arg_flow_edges`) remain strictly within their original repository databases. The merge stage is purely a deterministic linker that reconnects external call edges across repositories. Its shared-schema output leaves flow tables empty and call-site variable bindings NULL; see the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
-- **Execution contexts carry over**: `execution_contexts` rows are copied with their function and call-site ids remapped, and one whose function or call site did not survive the merge is dropped. `receiver_var_id` is NULL in the merged database, which carries no variables. Rows several inputs contribute for one context (same start, modelled callee, parameter, entry, kind and model: an IPC handler or an override entry a shared header defines, since call sites are not deduplicated) are kept once, with the evidence of all: `self_concurrent` when any input says so, and the first `multi_instance` that applies in the analysis' order. Merged rows are ordered as `trace analyze` orders them, by call site, then the entries no call site starts by entry. The evidence is otherwise each input's own: a cross-repository edge re-linked here is not searched for new cycles or parents ([Execution contexts](#execution-contexts)). Which inputs supply the table, and what an input exported before it contributes, is part of the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
+- **Execution contexts carry over**: `execution_contexts` rows are copied with their function and call-site ids remapped, and one whose function or call site did not survive the merge is dropped. A context a call site starts enters what the edge from that site to its entry now goes to: the definition another repository holds of a callback this one only declares (the callback edge is re-linked to it, and so is the context), or each candidate of an ambiguous edge, one row per candidate. `receiver_var_id` is NULL in the merged database, which carries no variables. Rows several inputs contribute for one context (same start, modelled callee, parameter, entry, kind and model: an IPC handler or an override entry a shared header defines, since call sites are not deduplicated) are kept once, with the evidence of all: `self_concurrent` when any input says so, and the first `multi_instance` that applies in the analysis' order. Merged rows are ordered as `trace analyze` orders them, by call site, then the entries no call site starts by entry. The evidence is otherwise each input's own: a cross-repository edge re-linked here is not searched for new cycles or parents ([Execution contexts](#execution-contexts)). Which inputs supply the table, and what an input exported before it contributes, is part of the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
 - **External call re-linking and may-analysis over-approximation**:
   - In individual repositories, calls to functions declared but not defined in that repository are emitted with `resolution = 'external'` (or point to `is_defined = 0` declarations). `trace-merge` matches these calls against exported strong definitions (`is_defined = 1`, `linkage = 'external'`) from other repositories, updating `call_edges.callee_fn_id` to the survivor's unified ID and retargeting `resolution` to `'direct'` (or `'ambiguous'` if conflicting definitions exist), while preserving original non-direct resolutions (`indirect` and `ipc`). Unresolved external calls retain their original resolution.
   - When multiple strong definitions exist across different repositories (or multiple weak definitions), `trace-merge` emits an ambiguous edge (`resolution = 'ambiguous'`) to **every candidate definition**, satisfying the may-analysis invariant (AGENTS.md §2). This ensures downstream path queries such as `trace inspect callchain` do not miss valid paths.
@@ -1641,6 +1641,8 @@ as `flow_nodes` / `flow_edges` for the `inspect dataflow` command:
   no stronger constraint already connects the actual/formal pair — this
   covers scalar (non-pointer) arguments that the solver does not persist as
   PAG constraints.
+- The memory cells each load and store reaches are a table of their own,
+  `flow_memory_access`; see [Memory access edges](#memory-access-edges).
 
 #### Where a value moves
 
@@ -1657,7 +1659,15 @@ recording, merging and text rules are in
   header statement that several units contribute merge into one row.
 - **Original-file position.** Sites follow the LineMap rule (AGENTS.md
   invariant 1): inside a macro expansion, the outermost invocation; inside a
-  header body, the header.
+  header body, the header. The operations reading a returned value
+  (`return cb_;` loads the member) are at the value, as an initializer's
+  are, and a `new` expression's allocation (the `addr_of` from its heap
+  object) is at the expression. A field or element a call's argument reads
+  or takes the address of (`sink(a->p, b->p)`, `take(&s.f)`) is at the
+  argument, with the argument's text as its expression, not the call's: a
+  position on one argument then names only that argument's access
+  ([Value slice](#value-slice-inspect-slice)). Other arguments are the
+  call's: its site and text.
 - **Enclosing function.** It follows from the site by the edge-scope rule
   of the source-level view: the innermost defined function whose
   `[line_start, line_end]` in the site's file holds the line. When several
@@ -1679,9 +1689,76 @@ recording, merging and text rules are in
   rows: `points_to`, `call_arg`, `terminates`, `dlsym`, and parameter copies
   the solver wires at a resolved call. Calls are located by `call_sites`
   (`flow_calls`, `flow_return_calls`).
+- **Memory accesses.** A memory access has no rows of its own: its sites
+  are those of the `load` or `store` it was read off
+  ([Memory access edges](#memory-access-edges)). A load or store without rows
+  (a model's `content_store`) leaves its accesses without any.
 - **Deterministic.** Rows are written in first-occurrence order of the merged
   constraints, so they are identical for every `--jobs` (AGENTS.md
   invariant 10).
+
+#### Memory access edges
+
+The constraint edges say how a pointer is used (`load q → x` is `x = *q`,
+`store v → p` is `*p = v`), not which memory it reaches, so the graph leaves
+a store and the load that reads the stored value unconnected. Once the solver
+has converged, before the points-to sets are released, `memory_accesses`
+(`trace-analysis/src/memory.rs`) lists for every `Load` and `Store`
+constraint the cells its pointer may point to
+(`AnalysisResult::memory_accesses`), or that it has none recorded. The export
+writes them to `flow_memory_access`, additive to the v7 contract
+([schema](SQLITE_SCHEMA.md#flow_memory_access)): per access, the `flow_edges`
+id of its load or store and each cell, or one row without a cell when none is
+recorded. `flow_edges` keeps only constraint edges, and the access's sites are
+its load's or store's `flow_origins` rows
+([Where a value moves](#where-a-value-moves)), not repeated for it. Read as
+edges, they are `mem_write` from the stored value to each cell and `mem_read`
+from each cell to the load's destination: the kinds a slice shows.
+
+- **Which cells.** Every location in the pointer's points-to set except
+  function and string-literal locations: a load through a function pointer
+  yields the function itself, not memory. The pointer a field access yields
+  (a `gep` destination) also holds the contents of the cells it designates,
+  so that later uses of the field lvalue see stores recorded against the
+  cell. Its accesses are instead the cells the `gep` designates, which the
+  solver records as its `gep` step points the destination at them: the
+  field's cell in each object the base points to, the field's summary, and
+  the summary the solver falls back to for the base variable's declared type
+  (its positional member, which need not carry the field's name; see "Field
+  sensitivity"). A field holding another field's address (`s->p = &o->x`) is
+  therefore not an access of `o->x` when `s->p` is read or written. A store
+  into a field cell also writes the field's summary, as the solver does. A
+  field cell lives in its parent's storage, so a local's field cell carries
+  the local's function (`flow_nodes.fn_id`).
+- **Fan-out cap.** An access keeps at most 16 cells (`MEMORY_ACCESS_CAP`).
+  Past that, each instance cell is replaced by its field's summary, which
+  every store into the cell also writes; an access still wider keeps no
+  cell: it is recorded without one, as is an access whose pointer points at
+  no memory, and a slice reports such a load's value as an `unrecorded_load`
+  source. Counting stops as soon as the cells folding cannot remove pass the
+  cap. Such a pointer's points-to
+  set is too coarse to say which memory it touches (generic service and
+  buffer pointers), and a slice through it would join unrelated objects.
+- **A call through a pointer field reads it.** `cb_->OnError()`,
+  `this->cb_->OnError()` and `obj->cb_->OnError()` read the pointer the
+  field holds, and so does an explicit member operator through it
+  (`cb_->operator()()`, `cb_->operator->()`), as `auto *cb = cb_; cb->OnError();` does. Lowering loads the
+  field into a temporary at the call (`read_field_receiver`, `lower.rs`), so
+  the read is a `load` and a memory read at the call's position: every such
+  call reads it, each at its own position, so a slice can start at any of
+  them. A receiver path lowering cannot resolve reads nothing and leaves no
+  temporary. The temporary is not bound to the callee's `this`: a member
+  call's receiver stays identity (`CallSite::receiver`), not value flow, so
+  the call graph and every other points-to set are unchanged. A call through
+  a variable (`p->f()`) or a dot call on a field object (`list_.size()`)
+  reads nothing new.
+- **Who follows them.** [`inspect slice`](#value-slice-inspect-slice) does.
+  `inspect dataflow`, `dataflow_graph` and the C API's `trace_db_dataflow`
+  read `flow_edges` and `flow_origins`, which hold none.
+- **Deterministic.** The accesses are listed in constraint order, then by
+  cell, and written sorted by load or store, then cell.
+
+Measured cost: [Value slice: #205](EVAL_REPORT.md#value-slice-205--2026-10-09).
 
 ## Function models (configurable summaries)
 
@@ -1807,7 +1884,11 @@ image as an indirect call's targets are.
   wired. A reference (`const std::stop_token &`) is declared of its
   referent's class: lowering types it as the referent's address, and the
   function's `reference_params` tell it from a pointer parameter, which stays
-  a pointer. The supplied value itself carries no flow.
+  a pointer. A callback that takes the class but has no room for the
+  supplied value ahead of the arguments (`work(std::stop_token)` started as
+  `std::jthread t(work, token)`) is not invocable with it, so the arguments
+  are forwarded as given, the caller's token to the formal
+  ([thread.jthread.cons]). The supplied value itself carries no flow.
 - **A call it applies at.** `if_arg = { param = 0, type = "std::launch" }`
   applies the effect only at a call whose argument 0 may be a value of that
   class or enumeration, `unless_arg` only at one where it may not be; the two
@@ -2104,7 +2185,340 @@ effect, is rejected when the file is loaded.
 - **An `entry` is every definition of the member or an override of it** the
   tree holds, whether or not anything constructs its class or starts it
   (`Thread::Start`, a handler's runner, `AddDeathRecipient`); one declared
-  but defined elsewhere is none.
+  but defined elsewhere is none. Where the tree declares the model's member
+  (`virtual bool Run()` on the framework's class), a definition of the name
+  overrides it only with the same number of parameters, of the types the
+  declaration spells (`trace_ir::spelled_alike` under `Entry`: a class with
+  and without its qualifiers, a template argument of a class-template base
+  against the override's, a type the index does not know against any; an
+  `int` lowering read an unresolved name as stands in only for a class the
+  tree does not declare), each bound as the declaration binds it, by
+  reference or by value (`reference_params`; a reference and a pointer
+  lower to one pointer type): `Run(int *)` beside it is an overload, and
+  so are `ProcessEvent(int *)` and `ProcessEvent(InnerEvent *)` beside
+  `ProcessEvent(const InnerEvent &)`, and none is an entry. Without such a
+  declaration, the name alone matches.
+
+## Value slice (`inspect slice`)
+
+`trace inspect <DB> slice --file F --line L --col C` asks where a value
+comes from, where it goes, and which execution contexts run the code that
+moves it: a bounded two-stage walk over `flow_edges` and the
+[memory accesses](#memory-access-edges) (`trace-db/src/inspect/slice.rs`), annotated with the
+[execution contexts](#execution-contexts). It is an adviser query (#197): it
+lays out evidence for a person or a tool (an LLM) to judge, and is not a race
+report. This section is the authoritative statement of its rules; the CLI
+reference is in [README.md](../README.md#trace-inspect-slice).
+
+It reads an analysis export's flow graph, the operation sites of
+`flow_origins` (every position it shows: [Where a value moves](#where-a-value-moves)),
+`flow_memory_access` and `execution_contexts`. Under the v7 capability contract
+([schema](SQLITE_SCHEMA.md#version-and-capability-contract)) it checks the
+tables and columns it reads, refusing a database without them (an earlier v7
+export: re-run `trace analyze`), and refuses a `trace-merge` output, whose
+flow tables hold no flow graph, as source-level `inspect dataflow` does.
+
+### Start
+
+- **A declaration.** The candidates are `inspect dataflow`'s declaration
+  lookup (`find_symbols_at`). When the identifier at the column is the name a
+  variable on that line declares, the slice starts at the variable: its node
+  and its own storage location, not the cells of its fields. The declaration
+  must occupy that identifier: read by tokens from its recorded column (the
+  declarator's start; a named parameter's identifier), the identifier comes
+  before anything that ends a declarator's prefix. Only declarator
+  punctuation (`*`, `&`, `(`, `...`), type, qualifier and scope names (`::`),
+  a template argument list and an attribute (`__attribute__((...))`,
+  `[[...]]`, `alignas(...)`, `__declspec(...)`) may lie between, whatever
+  those lists hold. So `fns` in `int (*fns[2])(int)` and `at` in
+  `Cb *__attribute__((unused)) at` are declarations, while in
+  `int *p = obj->p;` the second `p` is not, nor is an identifier inside a
+  template argument list, an attribute or an array size. A readable column on no identifier (the `*`
+  or `=` of `int *p = q;`) declares nothing: the line is then searched as a
+  use, below. Without the source line, the column must fall inside the
+  declared name as recorded. Columns count characters, as
+  LineMap's do, and an identifier may hold characters outside ASCII
+  (`größe`). Parameter twins widen as in `inspect dataflow`.
+- **A use.** Otherwise the operations recorded on that line (its
+  `flow_origins` rows, with the cells of its loads and stores) and the
+  values its calls pass (the actuals of its `flow_calls` rows, by the call
+  site's line: `p` in `sink(p);`, a line with no operation of its own; the
+  formal a call passes to is never spelled on the line, and does not join)
+  and the variables its indirect calls go through (`call_sites.callee_var`:
+  `cb` in `cb();`, which moves nothing else, so a callback is traced from
+  its invocation as from its declaration) are searched for the identifier. Each operation and call has a span:
+  from its recorded line and column over the expression recorded with it,
+  which keeps its newlines, so an operation written across lines (`p =`
+  with `q;` on the next line, a call whose arguments run on) is found from
+  a position on any of its lines. When any span covers the position, only
+  the operations and calls whose span does are searched, so in
+  `a->p = x; b->p = y;` each `p` starts at its own class's cells, and `y`
+  in `sink(y)` is told from the `y` an operation beside it moves; when none
+  does (an identifier a macro invocation spells outside the expansion's
+  text), every operation and call on the line is. A field access
+  starts at the cells the line reads or writes for that field: the `field`
+  and `field_summary` locations of that name. A variable starts at the
+  variable; but a variable of that name declared on the line, which the
+  identifier does not name there (`t` in `std::thread t(Run); t.join();`),
+  goes before other variables: a use of the name on its declaration's line
+  is most likely that variable, and not, say, a same-named parameter of a
+  callee the line passes a value to. When a field and a variable go by the
+  name (`s->p = p;`), the spelling decides: an identifier that `.` or `->`
+  precedes, whitespace aside (`s->p`, `s -> p`, `(*s).p`), is the field
+  access, any other (`p`, `S::p`) the variable, each falling back to the
+  other when its own has no candidate (`callback_ = cb;` in a member
+  function: no variable, so the member's cells). Without the spelling (the
+  file not readable here, or the column on no identifier), the field's
+  cells go first.
+- **The identifier** is read from the source file at the path the database
+  records, from each file `--file` matches that has a declaration or an
+  operation on that line (each read once). When that file is not readable
+  from here, `--name` gives it. Without either (or with the column on no
+  identifier), the line's operations must move exactly one name,
+  temporaries (`variables.is_synthetic`) aside: that variable, or that
+  field's cells, is the start; a line moving
+  several is an error that lists them and asks for `--name`. A position
+  whose line moves no pointer or function value through that name is an
+  error.
+- **One file.** `--file` is a literal substring of the recorded path (`_`
+  and `%` are no wildcards), as in every `inspect` query. When it matches
+  several files and more than one of them has a declaration or a use at the
+  position, the query is refused with the files listed: give more of the
+  path.
+- **Globals, statics and static data members.** A start like any other, and
+  expanded both ways although they are boundaries anywhere else in a slice:
+  every write the graph records is a predecessor and every read a successor,
+  whichever function makes it. A static data member is the variable
+  `Class::member`, so `current_` and `Registry::current_` both name it. A
+  slice from a widely used global can be large; the depth limits bound it.
+
+### Stage 1 (up): sources
+
+Breadth first from the start, following edges backwards, at most
+`--up-depth` edges deep ([Stop rules](#stop-rules)):
+
+| Edge | Followed |
+|------|----------|
+| `copy`, `call_arg`, `unwrap`, `dlsym`, `mem_read`, `mem_write` | against its direction: the value at the source becomes the value at the destination |
+| `points_to` | both ways: a variable and its own storage hold one value |
+| `addr_of` into the node | not past it: the address is the source, an `allocation` for a heap location, else `function`, `string` or `address`; the location is not expanded through this edge |
+| `gep` into the node | not past it: a `field_address` computed from the base pointer, which is the source node and is not expanded through this edge |
+
+Recording an `addr_of` or `gep` source does not mark it expanded: a value
+edge reaching the same node on another path expands it as usual, so in
+`p = &base->field; p = (int *)base;` both `base` (`field_address`) and the
+`&object` that sets it are sources, whichever path the walk finds first.
+| `load`, `store` | no: what a load reads arrives over `mem_read` |
+
+`nullptr` reached is a source of kind `null` and is not expanded: it is one
+`constant` node for the whole program
+([schema](SQLITE_SCHEMA.md#flow_nodes)), whose value goes to every null
+assignment, so stage 2 does not walk on from it.
+
+A node a `load` leads into whose access is recorded without a cell is an
+`unrecorded_load` source, whatever else it receives: the load's pointer
+reaches more cells than the fan-out cap of
+[Memory access edges](#memory-access-edges), or no memory at all. The `load` edge is in the slice to show where; its pointer is not
+expanded. The node's other incoming edges are followed as usual.
+
+A node no followed edge leads into is a source too: `parameter` (an entry
+parameter: nothing passes it a value, as for an IPC handler's arguments), a
+`global`, `unrecorded_load` (above), or
+`unknown` (a value from a callee nothing models, or that no pointer flow
+writes). A node's edge into itself (a recursive call passing a parameter
+on) brings no value from elsewhere and does not keep it from being a
+source. Nor does the `points_to` pair of a variable and its own storage
+(present when its address is taken): the two hold one value, so they are a
+source when nothing outside them feeds either (a value edge from elsewhere,
+an `addr_of`, `gep` or `load` into the storage). The source is the
+variable, of its kind (an address-taken entry parameter is a `parameter`),
+and stage 2 starts from it. A boundary reached is a source of kind `global` or
+`field_summary`.
+
+### Stage 2 (down): sinks
+
+Breadth first from the start and from every source that is not a
+boundary, following edges forwards, at most `--down-depth` edges
+from the nearest root: an `addr_of` source through its `addr_of` edges (the
+address goes everywhere it is taken), a field address from the `gep`
+destination, any other source from itself. The value edges are followed in
+their direction and `points_to` both ways. A node is expanded again
+whenever a walk reaches it at a smaller depth than before, so its successors
+get the extra depth budget: a return released only once its call is entered
+(below) can arrive after a longer path reached the node. The start's walk,
+whose returns are not restricted (below), covers a source's walk at the same
+depth or deeper; a node a source's walk expanded is expanded again when the
+start's walk reaches it. A node is queued at most once per walk at a time:
+an arrival of a walk while its entry waits lowers that entry's depth, and
+the start's walk arriving at a waiting source's entry's depth or less takes
+that entry over, at its own depth, as it covers it. Each walk keeps its own
+depth: the start's walk arriving deeper than a waiting source's entry gets
+no budget from it. Depths only decrease, so the walk ends; nodes past the
+limit are judged against the finished walk, so `truncated_down` holds only
+when one of them stays unreached.
+
+From a source, a value leaves a function through its return value (an edge
+from one function's variable into a non-parameter variable of another) only
+along the calls stage 1 came up through, and back into a function whose
+call the walk entered (a value passed from one function's variable to
+another's parameter): a pass-through function (`T *Id(T *x) { return x; }`)
+hands the value back to the call it came in through, and not to its other
+callers. Return and entry edges are recognized by their ends, not by
+`flow_return_calls` and `flow_calls`: those record
+only returns and arguments of a call a call edge resolves, and miss, for
+example, the copy out of a template factory's `Create()` into each caller.
+A lambda reading or writing a variable it captured (`copy = local;` or
+`local = other;` in a lambda written in the function that declares `local`,
+which the lambda's body names as that variable itself) is neither: nothing
+is called, so the edge is followed like one within a function. Such an
+access is a move between a lambda and the function it is written in, at a
+site in the lambda's body; a return out of the lambda (`other = make();`)
+is written in the enclosing function's body and is a return like any, so
+the value of an allocating lambda returns only along the calls stage 1
+came up through. A lambda is known by its name,
+`{owner}::$lambda{line}:{col}` after the function whose body it is written
+in; a move at no site, or at a site with no single innermost function (a
+one-line lambda), is taken for a return.
+Which call entered is per pair of functions, not per call site,
+and a call counts as entered only once the walk follows its entry edge: an
+entry edge at a node the depth limit stops does not release a return
+waiting for it, and the stage is then `truncated_down`.
+Each call of an allocating wrapper
+returns its own object, which the context-insensitive heap merges into one
+(`OsalMemCalloc`'s `malloc() storage` returns to all its callers); without
+this, a slice whose value came from such a wrapper spreads to every other
+caller's object. From the start, returns reach every caller: a getter of a
+member hands the one object to all of them. The uses of a value are leaves: a
+`load` or `gep` out of the node (dereferenced to read, or to address a
+field), a `store` into it (dereferenced to write) and `terminates` (cleared
+by a [`clears`](#terminators-clears) model). A node is a sink when it is used
+that way, when no value edge leaves it, when it is a call target or a
+terminator, or when it is a boundary reached here.
+
+### Stop rules
+
+- **Depth.** `--up-depth` bounds stage 1 and `--down-depth` stage 2, 6
+  edges each by default (`SliceOptions::default()`); `truncated_up` /
+  `truncated_down` say a node at the limit had more to follow (in stage 2,
+  including a call entry that would have released a waiting return).
+- **Returns from a source** are restricted as [Stage 2](#stage-2-down-sinks)
+  states.
+- **Boundaries.** A field summary (`field_summary`) and a global or static
+  (`global`, `file_static` and `fn_static` variables and locations) are in
+  the slice, marked `boundary`, but never expanded unless they are the start:
+  a summary merges every instance of a field and a global every function that
+  touches it, so expanding them would pull in unrelated code. An instance
+  cell (`field`) is expanded.
+
+### Contexts
+
+Which contexts reach a function is computed at query time from `call_edges`
+and `execution_contexts` (the callers of each function a slice reaches are
+read as it is reached, transitively, not the whole call graph): every
+context whose entry reaches the function over
+ordinary call edges, and `root` when code nothing calls reaches it (`main`, a
+framework callback the index does not see called, an exported API, a test).
+That code is a strongly connected component of the ordinary-call graph that
+no edge from outside enters and that holds no context's entry: a function no
+ordinary edge reaches, or a recursion nothing outside it calls. A context's start edge
+is not ordinary (the started code runs in the new context, not the
+starter's), and neither is an IPC bridge (the request comes from another
+process). A function called from `main` and from an IPC handler is in both.
+
+Nor is a call into the entry of a context no call site starts (an `entry`
+model's member or override, an IPC stub handler): that entry is reached by
+its own contexts only. The context stands for the framework's dispatch,
+and in-tree code that calls the entry is taken to be that dispatch:
+c_utils' `Thread::ThreadStart`, started by `pthread_create` in
+`Thread::Start`, calls the `Worker::Run` override, which would otherwise be
+in the `pthread_create` context as well as its own, two contexts for one
+thread; a stub's `OnRemoteRequest` switch calls its handlers, which would
+otherwise also be `root`'s code. A memory cell such an entry alone touches
+is then not `contexts_differ`. The cost is a direct call from elsewhere (a
+service calling its own handler, a test calling `Run`): its contexts do not
+reach the entry or what the entry calls through it. The entry's callers
+keep their own contexts, and a callback started at a call site keeps its
+ordinary callers' contexts: those calls run it on the caller's thread.
+
+Each node is `private` (a local, a parameter or a temporary, a local's or
+parameter's own storage, or a field cell of that storage, nested or not:
+one invocation's), `shared` (heap objects and their field cells, field
+summaries, globals and statics, and anything a pointer parameter points to) or `constant` (function and string
+addresses, `nullptr`). A private node's contexts are its function's. A shared node's
+are those of the slice's statements that touch it: the function of each
+edge's site by the edge-scope rule of
+[Where a value moves](#where-a-value-moves) (a statement in a lambda task's
+body is the lambda's, so it runs in the task's context), or for an edge
+without a site (or at a site with no single innermost function, such as a
+one-line lambda) the function of its private end. So they depend on the slice: they are the contexts of the
+accesses it shows.
+
+### Cross-context edges
+
+An edge is `cross_context` when the value may change hands between code that
+different contexts, or two instances of one, run at once. The reasons:
+
+- `contexts_differ`: the edge touches a shared node that the slice shows
+  touched from code of two or more contexts (`root` counts as one), and code
+  of some context makes this access.
+- `self_concurrent`: the edge touches a shared node from code a
+  self-concurrent context reaches (an IPC handler, or a context with
+  multi-instance evidence; see [Execution contexts](#execution-contexts)).
+- `start`: the edge moves a value between private nodes of two functions,
+  and the second is the entry of a context the first starts: the value is
+  handed to the new thread or task (an argument `pthread_create` forwards,
+  `this` in `std::thread(&C::Run, this)`).
+
+A value in private storage otherwise stays on its thread, so an edge between
+private nodes is flagged only at a start, or when a local's storage (or a
+field cell of it), or a variable a lambda captured, is touched from a
+function with other contexts than its owner's: the owner's code from the
+lambda's, or the lambda's from the owner's
+(`contexts_differ`). An edge with a constant end is never flagged. A flag is a
+hint, not a proven race: locks, ordering, joins and object lifetimes are not
+modelled, and context sets over-approximate.
+
+### Output
+
+`--format text` (the default) is for people; `--format json` is one document
+for tools (the graph formats are rejected):
+
+| Field | Content |
+|-------|---------|
+| `start` | `name`, `kind` (`variable` or `field`), `at` (`path`, `line`, `col`), `nodes` |
+| `up_depth`, `down_depth`, `truncated_up`, `truncated_down` | the bounds and whether each stage hit them |
+| `contexts` | each context a node is reached by: `id` (`C<execution_contexts.id>` or `root`), `kind`, `entry`, `start_site`, `api`, `multi_instance`, `self_concurrent` |
+| `nodes` | `id` (`flow_nodes.id`), `kind`, `label`, `var_kind`, `loc_kind`, `function`, `decl`, `sharing`, `roles` (`start`, `source`, `sink`, `boundary`), `source` (its kind), `stages` (`up`, `down`), `contexts` |
+| `edges` | one per `flow_edges` row and site (its distinct `flow_origins` positions, or none): `from`, `to`, `kind` (`flow_edges.kind`), `stages`, `site` (`path`, `line`, `col`), `function` (the site's), `cross_context`, `reasons` |
+| `limits` | what the slice does not show, below |
+
+Nodes, edges and contexts are sorted, so the output is the same for the same
+database. The text form lists the contexts, sources, sinks, each stage's
+edges with their positions and flags, each node's contexts, and the limits.
+
+### Limits
+
+Both formats state them:
+
+- Scalar values are not tracked: the slice follows pointer and function
+  values, so integers and plain data are not in it, and a pointer's scalar
+  uses (`if (cb_ != nullptr)`) record nothing.
+- A flag is a hint, not a proven race (above).
+- The analysis is flow- and context-insensitive and a field summary merges
+  every instance of a field, so a slice can join flows that never happen
+  together.
+- A boundary's other writers and readers are not followed.
+- An access through a pointer past the fan-out cap is not
+  followed ([Memory access edges](#memory-access-edges)): a load's value is
+  an `unrecorded_load` source, and a store's destination memory is not in
+  the slice.
+
+Also not shown: a member call through a variable (`p->f()`) is not a use of
+`p` (receivers are identity, [Memory access edges](#memory-access-edges)),
+and a container's elements accessed through member calls (`v.push_back(x)`,
+`v.size()`, a range-for over a field) are not value flow; a whole-container
+copy is. Measurements and the camera race-fix retro-test:
+[Value slice: #205](EVAL_REPORT.md#value-slice-205--2026-10-09).
 
 ## Noise macro filtering (`--ignore-macro`, `--ignore-logging`, `[noise]`)
 
@@ -2971,9 +3385,15 @@ Known C++ imprecision (in addition to the general list below):
 - In-class prototypes record no parameter variables. They record their
   parameter types where those decide something: a name the class body
   declares or defines more than once, or brings in again with
-  `using Base::f;`, and a virtual member whose nearest declaring ancestor
-  overloads the name (so a call ranked to another overload does not dispatch
-  to it). A name declared once merges with its definition by name and arity.
+  `using Base::f;`, and a virtual member, whose declaration is what a
+  definition of the name in a subclass is matched against (a call ranked to
+  another overload of the name does not dispatch to it, and only a
+  definition of its types is an [entry](#execution-contexts) of a model
+  naming it), except a member of an interface synthesized from an `.idl`
+  file ([IDL-generated interfaces](#idl-generated-interfaces)), which
+  spells its types as the IDL does (`sharedptr<T>`), not as its overrides
+  do, and so records none. A name declared once otherwise merges with its
+  definition by name and arity.
   So same-arity overloads of a member (`Worker *find(int)`,
   `Other *find(const char *)`, `Set(sptr<A>)` beside `Set(sptr<B>)`) are
   separate entries. A definition joins the prototype whose types it spells

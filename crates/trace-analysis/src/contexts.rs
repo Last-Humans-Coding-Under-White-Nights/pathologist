@@ -8,7 +8,7 @@
 use crate::constraints::{CallGraphEdge, ResolutionKind};
 use crate::summaries::{ContextKind, ModelLookup};
 use rustc_hash::{FxHashMap, FxHashSet};
-use trace_ir::{CallSiteId, FnId, Program, VarId};
+use trace_ir::{CallSiteId, FnId, Program, SpellingTolerance, VarId};
 
 /// One place where an execution context starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,9 +112,50 @@ pub(crate) fn framework_entries<'m>(program: &Program, models: &ModelLookup<'m>)
         .filter(|f| f.is_defined)
         .filter_map(|f| {
             let (model, kind) = models.entry(&f.name)?;
-            Some((f.id, kind, Some(model.name.as_str())))
+            overrides_declared(program, f, &model.name).then_some((
+                f.id,
+                kind,
+                Some(model.name.as_str()),
+            ))
         })
         .collect()
+}
+
+/// Whether `f`, a definition named as the member an `entry` model names,
+/// overrides that member rather than overloading its name: it takes as
+/// many parameters as a declaration of the model's member the tree holds
+/// (`Run()` beside the framework's `virtual bool Run()`, not `Run(int *)`),
+/// of the types the declaration spells
+/// ([`SymbolTable::explicit_params_alike`]: `ProcessEvent(int *)` beside
+/// `ProcessEvent(const InnerEvent &)` is an overload; a template argument
+/// of a class-template base matches the override's, `Entry`), a side whose
+/// types are not known matching by arity alone, and bound alike by
+/// reference or by value ([`SymbolTable::references_alike`]:
+/// `ProcessEvent(InnerEvent *)` beside it is an overload too). A tree
+/// declaring none, the framework's headers not being in it, matches by
+/// name alone.
+///
+/// [`SymbolTable::explicit_params_alike`]: trace_ir::SymbolTable::explicit_params_alike
+fn overrides_declared(program: &Program, f: &trace_ir::Function, member: &str) -> bool {
+    let declared = program.symbols.functions_named(member);
+    if declared.is_empty() {
+        return true;
+    }
+    let arity = |g: &trace_ir::Function| {
+        g.explicit_arity.unwrap_or(
+            (g.params.len() as u32).saturating_sub(u32::from(program.symbols.has_this_param(g.id))),
+        )
+    };
+    let own = arity(f);
+    declared.iter().any(|&d| {
+        let d = program.symbols.function(d);
+        arity(d) == own
+            && program
+                .symbols
+                .explicit_params_alike(f, d, &program.types, SpellingTolerance::Entry)
+                .unwrap_or(true)
+            && trace_ir::SymbolTable::references_alike(f, d)
+    })
 }
 
 /// One context per resolved callback invocation, in start-site order, then
@@ -189,14 +230,16 @@ pub(crate) fn execution_contexts(
     // Everything a self-concurrent context reaches may run more than once at
     // a time, and so may every context started from there. The call graph
     // holds the edge from each start site to its callback, so one search
-    // from the self-concurrent entries reaches the nested ones too.
+    // from the self-concurrent entries reaches the nested ones too. A
+    // context with evidence of its own keeps it; an IPC handler, which is
+    // self-concurrent on its kind alone, still records a parent's.
     let roots = contexts
         .iter()
         .filter(|c| c.self_concurrent)
         .map(|c| c.entry);
     let reached = graph.reachable_from(roots);
     for context in &mut contexts {
-        if context.self_concurrent {
+        if context.multi_instance != MultiInstance::Unknown {
             continue;
         }
         let under_parent = context

@@ -1,5 +1,168 @@
 # Evaluation Report
 
+## Value slice: #205 — 2026-10-09
+
+`trace inspect slice` walks from a variable or field access up to the
+value's sources and down to its sinks, with the execution contexts (#202)
+that reach each node and a cross-context flag on edges where the value may
+change hands between threads, tasks or IPC requests. Rules:
+[Value slice](ANALYSIS.md#value-slice-inspect-slice); CLI:
+[README.md](../README.md#trace-inspect-slice). The export adds a
+`flow_memory_access` table, the cells each load and store reaches read off
+the converged points-to sets (or a cell-less row when none is recorded), a
+call through a pointer field (`cb_->OnError()`) records a read of the field,
+and `flow_origins` now also records a `return` statement's operations and a
+`new` expression's allocation; a memory access's sites are its load's or
+store's `flow_origins` rows, and `flow_edges` keeps its four columns and its
+constraint kinds ([Memory access edges](ANALYSIS.md#memory-access-edges),
+schema v7).
+Fixture: `tests/fixtures/value_slice/`.
+
+Measured on macOS 27.0.1, Apple M1, release build, `--jobs 8`,
+`TRACE_SOLVE_BUDGET_POPS=800000`, the pinned clean corpora of
+`scripts/eval_expected.json`. Baseline is `f53fa1d` (#203, the commit this
+change follows); each binary is built from a clean archive of its commit in
+its own target directory.
+
+| Corpus | Export | Database, baseline → candidate | Change |
+|---|---|---:|---:|
+| HDF | minimal | 54,124,544 → 55,906,304 B | +1.70 MiB (+3.3%) |
+| HDF | `--full-export` | 57,065,472 → 58,851,328 B | +1.70 MiB (+3.1%) |
+| hiview | minimal | 27,295,744 → 28,192,768 B | +0.86 MiB (+3.3%) |
+| hiview | `--full-export` | 29,245,440 → 30,167,040 B | +0.88 MiB (+3.2%) |
+| camera | minimal | 72,421,376 → 80,580,608 B | +7.78 MiB (+11.3%) |
+| camera | `--full-export` | 77,103,104 → 85,364,736 B | +7.88 MiB (+10.7%) |
+
+| Corpus | `flow_edges` rows | `flow_memory_access` rows: cells (read as `mem_read` / `mem_write` edges) | without a cell | `load` edges (field-receiver reads) | `flow_origins` rows | `variables` rows |
+|---|---:|---:|---:|---:|---:|---:|
+| HDF | 154,298 → 156,079 | 30,399 (19,912 / 10,487) | 651 | 9,801 → 10,411 | 79,748 → 82,922 | 130,143 → 132,028 |
+| hiview | 58,970 → 60,811 | 6,843 (3,253 / 3,590) | 223 | 2,400 → 3,060 | 25,860 → 28,737 | 85,164 → 87,027 |
+| camera | 131,110 → 154,992 | 21,664 (14,814 / 6,850) | 774 | 3,508 → 14,841 | 48,919 → 75,906 | 180,637 → 210,857 |
+
+The memory accesses first shipped as `mem_read` / `mem_write` rows of
+`flow_edges`, each repeating its load's or store's `flow_origins` rows (19–27%
+of `flow_origins`); as one `flow_memory_access` table naming the load or store
+they take 1.05–3.74 MiB less (HDF 59,719,680, hiview 29,171,712, camera
+82,976,768 B minimal before), with the same memory edges, every other table
+identical, and every `inspect slice` and `inspect dataflow` output unchanged
+(the fixtures' identifier positions, the slice sample below and the camera
+retro-test). Of the accesses with cells, 4 (HDF), 74 (hiview) and 125
+(camera) belong to a load or store without a `flow_origins` row (a model's
+`content_store`, or an operation lowering records no site for). The
+constraint origins grow (HDF 79,748 → 82,922, hiview 25,860 → 28,737,
+camera 48,919 → 75,906):
+the receiver reads' `gep` and `load`, the operations of `return` statements,
+and the allocation of each `new` (77, 987 and 2,561 `addr_of` rows from a
+heap object). `flow_return_calls` gains the rows of calls written in a
+`return` statement, which now have origins (HDF 10,063 → 10,460, hiview
+1,483 → 1,484, camera 3,615 → 3,618). `functions`, `files`, `diagnostics`,
+`flow_call_origins` and `flow_call_expressions` are identical to the
+baseline; `call_edges`, `call_sites`, `arg_flow_edges`,
+`execution_contexts` and `flow_parameters` hold the same rows up to the
+numbering of temporaries, which the new receiver temporaries shift, so
+`scripts/eval_check.py` passes its 104 checks with the expectations
+unchanged. The analyze phase took about the same time on both binaries
+(HDF 1.1 → 1.2 s, hiview 0.1 s, camera 0.2 s); export took 0.1 s more (HDF
+0.7 → 0.8 s, hiview 0.3 → 0.4 s, camera 1.1 → 1.2 s); peak footprint, one
+run each, HDF 205.6 → 208.5 MB, hiview 69.6 → 73.5 MB, camera 179.1 → 183.3
+MB. Every table,
+`flow_origins`, `flow_edges` and `flow_memory_access` included, holds the same
+rows at `--jobs 1` and `--jobs 8` on all three corpora.
+
+The 16-cell fan-out cap keeps accesses through generic pointers, whose
+points-to sets reach many unrelated objects, out of the graph; reading a
+field receiver at every call is most of camera's growth (11,333 reads), and
+a slice can start at any of them. **Decision: exported in every mode**,
+since `inspect` reads the default database.
+
+### Slice sizes per corpus
+
+40 starts per corpus, a deterministic sample (every k-th, by name) of the
+struct and class fields some store writes outside test directories, each
+sliced from its first store (`flow_origins` position) with the default
+depths (6 and 6): `python3 scripts/slice_sizes.py <db> --sample 40`. Times
+are per CLI run, opening the database included. Every slice of the sample
+has the same node, edge, cross-context and context counts as before a site
+in a lambda body was attributed to the lambda
+([Where a value moves](ANALYSIS.md#where-a-value-moves)). Since an entry no
+call site starts (an IPC stub handler, a framework entry) is reached by its
+own contexts only ([Contexts](ANALYSIS.md#contexts)), the same slices have
+the same nodes, edges and flags, and fewer contexts where an IPC handler or
+task called such an entry directly: hiview median 2 → 1.5, camera p90 39 →
+11 and max 230 → 144 (an edge touching memory of a self-concurrent handler
+keeps its flag, now for `self_concurrent` alone); HDF is unchanged.
+
+| Corpus | Written fields | Nodes (median / p90 / max) | Edges | Cross-context edges | Contexts | With a flag | Truncated | Time (median / max) |
+|---|---:|---|---|---|---|---:|---:|---|
+| HDF | 2,174 | 12.5 / 135 / 1,258 | 17 / 178 / 1,674 | 4.5 / 74 / 165 | 21 / 43 / 65 | 26 | 7 | 0.04 / 0.10 s |
+| hiview | 1,809 | 9 / 81 / 113 | 8.5 / 84 / 117 | 0 / 5 / 17 | 1.5 / 9 / 23 | 17 | 2 | 0.03 / 0.03 s |
+| camera | 2,391 | 5.5 / 17 / 588 | 6 / 20 / 789 | 0 / 7 / 46 | 1 / 11 / 144 | 17 | 1 | 0.05 / 0.07 s |
+
+A slice edge is one `flow_edges` row at one of its sites, so an edge
+written at many statements counts once per statement. HDF's largest sampled
+slice, `TimerManager.device` (`timer_core.c:582`, truncated), stores the
+device object every driver's `Bind` hands on and has 1,442 such edges over
+1,258 nodes; HDF's sample changed with the field count (2,160 → 2,174, from
+reading a pointer field at every call and the rebase onto master), so its
+row describes different fields than before. camera's largest
+(`CameraServerPhotoProxy.displayName_`, 144 contexts) passes through the
+photo-proxy code that most IPC handlers reach. A context count of 1 is
+mostly `root` alone. `nullptr`, one node for the whole program, is a `null`
+source that stage 2 does not walk on from
+([Stage 1](ANALYSIS.md#stage-1-up-sources)); followed, it joined every null
+assignment of camera (about 1,600 nodes per slice in the retro-test below).
+
+### Camera race-fix retro-test
+
+The three camera fixes of #197 section 4.4, re-run from their history:
+`python3 scripts/cve_slice_retro.py`, inputs in
+`scripts/cve_slice_retro.json` (the pre-fix revision is the merge's first
+parent, the post-fix one the merge; the blob hashes of each patched file are
+checked before analysing). Each start is the member the fix guarded, at the
+store the patch locked. The script passes on both trees with the inputs
+unchanged (re-run on the final binary with a fresh `--work` directory).
+
+| Fix | Pre-fix tree | Member | Write (function, line) | Read (function, line) | Flagged |
+|---|---|---|---|---|---|
+| CVE-2023-47857, PR 988 | `c863b1a8e` | `HCameraDevice::deviceSvcCallback_` | `SetCallback` 401 | `OnError` 460, `OnResult` 491 | all three |
+| CVE-2024-22180, PR 1179 | `5e682933f` | `CaptureSession::exposureCallback_` | `SetExposureCallback` 1001 | `ProcessAutoExposureUpdates` 1020 | both |
+| | | `CaptureSession::focusCallback_` | `SetFocusCallback` 1083 | `ProcessAutoFocusUpdates` 1417 | both |
+| | | `CaptureSession::appCallback_` | `SetCallback` 363 | `GetApplicationCallback` 385 | both |
+| | | `PreviewOutput::appCallback_` | `SetCallback` 164 | `GetApplicationCallback` 196 | both |
+| | | `VideoOutput::appCallback_` | `SetCallback` 84 | `GetApplicationCallback` 218 | both |
+| | | `CameraInput::errorCallback_` | `SetErrorCallback` 156 | `GetErrorCallback` 172 | both |
+| | | `PhotoOutput::appCallback_` | `SetCallback` 236 | `GetApplicationCallback` 263 | no |
+| | | `MetadataOutput::appStateCallback_` | `SetCallback` 115 | `MetadataObjectListener::OnBufferAvailable` 252 | no |
+| | | `CameraManager::cameraMngrCallback_` | `SetCallback` 592 | `GetApplicationCallback` 599 | no |
+| CVE-2026-68965, PR 4579 | `afd0a2ebf` | `HCameraDeviceManager::activeCameras_` | — | `SortDeviceByPriority` 585, `GetActiveCameraHolders` 168 | both |
+
+- **What the flags rest on.** The `exposureCallback_` slice is the race the
+  fix closed: the application's thread writes the member through the NAPI
+  `On` (`root`), and `ProcessAutoExposureUpdates` reads and calls through it
+  under `CameraDeviceServiceCallback::OnResult`, an IPC handler
+  (`contexts_differ`, `self_concurrent`). `focusCallback_` is the same; for
+  the getters (`return appCallback_;`), the read is at the `return`
+  statement's `flow_origins` position and is attributed to the handlers
+  that call the getter. The `deviceSvcCallback_` write in `SetCallback` is
+  attributed to `root` only (the stub's base comes from an IPC header outside
+  this tree), but the member is also cleared (`= nullptr`) in `Close`, which
+  six IPC handlers reach, so the write is flagged `contexts_differ`.
+- **Found but not flagged** (3 of the 9 members of PR 1179): the slice
+  shows the write and the read, but nothing attributes the read to a
+  context; both ends are `root`.
+- **The container** (`activeCameras_`, PR 4579): the slice shows the two
+  whole-vector reads, both flagged against the IPC handlers that reach them;
+  the element accesses through member calls (`.size()`, range-for,
+  `push_back`, `erase`) are not value flow
+  ([Limits](ANALYSIS.md#limits)), and the script records them as expected
+  misses.
+- **Slice sizes.** Each slice has 6–12 nodes (10 for `activeCameras_`);
+  against the earlier implementation they also show the null stores of
+  destructors and `Release` / `Close` (a `null` source and its temporary),
+  which the null-pointer node of the source-level presentation adds.
+- **After the fix** the slices are the same (lines shifted): the fixes add
+  locks, which the slice does not model, as its limits state.
+
 ## Task and thread primitives: #203 — 2026-10-09
 
 OpenHarmony's task, handler, pool, timer and work-queue APIs are now
