@@ -1,5 +1,97 @@
 # Evaluation Report
 
+## Task and thread primitives: #203 — 2026-10-09
+
+OpenHarmony's task, handler, pool, timer and work-queue APIs are now
+`invoke` models, and three virtual members a framework runs are `entry`
+models whose overrides are execution contexts; the list and the kind each
+states are in [docs/ANALYSIS.md](ANALYSIS.md#built-in-models), how a member
+model meets a class the tree never declares or a subclass in
+[Model matching](ANALYSIS.md#model-matching). A member call site records
+the variable it is made on, exported as `execution_contexts.receiver_var_id`
+with the context's `model`: two nullable columns added to the table under
+the additive v7 contract
+([SQLITE_SCHEMA.md](SQLITE_SCHEMA.md#execution_contexts)). Fixture:
+`tests/fixtures/task_primitives/` (every primitive, undeclared as in the
+corpora, a bare `ThreadPool` in a nested namespace, a handler subclass,
+named and field receivers, and hiview-style declared classes named like the
+library's that must not match).
+
+Measured on macOS 27.0.1, Apple M1, release build, `--jobs 8`,
+`TRACE_SOLVE_BUDGET_POPS=800000`, the pinned clean corpora of
+`scripts/eval_expected.json` (HDF `cdc75a2`, hiview `92408e2`, camera
+`8ffd69d`). Baseline is `765d86a` (#202, the commit this change follows);
+each binary is built from a clean archive of its commit in its own target
+directory. Sizes are file sizes; the
+table size is the SQLite `dbstat` page total.
+
+| Corpus | Export | Database, baseline → candidate | Change |
+|---|---|---:|---:|
+| HDF | minimal | 54,116,352 → 54,124,544 B | +8 KiB (+0.015%) |
+| HDF | `--full-export` | 57,057,280 → 57,065,472 B | +8 KiB (+0.014%) |
+| hiview | minimal | 27,279,360 → 27,295,744 B | +16 KiB (+0.060%) |
+| hiview | `--full-export` | 29,229,056 → 29,245,440 B | +16 KiB (+0.056%) |
+| camera | minimal | 72,409,088 → 72,421,376 B | +12 KiB (+0.017%) |
+| camera | `--full-export` | 77,090,816 → 77,103,104 B | +12 KiB (+0.016%) |
+
+`execution_contexts` grows from 4 to 12 KiB (HDF, hiview) and from 32 to
+40 KiB (camera). Whole `trace analyze` runs took the same wall time on both
+binaries (HDF 4.7 / 4.7 s, hiview 1.8 / 1.8 s, camera 7.4 / 7.5 s, minimal
+export; recording the receiver at lowering costs nothing measurable), and
+`execution_contexts`, `call_edges`, `arg_flow_edges`, `flow_edges` and
+`flow_origins` are identical at `--jobs 1` and `--jobs 8`.
+
+| Corpus | Contexts, baseline → candidate | New rows by model | Start sites | Named receivers |
+|---|---:|---|---:|---:|
+| HDF | 40 → 83 | `HdfWorkInit` 18, `HdfDelayedWorkInit` 2, `OsalTimerCreate` 22, `OnRemoteDied` 1 | 2 → 44 | 1 |
+| hiview | 62 → 106 | `ffrt::submit` 36, `ffrt::submit_h` 1, `ffrt::queue::submit_h` 2, `OnRemoteDied` 5 | 17 → 56 | 6 |
+| camera | 735 → 821 | `EventHandler::PostTask` 70, `Utils::Timer::Register` 8, `OnRemoteDied` 8 | 17 → 88 | 13 |
+
+- **Edges.** Each new start is an indirect edge from the submitting site to
+  the callback, so `call_edges` gains exactly those rows (HDF +42, hiview
+  +39, camera +78, all `indirect`); HDF's work and timer models forward their
+  argument, which adds 42 `arg_flow_edges`, 42 `call_arg` flow edges and
+  their 42 `flow_calls` rows. Every other table holds the same rows,
+  `flow_origins` included (a forwarded argument is a derived edge with no
+  origin). Reading a `std::stop_token` or launch policy taken by reference
+  as one moves nothing here: no corpus calls `std::jthread` or `std::async`
+  at all. `scripts/eval_expected.json` is re-captured for these counts only;
+  it passes its 99 checks.
+- **hiview.** 37 of the 39 `ffrt::submit` / `submit_h` call sites are
+  contexts, and all 13 `ffrt::queue::submit` / `submit_h` ones. The two left
+  pass a `std::bind` result (`EventExportEngine::InitAndRunTasks`,
+  `UsageEventReport::RunTask`), which is not looked into (C4 in
+  [CPP_ROADMAP.md](CPP_ROADMAP.md)); the only C form, `ffrt_queue_submit` in
+  `TriggerExportEngine::StartTask`, passes
+  `ffrt::create_function_wrapper(taskFunc)`, whose return is not modelled
+  ([Documented imprecision](ANALYSIS.md#documented-imprecision)). The
+  submitted lambdas of `FaultLogDatabase::SaveFaultLogInfo` and the five
+  `PassthroughMonitor` handlers now have an edge from their submitter. The
+  six named receivers are `std::thread` objects; every queue is a field. No
+  hiview `EventHandler` subclass is taken for the eventhandler library's:
+  hiview declares its own `OHOS::HiviewDFX::EventHandler`.
+- **camera.** All 70 `PostTask` calls are contexts, on a handler held in a
+  field, so none records a receiver (the 13 named receivers are
+  `std::thread` objects). The 8 timer callbacks are submitted at one site,
+  the `Utils::Timer::Register` inside the `CameraTimer::Register` wrapper,
+  which collapses its callers' callbacks as `OsalThreadCreate` does HDF's;
+  the two other `Register` sites, in the `CameraCountingTimer` and `DpsTimer`
+  wrappers, are handed no function the analysis resolves. 46 `PostTask`
+  contexts are `parent`: their submitter is reachable from an IPC handler.
+- **HDF.** Each sensor, light, vibrator and test driver's work function and
+  timer is a context. Thirteen starts are made from functions on a cycle of
+  ordinary calls (twelve timers, most in `Set*Enable`, and the light
+  driver's work item), one work item in a loop (`EsdResInit`), so code they
+  reach is under a self-concurrent context: the wrapper `OsalThreadCreate`
+  is, which makes all 39 threads started at its `pthread_create` site
+  `parent`, where none had evidence before. That is the wrapper's collapse
+  documented in [Execution contexts](ANALYSIS.md#execution-contexts), now
+  with roots that reach it; 79 of 83 contexts are self-concurrent.
+- **Entries.** `OnRemoteDied` overrides are `ipc_handler` contexts: HDF 1,
+  hiview 5, camera 8, each a class deriving from
+  `IRemoteObject::DeathRecipient`. No corpus subclasses `OHOS::Thread` or
+  the library's `EventHandler`; the fixture covers both.
+
 ## Execution contexts: #202 — 2026-10-09
 
 The new `execution_contexts` table lists where threads, tasks and IPC
@@ -53,8 +145,9 @@ included, is identical at `--jobs 1` and `--jobs 8`.
   starts has evidence; the wrapper's collapsing of entries is described in
   [Execution contexts](ANALYSIS.md#execution-contexts).
 - **hiview.** The 12 `serial_task` rows are `ffrt::queue::submit`; the
-  free `ffrt::submit` is not modelled (#203), so most hiview tasks are
-  still missing. `loop`: a `std::thread` lambda started in a test loop and a
+  free `ffrt::submit` was not modelled yet, so most hiview tasks were
+  still missing (modelled since #203, see
+  [Task and thread primitives: #203](#task-and-thread-primitives-203--2026-10-09)). `loop`: a `std::thread` lambda started in a test loop and a
   queued lambda in `RsFrameMonitor::VideoStop`. `parent`: two delay-check
   threads in the video monitors, reached from the looping `VideoStop` task
   and from the `XperfServiceServer::NotifyToXperf` IPC handler.
@@ -9778,7 +9871,11 @@ Same-class calls bind. Nested `EventStore::…`, `TriggerExportEngine`, `TimeUti
 | Dispatch site | 34 `ffrt::submit` sites (all external) |
 | Resolved targets | **0** |
 
-**Fail.** 357 `$lambda` functions exist; 7 have in-edges, none from `ffrt::submit`.
+**Fail** when recorded. Superseded: `ffrt::submit` and `submit_h` are
+`invoke` models since #203, and 37 of hiview's 39 `ffrt::submit` /
+`submit_h` calls (at `92408e2`) reach the submitted callable; see
+[Task and thread primitives: #203](#task-and-thread-primitives-203--2026-10-09).
+At recording time, 357 `$lambda` functions existed; 7 had in-edges, none from `ffrt::submit`.
 
 **Resolved function-pointer / virtual targets:** none.
 

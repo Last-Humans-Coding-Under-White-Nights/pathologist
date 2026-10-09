@@ -4,6 +4,25 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### OpenHarmony task and thread primitives (#203)
+
+Callback models for `ffrt::submit` / `submit_h` and the C forms, the
+`EventHandler::PostTask` family, `ThreadPool::AddTask`,
+`Utils::Timer::Register`, `HdfWorkInit` / `HdfDelayedWorkInit`,
+`OsalTimerCreate`, `std::async` and `std::jthread`, and entry models for
+overrides of `Thread::Run`, `EventHandler::ProcessEvent` and
+`DeathRecipient::OnRemoteDied`. One resolver now serves every model effect: it
+matches qualified names, requalified names, classes the unit never declares
+and subclasses, so a plain `PostTask` model no longer matches every class's
+`PostTask`. A `std::stop_token` or launch policy taken by reference
+(`const std::stop_token &`, `const std::launch &`) counts as one. Member call
+sites record their receiver variable, and
+`execution_contexts` gains the nullable `receiver_var_id` and `model` columns
+(additive to v7; `trace-merge` carries `model`, NULL from an input whose table
+predates it, and leaves the receiver NULL).
+Rules: [Model matching](docs/ANALYSIS.md#model-matching) and "Built-in models";
+measurements in `docs/EVAL_REPORT.md` ("Task and thread primitives: #203").
+
 ### Execution contexts: thread, task and IPC entries (#202)
 
 A new `execution_contexts` table lists where code starts running on a thread,

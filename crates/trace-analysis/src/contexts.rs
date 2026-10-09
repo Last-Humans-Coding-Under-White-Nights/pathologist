@@ -6,9 +6,9 @@
 //! contexts start at: nothing here feeds the solver.
 
 use crate::constraints::{CallGraphEdge, ResolutionKind};
-use crate::summaries::ContextKind;
+use crate::summaries::{ContextKind, ModelLookup};
 use rustc_hash::{FxHashMap, FxHashSet};
-use trace_ir::{CallSiteId, FnId, Program};
+use trace_ir::{CallSiteId, FnId, Program, VarId};
 
 /// One place where an execution context starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +20,10 @@ pub struct ExecutionContext {
     /// no call site in the program starts.
     pub start: Option<ContextStart>,
     pub multi_instance: MultiInstance,
+    /// The function model that states this context: the `invoke` model
+    /// matched at the start site, or the `entry` model whose member the
+    /// entry overrides. `None` for an IPC stub handler.
+    pub model: Option<String>,
     /// Two instances may run at the same time: every IPC handler, and a
     /// context with multi-instance evidence. `false` is the absence of that
     /// evidence, not a proof of single execution.
@@ -35,6 +39,9 @@ pub struct ContextStart {
     /// The callee parameter the callback is passed in, counting explicit
     /// arguments as the model does.
     pub param: u32,
+    /// The variable the modelled member was called on (the queue, handler,
+    /// pool or timer), when the site records one ([`trace_ir::CallSite::receiver`]).
+    pub receiver: Option<VarId>,
 }
 
 /// Why a context may have more than one instance. The first that applies,
@@ -85,30 +92,52 @@ impl MultiInstance {
 }
 
 /// A callback a modelled callee runs at a call site, as the solver resolved
-/// it: the start, the callback's function, and the kind the model states.
-pub(crate) type Invocation = (ContextStart, FnId, ContextKind);
+/// it: the start, the callback's function, the kind the model states and the
+/// model's name.
+pub(crate) type Invocation<'m> = (ContextStart, FnId, ContextKind, &'m str);
+
+/// A function that is the entry of a context no call site starts: an IPC
+/// stub handler (no model), or a definition of an `entry` model's member or
+/// of an override of it, with the model's name.
+pub(crate) type Entry<'m> = (FnId, ContextKind, Option<&'m str>);
+
+/// Every function an `entry` model makes the entry of a context: a defined
+/// member of that name on a class that may be the model's, or derive from
+/// one ([`ModelLookup::entry`]), in `FnId` order.
+pub(crate) fn framework_entries<'m>(program: &Program, models: &ModelLookup<'m>) -> Vec<Entry<'m>> {
+    program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.is_defined)
+        .filter_map(|f| {
+            let (model, kind) = models.entry(&f.name)?;
+            Some((f.id, kind, Some(model.name.as_str())))
+        })
+        .collect()
+}
 
 /// One context per resolved callback invocation, in start-site order, then
-/// one per IPC stub handler in `FnId` order.
+/// one per entry no call site starts, by function. Within each, rows are
+/// ordered by kind spelling and model as `trace-merge` orders them.
 pub(crate) fn execution_contexts(
     program: &Program,
     mut invocations: Vec<Invocation>,
-    ipc_handlers: impl Iterator<Item = FnId>,
+    mut entries: Vec<Entry>,
     call_edges: &[CallGraphEdge],
 ) -> Vec<ExecutionContext> {
-    // Ordered by kind spelling, as `trace-merge` orders its rows.
-    invocations.sort_unstable_by(|a, b| (a.0, a.1, a.2.as_str()).cmp(&(b.0, b.1, b.2.as_str())));
+    // `ContextKind` orders by spelling, as `trace-merge` orders its rows.
+    invocations.sort_unstable();
     invocations.dedup();
-    let mut handlers: Vec<FnId> = ipc_handlers.collect();
-    handlers.sort_unstable();
-    handlers.dedup();
-    if invocations.is_empty() && handlers.is_empty() {
+    entries.sort_unstable();
+    entries.dedup();
+    if invocations.is_empty() && entries.is_empty() {
         return Vec::new();
     }
 
     let starts: FxHashSet<(CallSiteId, FnId)> = invocations
         .iter()
-        .map(|(start, entry, _)| (start.call_site, *entry))
+        .map(|(start, entry, _, _)| (start.call_site, *entry))
         .collect();
     let graph = Graph::new(call_edges, |edge| {
         edge.resolution == ResolutionKind::IpcBridge
@@ -123,7 +152,7 @@ pub(crate) fn execution_contexts(
     };
     let mut contexts: Vec<ExecutionContext> = invocations
         .into_iter()
-        .map(|(start, entry, kind)| {
+        .map(|(start, entry, kind, model)| {
             let multi_instance = match submitter(&start) {
                 Some((_, true)) => MultiInstance::Loop,
                 Some((caller, false)) if graph.index(caller).is_some_and(|i| cyclic[i]) => {
@@ -136,6 +165,7 @@ pub(crate) fn execution_contexts(
                 entry,
                 start: Some(start),
                 multi_instance,
+                model: Some(model.to_string()),
                 // A request handler runs on the IPC worker pool whether a
                 // stub or a model says so.
                 self_concurrent: kind == ContextKind::IpcHandler
@@ -143,13 +173,18 @@ pub(crate) fn execution_contexts(
             }
         })
         .collect();
-    contexts.extend(handlers.into_iter().map(|entry| ExecutionContext {
-        kind: ContextKind::IpcHandler,
-        entry,
-        start: None,
-        multi_instance: MultiInstance::Unknown,
-        self_concurrent: true,
-    }));
+    contexts.extend(
+        entries
+            .into_iter()
+            .map(|(entry, kind, model)| ExecutionContext {
+                kind,
+                entry,
+                start: None,
+                multi_instance: MultiInstance::Unknown,
+                model: model.map(str::to_string),
+                self_concurrent: kind == ContextKind::IpcHandler,
+            }),
+    );
 
     // Everything a self-concurrent context reaches may run more than once at
     // a time, and so may every context started from there. The call graph

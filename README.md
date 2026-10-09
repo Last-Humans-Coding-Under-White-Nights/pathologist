@@ -597,7 +597,7 @@ indexes before that export phase. See the
 SQLite export also builds a function-range index for operation ownership lookup
 during source-level dataflow inspection; see the [inspection index rules](docs/SQLITE_SCHEMA.md#source-level-presentation-metadata-v7).
 
-Schema version: **v7**, an additive compatibility family. Readers check required structures and database origin rather than infer available capabilities from the number alone; see the [version and capability contract](docs/SQLITE_SCHEMA.md#version-and-capability-contract). Optional `flow_call_origins` and `flow_call_expressions` metadata improves exact occurrence attribution and call text; older v7 analysis exports retain fallback behavior. Re-analysis supplies new metadata and selective-query indexes. `trace-merge` accepts v7 inputs with the required call-graph columns, rejects v6 or missing required structures before writing output, and produces a call-graph database without PAG/provenance data. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries. `flow_edges` rows carry no position: `flow_origins` records where each edge's operation is written (original file, line and column, one row per statement), and the enclosing function follows from that position (see [Where a value moves](docs/ANALYSIS.md#where-a-value-moves)). `execution_contexts` lists where threads, tasks and IPC requests start running code — one row per resolved callback of an `invoke` model (`pthread_create`, `std::thread`, `ffrt::queue::submit`) and one per IPC stub handler — with its kind (`thread`, `pool_task`, `serial_task`, `ipc_handler`, `unknown`) and multi-instance evidence (`loop`, `cycle`, `parent`, `unknown`; see [Execution contexts](docs/ANALYSIS.md#execution-contexts)); an earlier v7 export has no such table.
+Schema version: **v7**, an additive compatibility family. Readers check required structures and database origin rather than infer available capabilities from the number alone; see the [version and capability contract](docs/SQLITE_SCHEMA.md#version-and-capability-contract). Optional `flow_call_origins` and `flow_call_expressions` metadata improves exact occurrence attribution and call text; older v7 analysis exports retain fallback behavior. Re-analysis supplies new metadata and selective-query indexes. `trace-merge` accepts v7 inputs with the required call-graph columns, rejects v6 or missing required structures before writing output, and produces a call-graph database without PAG/provenance data. Foreign keys are declared in DDL; exports temporarily disable FK enforcement for bulk load speed. Macro-body calls use their definition spelling in `call_sites.file_id/line/col`; nullable `expansion_file_id/expansion_line/expansion_col` retain the outermost invocation. `flow_nodes` stores empty labels/details for variable nodes to save space; the `flow_nodes_text` view reconstructs them for direct queries. `flow_edges` rows carry no position: `flow_origins` records where each edge's operation is written (original file, line and column, one row per statement), and the enclosing function follows from that position (see [Where a value moves](docs/ANALYSIS.md#where-a-value-moves)). `execution_contexts` lists where threads, tasks and IPC requests start running code — one row per resolved callback of an `invoke` model (`pthread_create`, `std::thread`, `ffrt::submit`, `EventHandler::PostTask`, `HdfWorkInit`, ...), with the model's name and the receiver variable it was submitted on when named, and one per entry no call site starts (an override of `Thread::Run`, `EventHandler::ProcessEvent` or `DeathRecipient::OnRemoteDied`; an IPC stub handler) — with its kind (`thread`, `pool_task`, `serial_task`, `ipc_handler`, `unknown`) and multi-instance evidence (`loop`, `cycle`, `parent`, `unknown`; see [Execution contexts](docs/ANALYSIS.md#execution-contexts)); an earlier v7 export has no such table.
 
 ### Entity relationship (overview)
 
@@ -608,7 +608,7 @@ link_targets ─┬─ target_sources → files
 files ─┬─ functions ─┬─ call_sites ─ arg_flow_edges → variables
        │             │  (target_id → link_targets)
        │             ├─ call_edges → functions (caller and callee)
-       │             └─ execution_contexts → functions, call_sites
+       │             └─ execution_contexts → functions, call_sites, variables
        └─ variables ─ flow_nodes ─ flow_edges → flow_nodes
                     (fn_id → functions, type_id → types,
                      target_id → link_targets)
@@ -699,12 +699,13 @@ WHERE af.actual_fn_id IS NOT NULL;
 ### Where threads and tasks start
 
 ```sql
-SELECT e.kind, entry.name AS entry, caller.name AS started_in, cs.line,
-       e.multi_instance, e.self_concurrent
+SELECT e.kind, entry.name AS entry, e.model, caller.name AS started_in, cs.line,
+       queue.name AS submitted_on, e.multi_instance, e.self_concurrent
 FROM execution_contexts e
 JOIN functions entry ON entry.id = e.entry_fn_id
 LEFT JOIN call_sites cs ON cs.id = e.call_site_id
 LEFT JOIN functions caller ON caller.id = cs.caller_fn_id
+LEFT JOIN variables queue ON queue.id = e.receiver_var_id
 ORDER BY e.kind, entry.name;
 ```
 

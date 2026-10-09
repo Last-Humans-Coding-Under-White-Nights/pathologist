@@ -296,6 +296,13 @@ pub struct CallSite {
     /// LHS of `dst = callee(...)` when the call's value is used (`CallReturn`
     /// destination). `dlsym` models write function addresses here.
     pub return_dst: Option<VarId>,
+    /// The variable a member call is made on, when its receiver is one by
+    /// name (`queue.submit(f)`, `handler->PostTask(f)`, `this->Run()`, the
+    /// object a constructor builds); `None` for a field, a call result or any
+    /// other expression, and for a free function. Identity only: it is not
+    /// bound to the callee's `this` (`docs/ANALYSIS.md`, "Execution
+    /// contexts").
+    pub receiver: Option<VarId>,
     /// Originating translation unit, recorded by merge. Absent before merge.
     pub tu: Option<crate::FileId>,
 }
@@ -425,6 +432,7 @@ impl CallSite {
             receiver_class: self.receiver_class.as_deref(),
             exact_receiver: self.exact_receiver,
             return_dst: self.return_dst,
+            receiver: self.receiver,
         }
     }
 
@@ -473,6 +481,7 @@ struct CallFacts<'a> {
     receiver_class: Option<&'a str>,
     exact_receiver: bool,
     return_dst: Option<VarId>,
+    receiver: Option<VarId>,
 }
 
 /// What a surviving entry takes from any redeclaration merged into it,
@@ -3061,6 +3070,7 @@ mod tests {
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
+            receiver: None,
             tu: None,
         };
         let mut symbols = SymbolTable {
@@ -3130,6 +3140,7 @@ mod tests {
             receiver_class: Some("Cls".into()),
             exact_receiver: false,
             return_dst: Some(VarId(6)),
+            receiver: None,
             tu: Some(FileId(2)),
         };
         let mut elsewhere = CallSite {
@@ -3174,6 +3185,7 @@ mod tests {
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
+            receiver: None,
             tu: None,
         };
         assert!(mk("OsalMemCalloc", None, false).resolves_by_name());
@@ -3366,6 +3378,7 @@ mod tests {
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
+            receiver: None,
             tu: Some(caller_file),
         };
         // The shortcut applies, and the walk it replaces yields the same edge.

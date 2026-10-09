@@ -2052,6 +2052,7 @@ fn expand_virtual_overrides(program: &mut Program) {
                 receiver_class: cs.receiver_class.clone(),
                 exact_receiver: cs.exact_receiver,
                 return_dst: cs.return_dst,
+                receiver: cs.receiver,
                 tu: cs.tu,
             });
         }
@@ -7318,7 +7319,7 @@ fn emit_factory_construction(
         caller,
         &cls,
         &trace_ir::MethodKind::Ctor,
-        Some(heap),
+        Receiver::Bound(heap),
         args,
         span,
         expansion_span,
@@ -7415,7 +7416,7 @@ fn construct_on_heap(
             caller,
             cls,
             &trace_ir::MethodKind::Ctor,
-            Some(heap),
+            Receiver::Bound(heap),
             args,
             span,
             expansion_span,
@@ -8203,6 +8204,7 @@ fn lower_declaration(
                                             receiver_class: None,
                                             exact_receiver: false,
                                             return_dst: None,
+                                            receiver: None,
                                             tu: Some(ctx.current_file),
                                         });
                                         continue;
@@ -8532,7 +8534,7 @@ fn lower_direct_init(
         caller,
         &cls,
         &trace_ir::MethodKind::Ctor,
-        Some(object),
+        Receiver::Bound(object),
         args,
         call_span,
         expansion_span,
@@ -8791,7 +8793,7 @@ fn emit_automatic_lifecycle(
                 caller,
                 &owner,
                 &kind,
-                Some(var),
+                Receiver::Bound(var),
                 CallArgs::empty(),
                 span,
                 expansion_span,
@@ -8978,7 +8980,7 @@ fn lower_one_declarator(
                     ctx.current_fn.unwrap(),
                     &cls,
                     &trace_ir::MethodKind::Ctor,
-                    Some(var_id),
+                    Receiver::Bound(var_id),
                     call_args,
                     span,
                     expansion_span,
@@ -9726,7 +9728,7 @@ fn walk_function_body(
                         caller,
                         &cls,
                         &trace_ir::MethodKind::Dtor,
-                        None,
+                        Receiver::Unnamed,
                         CallArgs::empty(),
                         span,
                         expansion_span,
@@ -10004,6 +10006,7 @@ fn collect_call_at_node_inner(
         let kind = trace_ir::MethodKind::Named(op_norm.clone());
         let call_args = collect_call_args(program, ctx, source, node.cached_field("arguments"));
         if let Some(recv_cls) = infer_static_class(program, ctx, source, op.receiver) {
+            let named = Receiver::named(program, ctx, source, op.receiver);
             let cls = if op.is_arrow {
                 let Some(cls) = member_receiver_class(program, ctx, source, op.receiver, true)
                 else {
@@ -10017,6 +10020,7 @@ fn collect_call_at_node_inner(
                         span,
                         expansion_span,
                         return_dst,
+                        None,
                     );
                     return;
                 };
@@ -10032,7 +10036,7 @@ fn collect_call_at_node_inner(
                     caller,
                     &cls,
                     &kind,
-                    None,
+                    named,
                     call_args,
                     span,
                     expansion_span,
@@ -10050,6 +10054,7 @@ fn collect_call_at_node_inner(
                 span,
                 expansion_span,
                 return_dst,
+                named.var(),
             );
             return;
         }
@@ -10065,6 +10070,7 @@ fn collect_call_at_node_inner(
             span,
             expansion_span,
             return_dst,
+            None,
         );
         return;
     }
@@ -10115,6 +10121,7 @@ fn collect_call_at_node_inner(
                     if let Some((recv, recv_cls)) = func.cached_field("argument").and_then(|recv| {
                         infer_static_class(program, ctx, source, recv).map(|c| (recv, c))
                     }) {
+                        let named = Receiver::named(program, ctx, source, recv);
                         // `p->m()` looks `m` up on what `p`'s `operator->`
                         // yields, not on `p`'s own class (#64). `r.m()` looks
                         // it up on `r`'s own class, which is already in hand.
@@ -10139,6 +10146,7 @@ fn collect_call_at_node_inner(
                                     span,
                                     expansion_span,
                                     return_dst,
+                                    None,
                                 );
                                 return;
                             };
@@ -10171,7 +10179,7 @@ fn collect_call_at_node_inner(
                                 caller,
                                 &cls,
                                 &kind,
-                                None,
+                                named,
                                 call_args,
                                 span,
                                 expansion_span,
@@ -10198,7 +10206,7 @@ fn collect_call_at_node_inner(
                                     caller,
                                     &field_cls,
                                     &op,
-                                    None,
+                                    Receiver::Unnamed,
                                     call_args,
                                     span,
                                     expansion_span,
@@ -10232,6 +10240,7 @@ fn collect_call_at_node_inner(
                                 span,
                                 expansion_span,
                                 return_dst,
+                                named.var(),
                             );
                             return;
                         }
@@ -10265,7 +10274,7 @@ fn collect_call_at_node_inner(
                         caller,
                         &cls,
                         &kind,
-                        None,
+                        Receiver::this_of(ctx),
                         call_args,
                         span,
                         expansion_span,
@@ -10285,7 +10294,7 @@ fn collect_call_at_node_inner(
             caller,
             &cls,
             &kind,
-            None,
+            Receiver::Unnamed,
             call_args,
             span,
             expansion_span,
@@ -10313,7 +10322,7 @@ fn collect_call_at_node_inner(
                 caller,
                 &cls,
                 &kind,
-                None,
+                Receiver::Unnamed,
                 call_args,
                 span,
                 expansion_span,
@@ -10459,6 +10468,7 @@ fn collect_call_at_node_inner(
             receiver_class: None,
             exact_receiver: false,
             return_dst,
+            receiver: None,
             tu: Some(ctx.current_file),
         });
         return;
@@ -10508,6 +10518,7 @@ fn collect_call_at_node_inner(
             receiver_class: None,
             exact_receiver: false,
             return_dst,
+            receiver: None,
             tu: Some(ctx.current_file),
         });
     }
@@ -11822,6 +11833,7 @@ fn emit_unresolved_site(
     span: Span,
     expansion_span: Option<Span>,
     return_dst: Option<VarId>,
+    receiver: Option<VarId>,
 ) {
     let CallArgs {
         var_args,
@@ -11853,22 +11865,78 @@ fn emit_unresolved_site(
         receiver_class,
         exact_receiver: false,
         return_dst,
+        receiver,
         tu: program.symbols.function_by_id(caller).and_then(|f| f.tu),
     });
+}
+
+/// The object a member call runs on, as lowering knows it
+/// ([`CallSite::receiver`]).
+#[derive(Clone, Copy)]
+enum Receiver {
+    /// A field, a call result or another expression, or not known.
+    Unnamed,
+    /// A variable by name: recorded on the site, for identity only.
+    Named(VarId),
+    /// The object a constructor or destructor builds or destroys: recorded,
+    /// and bound to the callee's `this` as argument 0.
+    Bound(VarId),
+}
+
+impl Receiver {
+    /// The variable a receiver expression names, without lowering it: `q`
+    /// in `q.f()`, `p` in `p->f()`, `this` in `this->f()`, through
+    /// parentheses, casts and `std::move`. A bare instance field in a member
+    /// body (`handler_->f()`) is `this->handler_`, no variable.
+    fn named(program: &Program, ctx: &LowerContext, source: &str, receiver: Node) -> Self {
+        let receiver = peel_casts(source, receiver);
+        let var = match receiver.cached_kind() {
+            "this" => return Self::this_of(ctx),
+            "identifier" if implicit_this(program, ctx, source, receiver).is_some() => None,
+            "identifier" | "qualified_identifier" => {
+                lookup_var_node(program, ctx, source, receiver)
+            }
+            _ => None,
+        };
+        var.map_or(Self::Unnamed, Self::Named)
+    }
+
+    /// The implicit `this` of a member body, the receiver of a bare
+    /// `method()` call there.
+    fn this_of(ctx: &LowerContext) -> Self {
+        ctx.locals
+            .get("this")
+            .copied()
+            .map_or(Self::Unnamed, Self::Named)
+    }
+
+    fn var(self) -> Option<VarId> {
+        match self {
+            Self::Unnamed => None,
+            Self::Named(var) | Self::Bound(var) => Some(var),
+        }
+    }
+
+    fn bound(self) -> Option<VarId> {
+        match self {
+            Self::Bound(var) => Some(var),
+            Self::Unnamed | Self::Named(_) => None,
+        }
+    }
 }
 
 /// Emit call sites for `cls::member` — the override set across derived
 /// classes, found by walking up the inheritance chain to the nearest
 /// declaring class and expanding its subclasses. `args` are the explicit
-/// arguments, bound here past the member's `this`, which is `receiver` when
-/// the caller has the object (#93, #94).
+/// arguments, bound here past the member's `this`, which is the `receiver`
+/// when the caller has the object (#93, #94).
 #[allow(clippy::too_many_arguments)]
 fn emit_member_sites(
     program: &mut Program,
     caller: FnId,
     cls: &str,
     kind: &trace_ir::MethodKind,
-    receiver: Option<VarId>,
+    receiver: Receiver,
     args: CallArgs,
     span: Span,
     expansion_span: Option<Span>,
@@ -11900,7 +11968,7 @@ fn emit_member_targets(
     caller: FnId,
     cls: &str,
     kind: &trace_ir::MethodKind,
-    receiver: Option<VarId>,
+    receiver: Receiver,
     args: CallArgs,
     span: Span,
     expansion_span: Option<Span>,
@@ -11915,7 +11983,7 @@ fn emit_member_targets(
         return;
     }
     let tu = program.symbols.function_by_id(caller).and_then(|f| f.tu);
-    let mut args = args.bind_past_this(receiver);
+    let mut args = args.bind_past_this(receiver.bound());
     let argc = args.argc;
     let targets = filter_targets_by_argc(program, targets, argc as usize, &args.arg_desc, true);
     // Same-arity overloads the argument types tell apart (`Set(int)`,
@@ -11955,6 +12023,7 @@ fn emit_member_targets(
             receiver_class: Some(cls.to_string()),
             exact_receiver: false,
             return_dst,
+            receiver: receiver.var(),
             tu,
         });
         return;
@@ -11991,6 +12060,7 @@ fn emit_member_targets(
             receiver_class: Some(cls.to_string()),
             exact_receiver: false,
             return_dst,
+            receiver: receiver.var(),
             tu,
         });
     }
@@ -12829,7 +12899,7 @@ fn lower_class_initializer(
             caller,
             &class,
             &kind,
-            object.address,
+            object.address.map_or(Receiver::Unnamed, Receiver::Bound),
             call_args.take_for(index == last),
             span,
             expansion_span,
@@ -13130,7 +13200,7 @@ fn lower_copy_subobject(
                 caller,
                 target,
                 &kind,
-                object.address,
+                object.address.map_or(Receiver::Unnamed, Receiver::Bound),
                 args,
                 span,
                 expansion_span,

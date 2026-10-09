@@ -152,15 +152,17 @@ edges**; `std::bind` is opaque.
   field so body member calls type.
 - `std::packaged_task<Sig>` intern as `FnPtr` like `std::function`.
 
-**Done so far:** `ffrt::queue::submit` and thread entry points
-(`std::thread`, `pthread_create`, #187) are `invoke` models; see
-`docs/ANALYSIS.md`, "Callback invocation". `std::bind` and
-`packaged_task` remain.
+**Done so far:** thread entry points (`std::thread`, `pthread_create`,
+#187) and the OpenHarmony task primitives (#203, `ffrt::submit` among them)
+are `invoke` models; the list and its imprecision are in
+`docs/ANALYSIS.md`, "Built-in models" and "Documented imprecision". A
+submitted lambda (`FaultLogDatabase::SaveFaultLogInfo`, the
+`PassthroughMonitor` handlers) now has an edge **from the submitter**
+([EVAL_REPORT.md](EVAL_REPORT.md#task-and-thread-primitives-203--2026-10-09)).
+`std::bind` (e.g. `base/plugin.cpp:93`), `packaged_task` and lambda captures remain.
 
 **Eval when done:** `Plugin::DelayProcessEvent` reaches `OnEventProxy`;
-`EventLoop::ProcessEvent` packaged path reaches `EventHandler::OnEventProxy`;
-a sample `ffrt::submit` lambda (`FaultLogDatabase::SaveFaultLogInfo` or
-passthrough_monitor) has an edge **from the submitter**.
+`EventLoop::ProcessEvent` packaged path reaches `EventHandler::OnEventProxy`.
 
 ---
 
@@ -603,7 +605,7 @@ plugins without `dlsym` is C3 (static `REGISTER` ctors).
 | C1 | `auto p = wp.lock(); p->OnEventProxy();` + `auto l = p->GetWorkLoop(); l->AddEvent(...)` — done, see `tests/fixtures/cpp_auto_return` |
 | C2 | `Event::DownCastTo<SysEvent>(e); sys->SetEventValue(...)` |
 | C3 | `REGISTER`-like static `PluginRegistInfo(MakeFoo)` + `info->getPluginObject()` |
-| C4 | `std::bind(&Plugin::OnEventProxy, this, e)` stored and invoked; `ffrt::submit` stub summary |
+| C4 | `std::bind(&Plugin::OnEventProxy, this, e)` stored and invoked; `ffrt::submit` summary done, see `tests/fixtures/task_primitives` |
 | C5 | `map<string, shared_ptr<Plugin>>` + `find("Foo")->second->OnEventProxy()` |
 | C6 | Proxy field filled by factory, then `proxy->OnEvent()` |
 | C7 | `map<int, int(*)(Msg*)>` + `parser(msg)` |

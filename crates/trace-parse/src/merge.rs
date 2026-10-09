@@ -1181,6 +1181,7 @@ fn merge_unit(
             });
         }
         site.return_dst = site.return_dst.and_then(|v| var_map.get(&v).copied());
+        site.receiver = site.receiver.and_then(|v| var_map.get(&v).copied());
         site.span.file = span_file;
         site.expansion_span = site.expansion_span.map(|mut span| {
             span.file = map_file(span.file);
@@ -2142,6 +2143,7 @@ mod tests {
                 receiver_class: None,
                 exact_receiver: false,
                 return_dst: Some(VarId(0)),
+                receiver: None,
                 tu: None,
             };
             site.details_mut().return_operation = Some(Box::new((
@@ -2408,6 +2410,7 @@ mod tests {
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
+            receiver: None,
             tu: None,
         };
         let text: Arc<str> = Arc::from("static inline int Unmarshal(struct Buf *data) { .. }");
@@ -2530,6 +2533,7 @@ mod tests {
                     receiver_class: None,
                     exact_receiver: false,
                     return_dst: None,
+                    receiver: None,
                     tu: None,
                 }],
                 ..Default::default()
@@ -2614,6 +2618,7 @@ mod tests {
                 receiver_class: None,
                 exact_receiver: false,
                 return_dst: None,
+                receiver: None,
                 tu: None,
             }],
             ..Default::default()
@@ -2966,6 +2971,7 @@ mod tests {
                     receiver_class: None,
                     exact_receiver: false,
                     return_dst: None,
+                    receiver: None,
                     tu: None,
                 }],
             )

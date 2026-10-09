@@ -768,7 +768,7 @@ Instead, `trace` decouples intra-repository static analysis from cross-repositor
 ### Invariants and linking rules
 
 - **No analysis during merge**: Andersen pointer analysis, PAG construction, and interprocedural dataflow solvers do **not** run during the merge stage. Intra-repository dataflow facts (`flow_nodes`, `flow_edges`, `arg_flow_edges`) remain strictly within their original repository databases. The merge stage is purely a deterministic linker that reconnects external call edges across repositories. Its shared-schema output leaves flow tables empty and call-site variable bindings NULL; see the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
-- **Execution contexts carry over**: `execution_contexts` rows are copied with their function and call-site ids remapped, and one whose function or call site did not survive the merge is dropped. Rows several inputs contribute for one context (same start, modelled callee, parameter, entry and kind: an IPC handler a shared header defines, since call sites are not deduplicated) are kept once, with the evidence of all: `self_concurrent` when any input says so, and the first `multi_instance` that applies in the analysis' order. Merged rows are ordered as `trace analyze` orders them, by call site, then the IPC handlers by entry. The evidence is otherwise each input's own: a cross-repository edge re-linked here is not searched for new cycles or parents ([Execution contexts](#execution-contexts)). Which inputs supply the table, and what an input exported before it contributes, is part of the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
+- **Execution contexts carry over**: `execution_contexts` rows are copied with their function and call-site ids remapped, and one whose function or call site did not survive the merge is dropped. `receiver_var_id` is NULL in the merged database, which carries no variables. Rows several inputs contribute for one context (same start, modelled callee, parameter, entry, kind and model: an IPC handler or an override entry a shared header defines, since call sites are not deduplicated) are kept once, with the evidence of all: `self_concurrent` when any input says so, and the first `multi_instance` that applies in the analysis' order. Merged rows are ordered as `trace analyze` orders them, by call site, then the entries no call site starts by entry. The evidence is otherwise each input's own: a cross-repository edge re-linked here is not searched for new cycles or parents ([Execution contexts](#execution-contexts)). Which inputs supply the table, and what an input exported before it contributes, is part of the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
 - **External call re-linking and may-analysis over-approximation**:
   - In individual repositories, calls to functions declared but not defined in that repository are emitted with `resolution = 'external'` (or point to `is_defined = 0` declarations). `trace-merge` matches these calls against exported strong definitions (`is_defined = 1`, `linkage = 'external'`) from other repositories, updating `call_edges.callee_fn_id` to the survivor's unified ID and retargeting `resolution` to `'direct'` (or `'ambiguous'` if conflicting definitions exist), while preserving original non-direct resolutions (`indirect` and `ipc`). Unresolved external calls retain their original resolution.
   - When multiple strong definitions exist across different repositories (or multiple weak definitions), `trace-merge` emits an ambiguous edge (`resolution = 'ambiguous'`) to **every candidate definition**, satisfying the may-analysis invariant (AGENTS.md §2). This ensures downstream path queries such as `trace inspect callchain` do not miss valid paths.
@@ -1690,8 +1690,76 @@ IR: calls to them produce call edges but no data flow. **Function models** close
 gap with declarative per-function summaries that relate parameters to each other.
 
 Models are matched by function name at every resolved call site — direct, recovered
-cross-TU, indirect, and external. A model applies regardless of whether the callee is
-defined in-tree, so project-specific wrappers can be described too.
+cross-TU, indirect, and external (see [Model matching](#model-matching)). A model
+applies regardless of whether the callee is defined in-tree, so project-specific
+wrappers can be described too.
+
+### Model matching
+
+This section is the authoritative statement of which function a model applies to
+(`ModelLookup`, `summaries.rs`). Every effect is looked up through it — at call
+sites, into call results, for `dlsym`, callbacks and framework entries — so one
+model is matched under the same rules whatever its effects, except that argument
+and return effects skip rules 2 and 3 (below). The rules, in precedence order:
+
+1. **The exact name** (`memcpy_s`, `ffrt::submit`, `OHOS::Utils::Timer::Register`).
+2. **A constructor's class name**: a model named for a constructor (`C::C`) also
+   covers a call recorded under the class name `C`, which is how a temporary is
+   spelled when the unit never saw the class (`std::thread(f, x)`).
+3. **An unqualified model by the callee's last segment**: `dlsym` covers `::dlsym`
+   and `ns::dlsym`. A model named plain `PostTask` would therefore cover every
+   class's `PostTask`; the built-in member models are qualified.
+4. **A qualified member model `B::m` on another class's `m`**, when the function's
+   class, or else its nearest base that does, *may be* `B`: a class the tree
+   declares is the class its name says, so only equal names match; a class it
+   never declares is named as written, or, written bare, in the innermost
+   namespace around it ([Undeclared receiver classes](#undeclared-receiver-classes)),
+   and C++ lookup from there finds a class of an enclosing namespace too. So past
+   the trailing segments the two names share (the class name at least), the
+   recorded name may keep no namespace or one nested in `B`'s
+   (`class_may_be`). `AppExecFwk::EventHandler::PostTask` (written under
+   `using namespace OHOS`), `OHOS::Camera::ThreadPool::AddTask` (a bare
+   `ThreadPool` inside `OHOS::Camera`) and `MyHandler::PostTask` (a subclass of
+   the library's handler that declares no `PostTask`) take the models of
+   `OHOS::AppExecFwk::EventHandler::PostTask` and `OHOS::ThreadPool::AddTask`;
+   hiview's own, declared `OHOS::HiviewDFX::EventHandler` takes none. Of several
+   models that may match, the one matched on the nearest class wins: the
+   function's own class is at distance 0, its direct bases at 1, and a base
+   reached along several paths at its shortest. Models at equal distance are
+   ordered by model name (byte order), never by the order a class lists its
+   bases, so `Leaf : Z, A` and `Leaf : A, Z` both take `A::Post` over `Z::Post`.
+   The choice is per effect group (see below).
+
+Rules 2 and 3 name models for `dlsym`, `invoke` and `entry` effects only.
+**Argument and return effects** (`alias`, `mem_copy`, `content_store`, `clears`;
+`return_alias`, `return_heap`) take rule 1 alone, where
+the name may also be written with a leading `::` or `std::`, which name the
+same C library function: `memset`, `::memset` and `std::memset` take the
+`memset` model, while a class's or namespace's own `SecureBuffer::memset`,
+`Pool::memcpy`, `secure::memset` or bodyless `Arena::malloc` take none of
+the libc models (no terminator, no copy, no fresh heap), and rule 4 still
+applies to them.
+
+Not matched: a member a subclass inherits from a base the unit never declares,
+called bare in the subclass's body (`PostTask(f)` inside a subclass of
+`AppExecFwk::EventHandler`): lowering records it as a free function `PostTask`,
+not as a member of any class.
+
+**A named model is authoritative.** A model rules 1-3 give a function, for the
+effect group looked up, states all of its effects, so an explicitly empty one
+disables the function: `disabled::dispatch` with no effects keeps a bare
+`dispatch` model off `disabled::dispatch`. Only when no model is named for it
+does a function take rule 4's.
+
+**Rule 4 is chosen per effect group.** A function's effects of one group come from
+the first rule-4 model, in the order above, that has an effect of that group; a
+model with none is passed over. The groups are the parts of the analysis that
+apply them: argument effects (`alias`, `mem_copy`, `content_store`, `clears`),
+return effects (`return_alias`, `return_heap`), `dlsym`, `invoke` and `entry`. So
+a nearer base's `entry` model of `Mid::m` does not hide a farther base's `invoke`
+model of `Base::m` for `Leaf::m`, and a requalified or subclass call takes every
+group of the library member's model. The rule-4 candidates for a name are
+resolved once per analysis and shared by every lookup.
 
 ### Effect kinds
 
@@ -1704,7 +1772,8 @@ defined in-tree, so project-specific wrappers can be described too.
 | `return_heap` | returns a fresh storage location | fresh `Heap` loc per call site into the destination |
 | `clears { param }` | **terminator**: memory reachable via `param[param]` is zeroed by this call | no value introduction; terminator event exported |
 | `dlsym { param }` | return value may be the address of the in-tree function named by string constants in `param[param]` | `Dlsym` PAG constraint; unknown names add nothing |
-| `invoke { param, args / rest, context }` | may invoke the callback passed in `param[param]`, with the arguments `args = [..]` lists (none when omitted: a zero-argument callback) or every argument from position `rest` on, in an execution context of kind `context` (`unknown` when omitted) | adds an indirect edge from the submitting caller at the submission site, read off the converged points-to sets; callback return values and scheduling are ignored. Forwarded arguments are wired into the callback's formals inside the fixpoint (see [Callback invocation](#callback-invocation-invoke)). Unlike the value-introducing effects this is not restricted to a bodyless callee — a callback API is routinely a template whose body the index holds once, uninstantiated — and an edge the callee's own body already yields is not added twice. Each resolved callback is also an [execution context](#execution-contexts) |
+| `entry { context }` | the named member `Class::method` is one a framework calls: it and every override of it the tree defines is the entry of an [execution context](#execution-contexts) of kind `context`, which no call site starts | none: no edge, no flow |
+| `invoke { param, args / rest, context, supplies, if_arg / unless_arg }` | may invoke the callback passed in `param[param]`, with the arguments `args = [..]` lists (none when omitted: a zero-argument callback) or every argument from position `rest` on, preceded by a value of class `supplies` when the callback takes one, in an execution context of kind `context` (`unknown` when omitted); with `if_arg` / `unless_arg`, only at a call whose argument it names may be / may not be of the class it names | adds an indirect edge from the submitting caller at the submission site, read off the converged points-to sets; callback return values and scheduling are ignored. Forwarded arguments are wired into the callback's formals inside the fixpoint (see [Callback invocation](#callback-invocation-invoke)). Unlike the value-introducing effects this is not restricted to a bodyless callee — a callback API is routinely a template whose body the index holds once, uninstantiated — and an edge the callee's own body already yields is not added twice. Each resolved callback is also an [execution context](#execution-contexts) |
 
 Effects attach to parameter positions (0-based) of the *actual arguments* recorded at
 the call site. Arguments that are not IR variables or functions (literals like
@@ -1726,10 +1795,37 @@ image as an indirect call's targets are.
   explicit arguments, so a constructor's or member's implicit `this` is not
   one of them. A model that passes the callback to itself, or gives `args` /
   `rest` to another effect kind, is rejected when the file is loaded.
-- **Constructors.** A model named for a constructor (`C::C`) also applies
-  to a call recorded under the class name `C`, which is how a temporary is
-  spelled when the unit never saw the class (`task = std::thread(f, x)`).
-  One registration, so overriding or disabling it covers both.
+- **A value the callee supplies.** `supplies = "std::stop_token"` says the
+  callee passes a value of that class ahead of the forwarded arguments to a
+  callback that takes one (`std::jthread`). Per callback definition, the
+  formal the first forwarded argument would reach decides: declared of that
+  class (however qualified), the supplied value takes it and the forwarded
+  arguments start at the next formal, which also needs room in the count; of
+  a type that cannot be the class (a pointer, a function pointer, another
+  class), the arguments start there as without `supplies`; of a type lowering
+  could not resolve (read as `int`, or a guessed class), both readings are
+  wired. A reference (`const std::stop_token &`) is declared of its
+  referent's class: lowering types it as the referent's address, and the
+  function's `reference_params` tell it from a pointer parameter, which stays
+  a pointer. The supplied value itself carries no flow.
+- **A call it applies at.** `if_arg = { param = 0, type = "std::launch" }`
+  applies the effect only at a call whose argument 0 may be a value of that
+  class or enumeration, `unless_arg` only at one where it may not be; the two
+  are alternatives (`std::async(policy, f, args...)` beside
+  `std::async(f, args...)`). The argument decides by what the call site
+  records there: a function named is never such a value; a variable is one
+  by its declared type, read as for `supplies` (a reference parameter,
+  `const std::launch &`, by its referent's). A local bound as a reference is
+  not recorded as one past lowering, so a pointer-typed local whose referent
+  may be the class may be either. An argument the site records
+  nothing for (an enumerator such as `std::launch::async`, a literal, a call
+  result) and a variable of an unresolved type may be either, so both a
+  model's `if_arg` and its `unless_arg` effect apply there.
+- **Which callees.** A constructor model also covers a temporary spelled
+  with the class name (`task = std::thread(f, x)`), and a member model the
+  member on a class the unit never declares and on a subclass
+  ([Model matching](#model-matching)). One registration, so overriding or
+  disabling it covers every form.
 - **Which callbacks fit.** A listed form reaches a callback that can be
   called with exactly that many arguments: its declared parameters, less
   those with defaults, more if it is variadic. So a zero-argument model does
@@ -1757,14 +1853,11 @@ image as an indirect call's targets are.
   seen are wired in `FnId` order.
 - **Arg-flow rows.** Each forwarded argument is an arg-flow row at the
   starting call site: its position there, and the callback's formal.
-- **Context.** `context = "thread"` (a new thread), `"pool_task"` (a
-  task on a pool of worker threads), `"serial_task"` (a task on a queue that
-  runs one task at a time), `"ipc_handler"` (a request handler on the IPC
-  worker pool, self-concurrent like a stub handler) or `"unknown"` says where
-  the callback runs; a model that does not say starts an `unknown` context, and
-  `context` on another effect kind is rejected when the file is loaded. Each
-  resolved callback is exported as one execution context (next section); the
-  call graph is the same whatever the kind.
+- **Context.** `context` names the [kind](#execution-contexts) of execution
+  context the callback runs in (`unknown` when omitted). `context` on an
+  effect kind other than `invoke` and `entry` is rejected when the file is
+  loaded. Each resolved callback is exported as one execution context (next
+  section); the call graph is the same whatever the kind.
 - **Not modeled.** No ordering or scheduling (the callback is simply
   reachable from the starting site), no return value, and no bound state:
   `std::bind` results and `std::function` objects are not looked into.
@@ -1780,31 +1873,54 @@ solver, and `call_edges` is unchanged: a start is still an ordinary
 `indirect` edge from the submitting caller there, and an IPC handler is
 still the callee of an `ipc` edge.
 
+- **Kinds** (`kind`, a model's `context`): `thread` (a new thread),
+  `pool_task` (a task on a pool of worker threads), `serial_task` (a task on
+  a queue that runs one task at a time), `ipc_handler` (a request handler on
+  the IPC worker pool) or `unknown`.
 - **Which contexts.** One per resolved callback of an `invoke` model:
   submitting call site, modelled callee (`pthread_create`,
-  `std::thread::thread`, `ffrt::queue::submit`), invoked parameter, callback
-  function, and the kind the model states. The callbacks are the targets of
-  the edges [Callback invocation](#callback-invocation-invoke) adds, so a
-  callback that reaches a declaration and its definition is two contexts, as
-  it is two edges. Then one per IPC stub handler a bridge targets
+  `std::thread::thread`, `ffrt::submit`, `AppExecFwk::EventHandler::PostTask`),
+  invoked parameter, the receiver the callee was called on, callback
+  function, the kind the model states and the model's name (which may differ
+  from the callee's, [Model matching](#model-matching)). The callbacks are the
+  targets of the edges [Callback invocation](#callback-invocation-invoke)
+  adds, so a callback that reaches a declaration and its definition is two
+  contexts, as it is two edges. Then the entries no call site starts, by
+  function: every definition of an `entry` model's member and of an override
+  of it (`Worker::Run` for `OHOS::Thread::Run`; matched as in
+  [Model matching](#model-matching), rule 4), with the model's kind and name,
+  and every IPC stub handler a bridge targets
   ([OpenHarmony IPC bridges](#openharmony-ipc-bridges)), of kind
-  `ipc_handler`, with no call site: the request comes from another process.
-  Rows are ordered by call site, modelled callee, parameter, callback and
-  kind, then by handler, so the export is the same at any `--jobs`, and
-  `trace-merge` orders merged rows the same way
+  `ipc_handler` and with no model: the request comes from another process.
+  Rows are ordered by call site, modelled callee, parameter, callback, kind
+  and model, then by entry, kind and model, so the export is the same at any
+  `--jobs`, and `trace-merge` orders merged rows the same way
   ([Invariants and linking rules](#invariants-and-linking-rules)).
+- **Which receiver.** A member call site records the variable it is made on
+  when the receiver is one by name (`CallSite::receiver`): `q` in
+  `q.submit(f)`, `handler` in `handler->PostTask(f)`, `this` in
+  `this->PostTask(f)` or a bare `Run()` in a member body, the object a
+  constructor builds (`std::thread t(f)`), through parentheses, casts and
+  `std::move`. It is identity only, not bound to the callee's `this`. A field
+  (`handler_->PostTask(f)`, `this->handler_`), a call result or any other
+  expression records none, so tasks queued on a member handler are not told
+  apart here; nor is a pointer variable's pointee: two variables naming one
+  queue are two receivers.
 - **A start site is a context, not a thread.** A wrapper every thread is
   started through (HDF's `OsalThreadCreate` around one `pthread_create`)
   makes one start site for every entry function the wrapper is given, and
-  the same callback started at two sites is two contexts. Which executor a
-  task is queued on is not recorded.
+  the same callback started at two sites is two contexts. The executor a
+  task is queued on is at most its receiver variable (above).
 - **Self-concurrency.** `self_concurrent` says two instances may run at the
   same time: every IPC handler, a stub handler or a callback a model states
   as `ipc_handler` (the IPC worker pool runs requests on the same stub
   concurrently unless the stub serializes them, which is not read), and
   every context with multi-instance evidence. For a `serial_task` this is
-  only "possibly": tasks on one queue run one at a time, and which queue is
-  not known. `0` means no evidence, not single execution.
+  only "possibly": tasks on one queue run one at a time, and the queue is at
+  most a receiver variable. An entry no call site starts has no
+  multi-instance evidence of its own: it is self-concurrent only as an
+  `ipc_handler` (`DeathRecipient::OnRemoteDied` runs on an IPC thread). `0`
+  means no evidence, not single execution.
 - **Multi-instance evidence** (`multi_instance`), the first that applies:
   - `loop`: the start site is lexically inside a loop of its function
     (`CallSite::in_loop`): a loop's body, condition or update, but not a
@@ -1862,9 +1978,22 @@ entries:
 | `malloc`, `calloc`, `zalloc`, `kmalloc` | `return_heap` |
 | `realloc` | `return_alias param=0`, `return_heap` |
 | `dlsym`, `dlvsym`, `GetProcAddress` | `dlsym param=1` (symbol-name argument) |
-| `ffrt::queue::submit` | `invoke param=0 context=serial_task` (explicit callback argument, excluding implicit `this`) |
+| `ffrt::submit`, `ffrt::submit_h` | `invoke param=0 context=pool_task` (the task; dependences and attributes after it) |
+| `ffrt::queue::submit`, `ffrt::queue::submit_h` | `invoke param=0 context=serial_task` (explicit callback argument, excluding implicit `this`) |
+| `ffrt_submit_base`, `ffrt_submit_h_base` | `invoke param=0 context=pool_task` (the function header) |
+| `ffrt_queue_submit`, `ffrt_queue_submit_h` | `invoke param=1 context=serial_task` (the function header, after the queue) |
+| `OHOS::AppExecFwk::EventHandler::PostTask`, `PostImmediateTask`, `PostHighPriorityTask`, `PostIdleTask`, `PostSyncTask`, `PostTimingTask`, `PostTaskAtFront` | `invoke param=0 context=serial_task` (the callback; name, delay, priority after it) |
+| `OHOS::ThreadPool::AddTask` | `invoke param=0 context=pool_task` |
+| `OHOS::Utils::Timer::Register` | `invoke param=0 context=serial_task` (the callback; interval and once-flag after it) |
+| `HdfWorkInit`, `HdfDelayedWorkInit` | `invoke param=1 args=[2] context=serial_task` (work function and its argument) |
+| `OsalTimerCreate` | `invoke param=2 args=[3] context=thread` (timer function and its argument) |
 | `pthread_create` | `invoke param=2 args=[3] context=thread` (start routine and its argument) |
 | `std::thread::thread` | `invoke param=0 rest=1 context=thread` (callable and everything after it); covers a temporary recorded as `std::thread` |
+| `std::jthread::jthread` | `invoke param=0 rest=1 supplies=std::stop_token context=thread` (as `std::thread`, with the thread's stop token first to a callable that takes one); covers a temporary recorded as `std::jthread` |
+| `std::async` | `invoke param=0 rest=1 unless_arg={param=0, type=std::launch} context=thread` and `invoke param=1 rest=2 if_arg={param=0, type=std::launch} context=thread` (the callable first, or after a launch policy) |
+| `OHOS::Thread::Run` | `entry context=thread` (c_utils runs it on the thread `Start` creates) |
+| `OHOS::AppExecFwk::EventHandler::ProcessEvent` | `entry context=serial_task` (the handler's event runner calls it) |
+| `OHOS::IRemoteObject::DeathRecipient::OnRemoteDied` | `entry context=ipc_handler` (an IPC thread calls it when the remote dies) |
 
 ### Configuration format
 
@@ -1899,11 +2028,31 @@ effects = [ { kind = "dlsym", param = 1 } ]
 name = "pool_post"
 effects = [ { kind = "invoke", param = 1, args = [2], context = "pool_task" } ]
 
+# Argument 0 is a launch policy or the callable; a callable that takes a
+# `Token` first gets the runner's own ahead of the forwarded arguments.
+[[model]]
+name = "run_async"
+effects = [
+    { kind = "invoke", param = 0, rest = 1, unless_arg = { param = 0, type = "Policy" } },
+    { kind = "invoke", param = 1, rest = 2, if_arg = { param = 0, type = "Policy" }, supplies = "Token" },
+]
+
+# A virtual member a framework runs on its own thread: every override is an
+# entry. Named `Class::method`; `entry` takes only `context`.
+[[model]]
+name = "OHOS::Worker::Loop"
+effects = [ { kind = "entry", context = "thread" } ]
+
 # An explicitly empty effect list overrides (disables) a same-name built-in.
 [[model]]
 name = "memcpy"
 effects = []
 ```
+
+`supplies`, `if_arg` and `unless_arg` belong to `invoke` and name a class or
+enumeration (`ns::Name`, no pointer, reference or template arguments); a test
+table takes exactly `param` and `type`. Anything else, or both tests on one
+effect, is rejected when the file is loaded.
 
 ### Documented imprecision
 
@@ -1927,6 +2076,35 @@ effects = []
   `ffrt::queue` can be created concurrent, and an execution context is keyed
   by start site, not by thread or executor (see
   [Execution contexts](#execution-contexts)).
+- **The task and thread primitives' kinds** are those of the usual
+  configuration: an `EventHandler` posts to the one thread of its event
+  runner, so the `PostTask` family is a `serial_task` (`PostSyncTask` too,
+  although its caller waits); the callbacks of one `Utils::Timer` run one at
+  a time on the timer's thread (`serial_task`); an HDF work queue is a single
+  thread (`serial_task`), and the work function is started where the work is
+  initialised, not where `HdfAddWork` queues it; an OSAL timer's function runs
+  apart from its creator, on a thread of its own in the user-space adapter and
+  as a kernel timer callback in the Linux one (`thread`). `std::async` is a
+  `thread` whether or not a policy lets the library defer the callable to the
+  caller's `get`. Whether its first argument is a policy is read off what the
+  call site records there ([Callback invocation](#callback-invocation-invoke)):
+  where that cannot tell (a variable of an unresolved type, an expression the
+  site records nothing for that is not a policy), the call is read both ways,
+  and a function passed as the callable's argument is a callback too. A
+  `std::jthread` callable takes the stop token by its declared first
+  parameter, not by whether it could be invoked with one, and the token
+  carries no flow.
+- **ffrt's C forms take a function header** (`ffrt_function_header_t *`)
+  whose `exec` member the runtime calls with the header. The models invoke
+  what the header argument itself may point to: a header object, the usual
+  case, holds no function, and neither the header's members nor the return
+  of `ffrt::create_function_wrapper` (a template outside the tree, with no
+  model) are looked into, so a C-form submission is a context only where the
+  argument may hold the function itself.
+- **An `entry` is every definition of the member or an override of it** the
+  tree holds, whether or not anything constructs its class or starts it
+  (`Thread::Start`, a handler's runner, `AddDeathRecipient`); one declared
+  but defined elsewhere is none.
 
 ## Noise macro filtering (`--ignore-macro`, `--ignore-logging`, `[noise]`)
 

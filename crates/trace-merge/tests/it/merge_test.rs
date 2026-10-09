@@ -1963,3 +1963,73 @@ fn execution_contexts_are_optional_in_v7_inputs_and_validated_when_present() {
     assert!(error.contains("re-analyze"), "{error}");
     assert_eq!(fs::read(&output).unwrap(), b"existing output");
 }
+
+/// The model naming a context is carried over, an override entry's too; the
+/// receiver variable is not, as no variable is.
+#[test]
+fn merged_execution_contexts_keep_their_model() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let repo_a = root.join("repo_a");
+    let repo_b = root.join("repo_b");
+    fs::create_dir_all(&repo_a).unwrap();
+    fs::create_dir_all(&repo_b).unwrap();
+    fs::write(
+        repo_a.join("a.cpp"),
+        r#"
+        namespace OHOS {
+        void Job() {}
+        void Post(AppExecFwk::EventHandler *handler) { handler->PostTask(Job); }
+        }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        repo_b.join("b.cpp"),
+        r#"
+        namespace OHOS {
+        class Recipient : public IRemoteObject::DeathRecipient {
+        public:
+            void OnRemoteDied(const wptr<IRemoteObject> &remote) override {}
+        };
+        }
+        "#,
+    )
+    .unwrap();
+    let db_a = root.join("a.db");
+    let db_b = root.join("b.db");
+    analyze_repo(&repo_a, &db_a);
+    analyze_repo(&repo_b, &db_b);
+    let merged = root.join("merged.db");
+    merge_databases(
+        &[db_a, db_b],
+        &MergeOptions {
+            output: merged.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+
+    let conn = Connection::open(&merged).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.kind || ' ' || f.name || ' ' || e.model || ' ' || \
+                    ifnull(e.receiver_var_id, 'NULL') \
+             FROM execution_contexts e \
+             JOIN functions f ON f.id = e.entry_fn_id ORDER BY e.id",
+        )
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "serial_task OHOS::Job OHOS::AppExecFwk::EventHandler::PostTask NULL",
+            "ipc_handler OHOS::Recipient::OnRemoteDied \
+             OHOS::IRemoteObject::DeathRecipient::OnRemoteDied NULL",
+        ]
+    );
+}

@@ -289,6 +289,13 @@ fn export_flow_and_arg_flow_vars(
         }
         needed.insert(edge.formal);
     }
+    // The queue, handler or pool a context was submitted on.
+    needed.extend(
+        analysis
+            .execution_contexts
+            .iter()
+            .filter_map(|c| c.start.as_ref()?.receiver),
+    );
     // The flow graph must be self-contained for inspect queries: every
     // variable with a PAG node is exported, not just arg-flow participants.
     for node in &pag.nodes {
@@ -993,7 +1000,8 @@ fn export_arg_flow(conn: &Connection, analysis: &AnalysisResult) -> Result<()> {
 fn export_execution_contexts(conn: &Connection, analysis: &AnalysisResult) -> Result<()> {
     let mut stmt = conn.prepare_cached(
         "INSERT INTO execution_contexts (id, kind, entry_fn_id, call_site_id, api_fn_id, \
-         param_index, multi_instance, self_concurrent) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         param_index, receiver_var_id, model, multi_instance, self_concurrent) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
     for (i, context) in analysis.execution_contexts.iter().enumerate() {
         let start = context.start.as_ref();
@@ -1004,6 +1012,8 @@ fn export_execution_contexts(conn: &Connection, analysis: &AnalysisResult) -> Re
             start.map(|s| s.call_site.0),
             start.map(|s| s.api.0),
             start.map(|s| s.param),
+            start.and_then(|s| s.receiver).map(|v| v.0),
+            context.model.as_deref(),
             context.multi_instance.as_str(),
             context.self_concurrent as i32,
         ])?;

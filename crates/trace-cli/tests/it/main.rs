@@ -32,5 +32,6 @@ mod preproc_context_cases;
 mod preproc_reinclude_cases;
 mod solver_budget_tests;
 mod static_member_sharing;
+mod task_primitives;
 mod thread_entry;
 mod weak_targets;

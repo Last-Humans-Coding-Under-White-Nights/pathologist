@@ -46,10 +46,10 @@ earlier v7 export) still merges and contributes no rows, and the merge records
 an `info` diagnostic with `stage = 'merge'` naming it
 (`MissingExecutionContexts`); an input that has the table must have every
 column the merger reads (`kind`, `entry_fn_id`, `call_site_id`, `api_fn_id`,
-`param_index`, `multi_instance`, `self_concurrent`) or it is rejected like a
-missing call-graph column. The output carries the rows of the inputs that have
-the table, with function and call-site ids remapped and each input's own
-multi-instance evidence; a merge-stage diagnostic of that kind marks an output
+`param_index`, `model`, `multi_instance`, `self_concurrent`) or it is rejected
+like a missing call-graph column. The output carries the rows of the inputs
+that have the table, with function and call-site ids remapped, each input's own
+multi-instance evidence and `receiver_var_id` NULL (no variable is carried); a merge-stage diagnostic of that kind marks an output
 whose table lists only some inputs' contexts. How rows are combined:
 [Invariants and linking rules](ANALYSIS.md#invariants-and-linking-rules).
 
@@ -81,6 +81,7 @@ omitted flow data from merger output.
 | `variables` | PAG-referenced | all | all (+ arg-flow) |
 | `flow_nodes` | ✓ | ✓ | ✓ |
 | `flow_edges` | ✓ | ✓ | ✓ |
+| `flow_memory_access` | ✓ | ✓ | ✓ |
 | `types` | | ✓ | ✓ |
 | `locations` | | ✓ | ✓ |
 | `points_to` | | | ✓ |
@@ -110,7 +111,8 @@ files ─┬─ functions ─┬─ call_sites ─ arg_flow_edges → variables
        │             │  (functions.target_id → link_targets)
        │             ├─ call_edges → functions (caller and callee)
        │             └─ execution_contexts → functions (entry, modelled
-       │                callee), call_sites (start; NULL for IPC handlers)
+       │                callee), call_sites (start; NULL for an entry no
+       │                call site starts), variables (receiver)
        ├─ variables ─ flow_nodes ─ flow_edges → flow_nodes
        └─ variables (type_id → types when exported,
                      target_id → link_targets)
@@ -293,7 +295,7 @@ Exactly one of `actual_var_id` or `actual_fn_id` is set per row. A function name
 ### execution_contexts
 
 Places where code starts running on a thread, a task queue or the IPC worker
-pool. Semantics and evidence rules:
+pool. Semantics, evidence rules and row order:
 [Execution contexts](ANALYSIS.md#execution-contexts). An additive v7 table: a
 v7 export written before it existed has no `execution_contexts` table, so a
 reader checks for the table (and the columns it reads) instead of the schema
@@ -302,22 +304,20 @@ version; in an ordinary analysis an empty table means no context was found.
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INTEGER PK | Context id |
-| `kind` | TEXT | `thread`, `pool_task`, `serial_task`, `ipc_handler` or `unknown`: what the `invoke` model states (`context`), `ipc_handler` for an IPC stub handler |
+| `kind` | TEXT | `thread`, `pool_task`, `serial_task`, `ipc_handler` or `unknown` |
 | `entry_fn_id` | INTEGER FK → `functions` | Function the context starts running |
-| `call_site_id` | INTEGER FK → `call_sites`, nullable | Submitting call site (`pthread_create(...)`); `NULL` for an IPC handler |
-| `api_fn_id` | INTEGER FK → `functions`, nullable | Modelled callee that runs the callback (`pthread_create`, `std::thread::thread`); `NULL` for an IPC handler |
-| `param_index` | INTEGER, nullable | Callee parameter the callback is passed in, counting explicit arguments as the model does (no `this`); `NULL` for an IPC handler |
-| `multi_instance` | TEXT | Evidence that more than one instance may exist: `loop` (start site inside a loop), `cycle` (submitting function in a cycle of ordinary calls), `parent` (submitting function reachable from a self-concurrent context), or `unknown` |
-| `self_concurrent` | INTEGER | `1` when two instances may run at the same time: every IPC handler (stub or modelled), and every context whose `multi_instance` is not `unknown`; `0` is no evidence, not single execution |
+| `call_site_id` | INTEGER FK → `call_sites`, nullable | Submitting call site (`pthread_create(...)`); `NULL` for an entry no call site starts (an `entry` model's override, an IPC stub handler) |
+| `api_fn_id` | INTEGER FK → `functions`, nullable | Modelled callee that runs the callback (`pthread_create`, `std::thread::thread`, `AppExecFwk::EventHandler::PostTask`); `NULL` without a call site |
+| `param_index` | INTEGER, nullable | Callee parameter the callback is passed in, counting explicit arguments (no `this`); `NULL` without a call site |
+| `receiver_var_id` | INTEGER FK → `variables`, nullable | Variable the modelled member was called on (`q` in `q.submit(f)`); `NULL` when the receiver is not a named variable, without a call site, and in a `trace-merge` output |
+| `model` | TEXT, nullable | Name of the `invoke` or `entry` model that states the context (may differ from the `api_fn_id` name); `NULL` for an IPC stub handler |
+| `multi_instance` | TEXT | Multi-instance evidence: `loop`, `cycle`, `parent` or `unknown` |
+| `self_concurrent` | INTEGER | `1` when two instances may run at the same time; `0` means no evidence, not single execution |
 
-One row per resolved callback of an `invoke` model, ordered by call site,
-then one per IPC stub handler; `trace-merge` keeps that order (see
-[Invariants and linking rules](ANALYSIS.md#invariants-and-linking-rules)
-for how it combines rows). The same starts stay in `call_edges` as
-`indirect` (start site to entry) and `ipc` (proxy to handler) edges, so the
-functions a context reaches are a walk over `call_edges` from
-`entry_fn_id`. Not indexed: a database holds tens to hundreds of rows
-(sizes in [EVAL_REPORT.md](EVAL_REPORT.md#execution-contexts-202--2026-10-09)).
+The same starts stay in `call_edges` as `indirect` (start site to entry) and
+`ipc` (proxy to handler) edges, so the functions a context reaches are a walk
+over `call_edges` from `entry_fn_id`. Not indexed: the table is small (sizes
+in [EVAL_REPORT.md](EVAL_REPORT.md#task-and-thread-primitives-203--2026-10-09)).
 
 ### variables
 

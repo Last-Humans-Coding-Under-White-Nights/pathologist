@@ -1,6 +1,6 @@
 use crate::constraints::{AbstractLocation, Constraint, ConstraintKind, LocKind};
 use crate::ipc::detect_ipc_pairs;
-use crate::summaries::{Effect, FnModelSet};
+use crate::summaries::{Effect, EffectGroup, FnModelSet, ModelLookup};
 use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use trace_ir::{
@@ -119,12 +119,12 @@ impl Pag {
     }
 
     pub fn build_with_models(program: &Program, models: &FnModelSet) -> Self {
-        Self::build_with_models_and_ipc(program, models, true)
+        Self::build_with_models_and_ipc(program, &models.lookup(program), true)
     }
 
     pub(crate) fn build_with_models_and_ipc(
         program: &Program,
-        models: &FnModelSet,
+        models: &ModelLookup,
         enable_ipc: bool,
     ) -> Self {
         let mut pag = Self::default();
@@ -597,7 +597,7 @@ impl Pag {
         }
     }
 
-    fn build_flow_constraints(&mut self, program: &Program, models: &FnModelSet) {
+    fn build_flow_constraints(&mut self, program: &Program, models: &ModelLookup) {
         for flow in &program.flow {
             match flow {
                 FlowConstraint::Copy { dst, src } => {
@@ -679,7 +679,7 @@ impl Pag {
                     // name-resolution maps, so the model is consulted by
                     // call name directly.
                     if !any_real {
-                        if let Some(model) = models.get(callee_name) {
+                        if let Some(model) = models.model(callee_name, EffectGroup::Return) {
                             let params = candidates
                                 .iter()
                                 .find(|c| !program.symbols.function(**c).params.is_empty())
@@ -746,7 +746,7 @@ impl Pag {
     /// virtual candidates of that specific call. This ensures a real return from
     /// one call does not suppress return models for another call assigning the
     /// same destination variable.
-    fn expand_call_site_returns(&mut self, program: &Program, models: &FnModelSet) {
+    fn expand_call_site_returns(&mut self, program: &Program, models: &ModelLookup) {
         let mut call_keys = Vec::new();
         let mut by_call: FxHashMap<
             (VarId, FnId, trace_ir::CallOccurrence),
@@ -779,7 +779,7 @@ impl Pag {
             }
             if !any_real {
                 for cs in sites {
-                    if let Some(model) = models.get(&cs.callee_name) {
+                    if let Some(model) = models.model(&cs.callee_name, EffectGroup::Return) {
                         let params = cs
                             .callee_fn_id
                             .map(|fid| program.symbols.function(fid).params.clone());
@@ -819,9 +819,9 @@ impl Pag {
     /// Persistent `Dlsym` edges: `pts(return_dst)` gains function locations
     /// named by string constants in the name-argument node. Wired here
     /// (not in `apply_fn_model`) so later-arriving string constants still fire.
-    fn build_dlsym_constraints(&mut self, program: &Program, models: &FnModelSet) {
+    fn build_dlsym_constraints(&mut self, program: &Program, models: &ModelLookup) {
         for cs in &program.symbols.call_sites {
-            let Some(model) = models.get_for_callee(&cs.callee_name) else {
+            let Some(model) = models.model(&cs.callee_name, EffectGroup::Dlsym) else {
                 continue;
             };
             let Some(name_param) = model.effects.iter().find_map(|e| match e {
@@ -847,7 +847,7 @@ impl Pag {
         program: &Program,
         dst: PagNodeId,
         callee: FnId,
-        models: &FnModelSet,
+        models: &ModelLookup,
         visited: &mut FxHashSet<FnId>,
     ) -> bool {
         if !visited.insert(callee) {
@@ -891,7 +891,8 @@ impl Pag {
                             // realloc has no tree body): fall back to the
                             // modeled return effects.
                             if !inner_applied {
-                                if let Some(model) = models.get(&callee_name) {
+                                if let Some(model) = models.model(&callee_name, EffectGroup::Return)
+                                {
                                     let params = inner_candidates
                                         .iter()
                                         .find(|c| !program.symbols.function(**c).params.is_empty())

@@ -123,8 +123,9 @@ CREATE TABLE IF NOT EXISTS arg_flow_edges (
 );
 
 -- Where threads, tasks and IPC requests start running code: one row per
--- resolved callback invocation (`call_site_id` set), then one per IPC stub
--- handler (`call_site_id` NULL). `call_edges` holds the same starts as
+-- resolved callback invocation (`call_site_id` set), then one per entry no
+-- call site starts (`call_site_id` NULL): an override of a member a framework
+-- runs, or an IPC stub handler. `call_edges` holds the same starts as
 -- ordinary edges. Additive to v7: earlier v7 exports lack the table.
 CREATE TABLE IF NOT EXISTS execution_contexts (
     id INTEGER PRIMARY KEY,
@@ -133,6 +134,8 @@ CREATE TABLE IF NOT EXISTS execution_contexts (
     call_site_id INTEGER REFERENCES call_sites(id),
     api_fn_id INTEGER REFERENCES functions(id),
     param_index INTEGER,
+    receiver_var_id INTEGER REFERENCES variables(id),
+    model TEXT,
     multi_instance TEXT NOT NULL,
     self_concurrent INTEGER NOT NULL
 );
