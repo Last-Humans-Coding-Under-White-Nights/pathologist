@@ -10877,7 +10877,22 @@ fn collect_call_arg_nodes<'t>(
                 arg_index += 1;
                 continue;
             }
-            if let Some(v) = resolve_expr_var(program, ctx, source, arg) {
+            let resolved_var = resolve_expr_var(program, ctx, source, arg);
+            // Resolve field addresses once, before falling back to the
+            // enclosing variable. Only that fallback needs alias suppression.
+            if is_addr_of_member(source, arg) || resolved_var.is_none() {
+                let first_flow = program.flow.len();
+                let first_pending = ctx.pending.borrow().len();
+                let member = addr_of_field_path(program, ctx, source, peel_casts(source, arg));
+                record_argument_origins(program, ctx, source, arg, first_flow, first_pending);
+                if let Some(member) = member {
+                    var_args.push((arg_index, member));
+                    arg_desc.push(adesc);
+                    arg_index += 1;
+                    continue;
+                }
+            }
+            if let Some(v) = resolved_var {
                 // A field/subscript argument passes the *value* stored in
                 // that memory (e.g. `take(g_h.h, 0)` passes the fn-ptr in
                 // `g_h.h`). `resolve_expr_var` yields the base object, so
@@ -10936,14 +10951,6 @@ fn collect_call_arg_nodes<'t>(
                     value: s,
                 });
                 var_args.push((arg_index, temp));
-            } else if let Some(gep) = {
-                let first_flow = program.flow.len();
-                let first_pending = ctx.pending.borrow().len();
-                let gep = addr_of_field_path(program, ctx, source, arg);
-                record_argument_origins(program, ctx, source, arg, first_flow, first_pending);
-                gep
-            } {
-                var_args.push((arg_index, gep));
             } else if let Some(fn_id) = resolve_call_fn_arg(program, ctx, source, arg) {
                 fn_args.push((arg_index, fn_id));
             }
@@ -17852,8 +17859,8 @@ fn resolve_lvalue_var(
 
 /// `&x` (through parentheses and casts) naming a plain variable: the
 /// argument is x's *address*. `&base.member` / `&arr[i]` are not plain —
-/// they keep their base-variable handling — unless the member is a static
-/// data member, whose address is its own variable's. Nor is a C++
+/// they use field addresses or a base-variable fallback — unless the member
+/// is a static data member, whose address is its own variable's. Nor is a C++
 /// reference: a reference variable already holds its referent's address, so
 /// `&r` is `r`'s value, not a cell of its own.
 fn addr_of_plain_var(
@@ -17891,8 +17898,8 @@ fn addr_of_temp(program: &mut Program, ctx: &LowerContext, span_node: Node, v: V
 }
 
 /// True when `node` is a `&base.member` or `&arr[i]` address expression.
-/// Such arguments resolve to the base variable, so alias-style function
-/// models must not treat them as whole-object copies.
+/// Resolved members carry a GEP address; unresolved paths and array
+/// elements may still name the base. Alias models must not copy that container.
 fn is_addr_of_member(source: &str, node: Node) -> bool {
     let node = peel_casts(source, node);
     if pointer_op(source, node).as_deref() != Some("&") {

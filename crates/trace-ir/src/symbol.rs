@@ -314,7 +314,8 @@ pub struct CallSite {
 #[derive(Debug, Clone, Default)]
 pub struct CallSiteDetails {
     pub fn_args: Vec<(u32, FnId)>,
-    /// Positions spelled as `&base.member` / `&arr[i]`; model alias effects
+    /// Unresolved `&base.member` / `&arr[i]` positions naming the base
+    /// container rather than a precise field address; model alias effects
     /// must not copy the whole base object into unrelated fields.
     pub addr_of_member_args: Vec<u32>,
     /// Positions spelled as `&x`; consumers reporting the object name `x`

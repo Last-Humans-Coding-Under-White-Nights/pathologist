@@ -4,6 +4,29 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Epoll event-data flow (#144)
+
+Built-in models connect event objects registered with `epoll_ctl` to buffers
+filled by `epoll_wait`, `epoll_pwait` and `epoll_pwait2`. The copies appear in
+the exported value-flow graph and participate in indirect-call resolution.
+Member-address arguments preserve the embedded object's address, and array
+field lookup recovers a named element declaration when its nested type
+snapshot was never separately interned. Together these restore the upward
+caller chain from `memory_pressure_observer.cpp:195` in OpenHarmony memmgr
+through `HandleEpollEvent`, `MainLoop` and `Init`.
+
+Late-discovered endpoints immediately receive existing pointees as well as
+future growth; registrations retain local event addresses and decayed array
+storage. Precise member addresses admit alias models, while unresolved
+container fallbacks remain suppressed. Literal-null registrations do not
+add copy edges into wait buffers; mutable pointers initialized to null remain
+eligible for later values.
+
+Semantics and conservative pooling limits:
+[Epoll event data](docs/ANALYSIS.md#epoll-event-data). Validation and the
+reference checkout revision:
+[Evaluation report](docs/EVAL_REPORT.md#epoll-event-data-flow-144--2026-10-11).
+
 ### Value slice with execution-context hints (#205)
 
 `trace inspect <DB> slice --file F --line N --col C` walks from a variable or

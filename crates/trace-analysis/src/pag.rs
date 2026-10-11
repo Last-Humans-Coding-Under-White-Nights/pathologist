@@ -78,6 +78,8 @@ pub struct Pag {
     pub call_targets: IndexMap<trace_ir::CallSiteId, PagNodeId, FxBuildHasher>,
     /// Interned null value node; no associated abstract location.
     pub null_node: Option<PagNodeId>,
+    /// Synthetic null values with no other producer; excludes mutable variables.
+    pub(crate) null_temps: FxHashSet<PagNodeId>,
     pub fn_locations: IndexMap<FnId, LocId, FxBuildHasher>,
     pub var_location: IndexMap<VarId, LocId, FxBuildHasher>,
     /// Interned `StringConst` locations keyed by literal contents.
@@ -244,6 +246,9 @@ impl Pag {
 
     fn build_indices(&mut self, program: &Program) {
         for (i, c) in self.constraints.iter().enumerate() {
+            if c.kind != ConstraintKind::Copy || Some(c.src) != self.null_node {
+                self.null_temps.remove(&c.dst);
+            }
             match c.kind {
                 ConstraintKind::Copy => {
                     self.indices.copy_src.entry(c.src).or_default().push(i);
@@ -712,6 +717,9 @@ impl Pag {
                 }
                 FlowConstraint::NullPointer { dst } => {
                     let dst_n = self.var_node_id(*dst);
+                    if program.symbols.variable(*dst).temp.is_some() {
+                        self.null_temps.insert(dst_n);
+                    }
                     let null_n = match self.null_node {
                         Some(node) => node,
                         None => {
@@ -1123,6 +1131,20 @@ fn inner_or_elem(desc: &trace_ir::TypeDesc) -> &trace_ir::TypeDesc {
     }
 }
 
+// An array descriptor can retain an element snapshot with nested forward
+// tags that was never interned as a standalone type. Keep exact snapshots
+// when available; otherwise use the tag declaration that lowering used.
+fn array_element_type(program: &Program, elem: &trace_ir::TypeDesc) -> trace_ir::TypeId {
+    let elem = inner_or_elem(elem);
+    let exact = program.types.resolve_type_id(elem);
+    // resolve_type_id already resolves empty named tags to their declaration.
+    if exact == program.types.unknown() {
+        program.types.tag_declaration(elem).unwrap_or(exact)
+    } else {
+        exact
+    }
+}
+
 fn type_id_of_loc(pag: &Pag, program: &Program, loc: LocId) -> Option<trace_ir::TypeId> {
     let mut type_id = pag.locations[loc.0 as usize].type_id;
     for _ in 0..4 {
@@ -1132,7 +1154,7 @@ fn type_id_of_loc(pag: &Pag, program: &Program, loc: LocId) -> Option<trace_ir::
             }
             // A table of structs: its elements' fields.
             trace_ir::TypeDesc::Array { elem, .. } => {
-                type_id = program.types.resolve_type_id(inner_or_elem(elem));
+                type_id = array_element_type(program, elem);
             }
             _ => break,
         }
@@ -1158,7 +1180,7 @@ fn struct_type_from_type_id(
             }
             // Arrays of structs: resolve fields against the element type.
             trace_ir::TypeDesc::Array { elem, .. } => {
-                type_id = program.types.resolve_type_id(inner_or_elem(elem));
+                type_id = array_element_type(program, elem);
             }
             trace_ir::TypeDesc::Struct { fields, .. }
             | trace_ir::TypeDesc::Union { fields, .. } => {
@@ -1522,6 +1544,45 @@ mod tests {
             .ensure_field_summary_for_var(&program, g, FieldId(0))
             .expect("a forward-declared variable must resolve its field summary");
         assert_eq!(pag.field_loc_to_summary[&concrete], summary);
+    }
+
+    #[test]
+    fn heap_array_elements_complete_forward_tags_but_preserve_nonempty_snapshots() {
+        for forward in [true, false] {
+            let mut program = Program::new(".".into());
+            let element = TypeDesc::Struct {
+                name: "Element".into(),
+                fields: if forward {
+                    vec![]
+                } else {
+                    vec![("own".into(), TypeDesc::Int)]
+                },
+            };
+            let snapshot = program.types.intern(element.clone());
+            let array = program.types.intern(TypeDesc::Array {
+                elem: Box::new(element),
+                size: None,
+            });
+            let definition = program.types.intern(TypeDesc::Struct {
+                name: "Element".into(),
+                fields: vec![
+                    ("first".into(), TypeDesc::Int),
+                    ("own".into(), TypeDesc::Int),
+                ],
+            });
+            let mut pag = Pag::build(&program);
+            let heap = pag.alloc_heap_loc("array".into());
+            pag.locations[heap.0 as usize].type_id = array;
+            assert_eq!(
+                struct_type_for_loc(&pag, &program, heap),
+                Some(if forward { definition } else { snapshot })
+            );
+            let field = pag.ensure_field_loc(&program, heap, FieldId(0)).unwrap();
+            assert_eq!(
+                pag.locations[field.0 as usize].desc,
+                if forward { "first" } else { "own" }
+            );
+        }
     }
 
     /// Review of #127: a scalar, however many pointers deep, has no struct.
