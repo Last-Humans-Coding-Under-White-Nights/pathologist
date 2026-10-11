@@ -122,6 +122,12 @@ trace analyze [OPTIONS] <TARGET>
 | `--solve-budget-pops <N>` | Solver work budget in worklist pops. Default derives from the PAG constraint count (`800000 + 6×constraints`), so normal trees converge and huge ones finish instead of stopping at a partial result; `0` = unlimited. `TRACE_SOLVE_BUDGET_POPS` overrides it for experimentation. A truncated run is recorded, not silent: `analysis_run.options_json.solver_partial`, an `analyze`-stage diagnostic, and a `trace inspect` warning. |
 | `--solve-budget-secs <N>` | Solver wall-clock budget in seconds (default: off; `0` = no time limit). Checked periodically, so lead time can overshoot by up to one checkpoint, and the stop point varies with machine load. |
 
+Epoll event-data flow is modeled by default: registrations through `epoll_ctl`
+feed buffers returned by `epoll_wait`, `epoll_pwait` and `epoll_pwait2`, so
+indirect dispatch and upward value tracing can cross the registration/wait
+boundary. See [Epoll event data](docs/ANALYSIS.md#epoll-event-data) for the
+approximation and configurable wrapper effects.
+
 **Progress output** (stderr):
 
 ```text

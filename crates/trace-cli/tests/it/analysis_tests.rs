@@ -1415,9 +1415,9 @@ fn cast_member_address_is_stored_as_the_member() {
     );
 }
 
-/// Review round 4: `memcpy((void *)&s.a, ..)` is a member address for models.
+/// A resolved member address is safe for models; only container fallbacks are flagged.
 #[test]
-fn cast_member_address_argument_is_flagged() {
+fn cast_member_address_argument_is_precise() {
     let (program, _pag, _analysis) = var_cell_sync();
     let site = program
         .symbols
@@ -1425,7 +1425,7 @@ fn cast_member_address_argument_is_flagged() {
         .iter()
         .find(|cs| cs.callee_name == "memcpy" && fn_name(&program, cs.caller) == "copy_cast_member")
         .expect("memcpy site");
-    assert_eq!(site.addr_of_member_args(), vec![0]);
+    assert!(site.addr_of_member_args().is_empty());
 }
 
 /// Review round 4: `drv.ops[i]()` and `pd->ops[i]()` call the table's element.

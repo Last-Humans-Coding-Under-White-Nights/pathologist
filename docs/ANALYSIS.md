@@ -1496,7 +1496,7 @@ limitations.
 - Unknown or non-struct base → GEP may no-op.
 - **Struct identity is per-TypeDesc**: types intern by full `(tag, fields)` equality, so layouts of divergent copies diverge, and lowering must produce *identical* descs for the same logical struct in every TU. In particular, a typedef'd anonymous struct (`typedef struct { .. } Alias;`) takes `Alias` as its tag — per-unit `anon_N` counters would otherwise split one shared-header type into several TypeIds after merge.
 - **Field summaries are keyed by declaration, not by desc**: nested aggregates are recorded structurally, so one declaration can still intern under several ids that differ only in how completely a nested member's tag was known — `IDriverLoader` reached through `HdfDriverLoader.super` vs named directly. `TypeTable::tag_identity` (from a descriptor: `tag_declaration`) maps a named, non-anonymous struct/union to its tag's richest id; the pointer lookups (`struct_type_for_loc`, `struct_type_from_type_id`) and `ensure_field_summary_loc` all use it, the latter remapping the field **by name** into that declaration, so a store through one snapshot meets a load through the other (#127 review: HDF's `driverLoader->GetDriver` / `->ReclaimDriver`), including a snapshot that lacks a member another configuration compiled in. A member the declaration's richest layout lacks keeps the snapshot's own summary; an anonymous aggregate (`anon_N`, a per-unit counter) is its own identity. The mapping is memoized per `(type, field)` (`Pag::declared_member`).
-- **A location's struct type** (`struct_type_for_loc`) is the type its field positions refer to: a variable's own snapshot, or the tag's definition when the variable was declared with a forward-declared (empty) tag, as lowering numbers such fields (`struct_type_for_var`); through pointers and arrays, the pointee or element; for a non-variable location (heap, field, table element) the same through its recorded type. A scalar has none. Variable-based summary lookup uses the same type resolver, including forward-declared tags, so it selects the same member as concrete field lookup.
+- **A location's struct type** (`struct_type_for_loc`) is the type its field positions refer to: a variable's own snapshot, or the tag's definition when the variable was declared with a forward-declared (empty) tag, as lowering numbers such fields (`struct_type_for_var`); through pointers and arrays, the pointee or element (an array element snapshot that was never separately interned falls back to its named tag declaration; an interned snapshot keeps its own positions); for a non-variable location (heap, field, table element) the same through its recorded type. A scalar has none. Variable-based summary lookup uses the same type resolver, including forward-declared tags, so it selects the same member as concrete field lookup.
 - **The GEP field-name guard** rejects a pointee whose struct type lacks the GEP's named field at that position, and a pointee with no struct type at all, so a wrong-type pointer cannot pull fields out of an unrelated layout. Function values are not judged by it: a table's initializer places its functions directly in the table's points-to (`ArrayFnMember`), and they reach `table[i].func` through the table-member and arity rules instead (HDF's local `dispatchFunc[i].func(..)` tables).
 
 ## Arrays and function-pointer tables
@@ -1617,7 +1617,7 @@ When a call edge is created (direct or indirect), actuals are connected to calle
 - **Pointer variables** → PAG `Copy` from actual var node to formal var node, persistent for pointers whose pointees can hold callbacks (`var_may_hold_pointee`: fn pointers, pointers to fn-pointer slots such as `cb_t *out` or a table row, and pointers to aggregates or unknown types)
 - **Function identifiers** passed as fn-ptr args → `add_pts(formal, fn_loc)`
 - **Dereferenced arguments** (`f(*x)`) pass what [Dereferenced operands](#dereferenced-operands) gives the parameter kind
-- **Address of a plain variable** (`f(&x)`, through parentheses and casts — C `(T)` and C++ `static_cast` / `reinterpret_cast` / `const_cast` / `dynamic_cast`, one peeling rule, `peel_casts`, at every value entry point: stored values, assignments and initializers, return values, arguments and callback arguments) → lowering materializes a temp with `AddrOfVar { dst: temp, src: x }` (`addr_of_temp`) and records the temp as the actual, so the formal points to `x` (the out-parameter idiom: `get_buf(&q)` gives `out -> q`). Before #127 the actual was `x` itself, which handed the callee `x`'s *pointees* instead of its address. The same temp carries a stored `&x` (`*p = &x`, `.f = &x`). `&base.member` / `&arr[i]` keep their base-variable handling (see "Documented imprecision" under function models; a stored `(void *)&s.f` is the member's field address, and a cast `memcpy((void *)&s.f, ..)` argument is still flagged as a member address), and so does `&r` for any C++ reference binding `r`, `auto &r` included (`reference_bindings`): the reference already holds its referent's address, so `&r` — as an argument, a stored value, `p = &r` or `return &r` — is `r`'s value (`names_reference_binding`). A qualified name (`&ns::var`, `&(ns::var)`) takes the same path once it resolves (see [Canonical variable identity](#canonical-variable-identity)), a qualified reference binding included. The position is recorded in `CallSite::addr_of_args`: consumers that report the argument's *object* rather than its value — arg-flow rows (`actual_var`), `clears` terminators, and the `alias` / `mem_copy` models (`model_copy_side`) — name `x` through `Pag::argument_var` / `Pag::addressed_var`, so `memcpy_s(&dst, .., &src, ..)` still copies between the objects.
+- **Address of a plain variable** (`f(&x)`, through parentheses and casts — C `(T)` and C++ `static_cast` / `reinterpret_cast` / `const_cast` / `dynamic_cast`, one peeling rule, `peel_casts`, at every value entry point: stored values, assignments and initializers, return values, arguments and callback arguments) → lowering materializes a temp with `AddrOfVar { dst: temp, src: x }` (`addr_of_temp`) and records the temp as the actual, so the formal points to `x` (the out-parameter idiom: `get_buf(&q)` gives `out -> q`). Before #127 the actual was `x` itself, which handed the callee `x`'s *pointees* instead of its address. The same temp carries a stored `&x` (`*p = &x`, `.f = &x`). `&base.member` preserves the member’s own field address using the same GEP path as a stored address; unresolved paths and `&arr[i]` keep their base-variable handling (see "Documented imprecision" under function models; a stored `(void *)&s.f` is the member's field address, and a cast `memcpy((void *)&s.f, ..)` argument follows the same field path), and so does `&r` for any C++ reference binding `r`, `auto &r` included (`reference_bindings`): the reference already holds its referent's address, so `&r` — as an argument, a stored value, `p = &r` or `return &r` — is `r`'s value (`names_reference_binding`). A qualified name (`&ns::var`, `&(ns::var)`) takes the same path once it resolves (see [Canonical variable identity](#canonical-variable-identity)), a qualified reference binding included. The position is recorded in `CallSite::addr_of_args`: consumers that report the argument's *object* rather than its value — arg-flow rows (`actual_var`), `clears` terminators, and the `alias` / `mem_copy` models (`model_copy_side`) — name `x` through `Pag::argument_var` / `Pag::addressed_var`, so `memcpy_s(&dst, .., &src, ..)` still copies between the objects.
 
 After fixpoint, `extract_arg_flow` records:
 
@@ -1764,7 +1764,8 @@ Measured cost: [Value slice: #205](EVAL_REPORT.md#value-slice-205--2026-10-09).
 
 Bodyless functions (libc, `_s`-family secure variants, vendor externs) contribute no
 IR: calls to them produce call edges but no data flow. **Function models** close this
-gap with declarative per-function summaries that relate parameters to each other.
+gap with declarative per-function summaries that relate parameters to each other
+or connect registrations to receipts across modeled API calls.
 
 Models are matched by function name at every resolved call site — direct, recovered
 cross-TU, indirect, and external (see [Model matching](#model-matching)). A model
@@ -1808,7 +1809,7 @@ and return effects skip rules 2 and 3 (below). The rules, in precedence order:
    The choice is per effect group (see below).
 
 Rules 2 and 3 name models for `dlsym`, `invoke` and `entry` effects only.
-**Argument and return effects** (`alias`, `mem_copy`, `content_store`, `clears`;
+**Argument and return effects** (`alias`, `mem_copy`, `content_store`, `epoll_register`, `epoll_wait`, `clears`;
 `return_alias`, `return_heap`) take rule 1 alone, where
 the name may also be written with a leading `::` or `std::`, which name the
 same C library function: `memset`, `::memset` and `std::memset` take the
@@ -1831,7 +1832,7 @@ does a function take rule 4's.
 **Rule 4 is chosen per effect group.** A function's effects of one group come from
 the first rule-4 model, in the order above, that has an effect of that group; a
 model with none is passed over. The groups are the parts of the analysis that
-apply them: argument effects (`alias`, `mem_copy`, `content_store`, `clears`),
+apply them: argument effects (`alias`, `mem_copy`, `content_store`, `epoll_register`, `epoll_wait`, `clears`),
 return effects (`return_alias`, `return_heap`), `dlsym`, `invoke` and `entry`. So
 a nearer base's `entry` model of `Mid::m` does not hide a farther base's `invoke`
 model of `Base::m` for `Leaf::m`, and a requalified or subclass call takes every
@@ -1845,6 +1846,8 @@ resolved once per analysis and shared by every lookup.
 | `alias { dst, src }` | `pts(param[dst]) ⊇ pts(param[src])` after the call | persistent `Copy(actual[dst] ← actual[src])` |
 | `mem_copy { dst, src }` | contents of `*src` copied into `*dst` (memcpy family) | modeled as `alias` (see imprecision note) |
 | `content_store { ptr, value }` | `*param[ptr] = param[value]` | persistent `Store(actual[ptr] ← actual[value])` |
+| `epoll_register { param }` | register the event object at this argument with the epoll summary | persistent copies from registered objects to waiting buffers |
+| `epoll_wait { param }` | receive registered event objects into this argument | pairs with `epoll_register` (see below) |
 | `return_alias { param }` | returned pointer may be `param[param]` | addr/copy edges into the `CallReturn` destination |
 | `return_heap` | returns a fresh storage location | fresh `Heap` loc per call site into the destination |
 | `clears { param }` | **terminator**: memory reachable via `param[param]` is zeroed by this call | no value introduction; terminator event exported |
@@ -1855,6 +1858,41 @@ resolved once per analysis and shared by every lookup.
 Effects attach to parameter positions (0-based) of the *actual arguments* recorded at
 the call site. Arguments that are not IR variables or functions (literals like
 `sizeof(...)` or `0`) simply do not participate.
+
+### Epoll event data
+
+`epoll_ctl` registers argument 3; `epoll_wait`, `epoll_pwait` and
+`epoll_pwait2` receive into argument 1. The solver connects each registered
+event pointer to each receiving buffer with the same whole-object aliasing
+approximation as `mem_copy`. Registration retains the actual pointer, including
+`&local_event`; a decayed local event array denotes its own storage. Receiving
+`&buffer` arguments name the buffer's value node. Wiring immediately propagates
+the source's existing pointees and installs a persistent copy for later growth,
+so endpoints discovered in different fixpoint iterations still exchange data.
+They are exported as ordinary flow edges, so upward value slices can cross
+from the returned event back to its registration. Epoll does not itself call
+`data.ptr`: an indirect call in the event loop resolves through the returned
+value and retains that call's source position.
+
+**Imprecision:** registrations are pooled across the analysis, without epoll-fd,
+watched-fd, link-image, event-index or readiness discrimination. Integer handles
+are not pointer identities; shared libraries may register events consumed by a
+caller in another image. Whole event objects alias rather than copying only
+`data`; `events` flags, timeout, return counts and failures are not evaluated.
+ADD and MOD both contribute values. DEL/close do not kill earlier registrations
+(flow-insensitive may-analysis); an event argument supplied to DEL is also
+conservatively admitted, though the kernel ignores it. Null event arguments
+contribute no values. Synthetic temporaries produced only by the null value
+are omitted as registration endpoints, so a literal-null DEL argument does not
+appear as a source of wait buffers. A variable initialized to null is still an
+endpoint: it may receive values later. An empty points-to set alone is never a
+reason to skip registration.
+No epoll creation model is needed. This can mix payloads
+from independent instances, but does not invent a callback or an execution
+context when the program only retrieves data.
+
+The kernel's data round trip is specified in
+[epoll_wait(2)](https://man7.org/linux/man-pages/man2/epoll_wait.2.html).
 
 ### Callback invocation (`invoke`)
 
@@ -2055,6 +2093,8 @@ entries:
 |-------------|---------|
 | `memcpy`, `memmove`, `strcpy`, `strncpy` | `mem_copy dst=0 src=1` |
 | `memcpy_s`, `memmove_s`, `strcpy_s`, `strncpy_s` | `mem_copy dst=0 src=2` |
+| `epoll_ctl` | `epoll_register param=3` |
+| `epoll_wait`, `epoll_pwait`, `epoll_pwait2` | `epoll_wait param=1` |
 | `memset`, `memset_s` | `clears param=0` |
 | `malloc`, `calloc`, `zalloc`, `kmalloc` | `return_heap` |
 | `realloc` | `return_alias param=0`, `return_heap` |
@@ -2142,10 +2182,12 @@ effect, is rejected when the file is loaded.
   (field cells and summaries of the source objects become visible), but stores through
   the destination may also land in source-side field cells (over-approximation, sound
   for may-analysis).
-- **Member-address arguments are skipped**: lowering resolves `&base.member` to the
-  base variable, so alias effects (`mem_copy`, `alias`) refuse to fire when either
-  side is a member/array-element address — copying the whole container would pollute
-  unrelated fields with the source's pointees. Such copies contribute no flow.
+- **Member-address arguments**: resolved members carry their field address
+  (see [Argument flow](#argument-flow)); unresolved paths and array elements
+  may still carry the base variable. Only these fallbacks are marked in
+  `addr_of_member_args` and refused by `alias`; precise member addresses admit
+  the model. `mem_copy` admits fallbacks conservatively, which can pollute other
+  fields when the actual is still the enclosing container.
 - `return_alias`/`return_heap` fire only when the callee has **no body** under the
   analyzed root; defined functions keep their exact return flow.
 - Terminators kill nothing (see above).

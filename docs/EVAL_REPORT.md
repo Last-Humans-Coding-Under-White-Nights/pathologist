@@ -1,5 +1,142 @@
 # Evaluation Report
 
+## Epoll event-data flow: #144 — 2026-10-11
+
+Rules: [Epoll event data](ANALYSIS.md#epoll-event-data),
+[Argument flow](ANALYSIS.md#argument-flow) and
+[Field sensitivity](ANALYSIS.md#field-sensitivity). The change adds epoll
+registration/receipt summaries, preserves member addresses passed as
+arguments, and recovers array-element declarations whose nested snapshots
+were never separately interned. Fixture: `tests/fixtures/epoll/`.
+
+Checked on Linux against the clean `resourceschedule_memmgr` checkout at
+`860a64e32f4914bbc0f0baf87300df6fd9142b87`, with the candidate based on
+`1ea98b4`. This was a correctness check using the current debug binary,
+`--jobs 2`, minimal export and default include settings, without
+`--system-includes`; no timing or memory comparison was made.
+
+```bash
+cargo run -p trace-cli -- analyze /home/sergei/resourceschedule_memmgr \
+  --jobs 2 -o /tmp/trace-epoll-memmgr.db
+cargo run -p trace-cli -- inspect /tmp/trace-epoll-memmgr.db callgraph \
+  --file memory_pressure_observer.cpp --line 195 --direction up --depth 4
+```
+
+The upward query now reports five functions and four edges:
+
+```text
+HandleLevelReport
+  ← HandleEpollEvent        indirect, memory_pressure_observer.cpp:188
+    ← MainLoop             direct, memory_pressure_observer.cpp:178
+      ← Init::$lambda58:33 direct, memory_pressure_observer.cpp:58
+        ← Init             indirect, memory_pressure_observer.cpp:58
+```
+
+The callback edge from `HandleEpollEvent` to `HandleLevelReport`, missing in
+the initial investigation, is present in the candidate. The nested payload
+`&levelConfigArr[level].levelHandler` is covered by a distinct callback in
+the fixture so a separate top-level handler cannot mask a broken nested
+registration.
+
+| Candidate metric | Count |
+|---|---:|
+| Functions | 1,248 |
+| Call edges | 4,413 |
+| Direct / indirect / external / IPC edges | 2,287 / 36 / 2,076 / 14 |
+| Argument-flow edges | 2,184 |
+
+Initial validation: `cargo test --workspace -j 2` passed all 2,178 tests, including
+all 1,136 trace-cli integration tests. The epoll regression was rerun after
+adding an assertion that the registration's payload points to the handler
+subobject. Coverage includes all three wait APIs, indirect API calls,
+MOD and null DEL arguments, qualified lookalikes, a wait without dispatch,
+exported registration-to-buffer copies, and a models-disabled control.
+Model tests cover built-in argument positions, TOML wrapper effects,
+overrides and required parameters. Subsequent review fixes and their validation
+are recorded below.
+
+### Pinned corpus recapture
+
+The review compared base `1ea98b4` with `230909f`, using release binaries,
+`--jobs 8` and clean checkouts at the pinned revisions below. Its initial
+`eval_check.py` run failed 2 of 104 checks: HDF's exact indirect-edge count
+and camera's argument-flow band. Both changes follow from precise member
+addresses; the expectations are recaptured without widening tolerances.
+The memmgr table above describes a separate checkout.
+
+| Corpus | Pinned revision |
+|---|---|
+| HDF (`drivers_hdf_core`) | `cdc75a20bb8f1a046cd22e189405a20d602d0521` |
+| hiview (`hiviewdfx_hiview`) | `92408e2072bd6dc8fb0d980773e80b6ec898710c` |
+| camera (`multimedia_camera_framework`) | `8ffd69dcd47f533e70b4dba428439da9008b0cae` |
+
+Reproduction with the current binary and updated expectations:
+
+```bash
+cargo build --release -p trace-cli -j 2
+python3 scripts/eval_check.py --bin target/release/trace --jobs 8 \
+  --outdir /tmp/trace-144-eval
+```
+
+The fresh local run with the null-registration cleanup and updated expectations
+passes **104 checks, 0 failures**. It reproduces HDF's 5,087 indirect edges and
+71,758 argument-flow rows, hiview's 27,204 argument-flow rows, and camera's
+57,543 argument-flow rows. Formatting and all 2,181 workspace tests also pass.
+
+- **HDF:** indirect edges 5,076 → 5,087 (+13 / −2). New edges from
+  `PowerStateChange`, `PowerStateTokenOnFirstAcquire` and
+  `PowerStateTokenOnLastRelease` reach `HdfPmSample*` and `HdfPmHdfTest*`
+  callbacks registered through
+  `HdfPmRegisterPowerListener(obj, &g_pmTestType[index].listener.powerListener)`
+  at `hdf_pm_driver_test.c:269`; `RefMessageNode` also reaches
+  `ReferenceMessageNode`. The removed edges are
+  `HdfIoServiceAdapterRecycle` / `HdfVNodeAdapterClose` → `HdfSRefRelease`
+  at `hdf_vnode_adapter.c:134,709`. They were false positives:
+  `HdfSRefConstruct(&device->ref, ..)` previously stored into the enclosing
+  container, leaking the callback into `IDeviceIoService::Release` through
+  the shared field name. Argument-flow rows are 71,758, inside the existing
+  band.
+- **Camera:** 395 additional argument-flow rows, all at module-test
+  `AddInput((sptr<CaptureInput>&)cameraInput_)` /
+  `AddOutput((sptr<CaptureOutput>&)previewOutput_)` sites. Cast implicit-member
+  arguments now resolve to field addresses through `peel_casts`. The measured
+  total is 57,543. The stored expectation center moves from 57,149 to 57,543,
+  with tolerance 250 unchanged.
+- **hiview:** argument-flow rows 27,195 → 27,204 (+9), inside the existing band.
+
+The review's single-run wall times on the same machine were HDF 4.3 → 4.9 s,
+hiview 1.9 → 1.9 s and camera 8.0 → 8.1 s; peak RSS stayed within 5%.
+These are review measurements, not a repeated performance benchmark here.
+
+
+### Epoll review follow-up
+
+Strengthened the regression to check the actual points-to sets of
+`late_events`, including the concrete locations of `late_registration` and a
+local registration array, rather than only the exported copy edge or a shared
+handler's callback targets. A solver regression consumes the source's delta
+before wiring and verifies that existing pointees immediately reach the new
+destination. The implementation now seeds new epoll copies immediately,
+retains registration pointer arguments, and seeds decayed event-array storage.
+
+Member-address resolution now has one path in argument lowering. Only
+unresolved container fallbacks suppress `alias` models; the new
+`tests/fixtures/member_alias/` verifies a precise member alias with models
+on/off and an array-element fallback that must remain suppressed. A heap-array
+regression confirms that existing `resolve_type_id` behavior completes empty
+forward tags while retaining nonempty snapshots' field positions. Explicit
+null temporaries remain empty; this is distinct from a pointer variable whose
+pointees can arrive later. The final null-registration cleanup also omits
+synthetic null-only temporaries from epoll registration endpoints, preventing
+DEL calls with literal null arguments from appearing as sources of wait buffers.
+The fixture verifies both the missing copy edges and a mutable pointer that
+starts null and later receives a real event.
+
+`cargo test --workspace -j 2` passes 2,181 tests, including 1,137 trace-cli
+integration tests. Rechecking the same memmgr revision with the command above
+preserves the five-function upward chain and every count in the table. The
+subsequent pinned corpus recapture is recorded above.
+
 ## Value slice: #205 — 2026-10-09
 
 `trace inspect slice` walks from a variable or field access up to the

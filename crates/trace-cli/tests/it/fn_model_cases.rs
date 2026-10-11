@@ -358,3 +358,209 @@ void std_clear(void) { std::memset(&g_std_cleared, 0, sizeof(op_t)); }
         "Arena::malloc is not libc malloc"
     );
 }
+
+#[test]
+fn epoll_registration_reaches_wait_dispatch() {
+    let root = fixture("epoll");
+    let program = build_program(&root, &default_opts(&root)).expect("build epoll");
+    let (pag, with) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            retain_points_to: true,
+            ..Default::default()
+        },
+    );
+    assert!(with.solve.converged);
+    let registration = program
+        .symbols
+        .call_sites
+        .iter()
+        .find(|cs| {
+            fn_name(&program, cs.caller) == "Observer::monitor"
+                && cs.callee_name == "register_event"
+        })
+        .expect("nested registration");
+    let payload = registration
+        .var_args
+        .iter()
+        .find(|(index, _)| *index == 2)
+        .unwrap()
+        .1;
+    assert!(with.points_to[&pag.var_node[&payload]].iter().any(|loc| {
+        let ty = pag.locations[loc.0 as usize].type_id;
+        matches!(program.types.get(ty).desc.as_ref(), trace_ir::TypeDesc::Struct { name, .. } if name == "LevelHandler")
+    }), "the registration passes the handler subobject's address");
+    for caller in [
+        "HandleEpollEvent",
+        "pwait_events",
+        "pwait2_events",
+        "Observer::handle",
+    ] {
+        assert!(
+            indirect_targets(&program, &with, caller).contains(&"HandleLevelReport".into()),
+            "{caller} must receive the registered handler"
+        );
+    }
+    assert!(
+        indirect_targets(&program, &with, "Observer::handle").contains(&"NestedReport".into()),
+        "nested handler must flow"
+    );
+    assert!(indirect_targets(&program, &with, "only_wait").is_empty());
+    let variable = |name: &str| {
+        program
+            .symbols
+            .variables
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap()
+            .id
+    };
+    let received = pag.var_node[&variable("late_events")];
+    for source in [
+        "late_registration",
+        "array_registration",
+        "mutable_registration",
+    ] {
+        let source_loc = pag.var_location[&variable(source)];
+        assert!(
+            with.points_to
+                .get(&received)
+                .is_some_and(|pts| pts.contains(&source_loc)),
+            "late-discovered endpoints must propagate {source}'s address"
+        );
+    }
+    // Literal null registrations must not appear as sources of wait buffers.
+    let wait_nodes: Vec<_> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|cs| {
+            matches!(
+                cs.callee_name.as_str(),
+                "epoll_wait" | "epoll_pwait" | "epoll_pwait2" | "wait_api"
+            )
+        })
+        .filter_map(|cs| pag.argument_var(cs, 1))
+        .map(|var| pag.var_node[&var])
+        .collect();
+    for flow in &program.flow {
+        if let trace_ir::FlowConstraint::NullPointer { dst } = flow {
+            if program.symbols.variable(*dst).temp.is_none() {
+                continue; // a real pointer variable can receive a value later
+            }
+            assert!(
+                !pag.constraints.iter().any(|c| c.src == pag.var_node[dst]
+                    && c.kind == trace_analysis::ConstraintKind::Copy
+                    && wait_nodes.contains(&c.dst)),
+                "literal-null temporary {} must not copy into a wait buffer",
+                program.symbols.variable(*dst).name
+            );
+            assert!(with
+                .points_to
+                .get(&pag.var_node[dst])
+                .is_none_or(|pts| pts.is_empty()));
+        }
+    }
+    // FieldSummary may already resolve the dispatch without models. Pin
+    // the actual new bridge in the exported graph, including its direction.
+    let db = export_program(&program, &pag, &with);
+    let conn = open_db(&db).expect("open epoll db");
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM flow_edges e
+         JOIN flow_edges a ON a.dst_node=e.src_node AND a.kind='addr_of'
+         JOIN flow_nodes_text s ON s.id=a.src_node
+         JOIN flow_nodes_text d ON d.id=e.dst_node
+         WHERE e.kind='copy' AND s.label='registration of registration' AND d.label='events'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 5,
+        "only the five libc wait buffers receive registrations"
+    );
+    let late: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM flow_edges e
+         JOIN flow_edges a ON a.dst_node=e.src_node AND a.kind='addr_of'
+         JOIN flow_nodes_text s ON s.id=a.src_node
+         JOIN flow_nodes_text d ON d.id=e.dst_node
+         WHERE e.kind='copy' AND s.label='late_registration of late_registration' AND d.label='late_events'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(late, 1, "indirect API calls must wire the epoll flow once");
+    let (base_pag, base) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            models: Arc::new(trace_analysis::FnModelSet::default()),
+            ..Default::default()
+        },
+    );
+    let base_db = export_program(&program, &base_pag, &base);
+    let base_conn = open_db(&base_db).unwrap();
+    let count: i64 = base_conn
+        .query_row(
+            "SELECT COUNT(*) FROM flow_edges e
+         JOIN flow_edges a ON a.dst_node=e.src_node AND a.kind='addr_of'
+         JOIN flow_nodes_text s ON s.id=a.src_node
+         JOIN flow_nodes_text d ON d.id=e.dst_node
+         WHERE e.kind='copy' AND s.label='registration of registration' AND d.label='events'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "epoll flow requires the models");
+}
+
+#[test]
+fn alias_models_accept_precise_members_but_reject_container_fallbacks() {
+    let root = fixture("member_alias");
+    let program = build_program(&root, &default_opts(&root)).unwrap();
+    let models = trace_analysis::FnModelSet::from_toml_str(
+        "version = 1\n[[model]]\nname = \"Alias\"\neffects = [{kind = \"alias\", dst = 0, src = 1}]\n",
+    ).unwrap();
+    for enabled in [false, true] {
+        let (pag, analysis) = analyze_with_options(
+            &program,
+            AnalyzeOptions {
+                retain_points_to: true,
+                models: Arc::new(if enabled {
+                    models.clone()
+                } else {
+                    trace_analysis::FnModelSet::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let payload = program
+            .symbols
+            .variables
+            .iter()
+            .find(|v| v.name == "payload")
+            .unwrap()
+            .id;
+        let loc = pag.var_location[&payload];
+        for cs in program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|cs| cs.callee_name == "Alias")
+        {
+            let precise = fn_name(&program, cs.caller) == "precise";
+            assert_eq!(cs.addr_of_member_args().is_empty(), precise);
+            let dst = cs.var_args.iter().find(|(index, _)| *index == 0).unwrap().1;
+            let reached = analysis
+                .points_to
+                .get(&pag.var_node[&dst])
+                .is_some_and(|pts| pts.contains(&loc));
+            assert_eq!(
+                reached,
+                enabled && precise,
+                "models={enabled}, precise={precise}"
+            );
+        }
+    }
+}

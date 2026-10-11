@@ -20,6 +20,10 @@ pub enum Effect {
     MemCopy { dst: u32, src: u32 },
     /// `*param[ptr] = param[value]`.
     ContentStore { ptr: u32, value: u32 },
+    /// Register an event object in the epoll summary (see docs/ANALYSIS.md).
+    EpollRegister { param: u32 },
+    /// Receive registered event objects into this buffer.
+    EpollWait { param: u32 },
     /// Return value may be `param[param]` (bodyless callees only).
     ReturnAlias { param: u32 },
     /// Returns a fresh storage location (malloc family; bodyless callees).
@@ -348,6 +352,10 @@ impl FnModelSet {
         ] {
             reg(name, vec![Effect::Entry { context }]);
         }
+        reg("epoll_ctl", vec![Effect::EpollRegister { param: 3 }]);
+        for name in ["epoll_wait", "epoll_pwait", "epoll_pwait2"] {
+            reg(name, vec![Effect::EpollWait { param: 1 }]);
+        }
         for n in ["memcpy", "memmove", "strcpy", "strncpy"] {
             reg(n, vec![Effect::MemCopy { dst: 0, src: 1 }]);
         }
@@ -528,7 +536,7 @@ impl FnModelSet {
 /// nearer model that has none does not hide a farther one that has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectGroup {
-    /// `alias`, `mem_copy`, `content_store`, `clears`: at each resolved call.
+    /// Argument effects, including epoll registration/receipt: at each resolved call.
     Args,
     /// `return_alias`, `return_heap`: into a bodyless callee's call result.
     Return,
@@ -547,6 +555,8 @@ impl Effect {
             Self::Alias { .. }
             | Self::MemCopy { .. }
             | Self::ContentStore { .. }
+            | Self::EpollRegister { .. }
+            | Self::EpollWait { .. }
             | Self::Clears { .. } => EffectGroup::Args,
             Self::ReturnAlias { .. } | Self::ReturnHeap => EffectGroup::Return,
             Self::Dlsym { .. } => EffectGroup::Dlsym,
@@ -735,6 +745,12 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
             ptr: need(raw.ptr, "ptr", "content_store")?,
             value: need(raw.value, "value", "content_store")?,
         }),
+        "epoll_register" => Ok(Effect::EpollRegister {
+            param: need(raw.param, "param", "epoll_register")?,
+        }),
+        "epoll_wait" => Ok(Effect::EpollWait {
+            param: need(raw.param, "param", "epoll_wait")?,
+        }),
         "return_alias" => Ok(Effect::ReturnAlias {
             param: need(raw.param, "param", "return_alias")?,
         }),
@@ -809,7 +825,7 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
         }),
         other => Err(format!(
             "unknown effect kind {other:?} (expected alias, mem_copy, content_store, \
-             return_alias, return_heap, clears, dlsym, invoke, entry)"
+             epoll_register, epoll_wait, return_alias, return_heap, clears, dlsym, invoke, entry)"
         )),
     }
 }
@@ -817,6 +833,55 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epoll_models_are_configurable() {
+        let mut models = FnModelSet::builtin();
+        assert_eq!(
+            models.get("epoll_ctl").unwrap().effects,
+            vec![Effect::EpollRegister { param: 3 }]
+        );
+        for name in ["epoll_wait", "epoll_pwait", "epoll_pwait2"] {
+            assert_eq!(
+                models.get(name).unwrap().effects,
+                vec![Effect::EpollWait { param: 1 }]
+            );
+        }
+        models
+            .merge_toml_str(
+                r#"
+version = 1
+[[model]]
+name = "register_wrapper"
+effects = [{kind = "epoll_register", param = 0}]
+[[model]]
+name = "wait_wrapper"
+effects = [{kind = "epoll_wait", param = 2}]
+[[model]]
+name = "epoll_ctl"
+effects = []
+"#,
+            )
+            .unwrap();
+        assert!(models.get("epoll_ctl").unwrap().effects.is_empty());
+        assert_eq!(
+            models.get("register_wrapper").unwrap().effects,
+            vec![Effect::EpollRegister { param: 0 }]
+        );
+        assert_eq!(
+            models.get("wait_wrapper").unwrap().effects,
+            vec![Effect::EpollWait { param: 2 }]
+        );
+        for kind in ["epoll_register", "epoll_wait"] {
+            let config = format!(
+                "version = 1\n[[model]]\nname = \"bad\"\neffects = [{{kind = \"{kind}\"}}]\n"
+            );
+            assert!(models
+                .merge_toml_str(&config)
+                .unwrap_err()
+                .contains("requires `param`"));
+        }
+    }
 
     #[test]
     fn builtin_covers_secure_variants_with_shifted_src() {

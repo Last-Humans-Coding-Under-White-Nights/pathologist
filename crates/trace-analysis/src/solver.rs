@@ -256,6 +256,10 @@ struct SolverState {
     /// Same dedup, shared with parameter copies, for model-effect stores
     /// (`content_store`) and alias/mem-copy edges.
     wired_model_edges: FxHashSet<(PagNodeId, PagNodeId)>,
+    /// Epoll object-copy endpoints, kept in discovery order. Each new
+    /// endpoint is wired to all opposite endpoints exactly once.
+    epoll_registered: IndexSet<PagNodeId, FxBuildHasher>,
+    epoll_waiting: IndexSet<PagNodeId, FxBuildHasher>,
     /// Signature-aware propagation guards (see `SlotGuard`).
     slot_guard: FxHashMap<LocId, SlotGuard>,
     /// Parameter count per function location (only when > 0; old-style `()`
@@ -1638,9 +1642,9 @@ fn apply_fn_model(
     let Some(model) = models.model(callee_name, EffectGroup::Args) else {
         return;
     };
-    // `&base.member` arguments resolve to the base variable; copying the
-    // whole container would pollute unrelated fields with the source's
-    // pointees, so alias-style effects refuse to fire on them.
+    // Unresolved member addresses may still name the base variable;
+    // copying it would pollute unrelated fields, so alias effects refuse
+    // these fallbacks (see docs/ANALYSIS.md, "Argument flow").
     let member_addr = |idx: u32| cs.addr_of_member_args().binary_search(&idx).is_ok();
     // Actual argument node for parameter slot `idx`, when the call passed an
     // IR variable there (literals like `0` or `sizeof(..)` do not
@@ -1681,6 +1685,50 @@ fn apply_fn_model(
                 if let (Some(d), Some(s)) = (d_side, s_side) {
                     if st.wired_model_edges.insert((s, d)) {
                         ensure_param_copy(pag, st, s, d);
+                    }
+                }
+            }
+            Effect::EpollRegister { param } | Effect::EpollWait { param } => {
+                let Some(actual) = arg_node(pag, *param) else {
+                    continue;
+                };
+                if matches!(effect, Effect::EpollRegister { .. }) {
+                    // A literal null registers no event. Do not use an empty
+                    // points-to set here: a variable may receive values later.
+                    if pag.null_temps.contains(&actual) {
+                        continue;
+                    }
+                    // Keep the event pointer: a local object's value node
+                    // need not hold its own address. A decayed array denotes
+                    // its storage even when no explicit address was taken.
+                    let node = actual;
+                    if let PagNodeKind::Var(var) = pag.nodes[node.0 as usize].kind {
+                        if matches!(
+                            program
+                                .types
+                                .get(program.symbols.variable(var).type_id)
+                                .desc
+                                .as_ref(),
+                            trace_ir::TypeDesc::Array { .. }
+                        ) {
+                            if let Some(loc) = pag.ensure_var_loc(program, var) {
+                                add_pts(st, node, loc);
+                            }
+                        }
+                    }
+                    if st.epoll_registered.insert(node) {
+                        for i in 0..st.epoll_waiting.len() {
+                            let dst = st.epoll_waiting[i];
+                            wire_epoll_copy(pag, st, scratch, node, dst);
+                        }
+                    }
+                } else {
+                    let node = model_copy_side(pag, actual);
+                    if st.epoll_waiting.insert(node) {
+                        for i in 0..st.epoll_registered.len() {
+                            let src = st.epoll_registered[i];
+                            wire_epoll_copy(pag, st, scratch, src, node);
+                        }
                     }
                 }
             }
@@ -1726,6 +1774,29 @@ fn apply_fn_model(
             | Effect::Invoke { .. }
             | Effect::Entry { .. } => {}
         }
+    }
+}
+
+/// An endpoint can be discovered after its source has settled. The new
+/// copy handles future deltas; seed it with existing pointees immediately,
+/// as parameter wiring does, without depending on another source delta.
+fn wire_epoll_copy(
+    pag: &mut Pag,
+    st: &mut SolverState,
+    scratch: &mut Scratch,
+    src: PagNodeId,
+    dst: PagNodeId,
+) {
+    ensure_param_copy(pag, st, src, dst);
+    if let Some(pts) = st.pts.get(&src) {
+        scratch.wire_src.clear();
+        scratch.wire_src.extend(pts.iter().copied());
+        propagate_locs(
+            st,
+            &mut scratch.fresh,
+            dst,
+            scratch.wire_src.iter().copied(),
+        );
     }
 }
 
@@ -2907,6 +2978,20 @@ mod tests {
     use super::*;
     use crate::constraints::AbstractLocation;
     use trace_ir::{FlowConstraint, LocId, TypeDesc, TypeId};
+
+    #[test]
+    fn epoll_copy_seeds_a_settled_source() {
+        let mut pag = Pag::default();
+        let mut st = SolverState::default();
+        let mut scratch = Scratch::default();
+        let (src, dst, value) = (PagNodeId(0), PagNodeId(1), LocId(0));
+        add_pts(&mut st, src, value);
+        st.delta.remove(&src); // the source's earlier delta has been consumed
+        wire_epoll_copy(&mut pag, &mut st, &mut scratch, src, dst);
+        assert!(st.pts[&dst].contains(&value));
+        assert_eq!(st.delta[&dst], vec![value]);
+        assert_eq!(pag.indices.copy_src[&src].len(), 1);
+    }
 
     #[test]
     fn holder_filter_reuses_stable_membership_and_preserves_order_after_growth() {
