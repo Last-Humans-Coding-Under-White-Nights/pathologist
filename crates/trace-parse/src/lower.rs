@@ -619,8 +619,12 @@ fn build_program_inner(
         &synthesized.headers,
     );
     include_graph.dep_roots = classification_roots;
-    let mut links =
-        crate::link_commands::LinkDatabase::load(root, &database, opts.link_commands.as_deref())?;
+    let mut links = crate::link_commands::LinkDatabase::load(
+        root,
+        &database,
+        opts.link_commands.as_deref(),
+        opts.input_boundary.as_deref(),
+    )?;
     if links.inferred && !links.unscoped_inference && !links.targets.is_empty() {
         let assigned: HashSet<_> = links
             .targets

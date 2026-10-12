@@ -34,6 +34,9 @@ cargo build -p trace-merge --release
 
 Ability-runtime benchmark build options and measurements are in the
 [evaluation report](docs/EVAL_REPORT.md#ability-runtime-acceptance-and-performance).
+An optional [two-stage PGO experiment](docs/PGO.md) trains on the pinned real
+projects and compares ThinLTO/PGO binaries, with optional fat LTO and holdouts:
+`python3 scripts/build_pgo.py --runs 5`.
 
 Run the workspace test suite:
 

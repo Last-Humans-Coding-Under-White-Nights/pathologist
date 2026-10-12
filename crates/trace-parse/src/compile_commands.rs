@@ -4,7 +4,7 @@
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use trace_preproc::{CommandMacro, Language, PreprocessOptions};
+use trace_preproc::{CommandMacro, InputBoundary, Language, PreprocessOptions};
 
 #[derive(Default)]
 pub(crate) struct CompilationDatabase {
@@ -49,7 +49,10 @@ impl CompilationDatabase {
             let direct = directory.join("compile_commands.json");
             let build = directory.join("build").join("compile_commands.json");
             if !direct.exists() && !build.exists() {
-                return Ok(Self::load_flags(directory));
+                return Ok(Self::load_flags(
+                    directory,
+                    overrides.input_boundary.as_deref(),
+                ));
             }
             if !direct.exists() && build.exists() {
                 build
@@ -59,6 +62,9 @@ impl CompilationDatabase {
         };
         let database_dir = trace_ir::canonicalize(path.parent().unwrap_or(Path::new(".")));
         let mut db = Self::default();
+        if let Some(boundary) = &overrides.input_boundary {
+            boundary.record(&trace_ir::canonicalize(&path));
+        }
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e)
@@ -166,8 +172,11 @@ impl CompilationDatabase {
         Ok(db)
     }
 
-    fn load_flags(directory: &Path) -> Self {
+    fn load_flags(directory: &Path, input_boundary: Option<&InputBoundary>) -> Self {
         let path = directory.join("compile_flags.txt");
+        if let Some(boundary) = input_boundary {
+            boundary.record(&trace_ir::canonicalize(&path));
+        }
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),

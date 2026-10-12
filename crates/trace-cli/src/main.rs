@@ -48,6 +48,9 @@ enum Commands {
         /// then TARGET/build/compile_commands.json).
         #[arg(long)]
         compile_commands: Option<PathBuf>,
+        /// Reject headers and build metadata consumed from outside the target tree.
+        #[arg(long)]
+        require_local_inputs: bool,
         /// Query the compiler for effective system header search paths.
         #[arg(long)]
         system_includes: bool,
@@ -338,6 +341,7 @@ fn main() -> Result<()> {
             includes,
             defines,
             compile_commands,
+            require_local_inputs,
             system_includes,
             link_commands,
             no_test_partition,
@@ -361,6 +365,7 @@ fn main() -> Result<()> {
             includes,
             defines,
             compile_commands,
+            require_local_inputs,
             system_includes,
             link_commands,
             no_test_partition,
@@ -402,6 +407,7 @@ fn run_analyze(
     includes: Vec<PathBuf>,
     defines: Vec<String>,
     compile_commands: Option<PathBuf>,
+    require_local_inputs: bool,
     system_includes: bool,
     link_commands: Option<PathBuf>,
     no_test_partition: bool,
@@ -474,6 +480,9 @@ fn run_analyze(
     opts.system_includes = system_includes;
     opts.link_commands = link_commands;
     let root_canon = trace_ir::canonicalize(&target);
+    let input_boundary = require_local_inputs
+        .then(|| std::sync::Arc::new(trace_preproc::InputBoundary::new(root_canon.clone())));
+    opts.input_boundary = input_boundary.clone();
     for dep in deps {
         if !dep.is_dir() {
             bail!(
@@ -569,6 +578,14 @@ fn run_analyze(
     let t0 = Instant::now();
     let mut program = build_program_for_analysis_with_jobs(&target, &opts, jobs)
         .map_err(|e| anyhow::anyhow!(e))?;
+    if let Some(boundary) = input_boundary {
+        if let Some(path) = boundary.external_paths().first() {
+            bail!(
+                "external analysis input cannot be verified under --require-local-inputs: {}",
+                path.display()
+            );
+        }
+    }
     eprintln!(
         "index: {:.1}s ({} files, {} functions, {} flow)",
         t0.elapsed().as_secs_f64(),

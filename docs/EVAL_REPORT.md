@@ -140,6 +140,131 @@ slice driver with the baseline reader and current v8 reader confirms identical
 JSON for all eight ability-runtime fields. The sampler selects the same sites
 on v7 and v8 for both ability-runtime (3,944 eligible fields) and camera (2,391).
 
+## Native LTO and PGO build experiment — 2026-10-12
+
+The optional two-stage workflow is implemented in `scripts/build_pgo.py`;
+training, validation, artifact and measurement rules are in [PGO.md](PGO.md).
+This experiment changes compiler configuration only. The Rust analyzer sources
+are at `b56a47156259651670513717cb6332952a0c469e`; the working-tree changes at
+build time were the new tooling and documentation. The report records that
+snapshot's content digest, build flags and binary/profile hashes.
+
+Measured on **Linux/WSL2 6.6.87.2, x86_64 GNU**, AMD Ryzen 7 8845HS (8 cores,
+16 logical CPUs), rustc **1.95.0**, LLVM **22.1.2**, default allocator/features.
+Every build used release optimization and one codegen unit. All analyses used
+minimal export, **8 workers**, and the same **800,000-pop** solver budget.
+All six builds finished before timing began, with no other agent builds or
+tests running during the benchmark. Filesystem caches were warm. Four binaries
+were compared in rotating order, with an untimed warmup and **five measured
+processes per binary/project**.
+
+Training ran HDF, hiview and camera once per LTO configuration. The two
+validation projects were excluded from training:
+
+| Project | Role | Revision |
+|---|---|---|
+| `drivers_hdf_core` | Training | `cdc75a20bb8f1a046cd22e189405a20d602d0521` |
+| `hiviewdfx_hiview` | Training | `92408e2072bd6dc8fb0d980773e80b6ec898710c` |
+| `multimedia_camera_framework` | Training | `8ffd69dcd47f533e70b4dba428439da9008b0cae` |
+| `ability_ability_runtime` | Validation | `6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8` |
+| `llvm-project/clang/test/Parser` | Validation | `1c6efc002f7d8a0a412ccbe5620908e0eef61d3b` |
+
+Whole-process elapsed seconds are **median [minimum–maximum]**:
+
+| Project | ThinLTO baseline | ThinLTO + PGO | Fat LTO | Fat LTO + PGO |
+|---|---:|---:|---:|---:|
+| HDF | 9.530 [9.445–9.975] | 9.008 [8.872–9.432] | 9.613 [9.524–9.988] | 8.892 [8.716–9.139] |
+| hiview | 3.705 [3.623–3.813] | 3.514 [3.446–3.612] | 3.666 [3.605–3.730] | 3.560 [3.498–3.565] |
+| camera | 15.161 [14.854–15.237] | 14.874 [14.204–15.712] | 15.011 [14.808–15.785] | 14.062 [13.281–14.304] |
+| Ability runtime | 82.059 [81.112–86.118] | 79.847 [77.848–82.479] | 81.072 [79.876–88.337] | 78.451 [77.882–82.141] |
+| Clang Parser | 1.989 [1.949–2.015] | 1.943 [1.888–1.990] | 2.054 [1.959–2.251] | 1.937 [1.843–2.017] |
+
+Geometric means weight each project equally within its role. The percentages
+below are reductions in elapsed time relative to ThinLTO, calculated as
+`1 - 1 / geometric_mean_speedup`:
+
+| Build | Training projects | Validation projects |
+|---|---:|---:|
+| ThinLTO + PGO | 4.2% lower | 2.5% lower |
+| Fat LTO | 0.4% lower | 1.0% higher |
+| Fat LTO + PGO | 6.0% lower | 3.5% lower |
+
+Fat LTO + PGO gave the largest observed aggregate gain; fat LTO alone had
+little benefit. Its median elapsed reduction was **6.7% HDF**, **3.9% hiview**,
+**7.2% camera**, **4.4% Ability runtime**, and **2.6% Clang Parser**. These are
+observations from five processes on one machine, not a confidence bound or a
+cross-platform speedup claim. Ranges overlap on several projects, particularly
+the small Parser case. The initial batch measured Python `perf_counter` elapsed
+around `Popen.wait(timeout=...)`, which can add tens of milliseconds of polling
+delay. This further limits conclusions about the small Parser differences.
+The helper was subsequently tightened to use `/usr/bin/time`'s elapsed field
+with 0.01-second resolution; the timings above retain the original method and
+were not replaced by the subsequent smoke test.
+
+Phase medians, rounded by the CLI to 0.1 seconds, indicate both solver and
+indexing gains. HDF analysis was **4.4 → 4.0 s** and camera indexing was
+**12.0 → 11.1 s** for baseline → fat LTO + PGO. Ability runtime indexing was
+**54.7 → 52.4 s**, analysis **6.4 → 5.8 s**, and export **19.4 → 19.3 s**.
+These rounded phase measurements should not be used to resolve tiny changes.
+
+Peak RSS stayed close: baseline → fat LTO + PGO medians were **343.0 → 342.9
+MiB HDF**, **170.7 → 170.5 MiB hiview**, **543.1 → 546.0 MiB camera**, and
+**1,660.0 → 1,667.0 MiB Ability runtime**. This does not establish a memory
+improvement. Native tree-sitter, SQLite and the standard library were not
+rebuilt with profiling; coverage limits are described in [PGO.md](PGO.md).
+
+Fresh build costs and unstripped CLI sizes:
+
+| Build | Build wall seconds | Binary MiB |
+|---|---:|---:|
+| ThinLTO | 191.4 | 14.92 |
+| ThinLTO instrumented | 193.1 | 21.96 |
+| ThinLTO + PGO | 191.0 | 15.45 |
+| Fat LTO | 211.6 | 14.44 |
+| Fat LTO instrumented | 234.3 | 21.78 |
+| Fat LTO + PGO | 221.8 | 14.94 |
+
+Each build used a separate Cargo target directory and two compilation jobs.
+Workspace tests overlapped the early baseline compilation, so these build times
+are informational rather than controlled build-speed comparisons. Both
+training passes emitted three raw profiles and merged successfully. Neither
+optimized build emitted missing-function profile warnings.
+
+Validation:
+
+- All **100 timed processes and 20 warmup processes** produced matching sorted
+  SQLite table contents and column schemas within each project. Comparisons
+  preserve duplicate rows and IDs, exclude only timestamp/binary-version fields,
+  and retain solver convergence/options/pop counts.
+- Every candidate passed the existing pinned-corpus correctness probes:
+  **104 checks each, 416 total, zero failures**.
+- `cargo test --workspace`: **2,181 passed, zero failed or ignored**.
+- Tooling regressions: **15 passed**, covering strict database equivalence,
+  JSON fingerprint roundtrips, Linux/macOS timer parsing, short-workload
+  rejection, and excluding generated output from source snapshots.
+- A real hiview smoke run verified the revised external timer and exactly
+  matched the saved baseline fingerprint. Formatting and whitespace checks pass.
+
+The workflow remains opt-in. Results justify further target-specific testing;
+they do not justify changing all shipped musl/Windows/ARM builds from this
+native GNU/WSL measurement alone. The existing release configuration remains
+ThinLTO. Repeat representative measurements on each intended release target
+before selecting a default.
+
+Invocation (a new artifact directory is selected automatically):
+
+```bash
+python3 scripts/build_pgo.py --runs 5 --fat-lto \
+  --holdout ~/ability_ability_runtime \
+  --holdout ~/llvm-project/clang/test/Parser
+```
+
+Local artifacts from this run are under `target/pgo/2026-10-12-native/`:
+`report.json`, compiler/training/measurement logs, profiles, each binary, and
+the four `*-eval.log` correctness-probe logs. The strongest observed candidate
+is `fat-pgo/x86_64-unknown-linux-gnu/release/trace`. Artifacts are excluded from
+Git; the durable results are recorded here.
+
 ## Epoll event-data flow: #144 — 2026-10-11
 
 Rules: [Epoll event data](ANALYSIS.md#epoll-event-data),
