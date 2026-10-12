@@ -174,7 +174,9 @@ def main():
         "cmd": cmd,
         "pid": proc.pid,
         "exit": proc.returncode,
-        "wall_s": round(wall, 2),
+        # Same precision as the sample timestamps: rounding is monotone, so
+        # no sample can then appear to land after the run ended.
+        "wall_s": round(wall, 3),
         "user_s": round(ru.ru_utime, 2),
         "sys_s": round(ru.ru_stime, 2),
         "ru_maxrss_bytes": ru.ru_maxrss,

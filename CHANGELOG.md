@@ -4,6 +4,14 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Lower analyze-phase memory (#225)
+
+The solver's membership bit mirrors keep only the blocks of the location
+numbering their set reaches, and the execution-context search runs after the
+solver state is released. The analyze-phase peak on `ability_ability_runtime`
+falls below its level before #221; the output is unchanged. Measurements:
+[docs/EVAL_REPORT.md](docs/EVAL_REPORT.md#analyze-phase-memory-after-221-225--2026-10-12).
+
 ### Epoll event-data flow (#144)
 
 Built-in models connect event objects registered with `epoll_ctl` to buffers

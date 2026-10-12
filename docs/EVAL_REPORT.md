@@ -1,5 +1,78 @@
 # Evaluation Report
 
+## Analyze-phase memory after #221: #225 — 2026-10-12
+
+`ability_ability_runtime` at `6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`,
+`analyze --jobs 8`, minimal export, default budgets; macOS 27.0.1 arm64,
+Apple M1 8 GB, rustc 1.100.0-nightly (bff8e12ff 2026-08-26), system allocator,
+release profile. Footprint from
+[`scripts/profile_memory_macos.py`](../scripts/profile_memory_macos.py); live
+heap bytes from a temporary counting global allocator (current and peak
+bytes requested, reported at stage boundaries), not in the tree.
+
+**Where the regression is.** The process peak is the analyze phase on both
+revisions. Live-heap peak over the phase, `43b41bd` → `1ea98b4` (#221):
+**1,357.7 → 1,445.5 MiB (+87.8)**, while live bytes once analyze returns
+grew only 824.2 → 837.3 MiB. By stage:
+
+| Live heap, MiB | 43b41bd | 1ea98b4 |
+|---|---:|---:|
+| Program (index returned) | 635.6 | 646.6 |
+| PAG built | 740.4 | 752.7 |
+| Solver loop done, peak | 1,357.7 | 1,424.0 |
+| Execution contexts, peak | — | 1,445.5 |
+
+The solver state at the end of the loop, per field (capacity estimates,
+MiB): every set and map is within 1 MiB of the baseline except the
+membership mirrors, `pts_bits` 134.9 → 173.4 and `memory_bits`
+126.0 → 135.3; the new `designated` and `access_pointers` sets take 3.5 and
+0.5. The mirrors' word counts are unchanged (`pts_bits` 12.93M → 12.96M
+words, 116,259 → 116,261 numbered locations): the +48 MiB is `Vec` growth
+slack, which #221's additional field-receiver loads and GEPs (`load`
+16,692 → 28,772 and `gep` 64,903 → 76,998 `flow_edges` rows) reached at
+different sizes. The other +21.5 MiB is the execution-context call graph
+(two pair sets over 676,579 call edges), built while the whole solver state
+was still alive.
+
+**What the mirrors cost.** The membership mirrors
+([Membership mirrors and per-load merges](ANALYSIS.md#propagation-highlights))
+assumed a numbering of a few thousand locations, true on HDF. Here it
+reaches 116k, so one flat mirror is about 14.5 KB while its set holds
+294 locations on average: 9,359 points-to mirrors and 6,798 cell mirrors
+held 25.2M words, of which 737k (2.9%) were non-zero, and 443k 512-bit
+blocks held any bit. The mirrors (≈ 309 MiB with slack) cost 8.4 times the
+points-to sets they mirror (36.7 MiB).
+
+**Fix.** A mirror keeps only the 512-number blocks it reaches, found
+through a per-mirror directory, and both grow in bounded steps instead of
+doubling. A test is now two dependent lookups after the numbering (directory,
+then block) where the flat mirror took one. The context search, and the
+`TRACE_SOLVER_STATS` line with it, runs after the solver state and the
+loop's working sets are dropped. Mirrors answer membership only, so nothing
+the solver computes or its order changes: every exported table of
+`ability_ability_runtime` (minimal export, all tables but `analysis_run`) is
+identical to `1ea98b4`'s, and `scripts/eval_check.py` passes its 104 checks.
+
+| | 1ea98b4 | fixed |
+|---|---:|---:|
+| Live-heap peak, analyze (MiB) | 1,445.5 | 1,156.7 |
+| Lifetime max footprint, 3 alternating runs (MiB) | 1,565 / 1,574 / 1,577 | 1,275 / 1,269 / 1,296 |
+| Solve, `[solver] DONE` elapsed (s) | 1.15 / 1.21 / 1.22 | 1.09 / 1.14 / 1.21 |
+| Analyze phase wall (s) | 2.3 / 2.4 / 2.3 | 2.1 / 2.2 / 2.3 |
+
+The extra lookup does not show in solve time over these runs; three runs of
+a one-second phase cannot establish a speed-up. `43b41bd` measured 1,519 MiB
+lifetime max footprint in one run of the same setup. The process peak is
+still analyze (1,156.7 MiB live), now 36 MiB above the indexing peak
+(1,121.2). `ru_maxrss` barely moves (1,424–1,448 → 1,111–1,422 MiB): freed
+pages the allocator keeps stay resident; footprint is the number the kernel
+acts on ([PERFORMANCE_REVIEW.md](PERFORMANCE_REVIEW.md#what-peak-means-on-macos)).
+
+Rebased onto `fa0732b` (after #222 and #223), two alternating runs:
+lifetime max footprint 1,548 / 1,560 → 1,260 / 1,268 MiB, `[solver] DONE`
+1.18 / 1.26 → 1.13 / 1.15 s, and every exported table identical to
+`fa0732b`'s.
+
 ## Compact text export — 2026-10-12
 
 Storage rules and compatibility: [Compact text storage](SQLITE_SCHEMA.md#compact-text-storage).
