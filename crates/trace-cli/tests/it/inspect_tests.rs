@@ -1668,7 +1668,7 @@ fn source_dataflow_return_origins_preserve_unannotated_global_initializer() {
         // Also cover the closest-position fallback for earlier v7 exports.
         for bound_origins in [true, false] {
             if !bound_origins {
-                conn.execute_batch("DROP TABLE flow_call_origins").unwrap();
+                conn.execute_batch("DROP VIEW flow_call_origins").unwrap();
             }
             for (direction, line) in [(Direction::Down, 1), (Direction::Up, 3)] {
                 let root = require_symbols_at(&conn, "main.cpp", line, 7)
@@ -1881,7 +1881,7 @@ fn source_dataflow_text_headers_map_arguments_to_all_canonical_parameters() {
                 "header metadata does not change JSON"
             );
         }
-        conn.execute_batch("DROP TABLE flow_parameters").unwrap();
+        conn.execute_batch("DROP VIEW flow_parameters").unwrap();
         let view = dataflow_view(
             &conn,
             &[symbol_in(&conn, "caller", "payload")],
@@ -3839,7 +3839,7 @@ fn source_dataflow_multiline_returns_retain_assignment_and_macro_provenance() {
             }
         }
     }
-    conn.execute("DROP TABLE flow_call_origins", []).unwrap();
+    conn.execute("DROP VIEW flow_call_origins", []).unwrap();
     let older = dataflow_view(&conn, &[symbol_in(&conn, "run", "out")], Direction::Up, 1).unwrap();
     let expressions: std::collections::BTreeSet<_> = older
         .edges
@@ -4266,7 +4266,7 @@ fn source_dataflow_cli_internal_overloads_keep_initializer_origins() {
             }
         }
         let origins: Vec<(i64, i64, String, i64, i64, String)> = conn
-            .prepare("SELECT src_node,dst_node,operation,line,col,expression FROM flow_origins ORDER BY rowid")
+            .prepare("SELECT o.src_node,o.dst_node,op.text,o.line,o.col,x.text FROM flow_origins_data o JOIN strings x ON x.id=o.expression_id JOIN strings op ON op.id=o.operation_id ORDER BY o.rowid")
             .unwrap()
             .query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))
             .unwrap()

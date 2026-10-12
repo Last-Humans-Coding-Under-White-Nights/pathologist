@@ -411,10 +411,10 @@ fn leak_resolution(resolution: &str) -> &'static str {
     }
 }
 
-/// True when `table` exists. Table names here are compile-time constants.
+/// True when the named table or view exists. Names are compile-time constants.
 pub fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1",
         [table],
         |r| r.get(0),
     )?;
@@ -1157,6 +1157,22 @@ pub(crate) fn dataflow_starts(conn: &Connection, symbols: &[SymbolRef]) -> Resul
     Ok(starts)
 }
 
+fn parameter_twins_sql(conn: &Connection) -> Result<&'static str> {
+    if column_exists(conn, "variables_data", "name_id")? {
+        // Compare interned identities directly so both columns of the
+        // parameter-twin index participate, without per-candidate text lookups.
+        Ok("SELECT DISTINCT v2.id FROM variables_data v1 \
+            JOIN variables_data v2 \
+              ON v2.fn_id = v1.fn_id AND v2.name_id = v1.name_id AND v2.kind = 'param' \
+            WHERE v1.id = ?1 AND v2.id != v1.id ORDER BY v2.id")
+    } else {
+        Ok("SELECT DISTINCT v2.id FROM variables v1 \
+            JOIN variables v2 \
+              ON v2.fn_id = v1.fn_id AND v2.name = v1.name AND v2.kind = 'param' \
+            WHERE v1.id = ?1 AND v2.id != v1.id ORDER BY v2.id")
+    }
+}
+
 /// The `flow_nodes` of variables: each one's variable node and storage
 /// location, and with `cells` the field cells of that storage too.
 ///
@@ -1197,12 +1213,7 @@ pub(crate) fn flow_nodes_of_variables(
         }
     }
     if !touches_any {
-        let mut twins = conn.prepare(
-            "SELECT DISTINCT v2.id FROM variables v1 \
-             JOIN variables v2 \
-               ON v2.fn_id = v1.fn_id AND v2.name = v1.name AND v2.kind = 'param' \
-             WHERE v1.id = ?1 AND v2.id != v1.id",
-        )?;
+        let mut twins = conn.prepare(parameter_twins_sql(conn)?)?;
         for vid in var_ids {
             let ids: Vec<i64> = twins
                 .query_map([vid], |row| row.get::<_, i64>(0))?
@@ -1576,6 +1587,92 @@ pub fn require_symbols_at(
 mod tests {
     use super::*;
     use crate::schema::SCHEMA_V7;
+
+    #[test]
+    fn parameter_twins_use_both_index_keys_and_preserve_function_scope() {
+        for (schema, compact) in [(SCHEMA_V7, false), (crate::SCHEMA_V8, true)] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+            conn.execute_batch(schema).unwrap();
+            let table = if compact {
+                "variables_data"
+            } else {
+                "variables"
+            };
+            let name = if compact { "name_id" } else { "name" };
+            let mut strings = compact.then(|| crate::TextPool::new(&conn).unwrap());
+            // Two real twins, another parameter name, a different canonical
+            // function, and a local of the same name. Only the twins qualify.
+            for (id, text, function, kind) in [
+                (9, "value", 1, "param"),
+                (2, "value", 1, "param"),
+                (7, "value", 1, "param"),
+                (3, "other", 1, "param"),
+                (4, "value", 2, "param"),
+                (5, "value", 1, "local"),
+            ] {
+                let sql = format!("INSERT INTO {table}(id,{name},kind,fn_id,type_id,file_id,line) VALUES(?1,?2,?3,?4,0,0,1)");
+                if let Some(pool) = strings.as_mut() {
+                    conn.execute(
+                        &sql,
+                        rusqlite::params![id, pool.intern(text).unwrap(), kind, function],
+                    )
+                    .unwrap();
+                } else {
+                    conn.execute(&sql, rusqlite::params![id, text, kind, function])
+                        .unwrap();
+                }
+            }
+            let sql = parameter_twins_sql(&conn).unwrap();
+            let twins: Vec<i64> = conn
+                .prepare(sql)
+                .unwrap()
+                .query_map([9], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(twins, [2, 7]);
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([9], |row| row.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let index = plan
+                .iter()
+                .find(|step| step.contains("idx_variables_parameter_twins"))
+                .unwrap_or_else(|| panic!("{plan:?}"));
+            assert!(
+                index.contains("fn_id=?") && index.contains(&format!("{name}=?")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|step| step.contains("SCAN") || step.contains("strings")),
+                "{plan:?}"
+            );
+            // Exercise the widening caller as well as the lookup: the queried
+            // copy has no node, while both twins do. Keep deterministic order.
+            for id in [2, 7] {
+                if let Some(pool) = strings.as_mut() {
+                    conn.execute(
+                        "INSERT INTO flow_nodes_data(id,kind_id,var_id) VALUES(?1,?2,?1)",
+                        rusqlite::params![id, pool.intern("var").unwrap()],
+                    )
+                    .unwrap();
+                } else {
+                    conn.execute(
+                        "INSERT INTO flow_nodes(id,kind,var_id) VALUES(?1,'var',?1)",
+                        [id],
+                    )
+                    .unwrap();
+                }
+            }
+            assert_eq!(flow_nodes_of_variables(&conn, &[9], true).unwrap(), [2, 7]);
+        }
+    }
 
     /// The edge-scope rule read literally (`ranges` as `(id, start, end)`):
     /// a holder owns the line when every other holder encloses it and the

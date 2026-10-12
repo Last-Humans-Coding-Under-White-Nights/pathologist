@@ -231,7 +231,7 @@ Migration note: `trace_db_find_symbols` retains its ABI layout while validating
 requests and required database capabilities more strictly. Existing callers
 should handle the errors described under **Positions**
 below; database compatibility follows the
-[v7 capability contract](SQLITE_SCHEMA.md#version-and-capability-contract).
+[schema capability contract](SQLITE_SCHEMA.md#version-and-capability-contract).
 
 - **Positions.** Function/symbol lookup takes a file-path *substring* plus
   line (and column), mirroring `trace inspect`. The best match is `items[0]`.

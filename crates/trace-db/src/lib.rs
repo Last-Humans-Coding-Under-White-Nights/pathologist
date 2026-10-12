@@ -5,6 +5,7 @@ mod filter;
 mod inspect;
 mod render;
 mod schema;
+mod text;
 
 pub use export::*;
 pub use filter::filter_call_chains;
@@ -13,6 +14,7 @@ pub use filter::CallGraphFilter;
 pub use inspect::*;
 pub use render::*;
 pub use schema::*;
+pub use text::{TextId, TextPool};
 
 mod dataflow;
 pub use dataflow::*;

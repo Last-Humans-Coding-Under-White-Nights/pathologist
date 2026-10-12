@@ -1,6 +1,6 @@
 # SQLite schema
 
-Schema version: **v7**
+Schema version: **v8** (readers also support v7)
 
 Export creates secondary indexes after bulk insertion, within the same
 transaction and before publishing the database. Primary keys and uniqueness
@@ -10,14 +10,21 @@ See also the [README](../README.md) for CLI flags that control what is exported.
 
 ## Version and capability contract
 
-`analysis_run.schema_version = 7` identifies an **additive compatibility
+`analysis_run.schema_version` identifies an **additive compatibility
 family**, not a fixed set of capabilities. New tables, indexes, and nullable
-or defaulted columns may extend v7 while preserving existing columns and their
+or defaulted columns may extend a family while preserving existing columns and their
 meaning. Incompatible layouts or meanings require a version bump. This retains
 compatibility with earlier v7 exports without forcing re-analysis for readers
 that use only the unchanged call-graph data.
 
-Consumers must check the tables and columns needed by their query, and account
+Version 8 changes repeated-text storage to a shared dictionary and compatibility
+views, described in [Compact text storage](#compact-text-storage).
+The query columns and values are unchanged. Current readers support v7 tables
+and v8 views; consumers must accept either relation type. Older readers that
+require table objects for these relations must be updated for v8 exports. Re-analysis
+produces the smaller format; existing databases are not rewritten automatically.
+
+Consumers must check the tables or views and columns needed by their query, and account
 for database origin and export mode. A version number or an empty table alone
 cannot establish that a producer supplied a capability. Source-level inspection
 checks its required structures and rejects `analysis_run.options_json.stage =
@@ -27,7 +34,7 @@ new metadata and query indexes; there is no automatic migration from v6.
 
 ### Merger inputs and output
 
-`trace-merge` requires v7 and structurally validates the exact columns it reads
+`trace-merge` accepts v7 and v8 and structurally validates the exact columns it reads
 in `files`, `link_targets`, `target_sources`, `target_dependencies`, `functions`,
 `call_sites`, `call_edges`, `diagnostics`, and `execution_contexts` when present
 before creating or replacing output.
@@ -35,7 +42,7 @@ Earlier v7 databases without newer flow tables or `call_sites.callee_var` /
 `return_dst` can therefore still be merged. A nominal v7 database missing a
 required call-graph column is rejected with a re-analysis diagnostic.
 
-The output uses the shared v7 DDL and records `options_json.stage = "merge"`.
+The output uses the shared v8 DDL and records `options_json.stage = "merge"`.
 It preserves/remaps those call-graph tables and diagnostics, including call-site
 spelling and expansion coordinates, and reconstructs external call edges.
 It supports function/call lookup, call graphs, call chains, and editor call
@@ -648,7 +655,60 @@ Both graph commands print a forest with `(truncated at --depth …)` markers
 when the frontier was cut off.
 
 
-### Source-level presentation metadata (v7)
+### Compact text storage
+
+In v8, `strings(id INTEGER PRIMARY KEY, text TEXT NOT NULL)` stores each
+distinct name, expression, graph label, type spelling, and graph tag once
+across the relations below. The exporter copies only distinct strings into
+its lookup map and assigns IDs in first-occurrence order after reserving small
+IDs for common graph tags. It never iterates the map. Analysis and merger
+exports use the same `TextPool`; no second SQLite text index is stored.
+
+Each logical relation has a physical backing table named `<relation>_data`.
+Its column order and all unlisted columns retain the v7 definitions; the
+following text columns become integer `<column>_id` foreign keys to `strings`:
+
+| Logical relation | Interned columns |
+|------------------|------------------|
+| `variables` | `name` |
+| `call_sites` | `callee_text` |
+| `call_edges` | `resolution` |
+| `flow_nodes` | `kind`, `label`, `detail` |
+| `flow_edges` | `kind` |
+| `flow_parameters` | `name`, `type_name` |
+| `flow_origins` | `kind`, `expression`, `operation` |
+| `flow_call_origins` | `expression` |
+| `flow_call_expressions` | `expression` |
+
+These logical relations are read-only views. They expose the same columns,
+text, entity IDs, row counts, and duplicate rows as v7's tables. Named columns
+and `SELECT *` queries retain their results; implicit `rowid` is not part of
+the view contract. Foreign keys and indexes refer to physical backing tables,
+not views. The empty string has dictionary ID 1, the default for a node's
+optional label and detail. Variable storage `kind` remains inline so the
+parameter-twin partial index can retain its `kind='param'` predicate; that
+index keys `(fn_id, name_id)`. Inspection compares the backing table's
+`name_id` values directly, using both index keys without decoding candidate
+names. On v7 it compares the inline names through `(fn_id, name)` instead.
+
+`flow_parameters_data`, `flow_field_access`, `target_sources`,
+`target_dependencies`, and `points_to` use `WITHOUT ROWID`: their existing
+composite primary key is their storage key, avoiding a duplicate rowid table
+and primary-key index. Use explicit keys for these relations; their rows have
+no implicit `rowid`. Other backing tables retain rowids, including operation
+origins used when an insertion-order storage identifier is needed.
+
+Each view uses scalar dictionary lookups so SQLite can flatten it inside a
+left join; a joined view could materialize the entire relation. Indexed
+endpoint and call-site queries fetch selected rows and dictionary entries.
+Source-position lookup guards multiline-expression checks with a file-matching
+`CASE` so dictionary text is fetched only for matching files during the scan.
+The storage is shared by minimal, full, and points-to exports. Merger output
+populates the call-site and call-edge backing tables and their strings, and
+leaves the variable and flow backing tables empty, following its existing
+call-graph-only contract.
+
+### Source-level presentation metadata (v7 and v8)
 
 Always exported by analysis in minimal and full modes, independently of points-to retention:
 
@@ -701,7 +761,7 @@ copies by `(fn_id, name)` under `kind='param'`. Function ownership lookup uses
 to read the definitions of each operation's file once, instead of scanning all
 functions. These indexes are exported in
 minimal and full modes and built after bulk export,
-keep version 7's row layout, and support selective source-level inspection.
+preserve the query columns and support selective source-level inspection.
 Older v7 exports may lack these additive indexes; re-analysis supplies them.
 
 Raw tables keep their existing meaning under the

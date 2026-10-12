@@ -939,7 +939,7 @@ fn memory_accesses_name_their_load_or_store() {
     let version: i64 = conn
         .query_row("SELECT schema_version FROM analysis_run", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, trace_db::SCHEMA_VERSION);
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     assert_eq!(
         count(

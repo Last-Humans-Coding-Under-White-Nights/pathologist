@@ -8,7 +8,7 @@ use trace_lsp::{locations::PathMapping, transport, Server};
     about = "Read-only LSP call hierarchy for a trace SQLite analysis snapshot"
 )]
 struct Args {
-    /// Existing analysis database (minimal or full export, schema v7).
+    /// Existing analysis database (minimal or full export, schema v7 or v8).
     #[arg(long)]
     db: PathBuf,
     /// Remap an absolute database source prefix to an absolute local prefix.

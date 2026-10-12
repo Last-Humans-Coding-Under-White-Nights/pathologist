@@ -19,6 +19,8 @@ import subprocess
 import sys
 import tempfile
 
+from analysis_sqlite import quote_identifier, storage_relation
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -63,6 +65,52 @@ def compare(conn, baseline):
                 kind = columns.index("kind")
                 result[table]["changed_kinds"] = dict(Counter(row[kind] for row in changed))
     return result
+
+
+def synthetic_graph(conn, nodes):
+    """Replace the measured graph through writable v7/v8 storage relations."""
+    compact = storage_relation(conn, "flow_edges") == "flow_edges_data"
+    for relation in ["flow_edges", "flow_call_origins", "flow_origins", "flow_calls",
+                     "flow_return_calls", "flow_parameters", "flow_field_access",
+                     "flow_field_locations", "flow_nodes", "variables"]:
+        conn.execute(f"DELETE FROM {quote_identifier(storage_relation(conn, relation))}")
+    conn.execute("UPDATE files SET path='/synthetic.c' WHERE id=0")
+    if compact:
+        # The benchmark creates many distinct names. Cache existing dictionary
+        # entries and allocate IDs once, avoiding a text-table scan per node.
+        strings = dict(conn.execute("SELECT text,id FROM strings"))
+        next_id = max(strings.values(), default=0) + 1
+
+        def intern(text):
+            nonlocal next_id
+            if text not in strings:
+                conn.execute("INSERT INTO strings VALUES (?,?)", (next_id, text))
+                strings[text] = next_id
+                next_id += 1
+            return strings[text]
+
+        var, copy = intern("var"), intern("copy")
+        conn.executemany(
+            "INSERT INTO variables_data(id,name_id,kind,type_id,file_id,line,col,is_synthetic) "
+            "VALUES(?,?,'global',0,0,?,1,0)",
+            ((i, intern(f"v{i}"), i + 1) for i in range(nodes + 2)))
+        conn.executemany("INSERT INTO flow_nodes_data(id,kind_id,label_id,var_id) VALUES(?,?,?,?)",
+                         ((i, var, intern(f"v{i}"), i) for i in range(nodes + 2)))
+        conn.executemany("INSERT INTO flow_edges_data(src_node,dst_node,kind_id) VALUES(?,?,?)",
+                         ((i, i + 1, copy) for i in range(nodes - 1)))
+        conn.execute("INSERT INTO flow_edges_data(src_node,dst_node,kind_id) VALUES(?,?,?)",
+                     (nodes, nodes + 1, copy))
+    else:
+        conn.executemany(
+            "INSERT INTO variables(id,name,kind,type_id,file_id,line,col,is_synthetic) "
+            "VALUES(?,?,'global',0,0,?,1,0)",
+            ((i, f"v{i}", i + 1) for i in range(nodes + 2)))
+        conn.executemany("INSERT INTO flow_nodes(id,kind,label,var_id) VALUES(?,'var',?,?)",
+                         ((i, f"v{i}", i) for i in range(nodes + 2)))
+        conn.executemany("INSERT INTO flow_edges(src_node,dst_node,kind) VALUES(?,?,'copy')",
+                         ((i, i + 1) for i in range(nodes - 1)))
+        conn.execute("INSERT INTO flow_edges(src_node,dst_node,kind) VALUES(?,?,'copy')",
+                     (nodes, nodes + 1))
 
 
 def main():
@@ -132,23 +180,14 @@ def main():
         with sqlite3.connect(db) as conn:
             result["fixture_provenance"] = {t: conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
                                              for t in ["flow_origins", "flow_return_calls", "flow_call_origins"]}
-            for table in ["flow_edges", "flow_call_origins", "flow_origins", "flow_calls", "flow_return_calls", "flow_parameters",
-                          "flow_field_access", "flow_field_locations", "flow_nodes", "variables"]:
-                conn.execute(f"DELETE FROM {table}")
-            conn.execute("UPDATE files SET path='/synthetic.c' WHERE id=0")
-            conn.executemany("INSERT INTO variables(id,name,kind,type_id,file_id,line,col,is_synthetic) VALUES(?,?,'global',0,0,?,1,0)",
-                             ((i, f"v{i}", i+1) for i in range(args.nodes+2)))
-            conn.executemany("INSERT INTO flow_nodes(id,kind,label,var_id) VALUES(?,'var',?,?)",
-                             ((i, f"v{i}", i) for i in range(args.nodes+2)))
-            conn.executemany("INSERT INTO flow_edges(src_node,dst_node,kind) VALUES(?,?,'copy')",
-                             ((i, i+1) for i in range(args.nodes-1)))
-            conn.execute("INSERT INTO flow_edges(src_node,dst_node,kind) VALUES(?,?,'copy')", (args.nodes,args.nodes+1))
+            synthetic_graph(conn, args.nodes)
             conn.commit()
         profile("chain", inspect(db,"synthetic.c",1,1))
         profile("disconnected", inspect(db,"synthetic.c",args.nodes+1,1))
         # Same large component, with technical rather than visible interiors.
         with sqlite3.connect(db) as conn:
-            conn.execute("UPDATE variables SET is_synthetic=1 WHERE id>0 AND id<?",(args.nodes-1,))
+            variables = quote_identifier(storage_relation(conn, "variables"))
+            conn.execute(f"UPDATE {variables} SET is_synthetic=1 WHERE id>0 AND id<?", (args.nodes-1,))
         profile("hidden_chain", inspect(db,"synthetic.c",1,1),1)
     args.output.write_text(json.dumps(result, indent=2)+"\n")
     print(json.dumps(result, indent=2))
