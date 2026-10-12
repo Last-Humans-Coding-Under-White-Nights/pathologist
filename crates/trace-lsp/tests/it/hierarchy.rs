@@ -531,10 +531,16 @@ fn startup_rejects_missing_invalid_and_incompatible_databases() {
         .unwrap()
         .to_string()
         .contains("unsupported"));
-    conn.execute("UPDATE analysis_run SET schema_version=7", [])
-        .unwrap();
-    conn.execute("ALTER TABLE call_sites DROP COLUMN expansion_col", [])
-        .unwrap();
+    conn.execute(
+        "UPDATE analysis_run SET schema_version=?1",
+        [trace_db::SCHEMA_VERSION],
+    )
+    .unwrap();
+    conn.execute(
+        "ALTER TABLE call_sites_data RENAME COLUMN expansion_col TO unavailable_col",
+        [],
+    )
+    .unwrap();
     assert!(Server::open(&fixture.db, &[]).is_err());
 }
 

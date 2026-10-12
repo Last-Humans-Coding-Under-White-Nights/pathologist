@@ -2,8 +2,8 @@
 """Compare repeated internal-overload provenance using two fresh release builds.
 
 macOS only; uses profile_memory_macos.py, alternates binaries, and compares
-every table's rows in insertion order, excluding analysis_run.created_at and
-trace_version (build/run metadata).
+every logical relation's rows in canonical multiset order, excluding creation
+time, trace build identity and schema version. Supports v7 tables and v8 views.
 All sources, databases and observer logs live in a TemporaryDirectory.
 """
 import argparse
@@ -19,19 +19,17 @@ import subprocess
 import sys
 import tempfile
 
+from analysis_sqlite import logical_relations, relation_query
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def analysis_rows(path):
     with closing(sqlite3.connect(path)) as conn:
-        tables = [r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
         result = {}
-        for table in tables:
-            columns = [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')
-                       if not (table == "analysis_run" and r[1] in ["created_at", "trace_version"])]
-            fields = ",".join(f'"{c}"' for c in columns)
-            result[table] = list(conn.execute(f'SELECT {fields} FROM "{table}" ORDER BY rowid'))
+        for relation in logical_relations(conn):
+            _, query = relation_query(conn, relation)
+            result[relation] = list(conn.execute(query))
         return result
 
 
@@ -89,7 +87,7 @@ def main():
                         else:
                             for table in sorted(rows.keys() | expected.keys()):
                                 assert rows.get(table) == expected.get(table), (
-                                    f"analysis rows or insertion order differ: {label}, {table}: "
+                                    f"logical analysis rows differ: {label}, {table}: "
                                     f"{rows.get(table, [])[:1]} != {expected.get(table, [])[:1]}")
                 case["identical_analysis_rows"] = True
                 case["flow_edges"] = len(expected["flow_edges"])

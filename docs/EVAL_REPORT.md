@@ -1,5 +1,145 @@
 # Evaluation Report
 
+## Compact text export — 2026-10-12
+
+Storage rules and compatibility: [Compact text storage](SQLITE_SCHEMA.md#compact-text-storage).
+Baseline is clean `b56a471`; the candidate is that revision with shared text
+storage and composite-key tables. Both binaries were rebuilt in release mode
+and analyzed the clean trees with `--jobs 8`, default minimal export and
+default solver budgets. Ability-runtime is at
+`6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`; camera is at
+`8ffd69dcd47f533e70b4dba428439da9008b0cae`. No logging or analysis facts were
+filtered to obtain the reduction.
+
+The ability-runtime export meets the **300,000,000-byte** target: it is
+**290,803,712 bytes (290.80 MB / 277.33 MiB)**. Expression interning alone
+produced 339,693,568 bytes; sharing repeated names, graph labels and tags,
+parameter text, and using existing composite keys as storage keys saves a
+further 48,889,856 bytes.
+
+| Metric | Before | After | Change |
+|--------|-------:|------:|-------:|
+| Ability-runtime database, MiB | 395.61 | 277.33 | −29.9% |
+| Ability-runtime text-backed storage, MiB (`dbstat`) | 257.35 | 143.02 | −44.4% |
+| Ability-runtime export, seconds | 22.2 | 22.4 | +0.2 |
+| Camera database, MiB | 76.40 | 59.01 | −22.8% |
+| Camera export, seconds | 3.0 | 2.8 | −0.2 |
+
+File sizes are 414,830,592 → 290,803,712 bytes for ability-runtime and
+80,113,664 → 61,878,272 bytes for camera. Text-backed storage counts the nine
+old text tables before, and their nine backing tables plus the shared
+`strings` dictionary after. Timing is one completed run per side, indicative
+rather than a repeated performance benchmark.
+
+Ability-runtime has 621,899 call-expression rows, 216,328 call-origin rows,
+and 355,739 flow-origin rows; these alone contain 136,772 distinct strings.
+The complete dictionary has 344,058 distinct strings and 18,874,683
+characters, including names and graph text. Logging expansions account for
+much of the duplication, including over 100,000 identical `__builtin_strrchr`
+expressions. All source text and non-variable graph labels are retained.
+
+All 26 original logical relations match row for row on both corpora, excluding
+run identity, schema version, and creation time. The ability-runtime comparison
+covers 6,780,023 rows, including every expression, source coordinate, call
+edge, argument flow, memory access, and duplicate provenance row. Integrity
+checks pass. Foreign-key checks pass for the new backing tables; variable-name
+references are checked independently of the minimal export's intentionally
+omitted types.
+
+Eight deterministic ability-runtime field slices at four steps up and down
+produce identical JSON with the baseline reader, the current reader on v7,
+and the current reader on v8. The field-site sample is unchanged; the check
+is maintained in [compare_slice_outputs.py](../scripts/compare_slice_outputs.py).
+Their combined command time in the final pass is 3.49 → 3.10 s (indicative).
+Source-position lookup checks the file before fetching dictionary text for
+multiline-expression tests. Regression tests cover sharing across all nine
+relations, empty/Unicode/quoted text, duplicate operation rows, insertion-order
+determinism across job counts, both detail modes, v7/v8 merger inputs, and
+read-only editor snapshots. The initial workspace suite passed all 2,183 tests.
+
+The views use scalar dictionary lookups. Query-plan regressions verify indexed
+endpoint and call-site access with no scans or materialization in those
+inspection queries. Parameter-twin lookups use both keys of their partial
+index, following the [compact-storage rules](SQLITE_SCHEMA.md#compact-text-storage).
+The sampler resolves store and field-summary tag IDs once and filters backing
+rows by those IDs, decoding only selected labels.
+
+Artifacts: `/tmp/trace-db-size-{ability,camera}-{before,final}.db`, matching
+analysis logs, `/tmp/trace-db-size-{ability,camera}-final-comparison.json`,
+`/tmp/trace-db-size-probes-final.log`, and `/tmp/trace-db-size-tests.log`.
+The initial comparison and slice drivers were `/tmp/trace-db-size-compare.py`
+and `/tmp/trace-db-size-probes.py`. The maintained comparison driver is
+[compare_analysis_databases.py](../scripts/compare_analysis_databases.py):
+it discovers public tables and views, excludes backing tables and the
+dictionary, and streams rows in canonical
+multiset order. It compares entity IDs, source text, options, and duplicate rows,
+while excluding trace build identity, schema version, and creation time.
+Exit status 1 identifies a difference. To regenerate the ability-runtime
+databases on another machine, use a clean source tree at the pinned revision
+above and build both readers. Set `TRACE_ABILITY_ROOT` to that checkout's
+absolute path; using the same path for both analyses preserves source identities.
+
+```bash
+TRACE_ABILITY_ROOT=/absolute/path/to/ability_ability_runtime
+TRACE_BASE_TREE=/tmp/trace-sqlite-baseline
+TRACE_MEASURE_DIR=/tmp/trace-sqlite-eval
+git worktree add --detach "$TRACE_BASE_TREE" b56a471
+cargo build --manifest-path "$TRACE_BASE_TREE/Cargo.toml" \
+  --target-dir "$TRACE_BASE_TREE/target" -p trace-cli --release
+cargo build -p trace-cli --release
+mkdir -p "$TRACE_MEASURE_DIR"
+"$TRACE_BASE_TREE/target/release/trace" analyze "$TRACE_ABILITY_ROOT" \
+  --jobs 8 -o "$TRACE_MEASURE_DIR/before.db"
+target/release/trace analyze "$TRACE_ABILITY_ROOT" \
+  --jobs 8 -o "$TRACE_MEASURE_DIR/after.db"
+python3 scripts/compare_analysis_databases.py \
+  "$TRACE_MEASURE_DIR/before.db" "$TRACE_MEASURE_DIR/after.db" \
+  --output "$TRACE_MEASURE_DIR/relations.json"
+python3 scripts/compare_slice_outputs.py \
+  "$TRACE_MEASURE_DIR/before.db" "$TRACE_MEASURE_DIR/after.db" \
+  --before-bin "$TRACE_BASE_TREE/target/release/trace" \
+  --output "$TRACE_MEASURE_DIR/baseline-slices.json"
+python3 scripts/compare_slice_outputs.py \
+  "$TRACE_MEASURE_DIR/before.db" "$TRACE_MEASURE_DIR/after.db" \
+  --output "$TRACE_MEASURE_DIR/current-slices.json"
+```
+
+The slice driver compares complete JSON, including expressions and context
+hints, and checks that both exports select the same field sites. Keep the
+original source checkout available for column/name resolution. The default is
+eight fields with four steps up and down. The camera check uses its pinned
+checkout in the same way. To reuse the original local database artifacts:
+
+```bash
+python3 scripts/compare_analysis_databases.py \
+  /tmp/trace-db-size-ability-before.db /tmp/trace-db-size-ability-final.db \
+  --output /tmp/ability-logical-comparison.json
+python3 scripts/compare_analysis_databases.py \
+  /tmp/trace-db-size-camera-before.db /tmp/trace-db-size-camera-final.db \
+  --output /tmp/camera-logical-comparison.json
+```
+
+`measure_overload_provenance.py` uses the same relation discovery and ordering,
+so it compares v7 tables with v8 views and reads composite-key tables without
+assuming rowids. `measure_dataflow_review.py` routes synthetic benchmark writes
+to v8 backing tables and interns their strings, retaining its v7 insert path.
+Regression commands:
+
+```bash
+python3 scripts/test_compare_analysis_databases.py
+python3 scripts/test_measure_dataflow_review.py
+python3 scripts/test_slice_sizes.py
+python3 scripts/test_compare_slice_outputs.py
+```
+
+Review follow-up validation: all 2,185 workspace tests and these 21 Python tests
+pass, as does workspace Clippy with warnings denied. Merger regression coverage
+checks formatted foreign-key errors for rowid and `WITHOUT ROWID` tables;
+schema-capability checks use actual v7 and v8 layouts. Re-running the maintained
+slice driver with the baseline reader and current v8 reader confirms identical
+JSON for all eight ability-runtime fields. The sampler selects the same sites
+on v7 and v8 for both ability-runtime (3,944 eligible fields) and camera (2,391).
+
 ## Epoll event-data flow: #144 — 2026-10-11
 
 Rules: [Epoll event data](ANALYSIS.md#epoll-event-data),

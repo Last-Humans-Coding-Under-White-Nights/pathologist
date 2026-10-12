@@ -218,7 +218,11 @@ fn origins_are_deterministic_across_jobs() {
         let db = cli_analyze(&root, &["--jobs", jobs]);
         let conn = open_db(&db).unwrap();
         (
-            text_rows(&conn, "SELECT rowid, * FROM flow_origins ORDER BY rowid"),
+            text_rows(
+                &conn,
+                "SELECT rowid, * FROM flow_origins_data ORDER BY rowid",
+            ),
+            text_rows(&conn, "SELECT * FROM strings ORDER BY id"),
             text_rows(&conn, "SELECT * FROM flow_edges ORDER BY id"),
         )
     };

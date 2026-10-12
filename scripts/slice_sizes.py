@@ -15,6 +15,7 @@ Uses only the stdlib.
 """
 
 import argparse
+from contextlib import closing
 import json
 import sqlite3
 import statistics
@@ -23,23 +24,67 @@ import sys
 import time
 from pathlib import Path
 
+from analysis_sqlite import storage_relation
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 TEST_DIRS = ("/test/", "/tests/", "/unittest/", "/fuzztest/", "/mock/", "/demo/")
 
 
+def sample_query(con):
+    # Sample the first stored site of each field. v8's public relation is a
+    # view, so use its backing table when an insertion rowid is needed.
+    origins = storage_relation(con, "flow_origins")
+    edges = storage_relation(con, "flow_edges")
+    compact_edges = edges == "flow_edges_data"
+    kind_match = "o.kind_id = e.kind_id" if compact_edges else "o.kind = e.kind"
+    if compact_edges:
+        # Resolve tags once. LIMIT stops at the common, pre-interned tags;
+        # neither tag spelling is looked up for every memory-access row.
+        tags = [con.execute("SELECT id FROM strings WHERE text=? LIMIT 1", [text]).fetchone()
+                for text in ["store", "field_summary"]]
+        if any(row is None for row in tags):
+            return None
+        params = tuple(row[0] for row in tags)
+        nodes = "flow_nodes_data"
+        label = "(SELECT text FROM strings WHERE id=n.label_id)"
+        predicates = "e.kind_id = ? AND n.detail_id = ?"
+    else:
+        params = ("store", "field_summary")
+        nodes, label = "flow_nodes", "n.label"
+        predicates = "e.kind = ? AND n.detail = ?"
+    return (
+        f"SELECT {label} AS label, p.path, o.line, MIN(o.rowid) FROM flow_memory_access a "
+        f"JOIN {edges} e ON e.id = a.edge_id JOIN {nodes} n ON n.id = a.cell_node "
+        f"JOIN {origins} o ON o.src_node = e.src_node AND o.dst_node = e.dst_node "
+        f"AND {kind_match} JOIN files p ON p.id = o.file_id "
+        f"WHERE {predicates} "
+        "GROUP BY n.id ORDER BY label, p.path, o.line", params)
+
+
 def starts(db, sample):
-    con = sqlite3.connect(db)
-    rows = con.execute(
-        "SELECT n.label, p.path, o.line, MIN(o.rowid) FROM flow_memory_access a "
-        "JOIN flow_edges e ON e.id = a.edge_id JOIN flow_nodes n ON n.id = a.cell_node "
-        "JOIN flow_origins o ON o.src_node = e.src_node AND o.dst_node = e.dst_node "
-        "AND o.kind = e.kind JOIN files p ON p.id = o.file_id "
-        "WHERE e.kind = 'store' AND n.detail = 'field_summary' "
-        "GROUP BY n.id ORDER BY n.label, p.path, o.line").fetchall()
+    with closing(sqlite3.connect(db)) as con:
+        query = sample_query(con)
+        if query is None:
+            return 0, []
+        sql, params = query
+        rows = con.execute(sql, params).fetchall()
     rows = [r for r in rows if not any(d in r[1] for d in TEST_DIRS)]
     step = max(1, len(rows) // sample)
     return len(rows), rows[::step][:sample]
+
+
+def slice_command(binary, db, start, up_depth, down_depth):
+    label, path, line, _ = start
+    name = label.rsplit(".", 1)[-1]
+    try:
+        row = Path(path).read_text(errors="replace").splitlines()[line - 1]
+        col = row.find(name) + 1 or 1
+    except (OSError, IndexError):
+        col = 1
+    return [str(binary), "inspect", str(db), "slice", "--file", path, "--line", str(line),
+            "--col", str(col), "--name", name, "--format", "json",
+            "--up-depth", str(up_depth), "--down-depth", str(down_depth)]
 
 
 def main():
@@ -52,18 +97,11 @@ def main():
     args = ap.parse_args()
     total, picked = starts(args.db, args.sample)
     results = []
-    for label, path, line, _ in picked:
-        name = label.rsplit(".", 1)[-1]
-        try:
-            row = Path(path).read_text(errors="replace").splitlines()[line - 1]
-            col = row.find(name) + 1 or 1
-        except (OSError, IndexError):
-            col = 1
+    for start in picked:
+        label, path, line, _ = start
         began = time.monotonic()
         proc = subprocess.run(
-            [args.bin, "inspect", args.db, "slice", "--file", path, "--line", str(line),
-             "--col", str(col), "--name", name, "--format", "json",
-             "--up-depth", str(args.up_depth), "--down-depth", str(args.down_depth)],
+            slice_command(args.bin, args.db, start, args.up_depth, args.down_depth),
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         secs = time.monotonic() - began
         if proc.returncode != 0:
