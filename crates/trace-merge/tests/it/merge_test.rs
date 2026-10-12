@@ -1488,7 +1488,7 @@ fn test_undeclared_receiver_member_call_relinks_to_defining_repo() {
 }
 
 #[test]
-fn schema_compatibility_checks_versions_and_required_v7_structures() {
+fn schema_compatibility_checks_versions_and_required_v7_and_v8_structures() {
     let tmp = tempdir().unwrap();
     let old = tmp.path().join("old-v6.db");
     let conn = Connection::open(&old).unwrap();
@@ -1529,7 +1529,7 @@ fn schema_compatibility_checks_versions_and_required_v7_structures() {
                 "is_direct INTEGER NOT NULL",
             )
         } else {
-            trace_db::SCHEMA_V7.to_owned()
+            trace_db::SCHEMA_V8.to_owned()
         };
         conn.execute_batch(&schema).unwrap();
         if i == 0 {
@@ -1545,7 +1545,7 @@ fn schema_compatibility_checks_versions_and_required_v7_structures() {
         }
         conn.execute(
             "INSERT INTO analysis_run VALUES(1,'test',?1,'/src','now','{}')",
-            [trace_db::SCHEMA_VERSION],
+            [if i == 0 { 7 } else { trace_db::SCHEMA_VERSION }],
         )
         .unwrap();
         conn.execute(
@@ -1573,21 +1573,38 @@ fn schema_compatibility_checks_versions_and_required_v7_structures() {
     assert_eq!(count, 2);
     drop(merged);
 
-    // A nominal v7 input can still lack a capability needed by the merger.
-    let broken = Connection::open(&current[1]).unwrap();
-    broken
-        .execute_batch("ALTER TABLE call_sites RENAME COLUMN expansion_col TO unavailable_col")
-        .unwrap();
-    drop(broken);
-    fs::write(&output, b"existing output").unwrap();
-    let error = merge_databases(&current, &options).unwrap_err().to_string();
-    assert!(error.contains("missing trace-merge capability"), "{error}");
-    assert!(
-        error.contains("call_sites") && error.contains("expansion_col"),
-        "{error}"
-    );
-    assert!(error.contains("re-analyze"), "{error}");
-    assert_eq!(fs::read(&output).unwrap(), b"existing output");
+    // Supported v7 and v8 inputs must both expose the required logical columns.
+    for (index, table) in [(0, "call_sites"), (1, "call_sites_data")] {
+        let broken = Connection::open(&current[index]).unwrap();
+        broken
+            .execute_batch(&format!(
+                "ALTER TABLE {table} RENAME COLUMN expansion_col TO unavailable_col"
+            ))
+            .unwrap();
+        drop(broken);
+        fs::write(&output, b"existing output").unwrap();
+        let error = merge_databases(&current, &options).unwrap_err().to_string();
+        assert!(
+            error.contains("missing trace-merge capability"),
+            "{table}: {error}"
+        );
+        assert!(
+            error.contains("call_sites") && error.contains("expansion_col"),
+            "{table}: {error}"
+        );
+        assert!(error.contains("re-analyze"), "{error}");
+        assert_eq!(fs::read(&output).unwrap(), b"existing output");
+        // Restore this input so the next iteration checks the other version.
+        let restored = Connection::open(&current[index]).unwrap();
+        restored
+            .execute_batch(&format!(
+                "ALTER TABLE {table} RENAME COLUMN unavailable_col TO expansion_col"
+            ))
+            .unwrap();
+        restored
+            .prepare("SELECT expansion_col FROM call_sites LIMIT 0")
+            .unwrap();
+    }
 }
 
 #[test]

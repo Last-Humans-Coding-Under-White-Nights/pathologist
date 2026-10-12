@@ -1177,7 +1177,7 @@ const SLICE_COLUMNS: [(&str, &[&str]); 4] = [
 ];
 
 /// The slice reads an analysis export's flow graph, operation sites and
-/// execution contexts. Under the v7 capability contract
+/// execution contexts. Under the schema capability contract
 /// (`docs/SQLITE_SCHEMA.md`, "Version and capability contract") it checks
 /// those structures, and refuses a `trace-merge` output, whose flow tables
 /// hold no flow graph.
@@ -1482,16 +1482,20 @@ pub fn resolve_slice_start(
     // An operation or call is on the line when it starts there or its
     // expression, which keeps its newlines, runs on to it (`p =` with `q;`
     // on the next line): the lines it covers are its own and as many more
-    // as it has newlines.
+    // as it has newlines. CASE checks the file before fetching expression
+    // text: SQLite can otherwise evaluate the length predicate before the
+    // file join, doing dictionary lookups for unrelated files in v8.
     let mut touched: Vec<Touched> = conn
         .prepare(
             "WITH o AS (SELECT o.file_id, o.src_node, o.dst_node, o.kind, o.line, o.col, \
                                o.expression \
                         FROM flow_origins o \
                         JOIN files f ON f.id = o.file_id \
-                        WHERE o.line <= ?1 AND f.path LIKE ?2 ESCAPE '!' \
-                          AND o.line + length(o.expression) \
-                              - length(replace(o.expression, char(10), '')) >= ?1) \
+                        WHERE o.line <= ?1 \
+                          AND CASE WHEN f.path LIKE ?2 ESCAPE '!' THEN \
+                              o.line + length(o.expression) \
+                                  - length(replace(o.expression, char(10), '')) >= ?1 \
+                              ELSE 0 END) \
              SELECT file_id, src_node, line, col, expression FROM o \
              UNION SELECT file_id, dst_node, line, col, expression FROM o \
              UNION SELECT o.file_id, a.cell_node, o.line, o.col, o.expression FROM o \
@@ -1504,18 +1508,22 @@ pub fn resolve_slice_start(
                    JOIN call_sites cs ON cs.id = fc.call_site_id \
                    JOIN files f ON f.id = cs.file_id \
                    LEFT JOIN flow_call_expressions ce ON ce.call_site_id = cs.id \
-                   WHERE cs.line <= ?1 AND f.path LIKE ?2 ESCAPE '!' \
-                     AND cs.line + length(coalesce(ce.expression, '')) \
-                         - length(replace(coalesce(ce.expression, ''), char(10), '')) >= ?1 \
+                   WHERE cs.line <= ?1 \
+                     AND CASE WHEN f.path LIKE ?2 ESCAPE '!' THEN \
+                         cs.line + length(coalesce(ce.expression, '')) \
+                             - length(replace(coalesce(ce.expression, ''), char(10), '')) >= ?1 \
+                         ELSE 0 END \
              UNION SELECT cs.file_id, n.id, cs.line, cs.col, ce.expression \
                    FROM call_sites cs \
                    JOIN flow_nodes n ON n.var_id = cs.callee_var AND n.kind = 'var' \
                    JOIN files f ON f.id = cs.file_id \
                    LEFT JOIN flow_call_expressions ce ON ce.call_site_id = cs.id \
                    WHERE cs.callee_var IS NOT NULL \
-                     AND cs.line <= ?1 AND f.path LIKE ?2 ESCAPE '!' \
-                     AND cs.line + length(coalesce(ce.expression, '')) \
-                         - length(replace(coalesce(ce.expression, ''), char(10), '')) >= ?1",
+                     AND cs.line <= ?1 \
+                     AND CASE WHEN f.path LIKE ?2 ESCAPE '!' THEN \
+                         cs.line + length(coalesce(ce.expression, '')) \
+                             - length(replace(coalesce(ce.expression, ''), char(10), '')) >= ?1 \
+                         ELSE 0 END",
         )?
         .query_map(rusqlite::params![line, pattern], |r| {
             let (from_line, from_col): (i64, i64) = (r.get(2)?, r.get(3)?);

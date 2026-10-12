@@ -62,10 +62,14 @@ pub fn open_editor_snapshot(path: &Path) -> Result<Connection> {
         .context("invalid analysis database: missing analysis_run metadata")?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    if versions.is_empty() || versions.iter().any(|v| *v != crate::SCHEMA_VERSION) {
+    if versions.is_empty()
+        || versions
+            .iter()
+            .any(|v| !crate::SUPPORTED_SCHEMA_VERSIONS.contains(v))
+    {
         bail!(
-            "unsupported analysis database schema {versions:?}; expected {}",
-            crate::SCHEMA_VERSION
+            "unsupported analysis database schema {versions:?}; expected one of {:?}",
+            crate::SUPPORTED_SCHEMA_VERSIONS
         );
     }
     // Preparing these queries validates every column used by the integration,
@@ -161,6 +165,35 @@ pub fn editor_calls(conn: &Connection, id: FnId, direction: Direction) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_accept_legacy_and_compact_schemas_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        for (version, schema) in [
+            (7, crate::SCHEMA_V7),
+            (8, crate::SCHEMA_V8),
+            (6, crate::SCHEMA_V7),
+            (9, crate::SCHEMA_V8),
+        ] {
+            let path = dir.path().join(format!("v{version}.db"));
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(schema).unwrap();
+            conn.execute(
+                "INSERT INTO analysis_run VALUES(1,'test',?1,'/src','now','{}')",
+                [version],
+            )
+            .unwrap();
+            drop(conn);
+            let snapshot = open_editor_snapshot(&path);
+            if version == 7 || version == 8 {
+                let snapshot = snapshot.unwrap();
+                assert!(snapshot.execute("DELETE FROM analysis_run", []).is_err());
+                assert!(editor_file_paths(&snapshot).unwrap().is_empty());
+            } else {
+                assert!(snapshot.is_err(), "version {version}");
+            }
+        }
+    }
 
     #[test]
     fn exact_file_lookup_preserves_candidates_and_source_predicate() {

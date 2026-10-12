@@ -1,4 +1,5 @@
-use crate::schema::{INDEXES_V7, PROVENANCE_INDEXES_V7, SCHEMA_VERSION, TABLES_V7};
+use crate::schema::{INDEXES_V8, PROVENANCE_INDEXES_V8, SCHEMA_VERSION, TABLES_V8};
+use crate::TextPool;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use rustc_hash::FxHashSet;
@@ -58,7 +59,8 @@ pub fn export_to_sqlite(
             "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY;",
         )?;
         conn.execute_batch("BEGIN IMMEDIATE;")?;
-        conn.execute_batch(TABLES_V7)?;
+        conn.execute_batch(TABLES_V8)?;
+        let mut strings = TextPool::new(&conn)?;
 
         let options_json = serde_json::json!({
             "test_partition": {
@@ -96,25 +98,25 @@ pub fn export_to_sqlite(
         export_files(&conn, program)?;
         export_link_targets(&conn, program)?;
         export_functions(&conn, program)?;
-        export_flow_parameters(&conn, program)?;
-        export_call_sites_filtered(&conn, program, analysis)?;
-        export_call_edges(&conn, analysis)?;
-        conn.execute_batch(PROVENANCE_INDEXES_V7)?;
+        export_flow_parameters(&conn, program, &mut strings)?;
+        export_call_sites_filtered(&conn, program, analysis, &mut strings)?;
+        export_call_edges(&conn, analysis, &mut strings)?;
+        conn.execute_batch(PROVENANCE_INDEXES_V8)?;
         if opts.full_detail {
             export_types(&conn, program)?;
-            export_variables(&conn, program)?;
+            export_variables(&conn, program, &mut strings)?;
             export_locations(&conn, pag)?;
         } else {
-            export_flow_and_arg_flow_vars(&conn, program, pag, analysis)?;
+            export_flow_and_arg_flow_vars(&conn, program, pag, analysis, &mut strings)?;
         }
         export_arg_flow(&conn, analysis)?;
         export_execution_contexts(&conn, analysis)?;
-        export_flow_graph(&conn, program, pag, analysis)?;
+        export_flow_graph(&conn, program, pag, analysis, &mut strings)?;
         if opts.include_points_to {
             export_points_to(&conn, pag, analysis)?;
         }
         export_diagnostics(&conn, program, analysis)?;
-        conn.execute_batch(INDEXES_V7)?;
+        conn.execute_batch(INDEXES_V8)?;
         conn.execute_batch("COMMIT;")?;
     }
 
@@ -231,11 +233,15 @@ fn type_name(desc: &TypeDesc) -> String {
     }
 }
 
-const INSERT_VARIABLE: &str = "INSERT INTO variables (id, name, kind, fn_id, type_id, file_id, line, col, is_weak, target_id, is_synthetic) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+const INSERT_VARIABLE: &str = "INSERT INTO variables_data (id, name_id, kind, fn_id, type_id, file_id, line, col, is_weak, target_id, is_synthetic) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
 
-fn export_flow_parameters(conn: &Connection, program: &Program) -> Result<()> {
+fn export_flow_parameters(
+    conn: &Connection,
+    program: &Program,
+    strings: &mut TextPool<'_>,
+) -> Result<()> {
     let mut stmt =
-        conn.prepare_cached("INSERT INTO flow_parameters VALUES (?1, ?2, ?3, ?4, ?5)")?;
+        conn.prepare_cached("INSERT INTO flow_parameters_data VALUES (?1, ?2, ?3, ?4, ?5)")?;
     for func in &program.symbols.functions {
         // Match the solver's argument numbering, including an implicit receiver.
         for (index, &id) in func.params.iter().enumerate() {
@@ -245,18 +251,22 @@ fn export_flow_parameters(conn: &Connection, program: &Program) -> Result<()> {
                 func.id.0,
                 index,
                 id.0,
-                var.name,
-                param_type_name(&ty.desc)
+                strings.intern(&var.name)?,
+                strings.intern(&param_type_name(&ty.desc))?
             ])?;
         }
     }
     Ok(())
 }
 
-fn export_variables(conn: &Connection, program: &Program) -> Result<()> {
+fn export_variables(
+    conn: &Connection,
+    program: &Program,
+    strings: &mut TextPool<'_>,
+) -> Result<()> {
     let mut stmt = conn.prepare_cached(INSERT_VARIABLE)?;
     for var in &program.symbols.variables {
-        export_one_variable(&mut stmt, var)?;
+        export_one_variable(&mut stmt, var, strings)?;
     }
     Ok(())
 }
@@ -266,6 +276,7 @@ fn export_flow_and_arg_flow_vars(
     program: &Program,
     pag: &Pag,
     analysis: &AnalysisResult,
+    strings: &mut TextPool<'_>,
 ) -> Result<()> {
     let mut needed: FxHashSet<VarId> = FxHashSet::default();
     // Every global and static, with or without a PAG node: inspect finds a
@@ -315,7 +326,7 @@ fn export_flow_and_arg_flow_vars(
     let mut stmt = conn.prepare_cached(INSERT_VARIABLE)?;
     for var in &program.symbols.variables {
         if needed.contains(&var.id) {
-            export_one_variable(&mut stmt, var)?;
+            export_one_variable(&mut stmt, var, strings)?;
         }
     }
     Ok(())
@@ -332,12 +343,13 @@ fn export_flow_graph(
     program: &Program,
     pag: &Pag,
     analysis: &AnalysisResult,
+    strings: &mut TextPool<'_>,
 ) -> Result<()> {
     let mut nodes = conn.prepare_cached(
-        "INSERT INTO flow_nodes (id, kind, label, detail, var_id, fn_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO flow_nodes_data (id, kind_id, label_id, detail_id, var_id, fn_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     let mut edges = conn.prepare_cached(
-        "INSERT INTO flow_edges (id, src_node, dst_node, kind) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO flow_edges_data (id, src_node, dst_node, kind_id) VALUES (?1, ?2, ?3, ?4)",
     )?;
 
     for node in &pag.nodes {
@@ -386,16 +398,16 @@ fn export_flow_graph(
         };
         nodes.execute(params![
             node.id.0,
-            kind,
-            label,
-            detail,
+            strings.intern(kind)?,
+            strings.intern(&label)?,
+            strings.intern(&detail)?,
             var_id.map(|v| v.0),
             fn_id.map(|f| f.0)
         ])?;
     }
 
     let mut target_sites =
-        conn.prepare_cached("UPDATE flow_nodes SET call_site_id=?2 WHERE id=?1")?;
+        conn.prepare_cached("UPDATE flow_nodes_data SET call_site_id=?2 WHERE id=?1")?;
     for node in &pag.nodes {
         if let PagNodeKind::CallTarget(cs) = node.kind {
             target_sites.execute(params![node.id.0, cs.0])?;
@@ -414,7 +426,7 @@ fn export_flow_graph(
             ])?;
         }
     }
-    export_flow_provenance(conn, program, pag, analysis)?;
+    export_flow_provenance(conn, program, pag, analysis, strings)?;
     let mut edge_rows: Vec<(u32, u32, &'static str)> = Vec::new();
     for c in &pag.constraints {
         let kind = match c.kind {
@@ -521,13 +533,13 @@ fn export_flow_graph(
         next_node_id += 1;
         nodes.execute(params![
             term_node,
-            "terminator",
-            format!("{} clears arg{param}", site.callee_name),
-            format!(
+            strings.intern("terminator")?,
+            strings.intern(&format!("{} clears arg{param}", site.callee_name))?,
+            strings.intern(&format!(
                 "call @{} in {}",
                 site.span.line,
                 program.symbols.function(site.caller).name
-            ),
+            ))?,
             Option::<i64>::None,
             Some(site.caller.0 as i64),
         ])?;
@@ -537,7 +549,7 @@ fn export_flow_graph(
     edge_rows.sort_unstable();
     edge_rows.dedup();
     for (i, (src, dst, kind)) in edge_rows.iter().enumerate() {
-        edges.execute(params![i as i64 + 1, src, dst, kind])?;
+        edges.execute(params![i as i64 + 1, src, dst, strings.intern(kind)?])?;
     }
     export_memory_accesses(conn, pag, analysis, &edge_rows)
 }
@@ -590,9 +602,10 @@ fn export_flow_provenance(
     program: &Program,
     pag: &Pag,
     analysis: &AnalysisResult,
+    strings: &mut TextPool<'_>,
 ) -> Result<()> {
-    let mut origins =
-        conn.prepare_cached("INSERT INTO flow_origins VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
+    let mut origins = conn
+        .prepare_cached("INSERT INTO flow_origins_data VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
     let field_destinations: FxHashSet<_> = program
         .flow
         .iter()
@@ -680,12 +693,12 @@ fn export_flow_provenance(
             origins.execute(params![
                 s.0,
                 d.0,
-                kind,
+                strings.intern(kind)?,
                 span.file.0,
                 span.line,
                 span.col,
-                expression.as_ref(),
-                operation
+                strings.intern(expression.as_ref())?,
+                strings.intern(operation)?
             ])?;
         }
     }
@@ -838,12 +851,12 @@ fn export_flow_provenance(
                 origins.execute(params![
                     constraint.src.0,
                     constraint.dst.0,
-                    kind,
+                    strings.intern(kind)?,
                     span.file.0,
                     span.line,
                     span.col,
-                    expression.as_ref(),
-                    "return value"
+                    strings.intern(expression.as_ref())?,
+                    strings.intern("return value")?
                 ])?;
             }
         }
@@ -851,7 +864,11 @@ fn export_flow_provenance(
     Ok(())
 }
 
-fn export_one_variable(stmt: &mut rusqlite::Statement<'_>, var: &trace_ir::Variable) -> Result<()> {
+fn export_one_variable(
+    stmt: &mut rusqlite::Statement<'_>,
+    var: &trace_ir::Variable,
+    strings: &mut TextPool<'_>,
+) -> Result<()> {
     let kind = match var.storage {
         StorageClass::Global => "global",
         StorageClass::FileStatic => "file_static",
@@ -861,7 +878,7 @@ fn export_one_variable(stmt: &mut rusqlite::Statement<'_>, var: &trace_ir::Varia
     };
     stmt.execute(params![
         var.id.0,
-        var.name,
+        strings.intern(&var.name)?,
         kind,
         var.fn_id.map(|f| f.0),
         var.type_id.0,
@@ -938,6 +955,7 @@ fn export_call_sites_filtered(
     conn: &Connection,
     program: &Program,
     analysis: &AnalysisResult,
+    strings: &mut TextPool<'_>,
 ) -> Result<()> {
     let mut with_edge = FxHashSet::default();
     for edge in &analysis.call_edges {
@@ -949,12 +967,12 @@ fn export_call_sites_filtered(
     }
 
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO call_sites (id, caller_fn_id, file_id, line, col, expansion_file_id, expansion_line, expansion_col, callee_text, is_direct, callee_var, return_dst) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO call_sites_data (id, caller_fn_id, file_id, line, col, expansion_file_id, expansion_line, expansion_col, callee_text_id, is_direct, callee_var, return_dst) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?;
     let mut operation_stmt =
-        conn.prepare_cached("INSERT INTO flow_call_origins VALUES (?1, ?2, ?3, ?4, ?5)")?;
+        conn.prepare_cached("INSERT INTO flow_call_origins_data VALUES (?1, ?2, ?3, ?4, ?5)")?;
     let mut expression_stmt =
-        conn.prepare_cached("INSERT INTO flow_call_expressions VALUES (?1, ?2)")?;
+        conn.prepare_cached("INSERT INTO flow_call_expressions_data VALUES (?1, ?2)")?;
     for cs in &program.symbols.call_sites {
         let export = with_edge.contains(&cs.id) || with_arg_flow.contains(&cs.id) || !cs.is_direct;
         if !export {
@@ -969,13 +987,13 @@ fn export_call_sites_filtered(
             cs.expansion_span.map(|span| span.file.0),
             cs.expansion_span.map(|span| span.line),
             cs.expansion_span.map(|span| span.col),
-            cs.callee_name.as_str(),
+            strings.intern(cs.callee_name.as_str())?,
             cs.is_direct as i32,
             cs.callee_var.map(|id| id.0),
             cs.return_dst.map(|id| id.0),
         ])?;
         if let Some(expression) = cs.details.as_ref().and_then(|d| d.call_expression.as_ref()) {
-            expression_stmt.execute(params![cs.id.0, expression.as_ref()])?;
+            expression_stmt.execute(params![cs.id.0, strings.intern(expression.as_ref())?])?;
         }
         if let Some((span, expression)) = cs
             .details
@@ -987,16 +1005,20 @@ fn export_call_sites_filtered(
                 span.file.0,
                 span.line,
                 span.col,
-                expression.as_ref()
+                strings.intern(expression.as_ref())?
             ])?;
         }
     }
     Ok(())
 }
 
-fn export_call_edges(conn: &Connection, analysis: &AnalysisResult) -> Result<()> {
+fn export_call_edges(
+    conn: &Connection,
+    analysis: &AnalysisResult,
+    strings: &mut TextPool<'_>,
+) -> Result<()> {
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO call_edges (id, call_site_id, caller_fn_id, callee_fn_id, resolution) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO call_edges_data (id, call_site_id, caller_fn_id, callee_fn_id, resolution_id) VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
     for (i, edge) in analysis.call_edges.iter().enumerate() {
         let resolution = match edge.resolution {
@@ -1016,7 +1038,7 @@ fn export_call_edges(conn: &Connection, analysis: &AnalysisResult) -> Result<()>
             call_site_id,
             edge.caller.0,
             edge.callee.0,
-            resolution
+            strings.intern(resolution)?
         ])?;
     }
     Ok(())
@@ -1148,6 +1170,211 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn interned_text_preserves_rows_and_uses_selective_indexes() {
+        let legacy = Connection::open_in_memory().unwrap();
+        legacy.execute_batch(crate::SCHEMA_V7).unwrap();
+        let compact = Connection::open_in_memory().unwrap();
+        compact.execute_batch(crate::SCHEMA_V8).unwrap();
+        for conn in [&legacy, &compact] {
+            conn.execute_batch(
+                "INSERT INTO files(id,path,sha256) VALUES(0,'main.cpp','');
+                 INSERT INTO functions(id,name,file_id,line_start,line_end,linkage,signature,is_defined)
+                 VALUES(0,'send',0,1,1000,'external','send()',1);
+                 INSERT INTO types VALUES(0,'ptr','char *',8,'{}');",
+            ).unwrap();
+        }
+        let mut strings = TextPool::new(&compact).unwrap();
+        let text = "receiver->send(\"quoted ' text\", payload /* Привет */)".repeat(20);
+        let send = strings.intern("send").unwrap();
+        let copy = strings.intern("copy").unwrap();
+        let ret = strings.intern("return value").unwrap();
+        let var = strings.intern("var").unwrap();
+        let direct = strings.intern("direct").unwrap();
+        let pointer = strings.intern("char *").unwrap();
+        let empty = strings.intern("").unwrap();
+        for site in 0..1000 {
+            legacy.execute("INSERT INTO call_sites(id,caller_fn_id,file_id,line,col,callee_text,is_direct) VALUES(?1,0,0,?1,1,'send',1)", [site]).unwrap();
+            compact.execute("INSERT INTO call_sites_data(id,caller_fn_id,file_id,line,col,callee_text_id,is_direct) VALUES(?1,0,0,?1,1,?2,1)", params![site, send]).unwrap();
+            let expression = if site % 2 == 0 { text.as_str() } else { "" };
+            let id = strings.intern(expression).unwrap();
+            legacy.execute("INSERT INTO variables(id,name,kind,fn_id,type_id,file_id,line) VALUES(?1,?2,'param',0,0,0,?1)", params![site, expression]).unwrap();
+            compact.execute("INSERT INTO variables_data(id,name_id,kind,fn_id,type_id,file_id,line) VALUES(?1,?2,'param',0,0,0,?1)", params![site, id]).unwrap();
+            legacy.execute("INSERT INTO flow_nodes(id,kind,label,detail,var_id,fn_id,call_site_id) VALUES(?1,'var',?2,'',?1,0,?1)", params![site, expression]).unwrap();
+            compact.execute("INSERT INTO flow_nodes_data(id,kind_id,label_id,var_id,fn_id,call_site_id) VALUES(?1,?2,?3,?1,0,?1)", params![site, var, id]).unwrap();
+            legacy
+                .execute(
+                    "INSERT INTO flow_parameters VALUES(0,?1,?1,?2,'char *')",
+                    params![site, expression],
+                )
+                .unwrap();
+            compact
+                .execute(
+                    "INSERT INTO flow_parameters_data VALUES(0,?1,?1,?2,?3)",
+                    params![site, id, pointer],
+                )
+                .unwrap();
+            legacy
+                .execute("INSERT INTO flow_edges VALUES(?1,?1,?1,'copy')", [site])
+                .unwrap();
+            compact
+                .execute(
+                    "INSERT INTO flow_edges_data VALUES(?1,?1,?1,?2)",
+                    params![site, copy],
+                )
+                .unwrap();
+            legacy
+                .execute("INSERT INTO call_edges VALUES(?1,?1,0,0,'direct')", [site])
+                .unwrap();
+            compact
+                .execute(
+                    "INSERT INTO call_edges_data VALUES(?1,?1,0,0,?2)",
+                    params![site, direct],
+                )
+                .unwrap();
+            legacy
+                .execute(
+                    "INSERT INTO flow_call_expressions VALUES (?1,?2)",
+                    params![site, expression],
+                )
+                .unwrap();
+            compact
+                .execute(
+                    "INSERT INTO flow_call_expressions_data VALUES (?1,?2)",
+                    params![site, id],
+                )
+                .unwrap();
+            legacy
+                .execute(
+                    "INSERT INTO flow_call_origins VALUES (?1,0,?1,1,?2)",
+                    params![site, expression],
+                )
+                .unwrap();
+            compact
+                .execute(
+                    "INSERT INTO flow_call_origins_data VALUES (?1,0,?1,1,?2)",
+                    params![site, id],
+                )
+                .unwrap();
+            // Preserve duplicate operation rows as well as repeated text.
+            for _ in 0..2 {
+                legacy
+                    .execute(
+                        "INSERT INTO flow_origins VALUES (?1,?1,'copy',0,?1,1,?2,'return value')",
+                        params![site, expression],
+                    )
+                    .unwrap();
+                compact
+                    .execute(
+                        "INSERT INTO flow_origins_data VALUES (?1,?1,?2,0,?1,1,?3,?4)",
+                        params![site, copy, id, ret],
+                    )
+                    .unwrap();
+            }
+        }
+        assert_eq!(strings.intern("").unwrap(), empty);
+        assert_eq!(
+            compact
+                .query_row("SELECT count(*) FROM strings WHERE text=?1", [&text], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        for (relation, order) in [
+            ("flow_call_expressions", "call_site_id"),
+            ("flow_call_origins", "call_site_id"),
+            ("flow_origins", "src_node,dst_node,line"),
+            ("variables", "id"),
+            ("call_sites", "id"),
+            ("call_edges", "id"),
+            ("flow_nodes", "id"),
+            ("flow_edges", "id"),
+            ("flow_parameters", "fn_id,arg_index"),
+        ] {
+            let rows = |conn: &Connection| {
+                let mut stmt = conn
+                    .prepare(&format!("SELECT * FROM {relation} ORDER BY {order}"))
+                    .unwrap();
+                let columns = stmt.column_count();
+                stmt.query_map([], |r| {
+                    (0..columns)
+                        .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+            };
+            assert_eq!(rows(&legacy), rows(&compact), "{relation}");
+            assert!(crate::table_exists(&compact, relation).unwrap());
+            let text_column = match relation {
+                "variables" | "flow_parameters" => "name",
+                "call_sites" => "callee_text",
+                "call_edges" => "resolution",
+                "flow_nodes" => "label",
+                "flow_edges" => "kind",
+                _ => "expression",
+            };
+            for column in [text_column, order.split(',').next().unwrap()] {
+                assert!(crate::column_exists(&compact, relation, column).unwrap());
+                let plan: Vec<String> = compact
+                    .prepare(&format!(
+                        "EXPLAIN QUERY PLAN SELECT {text_column} FROM {relation} WHERE {column}=?1"
+                    ))
+                    .unwrap()
+                    .query_map([42], |r| r.get(3))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                if column != text_column {
+                    assert!(
+                        plan.iter()
+                            .all(|step| !step.contains("SCAN") && !step.contains("MATERIALIZE")),
+                        "{plan:?}"
+                    );
+                }
+            }
+        }
+        let plan: Vec<String> = compact
+            .prepare("EXPLAIN QUERY PLAN SELECT expression FROM flow_origins WHERE dst_node=?1")
+            .unwrap()
+            .query_map([42], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_flow_origins_dst_node")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|step| !step.contains("SCAN") && !step.contains("MATERIALIZE")),
+            "{plan:?}"
+        );
+        // These are the left joins used by inspection. A view containing a
+        // join can pass direct-lookup checks yet materialize every text row here.
+        for query in [
+            "SELECT e.src_node,o.expression FROM flow_edges e LEFT JOIN flow_origins o
+             ON o.src_node=e.src_node AND o.dst_node=e.dst_node AND o.kind=e.kind WHERE e.src_node=?1",
+            "SELECT a.src_node,x.expression FROM flow_calls a LEFT JOIN flow_call_expressions x
+             ON x.call_site_id=a.call_site_id WHERE a.src_node=?1",
+        ] {
+            let plan: Vec<String> = compact.prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap().query_map([42], |r| r.get(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert!(plan.iter().all(|step| !step.contains("SCAN") && !step.contains("MATERIALIZE")), "{plan:?}");
+            assert!(plan.iter().any(|step| step.contains("SEARCH strings USING INTEGER PRIMARY KEY")), "{plan:?}");
+        }
+        let pages = |conn: &Connection| {
+            conn.query_row("PRAGMA page_count", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        assert!(
+            pages(&compact) * 4 < pages(&legacy),
+            "repeated text must occupy substantially fewer pages"
+        );
+    }
+
+    #[test]
     fn indirect_return_join_uses_export_indexes_and_excludes_unrelated_sites() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(crate::TABLES_V7).unwrap();
@@ -1173,7 +1400,7 @@ mod tests {
         )
         .unwrap();
         // The lookup must be indexed during export, before deferred indexes.
-        conn.execute_batch(super::PROVENANCE_INDEXES_V7).unwrap();
+        conn.execute_batch(crate::PROVENANCE_INDEXES_V7).unwrap();
         let plan: Vec<String> = conn
             .prepare(&format!(
                 "EXPLAIN QUERY PLAN {}",
@@ -1229,7 +1456,7 @@ mod tests {
             },
         ];
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(TABLES_V7).unwrap();
+        conn.execute_batch(TABLES_V8).unwrap();
         export_files(&conn, &program).unwrap();
         export_link_targets(&conn, &program).unwrap();
         let mut stmt = conn.prepare("SELECT t.name, t.output, f.path, d.name FROM link_targets t JOIN target_sources s ON s.target_id = t.id JOIN files f ON f.id = s.file_id JOIN target_dependencies e ON e.target_id = t.id JOIN link_targets d ON d.id = e.dependency_id").unwrap();
@@ -1316,13 +1543,20 @@ mod tests {
         for full_detail in [false, true] {
             let conn = Connection::open_in_memory().unwrap();
             conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-            conn.execute_batch(TABLES_V7).unwrap();
+            conn.execute_batch(TABLES_V8).unwrap();
+            let mut strings = TextPool::new(&conn).unwrap();
             export_functions(&conn, &program).unwrap();
             if full_detail {
-                export_variables(&conn, &program).unwrap();
+                export_variables(&conn, &program, &mut strings).unwrap();
             } else {
-                export_flow_and_arg_flow_vars(&conn, &program, &pag, &AnalysisResult::default())
-                    .unwrap();
+                export_flow_and_arg_flow_vars(
+                    &conn,
+                    &program,
+                    &pag,
+                    &AnalysisResult::default(),
+                    &mut strings,
+                )
+                .unwrap();
             }
             for table in ["functions", "variables"] {
                 let mut stmt = conn

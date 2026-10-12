@@ -9,7 +9,7 @@ target/release/trace analyze ./project -o analysis.db
 target/release/trace-lsp --db analysis.db
 ```
 
-The `--db` option is required. Both minimal and full exports of schema v7 work,
+The `--db` option is required. Both minimal and full exports of schema v7 and v8 work,
 without `--debug-points-to`. Missing, invalid, older, and newer databases are
 rejected on startup with errors on stderr. The server never creates databases,
 migrates schemas, or adds indexes. Stdout contains only Content-Length-framed

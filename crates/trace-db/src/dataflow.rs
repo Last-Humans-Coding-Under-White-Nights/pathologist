@@ -218,9 +218,16 @@ pub fn require_source_dataflow_metadata(conn: &Connection) -> Result<()> {
         );
     }
     crate::inspect::require_synthetic_metadata(conn)?;
-    let has_metadata: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='flow_origins') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='flow_calls') AND EXISTS(SELECT 1 FROM pragma_table_info('flow_nodes') WHERE name='call_site_id') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='flow_return_calls') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='flow_field_access') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='flow_field_locations')", [], |r|r.get(0)
-    )?;
+    let mut has_metadata = crate::column_exists(conn, "flow_nodes", "call_site_id")?;
+    for relation in [
+        "flow_origins",
+        "flow_calls",
+        "flow_return_calls",
+        "flow_field_access",
+        "flow_field_locations",
+    ] {
+        has_metadata &= crate::table_exists(conn, relation)?;
+    }
     if !has_metadata {
         bail!("source-level dataflow requires provenance metadata; re-run trace analyze");
     }
@@ -864,10 +871,7 @@ pub fn dataflow_view(
     // operations can share those endpoints (e.g. recursive calls); keep them.
     let mut argument_pairs = BTreeSet::new();
     let mut argument_steps = Vec::new();
-    let has_call_expressions: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='flow_call_expressions')",
-        [], |r| r.get(0),
-    )?;
+    let has_call_expressions = crate::table_exists(conn, "flow_call_expressions")?;
     let (expression_column, expression_join) = if has_call_expressions {
         (
             "x.expression",
@@ -977,10 +981,7 @@ pub fn dataflow_view(
     let mut return_steps = Vec::new();
     // Optional additive v7 metadata: older databases retain the indexed
     // endpoint/source-position fallback, but new exports bind exact call IDs.
-    let has_call_origins: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='flow_call_origins')",
-        [], |r| r.get(0),
-    )?;
+    let has_call_origins = crate::table_exists(conn, "flow_call_origins")?;
     let mut call_origins = has_call_origins.then(|| conn.prepare(
         "SELECT p.path,o.line,o.col,o.expression FROM flow_call_origins o JOIN files p ON p.id=o.file_id WHERE o.call_site_id=?1",
     )).transpose()?;
@@ -1217,11 +1218,7 @@ pub fn dataflow_view(
         .collect();
     view.scopes.retain(|k, _| used.contains(k));
     // Older exports still render, but never guess parameter positions or types.
-    let has_parameters: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='flow_parameters')",
-        [],
-        |r| r.get(0),
-    )?;
+    let has_parameters = crate::table_exists(conn, "flow_parameters")?;
     if has_parameters {
         let mut stmt = conn.prepare("SELECT arg_index,var_id,name,type_name FROM flow_parameters WHERE fn_id=?1 ORDER BY arg_index,var_id")?;
         for scope in view.scopes.values_mut() {

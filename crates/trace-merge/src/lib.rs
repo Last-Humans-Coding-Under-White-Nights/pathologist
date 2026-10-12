@@ -13,7 +13,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use trace_db::{MultiInstance, INDEXES_V7, SCHEMA_VERSION, TABLES_V7};
+use trace_db::{MultiInstance, INDEXES_V8, SCHEMA_VERSION, TABLES_V8};
 
 // Use the same projections for capability checks and ingestion. Additive v7
 // flow metadata is optional here because the merger only preserves call graphs.
@@ -288,9 +288,9 @@ pub fn merge_databases<P: AsRef<Path>>(
                     path.display()
                 )
             })?;
-        if ver != SCHEMA_VERSION {
+        if !trace_db::SUPPORTED_SCHEMA_VERSIONS.contains(&ver) {
             bail!(
-                "incompatible schema version in {}: database has version {}, expected {}; re-analyze the input with the current trace version",
+                "incompatible schema version in {}: database has version {}, expected 7 or {}; re-analyze the input with the current trace version",
                 path.display(),
                 ver,
                 SCHEMA_VERSION
@@ -1068,7 +1068,8 @@ pub fn merge_databases<P: AsRef<Path>>(
             "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; PRAGMA journal_mode = MEMORY;",
         )?;
         out_conn.execute_batch("BEGIN IMMEDIATE;")?;
-        out_conn.execute_batch(TABLES_V7)?;
+        out_conn.execute_batch(TABLES_V8)?;
+        let mut strings = trace_db::TextPool::new(&out_conn)?;
 
         // Record analysis_run for the merge
         let options_json = serde_json::json!({
@@ -1158,7 +1159,7 @@ pub fn merge_databases<P: AsRef<Path>>(
         // NULL: input variable IDs have no identity in this call-graph-only output.
         {
             let mut stmt = out_conn.prepare_cached(
-                "INSERT INTO call_sites (id, caller_fn_id, file_id, line, col, expansion_file_id, expansion_line, expansion_col, callee_text, is_direct) \
+                "INSERT INTO call_sites_data (id, caller_fn_id, file_id, line, col, expansion_file_id, expansion_line, expansion_col, callee_text_id, is_direct) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for cs in &unified_call_sites {
@@ -1171,7 +1172,7 @@ pub fn merge_databases<P: AsRef<Path>>(
                     cs.expansion_file_id,
                     cs.expansion_line,
                     cs.expansion_col,
-                    cs.callee_text,
+                    strings.intern(&cs.callee_text)?,
                     cs.is_direct
                 ])?;
             }
@@ -1180,7 +1181,7 @@ pub fn merge_databases<P: AsRef<Path>>(
         // Bulk insert call edges
         {
             let mut stmt = out_conn.prepare_cached(
-                "INSERT INTO call_edges (id, call_site_id, caller_fn_id, callee_fn_id, resolution) \
+                "INSERT INTO call_edges_data (id, call_site_id, caller_fn_id, callee_fn_id, resolution_id) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             for edge in &unified_call_edges {
@@ -1189,7 +1190,7 @@ pub fn merge_databases<P: AsRef<Path>>(
                     edge.call_site_id,
                     edge.caller_fn_id,
                     edge.callee_fn_id,
-                    edge.resolution
+                    strings.intern(&edge.resolution)?
                 ])?;
             }
         }
@@ -1229,31 +1230,10 @@ pub fn merge_databases<P: AsRef<Path>>(
             }
         }
 
-        // Verify referential integrity
-        {
-            let mut fk_stmt = out_conn.prepare("PRAGMA foreign_key_check")?;
-            let fk_violations: Vec<String> = fk_stmt
-                .query_map([], |row| {
-                    Ok(format!(
-                        "table: {}, rowid: {}, parent: {}, fkid: {}",
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?
-                    ))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-
-            if !fk_violations.is_empty() {
-                bail!(
-                    "foreign key violation in merged database:\n  {}",
-                    fk_violations.join("\n  ")
-                );
-            }
-        }
+        verify_foreign_keys(&out_conn)?;
 
         // Build secondary indexes
-        out_conn.execute_batch(INDEXES_V7)?;
+        out_conn.execute_batch(INDEXES_V8)?;
         out_conn.execute_batch("COMMIT;")?;
     }
 
@@ -1269,6 +1249,32 @@ pub fn merge_databases<P: AsRef<Path>>(
     Ok(report)
 }
 
+fn verify_foreign_keys(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+    let violations: Vec<String> = stmt
+        .query_map([], |row| {
+            // SQLite reports NULL instead of a rowid for WITHOUT ROWID tables.
+            let rowid = row
+                .get::<_, Option<i64>>(1)?
+                .map_or_else(|| "NULL".to_owned(), |id| id.to_string());
+            Ok(format!(
+                "table: {}, rowid: {}, parent: {}, fkid: {}",
+                row.get::<_, String>(0)?,
+                rowid,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if !violations.is_empty() {
+        bail!(
+            "foreign key violation in merged database:\n  {}",
+            violations.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
 fn chrono_lite_now() -> String {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1279,6 +1285,36 @@ fn chrono_lite_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreign_key_errors_report_rowids_and_without_rowid_violations() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute_batch(TABLES_V8).unwrap();
+        verify_foreign_keys(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO functions(id,name,file_id,line_start,line_end,linkage,signature,is_defined)
+             VALUES(4,'f',999,1,1,'external','f()',1);
+             INSERT INTO target_sources VALUES(2,7);",
+        ).unwrap();
+        let error = verify_foreign_keys(&conn).unwrap_err().to_string();
+        assert!(
+            error.starts_with("foreign key violation in merged database:"),
+            "{error}"
+        );
+        assert!(
+            error.contains("table: functions, rowid: 4, parent: files"),
+            "{error}"
+        );
+        assert!(
+            error.contains("table: target_sources, rowid: NULL, parent: files"),
+            "{error}"
+        );
+        assert!(
+            error.contains("table: target_sources, rowid: NULL, parent: link_targets"),
+            "{error}"
+        );
+    }
 
     fn row(
         call_site: Option<i64>,
