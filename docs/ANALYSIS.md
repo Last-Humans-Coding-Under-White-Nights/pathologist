@@ -1337,11 +1337,14 @@ order of anything:
 
 - A points-to set or cell memory of at least `MIRROR_MIN` locations gets a
   bit mirror (`LocBits`). Bits index a dense numbering of just the
-  locations mirrored sets hold, far fewer than all locations, so a mirror
-  stays small. The hash sets stay the storage and the iteration order. A mirror only ever says "held":
-  a bit is set once its set holds the location, sets never shrink, and a
-  clear bit falls back to the set. Every insert therefore happens as before,
-  in the same order.
+  locations mirrored sets hold, far fewer than all locations. On a large
+  tree that numbering still runs to about a hundred thousand locations while
+  a hub set holds a few hundred, so a mirror (`Mirror`) keeps only the
+  512-number blocks its set reaches, found through a per-mirror directory,
+  rather than one bit per number. The hash sets stay the storage and the
+  iteration order. A mirror only ever says "held": a bit is set once its set
+  holds the location, sets never shrink, and a clear bit falls back to the
+  set. Every insert therefore happens as before, in the same order.
 - A load steps over its source's new locations in one call per destination
   (`load_into`) rather than one per location. The destination's set, mirror
   and merged sizes are each looked up once. Only the destination's own

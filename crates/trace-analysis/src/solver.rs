@@ -286,8 +286,8 @@ struct SolverState {
     /// ([`LocBits`]): the sets stay the storage and the iteration order,
     /// the bits only answer "already held" without hashing.
     loc_bits: LocBits,
-    pts_bits: FxHashMap<PagNodeId, Vec<u64>>,
-    memory_bits: FxHashMap<LocId, Vec<u64>>,
+    pts_bits: FxHashMap<PagNodeId, Mirror>,
+    memory_bits: FxHashMap<LocId, Mirror>,
 }
 
 /// Sets of at least this many locations get a [`LocBits`] mirror.
@@ -301,8 +301,8 @@ const MIRROR_MIN: usize = 64;
 /// that usually holds it already, and a store re-inserts its whole source
 /// into cells that usually hold it already. A bit test answers those without
 /// hashing. The hub sets share a few thousand locations out of tens of
-/// thousands, so bits index a dense numbering of just those, which keeps a
-/// mirror a few hundred bytes instead of one bit per location.
+/// thousands, so bits index a dense numbering of just those, kept per set in
+/// a [`Mirror`].
 ///
 /// A mirror only ever says "held": a location is numbered and its bit set
 /// only once its set holds it, and sets never shrink. A clear bit falls back
@@ -319,19 +319,15 @@ struct LocBits {
 impl LocBits {
     /// Whether `bits` has `loc`'s bit set.
     #[inline]
-    fn test(&self, bits: &[u64], loc: LocId) -> bool {
+    fn test(&self, bits: &Mirror, loc: LocId) -> bool {
         match self.number.get(loc.0 as usize) {
-            Some(&n) if n != 0 => {
-                let n = n - 1;
-                bits.get(n as usize / 64)
-                    .is_some_and(|word| word >> (n % 64) & 1 != 0)
-            }
+            Some(&n) if n != 0 => bits.test(n as usize - 1),
             _ => false,
         }
     }
 
     /// Set `loc`'s bit in `bits`, numbering `loc` first if it has none.
-    fn set(&mut self, bits: &mut Vec<u64>, loc: LocId) {
+    fn set(&mut self, bits: &mut Mirror, loc: LocId) {
         let i = loc.0 as usize;
         if i >= self.number.len() {
             self.number.resize(i + 1, 0);
@@ -340,20 +336,69 @@ impl LocBits {
             self.next += 1;
             self.number[i] = self.next;
         }
-        let n = (self.number[i] - 1) as usize;
-        if n / 64 >= bits.len() {
-            bits.resize(n / 64 + 1, 0);
-        }
-        bits[n / 64] |= 1u64 << (n % 64);
+        bits.set((self.number[i] - 1) as usize);
     }
 
     /// A mirror of `set`, whose elements are all held.
-    fn mirror<'a>(&mut self, set: impl IntoIterator<Item = &'a LocId>) -> Vec<u64> {
-        let mut bits = Vec::new();
+    fn mirror<'a>(&mut self, set: impl IntoIterator<Item = &'a LocId>) -> Mirror {
+        let mut bits = Mirror::default();
         for &loc in set {
             self.set(&mut bits, loc);
         }
         bits
+    }
+}
+
+/// Words in one [`Mirror`] block.
+const BLOCK_WORDS: usize = 8;
+
+/// One set's bits over the [`LocBits`] numbering, in blocks of
+/// `BLOCK_WORDS` words: only blocks holding a bit are stored, found through
+/// `dir`. On a large tree the numbering runs to a hundred thousand
+/// locations while a hub set holds a few hundred, so one flat bit per
+/// number would cost the whole numbering per set. Both vectors grow in
+/// bounded steps rather than by doubling: thousands of mirrors live at
+/// once, and doubling slack across them is what a mirror saves.
+#[derive(Default)]
+struct Mirror {
+    /// Block number → its index in `blocks` plus one; `0` for a block
+    /// without a bit.
+    dir: Vec<u32>,
+    blocks: Vec<[u64; BLOCK_WORDS]>,
+}
+
+impl Mirror {
+    /// Number `n`'s block, its word within the block, and its bit.
+    #[inline]
+    fn locate(n: usize) -> (usize, usize, u64) {
+        let word = n / 64;
+        (word / BLOCK_WORDS, word % BLOCK_WORDS, 1u64 << (n % 64))
+    }
+
+    #[inline]
+    fn test(&self, n: usize) -> bool {
+        let (block, word, bit) = Self::locate(n);
+        match self.dir.get(block) {
+            Some(&slot) if slot != 0 => self.blocks[slot as usize - 1][word] & bit != 0,
+            _ => false,
+        }
+    }
+
+    fn set(&mut self, n: usize) {
+        let (block, word, bit) = Self::locate(n);
+        if block >= self.dir.len() {
+            self.dir.reserve_exact(block + 1 - self.dir.len());
+            self.dir.resize(block + 1, 0);
+        }
+        let slot = &mut self.dir[block];
+        if *slot == 0 {
+            if self.blocks.len() == self.blocks.capacity() {
+                self.blocks.reserve_exact(self.blocks.len() / 4 + 1);
+            }
+            self.blocks.push([0; BLOCK_WORDS]);
+            *slot = self.blocks.len() as u32;
+        }
+        self.blocks[*slot as usize - 1][word] |= bit;
     }
 }
 
@@ -370,7 +415,7 @@ struct MergeInto<'a> {
     sizes: Option<&'a mut FxHashMap<LocId, usize>>,
     /// `dst`'s mirror as it stood before this step; what the step adds is
     /// found in `held`.
-    bits: Option<&'a [u64]>,
+    bits: Option<&'a Mirror>,
     loc_bits: &'a LocBits,
 }
 
@@ -445,7 +490,7 @@ struct Memory<'a> {
 /// the one write path into cell memory. Returns whether the cell grew.
 fn write_memory(
     memory_pts: &mut FxHashMap<LocId, IndexSet<LocId, FxBuildHasher>>,
-    memory_bits: &mut FxHashMap<LocId, Vec<u64>>,
+    memory_bits: &mut FxHashMap<LocId, Mirror>,
     loc_bits: &mut LocBits,
     cell: LocId,
     locs: impl IntoIterator<Item = LocId>,
@@ -774,7 +819,7 @@ impl SolverState {
             held: None,
             merge_sizes: Some(merge_sizes),
             sizes: None,
-            bits: pts_bits.get(&dst).map(Vec::as_slice),
+            bits: pts_bits.get(&dst),
             loc_bits,
         };
         let memory = Memory {
@@ -1546,14 +1591,6 @@ fn solve(
             resolution: ResolutionKind::IpcBridge,
         });
     }
-    let mut entries = contexts::framework_entries(program, models);
-    entries.extend(
-        pag.ipc_bridges
-            .iter()
-            .map(|bridge| (bridge.stub_handler, ContextKind::IpcHandler, None)),
-    );
-    let execution_contexts =
-        contexts::execution_contexts(program, invocations, entries, &call_edges);
     if std::env::var("TRACE_DEBUG_IPC").is_ok() {
         for bridge in &pag.ipc_bridges {
             let caller = program.symbols.function(bridge.proxy_method).name.clone();
@@ -1563,15 +1600,47 @@ fn solve(
         eprintln!("[ipc] total bridges: {}", pag.ipc_bridges.len());
     }
 
-    if stats_enabled {
-        let biggest = st.pts.values().map(|s| s.len()).max().unwrap_or(0);
+    // Read for the stats line before the state is released.
+    let stats = stats_enabled.then(|| {
+        (
+            st.pts.values().map(|s| s.len()).max().unwrap_or(0),
+            resolved_indirect.len(),
+        )
+    });
+    let forwarded_arg_flow = std::mem::take(&mut st.forwarded_arg_flow);
+    let memory_accesses = crate::memory::memory_accesses(pag, &st.pts, &st.designated);
+    let points_to = if retain_points_to {
+        std::mem::take(&mut st.pts).into_iter().collect()
+    } else {
+        IndexMap::new()
+    };
+    // The solver state is the analyze phase's peak; the context search
+    // builds its own call graph, so it runs once the state and the loop's
+    // working sets are gone.
+    drop(invoke_watch);
+    drop(invoked);
+    drop(resolved_indirect);
+    drop(unwrap_memo);
+    drop(new_in_order);
+    drop(scratch);
+    drop(st);
+    let mut entries = contexts::framework_entries(program, models);
+    entries.extend(
+        pag.ipc_bridges
+            .iter()
+            .map(|bridge| (bridge.stub_handler, ContextKind::IpcHandler, None)),
+    );
+    let execution_contexts =
+        contexts::execution_contexts(program, invocations, entries, &call_edges);
+
+    if let Some((biggest, resolved_sites)) = stats {
         eprintln!(
             "[solver] DONE pops={} elapsed={:?} constraints={} max_pts={} resolved_sites={}",
             pops,
             t0.elapsed(),
             pag.constraints.len(),
             biggest,
-            resolved_indirect.len()
+            resolved_sites
         );
         if !converged {
             eprintln!(
@@ -1581,14 +1650,6 @@ fn solve(
             );
         }
     }
-
-    let forwarded_arg_flow = std::mem::take(&mut st.forwarded_arg_flow);
-    let memory_accesses = crate::memory::memory_accesses(pag, &st.pts, &st.designated);
-    let points_to = if retain_points_to {
-        st.pts.into_iter().collect()
-    } else {
-        IndexMap::new()
-    };
 
     let solve = SolveOutcome {
         converged,
@@ -3150,7 +3211,7 @@ mod tests {
     #[test]
     fn loc_bits_answer_only_what_was_set() {
         let mut numbering = LocBits::default();
-        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let (mut a, mut b) = (Mirror::default(), Mirror::default());
         assert!(!numbering.test(&a, LocId(7)));
         numbering.set(&mut a, LocId(7));
         numbering.set(&mut b, LocId(300));
@@ -3164,6 +3225,23 @@ mod tests {
         let mirrored = numbering.mirror(&[LocId(8), LocId(7)]);
         assert!(numbering.test(&mirrored, LocId(8)) && numbering.test(&mirrored, LocId(7)));
         assert!(!numbering.test(&mirrored, LocId(300)));
+    }
+
+    /// A mirror's size follows the numbers it holds, not the numbering: a
+    /// set holding one location numbered after many others keeps one block.
+    #[test]
+    fn a_mirror_stores_only_blocks_it_holds() {
+        let mut numbering = LocBits::default();
+        let mut wide = Mirror::default();
+        for l in 0..100_000 {
+            numbering.set(&mut wide, LocId(l));
+        }
+        let mut narrow = Mirror::default();
+        numbering.set(&mut narrow, LocId(99_999));
+        numbering.set(&mut narrow, LocId(99_998));
+        assert!(numbering.test(&narrow, LocId(99_999)) && numbering.test(&narrow, LocId(99_998)));
+        assert!(!numbering.test(&narrow, LocId(0)) && !numbering.test(&narrow, LocId(99_997)));
+        assert_eq!(narrow.blocks.len(), 1);
     }
 
     /// A merge tests the destination's mirror as it stood before the step,
