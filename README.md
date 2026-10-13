@@ -598,16 +598,17 @@ trace-merge [OPTIONS] <INPUT_DBS>... [-o <OUTPUT_DB>]
 
 **How it works**:
 - Ingests and remaps files, link targets, functions, call sites, call edges, and execution contexts across input databases (an input exported before `execution_contexts` existed contributes none and is named in a `MissingExecutionContexts` diagnostic).
-- Shared header paths, declarations, and definitions are deduplicated across repositories; if any merged repository defines or declares an entity as non-dependency code (`is_dep = 0`), the unified entry retains `is_dep = 0`.
+- Shared header declarations deduplicate across link images; definitions retain each image's ownership and outgoing calls. Project-file ownership (`is_dep = 0` in any input) propagates to all copies; see [database merger header copies](docs/ANALYSIS.md#database-merger-header-copies).
 - Re-links `external` call edges (`functions.is_defined = 0` or `call_edges.resolution = 'external'`) against matching exported definitions (`is_defined = 1`, `linkage = 'external'`) from other repositories, updating edge resolution to `direct` or `ambiguous`, while preserving original non-direct resolutions (`indirect` and `ipc`).
-- **May-analysis over-approximation**: When multiple definitions match an external call across repositories, an ambiguous edge (`resolution = 'ambiguous'`) is emitted to *every* candidate definition so downstream reachability queries (`trace inspect callchain`) do not miss execution paths. Deduplicates call edges per call site to eliminate duplicate edges.
-- Respects ELF linker semantics: internal-linkage (`static`) functions remain file-scoped; strong definitions (`is_weak = 0`) override weak definitions (`is_weak = 1`).
+- **May-analysis over-approximation**: External calls retain edges to every selected definition, including each image's copy of a shared header body. Distinct source origins make the call ambiguous; shared-origin copies retain a resolved classification. Deduplicates call edges per call site to eliminate duplicate edges.
+- Keeps internal-linkage (`static`) functions file-scoped and preserves resolved definitions in known link images; see [merge linking rules](docs/ANALYSIS.md#invariants-and-linking-rules) for weak-symbol precedence and ambiguous matches.
 - Uses normalized parameter signatures in `functions.signature` (`name(type1, type2)`) to disambiguate C++ overloads and avoid false collisions; falls back to all same-name candidates if exact signature matching misses.
 - Prevents accidental overwriting of any input database when specifying `-o`.
 - Opens inputs read-only and publishes through a unique temporary file beside the output. Failed merges clean up staging files and preserve the existing destination.
 - Merger output supports call graphs, call chains, and editor call hierarchy. It omits variables, arg-flow, points-to, and all PAG/provenance tables; call-site variable bindings remain NULL. Dataflow inspection requires an original analysis database or a new analysis of the combined source tree; see the [merger schema contract](docs/SQLITE_SCHEMA.md#merger-inputs-and-output).
+- Existing indirect and IPC edges are retained; discovering new edges that require cross-project pointer analysis or IPC proxy/stub pairing is outside the [merge contract](docs/ANALYSIS.md#invariants-and-linking-rules).
 - Identifies and reports merge problems:
-  - **Collisions**: Multiple strong definitions of the same symbol and signature across different repositories (`MultipleDefinitions`).
+  - **Collisions**: Multiple strong definitions of the same symbol and signature from distinct source origins across different repositories (`MultipleDefinitions`).
   - **Unresolved externals**: External function calls that remain unresolved in all merged repositories (`UnresolvedExternal`).
   - **Weak symbol overrides**: Weak definitions superseded by strong definitions across repositories (`WeakOverride`, scoped to cross-repository overrides).
   - **Inputs without execution contexts**: Inputs that have no `execution_contexts` table (`MissingExecutionContexts`).

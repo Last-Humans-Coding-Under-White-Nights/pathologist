@@ -223,6 +223,9 @@ query them.
 
 Header-defined functions are deduplicated across TUs within their link target
 at merge time (later copies redirect), so they appear once per origin and target.
+For database merging, definitions retain separate image ownership while
+shared declarations can have `target_id = NULL` when their copies belong to
+different targets; see [Database merger header copies](ANALYSIS.md#database-merger-header-copies).
 
 ### call_sites
 

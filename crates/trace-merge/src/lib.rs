@@ -225,6 +225,50 @@ struct DefRecord {
     target_id: Option<i64>,
 }
 
+impl DefRecord {
+    // The catalog is already partitioned by name. Unknown source positions
+    // cannot establish that two definitions are copies of the same body.
+    fn source_origin(&self) -> (i64, i64, &str, Option<i64>) {
+        (
+            self.file_id,
+            self.line_start,
+            &self.signature,
+            (self.line_start <= 0).then_some(self.new_fn_id),
+        )
+    }
+}
+
+// Declarations share a source origin across images. Bodies additionally need
+// their link target so their functions and outgoing calls stay separate.
+type FunctionOrigin = (i64, i64, String, String);
+
+fn resolve_definition_pool(
+    pool: &[&DefRecord],
+    db_idx: usize,
+    resolved_resolution: String,
+    report: &mut MergeReport,
+) -> (Vec<i64>, String) {
+    let first = pool[0];
+    let same_origin = pool
+        .iter()
+        .all(|d| d.source_origin() == first.source_origin());
+    let resolution = if same_origin {
+        if pool.iter().any(|d| d.db_idx != db_idx) {
+            report.cross_repo_calls_resolved += 1;
+        }
+        resolved_resolution
+    } else {
+        report.ambiguous_calls += 1;
+        "ambiguous".to_string()
+    };
+    // One source definition can have different outgoing bindings per image.
+    // Keep every copy reachable even when they share a direct resolution.
+    let mut callee_ids: Vec<i64> = pool.iter().map(|d| d.new_fn_id).collect();
+    callee_ids.sort_unstable();
+    callee_ids.dedup();
+    (callee_ids, resolution)
+}
+
 /// Merge multiple per-repository SQLite databases into a unified database.
 pub fn merge_databases<P: AsRef<Path>>(
     input_paths: &[P],
@@ -426,10 +470,8 @@ pub fn merge_databases<P: AsRef<Path>>(
     // 3. Functions Ingestion, Deduplication & Classification
     let mut unified_functions: Vec<DbFunction> = Vec::new();
     let mut fn_remap: Vec<FxHashMap<i64, i64>> = vec![FxHashMap::default(); inputs.len()];
-    // (new_file_id, line_start, name, signature) -> new_fn_id for header-defined inline functions
-    let mut header_def_map: FxHashMap<(i64, i64, String, String), i64> = FxHashMap::default();
-    // (new_file_id, line_start, name, signature) -> new_fn_id for header prototypes
-    let mut header_decl_map: FxHashMap<(i64, i64, String, String), i64> = FxHashMap::default();
+    let mut header_def_map: FxHashMap<(Option<i64>, FunctionOrigin), i64> = FxHashMap::default();
+    let mut header_decl_map: FxHashMap<FunctionOrigin, i64> = FxHashMap::default();
     // Exported definitions catalog: name -> list of definitions across repos
     let mut definitions_by_name: FxHashMap<String, Vec<DefRecord>> = FxHashMap::default();
     // Cache per-DB functions by old id for call edge lookup
@@ -463,6 +505,11 @@ pub fn merge_databases<P: AsRef<Path>>(
             let new_target_id = func
                 .target_id
                 .and_then(|t| target_remap[db_idx].get(&t).copied());
+            // File ownership is unified before functions: a shared header
+            // owned by any input is project code in every image's copy.
+            let is_dep = func
+                .is_dep
+                .min(unified_files[(new_file_id - 1) as usize].is_dep);
 
             // Check if this is an identical header definition or prototype that can be unified.
             if func.linkage != "internal" && func.line_start > 0 {
@@ -473,9 +520,9 @@ pub fn merge_databases<P: AsRef<Path>>(
                     func.signature.clone(),
                 );
                 if func.is_defined != 0 {
-                    if let Some(&existing_fn_id) = header_def_map.get(&key) {
+                    if let Some(&existing_fn_id) = header_def_map.get(&(new_target_id, key)) {
                         fn_remap[db_idx].insert(func.id, existing_fn_id);
-                        if func.is_dep == 0 {
+                        if is_dep == 0 {
                             unified_functions[(existing_fn_id - 1) as usize].is_dep = 0;
                         }
                         report.header_functions_deduped += 1;
@@ -483,8 +530,14 @@ pub fn merge_databases<P: AsRef<Path>>(
                     }
                 } else if let Some(&existing_fn_id) = header_decl_map.get(&key) {
                     fn_remap[db_idx].insert(func.id, existing_fn_id);
-                    if func.is_dep == 0 {
-                        unified_functions[(existing_fn_id - 1) as usize].is_dep = 0;
+                    let existing = &mut unified_functions[(existing_fn_id - 1) as usize];
+                    // A declaration shared by different images has no unique
+                    // target. Resolution still uses the original input rows.
+                    if existing.target_id != new_target_id {
+                        existing.target_id = None;
+                    }
+                    if is_dep == 0 {
+                        existing.is_dep = 0;
                     }
                     report.header_functions_deduped += 1;
                     continue;
@@ -502,7 +555,7 @@ pub fn merge_databases<P: AsRef<Path>>(
                     func.signature.clone(),
                 );
                 if func.is_defined != 0 {
-                    header_def_map.insert(key, new_fn_id);
+                    header_def_map.insert((new_target_id, key), new_fn_id);
                 } else {
                     header_decl_map.insert(key, new_fn_id);
                 }
@@ -535,7 +588,7 @@ pub fn merge_databases<P: AsRef<Path>>(
                 linkage: func.linkage,
                 signature: func.signature,
                 is_defined: func.is_defined,
-                is_dep: func.is_dep,
+                is_dep,
                 is_weak: func.is_weak,
                 target_id: new_target_id,
             });
@@ -576,9 +629,15 @@ pub fn merge_databases<P: AsRef<Path>>(
             for d in &strong_defs {
                 strong_db_indices.insert(d.db_idx);
             }
+            let mut seen_origins = FxHashSet::default();
+            let distinct_strong_defs: Vec<&DefRecord> = strong_defs
+                .iter()
+                .copied()
+                .filter(|d| seen_origins.insert(d.source_origin()))
+                .collect();
 
-            if strong_db_indices.len() > 1 {
-                let locations: Vec<String> = strong_defs
+            if strong_db_indices.len() > 1 && distinct_strong_defs.len() > 1 {
+                let locations: Vec<String> = distinct_strong_defs
                     .iter()
                     .map(|d| {
                         format!(
@@ -600,11 +659,13 @@ pub fn merge_databases<P: AsRef<Path>>(
                     file_id: Some(strong_defs[0].file_id),
                     line: strong_defs[0].line_start,
                 });
-            } else if strong_defs.len() == 1 {
+            } else if distinct_strong_defs.len() == 1 {
                 let remote_weak_defs: Vec<&DefRecord> = sig_defs
                     .iter()
                     .copied()
-                    .filter(|d| d.is_weak && d.db_idx != strong_defs[0].db_idx)
+                    .filter(|d| {
+                        d.is_weak && d.target_id.is_none() && d.db_idx != strong_defs[0].db_idx
+                    })
                     .collect();
                 if !remote_weak_defs.is_empty() {
                     let weak_locs: Vec<String> = remote_weak_defs
@@ -735,7 +796,12 @@ pub fn merge_databases<P: AsRef<Path>>(
             let unresolved_resolution = edge.resolution.clone();
 
             let (new_callees, new_resolution): (Vec<i64>, String) =
-                if is_external_call || is_weak_call {
+                // Internal declarations cannot bind outside their file. A
+                // defined weak symbol in a known image has already undergone
+                // that image's link selection; retain that resolved edge.
+                if orig_callee.linkage == "external"
+                    && (is_external_call || (is_weak_call && orig_callee.target_id.is_none()))
+                {
                     // Try to resolve the external or weak function against all known definitions.
                     if let Some(defs) = definitions_by_name.get(&orig_callee.name) {
                         let is_generic_sig = !orig_callee.signature.contains('(')
@@ -761,30 +827,19 @@ pub fn merge_databases<P: AsRef<Path>>(
                             candidates.iter().copied().filter(|d| !d.is_weak).collect();
 
                         if is_fallback && candidates.len() > 1 {
-                            // Multiple candidate definitions from fallback (e.g. multiple overloads
-                            // or same-name functions across repos). If there are strong definitions,
-                            // filter to strong ones (ELF semantics: strong overrides weak); if multiple
-                            // remain (or all are weak), emit ambiguous edges to all of them rather than
-                            // arbitrarily picking one via same-database/same-target preference.
-                            let pool: Vec<&DefRecord> = if !strong_defs.is_empty() {
-                                strong_defs
-                            } else {
-                                candidates
-                            };
+                            // Strength only competes within one signature. A strong
+                            // overload cannot suppress a different weak overload when
+                            // the call's signature is unknown or fails exact matching.
+                            let strong_signatures: FxHashSet<&str> = strong_defs
+                                .iter()
+                                .map(|d| d.signature.as_str())
+                                .collect();
+                            let pool: Vec<&DefRecord> = candidates
+                                .into_iter()
+                                .filter(|d| !d.is_weak || !strong_signatures.contains(d.signature.as_str()))
+                                .collect();
 
-                            if pool.len() == 1 {
-                                if pool[0].db_idx != db_idx {
-                                    report.cross_repo_calls_resolved += 1;
-                                }
-                                (vec![pool[0].new_fn_id], resolved_resolution)
-                            } else {
-                                report.ambiguous_calls += 1;
-                                let mut callee_ids: Vec<i64> =
-                                    pool.iter().map(|d| d.new_fn_id).collect();
-                                callee_ids.sort_unstable();
-                                callee_ids.dedup();
-                                (callee_ids, "ambiguous".to_string())
-                            }
+                            resolve_definition_pool(&pool, db_idx, resolved_resolution, &mut report)
                         } else if strong_defs.len() == 1 {
                             // Exactly one strong definition found!
                             if strong_defs[0].db_idx != db_idx {
@@ -800,35 +855,23 @@ pub fn merge_databases<P: AsRef<Path>>(
                         } else if strong_defs.len() > 1 {
                             // Multiple conflicting strong definitions for the same signature!
                             let caller_func = per_db_functions[db_idx].get(&edge.caller_fn_id);
-                            let same_target_strong = caller_func
+                            let caller_target = caller_func
                                 .and_then(|cf| cf.target_id)
-                                .and_then(|t| target_remap[db_idx].get(&t).copied())
-                                .and_then(|new_t| {
-                                    strong_defs.iter().find(|d| d.target_id == Some(new_t))
-                                });
-
-                            if let Some(target_def) = same_target_strong {
-                                // Target resolution within same target (target_def.db_idx == db_idx).
-                                (vec![target_def.new_fn_id], resolved_resolution)
+                                .and_then(|t| target_remap[db_idx].get(&t).copied());
+                            let same_target_strong: Vec<&DefRecord> = strong_defs
+                                .iter()
+                                .copied()
+                                .filter(|d| caller_target.is_some() && d.target_id == caller_target)
+                                .collect();
+                            let pool = if same_target_strong.is_empty() {
+                                strong_defs
                             } else {
-                                // Truly ambiguous across other repos/targets: emit an edge to
-                                // EVERY candidate strong definition to preserve may-analysis reachability.
-                                report.ambiguous_calls += 1;
-                                let mut callee_ids: Vec<i64> =
-                                    strong_defs.iter().map(|d| d.new_fn_id).collect();
-                                callee_ids.sort_unstable();
-                                callee_ids.dedup();
-                                (callee_ids, "ambiguous".to_string())
-                            }
+                                same_target_strong
+                            };
+
+                            resolve_definition_pool(&pool, db_idx, resolved_resolution, &mut report)
                         } else if !candidates.is_empty() {
-                            // Multiple weak definitions across repos: emit an edge to
-                            // EVERY candidate weak definition to preserve may-analysis reachability.
-                            report.ambiguous_calls += 1;
-                            let mut callee_ids: Vec<i64> =
-                                candidates.iter().map(|d| d.new_fn_id).collect();
-                            callee_ids.sort_unstable();
-                            callee_ids.dedup();
-                            (callee_ids, "ambiguous".to_string())
+                            resolve_definition_pool(&candidates, db_idx, resolved_resolution, &mut report)
                         } else if is_weak_call {
                             // Retain local weak definition
                             let remapped = *fn_remap[db_idx]

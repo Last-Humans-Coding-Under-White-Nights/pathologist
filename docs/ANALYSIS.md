@@ -150,6 +150,36 @@ after indexing and before analysis, releasing these merge-only tables in both
 scoped and unscoped runs. Rust callers that will merge more units retain the
 state until their final merge is complete.
 
+### Database merger header copies
+
+`trace-merge` has source coordinates and normalized signatures, but no expanded
+body text or TU lookup contexts. It recognizes a source origin by the remapped
+`(file_id, line_start, name, signature)` with a positive line number. This is a
+source-based approximation: different preprocessing configurations at the same
+origin cannot be distinguished by body text in the database.
+
+External declarations at one origin deduplicate across input databases and
+link images. A declaration shared by different targets has `target_id = NULL`
+in the merged output; relinking uses the original input records and the
+caller's target. Definitions additionally require the same remapped target
+to deduplicate. Each image keeps its own function ID and outgoing calls,
+even when the source origin agrees. `header_functions_deduped` counts rows
+actually unified, so retained definition copies in distinct images do not
+increase it.
+
+Copies of one source definition are not a `MultipleDefinitions` collision.
+For an external call, selected candidates from just one source origin use
+`direct` resolution (or preserve `indirect` / `ipc`) and count as one resolved
+call, while emitting edges to every selected image copy. This retains paths
+through different image-local callees. Distinct source origins remain
+ambiguous. Unknown source positions cannot establish shared identity.
+
+File dependency ownership is unified before function ingestion. When any
+input owns a shared file as project code (`is_dep = 0`), all function copies
+from that file are project code in the output, including prototypes and
+definitions that retain separate IDs. This preserves visibility under
+`--exclude-deps` independently of image deduplication.
+
 ### Declaring-header eligibility
 
 By default, bare-tree inference puts files below a `test`, `tests`, `mock`,
@@ -768,23 +798,26 @@ Instead, `trace` decouples intra-repository static analysis from cross-repositor
 ### Invariants and linking rules
 
 - **No analysis during merge**: Andersen pointer analysis, PAG construction, and interprocedural dataflow solvers do **not** run during the merge stage. Intra-repository dataflow facts (`flow_nodes`, `flow_edges`, `arg_flow_edges`) remain strictly within their original repository databases. The merge stage is purely a deterministic linker that reconnects external call edges across repositories. Its shared-schema output leaves flow tables empty and call-site variable bindings NULL; see the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
+  Existing indirect and IPC edges carry over, but the merger cannot discover a new callback target that requires pointer flow across repositories, or synthesize a new IPC bridge when the proxy and stub were analyzed in separate databases. Such edges require an analysis that sees the relevant facts together.
 - **Execution contexts carry over**: `execution_contexts` rows are copied with their function and call-site ids remapped, and one whose function or call site did not survive the merge is dropped. A context a call site starts enters what the edge from that site to its entry now goes to: the definition another repository holds of a callback this one only declares (the callback edge is re-linked to it, and so is the context), or each candidate of an ambiguous edge, one row per candidate. `receiver_var_id` is NULL in the merged database, which carries no variables. Rows several inputs contribute for one context (same start, modelled callee, parameter, entry, kind and model: an IPC handler or an override entry a shared header defines, since call sites are not deduplicated) are kept once, with the evidence of all: `self_concurrent` when any input says so, and the first `multi_instance` that applies in the analysis' order. Merged rows are ordered as `trace analyze` orders them, by call site, then the entries no call site starts by entry. The evidence is otherwise each input's own: a cross-repository edge re-linked here is not searched for new cycles or parents ([Execution contexts](#execution-contexts)). Which inputs supply the table, and what an input exported before it contributes, is part of the [merger output contract](SQLITE_SCHEMA.md#merger-inputs-and-output).
 - **External call re-linking and may-analysis over-approximation**:
   - In individual repositories, calls to functions declared but not defined in that repository are emitted with `resolution = 'external'` (or point to `is_defined = 0` declarations). `trace-merge` matches these calls against exported strong definitions (`is_defined = 1`, `linkage = 'external'`) from other repositories, updating `call_edges.callee_fn_id` to the survivor's unified ID and retargeting `resolution` to `'direct'` (or `'ambiguous'` if conflicting definitions exist), while preserving original non-direct resolutions (`indirect` and `ipc`). Unresolved external calls retain their original resolution.
-  - When multiple strong definitions exist across different repositories (or multiple weak definitions), `trace-merge` emits an ambiguous edge (`resolution = 'ambiguous'`) to **every candidate definition**, satisfying the may-analysis invariant (AGENTS.md §2). This ensures downstream path queries such as `trace inspect callchain` do not miss valid paths.
+  - When multiple distinct source definitions exist across different repositories (or multiple weak definitions from distinct origins), `trace-merge` emits an ambiguous edge (`resolution = 'ambiguous'`) to **every candidate definition**, satisfying the may-analysis invariant (AGENTS.md §2). Copies of one source origin retain every selected image's edge with a resolved classification; see [Database merger header copies](#database-merger-header-copies). This ensures downstream path queries such as `trace inspect callchain` do not miss valid paths.
   - Edges are deduplicated per call site on `(call_site_id, callee_fn_id)`, eliminating duplicate edges when an intra-repo direct or indirect edge and a re-linked external edge reach the same callee.
 - **ELF linker semantics**:
-  - `static` / internal-linkage functions are strictly kept file-local and are never exported for cross-repository resolution.
-  - Strong definitions (`is_weak = 0`) supersede weak definitions (`is_weak = 1`) across repositories. If an external call in Repo A binds to a weak fallback in Repo A, but Repo B supplies a strong definition for the same symbol and signature, the caller in Repo A is retargeted to Repo B's strong definition.
+  - `static` / internal-linkage functions are strictly kept file-local and are never exported for cross-repository resolution. An unresolved internal declaration also stays local: a same-name external definition cannot satisfy it.
+  - Strong definitions (`is_weak = 0`) supersede unscoped weak definitions (`is_weak = 1`) across repositories. If an external call in Repo A binds to an unscoped weak fallback in Repo A, but Repo B supplies a strong definition for the same symbol and signature, the caller in Repo A is retargeted to Repo B's strong definition. Calls already bound to defined weak functions in a known link target retain that image's selection; definitions in another image do not override them or produce `WeakOverride` diagnostics for them.
+  - For exact-signature matches with competing strong definitions, the caller's known target takes precedence when it supplies candidates. All candidates within that target remain reachable; the merger never arbitrarily selects the first definition. Without a candidate in that target, cross-repository matching is conservative: input target IDs are remapped independently, and the merger does not infer new target-dependency links between inputs.
 - **Header deduplication and dependency tracking**:
-  - Shared header files and header-declared functions/prototypes are deduplicated across repositories using `(file_id, line, name, signature)`. If any merged repository analyzes the header as non-dependency code (`is_dep = 0`, e.g. the owning repository), the unified function is updated to `is_dep = 0` so downstream queries filtering dependencies (`--exclude-deps`) retain project functions.
+  - Shared files deduplicate by path, declarations share source identity across targets, and definitions retain image ownership. Project-file ownership propagates to every function copy, preserving `--exclude-deps` visibility. The authoritative rules, including shared declarations' target metadata and the deduplication counter, are in [Database merger header copies](#database-merger-header-copies).
 - **Signature-aware C++ overload disambiguation and normalized matching**:
   - `trace-db` exports normalized parameter signatures in `functions.signature` (e.g. `process(int)`, `process(double)`). Top-level array parameters decay to pointers (`int[]` -> `int*`), while qualifiers (`const`, `volatile`) and signedness are dropped.
   - `trace-merge` groups exported definitions by `(name, signature)` before collision detection. Valid C++ overloads do not trigger false `MultipleDefinitions` warnings.
   - Calls to overloaded external functions first match candidates by exact signature (`orig_callee.signature == candidate.signature`). If no candidate matches by exact signature, `trace-merge` over-approximates by falling back to every same-name candidate rather than dropping the call, preventing lossy spelling discrepancies from stranding calls as unresolved.
-  - When candidates originate from the same-name fallback rather than an exact signature match and multiple candidate definitions exist, `trace-merge` emits ambiguous edges to all candidates rather than applying same-database/same-target direct preference (which applies only to conflicting definitions of the same overload).
+  - When candidates originate from the same-name fallback rather than an exact signature match, `trace-merge` retains every selected candidate rather than applying same-database/same-target preference (which applies only to conflicting definitions of the same overload). Distinct source origins make the call ambiguous; copies of one source origin retain a resolved classification as described in [Database merger header copies](#database-merger-header-copies).
+  - Strong-over-weak preference applies separately to each signature in the fallback pool. A strong `query(int)` cannot suppress a weak `query(double)` when either could match the call.
 - **Problem detection and diagnostic reporting**:
-  - `MultipleDefinitions`: Multiple strong definitions with the same signature found across different repositories. Reported as a collision warning and recorded with `stage = 'merge'`.
+  - `MultipleDefinitions`: Multiple strong definitions with the same signature and distinct source origins found across different repositories. Shared-origin image copies do not constitute a collision. Reported as a collision warning and recorded with `stage = 'merge'`.
   - `UnresolvedExternal`: External function references that have no matching definition in any merged database.
   - `WeakOverride`: Diagnostic informing that a weak definition in one repository was overridden by a strong definition from another repository. Intra-repository weak overrides do not trigger warnings.
   - `MissingExecutionContexts`: An input has no `execution_contexts` table (it was exported before the table existed), so it contributes no execution contexts. Recorded as an `info` diagnostic with `stage = 'merge'` naming the input.
