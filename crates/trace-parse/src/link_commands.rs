@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use trace_ir::resolve_against;
+use trace_preproc::InputBoundary;
 
 #[derive(Default, Debug)]
 pub(crate) struct LinkDatabase {
@@ -46,6 +47,7 @@ impl LinkDatabase {
         root: &Path,
         compilation: &CompilationDatabase,
         links: Option<&Path>,
+        input_boundary: Option<&InputBoundary>,
     ) -> Result<Self, String> {
         let root = trace_ir::canonicalize(root);
         let root = if root.is_file() {
@@ -66,7 +68,7 @@ impl LinkDatabase {
             batches.push((path.clone(), compilation.link_entries.clone()));
         }
         if let Some(path) = link_path {
-            match read_json(&path)
+            match read_json(&path, input_boundary)
                 .and_then(|v| serde_json::from_value::<Vec<Value>>(v).map_err(|e| e.to_string()))
             {
                 Ok(entries) => batches.push((path, entries.into_iter().enumerate().collect())),
@@ -103,7 +105,12 @@ impl LinkDatabase {
                     // the pair runs twice.
                     let mut args = args;
                     for _ in 0..2 {
-                        args = expand_response_files(&directory, forwarded_operands(&args)?, 0)?;
+                        args = expand_response_files(
+                            &directory,
+                            forwarded_operands(&args)?,
+                            0,
+                            input_boundary,
+                        )?;
                     }
                     if args.is_empty() {
                         return Err("empty command".into());
@@ -133,7 +140,7 @@ impl LinkDatabase {
         }
         for build in metadata_roots(root, database) {
             let start = db.targets.len();
-            if let Err(e) = db.read_cmake(&build) {
+            if let Err(e) = db.read_cmake(&build, input_boundary) {
                 db.targets.truncate(start);
                 db.warnings
                     .push(format!("CMake metadata {}: {e}", build.display()));
@@ -252,7 +259,11 @@ impl LinkDatabase {
         Ok(db)
     }
 
-    fn read_cmake(&mut self, build: &Path) -> Result<(), String> {
+    fn read_cmake(
+        &mut self,
+        build: &Path,
+        input_boundary: Option<&InputBoundary>,
+    ) -> Result<(), String> {
         let reply = build.join(".cmake/api/v1/reply");
         let entries = match std::fs::read_dir(&reply) {
             Ok(entries) => entries,
@@ -269,14 +280,17 @@ impl LinkDatabase {
             })
             .max();
         let Some(index) = index else { return Ok(()) };
-        let index = read_json(&index)?;
+        let index = read_json(&index, input_boundary)?;
         let Some(reference) = array(&index, "objects")
             .iter()
             .find(|v| v["kind"] == "codemodel" && v["version"]["major"] == 2)
         else {
             return Ok(());
         };
-        let model = read_json(&reply.join(required_str(reference, "jsonFile")?))?;
+        let model = read_json(
+            &reply.join(required_str(reference, "jsonFile")?),
+            input_boundary,
+        )?;
         let source_root = PathBuf::from(required_str(&model["paths"], "source")?);
         let build_root = PathBuf::from(required_str(&model["paths"], "build")?);
         // A multi-config reply (Xcode, Visual Studio, Ninja Multi-Config)
@@ -302,7 +316,10 @@ impl LinkDatabase {
             let mut ids = BTreeMap::new();
             let mut pending = Vec::new();
             for reference in array(config, "targets") {
-                let target = read_json(&reply.join(required_str(reference, "jsonFile")?))?;
+                let target = read_json(
+                    &reply.join(required_str(reference, "jsonFile")?),
+                    input_boundary,
+                )?;
                 let kind = required_str(&target, "type")?;
                 if !matches!(
                     kind,
@@ -496,7 +513,10 @@ fn database_path(
         .map(|dir| dir.join(name))
         .find(|p| p.is_file()))
 }
-fn read_json(path: &Path) -> Result<Value, String> {
+fn read_json(path: &Path, input_boundary: Option<&InputBoundary>) -> Result<Value, String> {
+    if let Some(boundary) = input_boundary {
+        boundary.record(&trace_ir::canonicalize(path));
+    }
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -626,6 +646,7 @@ fn expand_response_files(
     directory: &Path,
     args: Vec<String>,
     depth: usize,
+    input_boundary: Option<&InputBoundary>,
 ) -> Result<Vec<String>, String> {
     if depth > 8 {
         return Err("response file nesting exceeds eight levels".into());
@@ -641,10 +662,19 @@ fn expand_response_files(
             .strip_prefix('@')
             .filter(|path| !path.is_empty() && !is_loader_path(&arg))
         {
-            let text = std::fs::read_to_string(directory.join(path))
+            let resolved = directory.join(path);
+            if let Some(boundary) = input_boundary {
+                boundary.record(&trace_ir::canonicalize(&resolved));
+            }
+            let text = std::fs::read_to_string(resolved)
                 .map_err(|e| format!("response file {path}: {e}"))?;
             let args = split_command(&text).ok_or("unterminated response file quoting")?;
-            expanded.extend(expand_response_files(directory, args, depth + 1)?);
+            expanded.extend(expand_response_files(
+                directory,
+                args,
+                depth + 1,
+                input_boundary,
+            )?);
         } else {
             expanded.push(arg);
         }
@@ -801,7 +831,7 @@ mod tests {
         let mut options = trace_preproc::PreprocessOptions::new();
         options.compilation_database = compilation.map(Path::to_path_buf);
         let compilation = CompilationDatabase::load(root, &options)?;
-        LinkDatabase::load(root, &compilation, links)
+        LinkDatabase::load(root, &compilation, links, None)
     }
     fn write(root: &Path, name: &str, value: serde_json::Value) {
         let path = root.join(name);

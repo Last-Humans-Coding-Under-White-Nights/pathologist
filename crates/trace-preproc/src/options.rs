@@ -1,6 +1,46 @@
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+
+/// Collect inputs read outside a caller's root, including macro-only headers
+/// and build metadata that need not contribute exported file entities.
+#[derive(Debug)]
+pub struct InputBoundary {
+    root: PathBuf,
+    external: Mutex<BTreeSet<PathBuf>>,
+}
+
+impl InputBoundary {
+    /// `root` must use the same canonical spelling as preprocessing paths.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            external: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    /// Record a canonical input path observed by preprocessing or metadata readers.
+    pub fn record(&self, canonical: &Path) {
+        if !canonical.starts_with(&self.root) {
+            self.external
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(canonical.to_path_buf());
+        }
+    }
+
+    #[must_use]
+    pub fn external_paths(&self) -> Vec<PathBuf> {
+        self.external
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
 
 /// The language a translation unit is lexed as. Lexing is not identical
 /// across the two: C++11 raw string literals (`R"(…)"`) and user-defined
@@ -387,6 +427,8 @@ pub struct PreprocessOptions {
     /// `#include` expansion), and the [`SourceCache`] answer that keeps
     /// `include_exists` off the hash for a candidate that resolves nowhere.
     pub source_cache: Option<std::sync::Arc<SourceCache>>,
+    /// Optional input-boundary validation shared across preprocessing runs.
+    pub input_boundary: Option<Arc<InputBoundary>>,
     /// Shared cache of expanded `#include` bodies keyed by canonical path
     /// and lexing language (see [`ExpansionKey`]).
     pub include_expansion_cache: Option<ExpansionCache>,
@@ -491,6 +533,7 @@ impl Default for PreprocessOptions {
             working_directory: None,
             defines: indexmap::IndexMap::new(),
             source_cache: None,
+            input_boundary: None,
             include_expansion_cache: None,
             separate_header_paths: None,
             basename_index: None,

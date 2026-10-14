@@ -6,6 +6,117 @@ use trace_parse::build_program_with_jobs;
 use trace_preproc::PreprocessOptions;
 
 #[test]
+fn local_input_guard_rejects_external_headers_in_all_compilation_modes() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("project");
+    let external = scratch.path().join("external");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&external).unwrap();
+    let header = external.join("macros.h");
+    std::fs::write(&header, "#define VALUE 1\n").unwrap();
+    std::fs::write(root.join("nested.h"), "#include <macros.h>\n").unwrap();
+    for mode in ["nested", "forced", "shared"] {
+        let source = if mode == "forced" {
+            ""
+        } else {
+            "#include \"nested.h\"\n"
+        };
+        std::fs::write(
+            root.join("main.c"),
+            format!("{source}#if VALUE\nvoid selected(void) {{}}\n#endif\n"),
+        )
+        .unwrap();
+        let database = root.join("compile_commands.json");
+        if mode == "shared" {
+            std::fs::remove_file(&database).unwrap();
+            std::fs::write(
+                root.join("compile_flags.txt"),
+                format!("-I{}\n", external.display()),
+            )
+            .unwrap();
+        } else {
+            let flags = if mode == "forced" {
+                vec![
+                    "cc".to_string(),
+                    "-include".to_string(),
+                    header.display().to_string(),
+                    "main.c".to_string(),
+                ]
+            } else {
+                vec![
+                    "cc".to_string(),
+                    format!("-I{}", external.display()),
+                    "main.c".to_string(),
+                ]
+            };
+            std::fs::write(
+                &database,
+                json!([{"directory": root, "file": "main.c", "arguments": flags}]).to_string(),
+            )
+            .unwrap();
+        }
+        for jobs in [1, 4] {
+            for strict in [false, true] {
+                let db = scratch.path().join(format!("{mode}-{jobs}-{strict}.db"));
+                let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_trace"));
+                command
+                    .arg("analyze")
+                    .arg(&root)
+                    .arg("--jobs")
+                    .arg(jobs.to_string())
+                    .arg("-o")
+                    .arg(&db);
+                if strict {
+                    command.arg("--require-local-inputs");
+                }
+                let result = command.output().unwrap();
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                assert_eq!(result.status.success(), !strict, "{mode}: {stderr}");
+                assert_eq!(db.exists(), !strict, "{mode}: {stderr}");
+                if strict {
+                    assert!(
+                        stderr.contains("external analysis input cannot be verified"),
+                        "{stderr}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn local_input_guard_accepts_unused_external_search_paths() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("project");
+    let external = scratch.path().join("external");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&external).unwrap();
+    std::fs::write(
+        root.join("main.c"),
+        "#include \"local.h\"\nvoid entry(void) {}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("local.h"), "#define LOCAL 1\n").unwrap();
+    let db = scratch.path().join("out.db");
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_trace"))
+        .arg("analyze")
+        .arg(&root)
+        .arg("--require-local-inputs")
+        .arg("--include")
+        .arg(&external)
+        .arg("-o")
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(db.is_file());
+}
+
+#[test]
 fn explicit_commands_preserve_header_variants_and_call_flows() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

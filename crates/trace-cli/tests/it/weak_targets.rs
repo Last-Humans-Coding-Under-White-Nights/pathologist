@@ -31,6 +31,145 @@ fn analyze(root: &Path, jobs: Option<usize>) -> (TempDb, Connection) {
     (db, conn)
 }
 
+fn assert_local_metadata_rejected(root: &Path, input_name: &str) {
+    let db = TempDb::new("rejected.db");
+    let result = Command::new(env!("CARGO_BIN_EXE_trace"))
+        .arg("analyze")
+        .arg(root)
+        .arg("--require-local-inputs")
+        .arg("-o")
+        .arg(db.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("external analysis input cannot be verified"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(input_name), "{stderr}");
+    assert!(!db.path().exists());
+}
+
+#[test]
+fn local_input_guard_rejects_external_link_response_files() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("project");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.c"), "void hook(void) {}\n").unwrap();
+    fs::write(root.join("b.c"), "void hook(void) {}\n").unwrap();
+    fs::write(
+        root.join("caller.c"),
+        "void hook(void); void entry(void) { hook(); }\n",
+    )
+    .unwrap();
+    let response = scratch.path().join("external.rsp");
+    fs::write(root.join("local.rsp"), "@../external.rsp\n").unwrap();
+    for arguments in [
+        vec!["cc", "@../external.rsp"],
+        vec!["cc", "-Wl,@../external.rsp"],
+        vec!["cc", "-Xlinker", "@../external.rsp"],
+        vec!["cc", "@local.rsp"],
+    ] {
+        fs::write(
+            root.join("link_commands.json"),
+            json!([{
+                "directory": root, "arguments": arguments
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        for source in ["a.c", "b.c"] {
+            fs::write(&response, format!("{source} caller.c -o app\n")).unwrap();
+            let (_db, conn) = analyze(&root, Some(4));
+            let selected: String = conn.query_row(
+                "SELECT p.path FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id
+                 JOIN functions callee ON callee.id=e.callee_fn_id JOIN files p ON p.id=callee.file_id
+                 WHERE caller.name='entry' AND callee.name='hook'", [], |row| row.get(0)).unwrap();
+            assert!(selected.ends_with(source), "{selected}");
+            assert_local_metadata_rejected(&root, "external.rsp");
+        }
+    }
+    // Link-only entries in a mixed compilation database use the same reader.
+    fs::remove_file(root.join("link_commands.json")).unwrap();
+    fs::write(
+        root.join("compile_commands.json"),
+        json!([{
+            "directory": root, "arguments": ["cc", "@../external.rsp", "-o", "app"]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    assert_local_metadata_rejected(&root, "external.rsp");
+    // Entirely local recursive response files remain supported in strict mode.
+    fs::write(root.join("local.rsp"), "a.c caller.c -o app\n").unwrap();
+    fs::write(
+        root.join("compile_commands.json"),
+        json!([{
+            "directory": root, "arguments": ["cc", "@local.rsp", "-o", "app"]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let db = TempDb::new("local.db");
+    let result = Command::new(env!("CARGO_BIN_EXE_trace"))
+        .arg("analyze")
+        .arg(&root)
+        .arg("--require-local-inputs")
+        .arg("-o")
+        .arg(db.path())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(db.path().is_file());
+}
+
+#[test]
+fn local_input_guard_rejects_external_cmake_json_references() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("project");
+    let reply = root.join(".cmake/api/v1/reply");
+    fs::create_dir_all(&reply).unwrap();
+    fs::write(root.join("main.c"), "void entry(void) {}\n").unwrap();
+    let model = scratch.path().join("external-model.json");
+    fs::write(
+        &model,
+        json!({"paths": {"source": root, "build": root},
+            "configurations": [{"targets": [{"id": "app", "jsonFile": "target.json"}]}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        reply.join("target.json"),
+        json!({"name": "app", "type": "EXECUTABLE",
+            "artifacts": [{"path": "app"}], "sources": [{"path": "main.c"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        reply.join("index-0.json"),
+        json!({"objects": [{"kind": "codemodel",
+            "version": {"major": 2}, "jsonFile": model
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    let (_db, conn) = analyze(&root, None);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM link_targets", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_local_metadata_rejected(&root, "external-model.json");
+}
+
 /// Exercise lowering, target selection, Andersen propagation, and SQLite export.
 #[test]
 fn exported_edges_follow_each_targets_selected_weak_definitions() {

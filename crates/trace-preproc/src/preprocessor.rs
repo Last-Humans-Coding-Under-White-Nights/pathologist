@@ -1585,6 +1585,9 @@ impl PreprocessorState {
 
     fn process_file(&mut self, path: &Path) -> Result<Placed, PreprocessError> {
         let canonical = trace_ir::canonicalize(path);
+        if let Some(boundary) = &self.opts.input_boundary {
+            boundary.record(&canonical);
+        }
         // A repeated `#include` is skipped only on a reason the file itself
         // stated — its `#pragma once`, or its include guard while that guard
         // is defined. Membership in `included_files` is not one: suppressing

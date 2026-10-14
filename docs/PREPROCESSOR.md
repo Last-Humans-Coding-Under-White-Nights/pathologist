@@ -39,6 +39,14 @@ CLI equivalents: `--include PATH`, `-D NAME=VALUE`. `PreprocessOptions::with_rec
 
 ### Compilation database options (#62)
 
+`trace analyze --require-local-inputs` checks the canonical paths observed by
+preprocessing and compilation/link metadata readers, including cached, nested
+and forced includes, recursive response files and CMake JSON references. It rejects an
+analysis that consumed an input outside the target tree before solving or
+exporting. This is opt-in; the [PGO workflow](PGO.md) enables it for input
+verification. The shared `PreprocessOptions::input_boundary` collector also
+records macro-only headers that may not contribute exported file entities.
+
 When `compile_commands.json` exists at the analysis root or its `build/` directory
 (or is selected with `--compile-commands PATH`), indexing reads each
 command's working directory, include directories, macro operations, forced
@@ -160,6 +168,7 @@ flowchart LR
 
 | Feature | Notes |
 |---------|-------|
+| Input-boundary recording | Optional shared collector for consumed headers and compilation/link metadata; see [compilation database options](#compilation-database-options-62). |
 | Compilation options (#62) | Ordered command macro operations, quoted/normal/system/after include search classes, opt-in compiler default path discovery (`--system-includes`), forced headers with original LineMap origins; language and standard-version predefines. Inferred paths respect the [test partition](ANALYSIS.md#declaring-header-eligibility). |
 | Comments | `//`, `/* */` |
 | Line splicing | Translation phase 2 (C11 5.1.1.2p1) runs inside the lexer, at the character level: every `\`-newline (`\n` or `\r\n`, and — as gcc and clang accept with a warning — with horizontal whitespace between the `\` and the newline) is deleted before any token is recognized, so a spliced identifier is one identifier (`int c\`-newline-`d;` is `int cd;`), a spliced multi-character punctuator is munched whole (`.\`-newline-`..` is `...`, so `#define F(x, .\`-newline-`..)` is the variadic macro gcc and clang see — #38), a spliced encoding prefix or string body stays one literal, a `//` comment ending in `\` continues onto the next line and `/\`-newline-`*` opens a block comment. A `\r` counts only as the first half of a `\r\n`: `\`-CR-CR-LF and `\`-CR-space-LF are not splices, as in clang. Inside a C++11 raw string literal the splice is reverted ([lex.pptoken]p3) and the body is kept as written; in C, where `R"(…)"` is the identifier `R` followed by an ordinary string, a splice in that body is deleted like in any string — clang's `-std=c11` behaviour, while gcc and clang in their default GNU modes lex a raw string there and keep the splice as written. Token positions stay physical — a token starts where its first character sits in the file, which is what the LineMap needs — so adjacency can no longer be read off `line`/`col`; instead the lexer records on every token whether it touched the previous one (`Token::adjacent_before`, with a splice counting as nothing and whitespace, comments and newlines as a gap), and that flag is what the function-like `#define` test and `#` stringizing read. Before #38 the lexer kept `\` + newline as two tokens and each consumer that needed phase 2 skipped the pair itself, so the splice was still visible everywhere else: `int c\`-newline-`d;` came out as `int c\ d;` and a spliced ellipsis stayed three `.` tokens |
