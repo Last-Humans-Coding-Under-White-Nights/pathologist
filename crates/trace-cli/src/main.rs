@@ -122,6 +122,21 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum InspectCommands {
+    /// Show stored analysis diagnostics (missing includes, parse issues, solver limits).
+    Diagnostics {
+        /// Exact pipeline stage, e.g. preprocess, parse, or analyze.
+        #[arg(long)]
+        stage: Option<String>,
+        /// Filter by diagnostic severity.
+        #[arg(long, value_parser = ["error", "warning", "info"])]
+        severity: Option<String>,
+        /// Only diagnostics whose source path contains this literal substring.
+        #[arg(long)]
+        file: Option<String>,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: DiagnosticFormat,
+    },
     /// List call graph edges.
     Calls {
         /// Filter edges whose caller name equals FN or ends with `::FN`
@@ -270,6 +285,12 @@ enum OutputFormat {
     Json,
     Graphviz,
     Mermaid,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum DiagnosticFormat {
+    Text,
+    Json,
 }
 
 impl OutputFormat {
@@ -688,6 +709,13 @@ fn run_analyze(
         analysis.arg_flow_edges.len(),
         output.display()
     );
+    let diagnostic_count = program.diagnostics.len() + usize::from(!analysis.solve.converged);
+    if diagnostic_count > 0 {
+        eprintln!(
+            "{diagnostic_count} diagnostic(s) recorded; view with: trace inspect {} diagnostics",
+            output.display()
+        );
+    }
     Ok(())
 }
 
@@ -709,6 +737,33 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
         }
     }
     match command {
+        InspectCommands::Diagnostics {
+            stage,
+            severity,
+            file,
+            format,
+        } => {
+            let rows = trace_db::diagnostics(
+                &conn,
+                stage.as_deref(),
+                severity.as_deref(),
+                file.as_deref(),
+            )?;
+            match format {
+                DiagnosticFormat::Json => println!("{}", serde_json::to_string_pretty(&rows)?),
+                DiagnosticFormat::Text => {
+                    if rows.is_empty() {
+                        println!("No matching diagnostics.");
+                    }
+                    for row in rows {
+                        if let Some(file) = &row.file {
+                            print!("{file}:{}: ", row.line);
+                        }
+                        println!("{} [{}]: {}", row.severity, row.stage, row.message);
+                    }
+                }
+            }
+        }
         InspectCommands::Calls {
             from,
             to,

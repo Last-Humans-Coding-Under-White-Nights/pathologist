@@ -4,6 +4,19 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Inspect analysis diagnostics
+
+`trace inspect <DB> diagnostics` shows stored analysis diagnostics with their
+severity, stage, original source path and line when available. Exact stage and
+severity filters and a literal file-path substring filter can be combined;
+`--format json` emits structured records, including run-wide diagnostics with
+no source file. Both minimal and full exports work without a schema change.
+`analyze` now prints the diagnostic count and the command to inspect it.
+
+Usage: [Inspect diagnostics](README.md#trace-inspect-diagnostics).
+Corpus validation, timings, problem files and root-cause investigation:
+[Evaluation report](docs/EVAL_REPORT.md#inspect-diagnostics--2026-10-14).
+
 ### Lower analyze-phase memory (#225)
 
 The solver's membership bit mirrors keep only the blocks of the location

@@ -329,6 +329,31 @@ trace inspect /tmp/trace.db callchain --from main.c:10 --to target.c:20
 trace inspect /tmp/trace.db callchain --from caller --to helper --format mermaid
 ```
 
+### `trace inspect diagnostics`
+
+Read diagnostics saved during analysis without rerunning it or writing SQL.
+Both minimal and full exports include these records. When diagnostics exist,
+`analyze` prints their count and the command to inspect them.
+
+```bash
+trace inspect /tmp/trace.db diagnostics
+trace inspect /tmp/trace.db diagnostics --stage preprocess --severity warning
+trace inspect /tmp/trace.db diagnostics --file main.cpp --format json
+```
+
+Text output includes severity, pipeline stage, message, and the original source
+path and line when available. `--stage` and `--severity` match exactly;
+`--file` matches a literal path substring. Filters combine, and records retain
+export order. Diagnostics for the whole run (such as a solver budget limit)
+have no source path and are omitted when filtering by file. JSON output is an
+array of objects with `severity`, `file` (nullable), `line`, `message`, and
+`stage`; no matches produce `[]` (text: `No matching diagnostics.`).
+
+Some existing parse, IDL, and build-metadata diagnostics store their source
+path only inside the message. Use `--stage` to find these: `--file` matches
+the structured source path and therefore excludes them. See the
+[corpus evaluation and root-cause investigation](docs/EVAL_REPORT.md#inspect-diagnostics--2026-10-14).
+
 ### `trace inspect dataflow`
 
 Show possible value flows from a source variable declaration, grouped by
