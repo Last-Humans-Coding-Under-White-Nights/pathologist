@@ -6,6 +6,136 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use trace_preproc::{CommandMacro, InputBoundary, Language, PreprocessOptions};
 
+/// The search directories affected by ordinary candidate include roots.
+/// Includer-relative and quoted-only searches precede these directories and
+/// are unchanged by adding an ordinary include root.
+pub struct CompilationIncludeSearch {
+    /// `None` denotes a shared or inferred fallback configuration.
+    pub source: Option<PathBuf>,
+    /// Ordinary, system, then after directories, following command parsing
+    /// and search-class duplicate normalization.
+    pub paths: Vec<PathBuf>,
+}
+
+/// Reuse parsed compilation metadata across candidate-root conflict checks.
+/// One instance describes one analysis run: only `include_paths` may change.
+#[derive(Default)]
+pub struct CompilationIncludeSearches {
+    commands: Option<Vec<CachedIncludeSearch>>,
+}
+
+struct CachedIncludeSearch {
+    source: Option<PathBuf>,
+    ordinary: Vec<PathBuf>,
+    late: Vec<PathBuf>,
+    // Explicit system/after paths exclude CLI duplicates. Compiler-probed
+    // defaults do not: CLI paths intentionally override those defaults.
+    excluded_cli: BTreeSet<PathBuf>,
+}
+
+fn explicit_late_paths(opts: &PreprocessOptions) -> BTreeSet<PathBuf> {
+    opts.system_include_paths
+        .iter()
+        .chain(&opts.after_include_paths)
+        .cloned()
+        .collect()
+}
+
+impl CachedIncludeSearch {
+    fn new(source: Option<PathBuf>, opts: &PreprocessOptions) -> Self {
+        Self {
+            source,
+            ordinary: opts.include_paths.clone(),
+            late: opts
+                .system_include_paths
+                .iter()
+                .chain(&opts.after_include_paths)
+                .cloned()
+                .collect(),
+            excluded_cli: explicit_late_paths(opts),
+        }
+    }
+
+    fn with_cli(&self, cli: &[PathBuf]) -> CompilationIncludeSearch {
+        let mut seen = BTreeSet::new();
+        let paths = cli
+            .iter()
+            .filter(|path| !self.excluded_cli.contains(*path))
+            .chain(&self.ordinary)
+            .filter(|path| seen.insert((*path).clone()))
+            .chain(&self.late)
+            .cloned()
+            .collect();
+        CompilationIncludeSearch {
+            source: self.source.clone(),
+            paths,
+        }
+    }
+}
+
+impl CompilationIncludeSearches {
+    /// Parse commands once using the indexing parser, then merge prospective
+    /// CLI paths with their cached search classes. A CLI path also explicitly
+    /// named as system/after stays in that later class.
+    pub fn searches(
+        &mut self,
+        root: &Path,
+        overrides: &PreprocessOptions,
+        indexed_files: &[PathBuf],
+    ) -> Result<Vec<CompilationIncludeSearch>, String> {
+        if self.commands.is_none() {
+            let (sources, headers): (Vec<_>, Vec<_>) = indexed_files
+                .iter()
+                .cloned()
+                .partition(|path| crate::discover::has_extension_in(path, crate::TU_EXTENSIONS));
+            let mut base = overrides.clone();
+            base.include_paths.clear();
+            let mut commands = Vec::new();
+            let mut database = CompilationDatabase::load_inner(root, &base, Some(&mut commands))?;
+            database.configure_discovered(&sources, &headers, &base);
+            if database.uses_shared_flags() {
+                for (source, configs) in &database.commands {
+                    for opts in configs {
+                        commands.push(CachedIncludeSearch::new(Some(source.clone()), opts));
+                    }
+                }
+            }
+            // Match indexing's source order, preserving command order per TU.
+            commands.sort_by(|a, b| a.source.cmp(&b.source));
+            // Orphan headers can use shared flags in either language.
+            for language in [Language::C, Language::Cpp] {
+                if let Some(opts) = database.shared_options(language) {
+                    commands.push(CachedIncludeSearch::new(None, &opts));
+                }
+            }
+            self.commands = Some(commands);
+        }
+        let cli: Vec<_> = overrides
+            .include_paths
+            .iter()
+            .map(|path| trace_ir::canonicalize(path))
+            .collect();
+        let mut searches = vec![CompilationIncludeSearch {
+            source: None,
+            paths: overrides
+                .include_paths
+                .iter()
+                .chain(&overrides.system_include_paths)
+                .chain(&overrides.after_include_paths)
+                .cloned()
+                .collect(),
+        }];
+        searches.extend(
+            self.commands
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|search| search.with_cli(&cli)),
+        );
+        Ok(searches)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct CompilationDatabase {
     shared_flags: Option<(PathBuf, Vec<String>)>,
@@ -30,6 +160,14 @@ struct Entry {
 
 impl CompilationDatabase {
     pub fn load(root: &Path, overrides: &PreprocessOptions) -> Result<Self, String> {
+        Self::load_inner(root, overrides, None)
+    }
+
+    fn load_inner(
+        root: &Path,
+        overrides: &PreprocessOptions,
+        mut include_searches: Option<&mut Vec<CachedIncludeSearch>>,
+    ) -> Result<Self, String> {
         let root = trace_ir::canonicalize(root);
         let directory = if root.is_file() {
             root.parent().unwrap_or(&root)
@@ -105,14 +243,14 @@ impl CompilationDatabase {
             .collect();
         let cpath = std::env::var_os("CPATH");
         let mut cpath_by_directory: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
-        for (i, entry) in entries.into_iter().enumerate() {
+        for (i, entry) in entries.iter().enumerate() {
             // Link-only records in mixed databases are handled by the target
             // reader; they do not supply a preprocessing configuration.
-            if crate::link_commands::is_link_only_entry(&entry) {
-                db.link_entries.push((i, entry));
+            if crate::link_commands::is_link_only_entry(entry) {
+                db.link_entries.push((i, entry.clone()));
                 continue;
             }
-            let entry = match serde_json::from_value::<Entry>(entry) {
+            let entry = match Entry::deserialize(entry) {
                 Ok(entry) => entry,
                 Err(e) => {
                     db.warn_entry(&path, i, e);
@@ -130,6 +268,9 @@ impl CompilationDatabase {
             }
             match entry.options(directory.clone(), &file, overrides, wants_objects) {
                 Ok((mut opts, output, args)) => {
+                    let excluded_cli = include_searches
+                        .as_ref()
+                        .map(|_| explicit_late_paths(&opts));
                     if overrides.system_includes {
                         let language = opts.language.unwrap_or_else(|| Language::from_path(&file));
                         let search = compiler_includes.for_command(
@@ -156,6 +297,14 @@ impl CompilationDatabase {
                             opts.system_include_paths = search.paths;
                             opts.compiler_defines.extend(search.target_defines);
                         }
+                    }
+                    if let (Some(searches), Some(excluded_cli)) =
+                        (include_searches.as_mut(), excluded_cli)
+                    {
+                        let mut search = CachedIncludeSearch::new(Some(file.clone()), &opts);
+                        // Keep the explicit exclusions captured before probing.
+                        search.excluded_cli = excluded_cli;
+                        searches.push(search);
                     }
                     let ordinal = db.commands.get(&file).map_or(0, Vec::len);
                     if let Some(output) = output {
@@ -683,12 +832,7 @@ impl Entry {
         }
         // A directory supplied as both -I and a later system/after directory
         // belongs in that later class, as in GCC/Clang. Keep class order.
-        let systems: std::collections::HashSet<PathBuf> = opts
-            .system_include_paths
-            .iter()
-            .chain(opts.after_include_paths.iter())
-            .cloned()
-            .collect();
+        let systems = explicit_late_paths(&opts);
         opts.include_paths.retain(|p| !systems.contains(p));
         Ok((
             ParsedCommand {
@@ -970,6 +1114,205 @@ pub(crate) fn binary_stem(arg: &str) -> &str {
 #[cfg(test)]
 mod review_tests {
     use super::*;
+
+    #[test]
+    fn candidate_searches_reuse_parsed_commands_and_recompute_search_classes() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = trace_ir::canonicalize(scratch.path());
+        for name in ["ordinary", "system", "candidate"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        let source = root.join("main.c");
+        std::fs::write(&source, "").unwrap();
+        let path = root.join("compile_commands.json");
+        std::fs::write(&path, serde_json::json!([
+            {"directory": root, "file": "main.c", "arguments": ["cc", "-Iordinary", "-isystem", "system", "-c", "main.c"]}
+        ]).to_string()).unwrap();
+        let mut searches = CompilationIncludeSearches::default();
+        let mut opts = PreprocessOptions::default();
+        let initial = searches
+            .searches(&root, &opts, std::slice::from_ref(&source))
+            .unwrap();
+        let command = initial
+            .iter()
+            .find(|search| search.source.as_ref() == Some(&source))
+            .unwrap();
+        assert_eq!(command.paths, [root.join("ordinary"), root.join("system")]);
+
+        // Later checks use parsed commands, without rereading metadata or
+        // revalidating source operands while removing conflicting roots.
+        std::fs::write(&path, "[]").unwrap();
+        std::fs::remove_file(&source).unwrap();
+        opts.include_paths = vec![root.join("system"), root.join("candidate")];
+        let updated = searches
+            .searches(&root, &opts, std::slice::from_ref(&source))
+            .unwrap();
+        let command = updated
+            .iter()
+            .find(|search| search.source.as_ref() == Some(&source))
+            .unwrap();
+        // The CLI's system directory must still move behind ordinary paths.
+        assert_eq!(
+            command.paths,
+            [
+                root.join("candidate"),
+                root.join("ordinary"),
+                root.join("system")
+            ]
+        );
+    }
+
+    #[test]
+    fn cached_candidate_searches_match_indexing_after_roots_are_removed() {
+        for shared in [false, true] {
+            let scratch = tempfile::tempdir().unwrap();
+            let root = trace_ir::canonicalize(scratch.path());
+            for name in ["first", "ordinary", "system", "after", "candidate"] {
+                std::fs::create_dir(root.join(name)).unwrap();
+            }
+            let sources = [root.join("a.c"), root.join("z.cpp")];
+            for source in &sources {
+                std::fs::write(source, "").unwrap();
+            }
+            let flags = [
+                "-Ifirst",
+                "-Iordinary",
+                "-Isystem",
+                "-isystem",
+                "system",
+                "-idirafter",
+                "after",
+            ];
+            if shared {
+                std::fs::write(root.join("compile_flags.txt"), flags.join("\n")).unwrap();
+            } else {
+                // Deliberately reverse source order in the metadata.
+                let entries: Vec<_> = sources.iter().rev().map(|source| {
+                    let arguments: Vec<_> = ["cc"].into_iter().chain(flags).chain(["-c", source.to_str().unwrap()]).collect();
+                    serde_json::json!({"directory": root, "file": source, "arguments": arguments})
+                }).collect();
+                std::fs::write(
+                    root.join("compile_commands.json"),
+                    serde_json::to_string(&entries).unwrap(),
+                )
+                .unwrap();
+            }
+            let mut cached = CompilationIncludeSearches::default();
+            // A candidate duplicating a command -I path initially moves it
+            // ahead of first; removing it must restore the command's order.
+            for cli in [
+                vec!["ordinary", "system", "after", "candidate"],
+                vec!["system", "after", "candidate"],
+                vec!["candidate"],
+                vec![],
+            ] {
+                let opts = PreprocessOptions {
+                    include_paths: cli.iter().map(|name| root.join(name)).collect(),
+                    ..PreprocessOptions::default()
+                };
+                let searches = cached.searches(&root, &opts, &sources).unwrap();
+                let mut database = CompilationDatabase::load(&root, &opts).unwrap();
+                database.configure_discovered(&sources, &[], &opts);
+                let expected: Vec<_> = database
+                    .commands
+                    .iter()
+                    .flat_map(|(source, configs)| {
+                        configs.iter().map(|config| {
+                            (
+                                source.clone(),
+                                config
+                                    .include_paths
+                                    .iter()
+                                    .chain(&config.system_include_paths)
+                                    .chain(&config.after_include_paths)
+                                    .cloned()
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                    })
+                    .collect();
+                let actual: Vec<_> = searches
+                    .iter()
+                    .filter_map(|search| {
+                        search
+                            .source
+                            .as_ref()
+                            .map(|source| (source.clone(), search.paths.clone()))
+                    })
+                    .collect();
+                assert_eq!(actual, expected, "shared={shared}, cli={cli:?}");
+                if shared {
+                    let search = searches.last().unwrap();
+                    assert!(search.source.is_none());
+                    assert_eq!(search.paths, expected[0].1);
+                }
+            }
+            if shared {
+                // Shared flags receive the same parsed-metadata lifetime.
+                std::fs::write(root.join("compile_flags.txt"), "-Ireplacement").unwrap();
+                let searches = cached
+                    .searches(&root, &PreprocessOptions::default(), &sources)
+                    .unwrap();
+                assert_eq!(
+                    searches[1].paths,
+                    [
+                        root.join("first"),
+                        root.join("ordinary"),
+                        root.join("system"),
+                        root.join("after")
+                    ]
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_searches_preserve_cli_overrides_of_compiler_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let root = trace_ir::canonicalize(scratch.path());
+        for name in ["first", "probed", "explicit", "after", "candidate"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        let source = root.join("main.c");
+        std::fs::write(&source, "").unwrap();
+        let driver = root.join("compiler");
+        std::fs::write(&driver, format!(
+            "#!/bin/sh\nprintf '#include <...> search starts here:\\n {}\\n {}\\nEnd of search list.\\n' >&2\n",
+            root.join("explicit").display(), root.join("probed").display(),
+        )).unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(root.join("compile_commands.json"), serde_json::json!([
+            {"directory": root, "file": source, "arguments": [driver, "-Ifirst", "-Iprobed", "-Iexplicit", "-isystem", "explicit", "-idirafter", "after", "-c", "main.c"]}
+        ]).to_string()).unwrap();
+        let mut cached = CompilationIncludeSearches::default();
+        for cli in [vec!["probed", "explicit", "after", "candidate"], vec![]] {
+            let opts = PreprocessOptions {
+                system_includes: true,
+                include_paths: cli.iter().map(|name| root.join(name)).collect(),
+                ..PreprocessOptions::default()
+            };
+            let searches = cached
+                .searches(&root, &opts, std::slice::from_ref(&source))
+                .unwrap();
+            let database = CompilationDatabase::load(&root, &opts).unwrap();
+            let config = &database.commands[&source][0];
+            let expected: Vec<_> = config
+                .include_paths
+                .iter()
+                .chain(&config.system_include_paths)
+                .chain(&config.after_include_paths)
+                .cloned()
+                .collect();
+            assert_eq!(searches[1].paths, expected, "cli={cli:?}");
+            assert_eq!(
+                searches[1].paths[0],
+                root.join(if cli.is_empty() { "first" } else { "probed" })
+            );
+        }
+    }
 
     fn options(args: &[&str]) -> Result<PreprocessOptions, String> {
         let dir = tempfile::tempdir().unwrap();

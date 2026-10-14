@@ -20,6 +20,7 @@ mod node_metadata;
 mod parse;
 mod template_bases;
 
+pub use compile_commands::{CompilationIncludeSearch, CompilationIncludeSearches};
 pub use deps::*;
 pub use explore::*;
 pub use gn_defines::{Candidate, Confidence};

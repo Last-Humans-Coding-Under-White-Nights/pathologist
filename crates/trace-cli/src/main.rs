@@ -13,6 +13,7 @@ use trace_parse::build_program_for_analysis_with_jobs;
 use trace_preproc::PreprocessOptions;
 
 mod build_info;
+mod missing_headers;
 
 #[cfg(test)]
 #[path = "../build_support.rs"]
@@ -41,6 +42,9 @@ enum Commands {
         /// Add include search path (repeatable).
         #[arg(long = "include")]
         includes: Vec<PathBuf>,
+        /// Apply proposed include roots and repeat indexing until no new root is found.
+        #[arg(long)]
+        apply_include_candidates: bool,
         /// Define preprocessor macro NAME or NAME=VALUE (repeatable).
         #[arg(short = 'D')]
         defines: Vec<String>,
@@ -51,7 +55,8 @@ enum Commands {
         /// Reject headers and build metadata consumed from outside the target tree.
         #[arg(long)]
         require_local_inputs: bool,
-        /// Query the compiler for effective system header search paths.
+        /// Query compilation-command compilers for system header paths;
+        /// without commands, uses host GCC/Clang (must match the target SDK).
         #[arg(long)]
         system_includes: bool,
         /// Link commands database path (default: auto-discovery).
@@ -339,6 +344,7 @@ fn main() -> Result<()> {
             target,
             output,
             includes,
+            apply_include_candidates,
             defines,
             compile_commands,
             require_local_inputs,
@@ -363,6 +369,7 @@ fn main() -> Result<()> {
             target,
             output,
             includes,
+            apply_include_candidates,
             defines,
             compile_commands,
             require_local_inputs,
@@ -405,6 +412,7 @@ fn run_analyze(
     target: PathBuf,
     output: PathBuf,
     includes: Vec<PathBuf>,
+    apply_include_candidates: bool,
     defines: Vec<String>,
     compile_commands: Option<PathBuf>,
     require_local_inputs: bool,
@@ -575,17 +583,47 @@ fn run_analyze(
         }
     }
 
-    let t0 = Instant::now();
-    let mut program = build_program_for_analysis_with_jobs(&target, &opts, jobs)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    if let Some(boundary) = input_boundary {
-        if let Some(path) = boundary.external_paths().first() {
-            bail!(
-                "external analysis input cannot be verified under --require-local-inputs: {}",
-                path.display()
-            );
+    let check_input_boundary = || -> anyhow::Result<()> {
+        if let Some(boundary) = &input_boundary {
+            if let Some(path) = boundary.external_paths().first() {
+                bail!(
+                    "external analysis input cannot be verified under --require-local-inputs: {}",
+                    path.display()
+                );
+            }
         }
-    }
+        Ok(())
+    };
+    let t0 = Instant::now();
+    let mut include_candidates = missing_headers::IncludeCandidates::default();
+    let mut pass = 0;
+    let mut program = loop {
+        let program = build_program_for_analysis_with_jobs(&target, &opts, jobs)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        check_input_boundary()?;
+        if !apply_include_candidates {
+            break program;
+        }
+        let (candidates, diagnostics) = include_candidates
+            .additional_roots(&program, &opts)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        // Conflict checks can read compilation metadata as well.
+        check_input_boundary()?;
+        eprint!("{diagnostics}");
+        if candidates.is_empty() {
+            break program;
+        }
+        pass += 1;
+        eprintln!(
+            "include-candidates: applying {} candidate include root(s) (pass {pass})",
+            candidates.len()
+        );
+        for root in &candidates {
+            eprintln!("  {}", root.display());
+        }
+        opts.include_paths.extend(candidates);
+        // The previous index drops before rebuilding large source trees.
+    };
     eprintln!(
         "index: {:.1}s ({} files, {} functions, {} flow)",
         t0.elapsed().as_secs_f64(),
@@ -593,6 +631,7 @@ fn run_analyze(
         program.symbols.functions.len(),
         program.flow.len(),
     );
+    eprint!("{}", missing_headers::summary(&program, system_includes));
 
     let t1 = Instant::now();
     let (pag, analysis) = analyze_with_options(
