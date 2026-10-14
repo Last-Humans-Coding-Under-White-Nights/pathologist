@@ -12529,3 +12529,136 @@ Logs: `/tmp/trace-column-ownership-workspace.log`,
 `/tmp/trace-column-ownership-clippy.log`, `/tmp/trace-column-ownership-before-build.log`,
 `/tmp/trace-column-ownership-release.log`. Dev/test debug and incremental overrides
 limit artifact storage; release settings are unchanged.
+
+## Inspect diagnostics — 2026-10-14
+
+### Setup and reproduction
+
+The new `trace inspect <DB> diagnostics` command was evaluated on fresh minimal
+exports of the three clean, pinned corpora. CLI identity:
+`trace 0.1.0 (f9ac344-dirty 2026-10-14)` (the diagnostics changes on top of
+`f9ac344`); Linux 6.6.87.2-microsoft-standard-WSL2, x86_64. No analysis semantics
+or expected corpus counts changed.
+
+| Corpus | Revision |
+|---|---|
+| drivers_hdf_core | `cdc75a20bb8f1a046cd22e189405a20d602d0521` |
+| hiviewdfx_hiview | `92408e2072bd6dc8fb0d980773e80b6ec898710c` |
+| multimedia_camera_framework | `8ffd69dcd47f533e70b4dba428439da9008b0cae` |
+
+```bash
+cargo build -p trace-cli --release
+python3 scripts/fetch_corpora.py
+python3 scripts/eval_check.py --outdir /tmp/trace-diagnostics-eval
+python3 scripts/eval_diagnostics.py \
+  /tmp/trace-diagnostics-eval/eval_check_hdf.db \
+  /tmp/trace-diagnostics-eval/eval_check_hiview.db \
+  /tmp/trace-diagnostics-eval/eval_check_camera.db \
+  > /tmp/trace-diagnostics-report.json
+```
+
+`eval_check.py` uses eight indexing jobs and the solver budget pinned in
+`scripts/eval_expected.json`. The standalone trees have neither root nor
+`build/compile_commands.json`; these runs supply no additional dependency
+roots, compiler definitions, or system includes. This matters when interpreting
+missing-header and configuration diagnostics.
+
+The new evaluator opens databases read-only, compares every returned field and
+row order against SQLite, and exercises all rows, every observed stage, all
+three severities, the busiest located file, combined filters, and an empty
+result. Each case runs five times in both text and JSON; stdout and stderr
+must repeat exactly. All **310 invocations** passed (HDF 110, HiView 100,
+Camera 100). The existing production evaluation passed **104 checks, zero
+failures**; expectations were not re-captured.
+
+### Results by corpus
+
+| Corpus | Preprocess warnings / errors | Parse warnings | Link-command warnings | IDL warnings | Total | No structured source path |
+|---|---:|---:|---:|---:|---:|---:|
+| HDF | 1,632 / 1 | 23 | 223 | 38 | 1,917 | 284 |
+| HiView | 2,908 / 0 | 78 | 587 | 0 | 3,573 | 665 |
+| Camera | 4,395 / 0 | 212 | 439 | 0 | 5,046 | 651 |
+
+These are diagnostic **rows**, not unique failed files or lost call edges.
+Repeated parse warnings can name the same file from different indexing contexts.
+All three solves converged; none produced an `analyze`-stage budget warning.
+The CLI integration tests separately cover a diagnostic with no file, and both
+schema v7 and v8.
+
+Full-list latency in milliseconds, median (minimum–maximum), five subprocesses
+including CLI startup and captured output:
+
+| Corpus | Text | JSON |
+|---|---:|---:|
+| HDF | 11.129 (9.142–13.129) | 10.016 (8.115–11.075) |
+| HiView | 16.888 (15.586–23.122) | 15.346 (13.930–16.041) |
+| Camera | 19.987 (16.304–24.668) | 19.268 (15.613–20.973) |
+
+These are local inspection measurements, not analysis benchmarks or a claimed
+speedup. Filesystem caches were not flushed. The JSON report records timings
+and returned row counts for every filter case.
+
+### Problem files and root causes
+
+Paths below are relative to each corpus root. Counts refer to this run.
+
+| Corpus and file | Evidence | Cause and next action |
+|---|---|---|
+| HDF `framework/model/audio/usb/src/audio_usb_dma_ops.c` | 15 located warnings; lines 10–19 include `linux/device.h`, `linux/dma-mapping.h`, `linux/of.h`, and other unavailable kernel headers. | The standalone checkout lacks the target kernel header environment. Supply the matching build include paths and dependency roots; host C library include discovery alone does not provide internal kernel headers. |
+| HDF `adapter/khdf/linux/platform/mipi_dsi/mipi_tx_dev.c` | 14 located diagnostics; second busiest located file. | Another Linux integration file to prioritize when supplying kernel dependencies. Its count is a triage signal, not a measured number of missing edges. |
+| HiView `plugins/faultlogger/test/common/unittest/faultlogger_unittest.cpp` | 25 located warnings; lines 15–27 request standard C/C++ headers. Across HiView, missing `string` occurs 429 times, `memory` 189, `vector` 174. | Default bare-tree analysis has no compiler system include discovery. Supply matching compilation metadata or use `--system-includes` for the intended compiler, plus explicit external/test dependencies. This report does not claim that host headers reproduce the target SDK. |
+| HiView `base/utility/file_util.cpp` | 18 located diagnostics. | A production-file priority after fixing the shared include environment; avoid interpreting the test file's leading rank as proof the problem is confined to tests. |
+| Camera `services/camera_service/src/hstream_operator.cpp` | 38 located warnings; lines 18–27 request `algorithm`, `atomic`, `cstdint`, `memory`, and other standard headers. | Missing compiler/SDK include environment, as above. `hcapture_session.cpp` has 36 and `hcamera_device.cpp` 27 located diagnostics. |
+| HDF `framework/core/common/include/host/hdf_device_section.h:31` | The only error-severity row: `#error "No support section begin and section end!"`. | Lines 18–31 select GNU/Clang or IAR section support via `__GNUC__`, `__clang__`, or `__ICCARM__`. None is present in this bare-tree run. A scratch TU including this exact header reproduces the error; adding `-D __GNUC__=1` removes it. This establishes the configuration cause, not a recommendation to invent compiler identity for every project. Use the actual target build definitions. |
+| HDF `framework/tools/hdf_dbg/BUILD.gn:7` | `link_commands` reports an unresolved import and unscoped ownership. | The import is `//build/ohos.gni`, absent from this standalone checkout. All three corpus roots lack that path. A complete build tree or explicit link metadata is needed for trustworthy ownership; this does not establish that every GN warning has the same cause (some report unsupported blocks). |
+| HDF `framework/tools/hdi-gen/test/unittest/09_enum_nesting_idl/foo/v1_0/IFoo.idl:21` | IDL warning `expected an identifier` at `Ping([in] String sendMsg, ...)`. | `idl.rs::Parser::method` reads a return type followed by a method name; this HDI fixture omits a return type. `Ping` is consumed as the type, then `(` fails the name expectation. HDI dialect support needs a separate design/fix; suppressing the diagnostic would conceal a synthesis gap. Later `struct FooInfo` parameters need separate handling too. |
+| Camera `frameworks/cj/camera/include/camera_ffi.h:39` | Parse reporter flags `FFI_EXPORT int64_t ...`; lines 27–28 include external FFI headers. | An unavailable export macro disrupts the declaration grammar. A minimal `extern "C" { FFI_EXPORT int callback(); }` produces a parse warning; `-D FFI_EXPORT=` removes it. Restore the real FFI header/macro for production; the empty definition is only a diagnostic control. |
+| Camera `dynamic_libs/media_manager/include/media_manager/mpeg_manager_factory.h:26` | Parse reporter flags a missing semicolon at `DECLARE_SINGLETON(MpegManagerFactory)`; `singleton.h` is included at line 20. | Unexpanded function-like declaration macro. A reduced class with the same macro reproduces the warning; prepending `#define DECLARE_SINGLETON(x)` removes it. This source-level control does not model the actual singleton members. |
+| Camera `dynamic_libs/moving_photo/src/moving_photo_adapter.cpp:369` (also 374, 379, 384, 389) | Parse reporter flags `__attribute__((visibility("default"))) extern "C" ...`. | A minimal function with this order reproduces the parser warning even without external headers. Moving `extern "C"` before the attribute clears it. This isolates a parse-input/grammar limitation from missing dependencies; it does not justify rewriting the source tree or prove what every target compiler accepts. |
+
+Representative commands used for triage:
+
+```bash
+target/release/trace inspect /tmp/trace-diagnostics-eval/eval_check_hdf.db \
+  diagnostics --severity error
+target/release/trace inspect /tmp/trace-diagnostics-eval/eval_check_camera.db \
+  diagnostics --file hstream_operator.cpp --format json
+target/release/trace inspect /tmp/trace-diagnostics-eval/eval_check_camera.db \
+  diagnostics --stage parse --format json
+cargo run -p trace-cli --release --example parse_failures -- \
+  /home/sergei/multimedia_camera_framework \
+  --from-db /tmp/trace-diagnostics-eval/eval_check_camera.db
+```
+
+The parse reporter re-preprocesses files independently with its default options;
+its error-node positions refer to that parse input, not original source lines.
+Original line numbers in the table were checked in the pinned source files.
+The small controls above establish individual causes; they do not quantify
+whole-corpus accuracy after configuring a complete SDK. No corpus files were
+modified.
+
+### Diagnostic attribution gap and follow-up priorities
+
+`lower_prepared_source` currently emits parse warnings with `file: None`,
+`line: 0`, and a filename inside the message. IDL and GN warnings also lack a
+structured file in these exports. Consequently, `--file` excludes those rows,
+and the evaluator's file ranking covers only located diagnostics. Use
+`--stage parse`, `--stage idl`, or `--stage link_commands` to see them. The new
+query deliberately preserves stored data rather than guessing paths by
+parsing messages. Future attribution improvements should happen at diagnostic
+creation, preserving original source mapping and merge identity.
+
+Priority follow-ups: attach structured source locations to parse/IDL/GN
+warnings; configure real build/SDK dependencies before interpreting missing
+header counts; independently address the HDI method dialect and attributed
+`extern "C"` parsing. These remain findings, not fixes in this change.
+
+Artifacts from this run (not committed): `/tmp/trace-diagnostics-report.json`,
+`/tmp/trace-diagnostics-eval.log`, `/tmp/trace-diagnostics-camera-parse.tsv`,
+and the three databases under `/tmp/trace-diagnostics-eval/`. Reproduction is
+provided by the commands and committed evaluator above; no database is added
+to the repository.
+
+Validation: `cargo test --workspace` passed 2221 tests (0 ignored);
+`cargo fmt --all -- --check` and `git diff --check` passed. Workspace test
+log: `/tmp/trace-diagnostics-workspace.log`.

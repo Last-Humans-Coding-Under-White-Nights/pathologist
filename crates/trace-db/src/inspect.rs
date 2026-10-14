@@ -14,6 +14,45 @@ mod slice;
 pub use editor::*;
 pub use slice::*;
 
+/// A stored analysis diagnostic, with its original source path when available.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiagnosticRow {
+    pub severity: String,
+    pub file: Option<String>,
+    pub line: i64,
+    pub message: String,
+    pub stage: String,
+}
+
+/// Read diagnostics in export order. Stage and severity are exact matches;
+/// file is a literal path substring. Unlocated diagnostics survive unless a
+/// file filter is supplied.
+pub fn diagnostics(
+    conn: &Connection,
+    stage: Option<&str>,
+    severity: Option<&str>,
+    file: Option<&str>,
+) -> Result<Vec<DiagnosticRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.severity, f.path, d.line, d.message, d.stage
+         FROM diagnostics d LEFT JOIN files f ON f.id = d.file_id
+         WHERE (?1 IS NULL OR d.stage = ?1)
+           AND (?2 IS NULL OR d.severity = ?2)
+           AND (?3 IS NULL OR instr(f.path, ?3) > 0)
+         ORDER BY d.id",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![stage, severity, file], |row| {
+        Ok(DiagnosticRow {
+            severity: row.get(0)?,
+            file: row.get(1)?,
+            line: row.get(2)?,
+            message: row.get(3)?,
+            stage: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// Forward: callees (call graph) / where a value flows to (dataflow).

@@ -21,6 +21,7 @@ rusqlite.workspace = true
 rustc-hash.workspace = true
 walkdir.workspace = true
 tree-sitter.workspace = true
+serde_json.workspace = true
 
 [features]
 mimalloc = ["dep:mimalloc"]
@@ -36,5 +37,4 @@ path = "examples/conditional_coverage.rs"
 test = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
