@@ -524,25 +524,115 @@ fn build_program_inner(
     let mut headers = normalize_discovered_paths(headers);
     headers.retain(|p| !under_dep(p));
     database.configure_discovered(&files, &headers, opts);
+    // Commands may name translation units that discovery classifies as
+    // headers (for example, -x c-header). Include them before selecting the
+    // fallback's languages, as configured indexing does below.
+    files.extend(database.commands.keys().cloned());
+    files.sort();
+    files.dedup();
     // Sources without a database entry and orphan project headers use the
     // shared fallback configuration and need compiler default headers.
-    let needs_fallback = files
+    let needs_source_fallback = files
         .iter()
-        .any(|file| !under_dep(file) && !database.commands.contains_key(file))
-        || headers.iter().any(|header| !under_dep(header));
-    let needs_project_probe = opts.system_includes && (database.path.is_none() || needs_fallback);
+        .any(|file| !under_dep(file) && !database.commands.contains_key(file));
+    // Macro-only fallback discovery can wait until configured indexing knows
+    // which headers no command consumed. Include roots must be classified
+    // before any source symbols are interned.
+    let needs_fallback = needs_source_fallback
+        || ((opts.system_includes || database.commands.is_empty()) && !headers.is_empty());
+    let needs_project_probe = (opts.system_includes || opts.compiler_predefines)
+        && (database.path.is_none() || needs_fallback);
+    let mut project_compiler_warnings = Vec::new();
     let project_compiler_paths = if needs_project_probe {
         let directory = if root.is_file() {
             root.parent().unwrap_or(root)
         } else {
             root
         };
-        crate::compiler_includes::CompilerIncludes::default().for_project(
-            &trace_ir::canonicalize(directory),
-            database
-                .shared_system_paths()
-                .unwrap_or(&opts.system_include_paths),
-        )
+        let directory = trace_ir::canonicalize(directory);
+        let system_paths = database
+            .shared_system_paths()
+            .unwrap_or(&opts.system_include_paths)
+            .to_vec();
+        let mut probe = crate::compiler_includes::CompilerIncludes::default();
+        if opts.compiler_predefines || opts.compiler.is_some() {
+            // Probe only languages that project units/headers can use, so a
+            // C++-only fallback with -std=c++20 does not warn about unused C.
+            let mut languages = Vec::new();
+            for file in &files {
+                if let Some(configs) = database.commands.get(file) {
+                    // Shared flags have no driver and still use the fallback.
+                    if database.uses_shared_flags() {
+                        languages.extend(
+                            configs
+                                .iter()
+                                .map(|c| c.language.unwrap_or_else(|| Language::from_path(file))),
+                        );
+                    }
+                } else {
+                    languages.push(opts.language.unwrap_or_else(|| Language::from_path(file)));
+                }
+            }
+            let no_c_units = files.iter().all(|file| {
+                database.commands.get(file).map_or_else(
+                    || opts.language.unwrap_or_else(|| Language::from_path(file)) != Language::C,
+                    |configs| {
+                        configs.iter().all(|config| {
+                            config.language.unwrap_or_else(|| Language::from_path(file))
+                                != Language::C
+                        })
+                    },
+                )
+            });
+            let mut header_languages = Vec::new();
+            for header in headers.iter().chain(synthesized.headers.keys()) {
+                // Match configured orphan-header indexing: shared -x flags
+                // override this inferred language only when validation succeeds.
+                let inferred_language = opts.language.unwrap_or_else(|| {
+                    if no_c_units {
+                        Language::Cpp
+                    } else {
+                        Language::from_path(header)
+                    }
+                });
+                if header_languages.contains(&inferred_language) {
+                    continue;
+                }
+                header_languages.push(inferred_language);
+                let language = database
+                    .shared_options(inferred_language)
+                    .and_then(|config| config.language)
+                    .unwrap_or(inferred_language);
+                languages.push(language);
+            }
+            let shared_args = [Language::C, Language::Cpp].map(|language| {
+                if languages.contains(&language) {
+                    database.shared_probe_args(language).to_vec()
+                } else {
+                    Vec::new()
+                }
+            });
+            let system_paths = [Language::C, Language::Cpp].map(|language| {
+                if languages.contains(&language) {
+                    database
+                        .shared_options(language)
+                        .map(|config| config.system_include_paths)
+                        .unwrap_or_else(|| opts.system_include_paths.clone())
+                } else {
+                    Vec::new()
+                }
+            });
+            Some(probe.for_fallback(
+                &directory,
+                opts,
+                &system_paths,
+                &shared_args,
+                &languages,
+                &mut project_compiler_warnings,
+            ))
+        } else {
+            probe.for_project(&directory, &system_paths)
+        }
     } else {
         None
     };
@@ -580,9 +670,6 @@ fn build_program_inner(
         }
     }
     program.symbols.set_dep_roots(classification_roots.clone());
-    files.extend(database.commands.keys().cloned());
-    files.sort();
-    files.dedup();
     add_warnings(&mut program, "compile_commands", &database.warnings);
     let dep_headers =
         normalize_discovered_paths(dep_discovered.into_iter().flat_map(|d| d.headers).collect());
@@ -655,9 +742,18 @@ fn build_program_inner(
             database,
             links,
             project_compiler_paths,
+            project_compiler_warnings,
             retain_merge_state,
         );
     }
+    add_warnings(
+        &mut program,
+        "compile_commands",
+        &project_compiler_warnings
+            .into_iter()
+            .map(|(_, warning)| warning)
+            .collect::<Vec<_>>(),
+    );
     index_progress(format!(
         "include-graph: {} files, {} include edges",
         include_graph.project_files.len(),
@@ -685,11 +781,6 @@ fn build_program_inner(
     } else {
         None
     };
-    let base_defines: BTreeMap<String, String> = opts
-        .defines
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
 
     // Warm each header under a FRESH macro environment seeded only from the
     // command-line defines. Sharing one accumulating table across headers let
@@ -921,6 +1012,10 @@ fn build_program_inner(
                 with_project_system_paths(o, l, project_compiler_paths.as_ref()),
             )
         })
+        .collect();
+    let base_defines: HashMap<_, _> = index_opts
+        .iter()
+        .map(|(language, opts)| (*language, configured::effective_defines(opts)))
         .collect();
     let discover_opts: HashMap<Language, PreprocessOptions> = [Language::C, Language::Cpp]
         .into_iter()
@@ -1357,7 +1452,7 @@ fn build_program_inner(
                     Some(&header_ir),
                     &header_order,
                     gn_candidates.as_ref(),
-                    &base_defines,
+                    &base_defines[&lang],
                     opts.explore_budget,
                 );
                 source_cache.evict(path, &include_graph);
@@ -1406,7 +1501,7 @@ fn build_program_inner(
                         Some(&header_ir),
                         &header_order,
                         gn_candidates.as_ref(),
-                        &base_defines,
+                        &base_defines[&lang],
                         opts.explore_budget,
                     );
                     // Header provenance and PCH construction are complete.
@@ -2361,12 +2456,10 @@ fn with_project_system_paths(
         let searched = if language == Language::C { c } else { cpp };
         if !searched.paths.is_empty() {
             opts.system_include_paths.clone_from(&searched.paths);
-            for (name, value) in &searched.target_defines {
-                opts.compiler_defines
-                    .entry(name.clone())
-                    .or_insert_with(|| value.clone());
-            }
         }
+        opts.compiler_defines
+            .extend(searched.target_defines.iter().cloned());
+        crate::compiler_includes::apply_fallback_standard(&mut opts, language);
     }
     opts
 }

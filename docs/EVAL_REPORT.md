@@ -101,6 +101,76 @@ python3 scripts/eval_check.py --corpus-base /home/sergei \
   --outdir /tmp/trace-call-sites-eval
 ```
 
+## Opt-in target compiler predefines: #230 — 2026-10-14
+
+Rules, exact allowlist, precedence and supported probe configurations live in
+[Compiler predefined macros](PREPROCESSOR.md#compiler-predefined-macros-230).
+The existing default expectations in `scripts/eval_expected.json` are unchanged.
+All three checkouts were verified clean at their pinned revisions:
+
+| Corpus | Revision | Compiler-context evidence |
+|---|---|---|
+| HDF | `cdc75a20bb8f1a046cd22e189405a20d602d0521` | GNU/Clang versus IAR section selection; MinGW and architecture conditions |
+| HiView | `92408e2072bd6dc8fb0d980773e80b6ec898710c` | GNU/MSVC selection in `base/include/defines.h`; Windows, architecture and system-header endianness conditions |
+| Camera | `8ffd69dcd47f533e70b4dba428439da9008b0cae` | AArch64/x86-64 conditions |
+
+Release binaries were rebuilt with `cargo build -p trace-cli --release`.
+The flag-disabled baseline passed all **104 checks** with:
+
+```sh
+python3 scripts/eval_check.py --corpus-base /tmp/trace-issue229-corpora \
+  --outdir /tmp/trace-230-baseline
+```
+
+Opt-in runs used the same release binary, minimal export, eight jobs and
+`TRACE_SOLVE_BUDGET_POPS=800000`, explicitly selecting `/usr/bin/clang`
+(Apple Clang 17.0.0, clang-1700.6.3.2) and each of `aarch64-linux-gnu` and
+`x86_64-linux-gnu`. No compilation database was present. System include
+discovery remained disabled to isolate macro changes from installed headers:
+
+```sh
+TRACE_SOLVE_BUDGET_POPS=800000 target/release/trace analyze "$CORPUS" \
+  --jobs 8 --compiler-predefines --compiler /usr/bin/clang \
+  --compiler-arg=--target=aarch64-linux-gnu -o /tmp/optin.db
+# Repeat with --compiler-arg=--target=x86_64-linux-gnu for each corpus.
+```
+
+| Corpus / configuration | Defined functions | Call edges | Argument-flow edges | Diagnostics |
+|---|---:|---:|---:|---:|
+| HDF / baseline | 10,294 | 77,514 | 71,758 | 1,917 |
+| HDF / either target | 10,294 | 77,514 | 71,758 | 1,916 |
+| HiView / baseline | 7,993 | 36,518 | 27,204 | 3,573 |
+| HiView / AArch64 | 7,994 | 36,519 | 27,206 | 3,573 |
+| HiView / x86-64 | 7,993 | 36,518 | 27,204 | 3,573 |
+| Camera / baseline or either target | 19,806 | 115,645 | 57,543 | 5,046 |
+
+HDF's `framework/core/common/include/host/hdf_device_section.h:31`
+`No support section begin and section end!` error goes from one exported
+diagnostic to zero with either target. Its GNU/Clang section branch is now
+selected. A fixture independently reproduces the absent-identity failure and
+checks GNU, Clang and manually configured `__ICCARM__` branches.
+HiView's AArch64-only
+`FaultLogBundleUtilUnittest_GetDfxBundleInfo001_Test::TestBody` at
+`plugins/faultlogger/service/bdfr_base/test/unittest/faultlog_bundle_util_unittest.cpp:71`
+is included, accounting for the extra defined function, direct edge and two
+argument-flow edges. The x86-64 run excludes it, as the baseline does.
+File totals (HDF 1,483; HiView 1,452; Camera 1,703), indirect/IPC/dlsym edge
+counts and parse diagnostic counts are unchanged for both targets. No compiler
+configuration warning was emitted in these explicit configurations.
+
+The macro fixture was also exported with the rebuilt CLI under an explicit
+AArch64 compiler configuration, with both C and C++ translation units. All
+26 exported analysis tables were identical with one and four indexing jobs
+(`analysis_run` metadata excluded). `cargo test --workspace` passed 2,234 tests,
+including all four discovery-mode combinations and fake-driver failures.
+
+Measured opt-in wall times in one run were HDF 5.29/6.07 s, HiView 2.08/2.43 s,
+and Camera 12.65/9.80 s (AArch64/x86-64). These are single runs, not a performance
+comparison. The intentional opt-in changes
+above are recorded separately from the baseline expectations. This does not
+supply the corpora's missing SDK/generated headers, build definitions, or
+HiView's header-defined `__BYTE_ORDER`/`__LITTLE_ENDIAN`/`__BIG_ENDIAN` spellings.
+
 ## Analyze-phase memory after #221: #225 — 2026-10-12
 
 `ability_ability_runtime` at `6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`,

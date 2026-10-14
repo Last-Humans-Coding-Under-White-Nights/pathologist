@@ -847,6 +847,61 @@ mod tests {
     }
 
     #[test]
+    fn launcher_separators_preserve_link_inputs_and_driver_option_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        for (command, output, inputs, libraries) in [
+            (
+                vec!["gcc", "main.o", "-o", "app", "-Llib", "-lhelper"],
+                "app",
+                vec!["main.o"],
+                vec!["helper"],
+            ),
+            (
+                vec!["LINK.EXE", "/OUT:app.exe", "main.obj", "/IMPLIB:app.lib"],
+                "app.exe",
+                vec!["main.obj"],
+                vec![],
+            ),
+            (
+                vec!["ar", "rcs", "libapp.a", "main.o"],
+                "libapp.a",
+                vec!["main.o"],
+                vec![],
+            ),
+        ] {
+            for prefix in [
+                vec![],
+                vec!["ccache", "--"],
+                vec!["ccache", "--", "sccache", "--"],
+            ] {
+                let args: Vec<String> = prefix
+                    .into_iter()
+                    .chain(command.iter().copied())
+                    .map(str::to_owned)
+                    .collect();
+                let detected_output =
+                    command_output(&args).map(|path| resolve_against(dir.path(), Path::new(path)));
+                let link = parse_link(dir.path(), &args, detected_output)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(link.output, dir.path().join(output), "{args:?}");
+                assert_eq!(
+                    link.inputs,
+                    inputs
+                        .iter()
+                        .map(|path| dir.path().join(path))
+                        .collect::<Vec<_>>(),
+                    "{args:?}"
+                );
+                assert_eq!(link.libraries, libraries, "{args:?}");
+                if command[0] == "gcc" {
+                    assert_eq!(link.search, [dir.path().join("lib")], "{args:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn review_library_search_stops_at_first_directory() {
         let dir = tempfile::tempdir().unwrap();
         for first in ["libfoo.a", "libfoo.so.1"] {

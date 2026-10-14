@@ -5,6 +5,94 @@ use serde_json::json;
 use trace_parse::build_program_with_jobs;
 use trace_preproc::PreprocessOptions;
 
+#[cfg(unix)]
+#[test]
+fn missing_macro_context_preserves_host_include_discovery_without_host_macros() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("project");
+    let bin = scratch.path().join("bin");
+    let system = scratch.path().join("system");
+    for dir in [&root, &bin, &system] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    std::fs::write(system.join("probe.h"), "void system_header(void) {}\n").unwrap();
+    std::fs::write(
+        root.join("main.c"),
+        r#"
+#include <probe.h>
+#if defined(__GNUC__) || defined(__x86_64__)
+#error implicit host compiler must not supply macros
+#endif
+void entry(void) { system_header(); }
+"#,
+    )
+    .unwrap();
+    let gcc = bin.join("gcc");
+    std::fs::write(&gcc, format!(
+        "#!/bin/sh\nprintf '#define __GNUC__ 13\\n#define __x86_64__ 1\\n'\nprintf '#include <...> search starts here:\\n {}\\nEnd of search list.\\n' >&2\n", system.display())).unwrap();
+    std::fs::set_permissions(&gcc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for mode in ["bare", "shared", "partial"] {
+        if mode == "shared" {
+            std::fs::write(root.join("compile_flags.txt"), "-DVALUE=1\n").unwrap();
+        }
+        if mode == "partial" {
+            std::fs::write(root.join("configured.c"), "void configured(void) {}\n").unwrap();
+            std::fs::write(root.join("compile_commands.json"), json!([{
+                "directory": root, "file": "configured.c", "arguments": [gcc, "-c", "configured.c"]
+            }]).to_string()).unwrap();
+        }
+        let output = scratch.path().join(format!("{mode}.db"));
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_trace"))
+            .arg("analyze")
+            .arg(&root)
+            .args([
+                "--system-includes",
+                "--compiler-predefines",
+                "--jobs",
+                "1",
+                "-o",
+            ])
+            .arg(&output)
+            .env("PATH", &bin)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let conn = rusqlite::Connection::open(output).unwrap();
+        let missing: i64 = conn.query_row(
+            "SELECT count(*) FROM diagnostics WHERE message LIKE '%include file not found%' OR message LIKE '%must not supply macros%'", [], |row| row.get(0)).unwrap();
+        assert_eq!(missing, 0, "{mode}");
+        let warnings: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM diagnostics WHERE message LIKE '%no compiler context%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(warnings, 1, "{mode}");
+        let dependency: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM files WHERE path LIKE '%/probe.h' AND is_dep=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dependency, 1, "{mode}");
+        let definitions: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM functions WHERE name='system_header' AND is_defined=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(definitions, 0, "{mode}");
+    }
+}
+
 #[test]
 fn local_input_guard_rejects_external_headers_in_all_compilation_modes() {
     let scratch = tempfile::tempdir().unwrap();
@@ -833,6 +921,7 @@ namespace Launcher { void selected() {} }
             "file": "main.c",
             "arguments": [
                 "ccache",
+                "--",
                 "clang",
                 "-Xclang",
                 "-fcolor-diagnostics",
@@ -1692,5 +1781,78 @@ fn review_msvc_commands_recover_configured_call_flow() {
         let (_, analysis) = trace_analysis::analyze(&program);
         assert!(has_any_edge(&program, &analysis, "N::entry", "N::target"));
         assert!(program.diagnostics.is_empty(), "{:?}", program.diagnostics);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_fallback_compiler_paths_are_relative_to_cli_working_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let tools = dir.path().join("tools");
+    let system = dir.path().join("system");
+    for path in [&root, &tools, &system] {
+        std::fs::create_dir(path).unwrap();
+    }
+    std::fs::write(
+        root.join("main.c"),
+        "#include <probe.h>\n#ifdef __GNUC__\nvoid compiler_identity(void) {}\n#endif\nvoid entry(void) { system_function(); }\n",
+    ).unwrap();
+    std::fs::write(system.join("probe.h"), "void system_function(void);\n").unwrap();
+    let compiler = tools.join("compiler");
+    std::fs::write(&compiler, format!(
+        "#!/bin/sh\nprintf '#define __GNUC__ 13\\n'\nprintf '#include <...> search starts here:\\n {}\\nEnd of search list.\\n' >&2\n", system.display()
+    )).unwrap();
+    std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for macros in [false, true] {
+        for driver in ["./tools/compiler", "tools/compiler", "compiler"] {
+            let output = dir.path().join("result.db");
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_trace"));
+            command.args([
+                "analyze",
+                "project",
+                "--system-includes",
+                "--compiler",
+                driver,
+            ]);
+            if macros {
+                command.arg("--compiler-predefines");
+            }
+            let mut paths = vec![tools.clone()];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            let result = command
+                .arg("-o")
+                .arg(&output)
+                .env("PATH", std::env::join_paths(paths).unwrap())
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(result.status.success(), "{driver}: {stderr}");
+            assert!(
+                !stderr.contains("compiler executable not found"),
+                "{stderr}"
+            );
+            let conn = rusqlite::Connection::open(&output).unwrap();
+            for (name, expected) in [
+                ("system_function", 1),
+                ("compiler_identity", i64::from(macros)),
+            ] {
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM functions WHERE name=?1",
+                        [name],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    count, expected,
+                    "{driver}, macros={macros}, {name}: {stderr}"
+                );
+            }
+        }
     }
 }
