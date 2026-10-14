@@ -33,10 +33,11 @@ pub(super) fn build(
     mut graph: IncludeGraph,
     mut database: CompilationDatabase,
     links: crate::link_commands::LinkDatabase,
-    project_compiler_paths: Option<(
+    mut project_compiler_paths: Option<(
         crate::compiler_includes::CompilerSearch,
         crate::compiler_includes::CompilerSearch,
     )>,
+    mut project_compiler_warnings: Vec<(Language, String)>,
     retain_merge_state: bool,
 ) -> Result<Program, String> {
     let candidates = (opts.explore && opts.explore_budget > 0)
@@ -65,8 +66,13 @@ pub(super) fn build(
         &trace_ir::canonicalize(directory),
         std::env::var_os("CPATH").as_deref(),
     );
-    let project_options = |mut config: PreprocessOptions, language| {
-        if let Some((c, cpp)) = &project_compiler_paths {
+    let project_options = |mut config: PreprocessOptions,
+                           language,
+                           paths: &Option<(
+        crate::compiler_includes::CompilerSearch,
+        crate::compiler_includes::CompilerSearch,
+    )>| {
+        if let Some((c, cpp)) = paths {
             let searched = if language == Language::C { c } else { cpp };
             crate::compiler_includes::remove_system_include_duplicates(
                 &mut config,
@@ -75,8 +81,30 @@ pub(super) fn build(
                 &cpath_dirs,
             );
         }
-        with_project_system_paths(config, language, project_compiler_paths.as_ref())
+        with_project_system_paths(config, language, paths.as_ref())
     };
+    // Headers may all be consumed under real command configurations. Report
+    // fallback failures only for configurations a source or orphan really uses.
+    let mut reported_project_languages = Vec::new();
+    for (language, warning) in &project_compiler_warnings {
+        let used = files.iter().any(|path| {
+            let (configs, from_database) = configs_for(&database, &fallback, path);
+            (!from_database || database.uses_shared_flags())
+                && configs.iter().any(|config| {
+                    config.language.unwrap_or_else(|| Language::from_path(path)) == *language
+                })
+        });
+        if used {
+            if !database.warnings.contains(warning) {
+                add_warnings(
+                    &mut program,
+                    "compile_commands",
+                    std::slice::from_ref(warning),
+                );
+            }
+            reported_project_languages.push(*language);
+        }
+    }
     let pool = index_pool(jobs)?;
     index_progress(format!(
         "{}: {} commands for {} sources (jobs={jobs})",
@@ -100,7 +128,7 @@ pub(super) fn build(
             // Shared flags name no driver, so use project compiler defaults.
             if !from_database || database.uses_shared_flags() {
                 let language = config.language.unwrap_or_else(|| Language::from_path(path));
-                config = project_options(config, language);
+                config = project_options(config, language, &project_compiler_paths);
             }
             config.record_link_ownership = !links.targets.is_empty();
             if from_database {
@@ -248,6 +276,34 @@ pub(super) fn build(
         .chain(&graph.virtual_headers)
         .filter(|path| !consumed.contains(*path))
         .collect();
+    if opts.compiler_predefines
+        && !opts.system_includes
+        && project_compiler_paths.is_none()
+        && !unconsumed_headers.is_empty()
+    {
+        // All sources had commands, so only actual orphan languages need the
+        // fallback driver. Macro-only discovery cannot introduce dep roots.
+        let mut languages = Vec::new();
+        for path in &unconsumed_headers {
+            let language = index_language(path, &cpp_parse, no_c_units, opts.language);
+            if !languages.contains(&language) {
+                languages.push(language);
+            }
+        }
+        project_compiler_paths = Some(
+            crate::compiler_includes::CompilerIncludes::default().for_fallback(
+                &trace_ir::canonicalize(directory),
+                opts,
+                &[
+                    opts.system_include_paths.clone(),
+                    opts.system_include_paths.clone(),
+                ],
+                &[Vec::new(), Vec::new()],
+                &languages,
+                &mut project_compiler_warnings,
+            ),
+        );
+    }
     // Resolve shared configurations before workers start: validation and error
     // reporting use the same cache as the source pass, once per language.
     let warnings_before = database.warnings.len();
@@ -268,10 +324,24 @@ pub(super) fn build(
                 fallback.clone().with_language(inferred_language)
             };
             let language = config.language.unwrap_or_else(|| Language::from_path(path));
-            let config = project_options(config, language);
+            let config = project_options(config, language, &project_compiler_paths);
             (path, config)
         })
         .collect();
+    for (language, warning) in &project_compiler_warnings {
+        if !reported_project_languages.contains(language)
+            && header_configs
+                .iter()
+                .any(|(_, config)| config.language == Some(*language))
+            && !database.warnings.contains(warning)
+        {
+            add_warnings(
+                &mut program,
+                "compile_commands",
+                std::slice::from_ref(warning),
+            );
+        }
+    }
     add_warnings(
         &mut program,
         "compile_commands",
@@ -373,7 +443,7 @@ fn configs_for<'a>(
     }
 }
 
-fn effective_defines(opts: &PreprocessOptions) -> BTreeMap<String, String> {
+pub(super) fn effective_defines(opts: &PreprocessOptions) -> BTreeMap<String, String> {
     let mut defines: BTreeMap<String, String> = opts
         .compiler_defines
         .iter()

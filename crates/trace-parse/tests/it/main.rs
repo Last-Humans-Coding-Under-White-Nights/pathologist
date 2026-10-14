@@ -1,5 +1,6 @@
 mod ast_kinds;
 mod attribute_groups;
+mod compiler_predefines;
 mod cpp_decltype_base;
 mod cpp_gnu_typeof;
 mod cpp_member_function_pointer;

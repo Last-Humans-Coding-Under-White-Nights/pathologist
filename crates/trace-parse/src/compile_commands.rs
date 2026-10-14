@@ -168,6 +168,7 @@ impl CompilationDatabase {
         overrides: &PreprocessOptions,
         mut include_searches: Option<&mut Vec<CachedIncludeSearch>>,
     ) -> Result<Self, String> {
+        crate::compiler_includes::validate_options(overrides)?;
         let root = trace_ir::canonicalize(root);
         let directory = if root.is_file() {
             root.parent().unwrap_or(&root)
@@ -271,14 +272,26 @@ impl CompilationDatabase {
                     let excluded_cli = include_searches
                         .as_ref()
                         .map(|_| explicit_late_paths(&opts));
-                    if overrides.system_includes {
+                    if overrides.system_includes || overrides.compiler_predefines {
                         let language = opts.language.unwrap_or_else(|| Language::from_path(&file));
                         let search = compiler_includes.for_command(
                             &args,
                             &directory,
                             language,
                             &opts.system_include_paths,
+                            crate::compiler_includes::DiscoveryMode::from_options(overrides),
                         );
+                        if overrides.compiler_predefines {
+                            if let Some(reason) = &search.failure {
+                                let warning = crate::compiler_includes::configuration_warning(
+                                    &args, &directory, language, reason,
+                                );
+                                if !db.warnings.contains(&warning) {
+                                    db.warnings.push(warning);
+                                }
+                            }
+                        }
+                        opts.compiler_defines.extend(search.target_defines);
                         if !search.paths.is_empty() {
                             let cpath_dirs = cpath_by_directory
                                 .entry(directory.clone())
@@ -295,7 +308,6 @@ impl CompilationDatabase {
                                 cpath_dirs,
                             );
                             opts.system_include_paths = search.paths;
-                            opts.compiler_defines.extend(search.target_defines);
                         }
                     }
                     if let (Some(searches), Some(excluded_cli)) =
@@ -394,6 +406,7 @@ impl CompilationDatabase {
             };
         self.shared_configuration = Some(SharedConfiguration {
             path: path.clone(),
+            probe_args: compiler_args[1..].to_vec(),
             parsed,
             configs: [None, None],
             reported: BTreeSet::new(),
@@ -457,6 +470,19 @@ impl CompilationDatabase {
     pub fn shared_system_paths(&self) -> Option<&[PathBuf]> {
         self.shared_search_options()
             .map(|config| config.system_include_paths.as_slice())
+    }
+
+    /// Probe only flags accepted for this effective language, excluding the
+    /// synthetic driver and the linker tail discarded by the shared parser.
+    pub fn shared_probe_args(&mut self, language: Language) -> &[String] {
+        if self.shared_options(language).is_none_or(|config| {
+            config
+                .language
+                .is_some_and(|effective| effective != language)
+        }) {
+            return &[];
+        }
+        &self.shared_configuration.as_ref().unwrap().probe_args
     }
 
     pub fn uses_shared_flags(&self) -> bool {
@@ -539,6 +565,9 @@ impl Entry {
         opts.working_directory = Some(directory.clone());
         opts.strict_include_search = true;
         let driver_idx = driver_index(&args);
+        if is_launcher(binary_stem(&args[driver_idx])) || args[driver_idx].starts_with('-') {
+            return Err("missing compiler driver after launcher".into());
+        }
         let msvc = matches!(driver_stem(&args).as_str(), "cl" | "clang-cl")
             || args.iter().any(|arg| arg == "--driver-mode=cl");
         let driver_cpp = binary_stem(&args[driver_idx]).contains("++");
@@ -561,7 +590,7 @@ impl Entry {
         let mut updated_cplusplus = !binary_stem(&args[driver_idx]).eq_ignore_ascii_case("cl");
         let mut macros = Vec::new();
         let mut standard = None;
-        let args_for_probe = if overrides.system_includes {
+        let args_for_probe = if overrides.system_includes || overrides.compiler_predefines {
             args.clone()
         } else {
             Vec::new()
@@ -850,6 +879,7 @@ impl Entry {
 
 struct SharedConfiguration {
     path: PathBuf,
+    probe_args: Vec<String>,
     parsed: ParsedCommand,
     configs: [Option<Result<PreprocessOptions, String>>; 2],
     reported: BTreeSet<String>,
@@ -933,7 +963,7 @@ impl ParsedCommand {
     }
 }
 
-fn standard_macros(standard: &str) -> Result<(Language, Vec<CommandMacro>), String> {
+pub(super) fn standard_macros(standard: &str) -> Result<(Language, Vec<CommandMacro>), String> {
     use CommandMacro::{Define, Undef};
     let standard_lower = standard.to_ascii_lowercase();
     let (expected, value) = match standard_lower.as_str() {
@@ -1077,11 +1107,16 @@ fn is_launcher(stem: &str) -> bool {
     })
 }
 
-/// Index of the real driver in `args`, past any chained launchers.
+/// Index of the real driver in `args`, past chained launchers and their `--`
+/// separators. If no driver follows, readers must reject the launcher/option
+/// left at this index rather than treating it as an executable.
 pub(crate) fn driver_index<S: AsRef<str>>(args: &[S]) -> usize {
     let mut idx = 0;
     while idx + 1 < args.len() && is_launcher(binary_stem(args[idx].as_ref())) {
         idx += 1;
+        if args[idx].as_ref() == "--" && idx + 1 < args.len() {
+            idx += 1;
+        }
     }
     idx
 }
