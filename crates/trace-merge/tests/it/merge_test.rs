@@ -63,6 +63,411 @@ fn analyze_repo(repo: &std::path::Path, db: &std::path::Path) {
 }
 
 #[test]
+fn merge_keeps_unresolved_internal_calls_file_local() {
+    let tmp = tempdir().unwrap();
+    let mut inputs = Vec::new();
+    for (name, source) in [
+        (
+            "caller",
+            "static int hidden(void); int run(void) { return hidden(); }",
+        ),
+        ("provider", "int hidden(void) { return 1; }"),
+    ] {
+        let repo = tmp.path().join(name);
+        fs::create_dir(&repo).unwrap();
+        fs::write(repo.join("code.c"), source).unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_repo(&repo, &db);
+        inputs.push(db);
+    }
+    let output = tmp.path().join("merged.db");
+    let report = merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let conn = Connection::open(output).unwrap();
+    let callee: (String, i64) = conn.query_row(
+        "SELECT f.linkage, f.is_defined FROM call_edges e JOIN functions f ON f.id=e.callee_fn_id
+         JOIN functions caller ON caller.id=e.caller_fn_id WHERE caller.name='run'",
+        [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(callee, ("internal".into(), 0));
+    assert_eq!(report.cross_repo_calls_resolved, 0);
+}
+
+/// Analyze a single-source executable with build metadata and a shared include.
+fn analyze_executable(
+    repo: &std::path::Path,
+    include: &std::path::Path,
+    db: &std::path::Path,
+    dep: bool,
+) {
+    fs::write(
+        repo.join("compile_commands.json"),
+        serde_json::json!([
+            {"directory": repo, "file": "main.cpp", "output": "main.o",
+             "arguments": ["c++", "-I", include, "-c", "main.cpp", "-o", "main.o"]}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        repo.join("link_commands.json"),
+        serde_json::json!([
+            {"directory": repo, "output": "app", "arguments": ["c++", "main.o", "-o", "app"]}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let mut command = Command::new(trace_cli_bin());
+    command.arg("analyze").arg(repo).arg("-o").arg(db);
+    if dep {
+        command.arg("--dep").arg(include);
+    }
+    assert!(command.status().unwrap().success());
+}
+
+#[test]
+fn shared_header_images_do_not_collide_or_make_external_calls_ambiguous() {
+    let tmp = tempdir().unwrap();
+    let include = tmp.path().join("include");
+    fs::create_dir(&include).unwrap();
+    fs::write(
+        include.join("common.h"),
+        "int local(); inline int common() { return local(); }\n",
+    )
+    .unwrap();
+    let mut inputs = Vec::new();
+    for name in ["one", "two"] {
+        let repo = tmp.path().join(name);
+        fs::create_dir(&repo).unwrap();
+        fs::write(
+            repo.join("main.cpp"),
+            "#include \"common.h\"\nint local() { return 1; } int main() { return common(); }\n",
+        )
+        .unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_executable(&repo, &include, &db, false);
+        inputs.push(db);
+    }
+    let caller = tmp.path().join("caller");
+    fs::create_dir(&caller).unwrap();
+    fs::write(
+        caller.join("caller.cpp"),
+        "int common(); int common(char *);
+         int run() { return common(); }
+         int fallback(char *p) { return common(p); }
+         int callback(int (*fn)()) { return fn(); }
+         int start() { return callback(common); }\n",
+    )
+    .unwrap();
+    let caller_db = tmp.path().join("caller.db");
+    analyze_repo(&caller, &caller_db);
+    inputs.push(caller_db);
+    let output = tmp.path().join("merged.db");
+    for reverse in [false, true] {
+        if reverse {
+            inputs.reverse();
+        }
+        let report = merge_databases(
+            &inputs,
+            &MergeOptions {
+                output: output.clone(),
+                verbose: false,
+            },
+        )
+        .unwrap();
+        let collisions: Vec<_> = report
+            .warnings
+            .iter()
+            .filter(|w| w.kind == WarningKind::MultipleDefinitions)
+            .map(|w| w.symbol.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            collisions,
+            ["local", "main"],
+            "shared source copies are not collisions"
+        );
+        assert_eq!(report.ambiguous_calls, 0);
+        assert_eq!(report.cross_repo_calls_resolved, 3);
+        let conn = Connection::open(&output).unwrap();
+        let common: (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT target_id) FROM functions WHERE name='common' AND is_defined=1",
+            [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(common, (2, 2), "retain both image-owned definitions");
+        // An external caller must reach both copies and their own local callees.
+        let paths: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT local.file_id) FROM call_edges start
+             JOIN functions caller ON caller.id=start.caller_fn_id
+             JOIN functions common ON common.id=start.callee_fn_id
+             JOIN call_edges body ON body.caller_fn_id=common.id
+             JOIN functions local ON local.id=body.callee_fn_id
+             WHERE caller.name IN ('run', 'fallback') AND common.name='common' AND local.name='local'
+             AND start.resolution='direct' AND common.target_id=local.target_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(paths, (4, 2));
+        let indirect: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id
+             JOIN functions callee ON callee.id=e.callee_fn_id
+             WHERE caller.name='callback' AND callee.name='common' AND e.resolution='indirect'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            indirect, 2,
+            "shared-origin callback copies preserve indirect resolution"
+        );
+        let false_diagnostics: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM diagnostics WHERE stage='merge' AND message LIKE '%common()%'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(false_diagnostics, 0);
+    }
+}
+
+#[test]
+fn shared_header_prototypes_deduplicate_across_images_and_keep_owner_visibility() {
+    let tmp = tempdir().unwrap();
+    let include = tmp.path().join("include");
+    fs::create_dir(&include).unwrap();
+    fs::write(
+        include.join("service.h"),
+        "int service(); inline int helper() { return 1; }\n",
+    )
+    .unwrap();
+    let mut inputs = Vec::new();
+    for (name, dep) in [("consumer", true), ("owner", false)] {
+        let repo = tmp.path().join(name);
+        fs::create_dir(&repo).unwrap();
+        fs::write(
+            repo.join("main.cpp"),
+            "#include \"service.h\"\nint main() { return service() + helper(); }\n",
+        )
+        .unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_executable(&repo, &include, &db, dep);
+        let conn = Connection::open(&db).unwrap();
+        let prototype: (i64, i64) = conn
+            .query_row(
+                "SELECT is_dep, target_id IS NOT NULL FROM functions WHERE name='service'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(prototype, (i64::from(dep), 1));
+        inputs.push(db);
+    }
+    let output = tmp.path().join("merged.db");
+    for reverse in [false, true] {
+        if reverse {
+            inputs.reverse();
+        }
+        let report = merge_databases(
+            &inputs,
+            &MergeOptions {
+                output: output.clone(),
+                verbose: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.header_functions_deduped, 1);
+        let conn = Connection::open(&output).unwrap();
+        let prototypes: (i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(*), SUM(is_dep), SUM(target_id IS NOT NULL) FROM functions WHERE name='service'",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(
+            prototypes,
+            (1, 0, 0),
+            "a shared prototype belongs to no single image"
+        );
+        let helpers: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(is_dep) FROM functions WHERE name='helper'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            helpers,
+            (2, 0),
+            "owner visibility reaches the dependency's declaration and the owner's body"
+        );
+        let visible_calls: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id
+             JOIN functions callee ON callee.id=e.callee_fn_id
+             WHERE callee.name='service' AND caller.is_dep=0 AND callee.is_dep=0",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(visible_calls, 2);
+    }
+}
+
+#[test]
+fn merge_preserves_functions_in_distinct_link_targets() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    fs::write(
+        repo.join("common.c"),
+        "__attribute__((weak)) int leaf(void) { return 1; } int run(void) { return leaf(); }",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("compile_commands.json"),
+        serde_json::json!([
+            {"directory": repo, "file": "common.c", "output": "common.o",
+             "arguments": ["cc", "-c", "common.c", "-o", "common.o"]}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        repo.join("link_commands.json"),
+        serde_json::json!([
+            {"directory": repo, "output": "one", "arguments": ["cc", "common.o", "-o", "one"]},
+            {"directory": repo, "output": "two", "arguments": ["cc", "common.o", "-o", "two"]}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let input = tmp.path().join("input.db");
+    analyze_repo(&repo, &input);
+    let graph = |path: &std::path::Path| {
+        let conn = Connection::open(path).unwrap();
+        let rows = conn.prepare("SELECT caller.name, ct.name, callee.name, dt.name FROM call_edges e
+            JOIN functions caller ON caller.id=e.caller_fn_id JOIN link_targets ct ON ct.id=caller.target_id
+            JOIN functions callee ON callee.id=e.callee_fn_id JOIN link_targets dt ON dt.id=callee.target_id
+            ORDER BY ct.name, caller.name, dt.name, callee.name").unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))
+            .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        rows
+    };
+    let before = graph(&input);
+    assert_eq!(before.len(), 2);
+    let provider = tmp.path().join("provider");
+    fs::create_dir(&provider).unwrap();
+    fs::write(provider.join("leaf.c"), "int leaf(void) { return 2; }").unwrap();
+    let provider_db = tmp.path().join("provider.db");
+    analyze_repo(&provider, &provider_db);
+    let output = tmp.path().join("merged.db");
+    for inputs in [
+        vec![&input],
+        vec![&input, &provider_db],
+        vec![&provider_db, &input],
+    ] {
+        let report = merge_databases(
+            &inputs,
+            &MergeOptions {
+                output: output.clone(),
+                verbose: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            graph(&output),
+            before,
+            "merging must retain each link image's resolved weak functions"
+        );
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|w| w.kind == WarningKind::WeakOverride));
+    }
+}
+
+#[test]
+fn merge_keeps_all_exact_candidates_in_the_callers_target() {
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input.db");
+    empty_merge_input(&input);
+    // Exercise an unresolved edge directly: the ordinary analyzer already
+    // resolves these definitions and does not leave that edge for the merger.
+    Connection::open(&input).unwrap().execute_batch(
+        "INSERT INTO files VALUES (1, '/source/code.cpp', '', 0);
+         INSERT INTO link_targets VALUES (1, 'app', 'app'), (2, 'other', 'other');
+         INSERT INTO functions (id,name,file_id,line_start,line_end,linkage,signature,is_defined,target_id) VALUES
+           (1, 'run', 1, 1, 1, 'external', 'run()', 1, 1),
+           (2, 'query', 1, 2, 2, 'external', 'query()', 0, 1),
+           (3, 'query', 1, 3, 3, 'external', 'query()', 1, 1),
+           (4, 'query', 1, 4, 4, 'external', 'query()', 1, 1),
+           (5, 'query', 1, 5, 5, 'external', 'query()', 1, 2);
+         INSERT INTO call_sites (id,caller_fn_id,file_id,line,col,callee_text,is_direct)
+           VALUES (1,1,1,1,1,'query',1);
+         INSERT INTO call_edges VALUES (1,1,1,2,'external');"
+    ).unwrap();
+    let output = tmp.path().join("merged.db");
+    let report = merge_databases(
+        &[input],
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.ambiguous_calls, 1);
+    let conn = Connection::open(output).unwrap();
+    let rows = conn
+        .prepare(
+            "SELECT f.line_start, e.resolution FROM call_edges e
+        JOIN functions f ON f.id=e.callee_fn_id ORDER BY f.line_start",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(rows, [(3, "ambiguous".into()), (4, "ambiguous".into())]);
+}
+
+#[test]
+fn merge_fallback_does_not_discard_a_different_weak_overload() {
+    let tmp = tempdir().unwrap();
+    let mut inputs = Vec::new();
+    for (name, source) in [
+        ("caller", "int query(char *); int run(char *p) { return query(p); }"),
+        ("provider", "int query(int x) { return x; } __attribute__((weak)) int query(double x) { return 2; }"),
+    ] {
+        let repo = tmp.path().join(name);
+        fs::create_dir(&repo).unwrap();
+        fs::write(repo.join("code.cpp"), source).unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_repo(&repo, &db);
+        inputs.push(db);
+    }
+    let output = tmp.path().join("merged.db");
+    merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: output.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let conn = Connection::open(output).unwrap();
+    let callees = conn
+        .prepare(
+            "SELECT f.signature, e.resolution FROM call_edges e
+        JOIN functions f ON f.id=e.callee_fn_id JOIN functions caller ON caller.id=e.caller_fn_id
+        WHERE caller.name='run' ORDER BY f.signature",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        callees,
+        [
+            ("query(double)".into(), "ambiguous".into()),
+            ("query(int)".into(), "ambiguous".into())
+        ]
+    );
+}
+
+#[test]
 fn test_cross_repo_callgraph_restoration() {
     let tmp = tempdir().unwrap();
     let root = tmp.path();
