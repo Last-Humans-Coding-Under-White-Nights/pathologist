@@ -253,9 +253,12 @@ below; database compatibility follows the
   null-check `callee_path` before treating it as a string; it is not
   synonymous with `resolution == TRACE_RESOLUTION_EXTERNAL`.
 - **Call graphs.** `trace_db_callgraph(db, root_fn_id, direction, depth)` BFS
-  over `call_edges`. Node `id`s are `functions.id`; node `kind` is
-  `TRACE_NODE_UNKNOWN` (call-graph nodes are functions, not PAG nodes). Edges
-  carry `resolution` plus the full call-site path/line/col.
+  over `call_edges`, including unresolved call-site leaves when traversing
+  down ([query ID contract](SQLITE_SCHEMA.md#call-site-export-filter)). Function
+  node `id`s are `functions.id`; unresolved leaves have negative query-local IDs,
+  detail `[unresolved]`, and incoming `TRACE_RESOLUTION_UNKNOWN` edges.
+  Node `kind` is `TRACE_NODE_UNKNOWN`. Edges carry `resolution` plus the full
+  call-site path/line/col.
 - **Call chains.** `trace_db_call_chains(db, from_fn_id, to_fn_id, direction, depth, limit, out, out_err)`
   finds all paths between two functions bounded by `depth` steps. Direction
   `TRACE_DIRECTION_DOWN` searches callers->callees; `TRACE_DIRECTION_UP` searches

@@ -1,5 +1,106 @@
 # Evaluation Report
 
+## C++ call sites and unresolved callgraphs — 2026-10-15
+
+Baseline: `f9ac344`; candidate: the C++ call-site and callgraph fixes on
+`fix/cpp-callgraph-sites`. Rules:
+[Call source locations](ANALYSIS.md#call-source-locations),
+[Methods](ANALYSIS.md#c-support-first-step), and
+[callgraph query IDs](SQLITE_SCHEMA.md#call-site-export-filter).
+
+Focused regressions in
+[`call_sites.rs`](../crates/trace-cli/tests/it/call_sites.rs) use
+[`cpp_call_sites`](../tests/fixtures/cpp_call_sites). Before/after results:
+
+| Check | Before | After |
+|---|---|---|
+| Unknown-receiver calls in the downward `app::untyped` callgraph | Both hidden | Two distinct unresolved leaves |
+| Calls retained for `make().next().next().finish()` across two lines | Three sites; repeated `next` collapsed | Four sites, each method at its own member token |
+| `GetCallbacks()` inside `Context::Dispatch` without a class header | No call edge | Reaches `Context::GetCallbacks` |
+| Supplied `application_context.cpp:190`, without its header | No exported call-site row | Direct edge to `OHOS::AbilityRuntime::ApplicationContext::GetInteropCallbacks`, column 26 |
+
+The implicit-call regression additionally checks overload selection, return-type
+inference for a subsequent member call, and exclusion of the same-named outer
+function. The callgraph regression checks all four output formats, leaf depth
+limits, upward traversal, and the CLI's separate unresolved-call count.
+`cargo test --workspace` passed **2,222 tests**, with no failures;
+`cargo fmt --all -- --check` and `git diff --check` passed.
+
+The production-source reproduction copies only
+`frameworks/native/appkit/ability_runtime/context/application_context.cpp`
+from the clean `ability_ability_runtime` checkout at
+`6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8` into an isolated directory.
+The copied source matches the checkout byte for byte. Analyze both revisions
+with `--ignore-logging` and the same input path; excluding the class header
+reproduces the partial-index failure. With `application_context.h` supplied,
+the baseline already resolves the call. The candidate's release callgraph at
+line 190 also shows the unresolved `callback->OnAbilityCreate` at line 194.
+This is a focused source reproduction, not a full ability-runtime corpus run
+or a performance measurement.
+
+Local artifacts: `/tmp/trace-call-review-no-header-{before,after}.db`,
+`/tmp/trace-call-review-real.log`, and
+`/tmp/trace-call-review-tests-final.log`. Reproduce the maintained checks with:
+
+```bash
+cargo test -p trace-cli --test it call_sites::
+cargo test --workspace
+```
+
+The three pinned evaluation corpora were also analyzed with fresh release
+builds of `f9ac344` and the candidate, `--jobs 8`, minimal export, and
+`TRACE_SOLVE_BUDGET_POPS=800000`. All checkouts were clean at the revisions in
+[`scripts/eval_expected.json`](../scripts/eval_expected.json): HDF
+`cdc75a20bb8f1a046cd22e189405a20d602d0521`, hiview
+`92408e2072bd6dc8fb0d980773e80b6ec898710c`, and camera
+`8ffd69dcd47f533e70b4dba428439da9008b0cae`.
+
+| Metric, baseline → candidate | HDF | hiview | camera |
+|---|---:|---:|---:|
+| Exported call sites | 75,466 → 76,545 | 37,209 → 37,951 | 122,544 → 122,653 |
+| Direct call edges | 48,487 → 49,571 | 20,555 → 22,627 | 68,356 → 68,465 |
+| Indirect call edges | 5,087 → 5,087 | 229 → 246 | 449 → 449 |
+| External call edges | 23,940 → 23,935 | 15,690 → 15,690 | 46,032 → 46,032 |
+| Total call edges | 77,514 → 78,593 | 36,518 → 38,607 | 115,645 → 115,754 |
+| Argument-flow edges | 71,758 → 72,005 | 27,204 → 31,296 | 57,543 → 57,561 |
+
+Edge comparisons use function names and source definitions, call-expression
+text, spelling files and macro-expansion positions, preserving duplicate
+counts while ignoring the displayed call-token position that this fix moves.
+HDF adds 1,084 direct edges, including 1,056 repeated
+`StringBuilder::Append` calls; five bare-name external edges become class-member
+edges (`AST::AddType`, `Lexer::GetToken`, and `Lexer::PeekToken`). Hiview adds
+2,072 direct edges, including 1,995 `XperfEventBuilder::Param` chain edges.
+Its 17 new indirect edges reach the lambdas passed to `TraceCalling`: 11 in
+`HiviewServiceAbility` and six in `HiViewServiceTraceDelegate`. Camera adds
+112 direct edges and replaces three bare `CreatePhotoOutput` / `CreateVideoOutput`
+targets with their `NDKCamera` members. Function counts, diagnostics, dynamic
+symbol lookup edges and IPC edges are unchanged in all three corpora.
+
+The baseline passes all 104 saved checks. The initial candidate run misses
+eight count checks; the dispatch-site and calibration probes pass. The affected
+count expectations are re-captured from the candidate, including hiview's exact
+indirect-edge count, with existing tolerances unchanged. Previous band centers
+were not always the baseline's measured totals; the table above uses fresh
+baseline measurements rather than those centers.
+The fresh candidate rerun passes **all 104 checks**, with no failures. Its
+logical database rows match the first candidate run on all three corpora,
+excluding run and build metadata, using
+[`compare_analysis_databases.py`](../scripts/compare_analysis_databases.py).
+
+Corpus artifacts: `/tmp/trace-call-sites-eval{,-baseline,-confirm}/eval_check_*.db`,
+`/tmp/trace-call-sites-eval{,-baseline,-confirm}.log`,
+`/tmp/trace-call-sites-{hdf,hiview,camera}-repeat.json`, and
+`/tmp/trace-call-sites-eval-comparison.json`. The source-identity comparison
+driver is `/tmp/trace-call-sites-compare.py`. Reproduce the candidate corpus run
+after building the release binary:
+
+```bash
+cargo build -p trace-cli --release
+python3 scripts/eval_check.py --corpus-base /home/sergei \
+  --outdir /tmp/trace-call-sites-eval
+```
+
 ## Analyze-phase memory after #221: #225 — 2026-10-12
 
 `ability_ability_runtime` at `6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`,

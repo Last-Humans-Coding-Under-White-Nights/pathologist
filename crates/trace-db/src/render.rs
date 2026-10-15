@@ -427,14 +427,31 @@ fn render_graphviz(
     for &(id, _) in &graph.order {
         let mut l = String::new();
         label(id, &mut l);
-        writeln!(out, "  n{id} [label=\"{}\"];", dot_escape(&l)).unwrap();
+        writeln!(out, "  {} [label=\"{}\"];", graph_ident(id), dot_escape(&l)).unwrap();
     }
     for e in &graph.edges {
         let ann = dot_escape(&edge_annotation(e));
-        writeln!(out, "  n{} -> n{} [label=\"{}\"];", e.from, e.to, ann).unwrap();
+        writeln!(
+            out,
+            "  {} -> {} [label=\"{}\"];",
+            graph_ident(e.from),
+            graph_ident(e.to),
+            ann
+        )
+        .unwrap();
     }
     writeln!(out, "}}").unwrap();
     out
+}
+
+/// Unresolved call leaves use negative query-local IDs. Keep node identifiers
+/// valid in both DOT and Mermaid while preserving existing function IDs.
+fn graph_ident(id: i64) -> String {
+    if id < 0 {
+        format!("u{}", id.unsigned_abs())
+    } else {
+        format!("n{id}")
+    }
 }
 
 /// DOT identifiers may be bare keywords `[a-zA-Z_][a-zA-Z0-9_]*` or quoted
@@ -470,15 +487,15 @@ fn render_mermaid(
     for &(id, _) in &graph.order {
         let mut l = String::new();
         label(id, &mut l);
-        writeln!(out, "  n{id}[\"{}\"]", mermaid_escape(&l)).unwrap();
+        writeln!(out, "  {}[\"{}\"]", graph_ident(id), mermaid_escape(&l)).unwrap();
     }
     for e in &graph.edges {
         writeln!(
             out,
-            "  n{} -->|\"{}\"| n{}",
-            e.from,
+            "  {} -->|\"{}\"| {}",
+            graph_ident(e.from),
             mermaid_escape(&edge_annotation(e)),
-            e.to
+            graph_ident(e.to)
         )
         .unwrap();
     }

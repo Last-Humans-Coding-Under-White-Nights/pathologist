@@ -167,6 +167,8 @@ pub struct TraceCallEdgeList {
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct TraceGraphNode {
+    /// Function ID or negative query-local unresolved leaf ID for call
+    /// graphs; PAG node ID for value-flow graphs.
     pub id: i64,
     pub depth: i64,
     pub kind: TraceNodeKind,

@@ -294,6 +294,18 @@ contains `--line`. Edges are labeled with their resolution (`direct`,
 `indirect`, `external`, `ambiguous`) and call-site locations; repeated
 callees print `(see above; also file:line)`.
 
+Downward callgraphs also show call sites without a resolved target as
+`unresolved` leaves labeled by their callee expression. These retain the call's
+source position and count separately from functions; they do not assert a
+callee identity. They are available from existing databases that retained the
+unresolved sites, without re-analysis.
+
+Re-analyze existing databases to apply the C++
+[chained-call position](docs/ANALYSIS.md#call-source-locations) and
+[enclosing-scope lookup](docs/ANALYSIS.md#c-support-first-step) fixes. These
+preserve repeated methods in a chain and recover implicit calls whose class
+header is unavailable.
+
 **Examples**
 
 ```bash

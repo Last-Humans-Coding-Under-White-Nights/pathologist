@@ -107,6 +107,12 @@ A row is written to `call_sites` when **any** of:
 - `is_direct = 0` (indirect / fn-ptr syntax, **including unresolved**)
 
 Unresolved indirect calls therefore appear in `call_sites` with zero `call_edges`.
+`inspect callgraph` displays these sites as `unresolved` leaves during downward
+traversal. Their negative IDs exist only in the query result; they are not
+function IDs or new rows in `call_edges`.
+Copies with the same caller, callee text and full spelling path/line/column
+share one leaf, including shared-header sites copied from multiple merge
+inputs. The lowest call-site ID supplies that leaf's query-local ID.
 
 ## Entity relationships
 

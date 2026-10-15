@@ -286,10 +286,13 @@ typedef struct trace_call_edge_list {
  * @brief A node in a call or value-flow graph.
  *
  * @p kind and @p loc_kind are meaningful only for value-flow graphs;
- * for call graphs, nodes represent functions and @p kind is #TRACE_NODE_UNKNOWN.
+ * for call graphs, nodes represent functions or unresolved call leaves and
+ * @p kind is #TRACE_NODE_UNKNOWN. Unresolved leaves have negative query-local
+ * IDs and detail "[unresolved]"; their incoming resolution is
+ * #TRACE_RESOLUTION_UNKNOWN.
  */
 typedef struct trace_graph_node {
-    int64_t         id;       /**< Node ID (`functions.id` for call graphs, PAG node ID for dataflow). */
+    int64_t         id;       /**< Function ID or negative unresolved-leaf ID for call graphs; PAG node ID for dataflow. */
     int64_t         depth;    /**< BFS depth from the starting query node(s). */
     trace_node_kind kind;     /**< PAG node kind (#trace_node_kind; #TRACE_NODE_UNKNOWN for call graphs). */
     trace_loc_kind  loc_kind; /**< Location category (#trace_loc_kind; #TRACE_LOC_UNKNOWN for non-loc nodes). */

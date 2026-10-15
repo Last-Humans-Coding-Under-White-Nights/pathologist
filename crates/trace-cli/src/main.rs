@@ -878,15 +878,26 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
                 trace_db::Direction::Down => "callees",
                 trace_db::Direction::Up => "callers",
             };
+            let unresolved = graph.nodes.keys().filter(|&&id| id < 0).count();
+            let summary = if unresolved == 0 {
+                format!(
+                    "{} functions, {} edges",
+                    graph.nodes.len(),
+                    graph.edges.len()
+                )
+            } else {
+                format!(
+                    "{} functions, {} unresolved calls, {} edges",
+                    graph.nodes.len() - unresolved,
+                    unresolved,
+                    graph.edges.len()
+                )
+            };
             let meta = trace_db::GraphMeta {
                 title: &format!("callgraph from {start} ({dir_word}, depth {depth}):"),
                 direction: dir_word,
                 depth,
-                summary: &format!(
-                    "{} functions, {} edges",
-                    graph.nodes.len(),
-                    graph.edges.len()
-                ),
+                summary: &summary,
             };
             let out =
                 trace_db::render_graph(
