@@ -88,19 +88,121 @@ Relative executable paths are resolved from the command directory; relative
 `PATH` entries are resolved from trace's working directory, and Windows
 executable suffixes are honored. Both `-isysroot=/sdk` and `-isysroot/sdk`
 forms are forwarded with the command's path context.
-For sources without a usable database entry and for orphan project headers,
-one fallback compiler is chosen for the project. Trace tries `gcc` first,
+With `--system-includes` alone, sources without a usable database entry and
+orphan project headers share one fallback compiler. Trace tries `gcc` first,
 then `clang` when GCC cannot supply both C and C++ search lists; a usable
 single-language list is retained if neither compiler supplies both. C and C++
 have separate search lists. A failed probe leaves the existing explicit and
-inferred paths in place. The compiler is only queried for paths;
-trace continues to preprocess sources itself. The probe also seeds a small set
+inferred paths in place. Trace continues to preprocess sources itself.
+The probe also seeds a small set
 of target architecture, data-model, endianness, and hosted-mode macros from the
 selected compiler. Database `-D`/`-U` operations and CLI `-D` can override them.
-Vendor extension macros such as `__GNUC__` and unsupported SDK headers remain
-outside this discovery step.
+Compiler identity macros require the separate
+[compiler-predefines option](#compiler-predefined-macros-230). Unsupported SDK
+headers remain outside discovery.
 The probe stops when the complete search-list marker appears, even if a launcher
 remains alive; a 30-second limit applies only when the marker never appears.
+
+### Compiler predefined macros (#230)
+
+`--compiler-predefines` (library: `with_compiler_predefines(true)`) explicitly
+imports compiler identity in addition to the existing target/data-model set.
+It is off by default and independent of `--system-includes`. Trace still uses
+its custom preprocessor; the compiler receives **empty input only**.
+Compilation-command drivers, past the existing ccache/sccache/distcc launchers,
+take precedence. A launcher's `--` separator is skipped before reading the
+driver in compilation commands, link commands and compiler probes. Commands
+without a driver (including those starting with an option) warn and use the
+inferred or explicit fallback configuration.
+`--compiler EXECUTABLE` (`with_compiler`) supplies a fallback
+for sources without a usable command and orphan headers; it requires
+`--compiler-predefines` or `--system-includes`. CLI compiler paths containing
+a directory component resolve against the current working directory; bare
+executable names use `PATH`. Library relative compiler paths resolve against
+the analysis root. Repeatable `--compiler-arg ARG` (`with_compiler_arg`)
+requires `--compiler`. Supported fallback arguments are `-m32`, `-m64`, `-mx32`,
+`-nostdinc`, `-nostdinc++`, `-undef`, `-ffreestanding`, `-fhosted`, `-march=`, `-mcpu=`,
+`-mabi=`, and the shared probe's target, sysroot, architecture, toolchain,
+resource-directory, library, standard and executable-prefix options:
+`--target`/`-target`, `--sysroot`/`-isysroot`, `-arch`, `--gcc-toolchain`,
+`-resource-dir`, `-stdlib`, `-std`/`--std`, `-B`. Joined forms: `--target=`,
+`--sysroot=`, `-isysroot=`, `-isysrootPATH`, `--gcc-toolchain=`,
+`-resource-dir=`, `-stdlib=`, `-std=`/`--std=`, `-BPATH`.
+Command and fallback probes also preserve Clang's compatibility toggles
+`-fms-compatibility`, `-fno-ms-compatibility`, `-fms-extensions`, and
+`-fno-ms-extensions`, alongside its identity-version options
+`-fms-compatibility-version=`, `-fmsc-version=`, and `-fgnuc-version=`. Their
+order participates in probe cache keys so different compatibility modes and
+MSVC or GNU versions retain independent macro dumps.
+`-undef` is forwarded for command and fallback probes, so compiler identities
+and target macros explicitly suppressed by that configuration stay absent.
+Ordered command `-D`/`-U` and CLI `-D` still apply after the resulting dump.
+Unsupported fallback arguments are configuration errors.
+Shared `compile_flags.txt` options reach fallback probes only after validation
+for the effective language. Accepted shared options follow `--compiler-arg`
+options, so the shared value wins for last-option-wins settings such as target,
+sysroot and standard. Rejected shared options and linker-tail arguments
+cannot override the explicit fallback configuration. Explicit fallback standard
+arguments (`-std=`, `--std=`, or their separate-operand forms) apply only to
+their matching language. Probes normalize split `-std VALUE` and `--std VALUE`
+arguments to `-std=VALUE` for drivers that require the joined spelling.
+The last matching standard wins independently for C
+and C++, so mixed trees can supply both `-std=c11` and `-std=c++20` in either
+order. The same selection seeds language and strict-mode macros in both
+include-only and compiler-predefines modes. Configured
+translation units (including headers named by `-x c-header`) determine orphan
+header language inference but do not themselves require fallback probes.
+For header-only trees, accepted shared `-x` options select the header language
+before probe slots are populated; otherwise the normal inferred language applies.
+
+The exact object-like allowlist is:
+
+- Target/hosted: `__STDC_HOSTED__`, `__x86_64__`, `__amd64__`, `__i386__`,
+  `__aarch64__`, `__arm__`, `__riscv`, `__LP64__`, `_LP64`, `__ILP32__`,
+  `__linux__`, `__unix__`, `__APPLE__`, `__MACH__`, `_WIN32`, `_WIN64`,
+  `__BYTE_ORDER__`, `__ORDER_LITTLE_ENDIAN__`, `__ORDER_BIG_ENDIAN__`,
+  `__ORDER_PDP_ENDIAN__`, `__SIZEOF_POINTER__`, `__SIZEOF_LONG__`.
+- Identity (only with `--compiler-predefines`): `__GNUC__`, `__GNUC_MINOR__`,
+  `__GNUC_PATCHLEVEL__`, `__GNUG__`, `__clang__`, `__clang_major__`,
+  `__clang_minor__`, `__clang_patchlevel__`, `__clang_version__`,
+  `__MINGW32__`, `__MINGW64__`, `_MSC_VER`, `_MSC_FULL_VER`, `_MSC_BUILD`.
+
+Only definitions actually reported by a successful GNU-compatible `-dM` dump
+are imported. Native MSVC (`cl`, `clang-cl`/CL driver mode) and IAR probes are
+unsupported; use manual `-D`. The IAR name check matches known driver names
+without rejecting Intel's `icc`, versioned `icc` or `icpc` drivers; other
+drivers are validated by their exit status and dump. No compiler identity is
+inferred from a name.
+Language/standard predefines remain governed by trace's language configuration.
+Compiler definitions precede ordered database `-D`/`-U`; CLI `-D` wins last.
+Fallback standard operations also respect CLI definitions during header warming,
+so nested cached expansions and translation units select the same standard branches.
+System-header spellings `__BYTE_ORDER`, `__LITTLE_ENDIAN`, `__BIG_ENDIAN` are
+not synthesized. Build definitions such as `__USER__`, `__LITEOS__`, and
+`__HIVIEW_OHOS__` still come from build flags or manual `-D`.
+
+Macro discovery requires successful exit within 30 seconds. When include
+discovery is also enabled, the driver has a 250 ms grace period after the
+complete search-list marker before it is stopped. Failed or timed-out probes
+discard macro dumps and retain complete include lists. A valid dump works
+with zero system directories. Include-only discovery retains its early
+search-list completion behavior and existing target macros. Both modes share
+one probe, cached by executable, directory, language, supported flags, relevant
+environment, discovery mode and macro-driver support before parallel indexing.
+Unsupported-driver results use the same cache. Missing compiler
+context, executables, unsupported drivers and failed dumps emit deduplicated
+configuration warnings naming driver, directory/language/flags, reason and
+remedy; original source diagnostics remain. Without an explicit fallback,
+macro discovery continues with a warning recommending compilation commands,
+`--compiler-predefines --compiler ...`, or manual `-D`. It never substitutes
+host GCC/Clang for macro discovery. With both discovery flags enabled and no
+explicit fallback compiler, header discovery retains the historical GCC/Clang
+fallback; its macro dump is discarded so it does not claim a host target or
+compiler identity. Unsupported macro drivers still receive the include-only
+probe when system headers are requested. Macro-only fallback probes for a
+fully configured source tree wait until indexing identifies actual orphan
+headers. Include discovery runs before indexing so dependency ownership is
+settled before symbols are interned.
 
 Each command gets independent preprocessing and source caches, with inline header
 bodies, so include-path changes cannot reuse expansions from a different command.
@@ -280,7 +382,7 @@ flowchart LR
 |---------|-------|
 | Input-boundary recording | Optional shared collector for consumed headers and compilation/link metadata; see [compilation database options](#compilation-database-options-62). |
 | Missing-header guidance | Bounded CLI summary and opt-in candidate include roots; see [missing-header guidance](#missing-header-guidance). |
-| Compilation options (#62) | Ordered command macro operations, quoted/normal/system/after include search classes, opt-in compiler default path discovery (`--system-includes`), forced headers with original LineMap origins; language and standard-version predefines. Inferred paths respect the [test partition](ANALYSIS.md#declaring-header-eligibility). |
+| Compilation options (#62) | Ordered command macro operations, quoted/normal/system/after include search classes, opt-in compiler default path discovery (`--system-includes`), opt-in [compiler predefined macro discovery](#compiler-predefined-macros-230) (#230), forced headers with original LineMap origins; language and standard-version predefines. Inferred paths respect the [test partition](ANALYSIS.md#declaring-header-eligibility). |
 | Comments | `//`, `/* */` |
 | Line splicing | Translation phase 2 (C11 5.1.1.2p1) runs inside the lexer, at the character level: every `\`-newline (`\n` or `\r\n`, and — as gcc and clang accept with a warning — with horizontal whitespace between the `\` and the newline) is deleted before any token is recognized, so a spliced identifier is one identifier (`int c\`-newline-`d;` is `int cd;`), a spliced multi-character punctuator is munched whole (`.\`-newline-`..` is `...`, so `#define F(x, .\`-newline-`..)` is the variadic macro gcc and clang see — #38), a spliced encoding prefix or string body stays one literal, a `//` comment ending in `\` continues onto the next line and `/\`-newline-`*` opens a block comment. A `\r` counts only as the first half of a `\r\n`: `\`-CR-CR-LF and `\`-CR-space-LF are not splices, as in clang. Inside a C++11 raw string literal the splice is reverted ([lex.pptoken]p3) and the body is kept as written; in C, where `R"(…)"` is the identifier `R` followed by an ordinary string, a splice in that body is deleted like in any string — clang's `-std=c11` behaviour, while gcc and clang in their default GNU modes lex a raw string there and keep the splice as written. Token positions stay physical — a token starts where its first character sits in the file, which is what the LineMap needs — so adjacency can no longer be read off `line`/`col`; instead the lexer records on every token whether it touched the previous one (`Token::adjacent_before`, with a splice counting as nothing and whitespace, comments and newlines as a gap), and that flag is what the function-like `#define` test and `#` stringizing read. Before #38 the lexer kept `\` + newline as two tokens and each consumer that needed phase 2 skipped the pair itself, so the splice was still visible everywhere else: `int c\`-newline-`d;` came out as `int c\ d;` and a spliced ellipsis stayed three `.` tokens |
 | Punctuators | The multi-character forms the lexer knows are one token each, so the re-speller writes them back unbroken: `##`, the two-character operators (`<<` `>>` `<=` `>=` `==` `!=` `&&` `\|\|` `++` `--` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `->`) and the three-character `...` and `->*`. Anything else is one token per character; the ones that still come out glued do so because the output spacing rule happens not to separate them (`::`, `.*`, and the `=` after `>>` / `<<`), not because they are single tokens. `->*` needed its own token because the spacing rule *does* separate it: the space before `*` after `>` that keeps `shared_ptr<T> &p` from gluing into `>&` also split `c->*m` into `c-> * m`, which is not C++, and tree-sitter then recovered the operand as a callee — fabricating a function named after it, in one corpus case named after a template parameter (#37). Recovering the token does not make the construct parse: tree-sitter-cpp knows `->*` only as an overloadable operator name and as a fold operator — `struct S { int operator->*(int); };` and `(a ->* ...)` both parse — and has no rule for it as a binary operator in an ordinary expression, so `c->*m` is an ERROR site even in pristine source, while `c.*m` parses. `->*` is also lexed as one token only in C++: gcc and clang tokenize `a->*b` in C as `->` then `*`. The re-speller gives `...` a leading space when the output already ends in a preprocessing number, because a pp-number absorbs `.` and alphanumerics (C11 6.4.8) and would otherwise swallow it — the GNU case range `case 0x0300 ... 0x0307:` would come back as the single number `0x0300...0x0307`; after an identifier (`Args...`) no space is added. Before #28 there was no `...` case, so every ellipsis lexed as three `.` tokens and, since the spacing rule *does* put a space before `.`, came out as `. . .` — a tree-sitter ERROR site in every variadic declaration, 111 of the 756 catalogued ERROR sites across the pinned corpora |
@@ -313,7 +415,7 @@ flowchart LR
 
 ### P2 (planned)
 
-- `_Pragma`, the remaining standard predefined macros (`__DATE__` / `__TIME__`, the C++ feature-test macros); `__STDC_HOSTED__` is imported only in `--system-includes` mode
+- `_Pragma`, the remaining standard predefined macros (`__DATE__` / `__TIME__`, the C++ feature-test macros); `__STDC_HOSTED__` is imported only by compiler discovery
 
 ## Builtin fallback macros
 

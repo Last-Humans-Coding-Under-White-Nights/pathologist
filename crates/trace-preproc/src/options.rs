@@ -394,6 +394,15 @@ pub struct PreprocessOptions {
     /// Query a compiler for its effective system header search paths during
     /// indexing. Off by default; explicit system paths remain available.
     pub system_includes: bool,
+    /// Opt in to allowlisted compiler predefined macros during indexing.
+    pub compiler_predefines: bool,
+    /// Fallback driver for sources without a usable compilation command.
+    /// Requires `compiler_predefines` or `system_includes`; command drivers
+    /// always take precedence. Relative paths resolve against the analysis
+    /// root; the CLI resolves its compiler paths against its working directory.
+    pub compiler: Option<PathBuf>,
+    /// Supported probe configuration flags for the fallback driver.
+    pub compiler_args: Vec<String>,
     /// Link database path; otherwise indexing discovers root/build metadata.
     pub link_commands: Option<PathBuf>,
     /// Indexing-only: retain weak body/initializer ownership for link selection.
@@ -517,6 +526,9 @@ impl Default for PreprocessOptions {
             diagnostic_pool: None,
             compilation_database: None,
             system_includes: false,
+            compiler_predefines: false,
+            compiler: None,
+            compiler_args: Vec::new(),
             link_commands: None,
             record_link_ownership: false,
             include_paths: Vec::new(),
@@ -573,6 +585,7 @@ impl PreprocessOptions {
             || !self.system_include_paths.is_empty()
             || !self.compiler_defines.is_empty()
             || !self.after_include_paths.is_empty()
+            || self.compiler_predefines
             || self.system_includes
             || self.strict_include_search
     }
@@ -656,6 +669,27 @@ impl PreprocessOptions {
     #[must_use]
     pub fn with_system_includes(mut self, enabled: bool) -> Self {
         self.system_includes = enabled;
+        self
+    }
+
+    /// Enable or disable allowlisted compiler macro discovery during indexing.
+    #[must_use]
+    pub fn with_compiler_predefines(mut self, enabled: bool) -> Self {
+        self.compiler_predefines = enabled;
+        self
+    }
+
+    /// Select an explicit fallback compiler (requires a compiler discovery mode).
+    #[must_use]
+    pub fn with_compiler(mut self, compiler: impl Into<PathBuf>) -> Self {
+        self.compiler = Some(compiler.into());
+        self
+    }
+
+    /// Append a supported fallback compiler configuration argument.
+    #[must_use]
+    pub fn with_compiler_arg(mut self, arg: impl Into<String>) -> Self {
+        self.compiler_args.push(arg.into());
         self
     }
 
