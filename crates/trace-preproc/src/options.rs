@@ -1,7 +1,76 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+
+/// Optional per-indexing-run counts of system bundle refusals. Cloned options
+/// share this collector; normal preprocessing allocates no collector.
+#[derive(Debug, Default)]
+pub struct SystemBundleProfile {
+    declarations: AtomicU64,
+    project_preamble: AtomicU64,
+    not_at_boundary: AtomicU64,
+    variant_cap: AtomicU64,
+    incompatible: AtomicU64,
+    incomplete: AtomicU64,
+    uncovered: AtomicU64,
+    context_sensitive: AtomicU64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SystemBundleRefusals {
+    pub declarations: u64,
+    pub project_preamble: u64,
+    pub not_at_boundary: u64,
+    pub variant_cap: u64,
+    pub incompatible: u64,
+    pub incomplete: u64,
+    pub uncovered: u64,
+    pub context_sensitive: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SystemBundleRefusal {
+    Declarations,
+    ProjectPreamble,
+    NotAtBoundary,
+    VariantCap,
+    Incompatible,
+    Incomplete,
+    Uncovered,
+    ContextSensitive,
+}
+
+impl SystemBundleProfile {
+    pub(crate) fn refuse(&self, reason: SystemBundleRefusal) {
+        let counter = match reason {
+            SystemBundleRefusal::Declarations => &self.declarations,
+            SystemBundleRefusal::ProjectPreamble => &self.project_preamble,
+            SystemBundleRefusal::NotAtBoundary => &self.not_at_boundary,
+            SystemBundleRefusal::VariantCap => &self.variant_cap,
+            SystemBundleRefusal::Incompatible => &self.incompatible,
+            SystemBundleRefusal::Incomplete => &self.incomplete,
+            SystemBundleRefusal::Uncovered => &self.uncovered,
+            SystemBundleRefusal::ContextSensitive => &self.context_sensitive,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn refusals(&self) -> SystemBundleRefusals {
+        SystemBundleRefusals {
+            declarations: self.declarations.load(Ordering::Relaxed),
+            project_preamble: self.project_preamble.load(Ordering::Relaxed),
+            not_at_boundary: self.not_at_boundary.load(Ordering::Relaxed),
+            variant_cap: self.variant_cap.load(Ordering::Relaxed),
+            incompatible: self.incompatible.load(Ordering::Relaxed),
+            incomplete: self.incomplete.load(Ordering::Relaxed),
+            uncovered: self.uncovered.load(Ordering::Relaxed),
+            context_sensitive: self.context_sensitive.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// Collect inputs read outside a caller's root, including macro-only headers
 /// and build metadata that need not contribute exported file entities.
@@ -116,6 +185,14 @@ pub struct MacroFingerprint {
     pub defined: Vec<(Arc<str>, u64)>,
     /// Names read while unbound.
     pub undefined: FxHashSet<Arc<str>>,
+    /// Previously supplied system bundles whose declarations this expansion
+    /// requires. Values identify their declaration text and provenance,
+    /// independently of macro-read fingerprints or variant handles.
+    pub required_headers: FxHashMap<PathBuf, u64>,
+    /// Exact number of preceding shared system bundles. Together with
+    /// `required_headers`, this distinguishes the whole declaration context,
+    /// including the absence of a previously supplied bundle.
+    pub header_context_size: Option<usize>,
 }
 
 impl MacroFingerprint {
@@ -139,6 +216,16 @@ impl MacroFingerprint {
         for name in &self.undefined {
             one(1, name, 0);
         }
+        for (path, signature) in &self.required_headers {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (2u8, path, signature).hash(&mut h);
+            acc ^= h.finish();
+        }
+        if let Some(size) = self.header_context_size {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (3u8, size).hash(&mut h);
+            acc ^= h.finish();
+        }
         acc
     }
 
@@ -150,13 +237,22 @@ impl MacroFingerprint {
         &self,
         mut binding: impl FnMut(&str) -> Option<u64>,
         any_bound: impl FnOnce(&FxHashSet<Arc<str>>) -> bool,
+        mut header: impl FnMut(&Path) -> Option<u64>,
+        header_count: impl FnOnce() -> usize,
     ) -> bool {
         !self.incompatible
+            && self
+                .header_context_size
+                .is_none_or(|size| size == header_count())
             && self
                 .defined
                 .iter()
                 .all(|(name, hash)| binding(name) == Some(*hash))
             && (self.undefined.is_empty() || !any_bound(&self.undefined))
+            && self
+                .required_headers
+                .iter()
+                .all(|(path, signature)| header(path) == Some(*signature))
     }
 }
 
@@ -194,6 +290,22 @@ pub struct SourceCache {
     /// puts one here.
     virtual_keys: std::sync::OnceLock<FxHashSet<PathBuf>>,
     directory_searches: RwLock<DirectorySearches>,
+    raw_tokens: RwLock<RawTokens>,
+}
+
+const RAW_TOKEN_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct RawTokens {
+    files: FxHashMap<ExpansionKey, LexedFile>,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct LexedFile {
+    source: Arc<str>,
+    tokens: Arc<[crate::lexer::Token]>,
+    bytes: usize,
 }
 
 pub(crate) type DirectoryResults = Arc<RwLock<FxHashMap<(String, bool, bool), Option<PathBuf>>>>;
@@ -222,7 +334,76 @@ impl SourceCache {
             texts,
             virtual_keys: std::sync::OnceLock::new(),
             directory_searches: RwLock::new(DirectorySearches::default()),
+            raw_tokens: RwLock::new(RawTokens::default()),
         }
+    }
+
+    /// Share lexing of installed headers without caching their macro expansion.
+    /// Project sources are already shared as text; retaining their tokens as
+    /// well would scale memory with the entire project. Re-read external files
+    /// normally and compare their contents, so edits between runs remain visible.
+    pub(crate) fn external_tokens(
+        &self,
+        path: &Path,
+        source: &Arc<str>,
+        language: Language,
+    ) -> Option<Arc<[crate::lexer::Token]>> {
+        if self.texts.contains_key(path) {
+            return None;
+        }
+        let key = (path.to_path_buf(), language);
+        let cached = |files: &RawTokens| {
+            files
+                .files
+                .get(&key)
+                .and_then(|file| (file.source == *source).then(|| Arc::clone(&file.tokens)))
+        };
+        {
+            let files = self.raw_tokens.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(tokens) = cached(&files) {
+                return Some(tokens);
+            }
+            let replaced = files.files.get(&key).map_or(0, |file| file.bytes);
+            if source.len() > RAW_TOKEN_BYTES.saturating_sub(files.bytes - replaced) {
+                // Even the source bytes cannot fit. Keep the ordinary Vec
+                // lexing path rather than building and measuring an Arc that
+                // this cache would immediately discard.
+                return None;
+            }
+        }
+        let tokens: Arc<[_]> = crate::lexer::Lexer::new(source, language).tokenize().into();
+        let bytes = source.len()
+            + std::mem::size_of_val(tokens.as_ref())
+            + tokens
+                .iter()
+                .map(|token| match &token.kind {
+                    crate::lexer::TokenKind::Identifier(s)
+                    | crate::lexer::TokenKind::Number(s)
+                    | crate::lexer::TokenKind::String(s)
+                    | crate::lexer::TokenKind::Char(s) => s.capacity(),
+                    _ => 0,
+                })
+                .sum::<usize>();
+        let mut files = self.raw_tokens.write().unwrap_or_else(|e| e.into_inner());
+        // Another worker may have finished lexing the same header meanwhile.
+        if let Some(tokens) = cached(&files) {
+            return Some(tokens);
+        }
+        if let Some(old) = files.files.remove(&key) {
+            files.bytes -= old.bytes;
+        }
+        if bytes <= RAW_TOKEN_BYTES.saturating_sub(files.bytes) {
+            files.bytes += bytes;
+            files.files.insert(
+                key,
+                LexedFile {
+                    source: Arc::clone(source),
+                    tokens: Arc::clone(&tokens),
+                    bytes,
+                },
+            );
+        }
+        Some(tokens)
     }
 
     /// The shared directory-search results for `opts`' ordered quote, include
@@ -325,6 +506,9 @@ pub struct IncludeExpansion {
     /// Effective C++ language version for semantic lowering of this header.
     pub cpp_standard: u32,
     pub text: Arc<str>,
+    /// Identity of a system bundle's declarations and original provenance.
+    /// Macro compatibility is checked separately through `deps`/`signature`.
+    pub declaration_signature: u64,
     pub files: Arc<FxHashSet<PathBuf>>,
     /// Diagnostics emitted while producing this expansion, including
     /// diagnostics replayed from nested cached headers. Cache hits append
@@ -444,6 +628,12 @@ pub struct PreprocessOptions {
     /// Headers eligible for separate cached units when include bodies are not
     /// inlined. Other headers remain in their including unit's text.
     pub separate_header_paths: Option<Arc<FxHashSet<PathBuf>>>,
+    /// Indexing-only: cache balanced top-level system includes from project
+    /// files as units. Nested external fragments stay in their enclosing bundle.
+    pub separate_system_headers: bool,
+    /// Optional attempt counters shared by all preprocessing passes in one
+    /// indexing run. Reports are diagnostic only and never enter analysis data.
+    pub system_bundle_profile: Option<Arc<SystemBundleProfile>>,
     /// Basename → project paths for fast include resolution.
     pub basename_index: Option<Arc<FxHashMap<String, Vec<PathBuf>>>>,
     /// Shared macro table populated during header warm-up; inherited by translation units.
@@ -548,6 +738,8 @@ impl Default for PreprocessOptions {
             input_boundary: None,
             include_expansion_cache: None,
             separate_header_paths: None,
+            separate_system_headers: false,
+            system_bundle_profile: None,
             basename_index: None,
             shared_macros: None,
             accumulate_macros: false,

@@ -1912,6 +1912,18 @@ impl SymbolTable {
         self.unscoped_static_members.get(symbol).copied()
     }
 
+    /// Replay lookup selection when merge reuses dependency declaration storage.
+    /// Scoped globals retain their first registration; unscoped lookup follows
+    /// the last declaration, exactly as [`Self::add_variable`] does.
+    pub fn reuse_global_declaration(&mut self, id: VarId) {
+        let var = self.variable(id);
+        debug_assert_eq!(var.storage, StorageClass::Global);
+        if var.target.is_none() {
+            let name = var.lookup_name().to_owned();
+            self.global_by_name.insert(name, id);
+        }
+    }
+
     pub fn add_variable(&mut self, var: Variable) -> VarId {
         self.has_target_scopes |= var.target.is_some();
         self.has_weak_symbols |= var.is_weak;
