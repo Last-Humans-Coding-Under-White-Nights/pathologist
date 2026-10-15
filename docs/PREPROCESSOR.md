@@ -42,9 +42,9 @@ CLI equivalents: `--include PATH`, `-D NAME=VALUE`. `PreprocessOptions::with_rec
 `trace analyze --require-local-inputs` checks the canonical paths observed by
 preprocessing and compilation/link metadata readers, including cached, nested
 and forced includes, recursive response files and CMake JSON references. It rejects an
-analysis that consumed an input outside the target tree before solving or
-exporting. This is opt-in; the [PGO workflow](PGO.md) enables it for input
-verification. The shared `PreprocessOptions::input_boundary` collector also
+analysis that consumed an input outside the target tree after each indexing
+pass, before candidate retries, solving or exporting. This is opt-in; the
+[PGO workflow](PGO.md) enables it for input verification. The shared `PreprocessOptions::input_boundary` collector also
 records macro-only headers that may not contribute exported file entities.
 
 When `compile_commands.json` exists at the analysis root or its `build/` directory
@@ -122,6 +122,116 @@ even when several sources or both languages use the same invalid arguments.
 Shared flags use this check before indexing; selection and
 fallback rules are defined in [Compilation databases](ANALYSIS.md#compilation-databases-62).
 
+### Missing-header guidance
+
+After indexing, `trace analyze` prints a summary on stderr when ordinary or
+forced includes remain unresolved. It groups preprocessing warnings by the
+requested header spelling, counts retained diagnostic locations, and shows at
+most ten headers, ordered by count (then spelling), with an original file/line
+example. Other preprocessing warnings are excluded. All original diagnostic
+rows remain in the SQLite `diagnostics` table in minimal and full exports;
+the summary neither changes include resolution nor suppresses warnings.
+Standard and internal kernel header guidance recognizes redundant `.` components
+while preserving the requested spelling in the summary and diagnostics.
+
+A matching indexed file with the complete requested path suffix (ignoring
+redundant `.` components, but retaining `..`) is evidence
+that a file exists but the failing configuration did not reach it. The summary
+shows that file and its include search root; check per-TU paths and restrictions
+such as quoted-only search or the test partition before adding it. This is a
+candidate, not proof that the file belongs to the target SDK. Without a match,
+trace reports that availability outside indexed files is unknown: it does not
+search the host filesystem or infer that a dependency is uninstalled.
+
+`--apply-include-candidates` opts into applying these suggestions. For every
+unresolved header spelling, including those beyond the ten-entry display limit,
+it takes the same lexicographically first matching indexed file shown by the
+summary. Distinct candidate include roots are appended in path order after
+explicit CLI `--include` paths, with the same search precedence as `--include`
+(before compilation database paths). Absolute include spellings do not produce
+candidate roots. Existing CLI paths are not added again.
+
+Conflict checks protect only spellings selected from unresolved-header
+diagnostics, including selections repaired by earlier retries. Already-resolved
+headers are not protected: a new candidate root containing the same spelling
+can shadow a header previously found through compilation database `-I`,
+`-isystem` or `-idirafter` paths. Use explicit CLI `--include` paths or correct
+the build metadata when those existing resolutions must be preserved.
+
+Before each retry, the CLI combines cached command search classes with the
+proposed CLI paths and verifies every TU's explicit ordinary, system and after
+search paths, along with shared flags and CLI fallback paths, against the
+selected files. This includes search-class normalization: a path also named by
+`-isystem` or `-idirafter` moves out of the ordinary include list even when it was supplied by the CLI. It checks selected
+spellings in sorted order, removes the first conflicting new root in the
+effective search, and rechecks the remaining roots. Stderr names the rejected
+root, the shadowed selection, the file it would load instead, the skipped
+candidates, and the TU when its command causes the conflict. Selections remain protected across retry passes, even
+after their missing-include warnings disappear. Existing CLI paths are never
+removed or reordered; if they conflict with a selection, the new batch is
+skipped. Conflicting candidates may therefore remain unresolved: use explicit
+paths or build metadata to choose the intended search order.
+
+These checks omit inferred project include directories and the unique-basename
+fallback, which follow the explicit search classes. If no explicit path finds
+a selected spelling, a retry can still resolve it to a different file through
+those fallbacks without a conflict report. Includer-relative and quoted-only
+paths also remain outside these checks; adding ordinary roots does not change
+their earlier precedence.
+
+A rejected root can be added on a later pass if the previously applied paths
+now give it safe search precedence. Conflicts are checked again on every pass,
+but identical conflict reports are printed only once per analysis run. When an
+existing search path causes a conflict, the report names it as an existing path
+and explains that the new batch is skipped.
+
+Compilation metadata and command options are read and parsed once for these
+conflict checks across all retry passes. Only the proposed CLI roots are merged
+with the cached search classes on subsequent checks, preserving search-class
+normalization without reprocessing the database for every rejected root.
+
+Indexing repeats with those roots before analysis and export. If newly reached
+headers expose further missing includes, their candidate roots are applied too,
+until no new root can be added. Each root is added at most once; unresolved
+includes without a usable new candidate remain diagnostic warnings. Stderr
+lists the paths applied in each pass. The database retains the final pass's
+diagnostics; missing-include warnings repaired by a retry are no longer current.
+Without the flag, the summary and diagnostic retention behave as described above.
+
+Applying candidates uses the existing custom preprocessor and does not fetch
+headers, probe additional compilers, change dependency ownership or bypass
+`--require-local-inputs`. This option trusts matching indexed paths across the
+project: a matching spelling does not establish the right SDK version or per-TU
+configuration. Use compilation metadata or explicit includes when that choice
+must be controlled.
+
+Configure unresolved headers using the target build environment:
+
+- Prefer `--compile-commands PATH`, or automatic discovery at the root or
+  `build/`, for per-TU paths, macros, forced includes and language settings.
+  Root `compile_flags.txt` can supply shared flags when no JSON database is
+  selected; it does not identify a target compiler.
+- For standard C/C++ headers, opt into `--system-includes` with compilation
+  commands naming the target compiler and its target/sysroot options. A failed
+  command probe keeps explicit paths; it does not replace that compiler with
+  a host compiler. Sources without usable commands, shared flags and orphan
+  headers use the project GCC/Clang fallback described
+  [above](#compilation-database-options-62). Use that fallback only when it
+  matches the target. Host headers must not substitute for the target SDK.
+- Obtain the target SDK/dependencies and generated headers. Use `--dep ROOT`
+  to give dependency headers declaration-only ownership and `--include DIR`
+  for the directory above the requested include spelling, or record that path
+  in compilation metadata. Dependency ownership and include search paths serve
+  different purposes.
+- Internal kernel headers, such as `linux/device.h`, `linux/dma-mapping.h`
+  and `linux/of.h`, need the matching configured kernel build tree, generated
+  headers and architecture paths. Userspace `/usr/include/linux` UAPI headers
+  cannot replace them.
+
+Header categories are recognized by known spellings, not angle brackets or
+the presence/absence of `.h`. Compiler probes discover configuration only;
+the custom preprocessor still processes every project source.
+
 ## Role in the pipeline
 
 ```mermaid
@@ -169,6 +279,7 @@ flowchart LR
 | Feature | Notes |
 |---------|-------|
 | Input-boundary recording | Optional shared collector for consumed headers and compilation/link metadata; see [compilation database options](#compilation-database-options-62). |
+| Missing-header guidance | Bounded CLI summary and opt-in candidate include roots; see [missing-header guidance](#missing-header-guidance). |
 | Compilation options (#62) | Ordered command macro operations, quoted/normal/system/after include search classes, opt-in compiler default path discovery (`--system-includes`), forced headers with original LineMap origins; language and standard-version predefines. Inferred paths respect the [test partition](ANALYSIS.md#declaring-header-eligibility). |
 | Comments | `//`, `/* */` |
 | Line splicing | Translation phase 2 (C11 5.1.1.2p1) runs inside the lexer, at the character level: every `\`-newline (`\n` or `\r\n`, and — as gcc and clang accept with a warning — with horizontal whitespace between the `\` and the newline) is deleted before any token is recognized, so a spliced identifier is one identifier (`int c\`-newline-`d;` is `int cd;`), a spliced multi-character punctuator is munched whole (`.\`-newline-`..` is `...`, so `#define F(x, .\`-newline-`..)` is the variadic macro gcc and clang see — #38), a spliced encoding prefix or string body stays one literal, a `//` comment ending in `\` continues onto the next line and `/\`-newline-`*` opens a block comment. A `\r` counts only as the first half of a `\r\n`: `\`-CR-CR-LF and `\`-CR-space-LF are not splices, as in clang. Inside a C++11 raw string literal the splice is reverted ([lex.pptoken]p3) and the body is kept as written; in C, where `R"(…)"` is the identifier `R` followed by an ordinary string, a splice in that body is deleted like in any string — clang's `-std=c11` behaviour, while gcc and clang in their default GNU modes lex a raw string there and keep the splice as written. Token positions stay physical — a token starts where its first character sits in the file, which is what the LineMap needs — so adjacency can no longer be read off `line`/`col`; instead the lexer records on every token whether it touched the previous one (`Token::adjacent_before`, with a splice counting as nothing and whitespace, comments and newlines as a gap), and that flag is what the function-like `#define` test and `#` stringizing read. Before #38 the lexer kept `\` + newline as two tokens and each consumer that needed phase 2 skipped the pair itself, so the splice was still visible everywhere else: `int c\`-newline-`d;` came out as `int c\ d;` and a spliced ellipsis stayed three `.` tokens |

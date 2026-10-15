@@ -27,6 +27,7 @@ mod ipc_tests;
 mod macro_paste_cases;
 mod macro_source_mapping;
 mod malloc_mode_tests;
+mod missing_header_tests;
 mod mixed_lang_cases;
 mod mock_visibility;
 mod preproc_context_cases;
