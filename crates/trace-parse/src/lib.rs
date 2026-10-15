@@ -12,6 +12,7 @@ pub mod gn_defines;
 mod gn_targets;
 mod idl;
 mod index_cache;
+mod index_profile;
 mod link_commands;
 mod lower;
 mod memory;

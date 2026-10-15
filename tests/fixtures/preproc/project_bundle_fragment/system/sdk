@@ -1,0 +1,5 @@
+#pragma once
+void Callback();
+namespace SDK {
+#include "impl.inc"
+}

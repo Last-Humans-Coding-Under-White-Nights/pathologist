@@ -103,6 +103,15 @@ headers remain outside discovery.
 The probe stops when the complete search-list marker appears, even if a launcher
 remains alive; a 30-second limit applies only when the marker never appears.
 
+The indexing source cache also shares raw tokens for files outside its preloaded
+project sources, including installed system headers. Tokens are keyed by canonical
+path, language and exact file contents; macro expansion still runs in each
+consumer's environment. Raw-token payload retention is bounded to 32 MiB per
+source cache and released with that cache. Files that do not fit are lexed
+normally. Original source locations survive both inline expansion and shared
+header units. See the [evaluation report](EVAL_REPORT.md#shared-system-header-units--2026-10-16)
+for measurements and remaining limits.
+
 ### Compiler predefined macros (#230)
 
 `--compiler-predefines` (library: `with_compiler_predefines(true)`) explicitly
@@ -212,10 +221,8 @@ settled before symbols are interned.
 
 Each command gets independent preprocessing and source caches, with inline header
 bodies, so include-path changes cannot reuse expansions from a different command.
-In bare-tree indexing, only headers discovered under the project or explicit
-dependency roots use separate cached header units. Other external headers stay
-inline in their including unit so their declarations reach lowering and retain
-dependency ownership.
+Bare-tree indexing shares compatible system bundles as described in
+[Shared system header bundles](#shared-system-header-bundles).
 
 `validate_command_macros` checks command definitions with the same parser used
 by preprocessing, including function-like and variadic parameter lists, without
@@ -366,8 +373,13 @@ flowchart LR
   payload over 512 KiB. Aggregate victims are selected by canonical path order.
   Active preprocessing/loading workers and provenance metadata are outside this
   payload budget. Spills retain original bytes and all mapping provenance, use
-  independent read cursors, and are deleted on eviction or release. They share
-  a randomly named `trace-spill-*` directory under the temporary directory,
+  independent read cursors, and are deleted on eviction or release. LineMap
+  blocks store every source position and a bitmap indicating which entries
+  additionally carry macro-expansion provenance; absent expansion fields are
+  restored to their exact defaults. Both encoding and decoding use bounded
+  scratch buffers and 256 KiB I/O buffers, coalescing block bitmaps and payloads
+  into larger operations. Spill decisions still use the in-memory payload size.
+  Spills share a randomly named `trace-spill-*` directory under the temporary directory,
   removed when its last spill is released (also on normal completion or error).
   CLI `--timeout-secs` blocks new spills and removes this directory on a
   best-effort basis before exiting with code 124. SIGKILL cannot run cleanup;
@@ -389,6 +401,8 @@ flowchart LR
 | Input-boundary recording | Optional shared collector for consumed headers and compilation/link metadata; see [compilation database options](#compilation-database-options-62). |
 | Missing-header guidance | Bounded CLI summary and opt-in candidate include roots; see [missing-header guidance](#missing-header-guidance). |
 | Compilation options (#62) | Ordered command macro operations, quoted/normal/system/after include search classes, opt-in compiler default path discovery (`--system-includes`), opt-in [compiler predefined macro discovery](#compiler-predefined-macros-230) (#230), forced headers with original LineMap origins; language and standard-version predefines. Inferred paths respect the [test partition](ANALYSIS.md#declaring-header-eligibility). |
+| External-header lexing | Bounded sharing of raw tokens by path, language and contents; macro expansion remains per consumer. See [compilation database options](#compilation-database-options-62). |
+| Shared system bundles | Compatible leading system includes containing only dependency-owned inline text share expansions and declaration IR; see [Shared system header bundles](#shared-system-header-bundles). |
 | Comments | `//`, `/* */` |
 | Line splicing | Translation phase 2 (C11 5.1.1.2p1) runs inside the lexer, at the character level: every `\`-newline (`\n` or `\r\n`, and — as gcc and clang accept with a warning — with horizontal whitespace between the `\` and the newline) is deleted before any token is recognized, so a spliced identifier is one identifier (`int c\`-newline-`d;` is `int cd;`), a spliced multi-character punctuator is munched whole (`.\`-newline-`..` is `...`, so `#define F(x, .\`-newline-`..)` is the variadic macro gcc and clang see — #38), a spliced encoding prefix or string body stays one literal, a `//` comment ending in `\` continues onto the next line and `/\`-newline-`*` opens a block comment. A `\r` counts only as the first half of a `\r\n`: `\`-CR-CR-LF and `\`-CR-space-LF are not splices, as in clang. Inside a C++11 raw string literal the splice is reverted ([lex.pptoken]p3) and the body is kept as written; in C, where `R"(…)"` is the identifier `R` followed by an ordinary string, a splice in that body is deleted like in any string — clang's `-std=c11` behaviour, while gcc and clang in their default GNU modes lex a raw string there and keep the splice as written. Token positions stay physical — a token starts where its first character sits in the file, which is what the LineMap needs — so adjacency can no longer be read off `line`/`col`; instead the lexer records on every token whether it touched the previous one (`Token::adjacent_before`, with a splice counting as nothing and whitespace, comments and newlines as a gap), and that flag is what the function-like `#define` test and `#` stringizing read. Before #38 the lexer kept `\` + newline as two tokens and each consumer that needed phase 2 skipped the pair itself, so the splice was still visible everywhere else: `int c\`-newline-`d;` came out as `int c\ d;` and a spliced ellipsis stayed three `.` tokens |
 | Punctuators | The multi-character forms the lexer knows are one token each, so the re-speller writes them back unbroken: `##`, the two-character operators (`<<` `>>` `<=` `>=` `==` `!=` `&&` `\|\|` `++` `--` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `->`) and the three-character `...` and `->*`. Anything else is one token per character; the ones that still come out glued do so because the output spacing rule happens not to separate them (`::`, `.*`, and the `=` after `>>` / `<<`), not because they are single tokens. `->*` needed its own token because the spacing rule *does* separate it: the space before `*` after `>` that keeps `shared_ptr<T> &p` from gluing into `>&` also split `c->*m` into `c-> * m`, which is not C++, and tree-sitter then recovered the operand as a callee — fabricating a function named after it, in one corpus case named after a template parameter (#37). Recovering the token does not make the construct parse: tree-sitter-cpp knows `->*` only as an overloadable operator name and as a fold operator — `struct S { int operator->*(int); };` and `(a ->* ...)` both parse — and has no rule for it as a binary operator in an ordinary expression, so `c->*m` is an ERROR site even in pristine source, while `c.*m` parses. `->*` is also lexed as one token only in C++: gcc and clang tokenize `a->*b` in C as `->` then `*`. The re-speller gives `...` a leading space when the output already ends in a preprocessing number, because a pp-number absorbs `.` and alphanumerics (C11 6.4.8) and would otherwise swallow it — the GNU case range `case 0x0300 ... 0x0307:` would come back as the single number `0x0300...0x0307`; after an identifier (`Args...`) no space is added. Before #28 there was no `...` case, so every ellipsis lexed as three `.` tokens and, since the spacing rule *does* put a space before `.`, came out as `. . .` — a tree-sitter ERROR site in every variadic declaration, 111 of the 756 catalogued ERROR sites across the pinned corpora |
@@ -401,6 +415,7 @@ flowchart LR
 | Macro hide set | Replacement-list tokens carry the active macro name (and the invoking token's hide set) on rescan, so self-referential macros such as `#define FOO FOO, BAR` terminate. In emitted source, prescanned arguments acquire that hide state after prescan; nested `MIN(MIN(a,b),c)` still expands. Conditional expressions rescan raw arguments with their existing hide state, allowing nested same-name wrappers in `#if` and `#elif`. |
 | Compiler attribute groups | Balanced noise groups are elided at rescan boundaries after expanding arguments and chained marker aliases. GNU semantic attributes (including underscore spellings and `noreturn`) and MSVC linkage attributes survive. Directives and malformed groups are retained; elision preserves newlines and LineMap origins. |
 | Weak linkage pragmas | Active `#pragma weak name` survives preprocessing for IR annotation capture; inactive directives are discarded. Alias spelling marks the named declaration weak without synthesizing an alias body. |
+| Pragma operator | Active `_Pragma("...")` (also macro-generated, wide and UTF string spellings) destringizes its operand and uses the same handling as `#pragma`: `once` records the guard, `weak` retains annotation input, other pragmas are ignored. The operator contributes no syntax or include-boundary tokens. An incomplete rescan spelling stays as tokens; a balanced operator with an unsupported operand warns and is dropped without truncating the file. Resource limits still apply. |
 | Expansion depth cap | 256 nested expansions; further expansion is skipped with a warning (backstop if hide-set does not apply) |
 | Runaway caps | Per-file limits (defaults): 64 nested `#include`s, 64 inclusions of any one path per run (`max_file_expansions`, see the repeated-`#include` row above — depth alone does not bound repetition), 32 MiB live output, 8M tokens (macro rescan included). The token budget counts tokens **materialized**, not merely walked: a function-like invocation walks O(1) — the argument list is skipped wholesale — and then copies each argument once per parameter occurrence, so before #30 an 80k-token argument reached 397 MB of peak allocation under a 2,000-token budget. The projected replacement is charged before it is built, and the rescan charges the result again as it walks it, so a function-like expansion costs roughly twice its width against the budget. Exceeding output/token budget stops that file with an error diagnostic; include-depth and the per-path expansion cap skip the nested include. CLI `--timeout-secs N` aborts the whole process. |
 | `##` token pasting | In macro bodies after argument substitution; chained pastes (`a ## b ## c`) collapse left to right, empty operands are placemarkers on either side (the surviving operand keeps the left operand's adjacency), so an empty left parameter never pastes a preceding token; a dangling `##` with no operand is dropped |
@@ -670,6 +685,108 @@ candidate probes naming 224,945 distinct paths (#83).
 | Orphan headers | Project `.h` never reached from any `.c` are indexed as their own units (may contain calls) |
 | Parallel index | Header IR, orphan headers, and `.c` TUs: parallel parse/lower, sequential merge |
 
+### Shared system header bundles
+
+Bundle declaration fingerprints hash each interned source path and macro name
+once, then hash those content fingerprints at token positions. Intern table
+numbering and unused paths do not affect declaration identity.
+
+Bare-tree indexing caches top-level includes resolved under system search
+roots as separate header units, including extensionless standard-library headers.
+Only leading includes before project declarations are separated. An external
+include bundle keeps its nested implementation headers inline, so
+fragments inside namespaces and classes retain their enclosing syntax. Includes
+inside an unfinished declaration or scope, and bundles that leave unmatched
+delimiters or an unfinished token boundary, remain inline. Separation
+accepts a semicolon ending or a known namespace/linkage block;
+ambiguous global brace endings stay inline so an includer can continue a
+class or initializer declaration.
+Bundles containing inline text from outside the established dependency roots
+remain inline, preserving project body ownership by original source path.
+This includes project `.inc` files omitted by file discovery; absence from the
+discovered-file set does not establish dependency ownership. Indexing supplies
+its classified dependency roots to preprocessing, including external system
+roots. Installed fragments within those roots remain shareable.
+Ownership follows each include occurrence that emits inline text, including
+unguarded fragments included earlier with an inactive conditional body. A
+run-wide set of previously included paths cannot establish which files supplied
+text to a particular bundle.
+Bundles containing namespace directives, using-declarations or weak pragmas
+remain inline: these affect lookup or declarations in the consumer and are
+not carried by declaration IR. Type aliases (`using Name = Type;`) remain
+shareable. During system-header sharing, this fallback also applies to nested
+project cache entries so an enclosing bundle cannot hide these effects.
+`_Pragma` operators, including macro-generated libc++ macro-cleanup sequences,
+are processed as directives and removed before scope tracking. A header ending
+in those operators can finish a bundle without preventing the following system
+include from sharing. Macro push/pop stacks are not modeled: both pragma
+spellings retain the existing ignore policy for `push_macro`/`pop_macro`.
+
+Project declarations and a nonempty preceding project-header preamble still
+prevent system bundle separation. System-root membership alone does not prove
+independence from project types or overload context; relaxing this gate also
+requires preserving include-position imports. In particular, own-header-first
+layouts can still keep later system headers inline. The
+[indexing diagnostics](MEMORY_PROFILE.md#indexing-subphase-timings) expose
+refused bundle attempts by reason, so successful sharing must be checked on
+each platform rather than inferred from Linux measurements.
+
+Existing macro fingerprints, directive replay and ordered discovery select compatible variants;
+lowering imports the matching language and variant with original locations and
+dependency ownership. Each system bundle records the complete preceding shared
+system-header context, including its size and stable declaration identities;
+matching final macro values cannot substitute a different earlier declaration
+variant, even when the later header does not include its prerequisite itself.
+Declaration identities hash expanded text, the language standard and original
+source/macro provenance, with intern-table indices resolved to paths and names.
+Macro-read fingerprints still validate expansion compatibility separately.
+Different macro histories producing identical declarations therefore do not
+recursively split later declaration contexts.
+Existing project-header caching retains its macro/read-dependency policy;
+an explicit include of an already supplied system fragment records the exact
+bundle declarations supplying it. Implicit incoming type dependencies of
+project headers retain the [existing sharing approximation](ANALYSIS.md#shared-header-functions).
+Consumed prerequisites also enter a system variant's declaration preamble,
+including factory prototypes and return types used to infer global initializers.
+Cached project headers also import consumed system declarations before lowering
+initializers; see [Shared header functions](ANALYSIS.md#shared-header-functions).
+Reference-binding facts also survive declaration imports and reusable preambles;
+see [Dereferenced operands](ANALYSIS.md#dereferenced-operands).
+Deferred discovery records header adoption in its ordered history even
+when the header executes no macro directives. Prerequisites supplied inside a
+cached parent are local to that parent, rather than requirements on its caller.
+Compilation-database indexing retains its command-local
+inline preprocessing path. Conditional recording and exploration also keep
+system headers inline so their conditional chains remain observable.
+Repeated unguarded system includes remain inline after their first shared
+expansion, preserving deliberate re-inclusion under changed macros.
+
+Once ordinary translation units and standalone headers all have settled,
+spillable preprocessing results, indexing can release expansion-cache payloads
+as their final header-lowering consumer finishes. Standalone headers are
+preprocessed before that release; their later AST lowering reads the same
+settled text and source map. Cache keys with no planned header-lowering
+consumer are released first. Other keys remain until every selected
+language/variant has been lowered, keeping variant indices intact. Exploration
+or an unsettled input retains the cache through the ordinary lifetime instead.
+
+The final header-variant plan is built after standalone orphan preprocessing.
+Its consumed set includes both TUs and orphan headers and is closed over nested
+variant prerequisites. An orphan can replay a warmed configuration that no TU
+used; that configuration must still receive declaration IR before expansion
+retirement. TU-only provenance may classify initial header paths, but cannot
+choose the final variants or determine which cache keys have no consumers.
+This avoids retaining expanded text beside the corresponding declaration IR
+when no future preprocessing can use it.
+
+These caches live for one indexing run. The existing variant cap applies;
+entries that cannot be stored remain in the consuming unit. Cached system
+bodies contribute declarations only, under the existing dependency-root rules.
+Header lowering schedules dependencies between exact language/variant units;
+opposite include orders may form a path-level cycle while the variant
+dependencies remain acyclic. Genuine cycles retain a deterministic sequential
+fallback.
+
 ### Determinism
 
 Indexing output must be identical across runs of the same tree. Two mechanisms guarantee this:
@@ -809,7 +926,7 @@ where `K` counts the units the committing thread ran itself. Measurements are in
 
 Indexing sets `inline_include_bodies = false`. Nested cacheable `#include`s replay **macros and include-once state** but do not copy header tokens into the consumer's live output. Each header's preprocessed text is therefore file-local, except for a nested header whose expansion cannot be stored: its text stays in its includer's ("An expansion that cannot be stored", above).
 
-After the warm pass, reachable headers are parsed and lowered **once**. PCH order uses the include graph **plus preprocess `included_headers`** (macro includes the raw scanner misses). Independent leaves may run in parallel waves; a header is never in the same wave as a nested include it needs. Include **cycles** are not a parallel wave: leftovers are indexed in include-graph order so nested layouts stay visible. Nested `#include` IR merges **types and typedefs** from **direct** includes (plus this header's preprocess `included_headers`) so `struct StreamHost { struct IDeviceIoService service; }` sees `Dispatch`, and `GpioIrqFunc func` sees the typedef, without copying every descendant's functions/flow into ancestor units. Child PCH units already nested-merged grandchild types. Types-only merges also preserve the type table's C++ reference-member metadata, each class's own default/copy constructor eligibility and explicit constructor imports, including nested classes and member class templates; see [member-initializer construction](ANALYSIS.md#c-support-first-step). Parallel isolation *without* those preprocess edges interned empty tags / `Int` and dropped field stores (`DeviceNodeExtDispatch` lost `DispatchToMessage`, `GpioOnDevEventReceive` lost `gpio->func`).
+After the warm pass, reachable headers are parsed and lowered **once**. PCH order uses the include graph **plus preprocess `included_headers`** (macro includes the raw scanner misses). Independent leaves may run in parallel waves; a header is never in the same wave as a nested include it needs. Include **cycles** are not a parallel wave: leftovers are indexed in include-graph order so nested layouts stay visible. Between cached project headers, nested `#include` IR merges **types and typedefs** from **direct** includes (plus this header's preprocess `included_headers`) so `struct StreamHost { struct IDeviceIoService service; }` sees `Dispatch`, and `GpioIrqFunc func` sees the typedef, without copying every descendant's functions/flow into ancestor units. Child PCH units already nested-merged grandchild types. Types-only merges also preserve the type table's C++ reference-member metadata, each class's own default/copy constructor eligibility and explicit constructor imports, including nested classes and member class templates; see [member-initializer construction](ANALYSIS.md#c-support-first-step). Parallel isolation *without* those preprocess edges interned empty tags / `Int` and dropped field stores (`DeviceNodeExtDispatch` lost `DispatchToMessage`, `GpioOnDevEventReceive` lost `gpio->func`).
 
 Headers that become reachable only after those preprocess edges are added join the PCH set (and leave the orphan path) so translation units can merge their prototypes.
 

@@ -43,6 +43,39 @@ pub struct LineMapEntry {
 }
 
 impl LineMap {
+    /// Declaration identity ignores intern-table numbering and unused files,
+    /// while retaining every token's original and macro-expansion position.
+    pub(crate) fn declaration_signature(&self, text: &str, cpp_standard: u32) -> u64 {
+        use std::hash::{Hash, Hasher};
+        // A bundle can contain hundreds of thousands of mappings to the same
+        // few paths. Hash path components once, rather than at every token.
+        // Content fingerprints (not intern IDs) preserve cross-TU identity.
+        fn fingerprint(value: impl Hash) -> u64 {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut hash);
+            hash.finish()
+        }
+        let files: Vec<_> = self.files.iter().map(fingerprint).collect();
+        let macros: Vec<_> = self.macros.iter().map(fingerprint).collect();
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (cpp_standard, text).hash(&mut hash);
+        for entry in &self.entries {
+            (
+                entry.output_offset,
+                files[entry.file as usize],
+                entry.line,
+                entry.col,
+                (entry.expansion_file != u32::MAX).then(|| files[entry.expansion_file as usize]),
+                entry.expansion_line,
+                entry.expansion_col,
+                entry.expansion_id,
+                (entry.expansion_macro != u32::MAX).then(|| macros[entry.expansion_macro as usize]),
+            )
+                .hash(&mut hash);
+        }
+        hash.finish()
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -345,6 +378,76 @@ impl LineMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declaration_identity_preserves_origins_without_intern_table_identity() {
+        let mut left = LineMap::new();
+        left.intern_file(Path::new("/unused.h"));
+        let file = left.intern_file(Path::new("/api.h"));
+        left.push(0, file, 3, 2);
+        let mut right = LineMap::new();
+        let file = right.intern_file(Path::new("/api.h"));
+        right.push(0, file, 3, 2);
+        let signature = left.declaration_signature("void Run();", 201703);
+        assert_eq!(
+            signature,
+            right.declaration_signature("void Run();", 201703)
+        );
+        assert_ne!(
+            signature,
+            right.declaration_signature("void Stop();", 201703)
+        );
+        assert_ne!(
+            signature,
+            right.declaration_signature("void Run();", 202002)
+        );
+        right.entries[0].col += 1;
+        assert_ne!(
+            signature,
+            right.declaration_signature("void Run();", 201703)
+        );
+        right.entries[0].col -= 1;
+        right.entries[0].expansion_id = 7;
+        assert_ne!(
+            signature,
+            right.declaration_signature("void Run();", 201703)
+        );
+    }
+
+    #[test]
+    fn declaration_identity_preserves_macro_names_and_invocation_paths() {
+        let mut left = LineMap::new();
+        let file = left.intern_file(Path::new("/sdk/api.h"));
+        let invocation = left.intern_file(Path::new("/sdk/outer.h"));
+        let name = left.intern_macro("DEFINE_API");
+        left.push(0, file, 2, 3);
+        left.entries[0].expansion_file = invocation;
+        left.entries[0].expansion_line = 8;
+        left.entries[0].expansion_col = 5;
+        left.entries[0].expansion_macro = name;
+        let mut right = left.clone();
+        right.files.reverse();
+        right.entries[0].file = 1;
+        right.entries[0].expansion_file = 0;
+        right.macros.insert(0, "UNUSED".into());
+        right.entries[0].expansion_macro = 1;
+        let signature = left.declaration_signature("void Run();", 201703);
+        assert_eq!(
+            signature,
+            right.declaration_signature("void Run();", 201703)
+        );
+        right.macros[1] = "OTHER_API".into();
+        assert_ne!(
+            signature,
+            right.declaration_signature("void Run();", 201703)
+        );
+        right.macros[1] = "DEFINE_API".into();
+        right.files[0] = "/sdk/other.h".into();
+        assert_ne!(
+            signature,
+            right.declaration_signature("void Run();", 201703)
+        );
+    }
 
     #[test]
     fn splice_range_preserves_boundaries_and_origins() {

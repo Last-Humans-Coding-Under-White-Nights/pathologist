@@ -790,15 +790,35 @@ impl TypeTable {
             return;
         }
         let n = self.types.len();
+        // Completion may append pointer types, but cannot declare or widen a
+        // named tag. Each original type therefore has one answer for this
+        // pass. Keep first-use order, including newly interned pointer IDs.
+        let mut completed = vec![None; n];
         for i in 0..n {
-            let fids: Vec<FieldId> = self.types[i].layout.fields.keys().copied().collect();
-            for fid in fids {
-                let old = self.types[i].layout.fields[&fid].type_id;
-                let new_id = self.complete_type_id(old);
-                if new_id != old {
-                    if let Some(fl) = self.types[i].layout.fields.get_mut(&fid) {
-                        fl.type_id = new_id;
+            for field in 0..self.types[i].layout.fields.len() {
+                let old = self.types[i]
+                    .layout
+                    .fields
+                    .get_index(field)
+                    .unwrap()
+                    .1
+                    .type_id;
+                let new_id = match completed[old.0 as usize] {
+                    Some(id) => id,
+                    None => {
+                        let id = self.complete_type_id(old);
+                        completed[old.0 as usize] = Some(id);
+                        id
                     }
+                };
+                if new_id != old {
+                    self.types[i]
+                        .layout
+                        .fields
+                        .get_index_mut(field)
+                        .unwrap()
+                        .1
+                        .type_id = new_id;
                 }
             }
         }
@@ -806,15 +826,17 @@ impl TypeTable {
     }
 
     fn complete_type_id(&mut self, id: TypeId) -> TypeId {
-        match self.get(id).desc.as_ref().clone() {
+        // Most fields already have complete types. Inspect their shared
+        // descriptors without cloning an entire aggregate just to match it.
+        match self.get(id).desc.as_ref() {
             TypeDesc::Struct { name, fields } if fields.is_empty() && !name.is_empty() => {
-                self.type_id_by_tag(&name, TypeKind::Struct).unwrap_or(id)
+                self.type_id_by_tag(name, TypeKind::Struct).unwrap_or(id)
             }
             TypeDesc::Union { name, fields } if fields.is_empty() && !name.is_empty() => {
-                self.type_id_by_tag(&name, TypeKind::Union).unwrap_or(id)
+                self.type_id_by_tag(name, TypeKind::Union).unwrap_or(id)
             }
             TypeDesc::Ptr(inner) => {
-                let completed = self.canonicalize_desc(*inner);
+                let completed = self.canonicalize_desc(inner.as_ref().clone());
                 let richer = match &completed {
                     TypeDesc::Struct { fields, .. } | TypeDesc::Union { fields, .. } => {
                         !fields.is_empty()
@@ -942,14 +964,13 @@ impl TypeTable {
     }
 
     pub fn note_integer_constant(&mut self, name: &str, value: Option<i128>) {
-        self.integer_constants
-            .entry(name.to_owned())
-            .and_modify(|known| {
-                if *known != value {
-                    *known = None;
-                }
-            })
-            .or_insert(value);
+        if let Some(known) = self.integer_constants.get_mut(name) {
+            if *known != value {
+                *known = None;
+            }
+        } else {
+            self.integer_constants.insert(name.to_owned(), value);
+        }
     }
 
     pub fn integer_constant(&self, name: &str) -> Option<Option<i128>> {
@@ -1018,6 +1039,13 @@ impl TypeTable {
     }
 
     pub fn note_inherited_constructor(&mut self, class: &str, base: &str) {
+        if self
+            .inherited_ctors
+            .get(class)
+            .is_some_and(|bases| bases.iter().any(|b| b == base))
+        {
+            return;
+        }
         let bases = self.inherited_ctors.entry(class.to_owned()).or_default();
         if !bases.iter().any(|b| b == base) {
             bases.push(base.to_owned());
@@ -1380,10 +1408,18 @@ impl TypeTable {
         self.declared_ctors
             .extend(other.declared_ctors.iter().cloned());
         for (class, provided) in &other.default_ctors {
-            *self.default_ctors.entry(class.clone()).or_default() |= provided;
+            if let Some(known) = self.default_ctors.get_mut(class) {
+                *known |= provided;
+            } else {
+                self.default_ctors.insert(class.clone(), *provided);
+            }
         }
         for (class, provided) in &other.copy_ctors {
-            *self.copy_ctors.entry(class.clone()).or_default() |= provided;
+            if let Some(known) = self.copy_ctors.get_mut(class) {
+                *known |= provided;
+            } else {
+                self.copy_ctors.insert(class.clone(), *provided);
+            }
         }
         for (class, bases) in &other.inherited_ctors {
             for base in bases {
@@ -1391,9 +1427,17 @@ impl TypeTable {
             }
         }
         for (class, fields) in &other.member_initializers {
-            let initializers = self.member_initializers.entry(class.clone()).or_default();
+            let initializers = if self.member_initializers.contains_key(class) {
+                self.member_initializers.get_mut(class).unwrap()
+            } else {
+                self.member_initializers.entry(class.clone()).or_default()
+            };
             for (field, alternatives) in fields {
-                let entries = initializers.entry(field.clone()).or_default();
+                let entries = if initializers.contains_key(field) {
+                    initializers.get_mut(field).unwrap()
+                } else {
+                    initializers.entry(field.clone()).or_default()
+                };
                 for initializer in alternatives {
                     if !entries.contains(initializer) {
                         entries.push(Arc::clone(initializer));
@@ -1406,7 +1450,11 @@ impl TypeTable {
         }
         for (class, signatures) in &other.constructor_signatures {
             for signature in signatures {
-                self.note_constructor_signature(class, signature.clone());
+                // Shared headers normally re-add an existing signature;
+                // its parameter/syntax vectors need no owned copy on a hit.
+                if !self.constructor_signatures(class).contains(signature) {
+                    self.note_constructor_signature(class, signature.clone());
+                }
             }
         }
         // Membership metadata only: iteration order cannot affect type IDs
@@ -1982,6 +2030,123 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn repeated_metadata_imports_preserve_conflicts_and_distinct_signatures() {
+        let signature = ConstructorSignature {
+            parameters: vec![Arc::new(TypeDesc::Int)],
+            references: vec![false],
+            parameter_syntax: vec![Some(Arc::from("int"))],
+            reference_forms: vec![None],
+            declaration: None,
+            variadic: false,
+            default_args: 0,
+        };
+        let mut header = TypeTable::new();
+        header.note_constructor("C", false, true, false);
+        header.note_constructor_signature("C", signature.clone());
+        header.note_integer_constant("C::value", Some(1));
+        header.note_inherited_constructor("C", "Base");
+        let mut dst = TypeTable::new();
+        dst.merge_struct_declarations(&header);
+        let epoch = dst.constructor_metadata_epoch();
+        dst.merge_struct_declarations(&header);
+        assert!(dst.constructor_metadata_epoch() > epoch);
+        assert_eq!(
+            dst.constructor_signatures("C"),
+            std::slice::from_ref(&signature)
+        );
+        assert_eq!(dst.inherited_constructor_bases("C"), &["Base"]);
+        let mut changed = signature.clone();
+        changed.references[0] = true;
+        changed.parameter_syntax[0] = Some(Arc::from("const int&"));
+        header.note_constructor_signature("C", changed.clone());
+        header.note_constructor("C", true, true, true);
+        header.note_integer_constant("C::value", Some(2));
+        dst.merge_struct_declarations(&header);
+        assert_eq!(dst.constructor_signatures("C"), &[signature, changed]);
+        assert_eq!(dst.default_constructor("C"), Some(true));
+        assert_eq!(dst.copy_constructor("C"), Some(true));
+        assert_eq!(dst.integer_constant("C::value"), Some(None));
+        dst.note_integer_constant("C::value", Some(1));
+        assert_eq!(dst.integer_constant("C::value"), Some(None));
+    }
+
+    #[test]
+    fn completion_memo_preserves_first_use_ids_across_tag_changes() {
+        fn reference_pass(table: &mut TypeTable) {
+            if !table.needs_tag_completion {
+                return;
+            }
+            let n = table.types.len();
+            for i in 0..n {
+                let fields: Vec<_> = table.types[i].layout.fields.keys().copied().collect();
+                for field in fields {
+                    let old = table.types[i].layout.fields[&field].type_id;
+                    let new = table.complete_type_id(old);
+                    table.types[i]
+                        .layout
+                        .fields
+                        .get_mut(&field)
+                        .unwrap()
+                        .type_id = new;
+                }
+            }
+            table.needs_tag_completion = false;
+        }
+        fn check(fast: &mut TypeTable, reference: &mut TypeTable) {
+            fast.complete_nested_tags();
+            reference_pass(reference);
+            assert_eq!(
+                format!("{:?}", fast.types),
+                format!("{:?}", reference.types)
+            );
+            assert_eq!(fast.struct_tags, reference.struct_tags);
+            assert_eq!(fast.union_tags, reference.union_tags);
+            assert_eq!(fast.needs_tag_completion, reference.needs_tag_completion);
+        }
+        let mut fast = TypeTable::new();
+        let late = TypeDesc::Struct {
+            name: "Late".into(),
+            fields: vec![],
+        };
+        let union = TypeDesc::Union {
+            name: "Choice".into(),
+            fields: vec![],
+        };
+        let shapes = [
+            late.clone(),
+            TypeDesc::Ptr(Box::new(late.clone())),
+            TypeDesc::Ptr(Box::new(TypeDesc::Ptr(Box::new(late.clone())))),
+            TypeDesc::Array {
+                elem: Box::new(late),
+                size: Some(2),
+            },
+            union.clone(),
+            TypeDesc::Ptr(Box::new(union)),
+        ];
+        fast.compute_struct_layout(
+            "Holder".into(),
+            (0..120)
+                .map(|i| (format!("f{i}"), shapes[i % shapes.len()].clone()))
+                .collect(),
+        );
+        let mut reference = fast.clone();
+        check(&mut fast, &mut reference); // No definitions yet.
+        for table in [&mut fast, &mut reference] {
+            table.compute_struct_layout("Late".into(), vec![("value".into(), TypeDesc::Int)]);
+            table.compute_union_layout("Choice".into(), vec![("value".into(), TypeDesc::Char)]);
+        }
+        check(&mut fast, &mut reference);
+        for table in [&mut fast, &mut reference] {
+            let _ =
+                table.union_struct_layout("Late".into(), vec![("extra".into(), TypeDesc::Long)]);
+            let _ =
+                table.union_union_layout("Choice".into(), vec![("extra".into(), TypeDesc::Long)]);
+        }
+        check(&mut fast, &mut reference);
+        check(&mut fast, &mut reference); // Settled pass is a no-op.
+    }
 
     fn struct_desc(name: &str, fields: Vec<(&str, TypeDesc)>) -> TypeDesc {
         TypeDesc::Struct {

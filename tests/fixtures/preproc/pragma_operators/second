@@ -1,0 +1,3 @@
+#pragma once
+namespace Std { void Api(First *); }
+_Pragma("pop_macro(\"min\")")

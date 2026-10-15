@@ -1,8 +1,9 @@
+use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use trace_preproc::LineMap;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
 mod declaration_macros;
 pub(crate) use declaration_macros::recover_declaration_macros;
@@ -26,6 +27,8 @@ impl SourceLang {
 thread_local! {
     static PARSER_C: RefCell<Parser> = RefCell::new(make_parser(SourceLang::C));
     static PARSER_CPP: RefCell<Parser> = RefCell::new(make_parser(SourceLang::Cpp));
+    static LAST_C_TREE: RefCell<Option<ParseResult>> = const { RefCell::new(None) };
+    static LAST_CPP_TREE: RefCell<Option<ParseResult>> = const { RefCell::new(None) };
 }
 
 fn make_parser(lang: SourceLang) -> Parser {
@@ -53,32 +56,526 @@ pub fn parse_source_with_lang(
     source: impl Into<Arc<str>>,
     lang: SourceLang,
 ) -> Result<ParseResult, String> {
-    let source: Arc<str> = source.into();
+    parse_source(source.into(), lang, false)
+}
+
+/// Reuse unchanged syntax from the preceding large input on this indexing
+/// worker. Only syntax is shared: lowering still uses this unit's LineMap and
+/// starts from its own symbol/type environment.
+pub(crate) fn parse_index_source(
+    source: Arc<str>,
+    lang: SourceLang,
+) -> Result<ParseResult, String> {
+    parse_source(source, lang, true)
+}
+
+fn parse_source(
+    source: Arc<str>,
+    lang: SourceLang,
+    incremental: bool,
+) -> Result<ParseResult, String> {
     let source = if lang == SourceLang::Cpp {
         normalize_cpp_parse_syntax(&source)
     } else {
         source
     };
-    let tree = match lang {
-        SourceLang::C => PARSER_C.with(|p| {
-            let mut parser = p.borrow_mut();
-            let res = parser.parse(source.as_ref(), None);
-            parser.reset();
-            res
-        }),
-        SourceLang::Cpp => PARSER_CPP.with(|p| {
-            let mut parser = p.borrow_mut();
-            let res = parser.parse(source.as_ref(), None);
-            parser.reset();
-            res
-        }),
+    let parse = |previous: &mut Option<ParseResult>| {
+        let mut old = previous.take();
+        if old
+            .as_mut()
+            .is_some_and(|old| old.tree.root_node().has_error() || !edit_previous(old, &source))
+        {
+            // Error recovery depends on reuse history; only fresh parsing is
+            // the reference for malformed inputs, regardless of scheduling.
+            old = None;
+        }
+        let parse_with = |parser: &mut Parser| {
+            let mut tree = parse_tree(parser, &source, old.as_ref().map(|old| &old.tree));
+            if old.is_some()
+                && tree
+                    .as_ref()
+                    .is_some_and(|tree| tree.root_node().has_error())
+            {
+                tree = parse_tree(parser, &source, None);
+            }
+            tree
+        };
+        let tree = match lang {
+            SourceLang::C => PARSER_C.with(|p| parse_with(&mut p.borrow_mut())),
+            SourceLang::Cpp => PARSER_CPP.with(|p| parse_with(&mut p.borrow_mut())),
+        };
+        if let Some(tree) = &tree {
+            if incremental
+                && !tree.root_node().has_error()
+                && cacheable_source(&source)
+                && tree.root_node().descendant_count() <= 1_000_000
+            {
+                *previous = Some(ParseResult {
+                    tree: tree.clone(),
+                    source: Arc::clone(&source),
+                });
+            }
+        }
+        tree
+    };
+    let tree = if incremental {
+        match lang {
+            SourceLang::C => LAST_C_TREE.with(|last| parse(&mut last.borrow_mut())),
+            SourceLang::Cpp => LAST_CPP_TREE.with(|last| parse(&mut last.borrow_mut())),
+        }
+    } else {
+        parse(&mut None)
     };
     let tree = tree.ok_or_else(|| "tree-sitter returned no tree".to_string())?;
     Ok(ParseResult { tree, source })
 }
 
+fn parse_tree(parser: &mut Parser, source: &str, previous: Option<&Tree>) -> Option<Tree> {
+    let tree = parser.parse(source, previous);
+    parser.reset();
+    tree
+}
+
+fn cacheable_source(source: &str) -> bool {
+    (16 * 1024..=4 * 1024 * 1024).contains(&source.len())
+}
+
+/// Cover changed bytes with bounded edits around exact unchanged blocks.
+/// Tree-sitter revalidates retained syntax in its new grammar/scanner context.
+fn edit_previous(old: &mut ParseResult, source: &str) -> bool {
+    if !cacheable_source(source) {
+        return false;
+    }
+    let before = old.source.as_ref();
+    let mut prefix = before
+        .bytes()
+        .zip(source.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !before.is_char_boundary(prefix) || !source.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let mut suffix = before.as_bytes()[prefix..]
+        .iter()
+        .rev()
+        .zip(source.as_bytes()[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !before.is_char_boundary(before.len() - suffix)
+        || !source.is_char_boundary(source.len() - suffix)
+    {
+        suffix -= 1;
+    }
+    if prefix + suffix < before.len().min(source.len()) / 2 {
+        let middle = shared_middles(before, source, prefix, suffix);
+        let retained = prefix + suffix + middle.iter().map(|(old, _)| old.len()).sum::<usize>();
+        if middle.is_empty() || retained < before.len().min(source.len()) / 4 {
+            return false;
+        }
+        // Right to left: later edits do not change the original coordinates
+        // of an earlier edit. Each inserted extent starts at its OLD position;
+        // subsequent left edits shift it into its final position.
+        let (mut old_end, mut new_end) = (before.len() - suffix, source.len() - suffix);
+        for (old_middle, new_middle) in middle.iter().rev() {
+            edit_range(
+                &mut old.tree,
+                before,
+                source,
+                old_middle.end..old_end,
+                new_middle.end..new_end,
+            );
+            old_end = old_middle.start;
+            new_end = new_middle.start;
+        }
+        edit_range(
+            &mut old.tree,
+            before,
+            source,
+            prefix..old_end,
+            prefix..new_end,
+        );
+        return true;
+    }
+    edit_range(
+        &mut old.tree,
+        before,
+        source,
+        prefix..before.len() - suffix,
+        prefix..source.len() - suffix,
+    );
+    true
+}
+
+fn edit_range(
+    tree: &mut Tree,
+    before: &str,
+    after: &str,
+    old: std::ops::Range<usize>,
+    new: std::ops::Range<usize>,
+) {
+    if old.is_empty() && new.is_empty() {
+        return;
+    }
+    let start_position = advance_point(Point::new(0, 0), &before[..old.start]);
+    tree.edit(&InputEdit {
+        start_byte: old.start,
+        old_end_byte: old.end,
+        new_end_byte: old.start + new.len(),
+        start_position,
+        old_end_position: advance_point(start_position, &before[old]),
+        new_end_position: advance_point(start_position, &after[new]),
+    });
+}
+
+/// Unique matching lines anchor an exact common byte block, without a general
+/// diff or probabilistic content identity. The map and extension work are
+/// bounded by the already bounded input size. Repeated lines are not anchors.
+/// Keep at most 32 ordered blocks of at least 8 KiB, spending at most four
+/// input lengths extending anchors; this is a reuse heuristic, not a full diff.
+fn shared_middles(
+    before: &str,
+    after: &str,
+    prefix: usize,
+    suffix: usize,
+) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let old_end = before.len() - suffix;
+    let new_end = after.len() - suffix;
+    let mut anchors = FxHashMap::default();
+    let mut offset = prefix;
+    for line in before[prefix..old_end].split_inclusive('\n') {
+        if line.len() >= 32 {
+            anchors
+                .entry(line)
+                .and_modify(|pos| *pos = None)
+                .or_insert(Some(offset));
+        }
+        offset += line.len();
+    }
+    let mut blocks = Vec::new();
+    let mut last_match: Option<(std::ops::Range<usize>, std::ops::Range<usize>)> = None;
+    let mut budget = before.len().max(after.len()) * 4;
+    let (mut old_floor, mut new_floor) = (prefix, prefix);
+    offset = prefix;
+    for line in after[prefix..new_end].split_inclusive('\n') {
+        let new_at = offset;
+        offset += line.len();
+        let Some(&Some(old_at)) = anchors.get(line) else {
+            continue;
+        };
+        if old_at < old_floor || new_at < new_floor {
+            continue;
+        }
+        if last_match.as_ref().is_some_and(|(a, b)| {
+            a.contains(&old_at) && b.contains(&new_at) && old_at - a.start == new_at - b.start
+        }) {
+            continue;
+        }
+        let (mut a, mut b) = (old_at, new_at);
+        while budget > 0
+            && a > old_floor
+            && b > new_floor
+            && before.as_bytes()[a - 1] == after.as_bytes()[b - 1]
+        {
+            a -= 1;
+            b -= 1;
+            budget -= 1;
+        }
+        let (mut ae, mut be) = (old_at + line.len(), new_at + line.len());
+        while budget > 0
+            && ae < old_end
+            && be < new_end
+            && before.as_bytes()[ae] == after.as_bytes()[be]
+        {
+            ae += 1;
+            be += 1;
+            budget -= 1;
+        }
+        while !before.is_char_boundary(a) || !after.is_char_boundary(b) {
+            a += 1;
+            b += 1;
+        }
+        while !before.is_char_boundary(ae) || !after.is_char_boundary(be) {
+            ae -= 1;
+            be -= 1;
+        }
+        last_match = Some((a..ae, b..be));
+        if ae - a >= 8 * 1024 {
+            blocks.push((a..ae, b..be));
+            old_floor = ae;
+            new_floor = be;
+        }
+        if budget == 0 || blocks.len() == 32 {
+            break;
+        }
+    }
+    blocks
+}
+
+fn advance_point(mut point: Point, text: &str) -> Point {
+    for byte in text.bytes() {
+        if byte == b'\n' {
+            point.row += 1;
+            point.column = 0;
+        } else {
+            point.column += 1;
+        }
+    }
+    point
+}
+
 pub fn parse_c_source(source: impl Into<Arc<str>>) -> Result<ParseResult, String> {
     parse_source_with_lang(source, SourceLang::C)
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+
+    // Include anonymous/missing/error nodes, field names, and byte/point
+    // coordinates: an S-expression alone does not check source attribution.
+    fn assert_same_nodes(a: Node<'_>, b: Node<'_>) {
+        assert_eq!(a.kind(), b.kind());
+        assert_eq!(a.is_named(), b.is_named());
+        assert_eq!(a.is_missing(), b.is_missing());
+        assert_eq!(a.has_error(), b.has_error());
+        assert_eq!(a.range(), b.range());
+        assert_eq!(a.child_count(), b.child_count());
+        for i in 0..a.child_count() {
+            assert_eq!(
+                a.field_name_for_child(i as u32),
+                b.field_name_for_child(i as u32)
+            );
+            assert_same_nodes(a.child(i).unwrap(), b.child(i).unwrap());
+        }
+    }
+
+    fn prefix() -> String {
+        (0..800)
+            .map(|i| format!("struct Header{i} {{ int field; }};\n"))
+            .collect()
+    }
+
+    #[test]
+    fn error_recovery_matches_fresh_parsing_regardless_of_previous_input() {
+        let prefix: String = (0..300)
+            .map(|i| format!("struct Blk_{i} {{ int a; }}; static inline int fn_{i}(int a) {{ return a + {i}; }}\n"))
+            .collect();
+        let valid: Arc<str> = format!(
+            "{prefix}struct Blk_X {{ int a; }};\nstatic inline int fnX(int a) {{ return a; }}\n"
+        )
+        .into();
+        assert!(cacheable_source(&valid));
+        for malformed in [
+            valid.replace("\ns", "<"),
+            valid.replace("return a + 150;", "return a + ;"),
+            valid.replace(";\nstatic inline int fnX", ";<tatic inline int fnX"),
+        ] {
+            let malformed: Arc<str> = malformed.into();
+            for lang in [SourceLang::C, SourceLang::Cpp] {
+                let seeded = parse_index_source(Arc::clone(&valid), lang).unwrap();
+                assert!(!seeded.tree.root_node().has_error());
+                let indexed = parse_index_source(Arc::clone(&malformed), lang).unwrap();
+                let fresh = parse_source_with_lang(Arc::clone(&malformed), lang).unwrap();
+                assert!(fresh.tree.root_node().has_error());
+                assert_eq!(
+                    indexed.tree.root_node().to_sexp(),
+                    fresh.tree.root_node().to_sexp()
+                );
+                assert_same_nodes(indexed.tree.root_node(), fresh.tree.root_node());
+                match lang {
+                    SourceLang::C => LAST_C_TREE.with(|last| assert!(last.borrow().is_none())),
+                    SourceLang::Cpp => LAST_CPP_TREE.with(|last| assert!(last.borrow().is_none())),
+                }
+                // Exercise the predecessor gate directly, as well as refusing
+                // to retain malformed trees during normal indexing.
+                let previous = ParseResult {
+                    tree: fresh.tree.clone(),
+                    source: Arc::clone(&fresh.source),
+                };
+                match lang {
+                    SourceLang::C => LAST_C_TREE.with(|last| *last.borrow_mut() = Some(previous)),
+                    SourceLang::Cpp => {
+                        LAST_CPP_TREE.with(|last| *last.borrow_mut() = Some(previous))
+                    }
+                }
+                let indexed = parse_index_source(Arc::clone(&valid), lang).unwrap();
+                let fresh = parse_source_with_lang(Arc::clone(&valid), lang).unwrap();
+                assert_same_nodes(indexed.tree.root_node(), fresh.tree.root_node());
+            }
+        }
+    }
+
+    #[test]
+    fn unchanged_middle_survives_edits_on_both_sides() {
+        let shared = prefix();
+        for lang in [SourceLang::C, SourceLang::Cpp] {
+            let first: Arc<str> = format!("int before_a;\n{shared}int after_a;\n").into();
+            let first = parse_index_source(first, lang).unwrap();
+            let reused = first.tree.root_node().named_child(400).unwrap().id();
+            let second: Arc<str> =
+                format!("int prefix_with_longer_name;\r\n{shared}void after_b(void) {{}}\n").into();
+            let middle = shared_middles(&first.source, &second, 0, 0);
+            let (a, b) = middle[0].clone();
+            assert_eq!(&first.source[a], &second[b]);
+            let cached = parse_index_source(Arc::clone(&second), lang).unwrap();
+            let fresh = parse_source_with_lang(second, lang).unwrap();
+            assert_same_nodes(cached.tree.root_node(), fresh.tree.root_node());
+            assert_eq!(
+                reused,
+                cached.tree.root_node().named_child(400).unwrap().id()
+            );
+            assert!(!first.tree.root_node().has_changes());
+            for (before, after) in [
+                ("// éā\nint prefix_1;\n", "// éā\nint tail_1;\n"),
+                ("// êƁ\r\nint prefix_222;\n", "// êƁ\r\nint tail_222;\n"),
+                ("namespace N {\n", "}\n"),
+                ("void invalid( {\n", "broken }\n"),
+                ("", ""),
+            ] {
+                let source: Arc<str> = format!("{before}{shared}{after}").into();
+                let cached = parse_index_source(Arc::clone(&source), lang).unwrap();
+                let fresh = parse_source_with_lang(source, lang).unwrap();
+                assert_same_nodes(cached.tree.root_node(), fresh.tree.root_node());
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_middle_blocks_keep_coordinates_and_revalidate_scanner_context() {
+        let first = prefix();
+        let second = first.replace("Header", "OtherHeader");
+        for lang in [SourceLang::C, SourceLang::Cpp] {
+            let a: Arc<str> =
+                format!("int before_a;\n{first}int gap_a;\n{second}int after_a;\n").into();
+            parse_index_source(Arc::clone(&a), lang).unwrap();
+            let b: Arc<str> = format!("// êƁ\r\nint prefix_222;\n{first}int changed_gap;\n\n{second}// êƁ\r\nint tail_222;\n").into();
+            let blocks = shared_middles(&a, &b, 0, 0);
+            assert_eq!(blocks.len(), 2);
+            for (old, new) in &blocks {
+                assert_eq!(&a[old.clone()], &b[new.clone()]);
+            }
+            assert!(blocks[0].0.end <= blocks[1].0.start);
+            assert!(blocks[0].1.end <= blocks[1].1.start);
+            let cached = parse_index_source(Arc::clone(&b), lang).unwrap();
+            let fresh = parse_source_with_lang(b, lang).unwrap();
+            assert_same_nodes(cached.tree.root_node(), fresh.tree.root_node());
+            for (open, close) in [
+                ("namespace N {\n", "}\n"),
+                ("const char *s = R\"tag(\n", ")tag\";\n"),
+                ("void broken( {\n", "\n"),
+                ("// éā\n", "// éā\n"),
+            ] {
+                let source: Arc<str> = format!("{open}{first}int gap;\n{second}{close}").into();
+                let cached = parse_index_source(Arc::clone(&source), lang).unwrap();
+                let fresh = parse_source_with_lang(source, lang).unwrap();
+                assert_same_nodes(cached.tree.root_node(), fresh.tree.root_node());
+            }
+        }
+    }
+
+    #[test]
+    fn middle_search_ignores_repeated_and_unrelated_lines() {
+        let repeated = "int repeated_line_with_a_long_name;\n".repeat(800);
+        assert!(shared_middles(&repeated, &repeated, 0, 0).is_empty());
+        let old = prefix();
+        let new = "void different_declaration_with_a_long_name(void);\n".repeat(800);
+        assert!(shared_middles(&old, &new, 0, 0).is_empty());
+    }
+
+    #[test]
+    fn incremental_parse_matches_fresh_trees_across_edits_and_languages() {
+        let prefix = prefix();
+        for lang in [SourceLang::C, SourceLang::Cpp] {
+            let tails = [
+                "void f(void) { int x = 1; }\n",
+                "void longer_name(void) {\n int x = 2;\n}\n",
+                "void f(void) { const char *s = \"é\"; }\r\n",
+                "void f(void) { const char *s = \"ê\"; }\r\n",
+                "void f(void) { const char *s = \"éα\"; }\r\n",
+                "void f(void) { const char *s = \"êα\"; }\r\n",
+                "void f(void) { const char *s = \"āα\"; }\r\n",
+                "void f(void) { const char *s = \"Ɓα\"; }\r\n",
+                "void f( { broken syntax\n",
+                "void f(void) {}\n",
+                "",
+                "template<class T> struct C { T x; };\n",
+                "template<class T> struct C { T *x; };\n",
+                "struct C { [[nodiscard]] friend int f(); };\n",
+                "struct C { __typeof__(int) value; };\n",
+            ];
+            for tail in tails.into_iter().chain(tails.into_iter().rev()) {
+                let source: Arc<str> = format!("{prefix}{tail}").into();
+                let cached = parse_index_source(Arc::clone(&source), lang).unwrap();
+                let fresh = parse_source_with_lang(source, lang).unwrap();
+                assert_eq!(cached.source, fresh.source);
+                assert_same_nodes(cached.tree.root_node(), fresh.tree.root_node());
+            }
+            // Edits near the beginning exercise point updates on a shared
+            // suffix, including a partial common UTF-8 codepoint at both ends.
+            for comment in ["// éα\n", "// êα\r\n", "\n", ""] {
+                let source: Arc<str> = format!("{comment}{prefix}").into();
+                let cached = parse_index_source(Arc::clone(&source), lang).unwrap();
+                let fresh = parse_source_with_lang(source, lang).unwrap();
+                assert_same_nodes(cached.tree.root_node(), fresh.tree.root_node());
+            }
+        }
+    }
+
+    #[test]
+    fn reused_suffix_is_revalidated_after_changing_its_grammar_context() {
+        let prefix = prefix();
+        // A scope or raw string can change the interpretation of an otherwise
+        // unchanged suffix. Reuse must honor the grammar/scanner context.
+        for (open, close) in [
+            ("namespace Nested {\n", "}\n"),
+            ("/* é */\n", "\n"),
+            ("/* ê */\r\n", "\n"),
+            ("const char *s = R\"tag(\n", ")tag\";\n"),
+            ("template<class T>\n", "\n"),
+            ("", ""),
+        ] {
+            let source: Arc<str> = format!("{prefix}{open}{prefix}{close}").into();
+            let cached = parse_index_source(Arc::clone(&source), SourceLang::Cpp).unwrap();
+            let fresh = parse_source_with_lang(source, SourceLang::Cpp).unwrap();
+            assert_same_nodes(cached.tree.root_node(), fresh.tree.root_node());
+        }
+    }
+
+    #[test]
+    fn unchanged_header_nodes_are_reused_without_editing_the_returned_tree() {
+        let prefix = prefix();
+        let first =
+            parse_index_source(format!("{prefix}int one;\n").into(), SourceLang::Cpp).unwrap();
+        let retained = first.tree.root_node().named_child(0).unwrap().id();
+        let before = first.tree.root_node().to_sexp();
+        let range = first.tree.root_node().range();
+        let second =
+            parse_index_source(format!("{prefix}int other;\n").into(), SourceLang::Cpp).unwrap();
+        assert_eq!(
+            retained,
+            second.tree.root_node().named_child(0).unwrap().id()
+        );
+        assert_eq!(before, first.tree.root_node().to_sexp());
+        assert_eq!(range, first.tree.root_node().range());
+        assert!(!first.tree.root_node().has_changes());
+    }
+
+    #[test]
+    fn small_oversized_and_unrelated_inputs_release_the_previous_tree() {
+        let source = prefix();
+        parse_index_source(source.clone().into(), SourceLang::C).unwrap();
+        LAST_C_TREE.with(|last| assert!(last.borrow().is_some()));
+        parse_index_source("int small;".into(), SourceLang::C).unwrap();
+        LAST_C_TREE.with(|last| assert!(last.borrow().is_none()));
+        let mut previous = parse_c_source(source).unwrap();
+        let unchanged = previous.tree.root_node().to_sexp();
+        assert!(!edit_previous(
+            &mut previous,
+            &" ".repeat(4 * 1024 * 1024 + 1)
+        ));
+        assert!(!edit_previous(&mut previous, &"int other;\n".repeat(2000)));
+        assert_eq!(unchanged, previous.tree.root_node().to_sexp());
+    }
 }
 
 /// Rewrite only syntax in declaration-only C++ dependencies that tree-sitter
