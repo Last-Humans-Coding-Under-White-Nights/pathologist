@@ -1,3 +1,62 @@
+#[test]
+fn reused_system_syntax_keeps_unit_ownership_and_macro_locations() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("project");
+    let system = scratch.path().join("system");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&system).unwrap();
+    // An extensionless installed header stays inline, making each unit large
+    // enough for syntax reuse without requiring an installed C++ toolchain.
+    let mut header: String = (0..800)
+        .map(|i| format!("struct Header{i} {{ int field; }};\n"))
+        .collect();
+    header.push_str(
+        "void sink();\n#define FORWARD() sink()\ninline void dependency_body() { sink(); }\n",
+    );
+    std::fs::write(system.join("library"), header).unwrap();
+    for i in 0..4 {
+        std::fs::write(
+            root.join(format!("unit{i}.cpp")),
+            format!(
+                "struct Prefix{i} {{ int value; }};\n#include <library>\n{}static void entry() {{ FORWARD(); }}\n",
+                "\n".repeat(i)
+            ),
+        )
+        .unwrap();
+    }
+    let opts = trace_preproc::PreprocessOptions::new().with_system_include(&system);
+    let mut snapshots = Vec::new();
+    for jobs in [1, 3] {
+        let program = trace_parse::build_program_with_jobs(&root, &opts, jobs).unwrap();
+        assert_eq!(program.symbols.call_sites.len(), 4);
+        for call in &program.symbols.call_sites {
+            assert_eq!(call.callee_name.as_str(), "sink");
+            assert_eq!(
+                program.symbols.files[call.span.file.0 as usize].path,
+                system.join("library")
+            );
+            assert_eq!(call.span.line, 802);
+            let caller = program.symbols.function(call.caller);
+            let invocation = call.expansion_span.unwrap();
+            assert_eq!(invocation.file, caller.span.file);
+            assert_eq!(invocation.line, caller.span.line);
+            assert!(!program.is_dep_file(caller.span.file));
+        }
+        assert!(program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "dependency_body"
+                && !f.is_defined
+                && program.is_dep_file(f.span.file)));
+        snapshots.push(format!(
+            "{:?}\n{:?}\n{:?}",
+            program.symbols.functions, program.symbols.call_sites, program.flow
+        ));
+    }
+    assert_eq!(snapshots[0], snapshots[1]);
+}
+
 #[cfg(unix)]
 #[test]
 fn compilation_commands_probe_each_compiler_configuration_once() {

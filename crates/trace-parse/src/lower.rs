@@ -149,6 +149,16 @@ impl OriginalSource {
     }
 }
 
+type MemberAliasSpans = (std::ops::Range<usize>, std::ops::Range<usize>);
+
+/// Lexical facts from one live syntax tree, independent of symbol resolution.
+#[derive(Default)]
+struct DeclarationSyntaxCache {
+    parameters: HashMap<usize, Arc<[std::ops::Range<usize>]>>,
+    aliases: HashMap<usize, Arc<[MemberAliasSpans]>>,
+    member_functions: HashMap<usize, bool>,
+}
+
 struct LowerContext {
     /// Closest operation attribution wins for each emitted constraint occurrence.
     recorded_flow_origins: Vec<bool>,
@@ -201,6 +211,7 @@ struct LowerContext {
     /// Typedefs and `using` aliases declared in the blocks of the function
     /// being lowered, innermost last; each block drops its own on exit.
     local_aliases: Vec<(String, TypeDesc, bool)>,
+    declaration_syntax: RefCell<DeclarationSyntaxCache>,
     /// Gates C++-specific lowering (qualified members, CHA, namespaces).
     /// True for C++ TUs/headers and for `.h` files reached from a C++ TU.
     is_cpp: bool,
@@ -677,6 +688,9 @@ fn build_program_inner(
         .with_basename_index(basename_index)
         .with_inline_include_bodies(false);
     eff_opts.separate_header_paths = Some(Arc::new(include_graph.project_files.clone()));
+    eff_opts.separate_system_headers = opts.system_includes
+        || !opts.system_include_paths.is_empty()
+        || !opts.after_include_paths.is_empty();
     let eff_opts = eff_opts.with_record_conditionals(opts.explore || opts.record_conditionals);
 
     let gn_candidates = if opts.explore && opts.explore_budget > 0 {
@@ -765,6 +779,7 @@ fn build_program_inner(
         BTreeMap::new();
     let mut round = 0usize;
     loop {
+        register_system_header_units(&mut include_graph, &include_expansion_cache);
         for (from, headers) in source_cache.included_by_file() {
             include_graph.add_preprocess_includes(&from, &headers);
         }
@@ -886,7 +901,6 @@ fn build_program_inner(
     // Header warming is sequential; its temporary preprocess allocations
     // are no longer needed when the parallel TU discovery starts.
     crate::memory::reclaim_unused_pages();
-    let reachable_from_c = include_graph.reachable_from(&c_sources);
     let cpp_parse: Arc<HashSet<PathBuf>> = Arc::new(
         include_graph.reachable_from(cpp_tus.iter().chain(&include_graph.virtual_headers)),
     );
@@ -1006,6 +1020,16 @@ fn build_program_inner(
         file_order.len()
     ));
 
+    // Cache keys are actual resolved include bundles, not a directory scan.
+    register_system_header_units(&mut include_graph, &include_expansion_cache);
+    for (from, headers) in source_cache.included_by_file() {
+        include_graph.add_preprocess_includes(&from, &headers);
+    }
+    let reachable_from_c = include_graph.reachable_from(&c_sources);
+    let cpp_parse: Arc<HashSet<PathBuf>> = Arc::new(
+        include_graph.reachable_from(cpp_tus.iter().chain(&include_graph.virtual_headers)),
+    );
+
     // Preprocessing probes are not used by header/TU lowering. Drop both
     // serial and worker memos before retaining the header IR cache.
     trace_ir::release_filesystem_caches();
@@ -1043,11 +1067,17 @@ fn build_program_inner(
         .cloned()
         .collect();
     for (_, hs) in source_cache.included_by_file() {
-        pch_headers.extend(
-            hs.into_iter()
-                .filter(|h| include_graph.project_files.contains(h) && is_index_header(h)),
-        );
+        pch_headers.extend(hs.into_iter().filter(|h| {
+            is_index_header(h) && include_graph.project_files.contains(h)
+                || include_graph.external_headers.contains(h)
+        }));
     }
+    pch_headers.extend(
+        wanted_variants
+            .keys()
+            .filter(|(p, _)| include_graph.external_headers.contains(p))
+            .map(|(p, _)| p.clone()),
+    );
     pch_headers.sort();
     pch_headers.dedup();
     pch_headers.retain(|p| !skip_headers.contains(p));
@@ -1095,66 +1125,113 @@ fn build_program_inner(
     // header whose only stored expansion nothing consumed contributes
     // nothing: that is the warm pass's configuration, and if no unit
     // presents it, it is not a configuration this tree has.
-    let pch_units: Vec<(PathBuf, usize)> = pch_headers
+    let variants_of = |p: &Path| -> Vec<(Language, usize)> {
+        if include_graph.external_headers.contains(p) {
+            [Language::C, Language::Cpp]
+                .into_iter()
+                .flat_map(|language| {
+                    let mut variants: Vec<_> = wanted_variants
+                        .get(&(p.to_path_buf(), language))
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .collect();
+                    variants.sort_unstable();
+                    variants.into_iter().map(move |v| (language, v))
+                })
+                .collect()
+        } else {
+            let language = lang_of(p);
+            let mut variants =
+                variants_to_lower(&wanted_variants, &include_expansion_cache, p, language);
+            variants.sort_unstable();
+            variants.into_iter().map(|v| (language, v)).collect()
+        }
+    };
+    let pch_units: Vec<_> = pch_headers
         .iter()
-        .flat_map(|p| {
-            let mut vs =
-                variants_to_lower(&wanted_variants, &include_expansion_cache, p, lang_of(p));
-            vs.sort_unstable();
-            vs.into_iter().map(move |v| (p.clone(), v))
-        })
+        .flat_map(|p| variants_of(p).into_iter().map(|(l, v)| (p.clone(), l, v)))
         .collect();
+    // No later preprocessing may depend on an expansion we release. Settle
+    // standalone headers too, using the same frozen options their lowering
+    // would use, and keep the original cache lifetime if any input fails.
+    let release_expansions = if eff_opts.separate_system_headers
+        && gn_candidates.is_none()
+        && source_cache.has_indexable_sources(&file_order, &include_graph)
+    {
+        let orphan_preprocess_t = Instant::now();
+        if !orphan_headers.is_empty() {
+            index_progress(format!(
+                "preprocess-orphan: {} headers (jobs={jobs})",
+                orphan_headers.len()
+            ));
+        }
+        pool.install(|| {
+            orphan_headers.par_iter().for_each(|path| {
+                let language = index_language(path, &cpp_parse, no_c_units, forced_language);
+                if source_cache
+                    .get_or_preprocess(path, &include_graph, &index_opts[&language])
+                    .is_ok()
+                {
+                    // An unsuccessful spill leaves the resident result usable.
+                    let _ = source_cache.spill(path, &include_graph);
+                }
+            });
+        });
+        if !orphan_headers.is_empty() {
+            index_progress(format!(
+                "preprocess-orphan-done: {:.1}s",
+                orphan_preprocess_t.elapsed().as_secs_f64()
+            ));
+        }
+        source_cache.has_indexable_sources(&orphan_headers, &include_graph)
+    } else {
+        false
+    };
+    let expansion_consumers = release_expansions.then(|| HeaderExpansionConsumers::new(&pch_units));
     let pch_t = Instant::now();
     index_progress(format!(
         "pch: parse {} expansions of {} headers",
         pch_units.len(),
         pch_headers.len()
     ));
-    // Include-graph order (included files before includers), including
-    // preprocess-only edges so a header is never PCH'd in the same wave as a
-    // nested type the raw `#include` scanner missed. Nested merge copies
-    // types/typedefs only; TUs pull prototypes from every reachable header.
-    // Cyclic leftovers are indexed in `index_order`, never as a parallel wave.
-    let mut header_ir_map: HeaderIr = HashMap::default();
-    let (pch_waves, pch_cycles) = if jobs == 1 {
-        (vec![pch_order.as_ref().clone()], Vec::new())
-    } else {
-        include_graph.index_waves(&pch_headers)
-    };
-    for wave in pch_waves {
-        if wave.is_empty() {
-            continue;
+    // Schedule the exact consumed variants: opposite include orders can
+    // form a cycle between paths while their variant prerequisites are a DAG.
+    let mut header_ir_map = HeaderIr::default();
+    let (pch_waves, pch_cycles) = header_variant_waves(
+        pch_units,
+        &include_graph,
+        &include_expansion_cache,
+        &header_order,
+    );
+    if let Some(consumers) = &expansion_consumers {
+        consumers.retain(&include_expansion_cache);
+        if consumers.needs_reclaim() {
+            crate::memory::reclaim_unused_pages();
         }
-        let wave_units: Vec<(PathBuf, usize)> = wave
-            .iter()
-            .flat_map(|p| {
-                let mut vs =
-                    variants_to_lower(&wanted_variants, &include_expansion_cache, p, lang_of(p));
-                vs.sort_unstable();
-                vs.into_iter().map(move |v| (p.clone(), v))
-            })
-            .collect();
-        if wave_units.is_empty() {
-            continue;
-        }
+    }
+    for wave_units in pch_waves {
         if jobs == 1 || wave_units.len() == 1 {
-            for (path, variant) in &wave_units {
+            for (path, language, variant) in &wave_units {
                 let unit = index_header_variant(
                     path,
                     *variant,
                     root,
                     &include_graph,
                     &include_expansion_cache,
-                    index_language(path, &cpp_parse, no_c_units, forced_language),
+                    *language,
                     Some(&header_ir_map),
                     &header_order,
                     &opts.ignored_macros,
                 );
+                if let Some(consumers) = &expansion_consumers {
+                    consumers.release(&include_expansion_cache, path, *language);
+                }
                 push_header_ir(
                     &mut header_ir_map,
                     &include_graph,
                     path,
-                    lang_of(path),
+                    *language,
                     *variant,
                     unit,
                 );
@@ -1163,69 +1240,91 @@ fn build_program_inner(
             // The map is only extended between waves, so workers read it in
             // place rather than from a per-wave copy.
             let snapshot = &header_ir_map;
-            let units: Vec<(PathBuf, usize, UnitIndex)> = pool.install(|| {
+            let units: Vec<(PathBuf, Language, usize, UnitIndex)> = pool.install(|| {
                 wave_units
                     .par_iter()
-                    .map(|(path, variant)| {
-                        (
-                            path.clone(),
+                    .map(|(path, language, variant)| {
+                        let unit = index_header_variant(
+                            path,
                             *variant,
-                            index_header_variant(
-                                path,
-                                *variant,
-                                root,
-                                &include_graph,
-                                &include_expansion_cache,
-                                index_language(path, &cpp_parse, no_c_units, forced_language),
-                                Some(snapshot),
-                                &header_order,
-                                &opts.ignored_macros,
-                            ),
-                        )
+                            root,
+                            &include_graph,
+                            &include_expansion_cache,
+                            *language,
+                            Some(snapshot),
+                            &header_order,
+                            &opts.ignored_macros,
+                        );
+                        if let Some(consumers) = &expansion_consumers {
+                            consumers.release(&include_expansion_cache, path, *language);
+                        }
+                        (path.clone(), *language, *variant, unit)
                     })
                     .collect()
             });
-            for (path, variant, unit) in units {
+            for (path, language, variant, unit) in units {
                 push_header_ir(
                     &mut header_ir_map,
                     &include_graph,
                     &path,
-                    lang_of(&path),
+                    language,
                     variant,
                     unit,
                 );
             }
         }
-    }
-    for path in include_graph.index_order(&pch_cycles) {
-        let mut variants = variants_to_lower(
-            &wanted_variants,
-            &include_expansion_cache,
-            &path,
-            lang_of(&path),
-        );
-        variants.sort_unstable();
-        for variant in variants {
-            let unit = index_header_variant(
-                &path,
-                variant,
-                root,
-                &include_graph,
-                &include_expansion_cache,
-                index_language(&path, &cpp_parse, no_c_units, forced_language),
-                Some(&header_ir_map),
-                &header_order,
-                &opts.ignored_macros,
-            );
-            push_header_ir(
-                &mut header_ir_map,
-                &include_graph,
-                &path,
-                lang_of(&path),
-                variant,
-                unit,
-            );
+        if let Some(consumers) = &expansion_consumers {
+            if consumers.needs_reclaim() {
+                crate::memory::reclaim_unused_pages();
+            }
         }
+    }
+    for (path, language, variant) in pch_cycles {
+        let unit = index_header_variant(
+            &path,
+            variant,
+            root,
+            &include_graph,
+            &include_expansion_cache,
+            language,
+            Some(&header_ir_map),
+            &header_order,
+            &opts.ignored_macros,
+        );
+        if let Some(consumers) = &expansion_consumers {
+            consumers.release(&include_expansion_cache, &path, language);
+            if consumers.needs_reclaim() {
+                crate::memory::reclaim_unused_pages();
+            }
+        }
+        push_header_ir(
+            &mut header_ir_map,
+            &include_graph,
+            &path,
+            language,
+            variant,
+            unit,
+        );
+    }
+    if eff_opts.separate_system_headers && !eff_opts.record_conditionals && gn_candidates.is_none()
+    {
+        let mut keys = Vec::new();
+        source_cache.visit_metadata(&file_order, &include_graph, |path, pre| {
+            let language = index_language(path, &cpp_parse, no_c_units, forced_language);
+            let headers = headers_to_merge(
+                &include_graph,
+                &header_order,
+                path,
+                &pre.included_headers,
+                &pre.inlined_headers,
+                false,
+            );
+            let units = header_ir_map.select(&include_graph, pre, &headers, language);
+            if units.iter().any(|unit| program.is_dep_path(&unit.path)) {
+                keys.push(preamble_key(&units));
+            }
+        });
+        header_ir_map.plan(keys);
     }
     let header_ir = Arc::new(header_ir_map);
     crate::memory::reclaim_unused_pages();
@@ -1234,6 +1333,7 @@ fn build_program_inner(
         pch_t.elapsed().as_secs_f64(),
         header_ir.len()
     ));
+    let pch_merge_t = Instant::now();
     for path in include_graph.index_order(&header_ir.keys().cloned().collect::<Vec<_>>()) {
         if let Some(units) = header_ir.get(&path) {
             // A dependency header's own unit is not a translation unit of
@@ -1249,6 +1349,10 @@ fn build_program_inner(
         }
     }
     program.types.complete_nested_tags();
+    index_progress(format!(
+        "pch-merge-done: {:.1}s",
+        pch_merge_t.elapsed().as_secs_f64()
+    ));
 
     if jobs == 1 {
         pool.install(|| {
@@ -1293,6 +1397,8 @@ fn build_program_inner(
                 .max(INDEX_WINDOW_MIN_BYTES)
         };
         let byte_budget = index_byte_budget(orphan_headers.iter().map(&estimate_bytes));
+        let phase_t = Instant::now();
+        let mut merged = 0;
         index_in_window(
             &pool,
             &orphan_headers,
@@ -1312,7 +1418,18 @@ fn build_program_inner(
                 source_cache.evict(path, &include_graph);
                 unit
             },
-            |unit| merge_unit_index(&mut program, &unit),
+            |unit| {
+                merge_unit_index(&mut program, &unit);
+                index_item_progress(merged, orphan_headers.len(), || {
+                    format!(
+                        "parse-orphan-done: {}/{} {:.1}s elapsed",
+                        merged + 1,
+                        orphan_headers.len(),
+                        phase_t.elapsed().as_secs_f64()
+                    )
+                });
+                merged += 1;
+            },
         );
     }
 
@@ -1388,6 +1505,8 @@ fn build_program_inner(
                 .saturating_mul(variants.saturating_add(1))
         };
         let byte_budget = index_byte_budget(file_order.iter().map(&estimate_bytes));
+        let phase_t = Instant::now();
+        let mut merged = 0;
         for batch in file_order.chunks(512) {
             index_in_window(
                 &pool,
@@ -1414,7 +1533,18 @@ fn build_program_inner(
                     source_cache.evict(path, &include_graph);
                     units
                 },
-                |(base_unit, var_units)| merge_unit_variants(&mut program, &base_unit, &var_units),
+                |(base_unit, var_units)| {
+                    merge_unit_variants(&mut program, &base_unit, &var_units);
+                    index_item_progress(merged, file_order.len(), || {
+                        format!(
+                            "parse-done: {}/{} {:.1}s elapsed",
+                            merged + 1,
+                            file_order.len(),
+                            phase_t.elapsed().as_secs_f64()
+                        )
+                    });
+                    merged += 1;
+                },
             );
             // All workers finished this batch. Return their released AST
             // and temporary-IR pages before the next batch grows the
@@ -1452,6 +1582,8 @@ fn build_program_inner(
         inferred_dirs,
         retain_merge_state,
     );
+
+    crate::index_profile::report();
 
     Ok(program)
 }
@@ -2379,6 +2511,30 @@ pub(crate) fn is_index_header(path: &Path) -> bool {
     })
 }
 
+/// Register resolved system include bundles and their cached dependencies in
+/// stable path order. Implementation fragments remain part of their bundle.
+fn register_system_header_units(graph: &mut IncludeGraph, cache: &trace_preproc::ExpansionCache) {
+    let mut includes: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    {
+        let cache = cache.read().unwrap_or_else(|e| e.into_inner());
+        for ((path, _), variants) in cache.iter() {
+            if !graph.project_files.contains(path) {
+                graph.external_headers.insert(path.clone());
+            }
+            let entry = includes.entry(path.clone()).or_default();
+            for variant in variants {
+                entry.extend(variant.files.iter().cloned());
+                entry.extend(variant.nested_variants.iter().map(|(p, _)| p.clone()));
+            }
+        }
+    }
+    for (path, mut headers) in includes {
+        headers.sort();
+        headers.dedup();
+        graph.add_preprocess_includes(&path, &headers);
+    }
+}
+
 /// Global header order, computed once and queried only for needed headers.
 #[derive(Default)]
 struct HeaderOrder {
@@ -2417,6 +2573,7 @@ fn headers_to_merge<'a>(
     inlined_headers: &'a [PathBuf],
     types_only: bool,
 ) -> Vec<&'a Path> {
+    let header = |p: &Path| is_index_header(p) || graph.external_headers.contains(p);
     let mut wanted: HashSet<&Path> = HashSet::default();
     if types_only {
         // A header whose text this unit holds is lowered here, so what it
@@ -2428,17 +2585,17 @@ fn headers_to_merge<'a>(
                 .filter_map(|holder| graph.edges.get(holder))
                 .flatten()
                 .map(PathBuf::as_path)
-                .filter(|h| *h != self_canon && is_index_header(h)),
+                .filter(|h| *h != self_canon && header(h)),
         );
     } else {
         for p in graph.reachable_paths(self_canon) {
-            if p != self_canon && is_index_header(p) {
+            if p != self_canon && header(p) {
                 wanted.insert(p);
             }
         }
     }
     for h in included_headers {
-        if h.as_path() != self_canon && is_index_header(h) {
+        if h.as_path() != self_canon && header(h) {
             wanted.insert(h.as_path());
         }
     }
@@ -2475,7 +2632,370 @@ fn headers_to_merge<'a>(
 /// Lowered units for one header: one per cached expansion of it that some
 /// translation unit replayed (see `trace_preproc::ExpansionVariants`).
 /// Ordered by variant index.
-type HeaderIr = HashMap<PathBuf, Vec<(Language, usize, Arc<UnitIndex>)>>;
+type PreambleSlot = Arc<std::sync::OnceLock<Arc<Program>>>;
+
+#[derive(Default)]
+struct HeaderIr {
+    units: HashMap<PathBuf, Vec<(Language, usize, Arc<UnitIndex>)>>,
+    preambles: std::sync::Mutex<HashMap<Vec<usize>, PreambleSlot>>,
+    planned: bool,
+}
+
+impl std::ops::Deref for HeaderIr {
+    type Target = HashMap<PathBuf, Vec<(Language, usize, Arc<UnitIndex>)>>;
+    fn deref(&self) -> &Self::Target {
+        &self.units
+    }
+}
+
+impl std::ops::DerefMut for HeaderIr {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.units
+    }
+}
+
+impl HeaderIr {
+    fn select<'a>(
+        &'a self,
+        graph: &IncludeGraph,
+        pre: &PreprocessedSource,
+        headers: &[&Path],
+        language: Language,
+    ) -> Vec<&'a Arc<UnitIndex>> {
+        let mut selected = Vec::new();
+        for h in headers {
+            if let Some(units) = self.get(*h) {
+                for (unit_lang, variant, unit) in units {
+                    if header_variant_applies(graph, pre, h, language, *unit_lang, *variant) {
+                        selected.push(unit);
+                    }
+                }
+            }
+        }
+        selected
+    }
+
+    fn plan(&mut self, keys: Vec<Vec<usize>>) {
+        self.planned = true;
+        *self.preambles.get_mut().unwrap_or_else(|e| e.into_inner()) = preamble_plan(&keys)
+            .into_iter()
+            .map(|key| (key, Arc::default()))
+            .collect();
+    }
+
+    /// Cache the exact ordered preamble before any TU source is lowered.
+    /// Snapshots preserve native IDs, include edges and lookup selection;
+    /// consumers clone the assembled context instead of merging overlapping
+    /// header tables again. Cache admission affects only performance.
+    fn preamble(&self, template: &Program, units: &[&Arc<UnitIndex>]) -> Program {
+        let key = preamble_key(units);
+        let cell = {
+            let mut cache = self.preambles.lock().unwrap_or_else(|e| e.into_inner());
+            if !self.planned && cache.len() < 16 {
+                Some(Arc::clone(cache.entry(key.clone()).or_default()))
+            } else {
+                cache.get(&key).cloned()
+            }
+        };
+        let build = || {
+            let _profile = crate::index_profile::Metric::PreambleBuild.enter();
+            let prefix = {
+                let cache = self.preambles.lock().unwrap_or_else(|e| e.into_inner());
+                cache
+                    .iter()
+                    .filter(|(prefix, _)| prefix.len() < key.len() && key.starts_with(prefix))
+                    .filter_map(|(prefix, cell)| {
+                        cell.get()
+                            .map(|program| (prefix.len(), Arc::clone(program)))
+                    })
+                    .max_by_key(|(length, _)| *length)
+            };
+            let (start, mut program) = if let Some((length, prefix)) = prefix {
+                (length, (*prefix).clone())
+            } else {
+                let mut program = Program::new(template.root.clone());
+                program
+                    .symbols
+                    .set_dep_roots(template.symbols.dep_roots().to_vec());
+                program.ignored_macros.clone_from(&template.ignored_macros);
+                (0, program)
+            };
+            let mut checkpoints = if self.planned {
+                let cache = self.preambles.lock().unwrap_or_else(|e| e.into_inner());
+                cache
+                    .iter()
+                    .filter(|(prefix, _)| prefix.len() < key.len() && key.starts_with(prefix))
+                    .map(|(prefix, cell)| (prefix.len(), Arc::clone(cell)))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            checkpoints.sort_by_key(|(length, _)| *length);
+            let mut checkpoints = checkpoints.into_iter().peekable();
+            for (at, unit) in units.iter().enumerate().skip(start) {
+                merge_unit_symbols(&mut program, unit);
+                let end = at + 1;
+                while checkpoints.peek().is_some_and(|(length, _)| *length < end) {
+                    checkpoints.next();
+                }
+                if checkpoints.peek().is_some_and(|(length, _)| *length == end) {
+                    let (_, cell) = checkpoints.next().unwrap();
+                    cell.get_or_init(|| Arc::new(program.clone()));
+                }
+                if !self.planned && end % 32 == 0 && end < units.len() {
+                    let prefix = {
+                        let mut cache = self.preambles.lock().unwrap_or_else(|e| e.into_inner());
+                        (cache.len() < 16)
+                            .then(|| Arc::clone(cache.entry(key[..end].to_vec()).or_default()))
+                    };
+                    if let Some(prefix) = prefix {
+                        prefix.get_or_init(|| Arc::new(program.clone()));
+                    }
+                }
+            }
+            program
+        };
+        match cell {
+            Some(cell) => {
+                let preamble = cell.get_or_init(|| Arc::new(build()));
+                let _profile = crate::index_profile::Metric::PreambleClone.enter();
+                (**preamble).clone()
+            }
+            None => build(),
+        }
+    }
+}
+
+fn preamble_key(units: &[&Arc<UnitIndex>]) -> Vec<usize> {
+    units
+        .iter()
+        .map(|unit| Arc::as_ptr(unit) as usize)
+        .collect()
+}
+
+/// Full repeated keys and adjacent longest-common prefixes are exactly the
+/// branching/terminal points of the ordered-header trie. Select checkpoints
+/// by the remaining imports they save, with stable source-order tie breaks.
+fn preamble_plan(keys: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut ordered = keys.iter().enumerate().collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, key)| *key);
+    let mut prefixes: HashSet<Vec<usize>> = keys.iter().cloned().collect();
+    for pair in ordered.windows(2) {
+        let common = pair[0]
+            .1
+            .iter()
+            .zip(pair[1].1)
+            .take_while(|(a, b)| a == b)
+            .count();
+        if common > 0 {
+            prefixes.insert(pair[0].1[..common].to_vec());
+        }
+    }
+    let candidates = prefixes
+        .into_iter()
+        .filter_map(|prefix| {
+            let start = ordered.partition_point(|(_, key)| key.as_slice() < prefix.as_slice());
+            let end = start + ordered[start..].partition_point(|(_, key)| key.starts_with(&prefix));
+            (end - start > 1 && !prefix.is_empty()).then(|| {
+                let sources = ordered[start..end]
+                    .iter()
+                    .map(|(source, _)| *source)
+                    .collect::<Vec<_>>();
+                let first = *sources.iter().min().unwrap();
+                (prefix, sources, first)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut covered = vec![0; keys.len()];
+    let mut result = Vec::new();
+    for _ in 0..16 {
+        let best = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let (prefix, sources, first) = candidate;
+                let (sum, largest) = sources
+                    .iter()
+                    .map(|source| prefix.len().saturating_sub(covered[*source]))
+                    .fold((0usize, 0usize), |(sum, largest), next| {
+                        (sum + next, largest.max(next))
+                    });
+                let saved = sum - largest;
+                (saved > 0).then_some(((saved, std::cmp::Reverse(*first), prefix.len()), candidate))
+            })
+            .max_by_key(|(rank, _)| *rank);
+        let Some((_, (prefix, sources, _))) = best else {
+            break;
+        };
+        for &source in sources {
+            covered[source] = covered[source].max(prefix.len());
+        }
+        result.push(prefix.clone());
+    }
+    result
+}
+
+fn header_variant_applies(
+    graph: &IncludeGraph,
+    pre: &PreprocessedSource,
+    path: &Path,
+    language: Language,
+    unit_language: Language,
+    variant: usize,
+) -> bool {
+    let wanted = (unit_language == language)
+        .then(|| pre.replayed_variants.get(path))
+        .flatten();
+    if graph.external_headers.contains(path) {
+        wanted.is_some_and(|variants| variants.contains(&variant))
+    } else {
+        wanted.is_none_or(|variants| variants.contains(&variant))
+    }
+}
+
+type HeaderVariant = (PathBuf, Language, usize);
+
+/// Payloads outlive their last planned read, without changing variant indices.
+struct HeaderExpansionConsumers {
+    remaining: HashMap<trace_preproc::ExpansionKey, std::sync::atomic::AtomicUsize>,
+    retired_text: std::sync::atomic::AtomicUsize,
+}
+
+impl HeaderExpansionConsumers {
+    fn new(units: &[HeaderVariant]) -> Self {
+        let mut counts: HashMap<trace_preproc::ExpansionKey, usize> = HashMap::default();
+        for (path, language, _) in units {
+            *counts.entry((path.clone(), *language)).or_default() += 1;
+        }
+        Self {
+            remaining: counts
+                .into_iter()
+                .map(|(key, count)| (key, std::sync::atomic::AtomicUsize::new(count)))
+                .collect(),
+            retired_text: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn retain(&self, cache: &trace_preproc::ExpansionCache) {
+        cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|key, variants| {
+                let keep = self.remaining.contains_key(key);
+                if !keep {
+                    self.retired_text.fetch_add(
+                        variants.iter().map(|entry| entry.text.len()).sum(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                keep
+            });
+    }
+
+    fn release(&self, cache: &trace_preproc::ExpansionCache, path: &Path, language: Language) {
+        let key = (path.to_path_buf(), language);
+        let previous = self.remaining[&key].fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(previous > 0, "header expansion released twice");
+        if previous == 1 {
+            if let Some(variants) = cache
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key)
+            {
+                self.retired_text.fetch_add(
+                    variants.iter().map(|entry| entry.text.len()).sum(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
+    }
+
+    /// Check at idle wave boundaries, avoiding a trim for every small header.
+    fn needs_reclaim(&self) -> bool {
+        const TRIM_TEXT_BYTES: usize = 32 * 1024 * 1024;
+        if self.retired_text.load(std::sync::atomic::Ordering::Relaxed) < TRIM_TEXT_BYTES {
+            return false;
+        }
+        self.retired_text
+            .swap(0, std::sync::atomic::Ordering::AcqRel);
+        true
+    }
+}
+
+/// Use the same preamble selection as lowering, at variant granularity. Genuine
+/// cycles keep a stable sequential fallback, as project-header cycles did.
+fn header_variant_waves(
+    units: Vec<HeaderVariant>,
+    graph: &IncludeGraph,
+    cache: &trace_preproc::ExpansionCache,
+    order: &HeaderOrder,
+) -> (Vec<Vec<HeaderVariant>>, Vec<HeaderVariant>) {
+    let mut by_path: HashMap<&Path, Vec<usize>> = HashMap::default();
+    for (at, (path, _, _)) in units.iter().enumerate() {
+        by_path.entry(path).or_default().push(at);
+    }
+    let mut remaining = vec![0usize; units.len()];
+    let mut dependents = vec![Vec::new(); units.len()];
+    {
+        let cache = cache.read().unwrap_or_else(|e| e.into_inner());
+        for (at, (path, language, variant)) in units.iter().enumerate() {
+            let Some(expansion) = cache
+                .get(&(path.clone(), *language))
+                .and_then(|variants| variants.get(*variant))
+            else {
+                continue;
+            };
+            let pre = PreprocessedSource::from_expansion(expansion, *language);
+            let headers = headers_to_merge(
+                graph,
+                order,
+                path,
+                &pre.included_headers,
+                &pre.inlined_headers,
+                true,
+            );
+            for header in headers {
+                for &dependency in by_path.get(header).into_iter().flatten() {
+                    let (_, dep_language, dep_variant) = &units[dependency];
+                    if header_variant_applies(
+                        graph,
+                        &pre,
+                        header,
+                        *language,
+                        *dep_language,
+                        *dep_variant,
+                    ) {
+                        remaining[at] += 1;
+                        dependents[dependency].push(at);
+                    }
+                }
+            }
+        }
+    }
+    let mut ready: Vec<_> = (0..units.len()).filter(|at| remaining[*at] == 0).collect();
+    let mut done = vec![false; units.len()];
+    let mut waves = Vec::new();
+    while !ready.is_empty() {
+        let mut next = Vec::new();
+        for &at in &ready {
+            done[at] = true;
+            for &dependent in &dependents[at] {
+                remaining[dependent] -= 1;
+                if remaining[dependent] == 0 {
+                    next.push(dependent);
+                }
+            }
+        }
+        waves.push(ready.iter().map(|at| units[*at].clone()).collect());
+        next.sort_unstable();
+        ready = next;
+    }
+    let cycles = units
+        .into_iter()
+        .enumerate()
+        .filter_map(|(at, unit)| (!done[at]).then_some(unit))
+        .collect();
+    (waves, cycles)
+}
 
 fn push_header_ir(
     map: &mut HeaderIr,
@@ -2861,9 +3381,8 @@ fn lower_prepared_source(
 ) -> Result<Option<FlowOriginBindings>, String> {
     program.symbols.set_dep_roots(graph.dep_roots.clone());
     let self_canon = graph.intern_path(path);
-    let file_id = program.symbols.add_file_interned(&self_canon);
-    add_preprocess_diagnostics(program, graph, file_id, &pre.diagnostics);
-    let types_only = is_index_header(path);
+    let mut file_id = None;
+    let types_only = is_index_header(path) || graph.external_headers.contains(path);
     let headers = headers_to_merge(
         graph,
         pch_order,
@@ -2873,25 +3392,24 @@ fn lower_prepared_source(
         types_only,
     );
     if let Some(ir) = header_ir {
-        for h in &headers {
-            if let Some(units) = ir.get(*h) {
-                for (unit_lang, variant, unit) in units {
-                    let wanted = (*unit_lang == language)
-                        .then(|| pre.replayed_variants.get(*h))
-                        .flatten();
-                    if wanted.is_some_and(|w| !w.contains(variant)) {
-                        continue;
-                    }
-                    if types_only {
-                        merge_unit_types(program, unit);
-                    } else {
-                        merge_unit_symbols(program, unit);
-                    }
+        let selected = ir.select(graph, &pre, &headers, language);
+        if !types_only && selected.iter().any(|unit| program.is_dep_path(&unit.path)) {
+            *program = ir.preamble(program, &selected);
+        } else {
+            file_id = Some(program.symbols.add_file_interned(&self_canon));
+            for unit in selected {
+                if types_only {
+                    merge_unit_types(program, unit);
+                } else {
+                    merge_unit_symbols(program, unit);
                 }
             }
         }
         program.types.complete_nested_tags();
     }
+    let file_id = file_id.unwrap_or_else(|| program.symbols.add_file_interned(&self_canon));
+    let _profile = crate::index_profile::Metric::SourceLower.enter();
+    add_preprocess_diagnostics(program, graph, file_id, &pre.diagnostics);
     for h in headers {
         let hid = program.symbols.add_file_interned(h);
         if hid != file_id {
@@ -2906,6 +3424,7 @@ fn lower_prepared_source(
         let _ = std::fs::write(std::path::Path::new(&dir).join(fname), pre.text.as_ref());
     }
     let lang = source_lang(language);
+    let parse_profile = crate::index_profile::Metric::SyntaxParse.enter();
     let parse_text = if lang == crate::parse::SourceLang::Cpp {
         crate::parse::normalize_dependency_cpp_syntax(
             &pre.text,
@@ -2916,7 +3435,8 @@ fn lower_prepared_source(
     } else {
         Arc::clone(&pre.text)
     };
-    let parsed = crate::parse::parse_source_with_lang(parse_text, lang)?;
+    let parsed = crate::parse::parse_index_source(parse_text, lang)?;
+    drop(parse_profile);
     if crate::parse::has_parse_errors(&parsed.tree) {
         program.add_diagnostic(Diagnostic {
             severity: DiagnosticSeverity::Warning,
@@ -2951,6 +3471,7 @@ fn lower_prepared_source(
         friend_classes: Vec::new(),
         type_scope: RefCell::new(Vec::new()),
         local_aliases: Vec::new(),
+        declaration_syntax: RefCell::default(),
         is_cpp,
         cpp_standard: pre.cpp_standard,
         handled_new_exprs: RefCell::new(HashSet::default()),
@@ -2993,9 +3514,12 @@ fn lower_prepared_source(
             }
         }
     }
+    let ast_profile = crate::index_profile::Metric::AstLower.enter();
     lower_tree(program, &mut ctx, parsed.source.as_ref(), tree.root_node());
+    drop(ast_profile);
     // AST lowering complete: drop syntax tree and clear transient expression caches early.
     ctx.tree = None;
+    ctx.declaration_syntax.take();
     drop(tree);
     // Expression recovery finished with the AST walk; deferred references
     // already carry their complete spelling in pending_flow_origins.
@@ -3211,6 +3735,7 @@ fn program_into_unit(
     mut program: Program,
     origin_indices: Option<FlowOriginBindings>,
 ) -> UnitIndex {
+    let _profile = crate::index_profile::Metric::UnitFinish.enter();
     let inheritance = program.take_inheritance();
     let template_bases = program.take_template_bases();
     UnitIndex {
@@ -3738,6 +4263,17 @@ fn lower_using_declaration(ctx: &mut LowerContext, source: &str, node: Node) {
 /// rather than a data member? Function-pointer members (`int (*cb)(int);`)
 /// parse through a `function_declarator` too but their name sits behind a
 /// parenthesized/pointer declarator — those are data.
+fn cached_member_decl_is_function(ctx: &LowerContext, node: Node) -> bool {
+    if ctx.recovery_origin.is_some() {
+        return member_decl_is_function(node);
+    }
+    *ctx.declaration_syntax
+        .borrow_mut()
+        .member_functions
+        .entry(node.id())
+        .or_insert_with(|| member_decl_is_function(node))
+}
+
 fn member_decl_is_function(node: Node) -> bool {
     if let Some(decl) = node.cached_field("declarator") {
         let inner_decl = if decl.cached_kind() == "init_declarator" {
@@ -3808,6 +4344,23 @@ struct VirtualFlags {
 }
 
 fn virtual_flags(source: &str, node: Node) -> VirtualFlags {
+    // Most library methods have none of these tokens. Avoid walking every
+    // parameter/default argument just to establish that absence. A definition's
+    // body cannot supply its flags; malformed syntax keeps the recovery walk.
+    let end = node
+        .cached_field("body")
+        .map_or(node.end_byte(), |body| body.start_byte());
+    let signature = &source[node.start_byte()..end];
+    if !node.has_error()
+        && !signature.contains("virtual")
+        && !signature.contains("override")
+        && !signature.contains("final")
+    {
+        return VirtualFlags {
+            is_virtual: false,
+            is_final: false,
+        };
+    }
     let mut is_virtual = false;
     let mut is_final = false;
     fn walk(source: &str, n: Node, is_virtual: &mut bool, is_final: &mut bool) {
@@ -3949,6 +4502,7 @@ fn lower_struct_specifier(
         let dependent = |spelling: &str| {
             in_template
                 && mentions_template_parameter(
+                    ctx,
                     source,
                     path.iter().copied(),
                     spelling,
@@ -4094,7 +4648,7 @@ fn lower_struct_specifier(
         let mut cursor = body.walk();
         for child in body.children(&mut cursor) {
             match child.cached_kind() {
-                "field_declaration" if !member_decl_is_function(child) => {
+                "field_declaration" if !cached_member_decl_is_function(ctx, child) => {
                     // `class Inner { ... };` and `class Inner;` declare a
                     // type and no field.
                     if is_cpp_class && child.cached_field("declarator").is_none() {
@@ -4518,7 +5072,7 @@ fn register_class_prototypes(
             if parenthesized_data_member(program, ctx, source, m).is_some() {
                 None
             } else {
-                member_function(source, m)
+                member_function(ctx, source, m)
             }
         })
         .collect();
@@ -4568,7 +5122,7 @@ fn register_class_prototypes(
             // A class-scope `template <typename T> T GetNumber() {...}`
             // declares the member's primary; the template parameter list is
             // not an argument, so the nested member registers like any other.
-            "template_declaration" => member_decl_is_function(*decl),
+            "template_declaration" => cached_member_decl_is_function(ctx, *decl),
             "field_declaration" => true,
             // A ctor written `Cls(int);` inside the class parses as a plain
             // declaration wrapping a function_declarator.
@@ -4585,14 +5139,19 @@ fn register_class_prototypes(
 
 /// A class member that declares or defines a member function: its
 /// declaration (a template's nested one) and name.
-fn member_function<'t>(source: &str, member: Node<'t>) -> Option<(Node<'t>, String)> {
+fn member_function<'t>(
+    ctx: &LowerContext,
+    source: &str,
+    member: Node<'t>,
+) -> Option<(Node<'t>, String)> {
     let declaration = match member.cached_kind() {
         // A member class, alias or variable template declares no function.
         "template_declaration" => template_member_decl(member).filter(|decl| {
-            decl.cached_kind() == "function_definition" || member_decl_is_function(*decl)
+            decl.cached_kind() == "function_definition"
+                || cached_member_decl_is_function(ctx, *decl)
         })?,
         "function_definition" => member,
-        _ if member_decl_is_function(member) => member,
+        _ if cached_member_decl_is_function(ctx, member) => member,
         _ => return None,
     };
     Some((declaration, member_short_name(source, declaration)?))
@@ -4699,7 +5258,7 @@ fn lower_class_definitions(
     // lowered here rather than there.
     for &m in &members {
         if m.cached_kind() == "field_declaration"
-            && !member_decl_is_function(m)
+            && !cached_member_decl_is_function(ctx, m)
             && declaration_is_static(m)
         {
             lower_static_data_member(program, ctx, source, m, cls_qual);
@@ -4716,13 +5275,14 @@ fn lower_class_definitions(
             };
             (member, template)
         })
-        .filter(|&(member, _)| {
-            member.cached_kind() == "function_definition"
-                || (member.cached_kind() == "field_declaration"
-                    && member_decl_is_function(member)
-                    && node_has_compound_body(member))
-        })
         .filter_map(|(member, template)| {
+            let definition = member.cached_kind() == "function_definition"
+                || (member.cached_kind() == "field_declaration"
+                    && cached_member_decl_is_function(ctx, member)
+                    && node_has_compound_body(member));
+            if !definition {
+                return None;
+            }
             ctx.step_template(template);
             let signature = lower_function_signature(program, ctx, source, member);
             ctx.step_template(-template);
@@ -4735,7 +5295,7 @@ fn lower_class_definitions(
         } else {
             *member
         };
-        if member_function(source, member)
+        if member_function(ctx, source, member)
             .is_some_and(|(_, name)| name == last_segment_of(cls_qual))
         {
             note_constructor_declaration(program, ctx, source, member, cls_qual);
@@ -4931,9 +5491,11 @@ struct MemberClassTag {
 /// specifier that is no member, only refers to a class, is spelled
 /// qualified, or is lowered without its outer class in scope.
 fn member_class_tag(ctx: &LowerContext, source: &str, spec: Node) -> Option<MemberClassTag> {
-    // The parent check first: most specifiers are no member, and it walks no
-    // fields.
+    // An outer class scope is required for the result. Check it before
+    // asking tree-sitter for parents: parent() re-descends from the root,
+    // which is expensive for the many top-level system-header classes.
     if !ctx.is_cpp
+        || ctx.type_scope.borrow().is_empty()
         || enclosing_member_class(spec).is_none()
         || !is_named_class_specifier(spec)
         || is_class_reference(spec)
@@ -5872,6 +6434,16 @@ fn is_parameter_node(kind: &str) -> bool {
     )
 }
 
+/// A fixed parameter, excluding C's `(void)` and variadic tails. Counting
+/// these does not require resolving reference aliases or allocating a shape.
+fn declares_fixed_parameter(source: &str, param: Node) -> bool {
+    is_parameter_node(param.cached_kind())
+        && !(param.cached_field("declarator").is_none()
+            && param
+                .cached_field("type")
+                .is_some_and(|ty| node_text(source, &ty) == "void"))
+}
+
 /// What a parameter list declares beyond the parameters' names: whether
 /// each declared parameter is a reference, how many carry a default
 /// argument, and whether it ends in `...` or a parameter pack, either of
@@ -5889,7 +6461,6 @@ impl ParamListShape {
     /// Record one child of a parameter list. A parameter is declared the way
     /// `lower_parameter` lowers it: `(void)` declares none.
     fn record(&mut self, program: &Program, ctx: &LowerContext, source: &str, param: Node) {
-        let declarator = param.cached_field("declarator");
         let declares = match param.cached_kind() {
             // C's `...` parses as `variadic_parameter`. A pack followed by
             // `...` is one tail, the pack's.
@@ -5900,11 +6471,7 @@ impl ParamListShape {
                 if kind == "optional_parameter_declaration" {
                     self.defaults += 1;
                 }
-                let is_void = declarator.is_none()
-                    && param
-                        .cached_field("type")
-                        .is_some_and(|t| node_text(source, &t) == "void");
-                is_parameter_node(kind) && !is_void
+                declares_fixed_parameter(source, param)
             }
         };
         if declares {
@@ -6703,7 +7270,13 @@ fn call_result_among(
                 return false;
             };
             let enclosing = enclosing.get_or_insert_with(|| ancestors(ctx, value).collect());
-            mentions_template_parameter(source, enclosing.iter().copied(), owner, Spelling::Lowered)
+            mentions_template_parameter(
+                ctx,
+                source,
+                enclosing.iter().copied(),
+                owner,
+                Spelling::Lowered,
+            )
         }) {
             return None;
         }
@@ -7613,6 +8186,7 @@ fn ancestors<'t>(ctx: &'t LowerContext, node: Node<'t>) -> impl Iterator<Item = 
 /// Whether `spelling` mentions a parameter of any `template_declaration` in
 /// `path`.
 fn mentions_template_parameter<'t>(
+    ctx: &LowerContext,
     source: &str,
     path: impl IntoIterator<Item = Node<'t>>,
     spelling: &str,
@@ -7622,10 +8196,9 @@ fn mentions_template_parameter<'t>(
         .filter(|n| n.cached_kind() == "template_declaration")
         .filter_map(|n| n.cached_field("parameters"))
         .any(|params| {
-            template_parameter_names(source, params)
-                .into_iter()
-                .flatten()
-                .any(|name| spelling_mentions(spelling, from, name))
+            template_parameter_spans(ctx, params)
+                .iter()
+                .any(|range| spelling_mentions(spelling, from, &source[range.clone()]))
         })
 }
 
@@ -7635,36 +8208,57 @@ fn mentions_template_parameter<'t>(
 /// `class T = int`, `template<class> class TT`); a value parameter's is in its
 /// declarator (`size_t N`, `Kind K = {}`, `int... Ns`), never its type.
 fn template_parameter_names<'s>(source: &'s str, params: Node) -> Vec<Option<&'s str>> {
+    params
+        .named_children(&mut params.walk())
+        .filter(|p| p.cached_kind() != "comment")
+        .map(|param| template_parameter_name(param).map(|ident| node_text(source, &ident)))
+        .collect()
+}
+
+fn template_parameter_name(param: Node) -> Option<Node> {
     fn type_identifier(node: Node) -> Option<Node> {
         node.named_children(&mut node.walk())
             .find(|n| n.cached_kind() == "type_identifier")
     }
-    params
-        .named_children(&mut params.walk())
-        .filter(|p| p.cached_kind() != "comment")
-        .map(|param| {
-            match param.cached_kind() {
-                "type_parameter_declaration" | "variadic_type_parameter_declaration" => {
-                    type_identifier(param)
-                }
-                "optional_type_parameter_declaration" => param.cached_field("name"),
-                "template_template_parameter_declaration" => param
-                    .named_children(&mut param.walk())
-                    .find(|n| n.cached_kind() != "template_parameter_list")
-                    .and_then(type_identifier),
-                "parameter_declaration"
-                | "optional_parameter_declaration"
-                | "variadic_parameter_declaration" => param
-                    .cached_field("declarator")
-                    .and_then(declarator_identifier),
-                _ => None,
-            }
-            .map(|ident| node_text(source, &ident))
-            // Error recovery can leave a zero-width name, which every spelling
-            // would contain.
-            .filter(|name| !name.is_empty())
-        })
-        .collect()
+    match param.cached_kind() {
+        "type_parameter_declaration" | "variadic_type_parameter_declaration" => {
+            type_identifier(param)
+        }
+        "optional_type_parameter_declaration" => param.cached_field("name"),
+        "template_template_parameter_declaration" => param
+            .named_children(&mut param.walk())
+            .find(|n| n.cached_kind() != "template_parameter_list")
+            .and_then(type_identifier),
+        "parameter_declaration"
+        | "optional_parameter_declaration"
+        | "variadic_parameter_declaration" => param
+            .cached_field("declarator")
+            .and_then(declarator_identifier),
+        _ => None,
+    }
+    // Error recovery can leave a zero-width name, which every spelling
+    // would contain.
+    .filter(|name| !name.byte_range().is_empty())
+}
+
+fn template_parameter_spans(ctx: &LowerContext, params: Node) -> Arc<[std::ops::Range<usize>]> {
+    let read = || {
+        params
+            .named_children(&mut params.walk())
+            .filter_map(template_parameter_name)
+            .map(|name| name.byte_range())
+            .collect()
+    };
+    if ctx.recovery_origin.is_some() {
+        return read();
+    }
+    Arc::clone(
+        ctx.declaration_syntax
+            .borrow_mut()
+            .parameters
+            .entry(params.id())
+            .or_insert_with(read),
+    )
 }
 
 /// A class template's parameters, as [`ClassTemplate`](trace_ir::ClassTemplate)
@@ -7792,13 +8386,29 @@ fn spelling_mentions(spelling: &str, from: Spelling, name: &str) -> bool {
 /// Check names in all enclosing template parameter lists.
 fn return_is_dependent(ctx: &LowerContext, source: &str, node: Node) -> bool {
     ctx.has_templates
-        && return_is_dependent_under(source, &ancestors(ctx, node).collect::<Vec<_>>(), node)
+        && !has_primitive_return(source, node)
+        && return_is_dependent_under(ctx, source, &ancestors(ctx, node).collect::<Vec<_>>(), node)
+}
+
+/// A valid primitive keyword cannot name a template parameter or member alias.
+/// Named typedefs (including standard integer aliases) still need scope lookup.
+fn has_primitive_return(source: &str, node: Node) -> bool {
+    // The grammar also calls typedef spellings such as `size_t`
+    // primitive_type; those may be shadowed by template parameters.
+    !node.has_error()
+        && node.cached_field("type").is_some_and(|ty| {
+            ty.cached_kind() == "primitive_type"
+                && matches!(
+                    node_text(source, &ty),
+                    "void" | "bool" | "char" | "int" | "float" | "double"
+                )
+        })
 }
 
 /// [`return_is_dependent`] against an ancestor path already walked.
 /// `ancestors` rescans from the root once per level, so a caller with more
 /// than one question about the enclosing templates walks it once.
-fn return_is_dependent_under(source: &str, path: &[Node], node: Node) -> bool {
+fn return_is_dependent_under(ctx: &LowerContext, source: &str, path: &[Node], node: Node) -> bool {
     // The declaration whose `type` is the return type: `node` itself, or the
     // nearest ancestor with one (a prototype's declarator sits under it).
     let Some((enclosing, ty)) = node.cached_field("type").map(|ty| (path, ty)).or_else(|| {
@@ -7812,13 +8422,14 @@ fn return_is_dependent_under(source: &str, path: &[Node], node: Node) -> bool {
     enclosing
         .iter()
         .any(|n| n.cached_kind() == "template_declaration")
-        && spelling_names_dependent_type(source, enclosing, node_text(source, &ty), 0)
+        && spelling_names_dependent_type(ctx, source, enclosing, node_text(source, &ty), 0)
 }
 
 /// Whether a type spelled in a template names one of its parameters, directly
 /// or through a member alias of an enclosing class
 /// (`using Ptr = std::shared_ptr<T>; Ptr Get();`), a few aliases deep.
 fn spelling_names_dependent_type(
+    ctx: &LowerContext,
     source: &str,
     enclosing: &[Node],
     spelling: &str,
@@ -7826,6 +8437,7 @@ fn spelling_names_dependent_type(
 ) -> bool {
     const MAX_ALIAS_DEPTH: u8 = 4;
     mentions_template_parameter(
+        ctx,
         source,
         enclosing.iter().copied(),
         spelling,
@@ -7834,31 +8446,55 @@ fn spelling_names_dependent_type(
         && enclosing
             .iter()
             .filter(|n| n.cached_kind() == "field_declaration_list")
-            .flat_map(|body| body.named_children(&mut body.walk()).collect::<Vec<_>>())
-            .filter_map(|member| member_alias(source, member))
-            .any(|(name, aliased)| {
-                spelling_mentions(spelling, Spelling::Source, name)
-                    && spelling_names_dependent_type(source, enclosing, aliased, depth + 1)
+            .any(|&body| {
+                member_alias_spans(ctx, body).iter().any(|(name, aliased)| {
+                    spelling_mentions(spelling, Spelling::Source, &source[name.clone()])
+                        && spelling_names_dependent_type(
+                            ctx,
+                            source,
+                            enclosing,
+                            &source[aliased.clone()],
+                            depth + 1,
+                        )
+                })
             })
 }
 
 /// The name a member `using` alias or `typedef` declares, and the text of the
 /// type it stands for.
-fn member_alias<'s>(source: &'s str, member: Node) -> Option<(&'s str, &'s str)> {
+fn member_alias(member: Node) -> Option<MemberAliasSpans> {
     match member.cached_kind() {
         "alias_declaration" => Some((
-            node_text(source, &member.cached_field("name")?),
-            node_text(source, &member.cached_field("type")?),
+            member.cached_field("name")?.byte_range(),
+            member.cached_field("type")?.byte_range(),
         )),
         "type_definition" => {
             let name = std::iter::successors(member.cached_field("declarator"), |d| {
                 d.cached_field("declarator")
             })
             .find(|d| d.cached_kind() == "type_identifier")?;
-            Some((node_text(source, &name), node_text(source, &member)))
+            Some((name.byte_range(), member.byte_range()))
         }
         _ => None,
     }
+}
+
+fn member_alias_spans(ctx: &LowerContext, body: Node) -> Arc<[MemberAliasSpans]> {
+    let read = || {
+        body.named_children(&mut body.walk())
+            .filter_map(member_alias)
+            .collect()
+    };
+    if ctx.recovery_origin.is_some() {
+        return read();
+    }
+    Arc::clone(
+        ctx.declaration_syntax
+            .borrow_mut()
+            .aliases
+            .entry(body.id())
+            .or_insert_with(read),
+    )
 }
 
 fn spelling_is_dependent(
@@ -7868,7 +8504,8 @@ fn spelling_is_dependent(
     spelling: &str,
     from: Spelling,
 ) -> bool {
-    ctx.has_templates && mentions_template_parameter(source, ancestors(ctx, node), spelling, from)
+    ctx.has_templates
+        && mentions_template_parameter(ctx, source, ancestors(ctx, node), spelling, from)
 }
 
 fn type_is_dependent(ctx: &LowerContext, source: &str, node: Node, desc: &TypeDesc) -> bool {
@@ -8004,8 +8641,11 @@ fn register_template_return(
                 .position(|p| *p == Some(returned.as_str()))
         })
         .flatten();
-    let arity =
-        find_params(node).map_or(0, |p| param_list_shape(program, ctx, source, p).declared());
+    let arity = find_params(node).map_or(0, |p| {
+        p.children(&mut p.walk())
+            .filter(|param| declares_fixed_parameter(source, *param))
+            .count() as u32
+    });
     // Names and shapes only: a struct's fields differ with how complete it
     // was in the declaring unit, and would split one fact into several.
     let read;
@@ -8046,14 +8686,17 @@ fn declared_return_type(
         .cached_field("declarator")
         .and_then(fn_decl_under_pointer)
         .map_or(0, |(_, depth, _)| depth);
-    if !ctx.has_templates {
+    if !ctx.has_templates
+        || (has_primitive_return(source, node)
+            && !matches!(program.types.get(base).desc.as_ref(), TypeDesc::Unknown))
+    {
         return pointer_layers(program, base, depth);
     }
     // One ancestor walk answers both questions the enclosing templates
     // decide: whether the return is dependent, and which parameter a
     // concrete receiver substitutes for it.
     let path: Vec<Node> = ancestors(ctx, node).collect();
-    let dependent = return_is_dependent_under(source, &path, node);
+    let dependent = return_is_dependent_under(ctx, source, &path, node);
     if dependent || matches!(program.types.get(base).desc.as_ref(), TypeDesc::Unknown) {
         let declaration = MemberDeclaration {
             path: &path,
@@ -13405,10 +14048,14 @@ fn note_member_initializer(
     let end = value.end_byte();
     let mut origins = Vec::new();
     if let Some(map) = ctx.line_map.as_ref().filter(|map| !map.entries.is_empty()) {
-        for entry in map
+        // Each initializer needs only its own token mappings. Scanning from
+        // the beginning for every field is quadratic in large system headers.
+        // Lower bound retains all equal-offset entries at the expression start.
+        let begin = map
             .entries
+            .partition_point(|entry| (entry.output_offset as usize) < start);
+        for entry in map.entries[begin..]
             .iter()
-            .skip_while(|entry| (entry.output_offset as usize) < start)
             .take_while(|entry| (entry.output_offset as usize) < end)
         {
             origins.push(trace_ir::InitializerOrigin {
@@ -13547,6 +14194,7 @@ fn lower_member_initializer_expression(
         vec![Cell::new(None); ctx.line_map.as_ref().unwrap().files.len()],
     );
     let saved_tree = ctx.tree.replace(tree.clone());
+    let saved_declaration_syntax = ctx.declaration_syntax.take();
     let saved_locals = std::mem::take(&mut ctx.locals);
     let saved_aliases = std::mem::take(&mut ctx.local_aliases);
     let saved_imports = std::mem::replace(
@@ -13612,6 +14260,7 @@ fn lower_member_initializer_expression(
     ctx.local_aliases = saved_aliases;
     ctx.using_name_imports = saved_imports;
     ctx.tree = saved_tree;
+    ctx.declaration_syntax.replace(saved_declaration_syntax);
     ctx.origin_file_ids = saved_files;
     ctx.line_map = saved_map;
     true
@@ -19398,7 +20047,13 @@ fn undeclared_class_guess(ctx: &LowerContext, source: &str, node: Node) -> Optio
     };
     if !declares_object
         || (ctx.has_templates
-            && mentions_template_parameter(source, path.iter().copied(), name, Spelling::Source))
+            && mentions_template_parameter(
+                ctx,
+                source,
+                path.iter().copied(),
+                name,
+                Spelling::Source,
+            ))
     {
         return None;
     }
@@ -20453,6 +21108,173 @@ mod index_window_tests {
     }
 
     fn lower_cpp_snippet(source: &str) -> Program {
+        lower_cpp_snippet_with_map(source, trace_preproc::LineMap::new())
+    }
+
+    #[test]
+    fn expansion_payloads_survive_all_selected_languages_and_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = dir.path().join("api.h");
+        std::fs::write(
+            &header,
+            "#ifdef WIDE\nvoid Wide();\n#else\nvoid Narrow();\n#endif\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("unused.h"), "void Unused();\n").unwrap();
+        let cache = Arc::new(std::sync::RwLock::new(HashMap::default()));
+        let options = PreprocessOptions::new().with_include_expansion_cache(Arc::clone(&cache));
+        for language in [Language::C, Language::Cpp] {
+            let options = options.clone().with_language(language);
+            trace_preproc::preprocess_string(
+                "#include \"api.h\"\n#include \"unused.h\"\n",
+                &dir.path().join("main.cpp"),
+                &options,
+            );
+        }
+        let mut wide = options.with_language(Language::C);
+        wide.defines.insert("WIDE".into(), "1".into());
+        trace_preproc::preprocess_string("#include \"api.h\"\n", &dir.path().join("wide.c"), &wide);
+        let header = trace_ir::canonicalize(&header);
+        let key = (header.clone(), Language::C);
+        let held = cache.read().unwrap()[&key][0].clone();
+        let consumers = HeaderExpansionConsumers::new(&[
+            (header.clone(), Language::C, 0),
+            (header.clone(), Language::C, 1),
+            (header.clone(), Language::Cpp, 0),
+        ]);
+        consumers.retain(&cache);
+        assert_eq!(cache.read().unwrap().len(), 2);
+        consumers.release(&cache, &header, Language::Cpp);
+        consumers.release(&cache, &header, Language::C);
+        assert!(cache.read().unwrap()[&key][1].text.contains("Wide"));
+        consumers.release(&cache, &header, Language::C);
+        assert!(cache.read().unwrap().is_empty());
+        assert!(held.text.contains("Narrow"));
+    }
+
+    #[test]
+    fn dependency_modules_cache_exact_order_and_preserve_scope_and_lookup_replay() {
+        let unit = |path: &str, text: &str| {
+            let program = lower_cpp_snippet(text);
+            let mut unit = program_into_unit(path.into(), program, None);
+            unit.files[0] = path.into();
+            Arc::new(unit)
+        };
+        let a = unit("/sdk/first", "extern int *slot; static void First(int *);");
+        let b = unit(
+            "/sdk/second",
+            "extern double *slot; static void Second(double *);",
+        );
+        let mut program = Program::new("/project".into());
+        program.symbols.set_dep_roots(vec!["/sdk".into()]);
+        let ir = HeaderIr::default();
+        let module = ir.preamble(&program, &[&a, &b, &a]);
+        let same = ir.preamble(&program, &[&a, &b, &a]);
+        let reversed = ir.preamble(&program, &[&b, &a, &b]);
+        assert_eq!(
+            format!("{:?}", module.symbols.functions),
+            format!("{:?}", same.symbols.functions)
+        );
+        assert_ne!(
+            format!("{:?}", module.symbols.functions),
+            format!("{:?}", reversed.symbols.functions)
+        );
+        assert_eq!(ir.preambles.lock().unwrap().len(), 2);
+        let mut program = module;
+        let slot = program
+            .symbols
+            .variable(program.symbols.global_by_name["slot"]);
+        assert_eq!(
+            program.types.get(slot.type_id).desc.as_ref(),
+            &TypeDesc::Ptr(Box::new(TypeDesc::Int))
+        );
+        let first = program.symbols.add_file_interned("/sdk/first");
+        let second = program.symbols.add_file_interned("/sdk/second");
+        assert!(!program.symbols.file_sees(first, second));
+        assert!(!program.symbols.file_sees(second, first));
+        for (name, owner) in [("First", first), ("Second", second)] {
+            let f = program
+                .symbols
+                .functions
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap();
+            assert_eq!(f.tu, Some(owner));
+        }
+    }
+
+    #[test]
+    fn preamble_admission_prefers_recurring_prefixes_instead_of_first_seen_keys() {
+        let mut keys = (100..120).map(|n| vec![n]).collect::<Vec<_>>();
+        for n in 0..20 {
+            keys.push(vec![1, 2, 3, 4, 5, 200 + n]);
+        }
+        let plan = preamble_plan(&keys);
+        assert_eq!(plan, vec![vec![1, 2, 3, 4, 5]]);
+        // Pointer allocation order must not choose a different prefix.
+        let reverse = |key: &Vec<usize>| key.iter().map(|id| 1000 - id).collect::<Vec<_>>();
+        assert_eq!(
+            preamble_plan(&keys.iter().map(reverse).collect::<Vec<_>>()),
+            plan.iter().map(reverse).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn planned_preambles_preserve_lookup_and_native_ids_when_a_prefix_is_reused() {
+        let unit = |path: &str, text: &str| {
+            let mut unit = program_into_unit(path.into(), lower_cpp_snippet(text), None);
+            unit.files[0] = path.into();
+            Arc::new(unit)
+        };
+        let a = unit("/sdk/first", "extern int *slot; static void First(int *);");
+        let b = unit(
+            "/sdk/second",
+            "extern double *slot; static void Second(double *);",
+        );
+        let c = unit(
+            "/sdk/third",
+            "extern char *slot; static void Third(char *);",
+        );
+        let combinations = [&[&a, &b, &a][..], &[&a, &b, &c][..]];
+        let mut planned = HeaderIr::default();
+        planned.plan(
+            combinations
+                .iter()
+                .map(|units| preamble_key(units))
+                .collect(),
+        );
+        assert_eq!(planned.preambles.lock().unwrap().len(), 1);
+        let mut template = Program::new("/project".into());
+        template.symbols.set_dep_roots(vec!["/sdk".into()]);
+        for units in combinations {
+            let cached = planned.preamble(&template, units);
+            let ordinary = HeaderIr::default().preamble(&template, units);
+            assert_eq!(
+                format!("{:?}", cached.symbols),
+                format!("{:?}", ordinary.symbols)
+            );
+            assert_eq!(
+                format!("{:?}", cached.types),
+                format!("{:?}", ordinary.types)
+            );
+        }
+    }
+
+    #[test]
+    fn preamble_admission_remains_bounded_for_many_repeated_combinations() {
+        let mut keys = Vec::new();
+        for n in 0..40 {
+            for _ in 0..3 {
+                keys.push(vec![n, n + 100]);
+            }
+        }
+        let plan = preamble_plan(&keys);
+        assert_eq!(plan.len(), 16);
+        assert_eq!(plan[0], vec![0, 100]);
+        assert_eq!(plan[15], vec![15, 115]);
+    }
+
+    fn lower_cpp_snippet_with_map(source: &str, line_map: trace_preproc::LineMap) -> Program {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snippet.cpp");
         std::fs::write(&path, source).unwrap();
@@ -20460,7 +21282,7 @@ mod index_window_tests {
         let pre = PreprocessedSource {
             cpp_standard: 201703,
             text: source.into(),
-            line_map: Default::default(),
+            line_map: Arc::new(line_map),
             included_headers: Default::default(),
             inlined_headers: Default::default(),
             language: Language::Cpp,
@@ -20482,6 +21304,127 @@ mod index_window_tests {
         )
         .unwrap();
         program
+    }
+
+    #[test]
+    fn template_return_queries_keep_alias_chains_and_nested_scopes() {
+        for value in ["T", "int", "T"] {
+            let program = lower_cpp_snippet(&format!(
+                "template<class T, int N = 2> struct S {{
+                    using Value = {value}; typedef Value Alias;
+                    Alias through_alias(); Alias again(); T direct();
+                    struct Inner {{ using Number = int; Number nested(); }};
+                }};
+                template<class size_t> struct Named {{
+                    size_t shadowed(); int builtin();
+                }};"
+            ));
+            for name in [
+                "S::through_alias",
+                "S::again",
+                "S::direct",
+                "S::Inner::nested",
+                "Named::shadowed",
+                "Named::builtin",
+            ] {
+                let function = program
+                    .symbols
+                    .functions
+                    .iter()
+                    .find(|f| f.name == name)
+                    .unwrap();
+                let expected = if name == "S::Inner::nested"
+                    || name == "Named::builtin"
+                    || value == "int" && name.starts_with("S::") && name != "S::direct"
+                {
+                    TypeDesc::Int
+                } else {
+                    TypeDesc::Unknown
+                };
+                assert_eq!(
+                    *program.types.get(function.return_type).desc,
+                    expected,
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_modifiers_do_not_come_from_attributes_or_function_bodies() {
+        let program = lower_cpp_snippet(
+            r#"
+            struct B {
+                virtual void base();
+                virtual void sealed() final;
+                void final();
+                __attribute__((annotate("virtual override final"))) void attributed();
+            };
+            struct D : B {
+                void base() override;
+                void plain() {
+                    struct Local { virtual void local(); };
+                    const char *text = "virtual override final";
+                }
+            };
+        "#,
+        );
+        for (name, expected) in [
+            ("B::base", (true, false)),
+            ("B::sealed", (true, true)),
+            ("D::base", (true, false)),
+            ("B::final", (false, false)),
+            ("B::attributed", (false, false)),
+            ("D::plain", (false, false)),
+        ] {
+            let function = program
+                .symbols
+                .functions
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap();
+            assert_eq!((function.is_virtual, function.is_final), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn member_initializer_origins_keep_start_ties_and_exclude_end_mappings() {
+        let source = "struct S { int x = 123; };";
+        let start = source.find("123").unwrap();
+        let mut map = trace_preproc::LineMap::new();
+        let spelling = PathBuf::from("/original/spelling.h");
+        let invocation = PathBuf::from("/original/invocation.cpp");
+        let file = map.intern_file(&spelling);
+        let caller = map.intern_file(&invocation);
+        let macro_name = map.intern_macro("VALUE");
+        map.push(0, file, 1, 1);
+        map.push(start - 1, file, 29, 1);
+        map.push_expansion(start, file, 30, 4, caller, 12, 7, 17, macro_name);
+        map.push(start, file, 31, 6);
+        map.push(start + 1, file, 32, 5);
+        map.push(start + 3, file, 99, 1);
+        map.push(start + 3, file, 100, 1);
+
+        let program = lower_cpp_snippet_with_map(source, map);
+        let initializers = program.types.member_initializers("S", "x");
+        assert_eq!(initializers.len(), 1);
+        let initializer = &initializers[0];
+        assert_eq!(initializer.expression.as_ref(), "123");
+        let origins = &initializer.origins;
+        assert_eq!(
+            origins
+                .iter()
+                .map(|origin| (origin.offset, origin.line, origin.col))
+                .collect::<Vec<_>>(),
+            [(0, 30, 4), (0, 31, 6), (1, 32, 5)]
+        );
+        assert!(origins
+            .iter()
+            .all(|origin| origin.file.as_ref() == &spelling));
+        assert_eq!(origins[0].expansion, Some((Arc::new(invocation), 12, 7)));
+        assert_eq!(origins[0].expansion_id, 17);
+        assert_eq!(origins[0].expansion_macro.as_deref(), Some("VALUE"));
+        assert!(origins[1..].iter().all(|origin| origin.expansion.is_none()));
     }
 
     #[test]
@@ -21779,6 +22722,7 @@ mod qualified_variable_lookup_tests {
             friend_classes: Vec::new(),
             type_scope: RefCell::new(Vec::new()),
             local_aliases: Vec::new(),
+            declaration_syntax: RefCell::default(),
             is_cpp: true,
             cpp_standard: 201703,
             handled_new_exprs: RefCell::new(HashSet::default()),
@@ -22047,9 +22991,15 @@ mod member_function_tests {
                 .unwrap();
         let root = parsed.tree.root_node();
         let class = root.named_child(0).unwrap();
+        let ctx = qualified_variable_lookup_tests::test_ctx(
+            trace_ir::FileId(0),
+            None,
+            Vec::new(),
+            HashMap::default(),
+        );
         let names: Vec<String> = class_members(class)
             .into_iter()
-            .filter_map(|m| member_function(source, m).map(|(_, name)| name))
+            .filter_map(|m| member_function(&ctx, source, m).map(|(_, name)| name))
             .collect();
         assert_eq!(names, ["Run"]);
     }

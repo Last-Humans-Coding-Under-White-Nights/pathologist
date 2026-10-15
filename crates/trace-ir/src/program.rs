@@ -299,6 +299,9 @@ pub struct MergeDedup {
     /// Header definitions are shared only within one link image and expansion.
     header_functions: FxHashMap<Span, HeaderFunctions>,
     pub header_flow: FxHashSet<crate::FlowConstraint>,
+    /// Repeated dependency data declarations, indexed by original position.
+    /// Exact metadata and image are checked before sharing their identity.
+    dependency_globals: FxHashMap<Span, Vec<crate::VarId>>,
     pub site_keys: CallSourceIndex,
     /// Call records that configuration variants added at a site, beside the
     /// canonical one in `site_keys` (#59). Program-wide, so a fact recovered
@@ -321,6 +324,36 @@ pub struct MergeDedup {
 }
 
 impl MergeDedup {
+    pub fn dependency_global(
+        &self,
+        variable: &crate::Variable,
+        origin: Span,
+        ty: crate::TypeId,
+        symbols: &SymbolTable,
+    ) -> Option<crate::VarId> {
+        self.dependency_globals
+            .get(&origin)?
+            .iter()
+            .copied()
+            .find(|&id| {
+                let existing = symbols.variable(id);
+                existing.name == variable.name
+                    && existing.qualified_name == variable.qualified_name
+                    && existing.is_namespaced == variable.is_namespaced
+                    && existing.type_id == ty
+                    && existing.target == variable.target
+                    && existing.c_linkage == variable.c_linkage
+                    && existing.is_defined == variable.is_defined
+                    && existing.is_weak == variable.is_weak
+                    && existing.is_pointer == variable.is_pointer
+                    && existing.is_static_member == variable.is_static_member
+            })
+    }
+
+    pub fn insert_dependency_global(&mut self, origin: Span, id: crate::VarId) {
+        self.dependency_globals.entry(origin).or_default().push(id);
+    }
+
     /// Borrow both name and definition text on the repeated-header path.
     pub fn existing_header_fn(&self, origin: Span, name: &str, text: &str) -> Option<FnId> {
         self.header_functions
@@ -435,6 +468,7 @@ impl MergeDedup {
     /// program-wide fact about a source position, so re-reporting it once per
     /// target that happens to include the file is noise, not information.
     pub fn clear_entities(&mut self) {
+        self.dependency_globals.clear();
         self.fn_keys.clear();
         self.internal_definitions.clear();
         self.header_functions.clear();
@@ -837,6 +871,16 @@ impl Program {
     /// for a concrete receiver. Every unit merging the declaring header
     /// re-adds the header's facts, so the common case is a hit.
     pub fn add_template_return(&mut self, owner: &str, member: &str, fact: &TemplateReturn) {
+        if let Some(facts) = self
+            .template_returns
+            .get_mut(owner)
+            .and_then(|members| members.get_mut(member))
+        {
+            if !facts.contains(fact) {
+                facts.push(fact.clone());
+            }
+            return;
+        }
         let facts = self
             .template_returns
             .entry(owner.to_string())
@@ -1158,6 +1202,33 @@ fn push_edge_index(map: &mut FxHashMap<String, Vec<usize>>, key: &str, index: us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_return_hits_keep_overload_facts_in_first_seen_order() {
+        let mut program = Program::default();
+        let first = TemplateReturn {
+            arity: 1,
+            parameter: Some(0),
+            pointer_depth: 0,
+            wrapper: None,
+            params: vec![crate::TypeDesc::Int],
+        };
+        let mut second = first.clone();
+        second.params = vec![crate::TypeDesc::Char];
+        program.add_template_return("C", "get", &first);
+        program.add_template_return("C", "get", &first);
+        program.add_template_return("C", "get", &second);
+        program.add_template_return("C", "get", &first);
+        program.add_template_return("C", "other", &second);
+        assert_eq!(
+            program.template_returns_of("C", "get"),
+            Some([first, second.clone()].as_slice())
+        );
+        assert_eq!(
+            program.template_returns_of("C", "other"),
+            Some([second].as_slice())
+        );
+    }
 
     #[test]
     fn release_merge_state_releases_interning_pool_but_preserves_calls() {

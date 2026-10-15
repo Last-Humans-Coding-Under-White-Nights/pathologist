@@ -469,3 +469,26 @@ the sources of interest therefore moves the rest to the more expensive
 configuration instead of skipping them. Sharing header lowering across
 commands of one configuration family is the structural fix and is a
 separate change.
+
+## Indexing subphase timings
+
+For ordinary indexing, `TRACE_PROFILE_INDEX=1` prints cumulative elapsed scope
+timings at the end of program construction. Build the release binary before
+running the diagnostic:
+
+```bash
+cargo build --release -p trace-cli
+TRACE_PROFILE_INDEX=1 target/release/trace analyze /path/to/project \
+  --system-includes --jobs 1 --timeout-secs 1800 -o /tmp/profile.db
+```
+
+`preamble-build` includes assembling a missing preamble and copying any reused
+prefix; `preamble-clone` measures copying a complete cached preamble.
+`merge-full`, `merge-symbols` and `merge-types` separate source-result merges,
+header declaration imports and types-only imports. `type-import` is nested
+inside those merges. `source-lower` includes `syntax-parse` (normalization and
+parsing), `ast-lower` and the remaining lowering work. `unit-finish` measures
+conversion to the merge input. Timings are summed across workers, include
+waiting within a scope, and are cumulative within the process; nested timings
+must not be added together. Use ordinary release runs without this flag for
+before/after elapsed-time comparisons.

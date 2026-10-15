@@ -390,6 +390,12 @@ fn merge_unit(
     mode: MergeMode,
     mut variant_dedup: Option<&mut VariantDedup>,
 ) {
+    let _profile = match mode {
+        MergeMode::Full | MergeMode::Variant => crate::index_profile::Metric::MergeFull,
+        MergeMode::TypesOnly => crate::index_profile::Metric::MergeTypes,
+        _ => crate::index_profile::Metric::MergeSymbols,
+    }
+    .enter();
     let source_scope = variant_dedup
         .as_deref_mut()
         .map(|seen| seen.source_scope(&unit.path))
@@ -418,12 +424,14 @@ fn merge_unit(
     }
     program.namespaces.extend(unit.namespaces.iter().cloned());
 
+    let type_profile = crate::index_profile::Metric::TypeImport.enter();
     let type_map = merge_types(
         &mut program.types,
         &unit.types,
         matches!(mode, MergeMode::Variant),
         Some(unit.merge_descs.as_slice()).filter(|d| d.len() == unit.types.all().len()),
     );
+    drop(type_profile);
     // Decided once per unit: a unit is scoped or unscoped as a whole, and
     // `merge_linked_units` merges every image's units before the unassigned
     // ones, so once an image has claimed a symbol no later unit shares
@@ -873,6 +881,55 @@ fn merge_unit(
     for (&old_param, &canon_param) in &variant_param_map {
         var_map.insert(old_param, canon_param);
     }
+    let declarations: FxHashMap<FnId, &Function> = unit
+        .functions
+        .iter()
+        .filter(|func| !func.is_defined || program.is_dep_file(map_file(func.span.file)))
+        .map(|func| (func.id, func))
+        .collect();
+    // Lowering may have folded several prototypes into one function while
+    // retaining their old parameter records. They all denote the surviving
+    // signature's slot, provided its type agrees. Resolve forward aliases
+    // after allocating the signature's actual variables.
+    let mut declaration_param_aliases: FxHashMap<VarId, VarId> = FxHashMap::default();
+    for var in &unit.variables {
+        if var.storage != trace_ir::StorageClass::Param {
+            continue;
+        }
+        let Some(func) = var.fn_id.and_then(|id| declarations.get(&id)) else {
+            continue;
+        };
+        let Some(&parameter) = var.param_index.and_then(|at| func.params.get(at as usize)) else {
+            continue;
+        };
+        if parameter != var.id && unit_param_types.get(&parameter) == unit_param_types.get(&var.id)
+        {
+            declaration_param_aliases.insert(var.id, parameter);
+        }
+    }
+    // Declarations that joined an existing signature use that signature's
+    // parameter storage. Definitions keep their own body bindings, and a
+    // parameter list adopted in this merge still contains unit-local IDs.
+    for func in &unit.functions {
+        if func.is_defined && !program.is_dep_file(map_file(func.span.file)) {
+            continue;
+        }
+        let Some(&mapped) = fn_map.get(&func.id) else {
+            continue;
+        };
+        if remap_params.contains(&mapped) || dropped_fns.contains(&func.id) {
+            continue;
+        }
+        let canonical = program.symbols.function(mapped);
+        if canonical.params.len() == func.params.len() {
+            var_map.extend(
+                func.params
+                    .iter()
+                    .copied()
+                    .zip(canonical.params.iter().copied()),
+            );
+        }
+    }
 
     // Index only the functions extended by this variant. Scanning a function's
     // entire local list for every variable makes large bodies quadratic.
@@ -919,7 +976,7 @@ fn merge_unit(
         {
             continue;
         }
-        if var_map.contains_key(&var.id) {
+        if var_map.contains_key(&var.id) || declaration_param_aliases.contains_key(&var.id) {
             continue;
         }
         let span_file = map_file(var.span.file);
@@ -928,6 +985,26 @@ fn merge_unit(
         }
 
         let mapped_fn_id = var.fn_id.and_then(|id| fn_map.get(&id).copied());
+        let dependency_global = var.fn_id.is_none()
+            && var.storage == trace_ir::StorageClass::Global
+            && !var.is_synthetic
+            && program.is_dep_file(span_file);
+        if dependency_global {
+            let origin = trace_ir::Span {
+                file: span_file,
+                ..var.span
+            };
+            if let Some(existing) = program.dedup.dependency_global(
+                var,
+                origin,
+                remap_type(var.type_id, &type_map),
+                &program.symbols,
+            ) {
+                program.symbols.reuse_global_declaration(existing);
+                var_map.insert(var.id, existing);
+                continue;
+            }
+        }
         let file_temp_key = if var.fn_id.is_none() && var.temp.is_some() && variant_dedup.is_some()
         {
             file_temp_key(
@@ -1034,6 +1111,15 @@ fn merge_unit(
         v.fn_id = mapped_fn_id;
         v.span.file = span_file;
         program.symbols.add_variable(v);
+        if dependency_global {
+            program.dedup.insert_dependency_global(
+                trace_ir::Span {
+                    file: span_file,
+                    ..var.span
+                },
+                new_id,
+            );
+        }
         var_map.insert(old, new_id);
         if let Some(key) = local_key {
             local_by_site.insert(key, new_id);
@@ -1086,6 +1172,11 @@ fn merge_unit(
                     program.symbols.functions[idx].locals.push(new_id);
                 }
             }
+        }
+    }
+    for (alias, parameter) in declaration_param_aliases {
+        if let Some(&mapped) = var_map.get(&parameter) {
+            var_map.insert(alias, mapped);
         }
     }
     for merged_id in &remap_params {
@@ -1574,7 +1665,7 @@ fn merge_types(
             TypeDesc::Struct { fields, .. } | TypeDesc::Union { fields, .. }
                 if !fields.is_empty() && !union_aggregates && layout_spells_desc(src, info) =>
             {
-                dst.intern_ref(&info.desc)
+                dst.intern_arc(&info.desc)
             }
             TypeDesc::Struct { name, fields } if !fields.is_empty() => {
                 if union_aggregates {
@@ -1590,7 +1681,7 @@ fn merge_types(
                     dst.compute_union_layout(name.clone(), fields_from_layout(src, info))
                 }
             }
-            other => dst.intern_ref(other),
+            _ => dst.intern_arc(&info.desc),
         };
         debug_assert_eq!(info.id.0 as usize, map.len());
         map.push(new_id);
@@ -1811,6 +1902,94 @@ fn remap_return_flow(
 mod tests {
     use super::*;
     use trace_ir::{Diagnostic, DiagnosticSeverity};
+
+    #[test]
+    fn repeated_declarations_reuse_parameters_but_a_definition_keeps_its_binding() {
+        let prototype = unit_declaring_param("/source/a.h", false, vec![], "first");
+        let another = unit_declaring_param("/source/b.h", false, vec![], "second");
+        let definition = unit_declaring_param("/source/body.cpp", true, vec![], "body");
+        let mut program = Program::new("/source".into());
+        merge_unit_index(&mut program, &prototype);
+        merge_unit_index(&mut program, &another);
+        assert_eq!(program.symbols.variables.len(), 1);
+        merge_unit_index(&mut program, &definition);
+        let function = program
+            .symbols
+            .functions
+            .iter()
+            .find(|f| f.is_defined)
+            .unwrap();
+        assert_eq!(program.symbols.variable(function.params[0]).name, "body");
+        merge_unit_index(&mut program, &another);
+        let function = program
+            .symbols
+            .functions
+            .iter()
+            .find(|f| f.is_defined)
+            .unwrap();
+        assert_eq!(program.symbols.variable(function.params[0]).name, "body");
+        assert_eq!(program.symbols.variables.len(), 2);
+    }
+
+    #[test]
+    fn folded_prototypes_remap_old_parameters_even_before_the_surviving_slot() {
+        let mut unit = unit_declaring_param("/source/api.h", false, vec![], "current");
+        let mut earlier = unit.variables[0].clone();
+        earlier.id = VarId(99);
+        earlier.name = "earlier".into();
+        unit.variables.insert(0, earlier);
+        unit.flow.push(FlowConstraint::Copy {
+            dst: VarId(99),
+            src: unit.functions[0].params[0],
+        });
+        let mut program = Program::new("/source".into());
+        merge_unit_index(&mut program, &unit);
+        assert_eq!(program.symbols.variables.len(), 1);
+        let param = program.symbols.functions[0].params[0];
+        assert_eq!(
+            program.flow,
+            vec![FlowConstraint::Copy {
+                dst: param,
+                src: param
+            }]
+        );
+    }
+
+    #[test]
+    fn dependency_data_declarations_share_only_compatible_storage() {
+        let mut unit = unit_declaring_param("/sdk/api.h", false, vec![], "argument");
+        unit.functions.clear();
+        let var = &mut unit.variables[0];
+        var.name = "slot".into();
+        var.storage = trace_ir::StorageClass::Global;
+        var.fn_id = None;
+        var.param_index = None;
+        let mut program = Program::new("/source".into());
+        program.symbols.set_dep_roots(vec!["/sdk".into()]);
+        merge_unit_symbols(&mut program, &unit);
+        let id = program.symbols.global_by_name["slot"];
+        for _ in 0..8 {
+            merge_unit_symbols(&mut program, &unit);
+        }
+        assert_eq!(program.symbols.variables.len(), 1);
+        let mut different = unit.clone();
+        different.variables[0].type_id = different.types.intern(TypeDesc::Int);
+        merge_unit_symbols(&mut program, &different);
+        assert_eq!(program.symbols.variables.len(), 2);
+        assert_ne!(program.symbols.global_by_name["slot"], id);
+        merge_unit_symbols(&mut program, &unit);
+        assert_eq!(program.symbols.global_by_name["slot"], id);
+        assert_eq!(program.symbols.variables.len(), 2);
+        let mut local_object = unit.clone();
+        local_object.variables[0].storage = trace_ir::StorageClass::FileStatic;
+        for _ in 0..2 {
+            merge_unit_symbols(&mut program, &local_object);
+        }
+        assert_eq!(program.symbols.variables.len(), 4);
+        program.dedup.clear_entities();
+        merge_unit_symbols(&mut program, &unit);
+        assert_eq!(program.symbols.variables.len(), 5);
+    }
 
     /// A temporary pairs by its kind, a factory's heap object by its class
     /// as well; a declared variable never pairs as a temporary, whatever its

@@ -142,9 +142,18 @@ impl Seen {
 
 /// A run's macro table at every point of its history: the table it ended
 /// with, and before each change the binding the name had.
+#[derive(Debug, Clone)]
+enum Change {
+    Macro(Arc<str>, Option<Binding>),
+    Header(PathBuf, Option<u64>),
+}
+
 #[derive(Debug, Clone, Default)]
 struct MacroHistory {
-    undo: Vec<(Arc<str>, Option<Binding>)>,
+    undo: Vec<Change>,
+    last_headers: FxHashMap<PathBuf, u64>,
+    header_changes: OnceLock<FxHashMap<PathBuf, Vec<usize>>>,
+    header_additions: OnceLock<Vec<usize>>,
     last: MacroTable,
     last_fallbacks: FxHashSet<String>,
     /// Name → its positions in `undo`, built on first need.
@@ -155,8 +164,10 @@ impl MacroHistory {
     fn binding_at(&self, name: &str, point: usize) -> Option<(&MacroDef, bool)> {
         let changes = self.changes.get_or_init(|| {
             let mut by_name: FxHashMap<Arc<str>, Vec<usize>> = FxHashMap::default();
-            for (at, (name, _)) in self.undo.iter().enumerate() {
-                by_name.entry(Arc::clone(name)).or_default().push(at);
+            for (at, change) in self.undo.iter().enumerate() {
+                if let Change::Macro(name, _) = change {
+                    by_name.entry(Arc::clone(name)).or_default().push(at);
+                }
             }
             by_name
         });
@@ -165,14 +176,38 @@ impl MacroHistory {
             .get(name)
             .and_then(|ats| ats.get(ats.partition_point(|at| *at < point)))
         {
-            Some(at) => self.undo[*at]
-                .1
-                .as_ref()
-                .map(|(def, fallback)| (def.as_ref(), *fallback)),
+            Some(at) => match &self.undo[*at] {
+                Change::Macro(_, before) => before
+                    .as_ref()
+                    .map(|(def, fallback)| (def.as_ref(), *fallback)),
+                Change::Header(..) => unreachable!("macro history index"),
+            },
             None => self
                 .last
                 .get(name)
                 .map(|def| (def.as_ref(), self.last_fallbacks.contains(name))),
+        }
+    }
+
+    fn header_at(&self, path: &std::path::Path, point: usize) -> Option<u64> {
+        let changes = self.header_changes.get_or_init(|| {
+            let mut by_path: FxHashMap<PathBuf, Vec<usize>> = FxHashMap::default();
+            for (at, change) in self.undo.iter().enumerate() {
+                if let Change::Header(path, _) = change {
+                    by_path.entry(path.clone()).or_default().push(at);
+                }
+            }
+            by_path
+        });
+        match changes
+            .get(path)
+            .and_then(|ats| ats.get(ats.partition_point(|at| *at < point)))
+        {
+            Some(at) => match &self.undo[*at] {
+                Change::Header(_, before) => *before,
+                Change::Macro(..) => unreachable!("header history index"),
+            },
+            None => self.last_headers.get(path).copied(),
         }
     }
 
@@ -187,6 +222,20 @@ impl MacroHistory {
                 names
                     .iter()
                     .any(|name| self.binding_at(name, point).is_some())
+            },
+            |path| self.header_at(path, point),
+            || {
+                self.header_additions
+                    .get_or_init(|| {
+                        self.undo
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(at, change)| {
+                                matches!(change, Change::Header(_, None)).then_some(at)
+                            })
+                            .collect()
+                    })
+                    .partition_point(|at| *at < point)
             },
         )
     }
@@ -205,13 +254,50 @@ impl ExpansionJournal {
 
     /// Record that `name` changed, having been bound to `before`.
     pub(crate) fn record_macro_change(&mut self, name: &str, before: Option<Binding>) {
-        self.history.undo.push((Arc::from(name), before));
+        self.history
+            .undo
+            .push(Change::Macro(Arc::from(name), before));
+    }
+
+    pub(crate) fn record_header(&mut self, path: &std::path::Path, signature: u64) {
+        if self.history.last_headers.get(path) == Some(&signature) {
+            return;
+        }
+        let before = self
+            .history
+            .last_headers
+            .insert(path.to_path_buf(), signature);
+        self.history
+            .undo
+            .push(Change::Header(path.to_path_buf(), before));
     }
 
     /// Record the table the run ended with.
     pub(crate) fn finish(&mut self, table: MacroTable, fallbacks: FxHashSet<String>) {
         self.history.last = table;
         self.history.last_fallbacks = fallbacks;
+    }
+
+    /// Resolve a nested record without making another environment lookup.
+    /// Pending parent entries can refer to children in this or an earlier
+    /// journal, before either has a committed cache index.
+    pub(crate) fn recorded_entry(
+        &self,
+        key: &ExpansionKey,
+        handle: usize,
+        cache: &ExpansionCache,
+        ahead: &[Arc<ExpansionJournal>],
+    ) -> Option<IncludeExpansion> {
+        if let Some(id) = provisional_id(handle) {
+            std::iter::once(self)
+                .chain(ahead.iter().map(Arc::as_ref))
+                .filter_map(|journal| journal.pending.get(key))
+                .flatten()
+                .find(|entry| entry.id == id)
+                .cloned()
+        } else {
+            cache.read().ok()?.get(key)?.get(handle).cloned()
+        }
     }
 
     /// The first variant of `key` — shown, then kept back — that `matches`
@@ -570,6 +656,61 @@ mod tests {
         }
         replayed.sort();
         Some(replayed)
+    }
+
+    #[test]
+    fn nested_records_resolve_in_own_and_preceding_journals_before_commit() {
+        let tree = Tree::new(&[
+            ("main.c", "#include \"a.h\"\n"),
+            ("a.h", "#include \"b.h\"\nint a;\n"),
+            ("b.h", "int b;\n"),
+        ]);
+        let cache = new_cache();
+        let result = tree.run("main.c", &cache, true);
+        let journal = result.expansion_journal.as_ref().unwrap();
+        let later = ExpansionJournal::new(8, Language::C);
+        let parent_path = tree.root.join("a.h");
+        let parent = &journal.pending[&(parent_path.clone(), Language::C)][0];
+        let mut records = parent.nested_variants.to_vec();
+        records.push((parent_path, provisional(parent.id)));
+        assert_eq!(records.len(), 2);
+        for (path, handle) in &records {
+            let key = (path.clone(), Language::C);
+            let own = journal.recorded_entry(&key, *handle, &cache, &[]).unwrap();
+            let preceding = later
+                .recorded_entry(&key, *handle, &cache, &[Arc::new(journal.clone())])
+                .unwrap();
+            assert_eq!(own.id, preceding.id);
+            assert!(!own.text.trim().is_empty());
+        }
+        assert!(journal.commit(&cache, &mut records));
+        for (path, at) in records {
+            assert!(later
+                .recorded_entry(&(path, Language::C), at, &cache, &[])
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn header_requirements_use_the_context_at_each_lookup_without_macro_changes() {
+        let path = PathBuf::from("/system/api");
+        let mut journal = ExpansionJournal::new(8, Language::Cpp);
+        journal.record_header(&path, 7);
+        let between = journal.history.undo.len();
+        journal.record_header(&path, 9);
+        let after = journal.history.undo.len();
+        let mut deps = MacroFingerprint::default();
+        deps.required_headers.insert(path, 7);
+        deps.header_context_size = Some(1);
+        assert!(!journal.history.satisfies(&deps, 0));
+        assert!(journal.history.satisfies(&deps, between));
+        assert!(!journal.history.satisfies(&deps, after));
+        let empty = MacroFingerprint {
+            header_context_size: Some(0),
+            ..Default::default()
+        };
+        assert!(journal.history.satisfies(&empty, 0));
+        assert!(!journal.history.satisfies(&empty, between));
     }
 
     #[test]

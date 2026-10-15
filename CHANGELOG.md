@@ -4,6 +4,54 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Faster indexing with installed system headers
+
+Bare-tree `--system-includes` indexing shares compatible system-header
+expansions and lowered declaration units, including extensionless standard
+headers. Nested implementation fragments retain their enclosing syntax;
+includes requiring preceding project declarations remain inline. Macro and
+header prerequisites select the consumed language and variant deterministically.
+Compilation-database commands and conditional recording/exploration retain
+inline system headers.
+
+Indexing also shares raw installed-header tokens in a bounded cache and
+uses compact temporary source maps. It reuses unchanged syntax across
+large preprocessed inputs, including matching blocks between different
+prefixes and suffixes. Lowering keeps each unit's declarations, macro provenance
+and source locations.
+
+TUs consuming dependency headers also reuse assembled header preambles and
+their common prefixes, with canonical storage for repeated dependency globals and
+declaration parameters. Settled system-header runs select the recurring preambles
+and prefixes from actual TU metadata, preserving the 16-snapshot limit. Header
+fingerprints hash interned paths/names once, and type imports reuse shared
+descriptor identity. Standalone headers are settled early so expansion payloads
+can be released after their last header-lowering consumer. Default indexing skips
+system-header boundary and nested-replay tracking when no system search paths
+are enabled.
+
+Repeated imports avoid copying existing metadata and memoize nested-tag
+completion within each pass. Default member initializer locations use a
+binary search rather than scanning all preceding mappings per field.
+Template-return queries reuse lexical parameter and class-alias facts within
+each tree, and known primitive-keyword returns avoid template ancestry walks.
+Arity-only queries count fixed parameters without resolving reference aliases.
+Class passes reuse function-versus-field classification within each syntax
+tree, and spills coalesce mapping blocks into larger I/O operations.
+Parallel indexing reports completed orphan/TU merges and shared-header merging.
+
+Contracts: [preprocessing](docs/PREPROCESSOR.md#shared-system-header-bundles),
+[indexing syntax reuse](docs/ANALYSIS.md#indexing-syntax-reuse) and
+[template returns](docs/ANALYSIS.md#c-support-first-step).
+The [evaluation report](docs/EVAL_REPORT.md#shared-system-header-units--2026-10-16)
+records reproductions, behavioral and determinism comparisons, measurements and limits.
+The [preamble and cache-lifetime follow-up](docs/EVAL_REPORT.md#shared-header-preambles-and-default-mode-correction--2026-10-16)
+records the default-mode correction and the further peak-memory reduction.
+The [metadata-admission follow-up](docs/EVAL_REPORT.md#preamble-admission-from-settled-tu-metadata--2026-10-17)
+records the additional speedup and full-project output comparisons.
+The full `ability_ability_runtime` checkout completes with installed system
+headers when its watchdog allows the measured indexing run to finish.
+
 ### Lower analyze-phase memory (#225)
 
 The solver's membership bit mirrors keep only the blocks of the location

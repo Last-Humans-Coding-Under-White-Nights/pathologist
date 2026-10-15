@@ -89,6 +89,51 @@ presentation choice never changes call identity or semantic ownership.
 
 ## Shared header functions
 
+Ordinary indexing caches resolved top-level system include bundles as header
+units as well as project headers. Only leading includes before project
+declarations are separated, preserving incoming typedef and overload context
+for later includes. A bundle includes its nested implementation
+fragments; includes inside an unfinished declaration or scope remain inline.
+For system bundles, macro fingerprints, language and the preceding shared
+system declarations select the consumed expansion. Its type preamble imports those prerequisite
+variants, even without another textual include, and lowering schedules exact
+variants before their consumers. Only recorded matching system variants enter
+a consumer's preamble; a cache-limit or scope fallback lowers its own inline
+text. This uses the existing type/prototype merge and declaration-only dependency ownership,
+including their approximation rules below. Compilation-database indexing and
+conditional recording/exploration retain inline system headers. See the
+[preprocessor cache contract](PREPROCESSOR.md#shared-system-header-bundles).
+
+Before lowering a source TU that consumes dependency headers, indexing caches
+its assembled header preamble, keyed by the exact ordered header units (and
+therefore their languages and expansion variants). A preamble contains the
+existing types, declarations and shared-header facts before the TU's own source
+is visited. Reusing an assembled preamble avoids merging overlapping header
+tables again; recorded include relationships, function ownership and name
+lookup selections are preserved directly. For settled ordinary system-header
+indexing, a metadata-only pass selects
+recurring complete preambles and shared prefixes before TU lowering. The
+bounded plan favors the imports each additional checkpoint avoids, with source
+order breaking ties. It retains up to 16 full/prefix snapshots, including useful
+prefixes shorter than 32 units, and skips one-off combinations. Other paths
+retain bounded first-use admission and prefixes at 32-unit intervals;
+uncached combinations follow the same merge order so cache admission cannot
+change output. The source file is interned after a reused preamble and then
+lowered in its own context. Project source definitions are never selected from
+a representative TU. Consumers still clone the mutable context: this is not
+yet a lookup layer that borrows all declarations without importing them.
+Inline fallback headers still lower within their consuming TU.
+Runs without dependency headers keep the ordinary preamble path.
+
+Dependency-header data declarations share storage during preamble import and
+final merging when their original position, declared name, remapped type,
+link image and declaration metadata agree. Each replay still updates ordinary
+name lookup in import order. File-static objects retain their per-unit identity.
+A function declaration that joins an existing signature reuses its parameter
+variables when the signature keeps its existing parameter list. Old parameter
+records from folded prototypes alias the surviving slot only when their types
+agree; project function definitions retain their body bindings.
+
 This section defines header-function sharing. `SymbolTable` owns visibility
 and resolution: call consumers use `Program::callees_of` (or the symbol-table
 equivalent), and name-based return facts use
@@ -914,6 +959,15 @@ the layout it names does. Internal-linkage
 function and file-static lookups are indexed by name and filtered by the
 asking file's scope, rather than walking every header of the scope per name.
 See the [Clang benchmark](PERFORMANCE_REVIEW.md#clang-source-benchmark-header-import-and-lowering).
+
+Repeated metadata imports check borrowed constructor signatures, constant names,
+template-return keys and member-initializer keys before allocating copies.
+They retain the same conflict handling, fact order and constructor-cache
+invalidation. A nested-tag completion pass inspects shared descriptors by
+reference and memoizes each original field type's answer for that pass. The
+pass can append pointer types but cannot declare or widen a named tag, so its
+answers remain valid until the pass ends. First-use order still determines
+new IDs; later declarations and aggregate unions start a fresh pass.
 
 **Declarator shapes.** C declarators bind inside-out: in `T D`, a declarator `*D1` gives `D1` the type "pointer to T", `D1[n]` "array of T" and `D1(..)` "function returning T", and the identifier gets what is left after the last layer (`walk_declarator_shape`). So `int *t[4]` is `Array(Ptr(Int))`, `void (*h[4])(int)` is `Array(Ptr(FnPtr))`, `int *(*get)(void)` is `Ptr(FnPtr { ret: Ptr(Int) })`, and a fn-pointer variable `void (*fp)(int)` is `Ptr(FnPtr)`. Before #127 the walker wrapped outside-in: `int *t[4]` was `Ptr(Array(Int))` (exported `int[]*`), `int *(*get)(void)` was `Ptr(Ptr(FnPtr { ret: Int }))` (exported `fn_ptr**`), and `void (*h[4])(int)` was `Ptr(FnPtr { ret: Array(Void) })` — exported `fn_ptr*`, because an exported type name does not spell a function's return type.
 
@@ -3230,6 +3284,9 @@ C++-aware only where it must be — everything else reuses the C machinery.
   each derived level along an inherited-constructor chain. A base named through
   a type alias (`using Alias = Base;` followed by `using Alias::Alias`) resolves
   to the same declaring class.
+  Saving an initializer's source mappings uses a binary search for its start,
+  then visits only mappings before its end. Equal-offset entries at the start
+  remain in output order; no preceding mapping is synthesized.
   Cached type imports preserve default- and copy-constructor eligibility and
   these explicit constructor imports, retaining sites for later symbol merging.
   Types-only cached-header imports retain this constructor declaration
@@ -3384,6 +3441,18 @@ C++-aware only where it must be — everything else reuses the C machinery.
 - **Templates**: lowered once per primary name. Class-template members
   returning a bare type parameter (`T Get()`, `T *Get()`) preserve its
   parameter position and pointer depth as type metadata across header merges.
+  Lowering caches the lexical byte ranges of template parameter names and
+  enclosing class aliases per syntax tree. Repeated method-return queries
+  retain the same source order and alias-depth limit without rescanning all
+  class members. The cache stores no resolved types or symbol decisions, is
+  released with the tree, and is isolated when lowering a scratch initializer;
+  scratch recovery queries read their syntax afresh. Valid primitive-keyword returns
+  skip template ancestry queries when their base type is known. Template-return
+  arity counts fixed parameters directly, excluding `(void)` and variadic tails,
+  without constructing reference-parameter metadata; signatures still retain
+  their full reference/default/variadic facts. Named types,
+  including a template parameter named `size_t`, and malformed declarations
+  keep the existing lookup and recovery rules.
   A concrete receiver substitutes its arguments before member lookup and
   virtual dispatch, through its pointer layers and through an instantiated
   class-template base it inherits the member from (`struct D : Holder<T *>`).
@@ -3614,6 +3683,8 @@ Known C++ imprecision (in addition to the general list below):
   `override` implies virtual. `final` on a class or method stops further
   subclass targets. Flags belong to the declaration, not to local classes
   nested inside its body. Virtual inheritance is recorded as a normal base edge.
+  A well-formed declaration without `virtual`, `override` or `final` before
+  its body skips the recursive flag walk; malformed syntax retains that walk.
 - Headers shared between `.c` and `.cpp` TUs parse under whichever
   grammar reaches them first at merge time.
 - **`using namespace` in headers**: ANALYSIS.md says file-scope directives
@@ -4006,6 +4077,50 @@ Limits:
 - An exact global template name wins over the scoped lookup.
 - A base spelled with a partial specialization's arguments expands through
   the primary template's bases.
+
+### Indexing syntax reuse
+
+Large preprocessed inputs often repeat installed headers that remain inline in
+each TU or project header. Each indexing worker retains the preceding syntax
+tree and normalized source separately for C and C++. Before parsing a similar
+input, tree-sitter edits cover the changed bytes, with UTF-8 boundaries and
+byte-based row/column updates. Tree-sitter revalidates the retained syntax in
+its new context. Returned trees are independent
+clones; editing the cached tree does not change a tree still being lowered.
+
+Retention requires 16 KiB–4 MiB of normalized text and at most 1,000,000 syntax
+nodes per language per worker. If the common prefix and suffix together cover
+half the shorter input, a single edit covers the intervening bytes. Otherwise,
+unique matching lines of at least 32 bytes anchor exact unchanged middle blocks.
+The search retains at most 32 ordered blocks of at least 8 KiB, spending at most
+four times the larger input's length on byte extensions. Prefix, suffix and
+middle blocks must together cover a quarter of the shorter input. At most 33
+edits, applied right to left in original coordinates, cover the remaining gaps.
+Matching uses exact text, and the search never relies on a hash alone.
+Small, oversized, or unrelated inputs release the preceding tree before parsing
+afresh. These are source-size
+and node-count limits, rather than a bound on total parser memory.
+
+The field-layout, prototype and definition passes share each member's
+syntax-only function-versus-field classification within its live tree. Recovery
+queries use the original walker; scratch initializer trees receive isolated
+caches, and all retained classifications are released with their tree.
+
+Only syntax is reused. Macro expansion and
+[C++ parse-input normalization](#c-parse-input-normalization) run for the current
+input; lowering starts with its own symbol/type environment and uses its own
+LineMap, dependency classification and link ownership. No symbols, types, or
+source locations are inherited from the cached unit. Standalone parse helpers
+and scratch parses use fresh trees. Measurements:
+[system-header indexing](EVAL_REPORT.md#system-header-indexing-on-small-projects--2026-10-15)
+and [middle-block reuse](EVAL_REPORT.md#system-header-middle-block-reuse-and-import-cost--2026-10-15).
+
+Indexing progress distinguishes shared-header parsing (`pch-done`) from its
+initial merge (`pch-merge-done`). Parallel `parse-orphan-done` and `parse-done`
+messages count units after their ordered merge, reporting cumulative elapsed
+time for that phase at the first, every fiftieth, and final unit. Sequential
+messages retain their per-unit timings. These counters include lowering and
+merging; they do not measure merge CPU time alone.
 
 ### C++ parse-input normalization
 
