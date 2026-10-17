@@ -4,6 +4,27 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Preserve C++ calls and show unresolved callgraph leaves
+
+`inspect callgraph` now shows calls without a resolved target as `unresolved`
+leaves, including methods on receivers whose type is unknown. Text, JSON,
+Graphviz, Mermaid and the C API retain these sites and their source positions;
+unresolved leaves count separately from functions.
+
+Chained method calls use distinct member-token positions, preserving repeated
+calls to the same method during merge. Unqualified calls inside out-of-class
+definitions consult the written enclosing scope even when the class header is
+unavailable; overload selection and return-type inference share that lookup.
+This restores `ApplicationContext::GetInteropCallbacks()` at
+`application_context.cpp:190` in the partial-source reproduction.
+
+Existing databases with retained unresolved sites support the callgraph display
+change immediately. Re-analysis applies the lookup and chained-position fixes.
+Rules: [Call source locations](docs/ANALYSIS.md#call-source-locations),
+[Methods](docs/ANALYSIS.md#c-support-first-step), and
+[callgraph query IDs](docs/SQLITE_SCHEMA.md#call-site-export-filter).
+Validation: [Evaluation report](docs/EVAL_REPORT.md#cpp-call-sites-and-unresolved-callgraphs--2026-10-15).
+
 ### Inspect analysis diagnostics
 
 `trace inspect <DB> diagnostics` shows stored analysis diagnostics with their

@@ -10018,6 +10018,28 @@ fn record_call_expressions(program: &mut Program, first_site: usize, expression:
     }
 }
 
+/// Follow the receiver's value path without walking arguments or lambda bodies.
+/// Each member of a call chain needs its own request and merge position.
+fn receiver_contains_call(mut node: Node) -> bool {
+    loop {
+        node = peel_expression(node);
+        match node.cached_kind() {
+            "call_expression" => return true,
+            "field_expression" | "subscript_expression" | "pointer_expression" => {
+                match node.cached_field("argument") {
+                    Some(argument) => node = argument,
+                    None => return false,
+                }
+            }
+            "cast_expression" => match node.cached_field("value") {
+                Some(value) => node = value,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+}
+
 fn collect_call_at_node(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -10132,7 +10154,9 @@ fn collect_call_at_node_inner(
         .then(|| explicit_member_operator_call(node, source))
         .flatten()
     {
-        let source_node = if node_has_expansion_location(ctx, op.op_node) {
+        let source_node = if node_has_expansion_location(ctx, op.op_node)
+            || receiver_contains_call(op.receiver)
+        {
             op.op_node
         } else {
             node
@@ -10229,7 +10253,11 @@ fn collect_call_at_node_inner(
     // repeated calls distinct when this token came from a shared argument.
     let source_node = if func.cached_kind() == "field_expression" {
         let field = func.cached_field("field").unwrap_or(func);
-        if node_has_expansion_location(ctx, field) {
+        if node_has_expansion_location(ctx, field)
+            || func
+                .cached_field("argument")
+                .is_some_and(receiver_contains_call)
+        {
             field
         } else {
             node
@@ -11912,38 +11940,20 @@ fn resolve_cpp_name_candidates(
         }
     }
 
-    // Phase 2: enclosing namespaces (innermost to outermost).  Stop at the
-    // first scope that declares any function with `base` — standard C++
-    // hiding rule (inner declarations shadow outer ones).
-    let present: Vec<&str> = ctx.ns_stack.iter().flatten().map(String::as_str).collect();
-    for i in (0..=present.len()).rev() {
-        let ns = present[..i].join("::");
-        let mut found = program.symbols.functions_in_namespace(&ns, base);
-        if i == 0 {
-            // The global rung: also fold in file-scoped internal linkage
-            // (static / header-static) entries, which are declarations in
-            // the global namespace.  Consulting them here — not ahead of the
-            // whole walk — lets them participate in the hiding rule: an
-            // inner-namespace declaration shadows a global/static, and a
-            // file-static shadows an extern global of the same name.
-            for id in program
-                .symbols
-                .resolve_function_candidates(base, Some(ctx.current_file))
-            {
-                if !found.contains(&id) {
-                    found.push(id);
-                }
-            }
-        }
-        if !found.is_empty() {
-            for id in found {
-                if !out.contains(&id) {
-                    out.push(id);
-                }
-            }
-            break;
-        }
-    }
+    // Phase 2: ordinary lookup uses the same enclosing scopes as function
+    // references. An out-of-line definition retains its written owner here
+    // even when its unit never declared the class (and has no class_ctx).
+    let lookup = |candidate: &str| {
+        let found = program
+            .symbols
+            .resolve_function_candidates(candidate, Some(ctx.current_file));
+        (!found.is_empty()).then_some(found)
+    };
+    out.extend(
+        find_in_enclosing_scopes(program, ctx, base, &mut |candidate, _| lookup(candidate))
+            .or_else(|| lookup(base))
+            .unwrap_or_default(),
+    );
     // Phase 3: using namespace directives (always add, never hide — they
     // make the named namespace's declarations visible in the directive's
     // scope, alongside any enclosing-namespace candidates).

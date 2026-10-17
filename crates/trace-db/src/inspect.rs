@@ -729,7 +729,9 @@ fn require_flow_tables(conn: &Connection) -> Result<()> {
 }
 
 /// Bounded BFS over the call graph from `root_fn_id`. Down follows caller →
-/// callee edges, up follows callee → caller edges.
+/// callee edges and includes unresolved call sites as leaves; up follows
+/// callee → caller edges. Unresolved leaves have negative, query-local IDs,
+/// distinct from the nonnegative function IDs stored in the database.
 pub fn call_graph(
     conn: &Connection,
     root_fn_id: i64,
@@ -737,11 +739,54 @@ pub fn call_graph(
     max_depth: u32,
 ) -> Result<QueryGraph> {
     require_call_edge_caller(conn)?;
-    let labels = load_function_labels(conn)?;
+    let mut labels = load_function_labels(conn)?;
     if !labels.contains_key(&root_fn_id) {
         bail!("function id {root_fn_id} not found in database");
     }
-    let adj = load_call_adjacency(conn, dir)?;
+    let mut adj = load_call_adjacency(conn, dir)?;
+    if dir == Direction::Down {
+        let mut stmt = conn.prepare(
+            "SELECT cs.id, cs.caller_fn_id, cs.callee_text, p.path, cs.line, cs.col \
+             FROM call_sites cs JOIN files p ON p.id = cs.file_id \
+             WHERE cs.id NOT IN (SELECT call_site_id FROM call_edges WHERE call_site_id IS NOT NULL) \
+             ORDER BY cs.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                EdgeSite {
+                    path: row.get(3)?,
+                    line: row.get(4)?,
+                    col: row.get(5)?,
+                },
+            ))
+        })?;
+        let mut seen = FxHashSet::default();
+        for row in rows {
+            let (site_id, caller, name, site) = row?;
+            // Merge inputs can each retain the same shared-header call.
+            // Match resolved-edge display deduplication before assigning IDs.
+            if !seen.insert((caller, name.clone(), site.path.clone(), site.line, site.col)) {
+                continue;
+            }
+            let id = -site_id - 1;
+            labels.insert(
+                id,
+                GraphNode {
+                    id,
+                    label: name,
+                    detail: "[unresolved]".into(),
+                    kind: None,
+                    loc_kind: None,
+                },
+            );
+            adj.entry(caller)
+                .or_default()
+                .push((id, "unresolved", site));
+        }
+    }
 
     let mut graph = QueryGraph::default();
     let mut visited: FxHashSet<i64> = FxHashSet::default();
@@ -1936,6 +1981,60 @@ mod tests {
                 && e.site.col == 5),
             "edges: {e}"
         );
+    }
+
+    #[test]
+    fn call_graph_deduplicates_unresolved_sites_by_caller_name_and_position() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO files (id, path, sha256) VALUES (2, '/other/main.c', '')",
+            [],
+        )
+        .unwrap();
+        for (id, caller, name, file, line, col) in [
+            (102, 10, "g_cb", 1, 15, 8),
+            (103, 10, "g_cb", 1, 15, 8), // A copy from another merge input.
+            (104, 10, "g_cb", 1, 15, 9),
+            (105, 10, "g_cb", 1, 16, 8),
+            (106, 10, "g_cb", 2, 15, 8), // Same basename, different path.
+            (107, 10, "other_cb", 1, 15, 8),
+            (108, 11, "g_cb", 1, 15, 8),
+        ] {
+            conn.execute(
+                "INSERT INTO call_sites (id, caller_fn_id, file_id, line, col, callee_text, is_direct) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                rusqlite::params![id, caller, file, line, col, name],
+            )
+            .unwrap();
+        }
+        let graph = call_graph(&conn, 10, Direction::Down, 5).unwrap();
+        let leaves: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.label == "unresolved")
+            .map(|edge| {
+                (
+                    edge.from,
+                    graph.nodes[&edge.to].label.as_str(),
+                    edge.site.path.as_str(),
+                    edge.site.line,
+                    edge.site.col,
+                )
+            })
+            .collect();
+        assert_eq!(
+            leaves,
+            [
+                (10, "g_cb", "/proj/main.c", 15, 8),
+                (10, "g_cb", "/proj/main.c", 15, 9),
+                (10, "g_cb", "/proj/main.c", 16, 8),
+                (10, "g_cb", "/other/main.c", 15, 8),
+                (10, "other_cb", "/proj/main.c", 15, 8),
+                (11, "g_cb", "/proj/main.c", 15, 8),
+            ]
+        );
+        assert!(graph.nodes.contains_key(&-103), "keep the lowest site ID");
+        assert!(!graph.nodes.contains_key(&-104), "omit the duplicate leaf");
     }
 
     #[test]

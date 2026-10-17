@@ -42,6 +42,11 @@ flowchart TD
 
 ## Call source locations
 
+For a member call on a call result, the request position is the called
+member token: `make().next().next()` has a distinct position for each
+`next`. This also keeps repeated calls in a chain distinct during merge.
+Ordinary member calls retain their receiver's start position.
+
 A call token written in a source macro replacement list uses the token's
 spelling location in the macro definition as `CallSite::span`. Its optional
 `CallSite::expansion_span` identifies the outermost invocation that emitted the
@@ -3054,8 +3059,14 @@ C++-aware only where it must be — everything else reuses the C machinery.
   declared local or the `new` allocation); a method call's receiver is not
   bound. Every site records whether its positions count `this`
   (`CallSite::args_bound_past_this`). A unit that never saw a class cannot
-  tell its members from free functions, so two cases are finished after the
-  merge, in order:
+  supply `this` during lowering, but ordinary call and return-type lookup
+  still consult the definition's written qualifier through the shared
+  enclosing-scope lookup. Thus `GetCallbacks()` inside `Context::Dispatch`
+  reaches an indexed `Context::GetCallbacks` even without the class header,
+  including its overloads, instead of disappearing as a bare direct call.
+  The lookup does not invent members for names absent from that scope.
+  Without the class declaration, two cases involving implicit parameters are
+  finished after the merge, in order:
   - A member *defined* in such a unit (its header include unresolved) lowers
     without `this` yet merges with the in-class prototype, whose explicit
     arity agrees; a parameterless one (`void Remote::Reset() {}`) too. The

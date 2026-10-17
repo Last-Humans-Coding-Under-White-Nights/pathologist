@@ -230,6 +230,93 @@ fn shared_header_images_do_not_collide_or_make_external_calls_ambiguous() {
 }
 
 #[test]
+fn shared_header_unresolved_callgraph_matches_joint_analysis() {
+    let tmp = tempdir().unwrap();
+    let sources = tmp.path().join("sources");
+    fs::create_dir(&sources).unwrap();
+    let header = sources.join("h.h");
+    fs::write(
+        &header,
+        "typedef void(*fp)(void);\nextern fp g_cb;\nvoid ext(void);\n\
+         inline void shared_fn(){ g_cb(); ext(); }\n",
+    )
+    .unwrap();
+    let mut inputs = Vec::new();
+    for name in ["one", "two"] {
+        let repo = sources.join(name);
+        fs::create_dir(&repo).unwrap();
+        fs::write(
+            repo.join("main.cpp"),
+            format!(
+                "#include \"{}\"\nvoid {name}() {{ shared_fn(); }}\n",
+                header.display()
+            ),
+        )
+        .unwrap();
+        let db = tmp.path().join(format!("{name}.db"));
+        analyze_repo(&repo, &db);
+        inputs.push(db);
+    }
+    let joint = tmp.path().join("joint.db");
+    analyze_repo(&sources, &joint);
+    let merged = tmp.path().join("merged.db");
+    merge_databases(
+        &inputs,
+        &MergeOptions {
+            output: merged.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+
+    let mut graphs = Vec::new();
+    for (db, copies) in [(&joint, 1), (&merged, 2)] {
+        let conn = Connection::open(db).unwrap();
+        let caller: i64 = conn
+            .query_row(
+                "SELECT id FROM functions WHERE name = 'shared_fn' AND is_defined = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let sites: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM call_sites WHERE caller_fn_id = ?1 AND callee_text = 'g_cb'",
+                [caller],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sites, copies, "the merged export retains each input's site");
+        let graph = trace_db::call_graph(&conn, caller, trace_db::Direction::Down, 2).unwrap();
+        let mut edges: Vec<_> = graph
+            .edges
+            .iter()
+            .map(|edge| {
+                (
+                    graph.nodes[&edge.to].label.clone(),
+                    edge.label.clone(),
+                    edge.site.path.clone(),
+                    edge.site.line,
+                    edge.site.col,
+                )
+            })
+            .collect();
+        edges.sort();
+        assert_eq!(
+            edges.len(),
+            2,
+            "one external edge and one unresolved leaf: {edges:?}"
+        );
+        assert_eq!(edges[0].0, "ext");
+        assert_eq!(edges[0].1, "external");
+        assert_eq!(edges[1].0, "g_cb");
+        assert_eq!(edges[1].1, "unresolved");
+        graphs.push(edges);
+    }
+    assert_eq!(graphs[0], graphs[1]);
+}
+
+#[test]
 fn shared_header_prototypes_deduplicate_across_images_and_keep_owner_visibility() {
     let tmp = tempdir().unwrap();
     let include = tmp.path().join("include");
