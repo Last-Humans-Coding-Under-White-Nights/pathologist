@@ -22,6 +22,10 @@ pub struct IpcBridge {
 /// for it (docs/ANALYSIS.md, "IDL-generated interfaces").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdlInterface {
+    /// HDI stubs hold a separate implementation of `interface`; service-IDL
+    /// stubs inherit it. Pairing searches interface implementations only for
+    /// this composition model (docs/ANALYSIS.md, "IDL-generated interfaces").
+    pub composed_stub: bool,
     /// Dotted IDL name as written (`OHOS.Security.IAtm`), idl-tool's interface descriptor.
     pub descriptor: String,
     /// `OHOS::Security::IAtm`

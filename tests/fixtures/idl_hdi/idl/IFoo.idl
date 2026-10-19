@@ -1,0 +1,10 @@
+package ohos.hdi.foo.v1_0;
+
+import ohos.hdi.foo.v1_0.Types;
+
+interface IFoo {
+    Ping([in] String sendMsg, [out] String recvMsg);
+    GetData([out] struct FooInfo info);
+    InfoTest([in] struct FooInfo inParam, [out] struct FooInfo outParam);
+    Reset();
+};

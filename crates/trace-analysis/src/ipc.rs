@@ -43,11 +43,35 @@ pub fn detect_ipc_pairs(program: &Program) -> Vec<IpcBridge> {
     // interface names, and a `*Client` written by hand beside it. Indexing
     // records at most one fact per pair (the owner of its headers). Of
     // several, however a program came to hold them, the first names it.
-    let mut descriptors: FxHashMap<&str, &str> = FxHashMap::default();
+    let mut idl_by_stub = FxHashMap::default();
     for idl in &program.idl_interfaces {
-        descriptors
-            .entry(idl.stub.as_str())
-            .or_insert(idl.descriptor.as_str());
+        idl_by_stub.entry(idl.stub.as_str()).or_insert(idl);
+    }
+    // A composed interface's subclasses include senders as well as services.
+    // Reuse scan/IDL roles and indexed broker bases, including subclasses.
+    // Broker ancestry survives a lost IDL record and a SendRequest hidden in
+    // a free helper, so neither can turn a proxy into a service candidate.
+    let mut proxy_classes = FxHashSet::default();
+    if program.idl_interfaces.iter().any(|i| i.composed_stub) {
+        for class in proxies
+            .iter()
+            .map(|(class, _, _)| class)
+            .chain(program.idl_interfaces.iter().map(|i| &i.proxy))
+            .chain(
+                program
+                    .template_bases()
+                    .iter()
+                    .filter(|fact| {
+                        remote_interface_argument(&fact.spelling, "IProxyBroker").is_some()
+                            || remote_interface_argument(&fact.spelling, "IRemoteProxy").is_some()
+                    })
+                    .map(|fact| &fact.derived),
+            )
+        {
+            if !proxy_classes.contains(class) {
+                proxy_classes.extend(program.subclass_closure(class));
+            }
+        }
     }
 
     // Indexed once a proxy pairs with a stub; ancestries per class, not per
@@ -63,17 +87,24 @@ pub fn detect_ipc_pairs(program: &Program) -> Vec<IpcBridge> {
             continue;
         };
         let hierarchy = hierarchy.get_or_insert_with(|| Hierarchy::new(program));
-        let stub = stub_interfaces
-            .entry(stub_class)
-            .or_insert_with(|| hierarchy.interfaces(stub_class, "IRemoteStub"));
+        let stub = stub_interfaces.entry(stub_class).or_insert_with(|| {
+            let mut interfaces = hierarchy.interfaces(stub_class, "IRemoteStub");
+            if let Some(idl) = idl_by_stub.get(stub_class).filter(|i| i.composed_stub) {
+                interfaces.extend(program.types.declared_class(&idl.interface));
+            }
+            interfaces
+        });
         let compatible = *compatible.entry(proxy_class).or_insert_with(|| {
-            let proxy = hierarchy.interfaces(proxy_class, "IRemoteProxy");
+            let mut proxy = hierarchy.interfaces(proxy_class, "IRemoteProxy");
+            proxy.extend(hierarchy.interfaces(proxy_class, "IProxyBroker"));
             !interfaces_differ(program, &proxy, stub)
         });
         if !compatible {
             continue;
         }
-        let descriptor = descriptors.get(stub_class).copied().unwrap_or_default();
+        let descriptor = idl_by_stub
+            .get(stub_class)
+            .map_or("", |idl| idl.descriptor.as_str());
         let matched_handlers = find_handlers(program, handlers, method);
         if !matched_handlers.is_empty() {
             bridges.extend(matched_handlers.into_iter().map(|stub_handler| IpcBridge {
@@ -91,7 +122,7 @@ pub fn detect_ipc_pairs(program: &Program) -> Vec<IpcBridge> {
             .entry(stub_class)
             .or_insert_with(|| hierarchy.fallback_classes(stub_class));
         bridges.extend(
-            find_interface_methods(program, stub_class, fallback, method)
+            find_interface_methods(program, stub_class, fallback, method, &proxy_classes)
                 .into_iter()
                 .map(|stub_handler| IpcBridge {
                     proxy_method: *proxy_method,
@@ -255,13 +286,28 @@ fn find_interface_methods(
     stub_class: &str,
     ancestors: &FxHashSet<String>,
     method_name: &str,
+    proxy_classes: &FxHashSet<String>,
 ) -> Vec<FnId> {
     // Prefer concrete in-tree implementations deriving from the stub. This
     // keeps reachability alive beyond the IPC boundary when the stub itself
     // only declares the interface methods.
     let mut concrete = Vec::new();
     let mut seen = FxHashSet::default();
-    for class in program.subclass_closure(stub_class).into_iter().skip(1) {
+    // HDI stubs compose an interface implementation rather than inherit it.
+    // IDL metadata names that interface without guessing from the class name.
+    let idl = program
+        .idl_interfaces
+        .iter()
+        .find(|i| i.stub == stub_class)
+        .filter(|i| i.composed_stub);
+    let mut implementations = program.subclass_closure(stub_class);
+    if let Some(idl) = idl {
+        implementations.extend(program.subclass_closure(&idl.interface));
+    }
+    for class in implementations.into_iter().filter(|class| {
+        class != stub_class
+            && idl.is_none_or(|idl| class != &idl.interface && !proxy_classes.contains(class))
+    }) {
         let name = format!("{class}::{method_name}");
         for id in program.symbols.resolve_function_candidates(&name, None) {
             if program.symbols.function(id).is_defined && seen.insert(id) {
@@ -388,6 +434,16 @@ impl<'p> Hierarchy<'p> {
     fn fallback_classes(&self, stub_class: &str) -> FxHashSet<String> {
         let mut classes: FxHashSet<String> = FxHashSet::default();
         let mut pending = vec![stub_class.to_string()];
+        if let Some(idl) = self
+            .program
+            .idl_interfaces
+            .iter()
+            .find(|i| i.stub == stub_class)
+            .filter(|i| i.composed_stub)
+        {
+            classes.insert(idl.interface.clone());
+            pending.push(idl.interface.clone());
+        }
         let mut expanded = FxHashSet::default();
         while let Some(class) = pending.pop() {
             if !expanded.insert(class.clone()) {
@@ -652,6 +708,7 @@ mod tests {
         program.add_inheritance("p::AtmStub", "p::IAtm");
         for descriptor in ["p.IAtm", "p.Atm"] {
             program.idl_interfaces.push(trace_ir::IdlInterface {
+                composed_stub: false,
                 descriptor: descriptor.into(),
                 interface: "p::IAtm".into(),
                 proxy: "p::AtmProxy".into(),
@@ -685,7 +742,13 @@ mod tests {
         program.add_inheritance("svc::FooStub", "svc::IFoo");
 
         let ancestors = Hierarchy::new(&program).fallback_classes("svc::FooStub");
-        let handlers = find_interface_methods(&program, "svc::FooStub", &ancestors, "Run");
+        let handlers = find_interface_methods(
+            &program,
+            "svc::FooStub",
+            &ancestors,
+            "Run",
+            &FxHashSet::default(),
+        );
 
         assert_eq!(handlers, vec![first, second]);
     }

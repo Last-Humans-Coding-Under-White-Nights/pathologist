@@ -1480,8 +1480,9 @@ also has a real inheritance edge to `IFoo`
 recovery above covers the common case where it is not.
 A proxy and a stub whose names pair are bridged only when their interfaces
 can be one. Each side's interfaces are the arguments of its `IRemoteProxy<I>`
-or `IRemoteStub<I>` bases, written on the class or on one of its bases, read
-as lowering reads a template argument: each candidate in the lookup order
+or `IProxyBroker<I>` proxy bases or `IRemoteStub<I>` stub bases, written on
+the class or on one of its bases, read as lowering reads a template argument:
+each candidate in the lookup order
 above that is a declared class, or a `typedef`/`using` alias of one. Every
 such reading counts, not only the nearest, because the merged index cannot
 tell which of two declared namesakes the class's unit sees. A bare spelling
@@ -1520,7 +1521,10 @@ fallback above selects the service's overrides, and the bridge carries the
 IDL descriptor. So does the bridge of any other sender that pairs with that
 stub, a hand-written `AtmClient` beside the generated `AtmProxy`: the
 descriptor is the stub's interface's. `ipccode` is recorded but not used for
-matching yet.
+matching yet. HDI's composed stubs use the implementation relationship
+recorded by IDL synthesis; their interface also supplies compatibility
+evidence when it is declared. Their pairing rules are described in
+[IDL-generated interfaces](#idl-generated-interfaces).
 
 This is deliberately name-based and does not interpret transaction opcodes or
 control flow in `OnRemoteRequest`. Synthetic IPC edges are appended after the
@@ -4246,11 +4250,12 @@ panic. The probe is syntax-only and never enters the IR.
 
 ## IDL-generated interfaces
 
-OpenHarmony services declare their IPC interfaces in `.idl` files; the build
-runs idl-tool to generate the interface header, the proxy and the stub, and
+OpenHarmony services and HDF HDI interfaces declare their IPC interfaces in
+`.idl` files; the build runs idl-tool or hdi-gen to generate the interface
+header, the proxy and the stub, and
 none of the three is in the source tree. For every `.idl` file under the
 analysis root or a dependency root, indexing synthesizes the declarations
-idl-tool would generate and serves them from memory at
+for the supported C++ IPC dialect and serves them from memory at
 `<root>/.trace-idl-generated/<header>`. That directory is a dependency root
 ([Dependency roots](#dependency-roots)): the headers resolve `#include` like
 any other, carry `is_dep = 1`, and contribute declarations only. The headers
@@ -4265,6 +4270,9 @@ include guard of a header names its directory with its file
 (`TRACE_IDL_IATM_H`, `TRACE_IDL_TEST_IATM_H`): a unit that includes a
 production header and the header of that name in the partition gets both.
 
+The service dialect uses the following declarations; HDI's bases and package
+mapping are described below.
+
 | IDL | Synthesized |
 |-----|-------------|
 | `interface OHOS.Security.IAtm` (or `package OHOS.Security;` + `interface IAtm`) | `namespace OHOS { namespace Security { … } }` |
@@ -4274,9 +4282,11 @@ production header and the header of that name in the partition gets both.
 | stub | `atm_stub.h`: `class AtmStub : public IRemoteStub<IAtm>` declaring `OnRemoteRequest` |
 | descriptor | the dotted name as written, `OHOS.Security.IAtm`, or what the file's `interface_token a.b.c;` declares |
 
-Names follow idl-tool: a leading `I` followed by an uppercase letter is
-stripped to form the base (`IAtm` → `Atm`). A file is named after its class
-in lower case, with an underscore before every capital past the second
+In service IDL, a leading `I` followed by an uppercase letter is stripped
+to form the class base name (`IAtm` → `Atm`); HDI strips any leading `I`
+(`Input` → `nputProxy` / `nputStub`, while service IDL keeps
+`InputProxy` / `InputStub`). A file is named after its class in lower case,
+with an underscore before every capital past the second
 character (the generators' `CodeEmitter::FileName`):
 `IAccessTokenManager` → `iaccess_token_manager.h`,
 `AccessTokenManagerProxy` → `access_token_manager_proxy.h`, and a run of
@@ -4284,14 +4294,54 @@ capitals splits at each one (`IHDIFoo` → `ih_d_i_foo.h`). A name without
 the `I` prefix is its own base (`El5FilekeyManagerInterface` →
 `el5_filekey_manager_interface.h`, `El5FilekeyManagerInterfaceProxy`).
 
-Every method returns `int32_t` (idl-tool's `ErrCode`); a non-`void` IDL
-return becomes a trailing `T& funcResult` parameter. Parameters:
+Every method returns `int32_t` status. In the service dialect (idl-tool's
+`ErrCode`), a non-`void` IDL return becomes a trailing `T& funcResult`
+parameter. HDI's omitted-return syntax, `Ping([in] String sendMsg,
+[out] String recvMsg);`, has no result parameter: the generated signature is
+`int32_t Ping(const std::string& sendMsg, std::string& recvMsg)`.
+An omitted-return method selects HDI naming and bases for its file;
+explicit-return methods retain their result mapping, including in a file
+that also contains omitted-return methods. Parameters:
 
 | IDL | `[in]` | `[out]` / `[inout]` |
 |-----|--------|---------------------|
 | `boolean byte short int long float double char`, `unsigned …`, an IDL `enum`, `FileDescriptor` | `T name` | `T& name` |
-| `String` → `std::string`, `List<T>` / `T[]` → `std::vector<T>`, `Map<K,V>` → `std::unordered_map<K, V>`, a `sequenceable a.b.S` → `a::b::S` | `const T& name` | `T& name` |
+| `String` → `std::string`, `List<T>` / `T[]` → `std::vector<T>`, `Map<K,V>` → `std::unordered_map<K, V>` (service) / `std::map<K, V>` (HDI) | `const T& name` | `T& name` |
+| `sequenceable a.b.S` (service) → `a::b::S` | `const T& name` | `T& name` |
+| `sequenceable a.b.S` (HDI) → `sptr<S>` with the qualified C++ name | `const sptr<S>& name` | `sptr<S>& name` |
 | `IRemoteObject`, an IDL `interface` → `sptr<…>` | `const sptr<…>& name` | `sptr<…>& name` |
+| HDI `struct FooInfo` → `FooInfo` | `const FooInfo& name` | `FooInfo& name` |
+
+HDI C++ IPC declarations follow the pinned HDF hdi-gen sources
+([interface/status](https://github.com/openharmony/drivers_hdf_core/blob/cdc75a20bb8f1a046cd22e189405a20d602d0521/framework/tools/hdi-gen/codegen/cpp_interface_code_emitter.cpp),
+[package names](https://github.com/openharmony/drivers_hdf_core/blob/cdc75a20bb8f1a046cd22e189405a20d602d0521/framework/tools/hdi-gen/codegen/cpp_code_emitter.cpp),
+[class names](https://github.com/openharmony/drivers_hdf_core/blob/cdc75a20bb8f1a046cd22e189405a20d602d0521/framework/tools/hdi-gen/codegen/code_emitter.cpp),
+[sequenceables](https://github.com/openharmony/drivers_hdf_core/blob/cdc75a20bb8f1a046cd22e189405a20d602d0521/framework/tools/hdi-gen/ast/ast_sequenceable_type.cpp),
+[proxy](https://github.com/openharmony/drivers_hdf_core/blob/cdc75a20bb8f1a046cd22e189405a20d602d0521/framework/tools/hdi-gen/codegen/cpp_client_proxy_code_emitter.cpp),
+[stub](https://github.com/openharmony/drivers_hdf_core/blob/cdc75a20bb8f1a046cd22e189405a20d602d0521/framework/tools/hdi-gen/codegen/cpp_service_stub_code_emitter.cpp)).
+The default root `ohos.hdi` becomes `OHOS::HDI`; package segments before the
+version use PascalCase (`foo_bar` → `FooBar`), `v1_0` becomes `V1_0`, and
+segments after the version keep their spelling. Interface and type names
+keep their spelling. Thus `ohos.hdi.foo.v1_0.IFoo` names
+`OHOS::HDI::Foo::V1_0::IFoo`; the descriptor keeps the dotted IDL spelling.
+Header/class base names follow the table above, with these HDI bases:
+`IFoo : public OHOS::HDI::HdiBase`,
+`FooProxy : public IProxyBroker<IFoo>`, and
+`FooStub : public OHOS::IPCObjectStub`. The stub declares the same
+`OnRemoteRequest` signature as the service dialect. The stub composes an
+implementation of `IFoo` rather than inheriting it: IPC pairing uses the interface named by
+`Program::idl_interfaces` (its `composed_stub` fact) to find concrete service
+overrides. Every proxy named by IDL, detected as an IPC sender, or identified
+by an indexed `IProxyBroker<T>` / `IRemoteProxy<T>` base, and every subclass
+of those proxies, is excluded from this search, including proxies for
+descendant interfaces. Broker ancestry establishes that role even if a
+header collision drops the proxy's IDL record and its method delegates
+`SendRequest` to a free helper. This role evidence does not by itself mark
+the proxy method as an IPC sender. If no service implementation remains, pairing
+falls back to interface declarations. The recorded interface also enters
+the compatibility check above, so a same-named client of a declared unrelated
+interface does not pair with the composed stub. It adds no inheritance edge
+between the stub and interface.
 
 Primitive spellings: `boolean` → `bool`, `byte` → `int8_t`, `short` →
 `int16_t`, `int` → `int32_t`, `long` → `int64_t`, `unsigned char/short/int/long`
@@ -4299,16 +4349,17 @@ Primitive spellings: `boolean` → `bool`, `byte` → `int8_t`, `short` →
 spellings `bool`, `int8_t` … `int64_t` and `uint8_t` … `uint64_t`, which some
 IDL files use directly, map to themselves and are passed by value too.
 
-The synthesized headers include nothing but each other: `IRemoteBroker`,
-`IRemoteProxy`, `IRemoteStub`, `sptr` and the standard types stay whatever
-the tree declares. Where it declares `IRemoteBroker`, a call such as
+The synthesized headers include nothing but each other: framework bases
+(`IRemoteBroker`, `IRemoteProxy`, `IRemoteStub`, `HdiBase`, `IProxyBroker`,
+`IPCObjectStub`), `sptr` and the standard types stay whatever the tree
+declares. Where it declares `IRemoteBroker`, a call such as
 `proxy_->AsObject()` binds to the broker's member. When the IPC framework
 is not in the tree the undefined-template base
 rule ([Template-parameter bases](#template-parameter-bases)) makes the proxy
-and the stub subclasses of the interface, so a call through `sptr<IAtm>`
-reaches `AtmProxy`. That edge has resolution `external`, as every edge to a
-function declared without a body has: the proxy's body is generated, not in
-the tree.
+and, in the service dialect, the stub subclasses of the interface. A call
+through `sptr<IAtm>` reaches `AtmProxy`. That edge has resolution `external`,
+as every edge to a function declared without a body has: the proxy's body is
+generated, not in the tree.
 
 Precedence and failures:
 
@@ -4331,12 +4382,23 @@ Precedence and failures:
   same directory the first keeps it and a warning names both. An interface that
   lost its proxy or stub header this way, or whose proxy or stub class an
   earlier interface already names, records no fact on
-  `Program::idl_interfaces`: the classes declared are the earlier
-  interface's. One that lost its interface header (`IFoo` and `Ifoo` are
+  `Program::idl_interfaces`: a header of that pair belongs to the earlier
+  interface. Any on-disk interface/proxy headers are still indexed. One that
+  lost its interface header (`IFoo` and `Ifoo` are
   both `ifoo.h`) is not declared at all: its proxy and stub are not rendered
   either, since they would include a header declaring another class, and an
   interface extending it includes nothing for it and inherits nothing from
   it.
+- HDI synthesis currently uses the flat service-IDL header layout rather
+  than hdi-gen's package-relative paths. Normal versioned packages such as
+  `foo/v1_0/IFoo.idl` and `foo/v1_1/IFoo.idl` therefore collide within the
+  same generated partition. Without on-disk replacements, only the first
+  version in sorted path order is synthesized; later versions contribute
+  no interface, proxy or stub declarations or IDL pairing record. An include
+  such as `foo/v1_1/foo_proxy.h` can resolve by basename to the first version's
+  header without a missing-include diagnostic when that is the only available
+  match. Synthesizing multiple package versions together requires a future
+  package-relative header layout.
 - A file that does not parse is skipped with one warning
   (`stage = idl`, `<path>:<line>: <message>`). `enum`, `struct`, `union`,
   `import`, `option_*` declarations (`option_stub_hooks on;`) and
@@ -4358,9 +4420,20 @@ Precedence and failures:
   suffixes together) is a syntax error.
 - An interface that `extends` itself is reported with one warning and
   synthesized without the clause.
-- The grammar is idl-tool's service dialect. HDI interface files
-  (`Ping();` with no return type) do not parse and are skipped with that
-  warning.
+- HDI support covers omitted-return methods, `struct`-prefixed parameter
+  types, and the default C++ IPC naming convention above. Synthesis does not
+  interpret hdi-gen command-line options: custom package-root mappings,
+  C/Java output, lite/kernel/passthrough modes, and system-level attribute
+  filtering are not modeled. Empty interfaces with no omitted-return method
+  use the service dialect. Aggregate layouts and enum values are skipped;
+  `enum E` / `union U` parameter prefixes, fixed-size IDL array declarators,
+  and nested type declarations inside interfaces are unsupported and cause a
+  parse warning. HDI-specific types such as `Ashmem`, `NativeBuffer`,
+  `Pointer` and `SharedMemQueue` have no dedicated C++ mapping. Generated
+  convenience methods (`Get`, `GetVersion`, `IsProxy`, `GetDesc`), stub
+  marshalling helpers and their bodies are not synthesized. Attributes are
+  consumed without dialect validation; `[inout]` retains the service
+  dialect's mutable-reference approximation (hdi-gen accepts `[in]`/`[out]`).
 - Each file is rendered on its own. A type named only through `import`
   (a sequenceable or enum declared in another `.idl`, such as
   `IdlCommon.idl`) is not qualified: it is emitted as written

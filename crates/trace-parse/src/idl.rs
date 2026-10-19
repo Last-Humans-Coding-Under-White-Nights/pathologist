@@ -1,5 +1,5 @@
-//! OpenHarmony `.idl` interface definitions: the grammar, the idl-tool naming
-//! convention and the declarations idl-tool would generate
+//! OpenHarmony `.idl` interface definitions: the service/HDI grammars, naming
+//! conventions and the declarations idl-tool/hdi-gen would generate
 //! (docs/ANALYSIS.md, "IDL-generated interfaces").
 
 use crate::deps::VirtualHeaders;
@@ -14,6 +14,8 @@ use trace_preproc::PreprocessOptions;
 /// One parsed `.idl` file.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct File {
+    /// Omitted-return methods identify hdi-gen's C++ IPC dialect.
+    pub hdi: bool,
     pub interfaces: Vec<Interface>,
     /// `sequenceable a.b.C;` and `rawdata a.b.C;`, as dotted segments.
     pub sequenceables: Vec<Vec<String>>,
@@ -38,7 +40,8 @@ pub(crate) struct Interface {
 pub(crate) struct Method {
     pub name: String,
     pub ipccode: Option<u32>,
-    pub ret: Type,
+    /// None in HDI: the generated return is status, with no result parameter.
+    pub ret: Option<Type>,
     pub params: Vec<Param>,
 }
 
@@ -313,6 +316,10 @@ impl Parser {
         if self.type_depth > MAX_TYPE_DEPTH {
             return Err(self.error("type nested too deeply"));
         }
+        // HDI spells aggregate parameters `struct FooInfo`; C++ uses FooInfo.
+        if self.peek_ident() == Some("struct") {
+            self.pos += 1;
+        }
         let mut segs = self.dotted()?;
         if segs == ["unsigned"] {
             segs = vec![format!("unsigned {}", self.ident()?)];
@@ -346,8 +353,13 @@ impl Parser {
             .find(|a| a.name == "ipccode")
             .and_then(|a| a.value)
             .and_then(|v| u32::try_from(v).ok());
-        let ret = self.ty()?;
-        let name = self.ident()?;
+        let (ret, name) = if matches!(self.peek(), Some(Tok::Ident(_)))
+            && self.toks.get(self.pos + 1).map(|t| &t.0) == Some(&Tok::Punct('('))
+        {
+            (None, self.ident()?)
+        } else {
+            (Some(self.ty()?), self.ident()?)
+        };
         self.expect('(')?;
         let mut params = Vec::new();
         if !self.eat(')') {
@@ -458,7 +470,66 @@ fn parse(text: &str) -> Result<File, ParseError> {
             _ => return Err(p.error("expected a declaration")),
         }
     }
+    file.hdi = file
+        .interfaces
+        .iter()
+        .any(|i| i.methods.iter().any(|m| m.ret.is_none()));
     Ok(file)
+}
+
+/// hdi-gen's default `ohos.hdi` root, PascalCase packages before the version,
+/// and unchanged nested namespaces after it (CppCodeEmitter::EmitCppNameSpaceVec).
+fn cpp_name(qualified: &[String], file: &File) -> Vec<String> {
+    if !file.hdi {
+        return qualified.to_vec();
+    }
+    let mut version_seen = false;
+    let root_len = if qualified.first().map(String::as_str) == Some("ohos")
+        && qualified.get(1).map(String::as_str) == Some("hdi")
+    {
+        2
+    } else {
+        0
+    };
+    qualified
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            if i == qualified.len() - 1 || version_seen {
+                return part.clone();
+            }
+            if i < root_len {
+                return part.to_ascii_uppercase();
+            }
+            if part
+                .strip_prefix(['v', 'V'])
+                .and_then(|v| v.split_once('_'))
+                .is_some_and(|(major, minor)| {
+                    !major.is_empty()
+                        && !minor.is_empty()
+                        && major.bytes().all(|c| c.is_ascii_digit())
+                        && minor.bytes().all(|c| c.is_ascii_digit())
+                })
+            {
+                version_seen = true;
+                return format!("V{}", &part[1..]);
+            }
+            let mut upper = true;
+            part.chars()
+                .enumerate()
+                .filter_map(|(i, c)| {
+                    if c == '_' && i != 0 {
+                        upper = true;
+                        None
+                    } else {
+                        let c = if upper { c.to_ascii_uppercase() } else { c };
+                        upper = c == '_';
+                        Some(c)
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// The names idl-tool gives an interface's generated classes and headers.
@@ -502,15 +573,26 @@ fn file_name(class: &str) -> String {
 }
 
 impl Names {
-    /// The idl-tool naming convention for the interface `qualified` names;
-    /// the one place it is computed.
+    fn in_file(qualified: &[String], file: &File) -> Names {
+        let mut names = Self::for_dialect(&cpp_name(qualified, file), file.hdi);
+        // The descriptor keeps the IDL package spelling, including in HDI.
+        names.descriptor = qualified.join(".");
+        names
+    }
+
+    /// The service-IDL naming convention.
     fn of(qualified: &[String]) -> Names {
+        Self::for_dialect(qualified, false)
+    }
+
+    /// Common class/header naming, with the generators' distinct leading-I rules.
+    fn for_dialect(qualified: &[String], hdi: bool) -> Names {
         let (interface, namespace) = qualified
             .split_last()
             .expect("parser yields a non-empty name");
         let stripped = interface
             .strip_prefix('I')
-            .filter(|r| r.starts_with(|c: char| c.is_ascii_uppercase()));
+            .filter(|r| hdi || r.starts_with(|c: char| c.is_ascii_uppercase()));
         let base = stripped.unwrap_or(interface);
         let (proxy, stub) = (format!("{base}Proxy"), format!("{base}Stub"));
         Names {
@@ -583,6 +665,7 @@ fn cpp_type(ty: &Type, file: &File) -> String {
             let args: Vec<String> = args.iter().map(|a| cpp_type(a, file)).collect();
             match name.as_str() {
                 "List" => format!("std::vector<{}>", args.join(", ")),
+                "Map" if file.hdi => format!("std::map<{}>", args.join(", ")),
                 "Map" => format!("std::unordered_map<{}>", args.join(", ")),
                 other => format!("{}<{}>", other.replace('.', "::"), args.join(", ")),
             }
@@ -605,12 +688,17 @@ fn cpp_type(ty: &Type, file: &File) -> String {
                 .chain(&file.interface_refs)
                 .find(|q| q.ends_with(segs));
             if let Some(q) = declared_interface {
-                return format!("sptr<{}>", q.join("::"));
+                return format!("sptr<{}>", cpp_name(q, file).join("::"));
             }
             if let Some(q) = file.sequenceables.iter().find(|q| q.ends_with(segs)) {
-                return q.join("::");
+                let name = cpp_name(q, file).join("::");
+                return if file.hdi {
+                    format!("sptr<{name}>")
+                } else {
+                    name
+                };
             }
-            segs.join("::")
+            cpp_name(segs, file).join("::")
         }
     }
 }
@@ -626,8 +714,10 @@ fn param(p: &Param, file: &File) -> String {
 
 fn signature(m: &Method, file: &File) -> String {
     let mut params: Vec<String> = m.params.iter().map(|p| param(p, file)).collect();
-    if !matches!(&m.ret, Type::Named(segs) if *segs == ["void"]) {
-        params.push(format!("{}& funcResult", cpp_type(&m.ret, file)));
+    if let Some(ret) = &m.ret {
+        if !matches!(ret, Type::Named(segs) if *segs == ["void"]) {
+            params.push(format!("{}& funcResult", cpp_type(ret, file)));
+        }
     }
     format!("int32_t {}({})", m.name, params.join(", "))
 }
@@ -697,7 +787,7 @@ fn render(
     dir: Option<&OsStr>,
     base: &Base,
 ) -> [(String, String); 3] {
-    let n = Names::of(&i.qualified);
+    let n = Names::in_file(&i.qualified, file);
     let own = |prefix: &str, suffix: &str| -> String {
         i.methods
             .iter()
@@ -711,25 +801,42 @@ fn render(
         .iter()
         .map(|(m, declared_in)| format!("    {} override;\n", signature(m, declared_in)))
         .collect();
-    // Without `extends` the interface derives from the broker (`AsObject`),
-    // as every generated interface does.
-    let extends = i.extends.as_ref().map(|qualified| qualified.join("::"));
+    // Without `extends`, use the dialect's framework base.
+    let extends = i
+        .extends
+        .as_ref()
+        .map(|qualified| cpp_name(qualified, file).join("::"));
+    let broker = if file.hdi {
+        "OHOS::HDI::HdiBase"
+    } else {
+        BROKER
+    };
     let interface = format!(
         "class {} : public {} {{\npublic:\n{}}};\n",
         n.interface,
-        extends.as_deref().unwrap_or(BROKER),
+        extends.as_deref().unwrap_or(broker),
         own("virtual ", " = 0")
     );
     let proxy = format!(
-        "class {} : public IRemoteProxy<{}> {{\npublic:\n{}{}}};\n",
+        "class {} : public {}<{}> {{\npublic:\n{}{}}};\n",
         n.proxy,
+        if file.hdi {
+            "IProxyBroker"
+        } else {
+            "IRemoteProxy"
+        },
         n.interface,
         own("", " override"),
         inherited
     );
+    let stub_base = if file.hdi {
+        "OHOS::IPCObjectStub".to_string()
+    } else {
+        format!("IRemoteStub<{}>", n.interface)
+    };
     let stub = format!(
-        "class {} : public IRemoteStub<{}> {{\npublic:\n    int32_t OnRemoteRequest(uint32_t code, MessageParcel& data, MessageParcel& reply, MessageOption& option) override;\n}};\n",
-        n.stub, n.interface
+        "class {} : public {} {{\npublic:\n    int32_t OnRemoteRequest(uint32_t code, MessageParcel& data, MessageParcel& reply, MessageOption& option) override;\n}};\n",
+        n.stub, stub_base
     );
     let interface_header = n.interface_header.as_str();
     [
@@ -981,7 +1088,7 @@ fn synthesize(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         for iface in &file.interfaces {
-            let n = Names::of(&iface.qualified);
+            let n = Names::in_file(&iface.qualified, file);
             if !is_declared(dir, &iface.qualified) {
                 let first = owner.get(&target.join(&n.interface_header));
                 out.warnings.push(format!(
@@ -1032,6 +1139,7 @@ fn synthesize(
             claimed.insert(proxy.clone());
             claimed.insert(stub.clone());
             out.interfaces.push(trace_ir::IdlInterface {
+                composed_stub: file.hdi,
                 interface: n.qualify(&n.interface),
                 descriptor: file.interface_token.clone().unwrap_or(n.descriptor),
                 proxy,
@@ -1082,7 +1190,7 @@ mod tests {
         let m = &i.methods[0];
         assert_eq!(m.name, "VerifyAccessToken");
         assert_eq!(m.ipccode, Some(1));
-        assert_eq!(m.ret, named(&["void"]));
+        assert_eq!(m.ret, Some(named(&["void"])));
         assert_eq!(
             m.params,
             vec![
@@ -1110,6 +1218,113 @@ mod tests {
         let f = parse("package OHOS.AAFwk;\ninterface IFoo { void Ping(); }").unwrap();
         assert_eq!(f.interfaces[0].qualified, vec!["OHOS", "AAFwk", "IFoo"]);
         assert_eq!(f.interfaces[0].methods[0].ipccode, None);
+    }
+
+    #[test]
+    fn hdi_fixture_status_signatures_and_names() {
+        let (f, i) = iface(include_str!("../../../tests/fixtures/idl_hdi/idl/IFoo.idl"));
+        assert!(f.hdi);
+        assert!(i.methods.iter().all(|m| m.ret.is_none()));
+        assert_eq!(i.methods[0].params[0].dir, Direction::In);
+        assert_eq!(i.methods[0].params[1].dir, Direction::Out);
+        assert_eq!(i.methods[1].params[0].ty, named(&["FooInfo"]));
+        let n = Names::in_file(&i.qualified, &f);
+        assert_eq!(n.namespace, ["OHOS", "HDI", "Foo", "V1_0"]);
+        assert_eq!(n.descriptor, "ohos.hdi.foo.v1_0.IFoo");
+        let [(_, interface), (_, proxy), (_, stub)] =
+            render(&i, &f, "IFoo.idl", None, &Base::default());
+        for signature in [
+            "int32_t Ping(const std::string& sendMsg, std::string& recvMsg)",
+            "int32_t GetData(FooInfo& info)",
+            "int32_t InfoTest(const FooInfo& inParam, FooInfo& outParam)",
+            "int32_t Reset()",
+        ] {
+            assert!(
+                interface.contains(&format!("virtual {signature} = 0;")),
+                "{interface}"
+            );
+            assert!(proxy.contains(&format!("{signature} override;")), "{proxy}");
+        }
+        assert!(!interface.contains("funcResult"));
+        assert!(!proxy.contains("funcResult"));
+        assert!(interface.contains("class IFoo : public OHOS::HDI::HdiBase"));
+        assert!(proxy.contains("class FooProxy : public IProxyBroker<IFoo>"));
+        assert!(stub.contains("class FooStub : public OHOS::IPCObjectStub"));
+        assert!(stub.contains("int32_t OnRemoteRequest(uint32_t code, MessageParcel& data, MessageParcel& reply, MessageOption& option) override;"));
+    }
+
+    #[test]
+    fn omitted_and_explicit_returns_keep_their_result_conventions() {
+        let (f, i) = iface(
+            "interface IFoo { Ping(); void Reset(); String Get([inout] struct FooInfo info); }",
+        );
+        assert_eq!(signature(&i.methods[0], &f), "int32_t Ping()");
+        assert_eq!(signature(&i.methods[1], &f), "int32_t Reset()");
+        assert_eq!(
+            signature(&i.methods[2], &f),
+            "int32_t Get(FooInfo& info, std::string& funcResult)"
+        );
+        let (f, i) = iface("package a.b; interface IFoo { String Get([in] String key, [out] int value, [inout] int state); }");
+        assert!(!f.hdi);
+        assert_eq!(Names::in_file(&i.qualified, &f).namespace, ["a", "b"]);
+        assert_eq!(signature(&i.methods[0], &f), "int32_t Get(const std::string& key, int32_t& value, int32_t& state, std::string& funcResult)");
+    }
+
+    #[test]
+    fn hdi_qualified_type_and_base_names_follow_package_mapping() {
+        let (f, i) = iface("package ohos.hdi.foo_bar.v1_0.nested; interface IFoo extends ohos.hdi.foo_bar.v1_0.IBase { Put([in] struct ohos.hdi.foo_bar.v1_0.FooInfo info); }");
+        let n = Names::in_file(&i.qualified, &f);
+        assert_eq!(n.namespace, ["OHOS", "HDI", "FooBar", "V1_0", "nested"]);
+        assert_eq!(
+            cpp_name(&["_foo_bar".into(), "IFoo".into()], &f),
+            ["_FooBar", "IFoo"]
+        );
+        assert_eq!(
+            signature(&i.methods[0], &f),
+            "int32_t Put(const OHOS::HDI::FooBar::V1_0::FooInfo& info)"
+        );
+        let [(_, interface), _, _] = render(&i, &f, "IFoo.idl", None, &Base::default());
+        assert!(interface.contains("class IFoo : public OHOS::HDI::FooBar::V1_0::IBase"));
+    }
+
+    #[test]
+    fn hdi_containers_use_hdi_cpp_types() {
+        let (f, i) = iface("interface IFoo { Put([in] List<struct FooInfo> infos, [out] Map<String, int> values, [in] int[] ids); }");
+        assert_eq!(signature(&i.methods[0], &f), "int32_t Put(const std::vector<FooInfo>& infos, std::map<std::string, int32_t>& values, const std::vector<int32_t>& ids)");
+    }
+
+    #[test]
+    fn hdi_sequenceables_are_smart_pointers_in_both_headers() {
+        let (f, i) = iface("sequenceable ohos.hdi.foo.v1_0.Parcel; interface IFoo { Put([in] Parcel item, [out] Parcel reply, [inout] Parcel updated); }");
+        let expected = "int32_t Put(const sptr<OHOS::HDI::Foo::V1_0::Parcel>& item, sptr<OHOS::HDI::Foo::V1_0::Parcel>& reply, sptr<OHOS::HDI::Foo::V1_0::Parcel>& updated)";
+        let [(_, interface), (_, proxy), _] = render(&i, &f, "IFoo.idl", None, &Base::default());
+        assert!(
+            interface.contains(&format!("virtual {expected} = 0;")),
+            "{interface}"
+        );
+        assert!(proxy.contains(&format!("{expected} override;")), "{proxy}");
+
+        let (f, i) = iface("sequenceable ohos.hdi.foo.v1_0.Parcel; interface IFoo { void Put([in] Parcel item, [out] Parcel reply); }");
+        assert_eq!(signature(&i.methods[0], &f), "int32_t Put(const ohos::hdi::foo::v1_0::Parcel& item, ohos::hdi::foo::v1_0::Parcel& reply)");
+    }
+
+    #[test]
+    fn hdi_strips_any_leading_i_but_service_names_require_a_capital() {
+        for (interface, hdi_base, service_base) in [
+            ("Input", "nput", "Input"),
+            ("Ifoo", "foo", "Ifoo"),
+            ("IFoo", "Foo", "Foo"),
+            ("Foo", "Foo", "Foo"),
+        ] {
+            for (method, base) in [("Ping();", hdi_base), ("void Ping();", service_base)] {
+                let (f, i) = iface(&format!("interface {interface} {{ {method} }}"));
+                let names = Names::in_file(&i.qualified, &f);
+                assert_eq!(names.proxy, format!("{base}Proxy"));
+                assert_eq!(names.stub, format!("{base}Stub"));
+                assert_eq!(names.proxy_header, format!("{}.h", file_name(&names.proxy)));
+                assert_eq!(names.stub_header, format!("{}.h", file_name(&names.stub)));
+            }
+        }
     }
 
     #[test]
@@ -1159,7 +1374,7 @@ mod tests {
         );
         assert_eq!(f.enums, vec!["Mode"]);
         assert_eq!(f.interfaces.len(), 1);
-        assert_eq!(f.interfaces[0].methods[0].ret, named(&["int"]));
+        assert_eq!(f.interfaces[0].methods[0].ret, Some(named(&["int"])));
     }
 
     #[test]

@@ -14,6 +14,29 @@ preserved. Unrelated syntax errors still produce parse diagnostics.
 Rules: [C++ parse-input normalization](docs/ANALYSIS.md#c-parse-input-normalization).
 Validation: [Evaluation report](docs/EVAL_REPORT.md#gnu-visibility-before-c-linkage--2026-10-19).
 
+### HDI omitted-return IDL methods
+
+HDF HDI methods such as `Ping([in] String sendMsg, [out] String recvMsg);`
+and `struct FooInfo` parameters now synthesize C++ interface, proxy and stub
+declarations. Omitted-return methods use hdi-gen's `int32_t` status return
+without an extra result parameter; explicit-return service IDL retains its
+existing mapping. HDI package names and class bases follow the generator,
+and IPC pairing reaches implementations held by a composed stub.
+
+Composed-stub pairing excludes proxies for descendant interfaces and their
+subclasses, including broker-derived proxies whose IDL record was dropped
+by a header collision and whose send is delegated to a helper. Pairing also
+rejects clients of known unrelated interfaces. HDI
+sequenceables use the generator's smart-pointer signatures; HDI class naming
+also handles a lowercase letter after the leading `I` (`Input` generates
+`nputProxy` / `nputStub`). Service-IDL mappings remain unchanged.
+
+Supported syntax, generated signatures and remaining dialect limits:
+[IDL-generated interfaces](docs/ANALYSIS.md#idl-generated-interfaces).
+Fixtures, pinned-corpus results and the distinction between remaining parser
+warnings and generated-header collisions:
+[Evaluation report](docs/EVAL_REPORT.md#hdi-omitted-return-methods--2026-10-19).
+
 ### Preserve C++ calls and show unresolved callgraph leaves
 
 `inspect callgraph` now shows calls without a resolved target as `unresolved`
