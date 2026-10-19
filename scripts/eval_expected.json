@@ -111,7 +111,7 @@
         "edges_external": {"cmp": "band", "value": 46032, "tol": 420},
         "edges_ipc": {"cmp": "exact", "value": 808},
         "arg_flow_edges": {"cmp": "band", "value": 57561, "tol": 250},
-        "diagnostics": {"cmp": "exact", "value": 5046},
+        "diagnostics": {"cmp": "exact", "value": 5045},
         "dlsym_edges": {"cmp": "exact", "value": 6}
       },
       "sites": [

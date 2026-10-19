@@ -12763,3 +12763,42 @@ to the repository.
 Validation: `cargo test --workspace` passed 2221 tests (0 ignored);
 `cargo fmt --all -- --check` and `git diff --check` passed. Workspace test
 log: `/tmp/trace-diagnostics-workspace.log`.
+
+## GNU visibility before C linkage — 2026-10-19
+
+The parse-input adaptation described in
+[C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization)
+recovers the attribute/linkage order isolated in "Inspect diagnostics" above
+(#234).
+Regression fixtures cover both orders, declarations and definitions, external
+identity across translation units, original file/line/column mapping, and an
+unrelated malformed function body that must still produce a parse warning.
+
+Fresh minimal exports used eight indexing jobs, clean checkouts at the same
+pinned HDF, HiView and Camera revisions as the 2026-10-14 evaluation:
+`cdc75a20bb8f1a046cd22e189405a20d602d0521`,
+`92408e2072bd6dc8fb0d980773e80b6ec898710c` and
+`8ffd69dcd47f533e70b4dba428439da9008b0cae`, respectively. No additional SDK
+roots or system includes were supplied. Every measured global matches its
+existing expectation value except Camera diagnostics, which decrease from
+**5,046 to 5,045**: `moving_photo_adapter.cpp` no longer has a parse diagnostic.
+Its five factory functions remain defined with external linkage at original
+lines 369, 374, 379, 384 and 389. Function counts, call-edge counts, argument-flow
+counts and all dispatch probes match their existing expectations. This is
+parser recovery, not evidence of a defect in the analyzed project or a claim
+about compiler acceptance of this spelling.
+
+The Camera diagnostic expectation in `scripts/eval_expected.json` is
+re-captured for that single removed warning. Validation: all **2,255** workspace
+tests and all **104** corpus evaluation checks pass after the expectation
+refresh. Evaluation logs are `/tmp/trace-visibility-eval.log` and
+`/tmp/trace-visibility-eval-confirm.log`; fresh databases are under
+`/tmp/trace-visibility-eval/` and `/tmp/trace-visibility-eval-confirm/`
+(not committed).
+
+Reproduce after building the current release binary:
+
+```bash
+cargo build -p trace-cli --release
+python3 scripts/eval_check.py --jobs 8 --outdir /tmp/trace-visibility-eval
+```

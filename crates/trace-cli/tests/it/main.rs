@@ -11,6 +11,7 @@ mod compile_flags_tests;
 mod complex_cases;
 mod cpp_cases;
 mod cpp_type_syntax;
+mod cpp_visibility_linkage;
 mod cross_tu_tests;
 mod dep_root_tests;
 mod dlsym_cases;
