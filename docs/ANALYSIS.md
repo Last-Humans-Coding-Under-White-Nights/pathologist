@@ -4067,13 +4067,27 @@ records as semantics beyond what is stated below. Spellings the recognizers do
 not fully match stay unchanged and keep their parse diagnostic.
 
 The function first checks cheap substring triggers (`friend` with `[[`; `::`
-with `*` and `(`; `decltype`; `__typeof`) and scans the unit once, outside
-string/character literals, raw strings and comments. A standard-library-heavy
-unit satisfies the triggers without needing any edit, so the cost is one
-linear scan plus one scratch validation parse per actual candidate.
+with `*` and `(`; `decltype`; `__typeof`; `__attribute__` with `extern`) and scans
+the unit once, outside string/character literals, raw strings and comments. A
+standard-library-heavy unit satisfies the triggers without needing any edit, so
+the cost is one linear scan plus scratch validation parses for type candidates.
 
 Recognized spellings:
 
+- **GNU visibility attributes before C linkage** —
+  `__attribute__((visibility("default"))) extern "C" ...` has its visibility
+  group and intervening trivia blanked. Complete groups containing only
+  `visibility("...")` or `__visibility__("...")` are recognized, including
+  comma-separated entries, consecutive groups, comments and newlines between
+  tokens. The `extern "C"` tokens, declaration or definition, and function
+  identifier stay in place, preserving external linkage and original spans.
+  The accepted reverse order (`extern "C" __attribute__((visibility("default")))`)
+  stays unchanged. Visibility does not affect the analysis's symbol identity;
+  other attributes, including mixed groups containing `weak`, are left to the
+  ordinary parser so this adaptation cannot erase their semantics. Incomplete
+  attributes and unrelated syntax errors retain diagnostics. This accommodates
+  the pinned parser's input limitation without asserting compiler acceptance
+  of the source spelling.
 - **Attributes before `friend`** — `[[nodiscard]] friend bool operator==(...)`
   and `[[nodiscard]] constexpr friend ...`: the attribute specifiers are
   blanked (see "Friend declarations and operator attributes" above).

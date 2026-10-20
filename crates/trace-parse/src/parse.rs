@@ -229,6 +229,10 @@ fn raw_string_end(bytes: &[u8], start: usize) -> Option<usize> {
 /// Blanking such attributes in parse input preserves the friend declaration and
 /// all token positions without causing syntax errors.
 ///
+/// GNU visibility attributes before `extern "C"` are likewise blanked while
+/// keeping the linkage specification. Only complete visibility-only groups
+/// are discarded; attributes with analysis semantics such as `weak` stay.
+///
 /// A parenthesized member-function pointer `R (C::*)(Args...) const` (#170)
 /// has its owner blanked into the ordinary function-pointer approximation the
 /// grammar accepts, in every declaration context. A named typedef declarator
@@ -243,10 +247,13 @@ pub(crate) fn normalize_cpp_parse_syntax(source: &Arc<str>) -> Arc<str> {
         source.contains("::") && source.contains('*') && source.contains('(');
     let computed_base_candidates = source.contains("decltype");
     let typeof_candidates = source.contains("__typeof");
+    let linkage_attribute_candidates =
+        source.contains("__attribute__") && source.contains("extern");
     if !friend_candidates
         && !member_pointer_candidates
         && !computed_base_candidates
         && !typeof_candidates
+        && !linkage_attribute_candidates
     {
         return Arc::clone(source);
     }
@@ -327,6 +334,21 @@ pub(crate) fn normalize_cpp_parse_syntax(source: &Arc<str>) -> Arc<str> {
             }
         }
         let at_token = i == 0 || !is_cpp_ident(bytes[i - 1]);
+        if at_token && keyword_at(bytes, i, b"__attribute__") {
+            let mut end = i;
+            while let Some(next) = visibility_attribute_end(bytes, end) {
+                end = skip_ws_and_comments(bytes, next);
+            }
+            if end > i && keyword_at(bytes, end, b"extern") {
+                let language = skip_ws_and_comments(bytes, end + b"extern".len());
+                if bytes[language..].starts_with(b"\"C\"") {
+                    let output = changed.get_or_insert_with(|| bytes.to_vec());
+                    blank_preserving_lines(&mut output[i..end]);
+                    i = end;
+                    continue;
+                }
+            }
+        }
         if at_token
             && paren_depth == 0
             && keyword_at(bytes, i, b"typedef")
@@ -482,6 +504,58 @@ fn blank_preserving_lines(bytes: &mut [u8]) {
             *b = b' ';
         }
     }
+}
+
+/// Only visibility attributes can be discarded before a linkage specification.
+/// Other attributes (notably `weak`) carry semantics that lowering must see.
+/// Match the whole GNU group so malformed payloads keep their diagnostic.
+fn visibility_attribute_end(bytes: &[u8], at: usize) -> Option<usize> {
+    if !keyword_at(bytes, at, b"__attribute__") {
+        return None;
+    }
+    let mut p = skip_ws_and_comments(bytes, at + b"__attribute__".len());
+    for _ in 0..2 {
+        if bytes.get(p) != Some(&b'(') {
+            return None;
+        }
+        p = skip_ws_and_comments(bytes, p + 1);
+    }
+    loop {
+        let name = [b"visibility".as_slice(), b"__visibility__"]
+            .into_iter()
+            .find(|name| keyword_at(bytes, p, name))?;
+        p = skip_ws_and_comments(bytes, p + name.len());
+        if bytes.get(p) != Some(&b'(') {
+            return None;
+        }
+        p = skip_ws_and_comments(bytes, p + 1);
+        if bytes.get(p) != Some(&b'"') {
+            return None;
+        }
+        let end = literal_end(bytes, p)?;
+        if end < p + 2
+            || bytes[end - 1] != b'"'
+            || bytes[p..end].iter().any(|b| matches!(b, b'\r' | b'\n'))
+        {
+            return None;
+        }
+        p = skip_ws_and_comments(bytes, end);
+        if bytes.get(p) != Some(&b')') {
+            return None;
+        }
+        p = skip_ws_and_comments(bytes, p + 1);
+        if bytes.get(p) != Some(&b',') {
+            break;
+        }
+        p = skip_ws_and_comments(bytes, p + 1);
+    }
+    for _ in 0..2 {
+        if bytes.get(p) != Some(&b')') {
+            return None;
+        }
+        p = skip_ws_and_comments(bytes, p + 1);
+    }
+    Some(p)
 }
 
 /// Whether the C++ grammar parses `type_text` as a type: a scratch alias
@@ -1337,6 +1411,60 @@ fn collect_unrecovered_parse_errors_depth<'a>(node: Node<'a>, out: &mut Vec<Node
 #[cfg(test)]
 mod dependency_cpp_tests {
     use super::*;
+
+    #[test]
+    fn visibility_before_c_linkage_preserves_offsets_and_line_breaks() {
+        for source in [
+            "__attribute__((visibility(\"default\"))) extern \"C\" void *factory();",
+            "__attribute__((visibility(\"default\"))) extern \"C\" void *factory() { return nullptr; }",
+            "__attribute__ /* ( */ ( ( __visibility__ ( \"default\" ) ) )\r\nextern /* linkage */ \"C\" void *factory();",
+            "__attribute__((visibility(\"default\"), __visibility__(\"hidden\")))\n__attribute__((visibility(\"default\"))) extern \"C\" void *factory();",
+        ] {
+            // Record the pinned grammar's limitation without normalizing first.
+            let raw = PARSER_CPP.with(|p| p.borrow_mut().parse(source, None).unwrap());
+            assert!(has_parse_errors(&raw), "{source}");
+            let parsed = parse_source_with_lang(source, SourceLang::Cpp).unwrap();
+            assert!(!has_parse_errors(&parsed.tree), "{}", parsed.source);
+            let extern_at = source.find("extern").unwrap();
+            assert_eq!(&source[extern_at..], &parsed.source[extern_at..]);
+            assert_eq!(source.len(), parsed.source.len());
+            for (original, normalized) in source.bytes().zip(parsed.source.bytes()) {
+                if matches!(original, b'\r' | b'\n') {
+                    assert_eq!(original, normalized);
+                }
+            }
+            assert_eq!(normalize_cpp_parse_syntax(&parsed.source), parsed.source);
+        }
+    }
+
+    #[test]
+    fn visibility_linkage_controls_keep_syntax_and_diagnostics() {
+        for source in [
+            "extern \"C\" __attribute__((visibility(\"default\"))) void *factory();",
+            "extern \"C\" __attribute__((visibility(\"default\"))) void *factory() { return nullptr; }",
+            "__attribute__((visibility(\"default\"))) void *factory();",
+            "__attribute__((weak, visibility(\"default\"))) extern \"C\" void *factory();",
+            "__attribute__((visibility(\"default\") garbage)) extern \"C\" void *factory();",
+            "__attribute__((visibility(\"default\")) extern \"C\" void *factory();",
+            "my__attribute__((visibility(\"default\"))) extern \"C\" void *factory();",
+            "// __attribute__((visibility(\"default\"))) extern \"C\"\nint x;",
+            "const char *s = R\"tag(__attribute__((visibility(\"default\"))) extern \"C\")tag\";",
+            "const char *s = \"__attribute__((visibility(\\\"default\\\"))) extern \\\"C\\\"\";",
+        ] {
+            let source: Arc<str> = Arc::from(source);
+            assert_eq!(normalize_cpp_parse_syntax(&source), source);
+        }
+        for source in [
+            "__attribute__((visibility(\"default\") garbage)) extern \"C\" void *factory();",
+            "__attribute__((visibility(\"default\")) extern \"C\" void *factory();",
+            "__attribute__((visibility(\"default\"))) extern \"C\" void *factory() { return +; }",
+        ] {
+            let parsed = parse_source_with_lang(source, SourceLang::Cpp).unwrap();
+            assert!(has_parse_errors(&parsed.tree), "{}", parsed.source);
+        }
+        let c = "__attribute__((visibility(\"default\"))) extern \"C\" void *factory();";
+        assert_eq!(parse_c_source(c).unwrap().source.as_ref(), c);
+    }
 
     #[test]
     fn normalizes_only_dependency_syntax_without_moving_locations() {

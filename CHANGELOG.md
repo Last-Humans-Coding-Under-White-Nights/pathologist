@@ -4,6 +4,16 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Parse GNU visibility attributes before C linkage (#234)
+
+C++ indexing recovers `__attribute__((visibility("default"))) extern "C"`
+on declarations and definitions without changing source files. Original source
+positions, external function identity and calls across translation units are
+preserved. Unrelated syntax errors still produce parse diagnostics.
+
+Rules: [C++ parse-input normalization](docs/ANALYSIS.md#c-parse-input-normalization).
+Validation: [Evaluation report](docs/EVAL_REPORT.md#gnu-visibility-before-c-linkage--2026-10-19).
+
 ### Preserve C++ calls and show unresolved callgraph leaves
 
 `inspect callgraph` now shows calls without a resolved target as `unresolved`
