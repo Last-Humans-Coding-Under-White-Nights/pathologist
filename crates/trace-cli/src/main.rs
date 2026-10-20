@@ -33,6 +33,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Analyze a C project directory and write results to SQLite.
+    #[command(group(clap::ArgGroup::new("compiler_discovery")
+        .args(["compiler_predefines", "system_includes"]).multiple(true)))]
     Analyze {
         /// Target project directory containing .c files.
         target: PathBuf,
@@ -59,6 +61,15 @@ enum Commands {
         /// without commands, uses host GCC/Clang (must match the target SDK).
         #[arg(long)]
         system_includes: bool,
+        /// Import allowlisted target compiler predefined macros (opt-in).
+        #[arg(long)]
+        compiler_predefines: bool,
+        /// Fallback compiler; compilation-command drivers take precedence.
+        #[arg(long, requires = "compiler_discovery")]
+        compiler: Option<PathBuf>,
+        /// Fallback compiler configuration argument (repeatable).
+        #[arg(long, requires = "compiler", allow_hyphen_values = true)]
+        compiler_arg: Vec<String>,
         /// Link commands database path (default: auto-discovery).
         #[arg(long)]
         link_commands: Option<PathBuf>,
@@ -370,6 +381,9 @@ fn main() -> Result<()> {
             compile_commands,
             require_local_inputs,
             system_includes,
+            compiler_predefines,
+            compiler,
+            compiler_arg,
             link_commands,
             no_test_partition,
             test_dirs,
@@ -395,6 +409,9 @@ fn main() -> Result<()> {
             compile_commands,
             require_local_inputs,
             system_includes,
+            compiler_predefines,
+            compiler,
+            compiler_arg,
             link_commands,
             no_test_partition,
             test_dirs,
@@ -438,6 +455,9 @@ fn run_analyze(
     compile_commands: Option<PathBuf>,
     require_local_inputs: bool,
     system_includes: bool,
+    compiler_predefines: bool,
+    compiler: Option<PathBuf>,
+    compiler_arg: Vec<String>,
     link_commands: Option<PathBuf>,
     no_test_partition: bool,
     test_dirs: Vec<String>,
@@ -507,6 +527,14 @@ fn run_analyze(
     }
     opts.compilation_database = compile_commands;
     opts.system_includes = system_includes;
+    opts.compiler_predefines = compiler_predefines;
+    opts.compiler = match compiler {
+        Some(path) if path.is_relative() && path.components().count() > 1 => {
+            Some(std::env::current_dir()?.join(path))
+        }
+        compiler => compiler,
+    };
+    opts.compiler_args = compiler_arg;
     opts.link_commands = link_commands;
     let root_canon = trace_ir::canonicalize(&target);
     let input_boundary = require_local_inputs
@@ -1101,6 +1129,61 @@ mod malloc_mode_tests {
                 wants_space_efficient_malloc(Some(OsStr::new(value))),
                 "{value:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod compiler_options_tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn compiler_predefines_are_independent_and_fallback_accepts_hyphen_values() {
+        for extra in [
+            vec![],
+            vec!["--system-includes"],
+            vec!["--compiler-predefines"],
+            vec!["--system-includes", "--compiler", "clang"],
+        ] {
+            let args = ["trace", "analyze", "."].into_iter().chain(extra);
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        let cli = Cli::try_parse_from([
+            "trace",
+            "analyze",
+            ".",
+            "--compiler-predefines",
+            "--system-includes",
+            "--compiler",
+            "clang",
+            "--compiler-arg",
+            "--target=aarch64-linux-gnu",
+            "--compiler-arg=-m64",
+        ])
+        .unwrap();
+        let Commands::Analyze {
+            compiler_arg,
+            compiler_predefines,
+            system_includes,
+            ..
+        } = cli.command
+        else {
+            panic!("analyze");
+        };
+        assert_eq!(compiler_arg, ["--target=aarch64-linux-gnu", "-m64"]);
+        assert!(compiler_predefines && system_includes);
+    }
+
+    #[test]
+    fn fallback_flags_require_explicit_discovery_and_driver() {
+        for extra in [
+            vec!["--compiler", "clang"],
+            vec!["--compiler-arg=-m32"],
+            vec!["--compiler-predefines", "--compiler-arg=-m32"],
+        ] {
+            let args = ["trace", "analyze", "."].into_iter().chain(extra);
+            assert!(Cli::try_parse_from(args).is_err());
         }
     }
 }
