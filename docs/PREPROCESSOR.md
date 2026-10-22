@@ -429,8 +429,15 @@ Code is indexed without a real toolchain, so macros whose definitions live in
 headers the tree does not ship (gtest, Linux kernel headers, `<inttypes.h>`)
 survive preprocessing, produce tree-sitter ERROR nodes, and can drop whole
 functions from the index ([parse-failure reporting](PARSE_FAILURES.md) helps
-investigate the affected files). The preprocessor installs fallback definitions for the common
-offenders:
+investigate the affected files).
+
+`FFI_EXPORT` and `DECLARE_SINGLETON` are not preprocessor fallbacks. Their
+available definitions expand normally; narrowly supported unresolved forms
+can receive a diagnosed parser-input approximation afterward. See
+[C++ parse-input normalization](ANALYSIS.md#c-parse-input-normalization) for
+the authoritative recovery forms and their missing semantics.
+
+The preprocessor installs fallback definitions for the common offenders:
 
 | Macros | Fallback | Failure mode avoided |
 |--------|----------|----------------------|

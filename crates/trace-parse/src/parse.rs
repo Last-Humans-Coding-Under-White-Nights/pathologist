@@ -4,6 +4,9 @@ use std::sync::Arc;
 use trace_preproc::LineMap;
 use tree_sitter::{Node, Parser, Tree};
 
+mod declaration_macros;
+pub(crate) use declaration_macros::recover_declaration_macros;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceLang {
     C,
@@ -616,15 +619,20 @@ fn keyword_at(bytes: &[u8], at: usize, keyword: &[u8]) -> bool {
 /// `None` when `at` is not a literal start. A digit separator (`1'000`) is
 /// not a literal start; an unterminated literal runs to the end of input.
 fn literal_end(bytes: &[u8], at: usize) -> Option<usize> {
-    if bytes[at..].starts_with(b"R\"") {
+    let raw_at = match bytes[at..] {
+        [b'u', b'8', b'R', b'"', ..] => at + 2,
+        [b'u' | b'U' | b'L', b'R', b'"', ..] => at + 1,
+        _ => at,
+    };
+    if bytes[raw_at..].starts_with(b"R\"") {
         // `R` must be a raw-literal token, possibly with an encoding prefix,
         // not the tail of a user-defined suffix: `"a"_R"b"` is two strings.
-        let mut start = at;
+        let mut start = raw_at;
         while start > 0 && is_cpp_ident(bytes[start - 1]) {
             start -= 1;
         }
-        if matches!(&bytes[start..at], b"" | b"u8" | b"u" | b"U" | b"L") {
-            return Some(raw_string_end(bytes, at).unwrap_or(bytes.len()));
+        if matches!(&bytes[start..raw_at], b"" | b"u8" | b"u" | b"U" | b"L") {
+            return Some(raw_string_end(bytes, raw_at).unwrap_or(bytes.len()));
         }
     }
     if bytes[at] == b'\'' && is_digit_separator(bytes, at) {
