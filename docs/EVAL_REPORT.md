@@ -3860,10 +3860,14 @@ counts move and the expectations are re-captured.
 | camera | functions / external functions | 22,954 / 3,148 | 23,461 / 3,655 |
 | camera | argument-flow edges / diagnostics | 48,352 / 5,350 | 49,728 / 5,051 |
 
-HDF's IDL files are hdi-gen test inputs in the HDI dialect (`Ping();` with
-no return type), all under `framework/tools/hdi-gen/test/`. 38 of the 51 do
+At this evaluation revision, HDF's IDL files are hdi-gen test inputs in the
+HDI dialect (`Ping();` with no return type), all under
+`framework/tools/hdi-gen/test/`. 38 of the 51 do
 not parse as idl-tool interfaces and each reports one `idl` warning; no
 header is synthesized from the rest, and no file, symbol or call edge moves.
+The later [HDI evaluation](#hdi-omitted-return-methods--2026-10-19)
+records support for this syntax and the remaining limitations; the figures
+above describe the original service-IDL implementation.
 
 Hiview synthesizes 24 headers for its 8 interfaces and camera 110 for its 37.
 Every IDL file of both parses. The added files are those headers, the added
@@ -12823,6 +12827,9 @@ Priority follow-ups: attach structured source locations to parse/IDL/GN
 warnings; configure real build/SDK dependencies before interpreting missing
 header counts; independently address the HDI method dialect and attributed
 `extern "C"` parsing. These remain findings, not fixes in this change.
+The subsequent [HDI evaluation](#hdi-omitted-return-methods--2026-10-19)
+addresses the method-dialect finding and distinguishes later syntax failures
+from header collisions.
 
 Artifacts from this run (not committed): `/tmp/trace-diagnostics-report.json`,
 `/tmp/trace-diagnostics-eval.log`, `/tmp/trace-diagnostics-camera-parse.tsv`,
@@ -12872,3 +12879,185 @@ Reproduce after building the current release binary:
 cargo build -p trace-cli --release
 python3 scripts/eval_check.py --jobs 8 --outdir /tmp/trace-visibility-eval
 ```
+
+## HDI omitted-return methods — 2026-10-19
+
+This addresses the IDL syntax finding in [Inspect diagnostics](#inspect-diagnostics--2026-10-14).
+The supported dialect and remaining limitations are maintained in
+[IDL-generated interfaces](ANALYSIS.md#idl-generated-interfaces).
+Return/status conventions, package names and generated class bases were
+checked against hdi-gen's emitters in the pinned HDF checkout
+`cdc75a20bb8f1a046cd22e189405a20d602d0521`, including its checked-in
+`02_standard_interface_idl/target/foo/v1_0/ifoo.h.txt` golden file.
+The `idl_hdi` fixture follows the reported `09_enum_nesting_idl` methods
+and adds a zero-argument method. Parser/render tests check omitted and
+explicit returns, parameter directions, struct parameters, qualified names,
+containers, and interface/proxy/stub declarations. Integration tests check
+client dispatch, composition-based service pairing, the client-only fallback,
+and disabling IPC. The existing service-IDL tests still pass.
+
+Evaluation uses fresh minimal exports, eight jobs, clean checkouts at the
+three revisions listed in the diagnostics evaluation, and no additional SDK
+roots or system includes. HDF's pre-change binary
+(`trace 0.1.0 (5fcc02b-dirty 2026-10-19)`, saved before rebuilding) passes
+its 38 existing checks and reproduces the 38 IDL parser warnings.
+
+| HDF metric | Before | After |
+|---|---:|---:|
+| Files | 1483 | 1510 |
+| Functions (defined / external) | 12070 (10294 / 1776) | 12195 (10294 / 1901) |
+| Call edges | 78593 | 78651 |
+| IPC edges | 0 | 58 |
+| Diagnostics, all stages | 1917 | 1910 |
+| IDL warnings, total | 38 | 31 |
+| IDL parse warnings | 38 | 10 |
+| IDL header-collision warnings | 0 | 21 |
+
+The 27 additional files are generated dependency headers, and all 125 new
+functions are declarations. Every new call edge is an IPC bridge; direct,
+indirect, external and argument-flow counts are unchanged. The 58 IPC edges
+connect generated test proxies to interface declarations, so they are leaf
+targets, not evidence that an in-tree service implementation was recovered.
+Existing header-name precedence remains in force: many independent hdi-gen
+tests generate the same file names in the test partition. In particular,
+`09_enum_nesting_idl/.../IFoo.idl` now parses but loses `ifoo.h` to the earlier
+`hash_test/bad_03/.../IFoo.idl`, producing one collision warning instead of
+its parser warning. The isolated fixture verifies its signatures without
+that unrelated collision.
+
+The remaining ten parser warnings are at `enum ESample` parameter prefixes:
+six in array/data interfaces and four in list/map interfaces, under the
+C, C++, and kernel test directories. This is a later unsupported construct,
+not the omitted-return failure. The other diagnostics stages are unchanged.
+The changed HDF expectations retain their existing tolerances; two exact
+probes check a generated callback's qualified IPC pair and the absence of
+the reported enum-nesting file's parser warning.
+
+HiView and Camera retain all recorded global counts and existing probes;
+their IPC edge counts remain 44 and 808. The final evaluator passes 106
+checks (the existing 104 plus the two HDI probes). No corpus sources changed;
+these measurements describe analyzer behavior, not project defects.
+
+Reproduction and validation:
+
+```bash
+cargo test --workspace
+cargo build -p trace-cli --release
+python3 scripts/eval_check.py --outdir /tmp/trace-hdi-eval-final
+cargo fmt --all -- --check
+git diff --check
+```
+
+The workspace suite passes 2257 tests (0 ignored). Final logs are
+`/tmp/trace-hdi-workspace-tests-final.log` and `/tmp/trace-hdi-eval-final.log`;
+the three minimal databases are under `/tmp/trace-hdi-eval-final/` and are
+not committed.
+
+### HDI review corrections — 2026-10-20
+
+Four review findings are covered by five additional regression tests. The
+authoritative behavior is documented in
+[IDL-generated interfaces](ANALYSIS.md#idl-generated-interfaces):
+
+- Versioned interfaces with on-disk headers exercise a defined descendant
+  proxy and a subclass of that proxy. Neither becomes a service endpoint;
+  the base proxy falls back to its interface declaration when no service is
+  present and reaches a real derived-interface service when one is present.
+- A same-named client using either `IRemoteProxy<I>` or `IProxyBroker<I>` is
+  rejected when `I` is a declared unrelated interface. The same interface
+  and a derived interface remain compatible. The composed stub's recorded
+  interface supplies the evidence without changing its inheritance graph.
+- HDI sequenceable signatures match the pinned generator's
+  `ASTSequenceableType::EmitCppType` in both synthesized interface and proxy
+  headers, including parameter directions. Service-IDL value mapping is
+  retained.
+- HDI leading-`I` naming matches `CodeEmitter::Reset`: `Input` produces
+  `nputProxy`, `nputStub` and their header names. An integration test includes
+  those headers and checks the recorded IPC pair; parser tests retain the
+  service dialect's distinct naming rule.
+
+The workspace suite passes 2262 tests, including 40 IDL parser tests and 35
+IDL integration tests. A fresh release build and minimal exports at eight
+jobs pass all 106 pinned-corpus checks. Every recorded global equals its
+existing expectation center for HDF, HiView and Camera; no counts or
+tolerances were changed in `scripts/eval_expected.json`. The corpus revisions
+and include environment match the evaluation above.
+
+```bash
+cargo test --workspace
+cargo build -p trace-cli --release
+python3 scripts/eval_check.py --outdir /tmp/trace-233-review-eval
+cargo fmt --all -- --check
+git diff --check
+```
+
+Logs: `/tmp/trace-233-review-workspace.log` and
+`/tmp/trace-233-review-eval.log`. The databases under
+`/tmp/trace-233-review-eval/` are not committed.
+
+### Broker ancestry after an IDL collision — 2026-10-20
+
+The versioned-header regression now also omits both on-disk stub headers.
+It keeps both interface/proxy headers, asserts that the generated stub-header
+collision removes V1_1's IDL pairing record, and defines the V1_1 proxy's
+`Ping` through a free `ForwardPing` helper that calls `SendRequest`.
+That variant fails on `7754ca5`: the V1_0 proxy bridges to the V1_1 proxy
+and its `DerivedTransport` subclass instead of the interface declaration.
+The updated role index also uses indexed broker bases; the behavior and
+remaining layout limit are maintained in
+[IDL-generated interfaces](ANALYSIS.md#idl-generated-interfaces).
+
+The regression passes six scenarios: both `IProxyBroker` and `IRemoteProxy`
+with missing stub headers, and `IProxyBroker` with both stub headers present,
+each with and without a real derived-interface service. Proxy methods and
+their subclasses are excluded even when there is no surviving IDL record
+or direct `SendRequest` in the method. Without a service, the base proxy
+retains its interface-declaration fallback; with a service, that implementation
+remains reachable. Broker-role recovery does not add a synthetic sender edge
+for the helper-delegating proxy itself.
+
+This does not implement hdi-gen's package-relative header layout. Normal HDI
+package versions still collide when they rely on synthesized headers, and a
+later version's include can silently resolve by basename to the retained
+earlier version. That unsupported case is now explicit under "Precedence
+and failures" in the authoritative section above.
+
+Validation: 2262 workspace tests and all 106 pinned-corpus checks pass after
+a fresh release build. Every recorded global remains at its existing HDF,
+HiView and Camera expectation center; neither expectations nor tolerances
+were changed. Formatting and whitespace checks pass. `cargo clippy
+--workspace --all-targets` exits 0 with one existing `collapsible_match`
+warning at `crates/trace-parse/src/lower.rs:9785` (also emitted for its test
+build); that file is unchanged by this correction.
+
+```bash
+cargo test --workspace
+cargo build -p trace-cli --release
+python3 scripts/eval_check.py --outdir /tmp/trace-233-broker-role-eval
+cargo clippy --workspace --all-targets
+cargo fmt --all -- --check
+git diff --check
+```
+
+Logs: `/tmp/trace-233-broker-role-before.log`,
+`/tmp/trace-233-broker-role-after.log`,
+`/tmp/trace-233-broker-role-workspace.log`,
+`/tmp/trace-233-broker-role-eval.log` and
+`/tmp/trace-233-broker-role-clippy.log`. Databases under
+`/tmp/trace-233-broker-role-eval/` are not committed.
+
+### Validation after rebasing on local mainline — 2026-10-20
+
+The HDI change is rebased onto local `master` at `9221907` (#240). The
+combined tree passes 2266 workspace tests and all 106 pinned-corpus checks
+after a fresh release build, with eight jobs and the same corpus/include
+setup as above. Every measured global matches the current expectation
+center. Camera diagnostics remain at the mainline's 5045 (#234); the HDI
+change does not undo that correction or alter its expectation. Formatting
+and whitespace checks pass.
+
+Reproduction: `cargo test --workspace`, `cargo build -p trace-cli --release`,
+then `python3 scripts/eval_check.py --outdir /tmp/trace-233-rebase-eval`.
+Logs: `/tmp/trace-233-rebase-workspace.log` and
+`/tmp/trace-233-rebase-eval.log`. Databases in `/tmp/trace-233-rebase-eval/`
+are not committed.

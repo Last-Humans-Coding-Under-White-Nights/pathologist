@@ -38,6 +38,282 @@ fn declares(program: &Program, function: &str) -> bool {
     program.symbols.functions.iter().any(|f| f.name == function)
 }
 
+#[test]
+fn idl_hdi_client_dispatch_and_composed_service_pairing() {
+    let program = build(&fixture("idl_hdi"), PreprocessOptions::new());
+    assert!(
+        idl_warnings(&program).is_empty(),
+        "{:?}",
+        program.diagnostics
+    );
+    assert!(missing_includes(&program).is_empty());
+    let idl = &program.idl_interfaces[0];
+    assert_eq!(idl.interface, "OHOS::HDI::Foo::V1_0::IFoo");
+    assert_eq!(idl.proxy, "OHOS::HDI::Foo::V1_0::FooProxy");
+    assert_eq!(idl.stub, "OHOS::HDI::Foo::V1_0::FooStub");
+    assert_eq!(idl.descriptor, "ohos.hdi.foo.v1_0.IFoo");
+    assert!(idl.composed_stub);
+    assert!(!program.derives_from(&idl.stub, &idl.interface));
+    let (pag, analysis) = analyze(&program);
+    for (method, arity) in [("Ping", 2), ("GetData", 1), ("InfoTest", 2), ("Reset", 0)] {
+        let proxy = format!("{}::{method}", idl.proxy);
+        let service = format!("OHOS::HDI::Foo::V1_0::FooService::{method}");
+        assert!(
+            has_any_edge(
+                &program,
+                &analysis,
+                "OHOS::HDI::Foo::V1_0::Client::Run",
+                &proxy
+            ),
+            "{proxy}"
+        );
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                &proxy,
+                &service,
+                ResolutionKind::IpcBridge
+            ),
+            "{service}"
+        );
+        for class in [&idl.interface, &idl.proxy] {
+            let name = format!("{class}::{method}");
+            let functions: Vec<_> = program
+                .symbols
+                .functions
+                .iter()
+                .filter(|f| f.name == name)
+                .collect();
+            assert_eq!(functions.len(), 1, "{name}");
+            let f = functions[0];
+            assert_eq!(f.explicit_arity, Some(arity), "{name}: {f:?}");
+            assert!(!f.is_defined);
+            assert!(program.is_dep_file(f.file));
+        }
+    }
+    assert_eq!(pag.ipc_bridges.len(), 4);
+    assert!(pag
+        .ipc_bridges
+        .iter()
+        .all(|b| b.descriptor == idl.descriptor));
+}
+
+#[test]
+fn idl_hdi_client_only_falls_back_to_its_named_interface() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "idl/IFoo.idl",
+        include_str!("../../../../tests/fixtures/idl_hdi/idl/IFoo.idl"),
+    );
+    write(
+        dir.path(),
+        "types.h",
+        include_str!("../../../../tests/fixtures/idl_hdi/types.h"),
+    );
+    write(
+        dir.path(),
+        "client.cpp",
+        include_str!("../../../../tests/fixtures/idl_hdi/client.cpp"),
+    );
+    let program = build(dir.path(), PreprocessOptions::new());
+    assert!(idl_warnings(&program).is_empty());
+    let (pag, analysis) = analyze(&program);
+    assert_eq!(pag.ipc_bridges.len(), 4);
+    for method in ["Ping", "GetData", "InfoTest", "Reset"] {
+        assert!(has_edge(
+            &program,
+            &analysis,
+            &format!("OHOS::HDI::Foo::V1_0::FooProxy::{method}"),
+            &format!("OHOS::HDI::Foo::V1_0::IFoo::{method}"),
+            ResolutionKind::IpcBridge,
+        ));
+    }
+    let (pag, analysis) = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            enable_ipc: false,
+            ..Default::default()
+        },
+    );
+    assert!(pag.ipc_bridges.is_empty());
+    assert!(analysis
+        .call_edges
+        .iter()
+        .all(|e| e.resolution != ResolutionKind::IpcBridge));
+}
+
+#[test]
+fn idl_hdi_descendant_proxies_are_not_service_endpoints() {
+    for (wrapper, with_stub_headers) in [
+        ("IProxyBroker", false),
+        ("IRemoteProxy", false),
+        ("IProxyBroker", true),
+    ] {
+        for with_service in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            // Real interface/proxy headers keep the descendant proxy indexed even
+            // when a generated stub collision drops its IDL pairing metadata.
+            for version in ["v1_0", "v1_1"] {
+                let extends = if version == "v1_1" {
+                    " extends ohos.hdi.foo.v1_0.IFoo"
+                } else {
+                    ""
+                };
+                write(
+                    dir.path(),
+                    &format!("{version}/IFoo.idl"),
+                    &format!(
+                        "package ohos.hdi.foo.{version}; interface IFoo{extends} {{ Ping(); }}"
+                    ),
+                );
+            }
+            write(dir.path(), "v1_0/ifoo.h", "#pragma once\nnamespace OHOS { namespace HDI { namespace Foo { namespace V1_0 { class IFoo { public: virtual int Ping() = 0; }; } } } }");
+            write(dir.path(), "v1_1/ifoo.h", "#pragma once\n#include \"../v1_0/ifoo.h\"\nnamespace OHOS { namespace HDI { namespace Foo { namespace V1_1 { class IFoo : public V1_0::IFoo { public: virtual int Ping() = 0; }; } } } }");
+            for version in ["V1_0", "V1_1"] {
+                write(dir.path(), &format!("{}/foo_proxy.h", version.to_lowercase()), &format!("#pragma once\n#include \"ifoo.h\"\nnamespace OHOS {{ namespace HDI {{ namespace Foo {{ namespace {version} {{ class FooProxy : public {wrapper}<IFoo> {{ public: int Ping() override; }}; }} }} }} }}"));
+                if with_stub_headers {
+                    write(dir.path(), &format!("{}/foo_stub.h", version.to_lowercase()), &format!("#pragma once\n#include \"ifoo.h\"\nnamespace OHOS {{ namespace HDI {{ namespace Foo {{ namespace {version} {{ class FooStub : public IPCObjectStub {{}}; }} }} }} }}"));
+                }
+            }
+            write(dir.path(), "proxy.cpp", "#include \"v1_0/foo_proxy.h\"\n#include \"v1_1/foo_proxy.h\"\nnamespace OHOS { namespace HDI { namespace Foo { namespace V1_1 { int SendRequest(int); int ForwardPing() { return SendRequest(1); } int FooProxy::Ping() { return ForwardPing(); } class DerivedTransport : public FooProxy { public: int Ping() override { return ForwardPing(); } }; } } } }");
+            if with_service {
+                write(dir.path(), "service.cpp", "#include \"v1_1/ifoo.h\"\nnamespace OHOS { namespace HDI { namespace Foo { namespace V1_1 { class FooService : public IFoo { public: int Ping() override { return 0; } }; } } } }");
+            }
+            let program = build(dir.path(), PreprocessOptions::new());
+            let warnings = idl_warnings(&program);
+            if with_stub_headers {
+                assert!(warnings.is_empty(), "{warnings:?}");
+                assert_eq!(program.idl_interfaces.len(), 2);
+            } else {
+                assert_eq!(warnings.len(), 1, "{warnings:?}");
+                assert!(
+                    warnings[0].contains("foo_stub.h: rendered from both"),
+                    "{warnings:?}"
+                );
+                assert_eq!(program.idl_interfaces.len(), 1);
+                assert_eq!(
+                    program.idl_interfaces[0].interface,
+                    "OHOS::HDI::Foo::V1_0::IFoo"
+                );
+            }
+            assert!(declares(&program, "OHOS::HDI::Foo::V1_1::FooProxy::Ping"));
+            assert!(program.derives_from(
+                "OHOS::HDI::Foo::V1_1::FooProxy",
+                "OHOS::HDI::Foo::V1_0::IFoo"
+            ));
+            assert!(
+                missing_includes(&program).is_empty(),
+                "{:?}",
+                program.diagnostics
+            );
+            let (pag, analysis) = analyze(&program);
+            let expected = if with_service {
+                "OHOS::HDI::Foo::V1_1::FooService::Ping"
+            } else {
+                "OHOS::HDI::Foo::V1_0::IFoo::Ping"
+            };
+            let scenario = format!("{wrapper}, stubs={with_stub_headers}, service={with_service}");
+            assert!(
+                has_edge(
+                    &program,
+                    &analysis,
+                    "OHOS::HDI::Foo::V1_0::FooProxy::Ping",
+                    expected,
+                    ResolutionKind::IpcBridge
+                ),
+                "{scenario}: {:?}",
+                pag.ipc_bridges
+            );
+            assert!(
+                pag.ipc_bridges.iter().all(|b| {
+                    let target = fn_name(&program, b.stub_handler);
+                    !target.contains("::FooProxy::") && !target.contains("::DerivedTransport::")
+                }),
+                "{scenario}: {:?}",
+                pag.ipc_bridges
+            );
+        }
+    }
+}
+
+#[test]
+fn idl_hdi_composed_stub_checks_client_interface_compatibility() {
+    for wrapper in ["IRemoteProxy", "IProxyBroker"] {
+        for interface in ["IUnrelated", "IFoo", "IDerived"] {
+            let dir = tempfile::tempdir().unwrap();
+            write(
+                dir.path(),
+                "IFoo.idl",
+                "package h; interface IFoo { Ping(); }",
+            );
+            write(dir.path(), "client.cpp", &format!("#include \"ifoo.h\"\n#include \"foo_proxy.h\"\nnamespace H {{ class IDerived : public IFoo {{}}; class IUnrelated {{ public: virtual int Ping() = 0; }}; class Remote {{ public: int SendRequest(); }}; class FooClient : public {wrapper}<{interface}> {{ public: Remote* remote; int Ping() {{ return remote->SendRequest(); }} }}; }}"));
+            let program = build(dir.path(), PreprocessOptions::new());
+            assert!(idl_warnings(&program).is_empty());
+            let (pag, analysis) = analyze(&program);
+            let targets: Vec<_> = pag
+                .ipc_bridges
+                .iter()
+                .filter(|b| fn_name(&program, b.proxy_method) == "H::FooClient::Ping")
+                .map(|b| fn_name(&program, b.stub_handler))
+                .collect();
+            let expected = if interface == "IUnrelated" {
+                vec![]
+            } else {
+                vec!["H::IFoo::Ping"]
+            };
+            assert_eq!(targets, expected, "{wrapper}<{interface}>");
+            assert!(
+                has_edge(
+                    &program,
+                    &analysis,
+                    "H::FooProxy::Ping",
+                    "H::IFoo::Ping",
+                    ResolutionKind::IpcBridge
+                ),
+                "{wrapper}<{interface}>: {:?}",
+                pag.ipc_bridges
+                    .iter()
+                    .map(|b| (
+                        fn_name(&program, b.proxy_method),
+                        fn_name(&program, b.stub_handler)
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
+fn idl_hdi_input_uses_generated_nput_headers_and_pair_names() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "Input.idl",
+        "package ohos.hdi.foo.v1_0; interface Input { Ping(); }",
+    );
+    write(dir.path(), "main.cpp", "#include \"nput_proxy.h\"\n#include \"nput_stub.h\"\nnamespace OHOS { namespace HDI { namespace Foo { namespace V1_0 { int Run(nputProxy* proxy) { return proxy->Ping(); } } } } }");
+    let program = build(dir.path(), PreprocessOptions::new());
+    assert!(idl_warnings(&program).is_empty());
+    assert!(
+        missing_includes(&program).is_empty(),
+        "{:?}",
+        program.diagnostics
+    );
+    let idl = &program.idl_interfaces[0];
+    assert_eq!(idl.proxy, "OHOS::HDI::Foo::V1_0::nputProxy");
+    assert_eq!(idl.stub, "OHOS::HDI::Foo::V1_0::nputStub");
+    let (_, analysis) = analyze(&program);
+    assert!(has_edge(
+        &program,
+        &analysis,
+        "OHOS::HDI::Foo::V1_0::nputProxy::Ping",
+        "OHOS::HDI::Foo::V1_0::Input::Ping",
+        ResolutionKind::IpcBridge
+    ));
+}
+
 fn idl_warnings(program: &Program) -> Vec<&str> {
     program
         .diagnostics
@@ -119,6 +395,7 @@ fn idl_headers_resolve_as_dependency_declarations() {
     assert_eq!(
         program.idl_interfaces,
         vec![trace_ir::IdlInterface {
+            composed_stub: false,
             descriptor: "OHOS.Security.IAtm".into(),
             interface: "OHOS::Security::IAtm".into(),
             proxy: "OHOS::Security::AtmProxy".into(),
