@@ -65,16 +65,16 @@ pub(crate) fn recover_declaration_macros(
                 if bytes.get(open) != Some(&b'(') {
                     continue;
                 }
-                let name = skip_ws_and_comments(bytes, open + 1);
-                let mut end = name;
+                let name_start = skip_ws_and_comments(bytes, open + 1);
+                let mut end = name_start;
                 while end < bytes.len() && is_cpp_ident(bytes[end]) {
                     end += 1;
                 }
                 let close = skip_ws_and_comments(bytes, end);
-                if end > name && bytes.get(close) == Some(&b')') {
+                if end > name_start && bytes.get(close) == Some(&b')') {
                     candidates.push(Candidate {
                         range: start..close + 1,
-                        class: Some(name..end),
+                        class: Some(name_start..end),
                     });
                     at = close + 1;
                 }
@@ -158,14 +158,18 @@ fn supported(candidate: &Candidate, parsed: &ParseResult, original: &str, errors
         {
             return false;
         }
-        // No non-trivia between the preceding item and the invocation. This
-        // also excludes qualified and nested uses of the exact macro name.
+        // Check the retry's prefix so adjacent recovered invocations count as
+        // trivia. Bound the scan at this invocation; qualified and nested uses
+        // still leave non-trivia. Revalidation restores rejected edits first.
         let previous = node
             .children(&mut node.walk())
             .filter(|child| child.end_byte() <= candidate.range.start)
             .last();
         return previous.is_some_and(|previous| {
-            skip_ws_and_comments(original.as_bytes(), previous.end_byte()) == candidate.range.start
+            skip_ws_and_comments(
+                &parsed.source.as_bytes()[..candidate.range.start],
+                previous.end_byte(),
+            ) == candidate.range.start
         });
     }
     // With the prefix erased, require a complete, explicitly typed
@@ -297,6 +301,56 @@ mod tests {
             blank_preserving_lines(&mut expected[start..end]);
             assert_eq!(parsed.source.as_bytes(), expected, "{source}");
         }
+    }
+
+    #[test]
+    fn encoded_raw_strings_do_not_hide_following_declaration_macros() {
+        for prefix in ["", "u8", "L", "u", "U"] {
+            let source = format!(
+                "const auto text = {prefix}R\"tag(\" FFI_EXPORT int fake(); DECLARE_SINGLETON(X))tag\";\nFFI_EXPORT int visible();"
+            );
+            let (parsed, reports) = recover(&source);
+            assert_eq!(reports.len(), 1, "{prefix}: {}", parsed.source);
+            assert_eq!(reports[0].offset, source.rfind("FFI_EXPORT").unwrap());
+            assert!(!has_parse_errors(&parsed.tree), "{prefix}");
+            assert_eq!(
+                &parsed.source[..reports[0].offset],
+                &source[..reports[0].offset],
+                "raw string contents must remain untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_singleton_macros_are_recovered_together() {
+        for before in ["", "int before(); "] {
+            for separator in [" ", " /* between */\n", ";\n"] {
+                let source = format!(
+                    "class X {{ {before}DECLARE_SINGLETON(X){separator}DECLARE_SINGLETON(X) public: int after(); }};"
+                );
+                let (parsed, reports) = recover(&source);
+                assert_eq!(reports.len(), 2, "{source}");
+                assert!(!has_parse_errors(&parsed.tree), "{source}");
+                let expected = source.replace("DECLARE_SINGLETON(X)", "                    ");
+                assert_eq!(&*parsed.source, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn adjacent_singleton_macros_do_not_make_unsupported_uses_valid() {
+        for source in [
+            "class X { DECLARE_SINGLETON(Y) DECLARE_SINGLETON(X) public: int after; };",
+            "class X { DECLARE_SINGLETON(X) ns::DECLARE_SINGLETON(X) public: int after; };",
+        ] {
+            let (parsed, reports) = recover(source);
+            assert!(reports.is_empty(), "{source}");
+            assert_eq!(&*parsed.source, source);
+        }
+        let source = "class X { DECLARE_SINGLETON(X) void DECLARE_SINGLETON(X); };";
+        let (parsed, reports) = recover(source);
+        assert_eq!(reports.len(), 1);
+        assert!(parsed.source.contains("void DECLARE_SINGLETON(X);"));
     }
 
     #[test]

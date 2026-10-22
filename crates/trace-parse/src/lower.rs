@@ -3023,12 +3023,13 @@ fn lower_prepared_source(
                     (file_id, line)
                 },
                 |entry| {
-                    (
-                        program
-                            .symbols
-                            .add_file(pre.line_map.path_of(entry).to_path_buf()),
-                        entry.line,
-                    )
+                    let origin = pre.line_map.path_of(entry);
+                    let file = if origin == self_canon.as_path() {
+                        file_id
+                    } else {
+                        program.symbols.add_file_interned(origin)
+                    };
+                    (file, entry.line)
                 },
             );
             program.add_diagnostic(Diagnostic {
@@ -20944,6 +20945,55 @@ mod index_window_tests {
                 "{}",
                 parsed.tree.root_node().to_sexp()
             );
+        }
+    }
+
+    #[test]
+    fn declaration_macro_diagnostics_reuse_unit_file_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.cpp");
+        let header = dir.path().join("api.h");
+        std::fs::write(
+            &header,
+            "FFI_EXPORT int first();\nFFI_EXPORT int second();\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &path,
+            "#include \"api.h\"\nFFI_EXPORT int third();\nFFI_EXPORT int fourth();\n",
+        )
+        .unwrap();
+        let graph = IncludeGraph::build(dir.path(), std::slice::from_ref(&path), &[]);
+        let unit = index_source_file(
+            &path,
+            dir.path(),
+            &graph,
+            &PreprocessOptions::new().with_include(dir.path().to_path_buf()),
+            &IndexSourceCache::new(),
+            None,
+            &HeaderOrder::default(),
+        );
+        assert_eq!(unit.files.len(), 2, "{:?}", unit.files);
+        assert_eq!(unit.diagnostics.len(), 4, "{:?}", unit.diagnostics);
+        for (name, origin, line) in [
+            ("first", &header, 1),
+            ("second", &header, 2),
+            ("third", &path, 2),
+            ("fourth", &path, 3),
+        ] {
+            let function = unit.functions.iter().find(|f| f.name == name).unwrap();
+            let diagnostic = unit
+                .diagnostics
+                .iter()
+                .find(|d| {
+                    d.line == line
+                        && d.file.is_some_and(|file| {
+                            unit.files[file.0 as usize] == origin.canonicalize().unwrap()
+                        })
+                })
+                .unwrap();
+            assert!(diagnostic.message.starts_with("recovered"));
+            assert_eq!(diagnostic.file, Some(function.span.file));
         }
     }
 
