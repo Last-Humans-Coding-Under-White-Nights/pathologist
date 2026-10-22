@@ -9,6 +9,7 @@ mod designated_kinds;
 mod field_decl_kinds;
 mod in_out_preproc;
 mod link_targets;
+mod missing_declaration_macros;
 mod mock_visibility;
 mod qualified_variables;
 mod system_include_discovery;

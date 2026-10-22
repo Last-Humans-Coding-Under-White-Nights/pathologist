@@ -4,6 +4,9 @@ use std::sync::Arc;
 use trace_preproc::LineMap;
 use tree_sitter::{Node, Parser, Tree};
 
+mod declaration_macros;
+pub(crate) use declaration_macros::recover_declaration_macros;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceLang {
     C,

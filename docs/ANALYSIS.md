@@ -4020,6 +4020,60 @@ Limits:
 
 ### C++ parse-input normalization
 
+**Unavailable declaration macros (#231).** After ordinary preprocessing and
+normalization, the parser can retry two exact unresolved C++ spellings. Real
+definitions from headers or configuration expand normally first; tokens with
+macro-expansion provenance (including a self-referential definition) are never
+removed by this recovery. No macro is installed or changed, and conditionals
+are evaluated entirely by the ordinary preprocessor.
+
+- `FFI_EXPORT` as a prefix to an explicitly typed single-function prototype or
+  definition, at file or namespace scope, including within `extern "C" { ... }`,
+  after `extern "C"`, or before a single-declaration `extern "C"`. Recovery
+  requires a parse error in the original prefix/type region and an error-free
+  complete function in the retry. Pointer and reference return declarators
+  are accepted; variables, function-pointer variables, class-body members,
+  operators, templates and block-scope declarations are outside this recovery.
+  Forms the grammar accepts without a prefix/type error, such as
+  `FFI_EXPORT long f();`, keep ordinary lowering and are not repaired here.
+- `DECLARE_SINGLETON(ClassName)` as a complete item directly in the body of
+  that named class or struct, with one unqualified argument matching the class
+  name. Comments and newlines between tokens and an optional following
+  semicolon are accepted. The surrounding class body must parse without
+  errors in the retry. This form usually produces a missing-semicolon error;
+  with an explicit semicolon the grammar may accept it as a declaration, so
+  that exact form is also recovered without requiring a parse error.
+
+Only the prefix or exact invocation is replaced with whitespace in parser
+input; byte lengths and CR/LF positions remain identical. The retry validates
+the syntactic context before accepting edits; rejected edits are restored and
+the result is revalidated. Explicit function names, types, bodies, C linkage,
+neighboring members and access specifiers follow ordinary lowering, with
+original positions supplied by LineMap. Other macro-like identifiers and
+unsupported contexts are left alone. Unrelated syntax errors retain their
+ordinary parse diagnostics. Ambiguous or still-malformed declarations retain
+their original input and diagnostics rather than being guessed.
+
+The approximation is based on the dependency actually included by Camera:
+[`camera_ffi.h` at `8ffd69d`](https://github.com/openharmony/multimedia_camera_framework/blob/8ffd69dcd47f533e70b4dba428439da9008b0cae/frameworks/cj/camera/include/camera_ffi.h)
+includes `cj_common_ffi.h` and `ffi_remote_data.h` before its `FFI_EXPORT`
+declarations. OpenHarmony's
+[`arkui_napi` `cj_common_ffi.h` at `9be83fd`](https://github.com/openharmony/arkui_napi/blob/9be83fd128150c67f3495598af3c72dba1d44237/interfaces/inner_api/cjffi/cj_ffi/cj_common_ffi.h)
+defines `FFI_EXPORT` as a default-visibility GNU attribute, or
+`__declspec(dllexport)` under `WINDOWS_PLATFORM`, guarded by `#ifndef FFI_EXPORT`.
+This supports treating the missing prefix as an export annotation, but does
+not prove the unavailable definition in any particular build is identical.
+Each accepted recovery emits a `parse` warning at the original macro's file
+and line using the existing diagnostic representation (which has no column
+field). For `FFI_EXPORT` the warning states that annotation semantics were
+omitted: export visibility and other unavailable annotation effects are not
+inferred. For `DECLARE_SINGLETON` it states that macro-generated declarations
+are unknown and were not indexed. No accessor, constructor, destructor or
+other presumed generated member is synthesized. Results describe only the
+explicit declarations; restoring the real dependency is necessary to index
+the missing semantics. Recovery reads only the unit's text, tree and LineMap,
+and uses source order, independently of job count and expansion-cache replay.
+
 **Empty-parameter callback declarations (#219).** The C++ grammar can silently
 read `void post(void (*cb)());` as an initialized variable, and `void (*cb)();`
 as an expression. Lowering recovers only these callback-shaped declarations by

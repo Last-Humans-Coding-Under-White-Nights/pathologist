@@ -3010,6 +3010,39 @@ fn lower_prepared_source(
         Arc::clone(&pre.text)
     };
     let parsed = crate::parse::parse_source_with_lang(parse_text, lang)?;
+    let parsed = if lang == crate::parse::SourceLang::Cpp {
+        let (parsed, recoveries) = crate::parse::recover_declaration_macros(parsed, &pre.line_map)?;
+        for recovery in recoveries {
+            let (file, line) = pre.line_map.lookup(recovery.offset).map_or_else(
+                || {
+                    let line = pre.text[..recovery.offset]
+                        .bytes()
+                        .filter(|&b| b == b'\n')
+                        .count() as u32
+                        + 1;
+                    (file_id, line)
+                },
+                |entry| {
+                    (
+                        program
+                            .symbols
+                            .add_file(pre.line_map.path_of(entry).to_path_buf()),
+                        entry.line,
+                    )
+                },
+            );
+            program.add_diagnostic(Diagnostic {
+                severity: DiagnosticSeverity::Warning,
+                file: Some(file),
+                line,
+                message: recovery.message.into(),
+                stage: "parse".into(),
+            });
+        }
+        parsed
+    } else {
+        parsed
+    };
     if crate::parse::has_parse_errors(&parsed.tree) {
         program.add_diagnostic(Diagnostic {
             severity: DiagnosticSeverity::Warning,
