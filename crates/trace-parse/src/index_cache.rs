@@ -127,8 +127,12 @@ impl CachedSource {
     }
 }
 
-/// Bytes of one serialized `LineMapEntry` in a spill file.
+/// Bytes of one in-memory `LineMapEntry`, for retained-payload accounting.
 const LINE_MAP_ENTRY_BYTES: usize = 40;
+const MAP_BLOCK_ENTRIES: usize = 4096;
+const MAP_POSITION_BYTES: usize = 16;
+const MAP_EXPANSION_BYTES: usize = 24;
+const SPILL_IO_BYTES: usize = 256 * 1024;
 const SPILL_THRESHOLD: usize = 512 * 1024;
 
 #[derive(Default)]
@@ -245,29 +249,37 @@ impl SpilledSource {
     fn store(src: &PreprocessedSource) -> std::io::Result<Self> {
         let (mut file, spill_file) = SpillFile::create()?;
         let written = (|| {
-            let mut writer = BufWriter::new(&mut file);
+            // Coalesce small block bitmaps and payloads into larger writes.
+            let mut writer = BufWriter::with_capacity(SPILL_IO_BYTES, &mut file);
             writer.write_all(src.text.as_bytes())?;
-            // Through the buffered writer an entry at a time: no second
-            // copy of the map on the heap while it is being shed.
-            let mut entry = [0u8; LINE_MAP_ENTRY_BYTES];
-            for e in &src.line_map.entries {
-                for (slot, value) in [
-                    e.output_offset,
-                    e.file,
-                    e.line,
-                    e.col,
-                    e.expansion_file,
-                    e.expansion_line,
-                    e.expansion_col,
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    entry[slot * 4..slot * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            // Most installed-header tokens have no macro provenance. Keep
+            // their positions, omitting the 24 default expansion bytes. A
+            // block bitmap permits bounded reads without a tag per entry.
+            let mut expanded = [0u8; MAP_BLOCK_ENTRIES / 8];
+            let mut bytes = Vec::with_capacity(MAP_BLOCK_ENTRIES * LINE_MAP_ENTRY_BYTES);
+            for block in src.line_map.entries.chunks(MAP_BLOCK_ENTRIES) {
+                expanded.fill(0);
+                bytes.clear();
+                for (i, e) in block.iter().enumerate() {
+                    for value in [e.output_offset, e.file, e.line, e.col] {
+                        bytes.extend_from_slice(&value.to_le_bytes());
+                    }
+                    if e.expansion_file != u32::MAX
+                        || e.expansion_line != 0
+                        || e.expansion_col != 0
+                        || e.expansion_id != 0
+                        || e.expansion_macro != u32::MAX
+                    {
+                        expanded[i / 8] |= 1 << (i % 8);
+                        for value in [e.expansion_file, e.expansion_line, e.expansion_col] {
+                            bytes.extend_from_slice(&value.to_le_bytes());
+                        }
+                        bytes.extend_from_slice(&e.expansion_id.to_le_bytes());
+                        bytes.extend_from_slice(&e.expansion_macro.to_le_bytes());
+                    }
                 }
-                entry[28..36].copy_from_slice(&e.expansion_id.to_le_bytes());
-                entry[36..40].copy_from_slice(&e.expansion_macro.to_le_bytes());
-                writer.write_all(&entry)?;
+                writer.write_all(&expanded[..block.len().div_ceil(8)])?;
+                writer.write_all(&bytes)?;
             }
             writer.flush()?;
             Ok::<(), std::io::Error>(())
@@ -287,41 +299,50 @@ impl SpilledSource {
     fn load(&self) -> std::io::Result<PreprocessedSource> {
         // Open only while loading, giving each reader its own cursor and
         // avoiding one retained file descriptor per spilled source.
-        let mut reader = BufReader::new(std::fs::File::open(&self.file)?);
+        let mut reader = BufReader::with_capacity(SPILL_IO_BYTES, std::fs::File::open(&self.file)?);
         let mut text = vec![0; self.text_len];
         reader.read_exact(&mut text)?;
         let text = String::from_utf8(text)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         // Decoded a chunk at a time into the final vector, so the raw bytes
         // of the whole map never sit beside it.
-        const CHUNK_ENTRIES: usize = 4096;
         let mut entries = Vec::with_capacity(self.entry_count);
-        let mut bytes = vec![0; CHUNK_ENTRIES.min(self.entry_count) * LINE_MAP_ENTRY_BYTES];
+        let mut bytes = vec![0; MAP_BLOCK_ENTRIES.min(self.entry_count) * LINE_MAP_ENTRY_BYTES];
+        let mut expanded = [0u8; MAP_BLOCK_ENTRIES / 8];
         let mut remaining = self.entry_count;
         while remaining > 0 {
-            let n = remaining.min(CHUNK_ENTRIES);
-            let chunk = &mut bytes[..n * LINE_MAP_ENTRY_BYTES];
+            let n = remaining.min(MAP_BLOCK_ENTRIES);
+            let mask = &mut expanded[..n.div_ceil(8)];
+            reader.read_exact(mask)?;
+            let expanded_count = (0..n).filter(|i| mask[i / 8] & (1 << (i % 8)) != 0).count();
+            let chunk = &mut bytes[..n * MAP_POSITION_BYTES + expanded_count * MAP_EXPANSION_BYTES];
             reader.read_exact(chunk)?;
-            entries.extend(
-                chunk
-                    .as_chunks::<LINE_MAP_ENTRY_BYTES>()
-                    .0
-                    .iter()
-                    .map(|entry| {
-                        let value = |i| u32::from_le_bytes(entry[i..i + 4].try_into().unwrap());
-                        trace_preproc::LineMapEntry {
-                            output_offset: value(0),
-                            file: value(4),
-                            line: value(8),
-                            col: value(12),
-                            expansion_file: value(16),
-                            expansion_line: value(20),
-                            expansion_col: value(24),
-                            expansion_id: u64::from_le_bytes(entry[28..36].try_into().unwrap()),
-                            expansion_macro: value(36),
-                        }
-                    }),
-            );
+            let mut offset = 0;
+            for i in 0..n {
+                let value = |at| u32::from_le_bytes(chunk[at..at + 4].try_into().unwrap());
+                let mut entry = trace_preproc::LineMapEntry {
+                    output_offset: value(offset),
+                    file: value(offset + 4),
+                    line: value(offset + 8),
+                    col: value(offset + 12),
+                    expansion_file: u32::MAX,
+                    expansion_line: 0,
+                    expansion_col: 0,
+                    expansion_id: 0,
+                    expansion_macro: u32::MAX,
+                };
+                offset += MAP_POSITION_BYTES;
+                if mask[i / 8] & (1 << (i % 8)) != 0 {
+                    entry.expansion_file = value(offset);
+                    entry.expansion_line = value(offset + 4);
+                    entry.expansion_col = value(offset + 8);
+                    entry.expansion_id =
+                        u64::from_le_bytes(chunk[offset + 12..offset + 20].try_into().unwrap());
+                    entry.expansion_macro = value(offset + 20);
+                    offset += MAP_EXPANSION_BYTES;
+                }
+                entries.push(entry);
+            }
             remaining -= n;
         }
         let mut src = self.metadata.clone();
@@ -528,6 +549,23 @@ impl IndexSourceCache {
             CachedSource::Resident(src) => Some(src.text.len()),
             CachedSource::Spilled(src) => Some(src.text_len),
             CachedSource::Released(_) => None,
+        }
+    }
+
+    /// Settled include/variant metadata, without loading a spilled payload.
+    pub(crate) fn visit_metadata(
+        &self,
+        paths: &[PathBuf],
+        graph: &IncludeGraph,
+        mut visit: impl FnMut(&Path, &PreprocessedSource),
+    ) {
+        let Ok(guard) = self.inner.read() else {
+            return;
+        };
+        for path in paths {
+            if let Some(source) = guard.get(&graph.intern_path(path)) {
+                visit(path, source.metadata());
+            }
         }
     }
 
@@ -988,7 +1026,7 @@ mod tests {
             };
             assert_eq!(
                 std::fs::metadata(&src.file).unwrap().len(),
-                3 + LINE_MAP_ENTRY_BYTES as u64
+                3 + 1 + MAP_POSITION_BYTES as u64
             );
         }
         let loaded = cache
@@ -997,6 +1035,61 @@ mod tests {
         assert_eq!(loaded.text.as_ref(), "abc");
         assert_eq!(loaded.line_map.entries.len(), 1);
         assert_eq!(loaded.line_map.lookup(0).unwrap().line, 1);
+    }
+
+    #[test]
+    fn compact_spill_round_trips_block_boundaries_and_all_expansion_fields() {
+        for count in [
+            0,
+            1,
+            7,
+            8,
+            9,
+            MAP_BLOCK_ENTRIES - 1,
+            MAP_BLOCK_ENTRIES,
+            MAP_BLOCK_ENTRIES + 1,
+        ] {
+            let mut src = PreprocessedSource::raw(Arc::from("source bytes\n"));
+            let mut map = LineMap::new();
+            let file = map.intern_file(Path::new("/original.h"));
+            let macro_id = map.intern_macro("CALL");
+            for i in 0..count {
+                map.push(i * 3, file, i as u32 + 1, u32::MAX);
+                let entry = map.entries.last_mut().unwrap();
+                match i % 7 {
+                    0 => entry.expansion_file = file,
+                    1 => entry.expansion_line = u32::MAX,
+                    2 => entry.expansion_col = u32::MAX,
+                    3 => entry.expansion_id = u64::MAX,
+                    4 => entry.expansion_macro = macro_id,
+                    5 => {
+                        entry.expansion_file = file;
+                        entry.expansion_line = u32::MAX;
+                        entry.expansion_col = u32::MAX;
+                        entry.expansion_id = u64::MAX;
+                        entry.expansion_macro = macro_id;
+                    }
+                    _ => {}
+                }
+            }
+            src.line_map = Arc::new(map);
+            let spilled = SpilledSource::store(&src).unwrap();
+            let loaded = spilled.load().unwrap();
+            assert_eq!(loaded.text, src.text);
+            assert_eq!(loaded.line_map, src.line_map, "{count} entries");
+            // A truncated block must fail instead of restoring partial origins.
+            if count > 0 {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&spilled.file)
+                    .unwrap();
+                file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+                assert_eq!(
+                    spilled.load().unwrap_err().kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                );
+            }
+        }
     }
 
     #[test]

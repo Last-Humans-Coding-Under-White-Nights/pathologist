@@ -94,6 +94,80 @@ presentation choice never changes call identity or semantic ownership.
 
 ## Shared header functions
 
+Ordinary indexing caches resolved top-level system include bundles as header
+units as well as project headers. Only leading includes before project
+declarations are separated, preserving incoming typedef and overload context
+for later includes. A bundle includes its nested implementation
+fragments; includes inside an unfinished declaration or scope remain inline.
+For system bundles, macro fingerprints, language and the preceding shared
+system declarations select the consumed expansion. Its declaration preamble
+imports prerequisite types and callable prototypes (including return shapes
+needed by global initializers), even without another textual include. Lowering
+schedules exact variants before their consumers. Only recorded matching system
+variants enter a consumer's preamble; a cache-limit or scope fallback lowers its own inline
+text. This uses the existing type/prototype merge and declaration-only dependency ownership,
+including their approximation rules below. Namespace imports and weak pragmas
+remain in consumer text through the conservative inline fallback described in the
+preprocessor contract. Compilation-database indexing and
+conditional recording/exploration retain inline system headers. See the
+[preprocessor cache contract](PREPROCESSOR.md#shared-system-header-bundles).
+
+Before lowering a source TU that consumes dependency headers, indexing caches
+its assembled header preamble, keyed by the exact ordered header units (and
+therefore their languages and expansion variants). A preamble contains the
+existing types, declarations and shared-header facts before the TU's own source
+is visited. Reusing an assembled preamble avoids merging overlapping header
+tables again; recorded include relationships, function ownership and name
+lookup selections are preserved directly. For settled ordinary system-header
+indexing, a metadata-only pass selects
+recurring complete preambles and shared prefixes before TU lowering. The
+bounded plan favors the imports each additional checkpoint avoids, with source
+order breaking ties. It retains up to 16 full/prefix snapshots, including useful
+prefixes shorter than 32 units, and skips one-off combinations. Other paths
+retain bounded first-use admission and prefixes at 32-unit intervals;
+uncached combinations follow the same merge order so cache admission cannot
+change output. The source file is interned after a reused preamble and then
+lowered in its own context. Project source definitions are never selected from
+a representative TU. Consumers still clone the mutable context: this is not
+yet a lookup layer that borrows all declarations without importing them.
+Inline fallback headers still lower within their consuming TU.
+Runs without dependency headers keep the ordinary preamble path.
+
+Standalone orphan headers settle before the final header-variant plan and
+contribute their replayed variants and nested prerequisites alongside TUs.
+Their bodies import cached declarations, including function return types,
+rather than just type layouts; an orphan's header extension does not make its
+own function bodies declaration-only. Cached project-header units import
+system prerequisites as declarations too, including callable return shapes
+needed by inferred initializers. Imports between cached project-header units
+retain the existing types-only path; system bundles import prerequisite
+declarations regardless of their origin.
+
+Header-unit selection and dependency scheduling reject a different language
+before consulting variant records, including the project-header fallback when
+no variant was recorded. Project headers consumed in both languages retain
+matching declaration units for both contexts. Their established body-owning
+language, chosen by the existing indexing language decision, remains authoritative
+in the final header merge; supplementary language units supply declarations and
+diagnostics.
+Preamble planning, TU lowering and header wave
+scheduling use canonical graph paths for cache identity and include edges, so
+symlink spellings cannot change the selected units or miss planned snapshots.
+
+Separately lowered dependency-header diagnostics enter the final program with
+their header unit, even though its bodies are excluded. Identical reports are
+deduplicated across shared variants and are not copied into each TU's preamble;
+sharing must not hide parser warnings about incomplete header parsing.
+
+Dependency-header data declarations share storage during preamble import and
+final merging when their original position, declared name, remapped type,
+link image and declaration metadata agree. Each replay still updates ordinary
+name lookup in import order. File-static objects retain their per-unit identity.
+A function declaration that joins an existing signature reuses its parameter
+variables when the signature keeps its existing parameter list. Old parameter
+records from folded prototypes alias the surviving slot only when their types
+agree; project function definitions retain their body bindings.
+
 This section defines header-function sharing. `SymbolTable` owns visibility
 and resolution: call consumers use `Program::callees_of` (or the symbol-table
 equivalent), and name-based return facts use
@@ -920,6 +994,15 @@ function and file-static lookups are indexed by name and filtered by the
 asking file's scope, rather than walking every header of the scope per name.
 See the [Clang benchmark](PERFORMANCE_REVIEW.md#clang-source-benchmark-header-import-and-lowering).
 
+Repeated metadata imports check borrowed constructor signatures, constant names,
+template-return keys and member-initializer keys before allocating copies.
+They retain the same conflict handling, fact order and constructor-cache
+invalidation. A nested-tag completion pass inspects shared descriptors by
+reference and memoizes each original field type's answer for that pass. The
+pass can append pointer types but cannot declare or widen a named tag, so its
+answers remain valid until the pass ends. First-use order still determines
+new IDs; later declarations and aggregate unions start a fresh pass.
+
 **Declarator shapes.** C declarators bind inside-out: in `T D`, a declarator `*D1` gives `D1` the type "pointer to T", `D1[n]` "array of T" and `D1(..)` "function returning T", and the identifier gets what is left after the last layer (`walk_declarator_shape`). So `int *t[4]` is `Array(Ptr(Int))`, `void (*h[4])(int)` is `Array(Ptr(FnPtr))`, `int *(*get)(void)` is `Ptr(FnPtr { ret: Ptr(Int) })`, and a fn-pointer variable `void (*fp)(int)` is `Ptr(FnPtr)`. Before #127 the walker wrapped outside-in: `int *t[4]` was `Ptr(Array(Int))` (exported `int[]*`), `int *(*get)(void)` was `Ptr(Ptr(FnPtr { ret: Int }))` (exported `fn_ptr**`), and `void (*h[4])(int)` was `Ptr(FnPtr { ret: Array(Void) })` — exported `fn_ptr*`, because an exported type name does not spell a function's return type.
 
 ## IR flow constraints (`trace-ir`)
@@ -989,7 +1072,7 @@ Nested call arguments (`consume(make())`, `Register(obj->GetHandler())`, `consum
 
 **`CallReturnIndirect`** is the indirect-call analogue of `CallReturn`. The callee is resolved by the solver when indirect call targets are known (via function-pointer analysis). The `callee_var` is a synthetic load variable that holds the resolved function pointer; the solver wires return flows from each resolved target into `dst`.
 
-**`NewHeap`** represents C++ `new T(...)` allocations, and the object a recognised smart-pointer factory builds ([Factory construction](#factory-construction)). The PAG allocates a heap location typed to the allocated struct and adds an `AddrOf` edge from `dst` to the heap location. The solver then propagates into the struct's fields, enabling resolution of function pointers stored by constructors (e.g., `MParcelImplInterfaceAssign` writing into `HdfSBufImpl.readBuffer`). Lowering (`lower_new_object`, `construct_on_heap` in `lower.rs`) gives every `new T(args)` its heap object, a `$new<id>` temporary typed `T`, in value and statement position alike, and at file scope too; the constructor sites (in a body) take it as `this` and the constructor's own argument list as their arguments, never a placement list (`new (std::nothrow) T(a, b)` passes `a, b`); a braced list (`new T{a, b}`) is that list when `T` has a user-provided constructor, as for a braced local, and otherwise initializes an aggregate member by member, with no constructor site; and the expression's value is that object. A construction from one argument records no constructor site (`copies_implicitly`, checked in `emit_member_targets`) wherever the object is built (`new T(other)`, a factory, a local `T x(other)`, a class-typed member initializer `m_(other)`) when either no constructor of the class takes one argument, or the argument is an object of the class itself (directly or by reference) and no constructor takes the class: that is a copy or a move, which runs the implicit constructor, where arity filtering would otherwise fall back to every constructor, or rank `T(int)`, and bind the copied object to an unrelated parameter. A pointer argument (`T *`) is not an object copy; a reference to a pointer keeps that pointer type too. A user-declared copy or move constructor (`T(const T &)`) keeps its site, including constructors whose later parameters have defaults (`T(const T &, int = 0)`). An aggregate whose definition and constructor set are indexed, copied from its own type, records no unresolved constructor site. For `new` and factories, cached headers import included headers as types only, so an empty constructor lookup there retains a site for the later TU symbol merge to resolve. A missing class definition or an unknown constructor parameter type retains the possible constructor edge on those paths. Member-initializer lists omit the implicit default or copy constructor itself while retaining nontrivial construction of its base and member subobjects. A reference member's binding (`ref_(other)`) records none regardless of its class's constructors. See [Ctors / dtors](#c-support-first-step) for the member-initializer rule.
+**`NewHeap`** represents C++ `new T(...)` allocations, and the object a recognised smart-pointer factory builds ([Factory construction](#factory-construction)). The PAG allocates a heap location typed to the allocated struct and adds an `AddrOf` edge from `dst` to the heap location. The solver then propagates into the struct's fields, enabling resolution of function pointers stored by constructors (e.g., `MParcelImplInterfaceAssign` writing into `HdfSBufImpl.readBuffer`). Lowering (`lower_new_object`, `construct_on_heap` in `lower.rs`) gives every `new T(args)` its heap object, a `$new<id>` temporary typed `T`, in value and statement position alike, and at file scope too; the constructor sites (in a body) take it as `this` and the constructor's own argument list as their arguments, never a placement list (`new (std::nothrow) T(a, b)` passes `a, b`); a braced list (`new T{a, b}`) is that list when `T` has a user-provided constructor, as for a braced local, and otherwise initializes an aggregate member by member, with no constructor site; and the expression's value is that object. A construction from one argument records no constructor site (`copies_implicitly`, checked in `emit_member_targets`) wherever the object is built (`new T(other)`, a factory, a local `T x(other)`, a class-typed member initializer `m_(other)`) when either no constructor of the class takes one argument, or the argument is an object of the class itself (directly or by reference) and no constructor takes the class: that is a copy or a move, which runs the implicit constructor, where arity filtering would otherwise fall back to every constructor, or rank `T(int)`, and bind the copied object to an unrelated parameter. A pointer argument (`T *`) is not an object copy; a reference to a pointer keeps that pointer type too. A user-declared copy or move constructor (`T(const T &)`) keeps its site, including constructors whose later parameters have defaults (`T(const T &, int = 0)`). An aggregate whose definition and constructor set are indexed, copied from its own type, records no unresolved constructor site. For `new` and factories, cached project headers import project prerequisites as types only, so an empty constructor lookup there retains a site for the later TU symbol merge to resolve. A missing class definition or an unknown constructor parameter type retains the possible constructor edge on those paths. Member-initializer lists omit the implicit default or copy constructor itself while retaining nontrivial construction of its base and member subobjects. A reference member's binding (`ref_(other)`) records none regardless of its class's constructors. See [Ctors / dtors](#c-support-first-step) for the member-initializer rule.
 
 **`StringConst`** intern a C string literal as an abstract location (`LocKind::StringLit`). Assignments (`const char *n = "foo"`), copies, and call arguments intern the same way, so a later `dlsym(h, n)` still sees `"foo"`. Concatenated literals (`"ta" "rget"`) are folded. String literals represent immutable constants and are excluded from being writable memory cells: stores through untyped or cast pointers do not write into string literal locations, and dereferences of pointers holding string literals do not merge cell memory (see [Propagation highlights](#propagation-highlights)). No `sprintf` / buffer writes.
 
@@ -1009,6 +1092,14 @@ through and passes. `*x` goes through the value `x` holds, computed as a value
   header merging. Parameter signatures and local bindings use this metadata;
   constructor copy detection unwraps only a referent's address, keeping raw
   pointer arguments and references to pointers distinct from class objects.
+- Header units and reusable preambles retain reference-binding metadata with
+  their declarations. Unit merging remaps its variable and function IDs before
+  a consuming lowering context takes ownership of it; reference type-layer,
+  address-representation and return-reference facts travel with the bindings.
+  Skipping a declaration walk therefore preserves `&ref` as the referent's
+  address (`Copy`), including for static reference members. An ordinary
+  variable's address still uses `AddrOfVar`. This indexing metadata is released
+  with merge state and adds no database columns.
 - A member path (`h->pp`, `this->a->pp`, `(*this).m`) is projected and its cell
   loaded: `y = *h->f` is `Load(y, Load(GEP(h, f)))`, and `*h->f = v` stores
   through the loaded value the same way. An array member is its own cell
@@ -3245,6 +3336,9 @@ C++-aware only where it must be — everything else reuses the C machinery.
   each derived level along an inherited-constructor chain. A base named through
   a type alias (`using Alias = Base;` followed by `using Alias::Alias`) resolves
   to the same declaring class.
+  Saving an initializer's source mappings uses a binary search for its start,
+  then visits only mappings before its end. Equal-offset entries at the start
+  remain in output order; no preceding mapping is synthesized.
   Cached type imports preserve default- and copy-constructor eligibility and
   these explicit constructor imports, retaining sites for later symbol merging.
   Types-only cached-header imports retain this constructor declaration
@@ -3399,6 +3493,18 @@ C++-aware only where it must be — everything else reuses the C machinery.
 - **Templates**: lowered once per primary name. Class-template members
   returning a bare type parameter (`T Get()`, `T *Get()`) preserve its
   parameter position and pointer depth as type metadata across header merges.
+  Lowering caches the lexical byte ranges of template parameter names and
+  enclosing class aliases per syntax tree. Repeated method-return queries
+  retain the same source order and alias-depth limit without rescanning all
+  class members. The cache stores no resolved types or symbol decisions, is
+  released with the tree, and is isolated when lowering a scratch initializer;
+  scratch recovery queries read their syntax afresh. Valid primitive-keyword returns
+  skip template ancestry queries when their base type is known. Template-return
+  arity counts fixed parameters directly, excluding `(void)` and variadic tails,
+  without constructing reference-parameter metadata; signatures still retain
+  their full reference/default/variadic facts. Named types,
+  including a template parameter named `size_t`, and malformed declarations
+  keep the existing lookup and recovery rules.
   A concrete receiver substitutes its arguments before member lookup and
   virtual dispatch, through its pointer layers and through an instantiated
   class-template base it inherits the member from (`struct D : Holder<T *>`).
@@ -3629,6 +3735,8 @@ Known C++ imprecision (in addition to the general list below):
   `override` implies virtual. `final` on a class or method stops further
   subclass targets. Flags belong to the declaration, not to local classes
   nested inside its body. Virtual inheritance is recorded as a normal base edge.
+  A well-formed declaration without `virtual`, `override` or `final` before
+  its body skips the recursive flag walk; malformed syntax retains that walk.
 - Headers shared between `.c` and `.cpp` TUs parse under whichever
   grammar reaches them first at merge time.
 - **`using namespace` in headers**: ANALYSIS.md says file-scope directives
@@ -3832,8 +3940,8 @@ authoritative statement of the rule; lowering (`factory_constructed_class`,
   `std::make_shared<S>()` to `S::S()`). That differs from
   [Automatic objects](#automatic-objects), which drop defaulted members
   one by one. The check waits for a conclusive set (`ctor_set_known`):
-  an empty lookup in a cached header, which imports included headers as
-  types only, or of a class whose definition is not indexed, proves
+  an empty lookup in a cached project header, which imports project prerequisites
+  as types only, or of a class whose definition is not indexed, proves
   nothing, so the factory keeps an unresolved `T::T` site exactly as
   `new` does ([`NewHeap`](#ir-flow-constraints-trace-ir)), for the TU
   symbol merge to resolve (`inline` header functions) or to stay
@@ -4021,6 +4129,57 @@ Limits:
 - An exact global template name wins over the scoped lookup.
 - A base spelled with a partial specialization's arguments expands through
   the primary template's bases.
+
+### Indexing syntax reuse
+
+Large preprocessed inputs often repeat installed headers that remain inline in
+each TU or project header. Each indexing worker retains the preceding syntax
+tree and normalized source separately for C and C++. Before parsing a similar
+input, tree-sitter edits cover the changed bytes, with UTF-8 boundaries and
+byte-based row/column updates. Tree-sitter revalidates the retained syntax in
+its new context. Returned trees are independent
+clones; editing the cached tree does not change a tree still being lowered.
+
+Error recovery is not invariant under tree reuse. A preceding tree with errors
+is discarded before editing. If an incremental parse reports any error, the
+input is parsed again without a preceding tree, and that fresh tree is the
+result used by lowering and diagnostics. Error trees are never retained for
+reuse. This keeps malformed inputs independent of worker assignment and
+`--jobs`; error-free inputs retain the syntax-sharing path.
+
+Retention requires 16 KiB–4 MiB of normalized text and at most 1,000,000 syntax
+nodes per language per worker. If the common prefix and suffix together cover
+half the shorter input, a single edit covers the intervening bytes. Otherwise,
+unique matching lines of at least 32 bytes anchor exact unchanged middle blocks.
+The search retains at most 32 ordered blocks of at least 8 KiB, spending at most
+four times the larger input's length on byte extensions. Prefix, suffix and
+middle blocks must together cover a quarter of the shorter input. At most 33
+edits, applied right to left in original coordinates, cover the remaining gaps.
+Matching uses exact text, and the search never relies on a hash alone.
+Small, oversized, or unrelated inputs release the preceding tree before parsing
+afresh. These are source-size
+and node-count limits, rather than a bound on total parser memory.
+
+The field-layout, prototype and definition passes share each member's
+syntax-only function-versus-field classification within its live tree. Recovery
+queries use the original walker; scratch initializer trees receive isolated
+caches, and all retained classifications are released with their tree.
+
+Only syntax is reused. Macro expansion and
+[C++ parse-input normalization](#c-parse-input-normalization) run for the current
+input; lowering starts with its own symbol/type environment and uses its own
+LineMap, dependency classification and link ownership. No symbols, types, or
+source locations are inherited from the cached unit. Standalone parse helpers
+and scratch parses use fresh trees. Measurements:
+[system-header indexing](EVAL_REPORT.md#system-header-indexing-on-small-projects--2026-10-15)
+and [middle-block reuse](EVAL_REPORT.md#system-header-middle-block-reuse-and-import-cost--2026-10-15).
+
+Indexing progress distinguishes shared-header parsing (`pch-done`) from its
+initial merge (`pch-merge-done`). Parallel `parse-orphan-done` and `parse-done`
+messages count units after their ordered merge, reporting cumulative elapsed
+time for that phase at the first, every fiftieth, and final unit. Sequential
+messages retain their per-unit timings. These counters include lowering and
+merging; they do not measure merge CPU time alone.
 
 ### C++ parse-input normalization
 

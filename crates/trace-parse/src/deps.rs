@@ -20,6 +20,8 @@ pub struct IncludeGraph {
     pub dep_roots: Vec<PathBuf>,
     /// All `.c` / `.h` files under the analyzed root (canonical).
     pub project_files: HashSet<PathBuf>,
+    /// Consumed system include bundles, registered after preprocessing.
+    pub external_headers: HashSet<PathBuf>,
     /// Direct local include dependencies (dependent → included).
     pub edges: IndexMap<PathBuf, Vec<PathBuf>>,
     /// Search paths for `"..."` / `<...>` includes (project-local dirs).
@@ -164,6 +166,7 @@ impl IncludeGraph {
             test_partition: test_partition.clone(),
             dep_roots: dep_roots.iter().map(|p| canonicalize(p)).collect(),
             project_files,
+            external_headers: HashSet::default(),
             edges,
             include_dirs,
             needs_preprocess,
@@ -365,12 +368,14 @@ impl IncludeGraph {
     /// so a header is not lowered in parallel with a nested type it needs.
     pub fn add_preprocess_includes(&mut self, from: &Path, headers: &[PathBuf]) {
         let from = self.intern_path(from);
-        if !self.project_files.contains(&from) {
+        if !(self.project_files.contains(&from) || self.external_headers.contains(&from)) {
             return;
         }
         for h in headers {
             let to = self.intern_path(h);
-            if to == from || !self.project_files.contains(&to) {
+            if to == from
+                || !(self.project_files.contains(&to) || self.external_headers.contains(&to))
+            {
                 continue;
             }
             let e = self.edges.entry(from.clone()).or_default();
@@ -401,7 +406,9 @@ impl IncludeGraph {
                 continue;
             };
             for inc in incs {
-                if self.project_files.contains(inc) && seen.insert(inc.as_path()) {
+                if (self.project_files.contains(inc) || self.external_headers.contains(inc))
+                    && seen.insert(inc.as_path())
+                {
                     queue.push_back(inc.as_path());
                 }
             }
@@ -423,7 +430,9 @@ impl IncludeGraph {
         while let Some(node) = queue.pop_front() {
             if let Some(includes) = self.edges.get(&node) {
                 for inc in includes {
-                    if self.project_files.contains(inc) && seen.insert(inc.clone()) {
+                    if (self.project_files.contains(inc) || self.external_headers.contains(inc))
+                        && seen.insert(inc.clone())
+                    {
                         queue.push_back(inc.clone());
                     }
                 }

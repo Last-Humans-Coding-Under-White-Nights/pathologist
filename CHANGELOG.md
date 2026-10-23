@@ -71,6 +71,87 @@ Usage: [Inspect diagnostics](README.md#trace-inspect-diagnostics).
 Corpus validation, timings, problem files and root-cause investigation:
 [Evaluation report](docs/EVAL_REPORT.md#inspect-diagnostics--2026-10-14).
 
+### Faster system-header preprocessing, indexing and merging
+
+The combined changes reduce repeated preprocessing, parsing, declaration
+imports and lowering across translation units, and reduce peak memory through
+compact spills and earlier cache retirement. The
+[overall performance summary](docs/EVAL_REPORT.md#overall-results-of-the-squashed-optimization-series)
+separates the historical cumulative time and memory reductions from the last
+incremental speedup. Default-mode paired checks do not reproduce the earlier
+substantial regression; they do not establish a reliable default-mode speedup.
+
+Bare-tree `--system-includes` indexing shares compatible system-header
+expansions and lowered declaration units, including extensionless standard
+headers. Nested implementation fragments retain their enclosing syntax;
+includes requiring preceding project declarations remain inline. Macro and
+header prerequisites select the consumed language and variant deterministically.
+Compilation-database commands and conditional recording/exploration retain
+inline system headers.
+Parser diagnostics from separately lowered dependency headers remain visible
+in the final program, with repeated shared reports deduplicated.
+Syntax reuse discards previous error trees and retries incremental results
+with errors using a fresh parse, preserving independence from worker scheduling.
+The `_Pragma` operator uses directive handling before scope tracking, so libc++
+macro-cleanup suffixes no longer prevent compatible system bundles from sharing.
+Unsupported `_Pragma` operands preserve following declarations; wide and UTF
+string operands are accepted, and isolated object-like aliases retain their
+previous token behavior. Namespace imports and weak pragmas keep affected
+bundles inline so consumer lookup and linkage annotations remain visible.
+Header initializers import prerequisite system callable return types, including
+cached project headers consuming system declarations.
+Shared preambles preserve reference-binding metadata, so taking a reference
+variable's address keeps the baseline referent flow instead of addressing
+a separate reference cell.
+`TRACE_PROFILE_INDEX` also distinguishes context-sensitive, uncovered, incomplete
+and incompatible bundle refusals from admission gates and variant limits.
+Project-header units remain language-specific during selection and wave
+scheduling, with matching declaration contexts for consumed C/C++ variants and
+the established shared-body ownership. Canonical source/header paths keep
+preamble planning and dependency lookups consistent through symlinked directories.
+Standalone orphan headers pin the system variants they replay before the final
+lowering plan and cache retirement, including warmed variants unused by TUs.
+Their bodies import cached function declarations so chained calls retain
+their return-type and method resolution.
+
+Indexing also shares raw installed-header tokens in a bounded cache and
+uses compact temporary source maps. It reuses unchanged syntax across
+large preprocessed inputs, including matching blocks between different
+prefixes and suffixes. Lowering keeps each unit's declarations, macro provenance
+and source locations.
+
+TUs consuming dependency headers also reuse assembled header preambles and
+their common prefixes, with canonical storage for repeated dependency globals and
+declaration parameters. Settled system-header runs select the recurring preambles
+and prefixes from actual TU metadata, preserving the 16-snapshot limit. Header
+fingerprints hash interned paths/names once, and type imports reuse shared
+descriptor identity. Standalone headers are settled early so expansion payloads
+can be released after their last header-lowering consumer. Default indexing skips
+system-header boundary and nested-replay tracking when no system search paths
+are enabled.
+
+Repeated imports avoid copying existing metadata and memoize nested-tag
+completion within each pass. Default member initializer locations use a
+binary search rather than scanning all preceding mappings per field.
+Template-return queries reuse lexical parameter and class-alias facts within
+each tree, and known primitive-keyword returns avoid template ancestry walks.
+Arity-only queries count fixed parameters without resolving reference aliases.
+Class passes reuse function-versus-field classification within each syntax
+tree, and spills coalesce mapping blocks into larger I/O operations.
+Parallel indexing reports completed orphan/TU merges and shared-header merging.
+
+Contracts: [preprocessing](docs/PREPROCESSOR.md#shared-system-header-bundles),
+[indexing syntax reuse](docs/ANALYSIS.md#indexing-syntax-reuse) and
+[template returns](docs/ANALYSIS.md#c-support-first-step).
+The [evaluation report](docs/EVAL_REPORT.md#shared-system-header-units--2026-10-16)
+records reproductions, behavioral and determinism comparisons, measurements and limits.
+The [preamble and cache-lifetime follow-up](docs/EVAL_REPORT.md#shared-header-preambles-and-default-mode-correction--2026-10-16)
+records the default-mode correction and the further peak-memory reduction.
+The [metadata-admission follow-up](docs/EVAL_REPORT.md#preamble-admission-from-settled-tu-metadata--2026-10-17)
+records the additional speedup and full-project output comparisons.
+The full `ability_ability_runtime` checkout completes with installed system
+headers when its watchdog allows the measured indexing run to finish.
+
 ### Lower analyze-phase memory (#225)
 
 The solver's membership bit mirrors keep only the blocks of the location

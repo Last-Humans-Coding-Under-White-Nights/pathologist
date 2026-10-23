@@ -1,0 +1,5 @@
+_Pragma("once")
+namespace Std { struct First {}; }
+#define DO_PRAGMA(text) _Pragma(#text)
+#define POP_MACROS DO_PRAGMA(pop_macro("min")) DO_PRAGMA(pop_macro("max"))
+POP_MACROS

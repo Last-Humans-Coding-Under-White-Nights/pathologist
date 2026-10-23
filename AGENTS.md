@@ -29,6 +29,14 @@ discover .c/.cpp/.h → IncludeGraph → preprocess (cache) → parse/lower per 
 
 Each stage must remain independently testable.
 
+Ordinary shared-header indexing has substeps inside these phases: warm and
+settle preprocessing, settle standalone orphan headers, lower selected header
+variants while retiring their consumed expansions, plan reusable preambles,
+merge header units (`pch-merge`), then lower/merge orphan headers and source
+TUs. See [Shared system header bundles](docs/PREPROCESSOR.md#shared-system-header-bundles)
+and [Indexing syntax reuse](docs/ANALYSIS.md#indexing-syntax-reuse) before
+changing their ordering or cache lifetimes.
+
 ## Invariants
 
 1. **LineMap**: Preprocessor must preserve mappable `(original_file, line, col)` for output offsets. All exported spans use **original** file/line/col (resolved via LineMap, cached expansions included). General entities inside macro expansions attribute to the expansion site. Calls spelled in source macro replacement lists instead use the macro-body spelling as their request position and retain the outermost invocation in `CallSite::expansion_span`; semantic scope and ownership use that expansion span (see [Call source locations](docs/ANALYSIS.md#call-source-locations)). Header-origin entities are deduplicated across TUs at merge time.
@@ -137,6 +145,7 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 |------|---------------|
 | Editor call hierarchy (LSP) | `crates/trace-lsp/src/`, `crates/trace-db/src/inspect/editor.rs` → [docs/LSP.md](docs/LSP.md) |
 | Fix include resolution / graph | `trace-parse/src/deps.rs`, `trace-preproc/src/preprocessor.rs` |
+| Shared system-header bundles / preamble cache / syntax reuse / `TRACE_PROFILE_INDEX` | `trace-preproc/src/preprocessor.rs` (`is_cacheable_header`, `OutputScope`), `trace-parse/src/lower.rs` (`HeaderIr`, `HeaderExpansionConsumers`), `parse.rs` (`edit_previous`), `index_profile.rs` → [Shared system header bundles](docs/PREPROCESSOR.md#shared-system-header-bundles), [Indexing syntax reuse](docs/ANALYSIS.md#indexing-syntax-reuse), [Indexing diagnostics](docs/MEMORY_PROFILE.md#indexing-subphase-timings) |
 | Analyze-phase cost / points-to propagation | `trace-analysis/src/solver.rs` → [Propagation highlights](docs/ANALYSIS.md#propagation-highlights) |
 | Measure peak memory / phase CPU (Linux: `scripts/profile_memory.py`; macOS: `scripts/profile_memory_macos.py`, compare `phys_footprint`) | `docs/MEMORY_PROFILE.md`, [macOS measurements](docs/PERFORMANCE_REVIEW.md#incremental-per-tu-ir-cache-macos-measurements-and-decision-175) |
 | Analyze-phase name lookup order | `trace-ir/src/symbol.rs` → [Shared header functions](docs/ANALYSIS.md#shared-header-functions) |

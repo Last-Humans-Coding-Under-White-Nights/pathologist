@@ -13061,3 +13061,1291 @@ then `python3 scripts/eval_check.py --outdir /tmp/trace-233-rebase-eval`.
 Logs: `/tmp/trace-233-rebase-workspace.log` and
 `/tmp/trace-233-rebase-eval.log`. Databases in `/tmp/trace-233-rebase-eval/`
 are not committed.
+
+## Installed system-header preprocessing and spill I/O — 2026-10-15
+
+Measured on `ability_ability_runtime` at
+`6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8` (3,331 TUs), using Ubuntu GCC
+13.3's installed headers, release builds, and eight workers. The baseline is
+`f9ac344`; the candidate adds bounded external-header token sharing and compact
+LineMap spills. The cache and spill contracts are described in
+[Compilation database options](PREPROCESSOR.md#compilation-database-options-62)
+and [Role in the pipeline](PREPROCESSOR.md#role-in-the-pipeline).
+
+One sequential before/after pair used the bare checkout, with no compilation
+database or explicit dependency roots. Filesystem caches were not flushed.
+
+```bash
+cargo run -p trace-cli --release -- analyze \
+  /home/sergei/ability_ability_runtime --system-includes --jobs 8 \
+  --timeout-secs 900 -o /tmp/trace-system.db
+```
+
+| Measurement | Before | After |
+|---|---:|---:|
+| TU discovery preprocess | 58.4 s | 41.6 s |
+| Settle preprocess, 2,443 dirty TUs | 74.7 s | 35.9 s |
+| Total TU preprocessing | 133.5 s | 78.1 s |
+| Shared-header parsing | 78.8 s | 71.2 s |
+| Selected header expansions | 4,146 | 4,146 |
+| Filesystem writes by timeout | 39.59 GiB | 18.80 GiB |
+| Peak RSS by timeout | 11.96 GiB | 12.00 GiB |
+| Full analysis | 900 s watchdog, exit 124 | 900 s watchdog, exit 124 |
+
+TU preprocessing took **41.5% less time**; settling took 51.9% less time.
+Raw-token sharing avoids repeated lexing of installed headers, and compact
+LineMap blocks reduce temporary-file traffic. The retained raw-token payload
+has a separate 32 MiB cap. The filesystem-write figures convert Linux's
+512-byte output-block counters from `/usr/bin/time -v`.
+
+Both complete-project attempts stopped during later indexing. Their memory and
+I/O counters describe the progress reached within the watchdog budget, rather
+than equal amounts of completed indexing. Full-run runtime and full-corpus
+database equivalence remain unmeasured. This single pair establishes a phase
+improvement, with normal run-to-run variation; the first baseline sample's TU
+preprocessing took 121.2 s.
+
+Validation: `cargo test --workspace`; cached versus uncached preprocessing
+matches text, LineMap, include provenance and diagnostics across C/C++, macro
+environments and disk edits. Spill tests cover bitmap/block boundaries, every
+expansion field independently, concurrent reads and truncated files. A separate
+three-TU fixture with `<memory>`, `<string>`, `<vector>` and 18,000 macro-spelled
+callback sites produces **349,838 identical rows across all analysis tables**
+before/after, excluding `analysis_run`. The fixture is an output-equivalence
+check, not a timing sample.
+
+Logs: `/tmp/trace-system-baseline-full.log`,
+`/tmp/trace-system-optimized-full.log`, `/tmp/trace-system-bench-results.json`,
+`/tmp/trace-system-final-tests.log`, `/tmp/trace-system-fixture-check.log`.
+
+## System-header indexing on small projects — 2026-10-15
+
+The earlier full-project timeout was followed by small reproductions to
+separate repeated system-header parsing from solving and export. Each of 20
+tiny C++ TUs uses `std::string` and `std::vector`, after including `<string>`,
+`<memory>`, `<vector>`, `<functional>`, `<map>` and `<algorithm>`. Three layouts
+vary where these includes occur: directly in every TU, in one common project
+header, or in a distinct project header per TU. GDB sampling located repeated
+tree-sitter parsing and declaration lowering in the direct layout. The common
+header layout already amortizes that work through the existing header IR.
+
+The candidate adds [indexing syntax reuse](ANALYSIS.md#indexing-syntax-reuse).
+The baseline was rebuilt directly from `5336d8a`; both executables use the
+workspace release profile, without PGO. An earlier saved executable was
+discarded after differing source-column behavior was detected; the figures
+below use the rebuilt baseline. Ubuntu GCC 13.3 supplies the installed headers.
+
+Wall times below are medians of three sequential runs per executable with one
+indexing worker. Baseline/candidate order alternates between repeats;
+filesystem caches are not flushed. Database comparison occurs outside the
+timed interval.
+
+| 20-TU layout | Baseline | Syntax reuse | Change | Identical analysis rows per run |
+|---|---:|---:|---:|---:|
+| Direct system includes | 14.855 s | 8.043 s | −45.9% | 46,338 |
+| Distinct project headers | 14.796 s | 8.089 s | −45.3% | 53,318 |
+| One shared project header | 1.476 s | 1.597 s | +8.2% | 46,668 |
+
+There is no benefit claimed for the shared-header control: its small absolute
+increase is 0.121 s, with samples spanning 1.413–1.557 s before and
+1.429–1.791 s after. Solving and export are below a second in these cases.
+Declaration lowering still runs per input; syntax reuse does not eliminate
+that cost. These small-project measurements alone do not establish full-corpus
+completion; the full-run result is recorded below.
+
+A stack snapshot of the subsequent full-corpus run during TU indexing found
+workers in per-TU `merge_unit` / `merge_types` (type metadata and template-return
+facts), alongside tree-sitter parsing, while the controller waited for workers.
+It identifies repeated header-preamble imports as another optimization target;
+one snapshot does not establish a CPU percentage. Shared-header merging and
+orphan indexing are separately visible in the new progress counters.
+
+The reproducible harness generates scratch projects, runs both executables,
+and compares every underlying analysis table, including IDs, diagnostics and
+original/macro source spans. Only `analysis_run` is excluded. Temporary trees
+and databases are removed on exit; JSON retains timings and complete phase
+logs. Build the executables before running it:
+
+```bash
+python3 scripts/bench_system_includes.py \
+  --baseline /tmp/trace-syntax-clean-baseline \
+  --candidate target/release/trace --units 20 --repeats 3 --jobs 1 \
+  --output /tmp/trace-syntax-bench20.json
+```
+
+A separate check copies the 12 `.cpp` files from
+`frameworks/native/ability/ability_runtime` at corpus revision
+`6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8` into a scratch project and supplies
+the complete checkout with `--dep`. It completes with `--system-includes`
+and produces **99,326 identical analysis rows** against the rebuilt baseline.
+This tests real declarations and call provenance on a small subset; the rest
+of the checkout contributes dependency declarations rather than analyzed bodies.
+All three generated layouts also match their rebuilt baseline with four workers;
+the real 12-file subset's four-worker output matches its one-worker baseline.
+
+The full 3,331-TU checkout also **completes successfully** with the candidate,
+using the bare tree (no compilation database or explicit dependency roots):
+
+```bash
+cargo run -p trace-cli --release -- analyze \
+  /home/sergei/ability_ability_runtime --system-includes --jobs 8 \
+  --timeout-secs 1800 -o /tmp/trace-syntax-full.db
+```
+
+| Full candidate run | Measurement |
+|---|---:|
+| TU preprocessing | 106.1 s |
+| Shared-header parsing | 71.2 s |
+| Initial shared-header merge | 9.1 s |
+| 562 orphan headers, indexing and merge | 23.4 s |
+| 3,331 TUs, indexing and merge | 644.9 s |
+| Entire index phase, including warm-up and finalization | 974.0 s |
+| Analyze | 7.0 s |
+| Solver convergence | yes; 466,153 worklist pops |
+| Export | 36.1 s |
+| End-to-end, Python monotonic timer | 1,020.1 s |
+| Peak RSS, `/usr/bin/time -v` | 12.04 GiB |
+| Functions / call edges | 228,530 / 688,883 |
+| SQLite database size | 642 MiB |
+| Process exit status | 0 |
+
+The earlier 900-second watchdog is below this run's indexing time. A larger
+timeout allows the pipeline to finish; installed-header analysis is not
+inherently blocked. This is one candidate completion run, with two brief GDB
+attachments for diagnosis, rather than an equal-work full-project speedup
+comparison. Full-database equivalence against the baseline remains unmeasured;
+the exact comparisons above cover the small projects and real 12-file subset.
+End-to-end elapsed time uses a monotonic clock, consistently with the phase
+timers. The `/usr/bin/time` elapsed field differs from those timers in this
+environment and is not used for the reported duration.
+SQLite `quick_check` returns `ok`; references to exported entities are intact.
+The minimal export intentionally omits `types`, so its parameter type IDs have
+no corresponding type rows (see [entity relationships](SQLITE_SCHEMA.md#entity-relationships)).
+
+Regression coverage compares reused/fresh trees including anonymous, missing
+and error nodes, field names, byte ranges and row/column coordinates. It covers
+C/C++ switching, normalized C++ syntax, Unicode edits, scope/scanner-context
+changes, retained-tree independence, and fallback for small/oversized/unrelated
+inputs. An installed-header simulation checks dependency bodies, macro call
+locations and unit ownership across worker counts without requiring a compiler.
+`cargo test --workspace` passes all **2,226 tests**; formatting and diff checks pass.
+
+Logs: `/tmp/trace-syntax-bench20.log`, `/tmp/trace-syntax-bench20.json`,
+`/tmp/trace-syntax-parallel-bench.log`, `/tmp/trace-syntax-final-tests.log`,
+`/tmp/trace-system-small/ability12.clean-baseline.log`,
+`/tmp/trace-system-small/ability12.verify.log`,
+`/tmp/trace-syntax-ability12-compare.log`, `/tmp/trace-syntax-attach.log`,
+`/tmp/trace-syntax-full.log`, `/tmp/trace-syntax-final-checks.log`,
+`/tmp/trace-syntax-full-check.json`.
+
+## System-header middle-block reuse and import cost — 2026-10-15
+
+Follow-up to [system-header indexing](#system-header-indexing-on-small-projects--2026-10-15),
+using commit `175c5ba` as the baseline. The changes address three repeated costs:
+
+- Neighboring units can share installed-header blocks while differing at both
+  ends of their preprocessed text. Bounded, ordered exact matches retain those
+  middle blocks for tree-sitter reuse.
+- Metadata imports avoid copying existing facts, and nested-tag completion
+  memoizes each original field type within a pass. Class lowering also avoids
+  parent lookups when the required outer class scope is empty.
+- Saving default member initializer origins formerly scanned every preceding
+  LineMap entry for every field. A sampled profile of the 20-file reproduction
+  located the hot class-lowering instructions in that linear scan. A binary
+  search now selects the first entry at or after the expression start, followed
+  by a walk of just the expression's mappings. Equal-offset entries and the
+  half-open end boundary retain their previous behavior.
+
+Contracts: [indexing syntax reuse](ANALYSIS.md#indexing-syntax-reuse),
+[shared header functions](ANALYSIS.md#shared-header-functions) and
+[construction rules](ANALYSIS.md#c-support-first-step).
+
+Both release executables are built from their own source trees; the baseline
+uses an isolated Cargo target directory to prevent reuse of candidate library
+artifacts. Executable symbols verify the new edit helper is absent from the
+baseline and present in the candidate. Elapsed times use Python's monotonic
+clock; timed runs are sequential, without concurrent builds, tests or profiling.
+Only `analysis_run` metadata is excluded from exact SQLite comparisons; every
+other underlying table, ID and source position is compared.
+
+The synthetic benchmark uses 20 translation units, six GCC 13.3 installed C++
+standard headers, one worker, two repetitions and alternating execution order:
+
+```bash
+python3 scripts/bench_system_includes.py \
+  --baseline /tmp/trace-more-baseline-target/release/trace \
+  --candidate target/release/trace --units 20 --repeats 2 --jobs 1 \
+  --layouts middle initializers direct unique shared \
+  --output /tmp/trace-more-range-synthetic.json
+```
+
+`middle` puts a distinct struct before installed headers and a distinct function
+following them. `initializers` puts 512 initialized fields after those headers,
+exercising repeated source-map range selection. The other layouts retain the
+preceding evaluation's controls.
+
+| Layout | Baseline median | Candidate median | Elapsed change | Identical analysis rows |
+|---|---:|---:|---:|---:|
+| Different declarations around headers (`middle`) | 12.641 s | 7.593 s | -39.9% | 46,338 |
+| 512 initialized fields after headers (`initializers`) | 9.252 s | 7.134 s | -22.9% | 46,338 |
+| Direct installed includes (`direct`) | 7.010 s | 6.875 s | -1.9% | 46,338 |
+| Distinct project headers (`unique`) | 7.375 s | 7.145 s | -3.1% | 53,318 |
+| One shared project header (`shared`) | 1.262 s | 1.326 s | +5.1% | 46,668 |
+
+The shared-header control already indexes installed declarations once. Its
+candidate samples are 1.437 / 1.214 s, versus baseline 1.247 / 1.276 s; these
+short, two-sample measurements do not establish an improvement for that layout.
+
+The real-project reproduction selects the first 20 sorted `.cpp` files whose
+paths contain `/test/unittest/ability_manager_service_` and exclude `/mock/`,
+from `ability_ability_runtime` revision
+`6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`. It copies their 312 reachable project
+headers using `IncludeGraph::build` / `reachable_paths`, preserving relative
+paths, and analyzes the resulting 332-file tree with
+`--system-includes --jobs 1 --timeout-secs 180`. Project headers retain their
+bodies; this case uses no dependency-root exclusion.
+
+To isolate the initializer lookup, three alternating passes compare the
+candidate with that lookup left linear against the final candidate. Both
+variants include middle-block reuse and metadata improvements. The linear
+variant takes **39.001 / 39.141 / 39.002 s**; the final variant takes
+**36.414 / 36.561 / 35.727 s**. Their medians are
+**39.002 → 36.414 s
+(6.6% less elapsed time for the lookup fix alone)**.
+All six databases match the original `175c5ba` reproduction database exactly:
+**304,540 analysis rows**, including 14,919 functions, 17,002 call edges and
+14,317 flow facts. This is an ablation comparison, not a measurement of the
+whole patch's speedup against `175c5ba` on this subset.
+
+The full checkout uses the same revision and GCC 13.3 installed headers, with
+`--system-includes --jobs 8 --timeout-secs 1800`. One sequential baseline /
+final-candidate comparison gives:
+
+| Full-project measurement | Baseline | Final candidate |
+|---|---:|---:|
+| End-to-end monotonic elapsed | 913.333 s | 813.536 s |
+| Indexing | 866.1 s | 769.9 s |
+| Preprocessing | 81.0 s | 76.7 s |
+| Shared-header parsing/lowering | 67.3 s | 65.5 s |
+| Initial shared-header merge | 9.2 s | 8.8 s |
+| Orphan-header lowering/merge | 22.2 s | 22.6 s |
+| TU lowering/merge | 583.8 s | 496.4 s |
+| Analysis | 7.6 s | 6.9 s |
+| Export | 36.5 s | 33.9 s |
+| Peak RSS (`/usr/bin/time -v`) | 12,592,636 KiB | 12,624,492 KiB |
+
+This is **10.9% less total elapsed time** and **15.0% less
+TU lowering/merge time** in one comparison. The initial candidate without the
+initializer lookup fix took 898.155 s overall, with a 570.4 s TU phase;
+profiling that result motivated the range lookup change. Preprocessing is
+unchanged by this patch, and its different times show run-to-run variation.
+Repeated TU indexing remains the dominant cost, and the full-project gain is
+smaller than the synthetic middle-block result.
+
+Both full databases pass SQLite `quick_check` and contain **17,108,371 identical
+analysis rows**, comparing every underlying table except `analysis_run`.
+They each export 228,530 functions (159,056 external), 688,883 call edges
+(317,976 direct / 868 indirect / 368,885 external / 1,154 IPC), 442,412 arg-flow
+edges and 412,743 flow facts. Both solvers converge after 466,153 worklist pops
+with `solver_partial = false`. Peak RSS differs by about 31 MiB, approximately
+0.3% of the baseline peak.
+
+Regression coverage compares reused/fresh trees with multiple unchanged middle
+blocks, Unicode/CRLF edits, namespace/scanner-context changes and malformed
+inputs in both grammars. The installed-header fixture checks macro spelling and
+invocation locations, dependency-body suppression and unit ownership with one
+and three workers. IR tests check overload-fact order, sticky constant conflicts,
+constructor metadata and type-ID order across later tag definitions and unions.
+A mapped initializer test retains duplicate start entries, rejects end entries
+and preserves macro provenance. `cargo test --workspace` passes **2,233 tests**;
+formatting and diff checks also pass.
+
+Logs and measurements: `/tmp/trace-more-baseline-isolated-build.log`,
+`/tmp/trace-more-range-build.log`, `/tmp/trace-more-final-tests.log`,
+`/tmp/trace-more-range-synthetic.log`, `/tmp/trace-more-range-synthetic.json`,
+`/tmp/trace-more-range-ability20-{middle,range}-{0,1,2}.log`,
+`/tmp/trace-more-profile-fixed.log`, `/tmp/trace-more-full-baseline.log`,
+`/tmp/trace-more-range-full.log`, `/tmp/trace-more-range-results.json`.
+
+## Template metadata and primitive returns — 2026-10-16
+
+The three preceding system-header performance changes are squashed into one
+commit on `perf/system-includes-preprocessing`. Historical commit IDs in those
+measurements identify pre-squash implementation stages. This follow-up compares
+against the combined implementation after the initializer source-map fix
+(`a679e88` / `adda913`), using a freshly rebuilt saved release executable.
+
+A sampled profile of the 20-file ability-manager reproduction still spends
+substantial time in tree-sitter. Within lowering, repeated template return
+queries rebuild parameter names and scan entire class bodies for aliases. The
+candidate caches only their lexical byte ranges per tree, preserving query
+order and the existing alias-depth limit. Scratch initializer trees receive
+isolated caches, and scratch recovery queries bypass cache retention.
+
+Known primitive-keyword returns skip template ancestry queries. The pinned
+grammar also labels names such as `size_t` as `primitive_type`, so the shortcut
+explicitly matches only `void`, `bool`, `char`, `int`, `float` and `double`.
+Named types and malformed declarations keep the existing path, as do unknown
+base types that must register a substitution-blocking return fact. Virtual-flag
+queries skip the recursive walk only when a well-formed declaration has none
+of `virtual`, `override` or `final` before its body. Contracts:
+[C++ template and virtual support](ANALYSIS.md#c-support-first-step).
+
+The benchmark adds `templates`: each of 20 TUs includes the six installed
+standard headers and declares a class template with aliases and 256 methods.
+Three repetitions alternate baseline/candidate order, with one worker:
+
+```bash
+python3 scripts/bench_system_includes.py \
+  --baseline /tmp/trace-next-baseline --candidate target/release/trace \
+  --layouts templates direct shared --units 20 --repeats 3 --jobs 1 \
+  --output /tmp/trace-next-synthetic.json
+```
+
+| Layout | Baseline median | Candidate median | Elapsed change | Identical analysis rows |
+|---|---:|---:|---:|---:|
+| templates | 7.651 s | 6.569 s | -14.1% | 61,698 |
+| direct | 7.170 s | 6.120 s | -14.6% | 46,338 |
+| shared | 1.297 s | 1.362 s | +5.0% | 46,668 |
+
+The initial short shared-header control shows no improvement; its individual
+samples range from about 1.28 to 1.41 s. A separate seven-pair check with
+`--layouts shared --repeats 7` gives medians of 1.662 s baseline and 1.401 s
+candidate, but wide ranges of 1.365–1.847 s and 1.240–2.127 s respectively.
+All 14 databases contain 46,668 identical analysis rows. These short timings
+are variable, so no stable shared-layout improvement is claimed. The larger
+inline-header layouts show the repeatable gain.
+
+The real reproduction uses the same 20 TUs, 312 reachable project headers,
+revision and options as the preceding section. Three alternating passes give:
+
+| Variant | Samples | Median |
+|---|---|---:|
+| baseline | 37.051 s / 36.213 s / 37.195 s | 37.051 s |
+| candidate | 35.569 s / 35.119 s / 35.477 s | 35.477 s |
+
+This is **4.2% less elapsed time** on the real subset. All six databases
+match the original reproduction baseline: **304,540 identical analysis rows**,
+excluding `analysis_run` metadata. Timed runs use the current release binary,
+Python monotonic elapsed time and no concurrent builds, tests or profiling.
+
+The new regressions cover dependent alias chains, nested scopes, repeated
+queries in successive units, a template parameter named `size_t`, virtual
+modifiers, and distractor keywords in attributes and function bodies.
+`cargo test --workspace` passes **2,235 tests**.
+
+The full checkout uses the same revision, 3,331 TUs, installed GCC 13.3 headers
+and `--system-includes --jobs 8 --timeout-secs 1800` as the preceding full run.
+One further candidate run, compared with that completed baseline, gives:
+
+| Full-project measurement | Combined baseline | Final candidate |
+|---|---:|---:|
+| End-to-end monotonic elapsed | 813.536 s | 760.147 s |
+| Indexing | 769.9 s | 712.4 s |
+| Preprocessing | 76.7 s | 76.6 s |
+| Shared-header parsing/lowering | 65.5 s | 56.9 s |
+| Initial shared-header merge | 8.8 s | 8.3 s |
+| Orphan-header lowering/merge | 22.6 s | 19.6 s |
+| TU lowering/merge | 496.4 s | 455.3 s |
+| Analysis | 6.9 s | 8.0 s |
+| Export | 33.9 s | 36.1 s |
+| Peak RSS (`/usr/bin/time -v`) | 12,624,492 KiB | 12,611,532 KiB |
+
+This is **6.6% less total elapsed time** (13m34s → 12m40s) and **8.3% less
+TU lowering/merge time** in one full-project comparison. Preprocessing is
+nearly equal; memory is essentially unchanged. These are incremental gains
+over the preceding indexing improvements, rather than measurements against
+the parent of the squashed commit.
+
+All **17,108,371 analysis rows are identical**, comparing every underlying
+table except `analysis_run`. Function, edge and flow counts match the preceding
+full run. Both solvers converge after 466,153 worklist pops with
+`solver_partial = false`, and both databases pass SQLite `quick_check`.
+Formatting and diff checks also pass.
+
+Logs and measurements: `/tmp/trace-next-baseline-build.log`,
+`/tmp/trace-next-verified-build.log`, `/tmp/trace-next-verified-tests.log`,
+`/tmp/trace-next-profile.log`, `/tmp/trace-next-synthetic.json`,
+`/tmp/trace-next-shared-control.json`, `/tmp/trace-next-results.json`,
+`/tmp/trace-next-ability20-{baseline,candidate}-{0,1,2}.log`,
+`/tmp/trace-next-full.log`, `/tmp/trace-next-full-results.json`.
+
+## Member classification and spill buffering — 2026-10-16
+
+This comparison starts from `1d47347` (before the follow-up amend), the combined
+implementation measured in the preceding section. A fresh release build is
+saved as `/tmp/trace-further-baseline` before the changes. The same 20-file
+ability-manager reproduction and installed GCC 13.3 headers identify costs
+without running the whole checkout under the debugger.
+
+The profile still spends substantial time in parsing, but also samples spill
+writes and repeated function-versus-field classification in class passes.
+The candidate coalesces spill reads/writes with bounded 256 KiB I/O buffers
+and reuses syntax-only member classifications within the live tree. Contracts:
+[indexing syntax reuse](ANALYSIS.md#indexing-syntax-reuse) and
+[preprocessing pipeline](PREPROCESSOR.md#role-in-the-pipeline).
+
+The classification cache follows the existing per-tree lifetime: scratch
+initializer trees are isolated, recovered declarations use the original walker,
+and the cache is discarded after lowering. Function-pointer fields, nested
+classes, malformed declarations, and macro provenance retain their existing
+rules. Spill encoding and admission budgets are unchanged; the additional I/O
+buffer allocation is bounded per active writer or reader.
+
+Builds and tests finish before timing. Three repetitions alternate
+baseline/candidate order with one worker, using Python monotonic elapsed time.
+Each database comparison includes every underlying analysis table, excluding
+only `analysis_run` metadata.
+
+```bash
+python3 scripts/bench_system_includes.py \
+  --baseline /tmp/trace-further-baseline --candidate target/release/trace \
+  --layouts templates direct initializers shared --units 20 --repeats 3 --jobs 1 \
+  --output /tmp/trace-further-synthetic.json
+```
+
+| Layout | Baseline median | Candidate median | Elapsed change | Identical analysis rows |
+|---|---:|---:|---:|---:|
+| templates | 6.986 s | 6.911 s | -1.1% | 61,698 |
+| direct | 6.430 s | 6.552 s | +1.9% | 46,338 |
+| initializers | 7.569 s | 7.493 s | -1.0% | 46,338 |
+| shared | 1.405 s | 1.353 s | -3.7% | 46,668 |
+
+These small synthetic changes are mixed and close to run-to-run variation;
+no broad improvement is claimed for every installed-header layout. The real
+20-TU reproduction uses the same 312 project headers, revision and options as
+before. Three alternating repetitions give:
+
+| Variant | Samples | Median |
+|---|---|---:|
+| baseline | 39.283 s / 38.001 s / 38.845 s | 38.845 s |
+| candidate | 37.617 s / 37.491 s / 38.134 s | 37.617 s |
+
+The real subset takes **3.2% less elapsed time** at the median. All six
+databases contain **304,540 identical analysis rows**. This is a modest
+incremental improvement over the preceding changes. `cargo test --workspace`
+passes **2,235 tests**, including existing pointer-member, template, recovery,
+initializer, parallel indexing and spill/reload regressions.
+
+A separate trial of a faster private macro lookup table produced only a
+0.6% median improvement on the subset in three paired runs, with overlapping
+sample ranges. That trial was discarded; the retained changes are the two
+optimizations described above.
+
+A fresh sequential full-project baseline/candidate pair uses the unchanged
+`ability_ability_runtime` checkout at
+`6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`, all 3,331 TUs, installed GCC 13.3
+headers, and `--system-includes --jobs 8 --timeout-secs 1800`:
+
+| Full-project measurement | Fresh baseline | Retained candidate |
+|---|---:|---:|
+| End-to-end monotonic elapsed | 783.361 s | 757.319 s |
+| Indexing | 738.6 s | 711.1 s |
+| Preprocessing | 77.4 s | 71.8 s |
+| Shared-header parsing/lowering | 61.5 s | 57.0 s |
+| Initial shared-header merge | 7.2 s | 7.0 s |
+| Orphan-header lowering/merge | 18.7 s | 19.8 s |
+| TU lowering/merge | 468.2 s | 451.2 s |
+| Analysis | 7.5 s | 7.2 s |
+| Export | 34.1 s | 35.9 s |
+| User CPU (`/usr/bin/time -v`) | 3,171.92 s | 3,132.70 s |
+| System CPU (`/usr/bin/time -v`) | 297.66 s | 212.32 s |
+| Peak RSS (`/usr/bin/time -v`) | 12,650,500 KiB | 12,635,672 KiB |
+
+This pair takes **3.3% less total elapsed time** (13m03s → 12m37s), including
+**3.6% less TU lowering/merge time** and **7.2% less preprocessing time**.
+Peak memory is essentially unchanged. These measurements come from one fresh
+full-project pair, not a repeated full-project median. The earlier section's 760.147 s baseline
+measurement is from a different run; the new pair measures both binaries again
+to avoid treating that historical timing as the current baseline. Parallel
+discovery discards 343 speculative runs in the baseline and 381 in the candidate;
+both settle 2,443 units, with deterministic analysis output.
+
+All **17,108,371 analysis rows are identical**, excluding `analysis_run`.
+Both solvers converge after 466,153 worklist pops with `solver_partial = false`,
+and both databases pass SQLite `quick_check`. Both export the same 228,530
+functions, 688,883 call edges, 442,412 arg-flow edges and 412,743 flow facts.
+Formatting and diff checks pass.
+
+Logs and measurements: `/tmp/trace-further-baseline-build.log`,
+`/tmp/trace-further-retained-build.log`, `/tmp/trace-further-verified-tests.log`,
+`/tmp/trace-further-profile.log`, `/tmp/trace-further-synthetic.json`,
+`/tmp/trace-further-results.json`,
+`/tmp/trace-further-ability20-{baseline,candidate}-{0,1,2}.log`,
+`/tmp/trace-further-paired-full-{baseline,candidate}.log`,
+`/tmp/trace-further-paired-full-results.json`.
+
+## Shared system header units — 2026-10-16
+
+This follow-up compares the consolidated `ad5679b` implementation (saved as
+`/tmp/trace-header-units-baseline`) with shared installed-header expansion and
+IR units. Both use release builds and the installed GCC 13.3 headers. Builds,
+tests and profiling finish before timing; three repetitions alternate binary
+order, with one indexing worker. The caches are rebuilt for every invocation.
+The [cache contract](PREPROCESSOR.md#shared-system-header-bundles) defines
+admission, prerequisites and inline fallbacks; [Shared header functions](ANALYSIS.md#shared-header-functions)
+defines declaration merging and its existing approximations.
+
+Previously, ordinary indexing admitted only discovered project/dependency
+headers to the expansion cache, and its suffix check excluded extensionless
+standard headers. Cached raw tokens and reused syntax still left repeated
+expansion and lowering work. The direct-include reproduction now builds six
+shared system units for `<string>`, `<memory>`, `<vector>`, `<functional>`,
+`<map>` and `<algorithm>`, instead of lowering their declarations in each TU.
+Nested external implementation fragments stay within their enclosing bundle.
+
+| Reproduction | Baseline samples | Candidate samples | Baseline median | Candidate median | Elapsed reduction |
+|---|---|---|---:|---:|---:|
+| 20 TUs, direct standard includes | 6.769 / 6.479 / 6.613 s | 1.440 / 1.503 / 1.391 s | 6.613 s | 1.440 s | 78.2% (4.6×) |
+| 20 ability-manager TUs, 312 project headers | 38.080 / 36.635 / 39.026 s | 32.727 / 30.075 / 29.892 s | 38.080 s | 30.075 s | 21.0% (1.3×) |
+
+The real subset is copied from `ability_ability_runtime` revision
+`6c18fdc9bdef6cfcf5888517cd8ed9448584f6e8`: select the first 20 discovered
+`.cpp` paths containing `/test/unittest/ability_manager_service_` and not
+`/mock/`, then copy their reachable project headers, preserving relative paths.
+The resulting reproduction has 332 files. This is a fresh paired measurement;
+older subset measurements above are historical observations.
+
+In the first synthetic pair, preprocessing falls from 1.9 s to 0.2 s; the
+candidate spends 0.5 s building its six shared header units. In the first real
+pair, shared-header lowering falls from 5.6 s to 4.8 s while preprocessing
+changes from 3.8 s to 5.1 s. The conservative
+context fallback means the real project does not share every installed include.
+
+Reproduce the direct-include timing and behavioral comparison with:
+
+```bash
+python3 scripts/bench_system_includes.py \
+  --baseline /tmp/trace-header-units-baseline --candidate target/release/trace \
+  --layouts direct --units 20 --repeats 3 --jobs 1 --comparison semantic \
+  --output /tmp/trace-header-units-direct.json
+```
+
+The semantic comparison checks definitions, original call/expansion positions,
+call targets, argument flow, value-flow edges and operation origins. It
+normalizes entity IDs, parameter IDs and numeric synthetic-variable suffixes;
+it excludes unused dependency declarations and metadata. The synthetic pair
+has **440 identical normalized behavior rows** (20 project definitions,
+120 sites, 120 call edges, 80 argument edges and 100 value-flow edges).
+It gains 30 dependency declarations for internal `__gthread_*` functions;
+entity numbering and dependency parameter metadata also change.
+
+The real subset is **not semantically identical to the old output**. Its
+parse diagnostic rows change from 109 to 70 as different variants are lowered.
+For example, duplicate `std::GetDomainName0` definitions disappear while the correctly scoped
+`OHOS::AAFwk::GetDomainName0` remains. Parameter/type metadata and direct-call
+classification also change when declarations are imported from shared units.
+Two extra `GetDescriptor` definitions disappear from the old warm-header
+variants: neither expanded definition occurs in the consuming TU dumps, and
+neither has callers. A dedicated regression verifies that consumed
+macro-defined project methods still retain their definitions and caller edges.
+The counts are recorded explicitly rather than presented as exact equivalence:
+
+| Real-subset data | Baseline | Candidate |
+|---|---:|---:|
+| Functions | 14,919 | 14,570 |
+| Call sites | 18,937 | 19,273 |
+| Call edges | 17,002 | 17,339 |
+| Argument-flow edges | 6,058 | 6,478 |
+| Value-flow edges | 18,743 | 20,671 |
+| Flow-origin rows | 10,739 | 11,649 |
+
+Separately, exact comparisons of every candidate analysis table, excluding
+`analysis_run`, pass between `--jobs 1` and `--jobs 3`: **46,678 rows** for the
+synthetic project and **288,415 rows** for the real subset. This checks
+scheduling determinism, including IDs and source locations. The workspace
+suite passes **2,249 tests**. The new tests cover extensionless headers,
+C/C++ variants, shared guarded fragments with different prior declaration
+variants, prior declarations without an include, opposite include orders, cache
+caps, incoming project typedefs, scoped/unbalanced includes, continued
+class/initializer declarations,
+conditional recording, macro provenance, ordered header-adoption history and
+nested provisional journal handles. Declaration-key tests also distinguish
+macro compatibility from declaration identity and retain original positions
+while ignoring intern-table numbering.
+
+Compilation-database indexing and conditional recording/exploration keep
+inline system headers. These measurements establish no speedup for those
+paths, for system includes after project declarations, or for persistent reuse
+between separate analysis invocations.
+
+Three GDB snapshots of the small real reproduction found two samples in
+function-signature lowering and one in temporary spill-buffer allocation.
+The arity-only template-return query now counts fixed parameters without
+resolving reference aliases or constructing reference-parameter metadata.
+An exact before/after comparison of this additional optimization preserves
+all **324,574 analysis rows** at that intermediate stage, before narrowing the
+project-header key. No isolated timing percentage is claimed for it.
+
+Measurement artifacts: `/tmp/trace-header-units-{small,ability20}-boundary-final-results.json`,
+`/tmp/trace-header-units-{small,ability20}-boundary-final-{baseline,candidate}-{0,1,2}.db.log`,
+`/tmp/trace-header-units-cpu-{0,1,2}.log`, and
+`/tmp/trace-header-units-boundary-tests.log`.
+
+### Full checkout
+
+The unchanged full checkout at the revision above contains 3,331 TUs. The
+baseline and final candidate use `--system-includes --jobs 8
+--timeout-secs 1800`, with builds, tests and profiling outside the timed runs.
+These are one fresh baseline and one final-candidate observation, not repeated
+full-project medians. Elapsed times use Python's monotonic clock; phase times
+are the CLI's wall times. CPU and peak RSS come from `/usr/bin/time -v`.
+
+| Full-project measurement | Baseline | Final candidate |
+|---|---:|---:|
+| End-to-end monotonic elapsed | 824.590 s | 753.475 s |
+| Indexing | 772.7 s | 709.3 s |
+| Preprocessing | 101.3 s | 83.4 s |
+| Shared-header parsing/lowering | 56.2 s | 20.6 s |
+| Initial shared-header merge | 8.0 s | 7.0 s |
+| Orphan-header lowering/merge | 19.9 s | 19.5 s |
+| TU lowering/merge | 480.2 s | 490.8 s |
+| Analysis | 9.1 s | 8.5 s |
+| Export | 38.2 s | 32.8 s |
+| User CPU | 3,137.25 s | 3,154.14 s |
+| System CPU | 326.85 s | 173.02 s |
+| Peak RSS | 12,631,556 KiB | 6,799,108 KiB |
+
+Total elapsed falls **8.6%** (13m45s → 12m33s) and peak RSS falls **46.2%**
+(about 12.0 GiB → 6.5 GiB). Shared-header construction is much faster, and
+system CPU falls 47.1%; user CPU is essentially unchanged. TU lowering/merge
+remains the largest cost and is slightly slower in this pair. Thus this is
+not a uniform speedup of every phase, and shared header storage does not
+eliminate each TU's semantic lowering and merging work.
+
+An initial safety prototype attached the complete incoming system context to
+existing project-header cache entries too. That implementation took
+1,008.248 s overall, including 693.3 s in TU lowering/merge, and was rejected.
+The retained implementation applies that new key to system bundles and keeps
+the existing project-header policy, with exact owner prerequisites for explicit
+system includes. Declaration identity is independent of macro-read history.
+These distinctions avoid unnecessary cache variants without weakening the
+new system-bundle checks; their authoritative rules are in the cache contract.
+
+As with the real subset, the final full output differs from the old output:
+
+| Full-project data | Baseline | Final candidate |
+|---|---:|---:|
+| Functions | 228,530 | 219,235 |
+| Project function definitions | 69,474 | 70,409 |
+| Variables | 8,710,937 | 6,205,163 |
+| Call sites | 695,425 | 740,023 |
+| Call edges | 688,883 | 737,872 |
+| Argument-flow edges | 442,412 | 499,004 |
+| Value-flow edges | 754,776 | 1,062,469 |
+| Flow-origin rows | 333,648 | 480,261 |
+
+Both databases pass SQLite `quick_check`; both solvers converge with
+`solver_partial = false` (466,153 baseline / 613,374 candidate worklist pops).
+The last boundary safeguard preserves **all 15,094,461 analysis rows** of the
+preceding full candidate, excluding only `analysis_run`. The corresponding
+exact before/after checks also preserve all 46,678 synthetic and 288,415
+real-subset rows. These checks establish that the safeguard changes none of
+these corpora's indexed output; they do not assert equivalence with the old
+baseline. Formatting and diff checks pass.
+
+Full artifacts: `/tmp/trace-header-units-full-retained-baseline.{log,time,db}`,
+`/tmp/trace-header-units-full-boundary-candidate.{log,time,db}`,
+`/tmp/trace-header-units-full-boundary-results.json`, and
+`/tmp/trace-header-units-final-verification.json`. The intermediate full
+candidate used for the exact safeguard comparison is
+`/tmp/trace-header-units-full-retained-candidate.db`.
+
+
+## Shared header preambles and default-mode correction — 2026-10-16
+
+This follow-up compares against `cd81dd6` for installed-header indexing and
+against its parent `f9ac344` for default indexing. The source corpus and
+compiler header installation are those in the preceding system-header report.
+See [Shared header functions](ANALYSIS.md#shared-header-functions) for the
+sharing contract and its remaining per-consumer context cloning.
+
+The default-mode regression was reproduced on the 20-TU ability subset:
+three alternating observations gave medians **5.980 s** at `f9ac344` and
+**7.588 s** at `cd81dd6`. System-header separation had been enabled internally
+without checking whether any system search paths were requested. Its nested
+cached-header bookkeeping then ran on project-only headers too. Gating it on
+actual system-header options restores the original default cache behavior.
+
+Dependency metadata was also duplicated extensively: the preceding full
+installed-header database contains 2,703,338 dependency global-variable rows
+and 1,021,134 dependency parameter rows. These are actual exported rows, not
+estimates from source size. Reusing dependency declaration identities removes
+this duplication; file-static objects and project function body bindings retain
+their existing ownership.
+
+A leading-only combined-header prototype was measured and replaced: on the
+20-TU subset its median was 31.908 s against 32.204 s, too small a difference to
+support a useful speedup claim. The final approach reuses assembled preambles
+and their common prefixes while preserving the original header merge order.
+Measurements below use release binaries built before timing; builds, tests
+and timed analyses run separately. Elapsed time uses `time.monotonic()` and
+phase logs; peak RSS uses `/usr/bin/time -v`.
+
+### Small projects and default-mode timing
+
+Three alternating pairs, jobs=1, using the same retained projects as the
+preceding report:
+
+| Workload | Reference median | Candidate median | Interpretation |
+|---|---:|---:|---|
+| Direct standard includes, 20 TUs (`cd81dd6`) | 1.568 s | 1.292 s | 17.6% faster |
+| Ability subset, 20 TUs (`cd81dd6`) | 32.210 s | 31.849 s | 1.1% faster; a modest difference |
+| Ability subset, default (`f9ac344`) | 5.874 s | 6.056 s | 3.1% slower in this sample; near the timing spread |
+
+Raw elapsed samples (reference / candidate): direct includes
+`1.568, 1.695, 1.468 / 1.601, 1.210, 1.292`; installed-header ability subset
+`35.325, 32.210, 31.027 / 31.849, 32.180, 31.609`; default subset
+`5.977, 5.857, 5.874 / 5.962, 6.462, 6.056` seconds.
+Median peak RSS is respectively 76,100 -> 76,304 KiB,
+708,292 -> 706,504 KiB, and 134,464 -> 138,080 KiB. The small/subset runs do
+not establish a meaningful memory reduction.
+
+All three default pairs have **211,429 exactly identical analysis rows**
+against `f9ac344`, excluding run metadata. Both installed-header workloads have
+identical normalized behavior against `cd81dd6`: 440 rows for direct includes
+and 77,804 for the ability subset. Candidate jobs=1/jobs=3 comparisons are
+exact across 39,139 and 275,579 analysis rows respectively. The ability subset's
+global records drop from 11,785 to 5,989 and parameter records from 20,623 to
+17,048; project function definitions, calls, argument flow, value flow and
+operation origins retain the same normalized behavior.
+
+One full-checkout default observation per binary, jobs=8, measures
+**83.058 -> 80.355 s** (3.3% faster), with peak RSS
+**1,454,188 -> 1,508,776 KiB** (3.8% higher). This is a single pair, not a median.
+The former 27% subset slowdown is no longer reproduced; the remaining small
+variations should not be presented as a reliable default-mode speedup.
+
+The full default databases are not byte-for-byte equivalent. Every function
+definition and definition signature is preserved, while declarations change
+from 13,895 to 13,817 and call edges from 676,578 to 676,605. Most removed entries
+are prototypes that now join surviving definitions. One retained prototype
+qualifies `AppExecFwk::AbilityInfo` as `OHOS::AppExecFwk::AbilityInfo`. Calls on
+`contextConfig` in `ets_agent_extension.cpp` previously had no target; the
+candidate identifies `OHOS::AppExecFwk::Configuration` and records the external
+`GetName`, `CompareDifferent` and `Merge` declarations. These are resolution
+differences, not missing function bodies. Full edge comparisons follow below.
+
+The full default edge audit finds 77 additional defined-call relations and
+one removed relation. The removed relation is a false overload alternative:
+`GetWantExecuteCB` passes an `AsyncCallbackInfo*` at
+`napi_common_ability_execute_utils.cpp:811`; the reference also selected
+`CheckAbilityType(const CBBase*)` and an `AsyncJSCallbackInfo*` prototype.
+The candidate selects the exact `AsyncCallbackInfo*` overload defined in
+`napi_common_ability_wrap_utils.cpp:137`. The two removed call-site records
+are those extra overload alternatives at the same syntactic invocation.
+All 355,740 default-mode operation origins remain identical.
+
+### Declaration reuse and expansion-cache lifetime
+
+An interim full installed-header comparison, before early cache retirement,
+measured **812.655 -> 790.582 s** and **6,796,920 -> 6,777,128 KiB RSS**.
+That is only a 2.7% elapsed reduction and essentially unchanged peak memory,
+well below the initial 15–30% time projection. These are single observations,
+not repeated full-project medians.
+
+The interim candidate reduces variables from 6,205,163 to 3,131,703:
+globals 4,448,256 -> 1,745,952 and parameters 1,157,602 -> 786,446.
+Full normalized comparisons retain all 70,409 project definitions,
+740,023 call sites, 737,872 call edges and 480,261 operation origins.
+The 1,062,469 -> 1,062,457 exported flow edges represent the same
+**704,841 normalized value-flow relations**; duplicate relations disappear
+when equivalent dependency declaration variables share identity.
+Both databases pass `quick_check` and complete the solver.
+
+A separate Linux/glibc observer run diagnoses the unchanged memory peak.
+It samples existing progress messages and stops after the first source TU;
+its elapsed times are not benchmark results.
+
+| Diagnostic boundary | RSS, KiB | Allocated heap, KiB |
+|---|---:|---:|
+| Header warm pass complete / TU preprocessing starts | 2,619,792 | 2,590,904 |
+| TU preprocessing complete | 4,433,200 | 4,000,225 |
+| Header IR complete | 6,328,112 | 6,236,742 |
+| Initial header merge complete | 6,352,944 | 6,287,309 |
+| First TU, after the previous late expansion-cache release | 3,490,924 | 3,059,816 |
+
+The cache's expanded payloads overlap the lowered header IR during the peak.
+The final implementation settles standalone headers before header lowering,
+then drops cache keys with no planned consumer and releases each remaining key
+after its last selected language/variant has been lowered. Variant indices
+are never compacted. Reclamation is batched, with idle-boundary trims after
+at least 32 MiB of expansion text retires. Exploration and unsettled inputs
+keep the original lifetime; see the [cache contract](PREPROCESSOR.md#shared-system-header-bundles).
+The later AST order and preprocessing results remain the same.
+
+### Final cache-retirement measurements
+
+The final full-checkout installed-header run (3,331 TUs, jobs=8) took
+**833.350 s**, with **5,014,036 KiB peak RSS**. Against the earlier `cd81dd6`
+observation of 812.655 s and 6,796,920 KiB, that is **26.2% lower peak memory**
+(6.48 -> 4.78 GiB) and **2.5% longer elapsed time**. These are single observations
+from separate runs; they establish a substantial memory reduction but do not
+establish an overall speedup. The unchanged preprocessing stage itself varied
+from about 85–90 s in earlier runs to 104.9 s in this run. Final indexing took
+789.7 s, analysis 9.2 s and export 31.8 s. Per-TU context copying and lowering
+remain major costs; this change does not implement a fully borrowed, immutable
+system-header symbol table.
+
+Three alternating release-binary pairs isolate the last cache-lifetime change
+against the declaration-sharing candidate, with jobs=1:
+
+| Workload | Before retirement | Final median | Peak RSS before -> final, KiB |
+|---|---:|---:|---:|
+| Direct standard includes, 20 TUs | 1.303 s | 1.224 s | 76,348 -> 75,592 |
+| Ability subset, system includes, 20 TUs | 32.287 s | 32.447 s | 706,748 -> 675,428 |
+
+All three pairs have exactly identical analysis data: 39,139 rows for the
+small project and 275,579 for the ability subset. Final jobs=1/jobs=3 comparisons
+also match exactly on both workloads. Against `f9ac344`, the final default-mode
+subset medians are 5.995 -> 6.159 s, with 211,429 exactly identical analysis
+rows in every pair; this small difference remains within the observed spread.
+A later single full-default observation took 93.988 s, so the earlier 80.355 s
+observation alone was insufficient to dismiss the reported regression.
+A fresh release rebuild of `f9ac344` followed by two alternating full-project
+pairs produced these final confirmation samples (jobs=8):
+
+| Binary | Elapsed samples, s | Median, s | Median peak RSS, KiB |
+|---|---|---:|---:|
+| Default reference, `f9ac344` | 91.540, 99.393 | 95.466 | 1,453,028 |
+| Final candidate | 82.819, 100.101 | 91.460 | 1,512,324 |
+
+The candidate median is 4.2% lower, with 4.1% higher default-mode peak memory.
+The reported default timing regression does not reproduce in this paired
+confirmation. The wide sample spread still precludes a strong speedup claim;
+comparisons against historical runs in a different session are especially noisy.
+Both final full-default repeats have **7,123,840 exactly identical analysis
+rows**, excluding run metadata; the reference repeats match across 7,124,080.
+Both binaries pass SQLite `quick_check`. A fresh definition comparison preserves
+all **68,644** project definitions and their signatures exactly. The declaration
+and call-resolution differences are the audited changes described above.
+
+Validation for the final implementation: **2,257 workspace tests pass**,
+including tests for declaration parameter reuse, dependency globals, bounded
+preamble admission, consumed C/C++ variants, cross-TU callback flow, and
+standalone-header macro source positions. Formatting and whitespace checks
+pass. Library clippy checks for `trace-ir` and `trace-parse` pass with the two
+pre-existing `nonminimal_bool` and `collapsible_match` warnings allowed.
+
+To reproduce on an existing checkout with separately built binaries (use a
+watchdog long enough for the full installed-header run):
+
+```bash
+python3 scripts/bench_system_includes.py --baseline /path/to/baseline/trace \
+  --candidate target/release/trace --project /path/to/ability_ability_runtime \
+  --jobs 8 --repeats 3 --timeout 1800 --comparison semantic \
+  --output target/system-includes-comparison.json
+python3 scripts/bench_system_includes.py --baseline /path/to/default-baseline/trace \
+  --candidate target/release/trace --project /path/to/ability_ability_runtime \
+  --no-system-includes --jobs 8 --repeats 3 --timeout 600 \
+  --comparison semantic --output target/default-comparison.json
+```
+
+The semantic check normalizes IDs and ignores unused declaration metadata;
+it is narrower than the full definition/flow audits above. Use
+`--comparison exact` when comparing worker counts or cache-lifetime changes that must retain
+every analysis row. The benchmark excludes database comparison time from each
+analysis sample.
+
+## Preamble admission from settled TU metadata — 2026-10-17
+
+This follow-up starts from `180268d`, with the same pinned full ability-runtime
+checkout and installed compiler headers as the preceding report. Fresh release
+binaries are built before timing. Analysis runs, builds, tests and debugger
+sampling run separately. The final candidate retains ordinary whole-input
+parsing and per-TU mutable declaration contexts; it does not introduce a fully
+borrowed symbol table or choose project definitions from a representative TU.
+
+### Overall results of the squashed optimization series
+
+The squashed change includes token and expansion caching, syntax reuse,
+declaration-unit and preamble reuse, cheaper imports and lowering, compact
+source-map spills, and earlier expansion-cache retirement. Its scope is larger
+than the metadata-admission follow-up measured below.
+
+Across historical completed runs on the pinned 3,331-TU checkout with installed
+system headers and eight workers, elapsed time changes from **1,020.1 s to
+754.282 s** (roughly **26% less time**, or **1.35x speedup**) and peak RSS from
+**12.04 GiB to about 4.85 GiB** (roughly **60% less memory**). This is an
+approximate historical comparison, not a controlled original-to-final benchmark:
+the early completed run already includes initial optimizations and brief GDB
+attachments, and output also changes during the series as documented above.
+The original unoptimized full-project runs timed out, so their complete runtime
+and the exact cumulative speedup remain unmeasured. Incremental percentages
+from different comparisons must not be added together.
+
+The final incremental pair below measures **3.1% less total time** with identical
+analysis data and essentially unchanged peak memory. Default-mode comparisons
+do not establish a reliable speedup or reproduce the earlier substantial
+regression. These measurements precede the rebase onto local `master`; no
+benchmarks were rerun for the rebase or this documentation update.
+
+### Investigation and retained changes
+
+A diagnostic 20-TU sample takes the first 20 lexically sorted `.cpp` files in
+`services/abilitymgr/src` and all 184 headers under `services/abilitymgr`.
+The run reaches 158 project headers and lowers 26 standalone headers.
+The initial scoped probe records 0.713 s assembling missing preambles,
+0.080 s cloning complete cached preambles, 0.873 s importing types (nested
+inside merges), and 10.117 s in source parsing/lowering. A later diagnostic
+separates 6.651 s of normalization/parsing and 3.709 s of AST lowering.
+These are diagnostic summed scopes, not independent end-to-end benchmark
+samples; prefix copies are included in preamble assembly. The sample includes
+header and standalone-header work and should not be extrapolated directly to
+all 3,331 TUs. See [subphase timing instructions](MEMORY_PROFILE.md#indexing-subphase-timings).
+
+A bounded exact whole-input syntax cache has no hits on the real sample.
+An experimental cache of namespace/declaration syntax blocks preserves all
+247,001 analysis rows but makes the three-pair median **19.886 -> 20.648 s**
+(3.8% slower). That experiment is removed. The final change instead improves
+admission to the existing assembled-declaration cache: settled per-TU metadata
+selects recurring complete preambles and shared ordered prefixes, under the
+same 16-snapshot limit. It avoids retaining one-off combinations and admits
+useful prefixes shorter than the previous 32-unit checkpoint interval.
+Planning reads resident include/variant metadata without loading spilled text.
+The [sharing contract](ANALYSIS.md#shared-header-functions) remains authoritative.
+
+The candidate also fingerprints each interned path/macro name once per system
+bundle, rather than hashing full paths at every mapped token, and uses shared
+type-descriptor identity in ordinary TU imports while retaining canonical tag
+completion and aggregate-layout checks. No-dependency indexing skips planning.
+Conditional recording/exploration retain their existing admission path.
+
+### Small-project comparisons
+
+Three alternating pairs, jobs=1; all underlying analysis tables are compared
+exactly, excluding run metadata:
+
+| Workload | Reference median, s | Candidate median, s | Exact analysis rows |
+|---|---:|---:|---:|
+| Direct standard includes, 20 TUs | 1.246 | 1.183 | 39,139 |
+| Ability subset, system includes, 20 TUs | 20.053 | 19.377 | 247,001 |
+| Ability subset, default mode, 20 TUs | 2.338 | 2.392 | 160,706 |
+
+The installed-header samples improve by 5.1% and 3.4%, respectively. The
+2.3% default median increase is small relative to its observed spread
+(reference 2.256–2.356 s; candidate 2.299–2.804 s); it does not establish a
+reliable default-mode slowdown or speedup. Median RSS is 75,636 -> 75,888 KiB
+for direct includes, 669,148 -> 669,444 KiB for the ability system subset,
+and 87,016 -> 87,328 KiB for the default subset. There is no meaningful
+small-project memory change. All three pairs match exactly on every workload.
+
+Validation: **2,261 workspace tests pass**. New tests cover admission after
+one-off combinations, useful short prefixes, independence from pointer
+allocation order, bounded selection, native-ID/lookup preservation, and macro
+fingerprint identity across intern-table permutations. Formatting, whitespace
+checks and parser/preprocessor library clippy pass (with the same two
+pre-existing clippy warnings allowed as in the preceding report).
+
+### Full-checkout confirmation
+
+One sequential reference/candidate pair, jobs=8, on all **3,331 TUs**:
+
+| Measurement | Reference `180268d` | Candidate |
+|---|---:|---:|
+| End-to-end monotonic elapsed | 778.700 s | 754.282 s |
+| Indexing | 734.7 s | 709.4 s |
+| TU preprocessing | 86.2 s | 79.2 s |
+| Header lowering / admission planning | 25.1 s | 26.4 s |
+| Initial shared-header merge | 7.8 s | 8.4 s |
+| Standalone-header lowering/merge | 19.5 s | 19.4 s |
+| TU lowering/merge | 501.1 s | 486.4 s |
+| Analysis | 7.8 s | 7.4 s |
+| Export | 33.8 s | 34.9 s |
+| Peak RSS | 5,072,156 KiB | 5,081,520 KiB |
+
+This pair saves **24.4 seconds (3.1%)** overall; RSS changes by **0.2%** and
+remains about 4.84–4.85 GiB. It is an incremental gain, not the initially
+projected large reduction from a fully borrowed declaration table. Full-project
+timings are single observations; the repeated subset measurements above have
+narrower scope. Historical full runs in different sessions are not substituted
+for this paired reference.
+
+Every underlying analysis table is exactly identical across **11,642,284 rows**,
+excluding `analysis_run` metadata. Both databases pass SQLite `quick_check`, and
+both solvers converge after **613,376 worklist pops**, with `solver_partial=false`.
+Counts remain 219,235 functions, 3,131,703 variables, 740,023 call sites,
+737,872 call edges, 499,004 argument-flow edges and 480,261 operation origins.
+
+A further full-checkout default-mode pair (jobs=8) gives **89.006 -> 89.549 s**
+(0.6% longer in this observation) and **1,504,060 -> 1,492,116 KiB RSS**.
+All **7,123,840 analysis rows match exactly**; both integrity checks pass and
+both solvers converge after 717,534 pops. Together with the repeated subset
+samples, this does not reproduce the earlier substantial default regression.
+It also does not establish a default-mode speedup.
+
+The final candidate's jobs=1/jobs=3 ability-subset outputs match across all
+247,001 rows. The optional diagnostic flag preserves those same rows. Its
+scope counts show header declaration imports decreasing from 702 to 672 on the
+sample, and complete-preamble copies from nine to zero (prefix copies remain
+inside assembly). These counts describe avoided work; diagnostic scope times
+are not used as independent benchmark samples.
+
+Reproduce comparisons using `scripts/bench_system_includes.py --project PATH`
+with `--comparison exact`, adding `--no-system-includes` for the default check.
+Use prebuilt reference/candidate release binaries, jobs=8 and a 1,800-second
+watchdog for the full installed-header run. Retained local artifacts are under
+`target/perf-shared/`: `planned-ability20.json`, `final-direct.json`,
+`final-default.json`, `final-full.json`, `final-fulldefault.json`,
+`verification.json`, and the corresponding per-run logs/databases. The helper
+excludes database-comparison time from each elapsed analysis sample.
+
+
+### Review corrections and validation — 2026-10-19
+
+A malformed installed header (`#pragma once`, then
+`struct Broken { int value = ; };` and `void Api();`) exposed a missing
+parser warning when expansion caching separated its declaration unit. The
+new regression test passes with caching disabled and initially failed with
+`max_expansion_variants = 8`. Final dependency-header imports now preserve
+its diagnostics through the ordinary remapping/deduplication helper, without
+copying reports into each consuming TU's preamble. The test covers two TUs,
+one and three workers, cached/inline parsing, and exactly one cached-header
+warning. A merge unit test checks file-ID remapping and report deduplication.
+
+The syntax-reuse source-location test now canonicalizes its expected header
+path, matching macOS's `/var` to `/private/var` resolution. All 17 affected
+parser/CLI integration tests pass on Linux with `TMPDIR` pointing through a
+symlink. Native macOS confirmation remains for CI. The all-feature workspace
+suite passes 2,295 tests; strict all-target, all-feature workspace Clippy,
+formatting and whitespace checks pass. No benchmarks were rerun; the timings
+and exact-row comparisons above describe their recorded versions, before
+this diagnostic correction.
+
+
+### Further review: error recovery and libc++ bundle boundaries — 2026-10-19
+
+Review on macOS 27 with Apple clang/Xcode SDK found that incremental
+Tree-sitter error recovery can change syntax outside an ERROR node relative
+to a fresh parse. Dynamic TU-to-worker assignment therefore made the previous
+worker tree an unsafe predecessor for malformed inputs. Indexing now rejects
+error-containing predecessors, retries an incremental result containing errors
+with a fresh parse, and retains only error-free trees. Large-input C/C++ tests
+compare full node structure, coordinates and S-expressions against fresh
+parsing. The authoritative rule is in
+[Indexing syntax reuse](ANALYSIS.md#indexing-syntax-reuse).
+
+The same review found libc++ cleanup `_Pragma` operators reached boundary
+tracking as ordinary syntax. A later re-review confirmed the fix enables
+`<optional>` and `<tuple>` to share. Its initial attribution of the `<string>`
+miss to `_Pragma` alone was corrected: larger closures also encounter the
+existing guardless-header expansion limit, as detailed in the 2026-10-23
+correction below. `_Pragma` now
+expands/destringizes its operand, uses shared directive handling, and is
+removed before scope tracking. `once` and `weak` retain the directive's
+semantics; other pragmas, including macro push/pop, retain the documented
+ignore policy. A toolchain-independent fixture checks a macro-cleanup suffix,
+a following system include, frozen replay, dependency prerequisites and
+worker-count independence.
+
+The reviewer reported these pre-correction release observations on the same
+pinned ability-runtime checkout (seconds; macOS memory is footprint):
+
+| Workload | Base | Head | Qualification |
+|---|---|---|---|
+| Full default, jobs=8 | 78.6 | 63.4 | Base contended by another build; excluded from speedup claims |
+| Full default, jobs=8 | 62.2 | 61.0 | Clean pair; footprint 1.34 -> 1.36 GB |
+| 20-TU system subset, jobs=1 | 89.8 / 136.3 / 96.7 | 98.5 / 95.8 / 107.8 | Footprint pairs 174 -> 227, 154 -> 196, 131 -> 213 MB |
+| Same subset, timestamped pair | 91.1 | 81.5 | Separate observation |
+
+These observations establish no reliable system-mode time improvement on
+that host; footprint was higher in all three measured subset pairs. About
+46 seconds per subset run was sequential header warming. The full system-mode
+pair was incomplete: the base filled its spill disk after 25 minutes, and
+the head was stopped after 771 seconds of preprocessing. These are environment
+limits, not completed equal-work measurements. They precede the `_Pragma`
+correction and were supplied by the reviewer, not rerun for this update.
+Earlier Linux gains must not be generalized to libc++ or used to predict the
+corrected macOS performance.
+
+`TRACE_PROFILE_INDEX` now reports per-run refused system-bundle attempts for
+preceding declarations, project preambles, unsafe boundaries and variant caps.
+An include's eligibility is computed once, with canonical system roots and
+current-file classification prepared outside that check. Own-header-first
+layouts still conservatively retain later system headers inline: relaxing
+that gate requires preserving project declaration context and include-order
+imports. Skipping repeated preamble entity merges and compacting/revalidating
+the raw-token cache remain separate structural work, with no performance gain
+claimed here. See the [diagnostic counter contract](MEMORY_PROFILE.md#indexing-subphase-timings).
+
+Validation on Linux: `cargo test --offline --workspace --all-features` passes
+2,301 tests with no failures or ignored tests. Strict workspace Clippy passes
+for all targets under both default and all features; formatting and whitespace
+checks pass. All 19 affected parser/CLI integration tests also pass with a
+symlinked `TMPDIR` on Linux.
+The new counter tests cover all four refusal reasons and count one decision
+per include; the default-mode case leaves system expansion keys absent.
+The CLI test checks that the profiling report is opt-in. Native macOS SDK
+validation and post-correction performance measurement remain outstanding.
+
+
+### Review correction: header languages and canonical planning paths — 2026-10-19
+
+Header variant selection now rejects a mismatched language before applying
+project-header fallback rules. Previously, a language mismatch became a missing
+variant record and the project-header fallback accepted it. The same predicate
+serves TU preamble selection and header wave dependencies. A unit test checks
+both languages and a path-level header cycle whose C/C++ units must be
+independent; a mixed-language integration test retains both C and C++ API calls
+and their distinct parameter types with one and three workers.
+
+The strict language filter exposed five existing mixed-language integration
+failures: only the preferred-language project-header IR had been lowered, and
+C consumers had implicitly relied on importing that C++ unit. Project headers
+now also lower declaration contexts for other consumed languages. Final merging
+keeps the established preferred-language header bodies authoritative and imports
+supplementary units as declarations, preserving shared-body ownership and
+callback flow. All 1,193 CLI integration tests pass after this correction;
+no test expectations were weakened.
+
+Source preamble planning canonicalizes the source identity before following
+graph edges, matching TU lowering. Header wave scheduling canonicalizes its
+input paths once before building dependency indexes or looking up expansion
+variants. A Unix symlink test checks dependency order against canonical cache
+keys, then verifies that a raw aliased source path selects the same preamble
+key as lowering and fills the planned snapshot. Include provenance is cleared
+in that planning check so graph-only prerequisites cannot be masked by another
+lookup path. The authoritative rules remain in
+[Shared header functions](ANALYSIS.md#shared-header-functions).
+
+No benchmarks were rerun for these corrections; earlier performance and row
+comparisons describe the recorded versions.
+
+Final Linux validation: the all-feature workspace suite passes 2,304 tests with
+no failures or ignored tests. Strict all-target workspace Clippy with all
+features, formatting and whitespace checks pass. The mixed-language body and
+callback regressions retain their original expectations. Native macOS
+confirmation remains for CI.
+Default-feature strict workspace Clippy also passes. With a symlinked
+`TMPDIR`, 20 affected parser/CLI integration tests and 14 header-related unit
+tests pass on Linux, including the explicit symlink scheduling/planning check.
+
+
+### Review correction: orphan-only system variants — 2026-10-19
+
+The focused reproduction uses a warmed default system-header variant and a
+TU defining `SELECT=1`. An unreferenced project header consumes the default
+variant and calls `Make()->Run()`. Before this correction, cache capacity 8
+loses the `Orphan -> Default::Run` edge without diagnostics, while capacity 0
+resolves it. The first regression run reproduced that failure with one worker.
+
+Orphan preprocessing now precedes final variant selection. The lowering plan
+combines existing TU provenance with settled orphan replay records and closes
+both over nested variants. Newly needed header paths and orphan graph edges
+are registered before ordering the complete plan and calculating expansion
+consumers. This avoids rescanning TU include payloads to collect orphan edges.
+Cache retirement still requires all source/orphan preprocessing to succeed.
+
+Standalone orphan bodies also import cached function prototypes, including
+return types, instead of receiving only type layouts because of their header
+extension. Merely lowering the missing variant was insufficient for the
+`Make()` receiver shape without that declaration import. Cached header units
+retain their existing nested types-only path. The contracts are in
+[Shared system header bundles](PREPROCESSOR.md#shared-system-header-bundles)
+and [Shared header functions](ANALYSIS.md#shared-header-functions).
+
+The regression now resolves `Main -> Active::Run` and
+`Orphan -> Default::Run` with no diagnostics for cache capacities 0/8 and jobs
+1/3. It checks direct system inclusion and replay through the cached project
+header separately, with identical caller/callee results in all eight cases.
+No performance benchmarks were rerun for this correction.
+
+Final Linux validation: all 2,305 workspace tests pass with all features.
+Strict workspace Clippy passes for all targets with default and all features;
+formatting and whitespace checks pass. All 21 affected parser/CLI integration
+tests also pass with a symlinked `TMPDIR`. Native macOS confirmation remains
+for CI.
+
+
+### Review corrections: pragma recovery and consumer context — 2026-10-23
+
+Four focused regressions fail on the reviewed `6fa383f`: unsupported or
+object-aliased `_Pragma` truncates the file; separated namespace imports lose
+qualified call targets; a later bundle's inferred global initializer lacks an
+earlier factory's return type; and a weak pragma loses its consuming definition.
+
+The pragma recovery rule and conservative consumer-context fallback are defined
+in [Shared system header bundles](PREPROCESSOR.md#shared-system-header-bundles).
+System-bundle lowering imports prerequisite callable declarations using the
+existing symbol merge; cached project-header units retain types-only imports.
+The additional declaration import is necessary for inferred global initializer
+types. Its performance impact has not been measured.
+
+Integration coverage checks namespace directives, explicit imports, nested
+consumer scopes, scoped factory imports without leakage, and imports nested
+through a project header. Factory initialization checks both the pointer type
+and the member-call target. Both weak pragma spellings retain the consuming
+definition's annotation. These cases run with expansion capacities 0/8 and
+jobs 1/3. The pragma fixture checks object aliases, UTF operands, undefined
+operands and multiple arguments without losing following calls. Preprocessor
+unit tests also check unterminated-operand recovery and context/incomplete
+refusal counters while retaining type-alias sharing.
+
+The macOS review corrects the earlier attribution of libc++ misses: well-formed
+`_Pragma` cleanup no longer prevents sharing, but larger closures such as
+`<string>` and `<vector>` can still hit the pre-existing 64-expansion limit on
+guardless `__undef_macros`. The base has the same warning. The new `incomplete`
+refusal count makes this visible; the expansion limit remains unchanged.
+Other new completion reasons are documented with the
+[indexing diagnostics](MEMORY_PROFILE.md#indexing-subphase-timings).
+No performance benchmarks were run for these corrections.
+
+
+After rebasing onto local `master` (`1b6b5cf`), the all-feature workspace suite
+passes **2,364 tests**, with no failures or ignored tests. Strict workspace
+Clippy passes for all targets with both default and all features; formatting
+and whitespace checks pass. Native macOS validation remains for CI. The
+existing single optimization commit includes these corrections and the updated
+contracts; `REVIEW.md` remains an untracked review input.
+
+
+### Review correction: system prototypes in project-header initializers — 2026-10-23
+
+A cached project header including a system factory declaration followed by
+`inline auto value = SDK::Make();` still imported only types from that system
+unit. The focused reproduction failed with capacity 8 and one worker: `value`
+became `Unknown`, losing the consuming `value->Run()` edge. Capacity 0 retained
+`SDK::Obj*` and the expected target.
+
+The [header import rule](ANALYSIS.md#shared-header-functions) now imports system
+prototypes for cached project-header consumers too, using the existing
+symbols-only merge. Imports between project-header units retain types-only
+behavior. The regression checks direct system inclusion and inclusion through
+a project wrapper, two consuming TUs, capacities 0/8 and jobs 1/3. It requires
+both the inferred pointer type and each consumer's `SDK::Obj::Run` edge.
+No performance benchmarks were run for this correction.
+
+
+Validation: all **2,365 workspace tests** pass with all features. The 22
+system-header integration tests pass, including direct and nested project
+consumers of system prototypes. Strict workspace Clippy passes for all targets
+with both default and all features; formatting and whitespace checks pass.
+
+
+### Review correction: reference bindings in system preambles — 2026-10-23
+
+The focused export comparison confirms that capacity 8 changed `&ref` for a
+leading system `extern int &ref` from `Copy` to `AddrOfVar`; a static reference
+member had the same regression. Capacity 0 retained the referent flow. A fresh
+lowering context had discarded reference metadata when declarations came from
+a cached unit or preamble instead of its own AST walk.
+
+Reference metadata now travels through `Program` and `UnitIndex`, with IDs
+remapped by the existing header merge before dependency-only units return.
+Lowering moves the imported sets into its working context and returns them to
+IR afterward. The metadata includes the binding, type-layer, address and
+reference-return facts, keeping the reference representations consistent. It
+survives preamble cloning and is released with indexing merge state. The rule
+is documented in [Dereferenced operands](ANALYSIS.md#dereferenced-operands).
+
+The integration regression compares exported caller/source/destination/edge-kind
+rows across capacities 0/8 and jobs 1/3, both with direct system inclusion and
+through a cached project header. Two consuming TUs must retain `copy` edges for
+the global and static-member references and an `addr_of` edge for an ordinary
+pointer variable. There is no schema change. No performance benchmarks were run.
+
+
+Validation: **2,366 workspace tests** pass with all features. Strict workspace
+Clippy passes for all targets under both default and all features; formatting
+and whitespace checks pass. The regression checks exported value flow without
+requiring platform-specific system headers.
