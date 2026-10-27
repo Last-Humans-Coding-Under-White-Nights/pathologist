@@ -229,11 +229,13 @@ impl FunctionCfg {
         let mut renumber: Vec<Option<EventId>> = Vec::with_capacity(cfg.events.len());
         let mut omitted = Vec::new();
         for event in &cfg.events {
-            let mut sites: Vec<CallSiteId> =
-                event.sites.iter().filter_map(|&s| map_site(s)).collect();
             // Coalesced records of one invocation name one merged site.
-            let mut seen = rustc_hash::FxHashSet::default();
-            sites.retain(|s| seen.insert(*s));
+            let mut sites: Vec<CallSiteId> = Vec::with_capacity(event.sites.len());
+            for site in event.sites.iter().filter_map(|&s| map_site(s)) {
+                if !sites.contains(&site) {
+                    sites.push(site);
+                }
+            }
             let mut occurrence = event.occurrence;
             occurrence.span = map_span(occurrence.span);
             occurrence.expansion_span = occurrence.expansion_span.map(map_span);

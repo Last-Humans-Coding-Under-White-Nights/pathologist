@@ -631,7 +631,8 @@ impl<'a> Builder<'_, 'a> {
 
     /// Each named child in turn.
     fn sequence(&mut self, node: Node<'a>) {
-        for child in named_children(node) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
             self.visit(child);
         }
     }

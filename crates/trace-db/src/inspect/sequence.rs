@@ -24,32 +24,53 @@ pub struct SequencingCapability {
     pub notice: Option<String>,
 }
 
+/// `analysis_run.options_json.call_sequencing`: `true` from
+/// `trace analyze --sequencing`, `"partial"` from a trace-merge of inputs
+/// only some of which were sequenced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequencingMarker {
+    Complete,
+    Partial,
+    Absent,
+}
+
+impl SequencingMarker {
+    pub fn read(conn: &Connection) -> Result<Self> {
+        if !super::column_exists(conn, "analysis_run", "options_json")? {
+            return Ok(Self::Absent);
+        }
+        let options: Option<String> = conn
+            .query_row(
+                "SELECT options_json FROM analysis_run ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let marker = options
+            .and_then(|o| serde_json::from_str::<serde_json::Value>(&o).ok())
+            .map(|o| o["call_sequencing"].clone());
+        Ok(match marker {
+            Some(serde_json::Value::Bool(true)) => Self::Complete,
+            Some(serde_json::Value::String(s)) if s == "partial" => Self::Partial,
+            _ => Self::Absent,
+        })
+    }
+}
+
 /// Fail with the flag to regenerate a database that records no call order;
 /// a partial one is accepted with a notice.
 pub fn require_sequencing(conn: &Connection) -> Result<SequencingCapability> {
     let missing = "database records no call order; re-run `trace analyze --sequencing` \
                    to build the call-order graphs `inspect sequence` reads";
-    if !super::table_exists(conn, "cfg_functions")?
-        || !super::column_exists(conn, "analysis_run", "options_json")?
-    {
+    if !super::table_exists(conn, "cfg_functions")? {
         bail!(missing);
     }
-    let options: Option<String> = conn
-        .query_row(
-            "SELECT options_json FROM analysis_run ORDER BY id LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let marker = options
-        .and_then(|o| serde_json::from_str::<serde_json::Value>(&o).ok())
-        .map(|o| o["call_sequencing"].clone());
-    match marker {
-        Some(serde_json::Value::Bool(true)) => Ok(SequencingCapability {
+    match SequencingMarker::read(conn)? {
+        SequencingMarker::Complete => Ok(SequencingCapability {
             complete: true,
             notice: None,
         }),
-        Some(serde_json::Value::String(s)) if s == "partial" => Ok(SequencingCapability {
+        SequencingMarker::Partial => Ok(SequencingCapability {
             complete: false,
             notice: Some(
                 "call sequencing is partial: functions from merged inputs analysed without \
@@ -57,7 +78,7 @@ pub fn require_sequencing(conn: &Connection) -> Result<SequencingCapability> {
                     .into(),
             ),
         }),
-        _ => bail!(missing),
+        SequencingMarker::Absent => bail!(missing),
     }
 }
 

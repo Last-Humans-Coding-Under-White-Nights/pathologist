@@ -1292,15 +1292,10 @@ fn merge_unit(
         let Some(&function) = fn_map.get(&cfg.function) else {
             continue;
         };
-        // The gates of this unit's return flows: no dependency body, and only
-        // internal C++ bodies from a header's symbols-only merge.
         let Some(owner) = program.symbols.function_by_id(function) else {
             continue;
         };
-        if program.is_dep_file(owner.file)
-            || (matches!(mode, MergeMode::SymbolsOnly)
-                && !(owner.linkage == trace_ir::Linkage::Internal && owner.is_cpp))
-        {
+        if !merges_body(program, mode, owner) {
             continue;
         }
         let tu = unit_of(owner.file);
@@ -1485,21 +1480,12 @@ fn merge_unit(
         let Some(&new_fn) = fn_map.get(old_fn) else {
             continue;
         };
-        if program
-            .symbols
-            .function_by_id(new_fn)
-            .is_some_and(|f| program.is_dep_file(f.file))
-        {
+        let merges = match program.symbols.function_by_id(new_fn) {
+            Some(f) => merges_body(program, mode, f),
+            None => !matches!(mode, MergeMode::SymbolsOnly),
+        };
+        if !merges {
             continue;
-        }
-        if matches!(mode, MergeMode::SymbolsOnly) {
-            let is_internal = program
-                .symbols
-                .function_by_id(new_fn)
-                .is_some_and(|f| f.linkage == trace_ir::Linkage::Internal && f.is_cpp);
-            if !is_internal {
-                continue;
-            }
         }
         let remapped: Vec<ReturnFlow> = flows
             .iter()
@@ -1522,6 +1508,15 @@ fn merge_unit(
             target.extend(remapped);
         }
     }
+}
+
+/// Whether a merge keeps the body facts (return flows, call-order graphs)
+/// of `function`: never a dependency body, and only internal C++ bodies
+/// from a header's symbols-only merge.
+fn merges_body(program: &Program, mode: MergeMode, function: &Function) -> bool {
+    !program.is_dep_file(function.file)
+        && (!matches!(mode, MergeMode::SymbolsOnly)
+            || (function.linkage == trace_ir::Linkage::Internal && function.is_cpp))
 }
 
 fn flow_fns(flow: &FlowConstraint) -> impl Iterator<Item = FnId> {

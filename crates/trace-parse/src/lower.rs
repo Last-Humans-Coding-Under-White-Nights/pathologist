@@ -323,6 +323,13 @@ impl LowerContext {
         self.cfg_recorder.as_ref().map(|r| r.mark())
     }
 
+    /// Drop what was recorded since `mark`.
+    fn cfg_truncate(&mut self, mark: Option<cfg_build::RecorderMark>) {
+        if let (Some(recorder), Some(mark)) = (&mut self.cfg_recorder, mark) {
+            recorder.truncate(mark);
+        }
+    }
+
     /// Recovery lowered `node` through a scratch tree the graph never walks:
     /// `node` owns everything recorded since `mark`.
     fn record_recovered_cfg_sites(
@@ -332,9 +339,7 @@ impl LowerContext {
         first: usize,
         mark: Option<cfg_build::RecorderMark>,
     ) {
-        if let (Some(recorder), Some(mark)) = (&mut self.cfg_recorder, mark) {
-            recorder.truncate(mark);
-        }
+        self.cfg_truncate(mark);
         self.record_cfg_sites(program, node, first);
     }
 
@@ -5912,10 +5917,8 @@ fn lower_function_body(
     let using_nss_len = ctx.using_nss.len();
     let using_imports_len = ctx.using_name_imports.len();
     let local_aliases_len = ctx.local_aliases.len();
-    let cfg_start = ctx
-        .cfg_recorder
-        .as_ref()
-        .map(|r| (r.mark(), program.symbols.call_sites.len()));
+    let first_site = program.symbols.call_sites.len();
+    let cfg_mark = ctx.cfg_mark();
 
     let body = node.cached_field("body");
     if let Some(body_node) = body {
@@ -5933,12 +5936,8 @@ fn lower_function_body(
     for &il in &init_lists {
         walk_function_body(program, ctx, source, il, fn_id);
     }
-    if let Some((mark, first_site)) = cfg_start {
-        cfg_build::build_function_cfg(program, ctx, source, fn_id, first_site, body, &init_lists);
-        if let Some(recorder) = &mut ctx.cfg_recorder {
-            recorder.truncate(mark);
-        }
-    }
+    cfg_build::build_function_cfg(program, ctx, source, fn_id, first_site, body, &init_lists);
+    ctx.cfg_truncate(cfg_mark);
     ctx.using_nss.truncate(using_nss_len);
     ctx.using_name_imports.truncate(using_imports_len);
     ctx.local_aliases.truncate(local_aliases_len);
@@ -14466,9 +14465,7 @@ fn lower_lambda_expression(
         walk_function_body(program, ctx, source, body, fn_id);
         cfg_build::build_function_cfg(program, ctx, source, fn_id, first_site, Some(body), &[]);
         // The enclosing function's graph takes none of the lambda's sites.
-        if let (Some(recorder), Some(mark)) = (&mut ctx.cfg_recorder, cfg_mark) {
-            recorder.truncate(mark);
-        }
+        ctx.cfg_truncate(cfg_mark);
     }
     ctx.current_fn = saved_fn;
     ctx.locals = saved_locals;

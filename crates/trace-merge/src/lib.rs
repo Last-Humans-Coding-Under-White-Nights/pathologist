@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use trace_db::{MultiInstance, INDEXES_V8, SCHEMA_VERSION, TABLES_V8};
+use trace_db::{MultiInstance, SequencingMarker, INDEXES_V8, SCHEMA_VERSION, TABLES_V8};
 
 // Use the same projections for capability checks and ingestion. Additive v7
 // flow metadata is optional here because the merger only preserves call graphs.
@@ -112,44 +112,15 @@ pub enum WarningKind {
     MissingSequencing,
 }
 
-/// An input's `analysis_run.options_json.call_sequencing` marker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Sequencing {
-    Complete,
-    /// An earlier merge output some of whose inputs had no graphs.
-    Partial,
-    Absent,
-}
-
-impl Sequencing {
-    fn of(conn: &Connection) -> Self {
-        let options: Option<String> = conn
-            .query_row(
-                "SELECT options_json FROM analysis_run ORDER BY id LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .ok()
-            .flatten();
-        let marker = options
-            .and_then(|o| serde_json::from_str::<serde_json::Value>(&o).ok())
-            .map(|o| o["call_sequencing"].clone());
-        match marker {
-            Some(serde_json::Value::Bool(true)) => Self::Complete,
-            Some(serde_json::Value::String(s)) if s == "partial" => Self::Partial,
-            _ => Self::Absent,
-        }
-    }
-
-    /// The merged database's marker: complete only when every input is.
-    fn merged(inputs: &[Self]) -> serde_json::Value {
-        if inputs.iter().all(|&s| s == Self::Complete) {
-            serde_json::json!(true)
-        } else if inputs.iter().all(|&s| s == Self::Absent) {
-            serde_json::json!(false)
-        } else {
-            serde_json::json!("partial")
-        }
+/// The merged database's `call_sequencing` marker: complete only when
+/// every input is.
+fn merged_sequencing(inputs: &[SequencingMarker]) -> serde_json::Value {
+    if inputs.iter().all(|&s| s == SequencingMarker::Complete) {
+        serde_json::json!(true)
+    } else if inputs.iter().all(|&s| s == SequencingMarker::Absent) {
+        serde_json::json!(false)
+    } else {
+        serde_json::json!("partial")
     }
 }
 
@@ -553,7 +524,7 @@ pub fn merge_databases<P: AsRef<Path>>(
     // Per input: whether it has the `execution_contexts` table.
     let mut has_contexts_table: Vec<bool> = Vec::new();
     // Per input: whether `trace analyze --sequencing` wrote it.
-    let mut input_sequencing: Vec<Sequencing> = Vec::new();
+    let mut input_sequencing: Vec<SequencingMarker> = Vec::new();
     for path in &inputs {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("failed to open input database {}", path.display()))?;
@@ -606,8 +577,8 @@ pub fn merge_databases<P: AsRef<Path>>(
             })?;
         }
         has_contexts_table.push(has_contexts);
-        let sequencing = Sequencing::of(&conn);
-        if sequencing != Sequencing::Absent {
+        let sequencing = SequencingMarker::read(&conn).unwrap_or(SequencingMarker::Absent);
+        if sequencing != SequencingMarker::Absent {
             for (table, query) in READ_CFG {
                 conn.prepare(query).map_err(|error| {
                     anyhow::anyhow!(
@@ -1289,9 +1260,11 @@ pub fn merge_databases<P: AsRef<Path>>(
     // `omitted_sites` gap.
     let mut unified_cfgs: BTreeMap<trace_ir::FnId, Vec<trace_ir::FunctionCfg>> = BTreeMap::new();
     let mut cfg_owner: FxHashMap<i64, usize> = FxHashMap::default();
-    let any_sequenced = input_sequencing.iter().any(|&s| s != Sequencing::Absent);
+    let any_sequenced = input_sequencing
+        .iter()
+        .any(|&s| s != SequencingMarker::Absent);
     for (db_idx, conn) in conns.iter().enumerate() {
-        if input_sequencing[db_idx] == Sequencing::Absent {
+        if input_sequencing[db_idx] == SequencingMarker::Absent {
             if any_sequenced {
                 report.warnings.push(MergeWarning {
                     kind: WarningKind::MissingSequencing,
@@ -1414,8 +1387,7 @@ pub fn merge_databases<P: AsRef<Path>>(
         out_conn.execute_batch("BEGIN IMMEDIATE;")?;
         out_conn.execute_batch(TABLES_V8)?;
         let mut strings = trace_db::TextPool::new(&out_conn)?;
-        let call_sequencing = Sequencing::merged(&input_sequencing);
-        if call_sequencing != serde_json::json!(false) {
+        if any_sequenced {
             strings.seed_sequencing()?;
         }
 
@@ -1427,7 +1399,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             "external_calls_unresolved": report.external_calls_unresolved,
             "ambiguous_calls": report.ambiguous_calls,
             "warnings_count": report.warnings.len(),
-            "call_sequencing": call_sequencing,
+            "call_sequencing": merged_sequencing(&input_sequencing),
         })
         .to_string();
 
