@@ -1533,3 +1533,105 @@ fn gaps_cancel_guarantees() {
     assert_eq!(graph.frames[0].coverage, "partial");
     assert_eq!(graph.frames[0].gaps[0].kind, "unordered_branch");
 }
+
+#[test]
+fn separate_unordered_gaps_keep_statement_order() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "args_order.c", line, callee);
+    // Each full expression has an unordered_branch gap of its own; the
+    // first statement still runs before the second.
+    let (cond1, cond2) = (at(45, "cond1"), at(46, "cond2"));
+    assert_eq!(relation(&conn, &cond1, &cond2), GuaranteedBefore);
+    assert_eq!(relation(&conn, &at(45, "first"), &cond2), SequencedBefore);
+    assert_eq!(relation(&conn, &at(45, "then1"), &cond2), MayPrecede);
+    let graph = function_sequence(&conn, "two_ternaries", None, &Default::default());
+    let kinds: Vec<_> = graph.frames[0]
+        .gaps
+        .iter()
+        .map(|g| g.kind.as_str())
+        .collect();
+    assert_eq!(kinds, ["unordered_branch", "unordered_branch"]);
+}
+
+#[test]
+fn a_shared_unordered_gap_admits_either_order() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    // Whichever argument the builder walks first, an arm of one argument
+    // and the other argument may run in either order.
+    for line in [35, 40] {
+        let at = |callee| event(&conn, "args_order.c", line, callee);
+        let (cond, left, right, other) = (at("cond"), at("left"), at("right"), at("other"));
+        for (a, b) in [(&left, &other), (&right, &other), (&cond, &other)] {
+            assert_eq!(relation(&conn, a, b), Unordered, "line {line}");
+            assert_eq!(relation(&conn, b, a), Unordered, "line {line}");
+        }
+        // The arms of one conditional stay exclusive.
+        assert_eq!(relation(&conn, &left, &right), Exclusive, "line {line}");
+        assert_eq!(relation(&conn, &right, &left), Exclusive, "line {line}");
+        // Every argument precedes the call it is passed to.
+        let call = relation(&conn, &other, &at("sink"));
+        assert!(
+            matches!(call, SequencedBefore | GuaranteedBefore),
+            "line {line}: {call:?}"
+        );
+    }
+}
+
+/// Copies of a call in several variants are one call only when they are one
+/// invocation: a macro invoked on different lines under different
+/// configurations shares its body's spelling, not its invocation.
+#[test]
+fn macro_invocations_of_different_variants_stay_distinct() {
+    let dir = scratch(&[
+        (
+            "BUILD.gn",
+            "source_set(\"t\") {\n  defines = [ \"MODE=1\", \"MODE=2\" ]\n}\n",
+        ),
+        ("log.h", "void log_it(void);\n#define LOG() log_it()\n"),
+        (
+            "main.c",
+            "#include \"log.h\"\n\
+             void prepare(void);\n\
+             void run(void) {\n\
+             #if MODE == 1\n\
+             LOG();\n\
+             #elif MODE == 2\n\
+             prepare();\n\
+             LOG();\n\
+             #endif\n\
+             }\n",
+        ),
+    ]);
+    let db = sequenced_db(
+        dir.path(),
+        PreprocessOptions::new()
+            .with_explore(true)
+            .with_explore_budget(4),
+    );
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let variants = count(
+        &conn,
+        "SELECT COUNT(*) FROM cfg_functions cf JOIN functions f ON f.id = cf.fn_id \
+         WHERE f.name = 'run'",
+    );
+    assert!(variants >= 2, "{variants}");
+    let err = trace_db::resolve_event(&conn, "log.h", 2, None, Some("log_it"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.starts_with("2 call events"), "{err}");
+    // Each candidate names where it was invoked.
+    for at in ["invoked at main.c:5", "invoked at main.c:8"] {
+        assert!(err.contains(at), "{at}: {err}");
+    }
+    assert!(
+        err.contains("name the invocation's position"),
+        "suggests an invocation position: {err}"
+    );
+    // Each invocation position names its own call.
+    let five = trace_db::resolve_event(&conn, "main.c", 5, None, Some("log_it")).unwrap();
+    let eight = trace_db::resolve_event(&conn, "main.c", 8, None, Some("log_it")).unwrap();
+    assert_ne!(five.event, eight.event);
+    assert_ne!(five.cfg, eight.cfg);
+}

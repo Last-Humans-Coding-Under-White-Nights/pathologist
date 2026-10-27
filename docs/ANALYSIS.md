@@ -4931,7 +4931,8 @@ database carries no sequencing rows.
     block's local order; `guaranteed_before`: A's block dominates B's block
     over every edge, exception edges included, B's block does not reach A's,
     B's block is reached from the entry without an exception edge, and no gap
-    covers either event. When A's block has an `exception` edge, A must also
+    other than an `unordered_branch` gap covers either event (that kind only
+    unorders its own events; see `unordered` below). When A's block has an `exception` edge, A must also
     precede every other event of its block: in
     `try { a(); b(); } catch (...) { h(); } c();` `a` may throw before `b`
     runs and the handler fall through to `c`, so `b` only `may_precede` `c`,
@@ -4944,8 +4945,15 @@ database carries no sequencing rows.
     whatever the block's local order (`while (more()) { a(); b(); }`: one
     iteration's `b` precedes the next one's `a`).
   - `exclusive`: no path either way (`if (ok) send(); else recover();`).
-    `unordered`: same block without a local order, or covered by an
-    `unordered_branch` gap. `unknown`: a gap or boundary lies between them.
+    `unordered`: same block without a local order, or both held by one
+    `unordered_branch` gap with a relation that names a direction
+    (`sequenced_before`, `guaranteed_before`, `may_precede` or `may_follow`):
+    in `sink(cond() ? left() : right(), other())` `left` and `other` are
+    `unordered` both ways whichever argument the builder walked first, while
+    `left` and `right` stay `exclusive`. Events of two different gaps keep
+    their order: after `sink(c1() ? a() : b(), x()); sink(c2() ? d() : e(),
+    y());` `c1` is `guaranteed_before` `c2`. `unknown`: a gap or boundary
+    lies between them.
 
 ### Expressions
 
@@ -5102,12 +5110,16 @@ first, then loads graphs only as it reaches them:
   define one external function share its row, which records the first
   definition's file, so `--file` may name another unit's body. A position
   (`--file`/`--line`) names one call in every variant of its function that
-  compiles it (one event per graph at one position, with one callee); the
+  compiles it (one event per graph at one position, with one callee and one
+  macro invocation position); the
   query starts from each such variant, one frame per variant as for
   `--function`. A position matching several calls (two events of one graph,
   or calls of different functions or callees) is an error listing at most
   ten of them with the count of the rest; when they were matched at a macro
-  body's spelling, it names an invocation position to use instead.
+  body's spelling, each candidate names its invocation and the error names
+  an invocation position to use instead: a macro invoked on different lines
+  in different `--explore` variants is one call per invocation, not one
+  call.
 - **Frames.** Each graph shown is a frame: every variant of the starting
   function, then one frame per inlined (event, target variant) pair, breadth
   first in event order up to `--depth` call levels. A `call` edge joins the
@@ -5140,9 +5152,11 @@ first, then loads graphs only as it reaches them:
   when both events share a graph). A first event several variants compile is related
   in each of them, and the relations combine the same way; a variant that
   reaches no copy of the second event is skipped with a note. Found
-  nowhere, the relation is `unknown`. A gap over
-  either end turns `sequenced_before`/`guaranteed_before` into `unknown`, or
-  `unordered` when both ends share an `unordered_branch` gap. Between two
+  nowhere, the relation is `unknown`. One `unordered_branch` gap holding
+  both ends turns a directed relation (`sequenced_before`,
+  `guaranteed_before`, `may_precede`, `may_follow`) into `unordered`; any
+  other gap over either end turns `sequenced_before`/`guaranteed_before`
+  into `unknown`. Between two
   events of one graph, only the blocks on paths from the first to the second
   (or to the calls reaching it) are shown.
 

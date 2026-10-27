@@ -15,7 +15,7 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::fmt::Write;
 use std::rc::Rc;
-use trace_ir::{EdgeKind, FileId, FunctionCfg, GapKind, Span};
+use trace_ir::{EdgeKind, FileId, FunctionCfg, Gap, GapKind, Span};
 
 /// `analysis_run.options_json.call_sequencing`: `true` from
 /// `trace analyze --sequencing`, `"partial"` from a trace-merge of inputs
@@ -283,7 +283,8 @@ const RESOLVE_EVENT_SQL: &str = "WITH matching(id) AS ( \
              SELECT id FROM files WHERE path LIKE ?2 ESCAPE '!') \
          SELECT e.id, e.cfg_id, cf.fn_id, f.path, e.line, e.col, \
                 CASE WHEN e.line = ?1 AND e.file_id IN matching THEN x.path END, \
-                e.expansion_line, cs.callee_text \
+                e.expansion_line, cs.callee_text, \
+                e.expansion_file_id, e.expansion_col \
          FROM cfg_events e \
          JOIN cfg_functions cf ON cf.id = e.cfg_id \
          JOIN files f ON f.id = e.file_id \
@@ -317,14 +318,16 @@ pub fn resolve_event(
     // invocation; its invocation position is kept to suggest instead. One
     // row per site, in site order, with the event's callee spelling.
     let mut stmt = conn.prepare(RESOLVE_EVENT_SQL)?;
-    // The events found, each with its sites' callee spellings and the
-    // macro invocation (`file:line`) it was matched at.
-    let mut found: Vec<(EventRef, Vec<String>, Option<String>)> = Vec::new();
+    // The events found, each with its sites' callee spellings, the macro
+    // invocation (`file:line`) it was matched at, and its invocation
+    // position (`expansion_file_id`, line, column) if any.
+    let mut found: Vec<(EventRef, Vec<String>, Option<String>, Invocation)> = Vec::new();
     let mut rows = stmt.query(rusqlite::params![line, pattern, col])?;
     while let Some(r) = rows.next()? {
         let event: CfgEventId = r.get(0)?;
         if found.last().is_none_or(|f| f.0.event != event) {
             let expansion: (Option<String>, Option<i64>) = (r.get(6)?, r.get(7)?);
+            let invoked_at: Invocation = (r.get(9)?, r.get(7)?, r.get(10)?);
             let event = EventRef {
                 event,
                 cfg: r.get(1)?,
@@ -339,59 +342,61 @@ pub fn resolve_event(
                 .0
                 .zip(expansion.1)
                 .map(|(path, line)| format!("{}:{line}", super::basename(&path)));
-            found.push((event, Vec::new(), invocation));
+            found.push((event, Vec::new(), invocation, invoked_at));
         }
         if let (Some(f), Some(text)) = (found.last_mut(), r.get::<_, Option<String>>(8)?) {
             f.1.push(text);
         }
     }
     // Each variant of a function compiling the call has its own copy of
-    // it: copies at one position with one callee, each in another graph of
-    // the function, are one candidate (two events of one graph stay two).
-    let mut candidates: Vec<EventRef> = Vec::new();
-    let mut invocation = None;
-    for (mut event, callees, expansion) in found {
+    // it: copies at one position with one callee and one macro invocation
+    // position, each in another graph of the function, are one candidate
+    // (two events of one graph stay two). Copies spelled in one macro body
+    // but invoked at different positions are different calls.
+    let mut candidates: Vec<(EventRef, Invocation, Option<String>)> = Vec::new();
+    for (mut event, callees, expansion, invoked_at) in found {
         if callee.is_some_and(|want| !callees.iter().any(|c| super::names_function(c, want))) {
             continue;
         }
-        if invocation.is_none() {
-            invocation = expansion;
-        }
         event.callee = callees.into_iter().next().unwrap_or_default();
         let copy = (event.event, event.cfg);
-        let same = candidates.iter_mut().find(|c| {
-            (c.function, &c.path, c.line, c.col, &c.callee)
+        let same = candidates.iter_mut().find(|(c, at, _)| {
+            (c.function, &c.path, c.line, c.col, &c.callee, *at)
                 == (
                     event.function,
                     &event.path,
                     event.line,
                     event.col,
                     &event.callee,
+                    invoked_at,
                 )
                 && c.variants.iter().all(|&(_, cfg)| cfg != event.cfg)
         });
         match same {
-            Some(c) => c.variants.push(copy),
+            Some((c, _, _)) => c.variants.push(copy),
             None => {
                 event.variants.push(copy);
-                candidates.push(event);
+                candidates.push((event, invoked_at, expansion));
             }
         }
     }
     match candidates.len() {
         0 => bail!("no call event at {file}:{line}{}", narrowed(col, callee)),
-        1 => Ok(candidates.remove(0)),
+        1 => Ok(candidates.remove(0).0),
         n => {
             let mut listed = candidates
                 .iter()
                 .take(MAX_LISTED_CANDIDATES)
-                .map(|c| format!("{} at {}", c.callee, c.position()))
+                .map(|(c, _, expansion)| match expansion {
+                    Some(at) => format!("{} at {} (invoked at {at})", c.callee, c.position()),
+                    None => format!("{} at {}", c.callee, c.position()),
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             if n > MAX_LISTED_CANDIDATES {
                 write!(listed, ", and {} more", n - MAX_LISTED_CANDIDATES).unwrap();
             }
-            let hint = match invocation {
+            let hint = match candidates.iter().find_map(|c| c.2.as_ref()) {
                 Some(at) => format!(
                     "; calls spelled in a macro body match at every invocation, \
                      so name the invocation's position (such as {at})"
@@ -405,6 +410,10 @@ pub fn resolve_event(
         }
     }
 }
+
+/// A call's macro invocation position: `cfg_events.expansion_file_id`,
+/// `expansion_line` and `expansion_col`, all `None` outside a macro.
+type Invocation = (Option<i64>, Option<i64>, Option<i64>);
 
 /// Candidates an ambiguous position error lists before counting the rest.
 const MAX_LISTED_CANDIDATES: usize = 10;
@@ -1073,17 +1082,9 @@ impl LoadedCfg {
         search(a, &mut seen, |e| &self.next_events[e], |y| y == b)
     }
 
-    /// Kinds of the gaps whose event range holds `event`.
-    fn gaps_over(&self, event: usize) -> Vec<GapKind> {
-        self.graph
-            .gaps
-            .iter()
-            .filter(|g| {
-                g.events
-                    .is_some_and(|(a, b)| a.0 as usize <= event && event <= b.0 as usize)
-            })
-            .map(|g| g.kind)
-            .collect()
+    /// The gaps whose event range holds `event`.
+    fn gaps_over(&self, event: usize) -> impl Iterator<Item = &Gap> + '_ {
+        self.graph.gaps.iter().filter(move |g| covers(g, event))
     }
 
     /// How event `a`'s invocation relates to event `b`'s, both of this
@@ -1128,30 +1129,56 @@ impl LoadedCfg {
                 (false, false) => Relation::Exclusive,
             }
         };
+        // One unordered_branch gap holding both: the graph orders its
+        // operands one after another, so any order it shows between them
+        // may be the builder's walk rather than the language's. Arms of one
+        // branch stay exclusive, and a cycle already admits both orders.
+        let shared = self
+            .gaps_over(a)
+            .any(|g| g.kind == GapKind::UnorderedBranch && covers(g, b));
+        if shared
+            && matches!(
+                relation,
+                Relation::SequencedBefore
+                    | Relation::GuaranteedBefore
+                    | Relation::MayPrecede
+                    | Relation::MayFollow
+            )
+        {
+            return (
+                Relation::Unordered,
+                vec!["both lie in one unordered_branch gap".into()],
+            );
+        }
+        // Any other gap over an end leaves a proof unfounded. An
+        // unordered_branch gap only unorders its own events: what precedes
+        // or follows its full expression stays ordered against them.
         if matches!(
             relation,
             Relation::SequencedBefore | Relation::GuaranteedBefore
         ) {
-            let (ga, gb) = (self.gaps_over(a), self.gaps_over(b));
-            let unordered = GapKind::UnorderedBranch;
-            if ga.contains(&unordered) && gb.contains(&unordered) {
-                return (
-                    Relation::Unordered,
-                    vec!["both lie in an unordered_branch gap".into()],
-                );
-            }
-            if let Some(kind) = ga.iter().chain(&gb).next() {
+            if let Some(gap) = self
+                .gaps_over(a)
+                .chain(self.gaps_over(b))
+                .find(|g| g.kind != GapKind::UnorderedBranch)
+            {
                 return (
                     Relation::Unknown,
                     vec![format!(
                         "a {} gap covers an end; its order is not modeled",
-                        kind.as_str()
+                        gap.kind.as_str()
                     )],
                 );
             }
         }
         (relation, Vec::new())
     }
+}
+
+/// Gap `g`'s event range holds `event`.
+fn covers(g: &Gap, event: usize) -> bool {
+    g.events
+        .is_some_and(|(a, b)| a.0 as usize <= event && event <= b.0 as usize)
 }
 
 /// The notes stating what a relation of this kind claims.
