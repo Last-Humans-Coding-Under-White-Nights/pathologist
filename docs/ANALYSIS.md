@@ -2114,6 +2114,10 @@ still the callee of an `ipc` edge.
   - `unknown`: none of these. A start site several ordinary calls reach (a
     wrapper called twice, a function called in a caller's loop) can still run
     more than once.
+- **Call order.** A start site is an `async_start` boundary in
+  [Call sequencing](#call-sequencing-control-flow-sidecar): the callback is
+  not ordered after the starter's later calls, and no happens-before is
+  claimed across contexts.
 
 ### Terminators (`clears`)
 
@@ -5099,7 +5103,17 @@ first, then loads graphs only as it reaches them:
   events.
 - Member-initializer declaration order is not modeled (`initializer_order`).
 - Paths are not checked for feasibility; `may_*` relations over-approximate.
+  Constant conditions are not folded either: the `do { ... } while (0)` of a
+  statement macro keeps its back edge, so two calls in it relate as
+  `may_both`.
+- A call spelled in a macro body shares its spelling position with every
+  expansion of that macro (`DealFormat` in HDF's `HDF_LOG_WRAPPER`: 14,852
+  events), so a query position there is ambiguous; name the invocation
+  position instead.
 - C API exposure of the query is a follow-up.
+
+Measured indexing, storage and query cost:
+[Call-order sidecar](EVAL_REPORT.md#call-order-sidecar-248--2026-10-27).
 
 ## Known imprecision
 

@@ -1025,6 +1025,40 @@ fn sequence_renders_in_every_format() {
     assert!(dot.contains("subgraph cluster_"), "{dot}");
 }
 
+/// A block of many `g(a(), b());` statements is a chain of order diamonds,
+/// with 2^n paths through it. The text view groups and annotates it in time
+/// polynomial in the events (it walked every path once: an `EmitDriverBind`
+/// body of hdf's hdi-gen, 101 events in one block, never finished).
+#[test]
+fn text_view_of_a_diamond_chain_finishes() {
+    let body: String = (0..40).map(|_| "    g(a(), b());\n").collect();
+    let dir = scratch(&[(
+        "chain.c",
+        &format!(
+            "void a(void);\nvoid b(void);\nvoid g(int, int);\nvoid chain(void)\n{{\n{body}}}\n"
+        ),
+    )]);
+    let db = sequenced_db(dir.path(), default_opts(dir.path()));
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let graph = function_sequence(&conn, "chain", None, &Default::default());
+    assert_eq!(graph.events.len(), 120);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(trace_db::render_sequence(
+            &graph,
+            trace_db::RenderFormat::Text,
+        ));
+    });
+    let text = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the text view finishes")
+        .unwrap();
+    assert_eq!(
+        text.matches("{ a(), b() }  (order unspecified)").count(),
+        40
+    );
+}
+
 #[test]
 fn cli_inspect_sequence_end_to_end() {
     let root = fixture("call_sequence");

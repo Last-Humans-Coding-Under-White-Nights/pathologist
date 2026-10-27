@@ -725,6 +725,7 @@ that variable's `var_id`, a function's carries its `fn_id` instead.
 trace inspect graph.db calls [--from FN] [--to FN] [--file SUBSTR] [--exclude-deps]
 trace inspect graph.db callgraph --file SUBSTR --line N [--depth N] [--direction down|up]
 trace inspect graph.db dataflow --file SUBSTR --line N --col C [--depth N] [--direction down|up]
+trace inspect graph.db sequence (--function FN | --file SUBSTR --line N [--col C] [--callee NAME]) [--to-file SUBSTR --to-line N ...]
 ```
 
 - `calls` lists rows from `call_edges` joined with `functions` and left-joined
@@ -750,6 +751,16 @@ trace inspect graph.db dataflow --file SUBSTR --line N --col C [--depth N] [--di
   [source-level contract](ANALYSIS.md#source-level-dataflow-presentation).
   Parameters duplicated across TUs (header prototype vs definition copies)
   are reconciled automatically when the queried copy carries no edges.
+
+- `sequence` first reads `analysis_run.options_json.call_sequencing` and
+  fails with a message naming `trace analyze --sequencing` unless it is
+  `true` or `"partial"` (the latter adds a notice). It resolves a position
+  against `cfg_events` through `cfg_event_sites` → `call_sites` (spelling or
+  expansion position), then loads only the graphs it reaches: the
+  [call sequencing tables](#call-sequencing-tables) of each function, the
+  callees from `call_edges`, `execution_contexts` starts and `ipc` edges as
+  boundaries. Semantics:
+  [Call sequencing, Query](ANALYSIS.md#query).
 
 Both graph commands print a forest with `(truncated at --depth …)` markers
 when the frontier was cut off.

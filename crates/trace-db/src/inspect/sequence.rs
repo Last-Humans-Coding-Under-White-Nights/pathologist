@@ -10,7 +10,7 @@
 
 use anyhow::{bail, Result};
 use rusqlite::{Connection, OptionalExtension};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::fmt::Write;
@@ -456,6 +456,54 @@ fn loc(path: Option<String>, line: Option<i64>, col: Option<i64>) -> Option<SeqL
     })
 }
 
+// The statements loading one graph; each is a lookup by its graph or
+// function id. Events are reached through their blocks: `cfg_events` has
+// no index on `cfg_id`, and these run once per frame.
+const LOAD_GRAPH_SQL: &str = "SELECT cf.fn_id, fn.name, p.path, fn.line_start, cf.variant, \
+                    (SELECT text FROM strings WHERE id = cf.coverage_id), \
+                    cf.entry_block, cf.exit_block, u.path \
+             FROM cfg_functions cf JOIN functions fn ON fn.id = cf.fn_id \
+             JOIN files p ON p.id = fn.file_id LEFT JOIN files u ON u.id = cf.tu_file_id \
+             WHERE cf.id = ?1";
+const LOAD_BLOCKS_SQL: &str = "SELECT b.id, s.text, f.path, b.line, b.col FROM cfg_blocks b \
+             JOIN strings s ON s.id = b.kind_id LEFT JOIN files f ON f.id = b.file_id \
+             WHERE b.cfg_id = ?1 ORDER BY b.ordinal";
+const LOAD_EDGES_SQL: &str = "SELECT e.src_block, e.dst_block, s.text FROM cfg_edges e \
+             JOIN cfg_blocks b ON b.id = e.src_block JOIN strings s ON s.id = e.kind_id \
+             WHERE b.cfg_id = ?1 ORDER BY e.src_block, e.dst_block, e.kind_id";
+const LOAD_EVENTS_SQL: &str = "SELECT e.id, e.block_id, s.text, f.path, e.line, e.col, x.path, \
+                    e.expansion_line, e.expansion_col, \
+                    (SELECT cs.callee_text FROM cfg_event_sites es \
+                     JOIN call_sites cs ON cs.id = es.call_site_id \
+                     WHERE es.event_id = e.id ORDER BY cs.id LIMIT 1) \
+             FROM cfg_blocks b JOIN cfg_events e ON e.block_id = b.id \
+             JOIN strings s ON s.id = e.kind_id \
+             JOIN files f ON f.id = e.file_id LEFT JOIN files x ON x.id = e.expansion_file_id \
+             WHERE b.cfg_id = ?1 ORDER BY e.block_id, e.ordinal, e.id";
+const LOAD_TARGETS_SQL: &str =
+    "SELECT DISTINCT es.event_id, ce.callee_fn_id, f.name, ce.resolution, \
+                    f.is_defined, f.is_dep \
+             FROM cfg_blocks b JOIN cfg_events e ON e.block_id = b.id \
+             JOIN cfg_event_sites es ON es.event_id = e.id \
+             JOIN call_edges ce ON ce.call_site_id = es.call_site_id \
+             JOIN functions f ON f.id = ce.callee_fn_id \
+             WHERE b.cfg_id = ?1 ORDER BY es.event_id, ce.callee_fn_id, ce.resolution";
+const LOAD_CONTEXTS_SQL: &str = "SELECT DISTINCT es.event_id, x.kind, x.entry_fn_id \
+             FROM cfg_blocks b JOIN cfg_events e ON e.block_id = b.id \
+             JOIN cfg_event_sites es ON es.event_id = e.id \
+             JOIN execution_contexts x ON x.call_site_id = es.call_site_id \
+             WHERE b.cfg_id = ?1 ORDER BY es.event_id, x.entry_fn_id, x.kind";
+const LOAD_ORDER_SQL: &str = "SELECT o.event_id, o.next_event_id FROM cfg_event_order o \
+             JOIN cfg_events e ON e.id = o.event_id \
+             JOIN cfg_blocks b ON b.id = e.block_id WHERE b.cfg_id = ?1 \
+             ORDER BY o.event_id, o.next_event_id";
+const LOAD_GAPS_SQL: &str = "SELECT s.text, f.path, g.line, g.col, g.first_event, g.last_event \
+             FROM cfg_gaps g JOIN strings s ON s.id = g.kind_id \
+             LEFT JOIN files f ON f.id = g.file_id WHERE g.cfg_id = ?1 ORDER BY g.id";
+const LOAD_IPC_SQL: &str = "SELECT DISTINCT ce.callee_fn_id, f.name FROM call_edges ce \
+                 JOIN functions f ON f.id = ce.callee_fn_id \
+                 WHERE ce.caller_fn_id = ?1 AND ce.resolution = 'ipc' ORDER BY ce.callee_fn_id";
+
 /// Graphs loaded so far, by `cfg_functions.id`.
 struct Loader<'c> {
     conn: &'c Connection,
@@ -493,15 +541,8 @@ impl<'c> Loader<'c> {
             return Ok(i);
         }
         let conn = self.conn;
-        let (fn_id, name, fn_loc, variant, coverage, entry_db, exit_db, unit) = conn.query_row(
-            "SELECT cf.fn_id, fn.name, p.path, fn.line_start, cf.variant, \
-                    (SELECT text FROM strings WHERE id = cf.coverage_id), \
-                    cf.entry_block, cf.exit_block, u.path \
-             FROM cfg_functions cf JOIN functions fn ON fn.id = cf.fn_id \
-             JOIN files p ON p.id = fn.file_id LEFT JOIN files u ON u.id = cf.tu_file_id \
-             WHERE cf.id = ?1",
-            [cfg_id],
-            |r| {
+        let (fn_id, name, fn_loc, variant, coverage, entry_db, exit_db, unit) =
+            conn.query_row(LOAD_GRAPH_SQL, [cfg_id], |r| {
                 let line: i64 = r.get(3)?;
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -515,16 +556,11 @@ impl<'c> Loader<'c> {
                     r.get::<_, i64>(7)?,
                     r.get::<_, Option<String>>(8)?,
                 ))
-            },
-        )?;
+            })?;
 
         let mut block_index = FxHashMap::default();
         let mut blocks = Vec::new();
-        let mut stmt = conn.prepare_cached(
-            "SELECT b.id, s.text, f.path, b.line, b.col FROM cfg_blocks b \
-             JOIN strings s ON s.id = b.kind_id LEFT JOIN files f ON f.id = b.file_id \
-             WHERE b.cfg_id = ?1 ORDER BY b.ordinal",
-        )?;
+        let mut stmt = conn.prepare_cached(LOAD_BLOCKS_SQL)?;
         let mut rows = stmt.query([cfg_id])?;
         while let Some(r) = rows.next()? {
             block_index.insert(r.get::<_, i64>(0)?, blocks.len());
@@ -535,11 +571,7 @@ impl<'c> Loader<'c> {
             });
         }
         let mut edges = Vec::new();
-        let mut stmt = conn.prepare_cached(
-            "SELECT e.src_block, e.dst_block, s.text FROM cfg_edges e \
-             JOIN cfg_blocks b ON b.id = e.src_block JOIN strings s ON s.id = e.kind_id \
-             WHERE b.cfg_id = ?1 ORDER BY e.src_block, e.dst_block, e.kind_id",
-        )?;
+        let mut stmt = conn.prepare_cached(LOAD_EDGES_SQL)?;
         let mut rows = stmt.query([cfg_id])?;
         while let Some(r) = rows.next()? {
             let (src, dst): (i64, i64) = (r.get(0)?, r.get(1)?);
@@ -548,16 +580,7 @@ impl<'c> Loader<'c> {
 
         let mut event_index = FxHashMap::default();
         let mut events = Vec::new();
-        let mut stmt = conn.prepare_cached(
-            "SELECT e.id, e.block_id, s.text, f.path, e.line, e.col, x.path, \
-                    e.expansion_line, e.expansion_col, \
-                    (SELECT cs.callee_text FROM cfg_event_sites es \
-                     JOIN call_sites cs ON cs.id = es.call_site_id \
-                     WHERE es.event_id = e.id ORDER BY cs.id LIMIT 1) \
-             FROM cfg_events e JOIN strings s ON s.id = e.kind_id \
-             JOIN files f ON f.id = e.file_id LEFT JOIN files x ON x.id = e.expansion_file_id \
-             WHERE e.cfg_id = ?1 ORDER BY e.block_id, e.ordinal, e.id",
-        )?;
+        let mut stmt = conn.prepare_cached(LOAD_EVENTS_SQL)?;
         let mut rows = stmt.query([cfg_id])?;
         while let Some(r) = rows.next()? {
             let db_id: i64 = r.get(0)?;
@@ -580,14 +603,7 @@ impl<'c> Loader<'c> {
             });
         }
         // Each target once per event, in function id order.
-        let mut stmt = conn.prepare_cached(
-            "SELECT DISTINCT es.event_id, ce.callee_fn_id, f.name, ce.resolution, \
-                    f.is_defined, f.is_dep \
-             FROM cfg_events e JOIN cfg_event_sites es ON es.event_id = e.id \
-             JOIN call_edges ce ON ce.call_site_id = es.call_site_id \
-             JOIN functions f ON f.id = ce.callee_fn_id \
-             WHERE e.cfg_id = ?1 ORDER BY es.event_id, ce.callee_fn_id, ce.resolution",
-        )?;
+        let mut stmt = conn.prepare_cached(LOAD_TARGETS_SQL)?;
         let mut rows = stmt.query([cfg_id])?;
         while let Some(r) = rows.next()? {
             let targets = &mut events[event_index[&r.get::<_, i64>(0)?]].targets;
@@ -603,12 +619,7 @@ impl<'c> Loader<'c> {
                 is_dep: r.get::<_, i64>(5)? != 0,
             });
         }
-        let mut stmt = conn.prepare_cached(
-            "SELECT DISTINCT es.event_id, x.kind, x.entry_fn_id \
-             FROM cfg_events e JOIN cfg_event_sites es ON es.event_id = e.id \
-             JOIN execution_contexts x ON x.call_site_id = es.call_site_id \
-             WHERE e.cfg_id = ?1 ORDER BY es.event_id, x.entry_fn_id, x.kind",
-        )?;
+        let mut stmt = conn.prepare_cached(LOAD_CONTEXTS_SQL)?;
         let mut rows = stmt.query([cfg_id])?;
         while let Some(r) = rows.next()? {
             events[event_index[&r.get::<_, i64>(0)?]]
@@ -616,11 +627,7 @@ impl<'c> Loader<'c> {
                 .push((r.get(1)?, r.get(2)?));
         }
         let mut order = Vec::new();
-        let mut stmt = conn.prepare_cached(
-            "SELECT o.event_id, o.next_event_id FROM cfg_event_order o \
-             JOIN cfg_events e ON e.id = o.event_id WHERE e.cfg_id = ?1 \
-             ORDER BY o.event_id, o.next_event_id",
-        )?;
+        let mut stmt = conn.prepare_cached(LOAD_ORDER_SQL)?;
         let mut rows = stmt.query([cfg_id])?;
         while let Some(r) = rows.next()? {
             order.push((
@@ -629,11 +636,7 @@ impl<'c> Loader<'c> {
             ));
         }
         let mut gaps = Vec::new();
-        let mut stmt = conn.prepare_cached(
-            "SELECT s.text, f.path, g.line, g.col, g.first_event, g.last_event \
-             FROM cfg_gaps g JOIN strings s ON s.id = g.kind_id \
-             LEFT JOIN files f ON f.id = g.file_id WHERE g.cfg_id = ?1 ORDER BY g.id",
-        )?;
+        let mut stmt = conn.prepare_cached(LOAD_GAPS_SQL)?;
         let mut rows = stmt.query([cfg_id])?;
         while let Some(r) = rows.next()? {
             let range: (Option<i64>, Option<i64>) = (r.get(4)?, r.get(5)?);
@@ -649,11 +652,7 @@ impl<'c> Loader<'c> {
         // IPC bridges are synthetic edges without a call site: they belong to
         // the proxy function, not to one of its events.
         let ipc = conn
-            .prepare_cached(
-                "SELECT DISTINCT ce.callee_fn_id, f.name FROM call_edges ce \
-                 JOIN functions f ON f.id = ce.callee_fn_id \
-                 WHERE ce.caller_fn_id = ?1 AND ce.resolution = 'ipc' ORDER BY ce.callee_fn_id",
-            )?
+            .prepare_cached(LOAD_IPC_SQL)?
             .query_map([fn_id], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
 
@@ -1483,14 +1482,23 @@ fn event_groups(graph: &SequenceGraph, block: usize) -> Vec<Vec<usize>> {
         .filter(|e| e.block == block)
         .map(|e| e.id)
         .collect();
+    let mut next: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for &(p, q) in &graph.order {
+        if graph.events[p].block == block {
+            next.entry(p).or_default().push(q);
+        }
+    }
+    // Each event is visited once: the order is a DAG of diamonds, whose
+    // paths are exponential in the events.
     let reaches = |a: usize, b: usize| {
+        let mut seen = FxHashSet::default();
         let mut stack = vec![a];
         while let Some(x) = stack.pop() {
-            for &(p, q) in &graph.order {
-                if p == x {
-                    if q == b {
-                        return true;
-                    }
+            for &q in next.get(&x).into_iter().flatten() {
+                if q == b {
+                    return true;
+                }
+                if seen.insert(q) {
                     stack.push(q);
                 }
             }
@@ -1769,4 +1777,41 @@ fn render_flowchart(graph: &SequenceGraph, dot: bool) -> String {
         writeln!(out, "}}").unwrap();
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A query loads each graph it reaches; a statement that scans a
+    /// `cfg_*` table per load makes the query linear in the whole database
+    /// per frame (seconds on camera).
+    #[test]
+    fn loading_a_graph_is_indexed() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::SCHEMA_V8).unwrap();
+        for sql in [
+            LOAD_GRAPH_SQL,
+            LOAD_BLOCKS_SQL,
+            LOAD_EDGES_SQL,
+            LOAD_EVENTS_SQL,
+            LOAD_TARGETS_SQL,
+            LOAD_CONTEXTS_SQL,
+            LOAD_ORDER_SQL,
+            LOAD_GAPS_SQL,
+            LOAD_IPC_SQL,
+        ] {
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([1], |r| r.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                plan.iter().all(|step| !step.starts_with("SCAN")),
+                "{sql}\n{plan:?}"
+            );
+        }
+    }
 }
