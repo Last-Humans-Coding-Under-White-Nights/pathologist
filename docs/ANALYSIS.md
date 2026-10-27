@@ -5048,6 +5048,38 @@ A gap or boundary is uncertainty, never evidence for an order.
   the callback runs elsewhere and is not inlined) and `ipc_bridge` (an `ipc`
   edge). None establishes happens-before across threads or processes.
 
+### Query
+
+`trace inspect sequence` (`trace-db/src/inspect/sequence.rs`; options in the
+[README](../README.md#trace-inspect-sequence)) checks the capability marker
+first, then loads graphs only as it reaches them:
+
+- **Frames.** Each graph shown is a frame: every variant of the starting
+  function, then one frame per inlined (event, target variant) pair, breadth
+  first in event order up to `--depth` call levels. A `call` edge joins the
+  calling event's block to the frame's entry and a `return` edge joins its
+  exit back to that block, so a return always goes to the call that made it.
+  Blocks are listed in reverse postorder (branch arms before their join).
+- **Boundaries.** A target already on the frame stack is `recursion`; a
+  target without a graph is `omitted_body` (`dependency`, `declaration_only`
+  or `not_sequenced`); an event without call edges is `unknown_callee`; the
+  callback an event starts as an execution context is `async_start` (inlined
+  only with `--inline-contexts`); an `ipc` edge of the frame's function is
+  `ipc_bridge` and is never inlined. `--max-targets`, `--max-frames` and
+  `--max-events` cut inlining with a `truncated` marker naming the budget;
+  the starting frames are always shown.
+- **Relations.** Two events of one graph relate as in
+  [Events and what "before" means](#events-and-what-before-means). When the second event lies in another function,
+  the query looks for the events of the first event's function whose calls
+  reach that graph within `--depth` levels, never through an `async_start` or
+  `ipc_bridge`, and relates the first event to each of them (the call itself
+  counts as `guaranteed_before`); several calls combine to the weakest
+  claim they all allow. Found nowhere, the relation is `unknown`. A gap over
+  either end turns `sequenced_before`/`guaranteed_before` into `unknown`, or
+  `unordered` when both ends share an `unordered_branch` gap. Between two
+  events of one graph, only the blocks on paths from the first to the second
+  (or to the calls reaching it) are shown.
+
 ### Limits
 
 - Calls outside a `try` have no exceptional edge (see Exceptions above).

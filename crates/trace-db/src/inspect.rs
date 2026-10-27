@@ -10,8 +10,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 pub use trace_analysis::LocKind;
 
 mod editor;
+mod sequence;
 mod slice;
 pub use editor::*;
+pub use sequence::*;
 pub use slice::*;
 
 /// A stored analysis diagnostic, with its original source path when available.

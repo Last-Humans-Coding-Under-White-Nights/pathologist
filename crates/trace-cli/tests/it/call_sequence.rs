@@ -501,3 +501,661 @@ fn export_without_sequencing_has_no_cfg_rows() {
         "kind tags are interned only for a sequenced export"
     );
 }
+
+// --- `inspect sequence` (docs/ANALYSIS.md, "Call sequencing") ---
+
+/// `root` built with `--sequencing` on top of `opts`, analysed and exported.
+fn sequenced_db(root: &Path, opts: PreprocessOptions) -> TempDb {
+    let program = sequenced(root, opts);
+    let (pag, analysis) = trace_analysis::analyze(&program);
+    export_program(&program, &pag, &analysis)
+}
+
+/// The `call_sequence` fixture, exported once per test binary.
+fn fixture_db() -> rusqlite::Connection {
+    static DB: std::sync::OnceLock<TempDb> = std::sync::OnceLock::new();
+    let db = DB.get_or_init(|| {
+        let root = fixture("call_sequence");
+        sequenced_db(&root, default_opts(&root))
+    });
+    rusqlite::Connection::open(db.path()).unwrap()
+}
+
+/// The event calling `callee` written on `file:line`.
+fn event(conn: &rusqlite::Connection, file: &str, line: i64, callee: &str) -> trace_db::EventRef {
+    trace_db::resolve_event(conn, file, line, None, Some(callee)).expect("event")
+}
+
+/// The relation the query reports from `a` to `b`.
+fn relation(
+    conn: &rusqlite::Connection,
+    a: &trace_db::EventRef,
+    b: &trace_db::EventRef,
+) -> trace_db::Relation {
+    let scope = trace_db::SequenceScope::Between(a.clone(), b.clone());
+    let graph = trace_db::sequence_graph(conn, &scope, &trace_db::SequenceOptions::default())
+        .expect("sequence");
+    graph
+        .relation
+        .expect("a between query relates its ends")
+        .kind
+}
+
+/// A function's sequence with `options`.
+fn function_sequence(
+    conn: &rusqlite::Connection,
+    name: &str,
+    file: Option<&str>,
+    options: &trace_db::SequenceOptions,
+) -> trace_db::SequenceGraph {
+    let function = trace_db::resolve_function_target(conn, Some(name), file, None).unwrap();
+    trace_db::sequence_graph(
+        conn,
+        &trace_db::SequenceScope::Function(function.id),
+        options,
+    )
+    .expect("sequence")
+}
+
+fn callees(graph: &trace_db::SequenceGraph) -> Vec<&str> {
+    graph.events.iter().map(|e| e.callee.as_str()).collect()
+}
+
+#[test]
+fn sequence_query_requires_the_capability() {
+    let (_, _, db) = exported(false, false);
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let err = trace_db::require_sequencing(&conn).unwrap_err().to_string();
+    assert!(err.contains("--sequencing"), "{err}");
+    let err = trace_db::resolve_event(&conn, "branches.c", 8, None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--sequencing"), "{err}");
+    let conn = fixture_db();
+    let capability = trace_db::require_sequencing(&conn).unwrap();
+    assert!(capability.complete && capability.notice.is_none());
+}
+
+#[test]
+fn branch_arms_are_exclusive() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "branches.c", line, callee);
+    let (prepare, send, recover, finish) = (
+        at(8, "prepare"),
+        at(10, "send"),
+        at(12, "recover"),
+        at(13, "finish"),
+    );
+    assert_eq!(relation(&conn, &send, &recover), Exclusive);
+    assert_eq!(relation(&conn, &recover, &send), Exclusive);
+    assert_eq!(relation(&conn, &prepare, &finish), GuaranteedBefore);
+    assert_eq!(relation(&conn, &prepare, &send), GuaranteedBefore);
+    // A path, not a guarantee: `send` runs only when `ok` holds.
+    assert_eq!(relation(&conn, &send, &finish), MayPrecede);
+    assert_eq!(relation(&conn, &finish, &prepare), MayFollow);
+
+    // The whole body: no edge or order joins the two arms. (Both C fixtures
+    // define `run`, so the function has two graphs; start from an event.)
+    let graph = trace_db::sequence_graph(
+        &conn,
+        &trace_db::SequenceScope::From(prepare.clone()),
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(callees(&graph), ["prepare", "send", "recover", "finish"]);
+    let block_of = |callee: &str| {
+        graph
+            .events
+            .iter()
+            .find(|e| e.callee == callee)
+            .unwrap()
+            .block
+    };
+    let (send_block, recover_block) = (block_of("send"), block_of("recover"));
+    assert_ne!(send_block, recover_block);
+    assert!(!graph.edges.iter().any(|e| {
+        (e.src, e.dst) == (send_block, recover_block)
+            || (e.src, e.dst) == (recover_block, send_block)
+    }));
+    assert!(
+        graph.order.is_empty(),
+        "one event per block: {:?}",
+        graph.order
+    );
+}
+
+#[test]
+fn between_keeps_only_blocks_on_a_path() {
+    let conn = fixture_db();
+    let prepare = event(&conn, "branches.c", 8, "prepare");
+    let send = event(&conn, "branches.c", 10, "send");
+    let graph = trace_db::sequence_graph(
+        &conn,
+        &trace_db::SequenceScope::Between(prepare, send),
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        callees(&graph),
+        ["prepare", "send"],
+        "`recover` is off the path"
+    );
+}
+
+#[test]
+fn expression_order_follows_the_language() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "shortcircuit.c", line, callee);
+    // `a() && b()`: `b` runs only after `a` returned true.
+    let (a, b) = (at(13, "a"), at(13, "b"));
+    assert_eq!(relation(&conn, &a, &b), GuaranteedBefore);
+    let graph = function_sequence(&conn, "both", None, &Default::default());
+    let block_of = |callee: &str| {
+        graph
+            .events
+            .iter()
+            .find(|e| e.callee == callee)
+            .unwrap()
+            .block
+    };
+    assert!(graph
+        .edges
+        .iter()
+        .any(|e| (e.src, e.dst, e.kind.as_str()) == (block_of("a"), block_of("b"), "branch_true")));
+    // `f(g(), h())`: arguments are unordered, both precede the call.
+    let (g, h, f) = (at(19, "g"), at(19, "h"), at(19, "f"));
+    assert_eq!(relation(&conn, &g, &h), Unordered);
+    assert_eq!(relation(&conn, &h, &g), Unordered);
+    assert_eq!(relation(&conn, &g, &f), SequencedBefore);
+    assert_eq!(relation(&conn, &h, &f), SequencedBefore);
+    // `f1(g()) + k()`: the operands are unordered.
+    let (g, f1, k) = (at(24, "g"), at(24, "f1"), at(24, "k"));
+    assert_eq!(relation(&conn, &g, &f1), SequencedBefore);
+    assert_eq!(relation(&conn, &f1, &k), Unordered);
+    assert_eq!(relation(&conn, &g, &k), Unordered);
+    // `(p(), q())`: the comma operator is a sequence point.
+    assert_eq!(relation(&conn, &at(29, "p"), &at(29, "q")), SequencedBefore);
+}
+
+#[test]
+fn ambiguous_position_lists_the_candidates() {
+    let conn = fixture_db();
+    let err = trace_db::resolve_event(&conn, "shortcircuit.c", 19, None, None)
+        .unwrap_err()
+        .to_string();
+    for callee in ["f", "g", "h"] {
+        assert!(err.contains(&format!("{callee} at")), "{err}");
+    }
+    let err = trace_db::resolve_event(&conn, "shortcircuit.c", 2, None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no call event"), "{err}");
+}
+
+#[test]
+fn recursion_is_summarized_once() {
+    let conn = fixture_db();
+    let options = trace_db::SequenceOptions {
+        depth: 5,
+        ..Default::default()
+    };
+    let graph = function_sequence(&conn, "walk", None, &options);
+    assert_eq!(graph.frames.len(), 1, "the recursive call is not inlined");
+    let kinds: Vec<_> = graph.boundaries.iter().map(|b| b.kind.as_str()).collect();
+    assert_eq!(
+        kinds.iter().filter(|&&k| k == "recursion").count(),
+        1,
+        "{kinds:?}"
+    );
+    let leaf = graph
+        .boundaries
+        .iter()
+        .find(|b| b.name.as_deref() == Some("leaf"))
+        .unwrap();
+    assert_eq!(
+        (leaf.kind.as_str(), leaf.reason.as_deref()),
+        ("omitted_body", Some("declaration_only"))
+    );
+}
+
+/// A caller of an indirect call, a sequenced callee, a prototype and a
+/// dependency-header body.
+fn boundary_tree() -> tempfile::TempDir {
+    scratch(&[
+        (
+            "dep/api.h",
+            "void inner();\ninline void depbody() { inner(); }\n",
+        ),
+        (
+            "main.cpp",
+            "#include <api.h>\n\
+             void leaf();\n\
+             void proto();\n\
+             void known() { leaf(); }\n\
+             void run(void (*fp)()) {\n\
+                 fp();\n\
+                 known();\n\
+                 proto();\n\
+                 depbody();\n\
+             }\n",
+        ),
+    ])
+}
+
+fn boundary_db(dir: &tempfile::TempDir) -> TempDb {
+    let dep = dir.path().join("dep");
+    sequenced_db(
+        dir.path(),
+        PreprocessOptions::new()
+            .with_dep(&dep)
+            .with_include(dep.clone()),
+    )
+}
+
+#[test]
+fn boundaries_say_why_a_callee_is_not_inlined() {
+    let dir = boundary_tree();
+    let db = boundary_db(&dir);
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let graph = function_sequence(&conn, "run", None, &Default::default());
+    assert_eq!(callees(&graph), ["fp", "known", "proto", "depbody", "leaf"]);
+    let boundary = |name: &str| {
+        let event = graph.events.iter().find(|e| e.callee == name).unwrap().id;
+        graph
+            .boundaries
+            .iter()
+            .find(|b| b.event == Some(event))
+            .map(|b| (b.kind.as_str(), b.reason.as_deref()))
+    };
+    assert_eq!(boundary("fp"), Some(("unknown_callee", None)));
+    assert_eq!(boundary("known"), None, "`known` is inlined");
+    assert_eq!(
+        boundary("proto"),
+        Some(("omitted_body", Some("declaration_only")))
+    );
+    assert_eq!(
+        boundary("depbody"),
+        Some(("omitted_body", Some("dependency")))
+    );
+    // An unknown callee is still invoked before the next call.
+    let at = |line, callee| event(&conn, "main.cpp", line, callee);
+    assert_eq!(
+        relation(&conn, &at(6, "fp"), &at(7, "known")),
+        trace_db::Relation::SequencedBefore
+    );
+}
+
+#[test]
+fn inlined_callee_returns_to_its_call() {
+    let dir = boundary_tree();
+    let db = boundary_db(&dir);
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let graph = function_sequence(&conn, "run", None, &Default::default());
+    assert_eq!(graph.frames.len(), 2);
+    let known = graph.events.iter().find(|e| e.callee == "known").unwrap();
+    let child = &graph.frames[1];
+    assert_eq!(child.name, "known");
+    assert_eq!(child.parent_event, Some(known.id));
+    let target = known.targets.iter().find(|t| t.name == "known").unwrap();
+    assert_eq!(target.frame, Some(child.id));
+    let call = graph.edges.iter().find(|e| e.kind == "call").unwrap();
+    assert_eq!(
+        (call.src, call.dst, call.event),
+        (known.block, child.entry, Some(known.id))
+    );
+    let ret = graph.edges.iter().find(|e| e.kind == "return").unwrap();
+    assert_eq!(
+        (ret.src, ret.dst, ret.event),
+        (child.exit, known.block, Some(known.id))
+    );
+    // Across the call, `leaf` runs between `known`'s invocation and `proto`.
+    let at = |line, callee| event(&conn, "main.cpp", line, callee);
+    let leaf = at(4, "leaf");
+    assert_eq!(
+        relation(&conn, &at(6, "fp"), &leaf),
+        trace_db::Relation::SequencedBefore
+    );
+    assert_eq!(
+        relation(&conn, &at(8, "proto"), &leaf),
+        trace_db::Relation::MayFollow
+    );
+}
+
+#[test]
+fn budgets_mark_what_they_cut() {
+    let dir = boundary_tree();
+    let db = boundary_db(&dir);
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let options = trace_db::SequenceOptions {
+        max_frames: 1,
+        ..Default::default()
+    };
+    let graph = function_sequence(&conn, "run", None, &options);
+    assert_eq!(graph.frames.len(), 1);
+    let reasons: Vec<_> = graph.truncated.iter().map(|t| t.reason.as_str()).collect();
+    assert_eq!(reasons, ["max_frames"]);
+    let options = trace_db::SequenceOptions {
+        max_events: 4,
+        ..Default::default()
+    };
+    let graph = function_sequence(&conn, "run", None, &options);
+    assert_eq!(
+        graph.frames.len(),
+        1,
+        "`known`'s event would exceed the budget"
+    );
+    let reasons: Vec<_> = graph.truncated.iter().map(|t| t.reason.as_str()).collect();
+    assert_eq!(reasons, ["max_events"]);
+    let graph = function_sequence(&conn, "run", None, &Default::default());
+    assert!(graph.truncated.is_empty());
+}
+
+#[test]
+fn variants_are_sibling_frames() {
+    let dir = scratch(&[
+        (
+            "BUILD.gn",
+            "source_set(\"t\") {\n  defines = [ \"BACKEND=1\", \"BACKEND=2\" ]\n}\n",
+        ),
+        (
+            "main.c",
+            "void prepare(void); void send_fast(void); void send_slow(void);\n\
+             void send(void) {\n\
+                 prepare();\n\
+             #if BACKEND == 1\n\
+                 send_fast();\n\
+             #elif BACKEND == 2\n\
+                 send_slow();\n\
+             #endif\n\
+             }\n",
+        ),
+    ]);
+    let db = sequenced_db(
+        dir.path(),
+        PreprocessOptions::new()
+            .with_explore(true)
+            .with_explore_budget(4),
+    );
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let graph = function_sequence(&conn, "send", None, &Default::default());
+    let variants: Vec<_> = graph
+        .frames
+        .iter()
+        .map(|f| (f.variant, f.parent_event))
+        .collect();
+    assert!(variants.len() >= 2, "{variants:?}");
+    for wanted in ["send_fast", "send_slow"] {
+        assert!(graph.events.iter().any(|e| e.callee == wanted), "{wanted}");
+    }
+    assert!(variants.iter().all(|&(_, parent)| parent.is_none()));
+    // No edge or order pair crosses from one configuration to the other.
+    let frame_of_block = |b: usize| graph.blocks[b].frame;
+    assert!(graph
+        .edges
+        .iter()
+        .all(|e| frame_of_block(e.src) == frame_of_block(e.dst)));
+    assert!(graph
+        .order
+        .iter()
+        .all(|&(a, b)| graph.events[a].frame == graph.events[b].frame));
+}
+
+/// A thread start and an IPC proxy/stub pair (as in `ipc_basic`).
+const ASYNC_IPC: &str = "#include <thread>\n\
+void before(); void after(); void step(); void handle();\n\
+void worker() { step(); }\n\
+void start() {\n\
+    before();\n\
+    std::thread t(worker);\n\
+    t.join();\n\
+    after();\n\
+}\n\
+class IRemoteObject {\n\
+public:\n\
+    int SendRequest(int code, void *data, void *reply, void *option);\n\
+};\n\
+IRemoteObject *Remote();\n\
+class IFooStub {\n\
+public:\n\
+    int HandleGetInfo(int key) { handle(); return key; }\n\
+};\n\
+class IFooProxy {\n\
+public:\n\
+    int GetInfo(int key);\n\
+};\n\
+int IFooProxy::GetInfo(int key) {\n\
+    IRemoteObject *remote = Remote();\n\
+    remote->SendRequest(1, 0, 0, 0);\n\
+    return key;\n\
+}\n";
+
+#[test]
+fn thread_starts_and_ipc_are_boundaries() {
+    use trace_db::Relation::*;
+    let dir = scratch(&[("async_ipc.cpp", ASYNC_IPC)]);
+    let db = sequenced_db(dir.path(), default_opts(dir.path()));
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let options = trace_db::SequenceOptions {
+        depth: 3,
+        ..Default::default()
+    };
+    let graph = function_sequence(&conn, "start", None, &options);
+    let thread = graph
+        .events
+        .iter()
+        .find(|e| e.context_start.is_some())
+        .expect("the thread start");
+    assert_eq!(thread.context_start.as_deref(), Some("thread"));
+    assert!(
+        !graph.frames.iter().any(|f| f.name == "worker"),
+        "the thread body runs elsewhere"
+    );
+    assert!(graph.boundaries.iter().any(|b| b.kind == "async_start"
+        && b.event == Some(thread.id)
+        && b.name.as_deref() == Some("worker")));
+    // Nothing orders the thread's calls against the starter's.
+    let at = |line, callee| event(&conn, "async_ipc.cpp", line, callee);
+    let step = at(3, "step");
+    for other in [at(5, "before"), at(7, "join"), at(8, "after")] {
+        assert_eq!(relation(&conn, &other, &step), Unknown);
+        assert_eq!(relation(&conn, &step, &other), Unknown);
+    }
+    // With `inline_contexts`, the body is shown, but still never ordered.
+    let inlined = trace_db::SequenceOptions {
+        inline_contexts: true,
+        ..options.clone()
+    };
+    let graph = function_sequence(&conn, "start", None, &inlined);
+    assert!(graph.frames.iter().any(|f| f.name == "worker"));
+
+    let graph = function_sequence(&conn, "IFooProxy::GetInfo", None, &options);
+    let bridge: Vec<_> = graph
+        .boundaries
+        .iter()
+        .filter(|b| b.kind == "ipc_bridge")
+        .map(|b| b.name.as_deref())
+        .collect();
+    assert_eq!(bridge, [Some("IFooStub::HandleGetInfo")]);
+    assert_eq!(graph.frames.len(), 1, "the stub runs in another process");
+    let send = at(25, "IRemoteObject::SendRequest");
+    assert_eq!(relation(&conn, &send, &at(17, "handle")), Unknown);
+}
+
+#[test]
+fn sequencing_leaves_the_call_graph_unchanged() {
+    let (_, off, _) = exported(false, false);
+    let (_, on, _) = exported(true, false);
+    assert_eq!(
+        format!("{:?}", off.call_edges),
+        format!("{:?}", on.call_edges)
+    );
+    assert_eq!(
+        format!("{:?}", off.arg_flow_edges),
+        format!("{:?}", on.arg_flow_edges)
+    );
+    assert_eq!(
+        format!("{:?}", off.execution_contexts),
+        format!("{:?}", on.execution_contexts)
+    );
+    assert_eq!(off.points_to.len(), on.points_to.len());
+}
+
+#[test]
+fn sequence_renders_in_every_format() {
+    let conn = fixture_db();
+    let graph = function_sequence(&conn, "args", None, &Default::default());
+    let text = trace_db::render_sequence(&graph, trace_db::RenderFormat::Text).unwrap();
+    assert!(text.contains("args"), "{text}");
+    assert!(text.contains("(order unspecified)"), "{text}");
+    assert!(
+        text.contains("?? unknown callee") || text.contains("body omitted"),
+        "{text}"
+    );
+    let json = trace_db::render_sequence(&graph, trace_db::RenderFormat::Json).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["frames"][0]["name"], "args");
+    assert_eq!(value["events"].as_array().unwrap().len(), 3);
+    let mermaid = trace_db::render_sequence(&graph, trace_db::RenderFormat::Mermaid).unwrap();
+    assert!(mermaid.starts_with("flowchart TD"), "{mermaid}");
+    assert!(mermaid.contains("subgraph"), "{mermaid}");
+    let dot = trace_db::render_sequence(&graph, trace_db::RenderFormat::Graphviz).unwrap();
+    assert!(dot.starts_with("digraph"), "{dot}");
+    assert!(dot.contains("subgraph cluster_"), "{dot}");
+}
+
+#[test]
+fn cli_inspect_sequence_end_to_end() {
+    let root = fixture("call_sequence");
+    let run = |db: &TempDb, args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_trace"))
+            .arg("inspect")
+            .arg(db.path())
+            .arg("sequence")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let db = crate::common::cli_analyze(&root, &["--sequencing"]);
+    let out = run(&db, &["--file", "branches.c", "--line", "8"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    for callee in ["prepare()", "send()", "recover()", "finish()"] {
+        assert!(text.contains(callee), "{text}");
+    }
+    assert!(
+        text.contains("branch_true") && text.contains("branch_false"),
+        "{text}"
+    );
+    let out = run(
+        &db,
+        &[
+            "--file",
+            "branches.c",
+            "--line",
+            "10",
+            "--callee",
+            "send",
+            "--to-file",
+            "branches.c",
+            "--to-line",
+            "12",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["relation"]["kind"], "exclusive");
+
+    let plain = crate::common::cli_analyze(&root, &[]);
+    let out = run(&plain, &["--function", "run"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--sequencing"));
+}
+
+#[test]
+fn partial_merge_output_is_accepted_with_a_notice() {
+    let root = fixture("call_sequence");
+    let db = sequenced_db(&root, default_opts(&root));
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    // What trace-merge records when only some inputs were sequenced.
+    conn.execute(
+        "UPDATE analysis_run SET options_json = \
+         json_set(options_json, '$.call_sequencing', 'partial')",
+        [],
+    )
+    .unwrap();
+    let capability = trace_db::require_sequencing(&conn).unwrap();
+    assert!(!capability.complete);
+    assert!(capability.notice.unwrap().contains("--sequencing"));
+    let graph = function_sequence(&conn, "args", None, &Default::default());
+    assert_eq!(graph.capability, "partial");
+    let text = trace_db::render_sequence(&graph, trace_db::RenderFormat::Text).unwrap();
+    assert!(text.contains("note: call sequencing is partial"), "{text}");
+}
+
+#[test]
+fn loops_stay_cycles() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "loops.c", line, callee);
+    let body = at(13, "body");
+    assert_eq!(relation(&conn, &body, &body), MayBoth);
+    assert_eq!(relation(&conn, &at(12, "init"), &body), GuaranteedBefore);
+    assert_eq!(relation(&conn, &body, &at(20, "after")), MayPrecede);
+    let graph = function_sequence(&conn, "for_loop", None, &Default::default());
+    assert_eq!(
+        graph.edges.iter().filter(|e| e.kind == "back_edge").count(),
+        1,
+        "the loop is one back edge, never unrolled"
+    );
+    assert_eq!(
+        graph.events.iter().filter(|e| e.callee == "body").count(),
+        1
+    );
+}
+
+#[test]
+fn handler_may_follow_the_try_body() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "exceptions.cpp", line, callee);
+    // Reached over an exception edge: a path, never a guarantee.
+    assert_eq!(relation(&conn, &at(11, "a"), &at(14, "h")), MayPrecede);
+    assert_eq!(relation(&conn, &at(14, "h"), &at(11, "a")), MayFollow);
+    assert_eq!(
+        relation(&conn, &at(11, "a"), &at(16, "c")),
+        GuaranteedBefore
+    );
+    // Nothing runs after a `throw`.
+    assert_eq!(
+        relation(&conn, &at(21, "before"), &at(23, "dead")),
+        Exclusive
+    );
+    let graph = function_sequence(&conn, "guarded", None, &Default::default());
+    assert!(graph.edges.iter().any(|e| e.kind == "exception"));
+}
+
+#[test]
+fn gaps_cancel_guarantees() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "unsupported.c", line, callee);
+    // A statement expression is not modeled: its call's order is unknown.
+    assert_eq!(relation(&conn, &at(13, "g"), &at(14, "k")), Unknown);
+    // `a() && b()` as an argument: the branch sits in an unordered operand.
+    assert_eq!(relation(&conn, &at(33, "a"), &at(33, "b")), Unordered);
+    let graph = function_sequence(&conn, "branchy", None, &Default::default());
+    assert_eq!(graph.frames[0].coverage, "partial");
+    assert_eq!(graph.frames[0].gaps[0].kind, "unordered_branch");
+}

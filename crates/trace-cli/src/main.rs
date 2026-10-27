@@ -297,6 +297,63 @@ enum InspectCommands {
         #[arg(long = "callgraph-filter")]
         callgraph_filter: Option<PathBuf>,
     },
+    /// Bounded call sequence of a function, from a call, or between two
+    /// calls, from a database analysed with `--sequencing`.
+    ///
+    /// Callees are inlined up to `--depth`; loops stay back edges, and
+    /// unknown callees, omitted bodies, recursion, thread/task starts and IPC
+    /// bridges are shown as boundaries. With `--to-*`, the relation of the
+    /// two calls is reported (docs/ANALYSIS.md, "Call sequencing").
+    Sequence {
+        /// Function name, C++ qualified suffix, or FILE:LINE: every variant
+        /// of its body.
+        #[arg(long, conflicts_with_all = ["line", "col", "callee"])]
+        function: Option<String>,
+        /// File path substring locating the starting call (or narrowing
+        /// `--function`).
+        #[arg(long)]
+        file: Option<String>,
+        /// Line of the starting call (its spelling or macro invocation).
+        #[arg(long, requires = "file")]
+        line: Option<i64>,
+        /// Column of the starting call, when the line holds several.
+        #[arg(long, requires = "line")]
+        col: Option<i64>,
+        /// Callee name of the starting call, when the line holds several.
+        #[arg(long, requires = "line")]
+        callee: Option<String>,
+        /// File path substring locating the second call.
+        #[arg(long = "to-file", requires = "to_line")]
+        to_file: Option<String>,
+        /// Line of the second call.
+        #[arg(long = "to-line", requires = "to_file", conflicts_with = "function")]
+        to_line: Option<i64>,
+        /// Column of the second call.
+        #[arg(long = "to-col", requires = "to_line")]
+        to_col: Option<i64>,
+        /// Callee name of the second call.
+        #[arg(long = "to-callee", requires = "to_line")]
+        to_callee: Option<String>,
+        /// Call levels inlined below the starting function.
+        #[arg(long, default_value_t = trace_db::SequenceOptions::default().depth)]
+        depth: u32,
+        /// Events shown across all inlined functions.
+        #[arg(long = "max-events", default_value_t = trace_db::SequenceOptions::default().max_events)]
+        max_events: usize,
+        /// Function graphs shown, the starting ones included.
+        #[arg(long = "max-frames", default_value_t = trace_db::SequenceOptions::default().max_frames)]
+        max_frames: usize,
+        /// Targets of one call considered for inlining.
+        #[arg(long = "max-targets", default_value_t = trace_db::SequenceOptions::default().max_targets)]
+        max_targets: usize,
+        /// Inline the callbacks thread and task starts run (still unordered
+        /// against the starter).
+        #[arg(long = "inline-contexts")]
+        inline_contexts: bool,
+        /// Output format: `text`, `json`, `graphviz`, or `mermaid`.
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -1107,6 +1164,65 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
                 &labels,
             );
             print!("{out}");
+        }
+        InspectCommands::Sequence {
+            function,
+            file,
+            line,
+            col,
+            callee,
+            to_file,
+            to_line,
+            to_col,
+            to_callee,
+            depth,
+            max_events,
+            max_frames,
+            max_targets,
+            inline_contexts,
+            format,
+        } => {
+            trace_db::require_sequencing(&conn)?;
+            let scope = match (function, file, line) {
+                (Some(name), file, _) => {
+                    let f = trace_db::resolve_function_target(
+                        &conn,
+                        Some(&name),
+                        file.as_deref(),
+                        None,
+                    )?;
+                    trace_db::SequenceScope::Function(f.id)
+                }
+                (None, Some(file), Some(line)) => {
+                    let from = trace_db::resolve_event(&conn, &file, line, col, callee.as_deref())?;
+                    match (to_file, to_line) {
+                        (Some(to_file), Some(to_line)) => {
+                            let to = trace_db::resolve_event(
+                                &conn,
+                                &to_file,
+                                to_line,
+                                to_col,
+                                to_callee.as_deref(),
+                            )?;
+                            trace_db::SequenceScope::Between(from, to)
+                        }
+                        _ => trace_db::SequenceScope::From(from),
+                    }
+                }
+                _ => anyhow::bail!("give --function NAME, or --file FILE --line N"),
+            };
+            let graph = trace_db::sequence_graph(
+                &conn,
+                &scope,
+                &trace_db::SequenceOptions {
+                    depth,
+                    max_events,
+                    max_frames,
+                    max_targets,
+                    inline_contexts,
+                },
+            )?;
+            print!("{}", trace_db::render_sequence(&graph, format.to_render())?);
         }
     }
     Ok(())

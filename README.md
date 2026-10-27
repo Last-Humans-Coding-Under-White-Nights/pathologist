@@ -352,6 +352,56 @@ trace inspect /tmp/trace.db callchain --from main.c:10 --to target.c:20
 trace inspect /tmp/trace.db callchain --from caller --to helper --format mermaid
 ```
 
+### `trace inspect sequence`
+
+A bounded call sequence rebuilt from the call-order graphs a
+`trace analyze --sequencing` database records: one function body (every
+configuration variant side by side), the part of a body reachable from one
+call, or the blocks on paths between two calls together with their relation
+(`sequenced_before`, `guaranteed_before`, `may_precede`, `may_follow`,
+`may_both`, `exclusive`, `unordered` or `unknown`, with the conditions each
+claims). Callees are inlined up to `--depth`, each call returning to the
+event that made it; loops stay back edges. Unknown callees, bodies without a
+graph (dependency, declaration only), recursion, thread and task starts and
+IPC bridges are shown as boundaries, and a budget that cuts something leaves a
+`truncated` marker. A database analysed without `--sequencing` is rejected
+with an error naming the flag. Semantics and limits:
+[Call sequencing](docs/ANALYSIS.md#call-sequencing-control-flow-sidecar).
+
+```text
+trace inspect <DB> sequence (--function FN | --file SUBSTR --line N [--col C] [--callee NAME])
+    [--to-file SUBSTR --to-line N [--to-col C] [--to-callee NAME]]
+    [--depth N] [--max-events N] [--max-frames N] [--max-targets N] [--inline-contexts]
+    [--format text|json|graphviz|mermaid]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--function <FN>` | Function name, C++ qualified suffix, or `FILE:LINE`; `--file` narrows a name. |
+| `--file <SUBSTR>`, `--line <N>` | Position of the starting call: its spelling or its macro invocation. |
+| `--col <C>`, `--callee <NAME>` | Pick one call when the line holds several (`NAME` or a `::NAME` suffix). |
+| `--to-file`, `--to-line`, `--to-col`, `--to-callee` | The second call: show the paths between the two and report their relation. |
+| `--depth <N>` | Call levels inlined below the starting function (default 1). |
+| `--max-events <N>` | Events shown across all inlined bodies (default 200). |
+| `--max-frames <N>` | Function graphs shown, the starting ones included (default 32). |
+| `--max-targets <N>` | Targets of one call considered for inlining (default 4). |
+| `--inline-contexts` | Also inline the callbacks thread and task starts run; they stay unordered against the starter. |
+| `--format` | `text` (default), `json`, `graphviz` or `mermaid`. |
+
+In the text view, calls whose order the language leaves unspecified are
+grouped as `{ g(), h() }  (order unspecified)`; `↺` marks a back edge or a
+recursive call, `??` an unknown callee and `⊘` an omitted body.
+
+**Examples**
+
+```bash
+trace analyze tests/fixtures/call_sequence --sequencing -o /tmp/seq.db
+trace inspect /tmp/seq.db sequence --function for_loop
+trace inspect /tmp/seq.db sequence --file branches.c --line 10 \
+    --to-file branches.c --to-line 12        # relation: exclusive
+trace inspect /tmp/seq.db sequence --function args --format mermaid
+```
+
 ### `trace inspect diagnostics`
 
 Read diagnostics saved during analysis without rerunning it or writing SQL.
