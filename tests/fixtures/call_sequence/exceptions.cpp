@@ -34,3 +34,14 @@ void typed()
         h();
     }
 }
+
+Error work();
+
+void rethrow()
+{
+    try {
+        throw work();
+    } catch (...) {
+        h();
+    }
+}

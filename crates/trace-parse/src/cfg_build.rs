@@ -30,7 +30,7 @@ pub(super) struct CfgRecorder {
 }
 
 /// Lengths of a recorder's lists, to drop what was recorded after.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RecorderMark(usize, usize);
 
 impl CfgRecorder {
@@ -93,7 +93,13 @@ pub(super) fn build_function_cfg(
             SpanSlot::Gap(g) => cfg.gaps[g].span = span,
         }
     }
-    cfg.compact();
+    #[cfg(test)]
+    let compact = !tests::UNCOMPACTED.get();
+    #[cfg(not(test))]
+    let compact = true;
+    if compact {
+        cfg.compact();
+    }
     program.cfgs.entry(function).or_default().push(cfg);
 }
 
@@ -912,7 +918,9 @@ impl<'a> Builder<'_, 'a> {
             },
             None,
         );
-        self.enter(body);
+        // Every loop reaches its body: a `do` body through its back edge
+        // even when nothing before the loop does.
+        self.start(body);
         self.push_scope(ScopeKind::Block, None);
         if node.cached_kind() == "for_range_loop" {
             if let Some(declarator) = node.cached_field("declarator") {
@@ -1129,6 +1137,7 @@ impl<'a> Builder<'_, 'a> {
         let landing = self.new_block(BlockKind::Landing);
         let exit = self.new_block(BlockKind::Ordinary);
         let first_event = self.cfg.events.len();
+        let first_edge = self.cfg.edges.len();
         let body = self.block_at(node);
         self.jump(body, EdgeKind::Fallthrough);
         self.enter(body);
@@ -1145,8 +1154,17 @@ impl<'a> Builder<'_, 'a> {
             .collect();
         throwing.sort_unstable();
         throwing.dedup();
+        // A `throw` in the body already left its block for the landing.
+        let mut thrown: Vec<BlockId> = self.cfg.edges[first_edge..]
+            .iter()
+            .filter(|e| e.to == landing && e.kind == EdgeKind::Exception)
+            .map(|e| e.from)
+            .collect();
+        thrown.sort_unstable();
         for b in throwing {
-            self.edge(b, landing, EdgeKind::Exception);
+            if thrown.binary_search(&b).is_err() {
+                self.edge(b, landing, EdgeKind::Exception);
+            }
         }
         self.jump(exit, EdgeKind::Fallthrough);
         let mut catch_all = false;
@@ -1248,6 +1266,19 @@ mod tests {
 
     fn lower(name: &str) -> UnitIndex {
         lower_with(name, PreprocessOptions::new().with_call_sequencing(true))
+    }
+
+    thread_local! {
+        /// Keep graphs as the walk built them, before `compact`.
+        pub(super) static UNCOMPACTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// `lower`, with the graphs as the walk built them.
+    fn lower_uncompacted(name: &str) -> UnitIndex {
+        UNCOMPACTED.set(true);
+        let unit = lower(name);
+        UNCOMPACTED.set(false);
+        unit
     }
 
     /// The graph of `function`, with the unit to read site names from.
@@ -1548,6 +1579,35 @@ mod tests {
         assert!(g.may_precede(body, body));
         assert!(!g.guaranteed(body, after));
         assert!(g.guaranteed(more, after));
+    }
+
+    /// A `do` body entered only through its back edge is the block the
+    /// back edge returns to.
+    #[test]
+    fn a_do_back_edge_returns_to_the_body_events() {
+        let unit = lower("loops.c");
+        let g = graph(&unit, "unreachable_do");
+        let (handle, more) = (g.ev("handle"), g.ev("more"));
+        assert!(
+            g.edge(g.block(more), g.block(handle), EdgeKind::BackEdge),
+            "{}",
+            g.dump()
+        );
+    }
+
+    /// In Duff's device the `do` body is entered only through case labels;
+    /// the back edge still returns to the body, not to an orphan block.
+    #[test]
+    fn a_do_back_edge_in_duffs_device_returns_to_the_body_events() {
+        let unit = lower("loops.c");
+        let g = graph(&unit, "duff");
+        let (handle, odd, more) = (g.ev("handle"), g.ev("handle_odd"), g.ev("more"));
+        assert!(
+            g.edge(g.block(more), g.block(handle), EdgeKind::BackEdge),
+            "{}",
+            g.dump()
+        );
+        assert!(g.may_precede(odd, handle), "{}", g.dump());
     }
 
     #[test]
@@ -1961,6 +2021,24 @@ mod tests {
 
         let g = graph(&unit, "guarded");
         assert!(g.cfg.exceptional_exit.is_none());
+    }
+
+    /// `throw work();` in a `try` leaves for the handlers once: the throw's
+    /// own edge and the edge for the call in it are one edge, as built and
+    /// not only once `compact` drops duplicates.
+    #[test]
+    fn a_throw_in_a_try_has_one_exception_edge() {
+        let unit = lower_uncompacted("exceptions.cpp");
+        let g = graph(&unit, "rethrow");
+        let work = g.block(g.ev("work"));
+        let exception = |b: BlockId| {
+            g.cfg
+                .edges
+                .iter()
+                .filter(|e| e.from == b && e.kind == EdgeKind::Exception)
+                .count()
+        };
+        assert_eq!(exception(work), 1, "{}", g.dump());
     }
 
     #[test]

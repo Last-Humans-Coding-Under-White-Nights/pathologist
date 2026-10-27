@@ -45,3 +45,26 @@ void loop_pair(void)
         second();
     }
 }
+
+void handle(void);
+void handle_odd(void);
+
+void unreachable_do(void)
+{
+    return;
+    do {
+        handle();
+    } while (more());
+}
+
+void duff(int n)
+{
+    switch (n) {
+        do {
+        case 0:
+            handle();
+        case 1:
+            handle_odd();
+        } while (more());
+    }
+}

@@ -226,13 +226,22 @@ pub fn add_variant<'v>(
     map_site: impl Fn(CallSiteId) -> Option<CallSiteId>,
     map_file: impl Fn(FileId) -> FileId,
 ) -> Option<&'v mut FunctionCfg> {
-    if variants
-        .iter()
-        .any(|v| v.equal_after_remap(cfg, function, &map_site, &map_file))
-    {
-        return None;
-    }
-    let mut kept = cfg.remap(function, map_site, map_file);
+    let mut kept = if cfg.splices(&map_site) {
+        // The remapped graph is built anyway; compare it, built once.
+        let kept = cfg.remap(function, map_site, map_file);
+        if variants.iter().any(|v| v.structurally_equal(&kept)) {
+            return None;
+        }
+        kept
+    } else {
+        if variants
+            .iter()
+            .any(|v| v.equal_unspliced(cfg, function, &map_site, &map_file))
+        {
+            return None;
+        }
+        cfg.remap(function, map_site, map_file)
+    };
     kept.variant = variants.len() as u32;
     variants.push(kept);
     variants.last_mut()
@@ -249,6 +258,68 @@ fn mapped_sites<'s>(
         let repeat = sites[..i].iter().any(|&p| map_site(p) == Some(site));
         (!repeat).then_some(site)
     })
+}
+
+/// `order` with each event `renumber` drops (`None`) spliced out in
+/// ascending id order: its predecessors are joined to its successors, so
+/// the events around it keep their order. A pair is never added twice;
+/// added pairs follow the kept ones, in the order the splices add them.
+fn splice_order(
+    order: &[(EventId, EventId)],
+    renumber: &[Option<EventId>],
+) -> Vec<(EventId, EventId)> {
+    // Pairs in insertion order, `None` once removed.
+    let mut pairs: Vec<Option<(EventId, EventId)>> = order.iter().copied().map(Some).collect();
+    // Indices into `pairs` of each event's outgoing and incoming pairs, in
+    // insertion order; removed pairs are skipped as they are met.
+    let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); renumber.len()];
+    let mut incoming: Vec<Vec<usize>> = vec![Vec::new(); renumber.len()];
+    // The pairs not removed yet. Removing an event removes every copy of
+    // its pairs, so a pair is live while any copy of it is.
+    let mut live: rustc_hash::FxHashSet<(EventId, EventId)> = Default::default();
+    for (i, &(a, b)) in order.iter().enumerate() {
+        outgoing[a.0 as usize].push(i);
+        incoming[b.0 as usize].push(i);
+        live.insert((a, b));
+    }
+    let mut preds = Vec::new();
+    let mut succs = Vec::new();
+    for (old, new) in renumber.iter().enumerate() {
+        if new.is_some() {
+            continue;
+        }
+        preds.clear();
+        succs.clear();
+        preds.extend(incoming[old].iter().filter_map(|&i| pairs[i]).map(|p| p.0));
+        succs.extend(outgoing[old].iter().filter_map(|&i| pairs[i]).map(|p| p.1));
+        for &i in incoming[old].iter().chain(&outgoing[old]) {
+            if let Some(pair) = pairs[i].take() {
+                live.remove(&pair);
+            }
+        }
+        incoming[old].clear();
+        outgoing[old].clear();
+        for &p in &preds {
+            for &s in &succs {
+                let pair = (p, s);
+                // One still touching the spliced event (from a pair of the
+                // event with itself) is dropped by the renumbering.
+                if live.insert(pair) {
+                    let i = pairs.len();
+                    pairs.push(Some(pair));
+                    outgoing[pair.0 .0 as usize].push(i);
+                    incoming[pair.1 .0 as usize].push(i);
+                }
+            }
+        }
+    }
+    pairs.into_iter().flatten().collect()
+}
+
+/// Drop repeated edges, keeping each edge's first position.
+fn dedup_edges(edges: &mut Vec<CfgEdge>) {
+    let mut seen = rustc_hash::FxHashSet::default();
+    edges.retain(|e| seen.insert(*e));
 }
 
 impl FunctionCfg {
@@ -289,14 +360,28 @@ impl FunctionCfg {
         map_site: impl Fn(CallSiteId) -> Option<CallSiteId>,
         map_file: impl Fn(FileId) -> FileId,
     ) -> bool {
-        if other
-            .events
-            .iter()
-            .any(|e| mapped_sites(&e.sites, &map_site).next().is_none())
-        {
+        if other.splices(&map_site) {
             return self.structurally_equal(&other.remap(function, map_site, map_file));
         }
-        // No event is spliced out: ids, the order and gap ranges carry over.
+        self.equal_unspliced(other, function, map_site, map_file)
+    }
+
+    /// Whether [`Self::remap`] through `map_site` splices out an event.
+    fn splices(&self, map_site: &impl Fn(CallSiteId) -> Option<CallSiteId>) -> bool {
+        self.events
+            .iter()
+            .any(|e| mapped_sites(&e.sites, map_site).next().is_none())
+    }
+
+    /// [`Self::equal_after_remap`] when `map_site` splices out no event of
+    /// `other`: ids, the order and gap ranges carry over.
+    fn equal_unspliced(
+        &self,
+        other: &FunctionCfg,
+        function: FnId,
+        map_site: impl Fn(CallSiteId) -> Option<CallSiteId>,
+        map_file: impl Fn(FileId) -> FileId,
+    ) -> bool {
         let FunctionCfg {
             function: _,
             tu: _,
@@ -383,25 +468,11 @@ impl FunctionCfg {
                 sites,
             });
         }
-        let mut order = self.order.clone();
-        // Join each spliced event's predecessors to its successors, so the
-        // events around it keep their order.
-        for (old, new) in renumber.iter().enumerate() {
-            if new.is_some() {
-                continue;
-            }
-            let x = EventId(old as u32);
-            let preds: Vec<EventId> = order.iter().filter(|p| p.1 == x).map(|p| p.0).collect();
-            let succs: Vec<EventId> = order.iter().filter(|p| p.0 == x).map(|p| p.1).collect();
-            order.retain(|p| p.0 != x && p.1 != x);
-            for &p in &preds {
-                for &s in &succs {
-                    if !order.contains(&(p, s)) {
-                        order.push((p, s));
-                    }
-                }
-            }
-        }
+        let order = if omitted.is_empty() {
+            self.order.clone()
+        } else {
+            splice_order(&self.order, &renumber)
+        };
         let at = |e: EventId| renumber[e.0 as usize];
         let order = order
             .into_iter()
@@ -451,7 +522,7 @@ impl FunctionCfg {
 
     /// Remove event-free ordinary blocks that only fall through to another
     /// block, redirecting their incoming edges; branch, loop, exit and
-    /// landing structure is kept.
+    /// landing structure is kept. Repeated edges are dropped either way.
     pub fn compact(&mut self) {
         let n = self.blocks.len();
         let mut out_degree = vec![0u32; n];
@@ -472,6 +543,8 @@ impl FunctionCfg {
             }
         }
         if forward.iter().all(Option::is_none) {
+            // Nothing to remove, but duplicates still go.
+            dedup_edges(&mut self.edges);
             return;
         }
         // Resolve each chain to the block it ends at. A cycle of removable
@@ -514,18 +587,12 @@ impl FunctionCfg {
             }
         }
         let map = |b: BlockId| BlockId(renumber[target[b.0 as usize] as usize]);
-        let mut seen = rustc_hash::FxHashSet::default();
-        let edges = std::mem::take(&mut self.edges);
-        self.edges = edges
-            .into_iter()
-            .filter(|e| forward[e.from.0 as usize].is_none())
-            .map(|e| CfgEdge {
-                from: map(e.from),
-                to: map(e.to),
-                kind: e.kind,
-            })
-            .filter(|e| seen.insert(*e))
-            .collect();
+        self.edges.retain(|e| forward[e.from.0 as usize].is_none());
+        for e in &mut self.edges {
+            e.from = map(e.from);
+            e.to = map(e.to);
+        }
+        dedup_edges(&mut self.edges);
         let mut kept = forward.iter().map(Option::is_none);
         self.blocks.retain(|_| kept.next() == Some(true));
         for event in &mut self.events {
@@ -794,6 +861,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compact_drops_duplicate_edges_when_no_block_goes() {
+        let mut g = cfg(
+            vec![
+                block(BlockKind::Entry, &[]),
+                block(BlockKind::Exit, &[]),
+                block(BlockKind::Ordinary, &[0]),
+            ],
+            vec![
+                edge(0, 2, EdgeKind::Fallthrough),
+                edge(2, 1, EdgeKind::Exception),
+                edge(2, 1, EdgeKind::Fallthrough),
+                edge(2, 1, EdgeKind::Exception),
+            ],
+            vec![event(2, 3, 10)],
+        );
+        g.compact();
+        assert_eq!(
+            g.edges,
+            vec![
+                edge(0, 2, EdgeKind::Fallthrough),
+                edge(2, 1, EdgeKind::Exception),
+                edge(2, 1, EdgeKind::Fallthrough),
+            ]
+        );
+    }
+
     /// An event whose every site the merge dropped leaves its block and the
     /// local order; its neighbours stay ordered and a gap marks the hole.
     #[test]
@@ -934,6 +1028,131 @@ mod tests {
                 assert_eq!(merged.equal_after_remap(&g, FnId(9), other, file), expected);
             }
         }
+    }
+
+    /// With an event spliced out, adding a variant remaps the new graph
+    /// once, however many variants it is compared with.
+    #[test]
+    fn add_variant_remaps_once() {
+        let mut variants = Vec::new();
+        for n in 0..4u32 {
+            let mut g = straight();
+            g.events[0].sites = vec![CallSiteId(100 + n)];
+            add_variant(&mut variants, &g, FnId(7), Some, |f| f).unwrap();
+        }
+        let mut g = straight();
+        g.blocks[2].span = Some(span(2));
+        // The second invocation loses its site.
+        let drop = |s: CallSiteId| (s.0 != 11).then_some(s);
+        let calls = std::cell::Cell::new(0usize);
+        let file = |f: FileId| {
+            calls.set(calls.get() + 1);
+            f
+        };
+        g.remap(FnId(7), drop, file);
+        let one = calls.replace(0);
+        assert!(one > 0);
+        add_variant(&mut variants, &g, FnId(7), drop, file).unwrap();
+        assert_eq!(calls.get(), one);
+        assert_eq!(variants.len(), 5);
+        // And it is still recognised as a copy.
+        assert!(add_variant(&mut variants, &g, FnId(7), drop, |f| f).is_none());
+    }
+
+    /// The splice in [`FunctionCfg::remap`] as first written: quadratic, the
+    /// reference for the order the faster one must reproduce.
+    fn reference_splice(
+        order: &[(EventId, EventId)],
+        renumber: &[Option<EventId>],
+    ) -> Vec<(EventId, EventId)> {
+        let mut order = order.to_vec();
+        for (old, new) in renumber.iter().enumerate() {
+            if new.is_some() {
+                continue;
+            }
+            let x = EventId(old as u32);
+            let preds: Vec<EventId> = order.iter().filter(|p| p.1 == x).map(|p| p.0).collect();
+            let succs: Vec<EventId> = order.iter().filter(|p| p.0 == x).map(|p| p.1).collect();
+            order.retain(|p| p.0 != x && p.1 != x);
+            for &p in &preds {
+                for &s in &succs {
+                    if !order.contains(&(p, s)) {
+                        order.push((p, s));
+                    }
+                }
+            }
+        }
+        let at = |e: EventId| renumber[e.0 as usize];
+        order
+            .into_iter()
+            .filter_map(|(a, b)| Some((at(a)?, at(b)?)))
+            .collect()
+    }
+
+    /// One block of `n` events, each with its own site, ordered by `order`.
+    fn ordered(n: u32, order: Vec<(EventId, EventId)>) -> FunctionCfg {
+        let mut g = cfg(
+            vec![
+                block(BlockKind::Entry, &[]),
+                block(BlockKind::Exit, &[]),
+                block(BlockKind::Ordinary, &(0..n).collect::<Vec<_>>()),
+            ],
+            vec![
+                edge(0, 2, EdgeKind::Fallthrough),
+                edge(2, 1, EdgeKind::Fallthrough),
+            ],
+            (0..n).map(|e| event(2, e + 1, e)).collect(),
+        );
+        g.order = order;
+        g
+    }
+
+    #[test]
+    fn remap_splices_the_order_as_the_reference_does() {
+        // xorshift: varied, reproducible graphs without a dependency.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |bound: u32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % u64::from(bound)) as u32
+        };
+        for round in 0..500 {
+            let n = 1 + next(12);
+            let pairs = next(3 * n);
+            let order: Vec<(EventId, EventId)> = (0..pairs)
+                .map(|_| (EventId(next(n)), EventId(next(n))))
+                .collect();
+            let keep: Vec<bool> = (0..n).map(|_| next(3) != 0).collect();
+            let mut renumber = Vec::new();
+            let mut kept = 0;
+            for &k in &keep {
+                renumber.push(k.then(|| {
+                    kept += 1;
+                    EventId(kept - 1)
+                }));
+            }
+            let g = ordered(n, order.clone());
+            let merged = g.remap(FnId(7), |s| keep[s.0 as usize].then_some(s), |f| f);
+            assert_eq!(
+                merged.order,
+                reference_splice(&order, &renumber),
+                "round {round}: {order:?} keeping {keep:?}"
+            );
+        }
+    }
+
+    /// Splicing every other event of a long chain is linear, not quadratic.
+    #[test]
+    fn remap_splices_a_long_chain_quickly() {
+        let n = 200_000u32;
+        let order = (1..n).map(|e| (EventId(e - 1), EventId(e))).collect();
+        let g = ordered(n, order);
+        let merged = g.remap(FnId(7), |s| (s.0 % 2 == 0).then_some(s), |f| f);
+        let expected: Vec<_> = (1..n / 2).map(|e| (EventId(e - 1), EventId(e))).collect();
+        let mut got = merged.order;
+        got.sort();
+        assert_eq!(got, expected);
     }
 
     #[test]

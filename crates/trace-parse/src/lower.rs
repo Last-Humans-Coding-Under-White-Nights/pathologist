@@ -314,9 +314,19 @@ impl LowerContext {
 
     /// Record that lowering `node` emitted the sites from `first` on.
     fn record_cfg_sites(&mut self, program: &Program, node: Node, first: usize) {
-        if let Some(recorder) = &mut self.cfg_recorder {
+        if let Some(recorder) = self.body_cfg_recorder() {
             recorder.own(node, first..program.symbols.call_sites.len());
         }
+    }
+
+    /// The recorder, inside a function body only. Outside one (file and
+    /// class scope) a site's caller is a function whose graph is already
+    /// built, such as a lambda in an initializer, so a record there would
+    /// only lengthen every later graph's claim.
+    fn body_cfg_recorder(&mut self) -> Option<&mut cfg_build::CfgRecorder> {
+        self.cfg_recorder
+            .as_mut()
+            .filter(|_| self.current_fn.is_some())
     }
 
     fn cfg_mark(&self) -> Option<cfg_build::RecorderMark> {
@@ -9077,7 +9087,7 @@ fn emit_automatic_lifecycle(
         site.exact_receiver = true;
     }
     // The graph runs the one destructor site at each exit of the scope.
-    if let Some(recorder) = &mut ctx.cfg_recorder {
+    if let Some(recorder) = ctx.body_cfg_recorder() {
         recorder.destructors(span_node, first_dtor..program.symbols.call_sites.len());
     }
 }
@@ -22274,6 +22284,50 @@ mod call_args_tests {
 #[cfg(test)]
 mod unit_program_tests {
     use super::*;
+
+    /// Declarations outside a function body feed no call-order graph, so
+    /// the recorder keeps nothing for them: every later body's graph would
+    /// otherwise step over the whole unit's file-scope records.
+    #[test]
+    fn file_scope_declarations_record_no_cfg_sites() {
+        // The lambda's body is a function of its own, lowered (and its
+        // graph built) inside the file-scope declarator.
+        let source = "struct S { S(); ~S(); };\n\
+                      int f();\n\
+                      int a = f(), b = f();\n\
+                      S s;\n\
+                      auto l = [] { return f(); };\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut program = Program::new(PathBuf::from("/t"));
+        let file = program.symbols.add_file(PathBuf::from("/t/r.cpp"));
+        let mut ctx = super::qualified_variable_lookup_tests::test_ctx(
+            file,
+            None,
+            Vec::new(),
+            HashMap::default(),
+        );
+        ctx.cfg_recorder = Some(Default::default());
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let declarations: Vec<Node> = root
+            .named_children(&mut cursor)
+            .filter(|n| n.cached_kind() == "declaration")
+            .collect();
+        assert_eq!(declarations.len(), 4);
+        for declaration in declarations {
+            lower_declaration(&mut program, &mut ctx, source, declaration, None);
+        }
+        assert!(
+            !program.symbols.call_sites.is_empty(),
+            "the lambda body lowers a call"
+        );
+        let empty = cfg_build::CfgRecorder::default().mark();
+        assert_eq!(ctx.cfg_mark(), Some(empty));
+    }
 
     #[test]
     fn a_unit_program_carries_the_lowering_options() {
