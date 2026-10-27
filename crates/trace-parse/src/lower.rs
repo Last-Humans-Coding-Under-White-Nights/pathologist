@@ -5,6 +5,9 @@ mod configured;
 #[path = "callback_declarations.rs"]
 mod callback_declarations;
 
+#[path = "cfg_build.rs"]
+mod cfg_build;
+
 use crate::cpp_type_names::is_fundamental_type_name;
 use crate::deps::IncludeGraph;
 use crate::discover::{discover_files, DiscoveredFiles};
@@ -288,6 +291,9 @@ struct LowerContext {
     pending_initializer_owners: HashMap<usize, VarId>,
     ignored_macros: Arc<[String]>,
     ignored_macro_cache: RefCell<HashMap<String, bool>>,
+    /// Which node lowered which call sites, for call-order graphs; `None`
+    /// unless `--sequencing` is on.
+    cfg_recorder: Option<cfg_build::CfgRecorder>,
 }
 
 /// C++ class scope during member lowering.
@@ -304,6 +310,32 @@ impl LowerContext {
     /// variable identity").
     fn directive_namespaces(&self) -> impl Iterator<Item = &str> {
         self.using_nss.iter().rev().map(String::as_str)
+    }
+
+    /// Record that lowering `node` emitted the sites from `first` on.
+    fn record_cfg_sites(&mut self, program: &Program, node: Node, first: usize) {
+        if let Some(recorder) = &mut self.cfg_recorder {
+            recorder.own(node, first..program.symbols.call_sites.len());
+        }
+    }
+
+    fn cfg_mark(&self) -> Option<cfg_build::RecorderMark> {
+        self.cfg_recorder.as_ref().map(|r| r.mark())
+    }
+
+    /// Recovery lowered `node` through a scratch tree the graph never walks:
+    /// `node` owns everything recorded since `mark`.
+    fn record_recovered_cfg_sites(
+        &mut self,
+        program: &Program,
+        node: Node,
+        first: usize,
+        mark: Option<cfg_build::RecorderMark>,
+    ) {
+        if let (Some(recorder), Some(mark)) = (&mut self.cfg_recorder, mark) {
+            recorder.truncate(mark);
+        }
+        self.record_cfg_sites(program, node, first);
     }
 
     fn is_macro_ignored(&self, name: &str) -> bool {
@@ -3073,6 +3105,7 @@ fn lower_prepared_source(
         pending_initializer_owners: HashMap::default(),
         ignored_macros: Arc::from(program.ignored_macros.clone()),
         ignored_macro_cache: RefCell::new(HashMap::default()),
+        cfg_recorder: program.call_sequencing.then(Default::default),
     };
     if ctx.record_link_ownership && ctx.has_weak {
         // Header preamble facts may already aggregate several operation sites.
@@ -5875,19 +5908,31 @@ fn lower_function_body(
     let using_nss_len = ctx.using_nss.len();
     let using_imports_len = ctx.using_name_imports.len();
     let local_aliases_len = ctx.local_aliases.len();
+    let cfg_start = ctx
+        .cfg_recorder
+        .as_ref()
+        .map(|r| (r.mark(), program.symbols.call_sites.len()));
 
-    if let Some(body_node) = node.cached_field("body") {
+    let body = node.cached_field("body");
+    if let Some(body_node) = body {
         walk_function_body(program, ctx, source, body_node, fn_id);
     }
     // Constructor-initializer lists are siblings of the body on
     // function_definition; they carry base/member ctor calls.
-    if ctx.is_cpp {
-        let init_lists: Vec<_> = node
-            .children(&mut node.walk())
+    let init_lists: Vec<_> = if ctx.is_cpp {
+        node.children(&mut node.walk())
             .filter(|c| c.cached_kind() == "field_initializer_list")
-            .collect();
-        for il in init_lists {
-            walk_function_body(program, ctx, source, il, fn_id);
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for &il in &init_lists {
+        walk_function_body(program, ctx, source, il, fn_id);
+    }
+    if let Some((mark, first_site)) = cfg_start {
+        cfg_build::build_function_cfg(program, ctx, source, fn_id, first_site, body, &init_lists);
+        if let Some(recorder) = &mut ctx.cfg_recorder {
+            recorder.truncate(mark);
         }
     }
     ctx.using_nss.truncate(using_nss_len);
@@ -8306,12 +8351,21 @@ fn lower_declaration(
     // variable starts at the declarator, as an init_declarator's does.
     if let (Some(decl), Some(value)) = (node.cached_field("declarator"), node.cached_field("value"))
     {
+        let first_site = program.symbols.call_sites.len();
         lower_initialized(program, ctx, decl, decl, Some(value));
+        ctx.record_cfg_sites(program, decl, first_site);
         return false;
     }
 
+    let mut declarator = None;
     let mut cursor = node.walk();
     for (index, child) in node.children(&mut cursor).enumerate() {
+        // Each declarator owns the sites it lowered (`T a{f()}, b{g()};`).
+        if let Some((previous, first_site)) =
+            declarator.replace((child, program.symbols.call_sites.len()))
+        {
+            ctx.record_cfg_sites(program, previous, first_site);
+        }
         // Recovered declarations use class grammar, whose initializer is a
         // sibling field. Only declarators introduce names; an initializer's
         // identifier must never become a variable that shadows its function.
@@ -8498,6 +8552,9 @@ fn lower_declaration(
             }
             _ => {}
         }
+    }
+    if let Some((last, first_site)) = declarator {
+        ctx.record_cfg_sites(program, last, first_site);
     }
     false
 }
@@ -8935,7 +8992,7 @@ fn collect_lifecycle_members<'a>(
 /// (docs/ANALYSIS.md, "Automatic objects").
 fn emit_automatic_lifecycle(
     program: &mut Program,
-    ctx: &LowerContext,
+    ctx: &mut LowerContext,
     source: &str,
     var: VarId,
     decl: Node,
@@ -8990,10 +9047,14 @@ fn emit_automatic_lifecycle(
     // its overloads are ranked among themselves. The object is exactly its
     // class: the sites take no virtual dispatch.
     let first = program.symbols.call_sites.len();
+    let mut first_dtor = first;
     for (kind, groups) in [
         (trace_ir::MethodKind::Ctor, ctors),
         (trace_ir::MethodKind::Dtor, dtors),
     ] {
+        if kind.is_destructor() {
+            first_dtor = program.symbols.call_sites.len();
+        }
         for (owner, targets) in groups {
             emit_member_targets(
                 program,
@@ -9011,6 +9072,10 @@ fn emit_automatic_lifecycle(
     }
     for site in &mut program.symbols.call_sites[first..] {
         site.exact_receiver = true;
+    }
+    // The graph runs the one destructor site at each exit of the scope.
+    if let Some(recorder) = &mut ctx.cfg_recorder {
+        recorder.destructors(span_node, first_dtor..program.symbols.call_sites.len());
     }
 }
 
@@ -9859,9 +9924,12 @@ fn walk_function_body(
     node: Node,
     caller: FnId,
 ) {
+    let first_site = program.symbols.call_sites.len();
+    let cfg_mark = ctx.cfg_mark();
     if node.cached_kind() == "expression_statement"
         && callback_declarations::try_lower(program, ctx, source, node)
     {
+        ctx.record_recovered_cfg_sites(program, node, first_site, cfg_mark);
         return;
     }
     if ctx.ast_depth >= MAX_AST_WALK_DEPTH {
@@ -9885,6 +9953,7 @@ fn walk_function_body(
             if lower_declaration(program, ctx, source, node, None) {
                 // Recovery already visited the evaluated expressions. The
                 // original misparsed children must not be walked again.
+                ctx.record_recovered_cfg_sites(program, node, first_site, cfg_mark);
                 ctx.ast_depth = ctx.ast_depth.saturating_sub(1);
                 return;
             }
@@ -9921,6 +9990,7 @@ fn walk_function_body(
                 return;
             }
             let _ = lower_lambda_expression(program, ctx, source, node);
+            ctx.record_cfg_sites(program, node, first_site);
             ctx.ast_depth = ctx.ast_depth.saturating_sub(1);
             return;
         }
@@ -9963,6 +10033,7 @@ fn walk_function_body(
         }
         _ => {}
     }
+    ctx.record_cfg_sites(program, node, first_site);
     // `using namespace X;` / `using X::f;` are scoped to the enclosing block
     // in C++. A directive at function-body top level applies to the whole
     // body (restored when the root `compound_statement` exits, matching
@@ -14386,7 +14457,14 @@ fn lower_lambda_expression(
         .children(&mut node.walk())
         .find(|c| c.cached_kind() == "compound_statement")
     {
+        let first_site = program.symbols.call_sites.len();
+        let cfg_mark = ctx.cfg_mark();
         walk_function_body(program, ctx, source, body, fn_id);
+        cfg_build::build_function_cfg(program, ctx, source, fn_id, first_site, Some(body), &[]);
+        // The enclosing function's graph takes none of the lambda's sites.
+        if let (Some(recorder), Some(mark)) = (&mut ctx.cfg_recorder, cfg_mark) {
+            recorder.truncate(mark);
+        }
     }
     ctx.current_fn = saved_fn;
     ctx.locals = saved_locals;
@@ -21920,6 +21998,7 @@ mod qualified_variable_lookup_tests {
             pending_initializer_owners: HashMap::default(),
             ignored_macros: Arc::from(Vec::<String>::new()),
             ignored_macro_cache: RefCell::new(HashMap::default()),
+            cfg_recorder: None,
         }
     }
 

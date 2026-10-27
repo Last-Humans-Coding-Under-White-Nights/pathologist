@@ -4915,7 +4915,9 @@ database carries no sequencing rows.
   overrides, a configuration variant's own record), never a sequence of
   calls. Kinds: `call`, `construct` (including the constructor a
   `new`-expression runs), `destroy` and `delete`. Two expansions of one macro
-  are two events, even when their displayed coordinates match.
+  are two events, even when their displayed coordinates match; so is an
+  argument a macro substitutes twice (`TWICE(step())`), whose two sites share
+  one source position.
 - **"A before B"** compares the *invocations* of A and B, not their
   completions. Every guarantee is conditional on B executing and on every call
   between A and B completing normally (no `throw`, `longjmp`, `exit` or
@@ -4961,16 +4963,19 @@ labels (labels are resolved before the body is walked), `try`/`catch` and
 `throw`.
 
 - **Automatic objects** ([Automatic objects](#automatic-objects)): the
-  constructor event sits at its declarator, so `T a(f()), b(g());` orders
+  constructor event sits at its declarator, so `T a{f()}, b{g()};` orders
   `f`, `T::T`, `g`, `T::T`. The one destructor site the IR records per
   object is referenced from every exit of its scope: the normal end and each
   `return`, `break`, `continue` or `goto` leaving it, in reverse declaration
   order. No call site is added for this.
 - **Exceptions.** Each `try` has one `landing` block. Every block of the
-  `try` body has an `exception` edge to it, and the landing has an edge to
-  each handler. A `throw` has an `exception` edge to the innermost landing or
-  to the function's exceptional exit. A call *outside* a `try` has no
-  exceptional edge: the conditions above already exclude abnormal completion.
+  `try` body that holds an event, nested handlers included, has an
+  `exception` edge to it, and the landing has an edge to each handler. Unless
+  a handler is `catch (...)`, the landing also has an `exception` edge to the
+  enclosing landing or the function's exceptional exit. A `throw` has an
+  `exception` edge to the innermost landing or to the exceptional exit. A
+  call *outside* a `try` has no exceptional edge: the conditions above
+  already exclude abnormal completion.
 - Loops stay cycles (`back_edge`), never unrolled.
 
 ### Representation
@@ -5032,7 +5037,8 @@ A gap or boundary is uncertainty, never evidence for an order.
   conditional inside an unordered operand: the affected events are
   unordered), `initializer_order` (member initializers and default member
   initializers are one unordered group in a prologue block; declaration order
-  is not modeled) and `omitted_sites`. A body with a gap is `partial`.
+  is not modeled. A site of the function that no walked node owns joins that
+  group too) and `omitted_sites`. A body with a gap is `partial`.
 - **Boundaries** between functions, found by the query: `omitted_body` (the
   callee has no CFG: dependency, declaration only, suppressed or not
   sequenced), `unknown_callee` (a site without call edges), `recursion`,
