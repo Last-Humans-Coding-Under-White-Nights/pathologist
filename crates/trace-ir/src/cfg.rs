@@ -42,6 +42,11 @@ impl BlockKind {
             Self::Landing => "landing",
         }
     }
+
+    /// The kind [`Self::as_str`] names.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -82,6 +87,11 @@ impl EdgeKind {
             Self::Unsupported => "unsupported",
         }
     }
+
+    /// The kind [`Self::as_str`] names.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -103,6 +113,11 @@ impl EventKind {
             Self::Destroy => "destroy",
             Self::Delete => "delete",
         }
+    }
+
+    /// The kind [`Self::as_str`] names.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
     }
 }
 
@@ -140,6 +155,11 @@ impl GapKind {
             Self::InitializerOrder => "initializer_order",
             Self::OmittedSites => "omitted_sites",
         }
+    }
+
+    /// The kind [`Self::as_str`] names.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
     }
 }
 
@@ -194,48 +214,159 @@ pub struct FunctionCfg {
     pub gaps: Vec<Gap>,
 }
 
+/// Keep `cfg`, in another program's ids (see [`FunctionCfg::remap`]), as
+/// one more configuration variant of `function` unless `variants` already
+/// holds a structurally equal graph: the first copy of a body is kept, and
+/// one a unit or configuration compiles differently is another variant,
+/// numbered by position and never unioned. Returns the variant added.
+pub fn add_variant<'v>(
+    variants: &'v mut Vec<FunctionCfg>,
+    cfg: &FunctionCfg,
+    function: FnId,
+    map_site: impl Fn(CallSiteId) -> Option<CallSiteId>,
+    map_file: impl Fn(FileId) -> FileId,
+) -> Option<&'v mut FunctionCfg> {
+    if variants
+        .iter()
+        .any(|v| v.equal_after_remap(cfg, function, &map_site, &map_file))
+    {
+        return None;
+    }
+    let mut kept = cfg.remap(function, map_site, map_file);
+    kept.variant = variants.len() as u32;
+    variants.push(kept);
+    variants.last_mut()
+}
+
+/// `sites` through `map_site`, dropping those it does not map; coalesced
+/// records of one invocation name one merged site.
+fn mapped_sites<'s>(
+    sites: &'s [CallSiteId],
+    map_site: &'s impl Fn(CallSiteId) -> Option<CallSiteId>,
+) -> impl Iterator<Item = CallSiteId> + 's {
+    sites.iter().enumerate().filter_map(move |(i, &s)| {
+        let site = map_site(s)?;
+        let repeat = sites[..i].iter().any(|&p| map_site(p) == Some(site));
+        (!repeat).then_some(site)
+    })
+}
+
 impl FunctionCfg {
     /// Same body structure, whichever unit or variant slot it came from.
     pub fn structurally_equal(&self, other: &Self) -> bool {
-        self.function == other.function
-            && self.entry == other.entry
-            && self.exit == other.exit
-            && self.exceptional_exit == other.exceptional_exit
-            && self.blocks == other.blocks
-            && self.edges == other.edges
-            && self.events == other.events
-            && self.order == other.order
-            && self.gaps == other.gaps
+        // Exhaustive, so a new field is a decision here.
+        let FunctionCfg {
+            function,
+            tu: _,
+            variant: _,
+            entry,
+            exit,
+            exceptional_exit,
+            blocks,
+            edges,
+            events,
+            order,
+            gaps,
+        } = self;
+        *function == other.function
+            && *entry == other.entry
+            && *exit == other.exit
+            && *exceptional_exit == other.exceptional_exit
+            && *blocks == other.blocks
+            && *edges == other.edges
+            && *events == other.events
+            && *order == other.order
+            && *gaps == other.gaps
+    }
+
+    /// `self.structurally_equal(&other.remap(function, map_site, map_file))`,
+    /// without building the remapped graph unless one of `other`'s events
+    /// loses every site.
+    pub fn equal_after_remap(
+        &self,
+        other: &FunctionCfg,
+        function: FnId,
+        map_site: impl Fn(CallSiteId) -> Option<CallSiteId>,
+        map_file: impl Fn(FileId) -> FileId,
+    ) -> bool {
+        if other
+            .events
+            .iter()
+            .any(|e| mapped_sites(&e.sites, &map_site).next().is_none())
+        {
+            return self.structurally_equal(&other.remap(function, map_site, map_file));
+        }
+        // No event is spliced out: ids, the order and gap ranges carry over.
+        let FunctionCfg {
+            function: _,
+            tu: _,
+            variant: _,
+            entry,
+            exit,
+            exceptional_exit,
+            blocks,
+            edges,
+            events,
+            order,
+            gaps,
+        } = other;
+        let map_span = |span: Span| Span {
+            file: map_file(span.file),
+            ..span
+        };
+        self.function == function
+            && self.entry == *entry
+            && self.exit == *exit
+            && self.exceptional_exit == *exceptional_exit
+            && self.edges == *edges
+            && self.order == *order
+            && self.blocks.len() == blocks.len()
+            && self.blocks.iter().zip(blocks).all(|(a, b)| {
+                a.kind == b.kind && a.span == b.span.map(map_span) && a.events == b.events
+            })
+            && self.events.len() == events.len()
+            && self.events.iter().zip(events).all(|(a, b)| {
+                let mut occurrence = b.occurrence;
+                occurrence.span = map_span(occurrence.span);
+                occurrence.expansion_span = occurrence.expansion_span.map(map_span);
+                a.block == b.block
+                    && a.kind == b.kind
+                    && a.occurrence == occurrence
+                    && a.sites
+                        .iter()
+                        .copied()
+                        .eq(mapped_sites(&b.sites, &map_site))
+            })
+            && self.gaps.len() == gaps.len()
+            && self.gaps.iter().zip(gaps).all(|(a, b)| {
+                a.kind == b.kind
+                    && a.span == b.span.map(map_span)
+                    // A reversed range keeps no event.
+                    && a.events == b.events.filter(|(first, last)| first <= last)
+            })
     }
 
     /// The graph in another program's ids: `function` for its function,
-    /// sites through `map_site`, files through `map_file`. An event left
-    /// with no site is spliced out of its block and the local order, and an
-    /// `omitted_sites` gap marks where it was (docs/ANALYSIS.md, "Call
-    /// sequencing"). `tu` and `variant` are kept.
+    /// sites through `map_site`, files (`tu` too) through `map_file`. An
+    /// event left with no site is spliced out of its block and the local
+    /// order, and an `omitted_sites` gap marks where it was
+    /// (docs/ANALYSIS.md, "Call sequencing"). `variant` is kept.
     pub fn remap(
         &self,
         function: FnId,
         map_site: impl Fn(CallSiteId) -> Option<CallSiteId>,
         map_file: impl Fn(FileId) -> FileId,
     ) -> FunctionCfg {
-        let cfg = self;
         let map_span = |span: Span| Span {
             file: map_file(span.file),
             ..span
         };
-        let mut events = Vec::with_capacity(cfg.events.len());
+        let mut events = Vec::with_capacity(self.events.len());
         // Old event index -> new id, `None` once spliced out.
-        let mut renumber: Vec<Option<EventId>> = Vec::with_capacity(cfg.events.len());
+        let mut renumber: Vec<Option<EventId>> = Vec::with_capacity(self.events.len());
         let mut omitted = Vec::new();
-        for event in &cfg.events {
-            // Coalesced records of one invocation name one merged site.
-            let mut sites: Vec<CallSiteId> = Vec::with_capacity(event.sites.len());
-            for site in event.sites.iter().filter_map(|&s| map_site(s)) {
-                if !sites.contains(&site) {
-                    sites.push(site);
-                }
-            }
+        for event in &self.events {
+            let sites: Vec<CallSiteId> = mapped_sites(&event.sites, &map_site).collect();
             let mut occurrence = event.occurrence;
             occurrence.span = map_span(occurrence.span);
             occurrence.expansion_span = occurrence.expansion_span.map(map_span);
@@ -252,7 +383,7 @@ impl FunctionCfg {
                 sites,
             });
         }
-        let mut order = cfg.order.clone();
+        let mut order = self.order.clone();
         // Join each spliced event's predecessors to its successors, so the
         // events around it keep their order.
         for (old, new) in renumber.iter().enumerate() {
@@ -276,7 +407,7 @@ impl FunctionCfg {
             .into_iter()
             .filter_map(|(a, b)| Some((at(a)?, at(b)?)))
             .collect();
-        let blocks = cfg
+        let blocks = self
             .blocks
             .iter()
             .map(|b| Block {
@@ -285,7 +416,7 @@ impl FunctionCfg {
                 events: b.events.iter().filter_map(|&e| at(e)).collect(),
             })
             .collect();
-        let mut gaps: Vec<Gap> = cfg
+        let mut gaps: Vec<Gap> = self
             .gaps
             .iter()
             .map(|g| Gap {
@@ -305,13 +436,13 @@ impl FunctionCfg {
         }));
         FunctionCfg {
             function,
-            tu: cfg.tu,
-            variant: cfg.variant,
-            entry: cfg.entry,
-            exit: cfg.exit,
-            exceptional_exit: cfg.exceptional_exit,
+            tu: self.tu.map(&map_file),
+            variant: self.variant,
+            entry: self.entry,
+            exit: self.exit,
+            exceptional_exit: self.exceptional_exit,
             blocks,
-            edges: cfg.edges.clone(),
+            edges: self.edges.clone(),
             events,
             order,
             gaps,
@@ -745,5 +876,82 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn kind_names_parse_back() {
+        for kind in BlockKind::ALL {
+            assert_eq!(BlockKind::parse(kind.as_str()), Some(kind));
+        }
+        for kind in EdgeKind::ALL {
+            assert_eq!(EdgeKind::parse(kind.as_str()), Some(kind));
+        }
+        for kind in EventKind::ALL {
+            assert_eq!(EventKind::parse(kind.as_str()), Some(kind));
+        }
+        for kind in GapKind::ALL {
+            assert_eq!(GapKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(BlockKind::parse("nope"), None);
+    }
+
+    #[test]
+    fn remap_maps_the_unit() {
+        let mut g = straight();
+        g.tu = Some(FileId(0));
+        let merged = g.remap(FnId(7), Some, |_| FileId(4));
+        assert_eq!(merged.tu, Some(FileId(4)));
+    }
+
+    /// The comparison without remapping agrees with remapping first, with
+    /// and without an event spliced out.
+    #[test]
+    fn equal_after_remap_matches_remap() {
+        let mut g = straight();
+        g.blocks[2].span = Some(span(2));
+        g.gaps.push(Gap {
+            kind: GapKind::UnorderedBranch,
+            span: Some(span(3)),
+            events: Some((EventId(0), EventId(1))),
+        });
+        g.events[0].sites.push(CallSiteId(12));
+        let file = |_| FileId(5);
+        let maps: [&dyn Fn(CallSiteId) -> Option<CallSiteId>; 4] = [
+            &Some,
+            &|s: CallSiteId| Some(CallSiteId(s.0 + 100)),
+            // Both records of the first invocation become one site.
+            &|s: CallSiteId| Some(CallSiteId(if s.0 == 12 { 10 } else { s.0 })),
+            // The second invocation loses its site.
+            &|s: CallSiteId| (s.0 != 11).then_some(s),
+        ];
+        for map in maps {
+            let merged = g.remap(FnId(9), map, file);
+            assert!(merged.equal_after_remap(&g, FnId(9), map, file));
+            assert!(!merged.equal_after_remap(&g, FnId(8), map, file));
+            assert!(!merged.equal_after_remap(&g, FnId(9), map, |_| FileId(6)));
+            for other in maps {
+                let expected = merged.structurally_equal(&g.remap(FnId(9), other, file));
+                assert_eq!(merged.equal_after_remap(&g, FnId(9), other, file), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn add_variant_keeps_distinct_bodies_numbered() {
+        let mut variants = Vec::new();
+        let a = straight();
+        let kept = add_variant(&mut variants, &a, FnId(7), Some, |f| f).unwrap();
+        kept.tu = Some(FileId(1));
+        assert!(add_variant(&mut variants, &a, FnId(7), Some, |f| f).is_none());
+        let mut b = straight();
+        b.events.pop();
+        b.blocks[2].events.pop();
+        b.variant = 5;
+        assert_eq!(
+            add_variant(&mut variants, &b, FnId(7), Some, |f| f).map(|v| v.variant),
+            Some(1)
+        );
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0].tu, Some(FileId(1)));
     }
 }

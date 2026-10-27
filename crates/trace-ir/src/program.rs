@@ -675,33 +675,27 @@ impl Program {
         if pairs.is_empty() {
             return;
         }
-        // Function, variant position and event of each graph event naming a
-        // source.
-        let mut holders: FxHashMap<CallSiteId, Vec<(FnId, usize, usize)>> = pairs
-            .iter()
-            .map(|&(source, _)| (source, Vec::new()))
-            .collect();
-        for (&function, variants) in &self.cfgs {
-            for (position, cfg) in variants.iter().enumerate() {
-                for (event, e) in cfg.events.iter().enumerate() {
-                    for site in &e.sites {
-                        if let Some(at) = holders.get_mut(site) {
-                            at.push((function, position, event));
-                        }
-                    }
-                }
-            }
+        // Each source's additions, tagged with their pair's position.
+        let mut added_to: FxHashMap<CallSiteId, Vec<(usize, CallSiteId)>> = FxHashMap::default();
+        for (at, &(source, added)) in pairs.iter().enumerate() {
+            added_to.entry(source).or_default().push((at, added));
         }
-        for (source, added) in pairs {
-            for &(function, position, event) in &holders[source] {
-                if let Some(cfg) = self
-                    .cfgs
-                    .get_mut(&function)
-                    .and_then(|variants| variants.get_mut(position))
-                {
-                    cfg.events[event].sites.push(*added);
+        let mut extra = Vec::new();
+        for event in self
+            .cfgs
+            .values_mut()
+            .flatten()
+            .flat_map(|cfg| &mut cfg.events)
+        {
+            extra.clear();
+            for site in &event.sites {
+                if let Some(added) = added_to.get(site) {
+                    extra.extend_from_slice(added);
                 }
             }
+            // In pair order, as if each pair were applied in turn.
+            extra.sort_by_key(|&(at, _)| at);
+            event.sites.extend(extra.iter().map(|&(_, added)| added));
         }
     }
 

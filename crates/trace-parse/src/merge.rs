@@ -1299,16 +1299,11 @@ fn merge_unit(
             continue;
         }
         let tu = unit_of(owner.file);
-        let mut merged = cfg.remap(function, |s| call_map.get(&s).copied(), map_file);
         let variants = program.cfgs.entry(function).or_default();
-        // The first copy of a body is kept; one a unit or configuration
-        // compiles differently is another variant, never unioned.
-        if variants.iter().any(|v| v.structurally_equal(&merged)) {
-            continue;
+        let map_site = |s| call_map.get(&s).copied();
+        if let Some(kept) = trace_ir::add_variant(variants, cfg, function, map_site, map_file) {
+            kept.tu = Some(tu);
         }
-        merged.tu = Some(tu);
-        merged.variant = variants.len() as u32;
-        variants.push(merged);
     }
 
     let valid_flow = |flow: &FlowConstraint| {

@@ -1282,7 +1282,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             // Every file an input row names is one of its `files` rows.
             let map_file =
                 |f: trace_ir::FileId| trace_ir::FileId(file_remap[db_idx][&i64::from(f.0)] as u32);
-            let mut merged = cfg.remap(
+            let merged = cfg.remap(
                 trace_ir::FnId(function as u32),
                 |s| {
                     cs_remap[db_idx]
@@ -1291,7 +1291,6 @@ pub fn merge_databases<P: AsRef<Path>>(
                 },
                 map_file,
             );
-            merged.tu = cfg.tu.map(map_file);
             unified_cfgs
                 .entry(merged.function)
                 .or_default()

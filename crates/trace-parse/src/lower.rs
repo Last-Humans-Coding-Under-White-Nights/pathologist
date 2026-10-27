@@ -9052,30 +9052,27 @@ fn emit_automatic_lifecycle(
     // One site per class providing the members, each under its own name so
     // its overloads are ranked among themselves. The object is exactly its
     // class: the sites take no virtual dispatch.
+    let emit =
+        |program: &mut Program, kind: trace_ir::MethodKind, groups: Vec<(String, Vec<FnId>)>| {
+            for (owner, targets) in groups {
+                emit_member_targets(
+                    program,
+                    caller,
+                    &owner,
+                    &kind,
+                    Receiver::Bound(var),
+                    CallArgs::empty(),
+                    span,
+                    expansion_span,
+                    targets,
+                    None,
+                );
+            }
+        };
     let first = program.symbols.call_sites.len();
-    let mut first_dtor = first;
-    for (kind, groups) in [
-        (trace_ir::MethodKind::Ctor, ctors),
-        (trace_ir::MethodKind::Dtor, dtors),
-    ] {
-        if kind.is_destructor() {
-            first_dtor = program.symbols.call_sites.len();
-        }
-        for (owner, targets) in groups {
-            emit_member_targets(
-                program,
-                caller,
-                &owner,
-                &kind,
-                Receiver::Bound(var),
-                CallArgs::empty(),
-                span,
-                expansion_span,
-                targets,
-                None,
-            );
-        }
-    }
+    emit(program, trace_ir::MethodKind::Ctor, ctors);
+    let first_dtor = program.symbols.call_sites.len();
+    emit(program, trace_ir::MethodKind::Dtor, dtors);
     for site in &mut program.symbols.call_sites[first..] {
         site.exact_receiver = true;
     }

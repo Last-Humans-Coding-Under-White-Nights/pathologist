@@ -6,7 +6,7 @@
 //! a block-local sequenced-before order. Semantics and limits:
 //! docs/ANALYSIS.md, "Call sequencing (control-flow sidecar)".
 
-use super::{node_span, LowerContext, MAX_AST_WALK_DEPTH};
+use super::{last_segment_of, node_span, LowerContext, MAX_AST_WALK_DEPTH};
 use crate::node_metadata::NodeMetadata;
 use crate::parse::node_text;
 use rustc_hash::FxHashMap as HashMap;
@@ -170,23 +170,55 @@ impl<'s, 'a> Builder<'s, 'a> {
         cpp17: bool,
     ) -> Self {
         let first_site = first_site.min(sites.len());
-        let mut claimed = vec![false; sites.len() - first_site];
+        let ours = |i: usize| sites[i].caller == function;
+        // `free[k]` leads to the first site at or after `first_site + k` that
+        // is the function's and still unclaimed (`k == n`: none). Records nest,
+        // so a claimed site is stepped over once, not once per enclosing
+        // record.
+        let n = sites.len() - first_site;
+        let mut free: Vec<usize> = (0..=n)
+            .map(|k| {
+                if k < n && !ours(first_site + k) {
+                    k + 1
+                } else {
+                    k
+                }
+            })
+            .collect();
+        fn find(free: &mut [usize], k: usize) -> usize {
+            let mut root = k;
+            while free[root] != root {
+                root = free[root];
+            }
+            let mut k = k;
+            while free[k] != root {
+                k = std::mem::replace(&mut free[k], root);
+            }
+            root
+        }
         let mut claim = |records: &[(usize, Range<usize>)]| {
             let mut by_node: HashMap<usize, Vec<usize>> = HashMap::default();
             for (node, range) in records {
-                for i in range.start.max(first_site)..range.end.min(sites.len()) {
-                    if sites[i].caller == function && !claimed[i - first_site] {
-                        claimed[i - first_site] = true;
-                        by_node.entry(*node).or_default().push(i);
-                    }
+                let start = range.start.max(first_site) - first_site;
+                let end = range.end.min(sites.len()).saturating_sub(first_site);
+                if start >= end {
+                    continue;
+                }
+                let mut k = find(&mut free, start);
+                while k < end {
+                    by_node.entry(*node).or_default().push(first_site + k);
+                    free[k] = k + 1;
+                    k = find(&mut free, k + 1);
                 }
             }
             by_node
         };
         let destructors = claim(&recorder.destructors);
         let owned = claim(&recorder.owned);
-        let unclaimed = (first_site..sites.len())
-            .filter(|&i| sites[i].caller == function && !claimed[i - first_site])
+        // A claimed site no longer leads to itself.
+        let unclaimed = (0..n)
+            .filter(|&k| ours(first_site + k) && free[k] == k)
+            .map(|k| first_site + k)
             .collect();
         let mut builder = Self {
             sites,
@@ -318,14 +350,26 @@ impl<'s, 'a> Builder<'s, 'a> {
     /// among themselves and after the current frontier.
     fn emit_unordered(&mut self, indices: &[usize], kind: Option<EventKind>) {
         let before = std::mem::take(&mut self.frontier);
-        let mut sinks = Vec::new();
+        let first = self.cfg.events.len();
         for invocation in invocations(self.sites, indices) {
             let kind = kind.unwrap_or_else(|| event_kind(&self.sites[invocation.first]));
             self.frontier.clone_from(&before);
             self.emit(kind, invocation.occurrence, invocation.sites);
-            sinks.push(EventId(self.cfg.events.len() as u32 - 1));
         }
-        self.frontier = if sinks.is_empty() { before } else { sinks };
+        self.sinks_since(first, before);
+    }
+
+    /// The frontier after a group whose events are those since `first`,
+    /// each a sink: `before` when it emitted none.
+    fn sinks_since(&mut self, first: usize, before: Vec<EventId>) {
+        let last = self.cfg.events.len();
+        if last == first {
+            self.frontier = before;
+        } else {
+            self.frontier.clear();
+            self.frontier
+                .extend((first..last).map(|e| EventId(e as u32)));
+        }
     }
 
     fn gap(&mut self, kind: GapKind, node: Option<Node<'a>>, first_event: usize) {
@@ -367,14 +411,12 @@ impl<'s, 'a> Builder<'s, 'a> {
         if self.cur.is_none() {
             return;
         }
-        let objects: Vec<Vec<usize>> = self.scopes[from..]
-            .iter()
-            .rev()
-            .flat_map(|s| s.objects.iter().rev().cloned())
-            .collect();
-        for indices in objects {
-            for invocation in invocations(self.sites, &indices) {
-                self.emit(EventKind::Destroy, invocation.occurrence, invocation.sites);
+        let sites = self.sites;
+        for scope in (from..self.scopes.len()).rev() {
+            for object in (0..self.scopes[scope].objects.len()).rev() {
+                for invocation in invocations(sites, &self.scopes[scope].objects[object]) {
+                    self.emit(EventKind::Destroy, invocation.occurrence, invocation.sites);
+                }
             }
         }
     }
@@ -416,18 +458,17 @@ impl<'s, 'a> Builder<'s, 'a> {
     /// Every event of `node`'s subtree, as one unordered group.
     fn flatten(&mut self, node: Node<'a>) {
         let before = self.frontier.clone();
-        let mut sinks = Vec::new();
+        let first = self.cfg.events.len();
         let mut stack = vec![node];
+        let mut cursor = node.walk();
         while let Some(n) = stack.pop() {
             self.frontier.clone_from(&before);
-            let count = self.cfg.events.len();
             self.own(n);
-            sinks.extend((count..self.cfg.events.len()).map(|e| EventId(e as u32)));
-            let mut cursor = n.walk();
-            let children: Vec<_> = n.children(&mut cursor).collect();
-            stack.extend(children.into_iter().rev());
+            let at = stack.len();
+            stack.extend(n.children(&mut cursor));
+            stack[at..].reverse();
         }
-        self.frontier = if sinks.is_empty() { before } else { sinks };
+        self.sinks_since(first, before);
     }
 
     /// A construct whose order is not modeled: its events as one unordered
@@ -450,21 +491,16 @@ struct Invocation {
 /// The sites at `indices` grouped by invocation, in first-seen order.
 fn invocations(sites: &[CallSite], indices: &[usize]) -> Vec<Invocation> {
     let mut groups: Vec<Invocation> = Vec::new();
-    let mut by_occurrence: HashMap<CallOccurrence, usize> = HashMap::default();
     for &i in indices {
         let occurrence = sites[i].occurrence();
-        match by_occurrence.entry(occurrence) {
-            std::collections::hash_map::Entry::Occupied(at) => {
-                groups[*at.get()].sites.push(sites[i].id);
-            }
-            std::collections::hash_map::Entry::Vacant(at) => {
-                at.insert(groups.len());
-                groups.push(Invocation {
-                    occurrence,
-                    first: i,
-                    sites: vec![sites[i].id],
-                });
-            }
+        // Almost always one group: a linear scan beats hashing.
+        match groups.iter_mut().find(|g| g.occurrence == occurrence) {
+            Some(group) => group.sites.push(sites[i].id),
+            None => groups.push(Invocation {
+                occurrence,
+                first: i,
+                sites: vec![sites[i].id],
+            }),
         }
     }
     groups
@@ -480,7 +516,7 @@ fn event_kind(site: &CallSite) -> EventKind {
     if member.starts_with('~') {
         return EventKind::Destroy;
     }
-    let class = scope.rsplit("::").next().unwrap_or(scope);
+    let class = last_segment_of(scope);
     let class = class.split('<').next().unwrap_or(class);
     if class == member {
         EventKind::Construct
@@ -489,33 +525,30 @@ fn event_kind(site: &CallSite) -> EventKind {
     }
 }
 
-fn named_children<'t>(node: Node<'t>) -> Vec<Node<'t>> {
-    node.named_children(&mut node.walk()).collect()
-}
-
 impl<'a> Builder<'_, 'a> {
     fn visit(&mut self, node: Node<'a>) {
+        self.visit_in(node, false);
+    }
+
+    /// `in_parens`: `node` is a parenthesized expression's operand.
+    fn visit_in(&mut self, node: Node<'a>, in_parens: bool) {
         if self.depth >= MAX_AST_WALK_DEPTH {
             self.opaque(node, GapKind::DepthExceeded);
             return;
         }
         self.depth += 1;
-        self.visit_node(node);
+        self.visit_node(node, in_parens);
         self.depth -= 1;
     }
 
-    fn visit_node(&mut self, node: Node<'a>) {
+    fn visit_node(&mut self, node: Node<'a>, in_parens: bool) {
         if node.is_error() {
             self.opaque(node, GapKind::ParseError);
             return;
         }
         match node.cached_kind() {
             // A GNU statement expression.
-            "compound_statement"
-                if node
-                    .parent()
-                    .is_some_and(|p| p.cached_kind() == "parenthesized_expression") =>
-            {
+            "compound_statement" if in_parens => {
                 self.opaque(node, GapKind::UnsupportedConstruct);
             }
             "compound_statement" => {
@@ -575,24 +608,26 @@ impl<'a> Builder<'_, 'a> {
                 // The body is the lambda's own graph; init-captures are this
                 // function's.
                 if let Some(captures) = node.cached_field("captures") {
-                    self.unordered(&named_children(captures), node);
+                    self.unordered(captures.named_children(&mut captures.walk()), node);
                 }
                 self.own(node);
             }
             "call_expression" => {
                 let function = node.cached_field("function");
-                let mut args = node
-                    .cached_field("arguments")
-                    .map(named_children)
-                    .unwrap_or_default();
-                if self.cpp17 {
+                // Before C++17 the callee is one more unsequenced operand.
+                let callee = if self.cpp17 {
                     if let Some(function) = function {
                         self.visit(function);
                     }
-                } else if let Some(function) = function {
-                    args.insert(0, function);
-                }
-                self.unordered(&args, node);
+                    None
+                } else {
+                    function
+                };
+                let mut cursor = node.walk();
+                let args = node
+                    .cached_field("arguments")
+                    .map(|arguments| arguments.named_children(&mut cursor));
+                self.unordered(callee.into_iter().chain(args.into_iter().flatten()), node);
                 let first = self.cfg.events.len();
                 self.own(node);
                 // Control may come back to a `setjmp` from any later call.
@@ -607,7 +642,7 @@ impl<'a> Builder<'_, 'a> {
                         self.short_circuit(node, matches!(op, "&&" | "and"));
                     }
                     Some("<<" | ">>") if self.cpp17 => self.sequence(node),
-                    _ => self.unordered(&named_children(node), node),
+                    _ => self.unordered(node.named_children(&mut node.walk()), node),
                 }
                 self.own(node);
             }
@@ -618,8 +653,7 @@ impl<'a> Builder<'_, 'a> {
                         self.visit(side);
                     }
                 } else {
-                    let sides: Vec<_> = [left, right].into_iter().flatten().collect();
-                    self.unordered(&sides, node);
+                    self.unordered([left, right].into_iter().flatten(), node);
                 }
                 self.own(node);
             }
@@ -640,7 +674,7 @@ impl<'a> Builder<'_, 'a> {
                 self.own(node);
             }
             _ => {
-                self.unordered(&named_children(node), node);
+                self.unordered(node.named_children(&mut node.walk()), node);
                 self.own(node);
             }
         }
@@ -648,49 +682,49 @@ impl<'a> Builder<'_, 'a> {
 
     /// Each named child in turn.
     fn sequence(&mut self, node: Node<'a>) {
+        let in_parens = node.cached_kind() == "parenthesized_expression";
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            self.visit(child);
+            self.visit_in(child, in_parens);
         }
     }
 
     /// Operands evaluated in no specified order: each starts after what
     /// precedes the group, and what follows waits for all of them. A branch
     /// inside one makes the others' order relative to it unknown.
-    fn unordered(&mut self, operands: &[Node<'a>], node: Node<'a>) {
-        if operands.len() < 2 {
-            for &operand in operands {
-                self.visit(operand);
-            }
+    fn unordered(&mut self, operands: impl IntoIterator<Item = Node<'a>>, node: Node<'a>) {
+        let mut operands = operands.into_iter();
+        let Some(first_operand) = operands.next() else {
             return;
-        }
+        };
+        let Some(second_operand) = operands.next() else {
+            self.visit(first_operand);
+            return;
+        };
         let block = Some(self.current());
         let before = self.frontier.clone();
         let first = self.cfg.events.len();
-        let mut ends = Vec::new();
-        for &operand in operands {
+        // The frontier each operand ended with, tagged with its end block.
+        let mut ends: Vec<(Option<BlockId>, EventId)> = Vec::new();
+        for operand in [first_operand, second_operand].into_iter().chain(operands) {
             if self.cur == block {
                 self.frontier.clone_from(&before);
             } else {
                 self.frontier.clear();
             }
             self.visit(operand);
-            ends.push((self.cur, std::mem::take(&mut self.frontier)));
+            let end = self.cur;
+            ends.extend(self.frontier.iter().map(|&e| (end, e)));
         }
-        let mut sinks = Vec::new();
-        for (end, frontier) in ends {
-            if end == self.cur {
-                for e in frontier {
-                    if !sinks.contains(&e) {
-                        sinks.push(e);
-                    }
-                }
+        self.frontier.clear();
+        for (end, e) in ends {
+            if end == self.cur && !self.frontier.contains(&e) {
+                self.frontier.push(e);
             }
         }
         if self.cur != block {
             self.gap(GapKind::UnorderedBranch, Some(node), first);
         }
-        self.frontier = sinks;
     }
 
     // ---- expressions that branch ----
@@ -947,7 +981,8 @@ impl<'a> Builder<'_, 'a> {
             self.edge(head, label, EdgeKind::SwitchCase);
         }
         self.enter(label);
-        for child in named_children(node) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
             if Some(child.id()) != value.map(|v| v.id()) {
                 self.visit(child);
             }
@@ -1029,7 +1064,8 @@ impl<'a> Builder<'_, 'a> {
             self.jump(block, EdgeKind::Fallthrough);
             self.start(block);
         }
-        for child in named_children(node) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
             if Some(child.id()) != label.map(|l| l.id()) {
                 self.visit(child);
             }
@@ -1039,8 +1075,13 @@ impl<'a> Builder<'_, 'a> {
     /// Give every label of the body its block before the walk, so a `goto`
     /// may jump forward.
     fn collect_labels(&mut self, body: Node<'a>) {
-        let mut stack = vec![body];
-        while let Some(n) = stack.pop() {
+        // Each node with how many of `compounds` enclose it.
+        let mut stack = vec![(body, 0)];
+        // The compound statements around the node walked, outermost first.
+        let mut compounds: Vec<usize> = Vec::new();
+        let mut cursor = body.walk();
+        while let Some((n, depth)) = stack.pop() {
+            compounds.truncate(depth);
             if matches!(
                 n.cached_kind(),
                 "lambda_expression" | "field_declaration_list" | "function_definition"
@@ -1052,22 +1093,17 @@ impl<'a> Builder<'_, 'a> {
                     let name = node_text(self.source, &label);
                     if !self.labels.contains_key(name) {
                         let block = self.block_at(n);
-                        let mut enclosing = Vec::new();
-                        let mut up = n.parent();
-                        while let Some(p) = up {
-                            if p.cached_kind() == "compound_statement" {
-                                enclosing.push(p.id());
-                            }
-                            if p.id() == body.id() {
-                                break;
-                            }
-                            up = p.parent();
-                        }
+                        let enclosing = compounds.iter().rev().copied().collect();
                         self.labels.insert(name, Label { block, enclosing });
                     }
                 }
             }
-            stack.extend(named_children(n).into_iter().rev());
+            if n.cached_kind() == "compound_statement" {
+                compounds.push(n.id());
+            }
+            let at = stack.len();
+            stack.extend(n.named_children(&mut cursor).map(|c| (c, compounds.len())));
+            stack[at..].reverse();
         }
     }
 
@@ -1114,7 +1150,8 @@ impl<'a> Builder<'_, 'a> {
         }
         self.jump(exit, EdgeKind::Fallthrough);
         let mut catch_all = false;
-        for clause in named_children(node) {
+        let mut cursor = node.walk();
+        for clause in node.named_children(&mut cursor) {
             if clause.cached_kind() != "catch_clause" {
                 continue;
             }
@@ -1124,7 +1161,7 @@ impl<'a> Builder<'_, 'a> {
             self.push_scope(ScopeKind::Block, None);
             if let Some(params) = clause.cached_field("parameters") {
                 catch_all |= node_text(self.source, &params).contains("...");
-                for param in named_children(params) {
+                for param in params.named_children(&mut params.walk()) {
                     self.own(param);
                     if let Some(declarator) = param.cached_field("declarator") {
                         self.own(declarator);
