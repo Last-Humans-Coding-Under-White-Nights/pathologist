@@ -1183,10 +1183,15 @@ pub fn merge_databases<P: AsRef<Path>>(
                 let hash = keyed.structural_hash();
                 let kept = unified_cfgs.entry(function).or_default();
                 let hashes = cfg_hashes.entry(function).or_default();
-                let seen = hashes.iter().zip(kept.iter()).any(|(&h, v)| {
+                let seen = hashes.iter().zip(kept.iter()).position(|(&h, v)| {
                     h == hash && keyed.equal_after_remap(v, function, merged_key, |f| f)
                 });
-                if seen {
+                if let Some(at) = seen {
+                    // Its sites may call what the kept graph's do not (a
+                    // callback this input passes): they join the kept
+                    // events as alternatives. Their keys repeat the kept
+                    // ones, so the keyed form and its hash are unchanged.
+                    kept[at].add_alternatives_from(&cfg, map_site);
                     continue;
                 }
                 let mut merged = cfg.remap(function, map_site, map_file);

@@ -4988,8 +4988,13 @@ labels (labels are resolved before the body is walked), `try`/`catch` and
   `f`, `T::T`, `g`, `T::T`. The one destructor site the IR records per
   object is referenced from every exit of its scope: the normal end and each
   `return`, `break`, `continue`, `goto` or `throw` leaving it, in reverse
-  declaration order. A `while`, `for` or `if` condition's object is destroyed
-  where the statement ends. No call site is added for this.
+  declaration order. A `goto` back to a label the walk has passed also
+  destroys the objects the label's scope declared after the label
+  (`again: before(); Guard g; if (retry()) goto again;` runs `Guard::~Guard`
+  on the jump), after those of the scopes it leaves; a forward `goto` cannot
+  skip a declaration in valid C++ and destroys only what it leaves. A
+  `while`, `for` or `if` condition's object is destroyed where the statement
+  ends. No call site is added for this.
 - **Exceptions.** Each `try` has one `landing` block. Every block of the
   `try` body that holds an event, nested handlers included, has an
   `exception` edge to it, except a block of a nested `try` body: that block
@@ -5070,7 +5075,14 @@ structurally distinct body, in input order: an input compiling it as an
 earlier one did adds nothing, one compiling it differently adds a variant.
 Inputs share no call sites, so the comparison takes a site as its caller,
 position, callee spelling and directness (and how many such sites precede it
-in its input); a kept graph names its own input's sites. An event none of
+in its input). A kept graph names its own input's sites first; each later
+input compiling the body alike lists its sites, in input order, as further
+alternatives of the matching events (`FunctionCfg::add_alternatives_from`,
+through `CallEvent::add_alternative_sites`, as
+`Program::attach_alternative_sites` adds override records), so the targets
+its call edges reach are kept: two repositories passing
+`inline void invoke(void (*cb)()) { cb(); }` different callbacks keep one
+graph whose `cb()` event reaches both. An event none of
 whose sites was carried is spliced out with an `omitted_sites` gap. The output's marker is
 `true` when every input was sequenced, `false` when none was, and `"partial"`
 otherwise, with one `MissingSequencing` diagnostic per input without graphs:

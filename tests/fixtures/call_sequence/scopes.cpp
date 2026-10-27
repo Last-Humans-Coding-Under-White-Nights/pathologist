@@ -93,3 +93,40 @@ void local_class()
     };
     after();
 }
+
+bool retry();
+void before();
+
+void rewound()
+{
+again:
+    before();
+    Guard g;
+    if (retry())
+        goto again;
+    work();
+}
+
+void rewound_nested()
+{
+again:
+    before();
+    Guard outer;
+    {
+        Guard inner;
+        if (retry())
+            goto again;
+        work();
+    }
+    after();
+}
+
+void forward()
+{
+    Guard g;
+    if (quit())
+        goto out;
+    work();
+out:
+    after();
+}

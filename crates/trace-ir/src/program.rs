@@ -695,7 +695,7 @@ impl Program {
             }
             // In pair order, as if each pair were applied in turn.
             extra.sort_by_key(|&(at, _)| at);
-            event.sites.extend(extra.iter().map(|&(_, added)| added));
+            event.add_alternative_sites(extra.iter().map(|&(_, added)| added));
         }
     }
 

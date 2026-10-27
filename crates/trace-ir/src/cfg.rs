@@ -188,6 +188,19 @@ pub struct CallEvent {
     pub sites: Vec<CallSiteId>,
 }
 
+impl CallEvent {
+    /// List `sites` as further target records of this invocation, after
+    /// those it lists, in the order given; a site it already lists is not
+    /// repeated. The one way an event gains sites after it is built.
+    pub fn add_alternative_sites(&mut self, sites: impl IntoIterator<Item = CallSiteId>) {
+        for site in sites {
+            if !self.sites.contains(&site) {
+                self.sites.push(site);
+            }
+        }
+    }
+}
+
 /// A region whose order is not modeled; `events` is an inclusive range.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Gap {
@@ -402,6 +415,25 @@ impl FunctionCfg {
             return self.structurally_equal(&other.remap(function, map_site, map_file));
         }
         self.equal_unspliced(other, function, map_site, map_file)
+    }
+
+    /// For `other`, a graph found equal to this one through `map_site`
+    /// once both name their sites by a shared key (another input's copy of
+    /// one body): list each of its events' sites, through `map_site`, as
+    /// alternatives of the matching event here, so dropping `other` keeps
+    /// what its sites call. An event `map_site` splices out matches none.
+    pub fn add_alternatives_from(
+        &mut self,
+        other: &FunctionCfg,
+        map_site: impl Fn(CallSiteId) -> Option<CallSiteId>,
+    ) {
+        let kept = other.events.iter().filter_map(|e| {
+            let mut sites = mapped_sites(&e.sites, &map_site).peekable();
+            sites.peek().is_some().then_some(sites)
+        });
+        for (event, sites) in self.events.iter_mut().zip(kept) {
+            event.add_alternative_sites(sites);
+        }
     }
 
     /// Whether [`Self::remap`] through `map_site` splices out an event.

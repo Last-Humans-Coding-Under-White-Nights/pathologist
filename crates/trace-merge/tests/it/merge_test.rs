@@ -2944,7 +2944,7 @@ fn header_inputs(
 }
 
 #[test]
-fn a_header_body_merged_from_several_inputs_keeps_the_first_graph() {
+fn a_header_body_merged_from_several_inputs_keeps_one_graph_with_every_inputs_sites() {
     let tmp = tempdir().unwrap();
     let root = tmp.path();
     let inputs = header_inputs(
@@ -2973,24 +2973,122 @@ fn a_header_body_merged_from_several_inputs_keeps_the_first_graph() {
         1,
         "one graph for the one merged body"
     );
-    assert_eq!(event_callees(&conn, "common"), ["local", "local"]);
-    // The kept graph names the first input's call sites.
+    // The kept graph's two events each list the first input's site, then
+    // the second input's copy of it.
     let first_input_sites = count(
         &Connection::open(&inputs[0]).unwrap(),
         "SELECT COUNT(*) FROM call_sites",
     );
+    let sites: Vec<(i64, i64, bool)> = conn
+        .prepare(
+            "SELECT e.id, es.ordinal, es.call_site_id > ?1 FROM cfg_event_sites es \
+             JOIN cfg_events e ON e.id = es.event_id JOIN cfg_functions c ON c.id = e.cfg_id \
+             JOIN functions f ON f.id = c.fn_id WHERE f.name = 'common' \
+             ORDER BY e.id, es.ordinal",
+        )
+        .unwrap()
+        .query_map([first_input_sites], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let from_second: Vec<bool> = sites.iter().map(|s| s.2).collect();
+    assert_eq!(from_second, [false, true, false, true], "{sites:?}");
+    assert_eq!(event_callees(&conn, "common"), ["local"; 4]);
+    assert_eq!(misattributed_cfg_rows(&conn), 0);
+}
+
+/// Two inputs sharing `invoke`'s header body but passing it different
+/// callbacks keep one graph whose call event lists both inputs' sites, so
+/// the query follows each input's callback.
+#[test]
+fn a_header_body_merged_alike_keeps_every_inputs_call_targets() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let include = root.join("include");
+    fs::create_dir_all(&include).unwrap();
+    fs::write(
+        include.join("common.h"),
+        "inline void invoke(void (*cb)()) { cb(); }\n",
+    )
+    .unwrap();
+    let mut inputs = Vec::new();
+    for name in ["a", "b"] {
+        let repo = root.join(format!("repo_{name}"));
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("main.cpp"),
+            format!(
+                "#include \"common.h\"\nvoid mark_{name}();\n\
+                 void cb_{name}() {{ mark_{name}(); }}\n\
+                 void run_{name}() {{ invoke(cb_{name}); }}\n"
+            ),
+        )
+        .unwrap();
+        let db = root.join(format!("repo_{name}.db"));
+        analyze_repo_with(
+            &repo,
+            &db,
+            &[
+                "--sequencing".as_ref(),
+                "--include".as_ref(),
+                include.as_os_str(),
+            ],
+        );
+        inputs.push(db);
+    }
+    let output = root.join("merged.db");
+    merge_into(&inputs, &output);
+    let conn = Connection::open(&output).unwrap();
     assert_eq!(
         count(
             &conn,
-            &format!(
-                "SELECT COUNT(*) FROM cfg_event_sites es JOIN cfg_events e ON e.id = es.event_id \
-                 JOIN cfg_functions c ON c.id = e.cfg_id JOIN functions f ON f.id = c.fn_id \
-                 WHERE f.name = 'common' AND es.call_site_id > {first_input_sites}"
-            )
+            "SELECT COUNT(*) FROM cfg_functions c JOIN functions f ON f.id = c.fn_id \
+             WHERE f.name = 'invoke'"
         ),
-        0
+        1,
+        "one body compiled alike is one graph"
     );
+    // The call edges keep both callbacks ...
+    let targets: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT g.name FROM call_edges ce JOIN functions f ON f.id = ce.caller_fn_id \
+             JOIN functions g ON g.id = ce.callee_fn_id WHERE f.name = 'invoke' ORDER BY g.name",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(targets, ["cb_a", "cb_b"]);
+    // ... and so does the one event, primary first.
+    assert_eq!(event_callees(&conn, "invoke"), ["cb", "cb"]);
     assert_eq!(misattributed_cfg_rows(&conn), 0);
+    let invoke = trace_db::resolve_function_target(&conn, Some("invoke"), None, None).unwrap();
+    let graph = trace_db::sequence_graph(
+        &conn,
+        &trace_db::SequenceScope::Function {
+            function: trace_db::FunctionRowId(invoke.id),
+            file: None,
+        },
+        &Default::default(),
+    )
+    .unwrap();
+    let frames: Vec<&str> = graph.frames.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(
+        frames,
+        ["invoke", "cb_a", "cb_b"],
+        "both callbacks are followed"
+    );
+
+    // Merging again gives the same rows.
+    let again = root.join("again.db");
+    merge_into(&inputs, &again);
+    assert_eq!(
+        cfg_dump(&Connection::open(&again).unwrap()),
+        cfg_dump(&conn)
+    );
 }
 
 /// A header body the inputs compile differently is kept once per distinct
@@ -3121,8 +3219,8 @@ fn a_body_whose_site_ids_are_numbered_differently_keeps_one_graph() {
         .collect();
     assert_eq!(
         callees,
-        ["get", "Base::f", "D1::f", "D2::f"],
-        "primary first"
+        ["get", "get", "Base::f", "D1::f", "D2::f", "Base::f", "D1::f", "D2::f"],
+        "primary first, each input's records in its written order"
     );
 }
 

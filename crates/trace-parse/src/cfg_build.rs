@@ -138,6 +138,10 @@ struct Scope {
 struct Label {
     block: BlockId,
     enclosing: Vec<usize>,
+    /// Once the walk has passed the label: how many objects each open
+    /// scope had declared there, outermost first. A `goto` back to it
+    /// destroys the objects its scope declared since.
+    live: Option<Vec<usize>>,
 }
 
 struct Builder<'s, 'a> {
@@ -440,12 +444,19 @@ impl<'s, 'a> Builder<'s, 'a> {
     /// Destructor events of the objects of `scopes[from..]`, innermost
     /// first and in reverse declaration order.
     fn unwind(&mut self, from: usize) {
+        self.unwind_since(from, 0);
+    }
+
+    /// [`Self::unwind`], keeping the first `kept` objects of
+    /// `scopes[from]`.
+    fn unwind_since(&mut self, from: usize, kept: usize) {
         if self.cur.is_none() {
             return;
         }
         let sites = self.sites;
         for scope in (from..self.scopes.len()).rev() {
-            for object in (0..self.scopes[scope].objects.len()).rev() {
+            let first = if scope == from { kept } else { 0 };
+            for object in (first..self.scopes[scope].objects.len()).rev() {
                 for invocation in invocations(sites, &self.scopes[scope].objects[object]) {
                     self.emit(EventKind::Destroy, invocation.occurrence, invocation.sites);
                 }
@@ -1078,7 +1089,17 @@ impl<'a> Builder<'_, 'a> {
             .iter()
             .rposition(|s| s.node.is_some_and(|n| target.enclosing.contains(&n)))
             .map_or(0, |at| at + 1);
-        self.unwind(keep);
+        // Back to a label already passed, the innermost scope around both
+        // also loses the objects it declared after the label (C++ destroys
+        // them when the jump crosses their declarations). A forward jump
+        // cannot skip one in valid C++, so it keeps the scope whole.
+        let since = keep
+            .checked_sub(1)
+            .and_then(|at| Some((at, *target.live.as_ref()?.get(at)?)));
+        match since {
+            Some((at, kept)) => self.unwind_since(at, kept),
+            None => self.unwind(keep),
+        }
         self.jump(block, EdgeKind::Fallthrough);
     }
 
@@ -1091,9 +1112,13 @@ impl<'a> Builder<'_, 'a> {
 
     fn labeled_statement(&mut self, node: Node<'a>) {
         let label = node.cached_field("label");
+        let live: Vec<usize> = self.scopes.iter().map(|s| s.objects.len()).collect();
         let block = label
-            .and_then(|l| self.labels.get(node_text(self.source, &l)))
-            .map(|l| l.block);
+            .and_then(|l| self.labels.get_mut(node_text(self.source, &l)))
+            .map(|l| {
+                l.live = Some(live);
+                l.block
+            });
         if let Some(block) = block {
             self.jump(block, EdgeKind::Fallthrough);
             self.start(block);
@@ -1128,7 +1153,14 @@ impl<'a> Builder<'_, 'a> {
                     if !self.labels.contains_key(name) {
                         let block = self.block_at(n);
                         let enclosing = compounds.iter().rev().copied().collect();
-                        self.labels.insert(name, Label { block, enclosing });
+                        self.labels.insert(
+                            name,
+                            Label {
+                                block,
+                                enclosing,
+                                live: None,
+                            },
+                        );
                     }
                 }
             }
@@ -1970,6 +2002,63 @@ mod tests {
         let (on_continue, on_break) = (*on_continue[0], *on_break[0]);
         assert!(g.block_path(g.block(on_continue), g.block(more), Some(g.block(work))));
         assert!(g.block_path(g.block(on_break), g.block(after), Some(g.block(more))));
+    }
+
+    #[test]
+    fn a_backward_goto_destroys_the_objects_declared_after_its_label() {
+        let unit = lower("scopes.cpp");
+        let g = graph(&unit, "rewound");
+        let (before, retry, work) = (g.ev("before"), g.ev("retry"), g.ev("work"));
+        let dtors = g.all("Guard::~Guard");
+        // One destructor on the `goto` path, one at the body's end.
+        assert_eq!(dtors.len(), 2, "{}", g.dump());
+        let on_goto: Vec<_> = dtors
+            .iter()
+            .copied()
+            .filter(|&d| !g.may_precede(work, d))
+            .collect();
+        assert_eq!(on_goto.len(), 1, "{}", g.dump());
+        let on_goto = on_goto[0];
+        assert!(g.guaranteed(retry, on_goto), "{}", g.dump());
+        // Back to the label only through the destructor.
+        let label = g.block(before);
+        assert!(g.block_path(g.block(on_goto), label, None), "{}", g.dump());
+        assert!(
+            !g.block_path(g.block(retry), label, Some(g.block(on_goto))),
+            "{}",
+            g.dump()
+        );
+
+        // Leaving a nested scope too: its object, then the one declared
+        // after the label in the label's own scope.
+        let g = graph(&unit, "rewound_nested");
+        let (before, retry, work) = (g.ev("before"), g.ev("retry"), g.ev("work"));
+        let dtors = g.all("Guard::~Guard");
+        assert_eq!(dtors.len(), 4, "{}", g.dump());
+        let on_goto: Vec<_> = dtors
+            .iter()
+            .copied()
+            .filter(|&d| !g.may_precede(work, d))
+            .collect();
+        assert_eq!(on_goto.len(), 2, "{}", g.dump());
+        let (inner, outer) = (on_goto[0], on_goto[1]);
+        assert!(g.sequenced(inner, outer), "{}", g.dump());
+        let line = |e: EventId| g.cfg.events[e.0 as usize].occurrence.span.line;
+        assert!(line(inner) > line(outer), "inner first: {}", g.dump());
+        assert!(g.guaranteed(retry, inner));
+        let label = g.block(before);
+        assert!(
+            !g.block_path(g.block(retry), label, Some(g.block(outer))),
+            "{}",
+            g.dump()
+        );
+
+        // A forward `goto` within the scope destroys nothing early.
+        let g = graph(&unit, "forward");
+        let (work, after) = (g.ev("work"), g.ev("after"));
+        let dtor = g.ev("Guard::~Guard");
+        assert!(g.guaranteed(after, dtor), "{}", g.dump());
+        assert!(g.may_precede(work, dtor));
     }
 
     #[test]
