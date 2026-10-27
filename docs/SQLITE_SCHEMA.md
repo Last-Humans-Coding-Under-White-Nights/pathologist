@@ -406,9 +406,13 @@ kind_id)`, `WITHOUT ROWID`.
 | `file_id`, `line`, `col` | INTEGER | Request position, as in `call_sites` |
 | `expansion_file_id`, `expansion_line`, `expansion_col` | INTEGER, nullable | Outermost macro invocation, as in `call_sites` |
 
-`cfg_event_sites`: `event_id` → `cfg_events`, `call_site_id` → `call_sites`;
-the alternative-target records of one invocation (several rows for one event
-are alternatives, not a sequence). One site may belong to several events (a
+`cfg_event_sites`: `event_id` → `cfg_events`, `call_site_id` → `call_sites`,
+`ordinal` (the site's position among its event's, from 0; primary key
+`(event_id, call_site_id)`, `WITHOUT ROWID`); the alternative-target records
+of one invocation (several rows for one event are alternatives, not a
+sequence), the record the call was bound to first, then the alternatives
+added for it (virtual overrides) in the order they were found. Read them by
+`ordinal`, not by `call_site_id`. One site may belong to several events (a
 destructor at each scope exit). Every named site is exported (see the
 [call site export filter](#call-site-export-filter)).
 

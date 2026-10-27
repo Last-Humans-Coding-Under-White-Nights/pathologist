@@ -256,7 +256,7 @@ pub fn resolve_event(
          WHERE ((e.line = ?1 AND f.path LIKE ?2 ESCAPE '!' AND (?3 IS NULL OR e.col = ?3)) \
              OR (e.expansion_line = ?1 AND x.path LIKE ?2 ESCAPE '!' \
                  AND (?3 IS NULL OR e.expansion_col = ?3))) \
-         ORDER BY e.id, cs.id",
+         ORDER BY e.id, es.ordinal",
     )?;
     // The events found, each with its sites' callee spellings and the
     // macro invocation (`file:line`) it was matched at.
@@ -501,9 +501,10 @@ pub struct SeqRelation {
     pub kind: Relation,
     pub from: EventRef,
     pub to: EventRef,
-    /// When `to` runs inside a callee: the event of `from`'s function whose
-    /// call reaches it.
-    pub via: Option<i64>,
+    /// When `to` runs inside a callee: the events of `from`'s function
+    /// whose calls reach it, in every variant, in event order; empty when
+    /// `to` is in `from`'s own body.
+    pub via: Vec<i64>,
     pub notes: Vec<String>,
 }
 
@@ -580,7 +581,7 @@ const LOAD_CALLEES_SQL: &str = "SELECT es.event_id, cs.callee_text \
              FROM cfg_blocks b JOIN cfg_events e ON e.block_id = b.id \
              JOIN cfg_event_sites es ON es.event_id = e.id \
              JOIN call_sites cs ON cs.id = es.call_site_id \
-             WHERE b.cfg_id = ?1 ORDER BY es.event_id, cs.id";
+             WHERE b.cfg_id = ?1 ORDER BY es.event_id, es.ordinal";
 const LOAD_TARGETS_SQL: &str =
     "SELECT DISTINCT es.event_id, ce.callee_fn_id, f.name, ce.resolution, \
                     f.is_defined, f.is_dep \
@@ -1530,7 +1531,8 @@ pub fn sequence_graph(
             // and the frame showing the blocks between the ends.
             let mut relations = Vec::new();
             let mut notes: Vec<String> = Vec::new();
-            let mut via: Option<(i64, String)> = None;
+            // The calls reaching `to` from outside, with their positions.
+            let mut via: Vec<(i64, String)> = Vec::new();
             let mut unreached = 0;
             let mut frames = Vec::new();
             for &(event, cfg_id) in &from_copies {
@@ -1578,8 +1580,13 @@ pub fn sequence_graph(
                         }
                     }
                 }
-                if inside && via.is_none() {
-                    via = Some((g.db_ids[targets[0]], g.events[targets[0]].loc.display()));
+                if inside {
+                    for &t in &targets {
+                        let call = g.db_ids[t];
+                        if !via.iter().any(|&(e, _)| e == call) {
+                            via.push((call, g.events[t].loc.display()));
+                        }
+                    }
                 }
             }
             let not_reached = format!(
@@ -1594,14 +1601,25 @@ pub fn sequence_graph(
                     kind: Relation::Unknown,
                     from: from.clone(),
                     to: to.clone(),
-                    via: None,
+                    via: Vec::new(),
                     notes: vec![not_reached],
                 }
             } else {
                 let kind = combine(&relations);
                 notes.extend(conditions(kind));
-                if let Some((_, at)) = &via {
-                    notes.push(format!("{} runs inside the call at {at}", to.display()));
+                match via.as_slice() {
+                    [] => {}
+                    [(_, at)] => {
+                        notes.push(format!("{} runs inside the call at {at}", to.display()))
+                    }
+                    calls => {
+                        let at: Vec<&str> = calls.iter().map(|(_, at)| at.as_str()).collect();
+                        notes.push(format!(
+                            "{} runs inside the calls at {}",
+                            to.display(),
+                            at.join(", ")
+                        ));
+                    }
                 }
                 if unreached > 0 {
                     notes.push(format!(
@@ -1613,7 +1631,7 @@ pub fn sequence_graph(
                     kind,
                     from: from.clone(),
                     to: to.clone(),
-                    via: via.map(|(event, _)| event),
+                    via: via.into_iter().map(|(event, _)| event).collect(),
                     notes,
                 }
             };

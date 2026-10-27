@@ -163,7 +163,7 @@ impl GapKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Block {
     pub kind: BlockKind,
     pub span: Option<Span>,
@@ -180,7 +180,7 @@ pub struct CfgEdge {
 
 /// One syntactic invocation; `sites` are the alternative-target records of
 /// that one invocation, never a sequence of calls.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CallEvent {
     pub block: BlockId,
     pub kind: EventKind,
@@ -189,7 +189,7 @@ pub struct CallEvent {
 }
 
 /// A region whose order is not modeled; `events` is an inclusive range.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Gap {
     pub kind: GapKind,
     pub span: Option<Span>,
@@ -348,6 +348,44 @@ impl FunctionCfg {
             && *events == other.events
             && *order == other.order
             && *gaps == other.gaps
+    }
+
+    /// A hash of what [`Self::structurally_equal`] compares: structurally
+    /// equal graphs hash alike. Lets a caller keep a fingerprint per graph
+    /// instead of a second copy to compare against.
+    pub fn structural_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        // Exhaustive, as in `structurally_equal`.
+        let FunctionCfg {
+            function,
+            tu: _,
+            variant: _,
+            entry,
+            exit,
+            exceptional_exit,
+            blocks,
+            edges,
+            events,
+            order,
+            gaps,
+        } = self;
+        let mut hasher = rustc_hash::FxHasher::default();
+        (function, entry, exit, exceptional_exit).hash(&mut hasher);
+        (blocks, edges, events, order, gaps).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Every file the graph names: its unit, and the files of its block,
+    /// event and gap positions.
+    pub fn files(&self) -> impl Iterator<Item = FileId> + '_ {
+        let blocks = self.blocks.iter().filter_map(|b| b.span);
+        let events = self
+            .events
+            .iter()
+            .flat_map(|e| std::iter::once(e.occurrence.span).chain(e.occurrence.expansion_span));
+        let gaps = self.gaps.iter().filter_map(|g| g.span);
+        let spans = blocks.chain(events).chain(gaps).map(|s| s.file);
+        self.tu.into_iter().chain(spans)
     }
 
     /// `self.structurally_equal(&other.remap(function, map_site, map_file))`,
@@ -680,6 +718,35 @@ mod tests {
         b.tu = Some(FileId(3));
         b.variant = 2;
         assert!(a.structurally_equal(&b));
+    }
+
+    #[test]
+    fn structural_hash_follows_structural_equality() {
+        let a = straight();
+        let mut b = straight();
+        b.tu = Some(FileId(3));
+        b.variant = 2;
+        assert_eq!(a.structural_hash(), b.structural_hash());
+        let mut sites = straight();
+        sites.events[1].sites = vec![CallSiteId(12)];
+        assert_ne!(a.structural_hash(), sites.structural_hash());
+    }
+
+    #[test]
+    fn files_lists_every_position() {
+        let mut g = straight();
+        g.tu = Some(FileId(1));
+        g.blocks[2].span = Some(Span::new(FileId(2), 1, 1));
+        g.events[0].occurrence.expansion_span = Some(Span::new(FileId(3), 1, 1));
+        g.gaps.push(Gap {
+            kind: GapKind::ParseError,
+            span: Some(Span::new(FileId(4), 1, 1)),
+            events: None,
+        });
+        let mut files: Vec<u32> = g.files().map(|f| f.0).collect();
+        files.sort_unstable();
+        files.dedup();
+        assert_eq!(files, [0, 1, 2, 3, 4]);
     }
 
     #[test]

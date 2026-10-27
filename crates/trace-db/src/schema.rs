@@ -530,6 +530,7 @@ CREATE TABLE IF NOT EXISTS cfg_events (
 CREATE TABLE IF NOT EXISTS cfg_event_sites (
     event_id INTEGER NOT NULL REFERENCES cfg_events(id),
     call_site_id INTEGER NOT NULL REFERENCES call_sites_data(id),
+    ordinal INTEGER NOT NULL,
     PRIMARY KEY (event_id, call_site_id)
 ) WITHOUT ROWID;
 

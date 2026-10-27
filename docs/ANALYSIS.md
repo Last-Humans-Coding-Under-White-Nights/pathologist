@@ -5113,7 +5113,9 @@ first, then loads graphs only as it reaches them:
   reach that graph within `--depth` levels, never through an `async_start` or
   `ipc_bridge`, and relates the first event to each of them (the call itself
   counts as `guaranteed_before`); several calls combine to the weakest
-  claim they all allow. A first event several variants compile is related
+  claim they all allow. Every such call is cited: a note names their
+  positions and the JSON `relation.via` lists their `cfg_events` ids (empty
+  when both events share a graph). A first event several variants compile is related
   in each of them, and the relations combine the same way; a variant that
   reaches no copy of the second event is skipped with a note. Found
   nowhere, the relation is `unknown`. A gap over

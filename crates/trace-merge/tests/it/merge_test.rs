@@ -3032,6 +3032,100 @@ fn a_header_body_compiled_differently_keeps_a_variant_per_input() {
     assert_eq!(misattributed_cfg_rows(&conn), 0);
 }
 
+/// Swap the ids of two `call_sites` rows everywhere an input names them.
+fn swap_call_site_ids(conn: &Connection, a: i64, b: i64) {
+    let columns: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p \
+             WHERE m.type = 'table' AND (p.name = 'call_site_id' \
+               OR (m.name = 'call_sites_data' AND p.name = 'id'))",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    for (table, column) in columns {
+        for (from, to) in [(a, -1), (b, a), (-1, b)] {
+            conn.execute(
+                &format!("UPDATE {table} SET {column} = ?2 WHERE {column} = ?1"),
+                [from, to],
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// Two inputs compiling one header body alike, whose call-site ids for
+/// the alternatives of one dispatch are numbered differently, keep one
+/// graph: a graph reads back in its written site order, not by id.
+#[test]
+fn a_body_whose_site_ids_are_numbered_differently_keeps_one_graph() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let inputs = header_inputs(
+        root,
+        "struct Base { virtual int f(); };\n\
+         struct D1 : Base { int f() override { return 1; } };\n\
+         struct D2 : Base { int f() override { return 2; } };\n\
+         Base *get();\n\
+         inline int common() { return get()->f(); }\n",
+        [&[], &[]],
+    );
+    let b = Connection::open(&inputs[1]).unwrap();
+    let overrides: Vec<i64> = b
+        .prepare(
+            "SELECT s.id FROM call_sites s JOIN functions f ON f.id = s.caller_fn_id \
+             WHERE f.name = 'common' AND s.callee_text IN ('D1::f', 'D2::f') ORDER BY s.id",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(overrides.len(), 2, "the dispatch has two overrides");
+    let one_event: i64 = b
+        .query_row(
+            "SELECT COUNT(DISTINCT event_id) FROM cfg_event_sites WHERE call_site_id IN (?1, ?2)",
+            [overrides[0], overrides[1]],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(one_event, 1, "both overrides are alternatives of one event");
+    swap_call_site_ids(&b, overrides[0], overrides[1]);
+    drop(b);
+    let output = root.join("merged.db");
+    merge_into(&inputs, &output);
+    let conn = Connection::open(&output).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM cfg_functions c JOIN functions f ON f.id = c.fn_id \
+             WHERE f.name = 'common'"
+        ),
+        1,
+        "one body compiled alike is one graph"
+    );
+    let callees: Vec<String> = conn
+        .prepare(
+            "SELECT s.callee_text FROM cfg_event_sites es JOIN call_sites s ON s.id = es.call_site_id \
+             JOIN cfg_events e ON e.id = es.event_id JOIN cfg_functions c ON c.id = e.cfg_id \
+             JOIN functions f ON f.id = c.fn_id WHERE f.name = 'common' \
+             ORDER BY e.id, es.ordinal",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        callees,
+        ["get", "Base::f", "D1::f", "D2::f"],
+        "primary first"
+    );
+}
+
 #[test]
 fn an_event_whose_sites_were_not_carried_is_spliced_out() {
     let tmp = tempdir().unwrap();
@@ -3084,6 +3178,74 @@ fn an_event_whose_sites_were_not_carried_is_spliced_out() {
         )
         .unwrap();
     assert_eq!(coverage, "partial");
+}
+
+/// An input with more graphs than one read takes: every graph is carried,
+/// in id order, the same on every merge.
+#[test]
+fn graphs_are_carried_across_read_chunks() {
+    let tmp = tempdir().unwrap();
+    let functions = 1100;
+    let mut source = String::from("void a(void); void b(void);\n");
+    for i in 0..functions {
+        source.push_str(&format!("void f{i}(void) {{ a(); b(); }}\n"));
+    }
+    let inputs = sequencing_inputs(
+        tmp.path(),
+        &[
+            ("repo_a", "a.c", &source, true),
+            ("repo_b", "b.c", ORDERED, true),
+        ],
+    );
+    let output = tmp.path().join("merged.db");
+    merge_into(&inputs, &output);
+    let conn = Connection::open(&output).unwrap();
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM cfg_functions"),
+        functions + 1
+    );
+    assert_eq!(event_order(&conn, "f1099"), ["a<b"]);
+    assert_eq!(event_order(&conn, "run"), ["a<b", "b<c"]);
+    assert_eq!(misattributed_cfg_rows(&conn), 0);
+    let again = tmp.path().join("again.db");
+    merge_into(&inputs, &again);
+    assert_eq!(
+        cfg_dump(&Connection::open(&again).unwrap()),
+        cfg_dump(&conn)
+    );
+}
+
+/// A graph row naming a file its input does not list is an error naming
+/// the input, as a call site naming one is, never a panic.
+#[test]
+fn a_cfg_row_naming_an_unknown_file_is_an_error() {
+    for update in [
+        "UPDATE cfg_events SET file_id = 9999 WHERE id = (SELECT MIN(id) FROM cfg_events)",
+        "UPDATE cfg_events SET expansion_file_id = 9999, expansion_line = 1, expansion_col = 1 \
+         WHERE id = (SELECT MIN(id) FROM cfg_events)",
+        "UPDATE cfg_blocks SET file_id = 9999, line = 1, col = 1 \
+         WHERE id = (SELECT MIN(id) FROM cfg_blocks)",
+    ] {
+        let tmp = tempdir().unwrap();
+        let inputs = sequencing_inputs(tmp.path(), &[("repo_a", "a.c", ORDERED, true)]);
+        let input = Connection::open(&inputs[0]).unwrap();
+        input.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        input.execute(update, []).unwrap();
+        drop(input);
+        let error = merge_databases(
+            &inputs,
+            &MergeOptions {
+                output: tmp.path().join("merged.db"),
+                verbose: false,
+            },
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("9999") && error.contains("repo_a.db"),
+            "{update}: {error}"
+        );
+    }
 }
 
 #[test]

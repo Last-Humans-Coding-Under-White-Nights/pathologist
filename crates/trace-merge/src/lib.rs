@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use trace_db::{MultiInstance, SequencingMarker, INDEXES_V8, SCHEMA_VERSION, TABLES_V8};
 
+/// Call-order graph ids read from an input at a time.
+const CFG_READ_CHUNK: i64 = 1024;
+
 // Use the same projections for capability checks and ingestion. Additive v7
 // flow metadata is optional here because the merger only preserves call graphs.
 const READ_FILES: &str = "SELECT id, path, sha256, is_dep FROM files ORDER BY id";
@@ -1113,19 +1116,23 @@ pub fn merge_databases<P: AsRef<Path>>(
     // once when they compile it alike and once more per different graph.
     // Inputs share no call sites, so bodies are compared with each site
     // standing for its key (`site_keys`). An event none of whose sites was
-    // carried is spliced out, leaving an `omitted_sites` gap.
+    // carried is spliced out, leaving an `omitted_sites` gap. Graphs are
+    // read a chunk of ids at a time, and a kept graph is held once: beside
+    // it only the hash of its keyed form, the keyed form being rebuilt to
+    // confirm a hash that matches.
     let mut unified_cfgs: BTreeMap<trace_ir::FnId, Vec<trace_ir::FunctionCfg>> = BTreeMap::new();
+    let mut cfg_hashes: FxHashMap<trace_ir::FnId, Vec<u64>> = FxHashMap::default();
     let any_sequenced = input_sequencing
         .iter()
         .any(|&s| s != SequencingMarker::Absent);
-    // The kept graphs with their sites as keys, which `add_variant` compares.
-    let mut keyed_cfgs: FxHashMap<trace_ir::FnId, Vec<trace_ir::FunctionCfg>> =
-        FxHashMap::default();
     let site_key = if any_sequenced {
         site_keys(&unified_call_sites, &input_sites)
     } else {
         Vec::new()
     };
+    // A merged site's key.
+    let merged_key =
+        |s: trace_ir::CallSiteId| Some(trace_ir::CallSiteId(site_key[s.0 as usize - 1]));
     for (db_idx, conn) in conns.iter().enumerate() {
         if input_sequencing[db_idx] == SequencingMarker::Absent {
             if any_sequenced {
@@ -1142,28 +1149,51 @@ pub fn merge_databases<P: AsRef<Path>>(
             }
             continue;
         }
-        // Every file an input row names is one of its `files` rows.
-        let map_file =
-            |f: trace_ir::FileId| trace_ir::FileId(file_remap[db_idx][&i64::from(f.0)] as u32);
+        let files = &file_remap[db_idx];
+        // Every graph's files are checked to be in `files` before it is
+        // mapped.
+        let map_file = |f: trace_ir::FileId| trace_ir::FileId(files[&i64::from(f.0)] as u32);
         let map_site = |s: trace_ir::CallSiteId| {
             cs_remap[db_idx]
                 .get(&i64::from(s.0))
                 .map(|&id| trace_ir::CallSiteId(id as u32))
         };
-        let key = |s| map_site(s).map(|s| trace_ir::CallSiteId(site_key[s.0 as usize - 1]));
-        for stored in trace_db::read_cfgs(conn, 1..=i64::MAX)? {
-            let cfg = stored.cfg;
-            let function = *fn_remap[db_idx]
-                .get(&i64::from(cfg.function.0))
-                .context("missing remapped fn_id for cfg_functions")?;
-            let function = trace_ir::FnId(function as u32);
-            let keyed = keyed_cfgs.entry(function).or_default();
-            let Some(kept) = trace_ir::add_variant(keyed, &cfg, function, key, map_file) else {
-                continue;
-            };
-            let mut merged = cfg.remap(function, map_site, map_file);
-            merged.variant = kept.variant;
-            unified_cfgs.entry(function).or_default().push(merged);
+        let key = |s| map_site(s).and_then(merged_key);
+        let last: i64 =
+            conn.query_row("SELECT COALESCE(MAX(id), 0) FROM cfg_functions", [], |r| {
+                r.get(0)
+            })?;
+        for first in (1..=last).step_by(CFG_READ_CHUNK as usize) {
+            let chunk = first..=first.saturating_add(CFG_READ_CHUNK - 1);
+            for stored in trace_db::read_cfgs(conn, chunk)? {
+                let cfg = stored.cfg;
+                if let Some(file) = cfg.files().find(|f| !files.contains_key(&i64::from(f.0))) {
+                    bail!(
+                        "call-order graph {} of {} names file id {}, which is not in its files table",
+                        stored.id,
+                        inputs[db_idx].display(),
+                        file.0
+                    );
+                }
+                let function = *fn_remap[db_idx]
+                    .get(&i64::from(cfg.function.0))
+                    .context("missing remapped fn_id for cfg_functions")?;
+                let function = trace_ir::FnId(function as u32);
+                let keyed = cfg.remap(function, key, map_file);
+                let hash = keyed.structural_hash();
+                let kept = unified_cfgs.entry(function).or_default();
+                let hashes = cfg_hashes.entry(function).or_default();
+                let seen = hashes.iter().zip(kept.iter()).any(|(&h, v)| {
+                    h == hash && keyed.equal_after_remap(v, function, merged_key, |f| f)
+                });
+                if seen {
+                    continue;
+                }
+                let mut merged = cfg.remap(function, map_site, map_file);
+                merged.variant = kept.len() as u32;
+                kept.push(merged);
+                hashes.push(hash);
+            }
         }
     }
 

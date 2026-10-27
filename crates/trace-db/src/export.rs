@@ -1053,7 +1053,7 @@ pub fn export_cfg<'a>(
         "INSERT INTO cfg_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?;
     let mut site_stmt =
-        conn.prepare_cached("INSERT OR IGNORE INTO cfg_event_sites VALUES (?1, ?2)")?;
+        conn.prepare_cached("INSERT OR IGNORE INTO cfg_event_sites VALUES (?1, ?2, ?3)")?;
     let mut order_stmt =
         conn.prepare_cached("INSERT OR IGNORE INTO cfg_event_order VALUES (?1, ?2)")?;
     let mut gap_stmt =
@@ -1113,8 +1113,9 @@ pub fn export_cfg<'a>(
                 occurrence.expansion_span.map(|s| s.line),
                 occurrence.expansion_span.map(|s| s.col),
             ])?;
-            for site in &e.sites {
-                site_stmt.execute(params![id, site.0])?;
+            // A repeated site keeps its first position.
+            for (ordinal, site) in e.sites.iter().enumerate() {
+                site_stmt.execute(params![id, site.0, ordinal as i64])?;
             }
         }
         for &(a, b) in &cfg.order {
@@ -1144,7 +1145,10 @@ pub fn export_cfg<'a>(
 // in `?1..=?2`, each by its graph id; events are reached through their
 // blocks, as `cfg_events` has no index on `cfg_id`. `CROSS JOIN` keeps the
 // blocks the outer loop: over a range, SQLite would otherwise scan a whole
-// table in its `ORDER BY` order. Kinds are read as their names.
+// table in its `ORDER BY` order. Kinds are read as their names, and rows
+// in the order they were written (edges, whose order is not stored, by
+// kind name), so a graph reads back the same whatever ids its database
+// gave its sites and kinds.
 const READ_CFG_FUNCTIONS: &str =
     "SELECT id, fn_id, tu_file_id, variant, entry_block, exit_block, exceptional_exit_block \
      FROM cfg_functions WHERE id BETWEEN ?1 AND ?2 ORDER BY id";
@@ -1153,7 +1157,7 @@ const READ_CFG_BLOCKS: &str = "SELECT b.id, b.cfg_id, b.ordinal, k.text, b.file_
      WHERE b.cfg_id BETWEEN ?1 AND ?2 ORDER BY b.cfg_id, b.ordinal";
 const READ_CFG_EDGES: &str = "SELECT e.src_block, e.dst_block, k.text \
      FROM cfg_blocks b CROSS JOIN cfg_edges e ON e.src_block = b.id JOIN strings k ON k.id = e.kind_id \
-     WHERE b.cfg_id BETWEEN ?1 AND ?2 ORDER BY e.src_block, e.dst_block, e.kind_id";
+     WHERE b.cfg_id BETWEEN ?1 AND ?2 ORDER BY e.src_block, e.dst_block, k.text";
 const READ_CFG_EVENTS: &str = "SELECT e.id, b.cfg_id, e.block_id, e.ordinal, k.text, \
             e.file_id, e.line, e.col, e.expansion_file_id, e.expansion_line, e.expansion_col \
      FROM cfg_blocks b CROSS JOIN cfg_events e ON e.block_id = b.id JOIN strings k ON k.id = e.kind_id \
@@ -1161,7 +1165,7 @@ const READ_CFG_EVENTS: &str = "SELECT e.id, b.cfg_id, e.block_id, e.ordinal, k.t
 const READ_CFG_EVENT_SITES: &str = "SELECT es.event_id, es.call_site_id \
      FROM cfg_blocks b CROSS JOIN cfg_events e ON e.block_id = b.id \
      CROSS JOIN cfg_event_sites es ON es.event_id = e.id \
-     WHERE b.cfg_id BETWEEN ?1 AND ?2 ORDER BY es.event_id, es.call_site_id";
+     WHERE b.cfg_id BETWEEN ?1 AND ?2 ORDER BY es.event_id, es.ordinal";
 const READ_CFG_EVENT_ORDER: &str = "SELECT o.event_id, o.next_event_id \
      FROM cfg_blocks b CROSS JOIN cfg_events e ON e.block_id = b.id \
      CROSS JOIN cfg_event_order o ON o.event_id = e.id \
@@ -1503,6 +1507,88 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 
 #[cfg(test)]
 mod tests {
+    /// A one-block graph whose call has its sites out of id order and whose
+    /// two blocks are joined by two kinds of edge.
+    fn cfg_with_alternatives() -> trace_ir::FunctionCfg {
+        use trace_ir::*;
+        FunctionCfg {
+            function: FnId(0),
+            tu: None,
+            variant: 0,
+            entry: BlockId(0),
+            exit: BlockId(1),
+            exceptional_exit: None,
+            blocks: vec![
+                Block {
+                    kind: BlockKind::Entry,
+                    span: None,
+                    events: vec![EventId(0)],
+                },
+                Block {
+                    kind: BlockKind::Exit,
+                    span: None,
+                    events: Vec::new(),
+                },
+            ],
+            edges: vec![
+                CfgEdge {
+                    from: BlockId(0),
+                    to: BlockId(1),
+                    kind: EdgeKind::Return,
+                },
+                CfgEdge {
+                    from: BlockId(0),
+                    to: BlockId(1),
+                    kind: EdgeKind::Fallthrough,
+                },
+            ],
+            events: vec![CallEvent {
+                block: BlockId(0),
+                kind: EventKind::Call,
+                occurrence: CallOccurrence {
+                    span: Span::new(FileId(0), 2, 3),
+                    expansion_span: None,
+                    expansion_id: 0,
+                },
+                // The primary record, then an alternative with a lower id.
+                sites: vec![CallSiteId(5), CallSiteId(3), CallSiteId(4)],
+            }],
+            order: Vec::new(),
+            gaps: Vec::new(),
+        }
+    }
+
+    /// The graph written to a fresh database after `before` were interned,
+    /// read back.
+    fn cfg_round_trip(before: &[&str]) -> trace_ir::FunctionCfg {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::SCHEMA_V8).unwrap();
+        // The graph's function, file and sites have no rows here.
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        let mut strings = TextPool::new(&conn).unwrap();
+        for text in before {
+            strings.intern(text).unwrap();
+        }
+        super::export_cfg(&conn, [&cfg_with_alternatives()], &mut strings).unwrap();
+        let mut read = super::read_cfgs(&conn, 1..=1).unwrap();
+        assert_eq!(read.len(), 1);
+        read.pop().unwrap().cfg
+    }
+
+    #[test]
+    fn cfgs_read_back_as_written_whatever_the_ids() {
+        let fresh = cfg_round_trip(&[]);
+        let written = cfg_with_alternatives();
+        assert_eq!(
+            fresh.events[0].sites, written.events[0].sites,
+            "an event's sites keep their written order, primary first"
+        );
+        // Kind ids depend on what was interned first; the edges read back
+        // do not.
+        let reinterned = cfg_round_trip(&["return", "ordinary", "exit"]);
+        assert!(fresh.structurally_equal(&reinterned));
+    }
+
     #[test]
     fn interned_text_preserves_rows_and_uses_selective_indexes() {
         let legacy = Connection::open_in_memory().unwrap();

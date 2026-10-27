@@ -647,6 +647,40 @@ fn between_keeps_only_blocks_on_a_path() {
 }
 
 #[test]
+fn every_call_reaching_the_second_end_is_cited() {
+    let dir = scratch(&[(
+        "reach.c",
+        "void first(void); void target(void);\n\
+         void helper(void) { target(); }\n\
+         void run(int c) {\n\
+           first();\n\
+           if (c) helper();\n\
+           else helper();\n\
+         }\n",
+    )]);
+    let db = sequenced_db(dir.path(), default_opts(dir.path()));
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let first = event(&conn, "reach.c", 4, "first");
+    let target = event(&conn, "reach.c", 2, "target");
+    let graph = trace_db::sequence_graph(
+        &conn,
+        &trace_db::SequenceScope::Between(first, target.clone()),
+        &Default::default(),
+    )
+    .unwrap();
+    let relation = graph.relation.expect("a between query relates its ends");
+    let calls: Vec<i64> = [5, 6]
+        .map(|line| event(&conn, "reach.c", line, "helper").event)
+        .into();
+    assert_eq!(relation.via, calls, "both reaching calls are recorded");
+    let cited =
+        "target() at reach.c:2:21 runs inside the calls at reach.c:5:8, reach.c:6:6".to_string();
+    assert!(relation.notes.contains(&cited), "{:?}", relation.notes);
+    let json = serde_json::to_value(&relation).unwrap();
+    assert_eq!(json["via"], serde_json::json!(calls));
+}
+
+#[test]
 fn expression_order_follows_the_language() {
     use trace_db::Relation::*;
     let conn = fixture_db();

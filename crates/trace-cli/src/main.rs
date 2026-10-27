@@ -326,7 +326,11 @@ enum InspectCommands {
         #[arg(long = "to-file", requires = "to_line")]
         to_file: Option<String>,
         /// Line of the second call.
-        #[arg(long = "to-line", requires = "to_file", conflicts_with = "function")]
+        #[arg(
+            long = "to-line",
+            requires_all = ["to_file", "line"],
+            conflicts_with = "function"
+        )]
         to_line: Option<i64>,
         /// Column of the second call.
         #[arg(long = "to-col", requires = "to_line")]
@@ -1319,5 +1323,26 @@ mod compiler_options_tests {
             let args = ["trace", "analyze", "."].into_iter().chain(extra);
             assert!(Cli::try_parse_from(args).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod sequence_options_tests {
+    use super::Cli;
+    use clap::Parser;
+
+    fn parses(extra: &[&str]) -> bool {
+        let args = ["trace", "inspect", "x.db", "sequence"].iter().chain(extra);
+        Cli::try_parse_from(args).is_ok()
+    }
+
+    #[test]
+    fn a_second_call_needs_a_starting_call() {
+        let to = ["--to-file", "b.c", "--to-line", "12"];
+        assert!(!parses(&to), "--to-line without --line");
+        assert!(parses(
+            &[&["--file", "b.c", "--line", "10"][..], &to[..]].concat()
+        ));
+        assert!(!parses(&[&["--function", "run"][..], &to[..]].concat()));
     }
 }
