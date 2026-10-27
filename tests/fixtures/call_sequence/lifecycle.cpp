@@ -60,3 +60,21 @@ void two()
 {
     Pair a{first()}, b{second()};
 }
+
+struct BaseA {
+    BaseA();
+    ~BaseA();
+};
+
+struct BaseB {
+    BaseB();
+    ~BaseB();
+};
+
+struct Both : BaseA, BaseB {};
+
+void bases()
+{
+    Both both;
+    work();
+}

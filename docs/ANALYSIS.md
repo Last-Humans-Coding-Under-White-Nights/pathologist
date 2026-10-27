@@ -4917,7 +4917,10 @@ database carries no sequencing rows.
   `CallSite` records of that invocation as its `sites`: alternative targets of
   the *same* invocation (one record per member candidate, post-merge virtual
   overrides, a configuration variant's own record), never a sequence of
-  calls. Kinds: `call`, `construct` (including the constructor a
+  calls. An automatic object whose implicit constructor or destructor runs
+  its bases' (`struct C : A, B {}; C c;`) records one site per base class at
+  the declaration; each base's is an event of its own (`A::A` and `B::B`),
+  its overloads alternatives of that one. Kinds: `call`, `construct` (including the constructor a
   `new`-expression runs), `destroy` and `delete`. Two expansions of one macro
   are two events, even when their displayed coordinates match; so is an
   argument a macro substitutes twice (`TWICE(step())`), whose two sites share
@@ -4954,6 +4957,21 @@ database carries no sequencing rows.
     their order: after `sink(c1() ? a() : b(), x()); sink(c2() ? d() : e(),
     y());` `c1` is `guaranteed_before` `c2`. `unknown`: a gap or boundary
     lies between them.
+  - **Unmodeled transfers.** An `unsupported` edge (computed or unresolved
+    `goto`) or an event under a gap that may hide control flow
+    (`parse_error`, `depth_exceeded`, `unsupported_construct`,
+    `unresolved_goto`: a `longjmp`, a statement expression) may lead
+    anywhere; a `setjmp` may be returned to from any later call. A missing
+    edge is never evidence of impossibility: when A's block, or a block it
+    reaches, may leave that way, or A follows such an event, B may follow A
+    (and the same the other way), so `a(); goto *p; resume: b();` relates
+    `a` to `b` as `may_precede`, and the arms of `if (setjmp(env))` as
+    `may_both`; the answer notes the unmodeled transfer. A proof
+    (`guaranteed_before`) also needs every block that may leave that way to
+    be dominated by A's (in A's own block, every hiding event to follow A),
+    so no such jump enters B's block without A: in
+    `if (x) goto *p; a(); skip: b();` `a` only `may_precede` `b`. An end
+    under such a gap is `unknown`.
 
 ### Expressions
 
@@ -4988,7 +5006,10 @@ labels (labels are resolved before the body is walked), `try`/`catch` and
   `f`, `T::T`, `g`, `T::T`. The one destructor site the IR records per
   object is referenced from every exit of its scope: the normal end and each
   `return`, `break`, `continue`, `goto` or `throw` leaving it, in reverse
-  declaration order. A `goto` back to a label the walk has passed also
+  declaration order. The sites of one object's bases (one per base class
+  providing the member) are one unordered group, for construction and
+  destruction alike: the IR does not record which bases are virtual (built
+  first), so their order is not claimed. A `goto` back to a label the walk has passed also
   destroys the objects the label's scope declared after the label
   (`again: before(); Guard g; if (retry()) goto again;` runs `Guard::~Guard`
   on the jump), after those of the scopes it leaves; a forward `goto` cannot
@@ -5168,7 +5189,8 @@ first, then loads graphs only as it reaches them:
   both ends turns a directed relation (`sequenced_before`,
   `guaranteed_before`, `may_precede`, `may_follow`) into `unordered`; any
   other gap over either end turns `sequenced_before`/`guaranteed_before`
-  into `unknown`. Between two
+  into `unknown`, and a gap that may hide control flow over either end turns
+  every relation into `unknown` (see "Unmodeled transfers" above). Between two
   events of one graph, only the blocks on paths from the first to the second
   (or to the calls reaching it) are shown.
 

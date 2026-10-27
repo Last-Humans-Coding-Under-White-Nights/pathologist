@@ -634,6 +634,12 @@ struct LoadedCfg {
     succ: Vec<Vec<usize>>,
     pred: Vec<Vec<usize>>,
     next_events: Vec<Vec<usize>>,
+    /// Blocks control may leave through a transfer the graph does not
+    /// model, landing anywhere ([`unmodeled_transfers`]).
+    escapes: Vec<bool>,
+    /// Blocks an unmodeled transfer may come back before: those a block
+    /// holding a control-hiding gap's event reaches, itself included.
+    resumed: Vec<bool>,
 }
 
 // What the query reads of one graph beyond `crate::read_cfgs`; each is a
@@ -836,6 +842,7 @@ impl<'c> Loader<'c> {
         for &(a, b) in &graph.order {
             next_events[a.0 as usize].push(b.0 as usize);
         }
+        let (escapes, resumed) = unmodeled_transfers(&graph, &succ);
         let index = self.cfgs.len();
         self.cfgs.push(LoadedCfg {
             cfg_id,
@@ -853,6 +860,8 @@ impl<'c> Loader<'c> {
             succ,
             pred,
             next_events,
+            escapes,
+            resumed,
         });
         self.by_id.insert(cfg_id, index);
         Ok(index)
@@ -861,6 +870,57 @@ impl<'c> Loader<'c> {
 
 // ---------------------------------------------------------------------------
 // Graph facts of one loaded function
+
+/// A gap of this kind may hide a control transfer: an `ERROR` subtree or a
+/// subtree past the depth limit may hold a `goto` or `return`, an
+/// unsupported construct may be a computed `goto`, `setjmp` or `longjmp`.
+fn hides_control(kind: GapKind) -> bool {
+    matches!(
+        kind,
+        GapKind::ParseError
+            | GapKind::DepthExceeded
+            | GapKind::UnsupportedConstruct
+            | GapKind::UnresolvedGoto
+    )
+}
+
+/// The events of `graph` under a gap that may hide a control transfer.
+fn hidden_transfer_events(graph: &FunctionCfg) -> impl Iterator<Item = usize> + '_ {
+    graph
+        .gaps
+        .iter()
+        .filter(|g| hides_control(g.kind))
+        .filter_map(|g| g.events)
+        .flat_map(|(lo, hi)| lo.0 as usize..=hi.0 as usize)
+}
+
+/// Where control may move without an edge (docs/ANALYSIS.md, "Boundaries and
+/// gaps"): the blocks it may leave for anywhere (an `unsupported` edge, or an
+/// event under a control-hiding gap), and the blocks it may later come back
+/// before (those such an event's block reaches, itself included: a
+/// `longjmp` from any later call returns to a `setjmp`).
+fn unmodeled_transfers(graph: &FunctionCfg, succ: &[Vec<usize>]) -> (Vec<bool>, Vec<bool>) {
+    let n = graph.blocks.len();
+    let mut escapes = vec![false; n];
+    for edge in &graph.edges {
+        if edge.kind == EdgeKind::Unsupported {
+            escapes[edge.from.0 as usize] = true;
+        }
+    }
+    let mut resumed = vec![false; n];
+    for e in hidden_transfer_events(graph) {
+        let Some(event) = graph.events.get(e) else {
+            continue;
+        };
+        let b = event.block.0 as usize;
+        escapes[b] = true;
+        if !resumed[b] {
+            resumed[b] = true;
+            search(b, &mut resumed, |x| &succ[x], |_| false);
+        }
+    }
+    (escapes, resumed)
+}
 
 /// Nodes reached from `from` over one or more steps of `next`, marked in
 /// `seen`; stops as soon as one satisfies `stop`, and says whether one did.
@@ -1074,6 +1134,29 @@ impl LoadedCfg {
         dom.normal[to]
             && dominates(&dom.idom, ba, to)
             && (!self.throws_to_handler(ba) || self.first_of_block(a))
+            && self.escapes_follow(a, dom)
+    }
+
+    /// Every unmodeled transfer leaves after `a` was invoked, so none can
+    /// enter a block without it: each escaping block is dominated by `a`'s,
+    /// and in `a`'s own block each control-hiding event follows `a` (an
+    /// `unsupported` edge leaves after all of the block's events).
+    fn escapes_follow(&self, a: usize, dom: &Dominance) -> bool {
+        let ba = self.block_of(a);
+        self.escapes
+            .iter()
+            .enumerate()
+            .all(|(b, &escapes)| !escapes || b == ba || dominates(&dom.idom, ba, b))
+            && hidden_transfer_events(&self.graph)
+                .filter(|&e| e < self.graph.events.len() && self.block_of(e) == ba)
+                .all(|e| self.order_reaches(a, e))
+    }
+
+    /// Control may leave block `b` through an unmodeled transfer, once or
+    /// after the blocks it reaches (`reach`, from [`Self::reach`]), and land
+    /// anywhere, before any event of the graph.
+    fn leaves_unmodeled(&self, b: usize, reach: &[bool]) -> bool {
+        self.escapes[b] || self.resumed[b] || reach.iter().zip(&self.escapes).any(|(&r, &e)| r && e)
     }
 
     /// `b` follows `a` in their block's local order.
@@ -1099,8 +1182,12 @@ impl LoadedCfg {
         dom: &Dominance,
     ) -> (Relation, Vec<String>) {
         let (ba, bb) = (self.block_of(a), self.block_of(b));
+        // An unmodeled transfer after `a` may land before anything: its
+        // missing edges are no evidence that `b` cannot follow.
+        let a_loose = self.leaves_unmodeled(ba, forward);
+        let mut loosened = a_loose && !forward[ba];
         let relation = if a == b {
-            if forward[ba] {
+            if forward[ba] || a_loose {
                 Relation::MayBoth
             } else {
                 return (
@@ -1109,7 +1196,7 @@ impl LoadedCfg {
                 );
             }
         } else if ba == bb {
-            if forward[ba] {
+            if forward[ba] || a_loose {
                 // The block is on a cycle: a later iteration's `a` follows
                 // this one's `b` whatever the block's local order.
                 Relation::MayBoth
@@ -1121,7 +1208,10 @@ impl LoadedCfg {
                 Relation::Unordered
             }
         } else {
-            match (forward[bb], self.reach(bb, true)[ba]) {
+            let back = self.reach(bb, true);
+            let b_loose = self.leaves_unmodeled(bb, &back);
+            loosened = (a_loose && !forward[bb]) || (b_loose && !back[ba]);
+            match (forward[bb] || a_loose, back[ba] || b_loose) {
                 (true, true) => Relation::MayBoth,
                 (true, false) if self.guarantees(a, bb, dom) => Relation::GuaranteedBefore,
                 (true, false) => Relation::MayPrecede,
@@ -1129,6 +1219,21 @@ impl LoadedCfg {
                 (false, false) => Relation::Exclusive,
             }
         };
+        // An end under a gap that may hide a control transfer: whatever
+        // runs there may jump anywhere, so not even a path is claimed.
+        if let Some(gap) = self
+            .gaps_over(a)
+            .chain(self.gaps_over(b))
+            .find(|g| hides_control(g.kind))
+        {
+            return (
+                Relation::Unknown,
+                vec![format!(
+                    "a {} gap covers an end; its control flow is not modeled",
+                    gap.kind.as_str()
+                )],
+            );
+        }
         // One unordered_branch gap holding both: the graph orders its
         // operands one after another, so any order it shows between them
         // may be the builder's walk rather than the language's. Arms of one
@@ -1171,7 +1276,16 @@ impl LoadedCfg {
                 );
             }
         }
-        (relation, Vec::new())
+        let notes = if loosened && relation != Relation::Unordered {
+            vec![
+                "an unmodeled control transfer (unsupported edge or gap) may lead from one \
+                  to the other"
+                    .into(),
+            ]
+        } else {
+            Vec::new()
+        };
+        (relation, notes)
     }
 }
 

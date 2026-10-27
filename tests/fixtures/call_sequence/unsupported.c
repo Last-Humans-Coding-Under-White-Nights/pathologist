@@ -40,3 +40,40 @@ void jumps(void)
         a();
     longjmp(env, 1);
 }
+
+void computed_label(void *target)
+{
+    a();
+    goto *target;
+resume:
+    b();
+}
+
+void computed_skip(void *target, int x)
+{
+    if (x)
+        goto *target;
+    a();
+skip:
+    b();
+}
+
+void long_jumped(void)
+{
+    jmp_buf env;
+    if (setjmp(env))
+        a();
+    else
+        b();
+    longjmp(env, 1);
+}
+
+void resumed(void)
+{
+    jmp_buf env;
+    if (setjmp(env))
+        a();
+    else
+        b();
+    c();
+}

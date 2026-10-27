@@ -453,13 +453,15 @@ impl<'s, 'a> Builder<'s, 'a> {
         if self.cur.is_none() {
             return;
         }
-        let sites = self.sites;
         for scope in (from..self.scopes.len()).rev() {
             let first = if scope == from { kept } else { 0 };
             for object in (first..self.scopes[scope].objects.len()).rev() {
-                for invocation in invocations(sites, &self.scopes[scope].objects[object]) {
-                    self.emit(EventKind::Destroy, invocation.occurrence, invocation.sites);
-                }
+                // An object's base destructors are one unordered group: the
+                // IR does not say which bases are virtual, so their order is
+                // not claimed (docs/ANALYSIS.md, "Statements").
+                let sites = std::mem::take(&mut self.scopes[scope].objects[object]);
+                self.emit_unordered(&sites, Some(EventKind::Destroy));
+                self.scopes[scope].objects[object] = sites;
             }
         }
     }
@@ -532,12 +534,21 @@ struct Invocation {
 }
 
 /// The sites at `indices` grouped by invocation, in first-seen order.
+///
+/// An automatic object's lifecycle sites share the declaration's occurrence,
+/// one site name per class providing the members (`Both both;` with bases
+/// `A` and `B` runs `A::A` and `B::B`): each class's is a separate
+/// invocation, its overloads alternatives of that one.
 fn invocations(sites: &[CallSite], indices: &[usize]) -> Vec<Invocation> {
     let mut groups: Vec<Invocation> = Vec::new();
+    let subobject = |i: usize| sites[i].exact_receiver.then_some(&sites[i].callee_name);
     for &i in indices {
         let occurrence = sites[i].occurrence();
         // Almost always one group: a linear scan beats hashing.
-        match groups.iter_mut().find(|g| g.occurrence == occurrence) {
+        match groups
+            .iter_mut()
+            .find(|g| g.occurrence == occurrence && subobject(g.first) == subobject(i))
+        {
             Some(group) => group.sites.push(sites[i].id),
             None => groups.push(Invocation {
                 occurrence,
@@ -1809,6 +1820,29 @@ mod tests {
         let g = graph(&unit, "handler");
         let (recover, caught) = (g.ev("recover"), g.ev("Item::~Item"));
         assert!(g.guaranteed(recover, caught));
+    }
+
+    #[test]
+    fn each_base_lifecycle_call_is_its_own_event() {
+        let unit = lower("lifecycle.cpp");
+        let g = graph(&unit, "bases");
+        let (ctor_a, ctor_b) = (g.ev("BaseA::BaseA"), g.ev("BaseB::BaseB"));
+        let (dtor_a, dtor_b) = (g.ev("BaseA::~BaseA"), g.ev("BaseB::~BaseB"));
+        let work = g.ev("work");
+        for e in [ctor_a, ctor_b] {
+            assert_eq!(g.kind(e), EventKind::Construct);
+            assert_eq!(g.cfg.events[e.0 as usize].sites.len(), 1, "{}", g.dump());
+            assert!(g.sequenced(e, work), "{}", g.dump());
+        }
+        for e in [dtor_a, dtor_b] {
+            assert_eq!(g.kind(e), EventKind::Destroy);
+            assert_eq!(g.cfg.events[e.0 as usize].sites.len(), 1, "{}", g.dump());
+            assert!(g.sequenced(work, e), "{}", g.dump());
+        }
+        // Virtual bases are built first, and the IR does not say which are
+        // virtual: the bases' order is not claimed.
+        assert!(g.unordered(ctor_a, ctor_b), "{}", g.dump());
+        assert!(g.unordered(dtor_a, dtor_b), "{}", g.dump());
     }
 
     #[test]

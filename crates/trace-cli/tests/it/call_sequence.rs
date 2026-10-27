@@ -1635,3 +1635,61 @@ fn macro_invocations_of_different_variants_stay_distinct() {
     assert_ne!(five.event, eight.event);
     assert_ne!(five.cfg, eight.cfg);
 }
+
+/// Control that leaves through an unmodeled transfer (computed or
+/// unresolved `goto`, `setjmp`/`longjmp`, an opaque construct) may land
+/// anywhere: the missing edges are never evidence that two calls exclude
+/// each other or that one is always first.
+#[test]
+fn unmodeled_transfers_are_not_evidence_of_impossibility() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "unsupported.c", line, callee);
+    // `goto *target` may land on `resume`: `b` may follow `a`.
+    let (a, b) = (at(46, "a"), at(49, "b"));
+    assert_eq!(relation(&conn, &a, &b), MayPrecede);
+    assert_eq!(relation(&conn, &b, &a), MayFollow);
+    // `goto *target` may land on `skip`, bypassing `a`: a path, never a
+    // guarantee.
+    assert_eq!(relation(&conn, &at(56, "a"), &at(58, "b")), MayPrecede);
+    // `b` runs, `longjmp` returns to `setjmp`, then `a` runs.
+    let (a, b) = (at(65, "a"), at(67, "b"));
+    assert_eq!(relation(&conn, &a, &b), MayBoth);
+    assert_eq!(relation(&conn, &b, &a), MayBoth);
+    // `c` may `longjmp` back to the `setjmp` the arms follow.
+    let (a, b) = (at(75, "a"), at(77, "b"));
+    assert_eq!(relation(&conn, &a, &b), MayBoth);
+    assert_eq!(relation(&conn, &b, &a), MayBoth);
+    let scope = trace_db::SequenceScope::Between(a, b);
+    let graph = trace_db::sequence_graph(&conn, &scope, &Default::default()).unwrap();
+    let notes = graph.relation.unwrap().notes;
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("unmodeled control transfer")),
+        "{notes:?}"
+    );
+}
+
+/// `Both both;` runs each base's constructor and destructor: one event
+/// per base, never alternatives of one invocation.
+#[test]
+fn base_lifecycle_calls_are_separate_events() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "lifecycle.cpp", line, callee);
+    let (ctor_a, ctor_b) = (at(78, "BaseA::BaseA"), at(78, "BaseB::BaseB"));
+    let (dtor_a, dtor_b) = (at(78, "BaseA::~BaseA"), at(78, "BaseB::~BaseB"));
+    let work = at(79, "work");
+    assert_ne!(ctor_a.event, ctor_b.event);
+    assert_ne!(dtor_a.event, dtor_b.event);
+    // Both run; the order of base subobjects is not modeled.
+    assert_eq!(relation(&conn, &ctor_a, &ctor_b), Unordered);
+    assert_eq!(relation(&conn, &dtor_b, &dtor_a), Unordered);
+    for ctor in [&ctor_a, &ctor_b] {
+        assert_eq!(relation(&conn, ctor, &work), SequencedBefore);
+    }
+    for dtor in [&dtor_a, &dtor_b] {
+        assert_eq!(relation(&conn, &work, dtor), SequencedBefore);
+    }
+}
