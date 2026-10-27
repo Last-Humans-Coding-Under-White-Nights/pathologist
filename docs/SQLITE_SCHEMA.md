@@ -34,8 +34,8 @@ new metadata and query indexes; there is no automatic migration from v6.
 
 Call sequencing is such a capability: the [`cfg_*` tables](#call-sequencing-tables)
 exist in every v8 export but are filled only by `trace analyze --sequencing`,
-and `analysis_run.options_json.call_sequencing` (`true` / `false`) records
-which. A reader asks the marker, not the row count: a run with the flag whose
+and `analysis_run.options_json.call_sequencing` (`true` / `false`, or
+`"partial"` in a `trace-merge` output) records which. A reader asks the marker, not the row count: a run with the flag whose
 code has no function body also leaves the tables empty. Exports written before
 the marker existed lack the key and have no sequencing.
 
@@ -43,8 +43,8 @@ the marker existed lack the key and have no sequencing.
 
 `trace-merge` accepts v7 and v8 and structurally validates the exact columns it reads
 in `files`, `link_targets`, `target_sources`, `target_dependencies`, `functions`,
-`call_sites`, `call_edges`, `diagnostics`, and `execution_contexts` when present
-before creating or replacing output.
+`call_sites`, `call_edges`, `diagnostics`, and `execution_contexts` and the
+`cfg_*` tables when present before creating or replacing output.
 Earlier v7 databases without newer flow tables or `call_sites.callee_var` /
 `return_dst` can therefore still be merged. A nominal v7 database missing a
 required call-graph column is rejected with a re-analysis diagnostic.
@@ -66,6 +66,19 @@ that have the table, with function and call-site ids remapped, each input's own
 multi-instance evidence and `receiver_var_id` NULL (no variable is carried); a merge-stage diagnostic of that kind marks an output
 whose table lists only some inputs' contexts. How rows are combined:
 [Invariants and linking rules](ANALYSIS.md#invariants-and-linking-rules).
+
+The [`cfg_*` tables](#call-sequencing-tables) are read only from an input
+whose `options_json.call_sequencing` is `true` or `"partial"`; such an input
+must have every column the merger reads in all seven tables or it is rejected
+like a missing call-graph column. Their rows carry over with function,
+call-site and file ids remapped and row ids renumbered in input order, written
+by the same code as `trace analyze`'s export. The output's
+`options_json.call_sequencing` is `true` when every input is sequenced,
+`false` when none is (the tables stay empty and no kind strings are added),
+and `"partial"` otherwise; each input without graphs is then named in an
+`info` diagnostic with `stage = 'merge'` (`MissingSequencing`). Which graph a
+shared header body keeps, and how an event whose sites were not carried is
+spliced out: [Call sequencing, Merge](ANALYSIS.md#merge).
 
 It does **not** populate `variables`, `types`, `locations`,
 `points_to`, `arg_flow_edges`, or any `flow_*` tables. `call_sites.callee_var`

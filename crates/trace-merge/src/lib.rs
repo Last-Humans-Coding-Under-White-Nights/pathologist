@@ -10,6 +10,7 @@
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,6 +36,35 @@ const READ_DIAGNOSTICS: &str =
 // contributes no rows; a table that is present must have these columns.
 const READ_EXECUTION_CONTEXTS: &str = "SELECT kind, entry_fn_id, call_site_id, api_fn_id, param_index, model, multi_instance, self_concurrent \
              FROM execution_contexts ORDER BY id";
+// Optional: read only from an input analysed with `--sequencing`, whose
+// tables must then have these columns. Kinds are read as their names.
+const READ_CFG_FUNCTIONS: &str =
+    "SELECT id, fn_id, tu_file_id, variant, entry_block, exit_block, exceptional_exit_block \
+             FROM cfg_functions ORDER BY id";
+const READ_CFG_BLOCKS: &str = "SELECT b.id, b.cfg_id, b.ordinal, k.text, b.file_id, b.line, b.col \
+             FROM cfg_blocks b JOIN strings k ON k.id = b.kind_id ORDER BY b.id";
+const READ_CFG_EDGES: &str = "SELECT e.src_block, e.dst_block, k.text \
+             FROM cfg_edges e JOIN strings k ON k.id = e.kind_id ORDER BY e.src_block, e.dst_block, e.kind_id";
+const READ_CFG_EVENTS: &str =
+    "SELECT e.id, e.cfg_id, e.block_id, e.ordinal, k.text, e.file_id, e.line, e.col, \
+             e.expansion_file_id, e.expansion_line, e.expansion_col \
+             FROM cfg_events e JOIN strings k ON k.id = e.kind_id ORDER BY e.id";
+const READ_CFG_EVENT_SITES: &str =
+    "SELECT event_id, call_site_id FROM cfg_event_sites ORDER BY event_id, call_site_id";
+const READ_CFG_EVENT_ORDER: &str =
+    "SELECT event_id, next_event_id FROM cfg_event_order ORDER BY event_id, next_event_id";
+const READ_CFG_GAPS: &str =
+    "SELECT g.cfg_id, k.text, g.file_id, g.line, g.col, g.first_event, g.last_event \
+             FROM cfg_gaps g JOIN strings k ON k.id = g.kind_id ORDER BY g.id";
+const READ_CFG: [(&str, &str); 7] = [
+    ("cfg_functions", READ_CFG_FUNCTIONS),
+    ("cfg_blocks", READ_CFG_BLOCKS),
+    ("cfg_edges", READ_CFG_EDGES),
+    ("cfg_events", READ_CFG_EVENTS),
+    ("cfg_event_sites", READ_CFG_EVENT_SITES),
+    ("cfg_event_order", READ_CFG_EVENT_ORDER),
+    ("cfg_gaps", READ_CFG_GAPS),
+];
 
 #[derive(Debug, Clone)]
 pub struct MergeOptions {
@@ -77,6 +107,211 @@ pub enum WarningKind {
     /// An input exported before `execution_contexts` existed: it contributes
     /// no execution contexts to the merged database.
     MissingExecutionContexts,
+    /// An input analysed without `--sequencing` while another was: its
+    /// functions have no call-order graph in the merged database.
+    MissingSequencing,
+}
+
+/// An input's `analysis_run.options_json.call_sequencing` marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sequencing {
+    Complete,
+    /// An earlier merge output some of whose inputs had no graphs.
+    Partial,
+    Absent,
+}
+
+impl Sequencing {
+    fn of(conn: &Connection) -> Self {
+        let options: Option<String> = conn
+            .query_row(
+                "SELECT options_json FROM analysis_run ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        let marker = options
+            .and_then(|o| serde_json::from_str::<serde_json::Value>(&o).ok())
+            .map(|o| o["call_sequencing"].clone());
+        match marker {
+            Some(serde_json::Value::Bool(true)) => Self::Complete,
+            Some(serde_json::Value::String(s)) if s == "partial" => Self::Partial,
+            _ => Self::Absent,
+        }
+    }
+
+    /// The merged database's marker: complete only when every input is.
+    fn merged(inputs: &[Self]) -> serde_json::Value {
+        if inputs.iter().all(|&s| s == Self::Complete) {
+            serde_json::json!(true)
+        } else if inputs.iter().all(|&s| s == Self::Absent) {
+            serde_json::json!(false)
+        } else {
+            serde_json::json!("partial")
+        }
+    }
+}
+
+/// The kind of `all` named `text`, as `trace analyze` wrote it.
+fn cfg_kind<K: Copy>(all: &[K], name: fn(K) -> &'static str, text: &str) -> rusqlite::Result<K> {
+    all.iter()
+        .copied()
+        .find(|&k| name(k) == text)
+        .ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unknown call-order kind '{text}'").into(),
+            )
+        })
+}
+
+/// The call-order graphs of one sequenced input, in its own ids, by
+/// `cfg_functions.id`; `function` is the input's `fn_id`.
+fn read_cfgs(conn: &Connection) -> Result<BTreeMap<i64, trace_ir::FunctionCfg>> {
+    use trace_ir::{
+        Block, BlockId, BlockKind, CallEvent, CallOccurrence, CallSiteId, CfgEdge, EdgeKind,
+        EventId, EventKind, FileId, FnId, FunctionCfg, Gap, GapKind, Span,
+    };
+    let span = |file: Option<i64>, line: Option<i64>, col: Option<i64>| {
+        Some(Span::new(FileId(file? as u32), line? as u32, col? as u32))
+    };
+    let mut cfgs: BTreeMap<i64, FunctionCfg> = BTreeMap::new();
+    // Input block and event ids -> their graph and local id.
+    let mut blocks: FxHashMap<i64, (i64, BlockId)> = FxHashMap::default();
+    let mut events: FxHashMap<i64, (i64, EventId)> = FxHashMap::default();
+    let mut ends: FxHashMap<i64, (i64, i64, Option<i64>)> = FxHashMap::default();
+    let mut stmt = conn.prepare(READ_CFG_FUNCTIONS)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let id: i64 = r.get(0)?;
+        ends.insert(id, (r.get(4)?, r.get(5)?, r.get(6)?));
+        cfgs.insert(
+            id,
+            FunctionCfg {
+                function: FnId(r.get::<_, i64>(1)? as u32),
+                tu: r.get::<_, Option<i64>>(2)?.map(|f| FileId(f as u32)),
+                variant: r.get::<_, i64>(3)? as u32,
+                entry: BlockId(0),
+                exit: BlockId(0),
+                exceptional_exit: None,
+                blocks: Vec::new(),
+                edges: Vec::new(),
+                events: Vec::new(),
+                order: Vec::new(),
+                gaps: Vec::new(),
+            },
+        );
+    }
+    let mut stmt = conn.prepare(READ_CFG_BLOCKS)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let cfg_id: i64 = r.get(1)?;
+        let Some(cfg) = cfgs.get_mut(&cfg_id) else {
+            continue;
+        };
+        let ordinal = r.get::<_, i64>(2)? as usize;
+        if cfg.blocks.len() <= ordinal {
+            cfg.blocks.resize_with(ordinal + 1, || Block {
+                kind: BlockKind::Ordinary,
+                span: None,
+                events: Vec::new(),
+            });
+        }
+        cfg.blocks[ordinal] = Block {
+            kind: cfg_kind(&BlockKind::ALL, BlockKind::as_str, &r.get::<_, String>(3)?)?,
+            span: span(r.get(4)?, r.get(5)?, r.get(6)?),
+            events: Vec::new(),
+        };
+        blocks.insert(r.get(0)?, (cfg_id, BlockId(ordinal as u32)));
+    }
+    let block = |id: i64| blocks.get(&id).map(|&(_, b)| b);
+    for (cfg_id, cfg) in &mut cfgs {
+        let (entry, exit, exceptional) = ends[cfg_id];
+        cfg.entry = block(entry).context("cfg_functions.entry_block names no block")?;
+        cfg.exit = block(exit).context("cfg_functions.exit_block names no block")?;
+        cfg.exceptional_exit = exceptional.and_then(block);
+    }
+    let mut stmt = conn.prepare(READ_CFG_EDGES)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let (Some(&(cfg_id, from)), Some(to)) = (blocks.get(&r.get(0)?), block(r.get(1)?)) else {
+            continue;
+        };
+        let kind = cfg_kind(&EdgeKind::ALL, EdgeKind::as_str, &r.get::<_, String>(2)?)?;
+        cfgs.get_mut(&cfg_id)
+            .expect("block of a read graph")
+            .edges
+            .push(CfgEdge { from, to, kind });
+    }
+    // Each block's events by their ordinal in it.
+    let mut placed: Vec<(i64, BlockId, i64, EventId)> = Vec::new();
+    let mut stmt = conn.prepare(READ_CFG_EVENTS)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let cfg_id: i64 = r.get(1)?;
+        let (Some(cfg), Some(at)) = (cfgs.get_mut(&cfg_id), block(r.get(2)?)) else {
+            continue;
+        };
+        let event = EventId(cfg.events.len() as u32);
+        cfg.events.push(CallEvent {
+            block: at,
+            kind: cfg_kind(&EventKind::ALL, EventKind::as_str, &r.get::<_, String>(4)?)?,
+            // The export keeps no expansion fingerprint; nothing here
+            // compares occurrences.
+            occurrence: CallOccurrence {
+                span: span(r.get(5)?, r.get(6)?, r.get(7)?).expect("NOT NULL columns"),
+                expansion_span: span(r.get(8)?, r.get(9)?, r.get(10)?),
+                expansion_id: 0,
+            },
+            sites: Vec::new(),
+        });
+        events.insert(r.get(0)?, (cfg_id, event));
+        placed.push((cfg_id, at, r.get(3)?, event));
+    }
+    placed.sort_unstable();
+    for (cfg_id, at, _, event) in placed {
+        cfgs.get_mut(&cfg_id).expect("read graph").blocks[at.0 as usize]
+            .events
+            .push(event);
+    }
+    let mut stmt = conn.prepare(READ_CFG_EVENT_SITES)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        if let Some(&(cfg_id, event)) = events.get(&r.get(0)?) {
+            let site = CallSiteId(r.get::<_, i64>(1)? as u32);
+            cfgs.get_mut(&cfg_id).expect("read graph").events[event.0 as usize]
+                .sites
+                .push(site);
+        }
+    }
+    let mut stmt = conn.prepare(READ_CFG_EVENT_ORDER)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        if let (Some(&(cfg_id, a)), Some(&(_, b))) =
+            (events.get(&r.get(0)?), events.get(&r.get(1)?))
+        {
+            cfgs.get_mut(&cfg_id)
+                .expect("read graph")
+                .order
+                .push((a, b));
+        }
+    }
+    let event = |id: Option<i64>| id.and_then(|id| events.get(&id)).map(|&(_, e)| e);
+    let mut stmt = conn.prepare(READ_CFG_GAPS)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let Some(cfg) = cfgs.get_mut(&r.get(0)?) else {
+            continue;
+        };
+        cfg.gaps.push(Gap {
+            kind: cfg_kind(&GapKind::ALL, GapKind::as_str, &r.get::<_, String>(1)?)?,
+            span: span(r.get(2)?, r.get(3)?, r.get(4)?),
+            events: event(r.get(5)?).zip(event(r.get(6)?)),
+        });
+    }
+    Ok(cfgs)
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +552,8 @@ pub fn merge_databases<P: AsRef<Path>>(
     let mut conns = Vec::new();
     // Per input: whether it has the `execution_contexts` table.
     let mut has_contexts_table: Vec<bool> = Vec::new();
+    // Per input: whether `trace analyze --sequencing` wrote it.
+    let mut input_sequencing: Vec<Sequencing> = Vec::new();
     for path in &inputs {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("failed to open input database {}", path.display()))?;
@@ -369,6 +606,18 @@ pub fn merge_databases<P: AsRef<Path>>(
             })?;
         }
         has_contexts_table.push(has_contexts);
+        let sequencing = Sequencing::of(&conn);
+        if sequencing != Sequencing::Absent {
+            for (table, query) in READ_CFG {
+                conn.prepare(query).map_err(|error| {
+                    anyhow::anyhow!(
+                        "missing trace-merge capability in {} ({table}): {error}; re-analyze the input with the current trace version",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+        input_sequencing.push(sequencing);
         conns.push(conn);
     }
 
@@ -1033,6 +1282,57 @@ pub fn merge_databases<P: AsRef<Path>>(
     }
     let unified_contexts = unify_execution_contexts(carried_contexts);
 
+    // 5c. Call-order graphs, carried over with remapped ids. A body several
+    // inputs share (a header function merged above) keeps the graphs of the
+    // first input that has any, as `trace analyze` keeps the first copy.
+    // An event none of whose sites was carried is spliced out, leaving an
+    // `omitted_sites` gap.
+    let mut unified_cfgs: BTreeMap<trace_ir::FnId, Vec<trace_ir::FunctionCfg>> = BTreeMap::new();
+    let mut cfg_owner: FxHashMap<i64, usize> = FxHashMap::default();
+    let any_sequenced = input_sequencing.iter().any(|&s| s != Sequencing::Absent);
+    for (db_idx, conn) in conns.iter().enumerate() {
+        if input_sequencing[db_idx] == Sequencing::Absent {
+            if any_sequenced {
+                report.warnings.push(MergeWarning {
+                    kind: WarningKind::MissingSequencing,
+                    message: format!(
+                        "input {} was analysed without --sequencing; its functions have no call-order graph (re-analyze it with `trace analyze --sequencing` to include them)",
+                        inputs[db_idx].display()
+                    ),
+                    symbol: None,
+                    file_id: None,
+                    line: 0,
+                });
+            }
+            continue;
+        }
+        for cfg in read_cfgs(conn)?.into_values() {
+            let function = *fn_remap[db_idx]
+                .get(&i64::from(cfg.function.0))
+                .context("missing remapped fn_id for cfg_functions")?;
+            if *cfg_owner.entry(function).or_insert(db_idx) != db_idx {
+                continue;
+            }
+            // Every file an input row names is one of its `files` rows.
+            let map_file =
+                |f: trace_ir::FileId| trace_ir::FileId(file_remap[db_idx][&i64::from(f.0)] as u32);
+            let mut merged = cfg.remap(
+                trace_ir::FnId(function as u32),
+                |s| {
+                    cs_remap[db_idx]
+                        .get(&i64::from(s.0))
+                        .map(|&id| trace_ir::CallSiteId(id as u32))
+                },
+                map_file,
+            );
+            merged.tu = cfg.tu.map(map_file);
+            unified_cfgs
+                .entry(merged.function)
+                .or_default()
+                .push(merged);
+        }
+    }
+
     // 6. Diagnostics Ingestion
     let mut unified_diagnostics: Vec<DbDiagnostic> = Vec::new();
     for (db_idx, conn) in conns.iter().enumerate() {
@@ -1072,6 +1372,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             WarningKind::WeakOverride => "info",
             WarningKind::DuplicateInput => "warning",
             WarningKind::MissingExecutionContexts => "info",
+            WarningKind::MissingSequencing => "info",
         };
         let new_diag_id = (unified_diagnostics.len() + 1) as i64;
         unified_diagnostics.push(DbDiagnostic {
@@ -1113,6 +1414,10 @@ pub fn merge_databases<P: AsRef<Path>>(
         out_conn.execute_batch("BEGIN IMMEDIATE;")?;
         out_conn.execute_batch(TABLES_V8)?;
         let mut strings = trace_db::TextPool::new(&out_conn)?;
+        let call_sequencing = Sequencing::merged(&input_sequencing);
+        if call_sequencing != serde_json::json!(false) {
+            strings.seed_sequencing()?;
+        }
 
         // Record analysis_run for the merge
         let options_json = serde_json::json!({
@@ -1122,6 +1427,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             "external_calls_unresolved": report.external_calls_unresolved,
             "ambiguous_calls": report.ambiguous_calls,
             "warnings_count": report.warnings.len(),
+            "call_sequencing": call_sequencing,
         })
         .to_string();
 
@@ -1220,6 +1526,8 @@ pub fn merge_databases<P: AsRef<Path>>(
                 ])?;
             }
         }
+
+        trace_db::export_cfg(&out_conn, unified_cfgs.values().flatten(), &mut strings)?;
 
         // Bulk insert call edges
         {

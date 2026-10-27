@@ -104,7 +104,7 @@ pub fn export_to_sqlite(
         export_functions(&conn, program)?;
         export_flow_parameters(&conn, program, &mut strings)?;
         export_call_sites_filtered(&conn, program, analysis, &mut strings)?;
-        export_cfg(&conn, program, &mut strings)?;
+        export_cfg(&conn, program.cfgs.values().flatten(), &mut strings)?;
         export_call_edges(&conn, analysis, &mut strings)?;
         conn.execute_batch(PROVENANCE_INDEXES_V8)?;
         if opts.full_detail {
@@ -1030,8 +1030,13 @@ fn export_call_sites_filtered(
 
 /// The call-order graphs, in function and variant order; row ids count up
 /// from 1 across graphs (see `docs/SQLITE_SCHEMA.md`, "Call sequencing
-/// tables"). Nothing to write without `--sequencing`.
-fn export_cfg(conn: &Connection, program: &Program, strings: &mut TextPool<'_>) -> Result<()> {
+/// tables"). Nothing to write without `--sequencing`. trace-merge writes
+/// its carried graphs through this too.
+pub fn export_cfg<'a>(
+    conn: &Connection,
+    cfgs: impl IntoIterator<Item = &'a trace_ir::FunctionCfg>,
+    strings: &mut TextPool<'_>,
+) -> Result<()> {
     let mut function_stmt =
         conn.prepare_cached("INSERT INTO cfg_functions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
     let mut block_stmt =
@@ -1050,7 +1055,7 @@ fn export_cfg(conn: &Connection, program: &Program, strings: &mut TextPool<'_>) 
     // Next row id of each table; a graph's blocks and events are offsets
     // from the first id it got.
     let (mut cfg_id, mut block_base, mut event_base, mut gap_id) = (1i64, 1i64, 1i64, 1i64);
-    for cfg in program.cfgs.values().flatten() {
+    for cfg in cfgs {
         let block = |b: trace_ir::BlockId| block_base + i64::from(b.0);
         let event = |e: trace_ir::EventId| event_base + i64::from(e.0);
         function_stmt.execute(params![

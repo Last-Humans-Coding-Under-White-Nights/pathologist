@@ -208,6 +208,114 @@ impl FunctionCfg {
             && self.gaps == other.gaps
     }
 
+    /// The graph in another program's ids: `function` for its function,
+    /// sites through `map_site`, files through `map_file`. An event left
+    /// with no site is spliced out of its block and the local order, and an
+    /// `omitted_sites` gap marks where it was (docs/ANALYSIS.md, "Call
+    /// sequencing"). `tu` and `variant` are kept.
+    pub fn remap(
+        &self,
+        function: FnId,
+        map_site: impl Fn(CallSiteId) -> Option<CallSiteId>,
+        map_file: impl Fn(FileId) -> FileId,
+    ) -> FunctionCfg {
+        let cfg = self;
+        let map_span = |span: Span| Span {
+            file: map_file(span.file),
+            ..span
+        };
+        let mut events = Vec::with_capacity(cfg.events.len());
+        // Old event index -> new id, `None` once spliced out.
+        let mut renumber: Vec<Option<EventId>> = Vec::with_capacity(cfg.events.len());
+        let mut omitted = Vec::new();
+        for event in &cfg.events {
+            let mut sites: Vec<CallSiteId> =
+                event.sites.iter().filter_map(|&s| map_site(s)).collect();
+            // Coalesced records of one invocation name one merged site.
+            let mut seen = rustc_hash::FxHashSet::default();
+            sites.retain(|s| seen.insert(*s));
+            let mut occurrence = event.occurrence;
+            occurrence.span = map_span(occurrence.span);
+            occurrence.expansion_span = occurrence.expansion_span.map(map_span);
+            if sites.is_empty() {
+                renumber.push(None);
+                omitted.push(occurrence.span);
+                continue;
+            }
+            renumber.push(Some(EventId(events.len() as u32)));
+            events.push(CallEvent {
+                block: event.block,
+                kind: event.kind,
+                occurrence,
+                sites,
+            });
+        }
+        let mut order = cfg.order.clone();
+        // Join each spliced event's predecessors to its successors, so the
+        // events around it keep their order.
+        for (old, new) in renumber.iter().enumerate() {
+            if new.is_some() {
+                continue;
+            }
+            let x = EventId(old as u32);
+            let preds: Vec<EventId> = order.iter().filter(|p| p.1 == x).map(|p| p.0).collect();
+            let succs: Vec<EventId> = order.iter().filter(|p| p.0 == x).map(|p| p.1).collect();
+            order.retain(|p| p.0 != x && p.1 != x);
+            for &p in &preds {
+                for &s in &succs {
+                    if !order.contains(&(p, s)) {
+                        order.push((p, s));
+                    }
+                }
+            }
+        }
+        let at = |e: EventId| renumber[e.0 as usize];
+        let order = order
+            .into_iter()
+            .filter_map(|(a, b)| Some((at(a)?, at(b)?)))
+            .collect();
+        let blocks = cfg
+            .blocks
+            .iter()
+            .map(|b| Block {
+                kind: b.kind,
+                span: b.span.map(map_span),
+                events: b.events.iter().filter_map(|&e| at(e)).collect(),
+            })
+            .collect();
+        let mut gaps: Vec<Gap> = cfg
+            .gaps
+            .iter()
+            .map(|g| Gap {
+                kind: g.kind,
+                span: g.span.map(map_span),
+                // The range shrinks to the events still in it.
+                events: g.events.and_then(|(first, last)| {
+                    let kept = || (first.0..=last.0).filter_map(|e| at(EventId(e)));
+                    Some((kept().next()?, kept().next_back()?))
+                }),
+            })
+            .collect();
+        gaps.extend(omitted.into_iter().map(|span| Gap {
+            kind: GapKind::OmittedSites,
+            span: Some(span),
+            events: None,
+        }));
+        FunctionCfg {
+            function,
+            tu: cfg.tu,
+            variant: cfg.variant,
+            entry: cfg.entry,
+            exit: cfg.exit,
+            exceptional_exit: cfg.exceptional_exit,
+            blocks,
+            edges: cfg.edges.clone(),
+            events,
+            order,
+            gaps,
+        }
+    }
+
     /// Remove event-free ordinary blocks that only fall through to another
     /// block, redirecting their incoming edges; branch, loop, exit and
     /// landing structure is kept.
@@ -549,6 +657,90 @@ mod tests {
             vec![
                 edge(0, 2, EdgeKind::Fallthrough),
                 edge(2, 1, EdgeKind::SwitchCase),
+            ]
+        );
+    }
+
+    /// An event whose every site the merge dropped leaves its block and the
+    /// local order; its neighbours stay ordered and a gap marks the hole.
+    #[test]
+    fn remap_splices_events_whose_sites_vanished() {
+        let event = |line: u32, sites: &[u32]| CallEvent {
+            block: BlockId(2),
+            kind: EventKind::Call,
+            occurrence: CallOccurrence {
+                span: Span::new(FileId(0), line, 5),
+                expansion_span: None,
+                expansion_id: 0,
+            },
+            sites: sites.iter().map(|&s| CallSiteId(s)).collect(),
+        };
+        let block = |kind, events: &[u32]| Block {
+            kind,
+            span: None,
+            events: events.iter().map(|&e| EventId(e)).collect(),
+        };
+        let cfg = FunctionCfg {
+            function: FnId(3),
+            tu: None,
+            variant: 0,
+            entry: BlockId(0),
+            exit: BlockId(1),
+            exceptional_exit: None,
+            blocks: vec![
+                block(BlockKind::Entry, &[]),
+                block(BlockKind::Exit, &[]),
+                block(BlockKind::Ordinary, &[0, 1, 2]),
+            ],
+            edges: vec![
+                CfgEdge {
+                    from: BlockId(0),
+                    to: BlockId(2),
+                    kind: EdgeKind::Fallthrough,
+                },
+                CfgEdge {
+                    from: BlockId(2),
+                    to: BlockId(1),
+                    kind: EdgeKind::Fallthrough,
+                },
+            ],
+            // `a(); m(); b();` with the second site of `a` gone too.
+            events: vec![event(1, &[10, 11]), event(2, &[12]), event(3, &[13])],
+            order: vec![(EventId(0), EventId(1)), (EventId(1), EventId(2))],
+            gaps: vec![Gap {
+                kind: GapKind::ParseError,
+                span: None,
+                events: Some((EventId(0), EventId(2))),
+            }],
+        };
+        let call_map: rustc_hash::FxHashMap<CallSiteId, CallSiteId> = [
+            (CallSiteId(10), CallSiteId(20)),
+            (CallSiteId(13), CallSiteId(23)),
+        ]
+        .into_iter()
+        .collect();
+        let file = FileId(9);
+        let merged = cfg.remap(FnId(30), |s| call_map.get(&s).copied(), |_| file);
+        assert_eq!(merged.function, FnId(30));
+        assert_eq!(merged.events.len(), 2);
+        assert_eq!(merged.events[0].sites, [CallSiteId(20)]);
+        assert_eq!(merged.events[1].sites, [CallSiteId(23)]);
+        assert_eq!(merged.events[1].occurrence.span, Span::new(file, 3, 5));
+        assert_eq!(merged.blocks[2].events, [EventId(0), EventId(1)]);
+        assert_eq!(merged.order, [(EventId(0), EventId(1))]);
+        assert_eq!(
+            merged.gaps,
+            [
+                Gap {
+                    kind: GapKind::ParseError,
+                    span: None,
+                    events: Some((EventId(0), EventId(1))),
+                },
+                Gap {
+                    kind: GapKind::OmittedSites,
+                    span: Some(Span::new(file, 2, 5)),
+                    events: None,
+                },
             ]
         );
     }

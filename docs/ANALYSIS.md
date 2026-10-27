@@ -5028,6 +5028,18 @@ in its link target.
 - Post-merge virtual expansion adds override records as further sites of the
   same event (`Program::attach_alternative_site`).
 
+`trace-merge` carries the graphs of its sequenced inputs the same way
+(`FunctionCfg::remap` is shared): function, call-site and file ids are
+remapped, and row ids renumbered. A body several inputs share (a header
+function the merger unifies) keeps the graphs of the first input that has
+any, as `merge_unit` keeps the first copy; an event none of whose sites was
+carried is spliced out with an `omitted_sites` gap. The output's marker is
+`true` when every input was sequenced, `false` when none was, and `"partial"`
+otherwise, with one `MissingSequencing` diagnostic per input without graphs:
+an unsequenced input's functions have no CFG, so a merged database never
+claims more order than its inputs recorded. Schema side:
+[Merger inputs and output](SQLITE_SCHEMA.md#merger-inputs-and-output).
+
 ### Boundaries and gaps
 
 A gap or boundary is uncertainty, never evidence for an order.

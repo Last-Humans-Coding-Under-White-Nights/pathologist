@@ -699,6 +699,7 @@ trace-merge [OPTIONS] <INPUT_DBS>... [-o <OUTPUT_DB>]
 
 **How it works**:
 - Ingests and remaps files, link targets, functions, call sites, call edges, and execution contexts across input databases (an input exported before `execution_contexts` existed contributes none and is named in a `MissingExecutionContexts` diagnostic).
+- Carries the call-order graphs of inputs analysed with `--sequencing`, remapped; a shared header body keeps the first input's graphs. `options_json.call_sequencing` is `true` when every input was sequenced, `false` when none was and `"partial"` otherwise, which `trace inspect sequence` reports; see the [merger schema contract](docs/SQLITE_SCHEMA.md#merger-inputs-and-output).
 - Shared header declarations deduplicate across link images; definitions retain each image's ownership and outgoing calls. Project-file ownership (`is_dep = 0` in any input) propagates to all copies; see [database merger header copies](docs/ANALYSIS.md#database-merger-header-copies).
 - Re-links `external` call edges (`functions.is_defined = 0` or `call_edges.resolution = 'external'`) against matching exported definitions (`is_defined = 1`, `linkage = 'external'`) from other repositories, updating edge resolution to `direct` or `ambiguous`, while preserving original non-direct resolutions (`indirect` and `ipc`).
 - **May-analysis over-approximation**: External calls retain edges to every selected definition, including each image's copy of a shared header body. Distinct source origins make the call ambiguous; shared-origin copies retain a resolved classification. Deduplicates call edges per call site to eliminate duplicate edges.
@@ -713,6 +714,7 @@ trace-merge [OPTIONS] <INPUT_DBS>... [-o <OUTPUT_DB>]
   - **Unresolved externals**: External function calls that remain unresolved in all merged repositories (`UnresolvedExternal`).
   - **Weak symbol overrides**: Weak definitions superseded by strong definitions across repositories (`WeakOverride`, scoped to cross-repository overrides).
   - **Inputs without execution contexts**: Inputs that have no `execution_contexts` table (`MissingExecutionContexts`).
+  - **Inputs without call sequencing**: Inputs analysed without `--sequencing` when another input was (`MissingSequencing`).
 
 **Example**:
 
