@@ -132,7 +132,10 @@ A row is written to `call_sites` when **any** of:
 
 Unresolved indirect calls therefore appear in `call_sites` with zero `call_edges`.
 `inspect callgraph` displays these sites as `unresolved` leaves during downward
-traversal. Their negative IDs exist only in the query result; they are not
+traversal. A direct site with zero `call_edges` (a `static_cast<T>(x)` the
+lowering records as a call) is in `call_sites` only when a call-order event
+names it, so the leaves are the indirect sites alone and the call graph reads
+the same with and without `--sequencing`. Their negative IDs exist only in the query result; they are not
 function IDs or new rows in `call_edges`.
 Copies with the same caller, callee text and full spelling path/line/column
 share one leaf, including shared-header sites copied from multiple merge

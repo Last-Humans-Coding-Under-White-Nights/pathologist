@@ -4984,9 +4984,17 @@ labels (labels are resolved before the body is walked), `try`/`catch` and
   where the statement ends. No call site is added for this.
 - **Exceptions.** Each `try` has one `landing` block. Every block of the
   `try` body that holds an event, nested handlers included, has an
-  `exception` edge to it, and the landing has an edge to each handler. Unless
-  a handler is `catch (...)`, the landing also has an `exception` edge to the
-  enclosing landing or the function's exceptional exit. A `throw` has an
+  `exception` edge to it, except a block of a nested `try` body: that block
+  throws to the nested landing, which passes on what its handlers do not
+  catch. The landing has an edge to each handler. Unless a handler is
+  `catch (...)`, the landing also has an `exception` edge to the
+  enclosing landing or the function's exceptional exit. So in
+  `try { try { a(); } catch (...) {} } catch (...) { c(); }` `a` and `c`
+  are exclusive, while a typed inner `catch`, or a call in the inner
+  handler, may reach `c`. A constructor's function-try-block
+  (`A::A() try : m_(f()) { ... } catch (...) { ... }`) holds the prologue:
+  its member initializers (and default member initializers) run in a block
+  of the `try`, before the body, with an `exception` edge to its landing. A `throw` has an
   `exception` edge to the innermost landing or to the exceptional exit. A
   call *outside* a `try` has no exceptional edge: the conditions above
   already exclude abnormal completion.

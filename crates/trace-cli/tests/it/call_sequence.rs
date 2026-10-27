@@ -1226,6 +1226,41 @@ fn sequencing_leaves_the_call_graph_unchanged() {
     assert_eq!(off.points_to.len(), on.points_to.len());
 }
 
+/// The sites `--sequencing` retains for its events (a direct call nothing
+/// resolves, as `static_cast` is) are not unresolved call-graph leaves:
+/// `inspect callgraph` prints the same graph either way.
+#[test]
+fn sequencing_leaves_inspect_callgraph_unchanged() {
+    let dir = scratch(&[(
+        "main.cpp",
+        "void known();\nvoid (*hook)();\n\nint run(long v)\n{\n    known();\n    hook();\n    return static_cast<int>(v);\n}\n",
+    )]);
+    let callgraph = |args: &[&str]| {
+        let db = crate::common::cli_analyze(dir.path(), args);
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_trace"))
+            .arg("inspect")
+            .arg(db.path())
+            .args(["callgraph", "--file", "main.cpp", "--line", "6"])
+            .args(["--direction", "down", "--format", "json"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let plain = callgraph(&[]);
+    // The unresolved indirect call is a leaf; the direct one without a
+    // target is not exported without `--sequencing`.
+    assert!(
+        plain.contains("hook") && !plain.contains("static_cast"),
+        "{plain}"
+    );
+    assert_eq!(callgraph(&["--sequencing"]), plain);
+}
+
 #[test]
 fn sequence_renders_in_every_format() {
     let conn = fixture_db();
@@ -1440,6 +1475,49 @@ fn handler_may_follow_the_try_body() {
     );
     let graph = function_sequence(&conn, "guarded", None, &Default::default());
     assert!(graph.edges.iter().any(|e| e.kind == "exception"));
+}
+
+#[test]
+fn inner_catch_all_keeps_its_exceptions() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "exceptions.cpp", line, callee);
+    // The inner `catch (...)` takes whatever `a` throws, and its empty
+    // handler throws nothing: the outer handler never runs after `a`.
+    assert_eq!(relation(&conn, &at(71, "a"), &at(75, "c")), Exclusive);
+}
+
+#[test]
+fn typed_inner_catch_lets_exceptions_reach_the_outer_handler() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "exceptions.cpp", line, callee);
+    // An exception `catch (Error &)` does not match propagates outward.
+    assert_eq!(relation(&conn, &at(83, "a"), &at(88, "c")), MayPrecede);
+    // The inner handler may throw too.
+    assert_eq!(relation(&conn, &at(85, "h"), &at(88, "c")), MayPrecede);
+}
+
+#[test]
+fn function_try_block_covers_the_initializer_list() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "exceptions.cpp", line, callee);
+    // A member initializer may throw into the handler, before the body.
+    assert_eq!(relation(&conn, &at(104, "make"), &at(107, "h")), MayPrecede);
+    // `make` runs before the body; with the member's constructor it is one
+    // unordered initializer group, so it is not known to be the first call
+    // of the block that throws: a path, not a guarantee.
+    assert_eq!(
+        relation(&conn, &at(104, "make"), &at(105, "run")),
+        MayPrecede
+    );
+    assert_eq!(
+        relation(&conn, &at(105, "run"), &at(104, "make")),
+        MayFollow
+    );
+    // The handler may run without the body when an initializer throws.
+    assert_eq!(relation(&conn, &at(105, "run"), &at(107, "h")), MayPrecede);
 }
 
 #[test]

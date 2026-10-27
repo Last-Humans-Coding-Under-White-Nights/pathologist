@@ -747,7 +747,9 @@ fn require_flow_tables(conn: &Connection) -> Result<()> {
 }
 
 /// Bounded BFS over the call graph from `root_fn_id`. Down follows caller →
-/// callee edges and includes unresolved call sites as leaves; up follows
+/// callee edges and includes unresolved indirect call sites as leaves (a
+/// direct site without an edge is in `call_sites` only for `--sequencing`;
+/// see `docs/SQLITE_SCHEMA.md`, "Call site export filter"); up follows
 /// callee → caller edges. Unresolved leaves have negative, query-local IDs,
 /// distinct from the nonnegative function IDs stored in the database.
 pub fn call_graph(
@@ -766,7 +768,8 @@ pub fn call_graph(
         let mut stmt = conn.prepare(
             "SELECT cs.id, cs.caller_fn_id, cs.callee_text, p.path, cs.line, cs.col \
              FROM call_sites cs JOIN files p ON p.id = cs.file_id \
-             WHERE cs.id NOT IN (SELECT call_site_id FROM call_edges WHERE call_site_id IS NOT NULL) \
+             WHERE cs.is_direct = 0 \
+               AND cs.id NOT IN (SELECT call_site_id FROM call_edges WHERE call_site_id IS NOT NULL) \
              ORDER BY cs.id",
         )?;
         let rows = stmt.query_map([], |row| {

@@ -154,6 +154,14 @@ struct Builder<'s, 'a> {
     unclaimed: Vec<usize>,
     cfg: FunctionCfg,
     has_pred: Vec<bool>,
+    /// Blocks of a `try` body, whose exceptions go to that `try`'s landing;
+    /// an enclosing `try` reaches them through the landing.
+    caught: Vec<bool>,
+    /// A constructor's function-try-block (`A::A() try : m_(f()) {...}`):
+    /// its node, then the block in the `try` the prologue runs in, with
+    /// the landing it may throw to.
+    function_try: Option<usize>,
+    prologue_in_try: Option<(BlockId, BlockId, Vec<Node<'a>>)>,
     /// The block events go to; `None` after a jump, until a block that can
     /// be reached starts.
     cur: Option<BlockId>,
@@ -248,6 +256,9 @@ impl<'s, 'a> Builder<'s, 'a> {
                 gaps: Vec::new(),
             },
             has_pred: Vec::new(),
+            caught: Vec::new(),
+            function_try: None,
+            prologue_in_try: None,
             cur: None,
             frontier: Vec::new(),
             scopes: Vec::new(),
@@ -270,11 +281,25 @@ impl<'s, 'a> Builder<'s, 'a> {
         self.start(start);
         if let Some(body) = body {
             self.collect_labels(body);
+            if body.cached_kind() == "try_statement" {
+                self.function_try = Some(body.id());
+            }
             self.visit(body);
         }
         let exit = self.cfg.exit;
         self.jump(exit, EdgeKind::Fallthrough);
-        self.fill_prologue(head, prologue);
+        // The initializers of a function-try-block run in its `try`.
+        match self.prologue_in_try.take() {
+            Some((block, landing, mut nodes)) => {
+                nodes.extend_from_slice(prologue);
+                let first = self.cfg.events.len();
+                self.fill_prologue(block, &nodes);
+                if self.cfg.events.len() > first {
+                    self.edge(block, landing, EdgeKind::Exception);
+                }
+            }
+            None => self.fill_prologue(head, prologue),
+        }
     }
 
     // ---- blocks, edges and events ----
@@ -287,6 +312,7 @@ impl<'s, 'a> Builder<'s, 'a> {
             events: Vec::new(),
         });
         self.has_pred.push(false);
+        self.caught.push(false);
         id
     }
 
@@ -1142,15 +1168,31 @@ impl<'a> Builder<'_, 'a> {
         self.jump(body, EdgeKind::Fallthrough);
         self.enter(body);
         self.push_scope(ScopeKind::Try { landing }, None);
+        if self.function_try == Some(node.id()) {
+            // `try : m_(f()) { ... }`: the initializers come first, in a
+            // block of their own, filled with the rest of the prologue once
+            // the walk is done.
+            let mut cursor = node.walk();
+            let initializers = node
+                .children(&mut cursor)
+                .filter(|c| c.cached_kind() == "field_initializer_list")
+                .collect();
+            self.prologue_in_try = Some((body, landing, initializers));
+            let next = self.new_block(BlockKind::Ordinary);
+            self.jump(next, EdgeKind::Fallthrough);
+            self.enter(next);
+        }
         if let Some(statement) = node.cached_field("body") {
             self.visit(statement);
         }
         self.scopes.pop();
         // Any call in the body may throw, a label's block (made before the
-        // walk) included.
+        // walk) included, except in a nested `try`, whose landing passes on
+        // what its handlers do not catch.
         let mut throwing: Vec<BlockId> = self.cfg.events[first_event..]
             .iter()
             .map(|e| e.block)
+            .filter(|b| !self.caught[b.0 as usize])
             .collect();
         throwing.sort_unstable();
         throwing.dedup();
@@ -1161,10 +1203,13 @@ impl<'a> Builder<'_, 'a> {
             .map(|e| e.from)
             .collect();
         thrown.sort_unstable();
-        for b in throwing {
+        for &b in &throwing {
             if thrown.binary_search(&b).is_err() {
                 self.edge(b, landing, EdgeKind::Exception);
             }
+        }
+        for b in throwing.into_iter().chain(thrown) {
+            self.caught[b.0 as usize] = true;
         }
         self.jump(exit, EdgeKind::Fallthrough);
         let mut catch_all = false;
@@ -2039,6 +2084,62 @@ mod tests {
                 .count()
         };
         assert_eq!(exception(work), 1, "{}", g.dump());
+    }
+
+    /// A constructor's function-try-block is a child of the definition, not
+    /// its `body`: its initializers, body and handlers are lowered all the
+    /// same, the initializers inside the `try`.
+    #[test]
+    fn a_constructor_function_try_block_is_lowered() {
+        let unit = lower("exceptions.cpp");
+        let ctor = unit
+            .functions
+            .iter()
+            .find(|f| f.name == "Guarded::Guarded" && f.is_defined)
+            .unwrap()
+            .id;
+        let mut callees: Vec<&str> = unit
+            .call_sites
+            .iter()
+            .filter(|s| s.caller == ctor)
+            .map(|s| s.callee_name.as_str())
+            .collect();
+        callees.sort_unstable();
+        assert_eq!(callees, ["Member::Member", "h", "make", "run"]);
+        let g = graph(&unit, "Guarded::Guarded");
+        let make = g.block(g.ev("make"));
+        let run = g.block(g.ev("run"));
+        let h = g.block(g.ev("h"));
+        // The initializers run first, in the `try`.
+        assert!(
+            g.reach(make, None, |k| k == EdgeKind::Fallthrough)
+                .contains(&run),
+            "{}",
+            g.dump()
+        );
+        assert!(!g.reach(run, None, |_| true).contains(&make));
+        assert!(
+            g.reach(make, None, |k| k == EdgeKind::Exception)
+                .into_iter()
+                .any(|b| g.reach(b, None, |_| true).contains(&h)),
+            "{}",
+            g.dump()
+        );
+    }
+
+    /// The outer `try` takes what the inner handlers throw, and what the
+    /// inner `try` lets through, never what it catches.
+    #[test]
+    fn an_inner_catch_all_shields_the_outer_try() {
+        let unit = lower("exceptions.cpp");
+        let g = graph(&unit, "nested");
+        let a = g.block(g.ev("a"));
+        let c = g.block(g.ev("c"));
+        assert!(!g.reach(a, None, |_| true).contains(&c), "{}", g.dump());
+        let g = graph(&unit, "nested_typed");
+        let a = g.block(g.ev("a"));
+        let c = g.block(g.ev("c"));
+        assert!(g.reach(a, None, |_| true).contains(&c), "{}", g.dump());
     }
 
     #[test]

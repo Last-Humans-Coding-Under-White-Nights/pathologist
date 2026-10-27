@@ -5933,7 +5933,13 @@ fn lower_function_body(
     let first_site = program.symbols.call_sites.len();
     let cfg_mark = ctx.cfg_mark();
 
-    let body = node.cached_field("body");
+    // A constructor's function-try-block (`A::A() try : m_(f()) {...}`) is
+    // not the definition's `body` field but a child of it; its walk lowers
+    // the initializer list it holds.
+    let body = node.cached_field("body").or_else(|| {
+        node.children(&mut node.walk())
+            .find(|c| c.cached_kind() == "try_statement")
+    });
     if let Some(body_node) = body {
         walk_function_body(program, ctx, source, body_node, fn_id);
     }
