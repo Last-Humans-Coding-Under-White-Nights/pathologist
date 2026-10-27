@@ -55,6 +55,18 @@ impl SequencingMarker {
             _ => Self::Absent,
         })
     }
+
+    /// The marker of a trace-merge output: complete only when every input
+    /// is, absent only when none is sequenced.
+    pub fn merged(inputs: &[Self]) -> serde_json::Value {
+        if inputs.iter().all(|&s| s == Self::Complete) {
+            serde_json::json!(true)
+        } else if inputs.iter().all(|&s| s == Self::Absent) {
+            serde_json::json!(false)
+        } else {
+            serde_json::json!("partial")
+        }
+    }
 }
 
 /// Fail with the flag to regenerate a database that records no call order;

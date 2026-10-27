@@ -45,3 +45,51 @@ void heap()
     Node *n = new Node(value());
     delete n;
 }
+
+struct Lease {
+    Lease();
+    ~Lease();
+    explicit operator bool() const;
+};
+
+Lease lease();
+
+void leased()
+{
+    while (Lease l = lease()) {
+        work();
+    }
+    after();
+}
+
+void thrown()
+{
+    try {
+        Guard g;
+        if (quit())
+            throw 1;
+        work();
+    } catch (...) {
+        after();
+    }
+}
+
+void retried()
+{
+    try {
+    again:
+        work();
+    } catch (...) {
+        if (more())
+            goto again;
+    }
+}
+
+void local_class()
+{
+    work();
+    struct Local {
+        int get() { return value(); }
+    };
+    after();
+}

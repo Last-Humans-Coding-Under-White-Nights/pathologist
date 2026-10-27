@@ -522,10 +522,6 @@ impl SourceExpressions {
     }
 }
 
-/// An event holding a site: function, variant position in
-/// [`Program::cfgs`], event.
-type CfgEventRef = (FnId, usize, crate::EventId);
-
 #[derive(Debug, Clone, Default)]
 pub struct Program {
     pub root: PathBuf,
@@ -631,8 +627,6 @@ pub struct Program {
     /// Call-order graphs by function; several entries are configuration
     /// variants of one body. Ordered keys keep export deterministic.
     pub cfgs: BTreeMap<FnId, Vec<crate::FunctionCfg>>,
-    /// Built on the first [`Program::attach_alternative_site`].
-    cfg_site_index: Option<FxHashMap<CallSiteId, Vec<CfgEventRef>>>,
 }
 
 impl Program {
@@ -674,42 +668,41 @@ impl Program {
         self.fn_returns = IndexMap::new();
     }
 
-    /// List `added` as another target record of the invocation `source`
-    /// belongs to, in every graph naming `source`. For post-merge site
-    /// expansion: `cfgs` must not change afterwards.
-    pub fn attach_alternative_site(&mut self, source: CallSiteId, added: CallSiteId) {
-        let cfgs = &self.cfgs;
-        let index = self.cfg_site_index.get_or_insert_with(|| {
-            let mut index: FxHashMap<_, Vec<_>> = FxHashMap::default();
-            for (&function, variants) in cfgs {
-                for (position, cfg) in variants.iter().enumerate() {
-                    for (event, e) in cfg.events.iter().enumerate() {
-                        for &site in &e.sites {
-                            index.entry(site).or_default().push((
-                                function,
-                                position,
-                                crate::EventId(event as u32),
-                            ));
+    /// List each `(source, added)`'s `added` as another target record of the
+    /// invocation `source` belongs to, in every graph naming `source`. For
+    /// post-merge site expansion; a source is never an earlier `added`.
+    pub fn attach_alternative_sites(&mut self, pairs: &[(CallSiteId, CallSiteId)]) {
+        if pairs.is_empty() {
+            return;
+        }
+        // Function, variant position and event of each graph event naming a
+        // source.
+        let mut holders: FxHashMap<CallSiteId, Vec<(FnId, usize, usize)>> = pairs
+            .iter()
+            .map(|&(source, _)| (source, Vec::new()))
+            .collect();
+        for (&function, variants) in &self.cfgs {
+            for (position, cfg) in variants.iter().enumerate() {
+                for (event, e) in cfg.events.iter().enumerate() {
+                    for site in &e.sites {
+                        if let Some(at) = holders.get_mut(site) {
+                            at.push((function, position, event));
                         }
                     }
                 }
             }
-            index
-        });
-        let Some(holders) = index.get(&source) else {
-            return;
-        };
-        let holders = holders.clone();
-        for &(function, position, event) in &holders {
-            if let Some(cfg) = self
-                .cfgs
-                .get_mut(&function)
-                .and_then(|variants| variants.get_mut(position))
-            {
-                cfg.events[event.0 as usize].sites.push(added);
+        }
+        for (source, added) in pairs {
+            for &(function, position, event) in &holders[source] {
+                if let Some(cfg) = self
+                    .cfgs
+                    .get_mut(&function)
+                    .and_then(|variants| variants.get_mut(position))
+                {
+                    cfg.events[event].sites.push(*added);
+                }
             }
         }
-        index.insert(added, holders);
     }
 
     /// Dependency roots whose headers contribute declarations but whose
@@ -1274,8 +1267,10 @@ mod tests {
             .cfgs
             .insert(FnId(1), vec![one_event_cfg(1, 4), one_event_cfg(1, 4)]);
         program.cfgs.insert(FnId(2), vec![one_event_cfg(2, 5)]);
-        program.attach_alternative_site(CallSiteId(4), CallSiteId(9));
-        program.attach_alternative_site(CallSiteId(4), CallSiteId(10));
+        program.attach_alternative_sites(&[
+            (CallSiteId(4), CallSiteId(9)),
+            (CallSiteId(4), CallSiteId(10)),
+        ]);
         for cfg in &program.cfgs[&FnId(1)] {
             assert_eq!(
                 cfg.events[0].sites,
@@ -1289,7 +1284,7 @@ mod tests {
     fn alternative_of_an_unsequenced_site_is_ignored() {
         let mut program = Program::default();
         program.cfgs.insert(FnId(1), vec![one_event_cfg(1, 4)]);
-        program.attach_alternative_site(CallSiteId(6), CallSiteId(9));
+        program.attach_alternative_sites(&[(CallSiteId(6), CallSiteId(9))]);
         assert_eq!(program.cfgs[&FnId(1)][0].events[0].sites, [CallSiteId(4)]);
     }
 

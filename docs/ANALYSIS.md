@@ -4970,8 +4970,9 @@ labels (labels are resolved before the body is walked), `try`/`catch` and
   constructor event sits at its declarator, so `T a{f()}, b{g()};` orders
   `f`, `T::T`, `g`, `T::T`. The one destructor site the IR records per
   object is referenced from every exit of its scope: the normal end and each
-  `return`, `break`, `continue` or `goto` leaving it, in reverse declaration
-  order. No call site is added for this.
+  `return`, `break`, `continue`, `goto` or `throw` leaving it, in reverse
+  declaration order. A `while`, `for` or `if` condition's object is destroyed
+  where the statement ends. No call site is added for this.
 - **Exceptions.** Each `try` has one `landing` block. Every block of the
   `try` body that holds an event, nested handlers included, has an
   `exception` edge to it, and the landing has an edge to each handler. Unless
@@ -4981,6 +4982,10 @@ labels (labels are resolved before the body is walked), `try`/`catch` and
   call *outside* a `try` has no exceptional edge: the conditions above
   already exclude abnormal completion.
 - Loops stay cycles (`back_edge`), never unrolled.
+- Member functions of a local class and GNU nested functions run when called,
+  not where they are written: their control flow is not followed, and any
+  events lowering attributes to the enclosing function there form one
+  unordered group under an `unsupported_construct` gap.
 
 ### Representation
 
@@ -5030,7 +5035,7 @@ in its link target.
   dependency's macro body) is spliced out of its block and local order, and an
   `omitted_sites` gap records that it was there.
 - Post-merge virtual expansion adds override records as further sites of the
-  same event (`Program::attach_alternative_site`).
+  same event (`Program::attach_alternative_sites`).
 
 `trace-merge` carries the graphs of its sequenced inputs the same way
 (`FunctionCfg::remap` is shared): function, call-site and file ids are

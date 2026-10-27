@@ -551,8 +551,25 @@ impl<'a> Builder<'_, 'a> {
             "throw_statement" => {
                 self.sequence(node);
                 self.own(node);
+                // Leaving for a handler destroys the objects of the scopes
+                // left on the way.
+                let handler = self
+                    .scopes
+                    .iter()
+                    .rposition(|s| matches!(s.kind, ScopeKind::Try { .. }))
+                    .map_or(0, |at| at + 1);
+                self.unwind(handler);
                 let target = self.throw_target();
                 self.jump(target, EdgeKind::Exception);
+            }
+            // A local class's members and a GNU nested function run when
+            // called, not where they are written.
+            "field_declaration_list" | "function_definition" => {
+                let first = self.cfg.events.len();
+                self.flatten(node);
+                if self.cfg.events.len() > first {
+                    self.gap(GapKind::UnsupportedConstruct, Some(node), first);
+                }
             }
             "lambda_expression" => {
                 // The body is the lambda's own graph; init-captures are this
@@ -753,6 +770,8 @@ impl<'a> Builder<'_, 'a> {
     }
 
     fn while_statement(&mut self, node: Node<'a>) {
+        // A condition's declaration is destroyed as the loop ends, as `for`.
+        self.push_scope(ScopeKind::Block, None);
         let head = self.block_at(node);
         self.jump(head, EdgeKind::Fallthrough);
         self.start(head);
@@ -767,6 +786,7 @@ impl<'a> Builder<'_, 'a> {
         self.loop_body(node, body, exit, head, EdgeKind::BackEdge);
         self.jump(head, EdgeKind::BackEdge);
         self.enter(exit);
+        self.pop_scope();
     }
 
     fn do_statement(&mut self, node: Node<'a>) {
@@ -1021,7 +1041,10 @@ impl<'a> Builder<'_, 'a> {
     fn collect_labels(&mut self, body: Node<'a>) {
         let mut stack = vec![body];
         while let Some(n) = stack.pop() {
-            if n.cached_kind() == "lambda_expression" {
+            if matches!(
+                n.cached_kind(),
+                "lambda_expression" | "field_declaration_list" | "function_definition"
+            ) {
                 continue;
             }
             if n.cached_kind() == "labeled_statement" {
@@ -1069,7 +1092,7 @@ impl<'a> Builder<'_, 'a> {
     fn try_statement(&mut self, node: Node<'a>) {
         let landing = self.new_block(BlockKind::Landing);
         let exit = self.new_block(BlockKind::Ordinary);
-        let first_block = self.cfg.blocks.len();
+        let first_event = self.cfg.events.len();
         let body = self.block_at(node);
         self.jump(body, EdgeKind::Fallthrough);
         self.enter(body);
@@ -1078,11 +1101,16 @@ impl<'a> Builder<'_, 'a> {
             self.visit(statement);
         }
         self.scopes.pop();
-        // Any call in the body may throw.
-        for b in first_block..self.cfg.blocks.len() {
-            if !self.cfg.blocks[b].events.is_empty() {
-                self.edge(BlockId(b as u32), landing, EdgeKind::Exception);
-            }
+        // Any call in the body may throw, a label's block (made before the
+        // walk) included.
+        let mut throwing: Vec<BlockId> = self.cfg.events[first_event..]
+            .iter()
+            .map(|e| e.block)
+            .collect();
+        throwing.sort_unstable();
+        throwing.dedup();
+        for b in throwing {
+            self.edge(b, landing, EdgeKind::Exception);
         }
         self.jump(exit, EdgeKind::Fallthrough);
         let mut catch_all = false;
@@ -1800,6 +1828,48 @@ mod tests {
         let (on_continue, on_break) = (*on_continue[0], *on_break[0]);
         assert!(g.block_path(g.block(on_continue), g.block(more), Some(g.block(work))));
         assert!(g.block_path(g.block(on_break), g.block(after), Some(g.block(more))));
+    }
+
+    #[test]
+    fn a_loop_condition_object_is_destroyed_as_the_loop_ends() {
+        let unit = lower("scopes.cpp");
+        let g = graph(&unit, "leased");
+        let (dtor, after) = (g.ev("Lease::~Lease"), g.ev("after"));
+        assert!(g.guaranteed(dtor, after), "{}", g.dump());
+    }
+
+    #[test]
+    fn a_throw_destroys_the_objects_it_leaves() {
+        let unit = lower("scopes.cpp");
+        let g = graph(&unit, "thrown");
+        let (quit, work, after) = (g.ev("quit"), g.ev("work"), g.ev("after"));
+        let dtors = g.all("Guard::~Guard");
+        // One destructor on the `throw` path, one at the block's end.
+        assert_eq!(dtors.len(), 2, "{}", g.dump());
+        assert!(dtors
+            .iter()
+            .any(|&d| g.exclusive(d, work) && g.guaranteed(quit, d) && g.may_precede(d, after)));
+    }
+
+    #[test]
+    fn a_labeled_call_in_a_try_body_may_throw() {
+        let unit = lower("scopes.cpp");
+        let g = graph(&unit, "retried");
+        let (work, more) = (g.ev("work"), g.ev("more"));
+        assert!(g.may_precede(work, more), "{}", g.dump());
+        assert!(g.may_precede(more, work));
+    }
+
+    #[test]
+    fn a_local_class_member_is_not_the_enclosing_flow() {
+        let unit = lower("scopes.cpp");
+        let g = graph(&unit, "local_class");
+        let (work, after) = (g.ev("work"), g.ev("after"));
+        // The member's `return` does not leave the enclosing function.
+        assert!(g.guaranteed(work, after), "{}", g.dump());
+        for value in g.all("value") {
+            assert!(g.covered(value), "{}", g.dump());
+        }
     }
 
     #[test]

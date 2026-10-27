@@ -112,18 +112,6 @@ pub enum WarningKind {
     MissingSequencing,
 }
 
-/// The merged database's `call_sequencing` marker: complete only when
-/// every input is.
-fn merged_sequencing(inputs: &[SequencingMarker]) -> serde_json::Value {
-    if inputs.iter().all(|&s| s == SequencingMarker::Complete) {
-        serde_json::json!(true)
-    } else if inputs.iter().all(|&s| s == SequencingMarker::Absent) {
-        serde_json::json!(false)
-    } else {
-        serde_json::json!("partial")
-    }
-}
-
 /// The kind of `all` named `text`, as `trace analyze` wrote it.
 fn cfg_kind<K: Copy>(all: &[K], name: fn(K) -> &'static str, text: &str) -> rusqlite::Result<K> {
     all.iter()
@@ -577,7 +565,12 @@ pub fn merge_databases<P: AsRef<Path>>(
             })?;
         }
         has_contexts_table.push(has_contexts);
-        let sequencing = SequencingMarker::read(&conn).unwrap_or(SequencingMarker::Absent);
+        let sequencing = SequencingMarker::read(&conn).with_context(|| {
+            format!(
+                "failed to read the call-sequencing marker of {}",
+                path.display()
+            )
+        })?;
         if sequencing != SequencingMarker::Absent {
             for (table, query) in READ_CFG {
                 conn.prepare(query).map_err(|error| {
@@ -1399,7 +1392,7 @@ pub fn merge_databases<P: AsRef<Path>>(
             "external_calls_unresolved": report.external_calls_unresolved,
             "ambiguous_calls": report.ambiguous_calls,
             "warnings_count": report.warnings.len(),
-            "call_sequencing": merged_sequencing(&input_sequencing),
+            "call_sequencing": SequencingMarker::merged(&input_sequencing),
         })
         .to_string();
 

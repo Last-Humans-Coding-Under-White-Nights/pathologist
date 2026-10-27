@@ -2067,6 +2067,9 @@ fn expand_virtual_overrides(program: &mut Program) {
         })
         .collect();
     let snapshot = program.symbols.call_sites.clone();
+    // `(site, added target)`: another target of the same invocation, not
+    // another call.
+    let mut alternatives = Vec::new();
     for cs in snapshot {
         let Some(fid) = cs.callee_fn_id.filter(|_| !cs.exact_receiver) else {
             continue;
@@ -2201,12 +2204,12 @@ fn expand_virtual_overrides(program: &mut Program) {
                 receiver: cs.receiver,
                 tu: cs.tu,
             });
-            // Another target of the same invocation, not another call.
             if program.call_sequencing {
-                program.attach_alternative_site(cs.id, call_id);
+                alternatives.push((cs.id, call_id));
             }
         }
     }
+    program.attach_alternative_sites(&alternatives);
 }
 
 fn method_kind_of_function(name: &str) -> Option<(String, trace_ir::MethodKind)> {
