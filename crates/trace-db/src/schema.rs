@@ -564,6 +564,7 @@ CREATE INDEX IF NOT EXISTS idx_cfg_blocks_cfg ON cfg_blocks(cfg_id);
 CREATE INDEX IF NOT EXISTS idx_cfg_edges_dst ON cfg_edges(dst_block);
 CREATE INDEX IF NOT EXISTS idx_cfg_events_block ON cfg_events(block_id);
 CREATE INDEX IF NOT EXISTS idx_cfg_events_file_line ON cfg_events(file_id, line);
+CREATE INDEX IF NOT EXISTS idx_cfg_events_expansion ON cfg_events(expansion_file_id, expansion_line);
 CREATE INDEX IF NOT EXISTS idx_cfg_event_sites_site ON cfg_event_sites(call_site_id);
 CREATE INDEX IF NOT EXISTS idx_cfg_gaps_cfg ON cfg_gaps(cfg_id);
 "#

@@ -6,7 +6,7 @@
 //! reaches, inlines callees up to a depth and budget, and never stores or
 //! enumerates paths. Relations come from the loaded graph of one function:
 //! the local order inside a block, block reachability, and dominators over
-//! non-exception edges.
+//! every edge, exception edges included.
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -105,6 +105,50 @@ pub fn require_sequencing(conn: &Connection) -> Result<SequencingMarker> {
     }
 }
 
+/// Database row ids the sequence API names, each typed by its table so one
+/// cannot stand for another; they serialize as the bare id.
+macro_rules! row_id {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(pub i64);
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+
+        impl rusqlite::ToSql for $name {
+            fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+                self.0.to_sql()
+            }
+        }
+
+        impl rusqlite::types::FromSql for $name {
+            fn column_result(
+                value: rusqlite::types::ValueRef<'_>,
+            ) -> rusqlite::types::FromSqlResult<Self> {
+                i64::column_result(value).map(Self)
+            }
+        }
+    };
+}
+
+row_id!(
+    /// A `functions.id`.
+    FunctionRowId
+);
+row_id!(
+    /// A `cfg_functions.id`: one call-order graph (a function body variant).
+    CfgId
+);
+row_id!(
+    /// A `cfg_events.id`: one call event of a graph.
+    CfgEventId
+);
+
 /// Bounds of one query (`trace inspect sequence --depth ...`).
 #[derive(Debug, Clone, Serialize)]
 pub struct SequenceOptions {
@@ -137,9 +181,9 @@ impl Default for SequenceOptions {
 /// `cfg`), and the same call in the function's other variants.
 #[derive(Debug, Clone, Serialize)]
 pub struct EventRef {
-    pub event: i64,
-    pub cfg: i64,
-    pub function: i64,
+    pub event: CfgEventId,
+    pub cfg: CfgId,
+    pub function: FunctionRowId,
     pub callee: String,
     pub path: String,
     pub line: i64,
@@ -147,12 +191,12 @@ pub struct EventRef {
     /// `(event, cfg)` of the call in every variant of `function` compiling
     /// it, `(event, cfg)` first; empty means that one alone.
     #[serde(skip)]
-    pub variants: Vec<(i64, i64)>,
+    pub variants: Vec<(CfgEventId, CfgId)>,
 }
 
 impl EventRef {
     /// `(event, cfg)` of each variant's copy of the call.
-    fn copies(&self) -> Vec<(i64, i64)> {
+    fn copies(&self) -> Vec<(CfgEventId, CfgId)> {
         if self.variants.is_empty() {
             vec![(self.event, self.cfg)]
         } else {
@@ -173,7 +217,10 @@ impl EventRef {
 pub enum SequenceScope {
     /// The variants of a function's body; with `file`, those compiled from
     /// or written in a file matching it (all of them when none is).
-    Function { function: i64, file: Option<String> },
+    Function {
+        function: FunctionRowId,
+        file: Option<String>,
+    },
     /// The part of an event's body reachable from it.
     From(EventRef),
     /// The blocks on paths from the first event to the second, and their
@@ -192,11 +239,13 @@ pub fn resolve_sequence_function(
 ) -> Result<SequenceScope> {
     require_sequencing(conn)?;
     let function = match super::resolve_function_target(conn, Some(name), file, None) {
-        Ok(f) => f.id,
+        Ok(f) => FunctionRowId(f.id),
         Err(err) => {
             let Some(file) = file else { return Err(err) };
             match super::resolve_function_target(conn, Some(name), None, None) {
-                Ok(f) if !variants_in(conn, f.id, file)?.is_empty() => f.id,
+                Ok(f) if !variants_in(conn, FunctionRowId(f.id), file)?.is_empty() => {
+                    FunctionRowId(f.id)
+                }
                 _ => return Err(err),
             }
         }
@@ -209,7 +258,7 @@ pub fn resolve_sequence_function(
 
 /// The graphs of `function` compiled from, or with a block written in, a
 /// file whose path contains `file`.
-fn variants_in(conn: &Connection, function: i64, file: &str) -> Result<Vec<i64>> {
+fn variants_in(conn: &Connection, function: FunctionRowId, file: &str) -> Result<Vec<CfgId>> {
     Ok(conn
         .prepare_cached(
             "SELECT cf.id FROM cfg_functions cf \
@@ -225,6 +274,30 @@ fn variants_in(conn: &Connection, function: i64, file: &str) -> Result<Vec<i64>>
         )?
         .collect::<rusqlite::Result<_>>()?)
 }
+
+/// Events written at line `?1` of a file whose path matches `?2`, by
+/// spelling or macro expansion position, narrowed to column `?3`. The
+/// matching files are found first, so each position is an index lookup by
+/// `(file_id, line)` or `(expansion_file_id, expansion_line)`.
+const RESOLVE_EVENT_SQL: &str = "WITH matching(id) AS ( \
+             SELECT id FROM files WHERE path LIKE ?2 ESCAPE '!') \
+         SELECT e.id, e.cfg_id, cf.fn_id, f.path, e.line, e.col, \
+                CASE WHEN e.line = ?1 AND e.file_id IN matching THEN x.path END, \
+                e.expansion_line, cs.callee_text \
+         FROM cfg_events e \
+         JOIN cfg_functions cf ON cf.id = e.cfg_id \
+         JOIN files f ON f.id = e.file_id \
+         LEFT JOIN files x ON x.id = e.expansion_file_id \
+         LEFT JOIN cfg_event_sites es ON es.event_id = e.id \
+         LEFT JOIN call_sites cs ON cs.id = es.call_site_id \
+         WHERE e.id IN ( \
+             SELECT id FROM cfg_events \
+             WHERE file_id IN matching AND line = ?1 AND (?3 IS NULL OR col = ?3) \
+             UNION \
+             SELECT id FROM cfg_events \
+             WHERE expansion_file_id IN matching AND expansion_line = ?1 \
+                 AND (?3 IS NULL OR expansion_col = ?3)) \
+         ORDER BY e.id, es.ordinal";
 
 /// The event written at `file:line` (spelling or macro expansion position),
 /// narrowed by column and callee name (`name` or a `::name` suffix).
@@ -243,27 +316,13 @@ pub fn resolve_event(
     // A call spelled in a macro body matches by spelling at every
     // invocation; its invocation position is kept to suggest instead. One
     // row per site, in site order, with the event's callee spelling.
-    let mut stmt = conn.prepare(
-        "SELECT e.id, e.cfg_id, cf.fn_id, f.path, e.line, e.col, \
-                CASE WHEN e.line = ?1 AND f.path LIKE ?2 ESCAPE '!' THEN x.path END, \
-                e.expansion_line, cs.callee_text \
-         FROM cfg_events e \
-         JOIN cfg_functions cf ON cf.id = e.cfg_id \
-         JOIN files f ON f.id = e.file_id \
-         LEFT JOIN files x ON x.id = e.expansion_file_id \
-         LEFT JOIN cfg_event_sites es ON es.event_id = e.id \
-         LEFT JOIN call_sites cs ON cs.id = es.call_site_id \
-         WHERE ((e.line = ?1 AND f.path LIKE ?2 ESCAPE '!' AND (?3 IS NULL OR e.col = ?3)) \
-             OR (e.expansion_line = ?1 AND x.path LIKE ?2 ESCAPE '!' \
-                 AND (?3 IS NULL OR e.expansion_col = ?3))) \
-         ORDER BY e.id, es.ordinal",
-    )?;
+    let mut stmt = conn.prepare(RESOLVE_EVENT_SQL)?;
     // The events found, each with its sites' callee spellings and the
     // macro invocation (`file:line`) it was matched at.
     let mut found: Vec<(EventRef, Vec<String>, Option<String>)> = Vec::new();
     let mut rows = stmt.query(rusqlite::params![line, pattern, col])?;
     while let Some(r) = rows.next()? {
-        let event: i64 = r.get(0)?;
+        let event: CfgEventId = r.get(0)?;
         if found.last().is_none_or(|f| f.0.event != event) {
             let expansion: (Option<String>, Option<i64>) = (r.get(6)?, r.get(7)?);
             let event = EventRef {
@@ -418,10 +477,10 @@ pub struct SeqGap {
 #[derive(Debug, Clone, Serialize)]
 pub struct SeqFrame {
     pub id: usize,
-    pub fn_id: i64,
+    pub fn_id: FunctionRowId,
     pub name: String,
     pub loc: Option<SeqLoc>,
-    pub cfg_id: i64,
+    pub cfg_id: CfgId,
     pub variant: i64,
     /// The translation unit the graph was built in.
     pub unit: Option<String>,
@@ -444,7 +503,7 @@ pub struct SeqBlock {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SeqTarget {
-    pub fn_id: i64,
+    pub fn_id: FunctionRowId,
     pub name: String,
     pub resolution: String,
     /// The first frame inlining this target, when one was built.
@@ -455,7 +514,7 @@ pub struct SeqTarget {
 #[derive(Debug, Clone, Serialize)]
 pub struct SeqEvent {
     pub id: usize,
-    pub db_id: i64,
+    pub db_id: CfgEventId,
     pub frame: usize,
     pub block: usize,
     pub kind: String,
@@ -483,7 +542,7 @@ pub struct SeqBoundary {
     pub kind: String,
     pub frame: usize,
     pub event: Option<usize>,
-    pub fn_id: Option<i64>,
+    pub fn_id: Option<FunctionRowId>,
     pub name: Option<String>,
     pub reason: Option<String>,
 }
@@ -504,7 +563,7 @@ pub struct SeqRelation {
     /// When `to` runs inside a callee: the events of `from`'s function
     /// whose calls reach it, in every variant, in event order; empty when
     /// `to` is in `from`'s own body.
-    pub via: Vec<i64>,
+    pub via: Vec<CfgEventId>,
     pub notes: Vec<String>,
 }
 
@@ -528,7 +587,7 @@ pub struct SequenceGraph {
 // Loading
 
 struct Target {
-    fn_id: i64,
+    fn_id: FunctionRowId,
     name: String,
     resolution: String,
     is_defined: bool,
@@ -542,27 +601,27 @@ struct EventFacts {
     expansion: Option<SeqLoc>,
     targets: Vec<Target>,
     /// `(kind, entry function)` of each context this event starts.
-    contexts: Vec<(String, i64)>,
+    contexts: Vec<(String, FunctionRowId)>,
 }
 
 /// One `cfg_functions` row with everything under it; block and event
 /// indices are the graph's own ids.
 struct LoadedCfg {
-    cfg_id: i64,
+    cfg_id: CfgId,
     name: String,
     loc: Option<SeqLoc>,
     unit: Option<String>,
     coverage: String,
     graph: FunctionCfg,
     /// `cfg_events.id` of each event.
-    db_ids: Vec<i64>,
+    db_ids: Vec<CfgEventId>,
     events: Vec<EventFacts>,
     block_locs: Vec<Option<SeqLoc>>,
     gap_locs: Vec<Option<SeqLoc>>,
     /// `(stub function, name)` of each IPC bridge the function's proxy sends.
-    ipc: Vec<(i64, String)>,
+    ipc: Vec<(FunctionRowId, String)>,
     // Indexes over the graph.
-    event_ids: FxHashMap<i64, usize>,
+    event_ids: FxHashMap<CfgEventId, usize>,
     succ: Vec<Vec<usize>>,
     pred: Vec<Vec<usize>>,
     next_events: Vec<Vec<usize>>,
@@ -603,8 +662,8 @@ const LOAD_IPC_SQL: &str = "SELECT DISTINCT ce.callee_fn_id, f.name FROM call_ed
 struct Loader<'c> {
     conn: &'c Connection,
     cfgs: Vec<LoadedCfg>,
-    by_id: FxHashMap<i64, usize>,
-    by_fn: FxHashMap<i64, Rc<[i64]>>,
+    by_id: FxHashMap<CfgId, usize>,
+    by_fn: FxHashMap<FunctionRowId, Rc<[CfgId]>>,
     paths: FxHashMap<FileId, Option<String>>,
 }
 
@@ -620,11 +679,11 @@ impl<'c> Loader<'c> {
     }
 
     /// Graph ids of every variant of `function`, in variant order.
-    fn cfgs_of(&mut self, function: i64) -> Result<Rc<[i64]>> {
+    fn cfgs_of(&mut self, function: FunctionRowId) -> Result<Rc<[CfgId]>> {
         if let Some(ids) = self.by_fn.get(&function) {
             return Ok(Rc::clone(ids));
         }
-        let ids: Rc<[i64]> = self
+        let ids: Rc<[CfgId]> = self
             .conn
             .prepare_cached("SELECT id FROM cfg_functions WHERE fn_id = ?1 ORDER BY variant, id")?
             .query_map([function], |r| r.get(0))?
@@ -657,7 +716,7 @@ impl<'c> Loader<'c> {
         }))
     }
 
-    fn load(&mut self, cfg_id: i64) -> Result<usize> {
+    fn load(&mut self, cfg_id: CfgId) -> Result<usize> {
         if let Some(&i) = self.by_id.get(&cfg_id) {
             return Ok(i);
         }
@@ -683,10 +742,11 @@ impl<'c> Loader<'c> {
             cfg: graph,
             event_ids,
             ..
-        } = crate::read_cfgs(conn, cfg_id..=cfg_id)?
+        } = crate::read_cfgs(conn, cfg_id.0..=cfg_id.0)?
             .pop()
             .with_context(|| format!("no call-order graph {cfg_id}"))?;
-        let by_db: FxHashMap<i64, usize> = event_ids
+        let event_ids: Vec<CfgEventId> = event_ids.into_iter().map(CfgEventId).collect();
+        let by_db: FxHashMap<CfgEventId, usize> = event_ids
             .iter()
             .enumerate()
             .map(|(i, &id)| (id, i))
@@ -720,7 +780,7 @@ impl<'c> Loader<'c> {
         let mut rows = stmt.query([cfg_id])?;
         let mut last = None;
         while let Some(r) = rows.next()? {
-            let event: i64 = r.get(0)?;
+            let event: CfgEventId = r.get(0)?;
             if last != Some(event) {
                 last = Some(event);
                 events[by_db[&event]].callee = r.get::<_, Option<String>>(1)?.unwrap_or_default();
@@ -730,8 +790,8 @@ impl<'c> Loader<'c> {
         let mut stmt = conn.prepare_cached(LOAD_TARGETS_SQL)?;
         let mut rows = stmt.query([cfg_id])?;
         while let Some(r) = rows.next()? {
-            let targets = &mut events[by_db[&r.get::<_, i64>(0)?]].targets;
-            let fn_id: i64 = r.get(1)?;
+            let targets = &mut events[by_db[&r.get::<_, CfgEventId>(0)?]].targets;
+            let fn_id: FunctionRowId = r.get(1)?;
             if targets.last().is_some_and(|t| t.fn_id == fn_id) {
                 continue;
             }
@@ -746,7 +806,7 @@ impl<'c> Loader<'c> {
         let mut stmt = conn.prepare_cached(LOAD_CONTEXTS_SQL)?;
         let mut rows = stmt.query([cfg_id])?;
         while let Some(r) = rows.next()? {
-            events[by_db[&r.get::<_, i64>(0)?]]
+            events[by_db[&r.get::<_, CfgEventId>(0)?]]
                 .contexts
                 .push((r.get(1)?, r.get(2)?));
         }
@@ -839,6 +899,13 @@ fn postorder(entry: usize, succ: &[Vec<usize>]) -> (Vec<usize>, Vec<bool>) {
     (post, visited)
 }
 
+/// A graph's dominator tree over every edge, and the blocks its entry
+/// reaches over non-exception edges.
+struct Dominance {
+    idom: Vec<Option<usize>>,
+    normal: Vec<bool>,
+}
+
 /// Whether `a` dominates `b` under the immediate dominators `idom`.
 fn dominates(idom: &[Option<usize>], a: usize, b: usize) -> bool {
     let mut at = b;
@@ -854,8 +921,8 @@ fn dominates(idom: &[Option<usize>], a: usize, b: usize) -> bool {
 }
 
 impl LoadedCfg {
-    fn fn_id(&self) -> i64 {
-        i64::from(self.graph.function.0)
+    fn fn_id(&self) -> FunctionRowId {
+        FunctionRowId(i64::from(self.graph.function.0))
     }
 
     fn entry(&self) -> usize {
@@ -879,12 +946,12 @@ impl LoadedCfg {
             .flat_map(|b| b.events.iter().map(|e| e.0 as usize))
     }
 
-    fn event_by_db(&self, db_id: i64) -> Option<usize> {
+    fn event_by_db(&self, db_id: CfgEventId) -> Option<usize> {
         self.event_ids.get(&db_id).copied()
     }
 
     /// The local index of event `db_id`, which must belong to this graph.
-    fn event_of(&self, db_id: i64) -> Result<usize> {
+    fn event_of(&self, db_id: CfgEventId) -> Result<usize> {
         match self.event_by_db(db_id) {
             Some(e) => Ok(e),
             None => bail!("event {db_id} is not in call-order graph {}", self.cfg_id),
@@ -916,21 +983,13 @@ impl LoadedCfg {
         order
     }
 
-    /// Immediate dominators over non-exception edges from the entry
-    /// (Cooper, Harvey and Kennedy); `None` for blocks the entry does not
-    /// reach that way.
-    fn dominators(&self) -> Vec<Option<usize>> {
+    /// Dominance from the entry over every edge, exception edges included
+    /// (Cooper, Harvey and Kennedy), and the blocks the entry reaches
+    /// without one.
+    fn dominators(&self) -> Dominance {
         let n = self.graph.blocks.len();
-        let mut succ = vec![Vec::new(); n];
-        let mut pred = vec![Vec::new(); n];
-        for edge in &self.graph.edges {
-            if edge.kind != EdgeKind::Exception {
-                succ[edge.from.0 as usize].push(edge.to.0 as usize);
-                pred[edge.to.0 as usize].push(edge.from.0 as usize);
-            }
-        }
         let entry = self.entry();
-        let (mut rpo, _) = postorder(entry, &succ);
+        let (mut rpo, _) = postorder(entry, &self.succ);
         // Postorder numbers.
         let mut post = vec![usize::MAX; n];
         for (i, &b) in rpo.iter().enumerate() {
@@ -955,7 +1014,7 @@ impl LoadedCfg {
             changed = false;
             for &b in rpo.iter().skip(1) {
                 let mut new = None;
-                for &p in &pred[b] {
+                for &p in &self.pred[b] {
                     if idom[p].is_some() {
                         new = Some(match new {
                             None => p,
@@ -969,7 +1028,43 @@ impl LoadedCfg {
                 }
             }
         }
-        idom
+        let mut normal_succ = vec![Vec::new(); n];
+        for edge in &self.graph.edges {
+            if edge.kind != EdgeKind::Exception {
+                normal_succ[edge.from.0 as usize].push(edge.to.0 as usize);
+            }
+        }
+        let (_, normal) = postorder(entry, &normal_succ);
+        Dominance { idom, normal }
+    }
+
+    /// Block `b` has an `exception` edge: an event in it may throw to a
+    /// handler of this function, leaving the block before its later events.
+    fn throws_to_handler(&self, b: usize) -> bool {
+        self.graph
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Exception && e.from.0 as usize == b)
+    }
+
+    /// Event `e` precedes every other event of its block in the local order.
+    fn first_of_block(&self, e: usize) -> bool {
+        let mut seen = vec![false; self.graph.events.len()];
+        search(e, &mut seen, |x| &self.next_events[x], |_| false);
+        let reached = seen.iter().filter(|&&s| s).count();
+        reached + 1 == self.graph.blocks[self.block_of(e)].events.len()
+    }
+
+    /// Every path from the entry to block `to` invokes event `a` first:
+    /// `a`'s block dominates `to` over every edge, and when that block may
+    /// throw to a handler, `a` is its first event (an earlier one may throw
+    /// and the handler reach `to` without `a`). A block reached only through
+    /// a handler is never claimed.
+    fn guarantees(&self, a: usize, to: usize, dom: &Dominance) -> bool {
+        let ba = self.block_of(a);
+        dom.normal[to]
+            && dominates(&dom.idom, ba, to)
+            && (!self.throws_to_handler(ba) || self.first_of_block(a))
     }
 
     /// `b` follows `a` in their block's local order.
@@ -994,13 +1089,13 @@ impl LoadedCfg {
     /// How event `a`'s invocation relates to event `b`'s, both of this
     /// graph; `forward` are the blocks `a`'s reaches ([`Self::reach`], so
     /// `forward[block_of(a)]` holds when that block is on a cycle) and
-    /// `idom` the graph's [`Self::dominators`].
+    /// `dom` the graph's [`Self::dominators`].
     fn relate(
         &self,
         a: usize,
         b: usize,
         forward: &[bool],
-        idom: &[Option<usize>],
+        dom: &Dominance,
     ) -> (Relation, Vec<String>) {
         let (ba, bb) = (self.block_of(a), self.block_of(b));
         let relation = if a == b {
@@ -1027,7 +1122,7 @@ impl LoadedCfg {
         } else {
             match (forward[bb], self.reach(bb, true)[ba]) {
                 (true, true) => Relation::MayBoth,
-                (true, false) if dominates(idom, ba, bb) => Relation::GuaranteedBefore,
+                (true, false) if self.guarantees(a, bb, dom) => Relation::GuaranteedBefore,
                 (true, false) => Relation::MayPrecede,
                 (false, true) => Relation::MayFollow,
                 (false, false) => Relation::Exclusive,
@@ -1077,7 +1172,12 @@ fn conditions(relation: Relation) -> Vec<String> {
     }
 }
 
-/// One relation for several calling events: the weakest claim all allow.
+/// One relation for several calling events (or variants): the strongest
+/// claim every input allows. `unknown` absorbs everything; a proof survives
+/// only when every input is one, as the weaker of them (`sequenced_before`
+/// only when all are); otherwise the result admits each order some input
+/// admits, `unordered` admitting both (`may_precede`, `may_follow` or
+/// `may_both`), and `exclusive` or `unordered` only when every input is.
 fn combine(relations: &[Relation]) -> Relation {
     use Relation::*;
     if relations.windows(2).all(|w| w[0] == w[1]) {
@@ -1086,16 +1186,27 @@ fn combine(relations: &[Relation]) -> Relation {
     if relations.contains(&Unknown) {
         return Unknown;
     }
-    let precede = relations
+    if relations
         .iter()
-        .any(|r| matches!(r, SequencedBefore | GuaranteedBefore | MayPrecede | MayBoth));
-    let follow = relations.iter().any(|r| matches!(r, MayFollow | MayBoth));
+        .all(|r| matches!(r, SequencedBefore | GuaranteedBefore))
+    {
+        return GuaranteedBefore;
+    }
+    let precede = relations.iter().any(|r| {
+        matches!(
+            r,
+            SequencedBefore | GuaranteedBefore | MayPrecede | MayBoth | Unordered
+        )
+    });
+    let follow = relations
+        .iter()
+        .any(|r| matches!(r, MayFollow | MayBoth | Unordered));
     match (precede, follow) {
         (true, true) => MayBoth,
         (true, false) => MayPrecede,
         (false, true) => MayFollow,
-        _ if relations.contains(&Unordered) => Unordered,
-        _ => Exclusive,
+        // Only when every input is `exclusive`, returned above.
+        (false, false) => Exclusive,
     }
 }
 
@@ -1103,7 +1214,7 @@ fn combine(relations: &[Relation]) -> Relation {
 // The query
 
 /// A target is run by an execution context the event starts, not by the call.
-fn starts_context(event: &EventFacts, target: i64) -> bool {
+fn starts_context(event: &EventFacts, target: FunctionRowId) -> bool {
     event.contexts.iter().any(|&(_, entry)| entry == target)
 }
 
@@ -1124,6 +1235,9 @@ struct Builder<'c, 'o> {
     graph: SequenceGraph,
     /// Per frame of `graph`, what it was built from.
     frames: Vec<FrameState>,
+    /// `max_frames` was reached: nothing more is inlined or loaded, and its
+    /// one `truncated` marker names the first call it cut.
+    frames_spent: bool,
 }
 
 struct FrameState {
@@ -1245,7 +1359,7 @@ impl Builder<'_, '_> {
     }
 
     /// Functions of `frame` and the frames inlining it.
-    fn on_stack(&self, mut frame: usize, function: i64) -> bool {
+    fn on_stack(&self, mut frame: usize, function: FunctionRowId) -> bool {
         loop {
             if self.graph.frames[frame].fn_id == function {
                 return true;
@@ -1354,11 +1468,15 @@ impl Builder<'_, '_> {
                     self.boundary(frame, event, "omitted_body", Some(target), Some(reason));
                 } else if depth < self.options.depth {
                     for &variant in variants.iter() {
-                        let child = self.loader.load(variant)?;
+                        if self.frames_spent {
+                            break;
+                        }
                         if self.graph.frames.len() >= self.options.max_frames {
+                            self.frames_spent = true;
                             self.truncate(frame, event, "max_frames");
                             break;
                         }
+                        let child = self.loader.load(variant)?;
                         let events = self.loader.cfgs[child].events.len();
                         if self.graph.events.len() + events > self.options.max_events {
                             self.truncate(frame, event, "max_events");
@@ -1394,7 +1512,12 @@ impl Builder<'_, '_> {
 /// The events of `from`'s graph whose calls reach one of the graphs `to`
 /// within `depth` call levels, skipping context starts and IPC bridges:
 /// those run elsewhere and order nothing.
-fn calls_reaching(loader: &mut Loader, from: usize, to: &[i64], depth: u32) -> Result<Vec<usize>> {
+fn calls_reaching(
+    loader: &mut Loader,
+    from: usize,
+    to: &[CfgId],
+    depth: u32,
+) -> Result<Vec<usize>> {
     let mut memo = FxHashMap::default();
     let mut found = Vec::new();
     let events: Vec<usize> = loader.cfgs[from].events_in_order().collect();
@@ -1412,15 +1535,15 @@ fn event_reaches(
     loader: &mut Loader,
     cfg: usize,
     event: usize,
-    to: &[i64],
+    to: &[CfgId],
     depth: u32,
-    memo: &mut FxHashMap<(i64, u32), bool>,
+    memo: &mut FxHashMap<(CfgId, u32), bool>,
 ) -> Result<bool> {
     if depth == 0 {
         return Ok(false);
     }
     let ev = &loader.cfgs[cfg].events[event];
-    let callees: Vec<i64> = ev
+    let callees: Vec<FunctionRowId> = ev
         .targets
         .iter()
         .filter(|t| t.resolution != "ipc" && !starts_context(ev, t.fn_id))
@@ -1469,6 +1592,7 @@ pub fn sequence_graph(
             ..Default::default()
         },
         frames: Vec::new(),
+        frames_spent: false,
     };
     match scope {
         SequenceScope::Function { function, file } => {
@@ -1525,14 +1649,14 @@ pub fn sequence_graph(
         }
         SequenceScope::Between(from, to) => {
             let to_copies = to.copies();
-            let to_cfgs: Vec<i64> = to_copies.iter().map(|&(_, cfg)| cfg).collect();
+            let to_cfgs: Vec<CfgId> = to_copies.iter().map(|&(_, cfg)| cfg).collect();
             let from_copies = from.copies();
             // Per variant of `from`'s function: its relations and notes,
             // and the frame showing the blocks between the ends.
             let mut relations = Vec::new();
             let mut notes: Vec<String> = Vec::new();
             // The calls reaching `to` from outside, with their positions.
-            let mut via: Vec<(i64, String)> = Vec::new();
+            let mut via: Vec<(CfgEventId, String)> = Vec::new();
             let mut unreached = 0;
             let mut frames = Vec::new();
             for &(event, cfg_id) in &from_copies {
@@ -1563,19 +1687,18 @@ pub fn sequence_graph(
                     unreached += 1;
                     continue;
                 }
-                // Another variant's notes are not repeated.
-                let earlier = notes.len();
-                let idom = g.dominators();
+                let dom = g.dominators();
                 for &t in &targets {
                     let (r, n) = if inside && t == a {
                         // `to` runs inside the call `from` makes.
                         (Relation::GuaranteedBefore, Vec::new())
                     } else {
-                        g.relate(a, t, &forward, &idom)
+                        g.relate(a, t, &forward, &dom)
                     };
                     relations.push(r);
+                    // Each note once, across calls and variants.
                     for n in n {
-                        if !notes[..earlier].contains(&n) {
+                        if !notes.contains(&n) {
                             notes.push(n);
                         }
                     }
@@ -2076,6 +2199,99 @@ mod tests {
         }
     }
 
+    /// The plan steps of `sql`, every parameter bound to 1.
+    fn plan(conn: &Connection, sql: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let ids = vec![1; stmt.parameter_count()];
+        stmt.query_map(rusqlite::params_from_iter(ids), |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// A position is looked up by file and line, spelled or expanded: a
+    /// scan of `cfg_events` per lookup is linear in the database.
+    #[test]
+    fn resolving_a_position_is_indexed() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::SCHEMA_V8).unwrap();
+        let plan = plan(&conn, RESOLVE_EVENT_SQL);
+        // Only the file table is scanned, for the paths matching the filter.
+        assert!(
+            plan.iter()
+                .all(|step| !step.starts_with("SCAN") || step.starts_with("SCAN files ")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_cfg_events_expansion")),
+            "{plan:?}"
+        );
+    }
+
+    /// `combine` over every pair, both ways: proofs survive only together,
+    /// `unordered` admits both orders, `unknown` absorbs.
+    #[test]
+    fn combine_is_the_weakest_claim_of_every_pair() {
+        use Relation::*;
+        let all = [
+            SequencedBefore,
+            GuaranteedBefore,
+            MayPrecede,
+            MayFollow,
+            MayBoth,
+            Exclusive,
+            Unordered,
+            Unknown,
+        ];
+        let expected = |a: Relation, b: Relation| -> Relation {
+            let table = [
+                ((SequencedBefore, GuaranteedBefore), GuaranteedBefore),
+                ((SequencedBefore, MayPrecede), MayPrecede),
+                ((SequencedBefore, MayFollow), MayBoth),
+                ((SequencedBefore, MayBoth), MayBoth),
+                ((SequencedBefore, Exclusive), MayPrecede),
+                ((SequencedBefore, Unordered), MayBoth),
+                ((GuaranteedBefore, MayPrecede), MayPrecede),
+                ((GuaranteedBefore, MayFollow), MayBoth),
+                ((GuaranteedBefore, MayBoth), MayBoth),
+                ((GuaranteedBefore, Exclusive), MayPrecede),
+                ((GuaranteedBefore, Unordered), MayBoth),
+                ((MayPrecede, MayFollow), MayBoth),
+                ((MayPrecede, MayBoth), MayBoth),
+                ((MayPrecede, Exclusive), MayPrecede),
+                ((MayPrecede, Unordered), MayBoth),
+                ((MayFollow, MayBoth), MayBoth),
+                ((MayFollow, Exclusive), MayFollow),
+                ((MayFollow, Unordered), MayBoth),
+                ((MayBoth, Exclusive), MayBoth),
+                ((MayBoth, Unordered), MayBoth),
+                ((Exclusive, Unordered), MayBoth),
+            ];
+            if a == b {
+                return a;
+            }
+            if a == Unknown || b == Unknown {
+                return Unknown;
+            }
+            table
+                .iter()
+                .find(|((x, y), _)| (*x, *y) == (a, b) || (*x, *y) == (b, a))
+                .map(|&(_, r)| r)
+                .expect("every distinct pair is listed")
+        };
+        for a in all {
+            for b in all {
+                assert_eq!(combine(&[a, b]), expected(a, b), "{a:?} + {b:?}");
+            }
+        }
+        assert_eq!(combine(&[Unordered; 3]), Unordered);
+        assert_eq!(
+            combine(&[SequencedBefore, SequencedBefore, GuaranteedBefore]),
+            GuaranteedBefore
+        );
+    }
+
     /// Groups as defined: a position joins the last group when no order
     /// path joins it to any member, either way.
     fn runs_by_search(next: &[Vec<usize>]) -> Vec<Vec<usize>> {
@@ -2142,10 +2358,10 @@ mod tests {
             scope: "function f".into(),
             frames: vec![SeqFrame {
                 id: 0,
-                fn_id: 1,
+                fn_id: FunctionRowId(1),
                 name: "f".into(),
                 loc: None,
-                cfg_id: 1,
+                cfg_id: CfgId(1),
                 variant: 0,
                 unit: None,
                 coverage: "complete".into(),
@@ -2164,7 +2380,7 @@ mod tests {
             events: (0..n)
                 .map(|id| SeqEvent {
                     id,
-                    db_id: id as i64,
+                    db_id: CfgEventId(id as i64),
                     frame: 0,
                     block: 0,
                     kind: "call".into(),

@@ -4929,8 +4929,15 @@ database carries no sequencing rows.
   strengths:
   - `sequenced_before`: same block, not on a cycle, A precedes B in the
     block's local order; `guaranteed_before`: A's block dominates B's block
-    over non-exception edges, B's block does not reach A's, and no gap covers
-    either event. Both are proofs *under the conditions above*.
+    over every edge, exception edges included, B's block does not reach A's,
+    B's block is reached from the entry without an exception edge, and no gap
+    covers either event. When A's block has an `exception` edge, A must also
+    precede every other event of its block: in
+    `try { a(); b(); } catch (...) { h(); } c();` `a` may throw before `b`
+    runs and the handler fall through to `c`, so `b` only `may_precede` `c`,
+    while `a` (whose own throw still invoked it) is `guaranteed_before` `c`.
+    A block reached only through a handler is never claimed (`a` to `h` is
+    `may_precede`). Both are proofs *under the conditions above*.
   - `may_precede`, `may_follow`, `may_both` (a loop): a control-flow path
     exists. This is not feasibility: correlated branch predicates are not
     reasoned about. Two calls of one block on a cycle are `may_both`
@@ -5106,14 +5113,21 @@ first, then loads graphs only as it reaches them:
   only with `--inline-contexts`); an `ipc` edge of the frame's function is
   `ipc_bridge` and is never inlined. `--max-targets`, `--max-frames` and
   `--max-events` cut inlining with a `truncated` marker naming the budget;
-  the starting frames are always shown.
+  once `--max-frames` is reached nothing more is loaded or inlined, and its
+  one marker names the first call it cut. The starting frames are always
+  shown.
 - **Relations.** Two events of one graph relate as in
   [Events and what "before" means](#events-and-what-before-means). When the second event lies in another function,
   the query looks for the events of the first event's function whose calls
   reach that graph within `--depth` levels, never through an `async_start` or
   `ipc_bridge`, and relates the first event to each of them (the call itself
-  counts as `guaranteed_before`); several calls combine to the weakest
-  claim they all allow. Every such call is cited: a note names their
+  counts as `guaranteed_before`); several calls combine to the strongest
+  claim every one of them allows: `unknown` if any is; a proof only when all
+  are (`sequenced_before` when all are, otherwise `guaranteed_before`);
+  `exclusive` or `unordered` only when all are; otherwise `may_precede`,
+  `may_follow` or `may_both` by the orders the inputs admit, where an
+  `unordered` input admits both orders, a proof A first, and `exclusive`
+  neither. Every such call is cited: a note names their
   positions and the JSON `relation.via` lists their `cfg_events` ids (empty
   when both events share a graph). A first event several variants compile is related
   in each of them, and the relations combine the same way; a variant that

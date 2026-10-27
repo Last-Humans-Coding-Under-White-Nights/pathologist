@@ -552,7 +552,7 @@ fn function_sequence(
     trace_db::sequence_graph(
         conn,
         &trace_db::SequenceScope::Function {
-            function: function.id,
+            function: trace_db::FunctionRowId(function.id),
             file: None,
         },
         options,
@@ -669,10 +669,23 @@ fn every_call_reaching_the_second_end_is_cited() {
     )
     .unwrap();
     let relation = graph.relation.expect("a between query relates its ends");
-    let calls: Vec<i64> = [5, 6]
+    let calls: Vec<trace_db::CfgEventId> = [5, 6]
         .map(|line| event(&conn, "reach.c", line, "helper").event)
         .into();
     assert_eq!(relation.via, calls, "both reaching calls are recorded");
+    // Typed row ids serialize as the bare `cfg_events.id` numbers.
+    let ids: Vec<i64> = calls.iter().map(|c| c.0).collect();
+    assert_eq!(
+        serde_json::to_value(&relation).unwrap()["via"],
+        serde_json::json!(ids)
+    );
+    let from = serde_json::to_value(&relation.from).unwrap();
+    assert_eq!(from["event"], serde_json::json!(relation.from.event.0));
+    assert_eq!(from["cfg"], serde_json::json!(relation.from.cfg.0));
+    assert_eq!(
+        from["function"],
+        serde_json::json!(relation.from.function.0)
+    );
     let cited =
         "target() at reach.c:2:21 runs inside the calls at reach.c:5:8, reach.c:6:6".to_string();
     assert!(relation.notes.contains(&cited), "{:?}", relation.notes);
@@ -936,6 +949,66 @@ fn budgets_mark_what_they_cut() {
     assert_eq!(reasons, ["max_events"]);
     let graph = function_sequence(&conn, "run", None, &Default::default());
     assert!(graph.truncated.is_empty());
+}
+
+/// Once the frame budget is spent, inlining stops: one marker, not one
+/// per remaining call.
+#[test]
+fn frame_budget_cuts_once() {
+    let dir = scratch(&[(
+        "calls.c",
+        "void leaf(void);\n\
+         void f1(void) { leaf(); }\n\
+         void f2(void) { leaf(); }\n\
+         void f3(void) { leaf(); }\n\
+         void run(void) { f1(); f2(); f3(); }\n",
+    )]);
+    let db = sequenced_db(dir.path(), default_opts(dir.path()));
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let options = trace_db::SequenceOptions {
+        max_frames: 2,
+        ..Default::default()
+    };
+    let graph = function_sequence(&conn, "run", None, &options);
+    assert_eq!(graph.frames.len(), 2);
+    let reasons: Vec<_> = graph.truncated.iter().map(|t| t.reason.as_str()).collect();
+    assert_eq!(reasons, ["max_frames"], "{:?}", graph.truncated);
+    let f2 = graph.events.iter().find(|e| e.callee == "f2").unwrap();
+    assert_eq!(graph.truncated[0].event, Some(f2.id));
+}
+
+/// Two calls of one variant reaching the second end through the same kind
+/// of gap state its note once.
+#[test]
+fn relation_notes_are_not_repeated() {
+    let dir = scratch(&[(
+        "gaps.c",
+        "void target(void);\n\
+         void first(void);\n\
+         int mid(void) { target(); return 0; }\n\
+         void run(void) {\n\
+           first();\n\
+           int x = ({ int y = mid(); y; });\n\
+           int z = ({ int w = mid(); w; });\n\
+         }\n",
+    )]);
+    let db = sequenced_db(dir.path(), default_opts(dir.path()));
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let first = event(&conn, "gaps.c", 5, "first");
+    let target = event(&conn, "gaps.c", 3, "target");
+    let graph = trace_db::sequence_graph(
+        &conn,
+        &trace_db::SequenceScope::Between(first, target),
+        &Default::default(),
+    )
+    .unwrap();
+    let relation = graph.relation.expect("a between query relates its ends");
+    assert_eq!(relation.kind, trace_db::Relation::Unknown);
+    assert_eq!(relation.via.len(), 2, "{relation:?}");
+    let mut notes = relation.notes.clone();
+    notes.sort();
+    notes.dedup();
+    assert_eq!(notes.len(), relation.notes.len(), "{:?}", relation.notes);
 }
 
 #[test]
@@ -1345,10 +1418,21 @@ fn handler_may_follow_the_try_body() {
     // Reached over an exception edge: a path, never a guarantee.
     assert_eq!(relation(&conn, &at(11, "a"), &at(14, "h")), MayPrecede);
     assert_eq!(relation(&conn, &at(14, "h"), &at(11, "a")), MayFollow);
+    // `a` is the first event of the `try` block: whatever throws there,
+    // `a` was invoked first.
     assert_eq!(
         relation(&conn, &at(11, "a"), &at(16, "c")),
         GuaranteedBefore
     );
+    // `a` may throw before `b` runs, and the handler falls through to `c`.
+    assert_eq!(relation(&conn, &at(12, "b"), &at(16, "c")), MayPrecede);
+    // `d` is first in its block, but `a` or `k` in an earlier block of the
+    // `try` may throw, and the handler reaches `e` without `d`.
+    assert_eq!(
+        relation(&conn, &at(56, "a"), &at(64, "e")),
+        GuaranteedBefore
+    );
+    assert_eq!(relation(&conn, &at(60, "d"), &at(64, "e")), MayPrecede);
     // Nothing runs after a `throw`.
     assert_eq!(
         relation(&conn, &at(21, "before"), &at(23, "dead")),

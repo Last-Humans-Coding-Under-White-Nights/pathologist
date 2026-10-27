@@ -429,7 +429,12 @@ evidence for an order.
 
 **Indexes:** `cfg_functions(fn_id)`, `cfg_blocks(cfg_id)`,
 `cfg_edges(dst_block)`, `cfg_events(block_id)`, `cfg_events(file_id, line)`,
-`cfg_event_sites(call_site_id)`, `cfg_gaps(cfg_id)`.
+`cfg_events(expansion_file_id, expansion_line)`,
+`cfg_event_sites(call_site_id)`, `cfg_gaps(cfg_id)`. `inspect sequence`
+resolves a position by the ids of the files matching it, then one lookup by
+spelling and one by expansion position; a database exported before the
+expansion index existed answers the same, scanning `cfg_events` for the
+expansion half.
 
 ### variables
 

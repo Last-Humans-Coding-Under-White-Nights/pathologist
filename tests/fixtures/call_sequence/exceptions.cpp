@@ -45,3 +45,21 @@ void rethrow()
         h();
     }
 }
+
+bool k();
+void d();
+void e();
+
+void split()
+{
+    try {
+        a();
+        if (k()) {
+            b();
+        }
+        d();
+    } catch (...) {
+        h();
+    }
+    e();
+}
