@@ -4927,13 +4927,15 @@ database carries no sequencing rows.
   between A and B completing normally (no `throw`, `longjmp`, `exit` or
   noreturn call); the query states these conditions with its answer. Relation
   strengths:
-  - `sequenced_before`: same block, A precedes B in the block's local order;
-    `guaranteed_before`: A's block dominates B's block over non-exception
-    edges and no gap covers either event. Both are proofs *under the
-    conditions above*.
+  - `sequenced_before`: same block, not on a cycle, A precedes B in the
+    block's local order; `guaranteed_before`: A's block dominates B's block
+    over non-exception edges, B's block does not reach A's, and no gap covers
+    either event. Both are proofs *under the conditions above*.
   - `may_precede`, `may_follow`, `may_both` (a loop): a control-flow path
     exists. This is not feasibility: correlated branch predicates are not
-    reasoned about.
+    reasoned about. Two calls of one block on a cycle are `may_both`
+    whatever the block's local order (`while (more()) { a(); b(); }`: one
+    iteration's `b` precedes the next one's `a`).
   - `exclusive`: no path either way (`if (ok) send(); else recover();`).
     `unordered`: same block without a local order, or covered by an
     `unordered_branch` gap. `unknown`: a gap or boundary lies between them.
@@ -5084,7 +5086,11 @@ first, then loads graphs only as it reaches them:
   or written in (a block's file) a matching file are shown. Units that each
   define one external function share its row, which records the first
   definition's file, so `--file` may name another unit's body. A position
-  (`--file`/`--line`) matching several events is an error listing at most
+  (`--file`/`--line`) names one call in every variant of its function that
+  compiles it (one event per graph at one position, with one callee); the
+  query starts from each such variant, one frame per variant as for
+  `--function`. A position matching several calls (two events of one graph,
+  or calls of different functions or callees) is an error listing at most
   ten of them with the count of the rest; when they were matched at a macro
   body's spelling, it names an invocation position to use instead.
 - **Frames.** Each graph shown is a frame: every variant of the starting
@@ -5107,7 +5113,10 @@ first, then loads graphs only as it reaches them:
   reach that graph within `--depth` levels, never through an `async_start` or
   `ipc_bridge`, and relates the first event to each of them (the call itself
   counts as `guaranteed_before`); several calls combine to the weakest
-  claim they all allow. Found nowhere, the relation is `unknown`. A gap over
+  claim they all allow. A first event several variants compile is related
+  in each of them, and the relations combine the same way; a variant that
+  reaches no copy of the second event is skipped with a note. Found
+  nowhere, the relation is `unknown`. A gap over
   either end turns `sequenced_before`/`guaranteed_before` into `unknown`, or
   `unordered` when both ends share an `unordered_branch` gap. Between two
   events of one graph, only the blocks on paths from the first to the second

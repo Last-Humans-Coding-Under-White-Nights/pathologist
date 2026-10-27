@@ -954,6 +954,71 @@ fn variants_are_sibling_frames() {
         .all(|&(a, b)| graph.events[a].frame == graph.events[b].frame));
 }
 
+/// A call every configuration variant compiles is one call: its position
+/// names it in all of them, and a query from it covers each variant.
+#[test]
+fn a_call_in_several_variants_is_one_position() {
+    use trace_db::Relation::*;
+    let dir = scratch(&[
+        (
+            "BUILD.gn",
+            "source_set(\"t\") {\n  defines = [ \"BACKEND=1\", \"BACKEND=2\" ]\n}\n",
+        ),
+        (
+            "main.c",
+            "void prepare(void); void send_fast(void); void send_slow(void);\n\
+             void send(void) {\n\
+             prepare();\n\
+             #if BACKEND == 1\n\
+             send_fast();\n\
+             #elif BACKEND == 2\n\
+             send_slow();\n\
+             #endif\n\
+             prepare();\n\
+             }\n",
+        ),
+    ]);
+    let db = sequenced_db(
+        dir.path(),
+        PreprocessOptions::new()
+            .with_explore(true)
+            .with_explore_budget(4),
+    );
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let variants = count(
+        &conn,
+        "SELECT COUNT(*) FROM cfg_functions cf JOIN functions f ON f.id = cf.fn_id \
+         WHERE f.name = 'send'",
+    );
+    assert!(variants >= 2, "{variants}");
+    let prepare = trace_db::resolve_event(&conn, "main.c", 3, None, Some("prepare"))
+        .expect("one call across variants");
+    assert_eq!(
+        trace_db::resolve_event(&conn, "main.c", 3, Some(1), None)
+            .expect("narrowed by column")
+            .event,
+        prepare.event
+    );
+    // From the call: one frame per variant, each holding both arms' call.
+    let graph = trace_db::sequence_graph(
+        &conn,
+        &trace_db::SequenceScope::From(prepare.clone()),
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(graph.frames.len() as i64, variants);
+    for wanted in ["send_fast", "send_slow"] {
+        assert!(graph.events.iter().any(|e| e.callee == wanted), "{wanted}");
+    }
+    // Between: every variant runs `prepare` before the closing `prepare`.
+    let last = trace_db::resolve_event(&conn, "main.c", 9, None, Some("prepare")).unwrap();
+    assert_eq!(relation(&conn, &prepare, &last), SequencedBefore);
+    assert_eq!(relation(&conn, &last, &prepare), MayFollow);
+    // An arm only one variant compiles still relates.
+    let fast = trace_db::resolve_event(&conn, "main.c", 5, None, Some("send_fast")).unwrap();
+    assert_eq!(relation(&conn, &prepare, &fast), SequencedBefore);
+}
+
 /// A thread start and an IPC proxy/stub pair (as in `ipc_basic`).
 const ASYNC_IPC: &str = "#include <thread>\n\
 void before(); void after(); void step(); void handle();\n\
@@ -1221,6 +1286,21 @@ fn loops_stay_cycles() {
         graph.events.iter().filter(|e| e.callee == "body").count(),
         1
     );
+}
+
+/// Two calls of one loop block: each iteration runs `first` before
+/// `second`, and the next iteration's `first` after this one's `second`.
+#[test]
+fn calls_of_one_loop_block_may_run_either_way() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let (first, second) = (
+        event(&conn, "loops.c", 44, "first"),
+        event(&conn, "loops.c", 45, "second"),
+    );
+    assert_eq!(first.cfg, second.cfg);
+    assert_eq!(relation(&conn, &first, &second), MayBoth);
+    assert_eq!(relation(&conn, &second, &first), MayBoth);
 }
 
 #[test]

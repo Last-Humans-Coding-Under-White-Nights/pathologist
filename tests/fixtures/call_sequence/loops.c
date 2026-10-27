@@ -34,3 +34,14 @@ void while_loop(void)
         body();
     after();
 }
+
+void first(void);
+void second(void);
+
+void loop_pair(void)
+{
+    while (more()) {
+        first();
+        second();
+    }
+}

@@ -133,7 +133,8 @@ impl Default for SequenceOptions {
     }
 }
 
-/// One `cfg_events` row, found by source position.
+/// One call found by source position: a `cfg_events` row (`event` of graph
+/// `cfg`), and the same call in the function's other variants.
 #[derive(Debug, Clone, Serialize)]
 pub struct EventRef {
     pub event: i64,
@@ -143,9 +144,22 @@ pub struct EventRef {
     pub path: String,
     pub line: i64,
     pub col: i64,
+    /// `(event, cfg)` of the call in every variant of `function` compiling
+    /// it, `(event, cfg)` first; empty means that one alone.
+    #[serde(skip)]
+    pub variants: Vec<(i64, i64)>,
 }
 
 impl EventRef {
+    /// `(event, cfg)` of each variant's copy of the call.
+    fn copies(&self) -> Vec<(i64, i64)> {
+        if self.variants.is_empty() {
+            vec![(self.event, self.cfg)]
+        } else {
+            self.variants.clone()
+        }
+    }
+
     fn display(&self) -> String {
         format!("{}() at {}", self.callee, self.position())
     }
@@ -260,6 +274,7 @@ pub fn resolve_event(
                 path: r.get(3)?,
                 line: r.get(4)?,
                 col: r.get(5)?,
+                variants: Vec::new(),
             };
             let invocation = expansion
                 .0
@@ -271,7 +286,10 @@ pub fn resolve_event(
             f.1.push(text);
         }
     }
-    let mut candidates = Vec::new();
+    // Each variant of a function compiling the call has its own copy of
+    // it: copies at one position with one callee, each in another graph of
+    // the function, are one candidate (two events of one graph stay two).
+    let mut candidates: Vec<EventRef> = Vec::new();
     let mut invocation = None;
     for (mut event, callees, expansion) in found {
         if callee.is_some_and(|want| !callees.iter().any(|c| super::names_function(c, want))) {
@@ -281,7 +299,25 @@ pub fn resolve_event(
             invocation = expansion;
         }
         event.callee = callees.into_iter().next().unwrap_or_default();
-        candidates.push(event);
+        let copy = (event.event, event.cfg);
+        let same = candidates.iter_mut().find(|c| {
+            (c.function, &c.path, c.line, c.col, &c.callee)
+                == (
+                    event.function,
+                    &event.path,
+                    event.line,
+                    event.col,
+                    &event.callee,
+                )
+                && c.variants.iter().all(|&(_, cfg)| cfg != event.cfg)
+        });
+        match same {
+            Some(c) => c.variants.push(copy),
+            None => {
+                event.variants.push(copy);
+                candidates.push(event);
+            }
+        }
     }
     match candidates.len() {
         0 => bail!("no call event at {file}:{line}{}", narrowed(col, callee)),
@@ -846,15 +882,11 @@ impl LoadedCfg {
         self.event_ids.get(&db_id).copied()
     }
 
-    /// The local index of `event`, which must belong to this graph.
-    fn event_of(&self, event: &EventRef) -> Result<usize> {
-        match self.event_by_db(event.event) {
+    /// The local index of event `db_id`, which must belong to this graph.
+    fn event_of(&self, db_id: i64) -> Result<usize> {
+        match self.event_by_db(db_id) {
             Some(e) => Ok(e),
-            None => bail!(
-                "event {} is not in call-order graph {}",
-                event.event,
-                self.cfg_id
-            ),
+            None => bail!("event {db_id} is not in call-order graph {}", self.cfg_id),
         }
     }
 
@@ -959,7 +991,8 @@ impl LoadedCfg {
     }
 
     /// How event `a`'s invocation relates to event `b`'s, both of this
-    /// graph; `forward` are the blocks `a`'s reaches ([`Self::reach`]) and
+    /// graph; `forward` are the blocks `a`'s reaches ([`Self::reach`], so
+    /// `forward[block_of(a)]` holds when that block is on a cycle) and
     /// `idom` the graph's [`Self::dominators`].
     fn relate(
         &self,
@@ -979,7 +1012,11 @@ impl LoadedCfg {
                 );
             }
         } else if ba == bb {
-            if self.order_reaches(a, b) {
+            if forward[ba] {
+                // The block is on a cycle: a later iteration's `a` follows
+                // this one's `b` whatever the block's local order.
+                Relation::MayBoth
+            } else if self.order_reaches(a, b) {
                 Relation::SequencedBefore
             } else if self.order_reaches(b, a) {
                 Relation::MayFollow
@@ -1353,10 +1390,10 @@ impl Builder<'_, '_> {
     }
 }
 
-/// The events of `from`'s graph whose calls reach graph `to` within `depth`
-/// call levels, skipping context starts and IPC bridges: those run
-/// elsewhere and order nothing.
-fn calls_reaching(loader: &mut Loader, from: usize, to: i64, depth: u32) -> Result<Vec<usize>> {
+/// The events of `from`'s graph whose calls reach one of the graphs `to`
+/// within `depth` call levels, skipping context starts and IPC bridges:
+/// those run elsewhere and order nothing.
+fn calls_reaching(loader: &mut Loader, from: usize, to: &[i64], depth: u32) -> Result<Vec<usize>> {
     let mut memo = FxHashMap::default();
     let mut found = Vec::new();
     let events: Vec<usize> = loader.cfgs[from].events_in_order().collect();
@@ -1368,13 +1405,13 @@ fn calls_reaching(loader: &mut Loader, from: usize, to: i64, depth: u32) -> Resu
     Ok(found)
 }
 
-/// Whether a call of `event` reaches graph `to` within `depth` levels;
-/// `memo` holds the answer per `(graph, depth)`.
+/// Whether a call of `event` reaches one of the graphs `to` within `depth`
+/// levels; `memo` holds the answer per `(graph, depth)`.
 fn event_reaches(
     loader: &mut Loader,
     cfg: usize,
     event: usize,
-    to: i64,
+    to: &[i64],
     depth: u32,
     memo: &mut FxHashMap<(i64, u32), bool>,
 ) -> Result<bool> {
@@ -1390,7 +1427,7 @@ fn event_reaches(
         .collect();
     for callee in callees {
         for &variant in loader.cfgs_of(callee)?.iter() {
-            if variant == to {
+            if to.contains(&variant) {
                 return Ok(true);
             }
             if depth == 1 {
@@ -1474,88 +1511,117 @@ pub fn sequence_graph(
             }
         }
         SequenceScope::From(start) => {
-            let cfg = b.loader.load(start.cfg)?;
-            let g = &b.loader.cfgs[cfg];
-            let at = g.block_of(g.event_of(start)?);
-            let mut keep = g.reach(at, true);
-            keep[at] = true;
             b.graph.scope = format!("from {}", start.display());
-            b.add_frame(cfg, None, 0, Some(&keep));
+            // One frame per variant compiling the call, as for a function.
+            for (event, cfg_id) in start.copies() {
+                let cfg = b.loader.load(cfg_id)?;
+                let g = &b.loader.cfgs[cfg];
+                let at = g.block_of(g.event_of(event)?);
+                let mut keep = g.reach(at, true);
+                keep[at] = true;
+                b.add_frame(cfg, None, 0, Some(&keep));
+            }
         }
         SequenceScope::Between(from, to) => {
-            let cfg = b.loader.load(from.cfg)?;
-            let a = b.loader.cfgs[cfg].event_of(from)?;
-            let (targets, via) = if from.cfg == to.cfg {
-                (vec![b.loader.cfgs[cfg].event_of(to)?], false)
-            } else {
-                (
-                    calls_reaching(&mut b.loader, cfg, to.cfg, options.depth)?,
-                    true,
-                )
-            };
-            let g = &b.loader.cfgs[cfg];
-            let at = g.block_of(a);
-            let forward = g.reach(at, true);
-            let mut keep = vec![false; g.graph.blocks.len()];
-            keep[at] = true;
-            for &t in &targets {
-                let tb = g.block_of(t);
-                let backward = g.reach(tb, false);
-                for (i, k) in keep.iter_mut().enumerate() {
-                    *k |= forward[i] && backward[i];
+            let to_copies = to.copies();
+            let to_cfgs: Vec<i64> = to_copies.iter().map(|&(_, cfg)| cfg).collect();
+            let from_copies = from.copies();
+            // Per variant of `from`'s function: its relations and notes,
+            // and the frame showing the blocks between the ends.
+            let mut relations = Vec::new();
+            let mut notes: Vec<String> = Vec::new();
+            let mut via: Option<(i64, String)> = None;
+            let mut unreached = 0;
+            let mut frames = Vec::new();
+            for &(event, cfg_id) in &from_copies {
+                let cfg = b.loader.load(cfg_id)?;
+                let a = b.loader.cfgs[cfg].event_of(event)?;
+                let (targets, inside) = match to_copies.iter().find(|&&(_, c)| c == cfg_id) {
+                    Some(&(t, _)) => (vec![b.loader.cfgs[cfg].event_of(t)?], false),
+                    None => (
+                        calls_reaching(&mut b.loader, cfg, &to_cfgs, options.depth)?,
+                        true,
+                    ),
+                };
+                let g = &b.loader.cfgs[cfg];
+                let at = g.block_of(a);
+                let forward = g.reach(at, true);
+                let mut keep = vec![false; g.graph.blocks.len()];
+                keep[at] = true;
+                for &t in &targets {
+                    let tb = g.block_of(t);
+                    let backward = g.reach(tb, false);
+                    for (i, k) in keep.iter_mut().enumerate() {
+                        *k |= forward[i] && backward[i];
+                    }
+                    keep[tb] = true;
                 }
-                keep[tb] = true;
+                frames.push((cfg, keep));
+                if targets.is_empty() {
+                    unreached += 1;
+                    continue;
+                }
+                // Another variant's notes are not repeated.
+                let earlier = notes.len();
+                let idom = g.dominators();
+                for &t in &targets {
+                    let (r, n) = if inside && t == a {
+                        // `to` runs inside the call `from` makes.
+                        (Relation::GuaranteedBefore, Vec::new())
+                    } else {
+                        g.relate(a, t, &forward, &idom)
+                    };
+                    relations.push(r);
+                    for n in n {
+                        if !notes[..earlier].contains(&n) {
+                            notes.push(n);
+                        }
+                    }
+                }
+                if inside && via.is_none() {
+                    via = Some((g.db_ids[targets[0]], g.events[targets[0]].loc.display()));
+                }
             }
-            let relation = if targets.is_empty() {
+            let not_reached = format!(
+                "{} is not reached from {}'s function within depth {} by calls \
+                 that run in the same execution context",
+                to.display(),
+                from.display(),
+                options.depth
+            );
+            let relation = if relations.is_empty() {
                 SeqRelation {
                     kind: Relation::Unknown,
                     from: from.clone(),
                     to: to.clone(),
                     via: None,
-                    notes: vec![format!(
-                        "{} is not reached from {}'s function within depth {} by calls \
-                         that run in the same execution context",
-                        to.display(),
-                        from.display(),
-                        options.depth
-                    )],
+                    notes: vec![not_reached],
                 }
             } else {
-                let mut notes = Vec::new();
-                let idom = g.dominators();
-                let relations: Vec<Relation> = targets
-                    .iter()
-                    .map(|&t| {
-                        let (r, n) = if via && t == a {
-                            // `to` runs inside the call `from` makes.
-                            (Relation::GuaranteedBefore, Vec::new())
-                        } else {
-                            g.relate(a, t, &forward, &idom)
-                        };
-                        notes.extend(n);
-                        r
-                    })
-                    .collect();
                 let kind = combine(&relations);
                 notes.extend(conditions(kind));
-                if via {
+                if let Some((_, at)) = &via {
+                    notes.push(format!("{} runs inside the call at {at}", to.display()));
+                }
+                if unreached > 0 {
                     notes.push(format!(
-                        "{} runs inside the call at {}",
-                        to.display(),
-                        g.events[targets[0]].loc.display()
+                        "in {unreached} of {} variants, {not_reached}",
+                        from_copies.len()
                     ));
                 }
                 SeqRelation {
                     kind,
                     from: from.clone(),
                     to: to.clone(),
-                    via: via.then(|| g.db_ids[targets[0]]),
+                    via: via.map(|(event, _)| event),
                     notes,
                 }
             };
             b.graph.scope = format!("between {} and {}", from.display(), to.display());
             b.graph.relation = Some(relation);
-            b.add_frame(cfg, None, 0, Some(&keep));
+            for (cfg, keep) in frames {
+                b.add_frame(cfg, None, 0, Some(&keep));
+            }
         }
     }
     b.expand()?;
@@ -1579,41 +1645,128 @@ pub fn render_sequence(graph: &SequenceGraph, format: crate::RenderFormat) -> Re
     })
 }
 
-/// A block's events in evaluation order, each maximal run of mutually
-/// unordered neighbours as one group.
-fn event_groups(graph: &SequenceGraph, block: usize) -> Vec<Vec<usize>> {
-    let events: Vec<usize> = graph
-        .events
-        .iter()
-        .filter(|e| e.block == block)
-        .map(|e| e.id)
-        .collect();
-    // The block's order over positions in `events`.
-    let position: FxHashMap<usize, usize> =
-        events.iter().enumerate().map(|(i, &e)| (e, i)).collect();
-    let mut next = vec![Vec::new(); events.len()];
-    for (p, q) in &graph.order {
-        if let (Some(&p), Some(&q)) = (position.get(p), position.get(q)) {
-            next[p].push(q);
+/// A graph's rows grouped by what renders them, so each view reads every
+/// row a bounded number of times.
+struct RenderIndex<'g> {
+    blocks_of_frame: Vec<Vec<&'g SeqBlock>>,
+    /// Each block's events, in event order.
+    events_of_block: Vec<Vec<usize>>,
+    /// Each event's immediate predecessors and successors, in `order`'s order.
+    before: Vec<Vec<usize>>,
+    after: Vec<Vec<usize>>,
+    /// Each block's non-call edges.
+    edges_from: Vec<Vec<&'g SeqEdge>>,
+    boundaries_of_event: Vec<Vec<&'g SeqBoundary>>,
+    /// Each frame's boundaries not tied to an event.
+    boundaries_of_frame: Vec<Vec<&'g SeqBoundary>>,
+    truncated_of_event: Vec<Vec<&'g SeqTruncation>>,
+}
+
+impl<'g> RenderIndex<'g> {
+    fn new(graph: &'g SequenceGraph) -> Self {
+        let mut index = Self {
+            blocks_of_frame: vec![Vec::new(); graph.frames.len()],
+            events_of_block: vec![Vec::new(); graph.blocks.len()],
+            before: vec![Vec::new(); graph.events.len()],
+            after: vec![Vec::new(); graph.events.len()],
+            edges_from: vec![Vec::new(); graph.blocks.len()],
+            boundaries_of_event: vec![Vec::new(); graph.events.len()],
+            boundaries_of_frame: vec![Vec::new(); graph.frames.len()],
+            truncated_of_event: vec![Vec::new(); graph.events.len()],
+        };
+        for b in &graph.blocks {
+            index.blocks_of_frame[b.frame].push(b);
+        }
+        for e in &graph.events {
+            index.events_of_block[e.block].push(e.id);
+        }
+        for &(p, q) in &graph.order {
+            index.after[p].push(q);
+            index.before[q].push(p);
+        }
+        for e in graph.edges.iter().filter(|e| e.event.is_none()) {
+            index.edges_from[e.src].push(e);
+        }
+        for b in &graph.boundaries {
+            match b.event {
+                Some(e) => index.boundaries_of_event[e].push(b),
+                None => index.boundaries_of_frame[b.frame].push(b),
+            }
+        }
+        for t in &graph.truncated {
+            if let Some(e) = t.event {
+                index.truncated_of_event[e].push(t);
+            }
+        }
+        index
+    }
+
+    /// A block's events in evaluation order, each maximal run of mutually
+    /// unordered neighbours as one group.
+    fn event_groups(&self, block: usize) -> Vec<Vec<usize>> {
+        let events = &self.events_of_block[block];
+        let position: FxHashMap<usize, usize> =
+            events.iter().enumerate().map(|(i, &e)| (e, i)).collect();
+        let next: Vec<Vec<usize>> = events
+            .iter()
+            .map(|&e| {
+                self.after[e]
+                    .iter()
+                    .filter_map(|q| position.get(q).copied())
+                    .collect()
+            })
+            .collect();
+        let mut groups = unordered_runs(&next);
+        for group in &mut groups {
+            for e in group.iter_mut() {
+                *e = events[*e];
+            }
+        }
+        groups
+    }
+}
+
+/// Positions `0..next.len()` in order, each maximal run of neighbours no
+/// order path (`next`, immediate successors) joins as one group.
+fn unordered_runs(next: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    // The latest immediate predecessor of each position, when every pair
+    // runs forward (as an evaluation order lists them).
+    let mut latest: Vec<Option<usize>> = vec![None; next.len()];
+    let mut forward = true;
+    for (p, n) in next.iter().enumerate() {
+        for &q in n {
+            forward &= p < q;
+            latest[q] = latest[q].max(Some(p));
         }
     }
+    if forward {
+        // A path from a member of the last group (contiguous, mutually
+        // unordered) to the next position would pass only through members,
+        // so it is one pair; and no path runs back. The next position
+        // joins unless a predecessor is a member.
+        let mut start = 0;
+        for (e, latest) in latest.into_iter().enumerate() {
+            if e > 0 && latest.is_none_or(|p| p < start) {
+                groups.last_mut().unwrap().push(e);
+            } else {
+                start = e;
+                groups.push(vec![e]);
+            }
+        }
+        return groups;
+    }
     let reaches = |a: usize, b: usize| {
-        let mut seen = vec![false; events.len()];
+        let mut seen = vec![false; next.len()];
         search(a, &mut seen, |x| &next[x], |y| y == b)
     };
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    for e in 0..events.len() {
+    for e in 0..next.len() {
         let joins = groups
             .last()
             .is_some_and(|g| g.iter().all(|&x| !reaches(x, e) && !reaches(e, x)));
         match groups.last_mut() {
             Some(g) if joins => g.push(e),
             _ => groups.push(vec![e]),
-        }
-    }
-    for group in &mut groups {
-        for e in group.iter_mut() {
-            *e = events[*e];
         }
     }
     groups
@@ -1636,15 +1789,10 @@ fn boundary_text(b: &SeqBoundary) -> String {
 
 /// One event; `explicit` lists its immediate predecessors, for a block whose
 /// layout alone does not show its order.
-fn event_line(graph: &SequenceGraph, e: &SeqEvent, explicit: bool) -> String {
+fn event_line(index: &RenderIndex, e: &SeqEvent, explicit: bool) -> String {
     let mut line = format!("e{} {}() {}", e.id, e.callee, e.loc.display());
-    let after: Vec<String> = graph
-        .order
-        .iter()
-        .filter(|&&(_, b)| explicit && b == e.id)
-        .map(|&(a, _)| format!("e{a}"))
-        .collect();
-    if !after.is_empty() {
+    if explicit && !index.before[e.id].is_empty() {
+        let after: Vec<String> = index.before[e.id].iter().map(|a| format!("e{a}")).collect();
         write!(line, " after {}", after.join(", ")).unwrap();
     }
     if e.kind != trace_ir::EventKind::Call.as_str() {
@@ -1661,16 +1809,17 @@ fn event_line(graph: &SequenceGraph, e: &SeqEvent, explicit: bool) -> String {
             write!(line, "  → frame {f} ({})", t.name).unwrap();
         }
     }
-    for b in graph.boundaries.iter().filter(|b| b.event == Some(e.id)) {
+    for b in &index.boundaries_of_event[e.id] {
         write!(line, "  {}", boundary_text(b)).unwrap();
     }
-    for t in graph.truncated.iter().filter(|t| t.event == Some(e.id)) {
+    for t in &index.truncated_of_event[e.id] {
         write!(line, "  … truncated ({})", t.reason).unwrap();
     }
     line
 }
 
 fn render_text(graph: &SequenceGraph) -> String {
+    let index = RenderIndex::new(graph);
     let mut out = String::new();
     writeln!(out, "call sequence {} ({})", graph.scope, graph.capability).unwrap();
     if let Some(notice) = &graph.notice {
@@ -1690,17 +1839,17 @@ fn render_text(graph: &SequenceGraph) -> String {
             write!(out, ", called at e{e}").unwrap();
         }
         writeln!(out).unwrap();
-        for b in graph.blocks.iter().filter(|b| b.frame == f.id) {
+        for b in &index.blocks_of_frame[f.id] {
             write!(out, "  b{} {}", b.id, b.kind).unwrap();
             if let Some(l) = &b.loc {
                 write!(out, " {}", l.display()).unwrap();
             }
             writeln!(out).unwrap();
-            let groups = event_groups(graph, b.id);
+            let groups = index.event_groups(b.id);
             let explicit = groups.iter().any(|g| g.len() > 1);
             for group in groups {
                 if group.len() == 1 {
-                    let line = event_line(graph, &graph.events[group[0]], explicit);
+                    let line = event_line(&index, &graph.events[group[0]], explicit);
                     writeln!(out, "    {line}").unwrap();
                     continue;
                 }
@@ -1710,14 +1859,12 @@ fn render_text(graph: &SequenceGraph) -> String {
                     .collect();
                 writeln!(out, "    {{ {} }}  (order unspecified)", names.join(", ")).unwrap();
                 for &e in &group {
-                    let line = event_line(graph, &graph.events[e], explicit);
+                    let line = event_line(&index, &graph.events[e], explicit);
                     writeln!(out, "      {line}").unwrap();
                 }
             }
-            let next: Vec<String> = graph
-                .edges
+            let next: Vec<String> = index.edges_from[b.id]
                 .iter()
-                .filter(|e| e.src == b.id && e.event.is_none())
                 .map(|e| {
                     if e.kind == EdgeKind::BackEdge.as_str() {
                         format!("↺ b{} (back_edge)", e.dst)
@@ -1740,11 +1887,7 @@ fn render_text(graph: &SequenceGraph) -> String {
             }
             writeln!(out).unwrap();
         }
-        for b in graph
-            .boundaries
-            .iter()
-            .filter(|b| b.frame == f.id && b.event.is_none())
-        {
+        for b in &index.boundaries_of_frame[f.id] {
             writeln!(out, "  {}", boundary_text(b)).unwrap();
         }
     }
@@ -1787,6 +1930,7 @@ fn render_flowchart(graph: &SequenceGraph, dot: bool) -> String {
     let block = |b: usize| graph_ident(b as i64);
     // Boundaries use the negative identifiers `graph_ident` keeps distinct.
     let leaf = |i: usize| graph_ident(-(i as i64) - 1);
+    let index = RenderIndex::new(graph);
     let mut out = String::new();
     if dot {
         writeln!(out, "digraph sequence {{").unwrap();
@@ -1804,9 +1948,9 @@ fn render_flowchart(graph: &SequenceGraph, dot: bool) -> String {
         } else {
             writeln!(out, "  subgraph f{}[\"{}\"]", f.id, escape(&title)).unwrap();
         }
-        for b in graph.blocks.iter().filter(|b| b.frame == f.id) {
+        for b in &index.blocks_of_frame[f.id] {
             let mut lines = vec![escape(&format!("b{} {}", b.id, b.kind))];
-            for group in event_groups(graph, b.id) {
+            for group in index.event_groups(b.id) {
                 let names: Vec<String> = group
                     .iter()
                     .map(|&e| format!("{}()", graph.events[e].callee))
@@ -1911,6 +2055,133 @@ mod tests {
                 plan.iter().all(|step| !step.starts_with("SCAN")),
                 "{sql}\n{plan:?}"
             );
+        }
+    }
+
+    /// Groups as defined: a position joins the last group when no order
+    /// path joins it to any member, either way.
+    fn runs_by_search(next: &[Vec<usize>]) -> Vec<Vec<usize>> {
+        let reaches = |a: usize, b: usize| {
+            let mut seen = vec![false; next.len()];
+            search(a, &mut seen, |x| &next[x], |y| y == b)
+        };
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for e in 0..next.len() {
+            match groups.last_mut() {
+                Some(g) if g.iter().all(|&x| !reaches(x, e) && !reaches(e, x)) => g.push(e),
+                _ => groups.push(vec![e]),
+            }
+        }
+        groups
+    }
+
+    #[test]
+    fn unordered_runs_agree_with_path_search() {
+        // Deterministic pseudo-random forward orders of every density.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut random = |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below
+        };
+        for round in 0..400 {
+            let n = 1 + random(24) as usize;
+            let density = 1 + random(6);
+            let mut next = vec![Vec::new(); n];
+            for (p, succ) in next.iter_mut().enumerate() {
+                for q in p + 1..n {
+                    if random(density * 2) == 0 {
+                        succ.push(q);
+                    }
+                }
+            }
+            assert_eq!(
+                unordered_runs(&next),
+                runs_by_search(&next),
+                "round {round}: {next:?}"
+            );
+        }
+        // A pair running backwards takes the general search.
+        let next = vec![vec![], vec![], vec![0], vec![]];
+        assert_eq!(unordered_runs(&next), runs_by_search(&next));
+        assert_eq!(unordered_runs(&next), [vec![0, 1], vec![2, 3]]);
+    }
+
+    /// One block of `n` events in a chain, each with a boundary: rendering
+    /// reads each row a bounded number of times (scanning the order and the
+    /// boundaries per event took minutes here).
+    #[test]
+    fn rendering_a_long_block_is_linear() {
+        let n = 40_000;
+        let loc = SeqLoc {
+            path: "a.c".into(),
+            line: 1,
+            col: 1,
+        };
+        let graph = SequenceGraph {
+            capability: "complete".into(),
+            scope: "function f".into(),
+            frames: vec![SeqFrame {
+                id: 0,
+                fn_id: 1,
+                name: "f".into(),
+                loc: None,
+                cfg_id: 1,
+                variant: 0,
+                unit: None,
+                coverage: "complete".into(),
+                gaps: Vec::new(),
+                parent_event: None,
+                entry: 0,
+                exit: 0,
+            }],
+            blocks: vec![SeqBlock {
+                id: 0,
+                frame: 0,
+                ordinal: 0,
+                kind: "ordinary".into(),
+                loc: None,
+            }],
+            events: (0..n)
+                .map(|id| SeqEvent {
+                    id,
+                    db_id: id as i64,
+                    frame: 0,
+                    block: 0,
+                    kind: "call".into(),
+                    callee: "g".into(),
+                    loc: loc.clone(),
+                    expansion: None,
+                    targets: Vec::new(),
+                    context_start: None,
+                })
+                .collect(),
+            order: (1..n).map(|e| (e - 1, e)).collect(),
+            boundaries: (0..n)
+                .map(|e| SeqBoundary {
+                    kind: "unknown_callee".into(),
+                    frame: 0,
+                    event: Some(e),
+                    fn_id: None,
+                    name: None,
+                    reason: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for format in [crate::RenderFormat::Text, crate::RenderFormat::Mermaid] {
+                let _ = tx.send(render_sequence(&graph, format).map(|out| out.len()));
+            }
+        });
+        for _ in 0..2 {
+            let len = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("rendering finishes")
+                .unwrap();
+            assert!(len > n);
         }
     }
 }
