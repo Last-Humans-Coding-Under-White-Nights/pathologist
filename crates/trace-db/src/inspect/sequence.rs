@@ -148,13 +148,59 @@ impl EventRef {
 
 #[derive(Debug, Clone)]
 pub enum SequenceScope {
-    /// Every variant of a function's body.
-    Function(i64),
+    /// The variants of a function's body; with `file`, those compiled from
+    /// or written in a file matching it (all of them when none is).
+    Function { function: i64, file: Option<String> },
     /// The part of an event's body reachable from it.
     From(EventRef),
     /// The blocks on paths from the first event to the second, and their
     /// relation.
     Between(EventRef, EventRef),
+}
+
+/// The function `name` names (as `resolve_function_target`), its bodies
+/// narrowed to `file`. Units that each define one external function share
+/// its row, which records only the first definition's file, so `file` may
+/// name a body rather than the function.
+pub fn resolve_sequence_function(
+    conn: &Connection,
+    name: &str,
+    file: Option<&str>,
+) -> Result<SequenceScope> {
+    require_sequencing(conn)?;
+    let function = match super::resolve_function_target(conn, Some(name), file, None) {
+        Ok(f) => f.id,
+        Err(err) => {
+            let Some(file) = file else { return Err(err) };
+            match super::resolve_function_target(conn, Some(name), None, None) {
+                Ok(f) if !variants_in(conn, f.id, file)?.is_empty() => f.id,
+                _ => return Err(err),
+            }
+        }
+    };
+    Ok(SequenceScope::Function {
+        function,
+        file: file.map(str::to_owned),
+    })
+}
+
+/// The graphs of `function` compiled from, or with a block written in, a
+/// file whose path contains `file`.
+fn variants_in(conn: &Connection, function: i64, file: &str) -> Result<Vec<i64>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT cf.id FROM cfg_functions cf \
+             LEFT JOIN files t ON t.id = cf.tu_file_id \
+             WHERE cf.fn_id = ?1 AND (t.path LIKE ?2 ESCAPE '!' OR EXISTS ( \
+                 SELECT 1 FROM cfg_blocks b JOIN files f ON f.id = b.file_id \
+                 WHERE b.cfg_id = cf.id AND f.path LIKE ?2 ESCAPE '!')) \
+             ORDER BY cf.variant, cf.id",
+        )?
+        .query_map(
+            rusqlite::params![function, super::contains_pattern(file)],
+            |r| r.get(0),
+        )?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// The event written at `file:line` (spelling or macro expansion position),
@@ -171,8 +217,12 @@ pub fn resolve_event(
     }
     require_sequencing(conn)?;
     let pattern = super::contains_pattern(file);
+    // A call spelled in a macro body matches by spelling at every
+    // invocation; its invocation position is kept to suggest instead.
     let mut stmt = conn.prepare(
-        "SELECT e.id, e.cfg_id, cf.fn_id, f.path, e.line, e.col \
+        "SELECT e.id, e.cfg_id, cf.fn_id, f.path, e.line, e.col, \
+                CASE WHEN e.line = ?1 AND f.path LIKE ?2 ESCAPE '!' THEN x.path END, \
+                e.expansion_line \
          FROM cfg_events e \
          JOIN cfg_functions cf ON cf.id = e.cfg_id \
          JOIN files f ON f.id = e.file_id \
@@ -182,7 +232,8 @@ pub fn resolve_event(
                  AND (?3 IS NULL OR e.expansion_col = ?3))) \
          ORDER BY e.id",
     )?;
-    let rows: Vec<(i64, i64, i64, String, i64, i64)> = stmt
+    type Row = (i64, i64, i64, String, i64, i64, Option<String>, Option<i64>);
+    let rows: Vec<Row> = stmt
         .query_map(rusqlite::params![line, pattern, col], |r| {
             Ok((
                 r.get(0)?,
@@ -191,11 +242,14 @@ pub fn resolve_event(
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mut candidates = Vec::new();
-    for (event, cfg, function, path, line, col) in rows {
+    let mut invocation = None;
+    for (event, cfg, function, path, line, col, expansion_path, expansion_line) in rows {
         let callees = event_callees(conn, event)?;
         let matches = callee.is_none_or(|want| {
             callees
@@ -203,6 +257,9 @@ pub fn resolve_event(
                 .any(|c| c == want || c.ends_with(&format!("::{want}")))
         });
         if matches {
+            if let (None, Some(path), Some(line)) = (&invocation, expansion_path, expansion_line) {
+                invocation = Some(format!("{}:{line}", super::basename(&path)));
+            }
             candidates.push(EventRef {
                 event,
                 cfg,
@@ -217,23 +274,41 @@ pub fn resolve_event(
     match candidates.len() {
         0 => bail!("no call event at {file}:{line}{}", narrowed(col, callee)),
         1 => Ok(candidates.remove(0)),
-        n => bail!(
-            "{n} call events at {file}:{line}{}: {}; pick one with --col or --callee",
-            narrowed(col, callee),
-            candidates
+        n => {
+            let mut listed = candidates
                 .iter()
-                .map(|c| format!(
-                    "{} at {}:{}:{}",
-                    c.callee,
-                    super::basename(&c.path),
-                    c.line,
-                    c.col
-                ))
+                .take(MAX_LISTED_CANDIDATES)
+                .map(|c| {
+                    format!(
+                        "{} at {}:{}:{}",
+                        c.callee,
+                        super::basename(&c.path),
+                        c.line,
+                        c.col
+                    )
+                })
                 .collect::<Vec<_>>()
-                .join(", ")
-        ),
+                .join(", ");
+            if n > MAX_LISTED_CANDIDATES {
+                write!(listed, ", and {} more", n - MAX_LISTED_CANDIDATES).unwrap();
+            }
+            let hint = match invocation {
+                Some(at) => format!(
+                    "; calls spelled in a macro body match at every invocation, \
+                     so name the invocation's position (such as {at})"
+                ),
+                None => String::new(),
+            };
+            bail!(
+                "{n} call events at {file}:{line}{}: {listed}; pick one with --col or --callee{hint}",
+                narrowed(col, callee),
+            )
+        }
     }
 }
+
+/// Candidates an ambiguous position error lists before counting the rest.
+const MAX_LISTED_CANDIDATES: usize = 10;
 
 fn narrowed(col: Option<i64>, callee: Option<&str>) -> String {
     let mut out = String::new();
@@ -1370,8 +1445,14 @@ pub fn sequence_graph(
         frame_depth: Vec::new(),
     };
     match scope {
-        SequenceScope::Function(function) => {
-            let variants = b.loader.cfgs_of(*function)?;
+        SequenceScope::Function { function, file } => {
+            let mut variants = b.loader.cfgs_of(*function)?;
+            if let Some(file) = file {
+                let narrowed = variants_in(conn, *function, file)?;
+                if !narrowed.is_empty() {
+                    variants = narrowed;
+                }
+            }
             let name: Option<(String, i64, i64)> = conn
                 .query_row(
                     "SELECT name, is_defined, is_dep FROM functions WHERE id = ?1",
@@ -1395,7 +1476,10 @@ pub fn sequence_graph(
                     omitted_reason(&target)
                 );
             }
-            b.graph.scope = format!("function {name}");
+            b.graph.scope = match file {
+                Some(file) => format!("function {name} in {file}"),
+                None => format!("function {name}"),
+            };
             for variant in variants {
                 let cfg = b.loader.load(variant)?;
                 b.add_frame(cfg, None, 0, None);

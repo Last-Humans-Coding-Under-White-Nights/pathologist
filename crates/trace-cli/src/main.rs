@@ -310,7 +310,7 @@ enum InspectCommands {
         #[arg(long, conflicts_with_all = ["line", "col", "callee"])]
         function: Option<String>,
         /// File path substring locating the starting call (or narrowing
-        /// `--function`).
+        /// `--function` to the bodies compiled from or written in it).
         #[arg(long)]
         file: Option<String>,
         /// Line of the starting call (its spelling or macro invocation).
@@ -1185,13 +1185,7 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             trace_db::require_sequencing(&conn)?;
             let scope = match (function, file, line) {
                 (Some(name), file, _) => {
-                    let f = trace_db::resolve_function_target(
-                        &conn,
-                        Some(&name),
-                        file.as_deref(),
-                        None,
-                    )?;
-                    trace_db::SequenceScope::Function(f.id)
+                    trace_db::resolve_sequence_function(&conn, &name, file.as_deref())?
                 }
                 (None, Some(file), Some(line)) => {
                     let from = trace_db::resolve_event(&conn, &file, line, col, callee.as_deref())?;

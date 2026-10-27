@@ -5075,6 +5075,14 @@ A gap or boundary is uncertainty, never evidence for an order.
 [README](../README.md#trace-inspect-sequence)) checks the capability marker
 first, then loads graphs only as it reaches them:
 
+- **Starting point.** `--function` names a function as the other inspect
+  commands do; with `--file`, only the variants compiled from (`tu_file_id`)
+  or written in (a block's file) a matching file are shown. Units that each
+  define one external function share its row, which records the first
+  definition's file, so `--file` may name another unit's body. A position
+  (`--file`/`--line`) matching several events is an error listing at most
+  ten of them with the count of the rest; when they were matched at a macro
+  body's spelling, it names an invocation position to use instead.
 - **Frames.** Each graph shown is a frame: every variant of the starting
   function, then one frame per inlined (event, target variant) pair, breadth
   first in event order up to `--depth` call levels. A `call` edge joins the
@@ -5113,8 +5121,8 @@ first, then loads graphs only as it reaches them:
   `may_both`.
 - A call spelled in a macro body shares its spelling position with every
   expansion of that macro (`DealFormat` in HDF's `HDF_LOG_WRAPPER`: 14,852
-  events), so a query position there is ambiguous; name the invocation
-  position instead.
+  events), so a query position there is ambiguous; the error suggests an
+  invocation position to name instead.
 - C API exposure of the query is a follow-up.
 
 Measured indexing, storage and query cost:

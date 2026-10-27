@@ -551,7 +551,10 @@ fn function_sequence(
     let function = trace_db::resolve_function_target(conn, Some(name), file, None).unwrap();
     trace_db::sequence_graph(
         conn,
-        &trace_db::SequenceScope::Function(function.id),
+        &trace_db::SequenceScope::Function {
+            function: function.id,
+            file: None,
+        },
         options,
     )
     .expect("sequence")
@@ -692,6 +695,55 @@ fn ambiguous_position_lists_the_candidates() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("no call event"), "{err}");
+}
+
+#[test]
+fn file_narrows_a_function_to_the_bodies_written_there() {
+    let conn = fixture_db();
+    // `straight.c` and `branches.c` both define an external `run`: one
+    // function row, one graph per body.
+    let in_file = |file| {
+        let scope = trace_db::resolve_sequence_function(&conn, "run", file).unwrap();
+        trace_db::sequence_graph(&conn, &scope, &Default::default()).unwrap()
+    };
+    let graph = in_file(Some("branches.c"));
+    assert_eq!(graph.frames.len(), 1);
+    assert_eq!(callees(&graph), ["prepare", "send", "recover", "finish"]);
+    let graph = in_file(Some("straight.c"));
+    assert_eq!(graph.frames.len(), 1);
+    assert_eq!(callees(&graph), ["prepare", "work", "finish"]);
+    assert_eq!(in_file(None).frames.len(), 2);
+    let err = trace_db::resolve_sequence_function(&conn, "run", Some("loops.c"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("run") && err.contains("loops.c"), "{err}");
+}
+
+#[test]
+fn ambiguous_macro_body_position_is_capped_and_points_at_invocations() {
+    let calls: String = (0..15).map(|_| "    LOG(a());\n").collect();
+    let dir = scratch(&[
+        ("log.h", "void log_it(int v);\n#define LOG(e) log_it(e)\n"),
+        (
+            "main.c",
+            &format!("#include \"log.h\"\nint a(void);\nvoid many(void)\n{{\n{calls}}}\n"),
+        ),
+    ]);
+    let db = sequenced_db(dir.path(), default_opts(dir.path()));
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let err = trace_db::resolve_event(&conn, "log.h", 2, None, Some("log_it"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.starts_with("15 call events"), "{err}");
+    assert_eq!(err.matches("log_it at").count(), 10, "{err}");
+    assert!(err.contains("and 5 more"), "{err}");
+    assert!(
+        err.contains("macro") && err.contains("main.c:5"),
+        "suggests the invocation position: {err}"
+    );
+    // The invocation position names one event.
+    let at = trace_db::resolve_event(&conn, "main.c", 5, None, Some("log_it")).unwrap();
+    assert_eq!(at.callee, "log_it");
 }
 
 #[test]
@@ -1110,6 +1162,18 @@ fn cli_inspect_sequence_end_to_end() {
     );
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(value["relation"]["kind"], "exclusive");
+
+    let out = run(&db, &["--function", "run", "--file", "branches.c"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("send()") && !text.contains("work()"),
+        "{text}"
+    );
 
     let plain = crate::common::cli_analyze(&root, &[]);
     let out = run(&plain, &["--function", "run"]);

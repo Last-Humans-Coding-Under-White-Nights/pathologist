@@ -377,7 +377,7 @@ trace inspect <DB> sequence (--function FN | --file SUBSTR --line N [--col C] [-
 
 | Option | Description |
 |--------|-------------|
-| `--function <FN>` | Function name, C++ qualified suffix, or `FILE:LINE`; `--file` narrows a name. |
+| `--function <FN>` | Function name, C++ qualified suffix, or `FILE:LINE`; `--file` narrows a name, and shows only the bodies compiled from or written in that file. |
 | `--file <SUBSTR>`, `--line <N>` | Position of the starting call: its spelling or its macro invocation. |
 | `--col <C>`, `--callee <NAME>` | Pick one call when the line holds several (`NAME` or a `::NAME` suffix). |
 | `--to-file`, `--to-line`, `--to-col`, `--to-callee` | The second call: show the paths between the two and report their relation. |

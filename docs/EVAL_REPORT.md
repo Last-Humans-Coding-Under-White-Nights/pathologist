@@ -113,7 +113,8 @@ The five HDF `between` queries that failed started or ended at a call spelled
 in a logging macro's body (`DealFormat` or `udk_log` in `HDF_LOG_WRAPPER`,
 `hdf_log_adapter.h:35` and `:36`). Each of those spelling positions is shared
 by 14,852 events, so the query correctly reports an ambiguous position. The
-error also lists all 14,852 candidates, which is unreadably long. Naming the
+error first listed all 14,852 candidates; it now lists ten, counts the rest,
+and suggests an invocation position. Naming the
 invocation position instead (`--file`/`--line` of the macro use, with
 `--callee DealFormat` and `--to-callee udk_log`) resolves both calls. The
 relation it reports is `may_both`, not `may_precede`: the macro's

@@ -2853,7 +2853,10 @@ fn mixed_inputs_merge_into_partial_sequencing_with_a_diagnostic() {
     let run = trace_db::resolve_function_target(&conn, Some("run"), None, None).unwrap();
     let graph = trace_db::sequence_graph(
         &conn,
-        &trace_db::SequenceScope::Function(run.id),
+        &trace_db::SequenceScope::Function {
+            function: run.id,
+            file: None,
+        },
         &Default::default(),
     )
     .unwrap();
