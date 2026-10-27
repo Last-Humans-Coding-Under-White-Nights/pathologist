@@ -2196,6 +2196,10 @@ fn expand_virtual_overrides(program: &mut Program) {
                 receiver: cs.receiver,
                 tu: cs.tu,
             });
+            // Another target of the same invocation, not another call.
+            if program.call_sequencing {
+                program.attach_alternative_site(cs.id, call_id);
+            }
         }
     }
 }

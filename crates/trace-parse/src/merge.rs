@@ -1285,6 +1285,37 @@ fn merge_unit(
         call_map.insert(old, new_id);
     }
 
+    for cfg in &unit.cfgs {
+        if dropped_fns.contains(&cfg.function) {
+            continue;
+        }
+        let Some(&function) = fn_map.get(&cfg.function) else {
+            continue;
+        };
+        // The gates of this unit's return flows: no dependency body, and only
+        // internal C++ bodies from a header's symbols-only merge.
+        let Some(owner) = program.symbols.function_by_id(function) else {
+            continue;
+        };
+        if program.is_dep_file(owner.file)
+            || (matches!(mode, MergeMode::SymbolsOnly)
+                && !(owner.linkage == trace_ir::Linkage::Internal && owner.is_cpp))
+        {
+            continue;
+        }
+        let tu = unit_of(owner.file);
+        let mut merged = remap_cfg(cfg, function, &call_map, map_file);
+        let variants = program.cfgs.entry(function).or_default();
+        // The first copy of a body is kept; one a unit or configuration
+        // compiles differently is another variant, never unioned.
+        if variants.iter().any(|v| v.structurally_equal(&merged)) {
+            continue;
+        }
+        merged.tu = Some(tu);
+        merged.variant = variants.len() as u32;
+        variants.push(merged);
+    }
+
     let valid_flow = |flow: &FlowConstraint| {
         flow.vars().all(|v| var_map.contains_key(&v))
             && flow_fns(flow).all(|f| fn_map.contains_key(&f))
@@ -1490,6 +1521,116 @@ fn merge_unit(
         } else {
             target.extend(remapped);
         }
+    }
+}
+
+/// `cfg` in the merged program's ids: `function` for its function, sites
+/// through `call_map`, files through `map_file`. An event left with no site
+/// is spliced out of its block and the local order, and an `omitted_sites`
+/// gap marks where it was (docs/ANALYSIS.md, "Call sequencing").
+fn remap_cfg(
+    cfg: &trace_ir::FunctionCfg,
+    function: FnId,
+    call_map: &FxHashMap<CallSiteId, CallSiteId>,
+    map_file: impl Fn(trace_ir::FileId) -> trace_ir::FileId,
+) -> trace_ir::FunctionCfg {
+    use trace_ir::{EventId, Gap, GapKind, Span};
+    let map_span = |span: Span| Span {
+        file: map_file(span.file),
+        ..span
+    };
+    let mut events = Vec::with_capacity(cfg.events.len());
+    // Old event index -> new id, `None` once spliced out.
+    let mut renumber: Vec<Option<EventId>> = Vec::with_capacity(cfg.events.len());
+    let mut omitted = Vec::new();
+    for event in &cfg.events {
+        let mut sites: Vec<CallSiteId> = event
+            .sites
+            .iter()
+            .filter_map(|s| call_map.get(s).copied())
+            .collect();
+        // Coalesced records of one invocation name one merged site.
+        let mut seen = FxHashSet::default();
+        sites.retain(|s| seen.insert(*s));
+        let mut occurrence = event.occurrence;
+        occurrence.span = map_span(occurrence.span);
+        occurrence.expansion_span = occurrence.expansion_span.map(map_span);
+        if sites.is_empty() {
+            renumber.push(None);
+            omitted.push(occurrence.span);
+            continue;
+        }
+        renumber.push(Some(EventId(events.len() as u32)));
+        events.push(trace_ir::CallEvent {
+            block: event.block,
+            kind: event.kind,
+            occurrence,
+            sites,
+        });
+    }
+    let mut order = cfg.order.clone();
+    // Join each spliced event's predecessors to its successors, so the
+    // events around it keep their order.
+    for (old, new) in renumber.iter().enumerate() {
+        if new.is_some() {
+            continue;
+        }
+        let x = EventId(old as u32);
+        let preds: Vec<EventId> = order.iter().filter(|p| p.1 == x).map(|p| p.0).collect();
+        let succs: Vec<EventId> = order.iter().filter(|p| p.0 == x).map(|p| p.1).collect();
+        order.retain(|p| p.0 != x && p.1 != x);
+        for &p in &preds {
+            for &s in &succs {
+                if !order.contains(&(p, s)) {
+                    order.push((p, s));
+                }
+            }
+        }
+    }
+    let at = |e: EventId| renumber[e.0 as usize];
+    let order = order
+        .into_iter()
+        .filter_map(|(a, b)| Some((at(a)?, at(b)?)))
+        .collect();
+    let blocks = cfg
+        .blocks
+        .iter()
+        .map(|b| trace_ir::Block {
+            kind: b.kind,
+            span: b.span.map(map_span),
+            events: b.events.iter().filter_map(|&e| at(e)).collect(),
+        })
+        .collect();
+    let mut gaps: Vec<Gap> = cfg
+        .gaps
+        .iter()
+        .map(|g| Gap {
+            kind: g.kind,
+            span: g.span.map(map_span),
+            // The range shrinks to the events still in it.
+            events: g.events.and_then(|(first, last)| {
+                let kept = || (first.0..=last.0).filter_map(|e| at(EventId(e)));
+                Some((kept().next()?, kept().next_back()?))
+            }),
+        })
+        .collect();
+    gaps.extend(omitted.into_iter().map(|span| Gap {
+        kind: GapKind::OmittedSites,
+        span: Some(span),
+        events: None,
+    }));
+    trace_ir::FunctionCfg {
+        function,
+        tu: cfg.tu,
+        variant: cfg.variant,
+        entry: cfg.entry,
+        exit: cfg.exit,
+        exceptional_exit: cfg.exceptional_exit,
+        blocks,
+        edges: cfg.edges.clone(),
+        events,
+        order,
+        gaps,
     }
 }
 
@@ -3120,5 +3261,207 @@ mod tests {
             let program = merge_all(&[("a.cpp", spec), ("b.cpp", reader)]);
             assert_eq!(members_named(&program, name).len(), 2, "{why}");
         }
+    }
+
+    /// An event whose every site the merge dropped leaves its block and the
+    /// local order; its neighbours stay ordered and a gap marks the hole.
+    #[test]
+    fn remap_cfg_splices_events_whose_sites_vanished() {
+        use trace_ir::{
+            Block, BlockId, BlockKind, CallEvent, CallOccurrence, CfgEdge, EdgeKind, EventId,
+            EventKind, FunctionCfg, Gap, GapKind, Span,
+        };
+        let event = |line: u32, sites: &[u32]| CallEvent {
+            block: BlockId(2),
+            kind: EventKind::Call,
+            occurrence: CallOccurrence {
+                span: Span::new(trace_ir::FileId(0), line, 5),
+                expansion_span: None,
+                expansion_id: 0,
+            },
+            sites: sites.iter().map(|&s| CallSiteId(s)).collect(),
+        };
+        let block = |kind, events: &[u32]| Block {
+            kind,
+            span: None,
+            events: events.iter().map(|&e| EventId(e)).collect(),
+        };
+        let cfg = FunctionCfg {
+            function: FnId(3),
+            tu: None,
+            variant: 0,
+            entry: BlockId(0),
+            exit: BlockId(1),
+            exceptional_exit: None,
+            blocks: vec![
+                block(BlockKind::Entry, &[]),
+                block(BlockKind::Exit, &[]),
+                block(BlockKind::Ordinary, &[0, 1, 2]),
+            ],
+            edges: vec![
+                CfgEdge {
+                    from: BlockId(0),
+                    to: BlockId(2),
+                    kind: EdgeKind::Fallthrough,
+                },
+                CfgEdge {
+                    from: BlockId(2),
+                    to: BlockId(1),
+                    kind: EdgeKind::Fallthrough,
+                },
+            ],
+            // `a(); m(); b();` with the second site of `a` gone too.
+            events: vec![event(1, &[10, 11]), event(2, &[12]), event(3, &[13])],
+            order: vec![(EventId(0), EventId(1)), (EventId(1), EventId(2))],
+            gaps: vec![Gap {
+                kind: GapKind::ParseError,
+                span: None,
+                events: Some((EventId(0), EventId(2))),
+            }],
+        };
+        let call_map: FxHashMap<CallSiteId, CallSiteId> = [
+            (CallSiteId(10), CallSiteId(20)),
+            (CallSiteId(13), CallSiteId(23)),
+        ]
+        .into_iter()
+        .collect();
+        let file = trace_ir::FileId(9);
+        let merged = remap_cfg(&cfg, FnId(30), &call_map, |_| file);
+        assert_eq!(merged.function, FnId(30));
+        assert_eq!(merged.events.len(), 2);
+        assert_eq!(merged.events[0].sites, [CallSiteId(20)]);
+        assert_eq!(merged.events[1].sites, [CallSiteId(23)]);
+        assert_eq!(merged.events[1].occurrence.span, Span::new(file, 3, 5));
+        assert_eq!(merged.blocks[2].events, [EventId(0), EventId(1)]);
+        assert_eq!(merged.order, [(EventId(0), EventId(1))]);
+        assert_eq!(
+            merged.gaps,
+            [
+                Gap {
+                    kind: GapKind::ParseError,
+                    span: None,
+                    events: Some((EventId(0), EventId(1))),
+                },
+                Gap {
+                    kind: GapKind::OmittedSites,
+                    span: Some(Span::new(file, 2, 5)),
+                    events: None,
+                },
+            ]
+        );
+    }
+
+    /// A unit `/src/main.cpp` whose one function `body`, written in
+    /// `files[at]`, has an event-free graph.
+    fn sequenced_body_unit(files: &[&str], at: u32, linkage: trace_ir::Linkage) -> UnitIndex {
+        use trace_ir::{Block, BlockId, BlockKind, CfgEdge, EdgeKind, FunctionCfg};
+        let file = trace_ir::FileId(at);
+        let block = |kind| Block {
+            kind,
+            span: None,
+            events: Vec::new(),
+        };
+        UnitIndex {
+            path: PathBuf::from(files[0]),
+            files: files.iter().map(PathBuf::from).collect(),
+            functions: vec![Function {
+                is_weak: false,
+                target: None,
+                id: FnId(1),
+                name: "body".into(),
+                linkage,
+                return_type: TypeId(0),
+                params: Vec::new(),
+                locals: Vec::new(),
+                span: trace_ir::Span::new(file, 3, 1),
+                end_line: 5,
+                file,
+                is_defined: true,
+                param_type_ids: Vec::new(),
+                explicit_arity: Some(0),
+                default_args: 0,
+                reference_params: Vec::new(),
+                owner_unresolved: false,
+                variadic: false,
+                defaulted_in_class: false,
+                declared_in_class: false,
+                is_static_member: false,
+                is_virtual: false,
+                is_final: false,
+                is_cpp: true,
+                c_linkage: false,
+                tu: None,
+            }],
+            cfgs: vec![FunctionCfg {
+                function: FnId(1),
+                tu: None,
+                variant: 0,
+                entry: BlockId(0),
+                exit: BlockId(1),
+                exceptional_exit: None,
+                blocks: vec![block(BlockKind::Entry), block(BlockKind::Exit)],
+                edges: vec![CfgEdge {
+                    from: BlockId(0),
+                    to: BlockId(1),
+                    kind: EdgeKind::Fallthrough,
+                }],
+                events: Vec::new(),
+                order: Vec::new(),
+                gaps: Vec::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merged_cfg_records_its_function_and_unit() {
+        let mut program = Program::default();
+        let unit = sequenced_body_unit(&["/src/main.cpp"], 0, trace_ir::Linkage::External);
+        merge_unit_index(&mut program, &unit);
+        let (&function, graphs) = program.cfgs.iter().next().expect("graph merged");
+        assert_eq!(program.symbols.function(function).name, "body");
+        assert_eq!(graphs.len(), 1);
+        assert_eq!(graphs[0].function, function);
+        let tu = graphs[0].tu.expect("unit recorded");
+        assert_eq!(
+            program.symbols.files[tu.0 as usize].path,
+            Path::new("/src/main.cpp")
+        );
+        // The same body merged again is the same graph.
+        merge_unit_index(&mut program, &unit);
+        assert_eq!(program.cfgs.values().map(Vec::len).sum::<usize>(), 1);
+    }
+
+    /// A body in a dependency root keeps no graph, whatever unit lowered it.
+    #[test]
+    fn dependency_body_keeps_no_cfg() {
+        let mut program = Program::default();
+        program
+            .symbols
+            .set_dep_roots(vec![PathBuf::from("/nonexistent-dep")]);
+        let unit = sequenced_body_unit(
+            &["/src/main.cpp", "/nonexistent-dep/api.h"],
+            1,
+            trace_ir::Linkage::External,
+        );
+        merge_unit_index(&mut program, &unit);
+        assert!(program.cfgs.is_empty(), "{:?}", program.cfgs);
+    }
+
+    /// A header's symbols-only merge keeps the bodies whose call sites it
+    /// keeps: internal C++ ones.
+    #[test]
+    fn symbols_only_merge_keeps_internal_cpp_cfgs_only() {
+        let mut program = Program::default();
+        merge_unit_symbols(
+            &mut program,
+            &sequenced_body_unit(&["/src/a.h"], 0, trace_ir::Linkage::External),
+        );
+        assert!(program.cfgs.is_empty());
+        merge_unit_symbols(
+            &mut program,
+            &sequenced_body_unit(&["/src/b.h"], 0, trace_ir::Linkage::Internal),
+        );
+        assert_eq!(program.cfgs.len(), 1);
     }
 }
