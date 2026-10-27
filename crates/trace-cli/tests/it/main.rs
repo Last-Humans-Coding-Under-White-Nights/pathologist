@@ -3,6 +3,7 @@ mod common;
 
 mod adversarial_cases;
 mod analysis_tests;
+mod call_sequence;
 mod call_sites;
 mod callback_declarations;
 mod callback_models;

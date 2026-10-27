@@ -508,6 +508,7 @@ fn build_program_inner(
     program.explore = opts.explore;
     program.explore_budget = opts.explore_budget;
     program.ignored_macros = opts.ignored_macros.clone();
+    program.call_sequencing = opts.call_sequencing;
 
     // A dependency root contributes headers only: its sources are never
     // translation units, even when the root sits inside the analyzed tree,
@@ -1243,7 +1244,7 @@ fn build_program_inner(
                     index_language(path, &cpp_parse, no_c_units, forced_language),
                     Some(&header_ir_map),
                     &header_order,
-                    &opts.ignored_macros,
+                    opts,
                 );
                 push_header_ir(
                     &mut header_ir_map,
@@ -1274,7 +1275,7 @@ fn build_program_inner(
                                 index_language(path, &cpp_parse, no_c_units, forced_language),
                                 Some(snapshot),
                                 &header_order,
-                                &opts.ignored_macros,
+                                opts,
                             ),
                         )
                     })
@@ -1310,7 +1311,7 @@ fn build_program_inner(
                 index_language(&path, &cpp_parse, no_c_units, forced_language),
                 Some(&header_ir_map),
                 &header_order,
-                &opts.ignored_macros,
+                opts,
             );
             push_header_ir(
                 &mut header_ir_map,
@@ -2664,7 +2665,7 @@ fn index_header_variant(
     language: Language,
     header_ir: Option<&HeaderIr>,
     pch_order: &HeaderOrder,
-    ignored_macros: &[String],
+    opts: &PreprocessOptions,
 ) -> UnitIndex {
     let expansion = cache.read().ok().and_then(|guard| {
         guard
@@ -2679,8 +2680,7 @@ fn index_header_variant(
         };
     };
     let pre = Arc::new(PreprocessedSource::from_expansion(&expansion, language));
-    let mut program = Program::new(root.to_path_buf());
-    program.ignored_macros = ignored_macros.to_vec();
+    let mut program = unit_program(root, opts);
     match lower_prepared_source(
         &mut program,
         path,
@@ -2757,8 +2757,7 @@ fn index_source_file(
     header_ir: Option<&HeaderIr>,
     pch_order: &HeaderOrder,
 ) -> UnitIndex {
-    let mut program = Program::new(root.to_path_buf());
-    program.ignored_macros = index_opts.ignored_macros.clone();
+    let mut program = unit_program(root, index_opts);
     match process_indexed_file(
         &mut program,
         path,
@@ -2868,8 +2867,7 @@ fn index_source_file_with_variants(
         var_opts.defines.extend(variant.defines.iter().cloned());
         match source_cache.preprocess_uncached(path, graph, &var_opts) {
             Ok((var_pre, _)) => {
-                let mut var_program = Program::new(root.to_path_buf());
-                var_program.ignored_macros = var_opts.ignored_macros.clone();
+                let mut var_program = unit_program(root, &var_opts);
                 match lower_prepared_source(
                     &mut var_program,
                     path,
@@ -3299,6 +3297,14 @@ fn resolve_pending_fn_refs(program: &mut Program, ctx: &mut LowerContext) {
     }
 }
 
+/// An empty per-unit program carrying the options lowering reads from it.
+fn unit_program(root: &Path, opts: &PreprocessOptions) -> Program {
+    let mut program = Program::new(root.to_path_buf());
+    program.ignored_macros = opts.ignored_macros.clone();
+    program.call_sequencing = opts.call_sequencing;
+    program
+}
+
 fn program_into_unit(
     path: PathBuf,
     mut program: Program,
@@ -3341,6 +3347,7 @@ fn program_into_unit(
         anonymous_final_classes: std::mem::take(&mut program.anonymous_final_classes),
         anonymous_bases: std::mem::take(&mut program.anonymous_bases),
         namespaces: std::mem::take(&mut program.namespaces),
+        cfgs: program.cfgs.into_values().flatten().collect(),
         merge_descs: Vec::new(),
     }
 }
@@ -22181,5 +22188,45 @@ mod call_args_tests {
         assert_eq!(args.argc, 2);
         assert_eq!(args.arg_desc.len(), 2);
         assert_eq!(args.null_constants, [true, false]);
+    }
+}
+
+#[cfg(test)]
+mod unit_program_tests {
+    use super::*;
+
+    #[test]
+    fn a_unit_program_carries_the_lowering_options() {
+        let opts = PreprocessOptions::new()
+            .with_ignored_macros(["LOG*".to_string()])
+            .with_call_sequencing(true);
+        let program = unit_program(Path::new("/t"), &opts);
+        assert_eq!(program.root, Path::new("/t"));
+        assert_eq!(program.ignored_macros, ["LOG*"]);
+        assert!(program.call_sequencing);
+        assert!(!unit_program(Path::new("/t"), &PreprocessOptions::new()).call_sequencing);
+    }
+
+    #[test]
+    fn a_unit_takes_the_program_cfgs_in_function_order() {
+        let cfg = |function: u32| trace_ir::FunctionCfg {
+            function: FnId(function),
+            tu: None,
+            variant: 0,
+            entry: trace_ir::BlockId(0),
+            exit: trace_ir::BlockId(1),
+            exceptional_exit: None,
+            blocks: Vec::new(),
+            edges: Vec::new(),
+            events: Vec::new(),
+            order: Vec::new(),
+            gaps: Vec::new(),
+        };
+        let mut program = Program::new(PathBuf::from("/t"));
+        program.cfgs.insert(FnId(3), vec![cfg(3)]);
+        program.cfgs.insert(FnId(1), vec![cfg(1)]);
+        let unit = program_into_unit(PathBuf::from("/t/a.c"), program, None);
+        let functions: Vec<FnId> = unit.cfgs.iter().map(|c| c.function).collect();
+        assert_eq!(functions, [FnId(1), FnId(3)]);
     }
 }

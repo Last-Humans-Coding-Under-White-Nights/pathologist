@@ -115,6 +115,10 @@ enum Commands {
         /// Maximum number of configuration variants to explore per translation unit (#59).
         #[arg(long, default_value_t = 4)]
         explore_budget: usize,
+        /// Record per-function call-order graphs for `inspect sequence`
+        /// (opt-in; see docs/ANALYSIS.md, "Call sequencing").
+        #[arg(long)]
+        sequencing: bool,
         /// Solver work budget in worklist pops. The default scales with the
         /// PAG constraint count (800 000 + 6/constraint); 0 = unlimited.
         /// `TRACE_SOLVE_BUDGET_POPS` overrides this for experimentation.
@@ -398,6 +402,7 @@ fn main() -> Result<()> {
             no_ipc,
             explore,
             explore_budget,
+            sequencing,
             solve_budget_pops,
             solve_budget_secs,
         } => run_analyze(
@@ -426,6 +431,7 @@ fn main() -> Result<()> {
             no_ipc,
             explore,
             explore_budget,
+            sequencing,
             solve_budget_pops,
             solve_budget_secs,
         ),
@@ -472,6 +478,7 @@ fn run_analyze(
     no_ipc: bool,
     explore: bool,
     explore_budget: usize,
+    sequencing: bool,
     solve_budget_pops: Option<u64>,
     solve_budget_secs: Option<u64>,
 ) -> Result<()> {
@@ -582,7 +589,8 @@ fn run_analyze(
     }
     opts = opts
         .with_explore(explore)
-        .with_explore_budget(explore_budget);
+        .with_explore_budget(explore_budget)
+        .with_call_sequencing(sequencing);
 
     let mut effective_ignored_macros = Vec::new();
     if ignore_logging {
@@ -1173,6 +1181,19 @@ mod compiler_options_tests {
         };
         assert_eq!(compiler_arg, ["--target=aarch64-linux-gnu", "-m64"]);
         assert!(compiler_predefines && system_includes);
+    }
+
+    #[test]
+    fn sequencing_is_opt_in() {
+        let sequencing = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["trace", "analyze", "."].iter().chain(args)).unwrap();
+            let Commands::Analyze { sequencing, .. } = cli.command else {
+                panic!("analyze");
+            };
+            sequencing
+        };
+        assert!(!sequencing(&[]));
+        assert!(sequencing(&["--sequencing"]));
     }
 
     #[test]

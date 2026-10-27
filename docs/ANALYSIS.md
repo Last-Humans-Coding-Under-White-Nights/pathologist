@@ -11,6 +11,7 @@ trace uses inclusion-based (Andersen-style) pointer analysis to resolve indirect
 | Field handling | Field-sensitive with **instance-insensitive field summaries** |
 | Pointer analysis kind | **May-analysis** (sound over-approximation) |
 | Context sensitivity | **None** |
+| Call order | Not used by the analysis; optional per-function control-flow sidecar ([Call sequencing](#call-sequencing-control-flow-sidecar)) |
 
 ## Workflow
 
@@ -4891,9 +4892,167 @@ and feature implementations by exploring feasible configuration variants indepen
   files that define the same symbol, which is the pre-existing twin-definition dedup
   rather than anything exploration does.
 
+## Call sequencing (control-flow sidecar)
+
+The call graph says which functions a call site may reach; it does not say
+whether one call happens before another. `trace analyze --sequencing` (off by
+default) records, beside the unchanged call-graph facts, a compact control-flow
+graph per function body whose nodes carry the body's call occurrences. A query
+(`trace inspect sequence`) later rebuilds bounded partial sequences from the
+database alone, loading only the functions it reaches. The sidecar is never
+read by the PAG or the solver: `call_edges`, points-to and `arg_flow` are the
+same with the flag on or off, and the analysis stays flow-insensitive
+([Properties](#properties)). With the flag off nothing is recorded and the
+database carries no sequencing rows.
+
+### Events and what "before" means
+
+- **Event.** One syntactic invocation in a function body: one
+  `CallOccurrence` (spelling span, expansion span, expansion-chain id; see
+  [Call source locations](#call-source-locations)). An event lists the
+  `CallSite` records of that invocation as its `sites`: alternative targets of
+  the *same* invocation (one record per member candidate, post-merge virtual
+  overrides, a configuration variant's own record), never a sequence of
+  calls. Kinds: `call`, `construct` (including the constructor a
+  `new`-expression runs), `destroy` and `delete`. Two expansions of one macro
+  are two events, even when their displayed coordinates match.
+- **"A before B"** compares the *invocations* of A and B, not their
+  completions. Every guarantee is conditional on B executing and on every call
+  between A and B completing normally (no `throw`, `longjmp`, `exit` or
+  noreturn call); the query states these conditions with its answer. Relation
+  strengths:
+  - `sequenced_before`: same block, A precedes B in the block's local order;
+    `guaranteed_before`: A's block dominates B's block over non-exception
+    edges and no gap covers either event. Both are proofs *under the
+    conditions above*.
+  - `may_precede`, `may_follow`, `may_both` (a loop): a control-flow path
+    exists. This is not feasibility: correlated branch predicates are not
+    reasoned about.
+  - `exclusive`: no path either way (`if (ok) send(); else recover();`).
+    `unordered`: same block without a local order, or covered by an
+    `unordered_branch` gap. `unknown`: a gap or boundary lies between them.
+
+### Expressions
+
+Events of an expression are ordered post-order: a node's own events follow its
+children's, so an argument's calls precede the call they are passed to.
+
+- Call arguments form an **unordered group**. In C++17 and later the callee
+  and receiver expression is sequenced before the arguments; in C and earlier
+  C++ it joins the group.
+- `&&`, `||` and `?:` branch (short-circuit); the comma operator is sequenced.
+- Assignment: right before left in C++17 and later, unordered otherwise.
+  `<<`, `>>` and subscript are left before right in C++17 and later. Operands
+  of other binary and unary operators are unordered.
+- A lambda body is its own function's graph; init-captures are events of the
+  enclosing function at the lambda.
+
+The language standard is the unit's (`-std=` from the compilation database,
+otherwise the default).
+
+### Statements
+
+Compound statements, `if`/`else`, `while`, `do`, `for` (init once; condition;
+body; update; back edge to the condition; `continue` goes to the update),
+range-for (range expression once; header; body; back edge), `switch` (case
+edges, fallthrough edges, `default`, and an edge past the switch when there is
+no `default`), `break`, `continue`, `return` (edge to the exit), `goto` and
+labels (labels are resolved before the body is walked), `try`/`catch` and
+`throw`.
+
+- **Automatic objects** ([Automatic objects](#automatic-objects)): the
+  constructor event sits at its declarator, so `T a(f()), b(g());` orders
+  `f`, `T::T`, `g`, `T::T`. The one destructor site the IR records per
+  object is referenced from every exit of its scope: the normal end and each
+  `return`, `break`, `continue` or `goto` leaving it, in reverse declaration
+  order. No call site is added for this.
+- **Exceptions.** Each `try` has one `landing` block. Every block of the
+  `try` body has an `exception` edge to it, and the landing has an edge to
+  each handler. A `throw` has an `exception` edge to the innermost landing or
+  to the function's exceptional exit. A call *outside* a `try` has no
+  exceptional edge: the conditions above already exclude abnormal completion.
+- Loops stay cycles (`back_edge`), never unrolled.
+
+### Representation
+
+Per function body and configuration variant, `FunctionCfg`
+(`trace-ir/src/cfg.rs`) in `Program::cfgs` (ordered by function id):
+
+- blocks (`entry`, `exit`, `exceptional_exit`, `ordinary`, `landing`) with
+  their events in evaluation order, and typed successor edges
+  (`fallthrough`, `branch_true`, `branch_false`, `switch_case`, `back_edge`,
+  `return`, `exception`, `unsupported`);
+- the **immediate** sequenced-before pairs between events of one block (a
+  DAG); events of a block with no path between them are unordered;
+- gaps: regions whose order is not modeled.
+
+Storage stays linear in blocks + edges + events + sites: no transitive
+before-pairs, expanded callee bodies or enumerated paths are stored. After a
+body is built, event-free blocks that only fall through to their successor
+are removed (`FunctionCfg::compact`); branch, loop, exit and landing
+structure is kept.
+
+The export writes `cfg_functions`, `cfg_blocks`, `cfg_edges`, `cfg_events`,
+`cfg_event_sites`, `cfg_event_order` and `cfg_gaps` in both export modes, and
+retains every call site an event names even when the ordinary call-site
+filter would drop it (an unresolved direct call, a bodyless callee).
+`analysis_run.options_json.call_sequencing` records whether the capability
+was enabled; a database without it reports so and names the flag to
+regenerate it.
+
+### Merge
+
+CFGs are built per translation unit and remapped with the unit
+(`merge_unit`): the function through the unit's function map, every event's
+sites through its call-site map, spans through the file map; `tu` records the
+unit. A body the merge does not keep has no CFG: a dropped duplicate body, a
+dependency-root body, a declaration and a weak body suppressed by a strong one
+in its link target.
+
+- A shared-header body merged from a second unit is dropped when its remapped
+  CFG is structurally equal to the one kept ("first body is kept", see
+  [Shared header functions](#shared-header-functions)). A body another unit
+  compiles differently, or a `--explore` variant that differs, is kept as a
+  separate **variant** of the function. Variants are never unioned: a query
+  shows them side by side, so no sequence mixes two configurations.
+- An event whose sites the merge does not keep (a call expanded from a
+  dependency's macro body) is spliced out of its block and local order, and an
+  `omitted_sites` gap records that it was there.
+- Post-merge virtual expansion adds override records as further sites of the
+  same event (`Program::attach_alternative_site`).
+
+### Boundaries and gaps
+
+A gap or boundary is uncertainty, never evidence for an order.
+
+- **Gaps** inside a body: `parse_error` (an `ERROR` subtree; its events are
+  kept as an unordered group), `depth_exceeded`, `unsupported_construct`
+  (computed `goto`, `setjmp`/`longjmp`, coroutines, SEH, statement
+  expressions), `unresolved_goto`, `unordered_branch` (a short-circuit or
+  conditional inside an unordered operand: the affected events are
+  unordered), `initializer_order` (member initializers and default member
+  initializers are one unordered group in a prologue block; declaration order
+  is not modeled) and `omitted_sites`. A body with a gap is `partial`.
+- **Boundaries** between functions, found by the query: `omitted_body` (the
+  callee has no CFG: dependency, declaration only, suppressed or not
+  sequenced), `unknown_callee` (a site without call edges), `recursion`,
+  `async_start` (the site starts an [execution context](#execution-contexts):
+  the callback runs elsewhere and is not inlined) and `ipc_bridge` (an `ipc`
+  edge). None establishes happens-before across threads or processes.
+
+### Limits
+
+- Calls outside a `try` have no exceptional edge (see Exceptions above).
+- Temporaries' constructors and destructors are not lowered, so they are not
+  events.
+- Member-initializer declaration order is not modeled (`initializer_order`).
+- Paths are not checked for feasibility; `may_*` relations over-approximate.
+- C API exposure of the query is a follow-up.
+
 ## Known imprecision
 
 - All paths merged; no null-check refinement.
+- Call order (`--sequencing`) is control-flow reachability, not path feasibility; see [Call sequencing](#call-sequencing-control-flow-sidecar), "Limits".
 - `free` does not invalidate pointers.
 - `FieldSummary` may connect unrelated struct instances.
 - **Lazily created field cells carry no slot guard** (see "Variable cells"): their recorded type is not reliable enough to guard by.

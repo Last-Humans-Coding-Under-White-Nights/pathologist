@@ -64,6 +64,9 @@ pub struct UnitIndex {
     pub anonymous_bases: BTreeMap<String, BTreeSet<(trace_ir::FileId, String)>>,
     /// Namespaces this unit opens, merged in every mode.
     pub namespaces: BTreeSet<String>,
+    /// Call-order graphs of this unit's bodies, unit-local ids, in function
+    /// order (`--sequencing`).
+    pub cfgs: Vec<trace_ir::FunctionCfg>,
     /// Per type of `types`, the descriptor `merge_types` interns into the
     /// receiving table on the ordinary path: the type's own for a type whose
     /// layout spells it, otherwise the aggregate rebuilt from its layout.
@@ -92,6 +95,7 @@ impl UnitIndex {
         self.template_bases.shrink_to_fit();
         self.arrow_returns.shrink_to_fit();
         self.final_classes.shrink_to_fit();
+        self.cfgs.shrink_to_fit();
         self.merge_descs.shrink_to_fit();
     }
 }
