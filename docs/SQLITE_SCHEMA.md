@@ -71,8 +71,9 @@ The [`cfg_*` tables](#call-sequencing-tables) are read only from an input
 whose `options_json.call_sequencing` is `true` or `"partial"`; such an input
 must have every column the merger reads in all seven tables or it is rejected
 like a missing call-graph column. Their rows carry over with function,
-call-site and file ids remapped and row ids renumbered in input order, written
-by the same code as `trace analyze`'s export. The output's
+call-site and file ids remapped and row ids renumbered in input order, read
+by the same code as `trace inspect sequence` and written by the same code as
+`trace analyze`'s export. The output's
 `options_json.call_sequencing` is `true` when every input is sequenced,
 `false` when none is (the tables stay empty and no kind strings are added),
 and `"partial"` otherwise; each input without graphs is then named in an

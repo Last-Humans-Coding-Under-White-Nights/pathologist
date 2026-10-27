@@ -1182,7 +1182,6 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             inline_contexts,
             format,
         } => {
-            trace_db::require_sequencing(&conn)?;
             let scope = match (function, file, line) {
                 (Some(name), file, _) => {
                     trace_db::resolve_sequence_function(&conn, &name, file.as_deref())?
@@ -1203,7 +1202,11 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
                         _ => trace_db::SequenceScope::From(from),
                     }
                 }
-                _ => anyhow::bail!("give --function NAME, or --file FILE --line N"),
+                _ => {
+                    // A database that cannot answer says so before the usage.
+                    trace_db::require_sequencing(&conn)?;
+                    anyhow::bail!("give --function NAME, or --file FILE --line N")
+                }
             };
             let graph = trace_db::sequence_graph(
                 &conn,

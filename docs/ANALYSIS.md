@@ -5038,11 +5038,15 @@ in its link target.
   same event (`Program::attach_alternative_sites`).
 
 `trace-merge` carries the graphs of its sequenced inputs the same way
-(`FunctionCfg::remap` is shared): function, call-site and file ids are
-remapped, and row ids renumbered. A body several inputs share (a header
-function the merger unifies) keeps the graphs of the first input that has
-any, as `merge_unit` keeps the first copy; an event none of whose sites was
-carried is spliced out with an `omitted_sites` gap. The output's marker is
+(`trace_ir::add_variant` and `FunctionCfg::remap` are shared): function,
+call-site and file ids are remapped, and row ids renumbered. A body several
+inputs share (a header function the merger unifies) keeps one graph per
+structurally distinct body, in input order: an input compiling it as an
+earlier one did adds nothing, one compiling it differently adds a variant.
+Inputs share no call sites, so the comparison takes a site as its caller,
+position, callee spelling and directness (and how many such sites precede it
+in its input); a kept graph names its own input's sites. An event none of
+whose sites was carried is spliced out with an `omitted_sites` gap. The output's marker is
 `true` when every input was sequenced, `false` when none was, and `"partial"`
 otherwise, with one `MissingSequencing` diagnostic per input without graphs:
 an unsequenced input's functions have no CFG, so a merged database never

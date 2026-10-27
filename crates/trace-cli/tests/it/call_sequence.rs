@@ -576,7 +576,7 @@ fn sequence_query_requires_the_capability() {
     assert!(err.contains("--sequencing"), "{err}");
     let conn = fixture_db();
     let capability = trace_db::require_sequencing(&conn).unwrap();
-    assert!(capability.complete && capability.notice.is_none());
+    assert!(capability == trace_db::SequencingMarker::Complete && capability.notice().is_none());
 }
 
 #[test]
@@ -1194,8 +1194,8 @@ fn partial_merge_output_is_accepted_with_a_notice() {
     )
     .unwrap();
     let capability = trace_db::require_sequencing(&conn).unwrap();
-    assert!(!capability.complete);
-    assert!(capability.notice.unwrap().contains("--sequencing"));
+    assert_eq!(capability, trace_db::SequencingMarker::Partial);
+    assert!(capability.notice().unwrap().contains("--sequencing"));
     let graph = function_sequence(&conn, "args", None, &Default::default());
     assert_eq!(graph.capability, "partial");
     let text = trace_db::render_sequence(&graph, trace_db::RenderFormat::Text).unwrap();

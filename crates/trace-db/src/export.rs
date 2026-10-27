@@ -2,8 +2,9 @@ use crate::schema::{INDEXES_V8, PROVENANCE_INDEXES_V8, SCHEMA_VERSION, TABLES_V8
 use crate::TextPool;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fs;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use trace_analysis::{AnalysisResult, ConstraintKind, LocKind, Pag, PagNodeKind};
 use trace_ir::PagNodeId;
@@ -78,7 +79,7 @@ pub fn export_to_sqlite(
             "full_detail": opts.full_detail,
             "model_files": opts.model_files,
             "explore": program.explore,
-            "call_sequencing": program.call_sequencing,
+            "call_sequencing": crate::SequencingMarker::analysed(program.call_sequencing).to_json(),
             "explore_budget": program.explore_budget,
             "variants_merged": program.variants_merged,
             "solver_partial": !analysis.solve.converged,
@@ -1031,12 +1032,17 @@ fn export_call_sites_filtered(
 /// The call-order graphs, in function and variant order; row ids count up
 /// from 1 across graphs (see `docs/SQLITE_SCHEMA.md`, "Call sequencing
 /// tables"). Nothing to write without `--sequencing`. trace-merge writes
-/// its carried graphs through this too.
+/// its carried graphs through this too; [`read_cfgs`] reads them back.
 pub fn export_cfg<'a>(
     conn: &Connection,
     cfgs: impl IntoIterator<Item = &'a trace_ir::FunctionCfg>,
     strings: &mut TextPool<'_>,
 ) -> Result<()> {
+    let mut cfgs = cfgs.into_iter().peekable();
+    if cfgs.peek().is_none() {
+        return Ok(());
+    }
+    let kinds = strings.seed_sequencing()?;
     let mut function_stmt =
         conn.prepare_cached("INSERT INTO cfg_functions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
     let mut block_stmt =
@@ -1055,6 +1061,8 @@ pub fn export_cfg<'a>(
     // Next row id of each table; a graph's blocks and events are offsets
     // from the first id it got.
     let (mut cfg_id, mut block_base, mut event_base, mut gap_id) = (1i64, 1i64, 1i64, 1i64);
+    // An event's ordinal is its position in its block's evaluation order.
+    let mut ordinals: Vec<i64> = Vec::new();
     for cfg in cfgs {
         let block = |b: trace_ir::BlockId| block_base + i64::from(b.0);
         let event = |e: trace_ir::EventId| event_base + i64::from(e.0);
@@ -1066,28 +1074,24 @@ pub fn export_cfg<'a>(
             block(cfg.entry),
             block(cfg.exit),
             cfg.exceptional_exit.map(block),
-            strings.intern(crate::text::COVERAGE[usize::from(!cfg.gaps.is_empty())])?,
+            kinds.coverage(!cfg.gaps.is_empty()),
         ])?;
         for (ordinal, b) in cfg.blocks.iter().enumerate() {
             block_stmt.execute(params![
                 block_base + ordinal as i64,
                 cfg_id,
                 ordinal as i64,
-                strings.intern(b.kind.as_str())?,
+                kinds.block(b.kind),
                 b.span.map(|s| s.file.0),
                 b.span.map(|s| s.line),
                 b.span.map(|s| s.col),
             ])?;
         }
         for e in &cfg.edges {
-            edge_stmt.execute(params![
-                block(e.from),
-                block(e.to),
-                strings.intern(e.kind.as_str())?
-            ])?;
+            edge_stmt.execute(params![block(e.from), block(e.to), kinds.edge(e.kind)])?;
         }
-        // An event's ordinal is its position in its block's evaluation order.
-        let mut ordinals = vec![0i64; cfg.events.len()];
+        ordinals.clear();
+        ordinals.resize(cfg.events.len(), 0);
         for b in &cfg.blocks {
             for (ordinal, &e) in b.events.iter().enumerate() {
                 ordinals[e.0 as usize] = ordinal as i64;
@@ -1101,7 +1105,7 @@ pub fn export_cfg<'a>(
                 cfg_id,
                 block(e.block),
                 ordinals[i],
-                strings.intern(e.kind.as_str())?,
+                kinds.event(e.kind),
                 occurrence.span.file.0,
                 occurrence.span.line,
                 occurrence.span.col,
@@ -1120,7 +1124,7 @@ pub fn export_cfg<'a>(
             gap_stmt.execute(params![
                 gap_id,
                 cfg_id,
-                strings.intern(g.kind.as_str())?,
+                kinds.gap(g.kind),
                 g.span.map(|s| s.file.0),
                 g.span.map(|s| s.line),
                 g.span.map(|s| s.col),
@@ -1134,6 +1138,212 @@ pub fn export_cfg<'a>(
         event_base += cfg.events.len() as i64;
     }
     Ok(())
+}
+
+// The statements reading the call-order graphs whose `cfg_functions.id` is
+// in `?1..=?2`, each by its graph id; events are reached through their
+// blocks, as `cfg_events` has no index on `cfg_id`. `CROSS JOIN` keeps the
+// blocks the outer loop: over a range, SQLite would otherwise scan a whole
+// table in its `ORDER BY` order. Kinds are read as their names.
+const READ_CFG_FUNCTIONS: &str =
+    "SELECT id, fn_id, tu_file_id, variant, entry_block, exit_block, exceptional_exit_block \
+     FROM cfg_functions WHERE id BETWEEN ?1 AND ?2 ORDER BY id";
+const READ_CFG_BLOCKS: &str = "SELECT b.id, b.cfg_id, b.ordinal, k.text, b.file_id, b.line, b.col \
+     FROM cfg_blocks b JOIN strings k ON k.id = b.kind_id \
+     WHERE b.cfg_id BETWEEN ?1 AND ?2 ORDER BY b.cfg_id, b.ordinal";
+const READ_CFG_EDGES: &str = "SELECT e.src_block, e.dst_block, k.text \
+     FROM cfg_blocks b CROSS JOIN cfg_edges e ON e.src_block = b.id JOIN strings k ON k.id = e.kind_id \
+     WHERE b.cfg_id BETWEEN ?1 AND ?2 ORDER BY e.src_block, e.dst_block, e.kind_id";
+const READ_CFG_EVENTS: &str = "SELECT e.id, b.cfg_id, e.block_id, e.ordinal, k.text, \
+            e.file_id, e.line, e.col, e.expansion_file_id, e.expansion_line, e.expansion_col \
+     FROM cfg_blocks b CROSS JOIN cfg_events e ON e.block_id = b.id JOIN strings k ON k.id = e.kind_id \
+     WHERE b.cfg_id BETWEEN ?1 AND ?2 ORDER BY e.id";
+const READ_CFG_EVENT_SITES: &str = "SELECT es.event_id, es.call_site_id \
+     FROM cfg_blocks b CROSS JOIN cfg_events e ON e.block_id = b.id \
+     CROSS JOIN cfg_event_sites es ON es.event_id = e.id \
+     WHERE b.cfg_id BETWEEN ?1 AND ?2 ORDER BY es.event_id, es.call_site_id";
+const READ_CFG_EVENT_ORDER: &str = "SELECT o.event_id, o.next_event_id \
+     FROM cfg_blocks b CROSS JOIN cfg_events e ON e.block_id = b.id \
+     CROSS JOIN cfg_event_order o ON o.event_id = e.id \
+     WHERE b.cfg_id BETWEEN ?1 AND ?2 ORDER BY o.event_id, o.next_event_id";
+const READ_CFG_GAPS: &str = "SELECT g.cfg_id, k.text, g.file_id, g.line, g.col, \
+            g.first_event, g.last_event \
+     FROM cfg_gaps g JOIN strings k ON k.id = g.kind_id \
+     WHERE g.cfg_id BETWEEN ?1 AND ?2 ORDER BY g.id";
+
+/// The statements [`read_cfgs`] runs, by the table each reads first: a
+/// reader preparing them all checks a database has every column it needs.
+pub const CFG_READS: [(&str, &str); 7] = [
+    ("cfg_functions", READ_CFG_FUNCTIONS),
+    ("cfg_blocks", READ_CFG_BLOCKS),
+    ("cfg_edges", READ_CFG_EDGES),
+    ("cfg_events", READ_CFG_EVENTS),
+    ("cfg_event_sites", READ_CFG_EVENT_SITES),
+    ("cfg_event_order", READ_CFG_EVENT_ORDER),
+    ("cfg_gaps", READ_CFG_GAPS),
+];
+
+/// One `cfg_functions` row read back by [`read_cfgs`], in the database's
+/// own ids: `function`, sites and files are its rows.
+#[derive(Debug, Clone)]
+pub struct StoredCfg {
+    /// `cfg_functions.id`.
+    pub id: i64,
+    pub cfg: trace_ir::FunctionCfg,
+    /// `cfg_events.id` of each event, by [`trace_ir::EventId`].
+    pub event_ids: Vec<i64>,
+}
+
+/// The kind `parse` reads from `text`, as [`export_cfg`] wrote it.
+fn cfg_kind<K>(parse: fn(&str) -> Option<K>, text: &str) -> rusqlite::Result<K> {
+    parse(text).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("unknown call-order kind '{text}'").into(),
+        )
+    })
+}
+
+/// The inverse of [`export_cfg`]: the graphs whose `cfg_functions.id` is in
+/// `ids`, in id order. The export keeps no expansion fingerprint, so every
+/// occurrence reads back with `expansion_id` 0.
+pub fn read_cfgs(conn: &Connection, ids: RangeInclusive<i64>) -> Result<Vec<StoredCfg>> {
+    use trace_ir::{
+        Block, BlockId, BlockKind, CallEvent, CallOccurrence, CallSiteId, CfgEdge, EdgeKind,
+        EventId, EventKind, FileId, FnId, FunctionCfg, Gap, GapKind, Span,
+    };
+    let span = |file: Option<i64>, line: Option<i64>, col: Option<i64>| {
+        Some(Span::new(FileId(file? as u32), line? as u32, col? as u32))
+    };
+    let range = params![ids.start(), ids.end()];
+    let mut cfgs: Vec<StoredCfg> = Vec::new();
+    // Graph ids -> their index in `cfgs`; block and event ids -> their
+    // graph's index and local id.
+    let mut graphs: FxHashMap<i64, usize> = FxHashMap::default();
+    let mut blocks: FxHashMap<i64, (usize, BlockId)> = FxHashMap::default();
+    let mut events: FxHashMap<i64, (usize, EventId)> = FxHashMap::default();
+    let mut ends: Vec<(i64, i64, Option<i64>)> = Vec::new();
+    let mut stmt = conn.prepare_cached(READ_CFG_FUNCTIONS)?;
+    let mut rows = stmt.query(range)?;
+    while let Some(r) = rows.next()? {
+        let id: i64 = r.get(0)?;
+        graphs.insert(id, cfgs.len());
+        ends.push((r.get(4)?, r.get(5)?, r.get(6)?));
+        cfgs.push(StoredCfg {
+            id,
+            cfg: FunctionCfg {
+                function: FnId(r.get::<_, i64>(1)? as u32),
+                tu: r.get::<_, Option<i64>>(2)?.map(|f| FileId(f as u32)),
+                variant: r.get::<_, i64>(3)? as u32,
+                entry: BlockId(0),
+                exit: BlockId(0),
+                exceptional_exit: None,
+                blocks: Vec::new(),
+                edges: Vec::new(),
+                events: Vec::new(),
+                order: Vec::new(),
+                gaps: Vec::new(),
+            },
+            event_ids: Vec::new(),
+        });
+    }
+    let mut stmt = conn.prepare_cached(READ_CFG_BLOCKS)?;
+    let mut rows = stmt.query(range)?;
+    while let Some(r) = rows.next()? {
+        let Some(&g) = graphs.get(&r.get(1)?) else {
+            continue;
+        };
+        let cfg = &mut cfgs[g].cfg;
+        let ordinal = r.get::<_, i64>(2)? as usize;
+        if cfg.blocks.len() <= ordinal {
+            cfg.blocks.resize_with(ordinal + 1, || Block {
+                kind: BlockKind::Ordinary,
+                span: None,
+                events: Vec::new(),
+            });
+        }
+        cfg.blocks[ordinal] = Block {
+            kind: cfg_kind(BlockKind::parse, &r.get::<_, String>(3)?)?,
+            span: span(r.get(4)?, r.get(5)?, r.get(6)?),
+            events: Vec::new(),
+        };
+        blocks.insert(r.get(0)?, (g, BlockId(ordinal as u32)));
+    }
+    let block = |id: i64| blocks.get(&id).map(|&(_, b)| b);
+    for (stored, &(entry, exit, exceptional)) in cfgs.iter_mut().zip(&ends) {
+        let cfg = &mut stored.cfg;
+        cfg.entry = block(entry).context("cfg_functions.entry_block names no block")?;
+        cfg.exit = block(exit).context("cfg_functions.exit_block names no block")?;
+        cfg.exceptional_exit = exceptional.and_then(block);
+    }
+    let mut stmt = conn.prepare_cached(READ_CFG_EDGES)?;
+    let mut rows = stmt.query(range)?;
+    while let Some(r) = rows.next()? {
+        let (Some(&(g, from)), Some(to)) = (blocks.get(&r.get(0)?), block(r.get(1)?)) else {
+            continue;
+        };
+        let kind = cfg_kind(EdgeKind::parse, &r.get::<_, String>(2)?)?;
+        cfgs[g].cfg.edges.push(CfgEdge { from, to, kind });
+    }
+    // Each block's events by their ordinal in it.
+    let mut placed: Vec<(usize, BlockId, i64, EventId)> = Vec::new();
+    let mut stmt = conn.prepare_cached(READ_CFG_EVENTS)?;
+    let mut rows = stmt.query(range)?;
+    while let Some(r) = rows.next()? {
+        let (Some(&g), Some(at)) = (graphs.get(&r.get(1)?), block(r.get(2)?)) else {
+            continue;
+        };
+        let id: i64 = r.get(0)?;
+        let stored = &mut cfgs[g];
+        let event = EventId(stored.cfg.events.len() as u32);
+        stored.cfg.events.push(CallEvent {
+            block: at,
+            kind: cfg_kind(EventKind::parse, &r.get::<_, String>(4)?)?,
+            occurrence: CallOccurrence {
+                span: span(r.get(5)?, r.get(6)?, r.get(7)?).expect("NOT NULL columns"),
+                expansion_span: span(r.get(8)?, r.get(9)?, r.get(10)?),
+                expansion_id: 0,
+            },
+            sites: Vec::new(),
+        });
+        stored.event_ids.push(id);
+        events.insert(id, (g, event));
+        placed.push((g, at, r.get(3)?, event));
+    }
+    placed.sort_unstable();
+    for (g, at, _, event) in placed {
+        cfgs[g].cfg.blocks[at.0 as usize].events.push(event);
+    }
+    let mut stmt = conn.prepare_cached(READ_CFG_EVENT_SITES)?;
+    let mut rows = stmt.query(range)?;
+    while let Some(r) = rows.next()? {
+        if let Some(&(g, event)) = events.get(&r.get(0)?) {
+            let site = CallSiteId(r.get::<_, i64>(1)? as u32);
+            cfgs[g].cfg.events[event.0 as usize].sites.push(site);
+        }
+    }
+    let mut stmt = conn.prepare_cached(READ_CFG_EVENT_ORDER)?;
+    let mut rows = stmt.query(range)?;
+    while let Some(r) = rows.next()? {
+        if let (Some(&(g, a)), Some(&(_, b))) = (events.get(&r.get(0)?), events.get(&r.get(1)?)) {
+            cfgs[g].cfg.order.push((a, b));
+        }
+    }
+    let event = |id: Option<i64>| id.and_then(|id| events.get(&id)).map(|&(_, e)| e);
+    let mut stmt = conn.prepare_cached(READ_CFG_GAPS)?;
+    let mut rows = stmt.query(range)?;
+    while let Some(r) = rows.next()? {
+        let Some(&g) = graphs.get(&r.get(0)?) else {
+            continue;
+        };
+        cfgs[g].cfg.gaps.push(Gap {
+            kind: cfg_kind(GapKind::parse, &r.get::<_, String>(1)?)?,
+            span: span(r.get(2)?, r.get(3)?, r.get(4)?),
+            events: event(r.get(5)?).zip(event(r.get(6)?)),
+        });
+    }
+    Ok(cfgs)
 }
 
 fn export_call_edges(

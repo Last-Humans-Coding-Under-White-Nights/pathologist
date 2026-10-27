@@ -2800,7 +2800,7 @@ fn sequenced_inputs_merge_into_a_complete_call_order() {
         inputs_total
     );
     let capability = trace_db::require_sequencing(&conn).unwrap();
-    assert!(capability.complete && capability.notice.is_none());
+    assert!(capability == trace_db::SequencingMarker::Complete && capability.notice().is_none());
 
     // Merging again gives the same rows.
     let again = tmp.path().join("again.db");
@@ -2847,8 +2847,8 @@ fn mixed_inputs_merge_into_partial_sequencing_with_a_diagnostic() {
     assert_eq!(event_callees(&conn, "run"), ["a", "b", "c"]);
     assert!(event_callees(&conn, "other").is_empty());
     let capability = trace_db::require_sequencing(&conn).unwrap();
-    assert!(!capability.complete);
-    assert!(capability.notice.unwrap().contains("partial"));
+    assert_eq!(capability, trace_db::SequencingMarker::Partial);
+    assert!(capability.notice().unwrap().contains("partial"));
     // `inspect sequence` reads the merged graph and says it is partial.
     let run = trace_db::resolve_function_target(&conn, Some("run"), None, None).unwrap();
     let graph = trace_db::sequence_graph(
@@ -2903,19 +2903,18 @@ fn unsequenced_inputs_merge_without_call_order() {
     assert!(trace_db::require_sequencing(&conn).is_err());
 }
 
-#[test]
-fn a_header_body_merged_from_several_inputs_keeps_the_first_graph() {
-    let tmp = tempdir().unwrap();
-    let root = tmp.path();
+/// `repo_a` and `repo_b`, each including `include/common.h` (`header`) and
+/// calling its `common`, analysed `--sequencing` with each repo's extra args.
+fn header_inputs(
+    root: &std::path::Path,
+    header: &str,
+    args: [&[&str]; 2],
+) -> Vec<std::path::PathBuf> {
     let include = root.join("include");
     fs::create_dir_all(&include).unwrap();
-    fs::write(
-        include.join("common.h"),
-        "int local();\ninline int common() { local(); return local(); }\n",
-    )
-    .unwrap();
+    fs::write(include.join("common.h"), header).unwrap();
     let mut inputs = Vec::new();
-    for name in ["repo_a", "repo_b"] {
+    for (name, extra) in ["repo_a", "repo_b"].into_iter().zip(args) {
         let repo = root.join(name);
         fs::create_dir_all(&repo).unwrap();
         fs::write(
@@ -2924,15 +2923,13 @@ fn a_header_body_merged_from_several_inputs_keeps_the_first_graph() {
         )
         .unwrap();
         let db = root.join(format!("{name}.db"));
-        analyze_repo_with(
-            &repo,
-            &db,
-            &[
-                "--sequencing".as_ref(),
-                "--include".as_ref(),
-                include.as_os_str(),
-            ],
-        );
+        let mut all = vec![
+            "--sequencing".as_ref(),
+            "--include".as_ref(),
+            include.as_os_str(),
+        ];
+        all.extend(extra.iter().map(std::ffi::OsStr::new));
+        analyze_repo_with(&repo, &db, &all);
         assert_eq!(
             count(
                 &Connection::open(&db).unwrap(),
@@ -2943,6 +2940,18 @@ fn a_header_body_merged_from_several_inputs_keeps_the_first_graph() {
         );
         inputs.push(db);
     }
+    inputs
+}
+
+#[test]
+fn a_header_body_merged_from_several_inputs_keeps_the_first_graph() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let inputs = header_inputs(
+        root,
+        "int local();\ninline int common() { local(); return local(); }\n",
+        [&[], &[]],
+    );
     let output = root.join("merged.db");
     let report = merge_into(&inputs, &output);
     assert!(report.header_functions_deduped >= 1, "{report:?}");
@@ -2981,6 +2990,45 @@ fn a_header_body_merged_from_several_inputs_keeps_the_first_graph() {
         ),
         0
     );
+    assert_eq!(misattributed_cfg_rows(&conn), 0);
+}
+
+/// A header body the inputs compile differently is kept once per distinct
+/// graph, as `trace analyze` keeps configuration variants.
+#[test]
+fn a_header_body_compiled_differently_keeps_a_variant_per_input() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let inputs = header_inputs(
+        root,
+        "int local();\nint other();\ninline int common() {\n#ifdef MODE_B\n  other();\n#endif\n  return local();\n}\n",
+        [&[], &["-D", "MODE_B"]],
+    );
+    let output = root.join("merged.db");
+    let report = merge_into(&inputs, &output);
+    assert!(report.header_functions_deduped >= 1, "{report:?}");
+    let conn = Connection::open(&output).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM functions WHERE name = 'common'"
+        ),
+        1,
+        "the body is one merged function"
+    );
+    let variants: Vec<(i64, i64)> = conn
+        .prepare(
+            "SELECT c.variant, (SELECT COUNT(*) FROM cfg_events e WHERE e.cfg_id = c.id) \
+             FROM cfg_functions c JOIN functions f ON f.id = c.fn_id \
+             WHERE f.name = 'common' ORDER BY c.id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(variants, [(0, 1), (1, 2)], "one variant per distinct body");
+    assert_eq!(event_callees(&conn, "common"), ["local", "other", "local"]);
     assert_eq!(misattributed_cfg_rows(&conn), 0);
 }
 
