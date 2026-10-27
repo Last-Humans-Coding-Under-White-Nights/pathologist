@@ -1,7 +1,10 @@
 //! Call sequencing (`--sequencing`; docs/ANALYSIS.md, "Call sequencing
 //! (control-flow sidecar)").
 
-use crate::common::{default_opts, fixture, scratch};
+use crate::common::{
+    analysis_rows, default_opts, export_program, export_program_full, fixture, only_function,
+    scratch, text_rows, TempDb,
+};
 use std::path::Path;
 use trace_ir::{FunctionCfg, Program};
 use trace_preproc::PreprocessOptions;
@@ -300,4 +303,201 @@ fn suppressed_weak_body_has_no_graph_in_its_target() {
     let hooks = cfgs_named(&program, "hook");
     let shapes: Vec<_> = hooks.iter().map(|g| event_callees(&program, g)).collect();
     assert_eq!(shapes, [[["s1"]]], "only the strong body is sequenced");
+}
+
+/// The `call_sequence` fixture built with `opts`, analysed and exported in
+/// minimal (`full = false`) or full mode.
+fn exported(sequencing: bool, full: bool) -> (Program, trace_analysis::AnalysisResult, TempDb) {
+    let root = fixture("call_sequence");
+    let program =
+        trace_parse::build_program(&root, &default_opts(&root).with_call_sequencing(sequencing))
+            .expect("build");
+    let (pag, analysis) = trace_analysis::analyze(&program);
+    let db = if full {
+        export_program_full(&program, &pag, &analysis)
+    } else {
+        export_program(&program, &pag, &analysis)
+    };
+    (program, analysis, db)
+}
+
+const CFG_TABLES: [&str; 7] = [
+    "cfg_functions",
+    "cfg_blocks",
+    "cfg_edges",
+    "cfg_events",
+    "cfg_event_sites",
+    "cfg_event_order",
+    "cfg_gaps",
+];
+
+/// Every `cfg_*` table's rows, sorted, by table name.
+fn cfg_rows(db: &TempDb) -> Vec<(String, Vec<Vec<String>>)> {
+    analysis_rows(db)
+        .into_iter()
+        .filter(|(table, _)| CFG_TABLES.contains(&table.as_str()))
+        .collect()
+}
+
+fn sequencing_marker(db: &TempDb) -> serde_json::Value {
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let options: String = conn
+        .query_row("SELECT options_json FROM analysis_run", [], |r| r.get(0))
+        .unwrap();
+    serde_json::from_str::<serde_json::Value>(&options).unwrap()["call_sequencing"].clone()
+}
+
+fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn export_writes_every_graph_and_marks_the_capability() {
+    let (program, _analysis, db) = exported(true, false);
+    assert_eq!(sequencing_marker(&db), serde_json::json!(true));
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let graphs: Vec<_> = program.cfgs.values().flatten().collect();
+    let sum = |f: fn(&FunctionCfg) -> usize| graphs.iter().map(|g| f(g)).sum::<usize>() as i64;
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM cfg_functions"),
+        graphs.len() as i64
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM cfg_blocks"),
+        sum(|g| g.blocks.len())
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM cfg_events"),
+        sum(|g| g.events.len())
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM cfg_event_order"),
+        sum(|g| g.order.len())
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM cfg_gaps"),
+        sum(|g| g.gaps.len())
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM cfg_event_sites"),
+        sum(|g| g.events.iter().map(|e| e.sites.len()).sum())
+    );
+    // A body with a gap is partial; the others are complete.
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM cfg_functions f JOIN strings s ON s.id = f.coverage_id \
+             WHERE s.text = 'partial'"
+        ),
+        graphs.iter().filter(|g| !g.gaps.is_empty()).count() as i64
+    );
+    // `straight.c`'s `run`: prepare, work, finish in one block, in order.
+    let order = text_rows(
+        &conn,
+        "SELECT a.callee_text, b.callee_text FROM cfg_event_order o \
+         JOIN cfg_event_sites sa ON sa.event_id = o.event_id \
+         JOIN call_sites a ON a.id = sa.call_site_id \
+         JOIN cfg_event_sites sb ON sb.event_id = o.next_event_id \
+         JOIN call_sites b ON b.id = sb.call_site_id \
+         JOIN cfg_events e ON e.id = o.event_id \
+         JOIN files f ON f.id = e.file_id \
+         WHERE f.path LIKE '%straight.c' ORDER BY e.line",
+    );
+    let text = |s: &str| format!("{:?}", rusqlite::types::Value::Text(s.into()));
+    assert_eq!(
+        order,
+        [
+            vec![text("prepare"), text("work")],
+            vec![text("work"), text("finish")]
+        ]
+    );
+    // Kind tags are seeded with small ids, ahead of names and expressions.
+    assert!(
+        count(
+            &conn,
+            "SELECT MAX(kind_id) FROM (SELECT kind_id FROM cfg_blocks \
+             UNION SELECT kind_id FROM cfg_edges UNION SELECT kind_id FROM cfg_events \
+             UNION SELECT kind_id FROM cfg_gaps UNION SELECT coverage_id FROM cfg_functions)"
+        ) < 128
+    );
+}
+
+#[test]
+fn export_retains_every_sequenced_site() {
+    let dir = scratch(&[(
+        "a.c",
+        "int open(int);\nvoid connect(void) { open(1); }\nvoid other(void) { open(2); }\n",
+    )]);
+    let mut program = sequenced(dir.path(), default_opts(dir.path()));
+    let (pag, mut analysis) = trace_analysis::analyze(&program);
+    // Without edges or argument flow, the ordinary filter drops a direct
+    // site (docs/SQLITE_SCHEMA.md, "Call site export filter").
+    analysis.call_edges.clear();
+    analysis.arg_flow_edges.clear();
+    // Only `connect`'s graph names its site; `other`'s stays unsequenced.
+    let connect = only_function(&program, "connect");
+    program.cfgs.retain(|&f, _| f == connect);
+    let site = program.cfgs[&connect][0].events[0].sites[0];
+    assert!(program.symbols.call_site_by_id(site).unwrap().is_direct);
+    let db = export_program(&program, &pag, &analysis);
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    assert_eq!(
+        text_rows(&conn, "SELECT id FROM call_sites"),
+        [vec![format!(
+            "{:?}",
+            rusqlite::types::Value::Integer(site.0 as i64)
+        )]],
+        "the sequenced site is kept, the other one still filtered"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM cfg_event_sites es \
+             LEFT JOIN call_sites cs ON cs.id = es.call_site_id WHERE cs.id IS NULL"
+        ),
+        0,
+        "every site an event names is exported"
+    );
+}
+
+#[test]
+fn export_is_deterministic() {
+    let (_, _, first) = exported(true, false);
+    let (_, _, second) = exported(true, false);
+    let rows = cfg_rows(&first);
+    assert_eq!(rows.len(), CFG_TABLES.len());
+    assert!(rows.iter().all(|(_, r)| !r.is_empty()), "{rows:?}");
+    assert_eq!(analysis_rows(&first), analysis_rows(&second));
+}
+
+#[test]
+fn minimal_and_full_exports_agree() {
+    let (_, _, minimal) = exported(true, false);
+    let (_, _, full) = exported(true, true);
+    let rows = cfg_rows(&minimal);
+    assert!(rows.iter().any(|(_, r)| !r.is_empty()));
+    assert_eq!(rows, cfg_rows(&full));
+    let sites = |db: &TempDb| {
+        let conn = rusqlite::Connection::open(db.path()).unwrap();
+        text_rows(&conn, "SELECT * FROM call_sites ORDER BY id")
+    };
+    assert_eq!(sites(&minimal), sites(&full));
+}
+
+#[test]
+fn export_without_sequencing_has_no_cfg_rows() {
+    let (_, _, db) = exported(false, false);
+    assert_eq!(sequencing_marker(&db), serde_json::json!(false));
+    let rows = cfg_rows(&db);
+    assert_eq!(rows.len(), CFG_TABLES.len(), "the tables exist");
+    assert!(rows.iter().all(|(_, r)| r.is_empty()));
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM strings WHERE text IN ('fallthrough', 'landing', 'complete')"
+        ),
+        0,
+        "kind tags are interned only for a sequenced export"
+    );
 }

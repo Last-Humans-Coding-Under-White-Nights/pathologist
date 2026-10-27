@@ -479,8 +479,93 @@ SELECT o.fn_id,
        (SELECT text FROM strings WHERE id=o.name_id) AS name,
        (SELECT text FROM strings WHERE id=o.type_name_id) AS type_name
 FROM flow_parameters_data o;
+
+-- Call-order control-flow graphs (`trace analyze --sequencing`): one graph per
+-- function body and configuration variant. Kinds and coverage are `strings`
+-- ids; block and event ordinals count from 0 within their graph. Empty unless
+-- `analysis_run.options_json.call_sequencing` is true. Additive to v8. See
+-- docs/SQLITE_SCHEMA.md, "Call sequencing tables".
+CREATE TABLE IF NOT EXISTS cfg_functions (
+    id INTEGER PRIMARY KEY,
+    fn_id INTEGER NOT NULL REFERENCES functions(id),
+    tu_file_id INTEGER REFERENCES files(id),
+    variant INTEGER NOT NULL,
+    entry_block INTEGER NOT NULL REFERENCES cfg_blocks(id),
+    exit_block INTEGER NOT NULL REFERENCES cfg_blocks(id),
+    exceptional_exit_block INTEGER REFERENCES cfg_blocks(id),
+    coverage_id INTEGER NOT NULL REFERENCES strings(id)
+);
+
+CREATE TABLE IF NOT EXISTS cfg_blocks (
+    id INTEGER PRIMARY KEY,
+    cfg_id INTEGER NOT NULL REFERENCES cfg_functions(id),
+    ordinal INTEGER NOT NULL,
+    kind_id INTEGER NOT NULL REFERENCES strings(id),
+    file_id INTEGER REFERENCES files(id),
+    line INTEGER,
+    col INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS cfg_edges (
+    src_block INTEGER NOT NULL REFERENCES cfg_blocks(id),
+    dst_block INTEGER NOT NULL REFERENCES cfg_blocks(id),
+    kind_id INTEGER NOT NULL REFERENCES strings(id),
+    PRIMARY KEY (src_block, dst_block, kind_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS cfg_events (
+    id INTEGER PRIMARY KEY,
+    cfg_id INTEGER NOT NULL REFERENCES cfg_functions(id),
+    block_id INTEGER NOT NULL REFERENCES cfg_blocks(id),
+    ordinal INTEGER NOT NULL,
+    kind_id INTEGER NOT NULL REFERENCES strings(id),
+    file_id INTEGER NOT NULL REFERENCES files(id),
+    line INTEGER NOT NULL,
+    col INTEGER NOT NULL,
+    expansion_file_id INTEGER REFERENCES files(id),
+    expansion_line INTEGER,
+    expansion_col INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS cfg_event_sites (
+    event_id INTEGER NOT NULL REFERENCES cfg_events(id),
+    call_site_id INTEGER NOT NULL REFERENCES call_sites_data(id),
+    PRIMARY KEY (event_id, call_site_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS cfg_event_order (
+    event_id INTEGER NOT NULL REFERENCES cfg_events(id),
+    next_event_id INTEGER NOT NULL REFERENCES cfg_events(id),
+    PRIMARY KEY (event_id, next_event_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS cfg_gaps (
+    id INTEGER PRIMARY KEY,
+    cfg_id INTEGER NOT NULL REFERENCES cfg_functions(id),
+    kind_id INTEGER NOT NULL REFERENCES strings(id),
+    file_id INTEGER REFERENCES files(id),
+    line INTEGER,
+    col INTEGER,
+    first_event INTEGER REFERENCES cfg_events(id),
+    last_event INTEGER REFERENCES cfg_events(id)
+);
 "#
         )
+    };
+}
+
+// Only the compact layout carries the call-sequencing tables.
+macro_rules! sequencing_indexes {
+    () => {
+        r#"
+CREATE INDEX IF NOT EXISTS idx_cfg_functions_fn ON cfg_functions(fn_id);
+CREATE INDEX IF NOT EXISTS idx_cfg_blocks_cfg ON cfg_blocks(cfg_id);
+CREATE INDEX IF NOT EXISTS idx_cfg_edges_dst ON cfg_edges(dst_block);
+CREATE INDEX IF NOT EXISTS idx_cfg_events_block ON cfg_events(block_id);
+CREATE INDEX IF NOT EXISTS idx_cfg_events_file_line ON cfg_events(file_id, line);
+CREATE INDEX IF NOT EXISTS idx_cfg_event_sites_site ON cfg_event_sites(call_site_id);
+CREATE INDEX IF NOT EXISTS idx_cfg_gaps_cfg ON cfg_gaps(cfg_id);
+"#
     };
 }
 
@@ -604,7 +689,8 @@ pub const INDEXES_V8: &str = concat!(
         "flow_nodes_data",
         "name_id",
         "flow_origins_data"
-    )
+    ),
+    sequencing_indexes!()
 );
 pub const SCHEMA_V8: &str = concat!(
     common_tables!(
@@ -623,7 +709,8 @@ pub const SCHEMA_V8: &str = concat!(
         "flow_nodes_data",
         "name_id",
         "flow_origins_data"
-    )
+    ),
+    sequencing_indexes!()
 );
 
 #[cfg(test)]

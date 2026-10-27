@@ -32,6 +32,13 @@ checks its required structures and rejects `analysis_run.options_json.stage =
 Optional metadata has explicit fallback behavior below. Re-analysis supplies
 new metadata and query indexes; there is no automatic migration from v6.
 
+Call sequencing is such a capability: the [`cfg_*` tables](#call-sequencing-tables)
+exist in every v8 export but are filled only by `trace analyze --sequencing`,
+and `analysis_run.options_json.call_sequencing` (`true` / `false`) records
+which. A reader asks the marker, not the row count: a run with the flag whose
+code has no function body also leaves the tables empty. Exports written before
+the marker existed lack the key and have no sequencing.
+
 ### Merger inputs and output
 
 `trace-merge` accepts v7 and v8 and structurally validates the exact columns it reads
@@ -93,6 +100,7 @@ omitted flow data from merger output.
 | `locations` | | ✓ | ✓ |
 | `points_to` | | | ✓ |
 | `diagnostics` | ✓ | ✓ | ✓ |
+| `cfg_*` ([call sequencing](#call-sequencing-tables)) | with `--sequencing` | with `--sequencing` | with `--sequencing` |
 
 The flow-graph tables (`flow_nodes`, `flow_edges`) and the variables they
 reference are always exported because `trace inspect dataflow` and
@@ -105,6 +113,8 @@ A row is written to `call_sites` when **any** of:
 - the site has ≥1 row in `call_edges`
 - the site has ≥1 row in `arg_flow_edges`
 - `is_direct = 0` (indirect / fn-ptr syntax, **including unresolved**)
+- a `cfg_event_sites` row names the site (`--sequencing` only), so every
+  call-order event resolves to its call sites in both export modes
 
 Unresolved indirect calls therefore appear in `call_sites` with zero `call_edges`.
 `inspect callgraph` displays these sites as `unresolved` leaves during downward
@@ -146,7 +156,7 @@ diagnostics
 | `schema_version` | INTEGER | Compatibility family (currently `7`; see [contract](#version-and-capability-contract)) |
 | `target_root` | TEXT | Analyzed directory |
 | `created_at` | TEXT | Unix timestamp (seconds) |
-| `options_json` | TEXT | JSON: `test_partition`, `include_paths`, `defines`, `dep_roots`, `ignored_macros`, `include_points_to`, `full_detail`, `model_files`, `explore`, `explore_budget`, `variants_merged`, `solver_partial`, `solver_pops`, `solve_budget_pops`, `solve_budget_secs` |
+| `options_json` | TEXT | JSON: `test_partition`, `include_paths`, `defines`, `dep_roots`, `ignored_macros`, `include_points_to`, `full_detail`, `model_files`, `explore`, `call_sequencing`, `explore_budget`, `variants_merged`, `solver_partial`, `solver_pops`, `solve_budget_pops`, `solve_budget_secs` |
 
 `test_partition` is an object with `enabled` (boolean) and `directories`
 (array of strings), recording the effective configured name list. Disabled runs
@@ -334,6 +344,74 @@ The same starts stay in `call_edges` as `indirect` (start site to entry) and
 `ipc` (proxy to handler) edges, so the functions a context reaches are a walk
 over `call_edges` from `entry_fn_id`. Not indexed: the table is small (sizes
 in [EVAL_REPORT.md](EVAL_REPORT.md#task-and-thread-primitives-203--2026-10-09)).
+
+### Call sequencing tables
+
+Per-function call-order control-flow graphs, written by `trace analyze
+--sequencing` in every export mode and empty otherwise (see the
+[capability marker](#version-and-capability-contract)). What an event, an
+edge, an order pair and a gap mean, and what "before" may be concluded from
+them: [Call sequencing](ANALYSIS.md#call-sequencing-control-flow-sidecar).
+Additive to v8. Kind and coverage columns are `strings` ids (`JOIN strings s
+ON s.id = kind_id`). Row ids count up from 1 in function id, then variant
+order; a graph's blocks and events take consecutive ids in ordinal order, so
+an export is reproducible row for row. Storage is linear in blocks, edges,
+events and sites.
+
+`cfg_functions`: one row per graph.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER PK | Graph id |
+| `fn_id` | INTEGER FK → `functions` | Function whose body this is |
+| `tu_file_id` | INTEGER FK → `files`, nullable | Translation unit the body was lowered in |
+| `variant` | INTEGER | Configuration variant, from 0; several rows for one `fn_id` are alternatives, never one body |
+| `entry_block`, `exit_block` | INTEGER FK → `cfg_blocks` | Entry and normal exit |
+| `exceptional_exit_block` | INTEGER FK → `cfg_blocks`, nullable | Where uncaught exceptions leave; `NULL` when the graph has none |
+| `coverage_id` | INTEGER FK → `strings` | `complete`, or `partial` when the graph has a `cfg_gaps` row |
+
+`cfg_blocks`: `id`, `cfg_id` → `cfg_functions`, `ordinal` (from 0 within the
+graph), `kind_id` (`entry`, `exit`, `exceptional_exit`, `ordinary`,
+`landing`), and the nullable source position `file_id`, `line`, `col` (loop
+heads, case labels, labels, `try` bodies and handlers).
+
+`cfg_edges`: `src_block`, `dst_block` → `cfg_blocks` and `kind_id`
+(`fallthrough`, `branch_true`, `branch_false`, `switch_case`, `back_edge`,
+`return`, `exception`, `unsupported`). Primary key `(src_block, dst_block,
+kind_id)`, `WITHOUT ROWID`.
+
+`cfg_events`: one row per invocation.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER PK | Event id |
+| `cfg_id` | INTEGER FK → `cfg_functions` | Graph |
+| `block_id` | INTEGER FK → `cfg_blocks` | Block the event runs in |
+| `ordinal` | INTEGER | Position in the block's evaluation order, from 0; not an order guarantee (see `cfg_event_order`) |
+| `kind_id` | INTEGER FK → `strings` | `call`, `construct`, `destroy` or `delete` |
+| `file_id`, `line`, `col` | INTEGER | Request position, as in `call_sites` |
+| `expansion_file_id`, `expansion_line`, `expansion_col` | INTEGER, nullable | Outermost macro invocation, as in `call_sites` |
+
+`cfg_event_sites`: `event_id` → `cfg_events`, `call_site_id` → `call_sites`;
+the alternative-target records of one invocation (several rows for one event
+are alternatives, not a sequence). One site may belong to several events (a
+destructor at each scope exit). Every named site is exported (see the
+[call site export filter](#call-site-export-filter)).
+
+`cfg_event_order`: `event_id` is immediately sequenced before `next_event_id`;
+both are events of one block. Two events of a block without a path through
+these rows are unordered. No transitive pairs are stored.
+
+`cfg_gaps`: `id`, `cfg_id`, `kind_id` (`parse_error`, `depth_exceeded`,
+`unsupported_construct`, `unresolved_goto`, `unordered_branch`,
+`initializer_order`, `omitted_sites`), the nullable source position
+`file_id`, `line`, `col`, and the nullable inclusive event range
+`first_event`, `last_event` → `cfg_events`. A gap is uncertainty, never
+evidence for an order.
+
+**Indexes:** `cfg_functions(fn_id)`, `cfg_blocks(cfg_id)`,
+`cfg_edges(dst_block)`, `cfg_events(block_id)`, `cfg_events(file_id, line)`,
+`cfg_event_sites(call_site_id)`, `cfg_gaps(cfg_id)`.
 
 ### variables
 
@@ -688,6 +766,10 @@ following text columns become integer `<column>_id` foreign keys to `strings`:
 | `flow_origins` | `kind`, `expression`, `operation` |
 | `flow_call_origins` | `expression` |
 | `flow_call_expressions` | `expression` |
+
+The [call-sequencing tables](#call-sequencing-tables) have no `_data`/view
+pair: they did not exist in v7, so their kind columns are `strings` ids under
+their own `*_id` names; join `strings` to read them.
 
 These logical relations are read-only views. They expose the same columns,
 text, entity IDs, row counts, and duplicate rows as v7's tables. Named columns

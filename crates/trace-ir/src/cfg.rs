@@ -23,6 +23,27 @@ pub enum BlockKind {
     Landing,
 }
 
+impl BlockKind {
+    pub const ALL: [Self; 5] = [
+        Self::Entry,
+        Self::Exit,
+        Self::ExceptionalExit,
+        Self::Ordinary,
+        Self::Landing,
+    ];
+
+    /// The kind's name in exports and query output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Entry => "entry",
+            Self::Exit => "exit",
+            Self::ExceptionalExit => "exceptional_exit",
+            Self::Ordinary => "ordinary",
+            Self::Landing => "landing",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EdgeKind {
     Fallthrough,
@@ -36,12 +57,53 @@ pub enum EdgeKind {
     Unsupported,
 }
 
+impl EdgeKind {
+    pub const ALL: [Self; 8] = [
+        Self::Fallthrough,
+        Self::BranchTrue,
+        Self::BranchFalse,
+        Self::SwitchCase,
+        Self::BackEdge,
+        Self::Return,
+        Self::Exception,
+        Self::Unsupported,
+    ];
+
+    /// The kind's name in exports and query output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fallthrough => "fallthrough",
+            Self::BranchTrue => "branch_true",
+            Self::BranchFalse => "branch_false",
+            Self::SwitchCase => "switch_case",
+            Self::BackEdge => "back_edge",
+            Self::Return => "return",
+            Self::Exception => "exception",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventKind {
     Call,
     Construct,
     Destroy,
     Delete,
+}
+
+impl EventKind {
+    pub const ALL: [Self; 4] = [Self::Call, Self::Construct, Self::Destroy, Self::Delete];
+
+    /// The kind's name in exports and query output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Call => "call",
+            Self::Construct => "construct",
+            Self::Destroy => "destroy",
+            Self::Delete => "delete",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,6 +116,31 @@ pub enum GapKind {
     InitializerOrder,
     /// Events whose sites the merge did not keep were spliced out.
     OmittedSites,
+}
+
+impl GapKind {
+    pub const ALL: [Self; 7] = [
+        Self::ParseError,
+        Self::DepthExceeded,
+        Self::UnsupportedConstruct,
+        Self::UnresolvedGoto,
+        Self::UnorderedBranch,
+        Self::InitializerOrder,
+        Self::OmittedSites,
+    ];
+
+    /// The kind's name in exports and query output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ParseError => "parse_error",
+            Self::DepthExceeded => "depth_exceeded",
+            Self::UnsupportedConstruct => "unsupported_construct",
+            Self::UnresolvedGoto => "unresolved_goto",
+            Self::UnorderedBranch => "unordered_branch",
+            Self::InitializerOrder => "initializer_order",
+            Self::OmittedSites => "omitted_sites",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,6 +1,10 @@
 use anyhow::Result;
 use rusqlite::{params, types::ToSqlOutput, Connection, Statement, ToSql};
 use rustc_hash::FxHashMap;
+use trace_ir::{BlockKind, EdgeKind, EventKind, GapKind};
+
+/// `cfg_functions.coverage` by whether the graph has a gap.
+pub(crate) const COVERAGE: [&str; 2] = ["complete", "partial"];
 
 /// Identity of an interned SQLite string, independent of IR entity IDs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +70,19 @@ impl<'conn> TextPool<'conn> {
             pool.intern(text)?;
         }
         Ok(pool)
+    }
+
+    /// Give the call-sequencing kind tags small ids too. Only a sequenced
+    /// export calls this, so other exports keep their string table.
+    pub fn seed_sequencing(&mut self) -> Result<()> {
+        let kinds = BlockKind::ALL.iter().map(|k| k.as_str());
+        let kinds = kinds.chain(EdgeKind::ALL.iter().map(|k| k.as_str()));
+        let kinds = kinds.chain(EventKind::ALL.iter().map(|k| k.as_str()));
+        let kinds = kinds.chain(GapKind::ALL.iter().map(|k| k.as_str()));
+        for text in kinds.chain(COVERAGE) {
+            self.intern(text)?;
+        }
+        Ok(())
     }
 
     pub fn intern(&mut self, text: &str) -> Result<TextId> {

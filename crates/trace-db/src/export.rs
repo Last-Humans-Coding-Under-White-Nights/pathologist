@@ -61,6 +61,9 @@ pub fn export_to_sqlite(
         conn.execute_batch("BEGIN IMMEDIATE;")?;
         conn.execute_batch(TABLES_V8)?;
         let mut strings = TextPool::new(&conn)?;
+        if program.call_sequencing {
+            strings.seed_sequencing()?;
+        }
 
         let options_json = serde_json::json!({
             "test_partition": {
@@ -75,6 +78,7 @@ pub fn export_to_sqlite(
             "full_detail": opts.full_detail,
             "model_files": opts.model_files,
             "explore": program.explore,
+            "call_sequencing": program.call_sequencing,
             "explore_budget": program.explore_budget,
             "variants_merged": program.variants_merged,
             "solver_partial": !analysis.solve.converged,
@@ -100,6 +104,7 @@ pub fn export_to_sqlite(
         export_functions(&conn, program)?;
         export_flow_parameters(&conn, program, &mut strings)?;
         export_call_sites_filtered(&conn, program, analysis, &mut strings)?;
+        export_cfg(&conn, program, &mut strings)?;
         export_call_edges(&conn, analysis, &mut strings)?;
         conn.execute_batch(PROVENANCE_INDEXES_V8)?;
         if opts.full_detail {
@@ -965,6 +970,14 @@ fn export_call_sites_filtered(
     for edge in &analysis.arg_flow_edges {
         with_arg_flow.insert(edge.call_site);
     }
+    // Every site a call-order event names, so the graph never points past
+    // the table (empty without `--sequencing`).
+    let mut sequenced = FxHashSet::default();
+    for cfg in program.cfgs.values().flatten() {
+        for event in &cfg.events {
+            sequenced.extend(event.sites.iter().copied());
+        }
+    }
 
     let mut stmt = conn.prepare_cached(
         "INSERT INTO call_sites_data (id, caller_fn_id, file_id, line, col, expansion_file_id, expansion_line, expansion_col, callee_text_id, is_direct, callee_var, return_dst) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -974,7 +987,10 @@ fn export_call_sites_filtered(
     let mut expression_stmt =
         conn.prepare_cached("INSERT INTO flow_call_expressions_data VALUES (?1, ?2)")?;
     for cs in &program.symbols.call_sites {
-        let export = with_edge.contains(&cs.id) || with_arg_flow.contains(&cs.id) || !cs.is_direct;
+        let export = with_edge.contains(&cs.id)
+            || with_arg_flow.contains(&cs.id)
+            || !cs.is_direct
+            || sequenced.contains(&cs.id);
         if !export {
             continue;
         }
@@ -1008,6 +1024,109 @@ fn export_call_sites_filtered(
                 strings.intern(expression.as_ref())?
             ])?;
         }
+    }
+    Ok(())
+}
+
+/// The call-order graphs, in function and variant order; row ids count up
+/// from 1 across graphs (see `docs/SQLITE_SCHEMA.md`, "Call sequencing
+/// tables"). Nothing to write without `--sequencing`.
+fn export_cfg(conn: &Connection, program: &Program, strings: &mut TextPool<'_>) -> Result<()> {
+    let mut function_stmt =
+        conn.prepare_cached("INSERT INTO cfg_functions VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
+    let mut block_stmt =
+        conn.prepare_cached("INSERT INTO cfg_blocks VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+    let mut edge_stmt =
+        conn.prepare_cached("INSERT OR IGNORE INTO cfg_edges VALUES (?1, ?2, ?3)")?;
+    let mut event_stmt = conn.prepare_cached(
+        "INSERT INTO cfg_events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )?;
+    let mut site_stmt =
+        conn.prepare_cached("INSERT OR IGNORE INTO cfg_event_sites VALUES (?1, ?2)")?;
+    let mut order_stmt =
+        conn.prepare_cached("INSERT OR IGNORE INTO cfg_event_order VALUES (?1, ?2)")?;
+    let mut gap_stmt =
+        conn.prepare_cached("INSERT INTO cfg_gaps VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
+    // Next row id of each table; a graph's blocks and events are offsets
+    // from the first id it got.
+    let (mut cfg_id, mut block_base, mut event_base, mut gap_id) = (1i64, 1i64, 1i64, 1i64);
+    for cfg in program.cfgs.values().flatten() {
+        let block = |b: trace_ir::BlockId| block_base + i64::from(b.0);
+        let event = |e: trace_ir::EventId| event_base + i64::from(e.0);
+        function_stmt.execute(params![
+            cfg_id,
+            cfg.function.0,
+            cfg.tu.map(|f| f.0),
+            cfg.variant,
+            block(cfg.entry),
+            block(cfg.exit),
+            cfg.exceptional_exit.map(block),
+            strings.intern(crate::text::COVERAGE[usize::from(!cfg.gaps.is_empty())])?,
+        ])?;
+        for (ordinal, b) in cfg.blocks.iter().enumerate() {
+            block_stmt.execute(params![
+                block_base + ordinal as i64,
+                cfg_id,
+                ordinal as i64,
+                strings.intern(b.kind.as_str())?,
+                b.span.map(|s| s.file.0),
+                b.span.map(|s| s.line),
+                b.span.map(|s| s.col),
+            ])?;
+        }
+        for e in &cfg.edges {
+            edge_stmt.execute(params![
+                block(e.from),
+                block(e.to),
+                strings.intern(e.kind.as_str())?
+            ])?;
+        }
+        // An event's ordinal is its position in its block's evaluation order.
+        let mut ordinals = vec![0i64; cfg.events.len()];
+        for b in &cfg.blocks {
+            for (ordinal, &e) in b.events.iter().enumerate() {
+                ordinals[e.0 as usize] = ordinal as i64;
+            }
+        }
+        for (i, e) in cfg.events.iter().enumerate() {
+            let id = event_base + i as i64;
+            let occurrence = &e.occurrence;
+            event_stmt.execute(params![
+                id,
+                cfg_id,
+                block(e.block),
+                ordinals[i],
+                strings.intern(e.kind.as_str())?,
+                occurrence.span.file.0,
+                occurrence.span.line,
+                occurrence.span.col,
+                occurrence.expansion_span.map(|s| s.file.0),
+                occurrence.expansion_span.map(|s| s.line),
+                occurrence.expansion_span.map(|s| s.col),
+            ])?;
+            for site in &e.sites {
+                site_stmt.execute(params![id, site.0])?;
+            }
+        }
+        for &(a, b) in &cfg.order {
+            order_stmt.execute(params![event(a), event(b)])?;
+        }
+        for g in &cfg.gaps {
+            gap_stmt.execute(params![
+                gap_id,
+                cfg_id,
+                strings.intern(g.kind.as_str())?,
+                g.span.map(|s| s.file.0),
+                g.span.map(|s| s.line),
+                g.span.map(|s| s.col),
+                g.events.map(|(first, _)| event(first)),
+                g.events.map(|(_, last)| event(last)),
+            ])?;
+            gap_id += 1;
+        }
+        cfg_id += 1;
+        block_base += cfg.blocks.len() as i64;
+        event_base += cfg.events.len() as i64;
     }
     Ok(())
 }

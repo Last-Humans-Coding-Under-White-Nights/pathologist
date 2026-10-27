@@ -4998,11 +4998,13 @@ are removed (`FunctionCfg::compact`); branch, loop, exit and landing
 structure is kept.
 
 The export writes `cfg_functions`, `cfg_blocks`, `cfg_edges`, `cfg_events`,
-`cfg_event_sites`, `cfg_event_order` and `cfg_gaps` in both export modes, and
-retains every call site an event names even when the ordinary call-site
-filter would drop it (an unresolved direct call, a bodyless callee).
+`cfg_event_sites`, `cfg_event_order` and `cfg_gaps` in both export modes
+([schema](SQLITE_SCHEMA.md#call-sequencing-tables)), and retains every call
+site an event names even when the ordinary
+[call-site filter](SQLITE_SCHEMA.md#call-site-export-filter) would drop it (a
+direct site without call edges or argument flow).
 `analysis_run.options_json.call_sequencing` records whether the capability
-was enabled; a database without it reports so and names the flag to
+was enabled ([contract](SQLITE_SCHEMA.md#version-and-capability-contract)); a database without it reports so and names the flag to
 regenerate it.
 
 ### Merge
