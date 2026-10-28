@@ -897,6 +897,10 @@ struct ControlFacts {
     hidden: Vec<Vec<trace_ir::EventId>>,
     /// The gaps over each event.
     event_gaps: Vec<EventGaps>,
+    /// Each block's segment: the first block of the chain of `sequenced`
+    /// edges it continues, and its place in that chain. A segment is one
+    /// block whose local order the builder split ([`EdgeKind::Sequenced`]).
+    segment: Vec<(usize, u32)>,
 }
 
 impl ControlFacts {
@@ -946,12 +950,42 @@ impl ControlFacts {
                 }
             }
         }
+        // A `sequenced` edge continues its source only as its target's one
+        // way in.
+        let mut continues: Vec<Option<usize>> = vec![None; n];
+        for edge in &graph.edges {
+            let to = edge.to.0 as usize;
+            if edge.kind == EdgeKind::Sequenced && pred[to].len() == 1 {
+                continues[to] = Some(edge.from.0 as usize);
+            }
+        }
+        let mut segment: Vec<Option<(usize, u32)>> = vec![None; n];
+        let mut chain = Vec::new();
+        for b in 0..n {
+            let mut at = b;
+            while segment[at].is_none() {
+                match continues[at] {
+                    // The builder makes no cycle of them; one ends the walk.
+                    Some(from) if chain.len() < n => {
+                        chain.push(at);
+                        at = from;
+                    }
+                    _ => segment[at] = Some((at, 0)),
+                }
+            }
+            let mut base = segment[at].unwrap_or((at, 0));
+            while let Some(c) = chain.pop() {
+                base.1 += 1;
+                segment[c] = Some(base);
+            }
+        }
         Self {
             escapes,
             loose,
             throws,
             hidden,
             event_gaps,
+            segment: segment.into_iter().flatten().collect(),
         }
     }
 }
@@ -1158,6 +1192,11 @@ impl LoadedCfg {
     /// reached only through a handler is never claimed.
     fn guarantees(&self, a: usize, to: usize, dom: &Dominance) -> bool {
         let ba = self.block_of(a);
+        // Past the first block of its segment, an earlier event of the
+        // segment may throw before `a` runs.
+        if self.control.segment[ba].1 > 0 && self.control.throws[ba] {
+            return false;
+        }
         dom.normal[to] && dominates(&dom.idom, ba, to) && self.escapes_follow(a, dom)
     }
 
@@ -1197,8 +1236,13 @@ impl LoadedCfg {
             .all(|e| e.0 as usize == a || later.contains(&(e.0 as usize)))
     }
 
-    /// `b` follows `a` in their block's local order.
+    /// `b` follows `a` in their segment's local order: in one block's, or
+    /// `a`'s block earlier in the segment.
     fn order_reaches(&self, a: usize, b: usize) -> bool {
+        let (ba, bb) = (self.block_of(a), self.block_of(b));
+        if ba != bb {
+            return self.control.segment[ba].1 < self.control.segment[bb].1;
+        }
         let mut seen = vec![false; self.graph.events.len()];
         search(a, &mut seen, |e| &self.next_events[e], |y| y == b)
     }
@@ -1231,7 +1275,8 @@ impl LoadedCfg {
         // missing edges are no evidence that `b` cannot follow.
         let a_loose = self.control.loose[ba];
         let mut loosened = a_loose && !forward[ba];
-        let relation = if ba == bb {
+        // Blocks of one segment are one block's local order.
+        let relation = if self.control.segment[ba].0 == self.control.segment[bb].0 {
             if forward[ba] || a_loose {
                 // The block is on a cycle: a later iteration's `a` follows
                 // this one's `b` whatever the block's local order.

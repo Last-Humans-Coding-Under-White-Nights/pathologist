@@ -394,8 +394,10 @@ heads, case labels, labels, `try` bodies and handlers).
 
 `cfg_edges`: `src_block`, `dst_block` → `cfg_blocks` and `kind_id`
 (`fallthrough`, `branch_true`, `branch_false`, `switch_case`, `back_edge`,
-`return`, `exception`, `unsupported`). Primary key `(src_block, dst_block,
-kind_id)`, `WITHOUT ROWID`.
+`return`, `exception`, `unsupported`, `sequenced`; a `sequenced` edge joins
+two halves of one block's local order, see
+[Representation](ANALYSIS.md#representation)). Primary key `(src_block,
+dst_block, kind_id)`, `WITHOUT ROWID`.
 
 `cfg_events`: one row per invocation.
 

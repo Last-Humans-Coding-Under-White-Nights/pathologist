@@ -109,6 +109,11 @@ pub(super) fn build_function_cfg(
     program.cfgs.entry(function).or_default().push(cfg);
 }
 
+/// The widest frontier a group restores before each of its members; a
+/// wider one is joined first ([`Builder::join`]), so a group stores at most
+/// this many order pairs per event.
+const JOIN_WIDTH: usize = 1;
+
 enum SpanSlot {
     Block(BlockId),
     Gap(usize),
@@ -177,6 +182,10 @@ struct Builder<'s, 'a> {
     cur: Option<BlockId>,
     /// The latest events of `cur`, sequenced before the next event.
     frontier: Vec<EventId>,
+    /// How many constructs the walk is in whose events must stay in the
+    /// block they start in: an unordered group's operand (its siblings
+    /// start there) and the prologue (its block's edges are made).
+    unsplit: u32,
     scopes: Vec<Scope>,
     labels: HashMap<&'a str, Label>,
     depth: u32,
@@ -271,6 +280,7 @@ impl<'s, 'a> Builder<'s, 'a> {
             prologue_in_try: None,
             cur: None,
             frontier: Vec::new(),
+            unsplit: 0,
             scopes: Vec::new(),
             labels: HashMap::default(),
             depth: 0,
@@ -377,6 +387,24 @@ impl<'s, 'a> Builder<'s, 'a> {
         }
     }
 
+    /// Before a group that starts each of its members after the frontier:
+    /// when the frontier is wider than [`JOIN_WIDTH`], continue in a new
+    /// block behind a `sequenced` edge, which orders every event so far
+    /// before the group without a pair per two events. Not where the walk
+    /// is [unsplit](Self::unsplit).
+    fn join(&mut self) {
+        let Some(from) = self.cur else {
+            return;
+        };
+        if self.frontier.len() <= JOIN_WIDTH || self.unsplit > 0 {
+            return;
+        }
+        let to = self.new_block(BlockKind::Ordinary);
+        self.landing[to.0 as usize] = self.landing[from.0 as usize];
+        self.edge(from, to, EdgeKind::Sequenced);
+        self.start(to);
+    }
+
     fn emit(&mut self, kind: EventKind, occurrence: CallOccurrence, sites: Vec<CallSiteId>) {
         let block = self.current();
         if self.cfg.blocks[block.0 as usize].events.is_empty() {
@@ -402,9 +430,13 @@ impl<'s, 'a> Builder<'s, 'a> {
     /// Emit the sites at `indices`, one event per invocation, unordered
     /// among themselves and after the current frontier.
     fn emit_unordered(&mut self, indices: &[usize], kind: Option<EventKind>) {
+        let invocations = invocations(self.sites, indices);
+        if invocations.len() > 1 {
+            self.join();
+        }
         let before = std::mem::take(&mut self.frontier);
         let first = self.cfg.events.len();
-        for invocation in invocations(self.sites, indices) {
+        for invocation in invocations {
             let kind = kind.unwrap_or_else(|| event_kind(&self.sites[invocation.first]));
             self.frontier.clone_from(&before);
             self.emit(kind, invocation.occurrence, invocation.sites);
@@ -499,6 +531,9 @@ impl<'s, 'a> Builder<'s, 'a> {
 
     fn fill_prologue(&mut self, head: BlockId, prologue: &[Node<'a>]) {
         self.start(head);
+        // `head` already has its successors, and the unreached sites are
+        // unordered with all of it: it stays one block.
+        self.unsplit += 1;
         let first = self.cfg.events.len();
         for &node in prologue {
             self.flatten(node);
@@ -511,6 +546,7 @@ impl<'s, 'a> Builder<'s, 'a> {
         rest.sort_unstable();
         self.frontier.clear();
         self.emit_unordered(&rest, None);
+        self.unsplit -= 1;
         // Where an unreached site runs is not known either.
         if self.cfg.events.len() > first + 1 || !rest.is_empty() {
             self.gap(GapKind::InitializerOrder, prologue.first().copied(), first);
@@ -519,6 +555,7 @@ impl<'s, 'a> Builder<'s, 'a> {
 
     /// Every event of `node`'s subtree, as one unordered group.
     fn flatten(&mut self, node: Node<'a>) {
+        self.join();
         let before = self.frontier.clone();
         let first = self.cfg.events.len();
         let mut stack = vec![node];
@@ -797,6 +834,7 @@ impl<'a> Builder<'_, 'a> {
             self.visit(first_operand);
             return;
         };
+        self.join();
         let block = Some(self.current());
         let before = self.frontier.clone();
         let first = self.cfg.events.len();
@@ -808,7 +846,9 @@ impl<'a> Builder<'_, 'a> {
             } else {
                 self.frontier.clear();
             }
+            self.unsplit += 1;
             self.visit(operand);
+            self.unsplit -= 1;
             let end = self.cur;
             ends.extend(self.frontier.iter().map(|&e| (end, e)));
         }
@@ -900,7 +940,9 @@ impl<'a> Builder<'_, 'a> {
     }
 
     fn while_statement(&mut self, node: Node<'a>) {
-        // A condition's declaration is destroyed as the loop ends, as `for`.
+        // A condition's declaration lives for one iteration: the end of the
+        // body and `continue` destroy it in a block of their own before the
+        // next evaluation, a false condition and `break` at the exit.
         self.push_scope(ScopeKind::Block, None);
         let head = self.block_at(node);
         self.jump(head, EdgeKind::Fallthrough);
@@ -913,7 +955,16 @@ impl<'a> Builder<'_, 'a> {
         let exit = self.new_block(BlockKind::Ordinary);
         self.edge(test, body, EdgeKind::BranchTrue);
         self.edge(test, exit, EdgeKind::BranchFalse);
-        self.loop_body(node, body, exit, head, EdgeKind::BackEdge);
+        let scope = self.scopes.len() - 1;
+        if self.scopes[scope].objects.is_empty() {
+            self.loop_body(node, body, exit, head, EdgeKind::BackEdge);
+        } else {
+            let latch = self.new_block(BlockKind::Ordinary);
+            self.loop_body(node, body, exit, latch, EdgeKind::Fallthrough);
+            self.jump(latch, EdgeKind::Fallthrough);
+            self.enter(latch);
+            self.unwind(scope);
+        }
         self.jump(head, EdgeKind::BackEdge);
         self.enter(exit);
         self.pop_scope();
@@ -938,7 +989,8 @@ impl<'a> Builder<'_, 'a> {
     }
 
     fn for_statement(&mut self, node: Node<'a>) {
-        // The init-statement's declarations live until the loop ends.
+        // The init-statement's declarations live until the loop ends. (The
+        // grammar parses no declaration as a `for` condition.)
         self.push_scope(ScopeKind::Block, None);
         if let Some(init) = node.cached_field("initializer") {
             self.visit(init);
@@ -2172,8 +2224,76 @@ mod tests {
     fn a_loop_condition_object_is_destroyed_as_the_loop_ends() {
         let unit = lower("scopes.cpp");
         let g = graph(&unit, "leased");
-        let (dtor, after) = (g.ev("Lease::~Lease"), g.ev("after"));
+        let after = g.ev("after");
+        let dtors = g.all("Lease::~Lease");
+        assert!(
+            dtors.iter().any(|&d| g.guaranteed(d, after)),
+            "{}",
+            g.dump()
+        );
+    }
+
+    #[test]
+    fn a_loop_condition_object_is_destroyed_on_each_iteration() {
+        let unit = lower("scopes.cpp");
+        let g = graph(&unit, "lease_continued");
+        let (lease, skip, quit, work, after) = (
+            g.ev("lease"),
+            g.ev("skip"),
+            g.ev("quit"),
+            g.ev("work"),
+            g.ev("after"),
+        );
+        let head = g.block(lease);
+        let dtors = g.all("Lease::~Lease");
+        // Ending an iteration (the body's end or `continue`) destroys the
+        // object before the next condition is evaluated...
+        let again = *dtors
+            .iter()
+            .find(|&&d| g.edge(g.block(d), head, EdgeKind::BackEdge))
+            .unwrap_or_else(|| panic!("no destructor on the back edge: {}", g.dump()));
+        assert!(g.may_precede(work, again), "{}", g.dump());
+        assert!(
+            g.block_path(g.block(skip), g.block(again), Some(g.block(work))),
+            "{}",
+            g.dump()
+        );
+        assert!(
+            !g.block_path(g.block(again), g.block(work), Some(head)),
+            "{}",
+            g.dump()
+        );
+        // ...and leaving the loop (a false condition or `break`) destroys
+        // it before what follows.
+        let out = *dtors
+            .iter()
+            .find(|&&d| g.guaranteed(d, after))
+            .unwrap_or_else(|| panic!("no destructor after the loop: {}", g.dump()));
+        assert!(
+            g.block_path(g.block(quit), g.block(out), Some(head)),
+            "{}",
+            g.dump()
+        );
+        assert_eq!(dtors.len(), 2, "{}", g.dump());
+
+        // A `for` init-statement's object lives for the whole loop.
+        let g = graph(&unit, "guarded_for");
+        let (more, skip, step, work, after) = (
+            g.ev("more"),
+            g.ev("skip"),
+            g.ev("value"),
+            g.ev("work"),
+            g.ev("after"),
+        );
+        assert!(
+            g.block_path(g.block(skip), g.block(step), Some(g.block(work))),
+            "{}",
+            g.dump()
+        );
+        let dtor = g.ev("Guard::~Guard");
         assert!(g.guaranteed(dtor, after), "{}", g.dump());
+        assert!(!g.may_precede(dtor, more), "{}", g.dump());
+        assert!(!g.may_precede(dtor, step), "{}", g.dump());
     }
 
     #[test]
@@ -2338,6 +2458,50 @@ mod tests {
         let a = g.block(g.ev("a"));
         let c = g.block(g.ev("c"));
         assert!(g.reach(a, None, |_| true).contains(&c), "{}", g.dump());
+    }
+
+    /// Two statements of `n` unordered calls each: what orders the second
+    /// after the first is one `sequenced` edge between their blocks, not a
+    /// pair per two calls.
+    #[test]
+    fn consecutive_unordered_groups_store_linear_order() {
+        let n = 100;
+        let sum = vec!["step()"; n].join(" + ");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sums.c");
+        std::fs::write(
+            &path,
+            format!("int step(void);\nvoid sums(void)\n{{\n    {sum};\n    {sum};\n}}\n"),
+        )
+        .unwrap();
+        let graph_ = IncludeGraph::build(dir.path(), std::slice::from_ref(&path), &[]);
+        let unit = index_source_file(
+            &path,
+            dir.path(),
+            &graph_,
+            &PreprocessOptions::new().with_call_sequencing(true),
+            &IndexSourceCache::new(),
+            None,
+            &HeaderOrder::default(),
+        );
+        let g = graph(&unit, "sums");
+        let steps = g.all("step");
+        assert_eq!(steps.len(), 2 * n);
+        assert!(
+            g.cfg.order.len() < 4 * n,
+            "{} order pairs for {} events",
+            g.cfg.order.len(),
+            steps.len()
+        );
+        let line = |e: EventId| g.cfg.events[e.0 as usize].occurrence.span.line;
+        let (first, second): (Vec<_>, Vec<_>) = steps.iter().partition(|&&e| line(e) == 4);
+        assert_eq!((first.len(), second.len()), (n, n));
+        let (a, b) = (g.block(first[0]), g.block(second[0]));
+        assert!(first.iter().all(|&e| g.block(e) == a));
+        assert!(second.iter().all(|&e| g.block(e) == b));
+        assert!(g.edge(a, b, EdgeKind::Sequenced), "{}", g.dump());
+        assert!(g.unordered(first[0], first[n - 1]));
+        assert!(g.unordered(second[0], second[n - 1]));
     }
 
     #[test]

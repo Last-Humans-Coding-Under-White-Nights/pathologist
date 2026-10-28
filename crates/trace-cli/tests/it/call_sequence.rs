@@ -1792,3 +1792,67 @@ fn a_pack_expansion_handler_is_not_a_catch_all() {
     let at = |line, callee| event(&conn, "exceptions.cpp", line, callee);
     assert_eq!(relation(&conn, &at(149, "a"), &at(153, "b")), MayPrecede);
 }
+
+/// A `while` condition's object is destroyed at the end of each iteration
+/// (body end or `continue`), before the back edge to the next evaluation,
+/// and again where the loop ends (false condition or `break`).
+#[test]
+fn a_loop_condition_object_is_destroyed_each_iteration() {
+    let conn = fixture_db();
+    for name in ["leased", "lease_continued"] {
+        let graph = function_sequence(&conn, name, None, &Default::default());
+        let block_of = |callee: &str| -> Vec<usize> {
+            graph
+                .events
+                .iter()
+                .filter(|e| e.callee == callee)
+                .map(|e| e.block)
+                .collect()
+        };
+        let (head, dtors) = (block_of("lease"), block_of("Lease::~Lease"));
+        assert_eq!(head.len(), 1, "{name}");
+        assert_eq!(dtors.len(), 2, "{name}: once per iteration, once after");
+        let back = |b: usize| {
+            graph
+                .edges
+                .iter()
+                .any(|e| e.src == b && e.dst == head[0] && e.kind == "back_edge")
+        };
+        assert_eq!(dtors.iter().filter(|&&b| back(b)).count(), 1, "{name}");
+        // The one after the loop runs before `after`, in its block.
+        assert!(dtors.contains(&block_of("after")[0]), "{name}");
+    }
+}
+
+/// Two statements of `n` unordered calls each store order rows linear in
+/// `n`, and still relate every call of the first as `sequenced_before`
+/// every call of the second.
+#[test]
+fn consecutive_unordered_statements_stay_sequenced_in_linear_storage() {
+    use trace_db::Relation::*;
+    let n = 100;
+    let sum = vec!["step()"; n].join(" + ");
+    let dir = scratch(&[(
+        "sums.c",
+        &format!("int step(void);\nvoid sums(void)\n{{\n    {sum};\n    {sum};\n}}\n"),
+    )]);
+    let db = sequenced_db(dir.path(), PreprocessOptions::new());
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM cfg_events"),
+        2 * n as i64
+    );
+    let order = count(&conn, "SELECT count(*) FROM cfg_event_order");
+    assert!(order < 4 * n as i64, "{order} order rows");
+    let at = |line: i64, i: usize| {
+        trace_db::resolve_event(&conn, "sums.c", line, Some(5 + 9 * i as i64), Some("step"))
+            .expect("event")
+    };
+    let (first, last) = (0, n - 1);
+    for (a, b) in [(first, last), (last, first), (first, first)] {
+        assert_eq!(relation(&conn, &at(4, a), &at(5, b)), SequencedBefore);
+        assert_eq!(relation(&conn, &at(5, b), &at(4, a)), MayFollow);
+    }
+    assert_eq!(relation(&conn, &at(4, first), &at(4, last)), Unordered);
+    assert_eq!(relation(&conn, &at(5, last), &at(5, first)), Unordered);
+}

@@ -130,3 +130,25 @@ void forward()
 out:
     after();
 }
+
+void lease_continued()
+{
+    while (Lease l = lease()) {
+        if (skip())
+            continue;
+        if (quit())
+            break;
+        work();
+    }
+    after();
+}
+
+void guarded_for()
+{
+    for (Guard g; more(); value()) {
+        if (skip())
+            continue;
+        work();
+    }
+    after();
+}

@@ -4930,8 +4930,9 @@ database carries no sequencing rows.
   between A and B completing normally (no `throw`, `longjmp`, `exit` or
   noreturn call); the query states these conditions with its answer. Relation
   strengths:
-  - `sequenced_before`: same block, not on a cycle, A precedes B in the
-    block's local order; `guaranteed_before`: A's block dominates B's block
+  - `sequenced_before`: same block (the blocks of one chain of `sequenced`
+    edges count as one; see [Representation](#representation)), not on a
+    cycle, A precedes B in the block's local order; `guaranteed_before`: A's block dominates B's block
     over every edge, exception edges included, B's block does not reach A's,
     B's block is reached from the entry without an exception edge, and no gap
     other than an `unordered_branch` gap covers either event (that kind only
@@ -5022,9 +5023,15 @@ the jump leaves, and a fallthrough past it; a label the body lacks adds an
   destroys the objects the label's scope declared after the label
   (`again: before(); Guard g; if (retry()) goto again;` runs `Guard::~Guard`
   on the jump), after those of the scopes it leaves; a forward `goto` cannot
-  skip a declaration in valid C++ and destroys only what it leaves. A
-  `while`, `for` or `if` condition's object is destroyed where the statement
-  ends. No call site is added for this.
+  skip a declaration in valid C++ and destroys only what it leaves. An `if`
+  or `switch` condition's object is destroyed where the statement ends, a
+  `for` init-statement's where the loop ends. A `while` condition's object
+  lives for one iteration: the end of the body and `continue` reach a block
+  destroying it before the back edge to the next evaluation, and a false
+  condition or `break` destroy it at the loop's exit, so in
+  `while (T t = next()) work();` one iteration's `T::~T` precedes the next
+  one's `next` (the pinned grammar parses no declaration as a `for`
+  condition). No call site is added for this.
 - **Exceptions.** Each `try` has one `landing` block. Every block of the
   `try` body that holds an event, nested handlers included, has an
   `exception` edge to it, except a block of a nested `try` body: that block
@@ -5056,16 +5063,33 @@ Per function body and configuration variant, `FunctionCfg`
 - blocks (`entry`, `exit`, `exceptional_exit`, `ordinary`, `landing`) with
   their events in evaluation order, and typed successor edges
   (`fallthrough`, `branch_true`, `branch_false`, `switch_case`, `back_edge`,
-  `return`, `exception`, `unsupported`);
+  `return`, `exception`, `unsupported`, `sequenced`);
 - the **immediate** sequenced-before pairs between events of one block (a
-  DAG); events of a block with no path between them are unordered;
+  DAG); events of a block with no path between them are unordered. A
+  `sequenced` edge splits one block's local order in two: it is the only way
+  into its target, and every event of its source is sequenced before every
+  event of its target. The builder adds one before a group that starts each
+  of its members after the latest events (an unordered group, the base
+  destructors of one object) when more than one event is latest, so in
+  `a() + b(); c() + d();` the second statement follows the first through
+  one edge rather than a pair per two calls. A query treats the blocks of
+  such a chain as one block;
 - gaps: regions whose order is not modeled.
 
 Storage stays linear in blocks + edges + events + sites: no transitive
-before-pairs, expanded callee bodies or enumerated paths are stored. After a
-body is built, event-free blocks that only fall through to their successor
-are removed (`FunctionCfg::compact`); branch, loop, exit and landing
-structure is kept.
+before-pairs, expanded callee bodies or enumerated paths are stored, and a
+group never restores more than one latest event before each member (a wider
+frontier gets a `sequenced` edge first), so a body stores at most about two
+order pairs per event. The exception is where one block must hold a whole
+group: inside an operand of an unordered group (its siblings start in the
+block it starts in) and in a constructor's member-initializer list (one
+`initializer_order` gap). There a sequenced step after an unordered one
+(the second operand of a comma, an initializer-list element, the next
+member initializer) stores a pair per two calls of the two steps, as in
+`f((a() + b(), c() + d()), e())`. After a body is built, event-free blocks
+that only fall through to their successor are removed
+(`FunctionCfg::compact`; a `sequenced` edge into one becomes a
+`fallthrough`); branch, loop, exit and landing structure is kept.
 
 The export writes `cfg_functions`, `cfg_blocks`, `cfg_edges`, `cfg_events`,
 `cfg_event_sites`, `cfg_event_order` and `cfg_gaps` in both export modes

@@ -60,10 +60,15 @@ pub enum EdgeKind {
     Exception,
     /// Control leaves through a construct the graph does not model.
     Unsupported,
+    /// The only way into its target, from a block whose every event is
+    /// sequenced before every event of the target: one block's local order
+    /// split in two, so a wide group of unordered events is not paired with
+    /// each event of the next group.
+    Sequenced,
 }
 
 impl EdgeKind {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Fallthrough,
         Self::BranchTrue,
         Self::BranchFalse,
@@ -72,6 +77,7 @@ impl EdgeKind {
         Self::Return,
         Self::Exception,
         Self::Unsupported,
+        Self::Sequenced,
     ];
 
     /// The kind's name in exports and query output.
@@ -85,6 +91,7 @@ impl EdgeKind {
             Self::Return => "return",
             Self::Exception => "exception",
             Self::Unsupported => "unsupported",
+            Self::Sequenced => "sequenced",
         }
     }
 
@@ -700,8 +707,9 @@ impl FunctionCfg {
     }
 
     /// Remove event-free ordinary blocks that only fall through to another
-    /// block, redirecting their incoming edges; branch, loop, exit and
-    /// landing structure is kept. Repeated edges are dropped either way.
+    /// block, redirecting their incoming edges (a `sequenced` one becomes a
+    /// fallthrough); branch, loop, exit and landing structure is kept.
+    /// Repeated edges are dropped either way.
     pub fn compact(&mut self) {
         let n = self.blocks.len();
         let mut out_degree = vec![0u32; n];
@@ -768,6 +776,11 @@ impl FunctionCfg {
         let map = |b: BlockId| BlockId(renumber[target[b.0 as usize] as usize]);
         self.edges.retain(|e| forward[e.from.0 as usize].is_none());
         for e in &mut self.edges {
+            // A `sequenced` edge names its target as the source's
+            // continuation; the block a removed one fell through to is not.
+            if e.kind == EdgeKind::Sequenced && forward[e.to.0 as usize].is_some() {
+                e.kind = EdgeKind::Fallthrough;
+            }
             e.from = map(e.from);
             e.to = map(e.to);
         }
@@ -940,6 +953,46 @@ mod tests {
             vec![
                 edge(0, 2, EdgeKind::Fallthrough),
                 edge(2, 1, EdgeKind::Fallthrough),
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_turns_a_sequenced_edge_into_a_removed_block_into_a_fallthrough() {
+        // b2(events) =sequenced=> b3(empty) -> b4(label, also reached from
+        // b5) -> exit: b4 is not b2's continuation, so the edge to it
+        // claims no more than a fallthrough.
+        let mut g = cfg(
+            vec![
+                block(BlockKind::Entry, &[]),
+                block(BlockKind::Exit, &[]),
+                block(BlockKind::Ordinary, &[0, 1]),
+                block(BlockKind::Ordinary, &[]),
+                block(BlockKind::Ordinary, &[2]),
+                block(BlockKind::Ordinary, &[3]),
+            ],
+            vec![
+                edge(0, 2, EdgeKind::Fallthrough),
+                edge(2, 3, EdgeKind::Sequenced),
+                edge(3, 4, EdgeKind::Fallthrough),
+                edge(5, 4, EdgeKind::BranchTrue),
+                edge(4, 1, EdgeKind::Fallthrough),
+            ],
+            vec![
+                event(2, 3, 10),
+                event(2, 3, 11),
+                event(4, 4, 12),
+                event(5, 5, 13),
+            ],
+        );
+        g.compact();
+        assert_eq!(
+            g.edges,
+            vec![
+                edge(0, 2, EdgeKind::Fallthrough),
+                edge(2, 3, EdgeKind::Fallthrough),
+                edge(4, 3, EdgeKind::BranchTrue),
+                edge(3, 1, EdgeKind::Fallthrough),
             ]
         );
     }
