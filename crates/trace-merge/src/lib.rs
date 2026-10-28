@@ -1162,7 +1162,8 @@ pub fn merge_databases<P: AsRef<Path>>(
                 r.get(0)
             })?;
         for first in (1..=last).step_by(CFG_READ_CHUNK as usize) {
-            let chunk = first..=first.saturating_add(CFG_READ_CHUNK - 1);
+            let chunk =
+                trace_db::CfgId(first)..=trace_db::CfgId(first.saturating_add(CFG_READ_CHUNK - 1));
             for stored in trace_db::read_cfgs(conn, chunk)? {
                 let cfg = stored.cfg;
                 if let Some(file) = cfg.files().find(|f| !files.contains_key(&i64::from(f.0))) {

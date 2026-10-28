@@ -10,7 +10,7 @@
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, OptionalExtension};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::fmt::Write;
@@ -103,37 +103,6 @@ pub fn require_sequencing(conn: &Connection) -> Result<SequencingMarker> {
         SequencingMarker::Absent => bail!(missing),
         marker => Ok(marker),
     }
-}
-
-/// Database row ids the sequence API names, each typed by its table so one
-/// cannot stand for another; they serialize as the bare id.
-macro_rules! row_id {
-    ($(#[$doc:meta])* $name:ident) => {
-        $(#[$doc])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-        #[serde(transparent)]
-        pub struct $name(pub i64);
-
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                self.0.fmt(f)
-            }
-        }
-
-        impl rusqlite::ToSql for $name {
-            fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-                self.0.to_sql()
-            }
-        }
-
-        impl rusqlite::types::FromSql for $name {
-            fn column_result(
-                value: rusqlite::types::ValueRef<'_>,
-            ) -> rusqlite::types::FromSqlResult<Self> {
-                i64::column_result(value).map(Self)
-            }
-        }
-    };
 }
 
 row_id!(
@@ -353,30 +322,38 @@ pub fn resolve_event(
     // position, each in another graph of the function, are one candidate
     // (two events of one graph stay two). Copies spelled in one macro body
     // but invoked at different positions are different calls.
-    let mut candidates: Vec<(EventRef, Invocation, Option<String>)> = Vec::new();
+    let mut candidates: Vec<(EventRef, Option<String>)> = Vec::new();
+    // The candidates of each `(function, path, line, col, callee,
+    // invocation)`, in first-seen order.
+    let mut by_key: FxHashMap<_, Vec<usize>> = FxHashMap::default();
     for (mut event, callees, expansion, invoked_at) in found {
         if callee.is_some_and(|want| !callees.iter().any(|c| super::names_function(c, want))) {
             continue;
         }
         event.callee = callees.into_iter().next().unwrap_or_default();
         let copy = (event.event, event.cfg);
-        let same = candidates.iter_mut().find(|(c, at, _)| {
-            (c.function, &c.path, c.line, c.col, &c.callee, *at)
-                == (
-                    event.function,
-                    &event.path,
-                    event.line,
-                    event.col,
-                    &event.callee,
-                    invoked_at,
-                )
-                && c.variants.iter().all(|&(_, cfg)| cfg != event.cfg)
+        let key = (
+            event.function,
+            event.path.clone(),
+            event.line,
+            event.col,
+            event.callee.clone(),
+            invoked_at,
+        );
+        let same = by_key.entry(key).or_default();
+        let open = same.iter().copied().find(|&i| {
+            candidates[i]
+                .0
+                .variants
+                .iter()
+                .all(|&(_, cfg)| cfg != event.cfg)
         });
-        match same {
-            Some((c, _, _)) => c.variants.push(copy),
+        match open {
+            Some(i) => candidates[i].0.variants.push(copy),
             None => {
+                same.push(candidates.len());
                 event.variants.push(copy);
-                candidates.push((event, invoked_at, expansion));
+                candidates.push((event, expansion));
             }
         }
     }
@@ -387,7 +364,7 @@ pub fn resolve_event(
             let mut listed = candidates
                 .iter()
                 .take(MAX_LISTED_CANDIDATES)
-                .map(|(c, _, expansion)| match expansion {
+                .map(|(c, expansion)| match expansion {
                     Some(at) => format!("{} at {} (invoked at {at})", c.callee, c.position()),
                     None => format!("{} at {}", c.callee, c.position()),
                 })
@@ -396,7 +373,7 @@ pub fn resolve_event(
             if n > MAX_LISTED_CANDIDATES {
                 write!(listed, ", and {} more", n - MAX_LISTED_CANDIDATES).unwrap();
             }
-            let hint = match candidates.iter().find_map(|c| c.2.as_ref()) {
+            let hint = match candidates.iter().find_map(|c| c.1.as_ref()) {
                 Some(at) => format!(
                     "; calls spelled in a macro body match at every invocation, \
                      so name the invocation's position (such as {at})"
@@ -634,12 +611,8 @@ struct LoadedCfg {
     succ: Vec<Vec<usize>>,
     pred: Vec<Vec<usize>>,
     next_events: Vec<Vec<usize>>,
-    /// Blocks control may leave through a transfer the graph does not
-    /// model, landing anywhere ([`unmodeled_transfers`]).
-    escapes: Vec<bool>,
-    /// Blocks an unmodeled transfer may come back before: those a block
-    /// holding a control-hiding gap's event reaches, itself included.
-    resumed: Vec<bool>,
+    /// Where control may move without an edge ([`ControlFacts::of`]).
+    control: ControlFacts,
 }
 
 // What the query reads of one graph beyond `crate::read_cfgs`; each is a
@@ -757,10 +730,9 @@ impl<'c> Loader<'c> {
             cfg: graph,
             event_ids,
             ..
-        } = crate::read_cfgs(conn, cfg_id.0..=cfg_id.0)?
+        } = crate::read_cfgs(conn, cfg_id..=cfg_id)?
             .pop()
             .with_context(|| format!("no call-order graph {cfg_id}"))?;
-        let event_ids: Vec<CfgEventId> = event_ids.into_iter().map(CfgEventId).collect();
         let by_db: FxHashMap<CfgEventId, usize> = event_ids
             .iter()
             .enumerate()
@@ -842,7 +814,7 @@ impl<'c> Loader<'c> {
         for &(a, b) in &graph.order {
             next_events[a.0 as usize].push(b.0 as usize);
         }
-        let (escapes, resumed) = unmodeled_transfers(&graph, &succ);
+        let control = ControlFacts::of(&graph, &succ, &pred);
         let index = self.cfgs.len();
         self.cfgs.push(LoadedCfg {
             cfg_id,
@@ -860,8 +832,7 @@ impl<'c> Loader<'c> {
             succ,
             pred,
             next_events,
-            escapes,
-            resumed,
+            control,
         });
         self.by_id.insert(cfg_id, index);
         Ok(index)
@@ -886,40 +857,103 @@ fn hides_control(kind: GapKind) -> bool {
 
 /// The events of `graph` under a gap that may hide a control transfer.
 fn hidden_transfer_events(graph: &FunctionCfg) -> impl Iterator<Item = usize> + '_ {
+    let n = graph.events.len();
     graph
         .gaps
         .iter()
         .filter(|g| hides_control(g.kind))
         .filter_map(|g| g.events)
-        .flat_map(|(lo, hi)| lo.0 as usize..=hi.0 as usize)
+        .flat_map(move |(lo, hi)| lo.0 as usize..(hi.0 as usize + 1).min(n))
 }
 
-/// Where control may move without an edge (docs/ANALYSIS.md, "Boundaries and
-/// gaps"): the blocks it may leave for anywhere (an `unsupported` edge, or an
-/// event under a control-hiding gap), and the blocks it may later come back
-/// before (those such an event's block reaches, itself included: a
-/// `longjmp` from any later call returns to a `setjmp`).
-fn unmodeled_transfers(graph: &FunctionCfg, succ: &[Vec<usize>]) -> (Vec<bool>, Vec<bool>) {
-    let n = graph.blocks.len();
-    let mut escapes = vec![false; n];
-    for edge in &graph.edges {
-        if edge.kind == EdgeKind::Unsupported {
-            escapes[edge.from.0 as usize] = true;
+/// The gaps over one event, by what they leave unmodeled.
+#[derive(Default)]
+struct EventGaps {
+    /// The kind of the first gap over it that may hide a control transfer.
+    hides_control: Option<GapKind>,
+    /// The kind of the first gap over it other than `unordered_branch`.
+    unorders: Option<GapKind>,
+    /// The `unordered_branch` gaps over it, by index in the graph.
+    unordered_branch: Vec<usize>,
+}
+
+/// Where control may move without an edge in one graph (docs/ANALYSIS.md,
+/// "Boundaries and gaps").
+struct ControlFacts {
+    /// Blocks control may leave for anywhere: an `unsupported` edge, or an
+    /// event under a control-hiding gap.
+    escapes: Vec<bool>,
+    /// Blocks after which control may leave through an unmodeled transfer
+    /// and land anywhere, before any event of the graph: those that escape
+    /// or reach an escaping block, and those an unmodeled transfer may come
+    /// back before (the blocks a control-hiding event's block reaches,
+    /// itself included: a `longjmp` from any later call returns to a
+    /// `setjmp`).
+    loose: Vec<bool>,
+    /// Blocks with an `exception` edge: an event in them may throw to a
+    /// handler of this function, leaving before the block's later events.
+    throws: Vec<bool>,
+    /// The events of each block under a control-hiding gap.
+    hidden: Vec<Vec<trace_ir::EventId>>,
+    /// The gaps over each event.
+    event_gaps: Vec<EventGaps>,
+}
+
+impl ControlFacts {
+    fn of(graph: &FunctionCfg, succ: &[Vec<usize>], pred: &[Vec<usize>]) -> Self {
+        let n = graph.blocks.len();
+        let mut escapes = vec![false; n];
+        let mut throws = vec![false; n];
+        for edge in &graph.edges {
+            match edge.kind {
+                EdgeKind::Unsupported => escapes[edge.from.0 as usize] = true,
+                EdgeKind::Exception => throws[edge.from.0 as usize] = true,
+                _ => {}
+            }
+        }
+        let mut resumed = vec![false; n];
+        let mut hidden = vec![Vec::new(); n];
+        for e in hidden_transfer_events(graph) {
+            let b = graph.events[e].block.0 as usize;
+            hidden[b].push(trace_ir::EventId(e as u32));
+            escapes[b] = true;
+            if !resumed[b] {
+                resumed[b] = true;
+                search(b, &mut resumed, |x| &succ[x], |_| false);
+            }
+        }
+        // The escaping blocks and those reaching one.
+        let mut loose = escapes.clone();
+        for b in (0..n).filter(|&b| escapes[b]) {
+            search(b, &mut loose, |x| &pred[x], |_| false);
+        }
+        for (l, r) in loose.iter_mut().zip(&resumed) {
+            *l |= r;
+        }
+        let events = graph.events.len();
+        let mut event_gaps: Vec<EventGaps> = (0..events).map(|_| EventGaps::default()).collect();
+        for (i, gap) in graph.gaps.iter().enumerate() {
+            let Some((lo, hi)) = gap.events else { continue };
+            let end = (hi.0 as usize + 1).min(events);
+            for over in &mut event_gaps[(lo.0 as usize).min(end)..end] {
+                if hides_control(gap.kind) {
+                    over.hides_control.get_or_insert(gap.kind);
+                }
+                if gap.kind == GapKind::UnorderedBranch {
+                    over.unordered_branch.push(i);
+                } else {
+                    over.unorders.get_or_insert(gap.kind);
+                }
+            }
+        }
+        Self {
+            escapes,
+            loose,
+            throws,
+            hidden,
+            event_gaps,
         }
     }
-    let mut resumed = vec![false; n];
-    for e in hidden_transfer_events(graph) {
-        let Some(event) = graph.events.get(e) else {
-            continue;
-        };
-        let b = event.block.0 as usize;
-        escapes[b] = true;
-        if !resumed[b] {
-            resumed[b] = true;
-            search(b, &mut resumed, |x| &succ[x], |_| false);
-        }
-    }
-    (escapes, resumed)
 }
 
 /// Nodes reached from `from` over one or more steps of `next`, marked in
@@ -1107,67 +1141,66 @@ impl LoadedCfg {
         Dominance { idom, normal }
     }
 
-    /// Block `b` has an `exception` edge: an event in it may throw to a
-    /// handler of this function, leaving the block before its later events.
-    fn throws_to_handler(&self, b: usize) -> bool {
-        self.graph
-            .edges
-            .iter()
-            .any(|e| e.kind == EdgeKind::Exception && e.from.0 as usize == b)
-    }
-
-    /// Event `e` precedes every other event of its block in the local order.
-    fn first_of_block(&self, e: usize) -> bool {
-        let mut seen = vec![false; self.graph.events.len()];
-        search(e, &mut seen, |x| &self.next_events[x], |_| false);
-        let reached = seen.iter().filter(|&&s| s).count();
-        reached + 1 == self.graph.blocks[self.block_of(e)].events.len()
+    /// The events of block `b` that may leave it before its later events:
+    /// all of them when it may throw to a handler, otherwise those under a
+    /// control-hiding gap (an `unsupported` edge leaves after all of them).
+    fn early_exits(&self, b: usize) -> &[trace_ir::EventId] {
+        if self.control.throws[b] {
+            &self.graph.blocks[b].events
+        } else {
+            &self.control.hidden[b]
+        }
     }
 
     /// Every path from the entry to block `to` invokes event `a` first:
-    /// `a`'s block dominates `to` over every edge, and when that block may
-    /// throw to a handler, `a` is its first event (an earlier one may throw
-    /// and the handler reach `to` without `a`). A block reached only through
-    /// a handler is never claimed.
+    /// `a`'s block dominates `to` over every edge and no unmodeled transfer
+    /// enters a block without `a` ([`Self::escapes_follow`]). A block
+    /// reached only through a handler is never claimed.
     fn guarantees(&self, a: usize, to: usize, dom: &Dominance) -> bool {
         let ba = self.block_of(a);
-        dom.normal[to]
-            && dominates(&dom.idom, ba, to)
-            && (!self.throws_to_handler(ba) || self.first_of_block(a))
-            && self.escapes_follow(a, dom)
+        dom.normal[to] && dominates(&dom.idom, ba, to) && self.escapes_follow(a, dom)
     }
 
-    /// Every unmodeled transfer leaves after `a` was invoked, so none can
-    /// enter a block without it: each escaping block is dominated by `a`'s,
-    /// and in `a`'s own block each control-hiding event follows `a` (an
-    /// `unsupported` edge leaves after all of the block's events).
+    /// Every early leave happens after `a` was invoked, so none can enter a
+    /// block without it: each escaping block is dominated by `a`'s, and in
+    /// `a`'s own block `a` precedes each [early exit](Self::early_exits)
+    /// (when the block may throw, an earlier event may throw and the handler
+    /// reach the block without `a`). `a` itself is not under a
+    /// control-hiding gap: [`Self::relate`] answers `unknown` for one first.
     fn escapes_follow(&self, a: usize, dom: &Dominance) -> bool {
         let ba = self.block_of(a);
-        self.escapes
+        let dominated = self
+            .control
+            .escapes
             .iter()
             .enumerate()
-            .all(|(b, &escapes)| !escapes || b == ba || dominates(&dom.idom, ba, b))
-            && hidden_transfer_events(&self.graph)
-                .filter(|&e| e < self.graph.events.len() && self.block_of(e) == ba)
-                .all(|e| self.order_reaches(a, e))
-    }
-
-    /// Control may leave block `b` through an unmodeled transfer, once or
-    /// after the blocks it reaches (`reach`, from [`Self::reach`]), and land
-    /// anywhere, before any event of the graph.
-    fn leaves_unmodeled(&self, b: usize, reach: &[bool]) -> bool {
-        self.escapes[b] || self.resumed[b] || reach.iter().zip(&self.escapes).any(|(&r, &e)| r && e)
+            .all(|(b, &escapes)| !escapes || b == ba || dominates(&dom.idom, ba, b));
+        if !dominated {
+            return false;
+        }
+        let exits = self.early_exits(ba);
+        if exits.iter().all(|e| e.0 as usize == a) {
+            return true;
+        }
+        // The events after `a` in the local order.
+        let mut later = FxHashSet::default();
+        let mut stack = vec![a];
+        while let Some(x) = stack.pop() {
+            for &y in &self.next_events[x] {
+                if later.insert(y) {
+                    stack.push(y);
+                }
+            }
+        }
+        exits
+            .iter()
+            .all(|e| e.0 as usize == a || later.contains(&(e.0 as usize)))
     }
 
     /// `b` follows `a` in their block's local order.
     fn order_reaches(&self, a: usize, b: usize) -> bool {
         let mut seen = vec![false; self.graph.events.len()];
         search(a, &mut seen, |e| &self.next_events[e], |y| y == b)
-    }
-
-    /// The gaps whose event range holds `event`.
-    fn gaps_over(&self, event: usize) -> impl Iterator<Item = &Gap> + '_ {
-        self.graph.gaps.iter().filter(move |g| covers(g, event))
     }
 
     /// How event `a`'s invocation relates to event `b`'s, both of this
@@ -1181,25 +1214,33 @@ impl LoadedCfg {
         forward: &[bool],
         dom: &Dominance,
     ) -> (Relation, Vec<String>) {
+        let gaps = (&self.control.event_gaps[a], &self.control.event_gaps[b]);
+        // An end under a gap that may hide a control transfer: whatever
+        // runs there may jump anywhere, so not even a path is claimed.
+        if let Some(kind) = gaps.0.hides_control.or(gaps.1.hides_control) {
+            return (
+                Relation::Unknown,
+                vec![format!(
+                    "a {} gap covers an end; its control flow is not modeled",
+                    kind.as_str()
+                )],
+            );
+        }
         let (ba, bb) = (self.block_of(a), self.block_of(b));
         // An unmodeled transfer after `a` may land before anything: its
         // missing edges are no evidence that `b` cannot follow.
-        let a_loose = self.leaves_unmodeled(ba, forward);
+        let a_loose = self.control.loose[ba];
         let mut loosened = a_loose && !forward[ba];
-        let relation = if a == b {
-            if forward[ba] || a_loose {
-                Relation::MayBoth
-            } else {
-                return (
-                    Relation::Unknown,
-                    vec!["both positions name the same invocation".into()],
-                );
-            }
-        } else if ba == bb {
+        let relation = if ba == bb {
             if forward[ba] || a_loose {
                 // The block is on a cycle: a later iteration's `a` follows
                 // this one's `b` whatever the block's local order.
                 Relation::MayBoth
+            } else if a == b {
+                return (
+                    Relation::Unknown,
+                    vec!["both positions name the same invocation".into()],
+                );
             } else if self.order_reaches(a, b) {
                 Relation::SequencedBefore
             } else if self.order_reaches(b, a) {
@@ -1209,7 +1250,7 @@ impl LoadedCfg {
             }
         } else {
             let back = self.reach(bb, true);
-            let b_loose = self.leaves_unmodeled(bb, &back);
+            let b_loose = self.control.loose[bb];
             loosened = (a_loose && !forward[bb]) || (b_loose && !back[ba]);
             match (forward[bb] || a_loose, back[ba] || b_loose) {
                 (true, true) => Relation::MayBoth,
@@ -1219,28 +1260,15 @@ impl LoadedCfg {
                 (false, false) => Relation::Exclusive,
             }
         };
-        // An end under a gap that may hide a control transfer: whatever
-        // runs there may jump anywhere, so not even a path is claimed.
-        if let Some(gap) = self
-            .gaps_over(a)
-            .chain(self.gaps_over(b))
-            .find(|g| hides_control(g.kind))
-        {
-            return (
-                Relation::Unknown,
-                vec![format!(
-                    "a {} gap covers an end; its control flow is not modeled",
-                    gap.kind.as_str()
-                )],
-            );
-        }
         // One unordered_branch gap holding both: the graph orders its
         // operands one after another, so any order it shows between them
         // may be the builder's walk rather than the language's. Arms of one
         // branch stay exclusive, and a cycle already admits both orders.
-        let shared = self
-            .gaps_over(a)
-            .any(|g| g.kind == GapKind::UnorderedBranch && covers(g, b));
+        let shared = gaps
+            .0
+            .unordered_branch
+            .iter()
+            .any(|&g| covers(&self.graph.gaps[g], b));
         if shared
             && matches!(
                 relation,
@@ -1262,16 +1290,12 @@ impl LoadedCfg {
             relation,
             Relation::SequencedBefore | Relation::GuaranteedBefore
         ) {
-            if let Some(gap) = self
-                .gaps_over(a)
-                .chain(self.gaps_over(b))
-                .find(|g| g.kind != GapKind::UnorderedBranch)
-            {
+            if let Some(kind) = gaps.0.unorders.or(gaps.1.unorders) {
                 return (
                     Relation::Unknown,
                     vec![format!(
                         "a {} gap covers an end; its order is not modeled",
-                        gap.kind.as_str()
+                        kind.as_str()
                     )],
                 );
             }
@@ -1609,12 +1633,12 @@ impl Builder<'_, '_> {
                     self.boundary(frame, event, "omitted_body", Some(target), Some(reason));
                 } else if depth < self.options.depth {
                     for &variant in variants.iter() {
-                        if self.frames_spent {
-                            break;
-                        }
+                        // Frames only grow, so once spent the budget stays
+                        // spent; only the first cut call is marked.
                         if self.graph.frames.len() >= self.options.max_frames {
-                            self.frames_spent = true;
-                            self.truncate(frame, event, "max_frames");
+                            if !std::mem::replace(&mut self.frames_spent, true) {
+                                self.truncate(frame, event, "max_frames");
+                            }
                             break;
                         }
                         let child = self.loader.load(variant)?;
@@ -1653,17 +1677,18 @@ impl Builder<'_, '_> {
 /// The events of `from`'s graph whose calls reach one of the graphs `to`
 /// within `depth` call levels, skipping context starts and IPC bridges:
 /// those run elsewhere and order nothing.
+/// `memo` is [`event_reaches`]'s, shared by every query of one `to`.
 fn calls_reaching(
     loader: &mut Loader,
     from: usize,
     to: &[CfgId],
     depth: u32,
+    memo: &mut FxHashMap<(CfgId, u32), bool>,
 ) -> Result<Vec<usize>> {
-    let mut memo = FxHashMap::default();
     let mut found = Vec::new();
     let events: Vec<usize> = loader.cfgs[from].events_in_order().collect();
     for e in events {
-        if event_reaches(loader, from, e, to, depth, &mut memo)? {
+        if event_reaches(loader, from, e, to, depth, memo)? {
             found.push(e);
         }
     }
@@ -1671,7 +1696,8 @@ fn calls_reaching(
 }
 
 /// Whether a call of `event` reaches one of the graphs `to` within `depth`
-/// levels; `memo` holds the answer per `(graph, depth)`.
+/// levels; `memo` holds the answer per `(graph, depth)`. Each recursion
+/// lowers the depth, so no entry is read while its own answer is pending.
 fn event_reaches(
     loader: &mut Loader,
     cfg: usize,
@@ -1800,13 +1826,14 @@ pub fn sequence_graph(
             let mut via: Vec<(CfgEventId, String)> = Vec::new();
             let mut unreached = 0;
             let mut frames = Vec::new();
+            let mut memo = FxHashMap::default();
             for &(event, cfg_id) in &from_copies {
                 let cfg = b.loader.load(cfg_id)?;
                 let a = b.loader.cfgs[cfg].event_of(event)?;
                 let (targets, inside) = match to_copies.iter().find(|&&(_, c)| c == cfg_id) {
                     Some(&(t, _)) => (vec![b.loader.cfgs[cfg].event_of(t)?], false),
                     None => (
-                        calls_reaching(&mut b.loader, cfg, &to_cfgs, options.depth)?,
+                        calls_reaching(&mut b.loader, cfg, &to_cfgs, options.depth, &mut memo)?,
                         true,
                     ),
                 };
@@ -1843,9 +1870,7 @@ pub fn sequence_graph(
                             notes.push(n);
                         }
                     }
-                }
-                if inside {
-                    for &t in &targets {
+                    if inside {
                         let call = g.db_ids[t];
                         if !via.iter().any(|&(e, _)| e == call) {
                             via.push((call, g.events[t].loc.display()));

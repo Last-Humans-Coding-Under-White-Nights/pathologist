@@ -1191,11 +1191,10 @@ pub const CFG_READS: [(&str, &str); 7] = [
 /// own ids: `function`, sites and files are its rows.
 #[derive(Debug, Clone)]
 pub struct StoredCfg {
-    /// `cfg_functions.id`.
-    pub id: i64,
+    pub id: crate::CfgId,
     pub cfg: trace_ir::FunctionCfg,
-    /// `cfg_events.id` of each event, by [`trace_ir::EventId`].
-    pub event_ids: Vec<i64>,
+    /// The row of each event, by [`trace_ir::EventId`].
+    pub event_ids: Vec<crate::CfgEventId>,
 }
 
 /// The kind `parse` reads from `text`, as [`export_cfg`] wrote it.
@@ -1212,7 +1211,7 @@ fn cfg_kind<K>(parse: fn(&str) -> Option<K>, text: &str) -> rusqlite::Result<K> 
 /// The inverse of [`export_cfg`]: the graphs whose `cfg_functions.id` is in
 /// `ids`, in id order. The export keeps no expansion fingerprint, so every
 /// occurrence reads back with `expansion_id` 0.
-pub fn read_cfgs(conn: &Connection, ids: RangeInclusive<i64>) -> Result<Vec<StoredCfg>> {
+pub fn read_cfgs(conn: &Connection, ids: RangeInclusive<crate::CfgId>) -> Result<Vec<StoredCfg>> {
     use trace_ir::{
         Block, BlockId, BlockKind, CallEvent, CallOccurrence, CallSiteId, CfgEdge, EdgeKind,
         EventId, EventKind, FileId, FnId, FunctionCfg, Gap, GapKind, Span,
@@ -1224,14 +1223,14 @@ pub fn read_cfgs(conn: &Connection, ids: RangeInclusive<i64>) -> Result<Vec<Stor
     let mut cfgs: Vec<StoredCfg> = Vec::new();
     // Graph ids -> their index in `cfgs`; block and event ids -> their
     // graph's index and local id.
-    let mut graphs: FxHashMap<i64, usize> = FxHashMap::default();
+    let mut graphs: FxHashMap<crate::CfgId, usize> = FxHashMap::default();
     let mut blocks: FxHashMap<i64, (usize, BlockId)> = FxHashMap::default();
-    let mut events: FxHashMap<i64, (usize, EventId)> = FxHashMap::default();
+    let mut events: FxHashMap<crate::CfgEventId, (usize, EventId)> = FxHashMap::default();
     let mut ends: Vec<(i64, i64, Option<i64>)> = Vec::new();
     let mut stmt = conn.prepare_cached(READ_CFG_FUNCTIONS)?;
     let mut rows = stmt.query(range)?;
     while let Some(r) = rows.next()? {
-        let id: i64 = r.get(0)?;
+        let id: crate::CfgId = r.get(0)?;
         graphs.insert(id, cfgs.len());
         ends.push((r.get(4)?, r.get(5)?, r.get(6)?));
         cfgs.push(StoredCfg {
@@ -1298,7 +1297,7 @@ pub fn read_cfgs(conn: &Connection, ids: RangeInclusive<i64>) -> Result<Vec<Stor
         let (Some(&g), Some(at)) = (graphs.get(&r.get(1)?), block(r.get(2)?)) else {
             continue;
         };
-        let id: i64 = r.get(0)?;
+        let id: crate::CfgEventId = r.get(0)?;
         let stored = &mut cfgs[g];
         let event = EventId(stored.cfg.events.len() as u32);
         stored.cfg.events.push(CallEvent {
@@ -1334,7 +1333,7 @@ pub fn read_cfgs(conn: &Connection, ids: RangeInclusive<i64>) -> Result<Vec<Stor
             cfgs[g].cfg.order.push((a, b));
         }
     }
-    let event = |id: Option<i64>| id.and_then(|id| events.get(&id)).map(|&(_, e)| e);
+    let event = |id: Option<crate::CfgEventId>| id.and_then(|id| events.get(&id)).map(|&(_, e)| e);
     let mut stmt = conn.prepare_cached(READ_CFG_GAPS)?;
     let mut rows = stmt.query(range)?;
     while let Some(r) = rows.next()? {
@@ -1570,7 +1569,7 @@ mod tests {
             strings.intern(text).unwrap();
         }
         super::export_cfg(&conn, [&cfg_with_alternatives()], &mut strings).unwrap();
-        let mut read = super::read_cfgs(&conn, 1..=1).unwrap();
+        let mut read = super::read_cfgs(&conn, crate::CfgId(1)..=crate::CfgId(1)).unwrap();
         assert_eq!(read.len(), 1);
         read.pop().unwrap().cfg
     }
