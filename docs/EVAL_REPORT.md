@@ -1,5 +1,30 @@
 # Evaluation Report
 
+## Unevaluated operands: #249 — 2026-10-28
+
+Calls in an operand the language never evaluates are tagged at lowering
+and get no call edge, argument or return flow
+([Unevaluated operands](ANALYSIS.md#unevaluated-operands)). On the pinned
+corpora only camera moves, by 9 edges, every one from a `decltype` operand:
+
+| Corpus | Count | Before | After |
+|--------|-------|-------:|------:|
+| camera | `edges_indirect` | 449 | 442 |
+| camera | `edges_external` | 46032 | 46030 |
+| camera | `edges_total` | 115754 | 115745 |
+
+- 7 indirect edges from `UnifiedPipelineThreadpool::Submit`
+  (`unified_pipeline_threadpool.h:70`, `using ReturnType =
+  decltype(f(args...));`) to the lambdas handed to it. The task really runs
+  them later through `std::bind` and `std::packaged_task`, which no model
+  covers; the removed edges came only from the type query.
+- `capture_session.cpp:1407` `decltype(StreamIntentMap_.find(...)) itr;`
+  (`std::unordered_map::find`) and `hcamera_service.cpp:3310`
+  `decltype(args.size()) index` (`vector::size`).
+
+HDF and hiview are unchanged; argument-flow edges and execution contexts are
+unchanged on all three.
+
 ## Call-order sidecar: #248 — 2026-10-27
 
 What `trace analyze --sequencing` costs and what `trace inspect sequence`

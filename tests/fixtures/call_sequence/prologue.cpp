@@ -31,3 +31,28 @@ Owner::Owner() : value{1}
 {
     body();
 }
+
+int measured();
+int defaulted();
+
+struct Sized {
+    int n;
+    int m = sizeof(defaulted());
+};
+
+struct Measured {
+    Measured();
+    Measured(int);
+    int n_;
+    Sized sized_;
+};
+
+Measured::Measured() : n_(sizeof(measured()))
+{
+    body();
+}
+
+Measured::Measured(int) : sized_{1}
+{
+    body();
+}

@@ -61,3 +61,28 @@ void vla_size(void)
     (void)sizeof(int[counted()]);
     after_size();
 }
+
+int typed_c(int);
+void then_c(void);
+
+void typeof_operand(void)
+{
+    __typeof__(typed_c(1)) u = 0;
+    then_c();
+}
+
+void inner_c(void);
+void first_c(void);
+
+int reaches_inner(void)
+{
+    inner_c();
+    return 1;
+}
+
+void unevaluated_reach(void)
+{
+    first_c();
+    reaches_inner();
+    (void)sizeof reaches_inner();
+}

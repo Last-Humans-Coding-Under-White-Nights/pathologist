@@ -5002,19 +5002,34 @@ children's, so an argument's calls precede the call they are passed to.
   `_Generic(selector(), int: chosen(), default: other()); after();`
   `chosen` and `other` are `exclusive`, each `may_precede` `after`, and
   `selector` is `unknown` to every other call.
-- **Unevaluated operands.** The operands of `noexcept(e)` and the
-  requirements of a `requires` expression are never evaluated: their calls
-  are kept the same way, under an `unevaluated` gap. `sizeof`, `alignof`
-  and `decltype` (as which a GNU `__typeof__` with an expression operand
-  parses) do not evaluate their operand unless its type is variably
-  modified (C11 6.5.3.4p2; GNU `typeof` likewise). The builder does not know
-  types, so only an operand that is a call (parentheses aside, `sizeof(f())`)
-  is `unevaluated`: a call's result is never variably modified. A type
-  operand (`sizeof(int[n()])` calls `n` for its array bound) and any other
+- <a id="unevaluated-operands"></a>**Unevaluated operands.** Lowering
+  (`unevaluated_operand` in `trace-parse/src/lower.rs`) tags the calls of an
+  operand the language never evaluates `CallSite::unevaluated`: the operand
+  of `noexcept(e)`, the requirements of a `requires` expression, the
+  controlling expression of `_Generic`, and the operand of `sizeof`,
+  `alignof`, `decltype` and GNU `typeof`/`__typeof__` when it is a call.
+  Those four do not evaluate their operand unless its type is variably
+  modified (C11 6.5.3.4p2; GNU `typeof` likewise), and lowering does not
+  know types: a call's result is never variably modified (parentheses
+  aside: C++ `sizeof(f())`, C `sizeof f()`; C parses `sizeof(f())` and
+  `typeof(f())` as a function *type*, which calls nothing). A tagged call
+  never runs, so the solver gives it no call edge, no argument or return
+  flow and no model effect; it is part of the merge identity, so an
+  evaluated copy of the same site in another unit keeps its edges. The
+  operator keyword itself, which the grammars parse as a call
+  (`noexcept(e)` and `typeid(e)` in C++, `__typeof__(e)` with an expression
+  operand in C), is no call site at all. In the call-order graph a tagged
+  call is kept the way `_Generic`'s controlling expression is, under an
+  `unevaluated` gap ordering nothing after it, wherever it is written
+  (member and default member initializers too); the query relates it
+  `unknown`, never counts it as a call reaching the other end, and does not
+  inline it (an `unevaluated` boundary). A type operand
+  (`sizeof(int[n()])` calls `n` for its array bound) and any other
   expression (`sizeof(rows[f()])` over a two-dimensional variable-length
-  array) may be evaluated: like `typeid(e)`, whose operand is evaluated when
-  it is a polymorphic glvalue, it is a `branch_true` arm beside a
-  `branch_false` bypass, so its calls `may_precede` what follows.
+  array) may be evaluated: they stay ordinary calls, and like `typeid(e)`,
+  whose operand is evaluated when it is a polymorphic glvalue, the operand
+  is a `branch_true` arm beside a `branch_false` bypass, so its calls
+  `may_precede` what follows.
 - Assignment: right before left in C++17 and later, unordered otherwise.
   `<<`, `>>` and subscript are left before right in C++17 and later. Operands
   of other binary and unary operators are unordered.
@@ -5217,13 +5232,14 @@ A gap or boundary is uncertainty, never evidence for an order.
   is not modeled. A site of the function that no walked node owns joins that
   group too), `omitted_sites` and `unevaluated` (calls in an operand the
   language never evaluates, the controlling expression of `_Generic` and
-  the [unevaluated operands](#expressions) of `sizeof`, `decltype`,
-  `noexcept` and `requires`: kept as events so a position names them; an
+  the [unevaluated operands](#unevaluated-operands) of `sizeof`,
+  `alignof`, `decltype`, `typeof`, `noexcept` and `requires`: kept as events so a position names them; an
   end under one relates `unknown`, as the call never runs). A
   body with a gap is `partial`.
 - **Boundaries** between functions, found by the query: `omitted_body` (the
   callee has no CFG: dependency, declaration only, suppressed or not
-  sequenced), `unknown_callee` (a site without call edges), `recursion`,
+  sequenced), `unknown_callee` (a site without call edges), `unevaluated`
+  (a call that [never runs](#unevaluated-operands)), `recursion`,
   `async_start` (the site starts an [execution context](#execution-contexts):
   the callback runs elsewhere and is not inlined) and `ipc_bridge` (an `ipc`
   edge). None establishes happens-before across threads or processes.
@@ -5264,7 +5280,9 @@ first, then loads graphs only as it reaches them:
   Blocks are listed in reverse postorder (branch arms before their join).
 - **Boundaries.** A target already on the frame stack is `recursion`; a
   target without a graph is `omitted_body` (`dependency`, `declaration_only`
-  or `not_sequenced`); an event without call edges is `unknown_callee`; the
+  or `not_sequenced`); an event under an `unevaluated` gap is
+  `unevaluated` and inlines nothing; an event without call edges is
+  `unknown_callee`; the
   callback an event starts as an execution context is `async_start` (inlined
   only with `--inline-contexts`); an `ipc` edge of the frame's function is
   `ipc_bridge` and is never inlined. `--max-targets`, `--max-frames` and

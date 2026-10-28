@@ -2026,3 +2026,149 @@ fn unevaluated_operands_prove_no_order() {
     );
     assert_eq!(relation(&conn, &counted, &after), MayPrecede);
 }
+
+/// Lowering tags the calls of an operand the language never evaluates and
+/// emits no call for an operator spelled like one (`noexcept(e)`,
+/// `typeid(e)`, C `__typeof__(e)`): an unevaluated call has no call edge,
+/// and a possibly evaluated one keeps its edges.
+#[test]
+fn unevaluated_calls_are_tagged_and_never_resolved() {
+    let root = fixture("call_sequence");
+    let program = sequenced(&root, default_opts(&root));
+    let (_, analysis) = trace_analysis::analyze(&program);
+    let sites = |callee: &str| -> Vec<&trace_ir::CallSite> {
+        program
+            .symbols
+            .call_sites
+            .iter()
+            .filter(|s| s.callee_name.as_str() == callee)
+            .collect()
+    };
+    for operator in ["noexcept", "typeid", "__typeof__", "sizeof", "decltype"] {
+        assert!(sites(operator).is_empty(), "phantom `{operator}` call");
+        assert!(
+            !program.flow.iter().any(|c| matches!(
+                c,
+                trace_ir::FlowConstraint::CallReturn { callee_name, .. } if callee_name == operator
+            )),
+            "phantom `{operator}` return"
+        );
+    }
+    let edged =
+        |site: &trace_ir::CallSite| analysis.call_edges.iter().any(|e| e.call_site == site.id);
+    for callee in [
+        "sized",
+        "typed",
+        "checked",
+        "required",
+        "typed_c",
+        "measured",
+        "defaulted",
+    ] {
+        let found = sites(callee);
+        assert!(!found.is_empty(), "{callee} has a site");
+        for site in found {
+            assert!(site.unevaluated, "{callee} is unevaluated");
+            assert!(!edged(site), "{callee} has no call edge");
+        }
+    }
+    for callee in ["identified", "bound", "counted"] {
+        let found = sites(callee);
+        assert!(!found.is_empty(), "{callee} has a site");
+        for site in found {
+            assert!(!site.unevaluated, "{callee} may be evaluated");
+            assert!(edged(site), "{callee} keeps its call edge");
+        }
+    }
+    // `reaches_inner` is called once evaluated, once not.
+    let reaches = sites("reaches_inner");
+    assert_eq!(reaches.iter().filter(|s| s.unevaluated).count(), 1);
+    assert_eq!(reaches.iter().filter(|s| edged(s)).count(), 1);
+}
+
+/// An unevaluated call neither reaches nor relays a call it would make: it
+/// is no call reaching the second end, and as the first end it relates
+/// `unknown`.
+#[test]
+fn an_unevaluated_call_reaches_nothing() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "args_order.c", line, callee);
+    let inner = at(79, "inner_c");
+    let scope = trace_db::SequenceScope::Between(at(85, "first_c"), inner.clone());
+    let graph = trace_db::sequence_graph(&conn, &scope, &Default::default()).unwrap();
+    let r = graph.relation.expect("a between query relates its ends");
+    assert_eq!(r.kind, SequencedBefore);
+    assert_eq!(r.via, [at(86, "reaches_inner").event]);
+    assert_eq!(relation(&conn, &at(87, "reaches_inner"), &inner), Unknown);
+}
+
+/// An unevaluated call is not inlined: it is an `unevaluated` boundary.
+#[test]
+fn an_unevaluated_call_is_not_inlined() {
+    let conn = fixture_db();
+    let options = trace_db::SequenceOptions {
+        depth: 3,
+        ..Default::default()
+    };
+    let graph = function_sequence(&conn, "unevaluated_reach", None, &options);
+    let calls: Vec<_> = graph
+        .events
+        .iter()
+        .filter(|e| e.callee == "reaches_inner")
+        .collect();
+    assert_eq!(calls.len(), 2);
+    for e in calls {
+        let boundary = graph
+            .boundaries
+            .iter()
+            .find(|b| b.event == Some(e.id))
+            .map(|b| b.kind.as_str());
+        if e.loc.line == 87 {
+            assert_eq!(boundary, Some("unevaluated"));
+            assert!(e.targets.iter().all(|t| t.frame.is_none()));
+        } else {
+            assert_eq!(boundary, None);
+            assert!(e.targets.iter().any(|t| t.frame.is_some()));
+        }
+    }
+    assert!(!graph.events.iter().any(|e| e.callee == "typeid"));
+}
+
+/// A member initializer's or default member initializer's unevaluated
+/// operand never runs: under an `unevaluated` gap, it proves no order with
+/// the body.
+#[test]
+fn unevaluated_initializer_operands_prove_no_order() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "prologue.cpp", line, callee);
+    assert_eq!(
+        relation(&conn, &at(50, "measured"), &at(52, "body")),
+        Unknown
+    );
+    assert_eq!(
+        relation(&conn, &at(40, "defaulted"), &at(57, "body")),
+        Unknown
+    );
+    let root = fixture("call_sequence");
+    let program = sequenced(&root, default_opts(&root));
+    let unevaluated = |callee: &str| {
+        cfgs_named(&program, "Measured::Measured")
+            .into_iter()
+            .flat_map(|cfg| {
+                let callees = event_callees(&program, cfg);
+                let at = callees.iter().position(|c| c.iter().any(|n| n == callee));
+                at.map(|e| {
+                    cfg.gaps.iter().any(|g| {
+                        g.kind == trace_ir::GapKind::Unevaluated
+                            && g.events
+                                .is_some_and(|(a, b)| a.0 as usize <= e && e <= b.0 as usize)
+                    })
+                })
+            })
+            .collect::<Vec<bool>>()
+    };
+    assert_eq!(unevaluated("measured"), [true]);
+    assert_eq!(unevaluated("defaulted"), [true]);
+}

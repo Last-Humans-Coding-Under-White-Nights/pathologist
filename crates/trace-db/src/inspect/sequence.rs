@@ -1110,6 +1110,11 @@ impl LoadedCfg {
         self.graph.events[e].block.0 as usize
     }
 
+    /// Event `e` is under an `unevaluated` gap: its call never runs.
+    fn never_runs(&self, e: usize) -> bool {
+        self.control.event_gaps[e].unevaluated
+    }
+
     /// Events in block order, each block's in evaluation order.
     fn events_in_order(&self) -> impl Iterator<Item = usize> + '_ {
         self.graph
@@ -1308,10 +1313,7 @@ impl LoadedCfg {
         // A call in an operand the language never evaluates runs neither
         // before nor after anything.
         if gaps.0.unevaluated || gaps.1.unevaluated {
-            return (
-                Relation::Unknown,
-                vec!["an unevaluated gap covers an end; that call never runs".into()],
-            );
+            return (Relation::Unknown, vec![NEVER_RUNS.into()]);
         }
         let (ba, bb) = (self.block_of(a), self.block_of(b));
         // An unmodeled transfer after `a` may land before anything: its
@@ -1680,11 +1682,16 @@ impl Builder<'_, '_> {
         targets: &[Target],
         queue: &mut VecDeque<usize>,
     ) -> Result<()> {
+        let cfg = self.frames[frame].cfg;
+        // A call that never runs runs no callee.
+        if self.loader.cfgs[cfg].never_runs(local) {
+            self.boundary(frame, event, "unevaluated", None, None);
+            return Ok(());
+        }
         if targets.is_empty() {
             self.boundary(frame, event, "unknown_callee", None, None);
             return Ok(());
         }
-        let cfg = self.frames[frame].cfg;
         for (i, target) in targets.iter().enumerate() {
             if i == self.options.max_targets {
                 self.truncate(frame, event, "max_targets");
@@ -1762,9 +1769,13 @@ impl Builder<'_, '_> {
     }
 }
 
+/// The note of a relation with an end that never runs.
+const NEVER_RUNS: &str = "an unevaluated gap covers an end; that call never runs";
+
 /// The events of `from`'s graph whose calls reach one of the graphs `to`
 /// within `depth` call levels, skipping context starts and IPC bridges:
-/// those run elsewhere and order nothing.
+/// those run elsewhere and order nothing, and unevaluated calls: those never
+/// run.
 /// `memo` is [`event_reaches`]'s, shared by every query of one `to`.
 fn calls_reaching(
     loader: &mut Loader,
@@ -1794,7 +1805,7 @@ fn event_reaches(
     depth: u32,
     memo: &mut FxHashMap<(CfgId, u32), bool>,
 ) -> Result<bool> {
-    if depth == 0 {
+    if depth == 0 || loader.cfgs[cfg].never_runs(event) {
         return Ok(false);
     }
     let ev = &loader.cfgs[cfg].events[event];
@@ -1959,6 +1970,19 @@ pub fn sequence_graph(
                     ends.push((a, forward));
                 }
                 frames.push((cfg, keep));
+                // A `from` that never runs reaches nothing and precedes
+                // nothing.
+                let (never, ends): (Vec<_>, Vec<_>) =
+                    ends.into_iter().partition(|(a, _)| g.never_runs(*a));
+                if !never.is_empty() {
+                    relations.push(Relation::Unknown);
+                    if !notes.iter().any(|n| n == NEVER_RUNS) {
+                        notes.push(NEVER_RUNS.into());
+                    }
+                }
+                if ends.is_empty() {
+                    continue;
+                }
                 if targets.is_empty() {
                     unreached += 1;
                     continue;
@@ -2193,6 +2217,7 @@ fn boundary_text(b: &SeqBoundary) -> String {
     let name = b.name.as_deref().unwrap_or("?");
     match b.kind.as_str() {
         "unknown_callee" => "?? unknown callee".into(),
+        "unevaluated" => "∅ unevaluated: never runs".into(),
         "omitted_body" => format!(
             "⊘ body omitted ({}): {name}",
             b.reason.as_deref().unwrap_or("?")

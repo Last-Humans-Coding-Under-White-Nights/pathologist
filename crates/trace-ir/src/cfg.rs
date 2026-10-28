@@ -138,8 +138,12 @@ pub enum GapKind {
     InitializerOrder,
     /// Events whose sites the merge did not keep were spliced out.
     OmittedSites,
-    /// Calls written in an operand the language never evaluates (the
-    /// controlling expression of a C `_Generic`).
+    /// Calls written in an operand the language never evaluates, the sites
+    /// lowering tags `CallSite::unevaluated`: the operand of `noexcept` and
+    /// of a `requires` expression, the controlling expression of
+    /// `_Generic`, and a call operand of `sizeof`, `alignof`, `decltype` or
+    /// GNU `typeof`. Kept as events so a position names them; they never
+    /// run.
     Unevaluated,
 }
 

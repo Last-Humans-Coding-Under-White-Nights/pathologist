@@ -2208,6 +2208,7 @@ fn expand_virtual_overrides(program: &mut Program) {
                 expansion_span: cs.expansion_span,
                 is_direct: true,
                 in_loop: cs.in_loop,
+                unevaluated: cs.unevaluated,
                 receiver_class: cs.receiver_class.clone(),
                 exact_receiver: cs.exact_receiver,
                 return_dst: cs.return_dst,
@@ -8514,6 +8515,7 @@ fn lower_declaration(
                                             expansion_span,
                                             is_direct: false,
                                             in_loop: false,
+                                            unevaluated: false,
                                             receiver_class: None,
                                             exact_receiver: false,
                                             return_dst: None,
@@ -10125,7 +10127,15 @@ fn walk_function_body(
         if statement_body.is_some_and(|body| body.id() == child.id()) {
             lower_statement_local(program, ctx, source, node);
         }
+        let never_runs = unevaluated_operand(ctx.is_cpp, source, node, child);
         walk_function_body(program, ctx, source, child, caller);
+        if never_runs {
+            // As for loops: a lambda written in the operand is a function of
+            // its own.
+            for site in &mut program.symbols.call_sites[first_site..] {
+                site.unevaluated |= site.caller == caller;
+            }
+        }
         if repeats_in_loop(node, child) {
             // The calls this child lowered are the function's own; a lambda
             // written here lowered its calls into a function of its own.
@@ -10162,6 +10172,83 @@ fn repeats_in_loop(node: Node, child: Node) -> bool {
         "for_statement" => !runs_once("initializer"),
         "for_range_loop" => !runs_once("initializer") && !runs_once("right"),
         "while_statement" | "do_statement" => true,
+        _ => false,
+    }
+}
+
+/// An operator the grammars parse as a call: C++ `noexcept(e)` and
+/// `typeid(e)`, and GNU `typeof(e)` / `__typeof__(e)` with an expression
+/// operand in C (C++ parses it as `decltype`). The keyword is no call: no
+/// site is lowered for it, and its operand's calls are
+/// [unevaluated](unevaluated_operand) or ordinary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperatorCall {
+    Noexcept,
+    Typeid,
+    Typeof,
+}
+
+pub(crate) fn operator_call(is_cpp: bool, source: &str, node: Node) -> Option<OperatorCall> {
+    if node.cached_kind() != "call_expression" {
+        return None;
+    }
+    let function = node.cached_field("function")?;
+    if function.cached_kind() != "identifier" {
+        return None;
+    }
+    match node_text(source, &function) {
+        "noexcept" if is_cpp => Some(OperatorCall::Noexcept),
+        "typeid" if is_cpp => Some(OperatorCall::Typeid),
+        "typeof" | "__typeof__" | "__typeof" => Some(OperatorCall::Typeof),
+        _ => None,
+    }
+}
+
+/// Whether `child` of `node` is an operand the language never evaluates,
+/// so its calls never run (`CallSite::unevaluated`; docs/ANALYSIS.md,
+/// "Unevaluated operands"): a `noexcept` operand, a `requires` expression,
+/// `_Generic`'s controlling expression, and the operand of `sizeof`,
+/// `alignof`, `decltype` and GNU `typeof` when it is a call. Those evaluate
+/// an operand of variably modified type (C11 6.5.3.4p2), and lowering does
+/// not know types: a call's result never is one, any other expression or a
+/// type operand (`sizeof(int[n()])`) may be, as `typeid`'s operand may be
+/// evaluated. Those stay ordinary calls.
+pub(crate) fn unevaluated_operand(is_cpp: bool, source: &str, node: Node, child: Node) -> bool {
+    let is_call = |operand: Node| {
+        let mut inner = operand;
+        while inner.cached_kind() == "parenthesized_expression" {
+            match inner.named_child(0) {
+                Some(next) => inner = next,
+                None => return false,
+            }
+        }
+        inner.cached_kind() == "call_expression"
+    };
+    match node.cached_kind() {
+        "sizeof_expression" | "alignof_expression" | "decltype" => {
+            child.is_named() && child.cached_kind() != "type_descriptor" && is_call(child)
+        }
+        "requires_expression" => true,
+        "generic_expression" => {
+            let mut cursor = node.walk();
+            let control = node
+                .named_children(&mut cursor)
+                .find(|c| c.cached_kind() != "type_descriptor");
+            control.is_some_and(|c| c.id() == child.id())
+        }
+        "call_expression" => {
+            let arguments = node
+                .cached_field("arguments")
+                .filter(|a| a.id() == child.id());
+            match (operator_call(is_cpp, source, node), arguments) {
+                (Some(OperatorCall::Noexcept), Some(_)) => true,
+                (Some(OperatorCall::Typeof), Some(arguments)) => {
+                    arguments.named_child_count() == 1
+                        && arguments.named_child(0).is_some_and(is_call)
+                }
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
@@ -10273,7 +10360,7 @@ fn collect_call_at_node(
         return;
     }
 
-    if node_is_from_ignored_macro(ctx, node) {
+    if node_is_from_ignored_macro(ctx, node) || operator_call(ctx.is_cpp, source, node).is_some() {
         return;
     }
     let occurrence_node = node
@@ -10861,6 +10948,7 @@ fn collect_call_at_node_inner(
             expansion_span,
             is_direct,
             in_loop: false,
+            unevaluated: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst,
@@ -10911,6 +10999,7 @@ fn collect_call_at_node_inner(
             expansion_span,
             is_direct: true,
             in_loop: false,
+            unevaluated: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst,
@@ -12263,6 +12352,7 @@ fn emit_unresolved_site(
         expansion_span,
         is_direct: false,
         in_loop: false,
+        unevaluated: false,
         receiver_class,
         exact_receiver: false,
         return_dst,
@@ -12421,6 +12511,7 @@ fn emit_member_targets(
             expansion_span,
             is_direct: false,
             in_loop: false,
+            unevaluated: false,
             receiver_class: Some(cls.to_string()),
             exact_receiver: false,
             return_dst,
@@ -12458,6 +12549,7 @@ fn emit_member_targets(
             expansion_span,
             is_direct: true,
             in_loop: false,
+            unevaluated: false,
             receiver_class: Some(cls.to_string()),
             exact_receiver: false,
             return_dst,
@@ -17704,6 +17796,9 @@ fn resolve_call_for_return(
     source: &str,
     call_node: Node,
 ) -> Option<ResolvedCallReturn> {
+    if operator_call(ctx.is_cpp, source, call_node).is_some() {
+        return None;
+    }
     if weak_promotion(program, ctx, source, call_node).is_some() {
         return promoted_receiver_value(program, ctx, source, call_node)
             .map(ResolvedCallReturn::PromotedReceiver);

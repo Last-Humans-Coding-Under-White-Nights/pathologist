@@ -6,7 +6,7 @@
 //! a block-local sequenced-before order. Semantics and limits:
 //! docs/ANALYSIS.md, "Call sequencing (control-flow sidecar)".
 
-use super::{last_segment_of, node_span, LowerContext, MAX_AST_WALK_DEPTH};
+use super::{last_segment_of, node_span, operator_call, LowerContext, MAX_AST_WALK_DEPTH};
 use crate::node_metadata::NodeMetadata;
 use crate::parse::node_text;
 use rustc_hash::FxHashMap as HashMap;
@@ -206,6 +206,12 @@ struct Builder<'s, 'a> {
     /// block they start in: an unordered group's operand (its siblings
     /// start there) and the prologue (its block's edges are made).
     unsplit: u32,
+    /// How many [unevaluated](Self::never_run) groups the walk is in: a
+    /// site tagged `unevaluated` there joins that group's gap.
+    quiet: u32,
+    /// Each event made so far that never runs: no later event is ordered
+    /// after it.
+    inert: Vec<bool>,
     scopes: Vec<Scope>,
     serials: u32,
     labels: HashMap<&'a str, Label>,
@@ -308,6 +314,8 @@ impl<'s, 'a> Builder<'s, 'a> {
             cur: None,
             frontier: Vec::new(),
             unsplit: 0,
+            quiet: 0,
+            inert: Vec::new(),
             scopes: Vec::new(),
             serials: 0,
             labels: HashMap::default(),
@@ -558,14 +566,18 @@ impl<'s, 'a> Builder<'s, 'a> {
 
     /// The frontier after a group whose events are those since `first`,
     /// each a sink: `before` when it emitted none.
+    /// Events that [never run](Self::never_run) are no sinks.
     fn sinks_since(&mut self, first: usize, before: Vec<EventId>) {
         let last = self.cfg.events.len();
-        if last == first {
+        let inert = &self.inert;
+        let mut sinks = (first..last)
+            .filter(|&e| !inert.get(e).copied().unwrap_or(false))
+            .peekable();
+        if sinks.peek().is_none() {
             self.frontier = before;
         } else {
-            self.frontier.clear();
-            self.frontier
-                .extend((first..last).map(|e| EventId(e as u32)));
+            let sinks: Vec<EventId> = sinks.map(|e| EventId(e as u32)).collect();
+            self.frontier = sinks;
         }
     }
 
@@ -592,7 +604,7 @@ impl<'s, 'a> Builder<'s, 'a> {
     fn own(&mut self, node: Node<'a>) {
         if let Some(indices) = self.owned.remove(&node.id()) {
             let kind = (node.cached_kind() == "delete_expression").then_some(EventKind::Delete);
-            self.emit_unordered(&indices, kind);
+            self.emit_sites(&indices, kind, Some(node));
         }
         if let Some(indices) = self.destructors.remove(&node.id()) {
             match self.scopes.last_mut() {
@@ -678,7 +690,7 @@ impl<'s, 'a> Builder<'s, 'a> {
         rest.extend(self.destructors.drain().flat_map(|(_, v)| v));
         rest.sort_unstable();
         self.frontier.clear();
-        self.emit_unordered(&rest, None);
+        self.emit_sites(&rest, None, None);
         self.unsplit -= 1;
         // Where an unreached site runs is not known either.
         if self.cfg.events.len() > first + 1 || !rest.is_empty() {
@@ -877,20 +889,22 @@ impl<'a> Builder<'_, 'a> {
                     self.asm_goto(node, labels);
                 }
             }
-            // `noexcept(e)` and `typeid(e)` parse as calls.
-            "call_expression" if self.operator_call(node) == Some("noexcept") => {
-                self.unevaluated(node);
-            }
-            "call_expression" if self.operator_call(node) == Some("typeid") => {
-                // A polymorphic glvalue operand is evaluated, any other not.
+            // `noexcept(e)`, `typeid(e)` and C `typeof(e)` parse as calls.
+            "call_expression" if operator_call(self.cpp, self.source, node).is_some() => {
                 if let Some(arguments) = node.cached_field("arguments") {
-                    self.may_run(arguments);
+                    self.operand(arguments);
                 }
                 self.own(node);
             }
-            "requires_expression" => self.unevaluated(node),
+            "requires_expression" => self.operand(node),
             "sizeof_expression" | "alignof_expression" | "decltype" => {
-                self.type_query(node);
+                let operand = node
+                    .cached_field("value")
+                    .or_else(|| node.cached_field("type"))
+                    .or_else(|| node.named_child(0));
+                if let Some(operand) = operand {
+                    self.operand(operand);
+                }
                 self.own(node);
             }
             "call_expression" => {
@@ -1076,7 +1090,7 @@ impl<'a> Builder<'_, 'a> {
             return;
         };
         let associations: Vec<Node<'a>> = operands.collect();
-        self.unevaluated(control);
+        self.operand(control);
         if associations.is_empty() {
             return;
         }
@@ -1092,25 +1106,64 @@ impl<'a> Builder<'_, 'a> {
         self.enter(join);
     }
 
-    /// An operand the language never evaluates: its calls are one
-    /// unordered group under an `unevaluated` gap that orders nothing after
-    /// them.
-    fn unevaluated(&mut self, operand: Node<'a>) {
+    /// The operand of an operator that may not evaluate it. Lowering tags
+    /// the calls of one the language never evaluates (`CallSite::unevaluated`;
+    /// docs/ANALYSIS.md, "Unevaluated operands"): those
+    /// [never run](Self::never_run). The calls of one that may be evaluated
+    /// (`typeid(e)`, a `sizeof` operand of possibly variably modified type)
+    /// [may run](Self::may_run).
+    fn operand(&mut self, operand: Node<'a>) {
+        let (runs, never) = self.owned_sites(operand);
+        if runs {
+            self.may_run(operand);
+        } else if never {
+            self.never_run(Some(operand), |b| b.flatten(operand));
+        } else {
+            self.visit(operand);
+        }
+    }
+
+    /// The events `body` makes, which never run: one unordered group under
+    /// an `unevaluated` gap over `node` that orders nothing after it.
+    fn never_run(&mut self, node: Option<Node<'a>>, body: impl FnOnce(&mut Self)) {
         // Split first, so `before` names the block the walk goes on in.
         self.join();
         let before = self.frontier.clone();
         let first = self.cfg.events.len();
-        self.flatten(operand);
-        if self.cfg.events.len() > first {
-            self.gap(GapKind::Unevaluated, Some(operand), first);
+        self.quiet += 1;
+        body(self);
+        self.quiet -= 1;
+        let last = self.cfg.events.len();
+        if last > first {
+            self.inert.resize(last, false);
+            self.inert[first..last].fill(true);
+            self.gap(GapKind::Unevaluated, node, first);
         }
         self.frontier = before;
+    }
+
+    /// Emit the sites at `indices` as [`Self::emit_unordered`] does; those
+    /// lowering tagged `unevaluated` (a member initializer's operand, say,
+    /// which the walk flattens) first, as a group that
+    /// [never runs](Self::never_run), unless the walk is in one already.
+    fn emit_sites(&mut self, indices: &[usize], kind: Option<EventKind>, node: Option<Node<'a>>) {
+        let sites = self.sites;
+        if self.quiet > 0 || !indices.iter().any(|&i| sites[i].unevaluated) {
+            self.emit_unordered(indices, kind);
+            return;
+        }
+        let (never, runs): (Vec<usize>, Vec<usize>) =
+            indices.iter().partition(|&&i| sites[i].unevaluated);
+        self.never_run(node, |b| b.emit_unordered(&never, kind));
+        if !runs.is_empty() {
+            self.emit_unordered(&runs, kind);
+        }
     }
 
     /// An operand that may or may not be evaluated: a branch beside a
     /// bypass, both joining after it.
     fn may_run(&mut self, operand: Node<'a>) {
-        if !self.owns_any(operand) {
+        if !self.owned_sites(operand).0 {
             self.visit(operand);
             return;
         }
@@ -1123,48 +1176,6 @@ impl<'a> Builder<'_, 'a> {
         self.visit(operand);
         self.jump(join, EdgeKind::Fallthrough);
         self.start(join);
-    }
-
-    /// `sizeof`, `alignof` and `decltype` (as which a GNU `__typeof__`
-    /// operand parses): the operand is not evaluated unless its type is
-    /// variably modified (C11 6.5.3.4p2, GNU `typeof`), when it is. A type
-    /// operand may be one (`sizeof(int[n()])` calls `n`), and so may any
-    /// expression but a call (`sizeof(rows[f()])` over a two-dimensional
-    /// variable-length array): those [may run](Self::may_run). A call's
-    /// result never is, so a call operand is [unevaluated](Self::unevaluated).
-    fn type_query(&mut self, node: Node<'a>) {
-        let operand = node
-            .cached_field("value")
-            .or_else(|| node.cached_field("type"))
-            .or_else(|| node.named_child(0));
-        let Some(operand) = operand else {
-            return;
-        };
-        let mut inner = operand;
-        while inner.cached_kind() == "parenthesized_expression" {
-            match inner.named_child(0) {
-                Some(child) => inner = child,
-                None => break,
-            }
-        }
-        if inner.cached_kind() == "call_expression" {
-            self.unevaluated(operand);
-        } else {
-            self.may_run(operand);
-        }
-    }
-
-    /// The C++ operator a call expression spells: `noexcept` or `typeid`.
-    fn operator_call(&self, node: Node<'a>) -> Option<&'static str> {
-        if !self.cpp {
-            return None;
-        }
-        let function = node.cached_field("function")?;
-        match node_text(self.source, &function).trim() {
-            "noexcept" => Some("noexcept"),
-            "typeid" => Some("typeid"),
-            _ => None,
-        }
     }
 
     // ---- statements ----
@@ -1186,17 +1197,30 @@ impl<'a> Builder<'_, 'a> {
         }
     }
 
-    /// Some node of `node`'s subtree owns sites not yet taken.
-    fn owns_any(&self, node: Node<'a>) -> bool {
+    /// Whether some node of `node`'s subtree owns sites not yet taken that
+    /// may run (a destructor's among them), and whether one owns any that
+    /// lowering tagged `unevaluated`.
+    fn owned_sites(&self, node: Node<'a>) -> (bool, bool) {
+        let (mut runs, mut never) = (false, false);
         let mut stack = vec![node];
         let mut cursor = node.walk();
         while let Some(n) = stack.pop() {
-            if self.owned.contains_key(&n.id()) || self.destructors.contains_key(&n.id()) {
-                return true;
+            if self.destructors.contains_key(&n.id()) {
+                runs = true;
+            }
+            for &i in self.owned.get(&n.id()).into_iter().flatten() {
+                if self.sites[i].unevaluated {
+                    never = true;
+                } else {
+                    runs = true;
+                }
+            }
+            if runs {
+                break;
             }
             stack.extend(n.children(&mut cursor));
         }
-        false
+        (runs, never)
     }
 
     fn if_statement(&mut self, node: Node<'a>) {

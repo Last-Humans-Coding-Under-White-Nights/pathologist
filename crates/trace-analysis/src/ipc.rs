@@ -143,7 +143,7 @@ fn scan(program: &Program) -> (StubClasses, ProxyMethods) {
         .symbols
         .call_sites
         .iter()
-        .filter(|cs| final_callable_segment(&cs.callee_name) == "SendRequest")
+        .filter(|cs| !cs.unevaluated && final_callable_segment(&cs.callee_name) == "SendRequest")
         .map(|cs| cs.caller)
         .collect();
 

@@ -34,3 +34,9 @@ void unevaluated_operands()
     alignof(int[bound()]);
     then();
 }
+
+bool noexcept_value()
+{
+    bool b = noexcept(checked());
+    return noexcept(checked()) && b;
+}

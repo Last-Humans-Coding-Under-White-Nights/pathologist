@@ -1225,6 +1225,7 @@ mod tests {
             expansion_span: None,
             is_direct: false,
             in_loop: false,
+            unevaluated: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,

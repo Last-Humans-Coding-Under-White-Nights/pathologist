@@ -283,6 +283,13 @@ pub struct CallSite {
     /// (`docs/ANALYSIS.md`, "Execution contexts"); not part of the merge
     /// identity, and a merged record is in a loop when any copy is.
     pub in_loop: bool,
+    /// The call is in an operand the language never evaluates (the
+    /// operand of `noexcept` or a `requires` expression, the controlling
+    /// expression of `_Generic`, a call operand of `sizeof`, `alignof`,
+    /// `decltype` or GNU `typeof`): it never runs, so it has no call edge
+    /// and no argument flow (`docs/ANALYSIS.md`, "Unevaluated operands").
+    /// Part of the merge identity.
+    pub unevaluated: bool,
     /// Static class of a C++ member-call receiver (`this`, typed pointer).
     /// Post-merge virtual expansion uses this so `final` types are not
     /// re-expanded from the declaring base.
@@ -433,6 +440,7 @@ impl CallSite {
             is_direct: self.is_direct,
             receiver_class: self.receiver_class.as_deref(),
             exact_receiver: self.exact_receiver,
+            unevaluated: self.unevaluated,
             return_dst: self.return_dst,
             receiver: self.receiver,
         }
@@ -482,6 +490,7 @@ struct CallFacts<'a> {
     is_direct: bool,
     receiver_class: Option<&'a str>,
     exact_receiver: bool,
+    unevaluated: bool,
     return_dst: Option<VarId>,
     receiver: Option<VarId>,
 }
@@ -3095,6 +3104,7 @@ mod tests {
             expansion_span: None,
             is_direct: true,
             in_loop: false,
+            unevaluated: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
@@ -3165,6 +3175,7 @@ mod tests {
             expansion_span: None,
             is_direct: true,
             in_loop: false,
+            unevaluated: false,
             receiver_class: Some("Cls".into()),
             exact_receiver: false,
             return_dst: Some(VarId(6)),
@@ -3210,6 +3221,7 @@ mod tests {
             expansion_span: None,
             is_direct,
             in_loop: false,
+            unevaluated: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
@@ -3403,6 +3415,7 @@ mod tests {
             expansion_span: None,
             is_direct: true,
             in_loop: false,
+            unevaluated: false,
             receiver_class: None,
             exact_receiver: false,
             return_dst: None,
