@@ -5185,8 +5185,13 @@ first, then loads graphs only as it reaches them:
   compiles it (one event per graph at one position, with one callee and one
   macro invocation position); the
   query starts from each such variant, one frame per variant as for
-  `--function`. A position matching several calls (two events of one graph,
-  or calls of different functions or callees) is an error listing at most
+  `--function`. The destructor events of one automatic object on each way
+  out of its scope (the end, `return`, `break`, `continue`, `goto`, `throw`,
+  each iteration of a `while` with a condition object) name the same sites:
+  they are copies of that one call, so the position names all of them. A
+  position matching several calls (two events of one graph that are not
+  such copies, as the two calls `TWICE(step())` makes, or calls of
+  different functions or callees) is an error listing at most
   ten of them with the count of the rest; when they were matched at a macro
   body's spelling, each candidate names its invocation and the error names
   an invocation position to use instead: a macro invoked on different lines
@@ -5224,8 +5229,10 @@ first, then loads graphs only as it reaches them:
   neither. Every such call is cited: a note names their
   positions and the JSON `relation.via` lists their `cfg_events` ids (empty
   when both events share a graph). A first event several variants compile is related
-  in each of them, and the relations combine the same way; a variant that
-  reaches no copy of the second event is skipped with a note. Found
+  in each of them, and the relations combine the same way, as do the
+  relations of every pair of destructor copies at either end (so in
+  `while (T t = next()) work();` `T::~T` and `work` are `may_both`); a
+  variant that reaches no copy of the second event is skipped with a note. Found
   nowhere, the relation is `unknown`. One `unordered_branch` gap holding
   both ends turns a directed relation (`sequenced_before`,
   `guaranteed_before`, `may_precede`, `may_follow`) into `unordered`; any

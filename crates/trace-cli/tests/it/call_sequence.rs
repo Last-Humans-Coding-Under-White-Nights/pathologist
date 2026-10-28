@@ -1856,3 +1856,64 @@ fn consecutive_unordered_statements_stay_sequenced_in_linear_storage() {
     assert_eq!(relation(&conn, &at(4, first), &at(4, last)), Unordered);
     assert_eq!(relation(&conn, &at(5, last), &at(5, first)), Unordered);
 }
+
+/// The destructor events an object gets on each way out of its scope are
+/// copies of one call: a position names them together, and the relation
+/// combines theirs. Distinct calls at one position stay ambiguous.
+#[test]
+fn per_exit_destructor_copies_are_one_position() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "scopes.cpp", line, callee);
+    // `while (Lease l = lease()) { work(); }`: one iteration's destructor
+    // follows its `work` and precedes the next one's.
+    let (dtor, work) = (at(59, "Lease::~Lease"), at(60, "work"));
+    assert_eq!(relation(&conn, &dtor, &work), MayBoth);
+    assert_eq!(relation(&conn, &work, &dtor), MayBoth);
+    assert_eq!(relation(&conn, &dtor, &at(62, "after")), MayPrecede);
+    // `Guard g;` in a loop body left by `continue`, `break` and its end.
+    let (dtor, work) = (at(33, "Guard::~Guard"), at(38, "work"));
+    assert_eq!(relation(&conn, &dtor, &work), MayBoth);
+    assert_eq!(relation(&conn, &dtor, &at(40, "after")), MayPrecede);
+    // `TWICE(step())` substitutes the argument twice: two calls.
+    let err = trace_db::resolve_event(&conn, "macro_calls.c", 10, None, Some("step"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("2 call events"), "{err}");
+}
+
+/// The reviewer's query: between a loop-condition object's destructor and
+/// the loop body's call, from the command line.
+#[test]
+fn cli_relates_a_loop_condition_destructor_to_the_body() {
+    let root = fixture("call_sequence");
+    let db = crate::common::cli_analyze(&root, &["--sequencing"]);
+    let kind = |from: (&str, &str), to: (&str, &str)| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_trace"))
+            .arg("inspect")
+            .arg(db.path())
+            .arg("sequence")
+            .args(["--file", "scopes.cpp", "--line", from.0, "--callee", from.1])
+            .args([
+                "--to-file",
+                "scopes.cpp",
+                "--to-line",
+                to.0,
+                "--to-callee",
+                to.1,
+            ])
+            .args(["--format", "json"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        value["relation"]["kind"].as_str().unwrap().to_owned()
+    };
+    let (dtor, work) = (("59", "Lease::~Lease"), ("60", "work"));
+    assert_eq!(kind(dtor, work), "may_both");
+    assert_eq!(kind(work, dtor), "may_both");
+}

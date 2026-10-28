@@ -158,19 +158,32 @@ pub struct EventRef {
     pub line: i64,
     pub col: i64,
     /// `(event, cfg)` of the call in every variant of `function` compiling
-    /// it, `(event, cfg)` first; empty means that one alone.
+    /// it, and of each destructor event of one object on another way out
+    /// of its scope, `(event, cfg)` first; empty means that one alone.
     #[serde(skip)]
     pub variants: Vec<(CfgEventId, CfgId)>,
 }
 
 impl EventRef {
-    /// `(event, cfg)` of each variant's copy of the call.
+    /// `(event, cfg)` of each copy of the call.
     fn copies(&self) -> Vec<(CfgEventId, CfgId)> {
         if self.variants.is_empty() {
             vec![(self.event, self.cfg)]
         } else {
             self.variants.clone()
         }
+    }
+
+    /// The copies by graph, in first-seen order.
+    fn copies_by_graph(&self) -> Vec<(CfgId, Vec<CfgEventId>)> {
+        let mut graphs: Vec<(CfgId, Vec<CfgEventId>)> = Vec::new();
+        for (event, cfg) in self.copies() {
+            match graphs.iter_mut().find(|g| g.0 == cfg) {
+                Some(g) => g.1.push(event),
+                None => graphs.push((cfg, vec![event])),
+            }
+        }
+        graphs
     }
 
     fn display(&self) -> String {
@@ -253,7 +266,8 @@ const RESOLVE_EVENT_SQL: &str = "WITH matching(id) AS ( \
          SELECT e.id, e.cfg_id, cf.fn_id, f.path, e.line, e.col, \
                 CASE WHEN e.line = ?1 AND e.file_id IN matching THEN x.path END, \
                 e.expansion_line, cs.callee_text, \
-                e.expansion_file_id, e.expansion_col \
+                e.expansion_file_id, e.expansion_col, es.call_site_id, \
+                (SELECT text FROM strings WHERE id = e.kind_id) = 'destroy' \
          FROM cfg_events e \
          JOIN cfg_functions cf ON cf.id = e.cfg_id \
          JOIN files f ON f.id = e.file_id \
@@ -287,10 +301,7 @@ pub fn resolve_event(
     // invocation; its invocation position is kept to suggest instead. One
     // row per site, in site order, with the event's callee spelling.
     let mut stmt = conn.prepare(RESOLVE_EVENT_SQL)?;
-    // The events found, each with its sites' callee spellings, the macro
-    // invocation (`file:line`) it was matched at, and its invocation
-    // position (`expansion_file_id`, line, column) if any.
-    let mut found: Vec<(EventRef, Vec<String>, Option<String>, Invocation)> = Vec::new();
+    let mut found: Vec<FoundEvent> = Vec::new();
     let mut rows = stmt.query(rusqlite::params![line, pattern, col])?;
     while let Some(r) = rows.next()? {
         let event: CfgEventId = r.get(0)?;
@@ -311,22 +322,33 @@ pub fn resolve_event(
                 .0
                 .zip(expansion.1)
                 .map(|(path, line)| format!("{}:{line}", super::basename(&path)));
-            found.push((event, Vec::new(), invocation, invoked_at));
+            let destroys = r.get::<_, Option<bool>>(12)?.unwrap_or(false);
+            let copy = (event.cfg, destroys.then(Vec::new));
+            found.push((event, Vec::new(), invocation, invoked_at, copy));
         }
-        if let (Some(f), Some(text)) = (found.last_mut(), r.get::<_, Option<String>>(8)?) {
-            f.1.push(text);
+        if let Some(f) = found.last_mut() {
+            if let Some(text) = r.get::<_, Option<String>>(8)? {
+                f.1.push(text);
+            }
+            if let (Some(sites), Some(site)) = (&mut f.4 .1, r.get::<_, Option<i64>>(11)?) {
+                sites.push(site);
+            }
         }
     }
     // Each variant of a function compiling the call has its own copy of
     // it: copies at one position with one callee and one macro invocation
     // position, each in another graph of the function, are one candidate
-    // (two events of one graph stay two). Copies spelled in one macro body
-    // but invoked at different positions are different calls.
+    // (two events of one graph stay two, but for the destructor events
+    // naming the same sites: one object's destruction on each way out of
+    // its scope). Copies spelled in one macro body but invoked at different
+    // positions are different calls.
     let mut candidates: Vec<(EventRef, Option<String>)> = Vec::new();
+    // Each candidate's copies, as `found` holds them.
+    let mut copies: Vec<Vec<EventCopy>> = Vec::new();
     // The candidates of each `(function, path, line, col, callee,
     // invocation)`, in first-seen order.
     let mut by_key: FxHashMap<_, Vec<usize>> = FxHashMap::default();
-    for (mut event, callees, expansion, invoked_at) in found {
+    for (mut event, callees, expansion, invoked_at, copy_of) in found {
         if callee.is_some_and(|want| !callees.iter().any(|c| super::names_function(c, want))) {
             continue;
         }
@@ -342,18 +364,20 @@ pub fn resolve_event(
         );
         let same = by_key.entry(key).or_default();
         let open = same.iter().copied().find(|&i| {
-            candidates[i]
-                .0
-                .variants
+            copies[i]
                 .iter()
-                .all(|&(_, cfg)| cfg != event.cfg)
+                .all(|c| c.0 != event.cfg || (c.1.is_some() && *c == copy_of))
         });
         match open {
-            Some(i) => candidates[i].0.variants.push(copy),
+            Some(i) => {
+                candidates[i].0.variants.push(copy);
+                copies[i].push(copy_of);
+            }
             None => {
                 same.push(candidates.len());
                 event.variants.push(copy);
                 candidates.push((event, expansion));
+                copies.push(vec![copy_of]);
             }
         }
     }
@@ -387,6 +411,14 @@ pub fn resolve_event(
         }
     }
 }
+
+/// One copy of a call: its graph, and its sites when it destroys.
+type EventCopy = (CfgId, Option<Vec<i64>>);
+
+/// An event a position matched: its sites' callee spellings, the macro
+/// invocation (`file:line`) it was matched at, its invocation position
+/// (`expansion_file_id`, line, column) if any, and its copy identity.
+type FoundEvent = (EventRef, Vec<String>, Option<String>, Invocation, EventCopy);
 
 /// A call's macro invocation position: `cfg_events.expansion_file_id`,
 /// `expansion_line` and `expansion_col`, all `None` outside a macro.
@@ -1850,19 +1882,24 @@ pub fn sequence_graph(
         SequenceScope::From(start) => {
             b.graph.scope = format!("from {}", start.display());
             // One frame per variant compiling the call, as for a function.
-            for (event, cfg_id) in start.copies() {
+            for (cfg_id, events) in start.copies_by_graph() {
                 let cfg = b.loader.load(cfg_id)?;
                 let g = &b.loader.cfgs[cfg];
-                let at = g.block_of(g.event_of(event)?);
-                let mut keep = g.reach(at, true);
-                keep[at] = true;
+                let mut keep = vec![false; g.graph.blocks.len()];
+                for event in events {
+                    let at = g.block_of(g.event_of(event)?);
+                    for (k, r) in keep.iter_mut().zip(g.reach(at, true)) {
+                        *k |= r;
+                    }
+                    keep[at] = true;
+                }
                 b.add_frame(cfg, None, 0, Some(&keep));
             }
         }
         SequenceScope::Between(from, to) => {
             let to_copies = to.copies();
             let to_cfgs: Vec<CfgId> = to_copies.iter().map(|&(_, cfg)| cfg).collect();
-            let from_copies = from.copies();
+            let from_graphs = from.copies_by_graph();
             // Per variant of `from`'s function: its relations and notes,
             // and the frame showing the blocks between the ends.
             let mut relations = Vec::new();
@@ -1872,28 +1909,43 @@ pub fn sequence_graph(
             let mut unreached = 0;
             let mut frames = Vec::new();
             let mut memo = FxHashMap::default();
-            for &(event, cfg_id) in &from_copies {
-                let cfg = b.loader.load(cfg_id)?;
-                let a = b.loader.cfgs[cfg].event_of(event)?;
-                let (targets, inside) = match to_copies.iter().find(|&&(_, c)| c == cfg_id) {
-                    Some(&(t, _)) => (vec![b.loader.cfgs[cfg].event_of(t)?], false),
-                    None => (
+            for (cfg_id, events) in &from_graphs {
+                let cfg = b.loader.load(*cfg_id)?;
+                let local: Vec<CfgEventId> = to_copies
+                    .iter()
+                    .filter(|&&(_, c)| c == *cfg_id)
+                    .map(|&(t, _)| t)
+                    .collect();
+                let (targets, inside) = if local.is_empty() {
+                    (
                         calls_reaching(&mut b.loader, cfg, &to_cfgs, options.depth, &mut memo)?,
                         true,
-                    ),
+                    )
+                } else {
+                    let g = &b.loader.cfgs[cfg];
+                    let targets = local
+                        .into_iter()
+                        .map(|t| g.event_of(t))
+                        .collect::<Result<Vec<_>>>()?;
+                    (targets, false)
                 };
                 let g = &b.loader.cfgs[cfg];
-                let at = g.block_of(a);
-                let forward = g.reach(at, true);
                 let mut keep = vec![false; g.graph.blocks.len()];
-                keep[at] = true;
-                for &t in &targets {
-                    let tb = g.block_of(t);
-                    let backward = g.reach(tb, false);
-                    for (i, k) in keep.iter_mut().enumerate() {
-                        *k |= forward[i] && backward[i];
+                let mut ends = Vec::with_capacity(events.len());
+                for &event in events {
+                    let a = g.event_of(event)?;
+                    let at = g.block_of(a);
+                    let forward = g.reach(at, true);
+                    keep[at] = true;
+                    for &t in &targets {
+                        let tb = g.block_of(t);
+                        let backward = g.reach(tb, false);
+                        for (i, k) in keep.iter_mut().enumerate() {
+                            *k |= forward[i] && backward[i];
+                        }
+                        keep[tb] = true;
                     }
-                    keep[tb] = true;
+                    ends.push((a, forward));
                 }
                 frames.push((cfg, keep));
                 if targets.is_empty() {
@@ -1901,24 +1953,26 @@ pub fn sequence_graph(
                     continue;
                 }
                 let dom = g.dominators();
-                for &t in &targets {
-                    let (r, n) = if inside && t == a {
-                        // `to` runs inside the call `from` makes.
-                        (Relation::GuaranteedBefore, Vec::new())
-                    } else {
-                        g.relate(a, t, &forward, &dom)
-                    };
-                    relations.push(r);
-                    // Each note once, across calls and variants.
-                    for n in n {
-                        if !notes.contains(&n) {
-                            notes.push(n);
+                for (a, forward) in &ends {
+                    for &t in &targets {
+                        let (r, n) = if inside && t == *a {
+                            // `to` runs inside the call `from` makes.
+                            (Relation::GuaranteedBefore, Vec::new())
+                        } else {
+                            g.relate(*a, t, forward, &dom)
+                        };
+                        relations.push(r);
+                        // Each note once, across calls and variants.
+                        for n in n {
+                            if !notes.contains(&n) {
+                                notes.push(n);
+                            }
                         }
-                    }
-                    if inside {
-                        let call = g.db_ids[t];
-                        if !via.iter().any(|&(e, _)| e == call) {
-                            via.push((call, g.events[t].loc.display()));
+                        if inside {
+                            let call = g.db_ids[t];
+                            if !via.iter().any(|&(e, _)| e == call) {
+                                via.push((call, g.events[t].loc.display()));
+                            }
                         }
                     }
                 }
@@ -1958,7 +2012,7 @@ pub fn sequence_graph(
                 if unreached > 0 {
                     notes.push(format!(
                         "in {unreached} of {} variants, {not_reached}",
-                        from_copies.len()
+                        from_graphs.len()
                     ));
                 }
                 SeqRelation {
