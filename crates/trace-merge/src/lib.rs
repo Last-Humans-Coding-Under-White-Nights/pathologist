@@ -1111,15 +1111,15 @@ pub fn merge_databases<P: AsRef<Path>>(
 
     // 5c. Call-order graphs, carried over with remapped ids. A function
     // keeps one graph per distinct body, numbered in input order, as
-    // `trace analyze` keeps configuration variants (`trace_ir::add_variant`):
-    // a body several inputs share (a header function merged above) is kept
-    // once when they compile it alike and once more per different graph.
-    // Inputs share no call sites, so bodies are compared with each site
-    // standing for its key (`site_keys`). An event none of whose sites was
-    // carried is spliced out, leaving an `omitted_sites` gap. Graphs are
-    // read a chunk of ids at a time, and a kept graph is held once: beside
-    // it only the hash of its keyed form, the keyed form being rebuilt to
-    // confirm a hash that matches.
+    // `trace analyze` keeps configuration variants (both through
+    // `trace_ir::add_variant`): a body several inputs share (a header
+    // function merged above) is kept once when they compile it alike and
+    // once more per different graph. Inputs share no call sites, so bodies
+    // are compared with each site standing for its key (`site_keys`). An
+    // event none of whose sites was carried is spliced out, leaving an
+    // `omitted_sites` gap. Graphs are read a chunk of ids at a time, and a
+    // kept graph is held once, beside the hash of its keyed form; neither
+    // side of a comparison is copied to compare it.
     let mut unified_cfgs: BTreeMap<trace_ir::FnId, Vec<trace_ir::FunctionCfg>> = BTreeMap::new();
     let mut cfg_hashes: FxHashMap<trace_ir::FnId, Vec<u64>> = FxHashMap::default();
     let any_sequenced = input_sequencing
@@ -1131,8 +1131,7 @@ pub fn merge_databases<P: AsRef<Path>>(
         Vec::new()
     };
     // A merged site's key.
-    let merged_key =
-        |s: trace_ir::CallSiteId| Some(trace_ir::CallSiteId(site_key[s.0 as usize - 1]));
+    let merged_key = |s: trace_ir::CallSiteId| trace_ir::CallSiteId(site_key[s.0 as usize - 1]);
     for (db_idx, conn) in conns.iter().enumerate() {
         if input_sequencing[db_idx] == SequencingMarker::Absent {
             if any_sequenced {
@@ -1158,7 +1157,6 @@ pub fn merge_databases<P: AsRef<Path>>(
                 .get(&i64::from(s.0))
                 .map(|&id| trace_ir::CallSiteId(id as u32))
         };
-        let key = |s| map_site(s).and_then(merged_key);
         let last: i64 =
             conn.query_row("SELECT COALESCE(MAX(id), 0) FROM cfg_functions", [], |r| {
                 r.get(0)
@@ -1179,25 +1177,24 @@ pub fn merge_databases<P: AsRef<Path>>(
                     .get(&i64::from(cfg.function.0))
                     .context("missing remapped fn_id for cfg_functions")?;
                 let function = trace_ir::FnId(function as u32);
-                let keyed = cfg.remap(function, key, map_file);
-                let hash = keyed.structural_hash();
                 let kept = unified_cfgs.entry(function).or_default();
                 let hashes = cfg_hashes.entry(function).or_default();
-                let seen = hashes.iter().zip(kept.iter()).position(|(&h, v)| {
-                    h == hash && keyed.equal_after_remap(v, function, merged_key, |f| f)
-                });
-                if let Some(at) = seen {
+                let added = trace_ir::add_variant(
+                    kept,
+                    Some(hashes),
+                    &cfg,
+                    function,
+                    map_site,
+                    map_file,
+                    merged_key,
+                );
+                if let Err(at) = added {
                     // Its sites may call what the kept graph's do not (a
                     // callback this input passes): they join the kept
                     // events as alternatives. Their keys repeat the kept
                     // ones, so the keyed form and its hash are unchanged.
                     kept[at].add_alternatives_from(&cfg, map_site);
-                    continue;
                 }
-                let mut merged = cfg.remap(function, map_site, map_file);
-                merged.variant = kept.len() as u32;
-                kept.push(merged);
-                hashes.push(hash);
             }
         }
     }

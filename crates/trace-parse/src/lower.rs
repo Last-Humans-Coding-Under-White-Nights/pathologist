@@ -5955,7 +5955,31 @@ fn lower_function_body(
     for &il in &init_lists {
         walk_function_body(program, ctx, source, il, fn_id);
     }
-    cfg_build::build_function_cfg(program, ctx, source, fn_id, first_site, body, &init_lists);
+    // A function-try-block's own initializer list runs in its `try`, before
+    // any beside it.
+    let function_try = body.filter(|b| b.cached_kind() == "try_statement");
+    let in_try: Vec<_>;
+    let prologue = match function_try {
+        Some(try_node) => {
+            in_try = try_node
+                .children(&mut try_node.walk())
+                .filter(|c| c.cached_kind() == "field_initializer_list")
+                .chain(init_lists.iter().copied())
+                .collect();
+            &in_try
+        }
+        None => &init_lists,
+    };
+    cfg_build::build_function_cfg(
+        program,
+        ctx,
+        source,
+        fn_id,
+        first_site,
+        body,
+        prologue,
+        function_try.is_some(),
+    );
     ctx.cfg_truncate(cfg_mark);
     ctx.using_nss.truncate(using_nss_len);
     ctx.using_name_imports.truncate(using_imports_len);
@@ -14479,7 +14503,16 @@ fn lower_lambda_expression(
         let first_site = program.symbols.call_sites.len();
         let cfg_mark = ctx.cfg_mark();
         walk_function_body(program, ctx, source, body, fn_id);
-        cfg_build::build_function_cfg(program, ctx, source, fn_id, first_site, Some(body), &[]);
+        cfg_build::build_function_cfg(
+            program,
+            ctx,
+            source,
+            fn_id,
+            first_site,
+            Some(body),
+            &[],
+            false,
+        );
         // The enclosing function's graph takes none of the lambda's sites.
         ctx.cfg_truncate(cfg_mark);
     }

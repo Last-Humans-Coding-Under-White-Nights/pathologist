@@ -58,7 +58,10 @@ impl CfgRecorder {
 
 /// Build the graph of `function`'s body from the sites lowered for it since
 /// `first_site`, and add it to `program.cfgs`. `prologue` holds the
-/// member-initializer lists, which run before the body.
+/// member-initializer lists, which run before the body; with
+/// `function_try`, the body is a constructor's function-try-block
+/// (`A::A() try : m_(f()) {...}`) and they run inside its `try`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_function_cfg(
     program: &mut Program,
     ctx: &LowerContext,
@@ -67,6 +70,7 @@ pub(super) fn build_function_cfg(
     first_site: usize,
     body: Option<Node>,
     prologue: &[Node],
+    function_try: bool,
 ) {
     let Some(recorder) = &ctx.cfg_recorder else {
         return;
@@ -83,7 +87,7 @@ pub(super) fn build_function_cfg(
         );
         // A lambda's body nests in the walk that lowered it.
         builder.depth = ctx.ast_depth;
-        builder.run(body, prologue);
+        builder.run(body, prologue, function_try);
         (builder.cfg, builder.spans)
     };
     for (slot, node) in spans {
@@ -93,13 +97,15 @@ pub(super) fn build_function_cfg(
             SpanSlot::Gap(g) => cfg.gaps[g].span = span,
         }
     }
-    #[cfg(test)]
-    let compact = !tests::UNCOMPACTED.get();
-    #[cfg(not(test))]
-    let compact = true;
-    if compact {
-        cfg.compact();
-    }
+    debug_assert!(
+        {
+            let mut seen = rustc_hash::FxHashSet::default();
+            cfg.edges.iter().all(|e| seen.insert(*e))
+        },
+        "the walk added an edge twice: {:?}",
+        cfg.edges
+    );
+    cfg.compact();
     program.cfgs.entry(function).or_default().push(cfg);
 }
 
@@ -158,14 +164,14 @@ struct Builder<'s, 'a> {
     unclaimed: Vec<usize>,
     cfg: FunctionCfg,
     has_pred: Vec<bool>,
-    /// Blocks of a `try` body, whose exceptions go to that `try`'s landing;
-    /// an enclosing `try` reaches them through the landing.
-    caught: Vec<bool>,
-    /// A constructor's function-try-block (`A::A() try : m_(f()) {...}`):
-    /// its node, then the block in the `try` the prologue runs in, with
-    /// the landing it may throw to.
+    /// Each block's innermost `try` landing as it was made: where its
+    /// calls throw to, its first event adding the edge. An enclosing `try`
+    /// reaches the block through that landing.
+    landing: Vec<Option<BlockId>>,
+    /// A constructor's function-try-block: its node, then the block in the
+    /// `try` the prologue runs in.
     function_try: Option<usize>,
-    prologue_in_try: Option<(BlockId, BlockId, Vec<Node<'a>>)>,
+    prologue_in_try: Option<BlockId>,
     /// The block events go to; `None` after a jump, until a block that can
     /// be reached starts.
     cur: Option<BlockId>,
@@ -260,7 +266,7 @@ impl<'s, 'a> Builder<'s, 'a> {
                 gaps: Vec::new(),
             },
             has_pred: Vec::new(),
-            caught: Vec::new(),
+            landing: Vec::new(),
             function_try: None,
             prologue_in_try: None,
             cur: None,
@@ -275,7 +281,7 @@ impl<'s, 'a> Builder<'s, 'a> {
         builder
     }
 
-    fn run(&mut self, body: Option<Node<'a>>, prologue: &[Node<'a>]) {
+    fn run(&mut self, body: Option<Node<'a>>, prologue: &[Node<'a>], function_try: bool) {
         let entry = self.cfg.entry;
         // Filled last, once the body has taken the sites it owns.
         let head = self.new_block(BlockKind::Ordinary);
@@ -285,25 +291,15 @@ impl<'s, 'a> Builder<'s, 'a> {
         self.start(start);
         if let Some(body) = body {
             self.collect_labels(body);
-            if body.cached_kind() == "try_statement" {
-                self.function_try = Some(body.id());
-            }
+            self.function_try = function_try.then(|| body.id());
             self.visit(body);
         }
         let exit = self.cfg.exit;
         self.jump(exit, EdgeKind::Fallthrough);
-        // The initializers of a function-try-block run in its `try`.
-        match self.prologue_in_try.take() {
-            Some((block, landing, mut nodes)) => {
-                nodes.extend_from_slice(prologue);
-                let first = self.cfg.events.len();
-                self.fill_prologue(block, &nodes);
-                if self.cfg.events.len() > first {
-                    self.edge(block, landing, EdgeKind::Exception);
-                }
-            }
-            None => self.fill_prologue(head, prologue),
-        }
+        // The initializers of a function-try-block run in its `try`, in a
+        // block made there.
+        let head = self.prologue_in_try.take().unwrap_or(head);
+        self.fill_prologue(head, prologue);
     }
 
     // ---- blocks, edges and events ----
@@ -316,8 +312,24 @@ impl<'s, 'a> Builder<'s, 'a> {
             events: Vec::new(),
         });
         self.has_pred.push(false);
-        self.caught.push(false);
+        let landing = self.innermost_landing();
+        self.landing.push(landing);
         id
+    }
+
+    /// The landing of the innermost `try` around the walk, if any.
+    fn innermost_landing(&self) -> Option<BlockId> {
+        self.scopes.iter().rev().find_map(|s| match s.kind {
+            ScopeKind::Try { landing } => Some(landing),
+            _ => None,
+        })
+    }
+
+    /// The landing `b` already has its exception edge to: that of the `try`
+    /// it is in, once an event (any call may throw) added the edge.
+    fn throws_to(&self, b: BlockId) -> Option<BlockId> {
+        let b = b.0 as usize;
+        self.landing[b].filter(|_| !self.cfg.blocks[b].events.is_empty())
     }
 
     fn block_at(&mut self, node: Node<'a>) -> BlockId {
@@ -367,6 +379,11 @@ impl<'s, 'a> Builder<'s, 'a> {
 
     fn emit(&mut self, kind: EventKind, occurrence: CallOccurrence, sites: Vec<CallSiteId>) {
         let block = self.current();
+        if self.cfg.blocks[block.0 as usize].events.is_empty() {
+            if let Some(landing) = self.landing[block.0 as usize] {
+                self.edge(block, landing, EdgeKind::Exception);
+            }
+        }
         let id = EventId(self.cfg.events.len() as u32);
         self.cfg.events.push(CallEvent {
             block,
@@ -647,7 +664,14 @@ impl<'a> Builder<'_, 'a> {
                     .map_or(0, |at| at + 1);
                 self.unwind(handler);
                 let target = self.throw_target();
-                self.jump(target, EdgeKind::Exception);
+                match self.cur {
+                    // A call before it already took the block there.
+                    Some(b) if self.throws_to(b) == Some(target) => {
+                        self.cur = None;
+                        self.frontier.clear();
+                    }
+                    _ => self.jump(target, EdgeKind::Exception),
+                }
             }
             // A local class's members and a GNU nested function run when
             // called, not where they are written.
@@ -1107,10 +1131,8 @@ impl<'a> Builder<'_, 'a> {
         let since = keep
             .checked_sub(1)
             .and_then(|at| Some((at, *target.live.as_ref()?.get(at)?)));
-        match since {
-            Some((at, kept)) => self.unwind_since(at, kept),
-            None => self.unwind(keep),
-        }
+        let (at, kept) = since.unwrap_or((keep, 0));
+        self.unwind_since(at, kept);
         self.jump(block, EdgeKind::Fallthrough);
     }
 
@@ -1131,6 +1153,8 @@ impl<'a> Builder<'_, 'a> {
                 l.block
             });
         if let Some(block) = block {
+            // Made before the walk: it throws where the label is.
+            self.landing[block.0 as usize] = self.innermost_landing();
             self.jump(block, EdgeKind::Fallthrough);
             self.start(block);
         }
@@ -1185,11 +1209,7 @@ impl<'a> Builder<'_, 'a> {
     }
 
     fn throw_target(&mut self) -> BlockId {
-        let landing = self.scopes.iter().rev().find_map(|s| match s.kind {
-            ScopeKind::Try { landing } => Some(landing),
-            _ => None,
-        });
-        if let Some(landing) = landing {
+        if let Some(landing) = self.innermost_landing() {
             return landing;
         }
         match self.cfg.exceptional_exit {
@@ -1205,22 +1225,18 @@ impl<'a> Builder<'_, 'a> {
     fn try_statement(&mut self, node: Node<'a>) {
         let landing = self.new_block(BlockKind::Landing);
         let exit = self.new_block(BlockKind::Ordinary);
-        let first_event = self.cfg.events.len();
-        let first_edge = self.cfg.edges.len();
+        // The body's blocks, made inside, throw to the landing (a nested
+        // `try`'s to its own, which passes on what its handlers do not
+        // catch).
+        self.push_scope(ScopeKind::Try { landing }, None);
         let body = self.block_at(node);
         self.jump(body, EdgeKind::Fallthrough);
         self.enter(body);
-        self.push_scope(ScopeKind::Try { landing }, None);
         if self.function_try == Some(node.id()) {
             // `try : m_(f()) { ... }`: the initializers come first, in a
-            // block of their own, filled with the rest of the prologue once
-            // the walk is done.
-            let mut cursor = node.walk();
-            let initializers = node
-                .children(&mut cursor)
-                .filter(|c| c.cached_kind() == "field_initializer_list")
-                .collect();
-            self.prologue_in_try = Some((body, landing, initializers));
+            // block of their own, filled with the prologue once the walk is
+            // done.
+            self.prologue_in_try = Some(body);
             let next = self.new_block(BlockKind::Ordinary);
             self.jump(next, EdgeKind::Fallthrough);
             self.enter(next);
@@ -1229,31 +1245,6 @@ impl<'a> Builder<'_, 'a> {
             self.visit(statement);
         }
         self.scopes.pop();
-        // Any call in the body may throw, a label's block (made before the
-        // walk) included, except in a nested `try`, whose landing passes on
-        // what its handlers do not catch.
-        let mut throwing: Vec<BlockId> = self.cfg.events[first_event..]
-            .iter()
-            .map(|e| e.block)
-            .filter(|b| !self.caught[b.0 as usize])
-            .collect();
-        throwing.sort_unstable();
-        throwing.dedup();
-        // A `throw` in the body already left its block for the landing.
-        let mut thrown: Vec<BlockId> = self.cfg.edges[first_edge..]
-            .iter()
-            .filter(|e| e.to == landing && e.kind == EdgeKind::Exception)
-            .map(|e| e.from)
-            .collect();
-        thrown.sort_unstable();
-        for &b in &throwing {
-            if thrown.binary_search(&b).is_err() {
-                self.edge(b, landing, EdgeKind::Exception);
-            }
-        }
-        for b in throwing.into_iter().chain(thrown) {
-            self.caught[b.0 as usize] = true;
-        }
         self.jump(exit, EdgeKind::Fallthrough);
         let mut catch_all = false;
         let mut cursor = node.walk();
@@ -1354,19 +1345,6 @@ mod tests {
 
     fn lower(name: &str) -> UnitIndex {
         lower_with(name, PreprocessOptions::new().with_call_sequencing(true))
-    }
-
-    thread_local! {
-        /// Keep graphs as the walk built them, before `compact`.
-        pub(super) static UNCOMPACTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
-    /// `lower`, with the graphs as the walk built them.
-    fn lower_uncompacted(name: &str) -> UnitIndex {
-        UNCOMPACTED.set(true);
-        let unit = lower(name);
-        UNCOMPACTED.set(false);
-        unit
     }
 
     /// The graph of `function`, with the unit to read site names from.
@@ -2196,7 +2174,9 @@ mod tests {
     /// not only once `compact` drops duplicates.
     #[test]
     fn a_throw_in_a_try_has_one_exception_edge() {
-        let unit = lower_uncompacted("exceptions.cpp");
+        // Built without a repeated edge (asserted before `compact` in every
+        // debug build), so `compact` hides none here.
+        let unit = lower("exceptions.cpp");
         let g = graph(&unit, "rethrow");
         let work = g.block(g.ev("work"));
         let exception = |b: BlockId| {

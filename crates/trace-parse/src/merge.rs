@@ -1301,7 +1301,9 @@ fn merge_unit(
         let tu = unit_of(owner.file);
         let variants = program.cfgs.entry(function).or_default();
         let map_site = |s| call_map.get(&s).copied();
-        if let Some(kept) = trace_ir::add_variant(variants, cfg, function, map_site, map_file) {
+        // Units share merged sites: a site is its own key.
+        let added = trace_ir::add_variant(variants, None, cfg, function, map_site, map_file, |s| s);
+        if let Ok(kept) = added {
             kept.tu = Some(tu);
         }
     }

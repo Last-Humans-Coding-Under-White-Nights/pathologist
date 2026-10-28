@@ -231,33 +231,217 @@ pub struct FunctionCfg {
 /// one more configuration variant of `function` unless `variants` already
 /// holds a structurally equal graph: the first copy of a body is kept, and
 /// one a unit or configuration compiles differently is another variant,
-/// numbered by position and never unioned. Returns the variant added.
+/// numbered by position and never unioned. Returns the variant added, or
+/// the position of the equal one kept.
+///
+/// Graphs are compared by site key: `rekey` gives a kept graph's site its
+/// key, so a site of `cfg` is keyed as `rekey(map_site(s))` (`trace
+/// analyze`, whose units share merged sites, keys a site by itself).
+/// `hashes`, when given, holds one fingerprint per variant, kept in step,
+/// so only variants whose fingerprint matches are compared. The new graph
+/// is built once, and a keyed copy never.
 pub fn add_variant<'v>(
     variants: &'v mut Vec<FunctionCfg>,
+    hashes: Option<&mut Vec<u64>>,
     cfg: &FunctionCfg,
     function: FnId,
     map_site: impl Fn(CallSiteId) -> Option<CallSiteId>,
     map_file: impl Fn(FileId) -> FileId,
-) -> Option<&'v mut FunctionCfg> {
-    let mut kept = if cfg.splices(&map_site) {
-        // The remapped graph is built anyway; compare it, built once.
-        let kept = cfg.remap(function, map_site, map_file);
-        if variants.iter().any(|v| v.structurally_equal(&kept)) {
-            return None;
+    rekey: impl Fn(CallSiteId) -> CallSiteId,
+) -> Result<&'v mut FunctionCfg, usize> {
+    let key = |s| Some(rekey(s));
+    let fingerprints = hashes.as_deref().map(Vec::as_slice);
+    // An event spliced out renumbers the rest: the graph is built first
+    // (it is the one kept when new) and compared by its keys. Otherwise
+    // `cfg` is compared through the mappings, and built only when new.
+    let built = cfg
+        .splices(&map_site)
+        .then(|| cfg.remap(function, &map_site, &map_file));
+    let found = match &built {
+        Some(graph) => find_variant(
+            variants,
+            fingerprints,
+            &Mapped::new(graph, function, key, |f| f),
+            key,
+        ),
+        None => {
+            let site = |s| map_site(s).map(&rekey);
+            find_variant(
+                variants,
+                fingerprints,
+                &Mapped::new(cfg, function, site, &map_file),
+                key,
+            )
         }
-        kept
-    } else {
-        if variants
-            .iter()
-            .any(|v| v.equal_unspliced(cfg, function, &map_site, &map_file))
-        {
-            return None;
-        }
-        cfg.remap(function, map_site, map_file)
     };
+    let hash = match found {
+        Ok(at) => return Err(at),
+        Err(hash) => hash,
+    };
+    let mut kept = built.unwrap_or_else(|| cfg.remap(function, map_site, map_file));
     kept.variant = variants.len() as u32;
+    if let (Some(hashes), Some(hash)) = (hashes, hash) {
+        hashes.push(hash);
+    }
     variants.push(kept);
-    variants.last_mut()
+    Ok(variants.last_mut().expect("variant just added"))
+}
+
+/// The position of the variant equal to `graph` once each variant names
+/// its sites through `key`, or `graph`'s fingerprint when there is none
+/// (`None` without `hashes`).
+fn find_variant(
+    variants: &[FunctionCfg],
+    hashes: Option<&[u64]>,
+    graph: &Mapped<'_, impl Fn(CallSiteId) -> Option<CallSiteId>, impl Fn(FileId) -> FileId>,
+    key: impl Fn(CallSiteId) -> Option<CallSiteId>,
+) -> Result<usize, Option<u64>> {
+    let hash = hashes.map(|_| graph.hash());
+    let fingerprint_matches = |at: usize| match (hashes, hash) {
+        (Some(hashes), Some(hash)) => hashes[at] == hash,
+        _ => true,
+    };
+    variants
+        .iter()
+        .enumerate()
+        .position(|(at, v)| {
+            fingerprint_matches(at) && graph.equals(&Mapped::new(v, v.function, &key, |f| f))
+        })
+        .ok_or(hash)
+}
+
+/// A graph as [`FunctionCfg::remap`] would build it, for `function` and
+/// through `site` and `file`, when that splices out no event: ids, the
+/// order and gap ranges carry over, so it is compared and hashed without
+/// being built.
+struct Mapped<'g, S, F> {
+    cfg: &'g FunctionCfg,
+    function: FnId,
+    site: S,
+    file: F,
+}
+
+impl<'g, S, F> Mapped<'g, S, F>
+where
+    S: Fn(CallSiteId) -> Option<CallSiteId>,
+    F: Fn(FileId) -> FileId,
+{
+    fn new(cfg: &'g FunctionCfg, function: FnId, site: S, file: F) -> Self {
+        Self {
+            cfg,
+            function,
+            site,
+            file,
+        }
+    }
+
+    fn span(&self, span: Span) -> Span {
+        Span {
+            file: (self.file)(span.file),
+            ..span
+        }
+    }
+
+    fn occurrence(&self, occurrence: CallOccurrence) -> CallOccurrence {
+        CallOccurrence {
+            span: self.span(occurrence.span),
+            expansion_span: occurrence.expansion_span.map(|s| self.span(s)),
+            ..occurrence
+        }
+    }
+
+    /// A gap's range as remapped: a reversed range keeps no event.
+    fn gap_events(gap: &Gap) -> Option<(EventId, EventId)> {
+        gap.events.filter(|(first, last)| first <= last)
+    }
+
+    /// What [`FunctionCfg::structurally_equal`] compares, both sides
+    /// mapped.
+    fn equals(
+        &self,
+        other: &Mapped<'_, impl Fn(CallSiteId) -> Option<CallSiteId>, impl Fn(FileId) -> FileId>,
+    ) -> bool {
+        // Exhaustive, so a new field is a decision here.
+        let FunctionCfg {
+            function: _,
+            tu: _,
+            variant: _,
+            entry,
+            exit,
+            exceptional_exit,
+            blocks,
+            edges,
+            events,
+            order,
+            gaps,
+        } = self.cfg;
+        let b = other.cfg;
+        self.function == other.function
+            && *entry == b.entry
+            && *exit == b.exit
+            && *exceptional_exit == b.exceptional_exit
+            && *edges == b.edges
+            && *order == b.order
+            && blocks.len() == b.blocks.len()
+            && blocks.iter().zip(&b.blocks).all(|(x, y)| {
+                x.kind == y.kind
+                    && x.span.map(|s| self.span(s)) == y.span.map(|s| other.span(s))
+                    && x.events == y.events
+            })
+            && events.len() == b.events.len()
+            && events.iter().zip(&b.events).all(|(x, y)| {
+                x.block == y.block
+                    && x.kind == y.kind
+                    && self.occurrence(x.occurrence) == other.occurrence(y.occurrence)
+                    && mapped_sites(&x.sites, &self.site).eq(mapped_sites(&y.sites, &other.site))
+            })
+            && gaps.len() == b.gaps.len()
+            && gaps.iter().zip(&b.gaps).all(|(x, y)| {
+                x.kind == y.kind
+                    && x.span.map(|s| self.span(s)) == y.span.map(|s| other.span(s))
+                    && Self::gap_events(x) == Self::gap_events(y)
+            })
+    }
+
+    /// A hash of what [`Self::equals`] compares: equal graphs hash alike.
+    fn hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        // Exhaustive, as in `equals`.
+        let FunctionCfg {
+            function: _,
+            tu: _,
+            variant: _,
+            entry,
+            exit,
+            exceptional_exit,
+            blocks,
+            edges,
+            events,
+            order,
+            gaps,
+        } = self.cfg;
+        let mut hasher = rustc_hash::FxHasher::default();
+        (self.function, entry, exit, exceptional_exit, edges, order).hash(&mut hasher);
+        blocks.len().hash(&mut hasher);
+        for b in blocks {
+            (b.kind, b.span.map(|s| self.span(s)), &b.events).hash(&mut hasher);
+        }
+        events.len().hash(&mut hasher);
+        for e in events {
+            (e.block, e.kind, self.occurrence(e.occurrence)).hash(&mut hasher);
+            let mut sites = 0usize;
+            for site in mapped_sites(&e.sites, &self.site) {
+                site.hash(&mut hasher);
+                sites += 1;
+            }
+            sites.hash(&mut hasher);
+        }
+        gaps.len().hash(&mut hasher);
+        for g in gaps {
+            (g.kind, g.span.map(|s| self.span(s)), Self::gap_events(g)).hash(&mut hasher);
+        }
+        hasher.finish()
+    }
 }
 
 /// `sites` through `map_site`, dropping those it does not map; coalesced
@@ -331,6 +515,23 @@ fn splice_order(
 
 /// Drop repeated edges, keeping each edge's first position.
 fn dedup_edges(edges: &mut Vec<CfgEdge>) {
+    /// Up to this many edges a scan of those kept beats hashing.
+    const SCAN: usize = 32;
+    if edges.len() < 2 {
+        return;
+    }
+    if edges.len() <= SCAN {
+        let mut kept = 0;
+        for at in 0..edges.len() {
+            let edge = edges[at];
+            if !edges[..kept].contains(&edge) {
+                edges[kept] = edge;
+                kept += 1;
+            }
+        }
+        edges.truncate(kept);
+        return;
+    }
     let mut seen = rustc_hash::FxHashSet::default();
     edges.retain(|e| seen.insert(*e));
 }
@@ -367,25 +568,7 @@ impl FunctionCfg {
     /// equal graphs hash alike. Lets a caller keep a fingerprint per graph
     /// instead of a second copy to compare against.
     pub fn structural_hash(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        // Exhaustive, as in `structurally_equal`.
-        let FunctionCfg {
-            function,
-            tu: _,
-            variant: _,
-            entry,
-            exit,
-            exceptional_exit,
-            blocks,
-            edges,
-            events,
-            order,
-            gaps,
-        } = self;
-        let mut hasher = rustc_hash::FxHasher::default();
-        (function, entry, exit, exceptional_exit).hash(&mut hasher);
-        (blocks, edges, events, order, gaps).hash(&mut hasher);
-        hasher.finish()
+        Mapped::new(self, self.function, Some, |f| f).hash()
     }
 
     /// Every file the graph names: its unit, and the files of its block,
@@ -399,22 +582,6 @@ impl FunctionCfg {
         let gaps = self.gaps.iter().filter_map(|g| g.span);
         let spans = blocks.chain(events).chain(gaps).map(|s| s.file);
         self.tu.into_iter().chain(spans)
-    }
-
-    /// `self.structurally_equal(&other.remap(function, map_site, map_file))`,
-    /// without building the remapped graph unless one of `other`'s events
-    /// loses every site.
-    pub fn equal_after_remap(
-        &self,
-        other: &FunctionCfg,
-        function: FnId,
-        map_site: impl Fn(CallSiteId) -> Option<CallSiteId>,
-        map_file: impl Fn(FileId) -> FileId,
-    ) -> bool {
-        if other.splices(&map_site) {
-            return self.structurally_equal(&other.remap(function, map_site, map_file));
-        }
-        self.equal_unspliced(other, function, map_site, map_file)
     }
 
     /// For `other`, a graph found equal to this one through `map_site`
@@ -441,64 +608,6 @@ impl FunctionCfg {
         self.events
             .iter()
             .any(|e| mapped_sites(&e.sites, map_site).next().is_none())
-    }
-
-    /// [`Self::equal_after_remap`] when `map_site` splices out no event of
-    /// `other`: ids, the order and gap ranges carry over.
-    fn equal_unspliced(
-        &self,
-        other: &FunctionCfg,
-        function: FnId,
-        map_site: impl Fn(CallSiteId) -> Option<CallSiteId>,
-        map_file: impl Fn(FileId) -> FileId,
-    ) -> bool {
-        let FunctionCfg {
-            function: _,
-            tu: _,
-            variant: _,
-            entry,
-            exit,
-            exceptional_exit,
-            blocks,
-            edges,
-            events,
-            order,
-            gaps,
-        } = other;
-        let map_span = |span: Span| Span {
-            file: map_file(span.file),
-            ..span
-        };
-        self.function == function
-            && self.entry == *entry
-            && self.exit == *exit
-            && self.exceptional_exit == *exceptional_exit
-            && self.edges == *edges
-            && self.order == *order
-            && self.blocks.len() == blocks.len()
-            && self.blocks.iter().zip(blocks).all(|(a, b)| {
-                a.kind == b.kind && a.span == b.span.map(map_span) && a.events == b.events
-            })
-            && self.events.len() == events.len()
-            && self.events.iter().zip(events).all(|(a, b)| {
-                let mut occurrence = b.occurrence;
-                occurrence.span = map_span(occurrence.span);
-                occurrence.expansion_span = occurrence.expansion_span.map(map_span);
-                a.block == b.block
-                    && a.kind == b.kind
-                    && a.occurrence == occurrence
-                    && a.sites
-                        .iter()
-                        .copied()
-                        .eq(mapped_sites(&b.sites, &map_site))
-            })
-            && self.gaps.len() == gaps.len()
-            && self.gaps.iter().zip(gaps).all(|(a, b)| {
-                a.kind == b.kind
-                    && a.span == b.span.map(map_span)
-                    // A reversed range keeps no event.
-                    && a.events == b.events.filter(|(first, last)| first <= last)
-            })
     }
 
     /// The graph in another program's ids: `function` for its function,
@@ -1096,10 +1205,11 @@ mod tests {
         assert_eq!(merged.tu, Some(FileId(4)));
     }
 
-    /// The comparison without remapping agrees with remapping first, with
-    /// and without an event spliced out.
+    /// A variant is found equal without remapping exactly when remapping
+    /// first gives a structurally equal graph, with and without an event
+    /// spliced out, with and without fingerprints.
     #[test]
-    fn equal_after_remap_matches_remap() {
+    fn add_variant_matches_remap() {
         let mut g = straight();
         g.blocks[2].span = Some(span(2));
         g.gaps.push(Gap {
@@ -1117,14 +1227,37 @@ mod tests {
             // The second invocation loses its site.
             &|s: CallSiteId| (s.0 != 11).then_some(s),
         ];
+        // Whether `add_variant` finds `g`, through `map` and `file`, equal
+        // to `merged`.
+        let found = |merged: &FunctionCfg,
+                     function: FnId,
+                     map: &dyn Fn(CallSiteId) -> Option<CallSiteId>,
+                     file: &dyn Fn(FileId) -> FileId| {
+            let mut plain = vec![merged.clone()];
+            let plain = add_variant(&mut plain, None, &g, function, map, file, |s| s).is_err();
+            let mut hashed = vec![merged.clone()];
+            let mut hashes = vec![merged.structural_hash()];
+            let hashed = add_variant(
+                &mut hashed,
+                Some(&mut hashes),
+                &g,
+                function,
+                map,
+                file,
+                |s| s,
+            )
+            .is_err();
+            assert_eq!(plain, hashed);
+            plain
+        };
         for map in maps {
             let merged = g.remap(FnId(9), map, file);
-            assert!(merged.equal_after_remap(&g, FnId(9), map, file));
-            assert!(!merged.equal_after_remap(&g, FnId(8), map, file));
-            assert!(!merged.equal_after_remap(&g, FnId(9), map, |_| FileId(6)));
+            assert!(found(&merged, FnId(9), map, &file));
+            assert!(!found(&merged, FnId(8), map, &file));
+            assert!(!found(&merged, FnId(9), map, &|_| FileId(6)));
             for other in maps {
                 let expected = merged.structurally_equal(&g.remap(FnId(9), other, file));
-                assert_eq!(merged.equal_after_remap(&g, FnId(9), other, file), expected);
+                assert_eq!(found(&merged, FnId(9), other, &file), expected);
             }
         }
     }
@@ -1137,7 +1270,7 @@ mod tests {
         for n in 0..4u32 {
             let mut g = straight();
             g.events[0].sites = vec![CallSiteId(100 + n)];
-            add_variant(&mut variants, &g, FnId(7), Some, |f| f).unwrap();
+            add_variant(&mut variants, None, &g, FnId(7), Some, |f| f, |s| s).unwrap();
         }
         let mut g = straight();
         g.blocks[2].span = Some(span(2));
@@ -1151,11 +1284,11 @@ mod tests {
         g.remap(FnId(7), drop, file);
         let one = calls.replace(0);
         assert!(one > 0);
-        add_variant(&mut variants, &g, FnId(7), drop, file).unwrap();
+        add_variant(&mut variants, None, &g, FnId(7), drop, file, |s| s).unwrap();
         assert_eq!(calls.get(), one);
         assert_eq!(variants.len(), 5);
         // And it is still recognised as a copy.
-        assert!(add_variant(&mut variants, &g, FnId(7), drop, |f| f).is_none());
+        assert!(add_variant(&mut variants, None, &g, FnId(7), drop, |f| f, |s| s).is_err());
     }
 
     /// The splice in [`FunctionCfg::remap`] as first written: quadratic, the
@@ -1258,15 +1391,17 @@ mod tests {
     fn add_variant_keeps_distinct_bodies_numbered() {
         let mut variants = Vec::new();
         let a = straight();
-        let kept = add_variant(&mut variants, &a, FnId(7), Some, |f| f).unwrap();
+        let kept = add_variant(&mut variants, None, &a, FnId(7), Some, |f| f, |s| s).unwrap();
         kept.tu = Some(FileId(1));
-        assert!(add_variant(&mut variants, &a, FnId(7), Some, |f| f).is_none());
+        assert!(add_variant(&mut variants, None, &a, FnId(7), Some, |f| f, |s| s).is_err());
         let mut b = straight();
         b.events.pop();
         b.blocks[2].events.pop();
         b.variant = 5;
         assert_eq!(
-            add_variant(&mut variants, &b, FnId(7), Some, |f| f).map(|v| v.variant),
+            add_variant(&mut variants, None, &b, FnId(7), Some, |f| f, |s| s)
+                .ok()
+                .map(|v| v.variant),
             Some(1)
         );
         assert_eq!(variants.len(), 2);
