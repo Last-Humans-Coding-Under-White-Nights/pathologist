@@ -77,3 +77,14 @@ void resumed(void)
         b();
     c();
 }
+
+void hidden_goto(int x)
+{
+    if (x) {
+        a();
+        ({ goto target; 0; });
+    } else {
+    target:
+        b();
+    }
+}

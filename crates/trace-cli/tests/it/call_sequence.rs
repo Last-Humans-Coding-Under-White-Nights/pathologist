@@ -1284,6 +1284,46 @@ fn sequence_renders_in_every_format() {
     assert!(dot.contains("subgraph cluster_"), "{dot}");
 }
 
+/// What a budget cut shows in the diagrams too: a dashed edge from the
+/// cut call's block to a note naming the budget.
+#[test]
+fn diagrams_mark_what_budgets_cut() {
+    let dir = scratch(&[(
+        "calls.c",
+        "void leaf(void);\n\
+         void helper(void) { leaf(); }\n\
+         void run(void) { helper(); }\n",
+    )]);
+    let db = sequenced_db(dir.path(), default_opts(dir.path()));
+    let conn = rusqlite::Connection::open(db.path()).unwrap();
+    let options = trace_db::SequenceOptions {
+        max_events: 1,
+        ..Default::default()
+    };
+    let graph = function_sequence(&conn, "run", None, &options);
+    let reasons: Vec<_> = graph.truncated.iter().map(|t| t.reason.as_str()).collect();
+    assert_eq!(reasons, ["max_events"]);
+    let block = graph.events[graph.truncated[0].event.unwrap()].block;
+    let mermaid = trace_db::render_sequence(&graph, trace_db::RenderFormat::Mermaid).unwrap();
+    assert!(
+        mermaid.contains("  t0[/\"truncated: max_events\"/]"),
+        "{mermaid}"
+    );
+    assert!(
+        mermaid.contains(&format!("  n{block} -.-> t0")),
+        "{mermaid}"
+    );
+    let dot = trace_db::render_sequence(&graph, trace_db::RenderFormat::Graphviz).unwrap();
+    assert!(
+        dot.contains("  t0 [shape=note, label=\"truncated: max_events\"];"),
+        "{dot}"
+    );
+    assert!(
+        dot.contains(&format!("  n{block} -> t0 [style=dashed];")),
+        "{dot}"
+    );
+}
+
 /// A block of many `g(a(), b());` statements is a chain of order diamonds,
 /// with 2^n paths through it. The text view groups and annotates it in time
 /// polynomial in the events (it walked every path once: an `EmitDriverBind`
@@ -1660,6 +1700,26 @@ fn unmodeled_transfers_are_not_evidence_of_impossibility() {
     let (a, b) = (at(75, "a"), at(77, "b"));
     assert_eq!(relation(&conn, &a, &b), MayBoth);
     assert_eq!(relation(&conn, &b, &a), MayBoth);
+    let scope = trace_db::SequenceScope::Between(a, b);
+    let graph = trace_db::sequence_graph(&conn, &scope, &Default::default()).unwrap();
+    let notes = graph.relation.unwrap().notes;
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("unmodeled control transfer")),
+        "{notes:?}"
+    );
+}
+
+/// A control-hiding construct without calls still hides its transfer: the
+/// `goto` inside the statement expression joins the arms.
+#[test]
+fn a_call_free_opaque_construct_still_escapes() {
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "unsupported.c", line, callee);
+    let (a, b) = (at(84, "a"), at(88, "b"));
+    assert_eq!(relation(&conn, &a, &b), trace_db::Relation::MayPrecede);
+    assert_eq!(relation(&conn, &b, &a), trace_db::Relation::MayFollow);
     let scope = trace_db::SequenceScope::Between(a, b);
     let graph = trace_db::sequence_graph(&conn, &scope, &Default::default()).unwrap();
     let notes = graph.relation.unwrap().notes;

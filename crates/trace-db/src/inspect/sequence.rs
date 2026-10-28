@@ -2325,6 +2325,22 @@ fn render_flowchart(graph: &SequenceGraph, dot: bool) -> String {
             writeln!(out, "  {} -.-> {}", block(from), leaf(i)).unwrap();
         }
     }
+    // Truncation markers are notes `t<index>`, at the cut call's block (the
+    // frame's entry when no call is named).
+    for (i, t) in graph.truncated.iter().enumerate() {
+        let from = match t.event {
+            Some(e) => graph.events[e].block,
+            None => graph.frames[t.frame].entry,
+        };
+        let label = escape(&format!("truncated: {}", t.reason));
+        if dot {
+            writeln!(out, "  t{i} [shape=note, label=\"{label}\"];").unwrap();
+            writeln!(out, "  {} -> t{i} [style=dashed];", block(from)).unwrap();
+        } else {
+            writeln!(out, "  t{i}[/\"{label}\"/]").unwrap();
+            writeln!(out, "  {} -.-> t{i}", block(from)).unwrap();
+        }
+    }
     if dot {
         writeln!(out, "}}").unwrap();
     }

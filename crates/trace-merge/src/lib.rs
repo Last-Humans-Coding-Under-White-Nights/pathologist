@@ -29,6 +29,9 @@ const READ_TARGET_DEPENDENCIES: &str =
     "SELECT target_id, dependency_id FROM target_dependencies ORDER BY target_id, dependency_id";
 const READ_FUNCTIONS: &str = "SELECT id, name, file_id, line_start, line_end, linkage, signature, is_defined, is_dep, is_weak, target_id \
              FROM functions ORDER BY id";
+/// Each call-order event's sites, by event, in site order.
+const READ_EVENT_SITES: &str =
+    "SELECT event_id, call_site_id FROM cfg_event_sites ORDER BY event_id, ordinal";
 const READ_CALL_SITES: &str = "SELECT id, caller_fn_id, file_id, line, col, expansion_file_id, expansion_line, expansion_col, callee_text, is_direct \
              FROM call_sites ORDER BY id";
 const READ_CALL_EDGES: &str = "SELECT id, call_site_id, caller_fn_id, callee_fn_id, resolution \
@@ -88,8 +91,17 @@ pub enum WarningKind {
 /// A key per merged call site (by index), equal for the sites of two inputs
 /// that one body compiled alike gave: the same caller, position, callee
 /// spelling and directness, and the same count of such sites before it in
-/// its input. Sites of one input never share a key.
-fn site_keys(sites: &[DbCallSite], input_sites: &[std::ops::Range<usize>]) -> Vec<u32> {
+/// its input. Sites of one input share a key only when they are
+/// alternatives of one event (`alternatives`: the sites of each event with
+/// several) and spelled alike, as a merged input lists another input's
+/// copy of a header body's call: they count as the one site each input
+/// had, so merging a merged input again keys them as merging the inputs at
+/// once does.
+fn site_keys(
+    sites: &[DbCallSite],
+    input_sites: &[std::ops::Range<usize>],
+    alternatives: &[Vec<usize>],
+) -> Vec<u32> {
     type Key<'s> = (
         i64,
         i64,
@@ -101,23 +113,48 @@ fn site_keys(sites: &[DbCallSite], input_sites: &[std::ops::Range<usize>]) -> Ve
         &'s str,
         i64,
     );
+    fn key(cs: &DbCallSite) -> Key<'_> {
+        (
+            cs.caller_fn_id,
+            cs.file_id,
+            cs.line,
+            cs.col,
+            cs.expansion_file_id,
+            cs.expansion_line,
+            cs.expansion_col,
+            cs.callee_text.as_str(),
+            cs.is_direct,
+        )
+    }
+    // Each alternative's earliest equal alternative.
+    let mut first: FxHashMap<usize, usize> = FxHashMap::default();
+    let root = |first: &FxHashMap<usize, usize>, mut s: usize| {
+        while let Some(&p) = first.get(&s) {
+            s = p;
+        }
+        s
+    };
+    for event in alternatives {
+        let mut by_key: FxHashMap<Key<'_>, usize> = FxHashMap::default();
+        for &site in event {
+            let earlier = *by_key.entry(key(&sites[site])).or_insert(site);
+            let (a, b) = (root(&first, site), root(&first, earlier));
+            if a != b {
+                first.insert(a.max(b), a.min(b));
+            }
+        }
+    }
     let mut ids: FxHashMap<(Key<'_>, u32), u32> = FxHashMap::default();
     let mut keys = vec![0; sites.len()];
     for range in input_sites {
         let mut repeats: FxHashMap<Key<'_>, u32> = FxHashMap::default();
         for i in range.clone() {
-            let cs = &sites[i];
-            let key = (
-                cs.caller_fn_id,
-                cs.file_id,
-                cs.line,
-                cs.col,
-                cs.expansion_file_id,
-                cs.expansion_line,
-                cs.expansion_col,
-                cs.callee_text.as_str(),
-                cs.is_direct,
-            );
+            let earlier = root(&first, i);
+            if earlier != i {
+                keys[i] = keys[earlier];
+                continue;
+            }
+            let key = key(&sites[i]);
             let repeat = repeats.entry(key).or_default();
             let next = ids.len() as u32;
             keys[i] = *ids.entry((key, *repeat)).or_insert(next);
@@ -1126,7 +1163,34 @@ pub fn merge_databases<P: AsRef<Path>>(
         .iter()
         .any(|&s| s != SequencingMarker::Absent);
     let site_key = if any_sequenced {
-        site_keys(&unified_call_sites, &input_sites)
+        // The sites of each event with several, in site order.
+        let mut alternatives: Vec<Vec<usize>> = Vec::new();
+        for (db_idx, conn) in conns.iter().enumerate() {
+            if input_sequencing[db_idx] == SequencingMarker::Absent {
+                continue;
+            }
+            let mut stmt = conn.prepare(READ_EVENT_SITES)?;
+            let mut rows = stmt.query([])?;
+            let mut event = None;
+            let mut group = Vec::new();
+            while let Some(r) = rows.next()? {
+                let (id, site): (i64, i64) = (r.get(0)?, r.get(1)?);
+                if event != Some(id) {
+                    event = Some(id);
+                    if group.len() > 1 {
+                        alternatives.push(std::mem::take(&mut group));
+                    }
+                    group.clear();
+                }
+                if let Some(&merged) = cs_remap[db_idx].get(&site) {
+                    group.push(merged as usize - 1);
+                }
+            }
+            if group.len() > 1 {
+                alternatives.push(group);
+            }
+        }
+        site_keys(&unified_call_sites, &input_sites, &alternatives)
     } else {
         Vec::new()
     };

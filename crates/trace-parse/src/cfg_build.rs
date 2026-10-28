@@ -539,6 +539,17 @@ impl<'s, 'a> Builder<'s, 'a> {
         let first = self.cfg.events.len();
         self.flatten(node);
         self.gap(kind, Some(node), first);
+        // Every opaque kind may hide a control transfer. With no event
+        // under it to mark where, the block ends at it with an
+        // `unsupported` edge, the walk going on in a new block.
+        if self.cfg.events.len() == first {
+            if let Some(from) = self.cur {
+                let (exit, next) = (self.cfg.exit, self.new_block(BlockKind::Ordinary));
+                self.edge(from, exit, EdgeKind::Unsupported);
+                self.edge(from, next, EdgeKind::Fallthrough);
+                self.start(next);
+            }
+        }
     }
 }
 

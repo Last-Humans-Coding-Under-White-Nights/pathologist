@@ -3372,3 +3372,72 @@ fn a_sequenced_input_must_have_every_cfg_column() {
     );
     assert_eq!(fs::read(&output).unwrap(), b"existing output");
 }
+
+/// A merged input lists another input's copy of a header body's call as
+/// an alternative of its event: merging it again with a third input keeps
+/// one graph, as merging the three inputs at once does, and the query
+/// follows each callback once.
+#[test]
+fn re_merging_keeps_alternative_sites_one_event() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let include = root.join("include");
+    fs::create_dir_all(&include).unwrap();
+    fs::write(
+        include.join("common.h"),
+        "inline void common(void (*cb)()) { cb(); }\n",
+    )
+    .unwrap();
+    let mut inputs = Vec::new();
+    for name in ["a", "b", "c"] {
+        let repo = root.join(format!("repo_{name}"));
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("main.cpp"),
+            format!(
+                "#include \"common.h\"\nvoid mark_{name}();\n\
+                 void cb_{name}() {{ mark_{name}(); }}\n\
+                 void run_{name}() {{ common(cb_{name}); }}\n"
+            ),
+        )
+        .unwrap();
+        let db = root.join(format!("repo_{name}.db"));
+        analyze_repo_with(
+            &repo,
+            &db,
+            &[
+                "--sequencing".as_ref(),
+                "--include".as_ref(),
+                include.as_os_str(),
+            ],
+        );
+        inputs.push(db);
+    }
+    let graphs = "SELECT COUNT(*) FROM cfg_functions c JOIN functions f ON f.id = c.fn_id \
+                  WHERE f.name = 'common'";
+    let flat = root.join("flat.db");
+    merge_into(&inputs, &flat);
+    let flat = Connection::open(&flat).unwrap();
+    assert_eq!(count(&flat, graphs), 1);
+
+    let ab = root.join("ab.db");
+    merge_into(&inputs[..2], &ab);
+    let nested = root.join("nested.db");
+    merge_into(&[ab, inputs[2].clone()], &nested);
+    let conn = Connection::open(&nested).unwrap();
+    assert_eq!(count(&conn, graphs), count(&flat, graphs));
+    assert_eq!(event_callees(&conn, "common"), ["cb", "cb", "cb"]);
+    assert_eq!(misattributed_cfg_rows(&conn), 0);
+    let common = trace_db::resolve_function_target(&conn, Some("common"), None, None).unwrap();
+    let graph = trace_db::sequence_graph(
+        &conn,
+        &trace_db::SequenceScope::Function {
+            function: trace_db::FunctionRowId(common.id),
+            file: None,
+        },
+        &Default::default(),
+    )
+    .unwrap();
+    let frames: Vec<&str> = graph.frames.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(frames, ["common", "cb_a", "cb_b", "cb_c"]);
+}

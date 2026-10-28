@@ -4971,7 +4971,12 @@ database carries no sequencing rows.
     be dominated by A's (in A's own block, every hiding event to follow A),
     so no such jump enters B's block without A: in
     `if (x) goto *p; a(); skip: b();` `a` only `may_precede` `b`. An end
-    under such a gap is `unknown`.
+    under such a gap is `unknown`. Such a gap with no call under it (a
+    `goto` inside a statement expression, a call-free `ERROR` subtree)
+    leaves nothing to mark where: the builder ends the block at it with an
+    `unsupported` edge, beside a fallthrough to the block the walk goes on
+    in, so `if (x) { a(); ({ goto t; 0; }); } else { t: b(); }` relates `a`
+    to `b` as `may_precede`, not `exclusive`.
 
 ### Expressions
 
@@ -5096,7 +5101,10 @@ structurally distinct body, in input order: an input compiling it as an
 earlier one did adds nothing, one compiling it differently adds a variant.
 Inputs share no call sites, so the comparison takes a site as its caller,
 position, callee spelling and directness (and how many such sites precede it
-in its input). A kept graph names its own input's sites first; each later
+in its input). Sites spelled alike that are alternatives of one event of an
+input (a merged input's copies of one header call) count as one site, so
+merging a merged database again keys them as merging its inputs at once
+does: no extra variant appears. A kept graph names its own input's sites first; each later
 input compiling the body alike lists its sites, in input order, as further
 alternatives of the matching events (`FunctionCfg::add_alternatives_from`,
 through `CallEvent::add_alternative_sites`, as
@@ -5165,7 +5173,9 @@ first, then loads graphs only as it reaches them:
   callback an event starts as an execution context is `async_start` (inlined
   only with `--inline-contexts`); an `ipc` edge of the frame's function is
   `ipc_bridge` and is never inlined. `--max-targets`, `--max-frames` and
-  `--max-events` cut inlining with a `truncated` marker naming the budget;
+  `--max-events` cut inlining with a `truncated` marker naming the budget
+  (Mermaid and Graphviz draw each as a dashed edge from the cut call's block
+  to a note `t<index>` labelled `truncated: <budget>`);
   once `--max-frames` is reached nothing more is loaded or inlined, and its
   one marker names the first call it cut. The starting frames are always
   shown.
