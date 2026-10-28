@@ -288,7 +288,8 @@ pub struct CallSite {
     /// re-expanded from the declaring base.
     pub receiver_class: Option<String>,
     /// The receiver is an object whose dynamic type is its static type (an
-    /// automatic object's constructor or destructor site): post-merge
+    /// automatic object's constructor or destructor site, the constructor
+    /// site a smart-pointer factory call runs): post-merge
     /// virtual expansion leaves the site alone. Part of the merge identity
     /// ([`CallSite::same_facts`]): a dispatching and an exact record never
     /// coalesce.

@@ -12,3 +12,14 @@ void run(int ok)
         recover();
     finish();
 }
+
+int selector(void);
+int chosen(void);
+int other(void);
+void picked(void);
+
+void generic_pick(void)
+{
+    _Generic(selector(), int: chosen(), default: other());
+    picked();
+}

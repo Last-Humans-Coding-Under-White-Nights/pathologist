@@ -1917,3 +1917,60 @@ fn cli_relates_a_loop_condition_destructor_to_the_body() {
     assert_eq!(kind(dtor, work), "may_both");
     assert_eq!(kind(work, dtor), "may_both");
 }
+
+/// `_Generic` evaluates one association and never its controlling
+/// expression.
+#[test]
+fn generic_selection_branches_to_one_association() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "branches.c", line, callee);
+    let (selector, chosen, other) = (at(23, "selector"), at(23, "chosen"), at(23, "other"));
+    let picked = at(24, "picked");
+    assert_eq!(relation(&conn, &chosen, &other), Exclusive);
+    assert_eq!(relation(&conn, &chosen, &picked), MayPrecede);
+    assert_eq!(relation(&conn, &other, &picked), MayPrecede);
+    for e in [&chosen, &picked] {
+        let r = relation(&conn, &selector, e);
+        assert!(
+            !matches!(r, SequencedBefore | GuaranteedBefore),
+            "selector to {}: {r:?}",
+            e.callee
+        );
+    }
+}
+
+/// `std::make_shared<Widget>(make_arg())` runs `Widget::Widget` inside the
+/// factory: two invocations, not alternative targets of one.
+#[test]
+fn a_factory_and_its_constructor_are_separate_events() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |callee| event(&conn, "lifecycle.cpp", 90, callee);
+    let (factory, ctor, arg) = (at("std::make_shared"), at("Widget::Widget"), at("make_arg"));
+    assert_ne!(factory.event, ctor.event);
+    assert_eq!(relation(&conn, &arg, &factory), SequencedBefore);
+    assert_eq!(relation(&conn, &arg, &ctor), SequencedBefore);
+    assert_eq!(relation(&conn, &factory, &ctor), Unordered);
+}
+
+/// A `static` or `thread_local` local's initializer runs on the first pass
+/// only: it may precede what follows, never guaranteed to.
+#[test]
+fn a_once_only_local_initializer_is_bypassed() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "lifecycle.cpp", line, callee);
+    for (init, after) in [
+        (at(102, "Once::Once"), at(103, "after")),
+        (at(108, "seed_value"), at(109, "after")),
+        (at(114, "Once::Once"), at(115, "after")),
+    ] {
+        assert_eq!(
+            relation(&conn, &init, &after),
+            MayPrecede,
+            "{}",
+            init.callee
+        );
+    }
+}

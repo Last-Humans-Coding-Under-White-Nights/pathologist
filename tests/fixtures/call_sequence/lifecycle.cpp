@@ -78,3 +78,39 @@ void bases()
     Both both;
     work();
 }
+
+struct Widget {
+    Widget(int v);
+};
+
+int make_arg();
+
+void shared_build()
+{
+    auto p = std::make_shared<Widget>(make_arg());
+}
+
+struct Once {
+    Once();
+    ~Once();
+};
+
+int seed_value();
+
+void once_object()
+{
+    static Once s;
+    after();
+}
+
+void once_value()
+{
+    static int x = seed_value();
+    after();
+}
+
+void once_thread()
+{
+    thread_local Once t;
+    after();
+}

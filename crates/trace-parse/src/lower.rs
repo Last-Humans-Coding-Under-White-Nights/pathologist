@@ -7569,6 +7569,7 @@ fn emit_factory_construction(
         return;
     }
     let heap = factory_object(program, ctx, call, caller, cls.clone());
+    let first = program.symbols.call_sites.len();
     emit_member_targets(
         program,
         caller,
@@ -7581,6 +7582,13 @@ fn emit_factory_construction(
         targets,
         None,
     );
+    // The object is exactly `cls`. Marked so, the constructor sites, which
+    // share the factory call's position, stay an invocation of their own
+    // rather than alternatives of the factory's (docs/ANALYSIS.md, "Call
+    // sequencing").
+    for site in &mut program.symbols.call_sites[first..] {
+        site.exact_receiver = true;
+    }
 }
 
 /// The one heap object every factory call in `caller` building `cls` takes

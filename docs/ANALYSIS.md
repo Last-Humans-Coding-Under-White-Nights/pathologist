@@ -4920,7 +4920,13 @@ database carries no sequencing rows.
   calls. An automatic object whose implicit constructor or destructor runs
   its bases' (`struct C : A, B {}; C c;`) records one site per base class at
   the declaration; each base's is an event of its own (`A::A` and `B::B`),
-  its overloads alternatives of that one. Kinds: `call`, `construct` (including the constructor a
+  its overloads alternatives of that one. The constructor a smart-pointer
+  factory runs ([Factory construction](#factory-construction)) shares the
+  factory call's position but is no alternative target of it: its sites are
+  marked `exact_receiver` (the object is exactly `T`), so
+  `std::make_shared<S>(arg())` is two events, `std::make_shared` and
+  `S::S`, both after `arg` and `unordered` with each other (the constructor
+  runs inside the factory, whose body is not in the tree). Kinds: `call`, `construct` (including the constructor a
   `new`-expression runs), `destroy` and `delete`. Two expansions of one macro
   are two events, even when their displayed coordinates match; so is an
   argument a macro substitutes twice (`TWICE(step())`), whose two sites share
@@ -4988,6 +4994,14 @@ children's, so an argument's calls precede the call they are passed to.
   and receiver expression is sequenced before the arguments; in C and earlier
   C++ it joins the group.
 - `&&`, `||` and `?:` branch (short-circuit); the comma operator is sequenced.
+- C `_Generic` evaluates exactly one association and never its controlling
+  expression: each association is an arm of its own (a `switch_case` edge
+  from the current block, all arms joining after), and the controlling
+  expression's calls are one unordered group under an `unevaluated` gap that
+  orders nothing after it. So in
+  `_Generic(selector(), int: chosen(), default: other()); after();`
+  `chosen` and `other` are `exclusive`, each `may_precede` `after`, and
+  `selector` is proven before nothing.
 - Assignment: right before left in C++17 and later, unordered otherwise.
   `<<`, `>>` and subscript are left before right in C++17 and later. Operands
   of other binary and unary operators are unordered.
@@ -5032,6 +5046,16 @@ the jump leaves, and a fallthrough past it; a label the body lacks adds an
   `while (T t = next()) work();` one iteration's `T::~T` precedes the next
   one's `next` (the pinned grammar parses no declaration as a `for`
   condition). No call site is added for this.
+- **Once-only locals.** The initializer of a block-scope `static` (the
+  declarations lowering classifies `FnStatic`, `storage_for`) or thread-storage
+  (`thread_local`, `_Thread_local`, `__thread`) variable runs on the first
+  pass only. Each such declarator whose initializer or construction holds a
+  call is a `branch_true` arm beside a `branch_false` bypass, both joining
+  after it, so in `void f() { static S s; after(); }` and
+  `static int x = init(); after();` the initializer `may_precede` `after`
+  instead of being `sequenced_before` it. The guard is not a call; no site
+  is added for it. Such objects have no destructor event (they are destroyed
+  at exit).
 - **Exceptions.** Each `try` has one `landing` block. Every block of the
   `try` body that holds an event, nested handlers included, has an
   `exception` edge to it, except a block of a nested `try` body: that block
@@ -5162,7 +5186,10 @@ A gap or boundary is uncertainty, never evidence for an order.
   unordered), `initializer_order` (member initializers and default member
   initializers are one unordered group in a prologue block; declaration order
   is not modeled. A site of the function that no walked node owns joins that
-  group too) and `omitted_sites`. A body with a gap is `partial`.
+  group too), `omitted_sites` and `unevaluated` (calls in an operand the
+  language never evaluates, the controlling expression of `_Generic`: kept
+  as events so a position names them, but no proof is made about them). A
+  body with a gap is `partial`.
 - **Boundaries** between functions, found by the query: `omitted_body` (the
   callee has no CFG: dependency, declaration only, suppressed or not
   sequenced), `unknown_callee` (a site without call edges), `recursion`,

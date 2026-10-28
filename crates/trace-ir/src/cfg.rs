@@ -138,10 +138,13 @@ pub enum GapKind {
     InitializerOrder,
     /// Events whose sites the merge did not keep were spliced out.
     OmittedSites,
+    /// Calls written in an operand the language never evaluates (the
+    /// controlling expression of a C `_Generic`).
+    Unevaluated,
 }
 
 impl GapKind {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::ParseError,
         Self::DepthExceeded,
         Self::UnsupportedConstruct,
@@ -149,6 +152,7 @@ impl GapKind {
         Self::UnorderedBranch,
         Self::InitializerOrder,
         Self::OmittedSites,
+        Self::Unevaluated,
     ];
 
     /// The kind's name in exports and query output.
@@ -161,6 +165,7 @@ impl GapKind {
             Self::UnorderedBranch => "unordered_branch",
             Self::InitializerOrder => "initializer_order",
             Self::OmittedSites => "omitted_sites",
+            Self::Unevaluated => "unevaluated",
         }
     }
 

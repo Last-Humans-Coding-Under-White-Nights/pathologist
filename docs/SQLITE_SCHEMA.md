@@ -427,7 +427,7 @@ these rows are unordered. No transitive pairs are stored.
 
 `cfg_gaps`: `id`, `cfg_id`, `kind_id` (`parse_error`, `depth_exceeded`,
 `unsupported_construct`, `unresolved_goto`, `unordered_branch`,
-`initializer_order`, `omitted_sites`), the nullable source position
+`initializer_order`, `omitted_sites`, `unevaluated`), the nullable source position
 `file_id`, `line`, `col`, and the nullable inclusive event range
 `first_event`, `last_event` → `cfg_events`. A gap is uncertainty, never
 evidence for an order.

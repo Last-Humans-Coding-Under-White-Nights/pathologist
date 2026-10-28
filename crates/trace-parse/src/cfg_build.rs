@@ -603,7 +603,9 @@ struct Invocation {
 /// An automatic object's lifecycle sites share the declaration's occurrence,
 /// one site name per class providing the members (`Both both;` with bases
 /// `A` and `B` runs `A::A` and `B::B`): each class's is a separate
-/// invocation, its overloads alternatives of that one.
+/// invocation, its overloads alternatives of that one. So is the constructor
+/// a smart-pointer factory runs (`std::make_shared<S>(a)` and `S::S`), never
+/// an alternative target of the factory call it shares a position with.
 fn invocations(sites: &[CallSite], indices: &[usize]) -> Vec<Invocation> {
     let mut groups: Vec<Invocation> = Vec::new();
     let subobject = |i: usize| sites[i].exact_receiver.then_some(&sites[i].callee_name);
@@ -802,6 +804,14 @@ impl<'a> Builder<'_, 'a> {
                 self.conditional(node);
                 self.own(node);
             }
+            "generic_expression" => {
+                self.generic_selection(node);
+                self.own(node);
+            }
+            "declaration" if initializes_once(self.source, node) => {
+                self.once_only_declaration(node);
+                self.own(node);
+            }
             kind if is_sequenced(kind) => {
                 self.sequence(node);
                 self.own(node);
@@ -908,7 +918,81 @@ impl<'a> Builder<'_, 'a> {
         self.enter(join);
     }
 
+    /// `_Generic(control, T: a, default: b)`: the controlling expression is
+    /// never evaluated, so its calls are one unordered group under an
+    /// `unevaluated` gap that orders nothing after them; exactly one
+    /// association is evaluated, each an arm of its own.
+    fn generic_selection(&mut self, node: Node<'a>) {
+        let mut cursor = node.walk();
+        let mut operands = node
+            .named_children(&mut cursor)
+            .filter(|c| c.cached_kind() != "type_descriptor");
+        let Some(control) = operands.next() else {
+            return;
+        };
+        let associations: Vec<Node<'a>> = operands.collect();
+        let before = self.frontier.clone();
+        let first = self.cfg.events.len();
+        self.flatten(control);
+        if self.cfg.events.len() > first {
+            self.gap(GapKind::Unevaluated, Some(control), first);
+        }
+        self.frontier = before;
+        if associations.is_empty() {
+            return;
+        }
+        let test = self.current();
+        let join = self.new_block(BlockKind::Ordinary);
+        for association in associations {
+            let arm = self.new_block(BlockKind::Ordinary);
+            self.edge(test, arm, EdgeKind::SwitchCase);
+            self.start(arm);
+            self.visit(association);
+            self.jump(join, EdgeKind::Fallthrough);
+        }
+        self.enter(join);
+    }
+
     // ---- statements ----
+
+    /// A `static` or `thread_local` local: each declarator's initializer
+    /// (its calls and its construction) runs on the first pass only, so it
+    /// is a branch beside a bypass, both joining after it.
+    fn once_only_declaration(&mut self, node: Node<'a>) {
+        let mut cursor = node.walk();
+        let declarators: Vec<usize> = node
+            .children_by_field_name("declarator", &mut cursor)
+            .map(|d| d.id())
+            .collect();
+        for child in node.named_children(&mut cursor) {
+            if !declarators.contains(&child.id()) || !self.owns_any(child) {
+                self.visit(child);
+                continue;
+            }
+            let test = self.current();
+            let init = self.new_block(BlockKind::Ordinary);
+            let join = self.new_block(BlockKind::Ordinary);
+            self.edge(test, init, EdgeKind::BranchTrue);
+            self.edge(test, join, EdgeKind::BranchFalse);
+            self.start(init);
+            self.visit(child);
+            self.jump(join, EdgeKind::Fallthrough);
+            self.start(join);
+        }
+    }
+
+    /// Some node of `node`'s subtree owns sites not yet taken.
+    fn owns_any(&self, node: Node<'a>) -> bool {
+        let mut stack = vec![node];
+        let mut cursor = node.walk();
+        while let Some(n) = stack.pop() {
+            if self.owned.contains_key(&n.id()) || self.destructors.contains_key(&n.id()) {
+                return true;
+            }
+            stack.extend(n.children(&mut cursor));
+        }
+        false
+    }
 
     fn if_statement(&mut self, node: Node<'a>) {
         // A condition's declaration lives until the statement ends.
@@ -1413,6 +1497,16 @@ fn is_nonlocal_jump(callee: &str) -> bool {
             | "siglongjmp"
             | "__builtin_longjmp"
     )
+}
+
+/// A block-scope declaration whose initializers run once, not on every
+/// pass: `static` (the classification `storage_for` makes `FnStatic`) or
+/// thread storage.
+fn initializes_once(source: &str, declaration: Node) -> bool {
+    super::declaration_is_static(declaration)
+        || ["thread_local", "_Thread_local", "__thread"]
+            .into_iter()
+            .any(|keyword| super::has_storage_specifier(source, declaration, keyword))
 }
 
 /// Node kinds whose named children are evaluated in order.
@@ -2535,5 +2629,85 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn generic_selection_runs_one_association_and_not_its_controlling_expression() {
+        let unit = lower("branches.c");
+        let g = graph(&unit, "generic_pick");
+        let (selector, chosen, other, picked) = (
+            g.ev("selector"),
+            g.ev("chosen"),
+            g.ev("other"),
+            g.ev("picked"),
+        );
+        assert!(g.exclusive(chosen, other), "{}", g.dump());
+        for e in [chosen, other] {
+            assert!(g.may_precede(e, picked), "{}", g.dump());
+            assert!(!g.guaranteed(e, picked), "{}", g.dump());
+        }
+        // The controlling expression is never evaluated: no proof either way.
+        assert!(
+            covered_by(&g, selector, GapKind::Unevaluated),
+            "{}",
+            g.dump()
+        );
+        for e in [chosen, other, picked] {
+            assert!(!g.guaranteed(selector, e), "{}", g.dump());
+        }
+    }
+
+    #[test]
+    fn a_factory_and_the_constructor_it_runs_are_separate_events() {
+        let unit = lower("lifecycle.cpp");
+        let g = graph(&unit, "shared_build");
+        let site = |e: EventId, name: &str| {
+            g.cfg.events[e.0 as usize].sites.iter().any(|&s| {
+                unit.call_sites
+                    .iter()
+                    .any(|c| c.id == s && c.callee_name.as_str().starts_with(name))
+            })
+        };
+        let events = |name: &str| -> Vec<EventId> {
+            (0..g.cfg.events.len() as u32)
+                .map(EventId)
+                .filter(|&e| site(e, name))
+                .collect()
+        };
+        let (factory, ctor) = (events("std::make_shared"), events("Widget::Widget"));
+        assert_eq!(factory.len(), 1, "{}", g.dump());
+        assert_eq!(ctor.len(), 1, "{}", g.dump());
+        let (factory, ctor, arg) = (factory[0], ctor[0], g.ev("make_arg"));
+        assert_ne!(factory, ctor, "{}", g.dump());
+        assert!(!site(factory, "Widget::Widget"), "{}", g.dump());
+        assert_eq!(g.kind(ctor), EventKind::Construct);
+        assert!(g.sequenced(arg, factory), "{}", g.dump());
+        assert!(g.sequenced(arg, ctor), "{}", g.dump());
+        // It runs inside the factory: no order between the two is claimed.
+        assert!(g.unordered(factory, ctor), "{}", g.dump());
+    }
+
+    #[test]
+    fn a_once_only_local_initializer_may_be_skipped() {
+        let unit = lower("lifecycle.cpp");
+        for (function, init) in [
+            ("once_object", "Once::Once"),
+            ("once_value", "seed_value"),
+            ("once_thread", "Once::Once"),
+        ] {
+            let g = graph(&unit, function);
+            let (init, after) = (g.ev(init), g.ev("after"));
+            assert!(g.may_precede(init, after), "{function}\n{}", g.dump());
+            assert!(!g.sequenced(init, after), "{function}\n{}", g.dump());
+            assert!(!g.guaranteed(init, after), "{function}\n{}", g.dump());
+            // A path that skips the initializer reaches `after`.
+            let entry = g.cfg.entry;
+            assert!(
+                g.block_path(entry, g.block(after), Some(g.block(init))),
+                "{function}\n{}",
+                g.dump()
+            );
+            assert!(g.all("Once::~Once").is_empty(), "{function}\n{}", g.dump());
+        }
     }
 }
