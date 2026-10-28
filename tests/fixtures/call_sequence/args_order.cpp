@@ -15,3 +15,22 @@ void assign()
 {
     *lhs() = rhs();
 }
+
+int sized();
+int typed();
+int checked();
+int required();
+int identified();
+int bound();
+void then();
+
+void unevaluated_operands()
+{
+    sizeof(sized());
+    decltype(typed()) v = 0;
+    noexcept(checked());
+    bool r = requires { required(); };
+    typeid(identified());
+    alignof(int[bound()]);
+    then();
+}

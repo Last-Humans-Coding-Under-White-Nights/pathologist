@@ -138,6 +138,8 @@ enum ScopeKind {
 
 struct Scope {
     kind: ScopeKind,
+    /// Unique among the walk's scopes, to key [`Builder::cleanups`].
+    serial: u32,
     /// The compound statement the scope is, for `goto` targets.
     node: Option<usize>,
     /// Destructor sites of the automatic objects declared so far, one entry
@@ -170,9 +172,27 @@ struct Builder<'s, 'a> {
     cfg: FunctionCfg,
     has_pred: Vec<bool>,
     /// Each block's innermost `try` landing as it was made: where its
-    /// calls throw to, its first event adding the edge. An enclosing `try`
+    /// calls throw to, through a cleanup block destroying the objects the
+    /// exception leaves ([`Self::unwinding_to`]). An enclosing `try`
     /// reaches the block through that landing.
     landing: Vec<Option<BlockId>>,
+    /// The `exception` edges made, so each is made once.
+    exception_edges: rustc_hash::FxHashSet<(BlockId, BlockId)>,
+    /// Bumped whenever the set of live automatic objects changes; each
+    /// block's value when its events last took their exception edge.
+    live: u32,
+    thrown_at: Vec<u32>,
+    /// Cleanup blocks by the target they lead to and the live objects they
+    /// destroy, as `(scope serial, object count)` per scope holding any.
+    cleanups: HashMap<(BlockId, Vec<(u32, usize)>), BlockId>,
+    /// Each cleanup block, its target and the destructor sites of its
+    /// objects in destruction order: filled once the body is walked, so its
+    /// events never fall inside a group or gap the walk is making.
+    pending_cleanups: Vec<(BlockId, BlockId, Vec<Vec<usize>>)>,
+    /// While [`Self::unwind_since`] destroys `scopes[s].objects[k]`:
+    /// `(s, k)`. That object, and those destroyed before it, are no
+    /// longer live should its destructor throw.
+    dying: Option<(usize, usize)>,
     /// A constructor's function-try-block: its node, then the block in the
     /// `try` the prologue runs in.
     function_try: Option<usize>,
@@ -187,6 +207,7 @@ struct Builder<'s, 'a> {
     /// start there) and the prologue (its block's edges are made).
     unsplit: u32,
     scopes: Vec<Scope>,
+    serials: u32,
     labels: HashMap<&'a str, Label>,
     depth: u32,
     spans: Vec<(SpanSlot, Node<'a>)>,
@@ -276,12 +297,19 @@ impl<'s, 'a> Builder<'s, 'a> {
             },
             has_pred: Vec::new(),
             landing: Vec::new(),
+            exception_edges: Default::default(),
+            live: 0,
+            thrown_at: Vec::new(),
+            cleanups: HashMap::default(),
+            pending_cleanups: Vec::new(),
+            dying: None,
             function_try: None,
             prologue_in_try: None,
             cur: None,
             frontier: Vec::new(),
             unsplit: 0,
             scopes: Vec::new(),
+            serials: 0,
             labels: HashMap::default(),
             depth: 0,
             spans: Vec::new(),
@@ -306,6 +334,7 @@ impl<'s, 'a> Builder<'s, 'a> {
         }
         let exit = self.cfg.exit;
         self.jump(exit, EdgeKind::Fallthrough);
+        self.fill_cleanups();
         // The initializers of a function-try-block run in its `try`, in a
         // block made there.
         let head = self.prologue_in_try.take().unwrap_or(head);
@@ -324,6 +353,7 @@ impl<'s, 'a> Builder<'s, 'a> {
         self.has_pred.push(false);
         let landing = self.innermost_landing();
         self.landing.push(landing);
+        self.thrown_at.push(u32::MAX);
         id
     }
 
@@ -335,11 +365,84 @@ impl<'s, 'a> Builder<'s, 'a> {
         })
     }
 
-    /// The landing `b` already has its exception edge to: that of the `try`
-    /// it is in, once an event (any call may throw) added the edge.
-    fn throws_to(&self, b: BlockId) -> Option<BlockId> {
-        let b = b.0 as usize;
-        self.landing[b].filter(|_| !self.cfg.blocks[b].events.is_empty())
+    /// An `exception` edge, unless `from` already has it.
+    fn exception_edge(&mut self, from: BlockId, to: BlockId) {
+        if self.exception_edges.insert((from, to)) {
+            self.edge(from, to, EdgeKind::Exception);
+        }
+    }
+
+    /// Where an exception thrown now leaves for `target`, the landing of
+    /// the `try` at `scopes[from - 1]` (or the exceptional exit, `from` 0):
+    /// a cleanup block destroying the live objects of `scopes[from..]`,
+    /// innermost first as [`Self::unwind`] does, then `target`; `target`
+    /// itself when there are none. One cleanup block serves every throw
+    /// that leaves the same objects.
+    fn unwinding_to(&mut self, from: usize, target: BlockId) -> BlockId {
+        // Each scope's live objects, as a count of its first ones.
+        let live: Vec<(usize, usize)> = (from..self.scopes.len())
+            .map(|at| {
+                let count = match self.dying {
+                    Some((scope, _)) if at > scope => 0,
+                    Some((scope, object)) if at == scope => object,
+                    _ => self.scopes[at].objects.len(),
+                };
+                (at, count)
+            })
+            .filter(|&(_, count)| count > 0)
+            .collect();
+        if live.is_empty() {
+            return target;
+        }
+        let key = (
+            target,
+            live.iter()
+                .map(|&(at, count)| (self.scopes[at].serial, count))
+                .collect(),
+        );
+        if let Some(&cleanup) = self.cleanups.get(&key) {
+            return cleanup;
+        }
+        let cleanup = self.new_block(BlockKind::Ordinary);
+        // Its own edge leads on to `target`.
+        self.landing[cleanup.0 as usize] = None;
+        let objects = live
+            .iter()
+            .rev()
+            .flat_map(|&(at, count)| self.scopes[at].objects[..count].iter().rev().cloned())
+            .collect();
+        self.pending_cleanups.push((cleanup, target, objects));
+        self.cleanups.insert(key, cleanup);
+        cleanup
+    }
+
+    /// The events of the cleanup blocks [`Self::unwinding_to`] made.
+    fn fill_cleanups(&mut self) {
+        for (cleanup, target, objects) in std::mem::take(&mut self.pending_cleanups) {
+            self.start(cleanup);
+            for sites in objects {
+                self.emit_unordered(&sites, Some(EventKind::Destroy));
+            }
+            // The destructors may have continued in a block of their own.
+            if let Some(end) = self.cur {
+                self.exception_edge(end, target);
+            }
+        }
+        self.cur = None;
+        self.frontier.clear();
+    }
+
+    /// Where an exception thrown at this point of the walk goes: through
+    /// the objects it leaves to the innermost handler, or out of the
+    /// function.
+    fn unwinding_target(&mut self) -> BlockId {
+        let from = self
+            .scopes
+            .iter()
+            .rposition(|s| matches!(s.kind, ScopeKind::Try { .. }))
+            .map_or(0, |at| at + 1);
+        let target = self.throw_target();
+        self.unwinding_to(from, target)
     }
 
     fn block_at(&mut self, node: Node<'a>) -> BlockId {
@@ -407,10 +510,19 @@ impl<'s, 'a> Builder<'s, 'a> {
 
     fn emit(&mut self, kind: EventKind, occurrence: CallOccurrence, sites: Vec<CallSiteId>) {
         let block = self.current();
-        if self.cfg.blocks[block.0 as usize].events.is_empty() {
-            if let Some(landing) = self.landing[block.0 as usize] {
-                self.edge(block, landing, EdgeKind::Exception);
-            }
+        // Any call may throw: to the block's landing, destroying the
+        // objects live at the call on the way. A block whose objects
+        // change between its calls takes an edge for each set.
+        let b = block.0 as usize;
+        if let Some(landing) = self.landing[b].filter(|_| self.thrown_at[b] != self.live) {
+            self.thrown_at[b] = self.live;
+            let from = self
+                .scopes
+                .iter()
+                .rposition(|s| matches!(s.kind, ScopeKind::Try { landing: l } if l == landing))
+                .map_or(self.scopes.len(), |at| at + 1);
+            let target = self.unwinding_to(from, landing);
+            self.exception_edge(block, target);
         }
         let id = EventId(self.cfg.events.len() as u32);
         self.cfg.events.push(CallEvent {
@@ -484,7 +596,10 @@ impl<'s, 'a> Builder<'s, 'a> {
         }
         if let Some(indices) = self.destructors.remove(&node.id()) {
             match self.scopes.last_mut() {
-                Some(scope) => scope.objects.push(indices),
+                Some(scope) => {
+                    scope.objects.push(indices);
+                    self.live += 1;
+                }
                 None => self.unclaimed.extend(indices),
             }
         }
@@ -502,9 +617,12 @@ impl<'s, 'a> Builder<'s, 'a> {
         if self.cur.is_none() {
             return;
         }
+        let outer = self.dying;
         for scope in (from..self.scopes.len()).rev() {
             let first = if scope == from { kept } else { 0 };
             for object in (first..self.scopes[scope].objects.len()).rev() {
+                self.dying = Some((scope, object));
+                self.live += 1;
                 // An object's base destructors are one unordered group: the
                 // IR does not say which bases are virtual, so their order is
                 // not claimed (docs/ANALYSIS.md, "Statements").
@@ -513,11 +631,17 @@ impl<'s, 'a> Builder<'s, 'a> {
                 self.scopes[scope].objects[object] = sites;
             }
         }
+        if self.dying != outer {
+            self.dying = outer;
+            self.live += 1;
+        }
     }
 
     fn push_scope(&mut self, kind: ScopeKind, node: Option<Node<'a>>) {
+        self.serials += 1;
         self.scopes.push(Scope {
             kind,
+            serial: self.serials,
             node: node.map(|n| n.id()),
             objects: Vec::new(),
         });
@@ -526,7 +650,16 @@ impl<'s, 'a> Builder<'s, 'a> {
     /// Leave the innermost scope normally.
     fn pop_scope(&mut self) {
         self.unwind(self.scopes.len() - 1);
-        self.scopes.pop();
+        self.drop_scope();
+    }
+
+    /// Drop the innermost scope, its objects no longer live.
+    fn drop_scope(&mut self) -> Option<Scope> {
+        let scope = self.scopes.pop();
+        if scope.as_ref().is_some_and(|s| !s.objects.is_empty()) {
+            self.live += 1;
+        }
+        scope
     }
 
     fn fill_prologue(&mut self, head: BlockId, prologue: &[Node<'a>]) {
@@ -714,14 +847,11 @@ impl<'a> Builder<'_, 'a> {
                     .map_or(0, |at| at + 1);
                 self.unwind(handler);
                 let target = self.throw_target();
-                match self.cur {
-                    // A call before it already took the block there.
-                    Some(b) if self.throws_to(b) == Some(target) => {
-                        self.cur = None;
-                        self.frontier.clear();
-                    }
-                    _ => self.jump(target, EdgeKind::Exception),
+                // A call before it may already have taken the block there.
+                if let Some(b) = self.cur.take() {
+                    self.exception_edge(b, target);
                 }
+                self.frontier.clear();
             }
             // A local class's members and a GNU nested function run when
             // called, not where they are written.
@@ -746,6 +876,22 @@ impl<'a> Builder<'_, 'a> {
                 if let Some(labels) = node.cached_field("goto_labels") {
                     self.asm_goto(node, labels);
                 }
+            }
+            // `noexcept(e)` and `typeid(e)` parse as calls.
+            "call_expression" if self.operator_call(node) == Some("noexcept") => {
+                self.unevaluated(node);
+            }
+            "call_expression" if self.operator_call(node) == Some("typeid") => {
+                // A polymorphic glvalue operand is evaluated, any other not.
+                if let Some(arguments) = node.cached_field("arguments") {
+                    self.may_run(arguments);
+                }
+                self.own(node);
+            }
+            "requires_expression" => self.unevaluated(node),
+            "sizeof_expression" | "alignof_expression" | "decltype" => {
+                self.type_query(node);
+                self.own(node);
             }
             "call_expression" => {
                 let function = node.cached_field("function");
@@ -919,9 +1065,8 @@ impl<'a> Builder<'_, 'a> {
     }
 
     /// `_Generic(control, T: a, default: b)`: the controlling expression is
-    /// never evaluated, so its calls are one unordered group under an
-    /// `unevaluated` gap that orders nothing after them; exactly one
-    /// association is evaluated, each an arm of its own.
+    /// [never evaluated](Self::unevaluated); exactly one association is
+    /// evaluated, each an arm of its own.
     fn generic_selection(&mut self, node: Node<'a>) {
         let mut cursor = node.walk();
         let mut operands = node
@@ -931,13 +1076,7 @@ impl<'a> Builder<'_, 'a> {
             return;
         };
         let associations: Vec<Node<'a>> = operands.collect();
-        let before = self.frontier.clone();
-        let first = self.cfg.events.len();
-        self.flatten(control);
-        if self.cfg.events.len() > first {
-            self.gap(GapKind::Unevaluated, Some(control), first);
-        }
-        self.frontier = before;
+        self.unevaluated(control);
         if associations.is_empty() {
             return;
         }
@@ -953,11 +1092,85 @@ impl<'a> Builder<'_, 'a> {
         self.enter(join);
     }
 
+    /// An operand the language never evaluates: its calls are one
+    /// unordered group under an `unevaluated` gap that orders nothing after
+    /// them.
+    fn unevaluated(&mut self, operand: Node<'a>) {
+        // Split first, so `before` names the block the walk goes on in.
+        self.join();
+        let before = self.frontier.clone();
+        let first = self.cfg.events.len();
+        self.flatten(operand);
+        if self.cfg.events.len() > first {
+            self.gap(GapKind::Unevaluated, Some(operand), first);
+        }
+        self.frontier = before;
+    }
+
+    /// An operand that may or may not be evaluated: a branch beside a
+    /// bypass, both joining after it.
+    fn may_run(&mut self, operand: Node<'a>) {
+        if !self.owns_any(operand) {
+            self.visit(operand);
+            return;
+        }
+        let test = self.current();
+        let run = self.new_block(BlockKind::Ordinary);
+        let join = self.new_block(BlockKind::Ordinary);
+        self.edge(test, run, EdgeKind::BranchTrue);
+        self.edge(test, join, EdgeKind::BranchFalse);
+        self.start(run);
+        self.visit(operand);
+        self.jump(join, EdgeKind::Fallthrough);
+        self.start(join);
+    }
+
+    /// `sizeof`, `alignof` and `decltype` (as which a GNU `__typeof__`
+    /// operand parses): the operand is not evaluated unless its type is
+    /// variably modified (C11 6.5.3.4p2, GNU `typeof`), when it is. A type
+    /// operand may be one (`sizeof(int[n()])` calls `n`), and so may any
+    /// expression but a call (`sizeof(rows[f()])` over a two-dimensional
+    /// variable-length array): those [may run](Self::may_run). A call's
+    /// result never is, so a call operand is [unevaluated](Self::unevaluated).
+    fn type_query(&mut self, node: Node<'a>) {
+        let operand = node
+            .cached_field("value")
+            .or_else(|| node.cached_field("type"))
+            .or_else(|| node.named_child(0));
+        let Some(operand) = operand else {
+            return;
+        };
+        let mut inner = operand;
+        while inner.cached_kind() == "parenthesized_expression" {
+            match inner.named_child(0) {
+                Some(child) => inner = child,
+                None => break,
+            }
+        }
+        if inner.cached_kind() == "call_expression" {
+            self.unevaluated(operand);
+        } else {
+            self.may_run(operand);
+        }
+    }
+
+    /// The C++ operator a call expression spells: `noexcept` or `typeid`.
+    fn operator_call(&self, node: Node<'a>) -> Option<&'static str> {
+        if !self.cpp {
+            return None;
+        }
+        let function = node.cached_field("function")?;
+        match node_text(self.source, &function).trim() {
+            "noexcept" => Some("noexcept"),
+            "typeid" => Some("typeid"),
+            _ => None,
+        }
+    }
+
     // ---- statements ----
 
     /// A `static` or `thread_local` local: each declarator's initializer
-    /// (its calls and its construction) runs on the first pass only, so it
-    /// is a branch beside a bypass, both joining after it.
+    /// (its calls and its construction) runs on the first pass only.
     fn once_only_declaration(&mut self, node: Node<'a>) {
         let mut cursor = node.walk();
         let declarators: Vec<usize> = node
@@ -965,19 +1178,11 @@ impl<'a> Builder<'_, 'a> {
             .map(|d| d.id())
             .collect();
         for child in node.named_children(&mut cursor) {
-            if !declarators.contains(&child.id()) || !self.owns_any(child) {
+            if declarators.contains(&child.id()) {
+                self.may_run(child);
+            } else {
                 self.visit(child);
-                continue;
             }
-            let test = self.current();
-            let init = self.new_block(BlockKind::Ordinary);
-            let join = self.new_block(BlockKind::Ordinary);
-            self.edge(test, init, EdgeKind::BranchTrue);
-            self.edge(test, join, EdgeKind::BranchFalse);
-            self.start(init);
-            self.visit(child);
-            self.jump(join, EdgeKind::Fallthrough);
-            self.start(join);
         }
     }
 
@@ -1157,7 +1362,7 @@ impl<'a> Builder<'_, 'a> {
             self.visit(statement);
         }
         self.pop_scope();
-        self.scopes.pop();
+        self.drop_scope();
     }
 
     fn switch_statement(&mut self, node: Node<'a>) {
@@ -1183,7 +1388,7 @@ impl<'a> Builder<'_, 'a> {
         let Some(Scope {
             kind: ScopeKind::Switch { has_default, .. },
             ..
-        }) = self.scopes.pop()
+        }) = self.drop_scope()
         else {
             unreachable!("switch scope");
         };
@@ -1435,7 +1640,7 @@ impl<'a> Builder<'_, 'a> {
         if let Some(statement) = node.cached_field("body") {
             self.visit(statement);
         }
-        self.scopes.pop();
+        self.drop_scope();
         self.jump(exit, EdgeKind::Fallthrough);
         let mut catch_all = false;
         let mut cursor = node.walk();
@@ -1463,8 +1668,9 @@ impl<'a> Builder<'_, 'a> {
             self.jump(exit, EdgeKind::Fallthrough);
         }
         if !catch_all {
-            let outer = self.throw_target();
-            self.edge(landing, outer, EdgeKind::Exception);
+            // On through the objects the statement's scopes hold.
+            let outer = self.unwinding_target();
+            self.exception_edge(landing, outer);
         }
         self.enter(exit);
     }
@@ -2396,8 +2602,9 @@ mod tests {
         let g = graph(&unit, "thrown");
         let (quit, work, after) = (g.ev("quit"), g.ev("work"), g.ev("after"));
         let dtors = g.all("Guard::~Guard");
-        // One destructor on the `throw` path, one at the block's end.
-        assert_eq!(dtors.len(), 2, "{}", g.dump());
+        // One destructor on the `throw` path, one on the way from a call
+        // that throws, one at the block's end.
+        assert_eq!(dtors.len(), 3, "{}", g.dump());
         assert!(dtors
             .iter()
             .any(|&d| g.exclusive(d, work) && g.guaranteed(quit, d) && g.may_precede(d, after)));
@@ -2709,5 +2916,95 @@ mod tests {
             );
             assert!(g.all("Once::~Once").is_empty(), "{function}\n{}", g.dump());
         }
+    }
+
+    /// `try { Sentry s; may_throw(); later(); } catch (...)`: a call that
+    /// throws leaves the body through `s`'s destructor, so `later` is not
+    /// proven to precede every destruction of `s`.
+    #[test]
+    fn an_exception_destroys_the_objects_it_leaves() {
+        let unit = lower("exceptions.cpp");
+        let g = graph(&unit, "unwound");
+        let (ctor, thrower, later, h) = (
+            g.ev("Sentry::Sentry"),
+            g.ev("may_throw"),
+            g.ev("later"),
+            g.ev("h"),
+        );
+        let dtors = g.all("Sentry::~Sentry");
+        // At the body's end, and on the way to the handler.
+        assert_eq!(dtors.len(), 2, "{}", g.dump());
+        for &d in &dtors {
+            assert!(g.may_precede(thrower, d), "{}", g.dump());
+        }
+        let unwinding: Vec<_> = dtors
+            .iter()
+            .copied()
+            .filter(|&d| !g.may_precede(later, d) || !g.sequenced(later, d))
+            .collect();
+        assert_eq!(unwinding.len(), 1, "{}", g.dump());
+        let d = unwinding[0];
+        assert!(g.may_precede(d, h), "{}", g.dump());
+        assert!(!g.guaranteed(later, d), "{}", g.dump());
+        assert!(g.may_precede(ctor, d), "{}", g.dump());
+
+        // An exception the inner handlers do not catch leaves the outer
+        // body through its object's destructor too.
+        let g = graph(&unit, "unwound_nested");
+        let (thrower, h) = (g.ev("may_throw"), g.ev("h"));
+        let dtors = g.all("Sentry::~Sentry");
+        assert!(
+            dtors
+                .iter()
+                .any(|&d| g.may_precede(thrower, d) && g.may_precede(d, h)),
+            "{}",
+            g.dump()
+        );
+    }
+
+    /// A call written in an operand that is never evaluated orders
+    /// nothing; one in an operand that may be evaluated (`typeid`, a
+    /// variable-length array type) may run or not.
+    #[test]
+    fn unevaluated_operands_order_nothing() {
+        let unit = lower("args_order.cpp");
+        let g = graph(&unit, "unevaluated_operands");
+        let then = g.ev("then");
+        for callee in ["sized", "typed", "checked", "required"] {
+            let e = g.ev(callee);
+            assert!(
+                covered_by(&g, e, GapKind::Unevaluated),
+                "{callee}\n{}",
+                g.dump()
+            );
+            assert!(!g.guaranteed(e, then), "{callee}\n{}", g.dump());
+        }
+        for callee in ["identified", "bound"] {
+            let e = g.ev(callee);
+            assert!(
+                !covered_by(&g, e, GapKind::Unevaluated),
+                "{callee}\n{}",
+                g.dump()
+            );
+            assert!(g.may_precede(e, then), "{callee}\n{}", g.dump());
+            assert!(!g.sequenced(e, then), "{callee}\n{}", g.dump());
+            assert!(!g.guaranteed(e, then), "{callee}\n{}", g.dump());
+        }
+
+        let unit = lower("args_order.c");
+        let g = graph(&unit, "size_query");
+        let (sized, after) = (g.ev("sized"), g.ev("after_size"));
+        assert!(covered_by(&g, sized, GapKind::Unevaluated), "{}", g.dump());
+        assert!(!g.guaranteed(sized, after), "{}", g.dump());
+        // `sizeof(int[counted()])` evaluates the array bound.
+        let g = graph(&unit, "vla_size");
+        let (counted, after) = (g.ev("counted"), g.ev("after_size"));
+        assert!(
+            !covered_by(&g, counted, GapKind::Unevaluated),
+            "{}",
+            g.dump()
+        );
+        assert!(g.may_precede(counted, after), "{}", g.dump());
+        assert!(!g.guaranteed(counted, after), "{}", g.dump());
     }
 }

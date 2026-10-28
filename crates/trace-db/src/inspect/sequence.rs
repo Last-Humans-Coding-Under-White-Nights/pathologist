@@ -907,6 +907,8 @@ struct EventGaps {
     unorders: Option<GapKind>,
     /// The `unordered_branch` gaps over it, by index in the graph.
     unordered_branch: Vec<usize>,
+    /// An `unevaluated` gap is over it: the call never runs.
+    unevaluated: bool,
 }
 
 /// Where control may move without an edge in one graph (docs/ANALYSIS.md,
@@ -975,6 +977,7 @@ impl ControlFacts {
                 if hides_control(gap.kind) {
                     over.hides_control.get_or_insert(gap.kind);
                 }
+                over.unevaluated |= gap.kind == GapKind::Unevaluated;
                 if gap.kind == GapKind::UnorderedBranch {
                     over.unordered_branch.push(i);
                 } else {
@@ -1300,6 +1303,14 @@ impl LoadedCfg {
                     "a {} gap covers an end; its control flow is not modeled",
                     kind.as_str()
                 )],
+            );
+        }
+        // A call in an operand the language never evaluates runs neither
+        // before nor after anything.
+        if gaps.0.unevaluated || gaps.1.unevaluated {
+            return (
+                Relation::Unknown,
+                vec!["an unevaluated gap covers an end; that call never runs".into()],
             );
         }
         let (ba, bb) = (self.block_of(a), self.block_of(b));

@@ -153,3 +153,35 @@ template <typename... Ts> void variadic_catch()
         b();
     }
 }
+
+struct Sentry {
+    Sentry();
+    ~Sentry();
+};
+void may_throw();
+void later();
+
+void unwound()
+{
+    try {
+        Sentry s;
+        may_throw();
+        later();
+    } catch (...) {
+        h();
+    }
+}
+
+void unwound_nested()
+{
+    try {
+        Sentry s;
+        try {
+            may_throw();
+        } catch (Error &) {
+        }
+        later();
+    } catch (...) {
+        h();
+    }
+}

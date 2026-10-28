@@ -45,3 +45,19 @@ void two_ternaries(void)
     sink(cond1() ? then1() : else1(), first());
     sink(cond2() ? then2() : else2(), second());
 }
+
+int sized(void);
+int counted(void);
+void after_size(void);
+
+void size_query(void)
+{
+    (void)sizeof sized();
+    after_size();
+}
+
+void vla_size(void)
+{
+    (void)sizeof(int[counted()]);
+    after_size();
+}

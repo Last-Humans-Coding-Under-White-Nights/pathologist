@@ -5001,7 +5001,20 @@ children's, so an argument's calls precede the call they are passed to.
   orders nothing after it. So in
   `_Generic(selector(), int: chosen(), default: other()); after();`
   `chosen` and `other` are `exclusive`, each `may_precede` `after`, and
-  `selector` is proven before nothing.
+  `selector` is `unknown` to every other call.
+- **Unevaluated operands.** The operands of `noexcept(e)` and the
+  requirements of a `requires` expression are never evaluated: their calls
+  are kept the same way, under an `unevaluated` gap. `sizeof`, `alignof`
+  and `decltype` (as which a GNU `__typeof__` with an expression operand
+  parses) do not evaluate their operand unless its type is variably
+  modified (C11 6.5.3.4p2; GNU `typeof` likewise). The builder does not know
+  types, so only an operand that is a call (parentheses aside, `sizeof(f())`)
+  is `unevaluated`: a call's result is never variably modified. A type
+  operand (`sizeof(int[n()])` calls `n` for its array bound) and any other
+  expression (`sizeof(rows[f()])` over a two-dimensional variable-length
+  array) may be evaluated: like `typeid(e)`, whose operand is evaluated when
+  it is a polymorphic glvalue, it is a `branch_true` arm beside a
+  `branch_false` bypass, so its calls `may_precede` what follows.
 - Assignment: right before left in C++17 and later, unordered otherwise.
   `<<`, `>>` and subscript are left before right in C++17 and later. Operands
   of other binary and unary operators are unordered.
@@ -5060,17 +5073,33 @@ the jump leaves, and a fallthrough past it; a label the body lacks adds an
   `try` body that holds an event, nested handlers included, has an
   `exception` edge to it, except a block of a nested `try` body: that block
   throws to the nested landing, which passes on what its handlers do not
-  catch. The landing has an edge to each handler. Unless a handler is
+  catch. An exception leaving automatic objects destroys them on the way:
+  when objects of the scopes inside the `try` are live at a call, the
+  block's `exception` edge goes to a cleanup block holding their destructor
+  events (innermost first, in reverse declaration order, as a `return`
+  destroys them), which has an `exception` edge on to the landing. A block
+  whose live objects change between its calls (`Guard g;` after a call)
+  has an edge for each set; an object counts once its constructor has
+  run, and no longer once its destructor starts, so a destructor's own
+  event never throws through a copy of itself. One cleanup block serves
+  every call that leaves the same objects for the same landing; its
+  events are additional copies of the objects' destructor sites (one
+  position, see [Query](#query)). So in
+  `try { Guard g; may_throw(); later(); } catch (...) { h(); }`
+  `later` only `may_precede` `Guard::~Guard`, which `may_precede` `h`. The
+  landing has an edge to each handler. Unless a handler is
   `catch (...)` (its parameter list is the ellipsis alone: a pack expansion
   inside a typed handler, `catch (Fault<Ts...> &)`, does not count), the landing also has an `exception` edge to the
-  enclosing landing or the function's exceptional exit. So in
+  enclosing landing or the function's exceptional exit, through a cleanup
+  block for the objects live around the `try` statement. So in
   `try { try { a(); } catch (...) {} } catch (...) { c(); }` `a` and `c`
   are exclusive, while a typed inner `catch`, or a call in the inner
   handler, may reach `c`. A constructor's function-try-block
   (`A::A() try : m_(f()) { ... } catch (...) { ... }`) holds the prologue:
   its member initializers (and default member initializers) run in a block
-  of the `try`, before the body, with an `exception` edge to its landing. A `throw` has an
-  `exception` edge to the innermost landing or to the exceptional exit. A
+  of the `try`, before the body, with an `exception` edge to its landing. A `throw` destroys the objects it leaves in
+  its own block, then has an `exception` edge to the innermost landing or
+  to the exceptional exit. A
   call *outside* a `try` has no exceptional edge: the conditions above
   already exclude abnormal completion.
 - Loops stay cycles (`back_edge`), never unrolled.
@@ -5187,8 +5216,10 @@ A gap or boundary is uncertainty, never evidence for an order.
   initializers are one unordered group in a prologue block; declaration order
   is not modeled. A site of the function that no walked node owns joins that
   group too), `omitted_sites` and `unevaluated` (calls in an operand the
-  language never evaluates, the controlling expression of `_Generic`: kept
-  as events so a position names them, but no proof is made about them). A
+  language never evaluates, the controlling expression of `_Generic` and
+  the [unevaluated operands](#expressions) of `sizeof`, `decltype`,
+  `noexcept` and `requires`: kept as events so a position names them; an
+  end under one relates `unknown`, as the call never runs). A
   body with a gap is `partial`.
 - **Boundaries** between functions, found by the query: `omitted_body` (the
   callee has no CFG: dependency, declaration only, suppressed or not
@@ -5214,7 +5245,8 @@ first, then loads graphs only as it reaches them:
   query starts from each such variant, one frame per variant as for
   `--function`. The destructor events of one automatic object on each way
   out of its scope (the end, `return`, `break`, `continue`, `goto`, `throw`,
-  each iteration of a `while` with a condition object) name the same sites:
+  an exception's cleanup block, each iteration of a `while` with a
+  condition object) name the same sites:
   they are copies of that one call, so the position names all of them. A
   position matching several calls (two events of one graph that are not
   such copies, as the two calls `TWICE(step())` makes, or calls of

@@ -1974,3 +1974,55 @@ fn a_once_only_local_initializer_is_bypassed() {
         );
     }
 }
+
+/// `try { Sentry s; may_throw(); later(); } catch (...) { h(); }`: a call
+/// that throws destroys `s` on its way to the handler, so no call of the
+/// body is proven to precede every destruction of `s`.
+#[test]
+fn an_exception_destroys_the_objects_it_leaves() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "exceptions.cpp", line, callee);
+    let dtor = at(167, "Sentry::~Sentry");
+    assert_eq!(relation(&conn, &at(169, "later"), &dtor), MayPrecede);
+    assert_eq!(relation(&conn, &at(168, "may_throw"), &dtor), MayPrecede);
+    assert_eq!(relation(&conn, &dtor, &at(171, "h")), MayPrecede);
+    // Past an inner `try` whose handlers do not catch it.
+    let dtor = at(178, "Sentry::~Sentry");
+    assert_eq!(relation(&conn, &dtor, &at(185, "h")), MayPrecede);
+    assert_eq!(relation(&conn, &at(180, "may_throw"), &dtor), MayPrecede);
+}
+
+/// A call in an operand that is never evaluated proves no order; one in an
+/// operand that may be evaluated may precede what follows.
+#[test]
+fn unevaluated_operands_prove_no_order() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |file, line, callee| event(&conn, file, line, callee);
+    let then = at("args_order.cpp", 35, "then");
+    for (line, callee) in [
+        (29, "sized"),
+        (30, "typed"),
+        (31, "checked"),
+        (32, "required"),
+    ] {
+        let e = at("args_order.cpp", line, callee);
+        assert_eq!(relation(&conn, &e, &then), Unknown, "{callee}");
+    }
+    for (line, callee) in [(33, "identified"), (34, "bound")] {
+        let e = at("args_order.cpp", line, callee);
+        assert_eq!(relation(&conn, &e, &then), MayPrecede, "{callee}");
+    }
+    let (sized, after) = (
+        at("args_order.c", 55, "sized"),
+        at("args_order.c", 56, "after_size"),
+    );
+    assert_eq!(relation(&conn, &sized, &after), Unknown);
+    // `sizeof(int[counted()])` evaluates the bound of the array type.
+    let (counted, after) = (
+        at("args_order.c", 61, "counted"),
+        at("args_order.c", 62, "after_size"),
+    );
+    assert_eq!(relation(&conn, &counted, &after), MayPrecede);
+}
