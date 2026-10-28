@@ -5003,8 +5003,12 @@ body; update; back edge to the condition; `continue` goes to the update),
 range-for (range expression once; header; body; back edge), `switch` (case
 edges, fallthrough edges, `default`, and an edge past the switch when there is
 no `default`), `break`, `continue`, `return` (edge to the exit), `goto` and
-labels (labels are resolved before the body is walked), `try`/`catch` and
-`throw`.
+labels (labels are resolved before the body is walked), `asm goto` (a
+`switch_case` edge to each label it names, through a block destroying what
+the jump leaves, and a fallthrough past it; a label the body lacks adds an
+`unresolved_goto` gap and an `unsupported` edge, so in
+`asm goto("jmp %l0" : : : : out); a(); out: b();` `a` only `may_precede`
+`b`; any other `asm` transfers nothing), `try`/`catch` and `throw`.
 
 - **Automatic objects** ([Automatic objects](#automatic-objects)): the
   constructor event sits at its declarator, so `T a{f()}, b{g()};` orders
@@ -5026,7 +5030,8 @@ labels (labels are resolved before the body is walked), `try`/`catch` and
   `exception` edge to it, except a block of a nested `try` body: that block
   throws to the nested landing, which passes on what its handlers do not
   catch. The landing has an edge to each handler. Unless a handler is
-  `catch (...)`, the landing also has an `exception` edge to the
+  `catch (...)` (its parameter list is the ellipsis alone: a pack expansion
+  inside a typed handler, `catch (Fault<Ts...> &)`, does not count), the landing also has an `exception` edge to the
   enclosing landing or the function's exceptional exit. So in
   `try { try { a(); } catch (...) {} } catch (...) { c(); }` `a` and `c`
   are exclusive, while a typed inner `catch`, or a call in the inner
@@ -5126,7 +5131,9 @@ A gap or boundary is uncertainty, never evidence for an order.
 - **Gaps** inside a body: `parse_error` (an `ERROR` subtree; its events are
   kept as an unordered group), `depth_exceeded`, `unsupported_construct`
   (computed `goto`, `setjmp`/`longjmp`, coroutines, SEH, statement
-  expressions), `unresolved_goto`, `unordered_branch` (a short-circuit or
+  expressions; a nonlocal jump is recognized by its callee spelled plain or
+  qualified from the global namespace or `std`, so `::_setjmp` and
+  `std::longjmp` count), `unresolved_goto`, `unordered_branch` (a short-circuit or
   conditional inside an unordered operand: the affected events are
   unordered), `initializer_order` (member initializers and default member
   initializers are one unordered group in a prologue block; declaration order

@@ -88,3 +88,25 @@ void hidden_goto(int x)
         b();
     }
 }
+
+void asm_jump(void)
+{
+    asm goto("jmp %l0" : : : : out);
+    a();
+out:
+    b();
+}
+
+void asm_unresolved(void)
+{
+    asm goto("jmp %l0" : : : : nowhere);
+    a();
+    b();
+}
+
+void asm_plain(void)
+{
+    asm volatile("nop" : : : "memory");
+    a();
+    b();
+}

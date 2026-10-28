@@ -106,3 +106,50 @@ try : m_(make()) {
 } catch (...) {
     h();
 }
+
+typedef long jmp_buf[8];
+int _setjmp(jmp_buf env);
+void longjmp(jmp_buf env, int value);
+namespace std {
+int setjmp(jmp_buf env);
+void longjmp(jmp_buf env, int value);
+}
+void initial();
+void resumed();
+
+void global_jump()
+{
+    jmp_buf env;
+    if (::_setjmp(env)) {
+        resumed();
+    } else {
+        initial();
+        ::longjmp(env, 1);
+    }
+}
+
+void std_jump()
+{
+    jmp_buf env;
+    if (std::setjmp(env)) {
+        resumed();
+    } else {
+        initial();
+        std::longjmp(env, 1);
+    }
+}
+
+template <typename... Ts> struct Fault {
+};
+
+template <typename... Ts> void variadic_catch()
+{
+    try {
+        try {
+            a();
+        } catch (Fault<Ts...> &) {
+        }
+    } catch (...) {
+        b();
+    }
+}

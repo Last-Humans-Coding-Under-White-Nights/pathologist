@@ -701,6 +701,13 @@ impl<'a> Builder<'_, 'a> {
                 }
                 self.own(node);
             }
+            "gnu_asm_expression" => {
+                self.unordered(node.named_children(&mut node.walk()), node);
+                self.own(node);
+                if let Some(labels) = node.cached_field("goto_labels") {
+                    self.asm_goto(node, labels);
+                }
+            }
             "call_expression" => {
                 let function = node.cached_field("function");
                 // Before C++17 the callee is one more unsequenced operand.
@@ -1124,9 +1131,16 @@ impl<'a> Builder<'_, 'a> {
             self.unsupported_exit(node, GapKind::UnsupportedConstruct);
             return;
         };
-        let Some(target) = self.labels.get(label) else {
+        if !self.goto_label(label) {
             self.unsupported_exit(node, GapKind::UnresolvedGoto);
-            return;
+        }
+    }
+
+    /// Jump to `label`, destroying the objects of the scopes left; false,
+    /// with nothing done, when the body has no such label.
+    fn goto_label(&mut self, label: &str) -> bool {
+        let Some(target) = self.labels.get(label) else {
+            return false;
         };
         let block = target.block;
         // Leave the scopes the label is not inside.
@@ -1145,6 +1159,36 @@ impl<'a> Builder<'_, 'a> {
         let (at, kept) = since.unwrap_or((keep, 0));
         self.unwind_since(at, kept);
         self.jump(block, EdgeKind::Fallthrough);
+        true
+    }
+
+    /// `asm goto (... : labels)`: a branch to each label, each through a
+    /// block of its own destroying what the jump leaves, and a fallthrough
+    /// past it. A label the body lacks leaves through `unsupported`.
+    fn asm_goto(&mut self, node: Node<'a>, labels: Node<'a>) {
+        let from = self.current();
+        let mut unresolved = false;
+        let mut cursor = labels.walk();
+        for label in labels.children_by_field_name("label", &mut cursor) {
+            let name = node_text(self.source, &label);
+            if !self.labels.contains_key(name) {
+                unresolved = true;
+                continue;
+            }
+            let arm = self.new_block(BlockKind::Ordinary);
+            self.edge(from, arm, EdgeKind::SwitchCase);
+            self.start(arm);
+            self.goto_label(name);
+        }
+        if unresolved {
+            let first = self.cfg.events.len();
+            self.gap(GapKind::UnresolvedGoto, Some(node), first);
+            let exit = self.cfg.exit;
+            self.edge(from, exit, EdgeKind::Unsupported);
+        }
+        let next = self.new_block(BlockKind::Ordinary);
+        self.edge(from, next, EdgeKind::Fallthrough);
+        self.start(next);
     }
 
     fn unsupported_exit(&mut self, node: Node<'a>, kind: GapKind) {
@@ -1268,7 +1312,7 @@ impl<'a> Builder<'_, 'a> {
             self.start(handler);
             self.push_scope(ScopeKind::Block, None);
             if let Some(params) = clause.cached_field("parameters") {
-                catch_all |= node_text(self.source, &params).contains("...");
+                catch_all |= is_catch_all(params);
                 for param in params.named_children(&mut params.walk()) {
                     self.own(param);
                     if let Some(declarator) = param.cached_field("declarator") {
@@ -1290,9 +1334,23 @@ impl<'a> Builder<'_, 'a> {
     }
 }
 
+/// A handler's parameter list is `(...)`: the ellipsis is the list's own
+/// token, not one inside a declaration (`catch (Fault<Ts...> &)`).
+fn is_catch_all(params: Node) -> bool {
+    params.named_child_count() == 0
+        && params
+            .children(&mut params.walk())
+            .any(|c| c.kind() == "...")
+}
+
+/// `callee` names a `setjmp` or `longjmp`, written plain, from the global
+/// namespace (`::longjmp`) or from `std` (`std::longjmp`).
 fn is_nonlocal_jump(callee: &str) -> bool {
+    let name: String = callee.chars().filter(|c| !c.is_whitespace()).collect();
+    let name = name.strip_prefix("::").unwrap_or(&name);
+    let name = name.strip_prefix("std::").unwrap_or(name);
     matches!(
-        callee,
+        name,
         "setjmp"
             | "_setjmp"
             | "sigsetjmp"
@@ -1988,6 +2046,32 @@ mod tests {
         );
         assert!(covered_by(&g, jump, GapKind::UnsupportedConstruct));
         assert!(!g.guaranteed(set, jump));
+    }
+
+    /// `asm goto` branches to each label it names and falls through; a
+    /// label it names that the body lacks leaves through `unsupported`.
+    #[test]
+    fn asm_goto_branches_to_its_labels() {
+        let unit = lower("unsupported.c");
+        let g = graph(&unit, "asm_jump");
+        let (a, b) = (g.ev("a"), g.ev("b"));
+        let into =
+            |to: BlockId, kind: EdgeKind| g.cfg.edges.iter().any(|e| e.to == to && e.kind == kind);
+        assert!(into(g.block(b), EdgeKind::SwitchCase), "{}", g.dump());
+        assert!(g.may_precede(a, b));
+        assert!(!g.guaranteed(a, b));
+        assert!(g.cfg.gaps.is_empty());
+
+        let g = graph(&unit, "asm_unresolved");
+        let a = g.ev("a");
+        assert!(g.gap(GapKind::UnresolvedGoto), "{}", g.dump());
+        let asm = g.cfg.edges.iter().find(|e| e.kind == EdgeKind::Unsupported);
+        assert!(asm.is_some_and(|e| e.to == g.cfg.exit), "{}", g.dump());
+        assert!(g.block_path(asm.unwrap().from, g.block(a), None));
+
+        let g = graph(&unit, "asm_plain");
+        assert!(g.sequenced(g.ev("a"), g.ev("b")));
+        assert!(g.cfg.gaps.is_empty());
     }
 
     #[test]

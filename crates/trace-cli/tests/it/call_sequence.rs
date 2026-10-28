@@ -1753,3 +1753,42 @@ fn base_lifecycle_calls_are_separate_events() {
         assert_eq!(relation(&conn, &work, dtor), SequencedBefore);
     }
 }
+
+/// `asm goto` may jump to any of its labels: `b` after `out` may run
+/// without `a`. A plain `asm` transfers nothing.
+#[test]
+fn asm_goto_jumps_to_its_labels() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "unsupported.c", line, callee);
+    assert_eq!(relation(&conn, &at(95, "a"), &at(97, "b")), MayPrecede);
+    assert_eq!(relation(&conn, &at(97, "b"), &at(95, "a")), MayFollow);
+    assert_eq!(
+        relation(&conn, &at(110, "a"), &at(111, "b")),
+        SequencedBefore
+    );
+}
+
+/// `::_setjmp`, `::longjmp`, `std::setjmp` and `std::longjmp` are the
+/// nonlocal jumps their unqualified names are.
+#[test]
+fn qualified_nonlocal_jumps_are_unmodeled_transfers() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "exceptions.cpp", line, callee);
+    for (resumed, initial) in [(124, 126), (135, 137)] {
+        let (resumed, initial) = (at(resumed, "resumed"), at(initial, "initial"));
+        assert_eq!(relation(&conn, &initial, &resumed), MayBoth);
+        assert_eq!(relation(&conn, &resumed, &initial), MayBoth);
+    }
+}
+
+/// A pack expansion in a typed handler (`catch (Fault<Ts...> &)`) does not
+/// make it `catch (...)`: what it does not catch reaches the outer handler.
+#[test]
+fn a_pack_expansion_handler_is_not_a_catch_all() {
+    use trace_db::Relation::*;
+    let conn = fixture_db();
+    let at = |line, callee| event(&conn, "exceptions.cpp", line, callee);
+    assert_eq!(relation(&conn, &at(149, "a"), &at(153, "b")), MayPrecede);
+}
