@@ -1,6 +1,6 @@
 use crate::FnId;
 
-/// A matched proxy→stub IPC bridge, produced by `detect_ipc_pairs`.
+/// A detected or modeled IPC bridge, produced during PAG construction.
 ///
 /// Each bridge represents one concrete IPC call path: the proxy method sends
 /// a transaction and the stub handler processes it. At PAG build time the
@@ -8,7 +8,8 @@ use crate::FnId;
 /// `SYNTHETIC_CALL_SITE`) from `proxy_method` to `stub_handler`.
 #[derive(Debug, Clone)]
 pub struct IpcBridge {
-    /// The proxy method that initiates the IPC call.
+    /// The sending proxy method or bodyless framework function whose model
+    /// summarizes the IPC call (docs/ANALYSIS.md, "OpenHarmony IPC bridges").
     pub proxy_method: FnId,
     /// The stub handler that processes it (resolved to exact `FnId`).
     pub stub_handler: FnId,

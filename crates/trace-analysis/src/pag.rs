@@ -1,5 +1,5 @@
 use crate::constraints::{AbstractLocation, Constraint, ConstraintKind, LocKind};
-use crate::ipc::detect_ipc_pairs;
+use crate::ipc::detect_ipc_pairs_with_models;
 use crate::summaries::{Effect, EffectGroup, FnModelSet, ModelLookup};
 use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
@@ -137,7 +137,7 @@ impl Pag {
         pag.build_call_constraints(program);
         pag.build_indices(program);
         if enable_ipc {
-            pag.ipc_bridges = detect_ipc_pairs(program);
+            pag.ipc_bridges = detect_ipc_pairs_with_models(program, models);
         }
         pag
     }

@@ -238,6 +238,13 @@ pub struct Function {
     pub tu: Option<crate::FileId>,
 }
 
+impl Function {
+    /// Whether this declaration accepts the explicit argument count.
+    pub fn takes_argument_count(&self, declared: u32, count: u32) -> bool {
+        count >= declared.saturating_sub(self.default_args) && (self.variadic || count <= declared)
+    }
+}
+
 /// Stable identity of one syntactic call occurrence. The displayed request
 /// span may come from a substituted receiver or member token whose provenance
 /// is shared by several calls; this location remains tied to the call's own
@@ -321,6 +328,7 @@ pub struct CallSite {
 /// vectors retain their original argument order.
 #[derive(Debug, Clone, Default)]
 pub struct CallSiteDetails {
+    pub receiver_recovery: Option<Box<ReceiverRecovery>>,
     pub fn_args: Vec<(u32, FnId)>,
     /// Unresolved `&base.member` / `&arr[i]` positions naming the base
     /// container rather than a precise field address; model alias effects
@@ -335,6 +343,26 @@ pub struct CallSiteDetails {
     pub return_operation: Option<Box<(Span, Arc<str>)>>,
     /// Full source call expression for argument-flow presentation.
     pub call_expression: Option<Arc<str>>,
+}
+
+/// Lexical evidence retained for a member whose receiver declaration is absent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReceiverRecovery {
+    pub argument_count: u32,
+    pub lexical_owner: bool,
+    pub scope_recorded: bool,
+    pub namespaces: Vec<String>,
+}
+
+impl ReceiverRecovery {
+    pub fn new(argument_count: u32) -> Self {
+        Self {
+            argument_count,
+            lexical_owner: false,
+            scope_recorded: false,
+            namespaces: Vec::new(),
+        }
+    }
 }
 
 impl CallSiteDetails {
@@ -352,6 +380,7 @@ impl CallSiteDetails {
             None
         } else {
             Some(Box::new(Self {
+                receiver_recovery: None,
                 fn_args,
                 addr_of_member_args,
                 addr_of_args,
@@ -443,6 +472,10 @@ impl CallSite {
             unevaluated: self.unevaluated,
             return_dst: self.return_dst,
             receiver: self.receiver,
+            receiver_recovery: self
+                .details
+                .as_ref()
+                .and_then(|d| d.receiver_recovery.as_deref()),
         }
     }
 
@@ -479,6 +512,7 @@ impl CallSite {
 /// drifting — a field added to `CallSite` and weighed here reaches both.
 #[derive(PartialEq, Eq, Hash)]
 struct CallFacts<'a> {
+    receiver_recovery: Option<&'a ReceiverRecovery>,
     caller: FnId,
     callee_fn_id: Option<FnId>,
     callee_var: Option<VarId>,
@@ -828,6 +862,8 @@ pub struct SymbolTable {
     inference_root: Option<PathBuf>,
     test_partition: crate::TestPartition,
     resolved_external_functions: FxHashSet<FnId>,
+    /// Entries added without a source declaration or a name binding.
+    synthetic_functions: FxHashSet<FnId>,
     /// Monotonic cache: avoids scanning imported symbols in each translation unit.
     has_weak_symbols: bool,
     pub files: Vec<FileInfo>,
@@ -850,6 +886,8 @@ pub struct SymbolTable {
     /// program for a bare callee name across every namespace, which the
     /// exact-name `fn_by_name`/`externals_by_name` tables cannot express.
     base_by_name: FxHashMap<String, Vec<FnId>>,
+    /// Narrow missing-receiver lookup before touching same-named methods.
+    members_by_class_leaf: FxHashMap<String, FxHashMap<String, Vec<FnId>>>,
     pub global_by_name: IndexMap<String, VarId>,
     target_globals: FxHashMap<crate::TargetId, FxHashMap<String, VarId>>,
     /// Unscoped externally linked static data members by linker symbol; the
@@ -948,6 +986,10 @@ impl SymbolTable {
     /// alone may be incomplete and must not change resolution semantics.
     pub fn has_target_scopes(&self) -> bool {
         self.has_target_scopes
+    }
+
+    pub fn is_synthetic_function(&self, id: FnId) -> bool {
+        self.synthetic_functions.contains(&id)
     }
 
     /// Declare the dependency roots (canonical) that classify files as they
@@ -1589,6 +1631,7 @@ impl SymbolTable {
             !self.fn_slots.contains_key(&func.id),
             "synthetic function ID must be fresh"
         );
+        self.synthetic_functions.insert(func.id);
         self.push_indexed(func)
     }
 
@@ -1610,6 +1653,23 @@ impl SymbolTable {
             self.scoped_function_leaves.insert(base.clone());
         }
         self.base_by_name.entry(base).or_default().push(id);
+        if func.is_cpp {
+            if let Some((class, member)) = func.name.rsplit_once("::") {
+                let leaf = class
+                    .split('<')
+                    .next()
+                    .unwrap_or(class)
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(class);
+                self.members_by_class_leaf
+                    .entry(leaf.to_owned())
+                    .or_default()
+                    .entry(member.to_owned())
+                    .or_default()
+                    .push(id);
+            }
+        }
         self.functions.push(func);
         id
     }
@@ -2503,7 +2563,11 @@ impl SymbolTable {
         }
     }
 
-    fn fallback_admits(&self, id: FnId, file: FileId) -> bool {
+    /// Whether a candidate may bind from this file under the bare-tree test
+    /// partition, including declaring-header eligibility. This does not
+    /// restrict link images; authoritative target metadata disables the
+    /// inferred partition. IPC summaries reuse this policy across images.
+    pub fn fallback_admits(&self, id: FnId, file: FileId) -> bool {
         let function = self.function(id);
         let body = function.span.file;
         !function.is_defined
@@ -2528,6 +2592,16 @@ impl SymbolTable {
             .map_or(&[][..], Vec::as_slice);
         let resolve_equal_defs = |fid: FnId| -> Vec<FnId> {
             let f = self.function(fid);
+            if self.synthetic_functions.contains(&fid) && !f.is_defined {
+                if let Some(types) = types {
+                    let recovered = self.undeclared_receiver_definitions(cs, f, types, caller_tu);
+                    if !recovered.is_empty() {
+                        let mut candidates = vec![fid];
+                        candidates.extend(recovered);
+                        return candidates;
+                    }
+                }
+            }
             // Synthesized externals already represent a failed lookup in this
             // call's context. A same-name production overload is not evidence
             // for replacing their deliberately unknown signature.
@@ -2644,6 +2718,144 @@ impl SymbolTable {
         } else {
             Vec::new()
         }
+    }
+
+    /// A missing header may import the receiver from another namespace.
+    /// Keep its external leaf, but recover definitions of the same class
+    /// spelling using the shared type comparison and name resolver. See
+    /// docs/ANALYSIS.md, "Undeclared receiver classes".
+    fn undeclared_receiver_definitions(
+        &self,
+        cs: &CallSite,
+        external: &Function,
+        types: &crate::TypeTable,
+        caller_tu: FileId,
+    ) -> Vec<FnId> {
+        if cs.receiver_class.is_none() {
+            return Vec::new();
+        }
+        let Some((owner, member)) = external.name.rsplit_once("::") else {
+            return Vec::new();
+        };
+        if types.declares_class(owner) {
+            return Vec::new();
+        }
+        let evidence = cs
+            .details
+            .as_ref()
+            .and_then(|d| d.receiver_recovery.as_deref());
+        let owner_namespace = owner.rsplit_once("::").map(|(ns, _)| ns);
+        let lexical_owner = evidence.is_some_and(|e| e.lexical_owner);
+        // An explicit standard-library owner cannot name a project namesake.
+        if owner.split("::").any(|part| part == "std") {
+            return Vec::new();
+        }
+        let leaf = owner
+            .split('<')
+            .next()
+            .unwrap_or(owner)
+            .rsplit("::")
+            .next()
+            .unwrap_or(owner);
+        let mut names = FxHashSet::default();
+        let mut result = Vec::new();
+        for &id in self
+            .members_by_class_leaf
+            .get(leaf)
+            .and_then(|m| m.get(member))
+            .into_iter()
+            .flatten()
+        {
+            let candidate = self.function(id);
+            let Some((class, _)) = candidate.name.rsplit_once("::") else {
+                continue;
+            };
+            if !candidate.is_defined
+                || !candidate.is_cpp
+                || class == owner
+                || !types.declares_class(class)
+                || !evidence.is_some_and(|e| {
+                    !owner.contains("::")
+                        || class.rsplit_once("::").is_some_and(|(ns, _)| {
+                            // A guessed lexical owner may lose an import.
+                            // An explicit unrelated qualifier may only be
+                            // completed (IPC -> OHOS::Media::IPC), not swapped.
+                            (lexical_owner
+                                || owner_namespace.is_some_and(|written| {
+                                    ns == written
+                                        || ns
+                                            .strip_suffix(written)
+                                            .is_some_and(|prefix| prefix.ends_with("::"))
+                                }))
+                                && e.namespaces.iter().any(|visible| {
+                                    ns == visible
+                                        || ns
+                                            .strip_prefix(visible)
+                                            .is_some_and(|tail| tail.starts_with("::"))
+                                })
+                        })
+                })
+                || !names.insert(candidate.name.as_str())
+            {
+                continue;
+            }
+            let candidates = self.resolve_function_candidates_in_target(
+                &candidate.name,
+                Some(caller_tu),
+                self.caller_target(cs),
+            );
+            result.extend(
+                self.prefer_tu_overload_definitions(candidates, caller_tu, types)
+                    .into_iter()
+                    .filter(|&id| self.function(id).is_defined),
+            );
+        }
+        if let Some(evidence) = evidence {
+            let compatible: Vec<_> = result
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    let f = self.function(id);
+                    let arity = f
+                        .explicit_arity
+                        .or_else(|| self.explicit_params(f).map(|p| p.len() as u32));
+                    arity.is_none_or(|n| f.takes_argument_count(n, evidence.argument_count))
+                })
+                .collect();
+            if !compatible.is_empty() {
+                return compatible;
+            }
+        }
+        result
+    }
+
+    /// TU-local precedence applies independently to each overload family.
+    fn prefer_tu_overload_definitions(
+        &self,
+        candidates: Vec<FnId>,
+        tu: FileId,
+        types: &crate::TypeTable,
+    ) -> Vec<FnId> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.defined_in_tu(id, tu)
+                    || !candidates.iter().any(|&local| {
+                        let a = self.function(id);
+                        let b = self.function(local);
+                        self.defined_in_tu(local, tu)
+                            && a.variadic == b.variadic
+                            && Self::references_alike(a, b)
+                            && self.explicit_params_alike(
+                                a,
+                                b,
+                                types,
+                                SpellingTolerance::Redeclaration,
+                            ) == Some(true)
+                    })
+            })
+            .collect()
     }
 
     /// The image a call site resolves in: its caller's, or none at all when
@@ -3000,11 +3212,35 @@ impl SymbolTable {
     /// the record is lexically in a loop (`CallSite::in_loop`) when any copy
     /// is.
     pub fn absorb_call_copy(&mut self, id: CallSiteId, copy: &CallSite) {
-        if !copy.in_loop {
+        if !copy.in_loop
+            && copy
+                .details
+                .as_ref()
+                .is_none_or(|d| d.receiver_recovery.is_none())
+        {
             return;
         }
         if let Some(slot) = self.call_site_slot(id) {
-            self.call_sites[slot].in_loop = true;
+            let held = &mut self.call_sites[slot];
+            held.in_loop |= copy.in_loop;
+            if let Some(incoming) = copy
+                .details
+                .as_ref()
+                .and_then(|d| d.receiver_recovery.as_ref())
+            {
+                let recovery = held
+                    .details_mut()
+                    .receiver_recovery
+                    .get_or_insert_with(|| incoming.clone());
+                recovery.lexical_owner |= incoming.lexical_owner;
+                recovery.scope_recorded |= incoming.scope_recorded;
+                for ns in &incoming.namespaces {
+                    if !recovery.namespaces.contains(ns) {
+                        recovery.namespaces.push(ns.clone());
+                    }
+                }
+                recovery.namespaces.sort();
+            }
         }
     }
 

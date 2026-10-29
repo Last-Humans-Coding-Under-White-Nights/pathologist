@@ -19,6 +19,100 @@ fn direct_targets(program: &Program, analysis: &AnalysisResult, caller: &str) ->
         .collect()
 }
 
+analyzed_fixture!(cpp_wrapper_construction);
+analyzed_fixture!(cpp_declared_wrapper);
+analyzed_fixture!(cpp_wrapper_boundaries);
+
+#[test]
+fn cpp_declared_wrapper_keeps_template_arguments_for_pointee_calls() {
+    let (program, analysis) = cpp_declared_wrapper();
+    for caller in [
+        "lib::auto_arrow",
+        "lib::arrow_chain",
+        "lib::get_ref",
+        "lib::declared_arrow",
+    ] {
+        assert!(
+            has_any_edge(program, analysis, caller, "Item::Run"),
+            "{caller}"
+        );
+    }
+}
+
+#[test]
+fn cpp_wrapper_construction_rejects_a_dependent_wrapper_name() {
+    let (program, analysis) = cpp_wrapper_boundaries();
+    assert!(must_not_have_edge(
+        program,
+        analysis,
+        "dispatch",
+        "Item::Run"
+    ));
+}
+
+#[test]
+fn cpp_wrapper_construction_rejects_templated_owners() {
+    let (program, analysis) = cpp_wrapper_boundaries();
+    for caller in ["nested", "nested_chain", "typed_control"] {
+        assert!(
+            must_not_have_edge(program, analysis, caller, "Item::Run"),
+            "{caller} must not treat Outer<Item>'s argument as sptr's pointee"
+        );
+    }
+}
+
+#[test]
+fn cpp_wrapper_construction_keeps_the_declared_unqualified_template() {
+    let (program, analysis) = cpp_declared_wrapper();
+    for caller in ["lib::call", "lib::chain"] {
+        let targets = direct_targets(program, analysis, caller);
+        assert!(
+            targets.iter().any(|name| name == "lib::sptr::Run"),
+            "{caller}: {targets:?}"
+        );
+        assert!(
+            targets.iter().any(|name| name == "lib::sptr::sptr"),
+            "{caller} must construct its declared wrapper: {targets:?}"
+        );
+        for wrong in ["unrelated::sptr::Run", "sptr::Run"] {
+            assert!(
+                must_not_have_edge(program, analysis, caller, wrong),
+                "{caller} must not call {wrong}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cpp_wrapper_construction_preserves_declared_constructor_type() {
+    let (program, analysis) = cpp_wrapper_construction();
+    for caller in ["declared_wrapper", "declared_wrapper_chain"] {
+        let targets = direct_targets(program, analysis, caller);
+        assert!(
+            targets
+                .iter()
+                .any(|name| name == "std::unique_ptr::WrapperMember"),
+            "{caller}: {targets:?}"
+        );
+    }
+}
+
+#[test]
+fn cpp_wrapper_construction_defers_to_argument_dependent_factory() {
+    let (program, analysis) = cpp_wrapper_construction();
+    for caller in ["adl_factory", "adl_factory_chain"] {
+        let targets = direct_targets(program, analysis, caller);
+        assert!(
+            targets.iter().any(|name| name == "lib::Result::Run"),
+            "{caller}: {targets:?}"
+        );
+        assert!(
+            must_not_have_edge(program, analysis, caller, "sptr::Run"),
+            "{caller} must use the factory's declared return type"
+        );
+    }
+}
+
 analyzed_fixture!(cpp_issue113);
 
 #[test]

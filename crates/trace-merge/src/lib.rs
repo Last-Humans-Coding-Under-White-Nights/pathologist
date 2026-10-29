@@ -871,6 +871,7 @@ pub fn merge_databases<P: AsRef<Path>>(
     // a callback declared in one repository and defined in another enters
     // the definition, as the edge does.
     let mut retargets: FxHashMap<(usize, i64, i64), Vec<i64>> = FxHashMap::default();
+    let mut caller_bindings: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
     let mut unresolved_external_counts: FxHashMap<String, usize> = FxHashMap::default();
 
     for (db_idx, conn) in conns.iter().enumerate() {
@@ -1033,6 +1034,17 @@ pub fn merge_databases<P: AsRef<Path>>(
                     .or_default()
                     .extend(new_callees.iter().copied());
             }
+            if orig_callee.is_defined == 0 {
+                let declaration = fn_remap[db_idx][&edge.callee_fn_id];
+                for &id in &new_callees {
+                    // Include the declaration when a caller still reaches it,
+                    // even if other callers bind to a definition.
+                    let bindings = caller_bindings.entry(declaration).or_default();
+                    if !bindings.contains(&id) {
+                        bindings.push(id);
+                    }
+                }
+            }
             for new_callee_id in new_callees {
                 if new_cs_id.is_some() && !emitted.insert((new_cs_id, new_callee_id)) {
                     continue;
@@ -1048,6 +1060,32 @@ pub fn merge_databases<P: AsRef<Path>>(
             }
         }
     }
+    // A retained summary belongs to every sender binding callers now reach,
+    // including declarations that remain unresolved.
+    // Reuse the exact callee redirections above rather than resolving its
+    // name a second time with a different image/signature policy.
+    let mut rebound = Vec::new();
+    let mut ipc_seen = FxHashSet::default();
+    for edge in unified_call_edges {
+        let callers = (edge.resolution == "ipc")
+            .then(|| caller_bindings.get(&edge.caller_fn_id))
+            .flatten();
+        for caller in callers
+            .map(Vec::as_slice)
+            .unwrap_or(std::slice::from_ref(&edge.caller_fn_id))
+        {
+            if edge.resolution == "ipc"
+                && !ipc_seen.insert((*caller, edge.callee_fn_id, edge.call_site_id))
+            {
+                continue;
+            }
+            let mut copy = edge.clone();
+            copy.id = (rebound.len() + 1) as i64;
+            copy.caller_fn_id = *caller;
+            rebound.push(copy);
+        }
+    }
+    let unified_call_edges = rebound;
     report.call_edges_total = unified_call_edges.len();
 
     // Collect top unresolved external warnings.

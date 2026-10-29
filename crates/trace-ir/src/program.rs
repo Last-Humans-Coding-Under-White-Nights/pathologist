@@ -1199,40 +1199,48 @@ impl Program {
     ) -> Vec<FnId> {
         let mut out = Vec::new();
         for c in self.dispatch_subclass_closure(cls, kind, sees) {
-            let own = self.members_among(&kind.name_on(&c), targets);
-            if !own.is_empty() {
-                for id in own {
-                    if !out.contains(&id) {
-                        out.push(id);
-                    }
-                }
-                continue;
-            }
-            // `c`'s own lookup just missed, so start the walk at its bases
-            // rather than letting the queue repeat that same query.
-            let mut queue = std::collections::VecDeque::new();
-            let mut seen = std::collections::BTreeSet::new();
-            queue.extend(self.bases_seen(&c, sees));
-            seen.insert(c);
-            while let Some(cur) = queue.pop_front() {
-                if !seen.insert(cur.clone()) {
-                    continue;
-                }
-                let ids = self.members_among(&kind.name_on(&cur), targets);
-                if !ids.is_empty() {
-                    for id in ids {
-                        if !out.contains(&id) {
-                            out.push(id);
-                        }
-                    }
-                    break;
-                }
-                for base in self.bases_seen(&cur, sees) {
-                    queue.push_back(base);
+            for id in self.inherited_method_targets_among(&c, kind, sees, targets) {
+                if !out.contains(&id) {
+                    out.push(id);
                 }
             }
         }
         out
+    }
+
+    /// Nearest inherited member definitions for one concrete receiver view.
+    /// Unlike CHA this does not descend into subclasses or apply their final
+    /// boundaries. Callers can union independent receiver/image views safely.
+    pub fn inherited_method_targets_among(
+        &self,
+        cls: &str,
+        kind: &MethodKind,
+        sees: &dyn Fn(FileId) -> bool,
+        targets: &dyn Fn(FnId) -> bool,
+    ) -> Vec<FnId> {
+        let own = self.members_among(&kind.name_on(cls), targets);
+        if !own.is_empty() {
+            return own;
+        }
+        // `c`'s own lookup just missed, so start the walk at its bases
+        // rather than letting the queue repeat that same query.
+        let mut queue = std::collections::VecDeque::new();
+        let mut seen = std::collections::BTreeSet::new();
+        queue.extend(self.bases_seen(cls, sees));
+        seen.insert(cls.to_owned());
+        while let Some(cur) = queue.pop_front() {
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            let ids = self.members_among(&kind.name_on(&cur), targets);
+            if !ids.is_empty() {
+                return ids;
+            }
+            for base in self.bases_seen(&cur, sees) {
+                queue.push_back(base);
+            }
+        }
+        Vec::new()
     }
 
     pub fn add_diagnostic(&mut self, diag: Diagnostic) {

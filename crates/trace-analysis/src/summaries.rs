@@ -54,6 +54,10 @@ pub enum Effect {
     /// the member and every override of it the tree defines is the entry of
     /// an execution context of kind `context`, which no call site starts.
     Entry { context: ContextKind },
+    /// A bodyless framework callee dispatches across IPC to this qualified
+    /// member or an in-tree implementation (docs/ANALYSIS.md, "OpenHarmony
+    /// IPC bridges"). Call edges only; no parcel or pointer value flow.
+    Ipc { target: String },
 }
 
 /// Where a callback an [`Effect::Invoke`] model runs executes, as the model
@@ -264,6 +268,12 @@ impl FnModelSet {
     pub fn builtin() -> Self {
         let mut set = Self::default();
         let mut reg = |name: &str, effects: Vec<Effect>| set.register(FnModel::new(name, effects));
+        reg(
+            "OHOS::DataShare::DataShareHelper::OpenFile",
+            vec![Effect::Ipc {
+                target: "OHOS::DataShare::DataShareStub::OpenFile".into(),
+            }],
+        );
         // Task, thread and timer primitives (`docs/ANALYSIS.md`, "Built-in
         // models"): each runs one callback, in the context it states.
         use ContextKind::{PoolTask, SerialTask, Thread};
@@ -401,7 +411,7 @@ impl FnModelSet {
     /// `ns::dlsym` share the POSIX model. Authoritative for every effect of
     /// the function: an empty one disables. The analysis matches through
     /// [`ModelLookup`], which applies these rules to `dlsym`, `invoke` and
-    /// `entry` effects only and falls back to the class rule.
+    /// `entry` and `ipc` effects only and falls back to the class rule.
     pub fn get_for_callee(&self, name: &str) -> Option<&FnModel> {
         if let Some(m) = self.by_name.get(name) {
             return Some(m);
@@ -433,7 +443,7 @@ impl FnModelSet {
                     .into_iter()
                     .find_map(|n| self.by_name.get(n))
             }
-            EffectGroup::Dlsym | EffectGroup::Invoke | EffectGroup::Entry => {
+            EffectGroup::Dlsym | EffectGroup::Invoke | EffectGroup::Entry | EffectGroup::Ipc => {
                 self.get_for_callee(name)
             }
         }
@@ -546,6 +556,8 @@ pub enum EffectGroup {
     Invoke,
     /// `entry`: a member a framework calls.
     Entry,
+    /// `ipc`: a bodyless framework call crosses an opaque IPC boundary.
+    Ipc,
 }
 
 impl Effect {
@@ -562,6 +574,7 @@ impl Effect {
             Self::Dlsym { .. } => EffectGroup::Dlsym,
             Self::Invoke { .. } => EffectGroup::Invoke,
             Self::Entry { .. } => EffectGroup::Entry,
+            Self::Ipc { .. } => EffectGroup::Ipc,
         }
     }
 }
@@ -682,6 +695,7 @@ struct RawModel {
 #[derive(serde::Deserialize)]
 struct RawEffect {
     kind: String,
+    target: Option<String>,
     dst: Option<u32>,
     src: Option<u32>,
     ptr: Option<u32>,
@@ -707,6 +721,9 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
     let need = |v: Option<u32>, field: &str, kind: &str| -> Result<u32, String> {
         v.ok_or_else(|| format!("effect kind {kind:?} requires `{field}`"))
     };
+    if raw.kind != "ipc" && raw.target.is_some() {
+        return Err(format!("effect kind {:?} takes no `target`", raw.kind));
+    }
     if raw.kind != "invoke"
         && (raw.args.is_some()
             || raw.rest.is_some()
@@ -733,6 +750,39 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
         }),
     };
     match raw.kind.as_str() {
+        "ipc" => {
+            if [raw.dst, raw.src, raw.ptr, raw.value, raw.param]
+                .iter()
+                .any(Option::is_some)
+            {
+                return Err("effect kind \"ipc\" takes only `target`: it names no parameter".into());
+            }
+            let target = raw
+                .target
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .trim_start_matches("::");
+            if !target
+                .rsplit_once("::")
+                .is_some_and(|(class, method)| !class.is_empty() && !method.is_empty())
+                || target.chars().any(char::is_whitespace)
+                || target.contains(['<', '>', '*', '&', '~', '(', ')'])
+                || target.split("::").any(|part| {
+                    let mut chars = part.chars();
+                    part == "operator"
+                        || !chars.next().is_some_and(|c| c == '_' || c.is_alphabetic())
+                        || chars.any(|c| c != '_' && !c.is_alphanumeric())
+                })
+            {
+                return Err(
+                    "effect kind \"ipc\" requires `target` naming a member, `Class::method`".into(),
+                );
+            }
+            Ok(Effect::Ipc {
+                target: target.into(),
+            })
+        }
         "alias" => Ok(Effect::Alias {
             dst: need(raw.dst, "dst", "alias")?,
             src: need(raw.src, "src", "alias")?,
@@ -825,7 +875,7 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
         }),
         other => Err(format!(
             "unknown effect kind {other:?} (expected alias, mem_copy, content_store, \
-             epoll_register, epoll_wait, return_alias, return_heap, clears, dlsym, invoke, entry)"
+             epoll_register, epoll_wait, return_alias, return_heap, clears, dlsym, invoke, entry, ipc)"
         )),
     }
 }
@@ -833,6 +883,36 @@ fn effect_from_toml(raw: &RawEffect) -> Result<Effect, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipc_models_require_a_qualified_target_without_value_operands() {
+        for effect in [
+            "{ kind = 'ipc' }",
+            "{ kind = 'ipc', target = 'OpenFile' }",
+            "{ kind = 'ipc', target = 'Stub::' }",
+            "{ kind = 'ipc', target = \"Stub::\\tOpenFile\" }",
+            "{ kind = 'ipc', target = \"Stub::\\nOpenFile\" }",
+            "{ kind = 'ipc', target = 'A::~A' }",
+            "{ kind = 'ipc', target = 'A::operator()' }",
+            "{ kind = 'ipc', target = 'Stub::OpenFile', param = 0 }",
+            "{ kind = 'ipc', target = 'Stub::OpenFile', args = [] }",
+            "{ kind = 'ipc', target = 'Stub::OpenFile', context = 'thread' }",
+            "{ kind = 'return_heap', target = 'Stub::OpenFile' }",
+        ] {
+            let config = format!("[[model]]\nname = 'send'\neffects = [{effect}]");
+            assert!(FnModelSet::from_toml_str(&config).is_err(), "{config}");
+        }
+        let models = FnModelSet::from_toml_str(
+            "[[model]]\nname = 'send'\neffects = [{ kind = 'ipc', target = '::Stub::OpenFile' }]",
+        )
+        .unwrap();
+        assert_eq!(
+            models.get("send").unwrap().effects,
+            vec![Effect::Ipc {
+                target: "Stub::OpenFile".into()
+            }]
+        );
+    }
 
     #[test]
     fn epoll_models_are_configurable() {

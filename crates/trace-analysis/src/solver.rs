@@ -38,7 +38,8 @@ pub struct AnalyzeOptions {
     /// differently loaded machines stop at different points.
     pub solve_budget_secs: Option<u64>,
     /// Emit synthetic IPC proxy→stub bridge edges (detected from class-name
-    /// patterns). Disable to keep the call graph free of synthetic edges.
+    /// patterns or function models). Disable to keep the call graph free of
+    /// synthetic IPC edges.
     pub enable_ipc: bool,
 }
 
@@ -1838,7 +1839,8 @@ fn apply_fn_model(
             | Effect::ReturnHeap
             | Effect::Dlsym { .. }
             | Effect::Invoke { .. }
-            | Effect::Entry { .. } => {}
+            | Effect::Entry { .. }
+            | Effect::Ipc { .. } => {}
         }
     }
 }

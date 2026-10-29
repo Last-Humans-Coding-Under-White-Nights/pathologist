@@ -15,9 +15,13 @@
 //!   method name correspondence (e.g. `FooProxy::Bar` → `FooStub::Bar`).
 //! - A proxy/stub pair named by an `.idl` interface (`Program::idl_interfaces`)
 //!   is registered without a `SendRequest` call or handler bodies.
+//! - An `ipc` function model summarizes an out-of-tree framework boundary
+//!   from a bodyless sender to implementations of its named target member.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use trace_ir::{FnId, IpcBridge, Program, TypeKind};
+
+use crate::summaries::{class_may_be, Effect, EffectGroup, FnModelSet, ModelLookup};
 
 /// `(qualified_class_name, handler FnIds)` for each detected stub class.
 type StubClasses = Vec<(String, Vec<FnId>)>;
@@ -29,7 +33,180 @@ type ProxyMethods = Vec<(String, String, FnId)>;
 ///
 /// Pure: reads `program` and returns the matched bridges. Runs after merge,
 /// during PAG build. No `Program` mutation required.
+/// This convenience entry point uses built-in function models only. The
+/// analysis pipeline passes configured models to `Pag::build_with_models`.
 pub fn detect_ipc_pairs(program: &Program) -> Vec<IpcBridge> {
+    detect_ipc_pairs_with_models(program, &FnModelSet::builtin().lookup(program))
+}
+
+pub(crate) fn detect_ipc_pairs_with_models(
+    program: &Program,
+    models: &ModelLookup,
+) -> Vec<IpcBridge> {
+    let mut bridges = detect_named_pairs(program);
+    // Framework summaries use the same representation and execution-context
+    // handling as detected pairs. Keep the detector pure; all endpoints
+    // already exist in the merged symbol table.
+    let mut targets: FxHashMap<&str, Vec<FnId>> = FxHashMap::default();
+    let modeled: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| !f.is_defined)
+        .filter_map(|f| {
+            models
+                .model(&f.name, EffectGroup::Ipc)
+                .map(|model| (f, model))
+        })
+        .filter(|(_, model)| {
+            model
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Ipc { .. }))
+        })
+        .collect();
+    let names: FxHashSet<_> = modeled.iter().map(|(f, _)| f.name.as_str()).collect();
+    let mut callers: FxHashMap<FnId, std::collections::BTreeSet<trace_ir::FileId>> =
+        FxHashMap::default();
+    for site in program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|s| !s.unevaluated && names.contains(s.callee_name.as_str()))
+    {
+        for callee in program
+            .symbols
+            .callees_of_with_types(site, Some(&program.types))
+        {
+            let contexts = callers.entry(callee).or_default();
+            contexts.insert(site.scope_file());
+            contexts.extend(program.symbols.call_translation_units(site));
+        }
+    }
+    for (sender, model) in modeled {
+        let admits = |id| match callers.get(&sender.id) {
+            Some(contexts) => contexts
+                .iter()
+                .all(|&file| program.symbols.fallback_admits(id, file)),
+            None => {
+                !program.symbols.is_synthetic_function(sender.id)
+                    && program.symbols.fallback_admits(id, sender.file)
+            }
+        };
+        if sender.is_virtual {
+            let implementations = targets
+                .entry(&sender.name)
+                .or_insert_with(|| modeled_handlers(program, &sender.name));
+            if implementations.iter().any(|&id| {
+                let implementation = program.symbols.function(id);
+                implementation.target == sender.target
+                    && admits(id)
+                    && program.symbols.explicit_params_alike(
+                        sender,
+                        implementation,
+                        &program.types,
+                        trace_ir::SpellingTolerance::Override,
+                    ) != Some(false)
+            }) {
+                continue;
+            }
+        }
+        for effect in &model.effects {
+            let Effect::Ipc { target } = effect else {
+                continue;
+            };
+            let handlers = targets
+                .entry(target)
+                .or_insert_with(|| modeled_handlers(program, target));
+            // The cache is target-only and remains context-independent.
+            // Filter per sender through the same declaring-header policy as
+            // ordinary resolution, without confining the process boundary
+            // to a link image.
+            bridges.extend(
+                handlers
+                    .iter()
+                    .copied()
+                    .filter(|&id| admits(id))
+                    .map(|stub_handler| IpcBridge {
+                        proxy_method: sender.id,
+                        stub_handler,
+                        descriptor: String::new(),
+                    }),
+            );
+        }
+    }
+    let mut seen = FxHashSet::default();
+    bridges.retain(|b| seen.insert((b.proxy_method, b.stub_handler)));
+    bridges
+}
+
+/// Resolve on the modeled receiver classes, not on method owners: a
+/// provider's implementation may be inherited from a different base branch.
+fn modeled_handlers(program: &Program, target: &str) -> Vec<FnId> {
+    let Some((base, member)) = target.rsplit_once("::") else {
+        return Vec::new();
+    };
+    let owners = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.is_cpp)
+        .filter_map(|f| f.name.rsplit_once("::").map(|(class, _)| class));
+    // Inheritance endpoints include bodyless providers and out-of-tree
+    // bases. Sorting also makes declared_class_names' unordered view stable.
+    let classes: std::collections::BTreeSet<_> = program
+        .types
+        .declared_class_names()
+        .chain(owners)
+        .chain(
+            program
+                .inheritance()
+                .iter()
+                .flat_map(|(derived, base)| [derived.as_str(), base.as_str()]),
+        )
+        .filter(|class| class_may_be(base, class, program.types.is_struct_declared(class)))
+        .collect();
+    let kind = trace_ir::MethodKind::Named(member.to_owned());
+    let images: std::collections::BTreeSet<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.is_cpp && f.is_defined)
+        .map(|f| f.target)
+        .collect();
+    let providers: std::collections::BTreeSet<_> = classes
+        .into_iter()
+        .flat_map(|class| program.subclass_closure(class))
+        .collect();
+    let mut seen = FxHashSet::default();
+    let mut handlers = Vec::new();
+    for image in images {
+        let defined = |id| {
+            let f = program.symbols.function(id);
+            f.is_defined && f.is_cpp && f.target == image
+        };
+        let sees = |file| {
+            !program.symbols.has_target_scopes()
+                || program
+                    .link_targets
+                    .iter()
+                    .filter(|t| Some(t.id) == image)
+                    .flat_map(|t| &t.sources)
+                    .any(|&tu| program.symbols.file_sees(tu, file))
+        };
+        for class in &providers {
+            handlers.extend(
+                program
+                    .inherited_method_targets_among(class, &kind, &sees, &defined)
+                    .into_iter()
+                    .filter(|&id| seen.insert(id)),
+            );
+        }
+    }
+    handlers
+}
+
+fn detect_named_pairs(program: &Program) -> Vec<IpcBridge> {
     let (stubs, proxies) = scan(program);
     if proxies.is_empty() {
         return Vec::new();

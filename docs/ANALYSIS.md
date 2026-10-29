@@ -1602,6 +1602,52 @@ calls through the interface.
 The edge has resolution `ipc` and no source call site, and can be disabled
 with `--no-ipc`. Each handler a bridge targets is also an `ipc_handler`
 [execution context](#execution-contexts).
+
+When the framework's proxy and dispatcher are outside the analyzed tree, an
+`ipc { target = "Base::method" }` function model can summarize that boundary.
+For a bodyless modeled function, it adds a synthetic `ipc` edge to every
+in-tree implementation that member lookup on `Base` or its subclasses reaches.
+The shared inherited-method lookup retains the actual defining function,
+including an implementation on an ancestor or a separate branch of a virtual
+interface hierarchy. Repeated inherited targets produce one edge per sender.
+Class matching uses the [model matching](#model-matching) rule, including
+undeclared base spellings. All matching implementations and overloads are retained across
+link targets; no URI/provider selection, parcel argument flow, or return flow
+is inferred. In a bare tree, handlers obey
+[declaring-header eligibility](#declaring-header-eligibility) in **every known
+calling context** of the modeled sender, including shared-header contributors.
+A single sender node is shared by its callers: if any production context cannot
+admit a test provider, test callers sharing that sender also cannot reach it.
+Test-exclusive senders retain their mocks. A real declaration with no known
+callers uses its declaring context; an unreferenced synthesized sender supplies
+no declaration evidence and adds no summary. An arbitrary representative file
+of a synthesized external never decides eligibility. `--no-test-partition`
+disables this inferred partition. Authoritative link metadata disables it as
+in ordinary resolution; IPC bridges still cross link images.
+
+A defined sender uses its indexed body. A virtual declaration also uses its
+reachable indexed overrides in the sender's image instead of a summary;
+abstract interfaces without an indexed implementation retain the fallback.
+The convenience Rust API `detect_ipc_pairs` uses built-in models; the pipeline
+passes configured models to PAG construction.
+
+Provider inheritance is resolved separately for each image and concrete receiver,
+then unioned by defining `FnId`; final metadata in an independent service image
+cannot suppress another provider. During `trace-merge`, retained IPC edges follow
+the same bindings as incoming calls to their sender, including unresolved
+declarations. If callers reach both a declaration and definitions, each retains
+the bridge. Single-input merges preserve bridges without requiring a sender
+definition, and all retained bridges keep synthetic NULL call sites. Merge
+preserves these conservative summaries rather than revalidating framework absence or discovering new proxy/stub pairs.
+
+The built-in
+`OHOS::DataShare::DataShareHelper::OpenFile` model targets
+`OHOS::DataShare::DataShareStub::OpenFile`, so a media-library-only analysis
+can reach `MediaDataShareStubImpl::OpenFile` and its extension ability without
+indexing the DataShare framework. This is a may-call to every indexed provider,
+not proof that a particular URI selects one. An empty same-name model disables
+the summary; `--no-ipc` disables it together with detected bridges.
+
 Because v1 has no opcode or parcel-type information, overloaded handlers at
 the selected naming tier are all retained as a may-analysis result. With `m`
 proxy overloads and `n` handler overloads this deliberately emits the full
@@ -1947,7 +1993,7 @@ and return effects skip rules 2 and 3 (below). The rules, in precedence order:
    bases, so `Leaf : Z, A` and `Leaf : A, Z` both take `A::Post` over `Z::Post`.
    The choice is per effect group (see below).
 
-Rules 2 and 3 name models for `dlsym`, `invoke` and `entry` effects only.
+Rules 2 and 3 name models for `dlsym`, `invoke`, `entry` and `ipc` effects only.
 **Argument and return effects** (`alias`, `mem_copy`, `content_store`, `epoll_register`, `epoll_wait`, `clears`;
 `return_alias`, `return_heap`) take rule 1 alone, where
 the name may also be written with a leading `::` or `std::`, which name the
@@ -1972,7 +2018,7 @@ does a function take rule 4's.
 the first rule-4 model, in the order above, that has an effect of that group; a
 model with none is passed over. The groups are the parts of the analysis that
 apply them: argument effects (`alias`, `mem_copy`, `content_store`, `epoll_register`, `epoll_wait`, `clears`),
-return effects (`return_alias`, `return_heap`), `dlsym`, `invoke` and `entry`. So
+return effects (`return_alias`, `return_heap`), `dlsym`, `invoke`, `entry` and `ipc`. So
 a nearer base's `entry` model of `Mid::m` does not hide a farther base's `invoke`
 model of `Base::m` for `Leaf::m`, and a requalified or subclass call takes every
 group of the library member's model. The rule-4 candidates for a name are
@@ -1992,6 +2038,7 @@ resolved once per analysis and shared by every lookup.
 | `clears { param }` | **terminator**: memory reachable via `param[param]` is zeroed by this call | no value introduction; terminator event exported |
 | `dlsym { param }` | return value may be the address of the in-tree function named by string constants in `param[param]` | `Dlsym` PAG constraint; unknown names add nothing |
 | `entry { context }` | the named member `Class::method` is one a framework calls: it and every override of it the tree defines is the entry of an [execution context](#execution-contexts) of kind `context`, which no call site starts | none: no edge, no flow |
+| `ipc { target }` | a bodyless callee dispatches to the qualified member `Base::method` or its in-tree implementations; see [OpenHarmony IPC bridges](#openharmony-ipc-bridges) for matching and imprecision | synthetic `ipc` call edges, no value flow |
 | `invoke { param, args / rest, context, supplies, if_arg / unless_arg }` | may invoke the callback passed in `param[param]`, with the arguments `args = [..]` lists (none when omitted: a zero-argument callback) or every argument from position `rest` on, preceded by a value of class `supplies` when the callback takes one, in an execution context of kind `context` (`unknown` when omitted); with `if_arg` / `unless_arg`, only at a call whose argument it names may be / may not be of the class it names | adds an indirect edge from the submitting caller at the submission site, read off the converged points-to sets; callback return values and scheduling are ignored. Forwarded arguments are wired into the callback's formals inside the fixpoint (see [Callback invocation](#callback-invocation-invoke)). Unlike the value-introducing effects this is not restricted to a bodyless callee — a callback API is routinely a template whose body the index holds once, uninstantiated — and an edge the callee's own body already yields is not added twice. Each resolved callback is also an [execution context](#execution-contexts) |
 
 Effects attach to parameter positions (0-based) of the *actual arguments* recorded at
@@ -2258,6 +2305,7 @@ entries:
 | `OHOS::Thread::Run` | `entry context=thread` (c_utils runs it on the thread `Start` creates) |
 | `OHOS::AppExecFwk::EventHandler::ProcessEvent` | `entry context=serial_task` (the handler's event runner calls it) |
 | `OHOS::IRemoteObject::DeathRecipient::OnRemoteDied` | `entry context=ipc_handler` (an IPC thread calls it when the remote dies) |
+| `OHOS::DataShare::DataShareHelper::OpenFile` | `ipc target="OHOS::DataShare::DataShareStub::OpenFile"` |
 
 ### Configuration format
 
@@ -2307,9 +2355,20 @@ effects = [
 name = "OHOS::Worker::Loop"
 effects = [ { kind = "entry", context = "thread" } ]
 
+# A bodyless framework member dispatches to indexed provider implementations.
+# Matching and imprecision: see "OpenHarmony IPC bridges" above.
+[[model]]
+name = "MyFramework::OpenFile"
+effects = [ { kind = "ipc", target = "MyProviderStub::OpenFile" } ]
+
 # An explicitly empty effect list overrides (disables) a same-name built-in.
 [[model]]
 name = "memcpy"
+effects = []
+
+# Disable only the built-in DataShare summary, retaining detected IPC bridges.
+[[model]]
+name = "OHOS::DataShare::DataShareHelper::OpenFile"
 effects = []
 ```
 
@@ -3426,7 +3485,24 @@ C++-aware only where it must be — everything else reuses the C machinery.
   must all take the arguments and agree on one return type (`T *get()` and
   `T *get() const` do); otherwise the local stays unknown. `T(args)` is a
   construction when the call site reads it as one, and gives `T`. Pointer
-  layers on definitions and member prototypes, and declaration-only
+  wrapper constructions `std::shared_ptr<T>(p)`, `std::unique_ptr<T>(p)`,
+  `std::weak_ptr<T>(p)`, `sptr<T>(p)` and `wptr<T>(p)` also retain the wrapper
+  and its known class argument when their headers are absent. Declared
+  construction takes precedence, including unqualified template constructions
+  and wrappers with additional template arguments such as a `unique_ptr` deleter.
+  Declared constructions retain their fully qualified template arguments for
+  pointee and member-return substitution, including declarations from `--dep`.
+  Unqualified constructions retain the declared class's canonical namespace;
+  a same-named wrapper in another namespace is not a member-call candidate.
+  For calls without a declared construction, ordinary and argument-dependent
+  lookup use the actual argument types before this name-based inference;
+  any function declaration found takes
+  precedence, even when its return type cannot be inferred.
+  The fallback rejects a dependent complete callee spelling (including a
+  template-template parameter named `sptr`) and unsupported templated owners
+  such as `Outer<Item>::sptr<Other>`; the outer template's arguments are never
+  used as that nested wrapper's pointee.
+  Pointer layers on definitions and member prototypes, and declaration-only
   reference-return factories, are preserved for this lookup. A non-call
   initializer takes the receiver type the member-call path already reads:
   copies from typed variables and fields (`auto p = q.a`), `*pp` and `&w`; a
@@ -3782,6 +3858,38 @@ member name: `u->handler(1)` on an undeclared `Unseen` is
 `OHOS::Unseen::handler`, not a free function `handler` (#147, #153); as with
 a forward-declared class, the member may really be a function-pointer field
 of the unseen body, which the index cannot tell apart.
+
+After merge, an external member on an undeclared receiver retains its external
+leaf and may recover indexed definitions with the same final class name.
+Candidates are indexed by receiver class and member, so repeated misses do not
+scan every method sharing a common name. Lowering records the source argument
+count and lexical namespace evidence for these unresolved member calls.
+
+For a qualified owner, recovery requires a lexical namespace guess belonging
+to the caller, or completion of a partial namespace qualifier (`IPC` to
+`OHOS::Media::IPC`). Candidates must also lie in namespace prefixes reachable
+through enclosing scopes or visible using directives/declarations. An explicit
+unrelated qualifier is never replaced with a different namespace.
+An explicitly named standard-library owner (`std::mutex`, for example) never
+acquires an unrelated project class. A bare owner can reflect an unavailable
+using import and conservatively retains namesakes. An indexed using declaration
+is applied while guessing the receiver, before recovery is needed. When the
+imported type itself is absent, its first qualifier is resolved against declared
+namespace/class roots in enclosing scopes; without that evidence the spelling
+remains global (`using std::string;` keeps `std::string`). An explicit leading
+`::` also remains global. The motivating
+`OHOS::DataShare::MediaDataShareExtAbility` spelling can thus reach the definition
+under `OHOS::AbilityRuntime` through its enclosing `OHOS` context. A declared
+receiver never takes this fallback.
+
+The shared resolver preserves image, declaring-header and test-partition rules.
+TU-local definition precedence is applied **per compatible overload signature**,
+so a local `Run(int)` cannot suppress a `Run(long)` defined elsewhere. Recovered
+overloads are filtered by the source call's explicit argument count, including
+default arguments and variadics; when none fits, all remain as a may-analysis
+fallback. The missing declaration supplies no evidence for ranking equally
+viable overloads by receiver type. This adds call reachability without merging
+classes or inventing missing layouts.
 
 Not guessed: a function's return type (`Unresolved GetBare(); auto p =
 GetBare();` leaves `p` untyped; `T f();` declares a function anywhere, in
