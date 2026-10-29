@@ -5090,23 +5090,42 @@ the jump leaves, and a fallthrough past it; a label the body lacks adds an
   throws to the nested landing, which passes on what its handlers do not
   catch. An exception leaving automatic objects destroys them on the way:
   when objects of the scopes inside the `try` are live at a call, the
-  block's `exception` edge goes to a cleanup block holding their destructor
-  events (innermost first, in reverse declaration order, as a `return`
-  destroys them), which has an `exception` edge on to the landing. A block
-  whose live objects change between its calls (`Guard g;` after a call)
-  has an edge for each set; an object counts once its constructor has
-  run, and no longer once its destructor starts, so a destructor's own
-  event never throws through a copy of itself. One cleanup block serves
-  every call that leaves the same objects for the same landing; its
-  events are additional copies of the objects' destructor sites (one
-  position, see [Query](#query)). So in
+  block's `exception` edge goes to the cleanup block of the latest of them,
+  which holds that object's destructor events and has an `exception` edge
+  on to the cleanup block of the object declared before it, and so on
+  (innermost first, in reverse declaration order, as a `return` destroys
+  them) to the landing. A call that leaves fewer objects for the same
+  landing enters the same chain further down, so there is one cleanup
+  block per object and landing, never one per set of live objects: a body
+  of n objects stores O(n) cleanup events. A block whose live objects
+  change between its calls (`Guard g;` after a call) has an edge for each
+  set. An object counts once its constructor (its whole initializer) has
+  run, in every declaration form: in `if (G b = G())` and
+  `while (G d = G())` as in `G b = G();`, `G::G` throws straight to the
+  landing, never through a copy of `~G` for the object it failed to build.
+  It no longer counts once its destructor starts, so a destructor's own
+  event never throws through a copy of itself. The cleanup events are
+  additional copies of the objects' destructor sites (one position, see
+  [Query](#query)). So in
   `try { Guard g; may_throw(); later(); } catch (...) { h(); }`
-  `later` only `may_precede` `Guard::~Guard`, which `may_precede` `h`. The
+  `later` only `may_precede` `Guard::~Guard`, which `may_precede` `h`. A
+  destructor run on the way out of a scope normally (its end, `return`,
+  `break`, `continue`, `goto`) may throw like any call; one run while an
+  exception propagates (a `throw`'s own destructors, a cleanup block's)
+  takes no `exception` edge, since a destructor throwing then calls
+  `std::terminate`. Nor does a call that is never evaluated
+  ([unevaluated operands](#unevaluated-operands), `CallSite::unevaluated`). The
   landing has an edge to each handler. Unless a handler is
   `catch (...)` (its parameter list is the ellipsis alone: a pack expansion
   inside a typed handler, `catch (Fault<Ts...> &)`, does not count), the landing also has an `exception` edge to the
-  enclosing landing or the function's exceptional exit, through a cleanup
-  block for the objects live around the `try` statement. So in
+  enclosing landing or the function's exceptional exit, through the cleanup
+  chain of the objects live around the `try` statement, once a path from
+  the entry reaches the landing (a function-try-block's always, its
+  initializers may throw): a `try` whose body cannot throw, or throws only
+  from code after a `return` or `break`, passes nothing on and builds no
+  cleanup, so in `G g; w(); try { n = 1; } catch (E &) {} k();` `w`
+  stays `guaranteed_before` and `k` `sequenced_before` `~G`. A cleanup block no path reaches holds
+  no events and is removed with the empty blocks. So in
   `try { try { a(); } catch (...) {} } catch (...) { c(); }` `a` and `c`
   are exclusive, while a typed inner `catch`, or a call in the inner
   handler, may reach `c`. A constructor's function-try-block

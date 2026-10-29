@@ -185,3 +185,98 @@ void unwound_nested()
         h();
     }
 }
+
+struct G {
+    G();
+    ~G();
+    explicit operator bool() const;
+};
+struct E {
+};
+void w();
+int n;
+
+void dead_landing()
+{
+    G g;
+    w();
+    try {
+        n = 1;
+    } catch (E &) {
+    }
+    k();
+}
+
+void dead_after_return()
+{
+    w();
+    try {
+        return;
+        later();
+    } catch (E &) {
+    }
+}
+
+void dead_after_break()
+{
+    G g;
+    w();
+    for (;;) {
+        try {
+            break;
+            later();
+        } catch (E &) {
+        }
+    }
+    k();
+}
+
+void condition_if()
+{
+    try {
+        if (G b = G())
+            w();
+    } catch (...) {
+    }
+}
+
+void condition_while()
+{
+    try {
+        while (G d = G())
+            w();
+    } catch (...) {
+    }
+}
+
+void declared_object()
+{
+    try {
+        G b = G();
+        w();
+    } catch (...) {
+    }
+}
+
+void unevaluated_in_try()
+{
+    G g;
+    w();
+    try {
+        n = sizeof(k());
+    } catch (E &) {
+    }
+}
+
+void thrown_pair()
+{
+    try {
+        G a;
+        G b;
+        if (k())
+            throw 1;
+        w();
+    } catch (...) {
+        h();
+    }
+}

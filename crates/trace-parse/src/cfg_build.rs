@@ -171,6 +171,12 @@ struct Builder<'s, 'a> {
     unclaimed: Vec<usize>,
     cfg: FunctionCfg,
     has_pred: Vec<bool>,
+    /// Blocks a path from the entry reaches over the edges made so far
+    /// ([`Self::reach`]).
+    reached: Vec<bool>,
+    /// Each block's out-edges so far: how many, and the latest's target.
+    out_degree: Vec<u32>,
+    last_successor: Vec<BlockId>,
     /// Each block's innermost `try` landing as it was made: where its
     /// calls throw to, through a cleanup block destroying the objects the
     /// exception leaves ([`Self::unwinding_to`]). An enclosing `try`
@@ -182,13 +188,21 @@ struct Builder<'s, 'a> {
     /// block's value when its events last took their exception edge.
     live: u32,
     thrown_at: Vec<u32>,
-    /// Cleanup blocks by the target they lead to and the live objects they
-    /// destroy, as `(scope serial, object count)` per scope holding any.
-    cleanups: HashMap<(BlockId, Vec<(u32, usize)>), BlockId>,
-    /// Each cleanup block, its target and the destructor sites of its
-    /// objects in destruction order: filled once the body is walked, so its
-    /// events never fall inside a group or gap the walk is making.
-    pending_cleanups: Vec<(BlockId, BlockId, Vec<Vec<usize>>)>,
+    /// Cleanup blocks by the target their chain leads to, the serial of
+    /// the scope of the object they destroy and that object's count of
+    /// objects up to it in the scope ([`Self::unwinding_to`]).
+    cleanups: HashMap<(BlockId, u32, usize), BlockId>,
+    /// Each cleanup block and the destructor sites of its object: filled
+    /// once the body is walked, so its events never fall inside a group or
+    /// gap the walk is making.
+    pending_cleanups: Vec<(BlockId, Vec<usize>)>,
+    /// Objects whose declarator the walk passed before their initializer
+    /// (`if (G b = G())`): their destructor sites, by the initializer node
+    /// whose events build them. They are live once it has run.
+    unbuilt: Vec<(usize, Vec<usize>)>,
+    /// While a `throw` destroys the objects it leaves: a destructor
+    /// throwing then terminates, so its events take no exception edge.
+    unwinding: bool,
     /// While [`Self::unwind_since`] destroys `scopes[s].objects[k]`:
     /// `(s, k)`. That object, and those destroyed before it, are no
     /// longer live should its destructor throw.
@@ -302,12 +316,17 @@ impl<'s, 'a> Builder<'s, 'a> {
                 gaps: Vec::new(),
             },
             has_pred: Vec::new(),
+            reached: Vec::new(),
+            out_degree: Vec::new(),
+            last_successor: Vec::new(),
             landing: Vec::new(),
             exception_edges: Default::default(),
             live: 0,
             thrown_at: Vec::new(),
             cleanups: HashMap::default(),
             pending_cleanups: Vec::new(),
+            unbuilt: Vec::new(),
+            unwinding: false,
             dying: None,
             function_try: None,
             prologue_in_try: None,
@@ -322,7 +341,8 @@ impl<'s, 'a> Builder<'s, 'a> {
             depth: 0,
             spans: Vec::new(),
         };
-        builder.new_block(BlockKind::Entry);
+        let entry = builder.new_block(BlockKind::Entry);
+        builder.reached[entry.0 as usize] = true;
         builder.new_block(BlockKind::Exit);
         builder
     }
@@ -359,18 +379,38 @@ impl<'s, 'a> Builder<'s, 'a> {
             events: Vec::new(),
         });
         self.has_pred.push(false);
+        self.reached.push(false);
+        self.out_degree.push(0);
+        self.last_successor.push(id);
         let landing = self.innermost_landing();
         self.landing.push(landing);
         self.thrown_at.push(u32::MAX);
         id
     }
 
+    /// The scope index of the `try` whose landing is `landing`, or of the
+    /// innermost `try` around the walk (`landing` `None`), if any.
+    fn try_scope(&self, landing: Option<BlockId>) -> Option<usize> {
+        self.scopes.iter().rposition(|s| match s.kind {
+            ScopeKind::Try { landing: l } => landing.is_none_or(|x| x == l),
+            _ => false,
+        })
+    }
+
     /// The landing of the innermost `try` around the walk, if any.
     fn innermost_landing(&self) -> Option<BlockId> {
-        self.scopes.iter().rev().find_map(|s| match s.kind {
+        let at = self.try_scope(None)?;
+        match self.scopes[at].kind {
             ScopeKind::Try { landing } => Some(landing),
-            _ => None,
-        })
+            _ => unreachable!("a try scope"),
+        }
+    }
+
+    /// The first scope whose objects an exception thrown now destroys on
+    /// its way to the innermost handler: the one after the innermost `try`,
+    /// or the outermost when it leaves the function.
+    fn handler_scope(&self) -> usize {
+        self.try_scope(None).map_or(0, |at| at + 1)
     }
 
     /// An `exception` edge, unless `from` already has it.
@@ -382,59 +422,72 @@ impl<'s, 'a> Builder<'s, 'a> {
 
     /// Where an exception thrown now leaves for `target`, the landing of
     /// the `try` at `scopes[from - 1]` (or the exceptional exit, `from` 0):
-    /// a cleanup block destroying the live objects of `scopes[from..]`,
-    /// innermost first as [`Self::unwind`] does, then `target`; `target`
-    /// itself when there are none. One cleanup block serves every throw
-    /// that leaves the same objects.
+    /// the cleanup block destroying the latest live object of
+    /// `scopes[from..]`, which leads on to the one destroying the object
+    /// before it, and so on to `target` (innermost first, in reverse
+    /// declaration order, as [`Self::unwind`] destroys them); `target`
+    /// itself when none is live. The chain is shared: a throw that leaves
+    /// fewer objects for the same target enters it further down, so the
+    /// blocks are one per object, not one per set of live objects.
     fn unwinding_to(&mut self, from: usize, target: BlockId) -> BlockId {
-        // Each scope's live objects, as a count of its first ones.
-        let live: Vec<(usize, usize)> = (from..self.scopes.len())
-            .map(|at| {
-                let count = match self.dying {
-                    Some((scope, _)) if at > scope => 0,
-                    Some((scope, object)) if at == scope => object,
-                    _ => self.scopes[at].objects.len(),
-                };
-                (at, count)
-            })
-            .filter(|&(_, count)| count > 0)
-            .collect();
-        if live.is_empty() {
-            return target;
+        // From the latest live object back: the first that has its cleanup
+        // already, and where the objects after it start.
+        let mut next = target;
+        let mut resume = (from, 0);
+        'found: for at in (from..self.scopes.len()).rev() {
+            let serial = self.scopes[at].serial;
+            for count in (1..=self.live_count(at)).rev() {
+                if let Some(&cleanup) = self.cleanups.get(&(target, serial, count)) {
+                    next = cleanup;
+                    resume = (at, count);
+                    break 'found;
+                }
+            }
         }
-        let key = (
-            target,
-            live.iter()
-                .map(|&(at, count)| (self.scopes[at].serial, count))
-                .collect(),
-        );
-        if let Some(&cleanup) = self.cleanups.get(&key) {
-            return cleanup;
+        for at in resume.0..self.scopes.len() {
+            let first = if at == resume.0 { resume.1 } else { 0 };
+            let serial = self.scopes[at].serial;
+            for count in first + 1..=self.live_count(at) {
+                let cleanup = self.new_block(BlockKind::Ordinary);
+                // Its own edge leads on.
+                self.landing[cleanup.0 as usize] = None;
+                self.exception_edge(cleanup, next);
+                let sites = self.scopes[at].objects[count - 1].clone();
+                self.pending_cleanups.push((cleanup, sites));
+                self.cleanups.insert((target, serial, count), cleanup);
+                next = cleanup;
+            }
         }
-        let cleanup = self.new_block(BlockKind::Ordinary);
-        // Its own edge leads on to `target`.
-        self.landing[cleanup.0 as usize] = None;
-        let objects = live
-            .iter()
-            .rev()
-            .flat_map(|&(at, count)| self.scopes[at].objects[..count].iter().rev().cloned())
-            .collect();
-        self.pending_cleanups.push((cleanup, target, objects));
-        self.cleanups.insert(key, cleanup);
-        cleanup
+        next
     }
 
-    /// The events of the cleanup blocks [`Self::unwinding_to`] made.
+    /// How many of `scopes[at]`'s objects are live: those declared so far,
+    /// less those [`Self::unwind_since`] is destroying.
+    fn live_count(&self, at: usize) -> usize {
+        match self.dying {
+            Some((scope, _)) if at > scope => 0,
+            Some((scope, object)) if at == scope => object,
+            _ => self.scopes[at].objects.len(),
+        }
+    }
+
+    /// The events of the cleanup blocks [`Self::unwinding_to`] made that a
+    /// path reaches. One nothing reaches (a throw from code after a
+    /// `return`) holds none: its edge becomes a fallthrough, so
+    /// [`FunctionCfg::compact`] removes it.
     fn fill_cleanups(&mut self) {
-        for (cleanup, target, objects) in std::mem::take(&mut self.pending_cleanups) {
+        for (cleanup, sites) in std::mem::take(&mut self.pending_cleanups) {
+            let b = cleanup.0 as usize;
+            if !self.reached[b] {
+                if let Some(e) = self.cfg.edges.iter_mut().find(|e| e.from == cleanup) {
+                    e.kind = EdgeKind::Fallthrough;
+                }
+                continue;
+            }
             self.start(cleanup);
-            for sites in objects {
-                self.emit_unordered(&sites, Some(EventKind::Destroy));
-            }
-            // The destructors may have continued in a block of their own.
-            if let Some(end) = self.cur {
-                self.exception_edge(end, target);
-            }
+            self.emit_unordered(&sites, Some(EventKind::Destroy));
+            // An empty frontier never splits the block.
+            debug_assert_eq!(self.cur, Some(cleanup));
         }
         self.cur = None;
         self.frontier.clear();
@@ -444,11 +497,7 @@ impl<'s, 'a> Builder<'s, 'a> {
     /// the objects it leaves to the innermost handler, or out of the
     /// function.
     fn unwinding_target(&mut self) -> BlockId {
-        let from = self
-            .scopes
-            .iter()
-            .rposition(|s| matches!(s.kind, ScopeKind::Try { .. }))
-            .map_or(0, |at| at + 1);
+        let from = self.handler_scope();
         let target = self.throw_target();
         self.unwinding_to(from, target)
     }
@@ -462,6 +511,42 @@ impl<'s, 'a> Builder<'s, 'a> {
     fn edge(&mut self, from: BlockId, to: BlockId, kind: EdgeKind) {
         self.cfg.edges.push(CfgEdge { from, to, kind });
         self.has_pred[to.0 as usize] = true;
+        let f = from.0 as usize;
+        self.out_degree[f] += 1;
+        self.last_successor[f] = to;
+        if self.reached[f] {
+            self.reach(to);
+        }
+    }
+
+    /// Mark `b` reached, and what its edges so far lead to. A block is
+    /// almost always reached before its own edges are made, or has one;
+    /// one reached later with more (a loop head or label after code no
+    /// path reaches) spreads over every edge.
+    fn reach(&mut self, mut b: BlockId) {
+        loop {
+            let at = b.0 as usize;
+            if self.reached[at] {
+                return;
+            }
+            self.reached[at] = true;
+            match self.out_degree[at] {
+                0 => return,
+                1 => b = self.last_successor[at],
+                _ => break,
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for e in &self.cfg.edges {
+                let (from, to) = (e.from.0 as usize, e.to.0 as usize);
+                if self.reached[from] && !self.reached[to] {
+                    self.reached[to] = true;
+                    changed = true;
+                }
+            }
+        }
     }
 
     fn start(&mut self, b: BlockId) {
@@ -521,13 +606,15 @@ impl<'s, 'a> Builder<'s, 'a> {
         // Any call may throw: to the block's landing, destroying the
         // objects live at the call on the way. A block whose objects
         // change between its calls takes an edge for each set.
+        // An event that never runs, and a destructor run while a `throw`
+        // unwinds (one throwing then terminates), throw nowhere.
         let b = block.0 as usize;
-        if let Some(landing) = self.landing[b].filter(|_| self.thrown_at[b] != self.live) {
+        let throws = self.quiet == 0 && !self.unwinding;
+        if let Some(landing) = self.landing[b].filter(|_| throws && self.thrown_at[b] != self.live)
+        {
             self.thrown_at[b] = self.live;
             let from = self
-                .scopes
-                .iter()
-                .rposition(|s| matches!(s.kind, ScopeKind::Try { landing: l } if l == landing))
+                .try_scope(Some(landing))
                 .map_or(self.scopes.len(), |at| at + 1);
             let target = self.unwinding_to(from, landing);
             self.exception_edge(block, target);
@@ -607,13 +694,25 @@ impl<'s, 'a> Builder<'s, 'a> {
             self.emit_sites(&indices, kind, Some(node));
         }
         if let Some(indices) = self.destructors.remove(&node.id()) {
-            match self.scopes.last_mut() {
-                Some(scope) => {
-                    scope.objects.push(indices);
-                    self.live += 1;
-                }
-                None => self.unclaimed.extend(indices),
+            match initializer_after(node) {
+                Some(value) => self.unbuilt.push((value.id(), indices)),
+                None => self.declare(indices),
             }
+        }
+        if let Some(at) = self.unbuilt.iter().position(|&(id, _)| id == node.id()) {
+            let (_, indices) = self.unbuilt.swap_remove(at);
+            self.declare(indices);
+        }
+    }
+
+    /// An automatic object of the innermost scope, live from now on.
+    fn declare(&mut self, indices: Vec<usize>) {
+        match self.scopes.last_mut() {
+            Some(scope) => {
+                scope.objects.push(indices);
+                self.live += 1;
+            }
+            None => self.unclaimed.extend(indices),
         }
     }
 
@@ -688,6 +787,7 @@ impl<'s, 'a> Builder<'s, 'a> {
         let mut rest: Vec<usize> = std::mem::take(&mut self.unclaimed);
         rest.extend(self.owned.drain().flat_map(|(_, v)| v));
         rest.extend(self.destructors.drain().flat_map(|(_, v)| v));
+        rest.extend(self.unbuilt.drain(..).flat_map(|(_, v)| v));
         rest.sort_unstable();
         self.frontier.clear();
         self.emit_sites(&rest, None, None);
@@ -852,12 +952,10 @@ impl<'a> Builder<'_, 'a> {
                 self.own(node);
                 // Leaving for a handler destroys the objects of the scopes
                 // left on the way.
-                let handler = self
-                    .scopes
-                    .iter()
-                    .rposition(|s| matches!(s.kind, ScopeKind::Try { .. }))
-                    .map_or(0, |at| at + 1);
+                let handler = self.handler_scope();
+                self.unwinding = true;
                 self.unwind(handler);
+                self.unwinding = false;
                 let target = self.throw_target();
                 // A call before it may already have taken the block there.
                 if let Some(b) = self.cur.take() {
@@ -1691,13 +1789,28 @@ impl<'a> Builder<'_, 'a> {
             self.pop_scope();
             self.jump(exit, EdgeKind::Fallthrough);
         }
-        if !catch_all {
-            // On through the objects the statement's scopes hold.
+        // On through the objects the statement's scopes hold, when an
+        // exception reaches the landing at all: a function-try-block's
+        // initializers, filled last, may throw to it.
+        let reached = self.reached[landing.0 as usize] || self.function_try == Some(node.id());
+        if !catch_all && reached {
             let outer = self.unwinding_target();
             self.exception_edge(landing, outer);
         }
         self.enter(exit);
     }
+}
+
+/// The initializer written after `declarator` when it is a declaration's
+/// declarator with its `value` beside it (a condition's `G b = G()`), not
+/// inside it (`init_declarator`): what builds the object it declares.
+fn initializer_after(declarator: Node) -> Option<Node> {
+    let parent = declarator.parent()?;
+    let value = parent.child_by_field_name("value")?;
+    let is_declarator = parent
+        .child_by_field_name("declarator")
+        .is_some_and(|d| d.id() == declarator.id());
+    (is_declarator && value.start_byte() >= declarator.end_byte()).then_some(value)
 }
 
 /// A handler's parameter list is `(...)`: the ellipsis is the list's own
@@ -3030,5 +3143,140 @@ mod tests {
         );
         assert!(g.may_precede(counted, after), "{}", g.dump());
         assert!(!g.guaranteed(counted, after), "{}", g.dump());
+    }
+
+    /// Where `from`'s exception edges lead.
+    fn exception_targets(g: &Graph, from: BlockId) -> Vec<BlockId> {
+        g.cfg
+            .edges
+            .iter()
+            .filter(|e| e.from == from && e.kind == EdgeKind::Exception)
+            .map(|e| e.to)
+            .collect()
+    }
+
+    /// `n` objects declared one after another in a `try`: each
+    /// constructor may throw with the objects before it live, yet the
+    /// cleanup blocks chain, one destructor each, instead of one block per
+    /// set of live objects.
+    #[test]
+    fn cleanup_blocks_are_linear_in_live_objects() {
+        let n = 300;
+        let locals: String = (0..n).map(|i| format!("        L o{i};\n")).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.cpp");
+        std::fs::write(
+            &path,
+            format!(
+                "struct L {{\n    L();\n    ~L();\n}};\nvoid many()\n{{\n    try {{\n{locals}    }} catch (...) {{\n    }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        let graph_ = IncludeGraph::build(dir.path(), std::slice::from_ref(&path), &[]);
+        let unit = index_source_file(
+            &path,
+            dir.path(),
+            &graph_,
+            &PreprocessOptions::new().with_call_sequencing(true),
+            &IndexSourceCache::new(),
+            None,
+            &HeaderOrder::default(),
+        );
+        let g = graph(&unit, "many");
+        assert_eq!(g.all("L::L").len(), n);
+        assert!(
+            g.cfg.events.len() < 4 * n,
+            "{} events for {n} objects",
+            g.cfg.events.len()
+        );
+        assert!(
+            g.cfg.order.len() < 4 * n,
+            "{} order pairs for {n} objects",
+            g.cfg.order.len()
+        );
+        // Each object is destroyed at the body's end and, but for the last,
+        // in one cleanup block: the later constructors' throws share them.
+        assert_eq!(g.all("L::~L").len(), 2 * n - 1);
+    }
+
+    /// A `try` whose body never throws, or throws only from code nothing
+    /// reaches, passes nothing on: no cleanup for the objects around it.
+    #[test]
+    fn an_unreachable_landing_passes_nothing_on() {
+        let unit = lower("exceptions.cpp");
+        for function in ["dead_landing", "dead_after_break"] {
+            let g = graph(&unit, function);
+            let (w, k) = (g.ev("w"), g.ev("k"));
+            let dtor = g.ev("G::~G");
+            assert!(g.guaranteed(w, dtor), "{function}\n{}", g.dump());
+            assert!(g.guaranteed(k, dtor), "{function}\n{}", g.dump());
+            assert!(g.cfg.exceptional_exit.is_none(), "{function}\n{}", g.dump());
+        }
+        let g = graph(&unit, "dead_after_return");
+        assert!(g.cfg.exceptional_exit.is_none(), "{}", g.dump());
+    }
+
+    /// `if (G b = G())`, `while (G d = G())`: the object is live once
+    /// built, so its constructor throws straight to the landing, as in
+    /// `G b = G();`.
+    #[test]
+    fn a_condition_object_is_live_once_built() {
+        let unit = lower("exceptions.cpp");
+        for function in ["condition_if", "condition_while", "declared_object"] {
+            let g = graph(&unit, function);
+            let ctor = g.ev("G::G");
+            let landing = g
+                .cfg
+                .blocks
+                .iter()
+                .position(|b| b.kind == trace_ir::BlockKind::Landing)
+                .map(|b| BlockId(b as u32))
+                .unwrap();
+            assert!(
+                exception_targets(&g, g.block(ctor)).contains(&landing),
+                "{function}\n{}",
+                g.dump()
+            );
+        }
+    }
+
+    /// A call in an operand the language never evaluates never throws.
+    #[test]
+    fn an_unevaluated_call_throws_nothing() {
+        let unit = lower("exceptions.cpp");
+        let g = graph(&unit, "unevaluated_in_try");
+        assert!(
+            g.cfg.edges.iter().all(|e| e.kind != EdgeKind::Exception),
+            "{}",
+            g.dump()
+        );
+        assert_eq!(g.all("G::~G").len(), 1, "{}", g.dump());
+    }
+
+    /// A destructor a `throw` runs while unwinding terminates should it
+    /// throw: the throw's block leaves for the landing alone, never through
+    /// a cleanup of the objects still to destroy.
+    #[test]
+    fn a_throw_unwinding_destroys_without_throwing() {
+        let unit = lower("exceptions.cpp");
+        let g = graph(&unit, "thrown_pair");
+        let test = g.block(g.ev("k"));
+        let thrown = g
+            .cfg
+            .edges
+            .iter()
+            .find(|e| e.from == test && e.kind == EdgeKind::BranchTrue)
+            .unwrap()
+            .to;
+        let landing = g
+            .cfg
+            .blocks
+            .iter()
+            .position(|b| b.kind == trace_ir::BlockKind::Landing)
+            .map(|b| BlockId(b as u32))
+            .unwrap();
+        let destroys = g.cfg.blocks[thrown.0 as usize].events.len();
+        assert_eq!(destroys, 2, "{}", g.dump());
+        assert_eq!(exception_targets(&g, thrown), [landing], "{}", g.dump());
     }
 }
