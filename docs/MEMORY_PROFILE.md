@@ -1,6 +1,8 @@
 # Memory ownership investigation
 
-The latest measurements are in [Preprocessing cache budget and configured
+The current system-header before/after RSS results are in the
+[post-review performance recheck](EVAL_REPORT.md#performance-recheck-after-review-fixes--2026-10-27).
+Earlier measurements are in [Preprocessing cache budget and configured
 streaming](EVAL_REPORT.md#preprocessing-cache-budget-and-configured-streaming--2026-10-05).
 The preceding [ownership research](EVAL_REPORT.md#preprocessing-and-indexing-memory-research--2026-10-05)
 identified unused resident LineMap capacity, duplicated diagnostics, aggregate
@@ -469,3 +471,49 @@ the sources of interest therefore moves the rest to the more expensive
 configuration instead of skipping them. Sharing header lowering across
 commands of one configuration family is the structural fix and is a
 separate change.
+
+## Indexing subphase timings
+
+For ordinary indexing, `TRACE_PROFILE_INDEX=1` prints cumulative elapsed scope
+timings at the end of program construction. Build the release binary before
+running the diagnostic:
+
+```bash
+cargo build --release -p trace-cli
+TRACE_PROFILE_INDEX=1 target/release/trace analyze /path/to/project \
+  --system-includes --jobs 1 --timeout-secs 1800 -o /tmp/profile.db
+```
+
+`preamble-build` includes assembling a missing preamble and copying any reused
+prefix; `preamble-clone` measures copying a complete cached preamble.
+`merge-full`, `merge-symbols` and `merge-types` separate source-result merges,
+header declaration imports and types-only imports. `type-import` is nested
+inside those merges. `source-lower` includes `syntax-parse` (normalization and
+parsing), `ast-lower` and the remaining lowering work. `unit-finish` measures
+conversion to the merge input. Timings are summed across workers, include
+waiting within a scope, and are cumulative within the process; nested timings
+must not be added together. Use ordinary release runs without this flag for
+before/after elapsed-time comparisons.
+
+The same flag also prints `index-profile: system-bundles refused` with
+`declarations`, `project_preamble`, `not-at-boundary`, `variant-cap`,
+`context-sensitive`, `uncovered`, `incomplete`, and `incompatible` counts.
+These counters belong to one program-construction run and cover preprocessing
+attempts across warm, discovery, settle and orphan passes, including discarded
+speculative work. They are not a count of distinct headers or a cache hit rate.
+Admission checks count a resolved system-root include from a project file once:
+boundary refusal takes precedence, followed by project preamble, then preceding
+declarations. A candidate that starts at a valid boundary but ends at an unsafe
+boundary or imports a project preamble can also be refused at completion.
+Completion reports one reason, prioritizing uncovered held-header content,
+resource-limit truncation (`incomplete`), consumer lookup/linkage effects
+(`context-sensitive`), unsafe boundary, then project preamble. The last reason
+also covers embedded project text outside dependency roots, even when file
+discovery omitted the implementation fragment. Publication can
+also refuse incompatible fingerprints or a full variant list. A repeated
+guardless implementation header exceeding `max_file_expansions` makes the
+enclosing bundle incomplete, even when its own declarations are balanced. Nested
+external implementation fragments are not independent candidates. Counters
+are diagnostic only, have no analysis rows, and allocate no collector when the
+flag is absent. Eligibility and its context-sensitive fallbacks are defined in
+[Shared system header bundles](PREPROCESSOR.md#shared-system-header-bundles).

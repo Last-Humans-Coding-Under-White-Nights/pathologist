@@ -1,0 +1,12 @@
+#pragma once
+namespace SDK {
+#include "fragment.inc"
+#if SELECT == 1
+struct First { void Run(); }; using Selected = First;
+#else
+struct Second { void Run(); }; using Selected = Second;
+#endif
+void Read();
+inline void Hidden() { MustNotAppear(); }
+}
+#define SDK_CALL() SDK::Read()

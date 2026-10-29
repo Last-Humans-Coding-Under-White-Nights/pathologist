@@ -152,9 +152,9 @@ fn supported(candidate: &Candidate, parsed: &ParseResult, original: &str, errors
             return false;
         };
         if !matches!(owner.kind(), "class_specifier" | "struct_specifier")
-            || !owner
+            || owner
                 .child_by_field_name("name")
-                .is_some_and(|name| node_text(&parsed.source, &name) == &original[class.clone()])
+                .is_none_or(|name| node_text(&parsed.source, &name) != &original[class.clone()])
         {
             return false;
         }
