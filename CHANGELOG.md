@@ -4,6 +4,43 @@ All notable changes to `trace` are documented in this file.
 
 ## Unreleased
 
+### Restore DataShare file-open reachability without framework sources
+
+A configurable `ipc` function-model effect connects a bodyless framework
+callee to indexed implementations of a named stub member. The built-in
+DataShare `OpenFile` summary restores the path from `MediaLibraryManager::OpenAsset`
+through `MediaDataShareStubImpl` to the extension ability when only the media
+library is indexed. Smart-pointer functional constructions retain their `auto`
+receiver types, and member calls on undeclared receiver classes retain possible
+definitions across missing namespace imports.
+
+Wrapper inference preserves declared constructor types, including `unique_ptr`
+with a custom deleter, and checks argument-dependent factory declarations before
+guessing a wrapper, retaining subsequent calls on the declared result type.
+Unqualified template constructions retain the declared wrapper's namespace and
+template arguments, including dependency-declared pointees, and exclude
+unrelated namesakes. IPC summaries also retain inherited handlers,
+including final overriders inherited through another virtual-interface branch,
+using the actual defining function for the edge and handler execution context.
+Wrapper guesses reject dependent wrapper names and templated owners. Modeled
+IPC handlers obey the shared declaring-header/test-partition eligibility rules
+across every calling context. Test-exclusive senders retain mocks; callers
+sharing a production sender conservatively share its restrictions. Partition
+opt-out and authoritative cross-image bridges remain supported.
+Virtual senders with indexed overrides use those bodies. Merge redirects retained
+summary callers to every binding still reached, preserving unresolved
+declarations in single-input and unrelated-input merges. Imported unknown types
+retain global qualifiers unless declared scope evidence resolves them relatively.
+Undeclared-receiver recovery uses a class/member index, lexical namespace evidence, compatible
+argument counts and signature-specific TU precedence.
+
+The summary retains every matching provider and overload; it does not select
+providers by URI or propagate parcel values. An empty same-name model disables
+the summary; `--no-ipc` disables summaries and detected bridges. Rules:
+[IPC bridges](docs/ANALYSIS.md#openharmony-ipc-bridges).
+Validation and re-captured corpus expectations:
+[Evaluation report](docs/EVAL_REPORT.md#media-library-datashare-file-open-reachability--2026-10-29).
+
 ### Parse GNU visibility attributes before C linkage (#234)
 
 C++ indexing recovers `__attribute__((visibility("default"))) extern "C"`

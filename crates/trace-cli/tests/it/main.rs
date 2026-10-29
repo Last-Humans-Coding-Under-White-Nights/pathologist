@@ -35,6 +35,7 @@ mod mixed_lang_cases;
 mod mock_visibility;
 mod preproc_context_cases;
 mod preproc_reinclude_cases;
+mod review_regressions;
 mod solver_budget_tests;
 mod static_member_sharing;
 mod system_header_units;

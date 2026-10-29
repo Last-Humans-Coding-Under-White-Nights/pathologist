@@ -7257,15 +7257,22 @@ fn call_result_shape(
         )));
     }
     if (!ctx.is_cpp || explicit_member_operator_call(value, source).is_none())
-        && matches!(func.cached_kind(), "identifier" | "qualified_identifier")
+        && matches!(
+            func.cached_kind(),
+            "identifier" | "qualified_identifier" | "template_function"
+        )
     {
         let spelled = normalize_qualified(node_text(source, &func));
         if lookup_var_node(program, ctx, source, func).is_none() {
             // `T(args)` constructs a `T`, as the call site reads it.
             if let Some(cls) = constructed_class(program, ctx, &spelled) {
-                let desc = (!spelling_is_dependent(ctx, source, value, &spelled, Spelling::Source))
+                let desc = (!spelling_is_dependent(ctx, source, value, &raw, Spelling::Source))
                     .then_some(TypeDesc::Struct {
-                        name: cls,
+                        name: if raw.contains('<') {
+                            qualify_template_spelling(program, ctx, &raw)
+                        } else {
+                            cls
+                        },
                         fields: Vec::new(),
                     });
                 return Some(CallResult::Decided(desc));
@@ -7574,10 +7581,37 @@ fn call_result_among(
     let func = value.cached_field("function")?;
     let (candidates, by_name) = match candidates {
         Overloads::Declared(found) => (found, false),
-        Overloads::ByName(name) => (
-            cpp_callee_candidates(program, ctx, source, func, &name, args),
-            true,
-        ),
+        Overloads::ByName(name) => {
+            let found = cpp_callee_candidates(program, ctx, source, func, &name, args);
+            // Declared construction was handled in call_result_shape. Only
+            // guess a missing wrapper after ordinary lookup and ADL, using
+            // the actual argument types, have found no function declaration.
+            if found.is_empty()
+                && ctx.is_cpp
+                && matches!(
+                    func.cached_kind(),
+                    "template_function" | "qualified_identifier"
+                )
+                && (is_std_smart_ptr_name(&name)
+                    || matches!(last_type_segment(&name), "sptr" | "wptr"))
+            {
+                let raw = normalize_spacing(node_text(source, &func));
+                // The whole callee must name a concrete, supported wrapper:
+                // `sptr` itself may be a template-template parameter, and
+                // Outer<T>::sptr<U> does not hold the first list's T.
+                if !template_tail(&raw).trim().is_empty()
+                    || spelling_is_dependent(ctx, source, value, &raw, Spelling::Source)
+                {
+                    return None;
+                }
+                if let Some(desc) =
+                    smart_ptr_type(program, ctx, source, value, &name, &raw, Spelling::Source)
+                {
+                    return Some(desc);
+                }
+            }
+            (found, true)
+        }
     };
     // Looked up only for a candidate whose return is left to substitution.
     let static_receiver = std::cell::OnceCell::new();
@@ -11160,6 +11194,69 @@ fn collect_call_at_node(
     let first_flow = program.flow.len();
     let first_pending = ctx.pending.borrow().len();
     collect_call_at_node_inner(program, ctx, source, node, caller);
+    if program.symbols.call_sites[first_site..]
+        .iter()
+        .any(|site| site.receiver_class.is_some() && site.callee_fn_id.is_none())
+    {
+        // Capture lexical evidence before lowering leaves this scope. Nested
+        // calls have already recorded their own evidence in their recursive visit.
+        let mut namespaces: Vec<String> = ctx.directive_namespaces().map(str::to_owned).collect();
+        let lexical = ctx
+            .ns_stack
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("::");
+        for scope in std::iter::once(lexical.as_str())
+            .chain(ctx.class_ctx.as_ref().map(|c| c.qual_name.as_str()))
+        {
+            let mut prefix = scope;
+            while !prefix.is_empty() {
+                namespaces.push(prefix.to_owned());
+                prefix = prefix.rsplit_once("::").map_or("", |(parent, _)| parent);
+            }
+        }
+        for import in &ctx.using_name_imports {
+            namespaces.extend(
+                import
+                    .candidates
+                    .iter()
+                    .filter_map(|q| q.rsplit_once("::").map(|(ns, _)| ns.to_owned())),
+            );
+        }
+        namespaces.sort();
+        namespaces.dedup();
+        for site in &mut program.symbols.call_sites[first_site..] {
+            if site.receiver_class.is_some()
+                && site.callee_fn_id.is_none()
+                && site.details.as_ref().is_some_and(|d| {
+                    d.receiver_recovery
+                        .as_ref()
+                        .is_some_and(|r| !r.scope_recorded)
+                })
+            {
+                let lexical_owner = site
+                    .receiver_class
+                    .as_deref()
+                    .and_then(|name| name.rsplit_once("::"))
+                    .is_some_and(|(ns, _)| {
+                        std::iter::once(lexical.as_str())
+                            .chain(ctx.class_ctx.as_ref().map(|c| c.qual_name.as_str()))
+                            .any(|scope| {
+                                scope == ns
+                                    || scope
+                                        .strip_prefix(ns)
+                                        .is_some_and(|tail| tail.starts_with("::"))
+                            })
+                    });
+                let recovery = site.details_mut().receiver_recovery.as_mut().unwrap();
+                recovery.lexical_owner = lexical_owner;
+                recovery.namespaces = namespaces.clone();
+                recovery.scope_recorded = true;
+            }
+        }
+    }
     let operation_span = node_span(program, ctx, node);
     let expression = operation_expression(ctx, source, node);
     record_call_expressions(program, first_site, &expression);
@@ -11566,7 +11663,12 @@ fn collect_call_at_node_inner(
         );
         return;
     }
-    if ctx.is_cpp && matches!(func.cached_kind(), "identifier" | "qualified_identifier") {
+    if ctx.is_cpp
+        && matches!(
+            func.cached_kind(),
+            "identifier" | "qualified_identifier" | "template_function"
+        )
+    {
         let spelled = normalize_qualified(node_text(source, &func));
         let target = match lookup_var_node(program, ctx, source, func) {
             // `T(args)` where `T` names a class with a declared constructor
@@ -13112,7 +13214,7 @@ fn emit_unresolved_site(
         addr_of_member_args,
         addr_of_args,
         deref_args: _,
-        argc: _,
+        argc,
         arg_desc: _,
         address_reference_args: _,
         ctor_set_complete: _,
@@ -13140,6 +13242,13 @@ fn emit_unresolved_site(
         receiver,
         tu: program.symbols.function_by_id(caller).and_then(|f| f.tu),
     });
+    program
+        .symbols
+        .call_sites
+        .last_mut()
+        .unwrap()
+        .details_mut()
+        .receiver_recovery = Some(Box::new(trace_ir::ReceiverRecovery::new(argc)));
 }
 
 /// The object a member call runs on, as lowering knows it
@@ -13299,6 +13408,13 @@ fn emit_member_targets(
             receiver: receiver.var(),
             tu,
         });
+        program
+            .symbols
+            .call_sites
+            .last_mut()
+            .unwrap()
+            .details_mut()
+            .receiver_recovery = Some(Box::new(trace_ir::ReceiverRecovery::new(argc)));
         return;
     }
     let last_index = targets.len() - 1;
@@ -15092,11 +15208,7 @@ fn arity_compatible(expected: Option<usize>, got: Option<usize>) -> bool {
 /// Whether `f`, declaring `declared` explicit parameters, takes `argc`
 /// arguments on its own defaults and variadic tail.
 fn arity_takes(f: &Function, declared: usize, argc: usize) -> bool {
-    match declared.cmp(&argc) {
-        std::cmp::Ordering::Equal => true,
-        std::cmp::Ordering::Less => f.variadic,
-        std::cmp::Ordering::Greater => argc + f.default_args as usize >= declared,
-    }
+    f.takes_argument_count(declared as u32, argc as u32)
 }
 
 /// The targets a call passing `argc` arguments fits: no more arguments than a
@@ -20461,7 +20573,7 @@ fn type_desc_from_node(
                 return desc.clone();
             }
         }
-        match undeclared_class_guess(ctx, source, node) {
+        match undeclared_class_guess(program, ctx, source, node) {
             Some(name) => {
                 program.types.note_guessed_class(&name);
                 TypeDesc::Struct {
@@ -20484,7 +20596,12 @@ fn type_desc_from_node(
 /// argument is not, a function's return type is not (`auto p = GetBare();`
 /// stays untyped), and a template parameter or dependent name is not a
 /// class (`docs/ANALYSIS.md`, "Undeclared receiver classes").
-fn undeclared_class_guess(ctx: &LowerContext, source: &str, node: Node) -> Option<String> {
+fn undeclared_class_guess(
+    program: &Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<String> {
     if !ctx.is_cpp || node.cached_kind() != "type_identifier" {
         return None;
     }
@@ -20536,7 +20653,42 @@ fn undeclared_class_guess(ctx: &LowerContext, source: &str, node: Node) -> Optio
     {
         return None;
     }
-    Some(ctx.qualify(name))
+    let scopes = &[ImportScope::Body, ImportScope::Namespace, ImportScope::File];
+    Some(
+        imported_by_declaration(ctx, name, scopes, |q| program.types.declared_class(q))
+            .or_else(|| {
+                ctx.using_name_imports
+                    .iter()
+                    .rev()
+                    .filter(|import| import.base == name && scopes.contains(&import.scope))
+                    .find_map(|import| {
+                        undeclared_import_spelling(program, import).map(str::to_owned)
+                    })
+            })
+            .unwrap_or_else(|| ctx.qualify(name)),
+    )
+}
+
+/// An unknown imported class keeps the written global spelling unless its
+/// first qualifier is declared in an enclosing scope. Expanded lookup forms
+/// are candidates, not evidence for an invented nested namespace.
+fn undeclared_import_spelling<'a>(program: &Program, import: &'a UsingImport) -> Option<&'a str> {
+    let written = import.candidates.last()?.as_str();
+    let (_, tail) = written.split_once("::")?;
+    Some(
+        import
+            .candidates
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .strip_suffix(tail)
+                    .and_then(|prefix| prefix.strip_suffix("::"))
+                    .is_some_and(|root| {
+                        program.namespaces.contains(root) || program.types.declares_class(root)
+                    })
+            })
+            .map_or(written, String::as_str),
+    )
 }
 
 /// Distinguish C/C++ primitive scalar parameter types (`double` vs `int`,

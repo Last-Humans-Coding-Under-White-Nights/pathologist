@@ -1,5 +1,9 @@
 # IPC call-graph support (within-repo Stub ↔ Proxy linking)
 
+This document records the original design. Current detection rules, IDL support
+and configurable summaries for absent framework sources (including DataShare
+`OpenFile`) are specified in [OpenHarmony IPC bridges](ANALYSIS.md#openharmony-ipc-bridges).
+
 ## Problem statement
 
 OpenHarmony services use Binder IPC: a **proxy** method calls

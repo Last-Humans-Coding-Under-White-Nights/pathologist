@@ -50,6 +50,425 @@ fn has_bridge_edge(
 }
 
 #[test]
+fn ipc_datashare_summary_includes_inherited_implementations() {
+    check_inherited_datashare_summary("ipc_datashare_inherited");
+}
+
+#[test]
+fn ipc_datashare_summary_includes_inherited_final_overrider() {
+    check_inherited_datashare_summary("ipc_datashare_virtual_inherited");
+}
+
+fn check_inherited_datashare_summary(fixture: &str) {
+    let (program, pag, analysis) = build(fixture);
+    let sender = "OHOS::DataShare::DataShareHelper::OpenFile";
+    let handler = "OHOS::DataShare::Backend::OpenFile";
+    assert!(has_bridge_edge(&program, &analysis, sender, handler));
+    assert_eq!(
+        pag.ipc_bridges.len(),
+        1,
+        "inherited handlers are deduplicated"
+    );
+    let target = pag.ipc_bridges[0].stub_handler;
+    assert_eq!(fn_name(&program, target), handler);
+    assert!(program.symbols.function(target).is_defined);
+    assert!(analysis.call_edges.iter().any(|edge| {
+        edge.callee == target
+            && edge.resolution == ResolutionKind::IpcBridge
+            && edge.call_site == trace_analysis::SYNTHETIC_CALL_SITE
+    }));
+    assert!(analysis.execution_contexts.iter().any(|context| {
+        context.entry == target
+            && context.kind == trace_analysis::ContextKind::IpcHandler
+            && context.self_concurrent
+    }));
+}
+
+#[test]
+fn ipc_summary_respects_default_test_partition() {
+    for test_sender in [false, true] {
+        check_summary_partition(PartitionCase {
+            test_sender,
+            ..Default::default()
+        });
+    }
+}
+
+#[test]
+fn ipc_summary_respects_custom_test_partition() {
+    for test_sender in [false, true] {
+        check_summary_partition(PartitionCase {
+            test_dir: "specs",
+            policy: trace_ir::TestPartition::from_options(false, vec!["specs".into()]).unwrap(),
+            test_sender,
+            ..Default::default()
+        });
+    }
+}
+
+#[test]
+fn ipc_summary_allows_test_providers_when_partition_disabled() {
+    check_summary_partition(PartitionCase {
+        policy: trace_ir::TestPartition::from_options(true, vec![]).unwrap(),
+        production_admitted: true,
+        ..Default::default()
+    });
+}
+
+#[test]
+fn ipc_summary_partition_keeps_authoritative_cross_image_bridges() {
+    let one = check_summary_partition(PartitionCase {
+        images: true,
+        production_admitted: true,
+        ..Default::default()
+    });
+    let four = check_summary_partition(PartitionCase {
+        images: true,
+        production_admitted: true,
+        jobs: 4,
+        ..Default::default()
+    });
+    assert_eq!(one, four, "IPC call edges must not depend on indexing jobs");
+}
+
+struct PartitionCase {
+    test_dir: &'static str,
+    policy: trace_ir::TestPartition,
+    images: bool,
+    test_sender: bool,
+    production_admitted: bool,
+    jobs: usize,
+}
+
+impl Default for PartitionCase {
+    fn default() -> Self {
+        Self {
+            test_dir: "tests",
+            policy: Default::default(),
+            images: false,
+            test_sender: false,
+            production_admitted: false,
+            jobs: 1,
+        }
+    }
+}
+
+type PartitionEdge = (
+    String,
+    String,
+    String,
+    Option<trace_ir::TargetId>,
+    Option<trace_ir::TargetId>,
+);
+
+fn check_summary_partition(case: PartitionCase) -> Vec<PartitionEdge> {
+    let PartitionCase {
+        test_dir,
+        policy,
+        images,
+        test_sender,
+        production_admitted,
+        jobs,
+    } = case;
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::create_dir(root.join(test_dir)).unwrap();
+    std::fs::write(root.join("api.hpp"),
+        "namespace OHOS { namespace DataShare { class DataShareHelper { public: int OpenFile(int); }; }}"
+    ).unwrap();
+    std::fs::write(root.join("src/main.cpp"),
+        "#include \"api.hpp\"\nnamespace OHOS { namespace DataShare { int use(DataShareHelper *h) { return h->OpenFile(1); } }}"
+    ).unwrap();
+    let mut provider = String::from(
+        "#include \"api.hpp\"\nnamespace OHOS { namespace DataShare {\n\
+         class DataShareStub { public: virtual int OpenFile(int) = 0; };\n\
+         class MockProvider : public DataShareStub { public: int OpenFile(int x) { return x; } };\n"
+    );
+    if test_sender {
+        provider.push_str(
+            "class TestHelper : public DataShareHelper { public: int OpenFile(int); };\n\
+             int test_use(TestHelper *h) { return h->OpenFile(1); }\nint shared_test_use(DataShareHelper *h) { return h->OpenFile(2); }\n",
+        );
+    }
+    provider.push_str("}}\n");
+    std::fs::write(root.join(test_dir).join("provider.cpp"), provider).unwrap();
+    if images {
+        let commands: Vec<_> = [
+            ("src/main.cpp".to_owned(), "client"),
+            (format!("{test_dir}/provider.cpp"), "service"),
+        ]
+        .into_iter()
+        .map(|(file, image)| {
+            serde_json::json!({
+                "directory": root, "file": file, "output": format!("{image}.o"),
+                "arguments": ["c++", "-I", root, "-c", file, "-o", format!("{image}.o")]
+            })
+        })
+        .collect();
+        std::fs::write(
+            root.join("compile_commands.json"),
+            serde_json::json!(commands).to_string(),
+        )
+        .unwrap();
+        std::fs::write(root.join("link_commands.json"), serde_json::json!([
+            {"directory": root, "output": "client", "arguments": ["c++", "client.o", "-o", "client"]},
+            {"directory": root, "output": "service", "arguments": ["c++", "service.o", "-o", "service"]}
+        ]).to_string()).unwrap();
+    }
+    let mut opts = PreprocessOptions::new().with_include(root.to_path_buf());
+    opts.test_partition = policy;
+    let program = trace_parse::build_program_with_jobs(root, &opts, jobs).unwrap();
+    assert_eq!(program.symbols.has_target_scopes(), images);
+    let (_, analysis) = analyze(&program);
+    let functions = &program.symbols.functions;
+    let caller = functions
+        .iter()
+        .find(|f| f.name == "OHOS::DataShare::use")
+        .unwrap();
+    let sender = functions
+        .iter()
+        .find(|f| {
+            f.name == "OHOS::DataShare::DataShareHelper::OpenFile" && f.target == caller.target
+        })
+        .unwrap();
+    let handler = functions
+        .iter()
+        .find(|f| f.name == "OHOS::DataShare::MockProvider::OpenFile" && f.is_defined)
+        .unwrap();
+    let bridge = |from| {
+        analysis.call_edges.iter().any(|edge| {
+            edge.caller == from
+                && edge.callee == handler.id
+                && edge.resolution == ResolutionKind::IpcBridge
+                && edge.call_site == trace_analysis::SYNTHETIC_CALL_SITE
+        })
+    };
+    assert_eq!(
+        bridge(sender.id),
+        production_admitted,
+        "production sender must respect the partition"
+    );
+    if test_sender {
+        let shared = functions
+            .iter()
+            .find(|f| f.name == "OHOS::DataShare::shared_test_use")
+            .unwrap();
+        let bindings: Vec<_> = analysis
+            .call_edges
+            .iter()
+            .filter(|e| e.caller == shared.id)
+            .map(|e| e.callee)
+            .collect();
+        assert_eq!(
+            bindings,
+            [sender.id],
+            "the test call really shares the production-declared sender"
+        );
+        let test = functions
+            .iter()
+            .find(|f| f.name == "OHOS::DataShare::TestHelper::OpenFile")
+            .unwrap();
+        assert!(
+            bridge(test.id),
+            "test senders must retain access to their providers"
+        );
+    }
+    assert_eq!(
+        analysis
+            .execution_contexts
+            .iter()
+            .any(|ctx| ctx.entry == handler.id
+                && ctx.kind == trace_analysis::ContextKind::IpcHandler
+                && ctx.self_concurrent),
+        production_admitted || test_sender
+    );
+    if images {
+        assert!(sender.target.is_some());
+        assert!(handler.target.is_some());
+        assert_ne!(sender.target, handler.target);
+    }
+    let mut edges: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .map(|edge| {
+            let from = program.symbols.function(edge.caller);
+            let to = program.symbols.function(edge.callee);
+            (
+                from.name.clone(),
+                to.name.clone(),
+                format!("{:?}", edge.resolution),
+                from.target,
+                to.target,
+            )
+        })
+        .collect();
+    edges.sort();
+    edges
+}
+
+#[test]
+fn ipc_datashare_framework_summary_with_declared_sptr_reaches_extension() {
+    let root = fixture("ipc_datashare");
+    let opts = PreprocessOptions::new()
+        .with_include(root.clone())
+        .with_define("DECLARED_SPTR", "1");
+    let program = build_program(&root, &opts).unwrap();
+    let (_, analysis) = analyze(&program);
+    let stub = "OHOS::DataShare::MediaDataShareStubImpl::OpenFile";
+    assert!(has_bridge_edge(
+        &program,
+        &analysis,
+        "DataShare::DataShareHelper::OpenFile",
+        stub
+    ));
+    assert!(analysis
+        .call_edges
+        .iter()
+        .any(|e| fn_name(&program, e.caller) == stub
+            && fn_name(&program, e.callee)
+                == "OHOS::AbilityRuntime::MediaDataShareExtAbility::OpenFile"));
+}
+
+#[test]
+fn ipc_datashare_framework_summary_reaches_extension_ability() {
+    let (program, pag, analysis) = build("ipc_datashare");
+    let stub = "OHOS::DataShare::MediaDataShareStubImpl::OpenFile";
+    let edges: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .map(|e| {
+            (
+                fn_name(&program, e.caller),
+                fn_name(&program, e.callee),
+                e.resolution,
+            )
+        })
+        .collect();
+    let has = |caller: &str, callee: &str| edges.iter().any(|(a, b, _)| a == caller && b == callee);
+    assert!(
+        has("shadow::DeclaredFactory", "shadow::Result::Run"),
+        "{edges:?}"
+    );
+    assert!(
+        has(
+            "OHOS::Media::MediaLibraryManager::OpenAsset",
+            "DataShare::DataShareHelper::OpenFile"
+        ),
+        "{edges:?}"
+    );
+    assert!(
+        has_bridge_edge(
+            &program,
+            &analysis,
+            "DataShare::DataShareHelper::OpenFile",
+            stub
+        ),
+        "{edges:?}"
+    );
+    assert!(
+        has(stub, "OHOS::DataShare::MediaDataShareStubImpl::GetOwner"),
+        "{edges:?}"
+    );
+    assert!(
+        has(
+            stub,
+            "OHOS::AbilityRuntime::MediaDataShareExtAbility::OpenFile"
+        ),
+        "{edges:?}"
+    );
+    assert_eq!(
+        edges
+            .iter()
+            .filter(|(caller, callee, resolution)| {
+                caller == stub
+                    && callee == "OHOS::alternate::MediaDataShareExtAbility::OpenFile"
+                    && *resolution == ResolutionKind::Direct
+            })
+            .count(),
+        1,
+        "unresolved imports keep the overload compatible with two arguments"
+    );
+    let declared_edges: Vec<_> = edges
+        .iter()
+        .filter(|(caller, _, _)| caller == "declared::MissingMember")
+        .collect();
+    assert!(!declared_edges.is_empty());
+    assert!(declared_edges.iter().all(|(_, callee, resolution)| {
+        callee == "declared::MediaDataShareExtAbility::OpenFile"
+            && *resolution == ResolutionKind::External
+    }));
+    assert_eq!(
+        pag.ipc_bridges.len(),
+        3,
+        "both provider overloads must be kept"
+    );
+    for bridge in &pag.ipc_bridges {
+        assert!(analysis.execution_contexts.iter().any(|context| {
+            context.entry == bridge.stub_handler
+                && context.kind == trace_analysis::ContextKind::IpcHandler
+                && context.self_concurrent
+        }));
+    }
+    assert!(analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.resolution == ResolutionKind::IpcBridge)
+        .all(|e| {
+            e.call_site == trace_analysis::SYNTHETIC_CALL_SITE
+                && !fn_name(&program, e.caller).contains("unrelated")
+                && !fn_name(&program, e.caller).contains("LocalHelper")
+                && !fn_name(&program, e.callee).contains("unrelated")
+        }));
+}
+
+#[test]
+fn ipc_datashare_summary_respects_options_and_model_override() {
+    let (program, _, _) = build("ipc_datashare");
+    let opts = AnalyzeOptions {
+        enable_ipc: false,
+        ..Default::default()
+    };
+    let (pag, analysis) = analyze_with_options(&program, opts);
+    assert!(pag.ipc_bridges.is_empty());
+    assert!(analysis
+        .call_edges
+        .iter()
+        .all(|e| e.resolution != ResolutionKind::IpcBridge));
+
+    let mut opts = AnalyzeOptions::default();
+    std::sync::Arc::make_mut(&mut opts.models)
+        .merge_toml_str(
+            r#"
+        [[model]]
+        name = "OHOS::DataShare::DataShareHelper::OpenFile"
+        effects = []
+    "#,
+        )
+        .unwrap();
+    let (pag, _) = analyze_with_options(&program, opts.clone());
+    assert!(pag.ipc_bridges.is_empty());
+
+    std::sync::Arc::make_mut(&mut opts.models)
+        .merge_toml_str(
+            r#"
+        [[model]]
+        name = "OHOS::DataShare::DataShareHelper::OpenFile"
+        effects = [{ kind = "ipc", target = "OHOS::DataShare::MediaDataShareStubImpl::OpenFile" }]
+    "#,
+        )
+        .unwrap();
+    let (pag, analysis) = analyze_with_options(&program, opts);
+    assert_eq!(pag.ipc_bridges.len(), 1);
+    assert!(has_bridge_edge(
+        &program,
+        &analysis,
+        "DataShare::DataShareHelper::OpenFile",
+        "OHOS::DataShare::MediaDataShareStubImpl::OpenFile"
+    ));
+}
+
+#[test]
 fn ipc_basic_bridges_proxy_to_stub() {
     let (program, pag, analysis) = build("ipc_basic");
 

@@ -14728,3 +14728,148 @@ per-run databases, and the verification reports (`verification-small.json`,
 `verification-determinism.json`, `verification-solver.json`, and
 `verification-conditional-definitions.json`). Database comparisons and the
 conditional-feature/profiling probes ran only after all native timings ended.
+
+## Media-library DataShare file-open reachability — 2026-10-29
+
+Final validation of `fix/datashare-ipc-summary` against local master `0759dc6`.
+The media library is indexed alone at `ad09a5f888ed78c2c46f5c218fa144ef6774e8e9`,
+with eight jobs and `--ignore-logging`, without SDK/system headers or compilation
+commands. HDF, hiview and camera use the clean revisions and options pinned in
+`scripts/eval_expected.json`. Rules and imprecision are specified in
+[OpenHarmony IPC bridges](ANALYSIS.md#openharmony-ipc-bridges) and
+[Undeclared receiver classes](ANALYSIS.md#undeclared-receiver-classes).
+
+The required consecutive path reaches a **defined** extension method:
+
+```text
+OHOS::Media::MediaLibraryManager::OpenAsset
+  --external--> DataShare::DataShareHelper::OpenFile
+  --ipc-------> OHOS::DataShare::MediaDataShareStubImpl::OpenFile
+  --direct----> OHOS::AbilityRuntime::MediaDataShareExtAbility::OpenFile
+```
+
+The IPC source call site is NULL and the handler has a self-concurrent
+`ipc_handler` context. Separate regressions cover declared and absent `sptr`
+headers, dependency-declared wrappers, inherited/final handlers, independent
+provider images, shared production/test callers, directory-renaming invariance,
+virtual implementation precedence, and merged-database reachability.
+
+Reproduction (build both revisions separately before timing):
+
+```bash
+cargo test --workspace
+cargo build --release -p trace-cli -p trace-merge
+python3 scripts/eval_check.py --outdir eval-final
+./target/release/trace-merge eval-final/eval_check_camera.db -o camera-merged.db
+./target/release/trace analyze ~/multimedia_media_library \
+  --jobs 8 --ignore-logging -o media-final.db
+python3 scripts/bench_receiver_recovery.py \
+  --baseline /path/to/reviewed-trace --candidate target/release/trace \
+  --sizes 1000 2000 4000 --repeats 3 --output recovery-scaling.json
+```
+
+Generated databases, timings and logs are not committed. The following results
+all describe the final implementation; earlier intermediate revision tables
+have been removed.
+
+Each cell below is **master → final**, using the same corpus checkout and
+analysis options. Counts are exact; recaptured expectations retain their existing
+tolerances.
+
+| Corpus | Functions | Direct edges | All call edges | Argument-flow edges | IPC edges |
+|---|---:|---:|---:|---:|---:|
+| HDF | 12,207 → 12,198 | 49,569 → 49,673 | 78,649 → 78,728 | 72,003 → 72,106 | 58 → 58 |
+| Hiview | 9,972 → 9,971 | 22,627 → 23,319 | 38,607 → 39,299 | 31,296 → 31,924 | 44 → 44 |
+| Camera | 23,721 → 23,722 | 68,465 → 68,819 | 115,745 → 116,135 | 57,561 → 57,894 | 808 → 808 |
+| Media library | 49,316 → 49,332 | 140,047 → 142,568 | 231,142 → 233,681 | 181,754 → 184,717 | 8 → 10 |
+
+Defined-function and parse-diagnostic counts are unchanged in every corpus.
+Indirect edges are unchanged except HDF (5,087 → 5,088). The media solver reaches
+a fixpoint (`solver_partial = false`), and a recursive database query confirms
+that `OpenAsset` reaches the defined extension `OpenFile`.
+
+Import qualification removes 13 duplicate nested-`std` external rows in Hiview
+and seven `OHOS::Media::OHOS::DataShare` external rows in media compared with the
+reviewed implementation. Imported types now use the existing globally rooted
+names instead of duplicating namespace prefixes. Exact Hiview probes
+verify no external owner contains a nested `std` namespace and that
+`std::string::c_str` exists. Known relative namespace roots and explicit global
+imports have separate fixture coverage.
+
+Single-input camera merging preserves **808 → 808 IPC edges**, with identical
+source/target definition identities and NULL source call sites. The IDL fixtures
+preserve **1 → 1** (`idl_basic`) and **4 → 4** (`idl_hdi`). A missing-framework
+DataShare fixture retains its bridge and `OpenAsset` reachability both alone and
+with an unrelated input; merging a framework definition still rebinds the sender
+and retains the reachable bridge. These checks distinguish an unchanged
+unresolved declaration from an actual declaration-to-definition binding.
+
+The direct-edge audit compares source identities, including call-site position
+and callee definition position, rather than exported IDs. No original direct
+edges are removed in any corpus. The added edges break down as follows:
+
+| Corpus | Bare receiver owner | Same/nested namespace | Shared enclosing namespace | Using evidence to inspect | Constructors | Other resolution | Total added |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| HDF | 49 | 2 | 0 | 0 | 40 | 13 | 104 |
+| Hiview | 229 | 431 | 2 | 0 | 29 | 1 | 692 |
+| Camera | 61 | 213 | 0 | 3 | 27 | 50 | 354 |
+| Media library | 64 | 2,198 | 170 | 48 | 3 | 38 | 2,521 |
+
+These categories describe evidence, not a ground-truth precision percentage.
+The sample inspection checked namespace imports and receiver shapes:
+
+- Hiview's two shared-namespace edges target `EventRaw::RawData`; the caller's
+  file, `base/event_store/utility/reader/sys_event_doc_reader.cpp`, explicitly
+  imports that class at line 29. Exact probes at the three reviewed `ReadHeader`
+  and `Read` sites now each select one argument-count-compatible definition.
+- Camera's three partial-namespace cases are nested
+  `HStreamOperator::DisplayRotationListener` methods in the fuzzer, whose file
+  imports both `OHOS` and `OHOS::CameraStandard`. Both production copies of
+  `photo_asset_adapter.cpp` have **zero** direct adapter-to-camera-wrapper
+  `AddPhotoProxy` edges. A separate fixture preserves the genuine reverse edge
+  while rejecting the edge that would close the reported false recursion cycle.
+- Media's partial-namespace samples resolve `IPC::MediaReqVo` to
+  `OHOS::Media::IPC::MediaReqVo`; `media_datashare_ext_ability.cpp` imports that
+  namespace at line 85. Other sampled additions include stub ownership methods
+  reached through retained smart-pointer template arguments.
+- HDF samples include bare `SharedMemQueueMeta` members and `NativeBuffer`
+  construction. Other-resolution samples include newly typed wrapper receivers,
+  such as camera's `AudioTaskManager` callbacks.
+
+Reproduce the classification and inspect additional samples with separately
+exported master and final databases:
+
+```bash
+python3 scripts/audit_receiver_recovery.py master-camera.db final-camera.db \
+  --samples 12 --output camera-edge-audit.json
+```
+
+The repeated-miss scaling check generates N unrelated classes defining `Ping`
+and N calls on an undeclared `Absent` receiver. It verifies exactly N external
+edges and no direct edges, so the timing isolates lookup overhead rather than
+additional analysis. Release binaries run serially with one job, alternating
+order over three repetitions; medians exclude builds and database verification.
+
+| N | Reviewed a787524 wall (s) | Final wall (s) | Reviewed RESOLVE (ms) | Final RESOLVE (ms) |
+|---:|---:|---:|---:|---:|
+| 1,000 | 0.563 | 0.138 | 366.805 | 0.578 |
+| 2,000 | 1.730 | 0.197 | 1,525.959 | 1.132 |
+| 4,000 | 7.115 | 0.383 | 6,679.301 | 1.695 |
+
+Fourfold input growth takes 2.77× the final wall time, passing the script's
+explicit 8× bound. A separate serial comparison against master `0759dc6` gives
+master/final wall medians of 0.168/0.140, 0.261/0.250 and 0.484/0.535 seconds;
+at N=4,000, RESOLVE is 0.885/2.994 ms. This removes the reviewed quadratic scan
+while retaining a small recovery lookup cost. These are synthetic measurements;
+corpus memory, database-size and wall-time changes were not benchmarked here.
+Run the same benchmark command with the master binary as `--baseline` to
+reproduce that control.
+
+Final validation passes **2,577 workspace tests**, **112 pinned-corpus checks**,
+`cargo clippy --workspace --all-targets -- -D warnings`, formatting and
+`git diff --check`. Regression coverage includes signature-specific TU precedence,
+definition relocation, default/variadic arity, the SDK/camera false cycle,
+namespace imports, declared/dependency wrappers, test-directory renaming,
+shared senders, pure-virtual senders, independent provider images with different
+final metadata, one/four-job determinism, and merge reachability with NULL IPC
+source call sites.

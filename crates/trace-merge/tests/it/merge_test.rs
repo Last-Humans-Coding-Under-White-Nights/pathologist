@@ -3441,3 +3441,109 @@ fn re_merging_keeps_alternative_sites_one_event() {
     let frames: Vec<&str> = graph.frames.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(frames, ["common", "cb_a", "cb_b", "cb_c"]);
 }
+
+const DATASHARE_MEDIA_SOURCE: &str = r#"
+namespace OHOS { namespace DataShare {
+class DataShareHelper { public: int OpenFile(int); };
+class DataShareStub { public: virtual int OpenFile(int) = 0; };
+class MediaStubImpl : public DataShareStub {
+public: int OpenFile(int x) override { return x; }
+};
+}}
+int OpenAsset(OHOS::DataShare::DataShareHelper *h) { return h->OpenFile(1); }
+"#;
+
+fn ipc_targets(conn: &Connection) -> Vec<(String, String, bool)> {
+    conn.prepare(
+        "SELECT caller.name, callee.name, e.call_site_id IS NULL
+         FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id
+         JOIN functions callee ON callee.id=e.callee_fn_id
+         WHERE e.resolution='ipc' ORDER BY caller.name, callee.name",
+    )
+    .unwrap()
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+#[test]
+fn single_input_merge_preserves_idl_ipc_edges() {
+    let scratch = tempdir().unwrap();
+    for (fixture, expected_count) in [("idl_basic", 1), ("idl_hdi", 4)] {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(fixture);
+        let input = scratch.path().join(format!("{fixture}.db"));
+        let output = scratch.path().join(format!("{fixture}-merged.db"));
+        analyze_repo(&repo, &input);
+        let before = ipc_targets(&Connection::open(&input).unwrap());
+        assert_eq!(before.len(), expected_count, "{fixture}");
+        merge_into(&[input], &output);
+        assert_eq!(
+            ipc_targets(&Connection::open(output).unwrap()),
+            before,
+            "{fixture}"
+        );
+    }
+}
+
+#[test]
+fn merge_preserves_unresolved_summary_senders_alone_and_with_unrelated_input() {
+    let scratch = tempdir().unwrap();
+    let inputs = sequencing_inputs(
+        scratch.path(),
+        &[
+            ("media", "main.cpp", DATASHARE_MEDIA_SOURCE, false),
+            (
+                "unrelated",
+                "main.cpp",
+                "int unrelated() { return 1; }",
+                false,
+            ),
+        ],
+    );
+    let before = ipc_targets(&Connection::open(&inputs[0]).unwrap());
+    assert_eq!(before.len(), 1);
+    assert!(before[0].2, "IPC source call site must be NULL");
+    for count in [1, 2] {
+        let output = scratch.path().join(format!("merged-{count}.db"));
+        merge_into(&inputs[..count], &output);
+        let conn = Connection::open(output).unwrap();
+        assert_eq!(ipc_targets(&conn), before, "input count={count}");
+        assert_eq!(count_reachable_media_stubs(&conn), 1);
+    }
+}
+
+fn count_reachable_media_stubs(conn: &Connection) -> i64 {
+    count(conn, "WITH RECURSIVE reachable(id) AS (SELECT id FROM functions WHERE name='OpenAsset' AND is_defined=1 UNION SELECT e.callee_fn_id FROM call_edges e JOIN reachable r ON r.id=e.caller_fn_id) SELECT count(*) FROM functions f JOIN reachable r ON r.id=f.id WHERE f.name='OHOS::DataShare::MediaStubImpl::OpenFile' AND f.is_defined=1")
+}
+
+#[test]
+fn merge_rekeys_summary_ipc_callers_to_reachable_sender_definitions() {
+    let scratch = tempdir().unwrap();
+    let root = scratch.path();
+    let media = root.join("media");
+    let framework = root.join("framework");
+    fs::create_dir(&media).unwrap();
+    fs::create_dir(&framework).unwrap();
+    fs::write(media.join("main.cpp"), DATASHARE_MEDIA_SOURCE).unwrap();
+    fs::write(framework.join("helper.cpp"), "namespace OHOS { namespace DataShare { class DataShareProxy { public: int OpenFile(int); }; class DataShareHelper { public: int OpenFile(int); DataShareProxy *proxy_; }; int DataShareHelper::OpenFile(int x) { return proxy_->OpenFile(x); } }}").unwrap();
+    let m = root.join("m.db");
+    let f = root.join("f.db");
+    let out = root.join("out.db");
+    analyze_repo(&media, &m);
+    analyze_repo(&framework, &f);
+    merge_databases(
+        &[m, f],
+        &MergeOptions {
+            output: out.clone(),
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let c = Connection::open(&out).unwrap();
+    assert_eq!(count_reachable_media_stubs(&c), 1);
+    let bridges: i64 = c.query_row("SELECT count(*) FROM call_edges e JOIN functions caller ON caller.id=e.caller_fn_id WHERE e.resolution='ipc' AND e.call_site_id IS NULL AND caller.name='OHOS::DataShare::DataShareHelper::OpenFile' AND caller.is_defined=1", [], |r|r.get(0)).unwrap();
+    assert_eq!(bridges, 1);
+}
